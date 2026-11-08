@@ -1,0 +1,78 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+"""Authenticated generic extension-read routes."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from sanic import Blueprint
+
+from api.custom_import_billing_http import serve_custom_import_billing_search
+from api.custom_import_detail_batch import serve_custom_import_detail_batch
+from api.custom_import_provider_batch import serve_custom_import_provider_batch
+from api.custom_import_provider_geo import serve_custom_import_provider_geo
+from api.custom_import_provider_http import serve_custom_import_providers
+from api.custom_import_provider_service_http import serve_custom_import_provider_service
+from api.custom_import_read_http import serve_custom_import_detail, serve_custom_import_search
+
+blueprint = Blueprint("custom_import", url_prefix="/extensions/custom-import", version=1)
+
+
+def _session(request: Any) -> Any:
+    return getattr(getattr(request, "ctx", None), "sa_session", None)
+
+
+@blueprint.post("/search", name="custom_import.search")
+async def search(request: Any):
+    """Forward one extension search through the closed signed boundary."""
+
+    return await serve_custom_import_search(request, _session(request))
+
+
+@blueprint.post("/detail", name="custom_import.detail")
+async def detail(request: Any):
+    """Forward one full-family detail read through the closed signed boundary."""
+
+    return await serve_custom_import_detail(request, _session(request))
+
+
+@blueprint.post("/detail/batch", name="custom_import.detail_batch")
+async def detail_batch(request: Any):
+    """Hydrate exact identities from one previously selected provider page."""
+
+    return await serve_custom_import_detail_batch(request, _session(request))
+
+
+@blueprint.post("/providers", name="custom_import.providers")
+async def providers(request: Any):
+    """Compose imported filtering and ordering through the signed boundary."""
+
+    return await serve_custom_import_providers(request, _session(request))
+
+
+@blueprint.post("/providers/geo", name="custom_import.providers_geo")
+async def providers_geo(request: Any):
+    """Compose a pinned import with a live native geo page."""
+
+    return await serve_custom_import_provider_geo(request, _session(request))
+
+
+@blueprint.post("/providers/batch", name="custom_import.providers_batch")
+async def providers_batch(request: Any):
+    """Filter and page a finite native batch using one pinned import query."""
+
+    return await serve_custom_import_provider_batch(request, _session(request))
+
+
+@blueprint.post("/providers/by-service", name="custom_import.providers_by_service")
+async def providers_by_service(request: Any):
+    """Compose imported fields with one authorized provider-service claims page."""
+
+    return await serve_custom_import_provider_service(request, _session(request))
+
+
+@blueprint.post("/providers/billing-search", name="custom_import.providers_billing_search")
+async def providers_billing_search(request: Any):
+    """Compose configured fields while preserving exact billing authority."""
+
+    return await serve_custom_import_billing_search(request, _session(request))

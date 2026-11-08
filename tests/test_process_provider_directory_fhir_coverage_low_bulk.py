@@ -8,11 +8,11 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from tests.provider_directory_checkpoint_unit_support import checkpoint_unit_scope as checkpoint_unit_scope
 from tests.provider_directory_fhir_coverage_low_support import (
     assert_bulk_decode_edges,
     bulk_identity,
 )
-
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -61,9 +61,7 @@ async def test_bulk_checkpoint_write_helpers(monkeypatch):
 @pytest.mark.asyncio
 async def test_bulk_output_load_and_validation_error(monkeypatch):
     monkeypatch.setattr(importer.db, "all", AsyncMock(return_value=[{"output_id": "one"}]))
-    assert await importer._load_bulk_output_checkpoints("checkpoint-1") == [
-        {"output_id": "one"}
-    ]
+    assert await importer._load_bulk_output_checkpoints("checkpoint-1") == [{"output_id": "one"}]
     monkeypatch.setattr(
         importer,
         "_stored_bulk_output_validator",
@@ -74,9 +72,7 @@ async def test_bulk_output_load_and_validation_error(monkeypatch):
         {},
         bulk_identity(),
         importer.BulkExportManifest("hash", {}, False, ()),
-        importer.BulkExportManifestOutput(
-            0, "Practitioner", "https://bulk.example.test/out", "url", "id"
-        ),
+        importer.BulkExportManifestOutput(0, "Practitioner", "https://bulk.example.test/out", "url", "id"),
         {},
         timeout=1,
     )
@@ -120,12 +116,8 @@ async def test_accept_checkpoint_failures(monkeypatch):
         AsyncMock(return_value={"state": "accepted"}),
     )
     record_checkpoint_error = AsyncMock()
-    monkeypatch.setattr(
-        importer, "_record_bulk_export_checkpoint_error", record_checkpoint_error
-    )
-    accept_outcome = await importer._accept_checkpointed_bulk_start(
-        {}, identity, 202, "bad", None
-    )
+    monkeypatch.setattr(importer, "_record_bulk_export_checkpoint_error", record_checkpoint_error)
+    accept_outcome = await importer._accept_checkpointed_bulk_start({}, identity, 202, "bad", None)
     assert accept_outcome == ({"state": "accepted"}, None, "unsafe status")
     record_checkpoint_error.assert_awaited_once()
     importer._resolved_bulk_export_status_url.side_effect = None
@@ -136,9 +128,11 @@ async def test_accept_checkpoint_failures(monkeypatch):
         "_load_bulk_export_checkpoint",
         AsyncMock(return_value={"state": "starting"}),
     )
-    assert await importer._accept_checkpointed_bulk_start(
-        {}, identity, 202, identity.start_url, None
-    ) == ({"state": "starting"}, None, "accept lost")
+    assert await importer._accept_checkpointed_bulk_start({}, identity, 202, identity.start_url, None) == (
+        {"state": "starting"},
+        None,
+        "accept lost",
+    )
 
 
 @pytest.mark.asyncio
@@ -150,9 +144,7 @@ async def test_poll_checkpoint_status_error(monkeypatch):
         Mock(side_effect=RuntimeError("cipher invalid")),
     )
     record_checkpoint_error = AsyncMock()
-    monkeypatch.setattr(
-        importer, "_record_bulk_export_checkpoint_error", record_checkpoint_error
-    )
+    monkeypatch.setattr(importer, "_record_bulk_export_checkpoint_error", record_checkpoint_error)
     poll_outcome = await importer._poll_checkpointed_bulk_export_manifest(
         object(),
         {},
@@ -176,12 +168,8 @@ async def test_ready_manifest_and_checkpoint_errors(monkeypatch):
         Mock(side_effect=ValueError("manifest invalid")),
     )
     record_checkpoint_error = AsyncMock()
-    monkeypatch.setattr(
-        importer, "_record_bulk_export_checkpoint_error", record_checkpoint_error
-    )
-    manifest_outcome = await importer._persist_ready_bulk_export_manifest(
-        {}, identity, {}, polls=2
-    )
+    monkeypatch.setattr(importer, "_record_bulk_export_checkpoint_error", record_checkpoint_error)
+    manifest_outcome = await importer._persist_ready_bulk_export_manifest({}, identity, {}, polls=2)
     assert manifest_outcome == (None, "manifest invalid", 2)
     runtime_probe = AsyncMock()
     monkeypatch.setattr(

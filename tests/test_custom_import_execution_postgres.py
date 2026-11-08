@@ -6,15 +6,20 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import os
 import uuid
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, TypeVar
 
 import pytest
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy import func, select, text, update
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from db.connection import Base
@@ -25,6 +30,7 @@ from db.models.custom_import import (
     CustomImportExecution,
     CustomImportLease,
     CustomImportSchemaRevision,
+    CustomImportSourceBindingRevision,
 )
 from process.custom_import import execution as lifecycle
 
@@ -35,10 +41,17 @@ _LOCK_POLL_SECONDS = 0.01
 _WORKER = "synthetic-worker"
 _WORKER_A = "synthetic-worker-a"
 _WORKER_B = "synthetic-worker-b"
+_REQUEST_IDENTITY_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "alembic"
+    / "versions"
+    / "20260922010000_custom_import_execution_request_identity.py"
+)
 _TABLES = (
     CustomImportDataset.__table__,
     CustomImportSchemaRevision.__table__,
     CustomImportDefinitionRevision.__table__,
+    CustomImportSourceBindingRevision.__table__,
     CustomImportCaptureBundle.__table__,
     CustomImportExecution.__table__,
     CustomImportLease.__table__,
@@ -81,6 +94,18 @@ def _quoted_identifier(identifier: str) -> str:
     return f'"{identifier}"'
 
 
+def _downgrade_request_identity(sync_connection, schema_name: str) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "custom_import_request_identity_downgrade", _REQUEST_IDENTITY_MIGRATION_PATH
+    )
+    assert spec and spec.loader
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    migration._schema = lambda: schema_name
+    migration.op = Operations(MigrationContext.configure(sync_connection))
+    migration.downgrade()
+
+
 @asynccontextmanager
 async def _postgres_case() -> AsyncIterator[_PostgresCase]:
     url = _postgres_url()
@@ -95,13 +120,11 @@ async def _postgres_case() -> AsyncIterator[_PostgresCase]:
             await connection.execute(text(f"CREATE SCHEMA {schema}"))
         is_schema_created = True
         async with engine.begin() as connection:
-            await connection.run_sync(
-                lambda sync_connection: Base.metadata.create_all(
-                    sync_connection,
-                    tables=_TABLES,
-                    checkfirst=False,
-                )
+            # This lifecycle-only fixture cannot opt in; retain its referenced identity table.
+            await connection.execute(
+                text(f"CREATE TABLE {schema}.custom_import_build_continuation (continuation_id BIGINT PRIMARY KEY)")
             )
+            await connection.run_sync(Base.metadata.create_all, tables=_TABLES, checkfirst=False)
         async with sessions() as session:
             async with session.begin():
                 dataset = CustomImportDataset(dataset_key="synthetic_execution")
@@ -464,6 +487,176 @@ async def test_postgres_overlapping_duplicate_submissions_wait_on_the_unique_key
         assert replay.execution_id == created.execution_id
         assert execution.state == "queued"
         assert lease.fence == 0
+
+
+async def _reserve_overlapping_identity(case, session, request_identity):
+    """Reserve the same synthetic command with a caller-supplied identity seal."""
+
+    return await lifecycle.reserve_execution(
+        session,
+        dataset_id=case.dataset_id,
+        definition_revision_id=case.definition_revision_id,
+        schema_revision_id=case.schema_revision_id,
+        idempotency_key="synthetic-overlapping-request-identity",
+        mechanism="local",
+        request_identity_sha256=request_identity,
+    )
+
+
+@pytest.mark.asyncio
+async def test_postgres_overlapping_request_identity_reservations_wait_and_reject_drift():
+    """The unique-key wait must compare a persisted digest after the winner commits."""
+
+    async with _postgres_case() as case:
+        request_identity = hashlib.sha256(b"synthetic-overlapping-request-identity").digest()
+        conflicting_identity = hashlib.sha256(b"synthetic-conflicting-request-identity").digest()
+        async with case.sessions() as first_session, case.sessions() as second_session:
+            first_transaction = await first_session.begin()
+            second_transaction = await second_session.begin()
+            replay_task = None
+            try:
+                created = await _reserve_overlapping_identity(case, first_session, request_identity)
+                second_backend_pid = await _backend_pid(second_session)
+                replay_task = asyncio.create_task(_reserve_overlapping_identity(case, second_session, request_identity))
+                await _wait_for_backend_lock(case, backend_pid=second_backend_pid)
+                assert replay_task.done() is False
+
+                await first_transaction.commit()
+                replay = await asyncio.wait_for(replay_task, timeout=_LOCK_OBSERVATION_TIMEOUT_SECONDS)
+                await second_transaction.commit()
+            finally:
+                await _cancel_task(replay_task)
+                if second_transaction.is_active:
+                    await second_transaction.rollback()
+                if first_transaction.is_active:
+                    await first_transaction.rollback()
+
+        execution, lease = await _read_execution_and_lease(case, created.execution_id)
+        assert created.created is True
+        assert replay.created is False
+        assert replay.execution_id == created.execution_id
+        assert execution.request_identity_sha256 == request_identity
+        assert lease.fence == 0
+
+        with pytest.raises(lifecycle.IdempotencyConflict):
+            await _in_transaction(
+                case,
+                lambda session: _reserve_overlapping_identity(case, session, conflicting_identity),
+            )
+
+
+async def _bound_request_pins(case):
+    """Seed one immutable source binding for the concurrency proof."""
+
+    async with case.sessions() as setup, setup.begin():
+        definition = await setup.get(CustomImportDefinitionRevision, case.definition_revision_id)
+        schema = await setup.get(CustomImportSchemaRevision, case.schema_revision_id)
+        assert definition is not None and schema is not None
+        contract = "custom-import/source-binding/v1"
+        canonical_binding = "{}"
+        binding = CustomImportSourceBindingRevision(
+            dataset_id=case.dataset_id,
+            definition_revision_id=case.definition_revision_id,
+            schema_revision_id=case.schema_revision_id,
+            revision_number=1,
+            binding_contract=contract,
+            connector_kind="snowflake_bundle",
+            definition_sha256=definition.definition_sha256,
+            schema_sha256=schema.schema_sha256,
+            source_object_fingerprint_sha256=hashlib.sha256(b"synthetic-source").digest(),
+            source_object_version="v1",
+            canonical_binding=canonical_binding,
+            binding_sha256=hashlib.sha256(f"{contract}:{canonical_binding}".encode()).digest(),
+        )
+        setup.add(binding)
+        await setup.flush()
+        binding_id = binding.source_binding_revision_id
+    return {
+        "dataset_id": case.dataset_id,
+        "definition_revision_id": case.definition_revision_id,
+        "schema_revision_id": case.schema_revision_id,
+        "source_binding_revision_id": binding_id,
+        "idempotency_key": "synthetic-pre-cancel-overlap",
+        "request_identity_sha256": hashlib.sha256(b"synthetic-pre-cancel-overlap").digest(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_postgres_bound_cancellation_precedes_competing_reservation():
+    """A stop fence wins a concurrent replay of the same bound request."""
+
+    async with _postgres_case() as case:
+        request_pins = await _bound_request_pins(case)
+        async with case.sessions() as stopper, case.sessions() as competitor:
+            stop_transaction = await stopper.begin()
+            competitor_transaction = await competitor.begin()
+            replay_task = None
+            try:
+                canceled = await lifecycle.request_bound_execution_cancellation(stopper, **request_pins)
+                competitor_pid = await _backend_pid(competitor)
+                replay_task = asyncio.create_task(
+                    lifecycle.reserve_execution(competitor, **request_pins, mechanism="local")
+                )
+                await _wait_for_backend_lock(case, backend_pid=competitor_pid)
+                assert replay_task.done() is False
+
+                await stop_transaction.commit()
+                replay = await asyncio.wait_for(replay_task, timeout=_LOCK_OBSERVATION_TIMEOUT_SECONDS)
+                await competitor_transaction.commit()
+            finally:
+                await _cancel_task(replay_task)
+                if competitor_transaction.is_active:
+                    await competitor_transaction.rollback()
+                if stop_transaction.is_active:
+                    await stop_transaction.rollback()
+
+        execution, lease = await _read_execution_and_lease(case, canceled.execution_id)
+        assert canceled.changed is True and canceled.state == "canceled"
+        assert replay.created is False and replay.state == "canceled"
+        assert replay.execution_id == canceled.execution_id
+        assert execution.source_binding_revision_id == request_pins["source_binding_revision_id"]
+        assert execution.request_identity_sha256 == request_pins["request_identity_sha256"]
+        assert lease.fence == 0
+        assert await _claim(case, canceled.execution_id, _WORKER) is None
+        finalized = await _in_transaction(
+            case, lambda session: lifecycle.finalize_stopped_execution_request(session, **request_pins)
+        )
+        assert finalized.execution_id == canceled.execution_id
+        assert finalized.state == "canceled" and finalized.changed is False
+
+
+@pytest.mark.asyncio
+async def test_postgres_request_identity_storage_shape_and_downgrade_guard():
+    async with _postgres_case() as case:
+        request_identity = hashlib.sha256(b"synthetic-request-identity-storage").digest()
+        submission = await _in_transaction(
+            case,
+            lambda session: lifecycle.reserve_execution(
+                session,
+                dataset_id=case.dataset_id,
+                definition_revision_id=case.definition_revision_id,
+                schema_revision_id=case.schema_revision_id,
+                idempotency_key="synthetic-request-identity-storage",
+                mechanism="local",
+                request_identity_sha256=request_identity,
+            ),
+        )
+
+        with pytest.raises(DBAPIError):
+            await _in_transaction(
+                case,
+                lambda session: session.execute(
+                    update(CustomImportExecution)
+                    .where(CustomImportExecution.execution_id == submission.execution_id)
+                    .values(request_identity_sha256=b"short")
+                ),
+            )
+        with pytest.raises(DBAPIError, match="custom_import_execution_request_identity_downgrade_blocked"):
+            async with case.engine.begin() as connection:
+                await connection.run_sync(_downgrade_request_identity, case.schema_name)
+
+        execution, _lease = await _read_execution_and_lease(case, submission.execution_id)
+        assert execution.request_identity_sha256 == request_identity
 
 
 @pytest.mark.asyncio

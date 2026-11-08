@@ -1,16 +1,17 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-from contextlib import AbstractAsyncContextManager
 import importlib
+from contextlib import AbstractAsyncContextManager
+from dataclasses import replace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from api import control_imports
 import process.clinical_reference_publication as clinical_publication
 import process.reference_stage as reference_stage
+from api import control_imports
+from process import scoped_catalog_handoff as catalog_handoff
 from process.control_cancel import ImportCancelledError
-
 
 clinical = importlib.import_module("process.clinical_reference")
 ms_drg = importlib.import_module("process.ms_drg")
@@ -18,10 +19,7 @@ ms_drg = importlib.import_module("process.ms_drg")
 
 @pytest.mark.parametrize("importer_name", ["clinical-reference", "ms-drg"])
 def test_reference_importers_expose_cooperative_cancellation(importer_name):
-    importer_by_name = {
-        importer["name"]: importer
-        for importer in control_imports.importer_registry()
-    }
+    importer_by_name = {importer["name"]: importer for importer in control_imports.importer_registry()}
     assert importer_by_name[importer_name]["cancelable"] is True
     assert control_imports._supports_active_cancel(importer_name) is True
 
@@ -41,11 +39,7 @@ class _RecordingTransaction(AbstractAsyncContextManager):
         return self
 
     async def __aexit__(self, exception_type, *_exception):
-        event_name = (
-            "transaction-rollback"
-            if exception_type is not None
-            else "transaction-commit"
-        )
+        event_name = "transaction-rollback" if exception_type is not None else "transaction-commit"
         self.database.transaction_events.append(event_name)
         self.database.is_transaction_active = False
         return False
@@ -109,131 +103,117 @@ def _ms_drg_payloads():
 
 
 def _stage_drop_count(database):
-    return sum(
-        query.startswith("DROP TABLE IF EXISTS unit.reference_stage")
-        for query in database.status_queries
-    )
+    return sum(query.startswith("DROP TABLE IF EXISTS unit.reference_stage") for query in database.status_queries)
 
 
-def _install_ms_drg_publication_contract(
-    monkeypatch,
-    database,
-    merge_events,
-    stage_suffixes,
-    relationship_error=None,
-):
-    async def push_rows(_stage, row_maps):
-        return len(row_maps)
+def _install_ms_drg_handoff_contract(monkeypatch, database, events, failure=None):
+    """Double candidate I/O only; exercise the real handoff transaction and importer boundary."""
+    incoming, receipt = object(), object()
 
-    async def merge_catalog(*_args):
-        assert database.is_transaction_active
-        merge_events.append("catalog")
+    async def precreate(session, importer, schema):
+        assert session.database is database and database.is_transaction_active
+        assert (importer, schema) == ("ms-drg", "unit")
+        events.append("create")
+        return incoming
 
-    async def merge_synonyms(*_args):
-        assert database.is_transaction_active
-        merge_events.append("synonym")
+    async def copy_rows(session, selected, payloads):
+        assert session.database is database and database.is_transaction_active
+        assert selected is incoming
+        assert payloads == {
+            "code_catalog": _ms_drg_payloads().catalog_payloads,
+            "code_synonym": _ms_drg_payloads().synonym_payloads,
+            "code_relationship": _ms_drg_payloads().relationship_payloads,
+        }
+        events.extend(payloads)
+        if failure is not None:
+            raise failure
 
-    async def merge_relationships(*_args):
-        assert database.is_transaction_active
-        merge_events.append("relationship")
-        if relationship_error is not None:
-            raise relationship_error
-
-    def make_stage(_model_class, stage_suffix):
-        stage_suffixes.append(stage_suffix)
-        return _FakeStage
+    async def record(session, context, **options):
+        assert session.database is database and database.is_transaction_active
+        assert context["context"]["control_run_id"] == "run-safe"
+        assert options == {
+            "importer": "ms-drg",
+            "schema": "unit",
+            "incoming": incoming,
+            "options": {"include_relationships": True, "test_mode": False},
+            "metrics": {"catalog_rows": 1, "synonym_rows": 1, "relationship_rows": 1},
+        }
+        events.append("handoff")
+        return receipt
 
     monkeypatch.setattr(ms_drg, "db", database)
-    monkeypatch.setattr(ms_drg, "make_class", make_stage)
-    monkeypatch.setattr(ms_drg, "_push", push_rows)
-    monkeypatch.setattr(ms_drg, "_merge_catalog_stage", merge_catalog)
-    monkeypatch.setattr(ms_drg, "_merge_synonym_stage", merge_synonyms)
-    monkeypatch.setattr(ms_drg, "_merge_relationship_stage", merge_relationships)
     monkeypatch.setattr(ms_drg, "_raise_if_cancelled", lambda _run_id: None)
+    monkeypatch.setattr(catalog_handoff.publication, "precreate_catalog_input", precreate)
+    monkeypatch.setattr(catalog_handoff.publication, "copy_catalog_records", copy_rows)
+    record_handoff = AsyncMock(side_effect=record)
+    activate = AsyncMock()
+    monkeypatch.setattr(catalog_handoff, "record_catalog_handoff", record_handoff)
+    monkeypatch.setattr(catalog_handoff.publication, "activate_catalog_family", activate)
+    return receipt, record_handoff, activate
 
 
 @pytest.mark.asyncio
-async def test_ms_drg_live_replacements_share_one_transaction(monkeypatch):
-    database = _RecordingDb()
-    merge_events = []
-    stage_suffixes = []
-    _install_ms_drg_publication_contract(
-        monkeypatch,
-        database,
-        merge_events,
-        stage_suffixes,
+async def test_ms_drg_candidate_and_handoff_share_one_transaction(monkeypatch):
+    """All payload families commit one deferred handoff, never a worker-side live replacement."""
+    database, events = _RecordingDb(), []
+    receipt, recorded, activate = _install_ms_drg_handoff_contract(monkeypatch, database, events)
+    context_by_field = {"context": {"control_run_id": "run-safe"}}
+    summary_map = {"catalog_rows": 1, "synonym_rows": 1, "relationship_rows": 1}
+
+    outcome = await ms_drg._stage_and_publish(
+        "unit", replace(_ms_drg_request(), test_mode=False), _ms_drg_payloads(), summary_map, context_by_field
     )
 
-    publish_counts = await ms_drg._stage_and_publish(
-        "unit",
-        _ms_drg_request(),
-        _ms_drg_payloads(),
-    )
-
-    assert publish_counts == ms_drg.MsDrgPublishCounts(1, 1, 1)
-    assert merge_events == ["catalog", "synonym", "relationship"]
-    assert database.transaction_events == [
-        "transaction-enter",
-        "transaction-commit",
-    ]
-    expected_suffix = ms_drg._ms_drg_stage_suffix("shared", "run-safe")
-    assert stage_suffixes == [expected_suffix] * 3
-    assert _stage_drop_count(database) == 6
+    assert outcome == {**summary_map, "status": "finalizing", catalog_handoff.METRIC: receipt}
+    assert context_by_field["context"]["_control_committed_result"] is outcome
+    assert context_by_field["context"]["control_run_handoff_committed"] is True
+    assert events == ["create", "code_catalog", "code_synonym", "code_relationship", "handoff"]
+    assert database.transaction_events == ["transaction-enter", "transaction-commit"]
+    recorded.assert_awaited_once()
+    activate.assert_not_awaited()
+    assert database.status_queries == []
 
 
 @pytest.mark.asyncio
-async def test_ms_drg_late_merge_failure_rolls_back_publication(monkeypatch):
-    database = _RecordingDb()
-    merge_events = []
-    _install_ms_drg_publication_contract(
-        monkeypatch,
-        database,
-        merge_events,
-        [],
-        RuntimeError("relationship merge failed"),
-    )
-
-    with pytest.raises(RuntimeError, match="relationship merge failed"):
+@pytest.mark.parametrize(
+    "failure", [RuntimeError("relationship copy failed"), ImportCancelledError("canceled after staging")]
+)
+async def test_ms_drg_late_preparation_refusal_rolls_back_without_handoff(monkeypatch, failure):
+    """A late failure or cancellation leaves neither a committed handoff nor live publication."""
+    database, events = _RecordingDb(), []
+    _receipt, recorded, activate = _install_ms_drg_handoff_contract(monkeypatch, database, events, failure)
+    context_by_field = {"context": {"control_run_id": "run-safe"}}
+    with pytest.raises(type(failure)) as caught:
         await ms_drg._stage_and_publish(
-            "unit",
-            _ms_drg_request(),
-            _ms_drg_payloads(),
+            "unit", replace(_ms_drg_request(), test_mode=False), _ms_drg_payloads(), {}, context_by_field
         )
 
-    assert merge_events == ["catalog", "synonym", "relationship"]
-    assert database.transaction_events == [
-        "transaction-enter",
-        "transaction-rollback",
-    ]
-    assert _stage_drop_count(database) == 6
+    assert caught.value is failure
+    assert events == ["create", "code_catalog", "code_synonym", "code_relationship"]
+    assert database.transaction_events == ["transaction-enter", "transaction-rollback"]
+    assert "control_run_handoff_committed" not in context_by_field["context"]
+    assert "_control_committed_result" not in context_by_field["context"]
+    recorded.assert_not_awaited()
+    activate.assert_not_awaited()
+    assert database.status_queries == []
 
 
 @pytest.mark.asyncio
-async def test_ms_drg_cancellation_after_staging_prevents_publication(monkeypatch):
-    database = _RecordingDb()
-    merge_events = []
-    _install_ms_drg_publication_contract(
-        monkeypatch,
-        database,
-        merge_events,
-        [],
-    )
-    monkeypatch.setattr(
-        ms_drg,
-        "_raise_if_cancelled",
-        Mock(side_effect=ImportCancelledError("cancelled after staging")),
-    )
+async def test_ms_drg_cancellation_before_handoff_prevents_preparation(monkeypatch):
+    """Cancellation is checked before opening candidate custody or the publication handoff."""
+    database, events = _RecordingDb(), []
+    _receipt, recorded, activate = _install_ms_drg_handoff_contract(monkeypatch, database, events)
+    cancel_import = Mock(side_effect=ImportCancelledError("canceled before preparation"))
+    monkeypatch.setattr(ms_drg, "_raise_if_cancelled", cancel_import)
+    with pytest.raises(ImportCancelledError, match="before preparation"):
+        await ms_drg._stage_and_publish("unit", _ms_drg_request(), _ms_drg_payloads(), {})
 
-    with pytest.raises(ImportCancelledError, match="after staging"):
-        await ms_drg._stage_and_publish(
-            "unit",
-            _ms_drg_request(),
-            _ms_drg_payloads(),
-        )
-
-    assert merge_events == []
+    cancel_import.assert_called_once_with("run-safe")
+    assert events == []
     assert database.transaction_events == []
-    assert _stage_drop_count(database) == 6
+    recorded.assert_not_awaited()
+    activate.assert_not_awaited()
+    assert database.status_queries == []
 
 
 @pytest.mark.asyncio
@@ -290,10 +270,7 @@ async def test_stage_names_are_isolated_by_importer_and_execution(monkeypatch):
         second_clinical_suffix,
         ms_drg_suffix,
     )
-    assert all(
-        suffix == suffix.lower() and suffix.replace("_", "").isalnum()
-        for suffix in stage_suffix_values
-    )
+    assert all(suffix == suffix.lower() and suffix.replace("_", "").isalnum() for suffix in stage_suffix_values)
     assert max(map(len, stage_suffix_values)) <= 25
     assert clinical_request.import_suffix == ms_drg_request.import_suffix == "Release44"
 

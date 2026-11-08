@@ -31,7 +31,12 @@ from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models.custom_import import CustomImportDataset, CustomImportExecution, CustomImportLease
+from db.models.custom_import import (
+    CustomImportCaptureBundle,
+    CustomImportDataset,
+    CustomImportExecution,
+    CustomImportLease,
+)
 
 DEFAULT_LEASE_SECONDS = 300
 MAX_LEASE_SECONDS = 3_600
@@ -66,6 +71,8 @@ class _ExecutionRequest:
     idempotency_key: str
     mechanism: str
     capture_bundle_id: int | None
+    request_identity_sha256: bytes | None
+    source_binding_revision_id: int | None
 
 
 class ExecutionLifecycleError(RuntimeError):
@@ -95,6 +102,7 @@ class ExecutionSubmission:
     execution_id: int
     state: str
     created: bool
+    capture_bundle_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -308,6 +316,19 @@ def _persisted_digest(value: Any) -> bytes:
     return digest
 
 
+def _request_identity_sha256(value: bytes | bytearray | memoryview | None) -> bytes | None:
+    """Normalize the optional immutable caller identity before lifecycle writes."""
+
+    if value is None:
+        return None
+    if not isinstance(value, (bytes, bytearray, memoryview)):
+        raise ValueError("request_identity_sha256 must be bytes-like")
+    digest = bytes(value)
+    if len(digest) != hashlib.sha256().digest_size:
+        raise ValueError("request_identity_sha256 must contain exactly 32 bytes")
+    return digest
+
+
 def _validate_execution_state(execution: CustomImportExecution) -> str:
     state = getattr(execution, "state", None)
     if state not in EXECUTION_STATES:
@@ -341,12 +362,44 @@ def _has_matching_lease_authority(
     fence: int,
     token_sha256: bytes,
     now: dt.datetime,
+    continuation_id: int | None = None,
 ) -> bool:
     return (
         _is_lease_unexpired(lease, now)
+        and getattr(lease, "continuation_id", None) == continuation_id
+        and (continuation_id is None or getattr(lease, "continuation_started_at", None) is not None)
         and lease.fence == fence
         and hmac.compare_digest(_persisted_digest(lease.token_sha256), token_sha256)
     )
+
+
+async def _has_matching_continuation(session, execution, lease, continuation_id, token_sha256, now):
+    if continuation_id is None:
+        return getattr(lease, "continuation_id", None) is None
+    if getattr(lease, "continuation_id", None) != continuation_id:
+        return False
+    from db.models.custom_import_continuation import CustomImportBuildContinuation
+    from process.custom_import.continuation_runtime import (
+        continuation_epoch_binding_statement,
+        execution_continuation_matches,
+    )
+
+    authorization = (
+        await session.execute(
+            select(CustomImportBuildContinuation).where(
+                CustomImportBuildContinuation.continuation_id == continuation_id
+            )
+        )
+    ).scalar_one_or_none()
+    if not execution_continuation_matches(authorization, execution, lease, continuation_id, token_sha256, now):
+        return False
+    await session.execute(continuation_epoch_binding_statement(continuation_id, token_sha256))
+    return True
+
+
+def _require_expected_continuation(lease, expected_continuation_id):
+    if getattr(lease, "continuation_id", None) != expected_continuation_id:
+        raise IdempotencyConflict("execution processing authority differs from the expected continuation")
 
 
 async def _lock_execution(
@@ -491,11 +544,22 @@ def _has_matching_submission(
     request: _ExecutionRequest,
 ) -> bool:
     return (
+        _has_matching_execution_identity(execution, request)
+        and execution.capture_bundle_id == request.capture_bundle_id
+    )
+
+
+def _has_matching_execution_identity(
+    execution: CustomImportExecution,
+    request: _ExecutionRequest,
+) -> bool:
+    return (
         execution.dataset_id == request.dataset_id
         and execution.definition_revision_id == request.definition_revision_id
         and execution.schema_revision_id == request.schema_revision_id
         and execution.mechanism == request.mechanism
-        and execution.capture_bundle_id == request.capture_bundle_id
+        and execution.request_identity_sha256 == request.request_identity_sha256
+        and getattr(execution, "source_binding_revision_id", None) == request.source_binding_revision_id
     )
 
 
@@ -505,6 +569,7 @@ def _submission_result(execution: CustomImportExecution, *, is_created: bool) ->
         execution_id=execution.execution_id,
         state=state,
         created=is_created,
+        capture_bundle_id=execution.capture_bundle_id,
     )
 
 
@@ -516,6 +581,8 @@ def _validated_execution_request(
     idempotency_key: str,
     mechanism: str,
     capture_bundle_id: int | None,
+    request_identity_sha256: bytes | bytearray | memoryview | None,
+    source_binding_revision_id: int | None = None,
 ) -> _ExecutionRequest:
     normalized_dataset_id = _positive_id(dataset_id, "dataset_id")
     normalized_definition_revision_id = _positive_id(definition_revision_id, "definition_revision_id")
@@ -523,6 +590,14 @@ def _validated_execution_request(
     normalized_capture_bundle_id = _positive_id(capture_bundle_id, "capture_bundle_id", allow_none=True)
     normalized_idempotency_key = _idempotency_key(idempotency_key)
     normalized_mechanism = _mechanism(mechanism)
+    normalized_request_identity_sha256 = _request_identity_sha256(request_identity_sha256)
+    normalized_source_binding_revision_id = _positive_id(
+        source_binding_revision_id,
+        "source_binding_revision_id",
+        allow_none=True,
+    )
+    if normalized_source_binding_revision_id is not None and normalized_request_identity_sha256 is None:
+        raise ValueError("source_binding_revision_id requires request_identity_sha256")
     return _ExecutionRequest(
         dataset_id=normalized_dataset_id,
         definition_revision_id=normalized_definition_revision_id,
@@ -530,6 +605,8 @@ def _validated_execution_request(
         idempotency_key=normalized_idempotency_key,
         mechanism=normalized_mechanism,
         capture_bundle_id=normalized_capture_bundle_id,
+        request_identity_sha256=normalized_request_identity_sha256,
+        source_binding_revision_id=normalized_source_binding_revision_id,
     )
 
 
@@ -544,6 +621,8 @@ async def _insert_execution(session: AsyncSession, request: _ExecutionRequest) -
             mechanism=request.mechanism,
             state="queued",
             capture_bundle_id=request.capture_bundle_id,
+            request_identity_sha256=request.request_identity_sha256,
+            source_binding_revision_id=request.source_binding_revision_id,
         )
         .on_conflict_do_nothing(
             index_elements=(
@@ -602,6 +681,7 @@ async def create_execution(
     idempotency_key: str,
     mechanism: str,
     capture_bundle_id: int | None = None,
+    request_identity_sha256: bytes | bytearray | memoryview | None = None,
 ) -> ExecutionSubmission:
     """Create one queued execution or return its exact prior submission.
 
@@ -619,20 +699,383 @@ async def create_execution(
         idempotency_key=idempotency_key,
         mechanism=mechanism,
         capture_bundle_id=capture_bundle_id,
+        request_identity_sha256=request_identity_sha256,
     )
+
+    return await _submit_execution(session, request, allow_bound_capture_reuse=False)
+
+
+async def reserve_execution(
+    session: AsyncSession,
+    *,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+    idempotency_key: str,
+    mechanism: str,
+    request_identity_sha256: bytes | bytearray | memoryview | None = None,
+    source_binding_revision_id: int | None = None,
+) -> ExecutionSubmission:
+    """Reserve a source-neutral execution before an external acquisition.
+
+    Replays retain the exact execution even after its capture bundle is bound.
+    A caller must still take a current lease before acquiring a source; the
+    ``created`` flag only reports whether this transaction inserted the row.
+    """
+
+    _require_caller_transaction(session)
+    _require_clean_lifecycle_session(session)
+    request = _validated_execution_request(
+        dataset_id=dataset_id,
+        definition_revision_id=definition_revision_id,
+        schema_revision_id=schema_revision_id,
+        idempotency_key=idempotency_key,
+        mechanism=mechanism,
+        capture_bundle_id=None,
+        request_identity_sha256=request_identity_sha256,
+        source_binding_revision_id=source_binding_revision_id,
+    )
+    return await _submit_execution(session, request, allow_bound_capture_reuse=True)
+
+
+async def lookup_execution_request(
+    session: AsyncSession,
+    *,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+    idempotency_key: str,
+    mechanism: str,
+    request_identity_sha256: bytes | bytearray | memoryview,
+    source_binding_revision_id: int | None = None,
+) -> ExecutionSubmission | None:
+    """Read an exact request without creating work or changing a lease."""
+
+    _require_caller_transaction(session)
+    _require_clean_lifecycle_session(session)
+    request = _validated_execution_request(
+        dataset_id=dataset_id,
+        definition_revision_id=definition_revision_id,
+        schema_revision_id=schema_revision_id,
+        idempotency_key=idempotency_key,
+        mechanism=mechanism,
+        capture_bundle_id=None,
+        request_identity_sha256=request_identity_sha256,
+        source_binding_revision_id=source_binding_revision_id,
+    )
+    if request.request_identity_sha256 is None:
+        raise ValueError("request_identity_sha256 is required")
+    execution = await _submission_snapshot(
+        session,
+        definition_revision_id=request.definition_revision_id,
+        idempotency_key=request.idempotency_key,
+    )
+    if execution is None:
+        return None
+    if not _has_matching_execution_identity(execution, request):
+        raise IdempotencyConflict("idempotency_key is already bound to different execution inputs")
+    return _submission_result(execution, is_created=False)
+
+
+async def cancel_execution_request(
+    session: AsyncSession,
+    *,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+    idempotency_key: str,
+    mechanism: str,
+    request_identity_sha256: bytes | bytearray | memoryview,
+    terminal_reason: str | None = None,
+) -> ExecutionTransition:
+    """Cancel an exact request, retaining a canceled row if it arrives first."""
+
+    terminal_reason = _bounded_text(terminal_reason, "terminal_reason", maximum=64, allow_none=True)
+    identity = _request_identity_sha256(request_identity_sha256)
+    if identity is None:
+        raise ValueError("request_identity_sha256 is required")
+    submission = await reserve_execution(
+        session,
+        dataset_id=dataset_id,
+        definition_revision_id=definition_revision_id,
+        schema_revision_id=schema_revision_id,
+        idempotency_key=idempotency_key,
+        mechanism=mechanism,
+        request_identity_sha256=identity,
+    )
+    return await request_cancellation(
+        session,
+        execution_id=submission.execution_id,
+        terminal_reason=terminal_reason,
+    )
+
+
+async def request_bound_execution_cancellation(
+    session: AsyncSession,
+    *,
+    expected_continuation_id: int | None = None,
+    **request_pins,
+) -> ExecutionTransition:
+    """Fence one exact bound request before stopping its external worker.
+
+    A new request is retained as a canceled row.  A claimed execution stays
+    canceling until its worker finishes or a caller proves that it has stopped.
+    """
+
+    terminal_reason = _bounded_text(
+        request_pins.pop("terminal_reason", None), "terminal_reason", maximum=64, allow_none=True
+    )
+    expected_continuation_id = _positive_id(expected_continuation_id, "expected_continuation_id", allow_none=True)
+    _positive_id(request_pins.get("source_binding_revision_id"), "source_binding_revision_id")
+    identity = _request_identity_sha256(request_pins.get("request_identity_sha256"))
+    if identity is None:
+        raise ValueError("request_identity_sha256 is required")
+    submission = await reserve_execution(
+        session,
+        mechanism="local",
+        **request_pins,
+    )
+    return await request_cancellation(
+        session,
+        execution_id=submission.execution_id,
+        terminal_reason=terminal_reason,
+        expected_continuation_id=expected_continuation_id,
+    )
+
+
+async def finalize_stopped_execution_request(
+    session: AsyncSession,
+    *,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+    source_binding_revision_id: int,
+    idempotency_key: str,
+    request_identity_sha256: bytes | bytearray | memoryview,
+    expected_continuation_id: int | None = None,
+) -> ExecutionTransition:
+    """Terminalize a pre-canceled exact request after its worker is stopped.
+
+    The caller must establish that no worker for this request can continue or
+    start before committing this transaction.  A prior cancellation request
+    must have fenced delayed reservations.  Existing terminal outcomes remain
+    unchanged, and this operation never creates an execution.
+    """
+
+    _require_caller_transaction(session)
+    _require_clean_lifecycle_session(session)
+    expected_continuation_id = _positive_id(expected_continuation_id, "expected_continuation_id", allow_none=True)
+    request = _validated_execution_request(
+        dataset_id=dataset_id,
+        definition_revision_id=definition_revision_id,
+        schema_revision_id=schema_revision_id,
+        source_binding_revision_id=source_binding_revision_id,
+        idempotency_key=idempotency_key,
+        mechanism="local",
+        request_identity_sha256=request_identity_sha256,
+        capture_bundle_id=None,
+    )
+    if request.request_identity_sha256 is None:
+        raise ValueError("request_identity_sha256 is required")
+    await _lock_dataset(session, request.dataset_id)
+    execution = await _locked_submission_execution(session, request, None)
+    if execution is None:
+        raise ExecutionNotFound("exact bound execution request does not exist")
+    if not _has_matching_execution_identity(execution, request):
+        raise IdempotencyConflict("idempotency_key is already bound to different execution inputs")
+    state = _validate_execution_state(execution)
+    lease = await _lock_lease(session, execution.execution_id)
+    _validate_lease(lease)
+    _require_expected_continuation(lease, expected_continuation_id)
+    if state in TERMINAL_STATES:
+        return ExecutionTransition(execution_id=execution.execution_id, state=state, changed=False)
+    if state != "canceling":
+        raise ExecutionLifecycleError("request bound cancellation before worker-stop finality")
+
+    now = await _database_now(session)
+    await _apply_terminal_transition(
+        session,
+        execution_id=execution.execution_id,
+        terminal_state="canceled",
+        terminal_reason="worker_stopped",
+        now=now,
+    )
+    return ExecutionTransition(execution_id=execution.execution_id, state="canceled", changed=True)
+
+
+async def _submit_execution(
+    session: AsyncSession,
+    request: _ExecutionRequest,
+    *,
+    allow_bound_capture_reuse: bool,
+) -> ExecutionSubmission:
+    """Create or lock one idempotent execution under the dataset parent."""
 
     # The INSERT itself can wait on a competing idempotency row.  Serialize it
     # beneath the dataset lock so no execution/lease lock precedes that parent.
     await _lock_dataset(session, request.dataset_id)
+    if request.capture_bundle_id is not None:
+        await _require_sealed_capture_bundle(
+            session,
+            capture_bundle_id=request.capture_bundle_id,
+            dataset_id=request.dataset_id,
+            definition_revision_id=request.definition_revision_id,
+            schema_revision_id=request.schema_revision_id,
+        )
     inserted_execution_id = await _insert_execution(session, request)
     is_created = inserted_execution_id is not None
     execution = await _locked_submission_execution(session, request, inserted_execution_id)
     if execution is None:
         raise ExecutionInvariantError("idempotent execution row disappeared before it could be locked")
-    if not _has_matching_submission(execution, request):
+    if not _has_matching_submission(execution, request) and not (
+        allow_bound_capture_reuse
+        and request.capture_bundle_id is None
+        and _has_matching_execution_identity(execution, request)
+    ):
         raise IdempotencyConflict("idempotency_key is already bound to different execution inputs")
     await _ensure_lease(session, execution.execution_id)
     return _submission_result(execution, is_created=is_created)
+
+
+async def _require_sealed_capture_bundle(
+    session: AsyncSession,
+    *,
+    capture_bundle_id: int,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+) -> None:
+    bundle = (
+        await session.execute(
+            select(CustomImportCaptureBundle)
+            .where(
+                CustomImportCaptureBundle.capture_bundle_id == capture_bundle_id,
+                CustomImportCaptureBundle.dataset_id == dataset_id,
+                CustomImportCaptureBundle.definition_revision_id == definition_revision_id,
+                CustomImportCaptureBundle.schema_revision_id == schema_revision_id,
+                CustomImportCaptureBundle.capture_state == "sealed",
+            )
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if bundle is None or bundle.capture_state != "sealed":
+        raise ExecutionInvariantError("execution capture must be an exact sealed bundle")
+
+
+async def _lock_current_capture_binding(
+    session: AsyncSession,
+    *,
+    execution_id: int,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+    fence: int,
+    token_sha256: bytes,
+) -> tuple[CustomImportExecution, str, dt.datetime] | None:
+    """Lock and return a running execution only for its current lease owner."""
+
+    await _lock_dataset(session, dataset_id)
+    execution = await _lock_execution(session, execution_id, dataset_id=dataset_id)
+    if execution is None:
+        raise ExecutionNotFound(f"custom-import execution {execution_id} does not exist")
+    if execution.definition_revision_id != definition_revision_id or execution.schema_revision_id != schema_revision_id:
+        raise IdempotencyConflict("execution identity does not match the capture bundle")
+    state = _validate_execution_state(execution)
+    lease = await _lock_lease(session, execution_id)
+    _validate_lease(lease)
+    now = await _database_now(session)
+    if state != "running" or not _has_matching_lease_authority(
+        lease,
+        fence=fence,
+        token_sha256=token_sha256,
+        now=now,
+    ):
+        return None
+    return execution, state, now
+
+
+async def _bind_locked_capture_bundle(
+    session: AsyncSession,
+    *,
+    execution: CustomImportExecution,
+    dataset_id: int,
+    capture_bundle_id: int,
+    state: str,
+    now: dt.datetime,
+) -> ExecutionSubmission:
+    """Attach a bundle to an authorized locked execution without replacing one."""
+
+    existing_bundle_id = execution.capture_bundle_id
+    if existing_bundle_id is not None:
+        if existing_bundle_id != capture_bundle_id:
+            raise IdempotencyConflict("execution is already bound to a different capture bundle")
+        return _submission_result(execution, is_created=False)
+    await session.execute(
+        update(CustomImportExecution)
+        .where(CustomImportExecution.execution_id == execution.execution_id)
+        .where(CustomImportExecution.dataset_id == dataset_id)
+        .values(capture_bundle_id=capture_bundle_id, updated_at=now)
+    )
+    return ExecutionSubmission(
+        execution_id=execution.execution_id,
+        state=state,
+        created=False,
+        capture_bundle_id=capture_bundle_id,
+    )
+
+
+async def bind_execution_capture_bundle(
+    session: AsyncSession,
+    *,
+    execution_id: int,
+    dataset_id: int,
+    definition_revision_id: int,
+    schema_revision_id: int,
+    capture_bundle_id: int,
+    fence: int,
+    token: str | bytes | bytearray | memoryview,
+) -> ExecutionSubmission | None:
+    """Bind one retained bundle only while the exact owner lease is live.
+
+    A stale or canceled execution returns ``None`` without attaching the
+    bundle, allowing the caller to roll back its capture registration.
+    """
+
+    _require_caller_transaction(session)
+    _require_clean_lifecycle_session(session)
+    execution_id = _positive_id(execution_id, "execution_id")
+    dataset_id = _positive_id(dataset_id, "dataset_id")
+    definition_revision_id = _positive_id(definition_revision_id, "definition_revision_id")
+    schema_revision_id = _positive_id(schema_revision_id, "schema_revision_id")
+    capture_bundle_id = _positive_id(capture_bundle_id, "capture_bundle_id")
+    fence = _fence(fence)
+    binding_context = await _lock_current_capture_binding(
+        session,
+        execution_id=execution_id,
+        dataset_id=dataset_id,
+        definition_revision_id=definition_revision_id,
+        schema_revision_id=schema_revision_id,
+        fence=fence,
+        token_sha256=lease_token_sha256(token),
+    )
+    if binding_context is None:
+        return None
+    execution, state, now = binding_context
+    await _require_sealed_capture_bundle(
+        session,
+        capture_bundle_id=capture_bundle_id,
+        dataset_id=dataset_id,
+        definition_revision_id=definition_revision_id,
+        schema_revision_id=schema_revision_id,
+    )
+    return await _bind_locked_capture_bundle(
+        session,
+        execution=execution,
+        dataset_id=dataset_id,
+        capture_bundle_id=capture_bundle_id,
+        state=state,
+        now=now,
+    )
 
 
 async def _claim_or_resume_execution(
@@ -648,6 +1091,8 @@ async def _claim_or_resume_execution(
     lease = await _lock_lease(session, execution_id)
     now = await _database_now(session)
     _validate_lease(lease)
+    if getattr(lease, "continuation_id", None) is not None:
+        return None
     if state not in _ACTIVE_STATES or (state == "queued" and not allow_queued):
         return None
     if _is_lease_unexpired(lease, now):
@@ -742,6 +1187,7 @@ async def heartbeat_execution(
     fence: int,
     token: str | bytes | bytearray | memoryview,
     lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    continuation_id: int | None = None,
 ) -> LeaseGrant | None:
     """Renew one unexpired lease only when the holder still owns its fence."""
 
@@ -751,6 +1197,7 @@ async def heartbeat_execution(
     fence = _fence(fence)
     token_sha256 = lease_token_sha256(token)
     lease_seconds = _lease_seconds(lease_seconds)
+    continuation_id = _positive_id(continuation_id, "continuation_id", allow_none=True)
 
     execution = await _locked_heartbeat_execution(session, execution_id)
     state = _validate_execution_state(execution)
@@ -761,7 +1208,10 @@ async def heartbeat_execution(
         fence=fence,
         token_sha256=token_sha256,
         now=now,
+        continuation_id=continuation_id,
     ):
+        return None
+    if not await _has_matching_continuation(session, execution, lease, continuation_id, token_sha256, now):
         return None
 
     expires_at = now + dt.timedelta(seconds=lease_seconds)
@@ -783,29 +1233,21 @@ async def request_cancellation(
     *,
     execution_id: int,
     terminal_reason: str | None = None,
+    expected_continuation_id: int | None = None,
 ) -> ExecutionTransition:
-    """Record an idempotent cancellation request without bypassing a lease.
-
-    Queued work becomes terminal immediately because it has no worker-owned
-    authority.  Running work becomes ``canceling`` so its active holder can
-    observe the request and finish as ``canceled``; completion is thereafter
-    refused by :func:`finish_execution`.
-    """
+    """Cancel queued work immediately; fence running work until its holder acknowledges."""
 
     _require_caller_transaction(session)
     _require_clean_lifecycle_session(session)
     execution_id = _positive_id(execution_id, "execution_id")
-    terminal_reason = _bounded_text(
-        terminal_reason,
-        "terminal_reason",
-        maximum=64,
-        allow_none=True,
-    )
+    expected_continuation_id = _positive_id(expected_continuation_id, "expected_continuation_id", allow_none=True)
+    terminal_reason = _bounded_text(terminal_reason, "terminal_reason", maximum=64, allow_none=True)
     execution = await _locked_lifecycle_execution(session, execution_id)
     state = _validate_execution_state(execution)
     lease = await _lock_lease(session, execution_id)
     now = await _database_now(session)
     _validate_lease(lease)
+    _require_expected_continuation(lease, expected_continuation_id)
 
     if state in TERMINAL_STATES or state == "canceling":
         return ExecutionTransition(execution_id=execution_id, state=state, changed=False)
@@ -853,12 +1295,14 @@ def _can_finish_execution(
     fence: int,
     token_sha256: bytes,
     now: dt.datetime,
+    continuation_id: int | None = None,
 ) -> bool:
     return state in _terminal_transition_states(terminal_state) and _has_matching_lease_authority(
         lease,
         fence=fence,
         token_sha256=token_sha256,
         now=now,
+        continuation_id=continuation_id,
     )
 
 
@@ -901,6 +1345,7 @@ async def finish_execution(
     token: str | bytes | bytearray | memoryview,
     terminal_state: str,
     terminal_reason: str | None = None,
+    continuation_id: int | None = None,
 ) -> ExecutionTransition:
     """Apply a fenced terminal transition and expire, never clear, its lease.
 
@@ -917,6 +1362,7 @@ async def finish_execution(
     fence = _fence(fence)
     token_sha256 = lease_token_sha256(token)
     terminal_state = _terminal_state(terminal_state)
+    continuation_id = _positive_id(continuation_id, "continuation_id", allow_none=True)
     terminal_reason = _bounded_text(
         terminal_reason,
         "terminal_reason",
@@ -937,7 +1383,10 @@ async def finish_execution(
         fence=fence,
         token_sha256=token_sha256,
         now=now,
+        continuation_id=continuation_id,
     ):
+        return ExecutionTransition(execution_id=execution_id, state=state, changed=False)
+    if not await _has_matching_continuation(session, execution, lease, continuation_id, token_sha256, now):
         return ExecutionTransition(execution_id=execution_id, state=state, changed=False)
 
     await _apply_terminal_transition(
@@ -968,13 +1417,19 @@ __all__ = (
     "MAX_LEASE_SECONDS",
     "MAX_BIGINT",
     "TERMINAL_STATES",
+    "bind_execution_capture_bundle",
     "cancel_execution",
+    "cancel_execution_request",
     "claim_execution",
     "create_execution",
     "finish_execution",
+    "finalize_stopped_execution_request",
     "heartbeat_execution",
     "lease_token_sha256",
+    "lookup_execution_request",
     "request_cancellation",
+    "request_bound_execution_cancellation",
     "require_separate_publication_transaction",
+    "reserve_execution",
     "resume_execution",
 )

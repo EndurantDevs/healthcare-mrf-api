@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.sql import quoted_name
 
 from db.models.custom_import import (
     CustomImportCapture,
@@ -55,16 +56,47 @@ from db.models.custom_import import (
     CustomImportSourceStream,
     CustomImportWinner,
 )
+from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.publication import (
     _capture_source_bundle_digest,
     seal_generation,
 )
+from process.custom_import.storage_layout import snapshot_schema
 
 POSTGRES_DSN_ENV = "HLTHPRT_CUSTOM_IMPORT_POSTGRES_DSN"
 _TEST_DATABASE = re.compile(r"(?:^test(?:[_-]|$)|(?:^|[_-])test(?:[_-]|$))", re.IGNORECASE)
+_FIXTURE_DDL_LOCK_NAME = "custom_import_publication_fixture_ddl"
 _ROOT = Path(__file__).resolve().parents[1]
 _BASE_MIGRATION_PATH = _ROOT / "alembic" / "versions" / "20260914120000_custom_import_v1_schema.py"
 _FINALITY_MIGRATION_PATH = _ROOT / "alembic" / "versions" / "20260917130000_custom_import_generation_finality.py"
+_DURABLE_CAPTURE_MIGRATION_PATH = (
+    _ROOT / "alembic" / "versions" / "20260922000000_custom_import_durable_parquet_capture.py"
+)
+_EXECUTION_REQUEST_IDENTITY_MIGRATION_PATH = (
+    _ROOT / "alembic" / "versions" / "20260922010000_custom_import_execution_request_identity.py"
+)
+_SOURCE_BINDING_MIGRATION_PATH = _ROOT / "alembic" / "versions" / "20260923030000_custom_import_source_binding.py"
+_MATERIALIZATION_CONTRACT_MIGRATION_PATH = (
+    _ROOT / "alembic" / "versions" / "20261010010000_custom_import_materialization_contract.py"
+)
+_SEGMENTED_CAPTURE_MIGRATION_PATH = _ROOT / "alembic" / "versions" / "20261002000000_custom_import_segmented_capture.py"
+_RAW_CAPTURE_MIGRATION_PATH = _ROOT / "alembic" / "versions" / "20261017010000_custom_import_raw_objects.py"
+_SNAPSHOT_MIGRATION_NAMES = (
+    "20261002010000_custom_import_bounded_build",
+    "20261002020000_custom_import_processing_policy",
+    "20261002030000_custom_import_identical_children",
+    "20261002040000_custom_import_child_memberships",
+    "20261005020000_custom_import_sealed_append_plans",
+    "20261005030000_custom_import_snapshot_storage",
+    "20261005040000_custom_import_bulk_snapshot_writers",
+    "20261005050000_custom_import_legacy_snapshot_writers",
+    "20261005060000_custom_import_snapshot_finality",
+    "20261005070000_custom_import_materialization_storage",
+    "20261005080000_custom_import_writer_cutover",
+    "20261007000000_custom_import_rejection_anti_joins",
+    "20261009000000_custom_import_child_presence_decode",
+    "20261010000000_custom_import_admission_indexes",
+)
 
 
 def digest(label: str) -> bytes:
@@ -103,14 +135,122 @@ def _migration(path: Path, module_name: str):
     return module
 
 
-def _install_custom_import_migrations(sync_connection, schema_name: str) -> None:
-    """Install the exact v1 and finality DDL in one disposable schema."""
+def _install_custom_import_migrations(
+    sync_connection,
+    schema_name: str,
+    is_segmented_capture_enabled: bool,
+    is_snapshot_storage_enabled: bool = True,
+    migration_through: str | None = None,
+) -> None:
+    """Install the exact custom-import DDL needed by the focused PostgreSQL proofs."""
+
+    migration_names = ()
+    if is_segmented_capture_enabled and is_snapshot_storage_enabled:
+        migration_names = _SNAPSHOT_MIGRATION_NAMES
+        if migration_through is not None:
+            revisions = tuple(name.split("_", 1)[0] for name in migration_names)
+            if migration_through not in revisions:
+                raise ValueError("unknown custom-import fixture migration stop")
+            migration_names = migration_names[: revisions.index(migration_through) + 1]
+    elif migration_through is not None:
+        raise ValueError("custom-import fixture migration stop requires the snapshot chain")
 
     for path, module_name in (
         (_BASE_MIGRATION_PATH, "custom_import_v1_test_migration"),
         (_FINALITY_MIGRATION_PATH, "custom_import_finality_test_migration"),
+        (_DURABLE_CAPTURE_MIGRATION_PATH, "custom_import_durable_capture_test_migration"),
+        (_EXECUTION_REQUEST_IDENTITY_MIGRATION_PATH, "custom_import_execution_request_identity_test_migration"),
+        (_SOURCE_BINDING_MIGRATION_PATH, "custom_import_source_binding_test_migration"),
     ):
         migration = _migration(path, module_name)
+        migration._schema = lambda: schema_name
+        migration.op = Operations(MigrationContext.configure(sync_connection))
+        migration.upgrade()
+
+    if is_segmented_capture_enabled:
+        install_segmented_capture_migration(sync_connection, schema_name)
+        install_snapshot_storage_migrations(sync_connection, schema_name, migration_names)
+
+    install_materialization_contract_migration(sync_connection, schema_name)
+    install_query_projection_metadata(sync_connection, schema_name)
+    install_build_continuation_migration(
+        sync_connection,
+        schema_name,
+        install_authority=is_segmented_capture_enabled and is_snapshot_storage_enabled and migration_through is None,
+    )
+    if is_segmented_capture_enabled and is_snapshot_storage_enabled and migration_through is None:
+        install_snapshot_retirement_migration(sync_connection, schema_name)
+
+
+def install_snapshot_storage_migrations(sync_connection, schema_name, migration_names=_SNAPSHOT_MIGRATION_NAMES):
+    """Upgrade retained canonical rows through the real snapshot writer migration chain."""
+    for name in migration_names:
+        migration = _migration(_ROOT / "alembic" / "versions" / f"{name}.py", f"{name}_test_migration")
+        migration._schema = lambda: schema_name
+        migration.op = Operations(MigrationContext.configure(sync_connection))
+        migration.upgrade()
+
+
+def install_snapshot_retirement_migration(sync_connection, schema_name: str) -> None:
+    """Apply retirement guards after the current continuation authority definitions."""
+    path = _ROOT / "alembic" / "versions" / "20261102010000_custom_import_snapshot_retirement.py"
+    migration = _migration(path, "custom_import_retirement_test_migration")
+    migration._schema = lambda: schema_name
+    migration.op = Operations(MigrationContext.configure(sync_connection))
+    migration.upgrade()
+
+
+def install_build_continuation_migration(sync_connection, schema_name: str, *, install_authority=True) -> None:
+    """Keep lease metadata current without replacing deliberately historical gates."""
+    path = _ROOT / "alembic" / "versions" / "20261019010000_custom_import_build_continuation.py"
+    migration = _migration(path, "custom_import_continuation_test_migration")
+    migration._schema = lambda: schema_name
+    migration.op = Operations(MigrationContext.configure(sync_connection))
+    if install_authority:
+        migration.upgrade()
+    else:
+        has_snapshot = (
+            sync_connection.scalar(
+                text("SELECT to_regclass(:relation)"), {"relation": f"{schema_name}.custom_import_snapshot_family"}
+            )
+            is not None
+        )
+        migration._schema_changes(schema_name, ledger=has_snapshot)
+
+
+def install_materialization_contract_migration(sync_connection, schema_name: str) -> None:
+    """Keep current model metadata when a fixture selects historical writer DDL."""
+    migration = _migration(_MATERIALIZATION_CONTRACT_MIGRATION_PATH, "custom_import_materialization_contract_test")
+    migration._schema = lambda: schema_name
+    migration.op = Operations(MigrationContext.configure(sync_connection))
+    migration.upgrade()
+
+
+def install_query_projection_metadata(sync_connection, schema_name: str) -> None:
+    """Retain current seal columns even when qualifying historical writer DDL."""
+    path = _ROOT / "alembic" / "versions" / "20261015020000_custom_import_query_projections.py"
+    migration = _migration(path, "custom_import_query_projection_test_migration")
+    migration._schema = lambda: schema_name
+    migration.op = Operations(MigrationContext.configure(sync_connection))
+    if (
+        sync_connection.scalar(
+            text("SELECT to_regclass(:relation)"), {"relation": f"{schema_name}.custom_import_snapshot_family"}
+        )
+        is None
+    ):
+        migration._seal_metadata(schema_name)
+    else:
+        migration.upgrade()
+
+
+def install_segmented_capture_migration(sync_connection, schema_name: str) -> None:
+    """Install capture storage once, after any historical finality reconstruction."""
+
+    for migration_path, module_name in (
+        (_SEGMENTED_CAPTURE_MIGRATION_PATH, "custom_import_segmented_capture_test_migration"),
+        (_RAW_CAPTURE_MIGRATION_PATH, "custom_import_raw_capture_test_migration"),
+    ):
+        migration = _migration(migration_path, module_name)
         migration._schema = lambda: schema_name
         migration.op = Operations(MigrationContext.configure(sync_connection))
         migration.upgrade()
@@ -149,14 +289,33 @@ def _quoted_publication_schema(schema_name: str) -> str:
     return f'"{schema_name}"'
 
 
+async def _drop_snapshot_families(connection, schema_name: str) -> None:
+    """Drop only leaves recorded by this exact disposable control schema."""
+
+    quoted_schema = _quoted_publication_schema(schema_name)
+    registry = f"{quoted_schema}.custom_import_snapshot_family"
+    if await connection.scalar(text("SELECT to_regclass(:registry)"), {"registry": registry}) is None:
+        return
+    family_ids = await connection.scalars(text(f"SELECT family_id FROM {registry}"))
+    for family_id in family_ids:
+        namespace = snapshot_schema(family_id)
+        await connection.execute(text(f'DROP SCHEMA IF EXISTS "{namespace}" CASCADE'))
+
+
 @asynccontextmanager
-async def isolated_publication_case() -> AsyncIterator[IsolatedPublicationCase]:
-    """Create an exact disposable schema for committed multi-session races."""
+async def isolated_publication_case(
+    *,
+    is_segmented_capture_enabled: bool = True,
+    is_snapshot_storage_enabled: bool = True,
+    migration_through: str | None = None,
+) -> AsyncIterator[IsolatedPublicationCase]:
+    """Use current DDL by default; historical migration proofs name an inclusive stop."""
 
     raw_engine = create_async_engine(_database_url(), pool_pre_ping=True)
     schema_name = f"custom_import_publication_{uuid.uuid4().hex[:16]}"
     quoted_schema = _quoted_publication_schema(schema_name)
-    engine = raw_engine.execution_options(schema_translate_map={"mrf": schema_name})
+    # Keep SQLAlchemy's model-schema type so isolated fixtures exercise the same owner guard.
+    engine = raw_engine.execution_options(schema_translate_map={"mrf": quoted_name(schema_name, quote=None)})
     sessions = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
     is_schema_created = False
     try:
@@ -164,17 +323,34 @@ async def isolated_publication_case() -> AsyncIterator[IsolatedPublicationCase]:
             await connection.execute(text(f"CREATE SCHEMA {quoted_schema}"))
         is_schema_created = True
         async with raw_engine.begin() as connection:
-            await connection.run_sync(_install_custom_import_migrations, schema_name)
+            # Cutover reviews other installations; their fixture teardown must wait for this transaction.
+            await connection.scalar(
+                text("SELECT pg_advisory_xact_lock(hashtext(:lock_name))"), {"lock_name": _FIXTURE_DDL_LOCK_NAME}
+            )
+            await connection.run_sync(
+                _install_custom_import_migrations,
+                schema_name,
+                is_segmented_capture_enabled,
+                is_snapshot_storage_enabled,
+                migration_through,
+            )
         yield IsolatedPublicationCase(
             engine=engine,
             sessions=sessions,
             schema_name=schema_name,
         )
     finally:
-        if is_schema_created:
-            async with raw_engine.begin() as connection:
-                await connection.execute(text(f"DROP SCHEMA {quoted_schema} CASCADE"))
-        await raw_engine.dispose()
+        try:
+            if is_schema_created:
+                async with raw_engine.begin() as connection:
+                    await connection.scalar(
+                        text("SELECT pg_advisory_xact_lock(hashtext(:lock_name))"),
+                        {"lock_name": _FIXTURE_DDL_LOCK_NAME},
+                    )
+                    await _drop_snapshot_families(connection, schema_name)
+                    await connection.execute(text(f"DROP SCHEMA {quoted_schema} CASCADE"))
+        finally:
+            await raw_engine.dispose()
 
 
 @dataclass(frozen=True)
@@ -286,16 +462,34 @@ async def _seed_publication_identity(
     )
 
 
+def _publication_definition() -> CustomImportDefinition:
+    """Reuse the real scalar fixture with the shared publication collection identity."""
+
+    from tests.test_custom_import_materialization_postgres import _definition_document
+
+    document = _definition_document()
+    document["schema"]["children"][0]["name"] = "synthetic_children"
+    document["streams"][1]["child"] = "synthetic_children"
+    document["query"]["child"]["collection"] = "synthetic_children"
+    document["selection_profiles"][0]["id"] = "synthetic_profile"
+    return CustomImportDefinition.from_mapping(document)
+
+
 async def _seed_identity_schema(
     session: AsyncSession,
     suffix: str,
     semantic: str,
     *,
-    canonical_schema: str = '{"synthetic":true}',
+    canonical_schema: str | None = None,
     schema_sha256: bytes | None = None,
 ) -> tuple[CustomImportDataset, CustomImportSchemaRevision]:
     """Create the dataset, schema revision, and fixed field definitions."""
 
+    if canonical_schema is None:
+        contract = _publication_definition()
+        canonical_schema = contract.schema_canonical
+        if schema_sha256 is None:
+            schema_sha256 = bytes.fromhex(contract.schema_digest)
     dataset = CustomImportDataset(dataset_key=f"synthetic_{suffix[:24]}")
     session.add(dataset)
     await session.flush()
@@ -372,14 +566,15 @@ async def _seed_identity_definition(
 ) -> CustomImportDefinitionRevision:
     """Create the definition revision and optionally its synthetic profile."""
 
+    contract = _publication_definition()
     definition = CustomImportDefinitionRevision(
         dataset_id=dataset.dataset_id,
         schema_revision_id=schema.schema_revision_id,
         revision_number=1,
         contract_version="custom-import/v1",
         refresh_mode="upsert",
-        canonical_definition='{"synthetic":true}',
-        definition_sha256=digest(f"definition:{semantic}"),
+        canonical_definition=contract.canonical,
+        definition_sha256=bytes.fromhex(contract.digest),
     )
     session.add(definition)
     await session.flush()
@@ -523,6 +718,8 @@ async def _seed_completed_generation(
     suffix: str,
     ordinal: int,
     prior_generation: CustomImportGeneration | None,
+    *,
+    source_binding_revision_id: int | None = None,
 ) -> tuple[CustomImportExecution, CustomImportGeneration]:
     token = f"synthetic-generation-lease-{ordinal}-{suffix}"
     lease_now = dt.datetime.now(dt.UTC)
@@ -534,6 +731,8 @@ async def _seed_completed_generation(
         idempotency_key=f"synthetic-completed-{ordinal}-{suffix}",
         mechanism="local",
         state="running",
+        source_binding_revision_id=source_binding_revision_id,
+        request_identity_sha256=digest(f"synthetic-request:{suffix}") if source_binding_revision_id else None,
     )
     session.add(execution)
     await session.flush()
@@ -578,6 +777,8 @@ async def _seed_no_change_execution(
     session: AsyncSession,
     seed: _PublicationSeed,
     suffix: str,
+    *,
+    source_binding_revision_id: int | None = None,
 ) -> tuple[CustomImportExecution, CustomImportGeneration, str]:
     no_change_token = f"synthetic-lease-{suffix}"
     lease_now = dt.datetime.now(dt.UTC)
@@ -589,6 +790,8 @@ async def _seed_no_change_execution(
         idempotency_key=f"synthetic-no-change-{suffix}",
         mechanism="local",
         state="running",
+        source_binding_revision_id=source_binding_revision_id,
+        request_identity_sha256=digest(f"synthetic-request:{suffix}") if source_binding_revision_id else None,
     )
     session.add(no_change)
     await session.flush()
@@ -1165,6 +1368,8 @@ __all__ = (
     "attach_generation_family",
     "digest",
     "execution_state",
+    "install_materialization_contract_migration",
+    "install_segmented_capture_migration",
     "isolated_publication_case",
     "lease_digest",
     "seed_publication_graph",

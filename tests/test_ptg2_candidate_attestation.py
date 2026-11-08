@@ -18,14 +18,14 @@ from process.ptg_parts.ptg2_candidate_audit_contract import (
     PTG2_FAST_AUDIT_CONTRACT,
     PTG2_FAST_AUDIT_TOOL_VERSION,
 )
-from process.ptg_parts.ptg2_legacy_global_projection_queue import (
-    PTG2LegacyGlobalProjectionDrain,
-)
 from process.ptg_parts.ptg2_invalid_price_exclusion import (
     invalid_price_exclusion_evidence,
     invalid_price_exclusion_policy,
     invalid_price_exclusion_source,
     invalid_price_value_sha256,
+)
+from process.ptg_parts.ptg2_legacy_global_projection_queue import (
+    PTG2LegacyGlobalProjectionDrain,
 )
 from process.ptg_parts.ptg2_provider_quarantine import (
     provider_identifier_quarantine_payload,
@@ -47,11 +47,8 @@ from tests.ptg_frozen_test_support import (
     protected_control_payload,
 )
 
-
 EMPTY_PROVIDER_IDENTIFIER_QUARANTINE = provider_identifier_quarantine_payload({})
-MALFORMED_PROVIDER_IDENTIFIER_QUARANTINE = provider_identifier_quarantine_payload(
-    {123456789: 1}
-)
+MALFORMED_PROVIDER_IDENTIFIER_QUARANTINE = provider_identifier_quarantine_payload({123456789: 1})
 TYPED_PROVIDER_IDENTIFIER_QUARANTINE = provider_identifier_quarantine_payload(
     {123456789: 1}, text_counts={"1447744750`": 2}
 )
@@ -122,6 +119,9 @@ def _candidate_invalid_price_policy(raw_source_sha256):
 def _isolate_attempt_fence(monkeypatch):
     """Keep candidate-contract tests focused on their existing boundary."""
 
+    from process.ptg_parts import ptg2_physical_binding
+
+    monkeypatch.setattr(ptg2_physical_binding, "local_candidate_audit_state", AsyncMock(return_value=None))
     monkeypatch.setattr(
         source_pointers,
         "lock_writable_snapshot",
@@ -184,12 +184,8 @@ def _release_target(**target_overrides):
         "expected_database_backend": "postgresql",
         "expected_snapshot_lifecycle": "validated",
         "architecture_assertion": "required_postgresql_session_evidence",
-        "api_path_sha256": _sha256(
-            "/api/v1/pricing/providers/audit-search-by-procedure"
-        ),
-        "api_audit_path_sha256": _sha256(
-            "/api/v1/pricing/providers/audit-occurrences"
-        ),
+        "api_path_sha256": _sha256("/api/v1/pricing/providers/audit-search-by-procedure"),
+        "api_audit_path_sha256": _sha256("/api/v1/pricing/providers/audit-occurrences"),
         "endpoint_contract": "pricing.providers.search_by_procedure",
         "audit_endpoint_contract": "persisted_served_occurrence_sample_v2",
         "snapshot_id_sha256": _sha256("snap_new"),
@@ -210,9 +206,7 @@ def _release_source():
     }
     return {
         "source_count": 1,
-        "source_set_digest": source_identity_by_field[
-            "raw_container_sha256_digest"
-        ],
+        "source_set_digest": source_identity_by_field["raw_container_sha256_digest"],
         "witness": _source_witness(source_identity_by_field),
         "provider_identifier_quarantine": EMPTY_PROVIDER_IDENTIFIER_QUARANTINE,
     }
@@ -226,9 +220,7 @@ def _release_audit_metrics():
             "queryable_occurrence_population_count": 50_000,
             "emitted_rate_row_count": 1_000,
             "unqueryable_rate_row_count": 0,
-            "unqueryable_rate_policy": (
-                "count_but_exclude_from_npi_api_challenges_v1"
-            ),
+            "unqueryable_rate_policy": ("count_but_exclude_from_npi_api_challenges_v1"),
             "occurrence_sample_count": 10_000,
             "provider_sample_count": 1_000,
         },
@@ -262,9 +254,7 @@ def _release_audit_metrics():
 
 def _release_report(**target_overrides):
     """Support the release report test fixture."""
-    completed_at = datetime.datetime.now(datetime.timezone.utc).replace(
-        microsecond=0
-    )
+    completed_at = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
     return {
         "schema_version": 3,
         "harness": {
@@ -277,9 +267,7 @@ def _release_report(**target_overrides):
         "profile": "release",
         "release_profile_enforced": True,
         "release_gate_eligible": True,
-        "started_at": (
-            completed_at - datetime.timedelta(seconds=30)
-        ).isoformat(),
+        "started_at": (completed_at - datetime.timedelta(seconds=30)).isoformat(),
         "completed_at": completed_at.isoformat(),
         "duration_seconds": 30.0,
         "target": _release_target(**target_overrides),
@@ -438,9 +426,7 @@ def test_attestation_row_mapping_edges():
     assert ptg2_candidate_attestation._row_mapping(None) == {}
     assert ptg2_candidate_attestation._row_mapping({"value": 1}) == {"value": 1}
     assert ptg2_candidate_attestation._row_mapping(driver_row) == {"value": 3}
-    assert ptg2_candidate_attestation._row_mapping((("value", 4),)) == {
-        "value": 4
-    }
+    assert ptg2_candidate_attestation._row_mapping((("value", 4),)) == {"value": 4}
 
 
 @pytest.mark.parametrize(
@@ -463,10 +449,13 @@ def test_v3_report_time_normalizes_clock():
     report_by_field = _release_report()
     completed_at = datetime.datetime.fromisoformat(report_by_field["completed_at"])
 
-    assert ptg2_candidate_attestation._validated_v3_report_time(
-        report_by_field,
-        completed_at.replace(tzinfo=None),
-    ) == completed_at
+    assert (
+        ptg2_candidate_attestation._validated_v3_report_time(
+            report_by_field,
+            completed_at.replace(tzinfo=None),
+        )
+        == completed_at
+    )
 
 
 @pytest.mark.parametrize(
@@ -480,11 +469,7 @@ def test_v3_report_time_normalizes_clock():
         (
             lambda _report_by_field: None,
             datetime.timedelta(
-                seconds=(
-                    ptg2_candidate_attestation
-                    .PTG2_CANDIDATE_AUDIT_REPORT_FUTURE_SKEW_SECONDS
-                    + 1
-                )
+                seconds=(ptg2_candidate_attestation.PTG2_CANDIDATE_AUDIT_REPORT_FUTURE_SKEW_SECONDS + 1)
             ),
             "future",
         ),
@@ -513,11 +498,7 @@ def test_v3_report_time_edges(report_mutator, evaluation_delta, message):
 )
 def test_v3_tool_identity_edges(section_name, field_name, invalid_value):
     report_by_field = _release_report()
-    mutation_mapping = (
-        report_by_field
-        if section_name is None
-        else report_by_field[section_name]
-    )
+    mutation_mapping = report_by_field if section_name is None else report_by_field[section_name]
     mutation_mapping[field_name] = invalid_value
 
     with pytest.raises(ValueError):
@@ -558,10 +539,7 @@ async def test_database_timestamp_timezone_edges(database_timestamp):
     session.execute = AsyncMock(return_value=timestamp_result)
     expected_timestamp = database_timestamp.replace(tzinfo=datetime.timezone.utc)
 
-    assert (
-        await ptg2_candidate_attestation._database_timestamp(session)
-        == expected_timestamp
-    )
+    assert await ptg2_candidate_attestation._database_timestamp(session) == expected_timestamp
 
 
 def test_release_report_cannot_refresh_attestation_after_freshness_window():
@@ -631,9 +609,7 @@ def test_record_candidate_attestation_rechecks_freshness_after_lock(monkeypatch)
 
 def test_candidate_identity_binds_postgres_bytea_source_and_sealed_sample():
     raw_container_digest = b"x" * 32
-    source_set = ptg2_candidate_attestation.shared_source_set_metadata(
-        [raw_container_digest.hex()]
-    )
+    source_set = ptg2_candidate_attestation.shared_source_set_metadata([raw_container_digest.hex()])
     audit_sample_digest = "ab" * 32
     coverage_scope_id = b"c" * 32
     serving_index = {
@@ -677,14 +653,10 @@ def test_candidate_identity_binds_postgres_bytea_source_and_sealed_sample():
         }
     )
 
-    assert identity["source_set_digest"] == bytes.fromhex(
-        source_set["raw_container_sha256_digest"]
-    )
+    assert identity["source_set_digest"] == bytes.fromhex(source_set["raw_container_sha256_digest"])
     assert identity["audit_sample_digest"] == bytes.fromhex(audit_sample_digest)
     assert identity["ordered_source_ordinal_digest"] == (
-        ptg2_candidate_attestation.ordered_source_ordinal_digest(
-            [raw_container_digest.hex()]
-        )
+        ptg2_candidate_attestation.ordered_source_ordinal_digest([raw_container_digest.hex()])
     )
 
 
@@ -692,9 +664,7 @@ def test_candidate_identity_binds_complete_v4_packed_root():
     raw_container_digest = b"x" * 32
     map_digest = b"m" * 32
     coverage_scope_id = b"c" * 32
-    source_set = ptg2_candidate_attestation.shared_source_set_metadata(
-        [raw_container_digest.hex()]
-    )
+    source_set = ptg2_candidate_attestation.shared_source_set_metadata([raw_container_digest.hex()])
     common_index = {
         "arch_version": "postgres_binary_v3",
         "type": "ptg2_shared_blocks_v4",
@@ -706,9 +676,7 @@ def test_candidate_identity_binds_complete_v4_packed_root():
         "coverage_scope_id": coverage_scope_id.hex(),
         "source_witness": _source_witness(source_set),
         "audit_sample": _audit_sample("ab" * 32),
-        "provider_identifier_quarantine": (
-            EMPTY_PROVIDER_IDENTIFIER_QUARANTINE
-        ),
+        "provider_identifier_quarantine": (EMPTY_PROVIDER_IDENTIFIER_QUARANTINE),
     }
     identity = ptg2_candidate_attestation._candidate_identity(
         {
@@ -809,9 +777,7 @@ def test_candidate_identity_accepts_singleton_run_policy():
     raw_source_sha256 = "ab" * 32
     policy = _candidate_invalid_price_policy(raw_source_sha256)
     evidence = invalid_price_exclusion_evidence(policy)
-    source_set = ptg2_candidate_attestation.shared_source_set_metadata(
-        [raw_source_sha256]
-    )
+    source_set = ptg2_candidate_attestation.shared_source_set_metadata([raw_source_sha256])
     coverage_scope_id = b"c" * 32
     serving_index = {
         "arch_version": "postgres_binary_v3",
@@ -836,9 +802,7 @@ def test_candidate_identity_accepts_singleton_run_policy():
 
     identity = ptg2_candidate_attestation._candidate_identity(candidate_row)
 
-    assert identity["source_set_digest"] == bytes.fromhex(
-        source_set["raw_container_sha256_digest"]
-    )
+    assert identity["source_set_digest"] == bytes.fromhex(source_set["raw_container_sha256_digest"])
 
 
 @pytest.mark.parametrize("manifest_binding", [None, "malformed"])
@@ -885,9 +849,7 @@ def test_candidate_identity_rejects_frozen_markers_without_exact_binding(
 
 def test_candidate_identity_rejects_snapshot_layout_sample_mismatch():
     raw_container_digest = b"x" * 32
-    source_set = ptg2_candidate_attestation.shared_source_set_metadata(
-        [raw_container_digest.hex()]
-    )
+    source_set = ptg2_candidate_attestation.shared_source_set_metadata([raw_container_digest.hex()])
     coverage_scope_id = b"c" * 32
     serving_index = {
         "arch_version": "postgres_binary_v3",
@@ -935,9 +897,7 @@ def test_candidate_identity_rejects_snapshot_layout_sample_mismatch():
 
 def test_candidate_identity_rejects_snapshot_layout_quarantine_mismatch():
     raw_container_digest = b"x" * 32
-    source_set = ptg2_candidate_attestation.shared_source_set_metadata(
-        [raw_container_digest.hex()]
-    )
+    source_set = ptg2_candidate_attestation.shared_source_set_metadata([raw_container_digest.hex()])
     coverage_scope_id = b"c" * 32
     serving_index = {
         "arch_version": "postgres_binary_v3",
@@ -985,9 +945,7 @@ def test_candidate_identity_rejects_snapshot_layout_quarantine_mismatch():
 
 def test_candidate_identity_rejects_snapshot_layout_physical_scope_mismatch():
     raw_container_digest = b"x" * 32
-    source_set = ptg2_candidate_attestation.shared_source_set_metadata(
-        [raw_container_digest.hex()]
-    )
+    source_set = ptg2_candidate_attestation.shared_source_set_metadata([raw_container_digest.hex()])
     coverage_scope_id = b"c" * 32
     serving_index = {
         "arch_version": "postgres_binary_v3",
@@ -1161,10 +1119,7 @@ def _install_candidate_attestation_writer(
     monkeypatch.setattr(
         ptg2_candidate_attestation,
         "_database_timestamp",
-        AsyncMock(
-            return_value=database_now
-            or datetime.datetime.now(datetime.timezone.utc)
-        ),
+        AsyncMock(return_value=database_now or datetime.datetime.now(datetime.timezone.utc)),
     )
 
 
@@ -1174,14 +1129,10 @@ def test_record_candidate_attestation_binds_database_identity(monkeypatch):
     _install_candidate_attestation_writer(
         monkeypatch,
         session,
-        identity_map=_candidate_attestation_identity(
-            TYPED_PROVIDER_IDENTIFIER_QUARANTINE
-        ),
+        identity_map=_candidate_attestation_identity(TYPED_PROVIDER_IDENTIFIER_QUARANTINE),
     )
     report = _release_report()
-    report["source"]["provider_identifier_quarantine"] = (
-        TYPED_PROVIDER_IDENTIFIER_QUARANTINE
-    )
+    report["source"]["provider_identifier_quarantine"] = TYPED_PROVIDER_IDENTIFIER_QUARANTINE
 
     attestation_result = asyncio.run(
         ptg2_candidate_attestation.record_candidate_audit_attestation(
@@ -1194,10 +1145,7 @@ def test_record_candidate_attestation_binds_database_identity(monkeypatch):
     )
 
     assert attestation_result["status"] == "attested"
-    assert (
-        attestation_result["contract"]
-        == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
-    )
+    assert attestation_result["contract"] == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
     assert len(attestation_result["report_digest"]) == 64
     sql, params = session.calls[0]
     assert "ptg2_v3_candidate_audit_attestation" in sql
@@ -1208,21 +1156,14 @@ def test_record_candidate_attestation_binds_database_identity(monkeypatch):
     assert params["audit_sample_digest"] == bytes.fromhex("ab" * 32)
     assert params["source_witness_digest"] == b"w" * 32
     assert "ptg2_provider_identifier_quarantine_v2" in params["report_json"]
-    assert (
-        params["contract"]
-        == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
-    )
+    assert params["contract"] == ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
     assert params["expires_at"] > params["attested_at"]
     assert "contract = EXCLUDED.contract" in sql
     assert "tool_name = EXCLUDED.tool_name" in sql
     assert "attestation.contract = :v3_contract" in sql
     assert "EXCLUDED.contract = :v4_contract" in sql
-    assert params["v3_contract"] == (
-        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
-    )
-    assert params["v4_contract"] == (
-        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
-    )
+    assert params["v3_contract"] == (ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3)
+    assert params["v4_contract"] == (ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4)
 
 
 def test_record_candidate_attestation_rejects_report_quarantine_mismatch(monkeypatch):
@@ -1230,9 +1171,7 @@ def test_record_candidate_attestation_rejects_report_quarantine_mismatch(monkeyp
     _install_candidate_attestation_writer(
         monkeypatch,
         session,
-        identity_map=_candidate_attestation_identity(
-            MALFORMED_PROVIDER_IDENTIFIER_QUARANTINE
-        ),
+        identity_map=_candidate_attestation_identity(MALFORMED_PROVIDER_IDENTIFIER_QUARANTINE),
     )
 
     with pytest.raises(ValueError, match="does not match the sealed candidate"):
@@ -1289,9 +1228,7 @@ def test_attestation_expiry_is_capped_by_report_freshness(monkeypatch):
 
 def test_activation_rechecks_attestation_expiry_against_wall_clock(monkeypatch):
     report = _release_report()
-    expected_digest = hashlib.sha256(
-        ptg2_candidate_attestation._canonical_report_bytes(report)
-    ).digest()
+    expected_digest = hashlib.sha256(ptg2_candidate_attestation._canonical_report_bytes(report)).digest()
     session = _Session(_Result(_attestation_row(expected_digest, report)))
     identity_map = {
         "snapshot_key": 17,
@@ -1354,11 +1291,9 @@ def test_writer_cutover_writes_v4_and_keeps_v3_reader_compatibility():
 def test_candidate_attestation_digest_binds_activation_intent():
     report_digest = b"r" * 32
 
-    promotable_digest = (
-        ptg2_candidate_attestation.candidate_attestation_digest(
-            report_digest,
-            "audit_and_activate",
-        )
+    promotable_digest = ptg2_candidate_attestation.candidate_attestation_digest(
+        report_digest,
+        "audit_and_activate",
     )
     held_digest = ptg2_candidate_attestation.candidate_attestation_digest(
         report_digest,
@@ -1386,9 +1321,7 @@ def _held_candidate_identity() -> dict[str, object]:
 
 def _held_attestation_verification(monkeypatch, *, approval_digest=None):
     report = _release_report()
-    report_digest = hashlib.sha256(
-        ptg2_candidate_attestation._canonical_report_bytes(report)
-    ).digest()
+    report_digest = hashlib.sha256(ptg2_candidate_attestation._canonical_report_bytes(report)).digest()
     session = _Session(
         _Result(
             _attestation_row(
@@ -1404,62 +1337,50 @@ def _held_attestation_verification(monkeypatch, *, approval_digest=None):
         AsyncMock(return_value=_held_candidate_identity()),
     )
     if approval_digest is None:
-        verification = (
-            ptg2_candidate_attestation.verify_candidate_audit_attestation_in_transaction(
-                session,
-                schema_name="mrf",
-                snapshot_id="snap_new",
-                snapshot_key=17,
-                source_key="source_a",
-                plan_id="12-3456789",
-                plan_market_type="group",
-                coverage_scope_id=b"c" * 32,
-            )
+        verification = ptg2_candidate_attestation.verify_candidate_audit_attestation_in_transaction(
+            session,
+            schema_name="mrf",
+            snapshot_id="snap_new",
+            snapshot_key=17,
+            source_key="source_a",
+            plan_id="12-3456789",
+            plan_market_type="group",
+            coverage_scope_id=b"c" * 32,
         )
     else:
-        verification = (
-            ptg2_candidate_attestation.verify_held_candidate_attestation_in_transaction(
-                session,
-                schema_name="mrf",
-                snapshot_id="snap_new",
-                expected_identity_by_field=_held_candidate_identity(),
-                expected_attestation_digest=approval_digest,
-            )
+        verification = ptg2_candidate_attestation.verify_held_candidate_attestation_in_transaction(
+            session,
+            schema_name="mrf",
+            snapshot_id="snap_new",
+            expected_identity_by_field=_held_candidate_identity(),
+            expected_attestation_digest=approval_digest,
         )
     return report_digest, session, verification
 
 
 def test_activation_rejects_held_attestation_before_pointer_work(monkeypatch):
-    _report_digest, _session, verification = _held_attestation_verification(
-        monkeypatch
-    )
+    _report_digest, _session, verification = _held_attestation_verification(monkeypatch)
 
     with pytest.raises(ValueError, match="held for audit-only review"):
         asyncio.run(verification)
 
 
 def test_reviewed_audit_only_approval_requires_exact_full_digest(monkeypatch):
-    report_digest = hashlib.sha256(
-        ptg2_candidate_attestation._canonical_report_bytes(_release_report())
-    ).digest()
+    report_digest = hashlib.sha256(ptg2_candidate_attestation._canonical_report_bytes(_release_report())).digest()
     held_digest = ptg2_candidate_attestation.candidate_attestation_digest(
         report_digest,
         "audit_only",
     )
-    expected_report_digest, _session, verification = (
-        _held_attestation_verification(
-            monkeypatch,
-            approval_digest=held_digest,
-        )
+    expected_report_digest, _session, verification = _held_attestation_verification(
+        monkeypatch,
+        approval_digest=held_digest,
     )
 
     assert asyncio.run(verification) == expected_report_digest
 
-    _report_digest, _session, wrong_verification = (
-        _held_attestation_verification(
-            monkeypatch,
-            approval_digest=b"x" * 32,
-        )
+    _report_digest, _session, wrong_verification = _held_attestation_verification(
+        monkeypatch,
+        approval_digest=b"x" * 32,
     )
     with pytest.raises(
         ptg2_candidate_attestation.CandidateAttestationApprovalConflict,
@@ -1478,11 +1399,7 @@ def test_writer_cutover_rejects_new_v3_attestation_writes(monkeypatch):
     monkeypatch.setattr(
         ptg2_candidate_attestation,
         "validate_candidate_release_audit_report",
-        lambda *_args, **_kwargs: {
-            "contract": (
-                ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3
-            )
-        },
+        lambda *_args, **_kwargs: {"contract": (ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3)},
     )
     with pytest.raises(
         ptg2_candidate_attestation.CandidateAttestationWriterContractError,
@@ -1555,12 +1472,8 @@ def test_writer_cutover_rechecks_contract_under_lock(monkeypatch):
 
 def test_activation_rejects_report_quarantine_changed_after_attestation(monkeypatch):
     report = _release_report()
-    report["source"]["provider_identifier_quarantine"] = (
-        MALFORMED_PROVIDER_IDENTIFIER_QUARANTINE
-    )
-    report_digest = hashlib.sha256(
-        ptg2_candidate_attestation._canonical_report_bytes(report)
-    ).digest()
+    report["source"]["provider_identifier_quarantine"] = MALFORMED_PROVIDER_IDENTIFIER_QUARANTINE
+    report_digest = hashlib.sha256(ptg2_candidate_attestation._canonical_report_bytes(report)).digest()
     session = _Session(_Result(_attestation_row(report_digest, report)))
     monkeypatch.setattr(
         ptg2_candidate_attestation,
@@ -1575,9 +1488,7 @@ def test_activation_rejects_report_quarantine_changed_after_attestation(monkeypa
                 "source_set_digest": b"s" * 32,
                 "audit_sample_digest": bytes.fromhex("ab" * 32),
                 "source_witness_digest": b"w" * 32,
-                "provider_identifier_quarantine": (
-                    EMPTY_PROVIDER_IDENTIFIER_QUARANTINE
-                ),
+                "provider_identifier_quarantine": (EMPTY_PROVIDER_IDENTIFIER_QUARANTINE),
             }
         ),
     )
@@ -1599,9 +1510,7 @@ def test_activation_rejects_report_quarantine_changed_after_attestation(monkeypa
 
 def test_activation_rejects_stored_report_changed_after_attestation(monkeypatch):
     report = _release_report()
-    report_digest = hashlib.sha256(
-        ptg2_candidate_attestation._canonical_report_bytes(report)
-    ).digest()
+    report_digest = hashlib.sha256(ptg2_candidate_attestation._canonical_report_bytes(report)).digest()
     report["duration_seconds"] = 601.0
     session = _Session(_Result(_attestation_row(report_digest, report)))
     monkeypatch.setattr(
@@ -1617,9 +1526,7 @@ def test_activation_rejects_stored_report_changed_after_attestation(monkeypatch)
                 "source_set_digest": b"s" * 32,
                 "audit_sample_digest": bytes.fromhex("ab" * 32),
                 "source_witness_digest": b"w" * 32,
-                "provider_identifier_quarantine": (
-                    EMPTY_PROVIDER_IDENTIFIER_QUARANTINE
-                ),
+                "provider_identifier_quarantine": (EMPTY_PROVIDER_IDENTIFIER_QUARANTINE),
             }
         ),
     )
@@ -1721,9 +1628,7 @@ def test_non_candidate_publication_cannot_rewrite_a_strict_candidate():
 
     sql, params = session.calls[0]
     assert sql.count("<> :candidate_activation_contract") == 2
-    assert params["candidate_activation_contract"] == (
-        "ptg2_candidate_activation_v1"
-    )
+    assert params["candidate_activation_contract"] == ("ptg2_candidate_activation_v1")
 
 
 def _install_generic_candidate_publish_collaborators(monkeypatch):
@@ -1731,13 +1636,9 @@ def _install_generic_candidate_publish_collaborators(monkeypatch):
 
     session = object()
     activate = AsyncMock(return_value={"status": "promoted"})
-    source_plan_rows = AsyncMock(
-        side_effect=AssertionError("legacy path was selected")
-    )
+    source_plan_rows = AsyncMock(side_effect=AssertionError("legacy path was selected"))
     mark_projection = AsyncMock()
-    drain_projection = AsyncMock(
-        return_value=PTG2LegacyGlobalProjectionDrain(reconciled=1)
-    )
+    drain_projection = AsyncMock(return_value=PTG2LegacyGlobalProjectionDrain(reconciled=1))
     locked_snapshot = AsyncMock(
         return_value={
             "snapshot_id": "snap_new",
@@ -1790,9 +1691,7 @@ def test_generic_publish_uses_locked_database_candidate_not_caller_attributes(
         source_plan_rows,
         mark_projection,
         drain_projection,
-    ) = _install_generic_candidate_publish_collaborators(
-        monkeypatch
-    )
+    ) = _install_generic_candidate_publish_collaborators(monkeypatch)
 
     publication_result = asyncio.run(
         source_pointers._publish_ptg2_source_pointers(
@@ -2205,7 +2104,7 @@ def test_strict_candidate_activation_verifies_and_consumes_attestation_atomicall
     cas_calls = []
     verification_calls = []
     consumption_calls = []
-    session = object()
+    session = Mock(scalar=AsyncMock(return_value=False))
     (
         record_event,
         verify,
@@ -2375,7 +2274,7 @@ def _install_mixed_candidate_activation_collaborators(
 ):
     """Install the audited mixed-candidate activation collaborators."""
 
-    transaction_session = object()
+    transaction_session = Mock(scalar=AsyncMock(return_value=False))
     activation_time = datetime.datetime(2026, 7, 13, 9, 0, 0)
     record_event, compare_and_swap = _mixed_candidate_activation_recorders(
         event_names,
@@ -2543,7 +2442,7 @@ def _install_rollback_activation_readers(
 
 def test_attestation_consumption_failure_rolls_back_all_activation_state(monkeypatch):
     """Verify attestation consumption failure rolls back all activation state."""
-    session = object()
+    session = Mock(scalar=AsyncMock(return_value=False))
     state_map = {
         "source_pointer": "snap_old",
         "snapshot_status": "validated",
@@ -2581,19 +2480,14 @@ def test_candidate_attestation_low_level_validation_edges(monkeypatch):
     """Cover canonical serialization and configuration fallbacks."""
     with pytest.raises(ValueError, match="canonical JSON"):
         ptg2_candidate_attestation._canonical_report_bytes({"bad": object()})
-    assert (
-        ptg2_candidate_attestation._sha256_hex("ab" * 32, field="digest")
-        == "ab" * 32
-    )
+    assert ptg2_candidate_attestation._sha256_hex("ab" * 32, field="digest") == "ab" * 32
 
     monkeypatch.setenv(
         ptg2_candidate_attestation.PTG2_CANDIDATE_AUDIT_REPORT_MAX_AGE_MINUTES_ENV,
         "invalid",
     )
     assert ptg2_candidate_attestation._audit_report_max_age() == datetime.timedelta(
-        minutes=(
-            ptg2_candidate_attestation.PTG2_CANDIDATE_AUDIT_REPORT_MAX_AGE_MINUTES_DEFAULT
-        )
+        minutes=(ptg2_candidate_attestation.PTG2_CANDIDATE_AUDIT_REPORT_MAX_AGE_MINUTES_DEFAULT)
     )
     monkeypatch.setenv(
         ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_TTL_HOURS_ENV,
@@ -2610,11 +2504,7 @@ def test_candidate_attestation_report_shape_validation_edges():
         ptg2_candidate_attestation._required_report_mapping({}, "missing")
     with pytest.raises(ValueError):
         ptg2_candidate_attestation.validate_candidate_release_audit_report(
-            {
-                "schema_version": (
-                    ptg2_candidate_attestation.PTG2_BATCH_AUDIT_REPORT_SCHEMA_VERSION
-                )
-            },
+            {"schema_version": (ptg2_candidate_attestation.PTG2_BATCH_AUDIT_REPORT_SCHEMA_VERSION)},
             snapshot_id="s",
             source_key="k",
             plan_id="p",
@@ -2642,9 +2532,7 @@ def test_candidate_attestation_physical_identity_validation_edges():
             {"source_set": {}, "coverage_scope_id": ""},
             {},
         )
-    source_set = ptg2_candidate_attestation.shared_source_set_metadata(
-        ("aa" * 32,)
-    )
+    source_set = ptg2_candidate_attestation.shared_source_set_metadata(("aa" * 32,))
     with pytest.raises(ValueError, match="PostgreSQL bindings"):
         ptg2_candidate_attestation._validated_candidate_physical_identity(
             {
@@ -2745,9 +2633,7 @@ def test_candidate_attestation_digest_and_sample_validation_edges():
                 field="digest",
             )
 
-    source_set = ptg2_candidate_attestation.shared_source_set_metadata(
-        ("aa" * 32,)
-    )
+    source_set = ptg2_candidate_attestation.shared_source_set_metadata(("aa" * 32,))
     with pytest.raises(ValueError, match="audit identity is malformed"):
         ptg2_candidate_attestation._validated_candidate_physical_identity(
             {
@@ -2968,9 +2854,7 @@ def test_v4_attestation_writer_persists_request_accounting(monkeypatch):
 
     assert result["status"] == "attested"
     assert result["batch_api_actual_http_requests"] == 1
-    assert session.calls[0][1]["contract"] == (
-        ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
-    )
+    assert session.calls[0][1]["contract"] == (ptg2_candidate_attestation.PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4)
 
 
 def test_v4_attestation_writer_binds_packed_storage_generation(monkeypatch):
@@ -2989,16 +2873,11 @@ def test_v4_attestation_writer_binds_packed_storage_generation(monkeypatch):
         database_now=database_now,
     )
 
-    result = asyncio.run(
-        _record_v4_attestation(storage_generation="shared_blocks_v4")
-    )
+    result = asyncio.run(_record_v4_attestation(storage_generation="shared_blocks_v4"))
 
     assert result["status"] == "attested"
     assert report_validator.call_count == 2
-    assert all(
-        call.kwargs["storage_generation"] == "shared_blocks_v4"
-        for call in report_validator.call_args_list
-    )
+    assert all(call.kwargs["storage_generation"] == "shared_blocks_v4" for call in report_validator.call_args_list)
     assert session.calls[0][1]["snapshot_key"] == 17
 
 
@@ -3059,15 +2938,11 @@ def _verify_v4_attestation(monkeypatch, *, identity_by_field, query_result):
 def test_v4_attestation_verifier_accepts_unchanged_evidence(monkeypatch):
     identity_by_field = writer_identity_by_field()
     report_by_field = writer_report_by_field(4)
-    report_digest = hashlib.sha256(
-        ptg2_candidate_attestation._canonical_report_bytes(report_by_field)
-    ).digest()
+    report_digest = hashlib.sha256(ptg2_candidate_attestation._canonical_report_bytes(report_by_field)).digest()
     _session, verification = _verify_v4_attestation(
         monkeypatch,
         identity_by_field=identity_by_field,
-        query_result=_Result(
-            _attestation_row(report_digest, report_by_field)
-        ),
+        query_result=_Result(_attestation_row(report_digest, report_by_field)),
     )
 
     assert asyncio.run(verification) == report_digest
@@ -3092,9 +2967,7 @@ def test_v4_attestation_verifier_rejects_identity_or_row_drift(
     identity_by_field = writer_identity_by_field()
     identity_by_field["source_key"] = identity_source_key
     report_by_field = writer_report_by_field(4)
-    report_digest = hashlib.sha256(
-        ptg2_candidate_attestation._canonical_report_bytes(report_by_field)
-    ).digest()
+    report_digest = hashlib.sha256(ptg2_candidate_attestation._canonical_report_bytes(report_by_field)).digest()
     stored_rows_by_kind = {
         "valid": (report_digest, report_by_field),
         "missing": None,
@@ -3133,15 +3006,11 @@ def test_v4_attestation_verifier_rejects_digest_bound_identity_drift(
     identity_by_field = writer_identity_by_field()
     identity_by_field[identity_field] = changed_value
     report_by_field = writer_report_by_field(4)
-    report_digest = hashlib.sha256(
-        ptg2_candidate_attestation._canonical_report_bytes(report_by_field)
-    ).digest()
+    report_digest = hashlib.sha256(ptg2_candidate_attestation._canonical_report_bytes(report_by_field)).digest()
     _session, verification = _verify_v4_attestation(
         monkeypatch,
         identity_by_field=identity_by_field,
-        query_result=_Result(
-            _attestation_row(report_digest, report_by_field)
-        ),
+        query_result=_Result(_attestation_row(report_digest, report_by_field)),
     )
 
     with pytest.raises(ValueError, match=message):
@@ -3169,15 +3038,11 @@ def test_v4_attestation_verifier_rejects_sealed_metadata_drift(
         changed_field: changed_value,
     }
     report_by_field = writer_report_by_field(4)
-    report_digest = hashlib.sha256(
-        ptg2_candidate_attestation._canonical_report_bytes(report_by_field)
-    ).digest()
+    report_digest = hashlib.sha256(ptg2_candidate_attestation._canonical_report_bytes(report_by_field)).digest()
     _session, verification = _verify_v4_attestation(
         monkeypatch,
         identity_by_field=identity_by_field,
-        query_result=_Result(
-            _attestation_row(report_digest, report_by_field)
-        ),
+        query_result=_Result(_attestation_row(report_digest, report_by_field)),
     )
 
     with pytest.raises(ValueError, match="audit metadata changed"):
@@ -3210,11 +3075,9 @@ def test_candidate_attestation_consumption_normalizes_time_and_detects_conflict(
 
 def test_reviewed_audit_only_consumption_is_exact_and_single_use():
     report_digest = b"r" * 32
-    approval_digest = (
-        ptg2_candidate_attestation.candidate_attestation_digest(
-            report_digest,
-            "audit_only",
-        )
+    approval_digest = ptg2_candidate_attestation.candidate_attestation_digest(
+        report_digest,
+        "audit_only",
     )
     successful_session = _Session(_Result(("snap-new",)))
 
@@ -3230,10 +3093,7 @@ def test_reviewed_audit_only_consumption_is_exact_and_single_use():
         )
     )
     assert successful_session.calls[0][1]["activation_intent"] == "audit_only"
-    assert (
-        successful_session.calls[0][1]["attestation_digest"]
-        == approval_digest
-    )
+    assert successful_session.calls[0][1]["attestation_digest"] == approval_digest
 
     replay_session = _Session(_Result(None))
     with pytest.raises(

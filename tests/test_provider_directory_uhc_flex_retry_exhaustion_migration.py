@@ -9,12 +9,10 @@ from unittest.mock import Mock
 
 import sqlalchemy as sa
 
-from db.models import ProviderDirectoryUHCFlexPractitionerAcquisition
-from db.models import ProviderDirectoryUHCFlexPractitionerDataset
+from db.models import ProviderDirectoryUHCFlexPractitionerAcquisition, ProviderDirectoryUHCFlexPractitionerDataset
 
-
-MIGRATION_PATH = Path(__file__).resolve().parents[1] / "alembic/versions" / (
-    "20260830090000_uhc_flex_retry_exhaustion.py"
+MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1] / "alembic/versions" / ("20260830090000_uhc_flex_retry_exhaustion.py")
 )
 SCHEMA = "uhc_flex_retry_exhaustion_test"
 
@@ -38,27 +36,17 @@ def test_revision_is_linear_and_exhaustion_is_narrow() -> None:
     migration = _migration()
 
     assert migration.revision == "20260830090000_uhc_flex_retry_exhaustion"
-    assert migration.down_revision == (
-        "20260828120000_plan_pricing_factorized_projection"
-    )
+    assert migration.down_revision == ("20260828120000_plan_pricing_factorized_projection")
     assert migration._MAX_ATTEMPTS == 8
     assert migration._ERROR_CODE == "retry_exhausted_transport"
 
-    acquisition = _normalized(
-        migration._acquisition_guard_sql(SCHEMA, partial=True)
-    )
-    single_root = _normalized(
-        migration._single_root_guard_sql(SCHEMA, partial=True)
-    )
-    publication = _normalized(
-        migration._publication_valid_sql(SCHEMA, partial=True)
-    )
+    acquisition = _normalized(migration._acquisition_guard_sql(SCHEMA, partial=True))
+    single_root = _normalized(migration._single_root_guard_sql(SCHEMA, partial=True))
+    publication = _normalized(migration._publication_valid_sql(SCHEMA, partial=True))
     for sql in (acquisition, single_root, publication):
         assert "retry_exhausted_transport" in sql
         assert "attempt_count < 8" in sql
-    assert "actual_matched_count + actual_unmatched_count + actual_error_count" in (
-        acquisition
-    )
+    assert "actual_matched_count + actual_unmatched_count + actual_error_count" in (acquisition)
     assert "candidate.matched_count + candidate.unmatched_count +" in publication
     assert "retry_exhausted_count" in publication
     assert "'cohort_complete', false" in publication
@@ -81,19 +69,13 @@ def test_upgrade_sets_a_bounded_lock_timeout_before_locking(monkeypatch) -> None
 
 def test_constraints_keep_exact_rows_and_mark_partial_rows_incomplete() -> None:
     migration = _migration()
-    acquisition = _normalized(
-        migration._acquisition_state_sql(SCHEMA, partial=True)
-    )
-    publication = _normalized(
-        migration._publication_state_sql(SCHEMA, partial=True)
-    )
+    acquisition = _normalized(migration._acquisition_state_sql(SCHEMA, partial=True))
+    publication = _normalized(migration._publication_state_sql(SCHEMA, partial=True))
 
     assert "matched_count + unmatched_count + error_count" in acquisition
     assert "cohort_complete = (error_count = 0)" in acquisition
     assert "cohort_complete IN (TRUE, FALSE)" in publication
-    assert "cohort_complete IS TRUE" in _normalized(
-        migration._publication_state_sql(SCHEMA, partial=False)
-    )
+    assert "cohort_complete IS TRUE" in _normalized(migration._publication_state_sql(SCHEMA, partial=False))
 
 
 def test_downgrade_fails_closed_after_partial_evidence() -> None:
@@ -108,25 +90,32 @@ def test_downgrade_fails_closed_after_partial_evidence() -> None:
 def test_models_match_partial_root_constraints() -> None:
     acquisition_constraints_by_name = {
         constraint.name: _normalized(str(constraint.sqltext))
-        for constraint in (
-            ProviderDirectoryUHCFlexPractitionerAcquisition.__table__.constraints
-        )
+        for constraint in (ProviderDirectoryUHCFlexPractitionerAcquisition.__table__.constraints)
         if isinstance(constraint, sa.CheckConstraint)
     }
     publication_constraints_by_name = {
         constraint.name: _normalized(str(constraint.sqltext))
-        for constraint in (
-            ProviderDirectoryUHCFlexPractitionerDataset.__table__.constraints
-        )
+        for constraint in (ProviderDirectoryUHCFlexPractitionerDataset.__table__.constraints)
         if isinstance(constraint, sa.CheckConstraint)
     }
 
-    acquisition = acquisition_constraints_by_name[
-        "pd_uhc_flex_practitioner_acquisition_state_check"
-    ]
-    publication = publication_constraints_by_name[
-        "pd_uhc_flex_practitioner_dataset_check"
-    ]
+    acquisition = acquisition_constraints_by_name["pd_uhc_flex_practitioner_acquisition_state_check"]
+    publication = publication_constraints_by_name["pd_uhc_flex_practitioner_dataset_check"]
     assert "matched_count + unmatched_count + error_count" in acquisition
     assert "cohort_complete = (error_count = 0)" in acquisition
     assert "cohort_complete IN (TRUE, FALSE)" in publication
+
+
+def test_acquisition_model_preserves_migration_predicate_order() -> None:
+    """Native custody compares complete predicates, including their clause order."""
+    statement = _migration()._acquisition_state_sql(SCHEMA, partial=True)
+    _prefix, separator, check_body = statement.partition("CHECK (")
+    assert separator and check_body.endswith(") NOT VALID;")
+    migration_predicate = check_body.removesuffix(") NOT VALID;")
+    model_constraint = next(
+        constraint
+        for constraint in ProviderDirectoryUHCFlexPractitionerAcquisition.__table__.constraints
+        if isinstance(constraint, sa.CheckConstraint)
+        and constraint.name == "pd_uhc_flex_practitioner_acquisition_state_check"
+    )
+    assert _normalized(str(model_constraint.sqltext)) == _normalized(migration_predicate)

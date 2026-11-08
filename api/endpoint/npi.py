@@ -27,57 +27,176 @@ from sanic import Blueprint, response
 from sqlalchemy import JSON as SQLAlchemyJSON
 from sqlalchemy import false, func, or_, select
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql import literal_column, text, tuple_
 
-from api.code_systems import (EXTERNAL_PROCEDURE_CODE_SYSTEMS,
-                              INTERNAL_PROCEDURE_CODE_SYSTEM,
-                              INTERNAL_RX_CODE_SYSTEM)
+from api import provider_detail_network_metadata
+from api.code_systems import EXTERNAL_PROCEDURE_CODE_SYSTEMS, INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
+from api.custom_import_provider_sql import ProviderImportQuery
 from api.endpoint.pagination import parse_pagination
+from api.network_address_scope import (
+    _model_table_columns,
+    _npi_batch_address_filters,
+    _provider_detail_address_type_clause,
+    _request_selector,
+    canonical_network_read,
+    current_network_address_scope,
+    is_scoped_address_relation,
+    scoped_address_cache_key,
+    scoped_address_insurance_predicate,
+    scoped_address_parameters,
+    scoped_address_relation_sql,
+    scoped_address_statement,
+)
+from api.network_read_execution import direct_heap_relation_sql, execute_network_read, has_network_read_inventory
 from api.npi_detail_cache_identity import (
     NpiDetailCacheIdentity as _NpiDetailCacheIdentity,
+)
+from api.npi_detail_cache_identity import (
     npi_detail_cache_key as _format_npi_detail_cache_key,
 )
+from api.npi_native_cache_identity import npi_canonical_publication_identity
 from api.provider_demographic_filters import normalize_provider_sex_code
-from api.provider_specialty_filters import (
-    ensure_specialty_resolution_cache,
-    resolve_provider_specialty_filter,
+from api.provider_detail_sql import _npi_detail_address_filters, _npi_detail_taxonomy_aggregate
+from api.provider_directory_dataset_sql import (
+    PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE,
+    PROVIDER_DIRECTORY_EVIDENCE_CAPABILITY_SQL,
+    _provider_directory_current_resource_ctes_sql,
+)
+from api.provider_directory_dataset_sql import (
+    legacy_affiliation_candidates_sql as _legacy_affiliation_candidates_sql,
+)
+from api.provider_directory_dataset_sql import (
+    provider_directory_current_resource_join_sql as _provider_directory_current_resource_join_sql,
+)
+from api.provider_directory_dataset_sql import (
+    provider_directory_network_resolution_sql as _provider_directory_network_resolution_sql,
+)
+from api.provider_geo_sql import (
+    ImportedGeoQuery,
+    ImportedGeoStatements,
+    NearbySqlQuery,
+    _fetch_imported_geo_page,
+    build_imported_geo_statements,
+    build_native_nearby_count_sql,
+    build_native_nearby_sql,
+    canonical_zip_anchor_statement,
+    native_geo_entity_scope,
+    nearby_batch_identities,
+)
+from api.provider_list_sql import (
+    _CUSTOM_IMPORT_PROVIDER_RELATION,
+    _NATIVE_PROVIDER_RELATION,
+    _NPI_COUNT_READ_SCOPE,
+    MAX_PROVIDER_LIST_PHONE_CANDIDATES,
+    MIN_PROVIDER_LIST_PHONE_CANDIDATES,
+    _address_npi_filter,
+    _address_phone_candidates_cte,
+    _address_phone_candidates_join,
+    _address_phone_digits_filter,
+    _address_site_key_filter,
+    _address_zip5_filter,
+    _bounded_provider_list_count,
+    _extract_name_filters,
+    _is_unified_address_table,
+    _npi_count_read,
+    _primary_address_order_clause,
+    _provider_import_count_page,
+    _provider_import_match_clause,
+    _provider_import_membership_clause,
+    _provider_import_order_clause,
+    _provider_import_relation_cte,
+    _provider_list_address_type_clause,
+    _provider_list_connection,
+    _provider_list_count,
+    _provider_list_parameters,
+    _provider_list_phone_candidate_limit,
+    _provider_list_statement,
+    _provider_list_total_statement,
+    _provider_native_entity_scope,
+    _sql_with_ctes,
+    _sql_with_prefix_ctes,
 )
 from api.provider_profile import (
     compose_provider_profile,
     compose_provider_profile_evidence,
     fetch_provider_profile_projection,
 )
+from api.provider_profile_snapshot import (
+    provider_geo_read_snapshot,
+    provider_optional_read,
+    provider_profile_read_snapshot,
+    provider_read_savepoint,
+    snapshot_relation_available,
+)
 from api.provider_search_sql import (
     broad_name_page_sql as _broad_name_page_sql,
+)
+from api.provider_search_sql import (
     build_provider_name_where as _build_provider_name_where,
+)
+from api.provider_search_sql import (
     is_location_first_taxonomy_filter as _is_location_first_taxonomy_filter,
+)
+from api.provider_search_sql import (
     plan_release_npi_scope as _plan_release_npi_scope,
+)
+from api.provider_search_sql import (
     provider_taxonomy_code_parameters as _provider_taxonomy_code_parameters,
+)
+from api.provider_search_sql import (
     provider_taxonomy_lateral_join as _provider_taxonomy_lateral_join,
+)
+from api.provider_search_sql import (
     provider_taxonomy_matched_npi_cte as _provider_taxonomy_matched_npi_cte,
+)
+from api.provider_search_sql import (
     taxonomy_classification_subquery as _taxonomy_classification_subquery,
+)
+from api.provider_search_sql import (
     taxonomy_codes_subquery as _taxonomy_codes_subquery,
 )
-from db.models import (AddressArchive, EntityAddressUnified, Issuer,
-                       NPIAddress, NPIData, NPIDataOtherIdentifier,
-                       NPIDataTaxonomy, NPIDataTaxonomyGroup, NUCCTaxonomy,
-                       PlanNPIRaw, ProviderEnrichmentSummary,
-                       ProviderEnrollmentFFS,
-                       ProviderEnrollmentFFSAdditionalNPI,
-                       ProviderEnrollmentFFSAddress,
-                       ProviderEnrollmentFFSReassignment,
-                       ProviderEnrollmentFFSSecondarySpecialty,
-                       ProviderEnrollmentFQHC,
-                       ProviderEnrollmentHomeHealthAgency,
-                       ProviderEnrollmentHospice, ProviderEnrollmentHospital,
-                       ProviderEnrollmentRHC, ProviderEnrollmentSNF,
-                       ProviderDirectoryEndpoint,
-                       ProviderDirectoryHealthcareService,
-                       ProviderDirectoryInsurancePlan,
-                       ProviderDirectoryOrganization,
-                       ProviderDirectoryOrganizationAffiliation,
-                       ProviderDirectoryPractitionerRole,
-                       ProviderDirectorySource, db)
+from api.provider_specialty_filters import (
+    ensure_specialty_resolution_cache,
+    resolve_provider_specialty_filter,
+)
+from api.reference_family_reads import _claims_relation_sql
+from db.connection import gather_reader_calls, has_reader_session, run_as_writer
+from db.models import (
+    AddressArchive,
+    EntityAddressUnified,
+    Issuer,
+    NPIAddress,
+    NPIData,
+    NPIDataOtherIdentifier,
+    NPIDataTaxonomy,
+    NPIDataTaxonomyGroup,
+    NUCCTaxonomy,
+    PlanNPIRaw,
+    ProviderDirectoryEndpoint,
+    ProviderDirectoryHealthcareService,
+    ProviderDirectoryInsurancePlan,
+    ProviderDirectoryOrganization,
+    ProviderDirectoryOrganizationAffiliation,
+    ProviderDirectoryPractitionerRole,
+    ProviderDirectorySource,
+    ProviderEnrichmentSummary,
+    ProviderEnrollmentFFS,
+    ProviderEnrollmentFFSAdditionalNPI,
+    ProviderEnrollmentFFSAddress,
+    ProviderEnrollmentFFSReassignment,
+    ProviderEnrollmentFFSSecondarySpecialty,
+    ProviderEnrollmentFQHC,
+    ProviderEnrollmentHomeHealthAgency,
+    ProviderEnrollmentHospice,
+    ProviderEnrollmentHospital,
+    ProviderEnrollmentRHC,
+    ProviderEnrollmentSNF,
+    db,
+)
+from db.provider_directory_readiness import READINESS_INDEXES
+from process import provider_directory_profile as profile_artifact
+from process.custom_import.read_core import _is_statement_timeout
 from process.ext.address_format import (
     ADDRESS_FORMAT_FUNCTION,
     ADDRESS_FORMAT_SOURCE,
@@ -86,10 +205,12 @@ from process.ext.address_format import (
 )
 from process.ext.contact_canon import canonicalize_one as canonicalize_contact_one
 from process.ext.utils import download_it
-from process.openaddresses import exact_lookup_sql, fuzzy_lookup_sql, lookup_params_from_address, relaxed_lookup_sql
-from process import provider_directory_profile as profile_artifact
 from process.florida_mqa_profile import STANDARD_CATEGORIES
+from process.openaddresses import exact_lookup_sql, fuzzy_lookup_sql, lookup_params_from_address, relaxed_lookup_sql
 from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
+
+_attach_selected_address_source_details = provider_detail_network_metadata.attach_provider_source_details
+_project_provider_network_metadata = provider_detail_network_metadata.project_provider_network_metadata
 
 blueprint = Blueprint("npi", url_prefix="/npi", version=1)
 logger = logging.getLogger(__name__)
@@ -113,6 +234,7 @@ CODE_TOKEN_PATTERN = re.compile(r"^[A-Z0-9._-]+$")
 INT_CODE_PATTERN = re.compile(r"^-?\d+$")
 CHAIN_PECOS_PROVIDER_TYPE_CODES = {"12-C1"}
 PUBLIC_ADDRESS_EXCLUDED_COLUMNS = {
+    "canonical_network_ids",
     "premise_key",
     "_address_site_keys",
     "_address_site_key_status",
@@ -204,9 +326,7 @@ _PROVIDER_DIRECTORY_OBSERVED_DATASET_STATUSES = (
 )
 _PROVIDER_DIRECTORY_OBSERVED_RESOURCE_LIMIT = 32
 UHC_PROVIDER_FILE_ADDRESS_STATUS = "payer_directory_candidate"
-PROVIDER_DIRECTORY_PROFILE_SERVING_GENERATION_TABLE = (
-    "provider_directory_profile_serving_generation"
-)
+PROVIDER_DIRECTORY_PROFILE_SERVING_GENERATION_TABLE = "provider_directory_profile_serving_generation"
 PROVIDER_DIRECTORY_PROFILE_SERVING_QUERY_TEMPLATE = """
     WITH serving_generation AS MATERIALIZED (
         SELECT singleton_key, generation_id, published_at, profile_as_of,
@@ -269,9 +389,7 @@ def _public_nested_taxonomy_rows(rows: Sequence[Any]) -> list[dict[str, Any]]:
         if not isinstance(entry, Mapping):
             continue
         public_entry_map = {
-            str(key): value
-            for key, value in entry.items()
-            if str(key) not in PUBLIC_NESTED_TAXONOMY_EXCLUDED_COLUMNS
+            str(key): value for key, value in entry.items() if str(key) not in PUBLIC_NESTED_TAXONOMY_EXCLUDED_COLUMNS
         }
         if not public_entry_map:
             continue
@@ -324,9 +442,7 @@ def _render_public_formatted_address(value: dict[str, Any]) -> None:
         "state_name",
         "postal_code",
     )
-    if "formatted_address" not in value and not any(
-        key in value for key in component_keys
-    ):
+    if "formatted_address" not in value and not any(key in value for key in component_keys):
         return
     value["formatted_address"] = render_formatted_address_v2(
         value.get("first_line"),
@@ -383,9 +499,7 @@ def _parse_bounded_int(
     except ValueError as exc:
         raise sanic.exceptions.InvalidUsage(f"Parameter '{param_name}' must be an integer") from exc
     if parsed < minimum or parsed > maximum:
-        raise sanic.exceptions.InvalidUsage(
-            f"Parameter '{param_name}' must be between {minimum} and {maximum}"
-        )
+        raise sanic.exceptions.InvalidUsage(f"Parameter '{param_name}' must be between {minimum} and {maximum}")
     return parsed
 
 
@@ -403,9 +517,7 @@ def _parse_optional_bounded_int(
     except ValueError as exc:
         raise sanic.exceptions.InvalidUsage(f"Parameter '{param_name}' must be an integer") from exc
     if parsed < minimum or parsed > maximum:
-        raise sanic.exceptions.InvalidUsage(
-            f"Parameter '{param_name}' must be between {minimum} and {maximum}"
-        )
+        raise sanic.exceptions.InvalidUsage(f"Parameter '{param_name}' must be between {minimum} and {maximum}")
     return parsed
 
 
@@ -473,9 +585,7 @@ def _provider_display_name_from_mapping(mapping: Mapping[str, Any]) -> str:
 
 
 def _provider_card_taxonomy_code(taxonomy_entry: Mapping[str, Any]) -> Any:
-    return taxonomy_entry.get("taxonomy_code") or taxonomy_entry.get(
-        "healthcare_provider_taxonomy_code"
-    )
+    return taxonomy_entry.get("taxonomy_code") or taxonomy_entry.get("healthcare_provider_taxonomy_code")
 
 
 def _provider_card_taxonomy_display(taxonomy_entry: Mapping[str, Any]) -> Any:
@@ -486,35 +596,22 @@ def _provider_card_primary_taxonomy_display(
     taxonomy_entry: Mapping[str, Any],
 ) -> Any:
     nested_taxonomy = taxonomy_entry.get("nucc_taxonomy")
-    nested_display = (
-        nested_taxonomy.get("display_name")
-        if isinstance(nested_taxonomy, Mapping)
-        else None
-    )
-    return (
-        _provider_card_taxonomy_display(taxonomy_entry)
-        or nested_display
-    )
+    nested_display = nested_taxonomy.get("display_name") if isinstance(nested_taxonomy, Mapping) else None
+    return _provider_card_taxonomy_display(taxonomy_entry) or nested_display
 
 
 def _provider_card_primary_specialty(taxonomy_list: Any) -> dict[str, Any]:
     """Return the compact primary-specialty projection for one provider."""
 
     taxonomy_entries = [
-        dict(taxonomy_entry)
-        for taxonomy_entry in (taxonomy_list or [])
-        if isinstance(taxonomy_entry, Mapping)
+        dict(taxonomy_entry) for taxonomy_entry in (taxonomy_list or []) if isinstance(taxonomy_entry, Mapping)
     ]
     primary_taxonomy = next(
         (
             taxonomy_entry
             for taxonomy_entry in taxonomy_entries
             if taxonomy_entry.get("primary") is True
-            or str(
-                taxonomy_entry.get("healthcare_provider_primary_taxonomy_switch")
-                or ""
-            ).upper()
-            == "Y"
+            or str(taxonomy_entry.get("healthcare_provider_primary_taxonomy_switch") or "").upper() == "Y"
         ),
         taxonomy_entries[0] if taxonomy_entries else {},
     )
@@ -551,7 +648,7 @@ def _provider_card_from_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
     entity_type_code = mapping.get("entity_type_code")
     try:
         entity_type_code = int(entity_type_code)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         entity_type_code = None
     postal_code = mapping.get("zip5") or mapping.get("postal_code")
     provider_card_by_field = {
@@ -559,15 +656,9 @@ def _provider_card_from_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
         "display_name": _provider_display_name_from_mapping(mapping),
         "entity_type": _entity_kind_from_code(entity_type_code),
         "credential": mapping.get("provider_credential_text"),
-        "primary_specialty": _provider_card_primary_specialty(
-            mapping.get("taxonomy_list")
-        ),
+        "primary_specialty": _provider_card_primary_specialty(mapping.get("taxonomy_list")),
         "city": mapping.get("city") or mapping.get("city_name"),
-        "state": (
-            mapping.get("state")
-            or mapping.get("state_code")
-            or mapping.get("state_name")
-        ),
+        "state": (mapping.get("state") or mapping.get("state_code") or mapping.get("state_name")),
         "zip5": _provider_card_zip5(postal_code),
     }
     distance_miles = mapping.get("distance_miles")
@@ -582,9 +673,7 @@ ENABLE_NPI_SCHEMA_CACHE = _is_environment_flag_enabled(
     "HLTHPRT_ENABLE_NPI_SCHEMA_CACHE",
     "HLTHPRT_ENABLE_SCHEMA_CACHE",
 )
-ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION = _is_environment_flag_enabled(
-    "HLTHPRT_NPI_SEARCH_TAXONOMY_PROJECTION_ENABLED"
-)
+ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION = _is_environment_flag_enabled("HLTHPRT_NPI_SEARCH_TAXONOMY_PROJECTION_ENABLED")
 _NPI_SEARCH_TAXONOMY_PROJECTION_READY_SQL = """
 SELECT EXISTS (
     SELECT 1
@@ -630,20 +719,15 @@ async def _assert_npi_search_taxonomy_projection_ready() -> None:
 
 @blueprint.listener("before_server_start")
 async def _assert_npi_projection_before_start(_app, _loop):
-    await _assert_npi_search_taxonomy_projection_ready()
+    async with db.reader_session() if db.is_api_reader_enabled() else contextlib.nullcontext():
+        await _assert_npi_search_taxonomy_projection_ready()
 
 
 _NPI_SCHEMA_CACHE_TTL_SECONDS = 300.0
 _TABLE_EXISTS_CACHE: dict[str, tuple[float, bool]] = {}
 _TABLE_COLUMNS_CACHE: dict[str, tuple[float, set[str]]] = {}
-_NPI_FILTER_CAPABILITIES_CACHE_STATE: dict[
-    str, Optional[tuple[float, str, dict[str, bool]]]
-] = {"entry": None}
-_NPI_PRIMARY_TOTAL_CACHE_STATE: dict[
-    str, Optional[tuple[float, str, int]]
-] = {
-    "entry": None
-}
+_NPI_FILTER_CAPABILITIES_CACHE_STATE: dict[str, Optional[tuple[float, str, dict[str, bool]]]] = {"entry": None}
+_NPI_PRIMARY_TOTAL_CACHE_STATE: dict[str, Optional[tuple[float, str, int]]] = {"entry": None}
 _NPI_HAS_INSURANCE_TOTAL_CACHE: dict[str, tuple[float, int]] = {}
 _NPI_ALL_TOTAL_TIMEOUT_SECONDS = float(os.getenv("HLTHPRT_NPI_ALL_TOTAL_TIMEOUT_SECONDS", "3.0"))
 _MATCH_CANDIDATES_TIMEOUT_SECONDS = float(os.getenv("HLTHPRT_MATCH_CANDIDATES_TIMEOUT_SECONDS", "8.0"))
@@ -694,7 +778,7 @@ async def _get_taxonomy_codes_for_classification(classification: str, *, session
 
     query = select(NUCCTaxonomy.code).where(NUCCTaxonomy.classification == classification)
     if session is not None:
-        rows = await session.execute(query)
+        rows = await execute_network_read(session, query)
         values = [row[0] for row in rows if row and row[0]]
     else:
         async with db.acquire() as conn:
@@ -713,7 +797,8 @@ async def _classification_npi_rows(query, taxonomy_codes, session):
     """Read taxonomy-matched NPI rows through either supported DB seam."""
 
     if session is not None:
-        query_result = await session.execute(
+        query_result = await execute_network_read(
+            session,
             query,
             {"taxonomy_codes": taxonomy_codes},
         )
@@ -731,16 +816,12 @@ def _classification_npi_values(taxonomy_npi_rows) -> list[int]:
     npi_values: list[int] = []
     for taxonomy_npi_row in taxonomy_npi_rows:
         mapping = getattr(taxonomy_npi_row, "_mapping", None)
-        npi_value = (
-            mapping.get("npi")
-            if mapping is not None
-            else (taxonomy_npi_row[0] if taxonomy_npi_row else None)
-        )
+        npi_value = mapping.get("npi") if mapping is not None else (taxonomy_npi_row[0] if taxonomy_npi_row else None)
         if npi_value is None:
             continue
         try:
             npi_values.append(int(npi_value))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
     return npi_values
 
@@ -756,9 +837,7 @@ async def _get_classification_npi_list(
     classification_key = str(classification or "").strip().lower()
     if not classification_key:
         return []
-    publication_identity = await _npi_canonical_publication_identity(
-        session=session
-    )
+    publication_identity = await _npi_canonical_publication_identity(session=session)
     cache_key = (
         f"{publication_identity}|{classification_key}|{'primary' if primary_only else 'all'}"
         if publication_identity is not None
@@ -811,7 +890,11 @@ def _set_limited_classification_cache(
         oldest_key = min(cache.items(), key=lambda item: item[1][0])[0]
         if oldest_key == key and len(cache) > 1:
             oldest_key = min(
-                ((candidate_key, candidate_value) for candidate_key, candidate_value in cache.items() if candidate_key != key),
+                (
+                    (candidate_key, candidate_value)
+                    for candidate_key, candidate_value in cache.items()
+                    if candidate_key != key
+                ),
                 key=lambda item: item[1][0],
             )[0]
         cache.pop(oldest_key, None)
@@ -835,21 +918,10 @@ def _request_session(request) -> Any:
     return getattr(getattr(request, "ctx", None), "sa_session", None)
 
 
-def _model_table_columns(model: Any) -> set[str]:
-    table = getattr(model, "__table__", None)
-    if table is None:
-        return set()
-    return {str(column.key) for column in table.columns if getattr(column, "key", None)}
-
-
 def _npi_serving_columns() -> tuple[Any, ...]:
     """Return columns available before taxonomy-projection activation."""
 
-    return tuple(
-        column
-        for column in NPIData.__table__.columns
-        if column.key != "search_taxonomy_codes"
-    )
+    return tuple(column for column in NPIData.__table__.columns if column.key != "search_taxonomy_codes")
 
 
 _DB_SCHEMA_RE = re.compile(r"[a-z_][a-z0-9_]{0,62}", flags=re.ASCII)
@@ -869,7 +941,7 @@ def _runtime_db_schema() -> str:
 
 
 def _schema_cache_key(table_name: str) -> str:
-    return f"{_runtime_db_schema()}.{table_name}"
+    return scoped_address_relation_sql(f"{_runtime_db_schema()}.{table_name}")
 
 
 def _cache_get(cache: dict[str, tuple[float, Any]], key: str) -> Any:
@@ -996,12 +1068,7 @@ PROVIDER_DIRECTORY_VISIBILITY_TABLES = (
     "provider_directory_endpoint_dataset",
     "provider_directory_dataset_resource",
 )
-PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE = (
-    "provider_directory_dataset_network_plan"
-)
-PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE = (
-    "provider_directory_dataset_insurance_plan"
-)
+PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE = "provider_directory_dataset_network_plan"
 PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_SCALAR_COLUMNS = (
     "plan_active",
     "plan_identifier",
@@ -1010,50 +1077,16 @@ PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_SCALAR_REQUIREMENTS = tuple(
     (PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE, column_name)
     for column_name in PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_SCALAR_COLUMNS
 )
-PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE = (
-    "provider_directory_dataset_affiliation_organization"
-)
-PROVIDER_DIRECTORY_DATASET_RELATION_VERSION = "1"
-
-PROVIDER_DIRECTORY_EVIDENCE_CAPABILITY_SQL = """
-    WITH requested_columns AS (
-        SELECT column_table_name, column_name
-          FROM unnest(
-               CAST(:column_table_names AS varchar[]),
-               CAST(:column_names AS varchar[])
-          ) AS requested(column_table_name, column_name)
-    )
-    SELECT requested.table_name,
-           to_regclass(:schema || '.' || requested.table_name)
-               IS NOT NULL AS is_available
-      FROM unnest(CAST(:table_names AS varchar[]))
-           AS requested(table_name)
-    UNION ALL
-    SELECT requested.column_table_name || '.' || requested.column_name,
-           EXISTS (
-               SELECT 1
-                 FROM pg_attribute
-                WHERE attrelid = to_regclass(
-                      :schema || '.' || requested.column_table_name
-                )
-                  AND attname = requested.column_name
-                  AND attnum > 0
-                  AND NOT attisdropped
-           ) AS is_available
-      FROM requested_columns AS requested
-"""
+PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE = "provider_directory_dataset_affiliation_organization"
 
 
-# A handful of reference labs / large health systems carry 1k+ service locations.
-# Returning every address inline produces multi-MB responses and 90ms+ build times
-# (one geocode-enrichment task per address). Page the address_list by default so the
-# common provider (a few addresses) is unchanged while the outliers stay bounded;
-# callers walk every address via address_offset, or opt out with address_limit=all.
+# Provider address lists are paged by default; all or 0 returns the full ranked list.
+# Positive batch address limits share the exact-provider ceiling.
 NPI_DETAIL_ADDRESS_DEFAULT_LIMIT = 200
 NPI_DETAIL_ADDRESS_MAX_LIMIT = 1000
 NPI_BATCH_MAX_SIZE = 100
 NPI_BATCH_ADDRESS_DEFAULT_LIMIT = 5
-NPI_BATCH_ADDRESS_MAX_LIMIT = 20
+NPI_BATCH_ADDRESS_MAX_LIMIT = NPI_DETAIL_ADDRESS_MAX_LIMIT
 NPI_DETAIL_ADDRESS_GROUP_DEFAULT_LIMIT = 5
 NPI_DETAIL_ADDRESS_GROUP_MAX_LIMIT = 5
 NPI_DETAIL_ADDRESS_GROUP_MEMBER_LIMIT = 5
@@ -1064,14 +1097,20 @@ ADDRESS_GROUPING_VALUES = {ADDRESS_GROUPING_FLAT, ADDRESS_GROUPING_PREMISE}
 
 
 def _npi_detail_cache_key(identity: _NpiDetailCacheIdentity) -> str:
-    address_source = os.getenv(
-        ADDRESS_SERVING_SOURCE_ENV,
-        ADDRESS_SERVING_SOURCE_UNIFIED,
-    ).strip().lower()
-    return _format_npi_detail_cache_key(
-        identity,
-        schema=_runtime_db_schema(),
-        address_source=address_source,
+    address_source = (
+        os.getenv(
+            ADDRESS_SERVING_SOURCE_ENV,
+            ADDRESS_SERVING_SOURCE_UNIFIED,
+        )
+        .strip()
+        .lower()
+    )
+    return scoped_address_cache_key(
+        _format_npi_detail_cache_key(
+            identity,
+            schema=_runtime_db_schema(),
+            address_source=address_source,
+        )
     )
 
 
@@ -1236,10 +1275,7 @@ def _fill_hydrated_identity_scalars(
 ) -> None:
     """Fill row-specific evidence only from the selected base identity."""
     for field_name in HYDRATED_IDENTITY_SCALAR_FIELDS:
-        if (
-            location_map.get(field_name) in (None, "")
-            and hydrated_identity_map.get(field_name) not in (None, "")
-        ):
+        if location_map.get(field_name) in (None, "") and hydrated_identity_map.get(field_name) not in (None, ""):
             location_map[field_name] = hydrated_identity_map.get(field_name)
 
 
@@ -1247,10 +1283,7 @@ def _merge_duplicate_address(base: dict[str, Any], duplicate: Mapping[str, Any])
     """Merge corroborating rows without crossing canonical location identities."""
     _merge_address_lists(base, duplicate)
     _fill_address_scalars(base, duplicate)
-    if (
-        duplicate.get("address_status")
-        == UHC_PROVIDER_FILE_ADDRESS_STATUS
-    ):
+    if duplicate.get("address_status") == UHC_PROVIDER_FILE_ADDRESS_STATUS:
         base["address_status"] = UHC_PROVIDER_FILE_ADDRESS_STATUS
 
     merged_statuses = {
@@ -1308,7 +1341,9 @@ def _add_canonical_contact_fields_to_address(address: dict[str, Any]) -> dict[st
         address["phone_number"] = canonical.get("phone_number")
     if not _has_contact_value(address.get("phone_extension")) and _has_contact_value(canonical.get("phone_extension")):
         address["phone_extension"] = canonical.get("phone_extension")
-    if not _has_contact_value(address.get("fax_number_digits")) and _has_contact_value(canonical.get("fax_number_digits")):
+    if not _has_contact_value(address.get("fax_number_digits")) and _has_contact_value(
+        canonical.get("fax_number_digits")
+    ):
         address["fax_number_digits"] = canonical.get("fax_number_digits")
     if not _has_contact_value(address.get("fax_extension")) and _has_contact_value(canonical.get("fax_extension")):
         address["fax_extension"] = canonical.get("fax_extension")
@@ -1321,9 +1356,7 @@ def _normalized_address_identity(value: Any) -> str:
 
 def _address_key_and_site_key(address: Mapping[str, Any]) -> tuple[str, str]:
     address_key = _normalized_address_identity(address.get("address_key"))
-    site_key = _normalized_address_identity(
-        address.get(PUBLIC_ADDRESS_SITE_KEY) or address.get("premise_key")
-    )
+    site_key = _normalized_address_identity(address.get(PUBLIC_ADDRESS_SITE_KEY) or address.get("premise_key"))
     if site_key == address_key:
         site_key = ""
     return address_key, site_key
@@ -1375,11 +1408,7 @@ def _merge_address_key_group(
     if site_keys:
         merged_address["_address_site_keys"] = sorted(site_keys)
     merged_address["_address_site_key_status"] = (
-        "available"
-        if len(site_keys) == 1
-        else "conflicting"
-        if len(site_keys) > 1
-        else "missing"
+        "available" if len(site_keys) == 1 else "conflicting" if len(site_keys) > 1 else "missing"
     )
     return [merged_address]
 
@@ -1406,16 +1435,13 @@ def _dedupe_addresses_by_key(addresses: Sequence[Any]) -> list[dict[str, Any]]:
         for merged_address in _merge_address_key_group(address_group)
     ]
 
-    return [
-        _add_canonical_contact_fields_to_address(address)
-        for address in (deduped_addresses + unkeyed_addresses)
-    ]
+    return [_add_canonical_contact_fields_to_address(address) for address in (deduped_addresses + unkeyed_addresses)]
 
 
 def _address_number(address: Mapping[str, Any], key: str) -> float | None:
     try:
         value = float(address.get(key))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     return value if math.isfinite(value) else None
 
@@ -1451,9 +1477,7 @@ def _provider_location_sort_key(address: Mapping[str, Any]) -> tuple[Any, ...]:
         1,
     )
     independent_source_count = int(address.get("independent_source_count") or 0)
-    is_multi_source = bool(
-        address.get("multi_source_confirmed") or independent_source_count > 1
-    )
+    is_multi_source = bool(address.get("multi_source_confirmed") or independent_source_count > 1)
     has_complete_street = bool(
         address.get("first_line")
         and address.get("city_name")
@@ -1479,14 +1503,7 @@ def _provider_location_sort_key(address: Mapping[str, Any]) -> tuple[Any, ...]:
         str(address.get("city_name") or ""),
         str(address.get("state_code") or address.get("state_name") or ""),
         str(address.get("postal_code") or ""),
-        tuple(
-            sorted(
-                str(identity_value)
-                for identity_value in (
-                    address.get("_base_row_identities") or []
-                )
-            )
-        ),
+        tuple(sorted(str(identity_value) for identity_value in (address.get("_base_row_identities") or []))),
     )
 
 
@@ -1500,9 +1517,7 @@ def _address_site_keys(address: Mapping[str, Any]) -> list[str]:
     stored_site_keys = address.get("_address_site_keys")
     if isinstance(stored_site_keys, (list, tuple, set)):
         raw_site_keys.extend(stored_site_keys)
-    raw_site_keys.extend(
-        (address.get(PUBLIC_ADDRESS_SITE_KEY), address.get("premise_key"))
-    )
+    raw_site_keys.extend((address.get(PUBLIC_ADDRESS_SITE_KEY), address.get("premise_key")))
     return sorted(
         {
             normalized_site_key
@@ -1539,18 +1554,14 @@ def _premise_group_identity(
             "group_key": address_key,
             "grouping_basis": "address_key_fallback",
             "address_site_key": None,
-            "address_site_key_status": (
-                "conflicting" if len(site_keys) > 1 else "missing"
-            ),
+            "address_site_key_status": ("conflicting" if len(site_keys) > 1 else "missing"),
         }
     singleton_key = f"singleton:{singleton_index}"
     return ("singleton", singleton_key), {
         "group_key": None,
         "grouping_basis": "singleton",
         "address_site_key": None,
-        "address_site_key_status": (
-            "conflicting" if len(site_keys) > 1 else "missing"
-        ),
+        "address_site_key_status": ("conflicting" if len(site_keys) > 1 else "missing"),
     }
 
 
@@ -1612,10 +1623,7 @@ def _finalize_public_provider_address(
 ) -> dict[str, Any]:
     """Remove serving internals while preserving the full public member row."""
     _render_public_formatted_address(address)
-    if (
-        suppress_conflicting_site_key
-        and address.get("_address_site_key_status") == "conflicting"
-    ):
+    if suppress_conflicting_site_key and address.get("_address_site_key_status") == "conflicting":
         address.pop("premise_key", None)
         address.pop(PUBLIC_ADDRESS_SITE_KEY, None)
     else:
@@ -1662,9 +1670,7 @@ def _provider_directory_source_ids_from_addresses(addresses: Sequence[Any]) -> l
     for address in addresses or []:
         if not isinstance(address, Mapping):
             continue
-        for source_id in _directory_source_ids(
-            _provider_directory_record_ids_from_address(address)
-        ):
+        for source_id in _directory_source_ids(_provider_directory_record_ids_from_address(address)):
             if source_id in seen_source_ids:
                 continue
             seen_source_ids.add(source_id)
@@ -1696,9 +1702,7 @@ def _provider_directory_role_keys_from_addresses(
     for address in addresses or []:
         if not isinstance(address, Mapping):
             continue
-        for role_key in _directory_role_keys_from_records(
-            _provider_directory_record_ids_from_address(address)
-        ):
+        for role_key in _directory_role_keys_from_records(_provider_directory_record_ids_from_address(address)):
             if role_key in seen_set:
                 continue
             seen_set.add(role_key)
@@ -1761,114 +1765,11 @@ def _provider_directory_plan_network_match_sql(
         plan_network_reference,
         "Organization",
     )
-    return (
-        f"({plan_network_reference} = {network_reference} "
-        f"OR {normalized_plan_network_id} = {network_resource_id})"
-    )
+    return f"({plan_network_reference} = {network_reference} OR {normalized_plan_network_id} = {network_resource_id})"
 
 
 def _insurance_plan_active_sql(alias: str) -> str:
     return f"COALESCE(NULLIF(LOWER(BTRIM({alias}.status)), ''), 'active') = 'active'"
-
-
-def _dataset_relation_ready_sql(metadata_key: str) -> str:
-    return f"""
-        COALESCE(
-            dataset.publication_metadata_json::jsonb
-                -> '{metadata_key}' ->> 'complete',
-            'false'
-        ) = 'true'
-        AND COALESCE(
-            dataset.publication_metadata_json::jsonb
-                -> '{metadata_key}' ->> 'version',
-            ''
-        ) = '{PROVIDER_DIRECTORY_DATASET_RELATION_VERSION}'
-        AND COALESCE(
-            dataset.publication_metadata_json::jsonb
-                -> '{metadata_key}' ->> 'dataset_id',
-            ''
-        ) = dataset.dataset_id
-    """
-
-
-def _provider_directory_current_plan_resources_sql(
-    schema: str,
-    has_dataset_insurance_plan: bool,
-) -> str:
-    """Read immutable plan payloads from the compact projection when available."""
-    if not has_dataset_insurance_plan:
-        return """
-    current_plan_resources AS NOT MATERIALIZED (
-        SELECT resource.*
-          FROM current_resources AS resource
-         WHERE resource.resource_type = 'InsurancePlan'
-    )
-        """
-    return f"""
-    current_plan_resources AS NOT MATERIALIZED (
-        SELECT source.source_id, source.canonical_api_base,
-               dataset.dataset_id, dataset.run_id,
-               dataset.published_at AS dataset_published_at,
-               dataset.dataset_network_plan_complete,
-               dataset.dataset_affiliation_organization_complete,
-               'InsurancePlan'::varchar AS resource_type,
-               resource.resource_id,
-               resource.payload_json::jsonb AS payload_json
-          FROM {schema}.provider_directory_source AS source
-          JOIN current_datasets AS dataset
-            ON dataset.endpoint_id = source.endpoint_id
-          JOIN {schema}.{PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE} AS resource
-            ON resource.dataset_id = dataset.dataset_id
-    )
-    """
-
-
-def _provider_directory_current_resource_ctes_sql(
-    schema: str,
-    has_dataset_insurance_plan: bool = False,
-) -> str:
-    """Resolve resources through the one current, fully published endpoint dataset."""
-    network_plan_ready_sql = _dataset_relation_ready_sql("dataset_network_plan")
-    affiliation_ready_sql = _dataset_relation_ready_sql(
-        "dataset_affiliation_organization"
-    )
-    return f"""
-    current_endpoint_counts AS MATERIALIZED (
-        SELECT dataset.endpoint_id
-          FROM {schema}.provider_directory_endpoint_dataset AS dataset
-         WHERE dataset.is_current IS TRUE
-      GROUP BY dataset.endpoint_id
-        HAVING COUNT(*) = 1
-    ), current_datasets AS MATERIALIZED (
-        SELECT dataset.endpoint_id, dataset.dataset_id,
-               COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar AS run_id,
-               dataset.published_at,
-               ({network_plan_ready_sql}) AS dataset_network_plan_complete,
-               ({affiliation_ready_sql})
-                   AS dataset_affiliation_organization_complete
-          FROM {schema}.provider_directory_endpoint_dataset AS dataset
-          JOIN current_endpoint_counts AS current_endpoint
-            ON current_endpoint.endpoint_id = dataset.endpoint_id
-         WHERE dataset.is_current IS TRUE
-           AND dataset.status = 'published'
-           AND dataset.published_at IS NOT NULL
-           AND dataset.superseded_at IS NULL
-           AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) IS NOT NULL
-    ), current_resources AS NOT MATERIALIZED (
-        SELECT source.source_id, source.canonical_api_base,
-               dataset.dataset_id, dataset.run_id,
-               dataset.published_at AS dataset_published_at,
-               dataset.dataset_network_plan_complete,
-               dataset.dataset_affiliation_organization_complete,
-               resource.resource_type, resource.resource_id,
-               resource.payload_json::jsonb AS payload_json
-          FROM {schema}.provider_directory_source AS source
-          JOIN current_datasets AS dataset
-            ON dataset.endpoint_id = source.endpoint_id
-          JOIN {schema}.provider_directory_dataset_resource AS resource
-            ON resource.dataset_id = dataset.dataset_id
-    ), {_provider_directory_current_plan_resources_sql(schema, has_dataset_insurance_plan)}
-    """
 
 
 _CURRENT_PROVIDER_DIRECTORY_TYPED_RESOURCE_MODELS = (
@@ -1918,10 +1819,7 @@ def _provider_directory_current_payload_column_sql(column: Any) -> str:
     if isinstance(column.type, SQLAlchemyJSON):
         return f"{payload_expr} AS {column_name}"
     column_type = column.type.compile(dialect=postgresql.dialect())
-    return (
-        f"CAST(resource.payload_json ->> '{column_name}' AS {column_type}) "
-        f"AS {column_name}"
-    )
+    return f"CAST(resource.payload_json ->> '{column_name}' AS {column_type}) AS {column_name}"
 
 
 def _current_typed_resource_ctes_sql() -> str:
@@ -1931,18 +1829,9 @@ def _current_typed_resource_ctes_sql() -> str:
         selected_columns = ",\n               ".join(
             (
                 "resource.dataset_id AS dataset_id",
-                (
-                    "resource.dataset_network_plan_complete "
-                    "AS dataset_network_plan_complete"
-                ),
-                (
-                    "resource.dataset_affiliation_organization_complete "
-                    "AS dataset_affiliation_organization_complete"
-                ),
-                *(
-                    _provider_directory_current_payload_column_sql(column)
-                    for column in model.__table__.columns
-                ),
+                ("resource.dataset_network_plan_complete AS dataset_network_plan_complete"),
+                ("resource.dataset_affiliation_organization_complete AS dataset_affiliation_organization_complete"),
+                *(_provider_directory_current_payload_column_sql(column) for column in model.__table__.columns),
             )
         )
         cte_sql_list.append(
@@ -1955,44 +1844,6 @@ def _current_typed_resource_ctes_sql() -> str:
             """.strip()
         )
     return ", ".join(cte_sql_list)
-
-
-def _provider_directory_current_resource_join_sql(
-    resource_alias: str,
-    resource_type: str,
-    current_alias: str,
-) -> str:
-    return f"""
-          JOIN current_resources AS {current_alias}
-            ON {current_alias}.source_id = {resource_alias}.source_id
-           AND {current_alias}.resource_type = '{resource_type}'
-           AND {current_alias}.resource_id = {resource_alias}.resource_id
-           AND {resource_alias}.last_seen_run_id = {current_alias}.run_id
-    """
-
-
-def _provider_directory_network_resolution_sql(schema: str, has_catalog: bool) -> tuple[str, str, str]:
-    organization_join = (
-        "LEFT JOIN current_organizations AS network_organization "
-        "ON network_organization.dataset_id = network.dataset_id "
-        "AND network_organization.source_id = network.source_id "
-        "AND network_organization.resource_id = network.resource_id "
-        "AND network_organization.active IS DISTINCT FROM false"
-    )
-    if not has_catalog:
-        return organization_join, "network_organization.name", "'provider_directory_organization'::varchar"
-    catalog_join = (
-        f"LEFT JOIN {schema}.provider_directory_network_catalog AS network_catalog "
-        "ON network_catalog.source_id = network.source_id "
-        "AND network_catalog.network_resource_id = network.resource_id"
-    )
-    network_name = "COALESCE(network_catalog.provider_directory_network_name, network_organization.name)"
-    provenance = (
-        "CASE WHEN network_catalog.provider_directory_network_name IS NOT NULL "
-        "THEN 'provider_directory_network_catalog'::varchar "
-        "ELSE 'provider_directory_organization'::varchar END"
-    )
-    return f"{catalog_join} {organization_join}", network_name, provenance
 
 
 _EMPTY_AFFILIATION_NETWORK_CTE_SQL = """
@@ -2055,45 +1906,6 @@ def _dataset_affiliation_network_sql(
                COALESCE(affiliation.network_refs::jsonb, '[]'::jsonb)
          ) AS affiliation_network_ref(value)
          WHERE role_organization.dataset_affiliation_organization_complete
-    )
-    """
-
-
-def _legacy_affiliation_candidates_sql(
-    has_affiliations: bool,
-    has_dataset_affiliation_organization: bool,
-) -> str:
-    if not has_affiliations:
-        return """
-    affiliation_organization_candidates AS MATERIALIZED (
-        SELECT role_organization.dataset_id, role_organization.source_id,
-               role_organization.role_id,
-               role_organization.dataset_network_plan_complete,
-               NULL::varchar AS reference
-          FROM role_organizations AS role_organization
-         WHERE false
-    )
-        """
-    relation_fallback_filter = (
-        "AND NOT role_organization.dataset_affiliation_organization_complete"
-        if has_dataset_affiliation_organization
-        else ""
-    )
-    return f"""
-    affiliation_organization_candidates AS MATERIALIZED (
-        SELECT DISTINCT role_organization.dataset_id,
-               role_organization.source_id, role_organization.role_id,
-               role_organization.dataset_network_plan_complete,
-               organization_candidate.reference
-          FROM role_organizations AS role_organization
-         CROSS JOIN LATERAL (
-               VALUES
-                   (role_organization.organization_ref::varchar),
-                   (role_organization.organization_resource_id::varchar),
-                   (('Organization/' || role_organization.organization_resource_id)::varchar)
-         ) AS organization_candidate(reference)
-         WHERE NULLIF(BTRIM(organization_candidate.reference), '') IS NOT NULL
-           {relation_fallback_filter}
     )
     """
 
@@ -2322,9 +2134,7 @@ def _dataset_role_plan_resources_sql(
         if has_dataset_insurance_plan
         else "provider_directory_dataset_resource"
     )
-    resource_type_filter = (
-        "" if has_dataset_insurance_plan else "AND insurance_plan.resource_type = 'InsurancePlan'"
-    )
+    resource_type_filter = "" if has_dataset_insurance_plan else "AND insurance_plan.resource_type = 'InsurancePlan'"
     selected_identifier, active_filter = _dataset_plan_scalar_sql(
         insurance_plan_identifier,
         insurance_plan_active,
@@ -2377,16 +2187,9 @@ def _dataset_role_plan_sql(
     has_dataset_insurance_plan_scalars: bool,
 ) -> str:
     """Build indexed immutable role-to-plan resolution CTEs."""
-    insurance_plan_status = (
-        "insurance_plan.payload_json::jsonb ->> 'status'"
-    )
-    insurance_plan_identifier = (
-        "insurance_plan.payload_json::jsonb ->> 'plan_identifier'"
-    )
-    insurance_plan_active = (
-        "COALESCE(NULLIF(LOWER(BTRIM("
-        f"{insurance_plan_status})), ''), 'active') = 'active'"
-    )
+    insurance_plan_status = "insurance_plan.payload_json::jsonb ->> 'status'"
+    insurance_plan_identifier = "insurance_plan.payload_json::jsonb ->> 'plan_identifier'"
+    insurance_plan_active = f"COALESCE(NULLIF(LOWER(BTRIM({insurance_plan_status})), ''), 'active') = 'active'"
     candidate_sql = _dataset_role_plan_candidates_sql(schema)
     resource_sql = _dataset_role_plan_resources_sql(
         schema,
@@ -2407,11 +2210,7 @@ def _legacy_role_plan_sql(has_dataset_network_plan: bool) -> str:
         "role_network.resource_id",
         "role_network.reference",
     )
-    legacy_filter = (
-        "AND NOT role_network.dataset_network_plan_complete"
-        if has_dataset_network_plan
-        else ""
-    )
+    legacy_filter = "AND NOT role_network.dataset_network_plan_complete" if has_dataset_network_plan else ""
     return f"""
     legacy_network_derived_plans AS MATERIALIZED (
         SELECT role_network.source_id, role_network.role_id,
@@ -2464,11 +2263,7 @@ def _network_derived_role_plans_cte_sql(
     scoped_plan_ctes_sql = _scoped_current_insurance_plan_ctes_sql(
         "roles",
         "legacy_role_insurance_plans",
-        (
-            "WHERE NOT dataset_network_plan_complete"
-            if has_dataset_network_plan
-            else ""
-        ),
+        ("WHERE NOT dataset_network_plan_complete" if has_dataset_network_plan else ""),
     )
     dataset_plan_cte_sql = (
         _dataset_role_plan_sql(
@@ -2523,12 +2318,14 @@ def _provider_directory_catalog_plan_ctes_sql(
         return _missing_catalog_plan_ctes_sql()
     return f"""
     {_role_catalog_status_cte_sql(schema)},
-    {_network_derived_role_plans_cte_sql(
-        schema,
-        has_dataset_network_plan,
-        has_dataset_insurance_plan,
-        has_dataset_insurance_plan_scalars,
-    )}
+    {
+        _network_derived_role_plans_cte_sql(
+            schema,
+            has_dataset_network_plan,
+            has_dataset_insurance_plan,
+            has_dataset_insurance_plan_scalars,
+        )
+    }
     """
 
 
@@ -2542,9 +2339,7 @@ def _provider_directory_network_plan_ctes_sql(
     has_dataset_insurance_plan_scalars: bool,
 ) -> str:
     """Build same-source network intersection CTEs for role plan evidence."""
-    role_network_id = _provider_directory_reference_resource_id_sql(
-        "role_network_ref.value", "Organization"
-    )
+    role_network_id = _provider_directory_reference_resource_id_sql("role_network_ref.value", "Organization")
     affiliation_ctes_sql = _provider_directory_affiliation_network_ctes_sql(
         schema, has_affiliations, has_dataset_affiliation_organization
     )
@@ -2730,15 +2525,9 @@ _PROVIDER_DIRECTORY_REQUESTED_ROLE_CTES_TEMPLATE = """
 def _provider_directory_requested_role_ctes_sql(_schema: str) -> str:
     """Build CTEs that constrain provider-directory roles requested by callers."""
     return _PROVIDER_DIRECTORY_REQUESTED_ROLE_CTES_TEMPLATE.format(
-        plan_id=_provider_directory_reference_resource_id_sql(
-            "plan_ref.value", "InsurancePlan"
-        ),
-        service_id=_provider_directory_reference_resource_id_sql(
-            "service_ref.value", "HealthcareService"
-        ),
-        endpoint_id=_provider_directory_reference_resource_id_sql(
-            "endpoint_ref.value", "Endpoint"
-        ),
+        plan_id=_provider_directory_reference_resource_id_sql("plan_ref.value", "InsurancePlan"),
+        service_id=_provider_directory_reference_resource_id_sql("service_ref.value", "HealthcareService"),
+        endpoint_id=_provider_directory_reference_resource_id_sql("endpoint_ref.value", "Endpoint"),
         insurance_plan_active=_insurance_plan_active_sql("insurance_plan"),
         role_reference_limit=MAX_PROVIDER_DIRECTORY_ROLE_REFERENCE_DETAILS,
     )
@@ -2987,12 +2776,14 @@ def _provider_directory_role_evidence_sql(
     has_dataset_affiliation_organization: bool = False,
     has_dataset_insurance_plan: bool = False,
     has_dataset_insurance_plan_scalars: bool = False,
+    has_dataset_readiness_indexes: bool = False,
 ) -> str:
     """Build exact-key role evidence SQL with dataset-gated relation fallbacks."""
     return _PROVIDER_DIRECTORY_ROLE_EVIDENCE_SQL_TEMPLATE.format(
         current_resource_ctes_sql=_provider_directory_current_resource_ctes_sql(
             schema,
             has_dataset_insurance_plan,
+            has_dataset_readiness_indexes,
         ),
         current_typed_resource_ctes_sql=_current_typed_resource_ctes_sql(),
         role_ctes_sql=_provider_directory_role_ctes_sql(
@@ -3014,20 +2805,13 @@ def _provider_directory_role_evidence_sql(
 
 
 def _provider_directory_plan_metadata(mapping: Mapping[str, Any]) -> dict[str, Any] | None:
-    has_plan_metadata = (
-        mapping.get("plan_returned") is not None
-        or mapping.get("catalog_complete") is not None
-    )
+    has_plan_metadata = mapping.get("plan_returned") is not None or mapping.get("catalog_complete") is not None
     if not has_plan_metadata:
         return None
     return {
         "returned": int(mapping["plan_returned"] or 0),
         "total": int(mapping["plan_total"]) if mapping.get("plan_total") is not None else None,
-        "truncated": (
-            bool(mapping["plan_truncated"])
-            if mapping.get("plan_truncated") is not None
-            else None
-        ),
+        "truncated": (bool(mapping["plan_truncated"]) if mapping.get("plan_truncated") is not None else None),
         "catalog_complete": bool(mapping["catalog_complete"]),
     }
 
@@ -3089,16 +2873,12 @@ def _provider_directory_fhir_url_identity(value: Any) -> str | None:
     except ValueError:
         return None
     if not parsed.scheme or not parsed.hostname:
-        return urllib.parse.urlunsplit(
-            (parsed.scheme, "", parsed.path, "", "")
-        )
+        return urllib.parse.urlunsplit((parsed.scheme, "", parsed.path, "", ""))
     hostname = parsed.hostname.lower()
     if ":" in hostname and not hostname.startswith("["):
         hostname = f"[{hostname}]"
     netloc = f"{hostname}:{port}" if port is not None else hostname
-    return urllib.parse.urlunsplit(
-        (parsed.scheme.lower(), netloc, parsed.path, "", "")
-    )
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), netloc, parsed.path, "", ""))
 
 
 def _bounded_provider_directory_fhir_codings(value: Any) -> list[dict[str, Any]]:
@@ -3219,34 +2999,20 @@ def _provider_directory_role_detail(mapping: Mapping[str, Any]) -> dict[str, Any
         field_value = mapping.get(f"role_{field_name}")
         if field_value is not None:
             role_detail_map[field_name] = field_value
-    if (
-        "new_patient_acceptance" not in role_detail_map
-        and "accepting_patients" in role_detail_map
-    ):
-        role_detail_map["new_patient_acceptance"] = role_detail_map[
-            "accepting_patients"
-        ]
-    if (
-        "accepting_patients" not in role_detail_map
-        and "new_patient_acceptance" in role_detail_map
-    ):
-        role_detail_map["accepting_patients"] = role_detail_map[
-            "new_patient_acceptance"
-        ]
+    if "new_patient_acceptance" not in role_detail_map and "accepting_patients" in role_detail_map:
+        role_detail_map["new_patient_acceptance"] = role_detail_map["accepting_patients"]
+    if "accepting_patients" not in role_detail_map and "new_patient_acceptance" in role_detail_map:
+        role_detail_map["accepting_patients"] = role_detail_map["new_patient_acceptance"]
     period = _provider_directory_period(mapping, "role")
     if period is not None:
         role_detail_map["period"] = period
     provenance = _provider_directory_fhir_provenance(mapping, "role")
     if provenance is not None:
         role_detail_map["fhir_provenance"] = provenance
-    endpoints = _provider_directory_endpoint_details(
-        mapping.get("role_endpoints")
-    )
+    endpoints = _provider_directory_endpoint_details(mapping.get("role_endpoints"))
     if endpoints:
         role_detail_map["endpoints"] = endpoints
-    healthcare_services = _provider_directory_healthcare_service_details(
-        mapping.get("role_healthcare_services")
-    )
+    healthcare_services = _provider_directory_healthcare_service_details(mapping.get("role_healthcare_services"))
     if healthcare_services:
         role_detail_map["healthcare_services"] = healthcare_services
     return role_detail_map
@@ -3386,8 +3152,7 @@ def _append_provider_directory_plan_evidence(
     if provenance is not None:
         plan_detail_map["fhir_provenance"] = provenance
     plan_fields = tuple(
-        plan_detail_map.get(key)
-        for key in ("resource_type", "resource_id", "identifier", "provenance")
+        plan_detail_map.get(key) for key in ("resource_type", "resource_id", "identifier", "provenance")
     )
     if plan_fields not in plan_keys:
         plan_keys.add(plan_fields)
@@ -3407,8 +3172,7 @@ def _append_provider_directory_network_evidence(
         "provenance": mapping["provenance"],
     }
     network_fields = tuple(
-        network_detail_map.get(key)
-        for key in ("resource_type", "resource_id", "name", "reference", "provenance")
+        network_detail_map.get(key) for key in ("resource_type", "resource_id", "name", "reference", "provenance")
     )
     if network_fields not in network_keys:
         network_keys.add(network_fields)
@@ -3487,9 +3251,7 @@ async def _fetch_provider_directory_role_evidence_map(
             PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE,
             PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE,
         ),
-        optional_columns=(
-            PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_SCALAR_REQUIREMENTS
-        ),
+        optional_columns=(PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_SCALAR_REQUIREMENTS),
     )
     if table_flags is None:
         return {}
@@ -3505,6 +3267,7 @@ async def _fetch_provider_directory_role_evidence_map(
                 table_flags[PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE],
                 table_flags[PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE],
                 _has_provider_directory_plan_scalars(table_flags),
+                all(table_flags.get(index_name, False) for _key, index_name in READINESS_INDEXES),
             )
         ),
         session=session,
@@ -3532,14 +3295,13 @@ async def _provider_directory_evidence_tables(
             params={
                 "schema": _runtime_db_schema(),
                 "table_names": table_names,
-                "column_table_names": [
-                    table_name for table_name, _column_name in optional_columns
-                ],
-                "column_names": [
-                    column_name for _table_name, column_name in optional_columns
-                ],
+                "column_table_names": [table_name for table_name, _column_name in optional_columns],
+                "column_names": [column_name for _table_name, column_name in optional_columns],
+                "readiness_index_names": [index_name for _key, index_name in READINESS_INDEXES],
             },
         )
+    except sanic.exceptions.ServiceUnavailable:
+        raise
     except Exception:
         return None
     availability_by_name = {
@@ -3553,6 +3315,7 @@ async def _provider_directory_evidence_tables(
     optional_capability_names = [
         *optional_names,
         *(f"{table_name}.{column_name}" for table_name, column_name in optional_columns),
+        *(index_name for _key, index_name in READINESS_INDEXES),
     ]
     return {
         capability_name: availability_by_name.get(capability_name, False)
@@ -3576,7 +3339,7 @@ def _has_provider_directory_plan_scalars(
 async def _disable_provider_directory_evidence_jit(session: Any) -> None:
     if getattr(session, _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR, False):
         return
-    await session.execute(text("SET LOCAL jit = off"))
+    await execute_network_read(session, text("SET LOCAL jit = off"))
     setattr(session, _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR, True)
 
 
@@ -3633,21 +3396,14 @@ def _dataset_affiliation_plan_sql(
 ) -> str:
     """Resolve affiliation plan edges through active immutable plan scalars."""
     insurance_plan_status = "insurance_plan.payload_json::jsonb ->> 'status'"
-    insurance_plan_identifier = (
-        "insurance_plan.payload_json::jsonb ->> 'plan_identifier'"
-    )
-    insurance_plan_active = (
-        "COALESCE(NULLIF(LOWER(BTRIM("
-        f"{insurance_plan_status})), ''), 'active') = 'active'"
-    )
+    insurance_plan_identifier = "insurance_plan.payload_json::jsonb ->> 'plan_identifier'"
+    insurance_plan_active = f"COALESCE(NULLIF(LOWER(BTRIM({insurance_plan_status})), ''), 'active') = 'active'"
     resource_table = (
         PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE
         if has_dataset_insurance_plan
         else "provider_directory_dataset_resource"
     )
-    resource_type_filter = (
-        "" if has_dataset_insurance_plan else "AND insurance_plan.resource_type = 'InsurancePlan'"
-    )
+    resource_type_filter = "" if has_dataset_insurance_plan else "AND insurance_plan.resource_type = 'InsurancePlan'"
     selected_identifier, active_filter = _dataset_plan_scalar_sql(
         insurance_plan_identifier,
         insurance_plan_active,
@@ -3695,11 +3451,7 @@ def _legacy_affiliation_plan_sql(has_dataset_network_plan: bool) -> str:
         "affiliation_network.resource_id",
         "affiliation_network.reference",
     )
-    legacy_filter = (
-        "AND NOT affiliation_network.dataset_network_plan_complete"
-        if has_dataset_network_plan
-        else ""
-    )
+    legacy_filter = "AND NOT affiliation_network.dataset_network_plan_complete" if has_dataset_network_plan else ""
     return f"""
     legacy_affiliation_plans AS MATERIALIZED (
         SELECT DISTINCT affiliation_network.source_id,
@@ -3735,11 +3487,7 @@ def _affiliation_plan_resolution_cte_sql(
     scoped_plan_ctes_sql = _scoped_current_insurance_plan_ctes_sql(
         "affiliations",
         "legacy_affiliation_insurance_plans",
-        (
-            "WHERE NOT dataset_network_plan_complete"
-            if has_dataset_network_plan
-            else ""
-        ),
+        ("WHERE NOT dataset_network_plan_complete" if has_dataset_network_plan else ""),
     )
     dataset_plan_cte_sql = (
         _dataset_affiliation_plan_sql(
@@ -3759,9 +3507,7 @@ def _affiliation_plan_resolution_cte_sql(
     )
         """
     )
-    legacy_plan_cte_sql = _legacy_affiliation_plan_sql(
-        has_dataset_network_plan
-    )
+    legacy_plan_cte_sql = _legacy_affiliation_plan_sql(has_dataset_network_plan)
     return f"""
     {scoped_plan_ctes_sql}, {dataset_plan_cte_sql}, {legacy_plan_cte_sql},
     affiliation_plans AS MATERIALIZED (
@@ -3810,9 +3556,7 @@ def _provider_directory_affiliation_evidence_union_sql(
     has_catalog: bool,
 ) -> str:
     """Project affiliation, plan, and current network evidence rows."""
-    network_joins, network_name, _network_provenance = (
-        _provider_directory_network_resolution_sql(schema, has_catalog)
-    )
+    network_joins, network_name, _network_provenance = _provider_directory_network_resolution_sql(schema, has_catalog)
     return f"""
         SELECT affiliation.source_id, affiliation.affiliation_id,
                'affiliation'::varchar AS evidence_type,
@@ -3855,15 +3599,15 @@ def _provider_directory_affiliation_evidence_sql(
     has_dataset_network_plan: bool = False,
     has_dataset_insurance_plan: bool = False,
     has_dataset_insurance_plan_scalars: bool = False,
+    has_dataset_readiness_indexes: bool = False,
 ) -> str:
     """Resolve exact affiliation network and plan evidence from current resources."""
     current_resource_ctes_sql = _provider_directory_current_resource_ctes_sql(
         schema,
         has_dataset_insurance_plan,
+        has_dataset_readiness_indexes,
     )
-    affiliation_ctes_sql = _provider_directory_requested_affiliation_ctes_sql(
-        schema
-    )
+    affiliation_ctes_sql = _provider_directory_requested_affiliation_ctes_sql(schema)
     plan_resolution_cte_sql = _affiliation_plan_resolution_cte_sql(
         schema,
         has_dataset_network_plan,
@@ -3875,9 +3619,7 @@ def _provider_directory_affiliation_evidence_sql(
         schema,
         has_catalog,
     )
-    current_typed_resource_ctes_sql = (
-        _current_typed_resource_ctes_sql()
-    )
+    current_typed_resource_ctes_sql = _current_typed_resource_ctes_sql()
     return f"""
     WITH {current_resource_ctes_sql}, {current_typed_resource_ctes_sql},
          {affiliation_ctes_sql},
@@ -3963,9 +3705,7 @@ async def _fetch_provider_directory_affiliation_evidence_map(
     session: Any = None,
 ) -> dict[tuple[str, str], dict[str, Any]]:
     """Fetch bounded affiliation evidence through compact serving relations."""
-    bounded_keys = list(dict.fromkeys(affiliation_key_list))[
-        :MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_KEYS
-    ]
+    bounded_keys = list(dict.fromkeys(affiliation_key_list))[:MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_KEYS]
     if not bounded_keys:
         return {}
     if session is None:
@@ -3986,9 +3726,7 @@ async def _fetch_provider_directory_affiliation_evidence_map(
             PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE,
             PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE,
         ),
-        optional_columns=(
-            PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_SCALAR_REQUIREMENTS
-        ),
+        optional_columns=(PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_SCALAR_REQUIREMENTS),
     )
     if table_flags is None:
         return {}
@@ -4002,14 +3740,13 @@ async def _fetch_provider_directory_affiliation_evidence_map(
                 table_flags[PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE],
                 table_flags[PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE],
                 _has_provider_directory_plan_scalars(table_flags),
+                all(table_flags.get(index_name, False) for _key, index_name in READINESS_INDEXES),
             )
         ),
         session=session,
         params={
             "source_ids": [source_id for source_id, _affiliation_id in bounded_keys],
-            "affiliation_ids": [
-                affiliation_id for _source_id, affiliation_id in bounded_keys
-            ],
+            "affiliation_ids": [affiliation_id for _source_id, affiliation_id in bounded_keys],
         },
     )
     return _map_provider_directory_affiliation_evidence(evidence_result.all())
@@ -4037,9 +3774,7 @@ def _provider_directory_source_detail_statement(source_ids: Sequence[str]) -> An
             or_(
                 table.c.source_id.in_(source_ids),
                 table.c.endpoint_id.in_(
-                    select(selected_endpoints.c.endpoint_id).where(
-                        selected_endpoints.c.endpoint_id.is_not(None)
-                    )
+                    select(selected_endpoints.c.endpoint_id).where(selected_endpoints.c.endpoint_id.is_not(None))
                 ),
                 table.c.canonical_api_base.in_(
                     select(selected_endpoints.c.canonical_api_base).where(
@@ -4067,9 +3802,7 @@ def _map_source_details(
             "source": "provider_directory_fhir",
             "source_id": source_id,
             "endpoint_id": mapping["endpoint_id"],
-            "canonical_api_base": _normalized_provider_directory_api_base(
-                mapping["canonical_api_base"]
-            ),
+            "canonical_api_base": _normalized_provider_directory_api_base(mapping["canonical_api_base"]),
             "org_name": mapping["org_name"],
             "plan_name": mapping["plan_name"],
         }
@@ -4082,11 +3815,7 @@ async def _fetch_provider_directory_source_detail_map(
     session: Any = None,
 ) -> dict[str, dict[str, Any]]:
     """Fetch requested sources plus aliases that share their endpoint identity."""
-    unique_ids = [
-        source_id
-        for source_id in dict.fromkeys(str(item or "").strip() for item in source_ids)
-        if source_id
-    ]
+    unique_ids = [source_id for source_id in dict.fromkeys(str(item or "").strip() for item in source_ids) if source_id]
     if not unique_ids:
         return {}
     if not await _is_table_available(ProviderDirectorySource.__tablename__, session=session):
@@ -4110,9 +3839,7 @@ def _provider_directory_endpoint_group_key(
     source_detail: Mapping[str, Any],
 ) -> tuple[str, str]:
     endpoint_id = str(source_detail.get("endpoint_id") or "").strip()
-    canonical_api_base = _normalized_provider_directory_api_base(
-        source_detail.get("canonical_api_base")
-    )
+    canonical_api_base = _normalized_provider_directory_api_base(source_detail.get("canonical_api_base"))
     if endpoint_id:
         return "endpoint_id", endpoint_id
     if canonical_api_base:
@@ -4141,22 +3868,17 @@ def _merge_provider_directory_role_evidence(
     evidence_metadata_list: list[Mapping[str, Any]] = []
     for role_key, role_evidence in matching_role_evidence_list:
         for plan_detail in role_evidence.get("insurance_plans") or []:
-            plan_key_parts = tuple(
-                plan_detail.get(key) for key in ("resource_type", "resource_id")
-            )
+            plan_key_parts = tuple(plan_detail.get(key) for key in ("resource_type", "resource_id"))
             existing_plan_index = plan_indexes_by_key.get(plan_key_parts)
             if existing_plan_index is None:
                 plan_indexes_by_key[plan_key_parts] = len(insurance_plan_list)
                 insurance_plan_list.append(dict(plan_detail))
-            elif (
-                insurance_plan_list[existing_plan_index].get("provenance")
-                and not plan_detail.get("provenance")
-            ):
+            elif insurance_plan_list[existing_plan_index].get("provenance") and not plan_detail.get("provenance"):
                 insurance_plan_list[existing_plan_index] = dict(plan_detail)
         for network_detail in role_evidence.get("networks") or []:
-            network_fields = tuple(network_detail.get(key) for key in (
-                "resource_type", "resource_id", "name", "reference", "provenance"
-            ))
+            network_fields = tuple(
+                network_detail.get(key) for key in ("resource_type", "resource_id", "name", "reference", "provenance")
+            )
             if network_fields not in network_keys:
                 network_keys.add(network_fields)
                 network_list.append(dict(network_detail))
@@ -4223,17 +3945,13 @@ def _provider_directory_role_evidence_fields(
         return {}
     field_map: dict[str, Any] = {
         "source_ids": sorted(endpoint_source_ids),
-        "practitioner_role_ids": sorted(
-            {role_key[1] for role_key, _role_evidence in matching_role_evidence_list}
-        ),
+        "practitioner_role_ids": sorted({role_key[1] for role_key, _role_evidence in matching_role_evidence_list}),
     }
-    practitioner_roles = _provider_directory_practitioner_role_details(
-        matching_role_evidence_list
-    )
+    practitioner_roles = _provider_directory_practitioner_role_details(matching_role_evidence_list)
     if practitioner_roles:
         field_map["practitioner_roles"] = practitioner_roles
-    plan_list, network_list, role_plan_metadata_list, evidence_metadata_list = (
-        _merge_provider_directory_role_evidence(matching_role_evidence_list)
+    plan_list, network_list, role_plan_metadata_list, evidence_metadata_list = _merge_provider_directory_role_evidence(
+        matching_role_evidence_list
     )
     if plan_list:
         field_map["insurance_plans"] = plan_list
@@ -4241,8 +3959,7 @@ def _provider_directory_role_evidence_fields(
         field_map["networks"] = network_list
     if len(role_plan_metadata_list) == 1:
         field_map["insurance_plan_metadata"] = {
-            key: role_plan_metadata_list[0][key]
-            for key in ("returned", "total", "truncated", "catalog_complete")
+            key: role_plan_metadata_list[0][key] for key in ("returned", "total", "truncated", "catalog_complete")
         }
     elif role_plan_metadata_list:
         field_map["insurance_plan_metadata_by_role"] = role_plan_metadata_list
@@ -4268,32 +3985,22 @@ def _provider_directory_affiliation_evidence_fields(
     matching_affiliation_evidence_list = []
     seen_affiliation_keys: set[tuple[str, str]] = set()
     for affiliation_key in affiliation_keys:
-        if (
-            affiliation_key in seen_affiliation_keys
-            or affiliation_key[0] not in endpoint_source_ids
-        ):
+        if affiliation_key in seen_affiliation_keys or affiliation_key[0] not in endpoint_source_ids:
             continue
         seen_affiliation_keys.add(affiliation_key)
         affiliation_evidence = affiliation_evidence_map.get(affiliation_key)
         if affiliation_evidence is not None:
-            matching_affiliation_evidence_list.append(
-                (affiliation_key, affiliation_evidence)
-            )
+            matching_affiliation_evidence_list.append((affiliation_key, affiliation_evidence))
     if not matching_affiliation_evidence_list:
         return {}
     field_map: dict[str, Any] = {
         "organization_affiliation_ids": sorted(
-            {
-                affiliation_key[1]
-                for affiliation_key, _affiliation_evidence in matching_affiliation_evidence_list
-            }
+            {affiliation_key[1] for affiliation_key, _affiliation_evidence in matching_affiliation_evidence_list}
         ),
     }
-    plan_list, network_list, plan_metadata_list, evidence_metadata_list = (
-        _merge_provider_directory_role_evidence(
-            matching_affiliation_evidence_list,
-            evidence_id_field="organization_affiliation_id",
-        )
+    plan_list, network_list, plan_metadata_list, evidence_metadata_list = _merge_provider_directory_role_evidence(
+        matching_affiliation_evidence_list,
+        evidence_id_field="organization_affiliation_id",
     )
     if plan_list:
         field_map["insurance_plans"] = plan_list
@@ -4301,8 +4008,7 @@ def _provider_directory_affiliation_evidence_fields(
         field_map["networks"] = network_list
     if len(plan_metadata_list) == 1:
         field_map["insurance_plan_metadata"] = {
-            key: plan_metadata_list[0][key]
-            for key in ("returned", "total", "truncated", "catalog_complete")
+            key: plan_metadata_list[0][key] for key in ("returned", "total", "truncated", "catalog_complete")
         }
     elif plan_metadata_list:
         field_map["insurance_plan_metadata_by_affiliation"] = plan_metadata_list
@@ -4324,9 +4030,7 @@ def _merge_provider_directory_affiliation_fields(
             endpoint_provenance_map[key] = merged_values
     affiliation_ids = affiliation_field_map.get("organization_affiliation_ids")
     if affiliation_ids:
-        endpoint_provenance_map["organization_affiliation_ids"] = list(
-            affiliation_ids
-        )
+        endpoint_provenance_map["organization_affiliation_ids"] = list(affiliation_ids)
     for key in (
         "insurance_plan_metadata",
         "insurance_plan_metadata_by_affiliation",
@@ -4381,17 +4085,12 @@ def _provider_directory_endpoint_provenance_item(
             and _provider_directory_endpoint_group_key(source_detail) == endpoint_key
         ),
         "catalog_aliases_verified": False,
-        "catalog_aliases": [
-            _provider_directory_catalog_alias(source_detail)
-            for source_detail in endpoint_aliases
-        ],
+        "catalog_aliases": [_provider_directory_catalog_alias(source_detail) for source_detail in endpoint_aliases],
     }
     if endpoint_key[0] == "endpoint_id":
         endpoint_provenance_map["endpoint_id"] = endpoint_key[1]
     endpoint_provenance_map.update(
-        _provider_directory_role_evidence_fields(
-            source_ids, role_keys, detail_by_id, endpoint_key, role_evidence_map
-        )
+        _provider_directory_role_evidence_fields(source_ids, role_keys, detail_by_id, endpoint_key, role_evidence_map)
     )
     _merge_provider_directory_affiliation_fields(
         endpoint_provenance_map,
@@ -4452,30 +4151,18 @@ async def _attach_provider_directory_source_details(
             role_key_list,
             session=session,
         )
-        affiliation_key_list = _provider_directory_affiliation_keys_from_addresses(
-            addresses
-        )
-        affiliation_evidence_map = (
-            await _fetch_provider_directory_affiliation_evidence_map(
-                affiliation_key_list,
-                session=session,
-            )
+        affiliation_key_list = _provider_directory_affiliation_keys_from_addresses(addresses)
+        affiliation_evidence_map = await _fetch_provider_directory_affiliation_evidence_map(
+            affiliation_key_list,
+            session=session,
         )
     for address in addresses:
         if not isinstance(address, dict):
             continue
-        provider_directory_record_ids = _provider_directory_record_ids_from_address(
-            address
-        )
-        address_source_ids = _directory_source_ids(
-            provider_directory_record_ids
-        )
-        address_role_keys = _directory_role_keys_from_records(
-            provider_directory_record_ids
-        )
-        address_affiliation_keys = _directory_affiliation_keys_from_records(
-            provider_directory_record_ids
-        )
+        provider_directory_record_ids = _provider_directory_record_ids_from_address(address)
+        address_source_ids = _directory_source_ids(provider_directory_record_ids)
+        address_role_keys = _directory_role_keys_from_records(provider_directory_record_ids)
+        address_affiliation_keys = _directory_affiliation_keys_from_records(provider_directory_record_ids)
         endpoint_provenance = _provider_directory_endpoint_provenance(
             address_source_ids,
             detail_by_id,
@@ -4498,9 +4185,7 @@ def _public_mrf_source_url(value: Any) -> str | None:
         return None
     hostname = parsed.hostname.lower()
     normalized_hostname = hostname.rstrip(".")
-    if normalized_hostname == "localhost" or normalized_hostname.endswith(
-        ".localhost"
-    ):
+    if normalized_hostname == "localhost" or normalized_hostname.endswith(".localhost"):
         return None
     try:
         literal_ip = ipaddress.ip_address(normalized_hostname)
@@ -4527,7 +4212,7 @@ def _mrf_source_address_pairs(
             continue
         try:
             pairs.add((int(npi_value), address_key))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
     return sorted(pairs)
 
@@ -4579,7 +4264,7 @@ def _mrf_source_pair(source_row: Mapping[str, Any]) -> tuple[int, str] | None:
     npi_value = source_row.get("npi") or source_row.get("inferred_npi")
     try:
         return int(npi_value), address_key
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -4592,7 +4277,7 @@ def _mrf_source_detail(source_row: Mapping[str, Any]) -> dict[str, Any] | None:
     for raw_issuer_id in source_row.get("issuer_ids") or []:
         try:
             issuer_ids.append(int(raw_issuer_id))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
     issuer_ids = sorted(set(issuer_ids))
     if len(issuer_ids) == 1:
@@ -4680,27 +4365,20 @@ async def _attach_mrf_source_details(
     _apply_mrf_source_details(addresses, details_by_pair)
 
 
-async def _attach_selected_address_source_details(
-    addresses: Sequence[Any],
-    *,
-    include_sources: bool,
-    include_role_evidence: bool = False,
-    session: Any = None,
-) -> None:
-    """Attach opt-in source details through one shared response path."""
-    await _attach_provider_directory_source_details(
-        addresses,
-        include_role_evidence=include_role_evidence,
-        session=session,
-    )
-    if include_sources:
-        await _attach_mrf_source_details(addresses, session=session)
-
-
 async def _execute_stmt(stmt: Any, *, session: Any = None, params: Optional[dict[str, Any]] = None):
-    if session is not None:
-        return await session.execute(stmt, params or {})
-    return await db.execute(stmt, **(params or {}))
+    from api.network_read_execution import execute_network_read, has_network_read_guard
+
+    stmt, params = scoped_address_statement(stmt), scoped_address_parameters(params or {})
+    if session is None and not has_network_read_guard(stmt):
+        return await _npi_count_read(lambda: db.execute(stmt, **(params or {})))
+    if session is None:
+        from db.connection import current_session
+
+        try:
+            session = current_session()
+        except RuntimeError as error:
+            raise sanic.exceptions.ServiceUnavailable("Canonical network Reader is unavailable.") from error
+    return await _npi_count_read(lambda: execute_network_read(session, stmt, params))
 
 
 def _normalize_provider_enrichment_show_mode(raw_value: Any) -> str:
@@ -4774,12 +4452,8 @@ def _initialize_ffs_summary_overrides(
     npi_by_enrollment: dict[str, int] = {}
     all_enrollment_ids: list[str] = []
     for npi_value, enrollment_rows in visible_rows_by_npi.items():
-        enrollment_ids = _unique_non_empty(
-            [enrollment.get("enrollment_id") for enrollment in enrollment_rows]
-        )
-        pecos_ids = _unique_non_empty(
-            [enrollment.get("pecos_asct_cntl_id") for enrollment in enrollment_rows]
-        )
+        enrollment_ids = _unique_non_empty([enrollment.get("enrollment_id") for enrollment in enrollment_rows])
+        pecos_ids = _unique_non_empty([enrollment.get("pecos_asct_cntl_id") for enrollment in enrollment_rows])
         summary_overrides_by_npi[npi_value] = {
             "ffs_enrollment_ids": enrollment_ids,
             "ffs_pecos_asct_cntl_ids": pecos_ids,
@@ -4835,9 +4509,7 @@ async def _apply_ffs_related_npi_overrides(
     for npi_value, related_npis in related_by_npi.items():
         unique_related_npis = _unique_non_empty(related_npis)
         summary_overrides_by_npi[npi_value]["ffs_related_npis"] = unique_related_npis
-        summary_overrides_by_npi[npi_value]["ffs_related_npi_count"] = len(
-            unique_related_npis
-        )
+        summary_overrides_by_npi[npi_value]["ffs_related_npi_count"] = len(unique_related_npis)
 
 
 async def _apply_ffs_address_overrides(
@@ -4906,9 +4578,7 @@ async def _apply_ffs_specialty_overrides(
             ProviderEnrollmentFFSSecondarySpecialty.provider_type_code,
             ProviderEnrollmentFFSSecondarySpecialty.provider_type_text,
         )
-        .where(
-            ProviderEnrollmentFFSSecondarySpecialty.enrollment_id.in_(enrollment_ids)
-        )
+        .where(ProviderEnrollmentFFSSecondarySpecialty.enrollment_id.in_(enrollment_ids))
         .order_by(
             ProviderEnrollmentFFSSecondarySpecialty.enrollment_id.asc(),
             ProviderEnrollmentFFSSecondarySpecialty.provider_type_code.asc(),
@@ -4926,12 +4596,8 @@ async def _apply_ffs_specialty_overrides(
         if provider_type_text:
             texts_by_npi[npi_value].append(str(provider_type_text))
     for npi_value, summary in summary_overrides_by_npi.items():
-        summary["ffs_secondary_provider_type_codes"] = _unique_non_empty(
-            codes_by_npi.get(npi_value, [])
-        )
-        summary["ffs_secondary_provider_type_texts"] = _unique_non_empty(
-            texts_by_npi.get(npi_value, [])
-        )
+        summary["ffs_secondary_provider_type_codes"] = _unique_non_empty(codes_by_npi.get(npi_value, []))
+        summary["ffs_secondary_provider_type_texts"] = _unique_non_empty(texts_by_npi.get(npi_value, []))
 
 
 async def _fetch_ffs_reassignment_counts(
@@ -5025,77 +4691,48 @@ async def _fetch_ffs_summary_overrides(
     return summary_overrides_by_npi
 
 
-async def _fast_has_insurance_count(city: Optional[str], state: Optional[str]) -> int:
+async def _fast_has_insurance_count(city: Optional[str], state: Optional[str], *, session=None, deadline=None) -> int:
     required_columns = {"npi", "type", "plans_network_array"}
     if city:
         required_columns.add("city_name")
     if state:
         required_columns.add("state_name")
-    address_model = await _address_serving_model(required_columns)
-    publication_identity = await _npi_count_cache_identity(address_model)
+    metadata_options = {"session": session} if session is not None else {}
+    address_model = await _address_serving_model(required_columns, **metadata_options)
+    publication_identity = await _npi_count_cache_identity(address_model, **metadata_options)
     has_cached_insurance_count = (
-        _has_insurance_total_cache_get(publication_identity, city, state)
-        if publication_identity is not None
-        else None
+        _has_insurance_total_cache_get(publication_identity, city, state) if publication_identity is not None else None
     )
     if has_cached_insurance_count is not None:
         return has_cached_insurance_count
-    table = address_model.__table__
-    provider_npi = table.c.npi
-    if address_model is EntityAddressUnified:
-        provider_npi = func.coalesce(table.c.npi, table.c.inferred_npi)
-        is_serving_type = table.c.type.in_(GEO_SERVICE_LOCATION_TYPES)
+    stmt = _provider_list_total_statement(address_model, has_insurance=True, city=city, state=state)
+    if deadline is not None:
+        async with _provider_list_connection(db, None, session) as conn:
+            count = int(await _provider_list_count(conn, stmt, {}, session, deadline=deadline))
     else:
-        is_serving_type = table.c.type == "primary"
-    conditions = [
-        is_serving_type,
-        provider_npi.is_not(None),
-        literal_column("NOT (plans_network_array @@ '0'::query_int)"),
-    ]
-    if city:
-        conditions.append(table.c.city_name == city)
-    if state:
-        conditions.append(table.c.state_name == state)
-
-    # Legacy primary rows are one-per-NPI, so COUNT(*) avoids DISTINCT sorting.
-    # Unified serving has one primary row per canonical address and must count NPIs.
-    if city is None and state is None and address_model is NPIAddress:
-        stmt = select(func.count()).select_from(table).where(*conditions)
-    else:
-        stmt = select(func.count(func.distinct(provider_npi))).where(*conditions)
-    async with db.session() as session:
-        count_result = await session.execute(stmt)
-        count = int(count_result.scalar() or 0)
-        if publication_identity is None:
-            return count
-        return _has_insurance_total_cache_set(
-            publication_identity,
-            city,
-            state,
-            count,
-        )
+        async with db.session() as count_session:
+            count_result = await execute_network_read(count_session, stmt)
+            count = int(count_result.scalar() or 0)
+    if publication_identity is None:
+        return count
+    return _has_insurance_total_cache_set(publication_identity, city, state, count)
 
 
-async def _fast_primary_npi_count() -> int:
-    address_model = await _address_serving_model({"type"})
-    publication_identity = await _npi_count_cache_identity(address_model)
-    cached = (
-        _primary_total_cache_get(publication_identity)
-        if publication_identity is not None
-        else None
-    )
+async def _fast_primary_npi_count(*, session=None, deadline=None) -> int:
+    metadata_options = {"session": session} if session is not None else {}
+    address_model = await _address_serving_model({"type"}, **metadata_options)
+    publication_identity = await _npi_count_cache_identity(address_model, **metadata_options)
+    cached = _primary_total_cache_get(publication_identity) if publication_identity is not None else None
     if cached is not None:
         return cached
-    table = address_model.__table__
-    if address_model is EntityAddressUnified:
-        provider_npi = func.coalesce(table.c.npi, table.c.inferred_npi)
-        stmt = select(func.count(func.distinct(provider_npi))).where(
-            table.c.type.in_(GEO_SERVICE_LOCATION_TYPES),
-            provider_npi.is_not(None),
-        )
-    else:
-        stmt = select(func.count()).select_from(table).where(table.c.type == "primary")
+    stmt = _provider_list_total_statement(address_model)
     scalar_fn = getattr(db, "scalar", None)
+    if deadline is not None:
+        async with _provider_list_connection(db, None, session) as conn:
+            count = int(await _provider_list_count(conn, stmt, {}, session, deadline=deadline))
+        if publication_identity is None:
+            return count
+        return _primary_total_cache_set(publication_identity, count)
     if scalar_fn is not None:
         try:
             scalar_value = await scalar_fn(stmt)
@@ -5103,7 +4740,11 @@ async def _fast_primary_npi_count() -> int:
             if publication_identity is None:
                 return count
             return _primary_total_cache_set(publication_identity, count)
+        except sanic.exceptions.ServiceUnavailable:
+            raise
         except Exception as exc:  # pragma: no cover - fallback for lightweight test doubles
+            if isinstance(exc, TimeoutError) or (isinstance(exc, DBAPIError) and _is_statement_timeout(exc)):
+                raise
             logger.debug(
                 "Primary NPI count scalar path failed; using acquire path (%s)",
                 type(exc).__name__,
@@ -5120,115 +4761,34 @@ async def _fast_primary_npi_count() -> int:
 def _nearby_geo_type_clause(address_table_sql: str) -> str:
     """Return the partial geo-index address-type predicate."""
 
-    if address_table_sql.endswith(".entity_address_unified") and _should_include_geo_service_locations():
-        type_list = ", ".join(
-            f"'{address_type}'" for address_type in GEO_SERVICE_LOCATION_TYPES
-        )
+    if _is_unified_address_table(address_table_sql) and _should_include_geo_service_locations():
+        type_list = ", ".join(f"'{address_type}'" for address_type in GEO_SERVICE_LOCATION_TYPES)
         return f"AND a.type IN ({type_list})"
     return "AND (a.type = 'primary' OR a.type = 'secondary')"
 
 
-_NEARBY_SQL_TEMPLATE = dedent(
-    """
-    WITH sub_s AS (
-        SELECT d.npi AS npi_code,
-               ROUND(
-                   CAST(
-                       ST_Distance(
-                           Geography(
-                               ST_MakePoint(
-                                   (a.long)::double precision,
-                                   (a.lat)::double precision
-                               )
-                           ),
-                           Geography(
-                               ST_MakePoint(
-                                   CAST(:in_long AS double precision),
-                                   CAST(:in_lat AS double precision)
-                               )
-                           )
-                       ) / 1609.34 AS NUMERIC
-                   ),
-                   2
-               ) AS distance,
-               Geography(
-                   ST_MakePoint(
-                       (a.long)::double precision,
-                       (a.lat)::double precision
-                   )
-               ) <-> Geography(
-                   ST_MakePoint(
-                       CAST(:in_long AS double precision),
-                       CAST(:in_lat AS double precision)
-                   )
-               ) AS cursor_distance_meters,
-               a.*,
-               d.*
-          FROM {address_table_sql} AS a
-          JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
-         WHERE ST_DWithin(
-                   Geography(
-                       ST_MakePoint(
-                           (a.long)::double precision,
-                           (a.lat)::double precision
-                       )
-                   ),
-                   Geography(
-                       ST_MakePoint(
-                           CAST(:in_long AS double precision),
-                           CAST(:in_lat AS double precision)
-                       )
-                   ),
-                   :radius * 1609.34
-               )
-           AND a.lat IS NOT NULL
-           AND a.long IS NOT NULL
-           AND a.address_key IS NOT NULL
-           {taxonomy_where}
-           {geo_precision_clause}
-           {geo_type_clause}
-           {extra_clause}{ilike_clause}{cursor_clause}
-      ORDER BY Geography(
-                   ST_MakePoint(
-                       (a.long)::double precision,
-                       (a.lat)::double precision
-                   )
-               ) <-> Geography(
-                   ST_MakePoint(
-                       CAST(:in_long AS double precision),
-                       CAST(:in_lat AS double precision)
-                   )
-               ) ASC,
-               a.npi ASC,
-               a.address_key ASC,
-               CASE a.type
-                   WHEN 'primary' THEN 0
-                   WHEN 'practice' THEN 1
-                   WHEN 'site' THEN 2
-                   WHEN 'secondary' THEN 3
-                   ELSE 9
-               END ASC,
-               {row_tiebreaker}
-         LIMIT :limit
+def _nearby_sql_query(
+    taxonomy_conditions: str,
+    extra_clause: str,
+    ilike_clause: str,
+    *,
+    use_taxonomy_filter: bool,
+    primary_only: bool = False,
+    address_table_sql: str = "mrf.npi_address",
+    geo_precision_clause: str = "",
+) -> NearbySqlQuery:
+    """Return normalized query fragments for native and imported nearby SQL."""
+
+    return NearbySqlQuery(
+        taxonomy_conditions=taxonomy_conditions,
+        extra_clause=extra_clause,
+        ilike_clause=ilike_clause,
+        use_taxonomy_filter=use_taxonomy_filter,
+        primary_only=primary_only,
+        address_table_sql=address_table_sql,
+        geo_precision_clause=geo_precision_clause,
+        geo_type_clause=_nearby_geo_type_clause(address_table_sql),
     )
-    SELECT sub_s.*, t.*, nucc.display_name AS taxonomy_display
-      FROM sub_s
-      LEFT JOIN mrf.npi_taxonomy AS t ON sub_s.npi_code = t.npi
-      LEFT JOIN mrf.nucc_taxonomy AS nucc
-        ON nucc.code = t.healthcare_provider_taxonomy_code
-  ORDER BY sub_s.cursor_distance_meters ASC,
-           sub_s.npi_code ASC,
-           sub_s.address_key ASC,
-           CASE sub_s.type
-               WHEN 'primary' THEN 0
-               WHEN 'practice' THEN 1
-               WHEN 'site' THEN 2
-               WHEN 'secondary' THEN 3
-               ELSE 9
-           END ASC,
-           {outer_row_tiebreaker};
-    """
-)
 
 
 def _build_nearby_sql(
@@ -5242,90 +4802,20 @@ def _build_nearby_sql(
     geo_precision_clause: str = "",
     cursor_clause: str = "",
 ) -> str:
-    """Build the GiST KNN nearby-provider query for the selected address model.
+    """Build the native KNN nearby-provider query for the selected address model."""
 
-    Do not add a separate latitude/longitude bounding box here. It makes PostgreSQL
-    prefer the B-tree geo_bbox index, which must scan and sort the entire box before
-    applying LIMIT. The geography KNN order lets geo_idx stop after the first page.
-    Exact total counts use a different access pattern and should remain separate.
-    """
-    taxonomy_from = ""
-    taxonomy_where = ""
-    if use_taxonomy_filter:
-        taxonomy_from = (
-            ",\n"
-            "                              (\n"
-            "                                  SELECT ARRAY_AGG(code) AS taxonomy_codes,\n"
-            "                                         ARRAY_AGG(int_code) AS codes\n"
-            "                                    FROM mrf.nucc_taxonomy\n"
-            f"                                   WHERE {taxonomy_conditions}\n"
-            "                              ) AS g"
-        )
-        taxonomy_where = "\n                          AND a.taxonomy_array && g.codes"
-        if primary_only:
-            taxonomy_where += (
-                "\n                          AND EXISTS ("
-                "SELECT 1 FROM mrf.npi_taxonomy AS provider_taxonomy "
-                "WHERE provider_taxonomy.npi = a.npi "
-                "AND provider_taxonomy.healthcare_provider_taxonomy_code = ANY(g.taxonomy_codes) "
-                "AND UPPER(COALESCE("
-                "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y')"
-            )
-    geo_type_clause = _nearby_geo_type_clause(address_table_sql)
-    row_tiebreaker = (
-        "a.location_key ASC"
-        if address_table_sql.endswith(".entity_address_unified")
-        else "a.type ASC"
-    )
-    outer_row_tiebreaker = (
-        "sub_s.location_key ASC"
-        if address_table_sql.endswith(".entity_address_unified")
-        else "sub_s.type ASC"
-    )
-    return _NEARBY_SQL_TEMPLATE.format(
-        taxonomy_from=taxonomy_from,
-        taxonomy_where=taxonomy_where,
-        geo_precision_clause=geo_precision_clause,
-        geo_type_clause=geo_type_clause,
-        extra_clause=extra_clause,
-        ilike_clause=ilike_clause,
+    return build_native_nearby_sql(
+        _nearby_sql_query(
+            taxonomy_conditions,
+            extra_clause,
+            ilike_clause,
+            use_taxonomy_filter=use_taxonomy_filter,
+            primary_only=primary_only,
+            address_table_sql=address_table_sql,
+            geo_precision_clause=geo_precision_clause,
+        ),
         cursor_clause=cursor_clause,
-        row_tiebreaker=row_tiebreaker,
-        outer_row_tiebreaker=outer_row_tiebreaker,
-        address_table_sql=address_table_sql,
     )
-
-
-_NEARBY_COUNT_SQL_TEMPLATE = dedent(
-    """
-    SELECT COUNT(DISTINCT (a.npi, a.address_key)) AS total_count
-      FROM {address_table_sql} AS a
-      JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
-     WHERE ST_DWithin(
-               Geography(
-                   ST_MakePoint(
-                       (a.long)::double precision,
-                       (a.lat)::double precision
-                   )
-               ),
-               Geography(
-                   ST_MakePoint(
-                       CAST(:in_long AS double precision),
-                       CAST(:in_lat AS double precision)
-                   )
-               ),
-               :radius * 1609.34
-           )
-       AND a.lat IS NOT NULL
-       AND a.long IS NOT NULL
-       AND a.address_key IS NOT NULL
-       {taxonomy_where}
-       {geo_precision_clause}
-       {geo_type_clause}
-       {bbox_clause}
-       {extra_clause}{ilike_clause};
-    """
-)
 
 
 def _build_nearby_count_sql(
@@ -5341,38 +4831,17 @@ def _build_nearby_count_sql(
 ) -> str:
     """Build the exact provider-address count query for nearby search."""
 
-    taxonomy_from = ""
-    taxonomy_where = ""
-    if use_taxonomy_filter:
-        taxonomy_from = (
-            ",\n"
-            "       (\n"
-            "           SELECT ARRAY_AGG(code) AS taxonomy_codes,\n"
-            "                  ARRAY_AGG(int_code) AS codes\n"
-            "             FROM mrf.nucc_taxonomy\n"
-            f"            WHERE {taxonomy_conditions}\n"
-            "       ) AS g"
-        )
-        taxonomy_where = "\n   AND a.taxonomy_array && g.codes"
-        if primary_only:
-            taxonomy_where += (
-                "\n   AND EXISTS ("
-                "SELECT 1 FROM mrf.npi_taxonomy AS provider_taxonomy "
-                "WHERE provider_taxonomy.npi = a.npi "
-                "AND provider_taxonomy.healthcare_provider_taxonomy_code = ANY(g.taxonomy_codes) "
-                "AND UPPER(COALESCE("
-                "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y')"
-            )
-    geo_type_clause = _nearby_geo_type_clause(address_table_sql)
-    return _NEARBY_COUNT_SQL_TEMPLATE.format(
-        taxonomy_from=taxonomy_from,
-        taxonomy_where=taxonomy_where,
-        geo_precision_clause=geo_precision_clause,
-        geo_type_clause=geo_type_clause,
+    return build_native_nearby_count_sql(
+        _nearby_sql_query(
+            taxonomy_conditions,
+            extra_clause,
+            ilike_clause,
+            use_taxonomy_filter=use_taxonomy_filter,
+            primary_only=primary_only,
+            address_table_sql=address_table_sql,
+            geo_precision_clause=geo_precision_clause,
+        ),
         bbox_clause=bbox_clause,
-        extra_clause=extra_clause,
-        ilike_clause=ilike_clause,
-        address_table_sql=address_table_sql,
     )
 
 
@@ -5381,11 +4850,14 @@ _NEARBY_CURSOR_IGNORED_PARAMS = frozenset({"cursor", "include_total", "limit"})
 
 
 def _nearby_cursor_scope(args: Mapping[str, Any]) -> str:
-    values = []
-    for key in sorted(str(value) for value in args.keys()):
-        if key in _NEARBY_CURSOR_IGNORED_PARAMS:
-            continue
-        values.append((key, str(args.get(key) or "")))
+    keys = sorted(str(value) for value in args)
+    values = [(key, str(args.get(key) or "")) for key in keys if key not in _NEARBY_CURSOR_IGNORED_PARAMS]
+    network_scope = current_network_address_scope()
+    if network_scope is not None:
+        values.append(("network_manifest_sha256", network_scope.manifest.manifest_sha256))
+        values.append(("network_access_scope_sha256", network_scope.access_scope_sha256 or ""))
+        selection = network_scope.network_ids, network_scope.legacy_checksums, network_scope.excluded_network_ids
+        values.append(("network_selection", selection))
     serialized = json.dumps(values, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
@@ -5403,9 +4875,7 @@ def _encode_nearby_cursor(
         "n": int(npi),
         "a": str(address_key).lower(),
     }
-    encoded = base64.urlsafe_b64encode(
-        json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    )
+    encoded = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     return encoded.rstrip(b"=").decode("ascii")
 
 
@@ -5427,9 +4897,7 @@ def _decode_nearby_cursor(raw: str, scope: str) -> tuple[float, int, str]:
             raise ValueError("invalid cursor values")
         return distance, npi, address_key
     except (binascii.Error, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise sanic.exceptions.InvalidUsage(
-            "cursor is invalid or does not match the current geo filters"
-        ) from exc
+        raise sanic.exceptions.InvalidUsage("cursor is invalid or does not match the current geo filters") from exc
 
 
 def _nearby_cursor_filter(
@@ -5472,7 +4940,7 @@ def _nearby_cursor_filter(
 
 
 def _exact_geo_precision_clause(address_table_sql: str) -> str:
-    if address_table_sql.endswith(".entity_address_unified"):
+    if _is_unified_address_table(address_table_sql):
         return "\n                          AND COALESCE(a.address_precision, '') <> 'city_zip'"
     return ""
 
@@ -5490,11 +4958,7 @@ def _name_search_tokens(value: Any) -> tuple[str, ...]:
     """Return stable alphanumeric terms for order-insensitive name matching."""
 
     return tuple(
-        dict.fromkeys(
-            token.lower()
-            for token in re.findall(r"[^\W_]+", str(value or ""), flags=re.UNICODE)
-            if token
-        )
+        dict.fromkeys(token.lower() for token in re.findall(r"[^\W_]+", str(value or ""), flags=re.UNICODE) if token)
     )
 
 
@@ -5518,19 +4982,14 @@ def _names_like_filter_clause(alias: str, names: Sequence[str], base_param: str 
             continue
         token_clauses = []
         for token_index, token in enumerate(tokens):
-            parameter_suffix = (
-                str(idx) if len(tokens) == 1 else f"{idx}_{token_index}"
-            )
+            parameter_suffix = str(idx) if len(tokens) == 1 else f"{idx}_{token_index}"
             param_like = f"{base_param}_{parameter_suffix}"
             indexed_like_clause = " OR ".join(
-                f"({field_expression} LIKE :{param_like})"
-                for field_expression in indexed_like_expressions
+                f"({field_expression} LIKE :{param_like})" for field_expression in indexed_like_expressions
             )
             if ENABLE_TRGM_FUZZY_NAME_SEARCH:
                 param_fuzzy = f"{param_like}_fuzzy"
-                token_clauses.append(
-                    f"(({indexed_like_clause}) OR ({expr} % :{param_fuzzy}))"
-                )
+                token_clauses.append(f"(({indexed_like_clause}) OR ({expr} % :{param_fuzzy}))")
                 parameter_map[param_fuzzy] = token
             else:
                 token_clauses.append(f"({indexed_like_clause})")
@@ -5550,9 +5009,7 @@ def _normalize_zip_code(raw: Optional[str], param_name: str) -> Optional[str]:
         return None
     digits = "".join(ch for ch in text_value if ch.isdigit())
     if len(digits) < 5:
-        raise sanic.exceptions.InvalidUsage(
-            f"{param_name} must contain at least 5 digits"
-        )
+        raise sanic.exceptions.InvalidUsage(f"{param_name} must contain at least 5 digits")
     return digits[:5]
 
 
@@ -5564,9 +5021,7 @@ def _normalize_phone_digits(raw: Optional[str]) -> Optional[str]:
         return None
     digits = "".join(ch for ch in text_value if ch.isdigit())
     if len(digits) < 7 or len(digits) > 15:
-        raise sanic.exceptions.InvalidUsage(
-            "phone must contain between 7 and 15 digits"
-        )
+        raise sanic.exceptions.InvalidUsage("phone must contain between 7 and 15 digits")
     return digits
 
 
@@ -5593,9 +5048,7 @@ def _normalize_exact_npi(raw: Optional[str]) -> Optional[int]:
     if not text_value:
         return None
     if not re.fullmatch(r"[1-9][0-9]{9}", text_value):
-        raise sanic.exceptions.InvalidUsage(
-            "npi must be exactly 10 digits and cannot start with zero"
-        )
+        raise sanic.exceptions.InvalidUsage("npi must be exactly 10 digits and cannot start with zero")
     return int(text_value)
 
 
@@ -5605,9 +5058,7 @@ def _normalize_code_system(raw: Optional[str], param_name: str, allowed: set[str
         raise sanic.exceptions.InvalidUsage(f"{param_name} is required when codes are provided")
     if value not in allowed:
         allowed_values = ", ".join(sorted(allowed))
-        raise sanic.exceptions.InvalidUsage(
-            f"{param_name} must be one of: {allowed_values}"
-        )
+        raise sanic.exceptions.InvalidUsage(f"{param_name} must be one of: {allowed_values}")
     return value
 
 
@@ -5621,9 +5072,7 @@ def _parse_code_tokens(raw: Optional[str], param_name: str) -> list[str]:
         if not token:
             continue
         if not CODE_TOKEN_PATTERN.fullmatch(token):
-            raise sanic.exceptions.InvalidUsage(
-                f"{param_name} contains invalid code token: {item!r}"
-            )
+            raise sanic.exceptions.InvalidUsage(f"{param_name} contains invalid code token: {item!r}")
         if token in seen_tokens:
             continue
         seen_tokens.add(token)
@@ -5636,9 +5085,7 @@ def _to_int_codes(values: Sequence[str], param_name: str) -> list[int]:
     seen_codes: set[int] = set()
     for value in values:
         if not INT_CODE_PATTERN.fullmatch(str(value)):
-            raise sanic.exceptions.InvalidUsage(
-                f"{param_name} must contain numeric codes for internal matching"
-            )
+            raise sanic.exceptions.InvalidUsage(f"{param_name} must contain numeric codes for internal matching")
         parsed = int(value)
         if parsed in seen_codes:
             continue
@@ -5661,7 +5108,10 @@ def _parse_optional_year(raw: Optional[str], param_name: str = "year") -> Option
 
 async def _is_table_available(table_name: str, *, session: Any = None) -> bool:
     cache_key = _schema_cache_key(table_name)
-    cached = _cache_get(_TABLE_EXISTS_CACHE, cache_key)
+    if (is_available := snapshot_relation_available(cache_key)) is not None:
+        return is_available
+    has_guarded_read = has_network_read_inventory(session)
+    cached = None if has_guarded_read else _cache_get(_TABLE_EXISTS_CACHE, cache_key)
     if cached is not None:
         return bool(cached)
     try:
@@ -5671,13 +5121,19 @@ async def _is_table_available(table_name: str, *, session: Any = None) -> bool:
             params={"table_name": cache_key},
         )
         rows = result.all()
-        return bool(_cache_set(_TABLE_EXISTS_CACHE, cache_key, bool(rows and rows[0] and rows[0][0])))
+        available = bool(rows and rows[0] and rows[0][0])
+        return available if has_guarded_read else bool(_cache_set(_TABLE_EXISTS_CACHE, cache_key, available))
+    except sanic.exceptions.ServiceUnavailable:
+        raise
     except Exception:  # pragma: no cover - defensive fallback for transient DB states
+        if _NPI_COUNT_READ_SCOPE.get() is not None:
+            raise
         return False
 
 
 async def _resolve_npi_filter_capabilities(*, session: Any = None) -> dict[str, bool]:
-    cached = _filter_cache_get()
+    has_guarded_read = has_network_read_inventory(session)
+    cached = None if has_guarded_read else _filter_cache_get()
     if cached is not None:
         return cached
     model_columns = _model_table_columns(NPIAddress)
@@ -5688,7 +5144,7 @@ async def _resolve_npi_filter_capabilities(*, session: Any = None) -> dict[str, 
         "pricing_provider_prescription_available": False,
     }
 
-    if ENABLE_NPI_SCHEMA_CACHE:
+    if ENABLE_NPI_SCHEMA_CACHE or has_guarded_read:
         try:
             column_query_result = await _execute_stmt(
                 text(
@@ -5703,45 +5159,36 @@ async def _resolve_npi_filter_capabilities(*, session: Any = None) -> dict[str, 
                 session=session,
             )
             column_rows = column_query_result.all()
-            columns = {
-                str(column_row[0])
-                for column_row in column_rows
-                if column_row and column_row[0]
-            }
-            capability_map[
-                "npi_procedures_array_available"
-            ] = "procedures_array" in columns
-            capability_map[
-                "npi_medications_array_available"
-            ] = "medications_array" in columns
+            columns = {str(column_row[0]) for column_row in column_rows if column_row and column_row[0]}
+            capability_map["npi_procedures_array_available"] = "procedures_array" in columns
+            capability_map["npi_medications_array_available"] = "medications_array" in columns
+        except sanic.exceptions.ServiceUnavailable:
+            raise
         except Exception:  # pragma: no cover - defensive fallback for transient DB states
-            capability_map[
-                "npi_procedures_array_available"
-            ] = "procedures_array" in model_columns
-            capability_map[
-                "npi_medications_array_available"
-            ] = "medications_array" in model_columns
+            capability_map["npi_procedures_array_available"] = "procedures_array" in model_columns
+            capability_map["npi_medications_array_available"] = "medications_array" in model_columns
 
     capability_map["pricing_provider_procedure_available"] = await _is_table_available(
         "pricing_provider_procedure",
         session=session,
     )
-    capability_map[
-        "pricing_provider_prescription_available"
-    ] = await _is_table_available(
+    capability_map["pricing_provider_prescription_available"] = await _is_table_available(
         "pricing_provider_prescription",
         session=session,
     )
-    return _filter_cache_set(capability_map)
+    return capability_map if has_guarded_read else _filter_cache_set(capability_map)
 
 
 async def _table_columns(table_name: str, *, session: Any = None) -> set[str]:
+    if table_name == EntityAddressUnified.__tablename__ and current_network_address_scope() is not None:
+        return _model_table_columns(EntityAddressUnified)
     cache_key = _schema_cache_key(table_name)
-    cached = _cache_get(_TABLE_COLUMNS_CACHE, cache_key)
-    if cached is not None:
-        return set(cached)
+    has_guarded_read = has_network_read_inventory(session)
+    cached_columns = None if has_guarded_read else _cache_get(_TABLE_COLUMNS_CACHE, cache_key)
+    if cached_columns is not None:
+        return set(cached_columns)
     try:
-        result = await _execute_stmt(
+        column_result = await _execute_stmt(
             text(
                 """
                 SELECT column_name
@@ -5753,9 +5200,14 @@ async def _table_columns(table_name: str, *, session: Any = None) -> set[str]:
             session=session,
             params={"table_name": table_name},
         )
-        rows = result.all()
-        return set(_cache_set(_TABLE_COLUMNS_CACHE, cache_key, {str(row[0]) for row in rows if row and row[0]}))
+        column_rows = column_result.all()
+        columns = {str(column_row[0]) for column_row in column_rows if column_row and column_row[0]}
+        return columns if has_guarded_read else set(_cache_set(_TABLE_COLUMNS_CACHE, cache_key, columns))
+    except sanic.exceptions.ServiceUnavailable:
+        raise
     except Exception:  # pragma: no cover - defensive fallback for transient DB states
+        if _NPI_COUNT_READ_SCOPE.get() is not None:
+            raise
         return set()
 
 
@@ -5817,6 +5269,8 @@ async def _is_provider_directory_profile_table_available(
     *,
     session: Any = None,
 ) -> bool:
+    if (is_available := snapshot_relation_available(table_ref)) is not None:
+        return is_available
     if table_ref in _PROVIDER_DIRECTORY_PROFILE_TABLES_SEEN:
         return True
     relation_query_result = await _execute_stmt(
@@ -5840,9 +5294,7 @@ def _provider_directory_profile_payload(
     if profile is None:
         return None
     published_at = _serialize_utc_rfc3339_datetime(mapping.get("published_at"))
-    profile_as_of = _serialize_provider_directory_profile_as_of(
-        mapping.get("profile_as_of")
-    )
+    profile_as_of = _serialize_provider_directory_profile_as_of(mapping.get("profile_as_of"))
     profile["generation_id"] = mapping.get("generation_id")
     profile["published_at"] = published_at
     profile["profile_as_of"] = profile_as_of
@@ -5862,15 +5314,8 @@ def _provider_directory_profile_serving_identity(
 ) -> str:
     """Bind response caching to fallback or validated singleton publication."""
     generation_id = str(mapping.get("generation_id") or "none")
-    published_at = (
-        _serialize_utc_rfc3339_datetime(mapping.get("published_at")) or "none"
-    )
-    profile_as_of = (
-        _serialize_provider_directory_profile_as_of(
-            mapping.get("profile_as_of")
-        )
-        or "none"
-    )
+    published_at = _serialize_utc_rfc3339_datetime(mapping.get("published_at")) or "none"
+    profile_as_of = _serialize_provider_directory_profile_as_of(mapping.get("profile_as_of")) or "none"
     if mapping.get("serving_generation_key") == "global":
         return (
             f"singleton:{generation_id}:{published_at}:{profile_as_of}:"
@@ -5879,8 +5324,7 @@ def _provider_directory_profile_serving_identity(
             f"{mapping.get('serving_evidence_target_oid')}"
         )
     return (
-        f"fallback:{generation_id}:{published_at}:{profile_as_of}:"
-        f"{mapping.get('materialization_profile_target_oid')}"
+        f"fallback:{generation_id}:{published_at}:{profile_as_of}:{mapping.get('materialization_profile_target_oid')}"
     )
 
 
@@ -5898,9 +5342,7 @@ def _provider_directory_profiles_by_npi(
             include_evidence=include_evidence,
         )
         if profile_payload_by_kind is not None:
-            profile_payload_by_kind["_serving_identity"] = (
-                _provider_directory_profile_serving_identity(mapping)
-            )
+            profile_payload_by_kind["_serving_identity"] = _provider_directory_profile_serving_identity(mapping)
             profiles_by_npi[int(mapping["npi"])] = profile_payload_by_kind
     return profiles_by_npi
 
@@ -5912,22 +5354,12 @@ async def _fetch_provider_directory_profile_map(
     session: Any = None,
 ) -> dict[int, dict[str, Any]]:
     """Fetch indexed profile artifacts for valid NPIs, with optional evidence."""
-    normalized_npis = sorted(
-        {
-            int(npi)
-            for npi in npis
-            if profile_artifact.is_valid_npi(npi)
-        }
-    )
+    normalized_npis = sorted({int(npi) for npi in npis if profile_artifact.is_valid_npi(npi)})
     if not normalized_npis:
         return {}
     table_ref = _schema_cache_key(profile_artifact.PROFILE_TABLE)
-    evidence_table_ref = _schema_cache_key(
-        profile_artifact.PROFILE_EVIDENCE_TABLE
-    )
-    serving_generation_ref = _schema_cache_key(
-        PROVIDER_DIRECTORY_PROFILE_SERVING_GENERATION_TABLE
-    )
+    evidence_table_ref = _schema_cache_key(profile_artifact.PROFILE_EVIDENCE_TABLE)
+    serving_generation_ref = _schema_cache_key(PROVIDER_DIRECTORY_PROFILE_SERVING_GENERATION_TABLE)
     if not await _is_provider_directory_profile_table_available(
         table_ref,
         session=session,
@@ -5961,13 +5393,8 @@ async def _fetch_provider_directory_profile_map(
 
 def _provider_directory_observations_sql(schema: str) -> str:
     """Select the newest bounded, non-certified retained row per resource."""
-    statuses = ", ".join(
-        f"'{status}'" for status in _PROVIDER_DIRECTORY_OBSERVED_DATASET_STATUSES
-    )
-    resource_types = ", ".join(
-        f"'{resource_type}'"
-        for resource_type in _PROVIDER_DIRECTORY_OBSERVED_RESOURCE_TYPES
-    )
+    statuses = ", ".join(f"'{status}'" for status in _PROVIDER_DIRECTORY_OBSERVED_DATASET_STATUSES)
+    resource_types = ", ".join(f"'{resource_type}'" for resource_type in _PROVIDER_DIRECTORY_OBSERVED_RESOURCE_TYPES)
     return f"""
         WITH observed_datasets AS MATERIALIZED (
             SELECT source.source_id,
@@ -6045,175 +5472,10 @@ async def _fetch_provider_directory_observations(
 
 
 def _is_unified_address_serving_requested() -> bool:
-    return os.getenv(ADDRESS_SERVING_SOURCE_ENV, ADDRESS_SERVING_SOURCE_UNIFIED).strip().lower() == ADDRESS_SERVING_SOURCE_UNIFIED
-
-
-def _is_unified_address_table(address_table_sql: str) -> bool:
-    return address_table_sql.endswith(f".{EntityAddressUnified.__tablename__}")
-
-
-def _address_zip5_filter(alias: str, address_table_sql: str, *, any_array: bool = False) -> str:
-    column = f"{alias}.zip5" if _is_unified_address_table(address_table_sql) else f"LEFT({alias}.postal_code, 5)"
-    operator = "ANY (:zip_codes)" if any_array else ":zip_code"
-    return f"{column} = {operator}"
-
-
-def _address_phone_digits_filter(alias: str, address_table_sql: str) -> str:
-    raw_digits = f"regexp_replace(COALESCE({alias}.telephone_number, ''), '[^0-9]', '', 'g')"
-    if _is_unified_address_table(address_table_sql):
-        return f"COALESCE(NULLIF({alias}.phone_number, ''), {raw_digits}) = :phone_digits"
-    return f"{raw_digits} = :phone_digits"
-
-
-_CURRENT_PROVIDER_DIRECTORY_PHONE_CTES = """
-current_provider_directory_runs AS MATERIALIZED (
-    SELECT source.source_id, dataset.dataset_id,
-           COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar
-               AS run_id
-      FROM mrf.provider_directory_source AS source
-      JOIN mrf.provider_directory_endpoint_dataset AS dataset
-        ON dataset.endpoint_id = source.endpoint_id
-     WHERE dataset.is_current IS TRUE
-       AND dataset.status = 'published'
-       AND dataset.published_at IS NOT NULL
-       AND dataset.superseded_at IS NULL
-), matching_provider_directory_phone_rows AS MATERIALIZED (
-    SELECT overlay.npi, overlay.address_key, overlay.source_id,
-           overlay.last_seen_run_id, overlay.source_record_id,
-           overlay.resource_type, overlay.resource_id
-      FROM mrf.provider_directory_address_overlay AS overlay
-     WHERE overlay.phone_number = :phone_digits
-       AND overlay.npi IS NOT NULL
-       AND overlay.address_key IS NOT NULL
-)
-"""
-
-MIN_PROVIDER_LIST_PHONE_CANDIDATES = 100
-MAX_PROVIDER_LIST_PHONE_CANDIDATES = 500
-
-
-def _provider_list_phone_candidate_limit(
-    page_limit: int,
-    page_offset: int = 0,
-    *,
-    count_query: bool = False,
-) -> int:
-    """Bound phone candidates while retaining enough rows for paging/filtering."""
-    if count_query:
-        return MAX_PROVIDER_LIST_PHONE_CANDIDATES
-    requested_window = max(int(page_offset), 0) + max(int(page_limit), 1)
-    return min(
-        max(requested_window * 8, MIN_PROVIDER_LIST_PHONE_CANDIDATES),
-        MAX_PROVIDER_LIST_PHONE_CANDIDATES,
+    return (
+        os.getenv(ADDRESS_SERVING_SOURCE_ENV, ADDRESS_SERVING_SOURCE_UNIFIED).strip().lower()
+        == ADDRESS_SERVING_SOURCE_UNIFIED
     )
-
-
-_PHONE_CANDIDATE_ROWS_CTE = """
-phone_candidate_rows AS MATERIALIZED (
-    SELECT DISTINCT
-           COALESCE(phone_address.npi, phone_address.inferred_npi)::bigint AS provider_npi,
-           phone_address.address_key,
-           false AS provider_directory_matched,
-           NULL::varchar AS source_id,
-           NULL::varchar AS source_record_id,
-           phone_address.source_count::integer AS source_count
-      FROM {address_table_sql} AS phone_address
-     WHERE phone_address.type IN ({service_types})
-       AND phone_address.address_key IS NOT NULL
-       AND COALESCE(phone_address.npi, phone_address.inferred_npi) IS NOT NULL
-       AND {direct_phone}
-    UNION ALL
-    SELECT DISTINCT
-           overlay.npi::bigint AS provider_npi,
-           overlay.address_key,
-           true AS provider_directory_matched,
-           overlay.source_id::varchar,
-           overlay.source_record_id::varchar,
-           NULL::integer AS source_count
-      FROM matching_provider_directory_phone_rows AS overlay
-      JOIN current_provider_directory_runs AS current_run
-        ON current_run.source_id = overlay.source_id
-       AND current_run.run_id = overlay.last_seen_run_id
-      JOIN mrf.provider_directory_dataset_resource AS dataset_resource
-        ON dataset_resource.dataset_id = current_run.dataset_id
-       AND dataset_resource.resource_type = overlay.resource_type
-       AND dataset_resource.resource_id = overlay.resource_id
-)
-"""
-
-
-_RANKED_PHONE_CANDIDATE_CTES = """
-phone_candidates_unranked AS MATERIALIZED (
-    SELECT candidate.provider_npi, candidate.address_key,
-           BOOL_OR(candidate.provider_directory_matched) AS provider_directory_matched,
-           MAX(candidate.source_count) AS source_count
-      FROM phone_candidate_rows AS candidate
-  GROUP BY candidate.provider_npi, candidate.address_key
-), phone_candidate_best_addresses AS MATERIALIZED (
-    SELECT DISTINCT ON (candidate.provider_npi)
-           candidate.provider_npi, candidate.address_key,
-           candidate.provider_directory_matched, candidate.source_count
-      FROM phone_candidates_unranked AS candidate
-  ORDER BY candidate.provider_npi,
-           candidate.provider_directory_matched DESC,
-           candidate.source_count DESC NULLS LAST,
-           candidate.address_key
-), phone_candidates AS MATERIALIZED (
-    SELECT candidate.provider_npi, candidate.address_key,
-           candidate.provider_directory_matched
-      FROM phone_candidate_best_addresses AS candidate
-  ORDER BY candidate.provider_directory_matched DESC,
-           candidate.source_count DESC NULLS LAST,
-           candidate.provider_npi,
-           candidate.address_key
-     LIMIT :candidate_limit
-), phone_provider_directory_evidence AS MATERIALIZED (
-    SELECT evidence.provider_npi,
-           ARRAY_AGG(evidence.source_record_id ORDER BY evidence.source_id)
-               AS source_record_ids
-      FROM (
-            SELECT candidate.provider_npi, candidate.source_id,
-                   MIN(candidate.source_record_id) AS source_record_id
-              FROM phone_candidate_rows AS candidate
-              JOIN phone_candidates AS selected_candidate
-                ON selected_candidate.provider_npi = candidate.provider_npi
-             WHERE candidate.provider_directory_matched
-               AND candidate.source_id IS NOT NULL
-               AND candidate.source_record_id IS NOT NULL
-          GROUP BY candidate.provider_npi, candidate.source_id
-      ) AS evidence
-  GROUP BY evidence.provider_npi
-)
-"""
-
-
-def _address_phone_candidates_cte(address_table_sql: str) -> str | None:
-    """Return indexed phone candidates, including current FHIR evidence."""
-    if not _is_unified_address_table(address_table_sql):
-        return None
-    direct_phone = _address_phone_digits_filter("phone_address", address_table_sql)
-    service_types = ", ".join(f"'{location_type}'" for location_type in GEO_SERVICE_LOCATION_TYPES)
-    phone_candidate_rows_cte = _PHONE_CANDIDATE_ROWS_CTE.format(
-        address_table_sql=address_table_sql,
-        service_types=service_types,
-        direct_phone=direct_phone,
-    )
-    return ",\n".join(
-        (
-            _CURRENT_PROVIDER_DIRECTORY_PHONE_CTES.strip(),
-            phone_candidate_rows_cte.strip(),
-            _RANKED_PHONE_CANDIDATE_CTES.strip(),
-        )
-    )
-
-
-def _address_phone_candidates_join(alias: str, provider_npi_sql: str | None = None) -> str:
-    provider_npi = provider_npi_sql or f"COALESCE({alias}.npi, {alias}.inferred_npi)"
-    return f"""
-          JOIN phone_candidates AS phone_match
-            ON phone_match.provider_npi = {provider_npi}
-           AND phone_match.address_key = {alias}.address_key
-    """
 
 
 def _address_phone_candidates_lateral_from(address_table_sql: str, alias: str) -> str:
@@ -6241,59 +5503,6 @@ def _address_phone_candidates_lateral_from(address_table_sql: str, alias: str) -
     """
 
 
-def _sql_with_prefix_ctes(*ctes: str | None) -> str:
-    available_ctes = [cte.strip() for cte in ctes if cte and cte.strip()]
-    joined_ctes = ",\n".join(available_ctes)
-    return f"WITH {joined_ctes},\n" if available_ctes else "WITH "
-
-
-def _sql_with_ctes(*ctes: str | None) -> str:
-    available_ctes = [cte.strip() for cte in ctes if cte and cte.strip()]
-    joined_ctes = ",\n".join(available_ctes)
-    return f"WITH {joined_ctes}\n" if available_ctes else ""
-
-
-def _address_npi_filter(alias: str, address_table_sql: str) -> str:
-    if _is_unified_address_table(address_table_sql):
-        return f"COALESCE({alias}.npi, {alias}.inferred_npi) = :npi_filter"
-    return f"{alias}.npi = :npi_filter"
-
-
-def _address_site_key_filter(alias: str, address_table_sql: str) -> str:
-    if _is_unified_address_table(address_table_sql):
-        return f"{alias}.premise_key = CAST(:address_site_key AS uuid)"
-    return "1=0"
-
-
-def _provider_list_address_type_clause(
-    alias: str,
-    address_table_sql: str,
-    *,
-    include_service_locations: bool,
-) -> str:
-    if include_service_locations and _is_unified_address_table(address_table_sql):
-        type_list = ", ".join(f"'{value}'" for value in GEO_SERVICE_LOCATION_TYPES)
-        return f"{alias}.type IN ({type_list})"
-    return f"{alias}.type = 'primary'"
-
-
-def _primary_address_order_clause(alias: str, address_table_sql: str) -> str:
-    common = (
-        f"{alias}.npi, "
-        f"({alias}.lat IS NULL OR {alias}.long IS NULL), "
-        f"(NULLIF(TRIM(COALESCE({alias}.first_line, '')), '') IS NULL), "
-    )
-    if _is_unified_address_table(address_table_sql):
-        return (
-            common
-            + f"(COALESCE({alias}.address_precision, '') = 'city_zip'), "
-            + f"{alias}.source_count DESC NULLS LAST, "
-            + f"{alias}.updated_at DESC NULLS LAST, "
-            + f"{alias}.location_key"
-        )
-    return common + f"{alias}.date_added DESC NULLS LAST, {alias}.checksum"
-
-
 def _public_address_column_keys() -> set[str]:
     return _model_table_columns(NPIAddress) - PUBLIC_ADDRESS_EXCLUDED_COLUMNS
 
@@ -6303,6 +5512,8 @@ def _public_address_serving_column_keys() -> set[str]:
 
 
 async def _address_serving_model(required_columns: set[str] | None = None, *, session: Any = None):
+    if current_network_address_scope() is not None:
+        return EntityAddressUnified
     if not _is_unified_address_serving_requested():
         return NPIAddress
     required_columns_set = set(required_columns or ())
@@ -6362,7 +5573,7 @@ async def _provider_enrichment_rows_for_columns(
     query = text(
         f"""
         SELECT
-            {', '.join(select_columns)}
+            {", ".join(select_columns)}
           FROM {summary_table}
          WHERE npi = ANY(:npis)
         """
@@ -6386,6 +5597,8 @@ async def _fetch_provider_enrichment_summary_rows(
             _model_table_columns(ProviderEnrichmentSummary),
             session=session,
         )
+    except sanic.exceptions.ServiceUnavailable:
+        raise
     except Exception:
         available_columns = await _table_columns(
             ProviderEnrichmentSummary.__tablename__,
@@ -6422,11 +5635,7 @@ def _provider_enrichment_summary_from_row(summary_row: Sequence[Any]) -> dict[st
         "ffs_practice_zip_codes": list(summary_row[20] or []),
         "ffs_practice_cities": list(summary_row[21] or []),
         "ffs_practice_states": list(summary_row[22] or []),
-        "ffs_related_npis": [
-            int(related_npi)
-            for related_npi in (summary_row[23] or [])
-            if related_npi is not None
-        ],
+        "ffs_related_npis": [int(related_npi) for related_npi in (summary_row[23] or []) if related_npi is not None],
         "ffs_related_npi_count": int(summary_row[24] or 0),
         "ffs_reassignment_in_count": int(summary_row[25] or 0),
         "ffs_reassignment_out_count": int(summary_row[26] or 0),
@@ -6480,9 +5689,7 @@ def _visible_ffs_rows_by_npi(
 ) -> dict[int, list[dict[str, Any]]]:
     visible_rows_by_npi: dict[int, list[dict[str, Any]]] = {}
     for npi_value, summary in summary_map.items():
-        visible_rows, chain_rows = _partition_ffs_enrollment_payloads(
-            ffs_rows_by_npi.get(npi_value, [])
-        )
+        visible_rows, chain_rows = _partition_ffs_enrollment_payloads(ffs_rows_by_npi.get(npi_value, []))
         summary["ffs_chain_hidden"] = bool(chain_rows) and not include_chain
         summary["ffs_chain_enrollment_count"] = len(chain_rows)
         summary["ffs_chain_enrollment_ids"] = _unique_non_empty(
@@ -6497,9 +5704,7 @@ def _default_ffs_summary_override(
     visible_rows: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     return {
-        "ffs_enrollment_ids": _unique_non_empty(
-            [enrollment.get("enrollment_id") for enrollment in visible_rows]
-        ),
+        "ffs_enrollment_ids": _unique_non_empty([enrollment.get("enrollment_id") for enrollment in visible_rows]),
         "ffs_pecos_asct_cntl_ids": _unique_non_empty(
             [enrollment.get("pecos_asct_cntl_id") for enrollment in visible_rows]
         ),
@@ -6562,8 +5767,7 @@ async def _fetch_provider_enrichment_summary_map(
         session=session,
     )
     summary_map = {
-        int(summary_row[0]): _provider_enrichment_summary_from_row(summary_row)
-        for summary_row in summary_rows
+        int(summary_row[0]): _provider_enrichment_summary_from_row(summary_row) for summary_row in summary_rows
     }
     if not summary_map or not await _is_table_available(
         ProviderEnrollmentFFS.__tablename__,
@@ -6664,9 +5868,7 @@ async def _fetch_provider_enrichment_detail(
 
     summary_map = await _fetch_provider_enrichment_summary_map([npi], include_chain=include_chain, session=session)
     summary = summary_map.get(int(npi))
-    enrichment_detail_map["summary"] = _public_provider_enrichment_summary(
-        summary
-    )
+    enrichment_detail_map["summary"] = _public_provider_enrichment_summary(summary)
     enrichment_detail_map["ffs_visibility"] = _provider_enrichment_visibility(
         summary,
         include_chain=include_chain,
@@ -6703,28 +5905,18 @@ async def _fetch_provider_enrichment_detail(
             .limit(25)
         )
         enrollment_query_result = await _execute_stmt(stmt, session=session)
-        enrollment_rows = [
-            enrollment_record.to_json_dict()
-            for enrollment_record in enrollment_query_result.scalars()
-        ]
+        enrollment_rows = [enrollment_record.to_json_dict() for enrollment_record in enrollment_query_result.scalars()]
         if key == "ffs_public":
-            visible_rows, chain_rows = _partition_ffs_enrollment_payloads(
-                enrollment_rows
-            )
+            visible_rows, chain_rows = _partition_ffs_enrollment_payloads(enrollment_rows)
             enrichment_detail_map["ffs_visibility"] = {
                 "show_mode": "chain" if include_chain else "default",
                 "chain_hidden": bool(chain_rows) and not include_chain,
                 "chain_enrollment_count": len(chain_rows),
                 "chain_enrollment_ids": _unique_non_empty(
-                    [
-                        enrollment_record.get("enrollment_id")
-                        for enrollment_record in chain_rows
-                    ]
+                    [enrollment_record.get("enrollment_id") for enrollment_record in chain_rows]
                 ),
             }
-            enrichment_detail_map["enrollments"][key] = (
-                enrollment_rows if include_chain else visible_rows
-            )
+            enrichment_detail_map["enrollments"][key] = enrollment_rows if include_chain else visible_rows
         else:
             enrichment_detail_map["enrollments"][key] = enrollment_rows
 
@@ -6752,8 +5944,7 @@ async def _fetch_provider_enrichment_detail(
         )
         enrollment_query_result = await _execute_stmt(stmt, session=session)
         enrichment_detail_map["ffs_subfiles"]["additional_npis"] = [
-            enrollment_record.to_json_dict()
-            for enrollment_record in enrollment_query_result.scalars()
+            enrollment_record.to_json_dict() for enrollment_record in enrollment_query_result.scalars()
         ]
 
     if await _is_table_available(ProviderEnrollmentFFSAddress.__tablename__, session=session):
@@ -6770,8 +5961,7 @@ async def _fetch_provider_enrichment_detail(
         )
         enrollment_query_result = await _execute_stmt(stmt, session=session)
         enrichment_detail_map["ffs_subfiles"]["practice_locations"] = [
-            enrollment_record.to_json_dict()
-            for enrollment_record in enrollment_query_result.scalars()
+            enrollment_record.to_json_dict() for enrollment_record in enrollment_query_result.scalars()
         ]
 
     if await _is_table_available(ProviderEnrollmentFFSSecondarySpecialty.__tablename__, session=session):
@@ -6786,8 +5976,7 @@ async def _fetch_provider_enrichment_detail(
         )
         enrollment_query_result = await _execute_stmt(stmt, session=session)
         enrichment_detail_map["ffs_subfiles"]["secondary_specialties"] = [
-            enrollment_record.to_json_dict()
-            for enrollment_record in enrollment_query_result.scalars()
+            enrollment_record.to_json_dict() for enrollment_record in enrollment_query_result.scalars()
         ]
 
     if await _is_table_available(ProviderEnrollmentFFSReassignment.__tablename__, session=session):
@@ -6841,8 +6030,7 @@ async def _fetch_provider_enrichment_detail(
             params={"enrollment_ids": enrollment_ids},
         )
         enrichment_detail_map["ffs_subfiles"]["reassignments_out"] = [
-            _serialize_ffs_reassignment_row(reassignment_row)
-            for reassignment_row in out_rows.mappings().all()
+            _serialize_ffs_reassignment_row(reassignment_row) for reassignment_row in out_rows.mappings().all()
         ]
 
         in_rows = await _execute_stmt(
@@ -6895,8 +6083,7 @@ async def _fetch_provider_enrichment_detail(
             params={"enrollment_ids": enrollment_ids},
         )
         enrichment_detail_map["ffs_subfiles"]["reassignments_in"] = [
-            _serialize_ffs_reassignment_row(reassignment_row)
-            for reassignment_row in in_rows.mappings().all()
+            _serialize_ffs_reassignment_row(reassignment_row) for reassignment_row in in_rows.mappings().all()
         ]
 
     return enrichment_detail_map
@@ -6916,18 +6103,24 @@ async def _resolve_filter_year(
     if env_raw:
         return _parse_optional_year(env_raw, "HLTHPRT_NPI_FILTER_DEFAULT_YEAR"), "env"
 
-    sources: list[str] = []
+    year_queries: list[str] = []
     if include_procedures and await _is_table_available("pricing_provider_procedure", session=session):
-        sources.append("SELECT MAX(year)::INTEGER AS y FROM mrf.pricing_provider_procedure")
+        relation = "mrf.pricing_provider_procedure"
+        if has_network_read_inventory(session):
+            relation = direct_heap_relation_sql(session, "mrf", "pricing_provider_procedure")
+        year_queries.append(f"SELECT MAX(year)::INTEGER AS y FROM {relation}")
     if include_medications and await _is_table_available("pricing_provider_prescription", session=session):
-        sources.append("SELECT MAX(year)::INTEGER AS y FROM mrf.pricing_provider_prescription")
-    if not sources:
+        relation = "mrf.pricing_provider_prescription"
+        if has_network_read_inventory(session):
+            relation = direct_heap_relation_sql(session, "mrf", "pricing_provider_prescription")
+        year_queries.append(f"SELECT MAX(year)::INTEGER AS y FROM {relation}")
+    if not year_queries:
         return None, "none"
 
-    sql = "SELECT MAX(y) FROM (" + " UNION ALL ".join(sources) + ") AS years;"
-    result = await _execute_stmt(text(sql), session=session)
-    rows = result.all()
-    year = rows[0][0] if rows and rows[0] else None
+    sql = "SELECT MAX(y) FROM (" + " UNION ALL ".join(year_queries) + ") AS years;"
+    year_result = await _execute_stmt(text(sql), session=session)
+    year_rows = year_result.all()
+    year = year_rows[0][0] if year_rows and year_rows[0] else None
     return (int(year), "data") if year is not None else (None, "none")
 
 
@@ -6948,21 +6141,9 @@ async def _resolve_internal_filter_codes(
     if not await _is_table_available("code_crosswalk", session=session):
         return [], "none"
 
-    sql = text(
-        """
-        SELECT DISTINCT to_code
-          FROM mrf.code_crosswalk
-         WHERE UPPER(from_system) = :from_system
-           AND UPPER(from_code) = ANY(:input_codes)
-           AND UPPER(to_system) = :target_system
-        UNION
-        SELECT DISTINCT from_code
-          FROM mrf.code_crosswalk
-        WHERE UPPER(to_system) = :from_system
-           AND UPPER(to_code) = ANY(:input_codes)
-           AND UPPER(from_system) = :target_system
-        """
-    )
+    from api.reference_family_reads import claims_filter_crosswalk_query
+
+    sql = claims_filter_crosswalk_query(session)
     crosswalk_query_result = await _execute_stmt(
         sql,
         session=session,
@@ -6974,13 +6155,9 @@ async def _resolve_internal_filter_codes(
     )
     crosswalk_rows = crosswalk_query_result.all()
     mapped_codes = [
-        str(crosswalk_row[0])
-        for crosswalk_row in crosswalk_rows
-        if crosswalk_row and crosswalk_row[0] is not None
+        str(crosswalk_row[0]) for crosswalk_row in crosswalk_rows if crosswalk_row and crosswalk_row[0] is not None
     ]
-    return _to_int_codes(mapped_codes, param_name), (
-        "crosswalk" if mapped_codes else "none"
-    )
+    return _to_int_codes(mapped_codes, param_name), ("crosswalk" if mapped_codes else "none")
 
 
 def _build_npi_where_clause(
@@ -6994,9 +6171,7 @@ def _build_npi_where_clause(
     prefix = alias
     if prefix and not prefix.endswith("."):
         prefix = f"{prefix}."
-    name_clause, name_parameters = (
-        _names_like_filter_clause(alias, names_like) if names_like else ("", {})
-    )
+    name_clause, name_parameters = _names_like_filter_clause(alias, names_like) if names_like else ("", {})
     return _build_provider_name_where(
         prefix=prefix,
         name_clause=name_clause,
@@ -7009,36 +6184,6 @@ def _build_npi_where_clause(
     )
 
 
-def _extract_name_filters(request) -> list[str]:
-    args = getattr(request, "args", {}) or {}
-    names: list[str] = []
-    if hasattr(args, "getlist"):
-        names.extend(args.getlist("name_like"))
-    elif hasattr(args, "getall"):
-        try:
-            names.extend(args.getall("name_like"))
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("failed to read name_like filters with getall: %s", exc)
-    else:
-        maybe = args.get("name_like")
-        if maybe:
-            names.append(maybe)
-    single = args.get("name_like")
-    if single:
-        names.append(single)
-    normalized_names = []
-    seen_names = set()
-    for name in names:
-        if not name:
-            continue
-        lower = str(name).lower()
-        if lower in seen_names:
-            continue
-        seen_names.add(lower)
-        normalized_names.append(lower)
-    return normalized_names
-
-
 async def _compute_npi_counts():
     async def get_npi_count():
         """Count imported NPI identity rows."""
@@ -7048,15 +6193,15 @@ async def _compute_npi_counts():
         """Count imported NPI address identity rows."""
         return await db.scalar(select(func.count(tuple_(NPIAddress.npi, NPIAddress.checksum, NPIAddress.type))))
 
-    return await asyncio.gather(get_npi_count(), get_npi_address_count())
+    return await gather_reader_calls(db, get_npi_count(), get_npi_address_count())
 
 
-def _validate_section_filters(section: Optional[str], classification: Optional[str], codes: Optional[list[str]]) -> None:
+def _validate_section_filters(
+    section: Optional[str], classification: Optional[str], codes: Optional[list[str]]
+) -> None:
     """Disallow section-only lookups; they fan out to all NUCC codes and are not meaningful."""
     if section and not classification and not codes:
-        raise sanic.exceptions.InvalidUsage(
-            "section requires classification or codes"
-        )
+        raise sanic.exceptions.InvalidUsage("section requires classification or codes")
 
 
 @blueprint.get("/")
@@ -7206,7 +6351,7 @@ async def pharmacists_per_pharmacy(request):
         WITH target_npi AS (
             SELECT npi
               FROM mrf.npi AS d
-             WHERE {'1=1' if not name_clause else name_clause}
+             WHERE {"1=1" if not name_clause else name_clause}
         ),
         pharmacy_taxonomy AS (
             SELECT ARRAY_AGG(int_code) AS codes
@@ -7306,8 +6451,7 @@ async def pharmacists_per_pharmacy(request):
         histogram_rows = await conn.all(histogram_sql, **query_param_map)
         detail_rows = await conn.all(detail_sql, **query_param_map) if is_detailed else []
     histogram_entries = [
-        {"pharmacist_group": histogram_row[0], "pharmacy_count": histogram_row[1]}
-        for histogram_row in histogram_rows
+        {"pharmacist_group": histogram_row[0], "pharmacy_count": histogram_row[1]} for histogram_row in histogram_rows
     ]
     detail_entries = [
         {
@@ -7337,9 +6481,7 @@ def _normalize_match_candidate_float(
     except (TypeError, ValueError) as exc:
         raise sanic.exceptions.InvalidUsage(f"{param_name} must be a number") from exc
     if not math.isfinite(parsed) or parsed < minimum or parsed > maximum:
-        raise sanic.exceptions.InvalidUsage(
-            f"{param_name} must be between {minimum:g} and {maximum:g}"
-        )
+        raise sanic.exceptions.InvalidUsage(f"{param_name} must be between {minimum:g} and {maximum:g}")
     return parsed
 
 
@@ -7351,9 +6493,7 @@ def _normalize_match_candidate_limit(raw_value: Any) -> int:
     except (TypeError, ValueError) as exc:
         raise sanic.exceptions.InvalidUsage("limit must be an integer") from exc
     if parsed < 1 or parsed > _MATCH_CANDIDATES_MAX_LIMIT:
-        raise sanic.exceptions.InvalidUsage(
-            f"limit must be between 1 and {_MATCH_CANDIDATES_MAX_LIMIT}"
-        )
+        raise sanic.exceptions.InvalidUsage(f"limit must be between 1 and {_MATCH_CANDIDATES_MAX_LIMIT}")
     return parsed
 
 
@@ -7386,9 +6526,7 @@ def _normalize_match_candidate_entity_type(raw_code: Any, raw_kind: Any) -> Opti
                 "entity_type_code must be either 1 (individual) or 2 (organization)"
             ) from exc
         if entity_type_code not in (1, 2):
-            raise sanic.exceptions.InvalidUsage(
-                "entity_type_code must be either 1 (individual) or 2 (organization)"
-            )
+            raise sanic.exceptions.InvalidUsage("entity_type_code must be either 1 (individual) or 2 (organization)")
     kind_code = _normalize_match_candidate_entity_kind(raw_kind)
     if entity_type_code is not None and kind_code is not None and entity_type_code != kind_code:
         raise sanic.exceptions.InvalidUsage("entity_kind and entity_type_code disagree")
@@ -7412,9 +6550,7 @@ def _taxonomy_scope_tokens(raw_value: Any) -> tuple[tuple[str, ...], tuple[str, 
         is_prefix = item.endswith("*")
         token = item[:-1] if is_prefix else item
         if not re.fullmatch(r"[A-Z0-9]{2,16}", token):
-            raise sanic.exceptions.InvalidUsage(
-                "taxonomy_scope must contain NUCC codes or prefixes like 261Q*"
-            )
+            raise sanic.exceptions.InvalidUsage("taxonomy_scope must contain NUCC codes or prefixes like 261Q*")
         dedupe_key = f"{token}*" if is_prefix else token
         if dedupe_key in seen_tokens:
             continue
@@ -7431,9 +6567,7 @@ async def _normalize_match_candidate_params(request) -> dict[str, Any]:
     args = request.args
     unknown_params = sorted(set(args.keys()) - MATCH_CANDIDATE_QUERY_PARAMS)
     if unknown_params:
-        raise sanic.exceptions.InvalidUsage(
-            f"unknown query parameter(s): {', '.join(unknown_params)}"
-        )
+        raise sanic.exceptions.InvalidUsage(f"unknown query parameter(s): {', '.join(unknown_params)}")
 
     args.get("address_site_key")
     args.get("address_key")
@@ -7530,9 +6664,7 @@ async def _normalize_match_candidate_params(request) -> dict[str, Any]:
             suggestion_note = ""
             if specialty_filter.suggested_specialties:
                 suggestion_note = f" Suggestions: {', '.join(specialty_filter.suggested_specialties)}."
-            raise sanic.exceptions.InvalidUsage(
-                f"Unrecognized provider_type: {provider_type}.{suggestion_note}"
-            )
+            raise sanic.exceptions.InvalidUsage(f"Unrecognized provider_type: {provider_type}.{suggestion_note}")
 
     return {
         "address_site_key": address_site_key,
@@ -7685,7 +6817,7 @@ def _match_candidate_taxonomy_filter_sql(
          LEFT JOIN {nucc_table_sql} AS nu
                 ON nu.code = t.healthcare_provider_taxonomy_code
              WHERE t.npi = {npi_sql}
-               AND ({' OR '.join(taxonomy_conditions)})
+               AND ({" OR ".join(taxonomy_conditions)})
         )
     """
 
@@ -7736,7 +6868,11 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
     address_from_sql = f"FROM {address_table_sql} AS a"
     phone_provider_directory_match = "false"
     phone_source_record_ids = "ARRAY[]::varchar[]"
-    if selected_locator_name == "phone" and _is_unified_address_table(address_table_sql):
+    if (
+        selected_locator_name == "phone"
+        and _is_unified_address_table(address_table_sql)
+        and not is_scoped_address_relation(address_table_sql)
+    ):
         phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
         bound_parameter_map["candidate_limit"] = min(
             max(int(params["limit"]) * 8, 20),
@@ -7747,9 +6883,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
             "a",
         )
         phone_provider_directory_match = "phone_match.provider_directory_matched"
-        phone_source_record_ids = (
-            "COALESCE(phone_evidence.source_record_ids, ARRAY[]::varchar[])"
-        )
+        phone_source_record_ids = "COALESCE(phone_evidence.source_record_ids, ARRAY[]::varchar[])"
         selected_locator = "true"
     geo_distance_expr = _match_geo_distance_expr(params)
     geo_locator_predicates: list[str] = []
@@ -7797,7 +6931,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
             EXISTS (
                 SELECT 1
                   FROM {npi_table_sql} AS nf
-                 WHERE nf.npi = {columns['provider_npi']}
+                 WHERE nf.npi = {columns["provider_npi"]}
                    AND nf.entity_type_code = :entity_type_code
             )
             """
@@ -7832,22 +6966,18 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
         else "false"
     )
     geo_source_count_order = (
-        ""
-        if params.get("lat") is not None and params.get("long") is not None
-        else "source_count DESC NULLS LAST,"
+        "" if params.get("lat") is not None and params.get("long") is not None else "source_count DESC NULLS LAST,"
     )
     filtered_geo_source_count_order = (
-        ""
-        if params.get("lat") is not None and params.get("long") is not None
-        else "f.source_count DESC NULLS LAST,"
+        "" if params.get("lat") is not None and params.get("long") is not None else "f.source_count DESC NULLS LAST,"
     )
     taxonomy_table_sql = _schema_cache_key(NPIDataTaxonomy.__tablename__)
     nucc_table_sql = _schema_cache_key(NUCCTaxonomy.__tablename__)
     query = text(
         f"""
         {_sql_with_prefix_ctes(phone_candidates_cte)}candidate_locations AS (
-            SELECT DISTINCT ON ({columns['provider_npi']})
-                   {columns['provider_npi']}::bigint AS npi,
+            SELECT DISTINCT ON ({columns["provider_npi"]})
+                   {columns["provider_npi"]}::bigint AS npi,
                    a.type AS address_type,
                    a.first_line,
                    a.second_line,
@@ -7860,17 +6990,17 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
                    a.lat::double precision AS lat,
                    a.long::double precision AS long,
                    a.address_key::text AS address_key,
-                   {columns['premise_key']} AS address_site_key,
-                   {columns['address_precision']} AS address_precision,
-                   {columns['address_sources']} AS address_sources,
-                   {columns['source_record_ids']} AS source_record_ids,
+                   {columns["premise_key"]} AS address_site_key,
+                   {columns["address_precision"]} AS address_precision,
+                   {columns["address_sources"]} AS address_sources,
+                   {columns["source_record_ids"]} AS source_record_ids,
                    {phone_source_record_ids} AS phone_source_record_ids,
-                   {columns['source_count']}::integer AS source_count,
-                   {columns['independent_source_count']}::integer AS independent_source_count,
-                   {columns['multi_source_confirmed']}::boolean AS multi_source_confirmed,
-                   {columns['entity_name']} AS entity_name,
-                   {columns['location_key']} AS location_key,
-                   {columns['updated_at']} AS address_updated_at,
+                   {columns["source_count"]}::integer AS source_count,
+                   {columns["independent_source_count"]}::integer AS independent_source_count,
+                   {columns["multi_source_confirmed"]}::boolean AS multi_source_confirmed,
+                   {columns["entity_name"]} AS entity_name,
+                   {columns["location_key"]} AS location_key,
+                   {columns["updated_at"]} AS address_updated_at,
                    ({address_site_match})::boolean AS address_site_key_matched,
                    ({address_key_match})::boolean AS address_key_matched,
                    ({phone_match})::boolean AS phone_matched,
@@ -7878,8 +7008,8 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
                        AS phone_provider_directory_matched,
                    ({geo_distance_expr}) AS geo_distance_miles
               {address_from_sql}
-             WHERE {' AND '.join(address_predicates)}
-          ORDER BY {columns['provider_npi']},
+             WHERE {" AND ".join(address_predicates)}
+          ORDER BY {columns["provider_npi"]},
                    address_site_key_matched DESC,
                    address_key_matched DESC,
                    phone_matched DESC,
@@ -7956,10 +7086,8 @@ async def _fetch_match_candidate_rows(params: dict[str, Any], *, session: Any = 
     address_table_sql = await _address_serving_table_sql(required_columns, session=session)
     query, query_params = _match_candidate_query(params, address_table_sql)
     try:
-        candidate_query_result = await asyncio.wait_for(
-            _execute_match_candidate_query(query, query_params, session),
-            timeout=max(0.1, _MATCH_CANDIDATES_TIMEOUT_SECONDS),
-        )
+        async with asyncio.timeout(max(0.1, _MATCH_CANDIDATES_TIMEOUT_SECONDS)):
+            candidate_query_result = await _execute_match_candidate_query(query, query_params, session)
     except asyncio.TimeoutError:
         await _rollback_match_candidate_session(session)
         raise
@@ -8234,9 +7362,7 @@ def _rank_match_candidate_outputs(
     )
     return [
         candidate
-        for candidate, _phone_provider_directory_matched in ranked_candidates[
-            : int(candidate_params["limit"])
-        ]
+        for candidate, _phone_provider_directory_matched in ranked_candidates[: int(candidate_params["limit"])]
     ]
 
 
@@ -8283,9 +7409,7 @@ def _match_candidate_source_flags(
     public_provider_map: Mapping[str, Any],
     enrichment: Mapping[str, Any] | None,
 ) -> tuple[list[Any], list[Any], bool, Any, bool]:
-    fhir_sources = _json_array_value(
-        public_provider_map.get(PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY)
-    )
+    fhir_sources = _json_array_value(public_provider_map.get(PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY))
     address_sources = _json_array_value(provider_row.get("address_sources"))
     fhir_matched = bool(fhir_sources) or "provider_directory_fhir" in address_sources
     fhir_source_count = provider_row.get("provider_directory_source_count")
@@ -8324,11 +7448,7 @@ def _match_candidate_address_map(provider_row: Mapping[str, Any]) -> dict[str, A
         "address_key": provider_row.get("address_key"),
         "address_site_key": provider_row.get("address_site_key"),
     }
-    return {
-        key: field_value
-        for key, field_value in address_map.items()
-        if field_value not in (None, "", [])
-    }
+    return {key: field_value for key, field_value in address_map.items() if field_value not in (None, "", [])}
 
 
 def _match_candidate_source_map(
@@ -8346,12 +7466,8 @@ def _match_candidate_source_map(
         },
         "ffs": {
             "matched": ffs_matched,
-            "has_ffs_enrollment": bool(
-                enrichment and enrichment.get("has_ffs_enrollment")
-            ),
-            "has_medicare_claims": bool(
-                enrichment and enrichment.get("has_medicare_claims")
-            ),
+            "has_ffs_enrollment": bool(enrichment and enrichment.get("has_ffs_enrollment")),
+            "has_medicare_claims": bool(enrichment and enrichment.get("has_medicare_claims")),
         },
     }
 
@@ -8366,9 +7482,7 @@ def _match_candidate_evidence_map(
         "source_record_ids": _json_array_value(provider_row.get("source_record_ids")),
         "address_sources": list(address_sources),
     }
-    phone_source_record_ids = _json_array_value(
-        provider_row.get("phone_source_record_ids")
-    )
+    phone_source_record_ids = _json_array_value(provider_row.get("phone_source_record_ids"))
     if phone_source_record_ids:
         evidence_map["phone_source_record_ids"] = phone_source_record_ids
     return evidence_map
@@ -8411,9 +7525,7 @@ def _include_match_candidate_source_details(
     mrf_sources = _json_array_value(public_provider_map.get(MRF_SOURCE_DETAIL_KEY))
     if not mrf_sources:
         return
-    mrf_source_count = int(
-        public_provider_map.get(MRF_SOURCE_COUNT_KEY) or len(mrf_sources)
-    )
+    mrf_source_count = int(public_provider_map.get(MRF_SOURCE_COUNT_KEY) or len(mrf_sources))
     candidate_map[MRF_SOURCE_DETAIL_KEY] = mrf_sources
     candidate_map[MRF_SOURCE_COUNT_KEY] = mrf_source_count
     candidate_map["sources"]["mrf"] = {
@@ -8431,8 +7543,8 @@ def _match_candidate_output(
     public_provider_map = dict(provider_row)
     _redact_internal_address_fields(public_provider_map)
     taxonomy_list = _json_array_value(provider_row.get("taxonomy_list"))
-    fhir_sources, address_sources, fhir_matched, fhir_source_count, ffs_matched = (
-        _match_candidate_source_flags(provider_row, public_provider_map, enrichment)
+    fhir_sources, address_sources, fhir_matched, fhir_source_count, ffs_matched = _match_candidate_source_flags(
+        provider_row, public_provider_map, enrichment
     )
     is_taxonomy_matched = _is_provider_type_filter_matched(provider_row, params)
     is_provider_type_matched = _is_provider_type_taxonomy_matched(provider_row, params)
@@ -8476,11 +7588,7 @@ def _match_candidate_output(
             enrichment,
             address_sources,
         )
-    return {
-        key: field_value
-        for key, field_value in candidate_map.items()
-        if field_value is not None
-    }
+    return {key: field_value for key, field_value in candidate_map.items() if field_value is not None}
 
 
 async def _attach_match_candidate_source_details(
@@ -8530,16 +7638,12 @@ def _replace_stale_geo_provider_directory_evidence(
         candidate_row.pop(PROVIDER_DIRECTORY_SOURCE_DETAIL_KEY, None)
         candidate_row["source_record_ids"] = [
             record_id
-            for record_id in _merge_unique_list_values(
-                None, candidate_row.get("source_record_ids")
-            )
+            for record_id in _merge_unique_list_values(None, candidate_row.get("source_record_ids"))
             if not str(record_id).startswith("provider_directory_fhir:")
         ]
         candidate_row["address_sources"] = [
             address_source
-            for address_source in _merge_unique_list_values(
-                None, candidate_row.get("address_sources")
-            )
+            for address_source in _merge_unique_list_values(None, candidate_row.get("address_sources"))
             if str(address_source).strip().lower() != "provider_directory_fhir"
         ]
         _sync_match_candidate_source_counts(candidate_row)
@@ -8572,9 +7676,7 @@ async def _attach_geo_candidate_record_ids(
         session=database_session,
         params={
             "candidate_npis": [npi for npi, _address_key in candidate_pairs],
-            "candidate_address_keys": [
-                address_key for _npi, address_key in candidate_pairs
-            ],
+            "candidate_address_keys": [address_key for _npi, address_key in candidate_pairs],
         },
     )
     evidence_by_candidate = {
@@ -8601,9 +7703,7 @@ async def _attach_geo_candidate_record_ids(
                 "provider_directory_fhir",
             )
             _sync_match_candidate_source_counts(candidate_row)
-            candidate_row[
-                "provider_directory_source_count"
-            ] = provider_directory_source_count
+            candidate_row["provider_directory_source_count"] = provider_directory_source_count
 
 
 async def _run_match_candidate_stage_bounded(
@@ -8615,19 +7715,17 @@ async def _run_match_candidate_stage_bounded(
 ) -> Any:
     """Run one endpoint stage within the shared remaining query budget."""
     try:
-        remaining_seconds = _MATCH_CANDIDATES_TIMEOUT_SECONDS - (
-            time.monotonic() - started_at
-        )
+        remaining_seconds = _MATCH_CANDIDATES_TIMEOUT_SECONDS - (time.monotonic() - started_at)
         if remaining_seconds <= 0:
             raise asyncio.TimeoutError()
-        return await asyncio.wait_for(operation(), timeout=remaining_seconds)
+        async with asyncio.timeout(remaining_seconds):
+            return await operation()
     except asyncio.CancelledError:
         raise
     except asyncio.TimeoutError as exc:
         await _rollback_match_candidate_session(database_session)
         raise sanic.exceptions.ServiceUnavailable(
-            f"match candidate {stage_name} exceeded the "
-            f"{_MATCH_CANDIDATES_TIMEOUT_SECONDS:g} second endpoint budget"
+            f"match candidate {stage_name} exceeded the {_MATCH_CANDIDATES_TIMEOUT_SECONDS:g} second endpoint budget"
         ) from exc
     except Exception as exc:
         await _rollback_match_candidate_session(database_session)
@@ -8636,9 +7734,7 @@ async def _run_match_candidate_stage_bounded(
             stage_name,
             type(exc).__name__,
         )
-        raise sanic.exceptions.ServiceUnavailable(
-            f"match candidate {stage_name} is temporarily unavailable"
-        ) from exc
+        raise sanic.exceptions.ServiceUnavailable(f"match candidate {stage_name} is temporarily unavailable") from exc
 
 
 async def _attach_candidate_sources_bounded(
@@ -8775,7 +7871,7 @@ def _new_provider_from_search_mapping(
         if column.key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS and column.key in row_mapping:
             provider_by_field[column.key] = row_mapping.get(column.key)
     _attach_public_address_site_key(provider_by_field, row_mapping)
-    if address_table_sql.endswith(".entity_address_unified"):
+    if _is_unified_address_table(address_table_sql):
         for key in PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS:
             if key in row_mapping and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
                 provider_by_field[key] = row_mapping.get(key)
@@ -8795,9 +7891,7 @@ def _merge_search_provider_mapping(
 ) -> None:
     """Merge one list-search address and its unique taxonomies."""
 
-    provider_by_field.setdefault("_address_candidates", []).append(
-        address_candidate
-    )
+    provider_by_field.setdefault("_address_candidates", []).append(address_candidate)
     provider_by_field["_address_total"] = max(
         int(provider_by_field.get("_address_total") or 0),
         int(row_mapping.get("provider_address_total") or 0),
@@ -8809,8 +7903,7 @@ def _merge_search_provider_mapping(
         taxonomy_by_field = {
             column.key: row_mapping.get(column.key)
             for column in NPIDataTaxonomy.__table__.columns
-            if column.key not in ("npi", "checksum")
-            and column.key in row_mapping
+            if column.key not in ("npi", "checksum") and column.key in row_mapping
         }
         taxonomy_payloads = [taxonomy_by_field] if taxonomy_by_field else []
     for taxonomy_by_field in taxonomy_payloads:
@@ -8823,11 +7916,7 @@ def _append_unique_search_taxonomy(
 ) -> None:
     """Append one public taxonomy after null-normalized deduplication."""
 
-    taxonomy_by_field = {
-        key: field_value
-        for key, field_value in taxonomy_by_field.items()
-        if field_value is not None
-    }
+    taxonomy_by_field = {key: field_value for key, field_value in taxonomy_by_field.items() if field_value is not None}
     if not taxonomy_by_field:
         return
     taxonomy_identity_parts = tuple(
@@ -8839,9 +7928,7 @@ def _append_unique_search_taxonomy(
             for key, field_value in taxonomy_by_field.items()
         )
     )
-    taxonomy_identities = provider_by_field.setdefault(
-        "_taxonomy_identities", set()
-    )
+    taxonomy_identities = provider_by_field.setdefault("_taxonomy_identities", set())
     if taxonomy_identity_parts in taxonomy_identities:
         return
     taxonomy_identities.add(taxonomy_identity_parts)
@@ -8849,53 +7936,111 @@ def _append_unique_search_taxonomy(
 
 
 @blueprint.get("/all")
-async def list_providers(request):
+@canonical_network_read
+async def list_providers(
+    request, *, native_args=None, import_context=None, native_npis=None, native_scope_preparer=None
+):
     """Search, count, or page through public NPI provider records."""
-    is_count_only = str(request.args.get("count_only", "0")).strip() == "1"
-    include_chain_enrichment = _include_chain_provider_enrichment(request.args.get("show"))
-    response_format = request.args.get("format") or request.args.get("response_format")
+    if (
+        (native_args is None) != (import_context is None)
+        and native_npis is None
+        and (native_args is None or current_network_address_scope() is None)
+    ):
+        raise sanic.exceptions.InvalidUsage("custom-import provider arguments are invalid")
+    if import_context is not None and type(import_context) is not ProviderImportQuery:
+        raise sanic.exceptions.InvalidUsage("custom-import provider context is invalid")
+    if native_scope_preparer is not None and import_context is None:
+        raise sanic.exceptions.InvalidUsage("custom-import provider scope is invalid")
+    native_npis = None if native_npis is None else tuple(_normalize_npi_batch_npis(list(native_npis)))
+    args = request.args if native_args is None else native_args
+    is_count_only = str(args.get("count_only", "0")).strip() == "1"
+    include_chain_enrichment = _include_chain_provider_enrichment(args.get("show"))
+    response_format = args.get("format") or args.get("response_format")
     response_format = str(response_format).strip().lower() if response_format else None
     request_session = _request_session(request)
-    legacy_name_like = _extract_name_filters(request)
+    is_ordinary_provider_query = (
+        native_args is None
+        and import_context is None
+        and native_npis is None
+        and native_scope_preparer is None
+        and current_network_address_scope() is None
+    )
+    legacy_name_like = _extract_name_filters(request, args=args)
     # Explicit access for route collectors / OpenAPI parity.
+    # Imported calls use ``native_args`` but must retain the real request object.
+    request.args.get("count_only")
+    request.args.get("show")
+    request.args.get("format")
+    request.args.get("response_format")
     request.args.get("q")
     request.args.get("name_like")
+    request.args.get("page")
+    request.args.get("page_size")
     request.args.get("start")
+    request.args.get("offset")
     request.args.get("limit")
     request.args.get("include_total")
     request.args.get("include_sources")
     request.args.get("include_evidence")
+    request.args.get("debug")
     request.args.get("view")
     request.args.get("order_by")
+    request.args.get("classification")
+    request.args.get("specialization")
+    request.args.get("section")
+    request.args.get("display_name")
+    request.args.get("first_name")
+    request.args.get("last_name")
+    request.args.get("organization_name")
     request.args.get("npi")
+    request.args.get("phone")
+    request.args.get("address_key")
     request.args.get("address_site_key")
+    request.args.get("zip_code")
+    request.args.get("postal_code")
+    request.args.get("entity_type_code")
     request.args.get("provider_sex_code")
+    request.args.get("plan_network")
+    request.args.get("has_insurance")
+    request.args.get("city")
+    request.args.get("state")
+    request.args.get("codes")
+    request.args.get("primary_only")
     request.args.get("plan_release_id")
-    include_sources = _is_truthy_arg(request.args.get("include_sources"), default=False)
-    include_evidence = _is_truthy_arg(request.args.get("include_evidence"), default=False)
-    if _is_truthy_arg(request.args.get("debug"), default=False):
+    request.args.get("procedure_codes")
+    request.args.get("procedure_code_system")
+    request.args.get("medication_codes")
+    request.args.get("medication_code_system")
+    request.args.get("year")
+    include_sources = _is_truthy_arg(args.get("include_sources"), default=False)
+    include_evidence = _is_truthy_arg(args.get("include_evidence"), default=False)
+    if _is_truthy_arg(args.get("debug"), default=False):
         include_sources = True
         include_evidence = True
-    q_value = str(request.args.get("q") or "").strip().lower()
-    order_by = str(request.args.get("order_by") or "npi").strip().lower()
+    q_value = str(args.get("q") or "").strip().lower()
+    order_by = str(args.get("order_by") or "npi").strip().lower()
     if order_by not in {"npi", "relevance"}:
         raise sanic.exceptions.InvalidUsage("order_by must be one of: npi, relevance")
     relevance_q = " ".join(_name_search_tokens(q_value))
     if order_by == "relevance" and not relevance_q:
         raise sanic.exceptions.InvalidUsage("order_by=relevance requires q")
-    include_total_raw = request.args.get("include_total")
+    include_total_raw = args.get("include_total")
     include_total = _is_truthy_arg(
         include_total_raw,
-        default=_should_include_npi_all_total(request.args, is_count_only),
+        default=_should_include_npi_all_total(args, is_count_only),
     )
-    view_mode = str(request.args.get("view") or "").strip().lower()
+    view_mode = str(args.get("view") or "").strip().lower()
     if view_mode not in {"", "sitemap", "card"}:
         raise sanic.exceptions.InvalidUsage("view must be one of: sitemap, card")
-    classification = request.args.get("classification")
-    is_sitemap_limit_mode = (
-        view_mode == "sitemap"
-        and str(classification or "").strip().lower() == "pharmacy"
-    )
+    if import_context is not None:
+        if is_count_only or view_mode == "sitemap":
+            raise sanic.exceptions.InvalidUsage("custom-import provider pages require provider results")
+        if not include_total:
+            raise sanic.exceptions.InvalidUsage("custom-import provider pages require exact totals")
+        if not import_context.require_match and not import_context.prepared.normalized_order_terms:
+            raise sanic.exceptions.InvalidUsage("custom-import provider pages require imported ordering")
+    classification = args.get("classification")
+    is_sitemap_limit_mode = view_mode == "sitemap" and str(classification or "").strip().lower() == "pharmacy"
     name_like_values: list[str] = []
     if q_value:
         name_like_values.append(q_value)
@@ -8903,7 +8048,7 @@ async def list_providers(request):
         if legacy_name_filter not in name_like_values:
             name_like_values.append(legacy_name_filter)
     pagination = parse_pagination(
-        request.args,
+        args,
         default_limit=50,
         max_limit=20000 if is_sitemap_limit_mode else 200,
         default_page=1,
@@ -8913,32 +8058,32 @@ async def list_providers(request):
     )
     start = pagination.offset
     limit = pagination.limit
-    specialization = request.args.get("specialization")
-    section = request.args.get("section")
-    display_name = request.args.get("display_name")
-    first_name = request.args.get("first_name")
-    last_name = request.args.get("last_name")
-    organization_name = request.args.get("organization_name")
-    npi_raw = request.args.get("npi")
-    phone = request.args.get("phone")
-    address_key_raw = request.args.get("address_key")
-    address_site_key_raw = request.args.get(PUBLIC_ADDRESS_SITE_KEY)
-    zip_code_raw = request.args.get("zip_code")
-    postal_code_raw = request.args.get("postal_code")
-    entity_type_code_raw = request.args.get("entity_type_code")
-    provider_sex_code_raw = request.args.get("provider_sex_code")
-    plan_network_ids = request.args.get("plan_network")
-    has_insurance = request.args.get("has_insurance")
-    city = request.args.get("city")
-    state = request.args.get("state")
-    procedure_codes_raw = request.args.get("procedure_codes")
-    procedure_code_system_raw = request.args.get("procedure_code_system")
-    medication_codes_raw = request.args.get("medication_codes")
-    medication_code_system_raw = request.args.get("medication_code_system")
-    year_raw = request.args.get("year")
-    plan_release_id_raw = request.args.get("plan_release_id")
+    specialization = args.get("specialization")
+    section = args.get("section")
+    display_name = args.get("display_name")
+    first_name = args.get("first_name")
+    last_name = args.get("last_name")
+    organization_name = args.get("organization_name")
+    npi_raw = args.get("npi")
+    phone = args.get("phone")
+    address_key_raw = args.get("address_key")
+    address_site_key_raw = args.get(PUBLIC_ADDRESS_SITE_KEY)
+    zip_code_raw = args.get("zip_code")
+    postal_code_raw = args.get("postal_code")
+    entity_type_code_raw = args.get("entity_type_code")
+    provider_sex_code_raw = args.get("provider_sex_code")
+    plan_network_ids = args.get("plan_network")
+    has_insurance = args.get("has_insurance")
+    city = args.get("city")
+    state = args.get("state")
+    procedure_codes_raw = args.get("procedure_codes")
+    procedure_code_system_raw = args.get("procedure_code_system")
+    medication_codes_raw = args.get("medication_codes")
+    medication_code_system_raw = args.get("medication_code_system")
+    year_raw = args.get("year")
+    plan_release_id_raw = args.get("plan_release_id")
     is_primary_only = _is_boolean_query_arg(
-        request.args.get("primary_only"),
+        args.get("primary_only"),
         "primary_only",
         default=True,
     )
@@ -8946,13 +8091,16 @@ async def list_providers(request):
     city = city.upper() if city else None
     state = state.upper() if state else None
 
-    codes = request.args.get("codes")
+    codes = args.get("codes")
     if codes:
         codes = [x.strip() for x in codes.split(",")]
     _validate_section_filters(section, classification, codes)
 
     if plan_network_ids:
-        plan_network_ids = [int(x) for x in plan_network_ids.split(",")]
+        try:
+            plan_network_ids = [int(network_id) for network_id in plan_network_ids.split(",")]
+        except AttributeError, TypeError, ValueError:
+            raise sanic.exceptions.InvalidUsage("plan_network must contain integers") from None
 
     requested_procedure_codes = _parse_code_tokens(procedure_codes_raw, "procedure_codes")
     requested_medication_codes = _parse_code_tokens(medication_codes_raw, "medication_codes")
@@ -9055,9 +8203,7 @@ async def list_providers(request):
     zip_code = _normalize_zip_code(zip_code_raw, "zip_code")
     postal_code = _normalize_zip_code(postal_code_raw, "postal_code")
     if zip_code and postal_code and zip_code != postal_code:
-        raise sanic.exceptions.InvalidUsage(
-            "zip_code and postal_code must match when both are provided"
-        )
+        raise sanic.exceptions.InvalidUsage("zip_code and postal_code must match when both are provided")
     zip_code = zip_code or postal_code
 
     phone_digits = _normalize_phone_digits(phone)
@@ -9073,14 +8219,10 @@ async def list_providers(request):
                 "entity_type_code must be either 1 (individual) or 2 (organization)"
             ) from exc
         if entity_type_code not in (1, 2):
-            raise sanic.exceptions.InvalidUsage(
-                "entity_type_code must be either 1 (individual) or 2 (organization)"
-            )
+            raise sanic.exceptions.InvalidUsage("entity_type_code must be either 1 (individual) or 2 (organization)")
     provider_sex_code = normalize_provider_sex_code(provider_sex_code_raw)
     if entity_type_code == 2 and provider_sex_code is not None:
-        raise sanic.exceptions.InvalidUsage(
-            "provider_sex_code cannot be combined with entity_type_code=2"
-        )
+        raise sanic.exceptions.InvalidUsage("provider_sex_code cannot be combined with entity_type_code=2")
 
     filters_by_name = {
         "classification": classification,
@@ -9122,7 +8264,7 @@ async def list_providers(request):
         "pricing_provider_prescription_available": capability_by_name["pricing_provider_prescription_available"],
     }
 
-    simple_filter_present = any(
+    simple_filter_present = current_network_address_scope() is not None or any(
         filters_by_name.get(field)
         for field in (
             "classification",
@@ -9148,40 +8290,50 @@ async def list_providers(request):
             "plan_release_id",
         )
     )
-    broad_name_total_deferred = bool(name_like_values) and not any(
-        [
-            classification,
-            specialization,
-            section,
-            display_name,
-            first_name,
-            last_name,
-            organization_name,
-            exact_npi,
-            phone_digits,
-            address_key,
-            address_site_key,
-            zip_code,
-            entity_type_code,
-            provider_sex_code,
-            plan_network_ids,
-            codes,
-            has_insurance,
-            city,
-            state,
-            response_format,
-            procedure_internal_codes,
-            medication_internal_codes,
-            plan_release_id_raw,
-        ]
+    broad_name_total_deferred = (
+        current_network_address_scope() is None
+        and import_context is None
+        and native_npis is None
+        and bool(name_like_values)
+        and not any(
+            [
+                classification,
+                specialization,
+                section,
+                display_name,
+                first_name,
+                last_name,
+                organization_name,
+                exact_npi,
+                phone_digits,
+                address_key,
+                address_site_key,
+                zip_code,
+                entity_type_code,
+                provider_sex_code,
+                plan_network_ids,
+                codes,
+                has_insurance,
+                city,
+                state,
+                response_format,
+                procedure_internal_codes,
+                medication_internal_codes,
+                plan_release_id_raw,
+            ]
+        )
     )
-    inline_name_taxonomy_total = bool(
-        include_total
-        and order_by == "npi"
-        and name_like_values
-        and codes
-        and not phone_digits
-        and not any((classification, specialization, section, display_name))
+    inline_name_taxonomy_total = (
+        import_context is None
+        and native_npis is None
+        and bool(
+            include_total
+            and order_by == "npi"
+            and name_like_values
+            and codes
+            and not phone_digits
+            and not any((classification, specialization, section, display_name))
+        )
     )
 
     def _append_available_filter(
@@ -9208,9 +8360,7 @@ async def list_providers(request):
         """Append supported procedure and medication predicates and parameters."""
         parameters_by_name: dict[str, int] = {}
         provider_npi_sql = (
-            "COALESCE(c.npi, c.inferred_npi)"
-            if _is_unified_address_table(address_table_sql)
-            else "c.npi"
+            "COALESCE(c.npi, c.inferred_npi)" if _is_unified_address_table(address_table_sql) else "c.npi"
         )
         filter_year = filters_by_name.get("filter_year")
         procedure_internal_codes = filters_by_name.get("procedure_internal_codes") or []
@@ -9225,9 +8375,10 @@ async def list_providers(request):
             parameter_name = f"procedure_code_{idx}"
             parameters_by_name[parameter_name] = int(code)
             array_clause = f"c.procedures_array @> ARRAY[:{parameter_name}]::INTEGER[]"
+            claims_pp_relation = _claims_relation_sql(request_session, "mrf", "pricing_provider_procedure")
             exists_clause = (
                 "EXISTS ("
-                "SELECT 1 FROM mrf.pricing_provider_procedure AS pp "
+                f"SELECT 1 FROM {claims_pp_relation} AS pp "
                 f"WHERE pp.npi = {provider_npi_sql} AND pp.procedure_code = :{parameter_name}"
                 + (" AND pp.year = :filter_year" if filter_year is not None else "")
                 + ")"
@@ -9243,9 +8394,10 @@ async def list_providers(request):
             parameter_name = f"medication_code_{idx}"
             parameters_by_name[parameter_name] = int(code)
             array_clause = f"c.medications_array @> ARRAY[:{parameter_name}]::INTEGER[]"
+            claims_pr_relation = _claims_relation_sql(request_session, "mrf", "pricing_provider_prescription")
             exists_clause = (
                 "EXISTS ("
-                "SELECT 1 FROM mrf.pricing_provider_prescription AS pr "
+                f"SELECT 1 FROM {claims_pr_relation} AS pr "
                 f"WHERE pr.npi = {provider_npi_sql} "
                 "AND pr.rx_code_system = 'HP_RX_CODE' "
                 + ("AND pr.year = :filter_year " if filter_year is not None else "")
@@ -9271,7 +8423,7 @@ async def list_providers(request):
         plan_release_id_raw,
     )
 
-    async def get_count(filters_by_name):
+    async def get_count(filters_by_name, *, deadline=None):
         """Count providers matching the normalized request filters."""
         classification = filters_by_name.get("classification")
         specialization = filters_by_name.get("specialization")
@@ -9295,9 +8447,7 @@ async def list_providers(request):
         exact_npi = filters_by_name.get("npi")
         primary_only = bool(filters_by_name.get("primary_only"))
         is_unified_search = _is_unified_address_table(address_table_sql)
-        provider_npi_sql = (
-            "COALESCE(c.npi, c.inferred_npi)" if is_unified_search else "c.npi"
-        )
+        provider_npi_sql = "COALESCE(c.npi, c.inferred_npi)" if is_unified_search else "c.npi"
 
         taxonomy_filters = []
         if classification:
@@ -9343,6 +8493,10 @@ async def list_providers(request):
                 include_service_locations=include_service_locations,
             )
         ]
+        if (import_context is not None or native_npis is not None) and (
+            procedure_filter_unresolved or medication_filter_unresolved
+        ):
+            address_clauses.append("1=0")
         phone_candidates_cte = None
         phone_candidates_join = ""
         if use_taxonomy_filter and not use_location_first_taxonomy:
@@ -9350,7 +8504,7 @@ async def list_providers(request):
         if plan_network_ids:
             address_clauses.append("plans_network_array && :plan_network_array")
         if has_insurance:
-            address_clauses.append("NOT (plans_network_array @@ '0'::query_int)")
+            address_clauses.append(scoped_address_insurance_predicate())
         if city:
             address_clauses.append("city_name = :city")
         if state:
@@ -9358,7 +8512,10 @@ async def list_providers(request):
         if zip_code:
             address_clauses.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
-            phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
+            phone_candidates_cte = _address_phone_candidates_cte(
+                address_table_sql,
+                is_bounded=import_context is None and native_npis is None,
+            )
             if phone_candidates_cte:
                 phone_candidates_join = _address_phone_candidates_join("c")
             else:
@@ -9380,8 +8537,18 @@ async def list_providers(request):
                 ")"
             )
         dynamic_code_parameters = _append_array_filters(address_clauses, filters_by_name)
+        import_relation_cte = _provider_import_relation_cte(import_context)
+        import_membership_clause = _provider_import_membership_clause(
+            import_context,
+            provider_npi_sql,
+            native_npis=native_npis,
+        )
+        if import_membership_clause is not None:
+            address_clauses.append(import_membership_clause)
 
         taxonomy_conditions = " AND ".join(taxonomy_filters) if taxonomy_filters else "1=1"
+        if use_taxonomy_filter and is_ordinary_provider_query and not (codes and len(taxonomy_filters) == 1):
+            address_clauses.append(f"EXISTS (SELECT 1 FROM mrf.nucc_taxonomy WHERE {taxonomy_conditions})")
         taxonomy_subquery = _taxonomy_codes_subquery(taxonomy_conditions)
         taxonomy_join = f"CROSS JOIN {taxonomy_subquery}"
         taxonomy_parameters_by_name: dict[str, str] = {}
@@ -9393,11 +8560,9 @@ async def list_providers(request):
             )
         if use_location_first_taxonomy and not npi_where:
             if codes and len(taxonomy_filters) == 1:
-                taxonomy_parameters_by_name, taxonomy_code_placeholders = (
-                    _provider_taxonomy_code_parameters(
-                        codes,
-                        "count_provider_taxonomy_code",
-                    )
+                taxonomy_parameters_by_name, taxonomy_code_placeholders = _provider_taxonomy_code_parameters(
+                    codes,
+                    "count_provider_taxonomy_code",
                 )
                 taxonomy_join = _provider_taxonomy_lateral_join(
                     code_placeholders=taxonomy_code_placeholders,
@@ -9409,11 +8574,9 @@ async def list_providers(request):
                     provider_npi_sql=provider_npi_sql,
                 )
         elif npi_where and codes and len(taxonomy_filters) == 1:
-            taxonomy_parameters_by_name, taxonomy_code_placeholders = (
-                _provider_taxonomy_code_parameters(
-                    codes,
-                    "count_name_provider_taxonomy_code",
-                )
+            taxonomy_parameters_by_name, taxonomy_code_placeholders = _provider_taxonomy_code_parameters(
+                codes,
+                "count_name_provider_taxonomy_code",
             )
 
         filtered_npi_cte = None
@@ -9429,60 +8592,66 @@ async def list_providers(request):
                 )
                 """
             if use_taxonomy_filter:
-                taxonomy_matched_npi_cte = (
-                    _provider_taxonomy_matched_npi_cte(
-                        taxonomy_conditions,
-                        code_placeholders=taxonomy_code_placeholders,
-                        npi_where=npi_where if direct_name_taxonomy else "",
-                        primary_only=primary_only,
-                        is_projection_enabled=ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION,
-                    )
+                taxonomy_matched_npi_cte = _provider_taxonomy_matched_npi_cte(
+                    taxonomy_conditions,
+                    code_placeholders=taxonomy_code_placeholders,
+                    npi_where=npi_where if direct_name_taxonomy else "",
+                    primary_only=primary_only,
+                    is_projection_enabled=ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION,
                 )
 
         if npi_where and use_taxonomy_filter:
-            query = text(
+            query = _provider_list_statement(
                 f"""
-                {_sql_with_ctes(phone_candidates_cte, filtered_npi_cte, taxonomy_matched_npi_cte)}
+                {_sql_with_ctes(phone_candidates_cte, filtered_npi_cte, taxonomy_matched_npi_cte, import_relation_cte)}
                 SELECT COUNT(DISTINCT {provider_npi_sql})
                   FROM taxonomy_matched_npi AS fn
                   JOIN {address_table_sql} AS c
                     ON {provider_npi_sql} = fn.npi
                   {phone_candidates_join}
-                 WHERE {' AND '.join(address_clauses)}
-                """
+                 WHERE {" AND ".join(address_clauses)}
+                """,
+                import_context,
+                native_npis=native_npis,
             )
         elif npi_where:
-            query = text(
+            query = _provider_list_statement(
                 f"""
-                {_sql_with_ctes(phone_candidates_cte, filtered_npi_cte)}
+                {_sql_with_ctes(phone_candidates_cte, filtered_npi_cte, import_relation_cte)}
                 SELECT COUNT(DISTINCT {provider_npi_sql})
                   FROM filtered_npi AS fn
                   JOIN {address_table_sql} AS c
                     ON {provider_npi_sql} = fn.npi
                   {phone_candidates_join}
-                 WHERE {' AND '.join(address_clauses)}
-                """
+                 WHERE {" AND ".join(address_clauses)}
+                """,
+                import_context,
+                native_npis=native_npis,
             )
         elif use_taxonomy_filter:
-            query = text(
+            query = _provider_list_statement(
                 f"""
-                {_sql_with_ctes(phone_candidates_cte)}
+                {_sql_with_ctes(phone_candidates_cte, import_relation_cte)}
                 SELECT COUNT(DISTINCT {provider_npi_sql})
                   FROM {address_table_sql} AS c
                   {phone_candidates_join}
                   {taxonomy_join}
-                 WHERE {' AND '.join(address_clauses)}
-                """
+                 WHERE {" AND ".join(address_clauses)}
+                """,
+                import_context,
+                native_npis=native_npis,
             )
         else:
-            query = text(
+            query = _provider_list_statement(
                 f"""
-                {_sql_with_ctes(phone_candidates_cte)}
+                {_sql_with_ctes(phone_candidates_cte, import_relation_cte)}
                 SELECT COUNT(DISTINCT {provider_npi_sql})
                   FROM {address_table_sql} AS c
                   {phone_candidates_join}
-                 WHERE {' AND '.join(address_clauses)}
-                """
+                 WHERE {" AND ".join(address_clauses)}
+                """,
+                import_context,
+                native_npis=native_npis,
             )
 
         query_parameters_by_name = {
@@ -9510,15 +8679,17 @@ async def list_providers(request):
         query_parameters_by_name.update(npi_params)
         query_parameters_by_name.update(taxonomy_parameters_by_name)
         query_parameters_by_name.update(plan_scope_parameters)
-        if phone_candidates_cte:
+        if phone_candidates_cte and import_context is None and native_npis is None:
             query_parameters_by_name["candidate_limit"] = _provider_list_phone_candidate_limit(
                 limit,
                 count_query=True,
             )
 
-        async with db.acquire() as conn:
-            count_records = await conn.all(query, **query_parameters_by_name)
-        return count_records[0][0] if count_records else 0
+        query_parameters_by_name = _provider_list_parameters(
+            query_parameters_by_name, import_context, native_npis=native_npis
+        )
+        async with _provider_list_connection(db, import_context, request_session, native_npis=native_npis) as conn:
+            return await _provider_list_count(conn, query, query_parameters_by_name, request_session, deadline=deadline)
 
     async def get_formatted_count(response_format: str) -> dict:
         """
@@ -9526,20 +8697,15 @@ async def list_providers(request):
         """
         if response_format == "full_taxonomy":
             formatted_count_query = text(
-                "SELECT ARRAY[int_code] AS key, COUNT(*) AS value "
-                "FROM mrf.nucc_taxonomy GROUP BY ARRAY[int_code]"
+                "SELECT ARRAY[int_code] AS key, COUNT(*) AS value FROM mrf.nucc_taxonomy GROUP BY ARRAY[int_code]"
             )
         else:
             formatted_count_query = text(
-                "SELECT classification AS key, COUNT(*) AS value "
-                "FROM mrf.nucc_taxonomy GROUP BY classification"
+                "SELECT classification AS key, COUNT(*) AS value FROM mrf.nucc_taxonomy GROUP BY classification"
             )
         async with db.acquire() as conn:
-            formatted_count_records = await conn.all(formatted_count_query)
-        return {
-            count_record[0]: count_record[1]
-            for count_record in formatted_count_records
-        }
+            formatted_count_records = await _npi_count_read(lambda: conn.all(formatted_count_query))
+        return {count_record[0]: count_record[1] for count_record in formatted_count_records}
 
     async def get_classification_count_map(filters_by_name) -> dict:
         """Return provider counts grouped by NUCC classification."""
@@ -9566,9 +8732,7 @@ async def list_providers(request):
         primary_only = bool(filters_by_name.get("primary_only"))
 
         provider_npi_sql = (
-            "COALESCE(c.npi, c.inferred_npi)"
-            if _is_unified_address_table(address_table_sql)
-            else "c.npi"
+            "COALESCE(c.npi, c.inferred_npi)" if _is_unified_address_table(address_table_sql) else "c.npi"
         )
 
         taxonomy_filters = []
@@ -9605,7 +8769,7 @@ async def list_providers(request):
         if plan_network_ids:
             address_clauses.append("plans_network_array && :plan_network_array")
         if has_insurance:
-            address_clauses.append("NOT (plans_network_array @@ '0'::query_int)")
+            address_clauses.append(scoped_address_insurance_predicate())
         if city:
             address_clauses.append("city_name = :city")
         if state:
@@ -9637,16 +8801,13 @@ async def list_providers(request):
         dynamic_code_parameters = _append_array_filters(address_clauses, filters_by_name)
         if npi_where:
             address_clauses.append(
-                "EXISTS (SELECT 1 FROM mrf.npi AS b "
-                f"WHERE b.npi = {provider_npi_sql} AND {npi_where})"
+                f"EXISTS (SELECT 1 FROM mrf.npi AS b WHERE b.npi = {provider_npi_sql} AND {npi_where})"
             )
 
         taxonomy_conditions = " AND ".join(taxonomy_filters) if taxonomy_filters else "1=1"
         taxonomy_subquery = _taxonomy_classification_subquery(taxonomy_conditions)
         taxonomy_row_source = (
-            "CROSS JOIN LATERAL "
-            "unnest(COALESCE(c.taxonomy_array, ARRAY[]::INTEGER[])) "
-            "AS code(int_code)"
+            "CROSS JOIN LATERAL unnest(COALESCE(c.taxonomy_array, ARRAY[]::INTEGER[])) AS code(int_code)"
         )
         taxonomy_int_code_sql = "code.int_code"
         if primary_only:
@@ -9668,7 +8829,7 @@ async def list_providers(request):
                   FROM {address_table_sql} AS c
                   {phone_candidates_join}
                   {taxonomy_row_source}
-                 WHERE {' AND '.join(address_clauses)}
+                 WHERE {" AND ".join(address_clauses)}
             )
             SELECT q.classification AS key,
                    COUNT(DISTINCT ft.npi) AS value
@@ -9707,8 +8868,9 @@ async def list_providers(request):
                 limit,
                 count_query=True,
             )
-        async with db.acquire() as conn:
-            classification_count_records = await conn.all(query, **query_parameters_by_name)
+        query_parameters_by_name = _provider_list_parameters(query_parameters_by_name, import_context)
+        async with _provider_list_connection(db, import_context, request_session) as conn:
+            classification_count_records = await _npi_count_read(lambda: conn.all(query, **query_parameters_by_name))
         return {
             count_record[0]: count_record[1]
             for count_record in classification_count_records
@@ -9717,7 +8879,7 @@ async def list_providers(request):
 
     procedure_filter_unresolved = bool(requested_procedure_codes) and not bool(procedure_internal_codes)
     medication_filter_unresolved = bool(requested_medication_codes) and not bool(medication_internal_codes)
-    if procedure_filter_unresolved or medication_filter_unresolved:
+    if import_context is None and native_npis is None and (procedure_filter_unresolved or medication_filter_unresolved):
         if is_count_only and response_format in {"all", "full_taxonomy", "classification"}:
             return response.json({"rows": {}}, default=str)
         if is_count_only:
@@ -9734,31 +8896,53 @@ async def list_providers(request):
             default=str,
         )
 
-    if is_count_only and not simple_filter_present and not has_insurance and not city and not state:
-        return response.json({"rows": await _fast_primary_npi_count()}, default=str)
+    async def _count_rows(*, deadline=None):
+        count_options = {"session": request_session, "deadline": deadline} if deadline is not None else {}
+        if not simple_filter_present and not has_insurance and not city and not state:
+            return await _fast_primary_npi_count(**count_options)
+        if is_count_only:
+            if has_insurance and not simple_filter_present:
+                return await _fast_has_insurance_count(city, state, **count_options)
+            if response_format == "all":
+                return await get_classification_count_map(filters_by_name)
+            if response_format in {"full_taxonomy", "classification"}:
+                return await get_formatted_count(response_format)
+        return await get_count(filters_by_name, deadline=deadline)
 
-    if is_count_only and has_insurance and not simple_filter_present:
-        insurance_provider_count = await _fast_has_insurance_count(city, state)
-        return response.json({"rows": insurance_provider_count}, default=str)
+    async def _bounded_count_rows():
+        if import_context is not None or native_npis is not None:
+            return await _count_rows()
+        return await _bounded_provider_list_count(
+            _count_rows,
+            session=request_session,
+            has_reader=has_reader_session(db),
+            timeout=_NPI_ALL_TOTAL_TIMEOUT_SECONDS,
+        )
 
-    if is_count_only and response_format == "all":
-        mapping = await get_classification_count_map(filters_by_name)
-        return response.json({"rows": mapping}, default=str)
+    if is_count_only:
+        try:
+            count_rows = await _bounded_count_rows()
+        except (TimeoutError, DBAPIError) as exc:
+            if import_context is not None or native_npis is not None:
+                raise
+            if isinstance(exc, DBAPIError) and not _is_statement_timeout(exc):
+                raise
+            return response.json(
+                {"error": "count_timeout", "message": "The exact provider count exceeded its time limit."},
+                status=503,
+            )
+        return response.json({"rows": count_rows}, default=str)
 
-    if is_count_only and response_format in {"full_taxonomy", "classification"}:
-        mapping = await get_formatted_count(response_format)
-        return response.json({"rows": mapping}, default=str)
-
-    async def get_sitemap_results(start_offset: int, page_limit: int, classification_value: str) -> list[dict[str, Any]]:
+    async def get_sitemap_results(
+        start_offset: int, page_limit: int, classification_value: str
+    ) -> list[dict[str, Any]]:
         """Return a deterministic provider page for sitemap generation."""
         classification_npis = await _get_classification_npi_list(
-            classification_value,
-            primary_only=is_primary_only,
-            session=request_session,
+            classification_value, primary_only=is_primary_only, session=request_session
         )
         if not classification_npis:
             return []
-        page_npis = classification_npis[start_offset:start_offset + page_limit]
+        page_npis = classification_npis[start_offset : start_offset + page_limit]
         if not page_npis:
             return []
         query = text(
@@ -9785,10 +8969,7 @@ async def list_providers(request):
             """
         )
         async with db.acquire() as conn:
-            rows_iter = await conn.all(
-                query,
-                page_npis=page_npis,
-            )
+            rows_iter = await conn.all(query, page_npis=page_npis)
         sitemap_results: list[dict[str, Any]] = []
         for sitemap_record in rows_iter:
             mapping = getattr(sitemap_record, "_mapping", None)
@@ -9812,6 +8993,7 @@ async def list_providers(request):
 
     async def get_results(start, limit, filters_by_name):
         """Return one provider result page for normalized search filters."""
+        page_import_context = import_context
         classification = filters_by_name.get("classification")
         section = filters_by_name.get("section")
         display_name = filters_by_name.get("display_name")
@@ -9834,9 +9016,7 @@ async def list_providers(request):
         exact_npi = filters_by_name.get("npi")
         primary_only = bool(filters_by_name.get("primary_only"))
         is_unified_search = _is_unified_address_table(address_table_sql)
-        provider_npi_sql = (
-            "COALESCE(c.npi, c.inferred_npi)" if is_unified_search else "c.npi"
-        )
+        provider_npi_sql = "COALESCE(c.npi, c.inferred_npi)" if is_unified_search else "c.npi"
         npi_where, npi_params = _build_npi_where_clause(
             "b",
             name_like_values,
@@ -9854,6 +9034,10 @@ async def list_providers(request):
                 include_service_locations=include_service_locations,
             )
         ]
+        if (page_import_context is not None or native_npis is not None) and (
+            procedure_filter_unresolved or medication_filter_unresolved
+        ):
+            address_clauses.append("1=0")
         phone_candidates_cte = None
         phone_candidates_join = ""
         if classification:
@@ -9867,6 +9051,7 @@ async def list_providers(request):
         if codes:
             taxonomy_clauses.append("code = ANY(:codes)")
         use_taxonomy_filter = bool(taxonomy_clauses)
+        taxonomy_filter = " and ".join(taxonomy_clauses) if taxonomy_clauses else "1=1"
         use_location_first_taxonomy = _is_location_first_taxonomy_filter(
             use_taxonomy_filter,
             (
@@ -9882,10 +9067,12 @@ async def list_providers(request):
         )
         if use_taxonomy_filter and not use_location_first_taxonomy:
             address_clauses.insert(0, "c.taxonomy_array && q.int_codes")
+        if use_taxonomy_filter and is_ordinary_provider_query and not (codes and len(taxonomy_clauses) == 1):
+            address_clauses.append(f"EXISTS (SELECT 1 FROM mrf.nucc_taxonomy WHERE {taxonomy_filter})")
         if plan_network_ids:
             address_clauses.append("plans_network_array && :plan_network_array")
         if has_insurance:
-            address_clauses.append("NOT (plans_network_array @@ '0'::query_int)")
+            address_clauses.append(scoped_address_insurance_predicate())
         if city:
             address_clauses.append("city_name = :city")
         if state:
@@ -9893,7 +9080,10 @@ async def list_providers(request):
         if zip_code:
             address_clauses.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
-            phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
+            phone_candidates_cte = _address_phone_candidates_cte(
+                address_table_sql,
+                is_bounded=page_import_context is None and native_npis is None,
+            )
             if phone_candidates_cte:
                 phone_candidates_join = _address_phone_candidates_join("c")
             else:
@@ -9915,6 +9105,22 @@ async def list_providers(request):
                 ")"
             )
         dynamic_code_parameters = _append_array_filters(address_clauses, filters_by_name)
+        import_relation_cte = _provider_import_relation_cte(page_import_context)
+        scope_native_query = native_scope_preparer is not None and bool(
+            simple_filter_present or city or state or has_insurance or native_npis is not None
+        )
+        import_match_clause = _provider_import_match_clause(
+            None if scope_native_query else page_import_context,
+            provider_npi_sql,
+            native_npis=(
+                native_npis
+                if native_npis is not None or page_import_context is None
+                else page_import_context.native_npis
+            ),
+        )
+        eligible_address_clauses = list(address_clauses)
+        if import_match_clause is not None:
+            eligible_address_clauses.append(import_match_clause)
         lightweight_candidate_columns = tuple(
             dict.fromkeys(
                 NPI_LOCATION_CANDIDATE_COLUMNS
@@ -9926,58 +9132,44 @@ async def list_providers(request):
             )
         )
         candidate_projection = (
-            ", ".join(
-                f"c.{column_name}"
-                for column_name in lightweight_candidate_columns
-                if column_name != "npi"
-            )
+            ", ".join(f"c.{column_name}" for column_name in lightweight_candidate_columns if column_name != "npi")
             if is_unified_search
             else "c.*"
         )
         projected_candidate_names = (
-            tuple(
-                column_name
-                for column_name in lightweight_candidate_columns
-                if column_name != "npi"
-            )
+            tuple(column_name for column_name in lightweight_candidate_columns if column_name != "npi")
             if is_unified_search
             else tuple(column.key for column in NPIAddress.__table__.columns)
         )
-        search_npi_column_names = tuple(
-            column.key for column in _npi_serving_columns()
-        )
+        search_npi_column_names = tuple(column.key for column in _npi_serving_columns())
+        use_import_order = bool(page_import_context is not None and page_import_context.prepared.normalized_order_terms)
         search_row_column_names = (
             ("npi_code",)
             + search_npi_column_names
             + projected_candidate_names
             + ("provider_address_total",)
-            + (("_provider_total",) if inline_name_taxonomy_total else ())
+            + (("_provider_total",) if inline_name_taxonomy_total or page_import_context is not None else ())
+            + (("_provider_page_position",) if use_import_order else ())
         )
-        search_npi_projection = ", ".join(
-            f"b.{column_name}" for column_name in search_npi_column_names
-        )
+        search_npi_projection = ", ".join(f"b.{column_name}" for column_name in search_npi_column_names)
 
-        taxonomy_filter = " and ".join(taxonomy_clauses) if taxonomy_clauses else "1=1"
         taxonomy_parameters_by_name: dict[str, str] = {}
         taxonomy_code_placeholders: tuple[str, ...] = ()
         if npi_where and codes and len(taxonomy_clauses) == 1:
-            taxonomy_parameters_by_name, taxonomy_code_placeholders = (
-                _provider_taxonomy_code_parameters(
-                    codes,
-                    "page_name_provider_taxonomy_code",
-                )
+            taxonomy_parameters_by_name, taxonomy_code_placeholders = _provider_taxonomy_code_parameters(
+                codes,
+                "page_name_provider_taxonomy_code",
             )
         filtered_npi_cte = None
         taxonomy_matched_npi_cte = None
-        use_bounded_broad_name_page = broad_name_total_deferred and order_by == "npi"
+        use_bounded_broad_name_page = (
+            page_import_context is None and native_npis is None and broad_name_total_deferred and order_by == "npi"
+        )
         if npi_where:
             filtered_npi_projection = "b.npi"
             if order_by == "relevance":
                 name_expression = NAME_LIKE_TEMPLATE.format(alias="b.")
-                filtered_npi_projection += (
-                    f", similarity({name_expression}, :relevance_q) "
-                    "AS relevance_score"
-                )
+                filtered_npi_projection += f", similarity({name_expression}, :relevance_q) AS relevance_score"
             direct_name_taxonomy = bool(taxonomy_code_placeholders)
             if not direct_name_taxonomy and not use_bounded_broad_name_page:
                 filtered_npi_cte = f"""
@@ -9988,15 +9180,13 @@ async def list_providers(request):
         )
 """
             if use_taxonomy_filter:
-                taxonomy_matched_npi_cte = (
-                    _provider_taxonomy_matched_npi_cte(
-                        taxonomy_filter,
-                        code_placeholders=taxonomy_code_placeholders,
-                        npi_where=npi_where if direct_name_taxonomy else "",
-                        npi_projection=filtered_npi_projection,
-                        primary_only=primary_only,
-                        is_projection_enabled=ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION,
-                    )
+                taxonomy_matched_npi_cte = _provider_taxonomy_matched_npi_cte(
+                    taxonomy_filter,
+                    code_placeholders=taxonomy_code_placeholders,
+                    npi_where=npi_where if direct_name_taxonomy else "",
+                    npi_projection=filtered_npi_projection,
+                    primary_only=primary_only,
+                    is_projection_enabled=ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION,
                 )
 
         taxonomy_source = (
@@ -10013,11 +9203,9 @@ async def list_providers(request):
             )
         if use_location_first_taxonomy and not npi_where:
             if codes and len(taxonomy_clauses) == 1:
-                taxonomy_parameters_by_name, taxonomy_code_placeholders = (
-                    _provider_taxonomy_code_parameters(
-                        codes,
-                        "page_provider_taxonomy_code",
-                    )
+                taxonomy_parameters_by_name, taxonomy_code_placeholders = _provider_taxonomy_code_parameters(
+                    codes,
+                    "page_provider_taxonomy_code",
                 )
                 taxonomy_source = _provider_taxonomy_lateral_join(
                     code_placeholders=taxonomy_code_placeholders,
@@ -10045,31 +9233,26 @@ async def list_providers(request):
                     f"    {phone_candidates_join}"
                 )
         elif use_taxonomy_filter:
-            address_source = (
-                f"{address_table_sql} as c\n"
-                f"    {phone_candidates_join}\n"
-                f"    {taxonomy_source}"
-            )
+            address_source = f"{address_table_sql} as c\n    {phone_candidates_join}\n    {taxonomy_source}"
         else:
             address_source = f"{address_table_sql} as c\n    {phone_candidates_join}"
         address_order = _primary_address_order_clause("c", address_table_sql)
+        use_computed_page_order = bool(plan_network_ids) or (
+            is_ordinary_provider_query and zip_code and use_taxonomy_filter and not npi_where and order_by == "npi"
+        )
         if order_by == "relevance":
             eligible_npis_sql = f"""
             SELECT {provider_npi_sql} AS npi,
                    MAX(fn.relevance_score) AS relevance_score
               FROM {address_source}
-             WHERE {' and '.join(address_clauses)}
+             WHERE {" and ".join(eligible_address_clauses)}
              GROUP BY {provider_npi_sql}
             """
             page_order_sql = "ORDER BY relevance_score DESC, npi ASC"
             sub_s_relevance_projection = ", pn.relevance_score AS _search_relevance"
-            result_order_sql = (
-                "ORDER BY sub_s._search_relevance DESC, sub_s.npi_code ASC"
-            )
+            result_order_sql = "ORDER BY sub_s._search_relevance DESC, sub_s.npi_code ASC"
         elif use_bounded_broad_name_page:
-            eligible_npis_sql = _broad_name_page_sql(
-                npi_where, address_table_sql, provider_npi_sql, address_clauses
-            )
+            eligible_npis_sql = _broad_name_page_sql(npi_where, address_table_sql, provider_npi_sql, address_clauses)
             page_order_sql = "ORDER BY b.npi"
             sub_s_relevance_projection = ""
             result_order_sql = "ORDER BY sub_s.npi_code ASC"
@@ -10077,11 +9260,17 @@ async def list_providers(request):
             eligible_npis_sql = f"""
             SELECT DISTINCT {provider_npi_sql} AS npi
               FROM {address_source}
-             WHERE {' and '.join(address_clauses)}
+             WHERE {" and ".join(eligible_address_clauses)}
             """
-            page_order_sql = "ORDER BY npi"
+            page_order_sql = "ORDER BY npi + 0" if use_computed_page_order else "ORDER BY npi"
             sub_s_relevance_projection = ""
             result_order_sql = "ORDER BY sub_s.npi_code ASC"
+        native_eligible_cte = None
+        if scope_native_query:
+            native_eligible_cte = f"{_NATIVE_PROVIDER_RELATION} AS MATERIALIZED ({eligible_npis_sql})"
+            eligible_npis_sql = f"SELECT * FROM {_NATIVE_PROVIDER_RELATION}"
+            page_import_context = await native_scope_preparer(_provider_native_entity_scope())
+            import_relation_cte = _provider_import_relation_cte(page_import_context)
         if inline_name_taxonomy_total:
             page_npis_sql = f"""
             SELECT eligible_npi.*,
@@ -10091,34 +9280,50 @@ async def list_providers(request):
              LIMIT :limit OFFSET :start
             """
             sub_s_total_projection = ", pn.provider_total AS _provider_total"
+            sub_s_page_position_projection = ""
         else:
             page_npis_sql = f"""
-            {eligible_npis_sql}
+            {f"SELECT * FROM ({eligible_npis_sql}) AS eligible_npi" if use_computed_page_order else eligible_npis_sql}
             {page_order_sql}
             LIMIT :limit OFFSET :start
             """
             sub_s_total_projection = ""
-        provider_page_query = text(
+            sub_s_page_position_projection = ""
+        imported_count_ctes = None
+        final_projection = "sub_s.*"
+        final_source = "sub_s"
+        if page_import_context is not None:
+            imported_count_ctes, page_npis_sql = _provider_import_count_page(
+                eligible_npis_sql, page_import_context, native_order=page_order_sql
+            )
+            final_projection = "sub_s.*, provider_totals._provider_total"
+            final_source = "provider_totals LEFT JOIN sub_s ON TRUE"
+            if use_import_order:
+                sub_s_page_position_projection = ", pn._provider_page_position AS _provider_page_position"
+                result_order_sql = "ORDER BY sub_s._provider_page_position ASC, sub_s.npi_code ASC"
+        provider_page_query = _provider_list_statement(
             f"""
-        {_sql_with_prefix_ctes(phone_candidates_cte, filtered_npi_cte, taxonomy_matched_npi_cte)}page_npis AS (
+        {_sql_with_prefix_ctes(phone_candidates_cte, filtered_npi_cte, taxonomy_matched_npi_cte, native_eligible_cte, import_relation_cte, imported_count_ctes)}page_npis AS (
             {page_npis_sql}
         ),
         sub_s AS (
-            SELECT pn.npi AS npi_code, {search_npi_projection}, g.*{sub_s_relevance_projection}{sub_s_total_projection}
+            SELECT pn.npi AS npi_code, {search_npi_projection}, g.*{sub_s_relevance_projection}{sub_s_total_projection}{sub_s_page_position_projection}
               FROM page_npis AS pn
          LEFT JOIN mrf.npi AS b ON b.npi = pn.npi
               JOIN LATERAL (
                   SELECT {candidate_projection},
                          COUNT(*) OVER () AS provider_address_total
                     FROM {address_source}
-                   WHERE {' and '.join(address_clauses)}
+                   WHERE {" and ".join(address_clauses)}
                      AND {provider_npi_sql} = pn.npi
                    ORDER BY {address_order}
               ) AS g ON TRUE
         )
 
-    SELECT sub_s.* FROM sub_s {result_order_sql};
-    """
+    SELECT {final_projection} FROM {final_source} {result_order_sql};
+    """,
+            page_import_context,
+            native_npis=native_npis,
         )
 
         def _search_location_from_mapping(
@@ -10130,25 +9335,19 @@ async def list_providers(request):
                     continue
                 if column.key in row_mapping:
                     location_by_field[column.key] = row_mapping.get(column.key)
-            if location_by_field.get("npi") is None and row_mapping.get(
-                "inferred_npi"
-            ) is not None:
+            if location_by_field.get("npi") is None and row_mapping.get("inferred_npi") is not None:
                 location_by_field["npi"] = row_mapping.get("inferred_npi")
             if location_by_field.get("npi") is None:
                 location_by_field["npi"] = row_mapping.get("npi_code")
             if row_mapping.get("location_key") not in (None, ""):
-                location_by_field["location_key"] = row_mapping.get(
-                    "location_key"
-                )
+                location_by_field["location_key"] = row_mapping.get("location_key")
             _attach_public_address_site_key(location_by_field, row_mapping)
-            if address_table_sql.endswith(".entity_address_unified"):
+            if _is_unified_address_table(address_table_sql):
                 for key in PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS:
                     if key in row_mapping and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
                         location_by_field[key] = row_mapping.get(key)
                 if "source_record_ids" in row_mapping:
-                    location_by_field["source_record_ids"] = row_mapping.get(
-                        "source_record_ids"
-                    )
+                    location_by_field["source_record_ids"] = row_mapping.get("source_record_ids")
             base_identity = _base_address_row_identity(location_by_field)
             if base_identity:
                 location_by_field["_base_row_identities"] = [base_identity]
@@ -10157,36 +9356,41 @@ async def list_providers(request):
 
         providers_by_npi = {}
         provider_total: Optional[int] = None
-        async with db.acquire() as conn:
-            query_parameters_by_name = {
-                "start": start,
-                "limit": limit,
-                "classification": classification,
-                "section": section,
-                "display_name": display_name,
-                "codes": codes,
-                "plan_network_array": plan_network_ids,
-                "specialization": specialization,
-                "city": city,
-                "state": state,
-                "zip_code": zip_code,
-                "phone_digits": phone_digits,
-                "address_key": address_key,
-                "address_site_key": address_site_key,
-                "npi_filter": exact_npi,
-                "provider_sex_code": provider_sex_code,
-                **npi_params,
-                **dynamic_code_parameters,
-                **taxonomy_parameters_by_name,
-                **plan_scope_parameters,
-            }
-            if order_by == "relevance":
-                query_parameters_by_name["relevance_q"] = relevance_q
-            if phone_candidates_cte:
-                query_parameters_by_name["candidate_limit"] = _provider_list_phone_candidate_limit(
-                    limit,
-                    start,
-                )
+        query_parameters_by_name = {
+            "start": start,
+            "limit": limit,
+            "classification": classification,
+            "section": section,
+            "display_name": display_name,
+            "codes": codes,
+            "plan_network_array": plan_network_ids,
+            "specialization": specialization,
+            "city": city,
+            "state": state,
+            "zip_code": zip_code,
+            "phone_digits": phone_digits,
+            "address_key": address_key,
+            "address_site_key": address_site_key,
+            "npi_filter": exact_npi,
+            "provider_sex_code": provider_sex_code,
+            **npi_params,
+            **dynamic_code_parameters,
+            **taxonomy_parameters_by_name,
+            **plan_scope_parameters,
+        }
+        if order_by == "relevance":
+            query_parameters_by_name["relevance_q"] = relevance_q
+        if phone_candidates_cte and page_import_context is None and native_npis is None:
+            query_parameters_by_name["candidate_limit"] = _provider_list_phone_candidate_limit(
+                limit,
+                start,
+            )
+        query_parameters_by_name = _provider_list_parameters(
+            query_parameters_by_name,
+            page_import_context,
+            native_npis=native_npis,
+        )
+        async with _provider_list_connection(db, page_import_context, request_session, native_npis=native_npis) as conn:
             rows_iter = await conn.all(
                 provider_page_query,
                 **query_parameters_by_name,
@@ -10199,16 +9403,11 @@ async def list_providers(request):
                 if row_mapping is None:
                     row_mapping = {
                         column_name: provider_record[index]
-                        for index, column_name in enumerate(
-                            search_row_column_names
-                        )
+                        for index, column_name in enumerate(search_row_column_names)
                         if index < len(provider_record)
                     }
                 if row_mapping is not None:
-                    if (
-                        provider_total is None
-                        and row_mapping.get("_provider_total") is not None
-                    ):
+                    if provider_total is None and row_mapping.get("_provider_total") is not None:
                         provider_total = int(row_mapping["_provider_total"])
                     npi_value = (
                         row_mapping.get("npi_code")
@@ -10241,7 +9440,12 @@ async def list_providers(request):
         async def _fetch_search_taxonomy_records() -> list[Any]:
             if not providers_by_npi:
                 return []
-            async with db.acquire() as taxonomy_conn:
+            async with _provider_list_connection(
+                db,
+                page_import_context,
+                request_session,
+                native_npis=native_npis,
+            ) as taxonomy_conn:
                 return await taxonomy_conn.all(
                     text(
                         "SELECT taxonomy.*, nucc.display_name AS taxonomy_display "
@@ -10261,38 +9465,66 @@ async def list_providers(request):
                 return await _fetch_provider_enrichment_summary_map(
                     [provider_result.get("npi") for provider_result in provider_results],
                     include_chain=include_chain_enrichment,
-                    session=None,
+                    session=request_session
+                    if page_import_context is not None
+                    or native_npis is not None
+                    or current_network_address_scope() is not None
+                    else None,
                 )
+            except sanic.exceptions.ServiceUnavailable:
+                raise
             except Exception as exc:
+                if (
+                    page_import_context is not None
+                    or native_npis is not None
+                    or current_network_address_scope() is not None
+                ):
+                    raise
                 logger.debug("Provider enrichment summary fetch failed: %s", exc)
                 return {}
 
-        search_read_tasks = (
-            asyncio.create_task(_fetch_search_taxonomy_records()),
-            asyncio.create_task(
-                _apply_location_statuses(
-                    [
-                        address_candidate
-                        for provider_result in provider_results
-                        for address_candidate in provider_result.get(
-                            "_address_candidates",
-                            [],
-                        )
-                    ],
-                    session=request_session,
-                )
-            ),
-            asyncio.create_task(_fetch_search_enrichment_summary()),
-        )
-        try:
-            taxonomy_records, _, summary_map = await asyncio.gather(
-                *search_read_tasks
+        location_candidates = [
+            address_candidate
+            for provider_result in provider_results
+            for address_candidate in provider_result.get(
+                "_address_candidates",
+                [],
             )
-        except BaseException:
-            for search_read_task in search_read_tasks:
-                search_read_task.cancel()
-            await asyncio.gather(*search_read_tasks, return_exceptions=True)
-            raise
+        ]
+        if (
+            page_import_context is not None
+            or native_npis is not None
+            or current_network_address_scope() is not None
+            or has_reader_session(db)
+        ):
+            taxonomy_records = await _fetch_search_taxonomy_records()
+            await _apply_location_statuses(
+                location_candidates,
+                session=request_session,
+                use_request_session=True,
+                fail_closed=page_import_context is not None
+                or native_npis is not None
+                or current_network_address_scope() is not None,
+            )
+            summary_map = await _fetch_search_enrichment_summary()
+        else:
+            search_read_tasks = (
+                asyncio.create_task(_fetch_search_taxonomy_records()),
+                asyncio.create_task(
+                    _apply_location_statuses(
+                        location_candidates,
+                        session=request_session,
+                    )
+                ),
+                asyncio.create_task(_fetch_search_enrichment_summary()),
+            )
+            try:
+                taxonomy_records, _, summary_map = await asyncio.gather(*search_read_tasks)
+            except BaseException:
+                for search_read_task in search_read_tasks:
+                    search_read_task.cancel()
+                await asyncio.gather(*search_read_tasks, return_exceptions=True)
+                raise
         for taxonomy_record in taxonomy_records:
             taxonomy_mapping = getattr(
                 taxonomy_record,
@@ -10302,9 +9534,7 @@ async def list_providers(request):
             if taxonomy_mapping is None:
                 taxonomy_mapping = {
                     column.key: taxonomy_record[index]
-                    for index, column in enumerate(
-                        NPIDataTaxonomy.__table__.columns
-                    )
+                    for index, column in enumerate(NPIDataTaxonomy.__table__.columns)
                     if index < len(taxonomy_record)
                 }
             taxonomy_npi = taxonomy_mapping.get("npi")
@@ -10317,9 +9547,7 @@ async def list_providers(request):
                 if column.key not in ("npi", "checksum")
             }
             if taxonomy_mapping.get("taxonomy_display") is not None:
-                taxonomy_by_field["display"] = taxonomy_mapping.get(
-                    "taxonomy_display"
-                )
+                taxonomy_by_field["display"] = taxonomy_mapping.get("taxonomy_display")
             _append_unique_search_taxonomy(
                 provider_by_field,
                 taxonomy_by_field,
@@ -10327,23 +9555,13 @@ async def list_providers(request):
         for provider_result in provider_results:
             provider_result["do_business_as"] = provider_result.get("do_business_as") or []
             address_candidates = provider_result.pop("_address_candidates", [])
-            ranked_locations = _rank_provider_locations(
-                _dedupe_addresses_by_key(address_candidates)
-            )
-            candidates_are_complete = bool(
-                provider_result.pop("_address_candidates_complete", False)
-            )
-            raw_address_total = int(
-                provider_result.pop("_address_total", 0) or 0
-            )
+            ranked_locations = _rank_provider_locations(_dedupe_addresses_by_key(address_candidates))
+            candidates_are_complete = bool(provider_result.pop("_address_candidates_complete", False))
+            raw_address_total = int(provider_result.pop("_address_total", 0) or 0)
             address_total = (
-                len(ranked_locations)
-                if candidates_are_complete
-                else max(raw_address_total, len(ranked_locations))
+                len(ranked_locations) if candidates_are_complete else max(raw_address_total, len(ranked_locations))
             )
-            provider_result["_selected_locations"] = ranked_locations[
-                :NPI_SEARCH_ADDRESS_DEFAULT_LIMIT
-            ]
+            provider_result["_selected_locations"] = ranked_locations[:NPI_SEARCH_ADDRESS_DEFAULT_LIMIT]
             provider_result["_selected_location_total"] = address_total
 
         selected_location_keys = sorted(
@@ -10354,34 +9572,37 @@ async def list_providers(request):
                 for identity in (
                     list(location.get("_base_row_identities") or [])
                     + (
-                        [f"location:{location.get('location_key')}" ]
+                        [f"location:{location.get('location_key')}"]
                         if location.get("location_key") not in (None, "")
                         else []
                     )
                 )
-                if str(identity).startswith("location:")
-                and identity.removeprefix("location:")
+                if str(identity).startswith("location:") and identity.removeprefix("location:")
             }
         )
         hydrated_by_location_key: dict[str, dict[str, Any]] = {}
         if is_unified_search and selected_location_keys:
             try:
-                async with db.acquire() as hydration_conn:
+                async with _provider_list_connection(
+                    db,
+                    page_import_context,
+                    request_session,
+                    native_npis=native_npis,
+                ) as hydration_conn:
                     hydrated_rows = await hydration_conn.all(
-                        text(
-                            f"SELECT c.* FROM {address_table_sql} AS c "
-                            "WHERE c.location_key = ANY(:location_keys)"
-                        ),
-                        location_keys=selected_location_keys,
+                        text(f"SELECT c.* FROM {address_table_sql} AS c WHERE c.location_key = ANY(:location_keys)"),
+                        **_provider_list_parameters({"location_keys": selected_location_keys}, page_import_context),
                     )
-                allowed_hydrated_fields = {
-                    column.key for column in NPIAddress.__table__.columns
-                } | PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS | {
-                    "inferred_npi",
-                    "location_key",
-                    "premise_key",
-                    "source_record_ids",
-                }
+                allowed_hydrated_fields = (
+                    {column.key for column in NPIAddress.__table__.columns}
+                    | PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS
+                    | {
+                        "inferred_npi",
+                        "location_key",
+                        "premise_key",
+                        "source_record_ids",
+                    }
+                )
                 for hydrated_row in hydrated_rows:
                     hydrated_mapping = getattr(
                         hydrated_row,
@@ -10390,9 +9611,7 @@ async def list_providers(request):
                     )
                     if not isinstance(hydrated_mapping, Mapping):
                         continue
-                    location_key = str(
-                        hydrated_mapping.get("location_key") or ""
-                    )
+                    location_key = str(hydrated_mapping.get("location_key") or "")
                     if not location_key:
                         continue
                     hydrated_address_map = {
@@ -10401,19 +9620,19 @@ async def list_providers(request):
                         if field_name in hydrated_mapping
                     }
                     if hydrated_address_map.get("npi") is None:
-                        hydrated_address_map["npi"] = hydrated_mapping.get(
-                            "inferred_npi"
-                        )
+                        hydrated_address_map["npi"] = hydrated_mapping.get("inferred_npi")
                     _attach_public_address_site_key(
                         hydrated_address_map,
                         hydrated_mapping,
                     )
-                    hydrated_by_location_key[location_key] = (
-                        _add_canonical_contact_fields_to_address(
-                            hydrated_address_map
-                        )
+                    hydrated_by_location_key[location_key] = _add_canonical_contact_fields_to_address(
+                        hydrated_address_map
                     )
+            except sanic.exceptions.ServiceUnavailable:
+                raise
             except Exception as exc:
+                if page_import_context is not None:
+                    raise
                 logger.warning(
                     "NPI search location hydration failed; returning ranked candidates (%s)",
                     exc,
@@ -10431,7 +9650,7 @@ async def list_providers(request):
                     for identity in (
                         list(selected_location.get("_base_row_identities") or [])
                         + (
-                            [f"location:{selected_location.get('location_key')}" ]
+                            [f"location:{selected_location.get('location_key')}"]
                             if selected_location.get("location_key") not in (None, "")
                             else []
                         )
@@ -10457,9 +9676,7 @@ async def list_providers(request):
                     "unknown",
                 )
                 locations.append(merged_location_map)
-            address_total = int(
-                provider_result.pop("_selected_location_total", len(locations))
-            )
+            address_total = int(provider_result.pop("_selected_location_total", len(locations)))
             provider_result["address_list"] = locations
             provider_result["address_pagination"] = {
                 "limit": NPI_SEARCH_ADDRESS_DEFAULT_LIMIT,
@@ -10471,20 +9688,18 @@ async def list_providers(request):
             provider_result.pop("_taxonomy_identities", None)
             if locations:
                 provider_result.update(locations[0])
-            provider_result["location_status"] = locations[0].get(
-                "location_status", "unknown"
-            ) if locations else "unknown"
+            provider_result["location_status"] = (
+                locations[0].get("location_status", "unknown") if locations else "unknown"
+            )
             _add_canonical_contact_fields_to_address(provider_result)
             _redact_internal_address_fields(provider_result)
         return provider_results, provider_total, summary_map
 
-    if is_count_only:
-        count_rows = await get_count(filters_by_name)
-        return response.json({"rows": count_rows}, default=str)
-
     async def _count_with_timeout(*, allow_inline_total: bool = True) -> Optional[int]:
         if not include_total:
             return None
+        if import_context is not None or native_npis is not None:
+            return await get_count(filters_by_name)
         if allow_inline_total and inline_name_taxonomy_total:
             return None
         if broad_name_total_deferred:
@@ -10495,13 +9710,8 @@ async def list_providers(request):
                 include_total_raw is not None,
             )
             return None
-        if not simple_filter_present and not has_insurance and not city and not state:
-            return await _fast_primary_npi_count()
         try:
-            return await asyncio.wait_for(
-                get_count(filters_by_name),
-                timeout=max(0.1, _NPI_ALL_TOTAL_TIMEOUT_SECONDS),
-            )
+            return await _bounded_count_rows()
         except asyncio.TimeoutError:
             logger.warning(
                 "NPI /all total count timed out; offset=%s limit=%s",
@@ -10509,6 +9719,8 @@ async def list_providers(request):
                 pagination.limit,
             )
             return None
+        except sanic.exceptions.ServiceUnavailable:
+            raise
         except Exception as exc:  # pragma: no cover - defensive degradation
             logger.warning(
                 "NPI /all total count failed (%s); offset=%s limit=%s",
@@ -10519,7 +9731,10 @@ async def list_providers(request):
             return None
 
     use_sitemap_fast_path = (
-        view_mode == "sitemap"
+        import_context is None
+        and native_npis is None
+        and current_network_address_scope() is None
+        and view_mode == "sitemap"
         and not is_count_only
         and str(classification or "").strip().lower() == "pharmacy"
         and not any(
@@ -10555,11 +9770,26 @@ async def list_providers(request):
     if use_sitemap_fast_path:
         result_rows = await get_sitemap_results(start, limit, "Pharmacy")
         raw_total = None if not include_total else await _count_with_timeout()
+    elif import_context is not None or native_npis is not None:
+        raw_total = await _count_with_timeout() if import_context is None else None
+        result_rows, inline_total, summary_map = await get_results(start, limit, filters_by_name)
+        raw_total = inline_total if import_context is not None else raw_total
+        if raw_total is None:
+            raise RuntimeError(
+                "custom-import provider count is required"
+                if import_context
+                else "native batch provider count is required"
+            )
     else:
-        raw_total, result_payload = await asyncio.gather(
-            _count_with_timeout(),
-            get_results(start, limit, filters_by_name),
-        )
+        if current_network_address_scope() is not None:
+            raw_total = await _count_with_timeout()
+            result_payload = await get_results(start, limit, filters_by_name)
+        else:
+            raw_total, result_payload = await gather_reader_calls(
+                db,
+                _count_with_timeout(),
+                get_results(start, limit, filters_by_name),
+            )
         result_rows, inline_total, summary_map = result_payload
         if inline_total is not None:
             raw_total = inline_total
@@ -10577,14 +9807,12 @@ async def list_providers(request):
     if view_mode != "card" and use_sitemap_fast_path:
         try:
             summary_map = await _fetch_provider_enrichment_summary_map(
-                [
-                    provider_result.get("npi")
-                    for provider_result in result_rows
-                    if isinstance(provider_result, dict)
-                ],
+                [provider_result.get("npi") for provider_result in result_rows if isinstance(provider_result, dict)],
                 include_chain=include_chain_enrichment,
                 session=request_session,
             )
+        except sanic.exceptions.ServiceUnavailable:
+            raise
         except Exception as exc:
             logger.debug("Provider enrichment summary fetch failed: %s", exc)
     if summary_map:
@@ -10597,6 +9825,10 @@ async def list_providers(request):
             summary = summary_map.get(int(npi_value))
             if summary:
                 provider_result["provider_enrichment_summary"] = summary
+    if view_mode != "card":
+        result_rows = await _project_provider_network_metadata(
+            result_rows, session=request_session, include_sources=include_sources, include_evidence=include_evidence
+        )
     if view_mode != "card" and (include_sources or include_evidence):
         source_detail_targets = list(result_rows)
         source_detail_targets.extend(
@@ -10625,9 +9857,7 @@ async def list_providers(request):
             continue
         public_locations = [provider_result]
         public_locations.extend(
-            location
-            for location in (provider_result.get("address_list") or [])
-            if isinstance(location, dict)
+            location for location in (provider_result.get("address_list") or []) if isinstance(location, dict)
         )
         for location in public_locations:
             location.pop("_base_row_identities", None)
@@ -10677,8 +9907,12 @@ get_all.__name__ = "get_all"
 @blueprint.get("/facilities/providers")
 async def get_facility_connected_providers(request):
     """Return providers connected to a requested enrolled facility."""
+    if _request_selector(request, None) is not None:
+        raise sanic.exceptions.InvalidUsage("Canonical network selectors are not supported for facility relationships.")
     request_session = _request_session(request)
-    facility_type_raw = _normalize_text_filter(request.args.get("facility_type"), param_name="facility_type", max_length=32)
+    facility_type_raw = _normalize_text_filter(
+        request.args.get("facility_type"), param_name="facility_type", max_length=32
+    )
     facility_type = (facility_type_raw or "hospital").lower()
     enrollment_model = FACILITY_ENROLLMENT_MODELS.get(facility_type)
     if enrollment_model is None:
@@ -10700,7 +9934,9 @@ async def get_facility_connected_providers(request):
         maximum=3000,
     )
     limit = _parse_bounded_int(request.args.get("limit"), param_name="limit", default=50, minimum=1, maximum=200)
-    offset = _parse_bounded_int(request.args.get("offset"), param_name="offset", default=0, minimum=0, maximum=1_000_000)
+    offset = _parse_bounded_int(
+        request.args.get("offset"), param_name="offset", default=0, minimum=0, maximum=1_000_000
+    )
     stats_limit = _parse_bounded_int(
         request.args.get("stats_limit"),
         param_name="stats_limit",
@@ -10913,19 +10149,23 @@ async def get_facility_connected_providers(request):
 
     if request_session is not None:
         session = request_session
-        total_result = await session.execute(total_sql, query_parameter_map)
-        facility_result = await session.execute(facilities_sql, query_parameter_map)
-        providers_result = await session.execute(providers_sql, execute_parameter_map)
+        total_result = await execute_network_read(session, total_sql, query_parameter_map)
+        facility_result = await execute_network_read(session, facilities_sql, query_parameter_map)
+        providers_result = await execute_network_read(session, providers_sql, execute_parameter_map)
         specialty_result = (
-            await session.execute(specialty_sql, execute_parameter_map) if include_specialty_stats else None
+            await execute_network_read(session, specialty_sql, execute_parameter_map)
+            if include_specialty_stats
+            else None
         )
     else:
         async with db.session() as session:
-            total_result = await session.execute(total_sql, query_parameter_map)
-            facility_result = await session.execute(facilities_sql, query_parameter_map)
-            providers_result = await session.execute(providers_sql, execute_parameter_map)
+            total_result = await execute_network_read(session, total_sql, query_parameter_map)
+            facility_result = await execute_network_read(session, facilities_sql, query_parameter_map)
+            providers_result = await execute_network_read(session, providers_sql, execute_parameter_map)
             specialty_result = (
-                await session.execute(specialty_sql, execute_parameter_map) if include_specialty_stats else None
+                await execute_network_read(session, specialty_sql, execute_parameter_map)
+                if include_specialty_stats
+                else None
             )
 
     total_row = total_result.first()
@@ -11015,16 +10255,14 @@ def _populate_near_provider_mapping(
 
     if row_dict.get("distance") is not None:
         provider_by_field["distance"] = row_dict.get("distance")
-    provider_by_field["_cursor_distance_meters"] = row_dict.get(
-        "cursor_distance_meters"
-    )
+    provider_by_field["_cursor_distance_meters"] = row_dict.get("cursor_distance_meters")
     provider_by_field["_cursor_npi"] = npi_value
     provider_by_field["_cursor_address_key"] = str(address_key_value)
     for column in NPIAddress.__table__.columns:
         if column.key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS and column.key in row_dict:
             provider_by_field[column.key] = row_dict[column.key]
     _attach_public_address_site_key(provider_by_field, row_dict)
-    if address_table_sql.endswith(".entity_address_unified"):
+    if _is_unified_address_table(address_table_sql):
         for key in PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS:
             if key in row_dict and key not in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
                 provider_by_field[key] = row_dict[key]
@@ -11041,79 +10279,130 @@ def _populate_near_provider_mapping(
 
 
 @blueprint.get("/near/")
-async def get_near_npi(request):
+@canonical_network_read
+async def get_near_npi(
+    request, *, native_args=None, import_context=None, prepare_cursor=None, native_scope_preparer=None
+):
     """Return providers near coordinates under optional taxonomy filters."""
+    if (native_args is None) != (import_context is None) and (
+        native_args is None or current_network_address_scope() is None
+    ):
+        raise sanic.exceptions.InvalidUsage("custom-import geo arguments are invalid")
+    if import_context is not None and type(import_context) is not ProviderImportQuery:
+        raise sanic.exceptions.InvalidUsage("custom-import geo context is invalid")
+    if (prepare_cursor is None) != (import_context is None):
+        raise sanic.exceptions.InvalidUsage("custom-import geo cursor is invalid")
+    if native_scope_preparer is not None and import_context is None:
+        raise sanic.exceptions.InvalidUsage("custom-import geo scope is invalid")
+    args = request.args if native_args is None else native_args
     request_session = _request_session(request)
+    if import_context is not None and request_session is None:
+        raise RuntimeError("custom-import geo query requires a request session")
+    # Explicit access for route collectors / OpenAPI parity. Imported calls use
+    # native_args but must retain the real request object.
     request.args.get("view")
-    view_mode = str(request.args.get("view") or "").strip().lower()
+    request.args.get("long")
+    request.args.get("lat")
+    request.args.get("codes")
+    request.args.get("plan_network")
+    request.args.get("classification")
+    request.args.get("specialization")
+    request.args.get("section")
+    request.args.get("display_name")
+    request.args.get("procedure_codes")
+    request.args.get("procedure_code_system")
+    request.args.get("medication_codes")
+    request.args.get("medication_code_system")
+    request.args.get("year")
+    request.args.get("plan_release_id")
+    request.args.get("primary_only")
+    request.args.get("entity_type_code")
+    request.args.get("provider_sex_code")
+    request.args.get("q")
+    request.args.get("exclude_npi")
+    request.args.get("limit")
+    request.args.get("count_only")
+    request.args.get("include_total")
+    request.args.get("cursor")
+    request.args.get("zip_codes")
+    request.args.get("radius")
+    view_mode = str(args.get("view") or "").strip().lower()
     if view_mode not in {"", "card"}:
         raise sanic.exceptions.InvalidUsage("view must be: card")
     in_long, in_lat = None, None
-    if request.args.get("long"):
-        in_long = float(request.args.get("long"))
-    if request.args.get("lat"):
-        in_lat = float(request.args.get("lat"))
+    try:
+        if args.get("long"):
+            in_long = float(args.get("long"))
+        if args.get("lat"):
+            in_lat = float(args.get("lat"))
+    except (TypeError, ValueError) as exc:
+        raise sanic.exceptions.InvalidUsage("lat and long must be numbers") from exc
 
-    codes = request.args.get("codes")
+    codes = args.get("codes")
     if codes:
         codes = [x.strip() for x in codes.split(",")]
 
-    plan_network_ids = request.args.get("plan_network")
+    plan_network_ids = args.get("plan_network")
     if plan_network_ids:
-        plan_network_ids = [int(x) for x in plan_network_ids.split(",")]
-    classification = request.args.get("classification")
-    specialization = request.args.get("specialization")
-    section = request.args.get("section")
-    display_name = request.args.get("display_name")
-    procedure_codes_raw = request.args.get("procedure_codes")
-    procedure_code_system_raw = request.args.get("procedure_code_system")
-    medication_codes_raw = request.args.get("medication_codes")
-    medication_code_system_raw = request.args.get("medication_code_system")
-    year_raw = request.args.get("year")
-    plan_release_id_raw = request.args.get("plan_release_id")
+        try:
+            plan_network_ids = [int(x) for x in plan_network_ids.split(",")]
+        except AttributeError, TypeError, ValueError:
+            raise sanic.exceptions.InvalidUsage("plan_network must contain integers") from None
+    classification = args.get("classification")
+    specialization = args.get("specialization")
+    section = args.get("section")
+    display_name = args.get("display_name")
+    procedure_codes_raw = args.get("procedure_codes")
+    procedure_code_system_raw = args.get("procedure_code_system")
+    medication_codes_raw = args.get("medication_codes")
+    medication_code_system_raw = args.get("medication_code_system")
+    year_raw = args.get("year")
+    plan_release_id_raw = args.get("plan_release_id")
     is_primary_only = _is_boolean_query_arg(
-        request.args.get("primary_only"),
+        args.get("primary_only"),
         "primary_only",
         default=True,
     )
     entity_type_code = _normalize_match_candidate_entity_type(
-        request.args.get("entity_type_code"),
+        args.get("entity_type_code"),
         None,
     )
-    provider_sex_code = normalize_provider_sex_code(
-        request.args.get("provider_sex_code")
-    )
+    provider_sex_code = normalize_provider_sex_code(args.get("provider_sex_code"))
     if entity_type_code == 2 and provider_sex_code is not None:
-        raise sanic.exceptions.InvalidUsage(
-            "provider_sex_code cannot be combined with entity_type_code=2"
-        )
-    request.args.get("q")
-    if _extract_name_filters(request):
-        raise sanic.exceptions.InvalidUsage(
-            "name_like is no longer supported on /npi/near/; use q"
-        )
-    name_query = str(request.args.get("q") or "").strip()
-    exclude_npi = int(request.args.get("exclude_npi", 0))
-    limit = int(request.args.get("limit", 5))
+        raise sanic.exceptions.InvalidUsage("provider_sex_code cannot be combined with entity_type_code=2")
+    if _extract_name_filters(request, args=args):
+        raise sanic.exceptions.InvalidUsage("name_like is no longer supported on /npi/near/; use q")
+    name_query = str(args.get("q") or "").strip()
+    try:
+        exclude_npi = int(args.get("exclude_npi", 0))
+        limit = int(args.get("limit", 5))
+    except (TypeError, ValueError) as exc:
+        raise sanic.exceptions.InvalidUsage("exclude_npi and limit must be integers") from exc
     if limit < 1:
         raise sanic.exceptions.InvalidUsage("limit must be at least 1")
-    include_total = _is_truthy_arg(request.args.get("include_total"), default=False)
-    cursor_raw = str(request.args.get("cursor") or "").strip()
-    pagination_requested = include_total or bool(cursor_raw)
-    cursor_scope = _nearby_cursor_scope(request.args)
-    initial_cursor = (
-        _decode_nearby_cursor(cursor_raw, cursor_scope) if cursor_raw else None
-    )
+    if import_context is not None and limit > 50:
+        raise sanic.exceptions.InvalidUsage("custom-import geo limit must not exceed 50")
+    include_total = _is_truthy_arg(args.get("include_total"), default=False)
+    is_count_only = _is_truthy_arg(args.get("count_only"), default=False)
+    cursor_raw = str(args.get("cursor") or "").strip()
+    if import_context is not None:
+        if not include_total:
+            raise sanic.exceptions.InvalidUsage("custom-import geo pages require exact totals")
+        is_pagination_requested = True
+        cursor_scope = None
+        initial_cursor = None
+    else:
+        is_pagination_requested = include_total or bool(cursor_raw)
+        cursor_scope = _nearby_cursor_scope(args)
+        initial_cursor = _decode_nearby_cursor(cursor_raw, cursor_scope) if cursor_raw else None
     zip_codes = []
-    for zip_c in request.args.get("zip_codes", "").split(","):
+    for zip_c in args.get("zip_codes", "").split(","):
         if not zip_c:
             continue
-        zip_codes.append(
-            _normalize_zip_code(zip_c.strip().rjust(5, "0"), "zip_codes")
-        )
+        zip_codes.append(_normalize_zip_code(zip_c.strip().rjust(5, "0"), "zip_codes"))
     has_coordinates = in_long is not None and in_lat is not None
     radius = _normalize_match_candidate_float(
-        request.args.get("radius"),
+        args.get("radius"),
         param_name="radius",
         minimum=0.0,
         maximum=_MATCH_CANDIDATES_MAX_RADIUS_MILES,
@@ -11152,92 +10441,77 @@ async def get_near_npi(request):
             MEDICATION_ALLOWED_CODE_SYSTEMS,
         )
 
-    if requested_procedure_codes or requested_medication_codes or requested_year is not None:
-        if request_session is not None:
-            filter_year, _filter_year_source = await _resolve_filter_year(
-                requested_year,
-                include_procedures=bool(requested_procedure_codes),
-                include_medications=bool(requested_medication_codes),
-                session=request_session,
-            )
-        else:
-            filter_year, _filter_year_source = await _resolve_filter_year(
-                requested_year,
-                include_procedures=bool(requested_procedure_codes),
-                include_medications=bool(requested_medication_codes),
-            )
-    else:
-        filter_year = None
-
-    procedure_internal_codes: list[int] = []
-    medication_internal_codes: list[int] = []
-    if requested_procedure_codes:
-        if request_session is not None:
-            procedure_internal_codes, _ = await _resolve_internal_filter_codes(
-                requested_procedure_codes,
-                procedure_code_system or INTERNAL_PROCEDURE_CODE_SYSTEM,
-                INTERNAL_PROCEDURE_CODE_SYSTEM,
-                "procedure_codes",
-                session=request_session,
-            )
-        else:
-            procedure_internal_codes, _ = await _resolve_internal_filter_codes(
-                requested_procedure_codes,
-                procedure_code_system or INTERNAL_PROCEDURE_CODE_SYSTEM,
-                INTERNAL_PROCEDURE_CODE_SYSTEM,
-                "procedure_codes",
-            )
-    if requested_medication_codes:
-        if request_session is not None:
-            medication_internal_codes, _ = await _resolve_internal_filter_codes(
-                requested_medication_codes,
-                medication_code_system or INTERNAL_MEDICATION_CODE_SYSTEM,
-                INTERNAL_MEDICATION_CODE_SYSTEM,
-                "medication_codes",
-                session=request_session,
-            )
-        else:
-            medication_internal_codes, _ = await _resolve_internal_filter_codes(
-                requested_medication_codes,
-                medication_code_system or INTERNAL_MEDICATION_CODE_SYSTEM,
-                INTERNAL_MEDICATION_CODE_SYSTEM,
-                "medication_codes",
-            )
-
-    if (requested_procedure_codes and not procedure_internal_codes) or (
-        requested_medication_codes and not medication_internal_codes
-    ):
-        if pagination_requested:
-            return response.json(
-                {
-                    "items": [],
-                    "total_count": 0,
-                    "next_cursor": None,
-                    "has_more": False,
-                    "result_identity": ["npi", "address_key"],
-                },
-                default=str,
-            )
-        return response.json([], default=str)
-
-    capability_by_name = {
-        "npi_procedures_array_available": True,
-        "npi_medications_array_available": True,
-        "pricing_provider_procedure_available": False,
-        "pricing_provider_prescription_available": False,
-    }
-    if requested_procedure_codes or requested_medication_codes:
-        if request_session is not None:
-            capability_by_name = await _resolve_npi_filter_capabilities(session=request_session)
-        else:
-            capability_by_name = await _resolve_npi_filter_capabilities()
-
     _validate_section_filters(section, classification, codes)
-    # If only zip was provided, resolve to coordinates first using a separate connection.
-    if not has_coordinates and zip_codes and zip_codes[0]:
-        zip_sql = "select intptlat, intptlon from zcta5 where zcta5ce=:zip_code limit 1;"
-        async with db.acquire() as conn_zip:
-            for coordinate_record in await conn_zip.all(text(zip_sql), zip_code=zip_codes[0]):
+    async with (
+        provider_geo_read_snapshot(db, _runtime_db_schema())
+        if import_context is None and current_network_address_scope() is None
+        else contextlib.nullcontext(request_session)
+    ) as request_session:
+        if requested_procedure_codes or requested_medication_codes or requested_year is not None:
+            filter_year, _filter_year_source = await _resolve_filter_year(
+                requested_year,
+                include_procedures=bool(requested_procedure_codes),
+                include_medications=bool(requested_medication_codes),
+                session=request_session,
+            )
+        else:
+            filter_year = None
+
+        procedure_internal_codes: list[int] = []
+        medication_internal_codes: list[int] = []
+        if requested_procedure_codes:
+            procedure_internal_codes, _ = await _resolve_internal_filter_codes(
+                requested_procedure_codes,
+                procedure_code_system or INTERNAL_PROCEDURE_CODE_SYSTEM,
+                INTERNAL_PROCEDURE_CODE_SYSTEM,
+                "procedure_codes",
+                session=request_session,
+            )
+        if requested_medication_codes:
+            medication_internal_codes, _ = await _resolve_internal_filter_codes(
+                requested_medication_codes,
+                medication_code_system or INTERNAL_MEDICATION_CODE_SYSTEM,
+                INTERNAL_MEDICATION_CODE_SYSTEM,
+                "medication_codes",
+                session=request_session,
+            )
+
+        unresolved_code_filter = bool(
+            (requested_procedure_codes and not procedure_internal_codes)
+            or (requested_medication_codes and not medication_internal_codes)
+        )
+        if unresolved_code_filter and import_context is None:
+            if is_count_only:
+                return response.json({"rows": 0}, default=str)
+            if is_pagination_requested:
+                return response.json(
+                    {
+                        "items": [],
+                        "total_count": 0,
+                        "next_cursor": None,
+                        "has_more": False,
+                        "result_identity": ["npi", "address_key"],
+                    },
+                    default=str,
+                )
+            return response.json([], default=str)
+
+        capability_by_name = {
+            "npi_procedures_array_available": True,
+            "npi_medications_array_available": True,
+            "pricing_provider_procedure_available": False,
+            "pricing_provider_prescription_available": False,
+        }
+        if requested_procedure_codes or requested_medication_codes:
+            if request_session is not None:
+                capability_by_name = await _resolve_npi_filter_capabilities(session=request_session)
+            else:
+                capability_by_name = await _resolve_npi_filter_capabilities()
+
+        if not has_coordinates and zip_codes and zip_codes[0]:
+            async with _provider_list_connection(db, import_context, request_session) as conn_zip:
+                zip_rows = await conn_zip.all(canonical_zip_anchor_statement(), zip_code=zip_codes[0])
+            for coordinate_record in zip_rows:
                 try:
                     in_long = float(coordinate_record["intptlon"])
                     in_lat = float(coordinate_record["intptlat"])
@@ -11245,376 +10519,425 @@ async def get_near_npi(request):
                     in_lat = float(coordinate_record[0])
                     in_long = float(coordinate_record[1])
 
-    address_table_sql = await _address_serving_table_sql(
-        _public_address_serving_column_keys(),
-        session=request_session,
-    )
-    plan_member_sql, plan_scope_parameters = await _plan_release_npi_scope(
-        request_session,
-        plan_release_id_raw,
-    )
-
-    providers_by_identity: OrderedDict[tuple[int, str], dict[str, Any]] = OrderedDict()
-    extra_filters: list[str] = []
-    if exclude_npi:
-        extra_filters.append("a.npi <> :exclude_npi")
-    if plan_network_ids:
-        extra_filters.append("a.plans_network_array && (:plan_network_array)")
-    if entity_type_code is not None:
-        extra_filters.append("d.entity_type_code = :entity_type_code")
-    if plan_member_sql is not None:
-        extra_filters.append(f"a.npi IN ({plan_member_sql})")
-    if provider_sex_code is not None:
-        extra_filters.append(
-            "EXISTS ("
-            "SELECT 1 FROM mrf.npi AS sex_provider "
-            "WHERE sex_provider.npi = a.npi "
-            "AND sex_provider.provider_sex_code = :provider_sex_code"
-            ")"
+        address_table_sql = (
+            scoped_address_relation_sql(f"{_runtime_db_schema()}.entity_address_unified", location_lookup=True)
+            if current_network_address_scope() is not None and in_long is not None and in_lat is not None
+            else await _address_serving_table_sql(_public_address_serving_column_keys(), session=request_session)
         )
-    dynamic_code_parameters_by_name: dict[str, int] = {}
-    if filter_year is not None and (procedure_internal_codes or medication_internal_codes):
-        dynamic_code_parameters_by_name["filter_year"] = int(filter_year)
-
-    procedures_array_available = bool(capability_by_name.get("npi_procedures_array_available", True))
-    medications_array_available = bool(capability_by_name.get("npi_medications_array_available", True))
-    procedure_table_available = bool(capability_by_name.get("pricing_provider_procedure_available", False))
-    medication_table_available = bool(capability_by_name.get("pricing_provider_prescription_available", False))
-
-    for idx, code in enumerate(procedure_internal_codes):
-        param = f"procedure_code_{idx}"
-        dynamic_code_parameters_by_name[param] = int(code)
-        array_clause = f"a.procedures_array @> ARRAY[:{param}]::INTEGER[]"
-        exists_clause = (
-            "EXISTS ("
-            "SELECT 1 FROM mrf.pricing_provider_procedure AS pp "
-            f"WHERE pp.npi = a.npi AND pp.procedure_code = :{param}"
-            + (" AND pp.year = :filter_year" if filter_year is not None else "")
-            + ")"
+        plan_member_sql, plan_scope_parameters = await _plan_release_npi_scope(
+            request_session,
+            plan_release_id_raw,
         )
-        if procedures_array_available and procedure_table_available:
-            extra_filters.append(f"({array_clause} OR {exists_clause})")
-        elif procedures_array_available:
-            extra_filters.append(array_clause)
-        elif procedure_table_available:
-            extra_filters.append(exists_clause)
-        else:
+
+        providers_by_identity: OrderedDict[tuple[int, str], dict[str, Any]] = OrderedDict()
+        extra_filters: list[str] = []
+        if unresolved_code_filter:
             extra_filters.append("1=0")
+        if exclude_npi:
+            extra_filters.append("a.npi <> :exclude_npi")
+        if plan_network_ids:
+            extra_filters.append("a.plans_network_array && (:plan_network_array)")
+        if entity_type_code is not None:
+            extra_filters.append("d.entity_type_code = :entity_type_code")
+        if plan_member_sql is not None:
+            extra_filters.append(f"a.npi IN ({plan_member_sql})")
+        if provider_sex_code is not None:
+            extra_filters.append(
+                "EXISTS ("
+                "SELECT 1 FROM mrf.npi AS sex_provider "
+                "WHERE sex_provider.npi = a.npi "
+                "AND sex_provider.provider_sex_code = :provider_sex_code"
+                ")"
+            )
+        dynamic_code_parameters_by_name: dict[str, int] = {}
+        if filter_year is not None and (procedure_internal_codes or medication_internal_codes):
+            dynamic_code_parameters_by_name["filter_year"] = int(filter_year)
 
-    for idx, code in enumerate(medication_internal_codes):
-        param = f"medication_code_{idx}"
-        dynamic_code_parameters_by_name[param] = int(code)
-        array_clause = f"a.medications_array @> ARRAY[:{param}]::INTEGER[]"
-        exists_clause = (
-            "EXISTS ("
-            "SELECT 1 FROM mrf.pricing_provider_prescription AS pr "
-            "WHERE pr.npi = a.npi "
-            "AND pr.rx_code_system = 'HP_RX_CODE' "
-            + ("AND pr.year = :filter_year " if filter_year is not None else "")
-            + f"AND CASE WHEN pr.rx_code ~ '^-?[0-9]+$' THEN pr.rx_code::INTEGER END = :{param}"
-            ")"
-        )
-        if medications_array_available and medication_table_available:
-            extra_filters.append(f"({array_clause} OR {exists_clause})")
-        elif medications_array_available:
-            extra_filters.append(array_clause)
-        elif medication_table_available:
-            extra_filters.append(exists_clause)
-        else:
-            extra_filters.append("1=0")
+        procedures_array_available = bool(capability_by_name.get("npi_procedures_array_available", True))
+        medications_array_available = bool(capability_by_name.get("npi_medications_array_available", True))
+        procedure_table_available = bool(capability_by_name.get("pricing_provider_procedure_available", False))
+        medication_table_available = bool(capability_by_name.get("pricing_provider_prescription_available", False))
 
-    taxonomy_clauses: list[str] = []
-    if zip_codes:
-        extra_filters.append(_address_zip5_filter("a", address_table_sql, any_array=True))
-
-    if classification:
-        taxonomy_clauses.append("classification = :classification")
-    if specialization:
-        taxonomy_clauses.append("specialization = :specialization")
-    if section:
-        taxonomy_clauses.append("section = :section")
-    if display_name:
-        taxonomy_clauses.append("display_name = :display_name")
-    if codes:
-        taxonomy_clauses.append("code = ANY(:codes)")
-    ilike_clause = ""
-    q_like = None
-    if name_query:
-        q_like = f"%{name_query}%"
-        ilike_clause = f"\n            AND {_name_like_clause('d', 'q')}"
-
-    taxonomy_conditions = " AND ".join(taxonomy_clauses) if taxonomy_clauses else "1=1"
-    extra_clause = ""
-    if extra_filters:
-        extra_clause = "\n          AND " + "\n          AND ".join(extra_filters)
-
-    query_parameters_by_name: dict[str, Any] = {
-        "in_long": in_long,
-        "in_lat": in_lat,
-        "classification": classification,
-        "specialization": specialization,
-        "radius": radius,
-        "exclude_npi": exclude_npi,
-        "section": section,
-        "display_name": display_name,
-        "q": q_like,
-        "codes": codes,
-        "zip_codes": zip_codes,
-        "plan_network_array": plan_network_ids,
-        "provider_sex_code": provider_sex_code,
-        "entity_type_code": entity_type_code,
-        **plan_scope_parameters,
-        **dynamic_code_parameters_by_name,
-    }
-
-    async def fetch_nearby_rows() -> list[Any]:
-        """Fetch enough KNN rows to page unique provider-address identities."""
-        target_identities = limit + 1 if pagination_requested else limit
-        candidate_limit = max((target_identities + 1) * 4, 16)
-        batch_cursor = initial_cursor
-        collected_rows: list[Any] = []
-        collected_identities: set[tuple[int, str]] = set()
-        async with db.acquire() as conn:
-            for _batch_number in range(100):
-                cursor_clause, cursor_parameters_by_name = _nearby_cursor_filter(
-                    batch_cursor
+        for idx, code in enumerate(procedure_internal_codes):
+            param = f"procedure_code_{idx}"
+            dynamic_code_parameters_by_name[param] = int(code)
+            array_clause = f"a.procedures_array @> ARRAY[:{param}]::INTEGER[]"
+            claims_pp_relation = "mrf.pricing_provider_procedure"
+            if has_network_read_inventory(request_session):
+                claims_pp_relation = direct_heap_relation_sql(request_session, "mrf", "pricing_provider_procedure")
+            exists_clause = (
+                "EXISTS ("
+                f"SELECT 1 FROM {claims_pp_relation} AS pp "
+                f"WHERE pp.npi = a.npi AND pp.procedure_code = :{param}"
+                + (" AND pp.year = :filter_year" if filter_year is not None else "")
+                + ")"
+            )
+            if procedures_array_available:
+                extra_filters.append(
+                    f"({array_clause} OR {exists_clause})" if procedure_table_available else array_clause
                 )
-                batch_parameters_by_name = {
-                    **query_parameters_by_name,
-                    **cursor_parameters_by_name,
-                }
-                nearby_sql = _build_nearby_sql(
-                    taxonomy_conditions,
-                    extra_clause,
-                    ilike_clause,
-                    use_taxonomy_filter=bool(taxonomy_clauses),
-                    primary_only=is_primary_only,
-                    address_table_sql=address_table_sql,
-                    geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
-                    cursor_clause=cursor_clause,
+            else:
+                extra_filters.append(exists_clause if procedure_table_available else "1=0")
+
+        for idx, code in enumerate(medication_internal_codes):
+            param = f"medication_code_{idx}"
+            dynamic_code_parameters_by_name[param] = int(code)
+            array_clause = f"a.medications_array @> ARRAY[:{param}]::INTEGER[]"
+            claims_pr_relation = "mrf.pricing_provider_prescription"
+            if has_network_read_inventory(request_session):
+                claims_pr_relation = direct_heap_relation_sql(request_session, "mrf", "pricing_provider_prescription")
+            exists_clause = (
+                "EXISTS ("
+                f"SELECT 1 FROM {claims_pr_relation} AS pr "
+                "WHERE pr.npi = a.npi "
+                "AND pr.rx_code_system = 'HP_RX_CODE' "
+                + ("AND pr.year = :filter_year " if filter_year is not None else "")
+                + f"AND CASE WHEN pr.rx_code ~ '^-?[0-9]+$' THEN pr.rx_code::INTEGER END = :{param}"
+                ")"
+            )
+            if medications_array_available:
+                extra_filters.append(
+                    f"({array_clause} OR {exists_clause})" if medication_table_available else array_clause
                 )
-                batch_rows = await conn.all(
-                    text(nearby_sql),
-                    limit=candidate_limit,
-                    **batch_parameters_by_name,
-                )
-                if not batch_rows:
-                    break
-                collected_rows.extend(batch_rows)
-                last_cursor = None
-                for batch_row in batch_rows:
-                    mapping = getattr(batch_row, "_mapping", None)
-                    if mapping is None:
-                        continue
-                    npi_value = mapping.get("npi_code") or mapping.get("npi")
-                    address_key_value = mapping.get("address_key")
-                    distance_value = mapping.get("cursor_distance_meters")
-                    if npi_value is None or address_key_value is None:
-                        continue
-                    identity = (int(npi_value), str(address_key_value).lower())
-                    collected_identities.add(identity)
-                    if distance_value is not None:
-                        last_cursor = (
-                            float(distance_value),
-                            int(npi_value),
-                            str(address_key_value),
-                        )
+            else:
+                extra_filters.append(exists_clause if medication_table_available else "1=0")
 
-                if len(collected_identities) >= target_identities:
-                    break
-                if last_cursor is None or last_cursor == batch_cursor:
-                    break
-                batch_cursor = last_cursor
+        taxonomy_clauses: list[str] = []
+        if zip_codes:
+            extra_filters.append(_address_zip5_filter("a", address_table_sql, any_array=True))
 
-        return collected_rows
+        if classification:
+            taxonomy_clauses.append("classification = :classification")
+        if specialization:
+            taxonomy_clauses.append("specialization = :specialization")
+        if section:
+            taxonomy_clauses.append("section = :section")
+        if display_name:
+            taxonomy_clauses.append("display_name = :display_name")
+        if codes:
+            taxonomy_clauses.append("code = ANY(:codes)")
+        ilike_clause = ""
+        q_like = None
+        if name_query:
+            q_like = f"%{name_query.lower()}%"
+            ilike_clause = f"\n            AND {_name_like_clause('d', 'q')}"
 
-    bbox_parameters_by_name: dict[str, float] = {}
-    bbox_clause = ""
-    if in_long is not None and in_lat is not None:
-        delta_lat = radius / 69.0
-        cos_lat = math.cos(math.radians(in_lat)) or 1e-6
-        delta_long = radius / (69.0 * cos_lat)
-        bbox_parameters_by_name = {
-            "min_lat": in_lat - delta_lat,
-            "max_lat": in_lat + delta_lat,
-            "min_long": in_long - delta_long,
-            "max_long": in_long + delta_long,
+        taxonomy_conditions = " AND ".join(taxonomy_clauses) if taxonomy_clauses else "1=1"
+        extra_clause = ""
+        if extra_filters:
+            extra_clause = "\n          AND " + "\n          AND ".join(extra_filters)
+
+        query_parameters_by_name: dict[str, Any] = {
+            "in_long": in_long,
+            "in_lat": in_lat,
+            "classification": classification,
+            "specialization": specialization,
+            "radius": radius,
+            "exclude_npi": exclude_npi,
+            "section": section,
+            "display_name": display_name,
+            "q": q_like,
+            "codes": codes,
+            "zip_codes": zip_codes,
+            "plan_network_array": plan_network_ids,
+            "provider_sex_code": provider_sex_code,
+            "entity_type_code": entity_type_code,
+            **plan_scope_parameters,
+            **dynamic_code_parameters_by_name,
         }
-        bbox_clause = dedent(
-            """
-
-               AND a.lat BETWEEN :min_lat AND :max_lat
-               AND a.long BETWEEN :min_long AND :max_long
-            """
-        ).rstrip()
-
-    async def fetch_exact_total() -> int:
-        """Count exact provider-address matches without the page limit."""
-
-        count_sql = _build_nearby_count_sql(
-            taxonomy_conditions,
-            extra_clause,
-            ilike_clause,
-            use_taxonomy_filter=bool(taxonomy_clauses),
-            primary_only=is_primary_only,
-            address_table_sql=address_table_sql,
-            geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
-            bbox_clause=bbox_clause,
-        )
-        async with db.acquire() as conn:
-            rows = await conn.all(
-                text(count_sql),
-                **query_parameters_by_name,
-                **bbox_parameters_by_name,
+        query_parameters_by_name = scoped_address_parameters(query_parameters_by_name)
+        imported_statements = None
+        if import_context is not None:
+            geo_precision_clause = _exact_geo_precision_clause(address_table_sql)
+            geo_type_clause = _nearby_geo_type_clause(address_table_sql)
+            nearby_query = NearbySqlQuery(
+                taxonomy_conditions=taxonomy_conditions,
+                extra_clause=extra_clause,
+                ilike_clause=ilike_clause,
+                use_taxonomy_filter=bool(taxonomy_clauses),
+                primary_only=is_primary_only,
+                address_table_sql=address_table_sql,
+                geo_precision_clause=geo_precision_clause,
+                geo_type_clause=geo_type_clause,
             )
-        if not rows:
-            return 0
-        mapping = getattr(rows[0], "_mapping", None)
-        value = mapping.get("total_count") if mapping is not None else rows[0][0]
-        return int(value or 0)
-
-    if pagination_requested:
-        res_q, total_count = await asyncio.gather(
-            fetch_nearby_rows(),
-            fetch_exact_total(),
-        )
-    else:
-        res_q = await fetch_nearby_rows()
-        total_count = None
-
-    for provider_record in res_q:
-        row_mapping = getattr(provider_record, "_mapping", None)
-        if row_mapping is not None:
-            row_dict = dict(row_mapping)
-            npi_value = (
-                row_dict.get("npi_code")
-                or row_dict.get("npi")
-                or row_dict.get("npi_1")
-                or row_dict.get("npi_2")
+            if native_scope_preparer is not None:
+                import_context = await native_scope_preparer(native_geo_entity_scope())
+            cursor_anchor = await prepare_cursor(
+                session=request_session,
+                address_table_sql=address_table_sql,
+                query_parameters=dict(query_parameters_by_name),
+                taxonomy_conditions=taxonomy_conditions,
+                extra_clause=extra_clause,
+                ilike_clause=ilike_clause,
+                primary_only=is_primary_only,
+                use_taxonomy_filter=bool(taxonomy_clauses),
+                limit=limit,
+                geo_precision_clause=geo_precision_clause,
+                geo_type_clause=geo_type_clause,
             )
+            imported_statements = build_imported_geo_statements(
+                import_context,
+                ImportedGeoQuery(
+                    nearby=nearby_query,
+                    native_parameters=query_parameters_by_name,
+                    limit=limit,
+                    cursor_anchor=cursor_anchor,
+                ),
+            )
+
+        async def fetch_nearby_rows() -> list[Any]:
+            """Fetch an exact imported page or enough native KNN rows for one page."""
+            if imported_statements is not None:
+                return await _fetch_imported_geo_page(
+                    db,
+                    import_context,
+                    request_session,
+                    imported_statements,
+                )
+            target_identities = limit + 1 if is_pagination_requested else limit
+            candidate_limit = max((target_identities + 1) * 4, 16)
+            batch_cursor = initial_cursor
+            collected_rows: list[Any] = []
+            collected_identities: set[tuple[int, str]] = set()
+            async with _provider_list_connection(db, import_context, request_session) as conn:
+                for _batch_number in range(100):
+                    cursor_clause, cursor_parameters_by_name = _nearby_cursor_filter(batch_cursor)
+                    batch_parameters_by_name = {
+                        **query_parameters_by_name,
+                        **cursor_parameters_by_name,
+                    }
+                    nearby_sql = _build_nearby_sql(
+                        taxonomy_conditions,
+                        extra_clause,
+                        ilike_clause,
+                        use_taxonomy_filter=bool(taxonomy_clauses),
+                        primary_only=is_primary_only,
+                        address_table_sql=address_table_sql,
+                        geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
+                        cursor_clause=cursor_clause,
+                    )
+                    batch_rows = await conn.all(
+                        text(nearby_sql),
+                        limit=candidate_limit,
+                        **batch_parameters_by_name,
+                    )
+                    if not batch_rows:
+                        break
+                    collected_rows.extend(batch_rows)
+                    batch_identities, last_cursor = nearby_batch_identities(batch_rows)
+                    collected_identities.update(batch_identities)
+
+                    if len(collected_identities) >= target_identities:
+                        break
+                    if last_cursor is None or last_cursor == batch_cursor:
+                        break
+                    batch_cursor = last_cursor
+
+            return collected_rows
+
+        bbox_parameters_by_name: dict[str, float] = {}
+        bbox_clause = ""
+        if in_long is not None and in_lat is not None:
+            delta_lat = radius / 69.0
+            cos_lat = math.cos(math.radians(in_lat)) or 1e-6
+            delta_long = radius / (69.0 * cos_lat)
+            bbox_parameters_by_name = {
+                "min_lat": in_lat - delta_lat,
+                "max_lat": in_lat + delta_lat,
+                "min_long": in_long - delta_long,
+                "max_long": in_long + delta_long,
+            }
+            bbox_clause = dedent(
+                """
+
+                   AND a.lat BETWEEN :min_lat AND :max_lat
+                   AND a.long BETWEEN :min_long AND :max_long
+                """
+            ).rstrip()
+
+        async def fetch_exact_total() -> int:
+            """Count exact provider-address matches without the page limit."""
+
+            if imported_statements is not None:
+                statement, parameters_by_name = imported_statements.count, imported_statements.parameters
+            else:
+                statement = text(
+                    _build_nearby_count_sql(
+                        taxonomy_conditions,
+                        extra_clause,
+                        ilike_clause,
+                        use_taxonomy_filter=bool(taxonomy_clauses),
+                        primary_only=is_primary_only,
+                        address_table_sql=address_table_sql,
+                        geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
+                        bbox_clause=bbox_clause,
+                    )
+                )
+                parameters_by_name = {**query_parameters_by_name, **bbox_parameters_by_name}
+            async with _provider_list_connection(db, import_context, request_session) as conn:
+                count_records = await conn.all(statement, **parameters_by_name)
+            if not count_records:
+                return 0
+            count_mapping = getattr(count_records[0], "_mapping", None)
+            total_count_value = count_mapping.get("total_count") if count_mapping is not None else count_records[0][0]
+            return int(total_count_value or 0)
+
+        if is_count_only:
+            return response.json({"rows": await fetch_exact_total()}, default=str)
+        if imported_statements is not None:
+            res_q = await fetch_nearby_rows()
+            total_mapping = getattr(res_q[0], "_mapping", {}) if res_q else {}
+            if total_mapping.get("_geo_total") is None:
+                raise RuntimeError("custom-import geo count is required")
+            total_count = int(total_mapping["_geo_total"])
+        elif is_pagination_requested and current_network_address_scope() is not None:
+            res_q = await fetch_nearby_rows()
+            total_count = await fetch_exact_total()
+        elif is_pagination_requested:
+            res_q, total_count = await gather_reader_calls(db, fetch_nearby_rows(), fetch_exact_total())
+        else:
+            res_q = await fetch_nearby_rows()
+            total_count = None
+
+        for provider_record in res_q:
+            row_mapping = getattr(provider_record, "_mapping", None)
+            if row_mapping is not None:
+                row_dict = dict(row_mapping)
+                npi_value = (
+                    row_dict.get("npi_code") or row_dict.get("npi") or row_dict.get("npi_1") or row_dict.get("npi_2")
+                )
+                if npi_value is None:
+                    continue
+
+                npi_value = int(npi_value)
+                address_key_value = row_dict.get("address_key")
+                if address_key_value is None:
+                    continue
+                identity = (npi_value, str(address_key_value).lower())
+                is_new_identity = identity not in providers_by_identity
+                provider_by_field = providers_by_identity.get(identity, {"taxonomy_list": []})
+                if is_new_identity:
+                    _populate_near_provider_mapping(
+                        provider_by_field,
+                        row_dict,
+                        npi_value,
+                        address_key_value,
+                        address_table_sql,
+                    )
+
+                taxonomy_by_field = {
+                    column.key: row_dict[column.key]
+                    for column in NPIDataTaxonomy.__table__.columns
+                    if column.key not in ("npi", "checksum") and column.key in row_dict
+                }
+                if taxonomy_by_field and row_dict.get("taxonomy_display") is not None:
+                    taxonomy_by_field["display"] = row_dict.get("taxonomy_display")
+                if taxonomy_by_field and taxonomy_by_field not in provider_by_field["taxonomy_list"]:
+                    provider_by_field["taxonomy_list"].append(taxonomy_by_field)
+
+                providers_by_identity[identity] = provider_by_field
+                continue
+
+            # Fallback for positional row types. Keep this defensive to avoid crashes
+            # when result shape differs from model column expectations.
+            row_len = len(provider_record)
+            if row_len <= 1:
+                continue
+
+            provider_by_field = {"taxonomy_list": []}
+            count = 1
+            provider_by_field["distance"] = provider_record[count]
+
+            for column in NPIAddress.__table__.columns:
+                count += 1
+                if count >= row_len:
+                    break
+                if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
+                    continue
+                provider_by_field[column.key] = provider_record[count]
+            for column in NPIData.__table__.columns:
+                count += 1
+                if count >= row_len:
+                    break
+                if column.key in {
+                    "npi",
+                    "checksum",
+                    "do_business_as_text",
+                    *PUBLIC_NPI_EXCLUDED_COLUMNS,
+                }:
+                    continue
+                provider_by_field[column.key] = provider_record[count]
+
+            npi_value = provider_by_field.get("npi")
             if npi_value is None:
                 continue
-
-            npi_value = int(npi_value)
-            address_key_value = row_dict.get("address_key")
-            if address_key_value is None:
-                continue
-            identity = (npi_value, str(address_key_value).lower())
-            is_new_identity = identity not in providers_by_identity
-            provider_by_field = providers_by_identity.get(identity, {"taxonomy_list": []})
-            if is_new_identity:
-                _populate_near_provider_mapping(
-                    provider_by_field,
-                    row_dict,
-                    npi_value,
-                    address_key_value,
-                    address_table_sql,
-                )
-
+            address_key_value = provider_by_field.get("address_key")
+            identity = (int(npi_value), str(address_key_value or "").lower())
+            if identity in providers_by_identity:
+                provider_by_field = providers_by_identity[identity]
             taxonomy_by_field = {}
             for column in NPIDataTaxonomy.__table__.columns:
+                count += 1
+                if count >= row_len:
+                    break
                 if column.key in ("npi", "checksum"):
                     continue
-                if column.key in row_dict:
-                    taxonomy_by_field[column.key] = row_dict[column.key]
-            if taxonomy_by_field and row_dict.get("taxonomy_display") is not None:
-                taxonomy_by_field["display"] = row_dict.get("taxonomy_display")
+                taxonomy_by_field[column.key] = provider_record[count]
             if taxonomy_by_field and taxonomy_by_field not in provider_by_field["taxonomy_list"]:
                 provider_by_field["taxonomy_list"].append(taxonomy_by_field)
 
             providers_by_identity[identity] = provider_by_field
-            continue
 
-        # Fallback for positional row types. Keep this defensive to avoid crashes
-        # when result shape differs from model column expectations.
-        row_len = len(provider_record)
-        if row_len <= 1:
-            continue
-
-        provider_by_field = {"taxonomy_list": []}
-        count = 1
-        provider_by_field["distance"] = provider_record[count]
-
-        for column in NPIAddress.__table__.columns:
-            count += 1
-            if count >= row_len:
-                break
-            if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS:
-                continue
-            provider_by_field[column.key] = provider_record[count]
-        for column in NPIData.__table__.columns:
-            count += 1
-            if count >= row_len:
-                break
-            if column.key in {
-                "npi",
-                "checksum",
-                "do_business_as_text",
-                *PUBLIC_NPI_EXCLUDED_COLUMNS,
-            }:
-                continue
-            provider_by_field[column.key] = provider_record[count]
-
-        npi_value = provider_by_field.get("npi")
-        if npi_value is None:
-            continue
-        address_key_value = provider_by_field.get("address_key")
-        identity = (int(npi_value), str(address_key_value or "").lower())
-        if identity in providers_by_identity:
-            provider_by_field = providers_by_identity[identity]
-        taxonomy_by_field = {}
-        for column in NPIDataTaxonomy.__table__.columns:
-            count += 1
-            if count >= row_len:
-                break
-            if column.key in ("npi", "checksum"):
-                continue
-            taxonomy_by_field[column.key] = provider_record[count]
-        if taxonomy_by_field and taxonomy_by_field not in provider_by_field["taxonomy_list"]:
-            provider_by_field["taxonomy_list"].append(taxonomy_by_field)
-
-        providers_by_identity[identity] = provider_by_field
-
-    all_provider_results = list(providers_by_identity.values())
-    has_more = pagination_requested and len(all_provider_results) > limit
-    provider_results = all_provider_results[:limit]
-    next_cursor = None
-    if has_more and provider_results:
-        final_result = provider_results[-1]
-        distance_value = final_result.get("_cursor_distance_meters")
-        npi_value = final_result.get("_cursor_npi")
-        address_key_value = final_result.get("_cursor_address_key")
-        if distance_value is not None and npi_value is not None and address_key_value:
-            next_cursor = _encode_nearby_cursor(
-                cursor_scope,
-                float(distance_value),
-                int(npi_value),
-                str(address_key_value),
+        all_provider_results = list(providers_by_identity.values())
+        has_more = is_pagination_requested and len(all_provider_results) > limit
+        provider_results = all_provider_results[:limit]
+        next_cursor = None
+        next_import_anchor_parts = None
+        if has_more and provider_results:
+            final_result = provider_results[-1]
+            distance_value = final_result.get("_cursor_distance_meters")
+            npi_value = final_result.get("_cursor_npi")
+            address_key_value = final_result.get("_cursor_address_key")
+            if imported_statements is not None:
+                try:
+                    next_import_anchor_parts = [
+                        str(int(npi_value)),
+                        str(uuid.UUID(str(address_key_value))),
+                    ]
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("custom-import geo page identity is unavailable") from exc
+            elif distance_value is not None and npi_value is not None and address_key_value:
+                next_cursor = _encode_nearby_cursor(
+                    cursor_scope,
+                    float(distance_value),
+                    int(npi_value),
+                    str(address_key_value),
+                )
+        for provider_result in provider_results:
+            if isinstance(provider_result, dict):
+                provider_result.pop("_cursor_distance_meters", None)
+                provider_result.pop("_cursor_npi", None)
+                provider_result.pop("_cursor_address_key", None)
+                _add_canonical_contact_fields_to_address(provider_result)
+        if view_mode != "card":
+            provider_results = await _project_provider_network_metadata(
+                provider_results, session=request_session, include_sources=False, include_evidence=False
             )
-    for provider_result in provider_results:
-        if isinstance(provider_result, dict):
-            provider_result.pop("_cursor_distance_meters", None)
-            provider_result.pop("_cursor_npi", None)
-            provider_result.pop("_cursor_address_key", None)
-            _add_canonical_contact_fields_to_address(provider_result)
-    _redact_internal_address_fields(provider_results)
-    if view_mode == "card":
-        provider_results = [
-            _provider_card_from_mapping(provider_result)
-            for provider_result in provider_results
-        ]
-    if pagination_requested:
-        return response.json(
-            {
+        _redact_internal_address_fields(provider_results)
+        if view_mode == "card":
+            provider_results = [_provider_card_from_mapping(provider_result) for provider_result in provider_results]
+        if is_pagination_requested:
+            response_by_key = {
                 "items": provider_results,
                 "total_count": int(total_count or 0),
                 "next_cursor": next_cursor,
                 "has_more": bool(has_more),
                 "result_identity": ["npi", "address_key"],
-            },
-            default=str,
-        )
-    return response.json(provider_results, default=str)
+            }
+            if imported_statements is not None:
+                response_by_key["_custom_import_next_anchor"] = next_import_anchor_parts
+            return response.json(response_by_key, default=str)
+        return response.json(provider_results, default=str)
 
 
 @blueprint.get("/id/<npi>/full_taxonomy")
@@ -11713,8 +11036,7 @@ def _assert_provider_profile_query_scope(
             "category and categories cannot be used together",
         )
     has_page_window = any(
-        request_args.get(parameter_name) not in (None, "", "null")
-        for parameter_name in ("limit", "offset")
+        request_args.get(parameter_name) not in (None, "", "null") for parameter_name in ("limit", "offset")
     )
     if has_page_window and page_category is None:
         raise _ProviderProfileQueryError(
@@ -11735,17 +11057,11 @@ def _provider_profile_requested_categories(
     requested_categories = (
         (page_category,)
         if page_category
-        else tuple(
-            field_value.strip()
-            for field_value in str(raw_categories).split(",")
-            if field_value.strip()
-        )
+        else tuple(field_value.strip() for field_value in str(raw_categories).split(",") if field_value.strip())
         if raw_categories
         else tuple(STANDARD_CATEGORIES)
     )
-    unknown_categories = sorted(
-        set(requested_categories) - set(STANDARD_CATEGORIES)
-    )
+    unknown_categories = sorted(set(requested_categories) - set(STANDARD_CATEGORIES))
     if unknown_categories:
         raise _ProviderProfileQueryError(
             "invalid_profile_categories",
@@ -11815,11 +11131,7 @@ def _compose_requested_provider_profile(
     profile_by_key = compose_provider_profile(
         normalized_npi,
         state_projection=state_projection,
-        fhir_profile=(
-            fhir_record_by_key.get("profile")
-            if fhir_record_by_key
-            else None
-        ),
+        fhir_profile=(fhir_record_by_key.get("profile") if fhir_record_by_key else None),
         requested_categories=list(query.requested_categories),
         include_sensitive=query.include_sensitive,
         page_category=query.page_category,
@@ -11830,19 +11142,13 @@ def _compose_requested_provider_profile(
         return None
     fhir_profile_by_key = (
         fhir_record_by_key.get("profile")
-        if fhir_record_by_key
-        and isinstance(fhir_record_by_key.get("profile"), Mapping)
+        if fhir_record_by_key and isinstance(fhir_record_by_key.get("profile"), Mapping)
         else None
     )
-    if (
-        isinstance(fhir_profile_by_key, Mapping)
-        and "profile_as_of" in fhir_profile_by_key
-    ):
+    if isinstance(fhir_profile_by_key, Mapping) and "profile_as_of" in fhir_profile_by_key:
         profile_by_key = dict(profile_by_key)
-        profile_by_key["profile_as_of"] = (
-            _serialize_provider_directory_profile_as_of(
-                fhir_profile_by_key.get("profile_as_of")
-            )
+        profile_by_key["profile_as_of"] = _serialize_provider_directory_profile_as_of(
+            fhir_profile_by_key.get("profile_as_of")
         )
     return profile_by_key
 
@@ -11851,10 +11157,7 @@ def _provider_profile_generation_error(
     profile_by_key: Mapping[str, Any],
     requested_generation_id: str | None,
 ) -> Any | None:
-    if (
-        requested_generation_id is None
-        or profile_by_key["generation_id"] == requested_generation_id
-    ):
+    if requested_generation_id is None or profile_by_key["generation_id"] == requested_generation_id:
         return None
     return _provider_profile_error_response(
         "provider_profile_generation_changed",
@@ -11880,11 +11183,7 @@ def _provider_profile_response_by_key(
         return response_by_key
     evidence_by_key = compose_provider_profile_evidence(
         state_projection=state_projection,
-        fhir_evidence=(
-            fhir_record_by_key.get("evidence")
-            if fhir_record_by_key
-            else None
-        ),
+        fhir_evidence=(fhir_record_by_key.get("evidence") if fhir_record_by_key else None),
         provider_profile=profile_by_key,
         page_category=query.page_category,
     )
@@ -11919,13 +11218,12 @@ async def get_provider_profile(request, npi):
     except _ProviderProfileQueryError as exc:
         return response.json(exc.response_by_key, status=exc.status)
     normalized_npi = int(npi)
-    state_projection, fhir_profile_map = await asyncio.gather(
-        fetch_provider_profile_projection(normalized_npi),
-        _fetch_provider_directory_profile_map(
+    async with provider_profile_read_snapshot(db, _runtime_db_schema()):
+        state_projection = await fetch_provider_profile_projection(normalized_npi)
+        fhir_profile_map = await _fetch_provider_directory_profile_map(
             [normalized_npi],
             include_evidence=query.include_evidence,
-        ),
-    )
+        )
     fhir_record_by_key = fhir_profile_map.get(normalized_npi)
     profile_by_key = _compose_requested_provider_profile(
         normalized_npi,
@@ -12008,9 +11306,7 @@ async def get_plans_by_npi(_request, npi):
 def _normalize_npi_batch_npis(raw_npis: Any) -> list[int]:
     """Validate and normalize the ordered NPI list."""
     if not isinstance(raw_npis, list) or not 1 <= len(raw_npis) <= NPI_BATCH_MAX_SIZE:
-        raise sanic.exceptions.InvalidUsage(
-            f"npis must contain between 1 and {NPI_BATCH_MAX_SIZE} values"
-        )
+        raise sanic.exceptions.InvalidUsage(f"npis must contain between 1 and {NPI_BATCH_MAX_SIZE} values")
     normalized_npis: list[int] = []
     for raw_npi in raw_npis:
         if isinstance(raw_npi, bool):
@@ -12037,14 +11333,8 @@ def _bounded_npi_batch_integer(
 ) -> int:
     """Read one bounded integer option without accepting booleans."""
     field_value = raw_body.get(field_name, default)
-    if (
-        isinstance(field_value, bool)
-        or not isinstance(field_value, int)
-        or not minimum <= field_value <= maximum
-    ):
-        raise sanic.exceptions.InvalidUsage(
-            f"{field_name} must be an integer between {minimum} and {maximum}"
-        )
+    if isinstance(field_value, bool) or not isinstance(field_value, int) or not minimum <= field_value <= maximum:
+        raise sanic.exceptions.InvalidUsage(f"{field_name} must be an integer between {minimum} and {maximum}")
     return field_value
 
 
@@ -12059,60 +11349,31 @@ def _npi_batch_boolean_map(raw_body: Mapping[str, Any]) -> dict[str, bool]:
 
 
 def _normalize_npi_batch_request(raw_body: Any) -> dict[str, Any]:
-    """Validate the bounded, shared-option provider batch contract."""
-    if not isinstance(raw_body, Mapping):
-        raise sanic.exceptions.InvalidUsage("request body must be a JSON object")
-    allowed_fields = {
-        "npis",
-        "address_limit",
-        "address_offset",
-        "include_sources",
-        "include_evidence",
-    }
-    unknown_fields = sorted(set(raw_body) - allowed_fields)
-    if unknown_fields:
-        raise sanic.exceptions.InvalidUsage(f"unsupported batch field: {unknown_fields[0]}")
-    return {
-        "npis": _normalize_npi_batch_npis(raw_body.get("npis")),
-        "address_limit": _bounded_npi_batch_integer(
-            raw_body,
-            "address_limit",
-            default=NPI_BATCH_ADDRESS_DEFAULT_LIMIT,
-            minimum=1,
-            maximum=NPI_BATCH_ADDRESS_MAX_LIMIT,
-        ),
-        "address_offset": _bounded_npi_batch_integer(
-            raw_body,
-            "address_offset",
-            default=0,
-            minimum=0,
-            maximum=1_000_000,
-        ),
-        **_npi_batch_boolean_map(raw_body),
-    }
+    """Validate the shared finite native batch request."""
+    from api.provider_batch import normalize_native_batch_request
+
+    return normalize_native_batch_request(raw_body)
 
 
 async def _rank_npi_batch_addresses(
     npis: Sequence[int],
     *,
     session: Any,
+    use_request_session: bool = False,
+    fail_closed: bool = False,
 ) -> dict[int, list[dict[str, Any]]]:
     """Fetch and rank summary address candidates with fixed-count reads."""
-    base_addresses_by_npi = await _fetch_npi_location_candidates_map(
-        npis,
-        session=session,
-    )
-    overlay_addresses_by_npi = await _fetch_provider_directory_address_overlay_map(
-        npis,
-        session=session,
+    base_addresses_by_npi = await _fetch_npi_location_candidates_map(npis, session=session)
+    overlay_addresses_by_npi = (
+        {}
+        if current_network_address_scope() is not None
+        else await _fetch_provider_directory_address_overlay_map(npis, session=session)
     )
     await _apply_location_statuses(
-        [
-            address
-            for npi in npis
-            for address in base_addresses_by_npi.get(npi, [])
-        ],
+        [address for npi in npis for address in base_addresses_by_npi.get(npi, [])],
         session=session,
+        use_request_session=use_request_session,
+        fail_closed=fail_closed,
     )
     ranked_addresses_by_npi: dict[int, list[dict[str, Any]]] = {}
     for npi in npis:
@@ -12120,13 +11381,11 @@ async def _rank_npi_batch_addresses(
             address
             for address in (
                 list(base_addresses_by_npi.get(npi, []))
-                + list(overlay_addresses_by_npi.get(npi, []))
+                + (list(overlay_addresses_by_npi.get(npi, [])) if current_network_address_scope() is None else [])
             )
             if _is_public_street_level_address(address)
         ]
-        ranked_addresses = _rank_provider_locations(
-            _dedupe_addresses_by_key(addresses)
-        )
+        ranked_addresses = _rank_provider_locations(_dedupe_addresses_by_key(addresses))
         ranked_addresses_by_npi[npi] = ranked_addresses
     return ranked_addresses_by_npi
 
@@ -12142,21 +11401,12 @@ async def _hydrate_npi_batch_addresses(
     session: Any,
 ) -> dict[int, list[dict[str, Any]]]:
     """Hydrate only each provider's selected address page."""
-    selected_addresses_by_npi = {
-        npi: list(ranked_addresses_by_npi[npi])[
-            address_offset : address_offset + address_limit
-        ]
-        for npi in npis
-    }
+    selected_offset = address_offset if address_limit else 0
+    selected_end = address_offset + address_limit if address_limit else None
+    selected_addresses_by_npi = {npi: list(ranked_addresses_by_npi[npi])[selected_offset:selected_end] for npi in npis}
 
     selected_identity_list = sorted(
-        {
-            identity
-            for npi in npis
-            for identity in _selected_base_identity_list(
-                selected_addresses_by_npi[npi]
-            )
-        }
+        {identity for npi in npis for identity in _selected_base_identity_list(selected_addresses_by_npi[npi])}
     )
     hydrated_by_npi: dict[int, list[dict[str, Any]]] = {}
     if selected_identity_list:
@@ -12172,11 +11422,7 @@ async def _hydrate_npi_batch_addresses(
             selected_addresses_by_npi[npi],
             hydrated_by_npi.get(npi, []),
         )
-    selected_addresses = [
-        address
-        for npi in npis
-        for address in selected_addresses_by_npi[npi]
-    ]
+    selected_addresses = [address for npi in npis for address in selected_addresses_by_npi[npi]]
     if selected_addresses and (include_sources or include_evidence):
         await _attach_selected_address_source_details(
             selected_addresses,
@@ -12191,19 +11437,10 @@ def _npi_batch_dba_names(
     provider_detail_map: Mapping[str, Any],
     other_names: Sequence[Mapping[str, Any]],
 ) -> list[str]:
-    existing_dba_names = [
-        name for name in (provider_detail_map.get("do_business_as") or []) if name
-    ]
-    if existing_dba_names:
-        return list(dict.fromkeys(existing_dba_names))
-    return list(
-        dict.fromkeys(
-            entry.get("other_provider_identifier")
-            for entry in other_names
-            if entry.get("other_provider_identifier_type_code") == "3"
-            and entry.get("other_provider_identifier")
-        )
-    )
+    """Use the shared native batch name projection."""
+    from api.provider_batch import native_batch_dba_names
+
+    return native_batch_dba_names(provider_detail_map, other_names)
 
 
 def _npi_batch_provider_result(
@@ -12217,7 +11454,8 @@ def _npi_batch_provider_result(
 ) -> tuple[dict[str, Any], bool]:
     """Format one success or not-found entry without extra reads."""
     address_total = len(ranked_addresses)
-    if provider_detail_map is None and address_total == 0:
+    scope = current_network_address_scope()
+    if address_total == 0 and (provider_detail_map is None or (scope is not None and scope.network_ids is not None)):
         return (
             {
                 "npi": npi,
@@ -12238,14 +11476,15 @@ def _npi_batch_provider_result(
         )
         for address in selected_addresses
     ]
-    address_offset = int(batch_params["address_offset"])
+    address_limit = int(batch_params["address_limit"]) or None
+    address_offset = int(batch_params["address_offset"]) if address_limit is not None else 0
     public_provider_map["address_list"] = finalized_addresses
     public_provider_map["address_pagination"] = {
-        "limit": int(batch_params["address_limit"]),
+        "limit": address_limit,
         "offset": address_offset,
         "returned": len(finalized_addresses),
         "total": address_total,
-        "has_more": address_offset + len(finalized_addresses) < address_total,
+        "has_more": address_limit is not None and address_offset + len(finalized_addresses) < address_total,
     }
     public_provider_map["other_name_list"] = list(other_names)
     public_provider_map["do_business_as"] = _npi_batch_dba_names(
@@ -12263,127 +11502,82 @@ def _npi_batch_provider_result(
     return {"npi": npi, "status": 200, "provider": public_provider_map}, True
 
 
-async def _build_npi_batch_payload(
-    batch_params: Mapping[str, Any],
-    *,
-    session: Any = None,
-) -> dict[str, Any]:
-    """Assemble ordered provider summaries with set-based database reads."""
-    npis = list(batch_params["npis"])
-    detail_by_npi = await _build_npi_identity_details_map(npis, session=session)
-    ranked_addresses_by_npi = await _rank_npi_batch_addresses(npis, session=session)
-    selected_addresses_by_npi = await _hydrate_npi_batch_addresses(
-        npis,
-        ranked_addresses_by_npi,
-        address_limit=int(batch_params["address_limit"]),
-        address_offset=int(batch_params["address_offset"]),
-        include_sources=bool(batch_params["include_sources"]),
-        include_evidence=bool(batch_params["include_evidence"]),
-        session=session,
-    )
-    other_names_by_npi = await _fetch_other_names_map(npis, session=session)
-    enrichment_by_npi = await _fetch_provider_enrichment_summary_map(npis, session=session)
-    response_items: list[dict[str, Any]] = []
-    found_count = 0
-    for npi in npis:
-        provider_result_map, was_found = _npi_batch_provider_result(
-            npi,
-            detail_by_npi.get(npi),
-            ranked_addresses_by_npi[npi],
-            selected_addresses_by_npi[npi],
-            other_names_by_npi.get(npi, []),
-            enrichment_by_npi.get(npi),
-            batch_params,
-        )
-        response_items.append(provider_result_map)
-        found_count += int(was_found)
-    return {
-        "items": response_items,
-        "requested": len(npis),
-        "found": found_count,
-        "not_found": len(npis) - found_count,
-    }
+async def _build_npi_batch_payload(batch_params: Mapping[str, Any], *, session: Any = None) -> dict[str, Any]:
+    """Assemble summaries through the existing set-based native pipeline."""
+    from api.provider_batch import build_native_batch_payload
+
+    return await build_native_batch_payload(batch_params, session=session)
 
 
 @blueprint.post("/id/batch")
+@canonical_network_read
 async def get_npi_batch(request):
-    """Return up to 100 provider summaries from one bounded database pipeline."""
-    started = time.monotonic()
-    batch_params = _normalize_npi_batch_request(request.json)
-    payload = await _build_npi_batch_payload(
-        batch_params,
-        session=_request_session(request),
-    )
-    payload["meta"] = {
-        "elapsed_ms": round((time.monotonic() - started) * 1000.0, 2),
-        "max_batch_size": NPI_BATCH_MAX_SIZE,
-        "view": "summary",
-    }
-    return response.json(payload, default=str)
+    """Return a finite native provider batch using shared eligibility and shaping."""
+    from api.provider_batch import serve_native_batch
+
+    return await serve_native_batch(request)
 
 
 @blueprint.get("/id/<npi>")
 async def get_npi(request, npi):
     """Return one NPPES- or profile-backed provider with optional provenance."""
-    should_force_address_update = _is_truthy_arg(request.args.get("force_address_update"), default=False)
-    include_sources = _is_truthy_arg(request.args.get("include_sources"), default=False)
-    include_evidence = _is_truthy_arg(request.args.get("include_evidence"), default=False)
+    return await provider_detail_network_metadata.read_direct_detail_response(request, npi)
+
+
+async def read_npi_detail(request, npi, *, native_args=None):
+    """Assemble provider detail on the real request with optional normalized arguments."""
+    args = request.args if native_args is None else native_args
+    network_scope = current_network_address_scope()
+    should_force_address_update = _is_truthy_arg(args.get("force_address_update"), default=False)
+    include_sources = _is_truthy_arg(args.get("include_sources"), default=False)
+    include_evidence = _is_truthy_arg(args.get("include_evidence"), default=False)
     include_profile = _is_truthy_arg(
-        request.args.get("include_profile"),
+        args.get("include_profile"),
         default=True,
     )
-    if _is_truthy_arg(request.args.get("debug"), default=False):
+    if _is_truthy_arg(args.get("debug"), default=False):
         include_sources = True
         include_evidence = True
-    include_extra_info = _is_truthy_arg(request.args.get("extra_info"), default=False)
+    include_extra_info = _is_truthy_arg(args.get("extra_info"), default=False)
     should_sync_geocode = _is_truthy_arg(
-        request.args.get("sync_geocode"),
-        default=_is_environment_flag_enabled(
+        args.get("sync_geocode"),
+        default=network_scope is None
+        and _is_environment_flag_enabled(
             "HLTHPRT_NPI_DETAIL_SYNC_GEOCODE",
             "HLTHPRT_NPI_API_SYNC_GEOCODE",
             default=False,
         ),
     )
+    if network_scope is not None and (should_force_address_update or should_sync_geocode):
+        raise sanic.exceptions.InvalidUsage("Canonical network reads cannot update address data.")
     should_lookup_stored_geocode = _is_truthy_arg(
-        request.args.get("lookup_stored_geocode"),
+        args.get("lookup_stored_geocode"),
         default=_is_environment_flag_enabled(
             "HLTHPRT_NPI_DETAIL_LOOKUP_STORED_GEOCODE",
             "HLTHPRT_NPI_API_LOOKUP_STORED_GEOCODE",
             default=False,
         ),
     )
-    include_chain_enrichment = _include_chain_provider_enrichment(request.args.get("show"))
-    provider_enrichment_view = _normalize_provider_enrichment_view(request.args.get("view"))
-    address_grouping = str(
-        request.args.get("address_grouping") or ADDRESS_GROUPING_FLAT
-    ).strip().lower()
+    include_chain_enrichment = _include_chain_provider_enrichment(args.get("show"))
+    provider_enrichment_view = _normalize_provider_enrichment_view(args.get("view"))
+    address_grouping = str(args.get("address_grouping") or ADDRESS_GROUPING_FLAT).strip().lower()
     if address_grouping not in ADDRESS_GROUPING_VALUES:
-        raise sanic.exceptions.InvalidUsage(
-            "address_grouping must be one of: flat, premise"
-        )
+        raise sanic.exceptions.InvalidUsage("address_grouping must be one of: flat, premise")
     # address_list paging: default-bounded so high-volume providers never serialize
     # 1k+ addresses; address_limit=all (or 0) opts out and returns the full list.
-    raw_address_limit = request.args.get("address_limit")
+    raw_address_limit = args.get("address_limit")
     if address_grouping == ADDRESS_GROUPING_PREMISE:
         normalized_group_limit = str(raw_address_limit or "").strip().lower()
         if normalized_group_limit in ("all", "0", "-1"):
-            raise sanic.exceptions.InvalidUsage(
-                "address_limit must be between 1 and 5 for premise grouping"
-            )
+            raise sanic.exceptions.InvalidUsage("address_limit must be between 1 and 5 for premise grouping")
         try:
             address_limit = (
-                NPI_DETAIL_ADDRESS_GROUP_DEFAULT_LIMIT
-                if not normalized_group_limit
-                else int(normalized_group_limit)
+                NPI_DETAIL_ADDRESS_GROUP_DEFAULT_LIMIT if not normalized_group_limit else int(normalized_group_limit)
             )
         except (TypeError, ValueError) as exc:
-            raise sanic.exceptions.InvalidUsage(
-                "address_limit must be between 1 and 5 for premise grouping"
-            ) from exc
+            raise sanic.exceptions.InvalidUsage("address_limit must be between 1 and 5 for premise grouping") from exc
         if not 1 <= address_limit <= NPI_DETAIL_ADDRESS_GROUP_MAX_LIMIT:
-            raise sanic.exceptions.InvalidUsage(
-                "address_limit must be between 1 and 5 for premise grouping"
-            )
+            raise sanic.exceptions.InvalidUsage("address_limit must be between 1 and 5 for premise grouping")
     elif raw_address_limit is None or str(raw_address_limit).strip() == "":
         address_limit = NPI_DETAIL_ADDRESS_DEFAULT_LIMIT
     elif str(raw_address_limit).strip().lower() in ("all", "0", "-1"):
@@ -12391,113 +11585,27 @@ async def get_npi(request, npi):
     else:
         try:
             address_limit = max(1, min(int(raw_address_limit), NPI_DETAIL_ADDRESS_MAX_LIMIT))
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             address_limit = NPI_DETAIL_ADDRESS_DEFAULT_LIMIT
     try:
-        address_offset = max(int(request.args.get("address_offset") or 0), 0)
-    except (TypeError, ValueError):
+        address_offset = max(int(args.get("address_offset") or 0), 0)
+    except TypeError, ValueError:
         address_offset = 0
-    include_address_total = _is_truthy_arg(request.args.get("include_address_total"), default=True)
-    raw_address_key = request.args.get("address_key")
-    raw_address_site_key = request.args.get("address_site_key")
+    include_address_total = _is_truthy_arg(args.get("include_address_total"), default=True)
+    raw_address_key = args.get("address_key")
+    raw_address_site_key = args.get("address_site_key")
     if address_grouping == ADDRESS_GROUPING_PREMISE and (
-        str(raw_address_key or "").strip()
-        or str(raw_address_site_key or "").strip()
+        str(raw_address_key or "").strip() or str(raw_address_site_key or "").strip()
     ):
-        raise sanic.exceptions.InvalidUsage(
-            "address_key and address_site_key are not supported with premise grouping"
-        )
+        raise sanic.exceptions.InvalidUsage("address_key and address_site_key are not supported with premise grouping")
     address_key = _normalize_uuid_key(raw_address_key, "address_key")
     address_site_key = _normalize_uuid_key(
         raw_address_site_key,
         "address_site_key",
     )
     npi = int(npi)
-    request_session = _request_session(request)
-    profile_record: dict[str, Any] | None = None
-    if include_profile:
-        try:
-            profile_record = (
-                await _fetch_provider_directory_profile_map(
-                    [npi],
-                    include_evidence=include_evidence,
-                    session=request_session,
-                )
-            ).get(npi)
-        except Exception as exc:  # pragma: no cover - transient publication fallback
-            logger.debug(
-                "Provider Directory profile fetch failed for npi=%s: %s",
-                npi,
-                exc,
-            )
-    is_response_cache_enabled = bool(
-        not should_force_address_update
-        and _NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS > 0
-        and _NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS > 0
-    )
-    address_overlay_serving_identity: str | None = None
-    canonical_publication_identity: str | None = None
-    if is_response_cache_enabled:
-        try:
-            canonical_publication_identity = (
-                await _npi_canonical_publication_identity(
-                    session=request_session,
-                )
-            )
-            if canonical_publication_identity is None:
-                raise RuntimeError("npi_canonical_publication_identity_missing")
-            address_overlay_serving_identity = (
-                await _provider_directory_address_overlay_serving_identity(
-                    session=request_session,
-                )
-            )
-        except Exception as exc:
-            is_response_cache_enabled = False
-            logger.debug(
-                "NPI response cache identity fetch failed "
-                "for npi=%s; bypassing response cache: %s",
-                npi,
-                exc,
-            )
-    cache_key = _npi_detail_cache_key(
-        _NpiDetailCacheIdentity(
-            npi=npi,
-            view=provider_enrichment_view,
-            include_chain=include_chain_enrichment,
-            extra_info=include_extra_info,
-            sync_geocode=should_sync_geocode,
-            lookup_stored_geocode=should_lookup_stored_geocode,
-            include_sources=include_sources,
-            include_evidence=include_evidence,
-            include_profile=include_profile,
-            profile_generation=(
-                str(profile_record["profile"].get("generation_id"))
-                if profile_record and isinstance(profile_record.get("profile"), Mapping)
-                else None
-            ),
-            profile_serving_identity=(
-                str(profile_record.get("_serving_identity"))
-                if profile_record and profile_record.get("_serving_identity")
-                else None
-            ),
-            address_overlay_serving_identity=address_overlay_serving_identity,
-            canonical_publication_identity=canonical_publication_identity,
-            address_limit=address_limit,
-            address_offset=address_offset,
-            include_address_total=include_address_total,
-            address_key=address_key,
-            address_site_key=address_site_key,
-            address_grouping=address_grouping,
-        )
-    )
-    if is_response_cache_enabled:
-        cached_body = _npi_detail_response_cache_get(cache_key)
-        if cached_body is not None:
-            return response.raw(cached_body, content_type="application/json")
     db_schema = _runtime_db_schema()
-    is_address_archive_cutover = _is_environment_flag_enabled(
-        "HLTHPRT_ADDRESS_ARCHIVE_CUTOVER"
-    )
+    is_address_archive_cutover = _is_environment_flag_enabled("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER")
     v2_archive_table_cache = SimpleNamespace(resolved=False, table_name=None)
     v2_archive_table_lock = asyncio.Lock()
 
@@ -12511,8 +11619,9 @@ async def get_npi(request, npi):
         return isinstance(value, str) and bool(value)
 
     async def _has_table_column(table_name: str, column_name: str) -> bool:
-        return bool(await db.scalar(
-            """
+        return bool(
+            await db.scalar(
+                """
             SELECT EXISTS (
                 SELECT 1
                   FROM information_schema.columns
@@ -12521,10 +11630,11 @@ async def get_npi(request, npi):
                    AND column_name = :column
             );
             """,
-            schema=db_schema,
-            table=table_name,
-            column=column_name,
-        ))
+                schema=db_schema,
+                table=table_name,
+                column=column_name,
+            )
+        )
 
     async def _has_address_key_functions() -> bool:
         value = await db.scalar(
@@ -12540,7 +11650,9 @@ async def get_npi(request, npi):
             if v2_archive_table_cache.resolved:
                 return v2_archive_table_cache.table_name
             if is_address_archive_cutover and hasattr(db, "first"):
-                preferred = os.getenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2").strip() or "address_archive_v2"
+                preferred = (
+                    os.getenv("HLTHPRT_ADDRESS_ARCHIVE_TABLE", "address_archive_v2").strip() or "address_archive_v2"
+                )
                 for table_name in (preferred,):
                     if (
                         await _is_npi_detail_table_available(table_name)
@@ -12667,27 +11779,19 @@ async def get_npi(request, npi):
             )
         )
         if address_type is not None:
-            address_update = address_update.where(
-                NPIAddress.type == address_type
-            )
+            address_update = address_update.where(NPIAddress.type == address_type)
         await address_update.status()
         address_record_stmt = (
-            select(NPIAddress)
-            .where(NPIAddress.checksum == checksum)
-            .where(NPIAddress.npi == npi_value)
+            select(NPIAddress).where(NPIAddress.checksum == checksum).where(NPIAddress.npi == npi_value)
         )
         if address_type is not None:
-            address_record_stmt = address_record_stmt.where(
-                NPIAddress.type == address_type
-            )
+            address_record_stmt = address_record_stmt.where(NPIAddress.type == address_type)
         address_record = await db.scalar(address_record_stmt)
         if address_record is None:
             return
         archive_table = await _v2_archive_table()
         if archive_table:
-            address_type_predicate = (
-                "AND type = :address_type" if address_type is not None else ""
-            )
+            address_type_predicate = "AND type = :address_type" if address_type is not None else ""
             await db.status(
                 f"""
                 INSERT INTO {db_schema}.{archive_table} (
@@ -12774,8 +11878,7 @@ async def get_npi(request, npi):
             )
             return
         archive_value_map = {
-            column.key: getattr(address_record, column.key, None)
-            for column in AddressArchive.__table__.columns
+            column.key: getattr(address_record, column.key, None) for column in AddressArchive.__table__.columns
         }
         archive_value_map["formatted_address"] = render_formatted_address_v2(
             archive_value_map.get("first_line"),
@@ -12843,7 +11946,6 @@ async def get_npi(request, npi):
             address_by_field["place_id"] = None
 
         if not address_by_field["lat"]:
-
             # try:
             #     raw_sql = text(f"""SELECT
             #            g.rating,
@@ -12882,21 +11984,20 @@ async def get_npi(request, npi):
                 should_update_geo = True
 
             if should_lookup_stored_geocode and (not address_by_field["lat"]) and (not should_force_address_update):
-                stored_coordinates = await _archive_coordinates_for(address_by_field)
-                if stored_coordinates:
-                    address_by_field["long"] = stored_coordinates.long
-                    address_by_field["lat"] = stored_coordinates.lat
-                    address_by_field["place_id"] = stored_coordinates.place_id
-                    address_by_field["geo_source"] = getattr(stored_coordinates, "geo_source", None) or (
-                        "google" if stored_coordinates.place_id else None
-                    )
+                async with provider_optional_read(request_session, logger):
+                    stored_coordinates = await _archive_coordinates_for(address_by_field)
+                    if stored_coordinates:
+                        address_by_field["long"] = stored_coordinates.long
+                        address_by_field["lat"] = stored_coordinates.lat
+                        address_by_field["place_id"] = stored_coordinates.place_id
+                        address_by_field["geo_source"] = getattr(stored_coordinates, "geo_source", None) or (
+                            "google" if stored_coordinates.place_id else None
+                        )
 
             if (
-                should_lookup_stored_geocode
-                or should_sync_geocode
-                or should_force_address_update
+                should_lookup_stored_geocode or should_sync_geocode or should_force_address_update
             ) and not address_by_field["lat"]:
-                try:
+                async with provider_optional_read(request_session, logger):
                     openaddresses_coordinates = await _openaddresses_coordinates_for(address_by_field)
                     if openaddresses_coordinates:
                         address_by_field["long"] = openaddresses_coordinates.long
@@ -12905,8 +12006,6 @@ async def get_npi(request, npi):
                         address_by_field["geo_source"] = openaddresses_coordinates.geo_source
                         address_by_field["geocode_source"] = openaddresses_coordinates.geocode_source
                         address_by_field["geocode_quality"] = openaddresses_coordinates.geocode_quality
-                except Exception as exc:
-                    logger.debug("OpenAddresses geocoding failed for %s: %s", t_addr, exc)
 
             if (should_sync_geocode or should_force_address_update) and not address_by_field["lat"]:
                 try:
@@ -12971,9 +12070,10 @@ async def get_npi(request, npi):
                 except Exception as exc:
                     logger.warning("Google geocoding failed for %s: %s", t_addr, exc)
 
-            if should_update_geo and address_by_field.get("lat"):
+            if should_update_geo and address_by_field.get("lat") and network_scope is None:
                 request.app.add_task(
-                    update_addr_coordinates(
+                    run_as_writer(
+                        update_addr_coordinates,
                         address_by_field,
                         address_by_field["long"],
                         address_by_field["lat"],
@@ -12986,130 +12086,208 @@ async def get_npi(request, npi):
 
         return address_by_field
 
-    detail_build_map: dict[str, Any] = {
-        # Bounded requests assemble provider identity without full address rows.
-        # A lightweight complete candidate query ranks the combined set below,
-        # then a second bounded query hydrates only the selected base rows.
-        "address_limit": 0,
-        "include_address_total": False,
-        "address_key": address_key,
-    }
-    if request_session is not None:
-        detail_build_map["session"] = request_session
-    if include_sources or include_evidence:
-        detail_build_map["include_sources"] = include_sources
-        detail_build_map["include_evidence"] = include_evidence
-    provider_detail_by_field = await _build_npi_details(npi, **detail_build_map)
-    has_provider_detail = bool(provider_detail_by_field)
+    async with provider_profile_read_snapshot(db, _runtime_db_schema(), include_detail=True) as request_session:
+        profile_record: dict[str, Any] | None = None
+        if include_profile:
+            from api.provider_profile_network_read import read_detail_directory_profile
 
-    if not has_provider_detail:
-        provider_detail_by_field = {"npi": npi}
-        if profile_record:
-            provider_detail_by_field["provider_directory_profile"] = (
-                profile_record["profile"]
+            profile_record = await read_detail_directory_profile(
+                request_session, npi, include_evidence=include_evidence
             )
-        if (
-            include_evidence
-            and profile_record
-            and profile_record.get("evidence") is not None
+        is_response_cache_enabled = bool(
+            not should_force_address_update
+            and _NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS > 0
+            and _NPI_DETAIL_RESPONSE_CACHE_MAX_KEYS > 0
+        )
+        address_overlay_serving_identity: str | None = None
+        canonical_publication_identity: str | None = None
+        if is_response_cache_enabled:
+            try:
+                async with provider_read_savepoint(request_session):
+                    canonical_publication_identity = await _npi_canonical_publication_identity(
+                        session=request_session,
+                    )
+                    address_overlay_serving_identity = await _provider_directory_address_overlay_serving_identity(
+                        session=request_session,
+                    )
+                is_response_cache_enabled = canonical_publication_identity is not None
+            except sanic.exceptions.ServiceUnavailable:
+                raise
+            except Exception as exc:
+                is_response_cache_enabled = False
+                logger.debug(
+                    "NPI response cache identity fetch failed for npi=%s; bypassing response cache: %s",
+                    npi,
+                    exc,
+                )
+        cache_key = _npi_detail_cache_key(
+            _NpiDetailCacheIdentity(
+                npi=npi,
+                view=provider_enrichment_view,
+                include_chain=include_chain_enrichment,
+                extra_info=include_extra_info,
+                sync_geocode=should_sync_geocode,
+                lookup_stored_geocode=should_lookup_stored_geocode,
+                include_sources=include_sources,
+                include_evidence=include_evidence,
+                include_profile=include_profile,
+                profile_generation=(
+                    str(profile_record["profile"].get("generation_id"))
+                    if profile_record and isinstance(profile_record.get("profile"), Mapping)
+                    else None
+                ),
+                profile_serving_identity=(
+                    str(profile_record.get("_serving_identity"))
+                    if profile_record and profile_record.get("_serving_identity")
+                    else None
+                ),
+                address_overlay_serving_identity=address_overlay_serving_identity,
+                canonical_publication_identity=canonical_publication_identity,
+                address_limit=address_limit,
+                address_offset=address_offset,
+                include_address_total=include_address_total,
+                address_key=address_key,
+                address_site_key=address_site_key,
+                address_grouping=address_grouping,
+            )
+        )
+        if is_response_cache_enabled:
+            cached_body = _npi_detail_response_cache_get(cache_key)
+            if cached_body is not None:
+                return response.raw(cached_body, content_type="application/json")
+        detail_build_map: dict[str, Any] = {
+            # Bounded requests assemble provider identity without full address rows.
+            # A lightweight complete candidate query ranks the combined set below,
+            # then a second bounded query hydrates only the selected base rows.
+            "address_limit": 0,
+            "include_address_total": False,
+            "address_key": address_key,
+        }
+        if request_session is not None:
+            detail_build_map["session"] = request_session
+        if include_sources or include_evidence:
+            detail_build_map["include_sources"] = include_sources
+            detail_build_map["include_evidence"] = include_evidence
+        provider_detail_by_field = await _build_npi_details(npi, **detail_build_map)
+        has_provider_detail = bool(provider_detail_by_field)
+
+        if not has_provider_detail:
+            provider_detail_by_field = {"npi": npi}
+            if profile_record:
+                provider_detail_by_field["provider_directory_profile"] = profile_record["profile"]
+            if include_evidence and profile_record and profile_record.get("evidence") is not None:
+                provider_detail_by_field["provider_directory_profile_evidence"] = profile_record["evidence"]
+
+        provider_detail_by_field.pop("address_total", None)
+
+        overlay_addresses = (
+            []
+            if network_scope is not None
+            else await _fetch_provider_directory_address_overlay(
+                npi,
+                address_key=address_key,
+                address_site_key=address_site_key,
+                session=request_session,
+            )
+        )
+        initial_base_addresses = list(provider_detail_by_field.get("address_list") or [])
+        base_candidates = list(
+            await _fetch_npi_location_candidates(
+                npi,
+                address_key=address_key,
+                address_site_key=address_site_key,
+                session=request_session,
+            )
+        )
+        # A compatibility builder may retain direct rows despite its empty address
+        # window. Keep that evidence without replacing the complete candidate set.
+        base_candidates.extend(initial_base_addresses)
+        await _apply_location_statuses(
+            base_candidates,
+            session=request_session,
+            use_request_session=True,
+        )
+        addresses = base_candidates + (overlay_addresses if network_scope is None else [])
+        if address_key is not None:
+            addresses = [
+                address
+                for address in addresses
+                if isinstance(address, Mapping) and str(address.get("address_key") or "").lower() == address_key
+            ]
+        if address_site_key is not None:
+            addresses = [
+                address
+                for address in addresses
+                if isinstance(address, Mapping) and _is_address_site_key_match(address, address_site_key)
+            ]
+        if not include_extra_info:
+            addresses = [address for address in addresses if _is_public_street_level_address(address)]
+        addresses = _rank_provider_locations(_dedupe_addresses_by_key(addresses))
+        if not addresses and (
+            network_scope and network_scope.network_ids is not None or not (has_provider_detail or profile_record)
         ):
-            provider_detail_by_field["provider_directory_profile_evidence"] = (
-                profile_record["evidence"]
-            )
-
-    provider_detail_by_field.pop("address_total", None)
-
-    overlay_addresses = await _fetch_provider_directory_address_overlay(
-        npi,
-        address_key=address_key,
-        address_site_key=address_site_key,
-        session=request_session,
-    )
-    initial_base_addresses = list(
-        provider_detail_by_field.get("address_list") or []
-    )
-    base_candidates = list(
-        await _fetch_npi_location_candidates(
+            raise sanic.exceptions.NotFound
+        address_total = len(addresses)
+        selected_group_specs: list[dict[str, Any]] = []
+        if address_grouping == ADDRESS_GROUPING_PREMISE:
+            all_group_specs = _group_provider_locations_by_premise(addresses)
+            selected_group_specs = all_group_specs[address_offset : address_offset + address_limit]
+            selected_candidates = [
+                member
+                for group_spec in selected_group_specs
+                for member in group_spec["members"][:NPI_DETAIL_ADDRESS_GROUP_MEMBER_LIMIT]
+            ]
+        else:
+            all_group_specs = []
+            selected_candidates = addresses
+            if address_limit is not None:
+                selected_candidates = selected_candidates[address_offset : address_offset + address_limit]
+        addresses = await _hydrate_selected_provider_locations(
             npi,
-            address_key=address_key,
-            address_site_key=address_site_key,
-            session=request_session,
-        )
-    )
-    # A compatibility builder may retain direct rows despite its empty address
-    # window. Keep that evidence without replacing the complete candidate set.
-    base_candidates.extend(initial_base_addresses)
-    await _apply_location_statuses(
-        base_candidates,
-        session=request_session,
-    )
-    addresses = base_candidates + overlay_addresses
-    if address_key is not None:
-        addresses = [
-            address
-            for address in addresses
-            if isinstance(address, Mapping)
-            and str(address.get("address_key") or "").lower() == address_key
-        ]
-    if address_site_key is not None:
-        addresses = [
-            address
-            for address in addresses
-            if isinstance(address, Mapping)
-            and _is_address_site_key_match(address, address_site_key)
-        ]
-    if not include_extra_info:
-        addresses = [address for address in addresses if _is_public_street_level_address(address)]
-    addresses = _rank_provider_locations(_dedupe_addresses_by_key(addresses))
-    if not has_provider_detail and not profile_record and not addresses:
-        raise sanic.exceptions.NotFound
-    address_total = len(addresses)
-    selected_group_specs: list[dict[str, Any]] = []
-    if address_grouping == ADDRESS_GROUPING_PREMISE:
-        all_group_specs = _group_provider_locations_by_premise(addresses)
-        selected_group_specs = all_group_specs[
-            address_offset : address_offset + address_limit
-        ]
-        selected_candidates = [
-            member
-            for group_spec in selected_group_specs
-            for member in group_spec["members"][
-                :NPI_DETAIL_ADDRESS_GROUP_MEMBER_LIMIT
-            ]
-        ]
-    else:
-        all_group_specs = []
-        selected_candidates = addresses
-        if address_limit is not None:
-            selected_candidates = selected_candidates[
-                address_offset : address_offset + address_limit
-            ]
-    addresses = await _hydrate_selected_provider_locations(
-        npi,
-        selected_candidates,
-        already_hydrated=False,
-        include_sources=include_sources,
-        include_evidence=include_evidence,
-        address_key=address_key,
-        session=request_session,
-    )
-    if addresses and (include_sources or include_evidence):
-        await _attach_selected_address_source_details(
-            addresses,
+            selected_candidates,
+            already_hydrated=False,
             include_sources=include_sources,
-            include_role_evidence=include_evidence,
+            include_evidence=include_evidence,
+            address_key=address_key,
             session=request_session,
         )
-    update_address_tasks = [
-        _update_address(address)
-        for address in addresses
-        if address
-    ]
-    updated_addresses = (
-        list(await asyncio.gather(*update_address_tasks))
-        if update_address_tasks
-        else []
-    )
+        if addresses and (include_sources or include_evidence):
+            await _attach_selected_address_source_details(
+                addresses,
+                include_sources=include_sources,
+                include_role_evidence=include_evidence,
+                session=request_session,
+            )
+        fetch_provider_enrichment = (
+            _fetch_provider_enrichment_summary_detail
+            if provider_enrichment_view == "summary"
+            else _fetch_provider_enrichment_detail
+        )
+        provider_enrichment_payload: Optional[dict[str, Any]] = None
+        try:
+            async with provider_read_savepoint(request_session):
+                other_names = await _fetch_other_names(npi, session=request_session)
+                provider_enrichment_payload = await fetch_provider_enrichment(
+                    npi,
+                    include_chain=include_chain_enrichment,
+                    session=request_session,
+                )
+        except sanic.exceptions.ServiceUnavailable:
+            raise
+        except Exception as exc:
+            logger.debug("Provider enrichment detail fetch failed for npi=%s: %s", npi, exc)
+            try:
+                async with provider_read_savepoint(request_session):
+                    other_names = await _fetch_other_names(npi, session=request_session)
+            except sanic.exceptions.ServiceUnavailable:
+                raise
+            except Exception:
+                other_names = []
+            provider_enrichment_payload = None
+    # A direct-detail bridge can still own the Reader after this nested scope exits.
+    request_session = request_session if has_reader_session(db) else None
+    update_address_tasks = [_update_address(address) for address in addresses if address]
+    updated_addresses = list(await gather_reader_calls(db, *update_address_tasks)) if update_address_tasks else []
     if address_grouping == ADDRESS_GROUPING_PREMISE:
         provider_detail_by_field.pop("address_list", None)
         provider_detail_by_field.pop("address_pagination", None)
@@ -13128,9 +12306,7 @@ async def get_npi(request, npi):
                     include_evidence=include_evidence,
                     suppress_conflicting_site_key=True,
                 )
-                for address in updated_addresses[
-                    member_cursor : member_cursor + member_returned
-                ]
+                for address in updated_addresses[member_cursor : member_cursor + member_returned]
                 if isinstance(address, dict)
             ]
             member_cursor += member_returned
@@ -13139,9 +12315,7 @@ async def get_npi(request, npi):
                     "group_key": group_spec["group_key"],
                     "grouping_basis": group_spec["grouping_basis"],
                     "address_site_key": group_spec["address_site_key"],
-                    "address_site_key_status": group_spec[
-                        "address_site_key_status"
-                    ],
+                    "address_site_key_status": group_spec["address_site_key_status"],
                     "members": group_members,
                     "member_pagination": _member_pagination(
                         member_total,
@@ -13151,13 +12325,11 @@ async def get_npi(request, npi):
             )
         provider_detail_by_field["address_grouping"] = ADDRESS_GROUPING_PREMISE
         provider_detail_by_field["address_groups"] = response_groups
-        provider_detail_by_field["address_group_pagination"] = (
-            _address_group_pagination(
-                limit=address_limit,
-                offset=address_offset,
-                returned=len(response_groups),
-                total=len(all_group_specs),
-            )
+        provider_detail_by_field["address_group_pagination"] = _address_group_pagination(
+            limit=address_limit,
+            offset=address_offset,
+            returned=len(response_groups),
+            total=len(all_group_specs),
         )
     else:
         provider_detail_by_field["address_list"] = [
@@ -13177,67 +12349,21 @@ async def get_npi(request, npi):
             "offset": effective_offset,
             "returned": returned,
             "total": address_total if include_address_total else None,
-            "has_more": bool(
-                address_limit is not None
-                and effective_offset + returned < address_total
-            ),
+            "has_more": bool(address_limit is not None and effective_offset + returned < address_total),
         }
 
-    if provider_enrichment_view == "summary":
-        fetch_provider_enrichment = _fetch_provider_enrichment_summary_detail
-    else:
-        fetch_provider_enrichment = _fetch_provider_enrichment_detail
-
-    provider_enrichment_payload: Optional[dict[str, Any]] = None
-    try:
-        if request_session is not None:
-            other_names = await _fetch_other_names(npi, session=request_session)
-            provider_enrichment_payload = await fetch_provider_enrichment(
-                npi,
-                include_chain=include_chain_enrichment,
-                session=request_session,
-            )
-        else:
-            other_names_task = asyncio.create_task(_fetch_other_names(npi))
-            provider_enrichment_task = asyncio.create_task(
-                fetch_provider_enrichment(
-                    npi,
-                    include_chain=include_chain_enrichment,
-                )
-            )
-            other_names, provider_enrichment_payload = await asyncio.gather(
-                other_names_task,
-                provider_enrichment_task,
-            )
-    except Exception as exc:  # pragma: no cover - defensive fallback for transient DB states
-        logger.debug("Provider enrichment detail fetch failed for npi=%s: %s", npi, exc)
-        if "other_names_task" in locals() and not other_names_task.done():
-            other_names_task.cancel()
-        try:
-            other_names = await _fetch_other_names(npi, session=request_session)
-        except Exception:  # pragma: no cover - defensive fallback
-            other_names = []
-        provider_enrichment_payload = None
     provider_detail_by_field["other_name_list"] = other_names
 
-    existing_dba_names = [
-        name
-        for name in (provider_detail_by_field.get("do_business_as") or [])
-        if name
-    ]
+    existing_dba_names = [name for name in (provider_detail_by_field.get("do_business_as") or []) if name]
     if existing_dba_names:
-        provider_detail_by_field["do_business_as"] = list(
-            dict.fromkeys(existing_dba_names)
-        )
+        provider_detail_by_field["do_business_as"] = list(dict.fromkeys(existing_dba_names))
     else:
         candidates = [
             entry.get("other_provider_identifier")
             for entry in other_names
             if entry.get("other_provider_identifier_type_code") == "3" and entry.get("other_provider_identifier")
         ]
-        provider_detail_by_field["do_business_as"] = (
-            list(dict.fromkeys(candidates)) if candidates else []
-        )
+        provider_detail_by_field["do_business_as"] = list(dict.fromkeys(candidates)) if candidates else []
 
     if provider_enrichment_payload is not None:
         provider_detail_by_field["provider_enrichment"] = provider_enrichment_payload
@@ -13264,13 +12390,9 @@ async def get_npi(request, npi):
             }
 
     if include_profile and profile_record:
-        provider_detail_by_field["provider_directory_profile"] = profile_record[
-            "profile"
-        ]
+        provider_detail_by_field["provider_directory_profile"] = profile_record["profile"]
         if include_evidence and profile_record.get("evidence") is not None:
-            provider_detail_by_field["provider_directory_profile_evidence"] = (
-                profile_record["evidence"]
-            )
+            provider_detail_by_field["provider_directory_profile_evidence"] = profile_record["evidence"]
 
     _redact_internal_address_fields(provider_detail_by_field)
     response_body = json.dumps(
@@ -13285,6 +12407,7 @@ async def get_npi(request, npi):
     ):
         _npi_detail_response_cache_set(cache_key, response_body)
     return response.raw(response_body, content_type="application/json")
+
 
 NPI_LOCATION_CANDIDATE_COLUMNS = (
     "checksum",
@@ -13318,24 +12441,6 @@ NPI_LOCATION_CANDIDATE_COLUMNS = (
 )
 
 
-def _provider_detail_address_type_clause(address_model: Any, table: Any) -> Any:
-    if address_model is EntityAddressUnified:
-        return table.c.type.in_(("primary", "secondary", "practice", "site"))
-    return or_(table.c.type == "primary", table.c.type == "secondary")
-
-
-def _npi_batch_address_filters(
-    address_model: Any,
-    address_table: Any,
-    npis: Sequence[int],
-) -> list[Any]:
-    if address_model is EntityAddressUnified:
-        return [
-            func.coalesce(address_table.c.npi, address_table.c.inferred_npi).in_(npis)
-        ]
-    return [address_table.c.npi.in_(npis)]
-
-
 def _group_npi_location_candidates(
     query_result: Any,
     candidate_columns: Sequence[Any],
@@ -13343,9 +12448,7 @@ def _group_npi_location_candidates(
     candidates_by_npi: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for address_record in query_result.all():
         row_mapping = getattr(address_record, "_mapping", address_record)
-        candidate_map = {
-            column.key: row_mapping[column.key] for column in candidate_columns
-        }
+        candidate_map = {column.key: row_mapping[column.key] for column in candidate_columns}
         provider_npi = candidate_map.get("npi") or candidate_map.get("inferred_npi")
         if provider_npi is None:
             continue
@@ -13370,14 +12473,11 @@ async def _fetch_npi_location_candidates_map(
     if not unique_npis:
         return {}
     address_model = await _address_serving_model(
-        _public_address_serving_column_keys()
-        - {"procedures_array", "medications_array"},
+        _public_address_serving_column_keys() - {"procedures_array", "medications_array"},
         session=session,
     )
     address_table = address_model.__table__
-    existing_columns = await _table_columns(
-        address_model.__tablename__, session=session
-    )
+    existing_columns = await _table_columns(address_model.__tablename__, session=session)
     if not existing_columns:
         existing_columns = _model_table_columns(address_model)
     candidate_columns = [
@@ -13389,10 +12489,7 @@ async def _fetch_npi_location_candidates_map(
     if address_key is not None:
         filters.append(address_table.c.address_key == address_key)
     if address_site_key is not None:
-        if (
-            address_model is not EntityAddressUnified
-            or "premise_key" not in existing_columns
-        ):
+        if address_model is not EntityAddressUnified or "premise_key" not in existing_columns:
             return {}
         filters.append(address_table.c.premise_key == address_site_key)
     statement = (
@@ -13434,9 +12531,7 @@ def _address_hydration_columns(
     allowed_columns = set(_model_table_columns(NPIAddress))
     if address_model is EntityAddressUnified:
         allowed_columns.update(PUBLIC_ADDRESS_ATTRIBUTION_COLUMNS)
-        allowed_columns.update(
-            {"inferred_npi", "premise_key", "source_record_ids", "location_key"}
-        )
+        allowed_columns.update({"inferred_npi", "premise_key", "source_record_ids", "location_key"})
     if include_sources or include_evidence:
         allowed_columns.update(PUBLIC_ADDRESS_SOURCE_DEBUG_COLUMNS)
     if include_evidence:
@@ -13456,34 +12551,21 @@ def _address_identity_filter(
     address_row_identities: Sequence[str] | None,
 ) -> tuple[set[str], Any | None]:
     selected_identity_set = {
-        str(identity)
-        for identity in (address_row_identities or [])
-        if str(identity or "").strip()
+        str(identity) for identity in (address_row_identities or []) if str(identity or "").strip()
     }
     if address_row_identities is None:
         return selected_identity_set, None
     if address_model is EntityAddressUnified:
         selected_keys = sorted(
-            identity.split(":", 1)[1]
-            for identity in selected_identity_set
-            if identity.startswith("location:")
+            identity.split(":", 1)[1] for identity in selected_identity_set if identity.startswith("location:")
         )
-        return selected_identity_set, (
-            address_table.c.location_key.in_(selected_keys)
-            if selected_keys
-            else false()
-        )
+        return selected_identity_set, (address_table.c.location_key.in_(selected_keys) if selected_keys else false())
     selected_checksums = sorted(
         int(identity.rsplit(":", 1)[1])
         for identity in selected_identity_set
-        if identity.startswith("legacy:")
-        and identity.rsplit(":", 1)[1].lstrip("-").isdigit()
+        if identity.startswith("legacy:") and identity.rsplit(":", 1)[1].lstrip("-").isdigit()
     )
-    return selected_identity_set, (
-        address_table.c.checksum.in_(selected_checksums)
-        if selected_checksums
-        else false()
-    )
+    return selected_identity_set, (address_table.c.checksum.in_(selected_checksums) if selected_checksums else false())
 
 
 def _hydrate_address_query_rows(
@@ -13508,13 +12590,8 @@ def _hydrate_address_query_rows_map(
     hydrated_by_npi: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for address_record in query_result.all():
         mapping = getattr(address_record, "_mapping", address_record)
-        address_by_field = {
-            column.key: mapping[column.key]
-            for column in selected_columns
-        }
-        provider_npi = address_by_field.get("npi") or address_by_field.get(
-            "inferred_npi"
-        )
+        address_by_field = {column.key: mapping[column.key] for column in selected_columns}
+        provider_npi = address_by_field.get("npi") or address_by_field.get("inferred_npi")
         if provider_npi is None:
             continue
         provider_npi = int(provider_npi)
@@ -13525,9 +12602,7 @@ def _hydrate_address_query_rows_map(
         if identity:
             address_by_field["_base_row_identities"] = [identity]
         _attach_public_address_site_key(address_by_field, address_by_field)
-        hydrated_address = (
-            _add_canonical_contact_fields_to_address(address_by_field)
-        )
+        hydrated_address = _add_canonical_contact_fields_to_address(address_by_field)
         hydrated_by_npi[provider_npi].append(hydrated_address)
     return dict(hydrated_by_npi)
 
@@ -13554,9 +12629,7 @@ def _merge_hydrated_location_candidates(
     hydrated_by_identity = {
         str(identity_value): hydrated_location
         for hydrated_location in hydrated_locations
-        for identity_value in (
-            hydrated_location.get("_base_row_identities") or []
-        )
+        for identity_value in (hydrated_location.get("_base_row_identities") or [])
         if identity_value not in (None, "")
     }
     merged_locations: list[dict[str, Any]] = []
@@ -13564,9 +12637,7 @@ def _merge_hydrated_location_candidates(
         merged_location_map = dict(selected_location)
         identity_list = sorted(
             str(identity_value)
-            for identity_value in (
-                selected_location.get("_base_row_identities") or []
-            )
+            for identity_value in (selected_location.get("_base_row_identities") or [])
             if identity_value not in (None, "")
         )
         for identity_value in identity_list:
@@ -13630,8 +12701,7 @@ async def _fetch_npi_address_rows_map(
     if not unique_npis:
         return {}
     address_model = await _address_serving_model(
-        _public_address_serving_column_keys()
-        - {"procedures_array", "medications_array"},
+        _public_address_serving_column_keys() - {"procedures_array", "medications_array"},
         session=session,
     )
     address_table = address_model.__table__
@@ -13715,29 +12785,20 @@ def _npi_detail_from_result_row(
     for column in _npi_serving_columns():
         column_value = result_row[index]
         index += 1
-        if (
-            column.key == "do_business_as_text"
-            or column.key in PUBLIC_NPI_EXCLUDED_COLUMNS
-        ):
+        if column.key == "do_business_as_text" or column.key in PUBLIC_NPI_EXCLUDED_COLUMNS:
             continue
         provider_detail_map[column.key] = column_value
     if result_row[index]:
-        provider_detail_map["taxonomy_list"].extend(
-            _public_nested_taxonomy_rows(result_row[index])
-        )
+        provider_detail_map["taxonomy_list"].extend(_public_nested_taxonomy_rows(result_row[index]))
     index += 1
     if result_row[index]:
-        provider_detail_map["taxonomy_group_list"].extend(
-            _public_nested_taxonomy_rows(result_row[index])
-        )
+        provider_detail_map["taxonomy_group_list"].extend(_public_nested_taxonomy_rows(result_row[index]))
     index += 1
     if include_address_rows and index < len(result_row) and result_row[index]:
         provider_detail_map["address_list"] = result_row[index]
     if address_total is not None:
         provider_detail_map["address_total"] = address_total
-    provider_detail_map["do_business_as"] = (
-        provider_detail_map.get("do_business_as") or []
-    )
+    provider_detail_map["do_business_as"] = provider_detail_map.get("do_business_as") or []
     return provider_detail_map
 
 
@@ -13750,9 +12811,7 @@ def _npi_taxonomy_batch_aggregate(
     return (
         select(
             taxonomy_table.c.npi,
-            func.json_agg(
-                literal_column(f'distinct "{taxonomy_model.__tablename__}"')
-            ).label("rows"),
+            func.json_agg(literal_column(f'distinct "{taxonomy_model.__tablename__}"')).label("rows"),
         )
         .where(taxonomy_table.c.npi.in_(npis))
         .group_by(taxonomy_table.c.npi)
@@ -13798,7 +12857,7 @@ async def _build_npi_identity_details_map(
         .order_by(npi_data_table.c.npi)
     )
     if session is not None:
-        query_result = await session.execute(query._stmt)
+        query_result = await execute_network_read(session, query._stmt)
         detail_rows = query_result.all()
     else:
         detail_rows = await query.all()
@@ -13838,12 +12897,8 @@ def _npi_detail_address_columns(
     allowed_address_columns: set[str],
     filter_capabilities: Mapping[str, Any],
 ) -> list[Any]:
-    procedures_available = bool(
-        filter_capabilities.get("npi_procedures_array_available", True)
-    )
-    medications_available = bool(
-        filter_capabilities.get("npi_medications_array_available", True)
-    )
+    procedures_available = bool(filter_capabilities.get("npi_procedures_array_available", True))
+    medications_available = bool(filter_capabilities.get("npi_medications_array_available", True))
     address_columns: list[Any] = []
     for column in address_table.columns:
         if column.key in PUBLIC_ADDRESS_EXCLUDED_COLUMNS and column.key not in allowed_address_columns:
@@ -13875,8 +12930,7 @@ async def _npi_detail_address_context(
 ) -> tuple[Any, Any, list[Any]]:
     filter_capabilities = await _resolve_npi_filter_capabilities(session=session)
     address_model = await _address_serving_model(
-        _public_address_serving_column_keys()
-        - {"procedures_array", "medications_array"},
+        _public_address_serving_column_keys() - {"procedures_array", "medications_array"},
         session=session,
     )
     address_table = address_model.__table__
@@ -13904,43 +12958,6 @@ async def _npi_detail_address_context(
     )
 
 
-def _npi_detail_address_filters(
-    address_model: Any,
-    address_table: Any,
-    npi: int,
-    address_key: str | None,
-    address_row_identities: Sequence[str] | None,
-) -> list[Any]:
-    base_address_filters = [address_table.c.npi == npi]
-    if address_model is EntityAddressUnified:
-        base_address_filters[0] = func.coalesce(
-            address_table.c.npi, address_table.c.inferred_npi
-        ) == npi
-    if address_key is not None:
-        base_address_filters.append(address_table.c.address_key == address_key)
-    if address_row_identities is not None:
-        if address_model is EntityAddressUnified:
-            selected_location_keys = sorted(
-                str(identity).split(":", 1)[1]
-                for identity in address_row_identities
-                if str(identity).startswith("location:")
-            )
-            base_address_filters.append(
-                address_table.c.location_key.in_(selected_location_keys)
-            )
-        else:
-            selected_checksums = sorted(
-                int(str(identity).rsplit(":", 1)[1])
-                for identity in address_row_identities
-                if str(identity).startswith("legacy:")
-                and str(identity).rsplit(":", 1)[1].lstrip("-").isdigit()
-            )
-            base_address_filters.append(
-                address_table.c.checksum.in_(selected_checksums)
-            )
-    return base_address_filters
-
-
 def _npi_detail_address_subquery(
     address_model: Any,
     address_table: Any,
@@ -13948,12 +12965,7 @@ def _npi_detail_address_subquery(
     address_filters: Sequence[Any],
     address_limit: int | None,
 ) -> Any:
-    npi_address_rows = (
-        select(*address_columns)
-        .where(*address_filters)
-        .offset(0)
-        .subquery("npi_address_rows")
-    )
+    npi_address_rows = select(*address_columns).where(*address_filters).offset(0).subquery("npi_address_rows")
     address_subquery_base = (
         select(*npi_address_rows.c)
         .where(_provider_detail_address_type_clause(address_model, npi_address_rows))
@@ -13979,42 +12991,19 @@ async def _count_npi_detail_addresses(
     *,
     session: Any = None,
 ) -> int | None:
-    count_npi_rows = (
-        select(address_table.c.type)
-        .where(*address_filters)
-        .offset(0)
-        .subquery("count_npi_address_rows")
+    count_npi_rows = select(address_table.c.type).where(*address_filters).offset(0).subquery("count_npi_address_rows")
+    count_statement = (
+        select(func.count())
+        .select_from(count_npi_rows)
+        .where(_provider_detail_address_type_clause(address_model, count_npi_rows))
     )
-    count_statement = select(func.count()).select_from(count_npi_rows).where(
-        _provider_detail_address_type_clause(address_model, count_npi_rows)
-    )
-    if session is not None:
-        query_result = await session.execute(count_statement)
+    if session is not None or current_network_address_scope() is not None:
+        query_result = await _execute_stmt(count_statement, session=session)
         return int(query_result.scalar() or 0)
     try:
         return int(await db.scalar(count_statement) or 0)
     except Exception:
         return None
-
-
-def _npi_detail_taxonomy_aggregate(
-    taxonomy_model: Any,
-    npi: int,
-    alias: str,
-) -> Any:
-    taxonomy_table = taxonomy_model.__table__
-    return (
-        select(
-            taxonomy_table.c.npi,
-            func.json_agg(
-                literal_column(f'distinct "{taxonomy_model.__tablename__}"')
-            ).label("rows"),
-        )
-        .select_from(taxonomy_table)
-        .where(taxonomy_table.c.npi == npi)
-        .group_by(taxonomy_table.c.npi)
-        .subquery(alias)
-    )
 
 
 def _npi_detail_query(npi: int, address_subquery: Any) -> Any:
@@ -14045,9 +13034,7 @@ def _npi_detail_query(npi: int, address_subquery: Any) -> Any:
         address_aggregate = (
             select(
                 address_subquery.c.npi,
-                func.json_agg(
-                    literal_column('distinct "address_list"')
-                ).label("rows"),
+                func.json_agg(literal_column('distinct "address_list"')).label("rows"),
             )
             .select_from(address_subquery)
             .group_by(address_subquery.c.npi)
@@ -14060,11 +13047,7 @@ def _npi_detail_query(npi: int, address_subquery: Any) -> Any:
         select_columns.append(address_aggregate.c.rows)
     else:
         select_columns.append(literal_column("NULL::json"))
-    return (
-        db.select(*select_columns)
-        .select_from(join_clause)
-        .where(npi_data_table.c.npi == npi)
-    )
+    return db.select(*select_columns).select_from(join_clause).where(npi_data_table.c.npi == npi)
 
 
 async def _build_npi_details(
@@ -14109,8 +13092,8 @@ async def _build_npi_details(
     )
     query = _npi_detail_query(npi, address_subquery)
 
-    if session is not None:
-        detail_query_result = await session.execute(query._stmt)
+    if session is not None or current_network_address_scope() is not None:
+        detail_query_result = await _execute_stmt(query._stmt, session=session)
         detail_rows = detail_query_result.all()
     else:
         detail_rows = await query.all()
@@ -14133,9 +13116,7 @@ async def _fetch_other_names_map(
     if not unique_npis:
         return {}
     result = await _execute_stmt(
-        select(NPIDataOtherIdentifier).where(
-            NPIDataOtherIdentifier.npi.in_(unique_npis)
-        ),
+        select(NPIDataOtherIdentifier).where(NPIDataOtherIdentifier.npi.in_(unique_npis)),
         session=session,
     )
     rows_by_npi: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -14159,70 +13140,27 @@ async def _fetch_other_names(npi: int, *, session: Any = None) -> list[dict[str,
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE = "provider_directory_address_overlay"
 
 
-async def _npi_canonical_publication_identity(
-    *,
-    session: Any = None,
-) -> str | None:
+async def _npi_canonical_publication_identity(*, session: Any = None) -> str | None:
     """Return the uncached receipt identity for the six current NPI tables."""
-
-    schema = _runtime_db_schema()
-    receipt_table = _schema_cache_key("npi_canonical_publication_receipt")
-    seal_table = _schema_cache_key("npi_canonical_publication_receipt_seal")
-    live_table_by_oid_column = (
-        ("npi_table_oid", "npi"),
-        ("npi_address_table_oid", "npi_address"),
-        ("npi_taxonomy_table_oid", "npi_taxonomy"),
-        ("npi_taxonomy_group_table_oid", "npi_taxonomy_group"),
-        ("npi_other_identifier_table_oid", "npi_other_identifier"),
-        ("npi_phone_staffing_table_oid", "npi_phone_staffing"),
+    return await npi_canonical_publication_identity(
+        _execute_stmt,
+        _runtime_db_schema(),
+        logger,
+        receipt_table=_schema_cache_key("npi_canonical_publication_receipt"),
+        seal_table=_schema_cache_key("npi_canonical_publication_receipt_seal"),
+        session=session,
     )
-    relation_predicates = " AND ".join(
-        f"receipt.{oid_column}=to_regclass(:{table_name}_ref)::oid"
-        for oid_column, table_name in live_table_by_oid_column
-    )
-    parameters_by_name = {
-        f"{table_name}_ref": f"{schema}.{table_name}"
-        for _, table_name in live_table_by_oid_column
-    }
-    try:
-        identity_result = await _execute_stmt(
-            text(
-                f"SELECT receipt.publication_generation, receipt.publication_ref "
-                f"FROM {receipt_table} AS receipt "
-                f"JOIN {seal_table} AS sealed USING (publication_ref) "
-                f"WHERE {relation_predicates} "
-                "ORDER BY receipt.publication_generation DESC LIMIT 2"
-            ),
-            session=session,
-            params=parameters_by_name,
-        )
-        identity_rows = identity_result.all()
-    except Exception as exc:
-        logger.debug(
-            "Canonical NPI publication identity unavailable; bypassing cache (%s)",
-            type(exc).__name__,
-        )
-        return None
-    if len(identity_rows) != 1:
-        return None
-    publication_generation, publication_ref = identity_rows[0]
-    if (
-        type(publication_generation) is not int
-        or publication_generation < 1
-        or type(publication_ref) is not str
-        or len(publication_ref) != 50
-        or not publication_ref.startswith("nppub1_")
-    ):
-        return None
-    return f"{publication_generation}:{publication_ref}"
 
 
-async def _npi_count_cache_identity(address_model: Any) -> str | None:
+async def _npi_count_cache_identity(address_model: Any, *, session=None) -> str | None:
     """Bind count caches to both canonical NPI and address-serving generations."""
 
-    publication_identity = await _npi_canonical_publication_identity()
+    metadata_options = {"session": session} if session is not None else {}
+    publication_identity = await _npi_canonical_publication_identity(**metadata_options)
     if publication_identity is None:
         return None
+    if current_network_address_scope() is not None:
+        return scoped_address_cache_key(f"{publication_identity}|canonical-network-count")
     if address_model is NPIAddress:
         return f"{publication_identity}|address:npi-publication"
     if address_model is not EntityAddressUnified:
@@ -14230,10 +13168,15 @@ async def _npi_count_cache_identity(address_model: Any) -> str | None:
     try:
         relation_result = await _execute_stmt(
             text("SELECT to_regclass(:table_ref)::oid::bigint"),
+            session=session,
             params={"table_ref": _schema_cache_key(address_model.__tablename__)},
         )
         relation_oid = relation_result.scalar()
+    except sanic.exceptions.ServiceUnavailable:
+        raise
     except Exception:
+        if _NPI_COUNT_READ_SCOPE.get() is not None:
+            raise
         return None
     if type(relation_oid) is not int or relation_oid < 1:
         return None
@@ -14245,9 +13188,7 @@ async def _provider_directory_address_overlay_serving_identity(
     session: Any = None,
 ) -> str:
     """Return both address-serving relation identities used by response caches."""
-    overlay_table_ref = _schema_cache_key(
-        PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE
-    )
+    overlay_table_ref = _schema_cache_key(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
     unified_table_ref = _schema_cache_key(EntityAddressUnified.__tablename__)
     identity_result = await _execute_stmt(
         text(
@@ -14342,10 +13283,7 @@ def _overlay_formatted_address_sql(overlay_columns: set[str]) -> str:
     """Select a persisted overlay label without doing request-time rendering."""
     if "formatted_address" not in overlay_columns:
         return "NULL::varchar AS formatted_address"
-    return (
-        "MAX(NULLIF(BTRIM(formatted_address), ''))::varchar "
-        "AS formatted_address"
-    )
+    return "MAX(NULLIF(BTRIM(formatted_address), ''))::varchar AS formatted_address"
 
 
 def _overlay_premise_key_sql(
@@ -14377,21 +13315,20 @@ def _overlay_location_status_sql() -> str:
 
 
 _PROVIDER_DIRECTORY_OVERLAY_QUERY_TEMPLATE = """
-        WITH {current_resource_ctes_sql}, visible_overlay AS MATERIALIZED (
-            SELECT overlay.*, current_resource.canonical_api_base,
-                   current_resource.payload_json
-              FROM {overlay_table_sql} AS overlay
+        WITH {current_resource_ctes_sql}, matched_overlays AS MATERIALIZED (
+            SELECT overlay.* FROM {overlay_table_sql} AS overlay
+             WHERE overlay.npi = ANY(:npis)
+               AND (CAST(:address_key AS uuid) IS NULL
+                   OR overlay.address_key = CAST(:address_key AS uuid))
+               {premise_filter}
+        ), visible_overlay AS MATERIALIZED (
+            SELECT overlay.*, current_resource.canonical_api_base, current_resource.payload_json
+              FROM matched_overlays AS overlay
               JOIN current_resources AS current_resource
                 ON current_resource.source_id = overlay.source_id
                AND current_resource.resource_type = overlay.resource_type
                AND current_resource.resource_id = overlay.resource_id
                AND overlay.last_seen_run_id = current_resource.run_id
-             WHERE overlay.npi = ANY(:npis)
-               AND (
-                   CAST(:address_key AS uuid) IS NULL
-                   OR overlay.address_key = CAST(:address_key AS uuid)
-               )
-               {premise_filter}
         )
         SELECT
             npi,
@@ -14434,13 +13371,9 @@ def _provider_directory_overlay_query_sql(
 ) -> str:
     """Build the current-resource provider-directory address overlay query."""
     lat_select, long_select, coordinate_group_by = _overlay_coordinate_sql(overlay_columns)
-    premise_select, premise_filter, premise_group_by = _overlay_premise_key_sql(
-        overlay_columns
-    )
+    premise_select, premise_filter, premise_group_by = _overlay_premise_key_sql(overlay_columns)
     overlay_table_sql = _schema_cache_key(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
-    current_resource_ctes_sql = _directory_overlay_resource_ctes_sql(
-        _runtime_db_schema()
-    )
+    current_resource_ctes_sql = _directory_overlay_resource_ctes_sql(_runtime_db_schema())
     return _PROVIDER_DIRECTORY_OVERLAY_QUERY_TEMPLATE.format(
         current_resource_ctes_sql=current_resource_ctes_sql,
         overlay_table_sql=overlay_table_sql,
@@ -14523,8 +13456,7 @@ async def _fetch_provider_directory_address_overlay_map(
     if not await _is_table_available(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, session=session):
         return {}
     visibility_table_states = [
-        await _is_table_available(table_name, session=session)
-        for table_name in PROVIDER_DIRECTORY_VISIBILITY_TABLES
+        await _is_table_available(table_name, session=session) for table_name in PROVIDER_DIRECTORY_VISIBILITY_TABLES
     ]
     if not all(visibility_table_states):
         return {}
@@ -14547,19 +13479,13 @@ async def _fetch_provider_directory_address_overlay_map(
     for overlay_row in overlay_result.all():
         overlay_mapping = getattr(overlay_row, "_mapping", overlay_row)
         overlay_address_by_field = dict(overlay_mapping)
-        if UHC_PROVIDER_FILE_SOURCE_ID in _directory_source_ids(
-            overlay_address_by_field.get("source_record_ids")
-        ):
-            overlay_address_by_field["address_status"] = (
-                UHC_PROVIDER_FILE_ADDRESS_STATUS
-            )
+        if UHC_PROVIDER_FILE_SOURCE_ID in _directory_source_ids(overlay_address_by_field.get("source_record_ids")):
+            overlay_address_by_field["address_status"] = UHC_PROVIDER_FILE_ADDRESS_STATUS
         overlay_npi = overlay_address_by_field.get("npi")
         if overlay_npi is None and len(unique_npis) == 1:
             overlay_npi = unique_npis[0]
         if overlay_npi is not None:
-            overlay_addresses_by_npi[int(overlay_npi)].append(
-                overlay_address_by_field
-            )
+            overlay_addresses_by_npi[int(overlay_npi)].append(overlay_address_by_field)
     return dict(overlay_addresses_by_npi)
 
 
@@ -14645,9 +13571,7 @@ def _status_map_from_result(query_result: Any) -> dict[str, str]:
         mapping = getattr(status_record, "_mapping", status_record)
         record_id = str(mapping["source_record_id"] or "").strip()
         if record_id:
-            status_by_record_id[record_id] = str(
-                mapping["location_status"] or "unknown"
-            ).lower()
+            status_by_record_id[record_id] = str(mapping["location_status"] or "unknown").lower()
     return status_by_record_id
 
 
@@ -14655,35 +13579,43 @@ async def _fetch_location_status_by_record_id(
     source_record_ids: Sequence[Any],
     *,
     session: Any = None,
+    use_request_session: bool = False,
+    fail_closed: bool = False,
 ) -> dict[str, str]:
     """Resolve active/inactive/unknown for current PractitionerRole evidence."""
     normalized_record_ids = sorted(
         {
             str(record_id).strip()
             for record_id in source_record_ids
-            if str(record_id or "").strip().startswith(
-                "provider_directory_fhir:practitioner_role:"
-            )
+            if str(record_id or "").strip().startswith("provider_directory_fhir:practitioner_role:")
         }
     )
     if not normalized_record_ids:
         return {}
     try:
-        overlay_table_sql = _schema_cache_key(
-            PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE
-        )
+        overlay_table_sql = _schema_cache_key(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
         status_query = _location_status_query(
             _runtime_db_schema(),
             overlay_table_sql,
         )
-        async with db.session() as status_session:
+        use_passed_session = use_request_session and session is not None
+        async with (
+            contextlib.nullcontext(session) if use_passed_session else db.session() as status_session,
+            provider_read_savepoint(status_session)
+            if use_passed_session or has_network_read_inventory(status_session)
+            else contextlib.nullcontext(),
+        ):
             query_result = await _execute_stmt(
                 status_query,
                 session=status_session,
                 params={"source_record_ids": normalized_record_ids},
             )
             return _status_map_from_result(query_result)
+    except sanic.exceptions.ServiceUnavailable:
+        raise
     except Exception as exc:
+        if fail_closed:
+            raise
         logger.debug("Provider location status lookup failed: %s", exc)
         return {}
 
@@ -14692,22 +13624,14 @@ def _location_status_from_source_records(
     source_record_ids: Any,
     status_by_record_id: Mapping[str, str],
 ) -> str:
-    candidates = (
-        source_record_ids
-        if isinstance(source_record_ids, (list, tuple, set))
-        else [source_record_ids]
-    )
+    candidates = source_record_ids if isinstance(source_record_ids, (list, tuple, set)) else [source_record_ids]
     statuses = []
     for record_id in candidates:
         normalized_record_id = str(record_id or "").strip()
         if not normalized_record_id:
             continue
-        status = str(
-            status_by_record_id.get(normalized_record_id) or "unknown"
-        ).strip().lower()
-        statuses.append(
-            status if status in {"active", "inactive"} else "unknown"
-        )
+        status = str(status_by_record_id.get(normalized_record_id) or "unknown").strip().lower()
+        statuses.append(status if status in {"active", "inactive"} else "unknown")
     if "active" in statuses:
         return "active"
     if statuses and all(status == "inactive" for status in statuses):
@@ -14719,6 +13643,8 @@ async def _apply_location_statuses(
     addresses: Sequence[Any],
     *,
     session: Any = None,
+    use_request_session: bool = False,
+    fail_closed: bool = False,
 ) -> None:
     """Attach conservative per-location status without overriding unknown evidence."""
     source_record_ids = [
@@ -14735,6 +13661,8 @@ async def _apply_location_statuses(
         await _fetch_location_status_by_record_id(
             source_record_ids,
             session=session,
+            use_request_session=use_request_session,
+            fail_closed=fail_closed,
         )
         if source_record_ids
         else {}
@@ -14747,20 +13675,12 @@ async def _apply_location_statuses(
             status_by_record_id,
         )
         raw_sources = address.get("address_sources") or []
-        address_sources = (
-            raw_sources
-            if isinstance(raw_sources, (list, tuple, set))
-            else [raw_sources]
-        )
+        address_sources = raw_sources if isinstance(raw_sources, (list, tuple, set)) else [raw_sources]
         has_non_directory_source = any(
-            str(source_id or "").strip().lower()
-            not in {"", "provider_directory_fhir"}
-            for source_id in address_sources
+            str(source_id or "").strip().lower() not in {"", "provider_directory_fhir"} for source_id in address_sources
         )
         address["location_status"] = (
-            "unknown"
-            if directory_status == "inactive" and has_non_directory_source
-            else directory_status
+            "unknown" if directory_status == "inactive" and has_non_directory_source else directory_status
         )
 
 
@@ -14770,7 +13690,4 @@ def _should_include_npi_all_total(args: object, count_only: bool) -> bool:
     getter = getattr(args, "get", None)
     if not callable(getter) or getter("include_total") is not None:
         return True
-    return not any(
-        str(getter(key) or "").strip()
-        for key in ("phone", "address_key", PUBLIC_ADDRESS_SITE_KEY, "npi")
-    )
+    return not any(str(getter(key) or "").strip() for key in ("phone", "address_key", PUBLIC_ADDRESS_SITE_KEY, "npi"))

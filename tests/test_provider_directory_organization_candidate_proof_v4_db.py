@@ -26,12 +26,16 @@ from tests.provider_directory_organization_union_v4_postgres_support import (
 from tests.provider_directory_semantic_proof_v3_postgres_support import (
     PROJECTION_AS_OF,
     SOURCE_ID,
+    _admin_update_semantic_input,
+    _completed_semantic_scope,
     _insert_parent,
     _semantic_database,
     _shard_records,
     importer,
 )
-
+from tests.provider_directory_semantic_proof_v3_postgres_support import (
+    semantic_source_template as semantic_source_template,
+)
 
 DATASET_ID = "dataset-organization-candidate-proof"
 RESOURCE_SCOPE = ("Organization",)
@@ -51,7 +55,7 @@ def _candidate() -> importer.EndpointDatasetCandidate:
         previous_dataset_id=None,
         resource_hash_contract=SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
         semantic_projection_as_of=PROJECTION_AS_OF,
-        proof_resource_scope=RESOURCE_SCOPE,
+        proof_resource_scope=importer._provider_directory_proof_resource_scope(RESOURCE_SCOPE),
     )
 
 
@@ -89,15 +93,16 @@ async def _replace_retained_payload(
         resource_type="Organization",
     )
     assert mutated_hash != original_hash
-    await database.status(
-        f'UPDATE "{schema}".provider_directory_dataset_resource '
-        "SET payload_hash=:payload_hash, payload_json=CAST(:payload_json AS jsonb) "
-        "WHERE dataset_id=:dataset_id AND resource_type='Organization' "
-        "AND resource_id=:resource_id;",
-        payload_hash=mutated_hash,
-        payload_json=json.dumps(mutated_payload_by_field),
-        dataset_id=DATASET_ID,
-        resource_id=RESOURCE_ID,
+    await _admin_update_semantic_input(
+        database,
+        DATASET_ID,
+        "SET payload_hash=:payload_hash, payload_json=CAST(:payload_json AS jsonb) WHERE dataset_id=:dataset_id AND resource_type='Organization' AND resource_id=:resource_id",
+        dict(
+            payload_hash=mutated_hash,
+            payload_json=json.dumps(mutated_payload_by_field),
+            dataset_id=DATASET_ID,
+            resource_id=RESOURCE_ID,
+        ),
     )
     assert await stored_dataset_row(database, schema, DATASET_ID) == (
         mutated_hash,
@@ -139,18 +144,16 @@ async def test_postgres_v4_candidate_proof_rejects_retained_alias_drift(
         candidate = _candidate()
         sealed_proof = await stored_proof(database, schema, DATASET_ID)
         shards_before = await _shard_records(database, schema, DATASET_ID)
-        async with database.acquire() as connection:
-            candidate_proof = (
-                await importer._candidate_endpoint_dataset_content_proof(
-                    connection,
-                    candidate,
-                )
+        async with _completed_semantic_scope(database, DATASET_ID), database.acquire() as connection:
+            candidate_proof = await importer._candidate_endpoint_dataset_content_proof(
+                connection,
+                candidate,
             )
         _assert_proof_parity(candidate_proof, sealed_proof)
 
         await _replace_retained_payload(database, schema)
         assert await _shard_records(database, schema, DATASET_ID) == shards_before
-        async with database.acquire() as connection:
+        async with _completed_semantic_scope(database, DATASET_ID), database.acquire() as connection:
             with pytest.raises(
                 RuntimeError,
                 match="provider_directory_semantic_content_proof_mismatch",

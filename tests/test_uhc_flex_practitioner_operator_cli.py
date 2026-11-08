@@ -8,16 +8,15 @@ import argparse
 import asyncio
 import builtins
 import importlib.util
-from pathlib import Path
 import signal
 import sys
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 import pytest
 
 from process import uhc_flex_practitioner_operator as operation
-
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "scripts" / "smoke" / "uhc_flex_practitioner_operator.py"
@@ -38,6 +37,35 @@ def _script_module():
     return script_module
 
 
+@pytest.mark.parametrize("failure", [None, RuntimeError("private detail"), asyncio.CancelledError()])
+def test_supplied_operation_runner_uses_existing_cli_result_handling(monkeypatch, capsys, failure):
+    script_module = _script_module()
+    received_commands = []
+
+    async def original(_arguments):
+        raise AssertionError("unwrapped operation was called")
+
+    async def run(arguments):
+        received_commands.append(arguments.command)
+        if failure is not None:
+            raise failure
+        return '{"status":"ok"}'
+
+    monkeypatch.setattr(script_module, "_run_operation", original)
+    result = script_module.run_command(["sync-cohort"], operation_runner=run)
+    captured = capsys.readouterr()
+    assert received_commands == ["sync-cohort"]
+    assert result == (0 if failure is None else 1)
+    assert captured.out == ('{"status":"ok"}\n' if failure is None else "")
+    assert captured.err == (
+        ""
+        if failure is None
+        else '{"code":"canceled","status":"error"}\n'
+        if isinstance(failure, asyncio.CancelledError)
+        else '{"code":"failed","status":"error"}\n'
+    )
+
+
 def _disable_all_gates(monkeypatch) -> None:
     for gate_name in (
         operation.COHORT_ENABLED_ENV,
@@ -52,12 +80,8 @@ def _forbid_runtime_imports(monkeypatch) -> None:
     original_import = builtins.__import__
 
     def guarded_import(module_name, *args, **kwargs):
-        if module_name == "db.connection" or module_name.startswith(
-            "process.uhc_flex_"
-        ):
-            raise AssertionError(
-                f"runtime import before accepted arguments: {module_name}"
-            )
+        if module_name == "db.connection" or module_name.startswith("process.uhc_flex_"):
+            raise AssertionError(f"runtime import before accepted arguments: {module_name}")
         return original_import(module_name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", guarded_import)
@@ -158,9 +182,7 @@ def test_acquisition_defaults_match_the_bounded_runtime_contract() -> None:
     assert parsed.lease_seconds == 300
     assert parsed.retry_base_seconds == 1.0
     assert parsed.max_retry_seconds == 60.0
-    assert script_module._parser().parse_args(
-        [*_acquisition_arguments(), "--concurrency", "32"]
-    ).concurrency == 32
+    assert script_module._parser().parse_args([*_acquisition_arguments(), "--concurrency", "32"]).concurrency == 32
 
 
 @pytest.mark.asyncio
@@ -270,9 +292,7 @@ def test_historical_publication_prints_only_the_sanitized_receipt(
 
     monkeypatch.setattr(script_module, "_run_operation", run_operation)
 
-    exit_code = script_module.run_command(
-        ["publish-admitted", "--candidate-acquisition-id", CANDIDATE_ACQUISITION_ID]
-    )
+    exit_code = script_module.run_command(["publish-admitted", "--candidate-acquisition-id", CANDIDATE_ACQUISITION_ID])
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -290,9 +310,7 @@ def test_historical_publication_prints_only_the_sanitized_receipt(
         (asyncio.CancelledError(signal.SIGTERM), "canceled", 143),
     ],
 )
-def test_failures_are_sanitized(
-    monkeypatch, capsys, raised_error, expected_code, expected_exit
-) -> None:
+def test_failures_are_sanitized(monkeypatch, capsys, raised_error, expected_code, expected_exit) -> None:
     script_module = _script_module()
 
     async def fail_operation(_parsed_arguments):
@@ -476,9 +494,7 @@ async def test_runtime_database_is_loaded_only_after_the_gate(monkeypatch) -> No
         lambda _task: SignalRegistration(),
     )
 
-    rendered_receipt = await script_module._run_operation(
-        argparse.Namespace(command="sync-cohort")
-    )
+    rendered_receipt = await script_module._run_operation(argparse.Namespace(command="sync-cohort"))
 
     assert rendered_receipt == '{"status":"sealed"}'
     assert lifecycle_events == ["operation", "disconnect", "restore-signals"]

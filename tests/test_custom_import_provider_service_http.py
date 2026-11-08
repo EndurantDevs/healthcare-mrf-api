@@ -1,0 +1,760 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+"""Signed provider-service reads keep authorization and hydration in one snapshot."""
+
+from __future__ import annotations
+
+import json
+from contextlib import asynccontextmanager
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from sanic import response
+from sqlalchemy import literal, select
+
+from api import custom_import_plan_sql as plan_sql
+from api import custom_import_provider_service_http as service_http
+from api import custom_import_read_http as transport
+from process.custom_import.read_contracts import CustomImportReadRequestError, CustomImportReadUnavailableError
+from process.custom_import.read_core import PreparedNpiEntityRelation, ReadFieldValue
+from tests import test_custom_import_read_http as fixtures
+from tests.network_read_execution_support import _ReceiptDriver, mock_approved_control_metadata
+
+
+def _body(**changes):
+    document_map = {
+        "target": fixtures._TARGET,
+        "native_query": {"code_system": "CPT", "code": "99213", "limit": "2"},
+        "context": [{"field_id": "service", "operator": "eq", "value": "99213"}],
+        "filters": [{"field_id": "metric", "operator": "gt", "value": "5"}],
+        "order": None,
+        "require_match": True,
+        "include_filter": True,
+    }
+    document_map.update(changes)
+    return transport._canonical_json_bytes(document_map)
+
+
+def _request(body=None, **changes):
+    body = _body() if body is None else body
+    request = SimpleNamespace(
+        body=body,
+        headers=fixtures._provider_headers(body=body, path=service_http.CUSTOM_IMPORT_PROVIDER_SERVICE_PATH),
+        method="POST",
+        path=service_http.CUSTOM_IMPORT_PROVIDER_SERVICE_PATH,
+        query_string="",
+    )
+    for name, value in changes.items():
+        setattr(request, name, value)
+    return request
+
+
+class _Session:
+    def __init__(self):
+        self.events = []
+        self.rolled_back = False
+
+    def in_transaction(self):
+        return False
+
+    @asynccontextmanager
+    async def begin(self):
+        self.events.append("begin")
+        try:
+            yield self
+        except BaseException:
+            self.rolled_back = True
+            raise
+        finally:
+            self.events.append("end")
+
+    async def execute(self, statement):
+        assert str(statement) == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+        self.events.append("snapshot")
+
+
+def _read_service_type(session, page_items, imported, require_match):
+    """Build a synthetic authorized read service for one native page."""
+
+    class ReadService:
+        def __init__(self, *, authorizer):
+            self.authorizer = authorizer
+
+        async def prepare_npi_entity_relation(self, same_session, **kwargs):
+            assert same_session is session
+            assert self.authorizer.authorize(kwargs["authorization"], target=kwargs["target"]).value == "a" * 64
+            query = kwargs["query"]
+            assert query.require_match is require_match and query.require_exact_context is True
+            assert query.context_filters[0].value == "99213"
+            if require_match:
+                assert query.filters[0].value == "5"
+            else:
+                assert query.filters == ()
+            session.events.append("prepare")
+            columns = [literal("1104212877").label("entity_value")]
+            if query.order_terms:
+                columns.append(literal(7).label("sort_0"))
+            return PreparedNpiEntityRelation(select(*columns), query.order_terms or (), "b" * 64, "c" * 64)
+
+        async def hydrate_npi_page(self, same_session, **kwargs):
+            assert same_session is session
+            assert kwargs["entity_values"] == tuple(str(provider["npi"]) for provider in page_items or [])
+            session.events.append("hydrate")
+            if not imported:
+                return {}
+            return {
+                "1104212877": SimpleNamespace(
+                    root_fields=(ReadFieldValue("metric", "integer", "value", 7),),
+                    context_fields=(),
+                    children=(
+                        SimpleNamespace(collection="facts", fields=(ReadFieldValue("score", "integer", "value", 3),)),
+                    ),
+                )
+            }
+
+    return ReadService
+
+
+def _install(monkeypatch, session, *, page_items=None, imported=True, require_match=True, finality_failure=False):
+    """Bind signed transport, native rows, and generation finality to one session."""
+    fixtures._install_keyring(monkeypatch, session)
+
+    @asynccontextmanager
+    async def bounded(same_session, *, timeout_ms):
+        assert same_session is session and timeout_ms > 0
+        session.events.append("bounded")
+        yield
+
+    async def resolve(same_session, target):
+        assert same_session is session
+        session.events.append("resolve")
+        return await fixtures._resolved_target(same_session, target)
+
+    async def page(request, *, native_args, import_context):
+        assert request.path == service_http.CUSTOM_IMPORT_PROVIDER_SERVICE_PATH
+        assert native_args.get("code_system") == "CPT" and native_args.get("code") == "99213"
+        assert import_context.require_match is require_match
+        session.events.append("page")
+        return response.json(
+            {
+                "items": page_items or [],
+                "pagination": {"total": len(page_items or []), "page": 1, "limit": 2, "offset": 0},
+                "query": {"code_system": "CPT", "code": "99213"},
+            }
+        )
+
+    async def finality(same_session, target):
+        assert same_session is session and target.dataset_id == 11
+        session.events.append("finality")
+        if finality_failure:
+            raise CustomImportReadUnavailableError("synthetic ineligible generation")
+
+    monkeypatch.setattr(service_http, "_bounded_read_window", bounded)
+    monkeypatch.setattr(transport, "_resolve_pinned_target", resolve)
+    monkeypatch.setattr(
+        service_http, "CustomImportReadService", _read_service_type(session, page_items, imported, require_match)
+    )
+    monkeypatch.setattr(service_http, "_service_page", page)
+    monkeypatch.setattr(service_http, "verify_published_generation", finality)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    (
+        ("9000000000", ("9000000000",)),
+        ("[9000000000]", ("9000000000",)),
+        ("0009000000000", ("9000000000",)),
+        ("23", ()),
+        ("null", None),
+    ),
+)
+async def test_native_service_npi_normalization_scopes_imports_without_changing_native_args(monkeypatch, raw, expected):
+    session = _Session()
+    _install(monkeypatch, session)
+    observed_scopes = []
+    original = service_http._provider_relation_query
+
+    def relation_query(parsed, **arguments):
+        query = original(parsed, **arguments)
+        observed_scopes.append((query.entity_values, parsed.native_args.get("npi")))
+        return query
+
+    monkeypatch.setattr(service_http, "_provider_relation_query", relation_query)
+    reply = await service_http.serve_custom_import_provider_service(
+        _request(_body(native_query={"code_system": "CPT", "code": "99213", "npi": raw, "limit": "2"})), session
+    )
+    assert reply.status == 200 and observed_scopes == [(expected, raw)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope_failure", (False, True))
+async def test_service_native_scope_updates_hydration_or_rolls_back(monkeypatch, scope_failure):
+    session = _Session()
+    page_items = [{"npi": "1104212877"}]
+    _install(monkeypatch, session, page_items=page_items)
+    read_service = service_http.CustomImportReadService
+    original_hydrate = read_service.hydrate_npi_page
+    observed_by_stage = {}
+
+    async def scope_relation(self, same_session, **kwargs):
+        assert same_session is session and kwargs["query"].require_match is True
+        observed_by_stage["original"] = kwargs["prepared"]
+        if scope_failure:
+            raise CustomImportReadUnavailableError("synthetic scoped read failure")
+        scoped = replace(kwargs["prepared"], statement=select(literal("1104212877").label("entity_value")))
+        observed_by_stage["scoped"] = scoped
+        return scoped
+
+    async def hydrate_scoped(self, same_session, **kwargs):
+        assert kwargs["prepared"] is observed_by_stage["scoped"]
+        assert kwargs["prepared"] is not observed_by_stage["original"]
+        observed_by_stage["hydrated"] = True
+        return await original_hydrate(self, same_session, **kwargs)
+
+    async def scoped_page(request, *, native_args, import_context):
+        scoped = await import_context.scope_native(select(literal("1104212877").label("npi")))
+        assert scoped.prepared is observed_by_stage["scoped"]
+        return response.json(
+            {"items": page_items, "pagination": {"total": 1}, "query": {"code_system": "CPT", "code": "99213"}}
+        )
+
+    monkeypatch.setattr(read_service, "scope_npi_entity_relation", scope_relation, raising=False)
+    monkeypatch.setattr(read_service, "hydrate_npi_page", hydrate_scoped)
+    monkeypatch.setattr(service_http, "_service_page", scoped_page)
+    reply = await service_http.serve_custom_import_provider_service(_request(), session)
+    assert reply.status == (503 if scope_failure else 200)
+    assert session.rolled_back is scope_failure
+    assert observed_by_stage.get("hydrated", False) is not scope_failure
+
+
+@pytest.mark.parametrize(
+    "native_query", [{"mode": "plan"}, {"plan_id": "x"}, {"code": "99213"}, {"code_system": "CPT"}]
+)
+def test_service_native_query_rejects_nonclaims_or_missing_code(native_query):
+    with pytest.raises(CustomImportReadRequestError):
+        service_http._parse_service_native_query(native_query)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", ["51", "100"])
+@pytest.mark.parametrize("row_count", [0, 50, 51])
+@pytest.mark.parametrize("require_match", [False, True])
+async def test_complete_service_page_limit_is_rejected_before_storage(monkeypatch, limit, row_count, require_match):
+    session = _Session()
+    rows = [{"npi": str(1000000000 + index)} for index in range(row_count)]
+    _install(monkeypatch, session, page_items=rows, imported=False, require_match=require_match)
+    body = _body(
+        native_query={"code_system": "CPT", "code": "99213", "limit": limit},
+        filters=[{"field_id": "metric", "operator": "gt", "value": "5"}] if require_match else [],
+        order=None if require_match else [{"field_id": "metric", "direction": "desc"}],
+        require_match=require_match,
+    )
+
+    reply = await service_http.serve_custom_import_provider_service(_request(body), session)
+
+    assert reply.status == 400
+    assert session.events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row_count", [0, 50])
+async def test_order_only_service_page_limit_accepts_fifty_with_unmatched_rows(monkeypatch, row_count):
+    session = _Session()
+    rows = [{"npi": str(1000000000 + index)} for index in range(row_count)]
+    _install(monkeypatch, session, page_items=rows, imported=False, require_match=False)
+    body = _body(
+        native_query={"code_system": "CPT", "code": "99213", "limit": "50"},
+        filters=[],
+        order=[{"field_id": "metric", "direction": "desc"}],
+        require_match=False,
+    )
+
+    reply = await service_http.serve_custom_import_provider_service(_request(body), session)
+
+    assert reply.status == 200
+    payload = json.loads(reply.body)
+    assert len(payload["items"]) == row_count and payload["pagination"]["total"] == row_count
+    assert all(row["custom_import"] is None for row in payload["items"])
+    assert session.events.index("hydrate") < session.events.index("finality")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row_count", "field_bytes", "status"),
+    [(25, 300, 200), (50, 300, 200), (51, 300, 503), (25, 262144, 503)],
+)
+async def test_complete_service_page_keeps_per_provider_and_final_wire_bounds(
+    monkeypatch, row_count, field_bytes, status
+):
+    session = _Session()
+    provider_rows = [{"npi": str(1000000000 + index)} for index in range(row_count)]
+    _install(monkeypatch, session, page_items=provider_rows, imported=False)
+    imported = SimpleNamespace(
+        root_fields=(),
+        context_fields=(),
+        children=tuple(
+            SimpleNamespace(
+                collection="facts",
+                fields=(ReadFieldValue("text", "string", "value", "x" * field_bytes),),
+            )
+            for _ in range(42)
+        ),
+    )
+
+    async def hydrate(self, same_session, **kwargs):
+        assert same_session is session
+        assert kwargs["entity_values"] == tuple(provider_document["npi"] for provider_document in provider_rows)
+        session.events.append("hydrate")
+        return {provider_document["npi"]: imported for provider_document in provider_rows}
+
+    monkeypatch.setattr(service_http.CustomImportReadService, "hydrate_npi_page", hydrate)
+    reply = await service_http.serve_custom_import_provider_service(_request(), session)
+    assert reply.status == status
+    if status == 200:
+        response_document = json.loads(reply.body)
+        assert transport._MAX_RESPONSE_BYTES < len(reply.body) <= (row_count + 1) * transport._MAX_RESPONSE_BYTES
+        assert response_document["pagination"]["total"] == row_count
+        assert [provider_document["npi"] for provider_document in response_document["items"]] == [
+            provider_document["npi"] for provider_document in provider_rows
+        ]
+        assert all(
+            len(provider_document["custom_import"]["children"]) == 42
+            for provider_document in response_document["items"]
+        )
+        assert session.events.index("hydrate") < session.events.index("finality")
+    else:
+        assert session.rolled_back and len(reply.body) < 256
+        if row_count > 50:
+            assert "hydrate" not in session.events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_filter", [False, True])
+async def test_service_inclusion_keeps_native_page_under_one_signed_snapshot(monkeypatch, include_filter):
+    session = _Session()
+    native_provider_by_field = {"npi": 1104212877, "provider_name": "Synthetic Provider", "claims": {"count": 12}}
+    _install(monkeypatch, session, page_items=[native_provider_by_field])
+    reply = await service_http.serve_custom_import_provider_service(
+        _request(_body(include_filter=include_filter)), session
+    )
+
+    assert reply.status == 200 and reply.headers["cache-control"] == "private, no-store"
+    provider_payload = json.loads(reply.body)
+    expected_provider_by_field = {**native_provider_by_field, "npi": "1104212877"}
+    expected_import_by_field = {
+        "target": fixtures._TARGET,
+        "root_fields": [{"field_id": "metric", "field_type": "integer", "state": "value", "value": 7}],
+        "context_fields": [],
+        "children": [
+            {
+                "collection": "facts",
+                "fields": [{"field_id": "score", "field_type": "integer", "state": "value", "value": 3}],
+            }
+        ],
+    }
+    if include_filter:
+        expected_provider_by_field["custom_import"] = expected_import_by_field
+    assert provider_payload == {
+        "items": [expected_provider_by_field],
+        "pagination": {"total": 1, "page": 1, "limit": 2, "offset": 0},
+        "query": {"code_system": "CPT", "code": "99213"},
+    }
+    assert session.events == [
+        "begin",
+        "snapshot",
+        "bounded",
+        "resolve",
+        "prepare",
+        "page",
+        *(["hydrate"] if include_filter else []),
+        "finality",
+        "end",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "native_byte_count,include_filter,status", [(400000, True, 200), (524288, True, 503), (400000, False, 503)]
+)
+async def test_native_service_page_uses_existing_complete_response_bound(
+    monkeypatch, native_byte_count, include_filter, status
+):
+    session = _Session()
+    provider_by_field = {"npi": 1104212877, "evidence": "x" * native_byte_count}
+    _install(monkeypatch, session, page_items=[provider_by_field])
+    reply = await service_http.serve_custom_import_provider_service(
+        _request(_body(include_filter=include_filter)), session
+    )
+    assert reply.status == status
+    if status == 200:
+        response_by_field = json.loads(reply.body)
+        assert response_by_field["items"][0]["evidence"] == provider_by_field["evidence"]
+        assert response_by_field["items"][0]["custom_import"] is not None
+        assert transport._MAX_RESPONSE_BYTES < len(reply.body) <= 2 * transport._MAX_RESPONSE_BYTES
+    else:
+        assert session.rolled_back and "hydrate" not in session.events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_legacy", [False, True])
+async def test_native_price_alias_is_compacted_only_when_unrequested(monkeypatch, include_legacy):
+    session = _Session()
+    prices = [{"negotiated_rate": 42, "evidence": "x" * 180000}]
+    provider_by_field = {"npi": 1104212877, "prices": prices, "tic_prices": prices}
+    _install(monkeypatch, session, page_items=[provider_by_field])
+    body = _body(
+        native_query={"code_system": "CPT", "code": "99213", "include_legacy_fields": str(include_legacy).lower()}
+    )
+    reply = await service_http.serve_custom_import_provider_service(_request(body), session)
+    assert reply.status == 200
+    provider_item = json.loads(reply.body)["items"][0]
+    assert provider_item["prices"] == prices and provider_item["custom_import"] is not None
+    expected_by_field = {**provider_by_field, "npi": "1104212877"}
+    if not include_legacy:
+        expected_by_field.pop("tic_prices")
+    assert {key: value for key, value in provider_item.items() if key != "custom_import"} == expected_by_field
+    assert ("tic_prices" in provider_item) is include_legacy
+    if include_legacy:
+        assert provider_item["tic_prices"] == prices
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_plan_release", [False, True])
+async def test_signed_plan_storage_requires_prepared_reader_workspace(monkeypatch, has_plan_release):
+    session = SimpleNamespace(info={"native_plan_workspace": True})
+    allocation = AsyncMock()
+    monkeypatch.setattr(plan_sql, "prepare_plan_query_tables", allocation)
+    native_args = {"plan_release_id": "synthetic-release"} if has_plan_release else {}
+    await service_http._prepare_service_snapshot(session, native_args)
+    allocation.assert_not_awaited()
+    if has_plan_release:
+        session.info.clear()
+        with pytest.raises(CustomImportReadUnavailableError, match="workspace"):
+            await service_http._prepare_service_snapshot(session, native_args)
+
+
+@pytest.mark.asyncio
+async def test_order_only_service_page_keeps_unmatched_provider_with_null_import(monkeypatch):
+    session = _Session()
+    _install(
+        monkeypatch,
+        session,
+        page_items=[{"npi": 1104212877}, {"npi": "1000000000"}],
+        require_match=False,
+    )
+    body = _body(filters=[], order=[{"field_id": "metric", "direction": "desc"}], require_match=False)
+    reply = await service_http.serve_custom_import_provider_service(_request(body), session)
+    assert reply.status == 200
+    payload = json.loads(reply.body)
+    assert [item["npi"] for item in payload["items"]] == ["1104212877", "1000000000"]
+    assert payload["items"][0]["custom_import"] is not None
+    assert payload["items"][1]["custom_import"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["signature", "path", "query", "unknown_native"])
+@pytest.mark.parametrize("include_filter", [False, True])
+async def test_invalid_service_permit_does_not_touch_database(monkeypatch, failure, include_filter):
+    fixtures._install_keyring(monkeypatch)
+    request = _request(_body(include_filter=include_filter))
+    if failure == "signature":
+        request.headers[transport.CUSTOM_IMPORT_READ_SIGNATURE_HEADER] = "A" * 43
+    elif failure == "path":
+        request.headers = fixtures._provider_headers(body=request.body, path=transport.CUSTOM_IMPORT_READ_PATH)
+    elif failure == "query":
+        request.query_string = "code=99213"
+    else:
+        request = _request(
+            _body(
+                native_query={"code_system": "CPT", "code": "99213", "snapshot_id": "untrusted"},
+                include_filter=include_filter,
+            )
+        )
+    session = _Session()
+    reply = await service_http.serve_custom_import_provider_service(request, session)
+    assert reply.status in {400, 403, 404} and session.events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "items,imported",
+    [
+        ([{"npi": 1104212877}], False),
+        ([{"npi": "bad"}], True),
+        ([{"npi": 1104212877}, {"npi": "1104212877"}], True),
+    ],
+)
+async def test_missing_import_or_bad_native_identity_fails_closed(monkeypatch, items, imported):
+    session = _Session()
+    _install(monkeypatch, session, page_items=items, imported=imported)
+    reply = await service_http.serve_custom_import_provider_service(_request(), session)
+    assert reply.status == 503 and session.rolled_back
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_filter", [False, True])
+async def test_generation_finality_failure_does_not_return_provider_data(monkeypatch, include_filter):
+    session = _Session()
+    _install(monkeypatch, session, page_items=[{"npi": 1104212877}], finality_failure=True)
+    reply = await service_http.serve_custom_import_provider_service(
+        _request(_body(include_filter=include_filter)), session
+    )
+    assert reply.status == 503 and session.rolled_back
+    assert b'"items"' not in reply.body
+    assert session.events[-2:] == ["finality", "end"]
+
+
+@pytest.mark.parametrize(
+    "changes,expected_release,valid",
+    (
+        ({}, "synthetic-plan-release", True),
+        ({}, None, False),
+        ({"plan_release_id": "other-release"}, "synthetic-plan-release", False),
+        ({"query": {"plan_release_id": "other-release"}}, "synthetic-plan-release", False),
+        ({"pricing_scope": "claims"}, "synthetic-plan-release", False),
+        ({"custom_import_native_entry_ids": None}, "synthetic-plan-release", False),
+        ({"custom_import_native_entry_ids": ["a" * 64] * 2}, "synthetic-plan-release", False),
+        ({"custom_import_native_entry_ids": ["a" * 64]}, "synthetic-plan-release", False),
+        ({"custom_import_native_entry_ids": ["bad", "b" * 64]}, "synthetic-plan-release", False),
+    ),
+)
+def test_plan_native_entry_identity_is_bound_to_signed_release(changes, expected_release, valid):
+    """Repeated NPI rows require one unique native identity per signed plan entry."""
+
+    plan_payload_by_field = {
+        "items": [{"npi": 1104212877}, {"npi": "1104212877"}],
+        "pagination": {"total": 2, "limit": 2, "offset": 0, "page": 1},
+        "query": {"plan_release_id": "synthetic-plan-release"},
+        "plan_release_id": "synthetic-plan-release",
+        "pricing_scope": "plan_scoped_ptg",
+        "custom_import_native_entry_ids": ["a" * 64, "b" * 64],
+        **changes,
+    }
+    body = transport._canonical_json_bytes(plan_payload_by_field)
+    if not valid:
+        with pytest.raises(CustomImportReadUnavailableError):
+            service_http._service_payload(body, plan_release_id=expected_release)
+        return
+    parsed_by_field = service_http._service_payload(body, plan_release_id=expected_release)
+    assert [provider_item["npi"] for provider_item in parsed_by_field["items"]] == ["1104212877"] * 2
+    assert parsed_by_field["custom_import_native_entry_ids"] == ["a" * 64, "b" * 64]
+
+
+def _network_service_body():
+    import hashlib
+
+    document = json.loads(_body())
+    document["network_binding"] = {
+        "version": 2,
+        "client_id": "synthetic-client",
+        "policy_revision": 3,
+        "generation_id": 7,
+        "manifest_sha256": "c" * 64,
+        "selector": {"namespace": "canonical", "values": [42, 88]},
+        "network_ids": [42, 88],
+        "query_sha256": hashlib.sha256(transport._canonical_json_bytes(document)).hexdigest(),
+    }
+    return transport._canonical_json_bytes(document)
+
+
+class _NetworkServiceSession(_Session):
+    def __init__(self):
+        super().__init__()
+        self._transaction = object()
+        self.driver = _ReceiptDriver(self, None)
+
+    def in_transaction(self):
+        return "begin" in self.events and "end" not in self.events
+
+    def get_transaction(self):
+        return self._transaction if self.in_transaction() else None
+
+    async def connection(self):
+        return SimpleNamespace(
+            get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=self.driver))
+        )
+
+    async def execute(self, statement, parameters=None):
+        assert parameters in (None, {})
+        if str(statement).startswith("LOCK TABLE"):
+            self.events.append("heap-lock")
+        else:
+            await super().execute(statement)
+
+
+def _install_network_service(monkeypatch, session, *, fail_pin=False):
+    from api import custom_import_provider_network as network
+    from api.network_address_scope import current_network_address_scope
+    from tests.test_custom_import_provider_network import _MANIFEST
+
+    _install(monkeypatch, session, page_items=[{"npi": "1104212877"}])
+    mock_approved_control_metadata(monkeypatch, events=session.events)
+    service_page = service_http._service_page
+
+    async def resolve(driver, *, generation_id, api_read):
+        assert api_read is True
+        assert driver is session.driver and generation_id == 7
+        assert session.events[:2] == ["begin", "snapshot"]
+        session.events.append("manifest")
+        if fail_pin:
+            raise CustomImportReadUnavailableError("synthetic retained pin unavailable")
+        return _MANIFEST
+
+    async def scoped_page(request, **arguments):
+        scope = current_network_address_scope()
+        assert scope.manifest is _MANIFEST and scope.network_ids == (42, 88)
+        return await service_page(request, **arguments)
+
+    read_service = service_http.CustomImportReadService
+    hydrate = read_service.hydrate_npi_page
+
+    async def scoped_hydrate(self, same_session, **arguments):
+        scope = current_network_address_scope()
+        assert scope.manifest is _MANIFEST and scope.network_ids == (42, 88)
+        return await hydrate(self, same_session, **arguments)
+
+    monkeypatch.setattr(network, "resolve_network_serving_manifest", resolve)
+    monkeypatch.setattr(service_http, "_service_page", scoped_page)
+    monkeypatch.setattr(read_service, "hydrate_npi_page", scoped_hydrate)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_pin", [False, True])
+async def test_signed_service_network_binding_pins_native_page_and_hydration(monkeypatch, fail_pin):
+    from api.network_address_scope import current_network_address_scope
+
+    session = _NetworkServiceSession()
+    _install_network_service(monkeypatch, session, fail_pin=fail_pin)
+    reply = await service_http.serve_custom_import_provider_service(_request(_network_service_body()), session)
+    assert reply.status == (503 if fail_pin else 200)
+    assert session.rolled_back is fail_pin and session.events[-1] == "end"
+    assert current_network_address_scope() is None
+    if fail_pin:
+        assert "page" not in session.events and "hydrate" not in session.events
+        assert "X-Network-Generation" not in reply.headers
+    else:
+        assert reply.headers["X-Network-Generation"] == "7"
+        assert session.events.index("manifest") < session.events.index("page") < session.events.index("hydrate")
+        assert json.loads(reply.body)["pagination"]["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_signed_service_network_binding_does_not_accept_tampered_query(monkeypatch):
+    session = _NetworkServiceSession()
+    _install_network_service(monkeypatch, session)
+    document = json.loads(_network_service_body())
+    document["native_query"]["limit"] = "3"
+    body = transport._canonical_json_bytes(document)
+    reply = await service_http.serve_custom_import_provider_service(_request(body), session)
+    assert reply.status == 400 and session.events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 403, 404, 409, 422, 503])
+async def test_legacy_service_native_refusal_remains_unavailable(monkeypatch, status):
+    session = _Session()
+    _install(monkeypatch, session)
+    refused = AsyncMock(
+        return_value=response.json(
+            {
+                "status": 422,
+                "code": "ptg2_provider_scope_refused",
+                "message": "Bounded scope required.",
+                "fix_it": {"reason": "Choose a smaller scope.", "retry_options": []},
+            },
+            status=status,
+        )
+    )
+    monkeypatch.setattr(service_http, "_service_page", refused)
+    reply = await service_http.serve_custom_import_provider_service(_request(), session)
+    assert reply.status == 503 and set(json.loads(reply.body)) == {"error"}
+    assert reply.headers["Cache-Control"] == "private, no-store" and "X-Network-Generation" not in reply.headers
+    assert session.rolled_back and session.events[-1] == "end"
+    assert "hydrate" not in session.events and "finality" not in session.events
+    refused.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_service_legacy_body_cap_precedes_signature_and_snapshot(monkeypatch):
+    from unittest.mock import Mock
+
+    verifier = Mock(wraps=transport._verify_provider_transport)
+    monkeypatch.setattr(transport, "_verify_provider_transport", verifier)
+    session = _Session()
+    fixtures._install_keyring(monkeypatch, session)
+    body = _body()
+    request = _request(body)
+    monkeypatch.setattr(transport, "_MAX_BODY_BYTES", len(body) - 1)
+    reply = await service_http.serve_custom_import_provider_service(request, session)
+    assert reply.status == 404 and session.events == []
+
+    verifier.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_serialized_service_page_bound_rolls_back_without_partial_items(monkeypatch):
+    session = _Session()
+    _install(monkeypatch, session)
+    reader = AsyncMock(return_value={"items": [{"npi": "1104212877", "notes": "x" * 3000}]})
+    monkeypatch.setattr(service_http, "_read_service_payload", reader)
+    monkeypatch.setattr(transport, "_MAX_RESPONSE_BYTES", 1024)
+    reply = await service_http.serve_custom_import_provider_service(_request(), session)
+    assert reply.status == 503 and session.rolled_back
+    reader.assert_awaited_once()
+    assert "items" not in json.loads(reply.body)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {},
+        {"items": {}, "pagination": {}, "query": {}},
+        {"items": [None], "pagination": {}, "query": {}},
+        {"items": [{"npi": True}], "pagination": {}, "query": {}},
+    ],
+)
+def test_service_payload_rejects_invalid_native_page_before_hydration(payload):
+    with pytest.raises(CustomImportReadUnavailableError, match="response is unavailable"):
+        service_http._service_payload(transport._canonical_json_bytes(payload))
+
+
+@pytest.mark.asyncio
+async def test_service_dispatch_without_native_args_preserves_handler_contract(monkeypatch):
+    from api.endpoint import pricing
+
+    request = object()
+    handler = AsyncMock(return_value=object())
+    monkeypatch.setattr(pricing, "list_providers_by_procedure", handler)
+    expected = handler.return_value
+    assert await service_http._service_page(request, session="synthetic-session") is expected
+    handler.assert_awaited_once_with(request, session="synthetic-session")
+
+
+@pytest.mark.asyncio
+async def test_managed_service_limit_is_checked_before_transport_or_reader(monkeypatch):
+    from tests.test_custom_import_managed_service import _signed_request
+
+    request = _signed_request(limit="51", include_filter=False)
+    verify = AsyncMock(side_effect=AssertionError("unbounded request must not verify or serve"))
+    monkeypatch.setattr(transport, "_verify_provider_transport", verify)
+    reply = await service_http.serve_custom_import_provider_service(request, None)
+    assert reply.status == 400 and "items" not in json.loads(reply.body)
+    verify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_legacy_service_cannot_expose_managed_source_refusal(monkeypatch):
+    from tests.test_provider_collection_network_read import _service_refusal
+
+    session = _Session()
+    _install(monkeypatch, session)
+    reader = AsyncMock(
+        side_effect=service_http.ProviderCollectionServiceRefusal(transport._canonical_json_bytes(_service_refusal()))
+    )
+    monkeypatch.setattr(service_http, "_read_service_payload", reader)
+    reply = await service_http.serve_custom_import_provider_service(_request(), session)
+    assert reply.status == 503 and session.rolled_back
+    assert set(json.loads(reply.body)) == {"error"}

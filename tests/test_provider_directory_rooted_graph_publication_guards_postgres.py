@@ -12,17 +12,16 @@ from sqlalchemy.exc import DBAPIError
 
 from tests.formulary_fhir_twin_admission_pg_support import (
     load_migration,
-    run_migration,
 )
 from tests.provider_directory_rooted_graph_publication_pg_guard_support import (
+    LEGACY_RELATION,
+    ROOTED_RELATION,
     assert_graph_registry_drift_fences,
     commit_logical_current_race,
     complete_valid_missing,
-    LEGACY_RELATION,
     payload_budget_identity,
     prepare_logical_current_race,
     prepare_missing_claim,
-    ROOTED_RELATION,
     write_forged_missing,
 )
 from tests.test_provider_directory_rooted_graph_acquisition_postgres import _identity
@@ -31,10 +30,8 @@ from tests.test_provider_directory_rooted_graph_publication_postgres import (
     _publish_legacy_root,
 )
 
-
 EXACT_GUARD_SCOPE_MIGRATION_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "alembic/versions/20260904163000_provider_directory_exact_guard_scope.py"
+    Path(__file__).resolve().parents[1] / "alembic/versions/20260904163000_provider_directory_exact_guard_scope.py"
 )
 
 
@@ -63,11 +60,7 @@ async def test_logical_current_guard_serializes_direct_cross_endpoint_race(
     """Prove the DB advisory lock closes cross-endpoint write skew."""
 
     async with _lifecycle_scope(monkeypatch) as context:
-        migration = load_migration(
-            EXACT_GUARD_SCOPE_MIGRATION_PATH,
-            f"provider_directory_exact_guard_scope_race_{first_relation}",
-        )
-        await run_migration(context.engine, migration, "upgrade")
+        # Source custody verifies the scoped guard with its later argument-type repairs.
         legacy_id, rooted_id = await prepare_logical_current_race(context)
         first_outcome, second_outcome, current_ids = await commit_logical_current_race(
             context,
@@ -92,7 +85,6 @@ async def test_logical_current_guard_skips_unrelated_parent_rows(
             EXACT_GUARD_SCOPE_MIGRATION_PATH,
             "provider_directory_exact_guard_scope_postgres",
         )
-        await run_migration(context.engine, migration, "upgrade")
         await _make_exact_validity_fail(context)
 
         unrelated_endpoint_id = "f" * 64
@@ -124,8 +116,7 @@ async def test_logical_current_guard_skips_unrelated_parent_rows(
                 migration._rooted()._LEGACY_ENDPOINT_ID,
             )
         await context.connection.execute(
-            f"DELETE FROM {context.schema}.provider_directory_endpoint_dataset "
-            "WHERE dataset_id = 'dataset-unrelated'"
+            f"DELETE FROM {context.schema}.provider_directory_endpoint_dataset WHERE dataset_id = 'dataset-unrelated'"
         )
 
         with pytest.raises(asyncpg.PostgresError, match="exact validity called"):

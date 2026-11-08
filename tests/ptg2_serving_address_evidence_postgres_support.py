@@ -90,9 +90,11 @@ async def _create_geo_assurance_state_table(database: Database, schema: str) -> 
             active_geo_assurance_version smallint,
             active_table_oid oid,
             active_relation_signature jsonb,
+            active_dependency_bindings jsonb,
             candidate_geo_assurance_version smallint,
             candidate_table_oid oid,
             candidate_relation_signature jsonb,
+            candidate_dependency_bindings jsonb,
             candidate_projected_rows bigint,
             CONSTRAINT entity_address_geo_assurance_state_singleton_ck
                 CHECK (singleton)

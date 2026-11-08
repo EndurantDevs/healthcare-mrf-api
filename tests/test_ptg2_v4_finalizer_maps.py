@@ -22,6 +22,7 @@ from process.ptg_parts.ptg2_v4_finalizer_maps import (
     FinalizerMapError,
     has_complete_v4_finalizer_map,
     has_valid_finalizer_map,
+    read_v4_finalizer_map_set,
 )
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_MAP_BLOCK_KIND,
@@ -66,9 +67,7 @@ class _ScriptedSession:
                 if isinstance(self.finalizer_tables, dict)
                 else lambda _name: self.finalizer_tables
             )
-            return _Rows(
-                ({name: table_present(name) for name in parameters_by_name},)
-            )
+            return _Rows(({name: table_present(name) for name in parameters_by_name},))
         assert self.results, f"unexpected SQL: {statement}"
         return self.results.pop(0)
 
@@ -92,9 +91,10 @@ def _manifest() -> dict[str, object]:
     }
 
 
-def _root_row(*, relational_mapping_present: bool = False) -> dict[str, object]:
+def _root_row(*, relational_mapping_present: bool = False, snapshot_key: int = 17) -> dict[str, object]:
     manifest = _manifest()
     return {
+        "snapshot_key": snapshot_key,
         "root_present": True,
         "layout_state": "sealed",
         "layout_generation": PTG2_V4_SHARED_GENERATION,
@@ -180,12 +180,8 @@ def _packed_fixture(object_kind: str):
 
 def _single_packed_fixture(object_kind: str, pack_no: int):
     block_payload = pack_no.to_bytes(4, "big")
-    target_block = SharedBlock(
-        object_kind, pack_no, 0, 1, "none", len(block_payload), block_payload
-    )
-    map_payload = encode_v4_snapshot_map_pack(
-        object_kind, (target_block.reference(),)
-    )
+    target_block = SharedBlock(object_kind, pack_no, 0, 1, "none", len(block_payload), block_payload)
+    map_payload = encode_v4_snapshot_map_pack(object_kind, (target_block.reference(),))
     map_block = SharedBlock(
         PTG2_V4_MAP_BLOCK_KIND,
         pack_no,
@@ -251,23 +247,17 @@ async def test_packed_reader_matches_legacy_rows_for_all_six_kinds(
     object_kind: str,
 ) -> None:
     pack_by_field, target_rows, expected = _packed_fixture(object_kind)
-    packed = _ScriptedSession(
-        (_Rows((_root_row(),)), _Rows((pack_by_field,)), _Rows(target_rows))
-    )
+    packed = _ScriptedSession((_Rows((_root_row(),)), _Rows((pack_by_field,)), _Rows(target_rows)))
     legacy = _ScriptedSession(
         (
-            _Rows(({"root_present": False, "finalizer_manifest": None},)),
+            _Rows(({"snapshot_key": 17, "root_present": False, "finalizer_manifest": None},)),
             _Rows((expected,)),
         )
     )
     assert await _records(packed, object_kind=object_kind) == [expected]
     assert await _records(legacy, object_kind=object_kind) == [expected]
-    assert not any(
-        "ptg2_v3_snapshot_block mapping" in sql for sql, _params in packed.calls
-    )
-    assert any(
-        "ptg2_v3_snapshot_block mapping" in sql for sql, _params in legacy.calls
-    )
+    assert not any("ptg2_v3_snapshot_block mapping" in sql for sql, _params in packed.calls)
+    assert any("ptg2_v3_snapshot_block mapping" in sql for sql, _params in legacy.calls)
 
 
 @pytest.mark.asyncio
@@ -352,6 +342,7 @@ async def test_manifest_without_root_fails_closed() -> None:
             _Rows(
                 (
                     {
+                        "snapshot_key": 17,
                         "root_present": False,
                         "manifest_present": True,
                         "finalizer_manifest": _manifest(),
@@ -416,9 +407,7 @@ async def test_packed_map_and_target_mismatches_fail_closed(
     else:
         target_rows[1]["raw_byte_count"] = 4
         target_rows[1]["stored_byte_count"] = 4
-    session = _ScriptedSession(
-        (_Rows((_root_row(),)), _Rows((pack_by_field,)), _Rows(target_rows))
-    )
+    session = _ScriptedSession((_Rows((_root_row(),)), _Rows((pack_by_field,)), _Rows(target_rows)))
     with pytest.raises(PTG2SharedBlockError, match=message):
         await _records(session, object_kind=object_kind)
 
@@ -427,9 +416,7 @@ async def test_packed_map_and_target_mismatches_fail_closed(
 async def test_missing_target_anchor_and_row_overflow_fail_closed() -> None:
     object_kind = PTG2_V4_FINALIZER_PACKED_OBJECT_KINDS[0]
     pack_by_field, target_rows, _expected = _packed_fixture(object_kind)
-    missing_anchor = _ScriptedSession(
-        (_Rows((_root_row(),)), _Rows((pack_by_field,)), _Rows(target_rows[:1]))
-    )
+    missing_anchor = _ScriptedSession((_Rows((_root_row(),)), _Rows((pack_by_field,)), _Rows(target_rows[:1])))
     with pytest.raises(PTG2SharedBlockError, match="missing a durable target anchor"):
         await _records(
             missing_anchor,
@@ -438,9 +425,7 @@ async def test_missing_target_anchor_and_row_overflow_fail_closed() -> None:
             fragments=None,
         )
 
-    overflow = _ScriptedSession(
-        (_Rows((_root_row(),)), _Rows((pack_by_field,)), _Rows(target_rows))
-    )
+    overflow = _ScriptedSession((_Rows((_root_row(),)), _Rows((pack_by_field,)), _Rows(target_rows)))
     request = _shared_block_read_request(
         schema_name="mrf",
         snapshot_key=17,
@@ -492,8 +477,160 @@ async def test_sparse_packed_reads_page_before_row_overflow() -> None:
     assert [params["after_pack_no"] for params in pack_calls] == [-1, 127]
     assert all(params["pack_limit"] == 128 for params in pack_calls)
     target_calls = [
-        params
-        for sql, params in session.calls
-        if "ptg2_v4_finalizer_map_target" in sql and "block_hashes" in params
+        params for sql, params in session.calls if "ptg2_v4_finalizer_map_target" in sql and "block_hashes" in params
     ]
     assert max(len(params["block_hashes"]) for params in target_calls) == 128
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("snapshot_count", (1, 3, 128))
+async def test_finalizer_set_uses_two_queries(snapshot_count: int) -> None:
+    snapshot_keys = tuple(range(1, snapshot_count + 1))
+    session = _ScriptedSession((_Rows(_root_row(snapshot_key=key) for key in snapshot_keys),))
+    assert await read_v4_finalizer_map_set(session, schema_name="mrf", snapshot_keys=snapshot_keys) == dict.fromkeys(
+        snapshot_keys, True
+    )
+    assert len(session.calls) == 2
+    sql, parameters_by_name = session.calls[1]
+    assert parameters_by_name["snapshot_keys"] == list(snapshot_keys)
+    assert "unnest(CAST(:snapshot_keys AS bigint[]))" in sql
+    assert "mapping.snapshot_key = requested.snapshot_key" in sql
+    assert "layout.snapshot_key = requested.snapshot_key" in sql
+    assert "root.snapshot_key = requested.snapshot_key" in sql
+    assert ":snapshot_key\n" not in sql
+
+
+@pytest.mark.asyncio
+async def test_finalizer_set_handles_absence_and_duplicate_inputs() -> None:
+    session = _ScriptedSession((_Rows((_root_row(snapshot_key=5),)),))
+    assert await read_v4_finalizer_map_set(session, schema_name="mrf", snapshot_keys=iter((5, 7, 5, "7"))) == {
+        5: True,
+        7: False,
+    }
+    assert session.calls[1][1]["snapshot_keys"] == [5, 7]
+    assert len(session.calls) == 2
+    absent = _ScriptedSession((), finalizer_tables=False)
+    assert await read_v4_finalizer_map_set(absent, schema_name="mrf", snapshot_keys=(5, 7)) == {
+        5: False,
+        7: False,
+    }
+    assert len(absent.calls) == 1
+    empty = _ScriptedSession(())
+    assert await read_v4_finalizer_map_set(empty, schema_name="mrf", snapshot_keys=()) == {}
+    assert not empty.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("table_count", (1, 2))
+async def test_finalizer_set_rejects_partial_extension(table_count: int) -> None:
+    table_names = (
+        "ptg2_v4_finalizer_map_root",
+        "ptg2_v4_finalizer_map_pack",
+        "ptg2_v4_finalizer_map_target",
+    )
+    session = _ScriptedSession((), finalizer_tables=dict.fromkeys(table_names[:table_count], True))
+    with pytest.raises(FinalizerMapError, match="storage extension is partial"):
+        await read_v4_finalizer_map_set(session, schema_name="mrf", snapshot_keys=(17, 18))
+    assert len(session.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection_case", ("duplicate", "unexpected", "missing_key", "boolean_key"))
+async def test_finalizer_set_rejects_wrong_returned_identity(selection_case: str) -> None:
+    root_fields = _root_row()
+    if selection_case == "duplicate":
+        root_rows = (root_fields, root_fields)
+    else:
+        if selection_case == "unexpected":
+            root_fields["snapshot_key"] = 18
+        elif selection_case == "boolean_key":
+            root_fields["snapshot_key"] = True
+        else:
+            del root_fields["snapshot_key"]
+        root_rows = (root_fields,)
+    session = _ScriptedSession((_Rows(root_rows),))
+    with pytest.raises(FinalizerMapError, match="snapshot selection is inconsistent"):
+        await read_v4_finalizer_map_set(session, schema_name="mrf", snapshot_keys=(17,))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "root_changes",
+    (
+        {},
+        {"root_present": False, "manifest_present": False},
+        {"root_present": False},
+        {"manifest_present": False},
+        {"finalizer_manifest": None},
+        {"root_state": "building"},
+        {"root_completed_at": None},
+        {"root_map_digest": b"x" * 32},
+        {"root_coordinate_count": 5},
+        {"root_stored_map_byte_count": 0},
+        {"root_canonical_byte_count": 0},
+        {"relational_mapping_present": True},
+    ),
+)
+async def test_finalizer_set_matches_singleton_errors(root_changes: dict) -> None:
+    root_fields = _root_row()
+    root_fields.update(root_changes)
+    singleton = _ScriptedSession((_Rows((deepcopy(root_fields),)),))
+    batch = _ScriptedSession((_Rows((_root_row(snapshot_key=19), deepcopy(root_fields))),))
+    try:
+        expected = await has_complete_v4_finalizer_map(singleton, schema_name="mrf", snapshot_key=17)
+    except FinalizerMapError as expected_error:
+        with pytest.raises(FinalizerMapError) as actual_error:
+            await read_v4_finalizer_map_set(batch, schema_name="mrf", snapshot_keys=(17, 19))
+        assert str(actual_error.value) == str(expected_error)
+    else:
+        assert await read_v4_finalizer_map_set(batch, schema_name="mrf", snapshot_keys=(17, 19)) == {
+            17: expected,
+            19: True,
+        }
+    assert len(singleton.calls) == len(batch.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_finalizer_set_validates_in_input_order() -> None:
+    first_bad = _root_row(snapshot_key=17)
+    first_bad["root_present"] = False
+    second_bad = _root_row(snapshot_key=18)
+    second_bad["root_state"] = "building"
+    session = _ScriptedSession((_Rows((second_bad, first_bad)),))
+    with pytest.raises(FinalizerMapError, match="root and manifest must appear together"):
+        await read_v4_finalizer_map_set(session, schema_name="mrf", snapshot_keys=(17, 18))
+
+
+@pytest.mark.asyncio
+async def test_finalizer_singleton_delegates_to_set(monkeypatch) -> None:
+    from process.ptg_parts import ptg2_v4_finalizer_maps as finalizer_maps
+
+    session = object()
+    calls = []
+
+    async def select_set(actual_session, *, schema_name, snapshot_keys):
+        calls.append((actual_session, schema_name, snapshot_keys))
+        return {17: True}
+
+    monkeypatch.setattr(finalizer_maps, "read_v4_finalizer_map_set", select_set)
+    assert await finalizer_maps.has_complete_v4_finalizer_map(session, schema_name="mrf", snapshot_key="17")
+    assert calls == [(session, "mrf", (17,))]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ("query", "cancel"))
+async def test_finalizer_set_preserves_query_failure(failure_kind: str) -> None:
+    import asyncio
+
+    first_error = RuntimeError("synthetic query failure") if failure_kind == "query" else asyncio.CancelledError()
+
+    class FailingSession(_ScriptedSession):
+        async def execute(self, statement, params=None):
+            if "unnest" in str(statement):
+                raise first_error
+            return await super().execute(statement, params)
+
+    session = FailingSession(())
+    with pytest.raises(type(first_error)) as actual_error:
+        await read_v4_finalizer_map_set(session, schema_name="mrf", snapshot_keys=(17, 18))
+    assert actual_error.value is first_error

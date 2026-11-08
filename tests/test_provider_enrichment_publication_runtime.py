@@ -32,10 +32,13 @@ async def test_address_resolution_covers_disabled_and_enabled_sources(monkeypatc
     monkeypatch.setattr(enrichment, "source_enabled", source_enabled)
     monkeypatch.setattr(enrichment, "_resolve_provider_enrichment_stage_address", resolve_stage)
 
-    assert await enrichment._resolve_provider_enrichment_addresses(
-        staging_table_map,
-        "provider_test",
-    ) == {}
+    assert (
+        await enrichment._resolve_provider_enrichment_addresses(
+            staging_table_map,
+            "provider_test",
+        )
+        == {}
+    )
     resolve_stage.assert_not_awaited()
     source_enabled.return_value = True
     resolve_stage.side_effect = ({"rows": 3}, {"rows": 4})
@@ -109,10 +112,7 @@ async def test_create_indexes_covers_optional_using_and_where(monkeypatch):
         "provider_test",
     )
 
-    assert (
-        "USING gin (payload) WHERE payload IS NOT NULL"
-        in db_status.await_args_list[0].args[0]
-    )
+    assert "USING gin (payload) WHERE payload IS NOT NULL" in db_status.await_args_list[0].args[0]
     assert "indexed_stage_idx_npi" in db_status.await_args_list[1].args[0]
     assert "USING" not in db_status.await_args_list[1].args[0]
     assert " WHERE " not in db_status.await_args_list[1].args[0]
@@ -150,10 +150,7 @@ async def test_refresh_statistics_and_archive_index(monkeypatch):
     await enrichment._archive_provider_enrichment_index("provider_test", "first_idx_primary")
     assert db_status.await_args_list == [
         call("DROP INDEX IF EXISTS provider_test.first_idx_primary_old;"),
-        call(
-            "ALTER INDEX IF EXISTS provider_test.first_idx_primary "
-            "RENAME TO first_idx_primary_old;"
-        ),
+        call("ALTER INDEX IF EXISTS provider_test.first_idx_primary RENAME TO first_idx_primary_old;"),
     ]
 
 
@@ -164,6 +161,8 @@ async def test_publish_tables_moves_primary_and_declared_indexes(monkeypatch):
         __my_initial_indexes__ = [{"name": "npi", "index_elements": ["npi"]}]
         __my_additional_indexes__ = [{"name": "state", "index_elements": ["state"]}]
 
+    prepared = AsyncMock()
+    monkeypatch.setattr(enrichment, "prepare_local_native_input_publication", prepared)
     monkeypatch.setattr(enrichment, "PROCESSING_CLASSES", (PublishedModel,))
     monkeypatch.setattr(enrichment.db, "transaction", lambda: _AsyncTransaction())
     db_status = AsyncMock()
@@ -177,6 +176,11 @@ async def test_publish_tables_moves_primary_and_declared_indexes(monkeypatch):
         "provider_test",
     )
 
+    prepared.assert_awaited_once()
+    assert isinstance(prepared.await_args.args[0], _AsyncTransaction)
+    assert prepared.await_args.kwargs == dict(
+        ledger_schema="provider_test", relations=(("published", "published_stage"),)
+    )
     assert archive_index.await_args_list == [
         call("provider_test", "published_idx_primary"),
         call("provider_test", "published_idx_npi"),
@@ -261,6 +265,7 @@ def _install_publish_orchestration(monkeypatch, event_names):
         ("_complete_provider_enrichment_run", "complete", terminal_receipt_by_field),
     )
     for attribute_name, event_name, returned_value in step_fields:
+
         async def step(*_args, _name=event_name, _value=returned_value, **_kwargs):
             return await async_event(_name, _value)
 

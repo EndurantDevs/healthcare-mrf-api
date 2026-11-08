@@ -187,7 +187,7 @@ async def test_source_authority_database_guards_reject_missing_or_changed_rows(m
     monkeypatch.setattr(source_authority, "_source_key_for_snapshot", AsyncMock(return_value=expected.source_key))
     monkeypatch.setattr(source_authority, "_authority_row", AsyncMock(return_value=_authority_row()))
     monkeypatch.setattr(source_authority, "_authority_from_row", lambda *_args: changed)
-    session = SimpleNamespace(in_transaction=lambda: True)
+    session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock(return_value=_QueryResult(scalar=True)))
     with pytest.raises(source_authority.PtgResultArchiveSourceAuthorityError, match="changed while it was captured"):
         await source_authority.prepare_ptg_result_archive_source_authority(
             session,
@@ -195,6 +195,7 @@ async def test_source_authority_database_guards_reject_missing_or_changed_rows(m
             operation_id=expected.operation_id,
             snapshot_id=expected.snapshot_id,
         )
+    session.execute.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1028,6 +1029,11 @@ def test_candidate_validation_rejects_layout_receipt_drift_and_nonlocal_key() ->
     wrong_key["layout_manifest"] = {"serving_index": {"shared_snapshot_key": 7}}
     with pytest.raises(validation.ResultArchiveCandidateValidationError, match="destination-local serving key"):
         validation._validated_layout_serving_index(wrong_key, layout)
+
+
+def test_candidate_validation_keeps_published_source_identity_exact() -> None:
+    assert validation._validated_source_key(" Source-A ") == "source_a"
+    assert validation._validated_source_key(" Source-A ", exact_published=True) == "source-a"
 
 
 def test_candidate_validation_rejects_stale_replay_and_source_metadata() -> None:

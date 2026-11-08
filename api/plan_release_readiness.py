@@ -90,7 +90,7 @@ def is_release_binding_serving_scope_exact(
     serving_tables: PTG2ServingTables,
     binding: PlanReleaseSnapshotBinding,
 ) -> bool:
-    """Match the attested physical scope used by provider pricing."""
+    """Match the attested source and market plus a bound logical plan."""
 
     serving_plan_id = str(serving_tables.plan_id or "").strip()
     serving_market_type = str(
@@ -98,7 +98,10 @@ def is_release_binding_serving_scope_exact(
     ).strip().lower()
     serving_source_key = str(serving_tables.source_key or "").strip().lower()
     return bool(
-        serving_plan_id in set(ein_plan_id_variants(binding.plan_id))
+        (
+            serving_plan_id in set(ein_plan_id_variants(binding.plan_id))
+            or binding.logical_scope_present is True
+        )
         and serving_market_type
         and serving_market_type == binding.plan_market_type.strip().lower()
         and serving_source_key

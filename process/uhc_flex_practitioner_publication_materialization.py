@@ -4,19 +4,18 @@
 
 from __future__ import annotations
 
+from datetime import date
 import hashlib
 import json
-from typing import Any, Mapping
+from typing import Any
 
+from process.provider_directory_dataset_candidate import copy_dataset_candidate_rows
 from process.provider_directory_resource_hash import (
     SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
     resource_payload_sha256_for_contract,
 )
-from process.uhc_flex_official_cohort_contract import (
-    UHC_FLEX_OFFICIAL_RESOURCE_TYPE,
-)
 from process.uhc_flex_practitioner_materialization import (
-    materialize_uhc_flex_practitioner_stored_resource,
+    _materialize_admitted_practitioner_resource,
 )
 from process.uhc_flex_practitioner_publication import (
     _canonical_json,
@@ -32,7 +31,7 @@ from process.uhc_flex_practitioner_publication import (
     UHCFlexPractitionerPublicationError,
 )
 from process.uhc_flex_practitioner_result_store import (
-    read_uhc_flex_practitioner_resource_page,
+    _resource_page_records,
 )
 from process.uhc_flex_practitioner_single_root_contract import (
     UHCFlexPractitionerAdmission,
@@ -45,44 +44,22 @@ async def _insert_materialized_page(
 ) -> None:
     if not page_rows:
         return
-    rows_json = _canonical_json(page_rows)
-    inserted_resources = await database.status(
-        f"""
-        INSERT INTO {_table(_DATASET_RESOURCE)} (
-            dataset_id, resource_type, resource_id, payload_hash,
-            payload_json, acquired_resource_sha256
-        )
-        SELECT input.dataset_id, input.resource_type, input.resource_id,
-               input.payload_hash, input.payload_json, NULL
-          FROM pg_catalog.jsonb_to_recordset(CAST(:rows_json AS jsonb)) AS input(
-               dataset_id text, resource_type text, resource_id text,
-               payload_hash text, payload_json jsonb,
-               requested_npi bigint, candidate_acquisition_id text,
-               acquired_resource_sha256 text
-          );
-        """,
-        rows_json=rows_json,
+    inserted_resources = await copy_dataset_candidate_rows(
+        database, _DATASET_RESOURCE,
+        ("dataset_id", "resource_type", "resource_id", "payload_hash",
+         "payload_json", "acquired_resource_sha256"),
+        [(row["dataset_id"], row["resource_type"], row["resource_id"], row["payload_hash"],
+          _canonical_json(row["payload_json"]), None) for row in page_rows],
     )
     if inserted_resources != len(page_rows):
         raise UHCFlexPractitionerPublicationError("content")
-    inserted_provenance = await database.status(
-        f"""
-        INSERT INTO {_table(_PROVENANCE)} (
-            dataset_id, resource_type, resource_id, requested_npi,
-            candidate_acquisition_id, payload_hash,
-            acquired_resource_sha256
-        )
-        SELECT input.dataset_id, input.resource_type, input.resource_id,
-               input.requested_npi, input.candidate_acquisition_id,
-               input.payload_hash, input.acquired_resource_sha256
-          FROM pg_catalog.jsonb_to_recordset(CAST(:rows_json AS jsonb)) AS input(
-               dataset_id text, resource_type text, resource_id text,
-               payload_hash text, payload_json jsonb,
-               requested_npi bigint, candidate_acquisition_id text,
-               acquired_resource_sha256 text
-          );
-        """,
-        rows_json=rows_json,
+    provenance_columns = (
+        "dataset_id", "resource_type", "resource_id", "requested_npi",
+        "candidate_acquisition_id", "payload_hash", "acquired_resource_sha256",
+    )
+    inserted_provenance = await copy_dataset_candidate_rows(
+        database, _PROVENANCE, provenance_columns,
+        [tuple(row[name] for name in provenance_columns) for row in page_rows],
     )
     if inserted_provenance != len(page_rows):
         raise UHCFlexPractitionerPublicationError("content")
@@ -94,41 +71,36 @@ async def _materialize_candidate(
     admission: UHCFlexPractitionerAdmission,
     batch_size: int,
 ) -> int:
+    # Admission set validation binds immutable raw identity, hash and NPI.
+    projection_date = date.fromisoformat(admission.semantic_projection_as_of)
     after_npi = 0
     after_resource_id = ""
     inserted_count = 0
     while True:
-        stored_page = await read_uhc_flex_practitioner_resource_page(
-            admission.candidate_acquisition_id,
-            after_npi=after_npi,
-            after_resource_id=after_resource_id,
-            limit=batch_size,
-            database=database,
+        stored_page = await _resource_page_records(
+            database, admission.candidate_acquisition_id,
+            after_npi, after_resource_id, batch_size,
         )
         if not stored_page:
             break
-        page_rows: list[dict[str, Any]] = []
-        for stored_resource in stored_page:
-            materialized = materialize_uhc_flex_practitioner_stored_resource(
-                stored_resource,
-                dataset_id=identity.dataset_id,
-                source_id=admission.source_id,
-                run_id=admission.candidate_run_id,
-                semantic_projection_as_of=admission.semantic_projection_as_of,
-            )
-            page_rows.append(
-                {
-                    **materialized.dataset_resource,
-                    "requested_npi": materialized.requested_npi,
-                    "candidate_acquisition_id": admission.candidate_acquisition_id,
-                }
-            )
+        page_rows = [
+            {
+                **_materialize_admitted_practitioner_resource(
+                    _row_fields(stored_resource), dataset_id=identity.dataset_id,
+                    source_id=admission.source_id, run_id=admission.candidate_run_id,
+                    projection_date=projection_date,
+                ),
+                "candidate_acquisition_id": admission.candidate_acquisition_id,
+            }
+            for stored_resource in stored_page
+        ]
         await _insert_materialized_page(database, page_rows)
         inserted_count += len(page_rows)
         if inserted_count > admission.resource_count:
             raise UHCFlexPractitionerPublicationError("content")
-        after_npi = stored_page[-1].requested_npi
-        after_resource_id = stored_page[-1].resource_id
+        final_fields = _row_fields(stored_page[-1])
+        after_npi = final_fields["npi"]
+        after_resource_id = final_fields["resource_id"]
     if inserted_count != admission.resource_count:
         raise UHCFlexPractitionerPublicationError("content")
     return inserted_count
@@ -137,19 +109,12 @@ async def _materialize_candidate(
 def _semantic_resource_identity(
     database_fields: dict[str, Any],
 ) -> tuple[str, str, str]:
-    payload_by_field = database_fields.get("payload_json")
+    # The candidate set proof owns shape, identity and provenance validation.
+    # Recompute only the exact Python content commitment after JSONB storage;
+    # replacing this with a SQL JSON formatter changes numeric/name semantics.
+    payload_by_field = database_fields["payload_json"]
     if isinstance(payload_by_field, str):
-        try:
-            payload_by_field = json.loads(payload_by_field)
-        except ValueError:
-            raise UHCFlexPractitionerPublicationError("content") from None
-    if (
-        database_fields.get("resource_type")
-        != UHC_FLEX_OFFICIAL_RESOURCE_TYPE
-        or not isinstance(payload_by_field, Mapping)
-        or database_fields.get("acquired_resource_sha256") is not None
-    ):
-        raise UHCFlexPractitionerPublicationError("content")
+        payload_by_field = json.loads(payload_by_field)
     expected_payload_hash = resource_payload_sha256_for_contract(
         payload_by_field,
         SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,

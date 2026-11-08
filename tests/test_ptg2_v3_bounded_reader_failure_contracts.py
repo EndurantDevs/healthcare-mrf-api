@@ -6,41 +6,30 @@ import pytest
 
 from api import ptg2_db_serving_v3, ptg2_db_sidecars, ptg2_serving
 from api import ptg2_shared_blocks as shared_blocks
-
 from api.ptg2_candidate_audit_capacity import (
     CandidateAuditDecodedRetentionBudget,
 )
-
 from api.ptg2_db_sidecars import (
     ForwardReadBudget,
     PTG2ManifestArtifactError,
     lookup_code_prefix_rows_from_db,
 )
-
 from api.ptg2_shared_blocks import (
     PTG2_V3_GRAPH_NPI_TO_GROUP,
     SharedBlockPayload,
     fetch_shared_graph_members,
     stream_shared_blocks,
 )
-
-from process.ptg_parts.ptg2_shared_blocks import shared_block_hash
-
-from process.ptg_parts import ptg2_serving_binary_v3
-from process.ptg_parts import ptg2_v4_finalizer_range_reader
-
+from process.ptg_parts import ptg2_serving_binary_v3, ptg2_v4_finalizer_range_reader
 from process.ptg_parts.ptg2_serving_binary_v3_types import (
     PTG2V3PriceAtomRecord,
 )
-
+from process.ptg_parts.ptg2_shared_blocks import shared_block_hash
 from tests.test_ptg2_v3_bounded_readers import (
-    _AsyncRows,
-    _Rows,
-    _Session,
-    _StreamingSession,
     _aliased_forward_fragments,
     _assert_prefix_reference_reads,
     _assert_two_code_sparse_rows,
+    _AsyncRows,
     _capture_forward_fanout,
     _dense_forward_fragment,
     _eager_ranked_prefix,
@@ -50,13 +39,17 @@ from tests.test_ptg2_v3_bounded_readers import (
     _install_forward_fragment_reader,
     _patch_reference_lookups,
     _prefix_rows,
+    _Rows,
+    _Session,
     _shard_block_key,
     _source_vector,
     _stored_row,
+    _StreamingSession,
     _two_code_sparse_block_keys,
     _two_code_sparse_fragments,
     _uvarint,
 )
+
 
 @pytest.mark.asyncio
 async def test_same_provider_continuation_rejects_decreasing_occurrences(
@@ -83,6 +76,7 @@ async def test_same_provider_continuation_rejects_decreasing_occurrences(
             descending=False,
         )
 
+
 @pytest.mark.asyncio
 async def test_bounded_code_prefix_validates_later_fragments_after_heap_is_full(
     monkeypatch,
@@ -108,6 +102,7 @@ async def test_bounded_code_prefix_validates_later_fragments_after_heap_is_full(
             descending=False,
         )
 
+
 @pytest.mark.asyncio
 async def test_bounded_code_prefix_validates_unretained_price_keys(monkeypatch):
     fragments = (
@@ -125,6 +120,7 @@ async def test_bounded_code_prefix_validates_unretained_price_keys(monkeypatch):
             descending=False,
             item_count=2,
         )
+
 
 @pytest.mark.asyncio
 async def test_bounded_code_prefix_charges_physical_work_across_reads(
@@ -162,6 +158,7 @@ async def test_bounded_code_prefix_charges_physical_work_across_reads(
             scan_budget=scan_budget,
         )
 
+
 @pytest.mark.parametrize(
     "budget_values",
     ((True, 1), (1, True), (0, 1), (1, 0)),
@@ -169,6 +166,7 @@ async def test_bounded_code_prefix_charges_physical_work_across_reads(
 def test_forward_read_budget_requires_positive_integer_limits(budget_values):
     with pytest.raises(PTG2ManifestArtifactError, match="budget is invalid"):
         ForwardReadBudget(*budget_values)
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("limit", [0, -1, True])
@@ -183,6 +181,7 @@ async def test_bounded_code_prefix_requires_positive_integer_limit(limit):
             price_dictionary_item_count=1,
             price_dictionary_block_bytes=16,
         )
+
 
 @pytest.mark.asyncio
 async def test_code_shard_discovery_uses_exact_mapping_ranges(monkeypatch):
@@ -225,6 +224,7 @@ async def test_code_shard_discovery_uses_exact_mapping_ranges(monkeypatch):
         "shared_blocks_v4",
     )
 
+
 @pytest.mark.asyncio
 async def test_code_shard_discovery_rejects_unreachable_provider_shard(monkeypatch):
     monkeypatch.setattr(
@@ -242,6 +242,7 @@ async def test_code_shard_discovery_rejects_unreachable_provider_shard(monkeypat
             schema_name="mrf",
             code_keys=(7,),
         )
+
 
 @pytest.mark.asyncio
 async def test_code_existence_uses_provider_shard_range(monkeypatch):
@@ -272,6 +273,7 @@ async def test_code_existence_uses_provider_shard_range(monkeypatch):
         "shared_blocks_v4",
     )
 
+
 @pytest.mark.asyncio
 async def test_shared_block_stream_uses_server_side_iteration(monkeypatch):
     monkeypatch.setattr(
@@ -301,12 +303,11 @@ async def test_shared_block_stream_uses_server_side_iteration(monkeypatch):
     assert [fragment.payload for fragment in fragments] == [b"payload"]
     assert len(session.calls) == 1
 
+
 @pytest.mark.asyncio
-async def test_graph_member_limit_bounds_generate_series_and_decoded_bytes():
+async def test_graph_member_limit_selects_unique_chunks_and_decoded_prefix():
     all_members = (3, 9, 17, 25)
-    member_payload = b"".join(
-        member.to_bytes(4, "little", signed=False) for member in all_members
-    )
+    member_payload = b"".join(member.to_bytes(4, "little", signed=False) for member in all_members)
     graph_row = _stored_row(
         object_kind="graph_npi_groups_v1",
         block_key=4,
@@ -318,6 +319,7 @@ async def test_graph_member_limit_bounds_generate_series_and_decoded_bytes():
             "member_offset": 0,
             "member_count": len(all_members),
             "selected_member_count": 2,
+            "mapping_entry_count": len(all_members),
         },
     )
     session = _Session([graph_row])
@@ -333,9 +335,12 @@ async def test_graph_member_limit_bounds_generate_series_and_decoded_bytes():
 
     assert members == {1234567890: all_members[:2]}
     sql, params = session.calls[0]
-    assert sql.count("LEAST(owner.member_count, :max_members)") >= 2
-    assert "generate_series" in sql
+    assert "LEAST(owner.member_count, :max_members)" in sql
+    assert "block.payload" not in sql
     assert params["max_members"] == 2
+    assert len(session.calls) == 2
+    assert session.calls[1][1]["block_keys"] == (4,)
+
 
 @pytest.mark.asyncio
 async def test_graph_wrapper_threads_member_limit_into_storage_read(monkeypatch):

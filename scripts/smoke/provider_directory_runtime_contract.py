@@ -78,15 +78,9 @@ REQUIRED_SERVING_READINESS_CHECKS = (
     "ptg_corroboration_table",
     "ptg_network_name_overlap",
 )
-REVIEWED_SUBSET_OPERATOR = (
-    ROOT / "scripts/smoke/provider_directory_fhir_reviewed_subset_state.py"
-)
-TERMINAL_ROOT_RETIREMENT_OPERATOR = (
-    ROOT / "scripts/smoke/provider_directory_terminal_root_retirement.py"
-)
-REVIEWED_SUBSET_MANIFEST = (
-    ROOT / "specs/provider_directory_reviewed_subset_activation.json"
-)
+REVIEWED_SUBSET_OPERATOR = ROOT / "scripts/smoke/provider_directory_fhir_reviewed_subset_state.py"
+TERMINAL_ROOT_RETIREMENT_OPERATOR = ROOT / "scripts/smoke/provider_directory_terminal_root_retirement.py"
+REVIEWED_SUBSET_MANIFEST = ROOT / "specs/provider_directory_reviewed_subset_activation.json"
 
 
 def _command_text(args: list[str]) -> str:
@@ -102,14 +96,8 @@ def _command_text(args: list[str]) -> str:
 
 
 def _provider_directory_cli_report() -> dict[str, Any]:
-    help_text = _command_text(
-        ["main.py", "start", PROVIDER_DIRECTORY_IMPORTER, "--help"]
-    )
-    missing_options = [
-        option
-        for option in REQUIRED_PROVIDER_DIRECTORY_CLI_OPTIONS
-        if option not in help_text
-    ]
+    help_text = _command_text(["main.py", "start", PROVIDER_DIRECTORY_IMPORTER, "--help"])
+    missing_options = [option for option in REQUIRED_PROVIDER_DIRECTORY_CLI_OPTIONS if option not in help_text]
     return {
         "ok": not missing_options,
         "missing": missing_options,
@@ -118,12 +106,8 @@ def _provider_directory_cli_report() -> dict[str, Any]:
 
 
 def _coverage_audit_cli_report() -> dict[str, Any]:
-    help_text = _command_text(
-        ["scripts/research/provider_directory_coverage_audit.py", "--help"]
-    )
-    missing_options = [
-        option for option in REQUIRED_COVERAGE_AUDIT_OPTIONS if option not in help_text
-    ]
+    help_text = _command_text(["scripts/research/provider_directory_coverage_audit.py", "--help"])
+    missing_options = [option for option in REQUIRED_COVERAGE_AUDIT_OPTIONS if option not in help_text]
     return {
         "ok": not missing_options,
         "missing": missing_options,
@@ -132,14 +116,8 @@ def _coverage_audit_cli_report() -> dict[str, Any]:
 
 
 def _harness_cli_report() -> dict[str, Any]:
-    help_text = _command_text(
-        ["scripts/research/provider_directory_fhir_harness.py", "--help"]
-    )
-    missing_options = [
-        option
-        for option in REQUIRED_PROVIDER_DIRECTORY_HARNESS_OPTIONS
-        if option not in help_text
-    ]
+    help_text = _command_text(["scripts/research/provider_directory_fhir_harness.py", "--help"])
+    missing_options = [option for option in REQUIRED_PROVIDER_DIRECTORY_HARNESS_OPTIONS if option not in help_text]
     return {
         "ok": not missing_options,
         "missing": missing_options,
@@ -157,16 +135,8 @@ def _importer_schema_report() -> dict[str, Any]:
     }
     provider_directory = importer_by_name.get(PROVIDER_DIRECTORY_IMPORTER) or {}
     parameter_schemas = list(provider_directory.get("params_schema") or [])
-    by_name = {
-        str(param.get("name") or ""): param
-        for param in parameter_schemas
-        if isinstance(param, dict)
-    }
-    missing_schema_fields = [
-        name
-        for name in REQUIRED_PROVIDER_DIRECTORY_SCHEMA_PARAMS
-        if name not in by_name
-    ]
+    by_name = {str(param.get("name") or ""): param for param in parameter_schemas if isinstance(param, dict)}
+    missing_schema_fields = [name for name in REQUIRED_PROVIDER_DIRECTORY_SCHEMA_PARAMS if name not in by_name]
     refresh_preset = by_name.get("refresh_preset") or {}
     refresh_choices = list(refresh_preset.get("choices") or [])
     if "monthly-full" not in refresh_choices:
@@ -184,14 +154,12 @@ def _importer_schema_report() -> dict[str, Any]:
 def _monthly_preset_report() -> dict[str, Any]:
     provider_directory_fhir = importlib.import_module("process.provider_directory_fhir")
 
-    task = provider_directory_fhir._apply_provider_directory_refresh_preset(
-        {"refresh_preset": "monthly_full"}
-    )
+    task = provider_directory_fhir._apply_provider_directory_refresh_preset({"refresh_preset": "monthly_full"})
     expected_values_by_name = {
         "refresh_preset": "monthly-full",
         "import_resources": True,
         "full_refresh": True,
-        "stale_cleanup": True,
+        "stale_cleanup": False,
         "publish_artifacts": True,
         "publish_corroboration": True,
         "bulk_export": True,
@@ -210,9 +178,7 @@ def _monthly_preset_report() -> dict[str, Any]:
 
 
 def _serving_readiness_contract_report() -> dict[str, Any]:
-    coverage_audit = importlib.import_module(
-        "scripts.research.provider_directory_coverage_audit"
-    )
+    coverage_audit = importlib.import_module("scripts.research.provider_directory_coverage_audit")
     skipped_ptg_summary = getattr(coverage_audit, "_skipped_ptg_summary")
     serving_readiness_summary = getattr(coverage_audit, "_serving_readiness_summary")
     readiness_payload_map = {
@@ -245,13 +211,9 @@ def _serving_readiness_contract_report() -> dict[str, Any]:
     }
     readiness = serving_readiness_summary(readiness_payload_map)
     checks_by_name = {
-        str(check.get("name") or ""): check
-        for check in readiness.get("checks") or []
-        if isinstance(check, dict)
+        str(check.get("name") or ""): check for check in readiness.get("checks") or [] if isinstance(check, dict)
     }
-    missing_checks = [
-        name for name in REQUIRED_SERVING_READINESS_CHECKS if name not in checks_by_name
-    ]
+    missing_checks = [name for name in REQUIRED_SERVING_READINESS_CHECKS if name not in checks_by_name]
     phone_check = checks_by_name.get("searchable_phone_overlay") or {}
     if phone_check.get("required") is not True:
         missing_checks.append("searchable_phone_overlay.required.true")
@@ -324,15 +286,16 @@ def _reviewed_subset_operation_gates() -> tuple[tuple[str, str], ...]:
 def _reviewed_subset_state_sync_report() -> dict[str, Any]:
     """Prove the selector-free operators are packaged and default-off."""
 
+    from process.provider_directory_fhir_root_policy import (
+        POLICY_PENDING_STATUS,
+        POLICY_VERIFIED_STATUS,
+    )
     from process.provider_directory_fhir_subset_activation_contract import (
         PENDING_STATUS,
         VERIFIED_STATUS,
         reviewed_subset_activation_manifest,
     )
-    from process.provider_directory_fhir_root_policy import (
-        POLICY_PENDING_STATUS,
-        POLICY_VERIFIED_STATUS,
-    )
+
     missing_paths = [
         str(path.relative_to(ROOT))
         for path in (REVIEWED_SUBSET_OPERATOR, REVIEWED_SUBSET_MANIFEST)
@@ -344,17 +307,12 @@ def _reviewed_subset_state_sync_report() -> dict[str, Any]:
             command_name,
             disabled_environment,
         )
-        for command_name, disabled_environment in (
-            _reviewed_subset_operation_gates()
-        )
+        for command_name, disabled_environment in (_reviewed_subset_operation_gates())
     }
     is_manifest_valid = (
-        manifest.desired_candidate_status
-        in (PENDING_STATUS, POLICY_PENDING_STATUS)
-        and manifest.evidence is None
+        manifest.desired_candidate_status in (PENDING_STATUS, POLICY_PENDING_STATUS) and manifest.evidence is None
     ) or (
-        manifest.desired_candidate_status
-        in (VERIFIED_STATUS, POLICY_VERIFIED_STATUS)
+        manifest.desired_candidate_status in (VERIFIED_STATUS, POLICY_VERIFIED_STATUS)
         and manifest.evidence is not None
         and manifest.is_verified
     )
@@ -363,14 +321,12 @@ def _reviewed_subset_state_sync_report() -> dict[str, Any]:
             not missing_paths
             and is_manifest_valid
             and all(
-                operation["exit_code"] == 1 and operation["output_matches"]
-                for operation in operation_by_name.values()
+                operation["exit_code"] == 1 and operation["output_matches"] for operation in operation_by_name.values()
             )
         ),
         "missing": missing_paths,
         "default_off": all(
-            operation["exit_code"] == 1 and operation["output_matches"]
-            for operation in operation_by_name.values()
+            operation["exit_code"] == 1 and operation["output_matches"] for operation in operation_by_name.values()
         ),
         "operations": operation_by_name,
         "desired_state": manifest.desired_candidate_status,
@@ -422,9 +378,7 @@ def build_report() -> dict[str, Any]:
         "reviewed_subset_state_sync": _reviewed_subset_state_sync_report(),
         "terminal_root_retirement": _terminal_root_retirement_gate_report(),
     }
-    failures_by_name = {
-        name: check for name, check in checks_by_name.items() if not check.get("ok")
-    }
+    failures_by_name = {name: check for name, check in checks_by_name.items() if not check.get("ok")}
     return {
         "ok": not failures_by_name,
         "failures": failures_by_name,
@@ -446,19 +400,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.format == "json":
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
-        print(
-            "Provider Directory runtime contract: "
-            + ("PASS" if report["ok"] else "FAIL")
-        )
+        print("Provider Directory runtime contract: " + ("PASS" if report["ok"] else "FAIL"))
         for name, check in report["checks"].items():
             status = "PASS" if check.get("ok") else "FAIL"
             print(f"- {name}: {status}")
             if check.get("missing"):
                 print(f"  missing: {', '.join(check['missing'])}")
             if check.get("mismatched"):
-                print(
-                    f"  mismatched: {json.dumps(check['mismatched'], sort_keys=True)}"
-                )
+                print(f"  mismatched: {json.dumps(check['mismatched'], sort_keys=True)}")
     return 0 if report["ok"] else 1
 
 

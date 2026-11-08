@@ -5,8 +5,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from decimal import Decimal
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +17,9 @@ from sqlalchemy import text
 
 from db.models.custom_import import (
     CustomImportChildScalar,
+    CustomImportCurrentGeneration,
     CustomImportDefinitionRevision,
+    CustomImportEntityBinding,
     CustomImportField,
     CustomImportFieldSlot,
     CustomImportRootScalar,
@@ -28,17 +33,27 @@ from process.custom_import.definition import (
     canonical_json,
     canonical_sha256,
 )
-from process.custom_import.publication import activate_generation, seal_generation
+from process.custom_import.publication import (
+    activate_generation,
+    record_no_change,
+    rollback_generation,
+    seal_generation,
+)
 from process.custom_import.read_core import (
+    CustomImportReadCursorError,
     CustomImportReadRequestError,
     CustomImportReadService,
     CustomImportReadUnavailableError,
+    EntityLocator,
     ExtensionReadAuthorization,
     ExtensionReadScope,
     PinnedReadTarget,
     ReadFilter,
+    RootDetailRequest,
     SearchRequest,
 )
+from process.custom_import.runner import run_candidate
+from tests import test_custom_import_runner_postgres as runner_fixture
 from tests.custom_import_postgres_support import (
     FamilyMaterial,
     FamilyMaterialSpec,
@@ -50,6 +65,7 @@ from tests.custom_import_postgres_support import (
     digest,
     isolated_publication_case,
     seed_family_material,
+    seed_publication_graph,
     seed_running_generation,
     transaction_session,
 )
@@ -61,6 +77,14 @@ class _AllowSyntheticRead:
     def authorize(self, authorization, *, target):
         del authorization, target
         return ExtensionReadScope("synthetic:read")
+
+
+class _ScopedSyntheticRead:
+    """Issue one synthetic scope per accepted authorization for cursor tests."""
+
+    def authorize(self, authorization, *, target):
+        del target
+        return ExtensionReadScope(f"synthetic:{authorization.credential}")
 
 
 @dataclass(frozen=True)
@@ -345,26 +369,38 @@ def _publication_graph(seed: _ReadIdentity) -> PublicationGraph:
     )
 
 
-async def _add_selected_scalars(session, graph: PublicationGraph, family: FamilyMaterial) -> None:
-    """Persist one root value and an explicit-null metric on the selected child."""
+async def _add_selected_scalars(
+    session,
+    graph: PublicationGraph,
+    family: FamilyMaterial,
+    *,
+    selected_amount: Decimal | None = None,
+    sibling_amount: Decimal | None = None,
+) -> None:
+    """Persist one root value and selected-child metrics before sealing."""
 
     selected_child_revision_id = family.child_revision_ids[1]
+    session.add(
+        CustomImportRootScalar(
+            root_revision_id=family.root_revision_id,
+            dataset_id=graph.dataset_id,
+            schema_revision_id=graph.schema_revision_id,
+            root_record_id=family.root_record_id,
+            field_slot=3,
+            field_collection_slot=0,
+            projection_slot=3,
+            field_type="string",
+            value_state="value",
+            string_value="synthetic-root",
+        )
+    )
+    amounts = ((selected_child_revision_id, selected_amount),)
+    if sibling_amount is not None:
+        amounts += ((family.child_revision_ids[0], sibling_amount),)
     session.add_all(
         (
-            CustomImportRootScalar(
-                root_revision_id=family.root_revision_id,
-                dataset_id=graph.dataset_id,
-                schema_revision_id=graph.schema_revision_id,
-                root_record_id=family.root_record_id,
-                field_slot=3,
-                field_collection_slot=0,
-                projection_slot=3,
-                field_type="string",
-                value_state="value",
-                string_value="synthetic-root",
-            ),
             CustomImportChildScalar(
-                child_revision_id=selected_child_revision_id,
+                child_revision_id=child_revision_id,
                 dataset_id=graph.dataset_id,
                 schema_revision_id=graph.schema_revision_id,
                 root_record_id=family.root_record_id,
@@ -373,17 +409,24 @@ async def _add_selected_scalars(session, graph: PublicationGraph, family: Family
                 field_collection_slot=1,
                 projection_slot=4,
                 field_type="decimal",
-                value_state="null",
-            ),
+                value_state="null" if amount is None else "value",
+                decimal_value=amount,
+            )
+            for child_revision_id, amount in amounts
         )
     )
     await session.flush()
 
 
 async def _add_selected_winners(
-    session, graph: PublicationGraph, attempt: GenerationAttempt, family: FamilyMaterial
+    session,
+    graph: PublicationGraph,
+    attempt: GenerationAttempt,
+    family: FamilyMaterial,
+    *,
+    include_sibling: bool = False,
 ) -> None:
-    """Create two deterministic winner rows for exact-count page coverage."""
+    """Create two selected rows, optionally preceded by a different context child."""
 
     selected_child_revision_id = family.child_revision_ids[1]
     session.add_all(
@@ -397,9 +440,9 @@ async def _add_selected_winners(
             family_revision_id=family.family_revision_id,
             context_collection_slot=1,
             context_key_sha256=digest(f"read-core-context:{ordinal}"),
-            context_child_revision_id=selected_child_revision_id,
+            context_child_revision_id=family.child_revision_ids[0] if ordinal == 0 else selected_child_revision_id,
         )
-        for ordinal in (1, 2)
+        for ordinal in ((0, 1, 2) if include_sibling else (1, 2))
     )
     await session.flush()
 
@@ -501,9 +544,9 @@ async def _seed_read_fixture(session) -> _ReadFixture:
     )
 
 
-def _service(*, cache=None, statement_timeout_ms: int = 10_000) -> CustomImportReadService:
+def _service(*, cache=None, statement_timeout_ms: int = 10_000, authorizer=None) -> CustomImportReadService:
     return CustomImportReadService(
-        authorizer=_AllowSyntheticRead(),
+        authorizer=_AllowSyntheticRead() if authorizer is None else authorizer,
         cache=cache,
         cursor_secret=b"r" * 32,
         now=lambda: 1_000,
@@ -601,6 +644,21 @@ async def _assert_exact_family_detail(session, service, authorization, fixture: 
     }
     assert amount_state_by_child_id[fixture.selected_family.child_revision_ids[0]] == "missing"
     assert amount_state_by_child_id[fixture.selected_family.child_revision_ids[1]] == "null"
+    entity_binding = await session.get(CustomImportEntityBinding, fixture.selected_family.entity_binding_id)
+    assert entity_binding is not None
+    entity_detail = await service.root_detail_for_entity(
+        session,
+        authorization=authorization,
+        request=RootDetailRequest(
+            target=fixture.target,
+            entity=EntityLocator(entity_binding.adapter_id, entity_binding.canonical_value),
+            family_entitlement="full_family",
+        ),
+    )
+    assert entity_detail.winner.family_revision_id == fixture.selected_family.family_revision_id
+    assert {child.child_revision_id for child in entity_detail.children} == set(
+        fixture.selected_family.child_revision_ids
+    )
 
 
 @pytest.mark.asyncio
@@ -615,6 +673,150 @@ async def test_read_core_uses_one_selected_child_and_exact_family_membership():
         await _assert_selected_child_filtering(session, service, authorization, fixture)
         await _assert_metric_states(session, service, authorization, fixture)
         await _assert_exact_family_detail(session, service, authorization, fixture, first_page)
+
+
+@pytest.mark.asyncio
+async def test_read_core_filters_the_selected_child_before_count_and_pagination(monkeypatch):
+    """A high sibling metric cannot replace the selected low child after filtering."""
+
+    monkeypatch.setattr(
+        "tests.test_custom_import_read_core_postgres._add_selected_scalars",
+        partial(_add_selected_scalars, selected_amount=Decimal("4"), sibling_amount=Decimal("10")),
+    )
+    monkeypatch.setattr(
+        "tests.test_custom_import_read_core_postgres._add_selected_winners",
+        partial(_add_selected_winners, include_sibling=True),
+    )
+    async with transaction_session() as session, session.begin():
+        fixture = await _seed_read_fixture(session)
+        service = _service()
+        authorization = ExtensionReadAuthorization("synthetic-read-token")
+        rejected = await service.search(
+            session,
+            authorization=authorization,
+            request=SearchRequest(
+                target=fixture.target,
+                filters=(ReadFilter("synthetic_alpha", "eq", "low-1"), ReadFilter("amount", "gt", "5")),
+                page_size=1,
+            ),
+        )
+        assert rejected.total == 0
+        assert rejected.items == ()
+        assert rejected.next_cursor is None
+
+        unfiltered = await service.search(
+            session, authorization=authorization, request=SearchRequest(target=fixture.target, page_size=1)
+        )
+        assert unfiltered.total == 3
+        assert unfiltered.items[0].context_child_revision_id == fixture.selected_family.child_revision_ids[0]
+        accepted = await service.search(
+            session,
+            authorization=authorization,
+            request=SearchRequest(target=fixture.target, filters=(ReadFilter("amount", "lt", "5"),), page_size=1),
+        )
+        assert accepted.total == 2
+        assert len(accepted.items) == 1
+        assert accepted.items[0].context_child_revision_id == fixture.selected_family.child_revision_ids[1]
+        assert accepted.next_cursor is not None
+        next_page = await service.search(
+            session,
+            authorization=authorization,
+            request=SearchRequest(
+                target=fixture.target,
+                filters=(ReadFilter("amount", "lt", "5"),),
+                page_size=1,
+                cursor=accepted.next_cursor,
+            ),
+        )
+        assert next_page.total == 2
+        assert len(next_page.items) == 1
+        assert next_page.items[0].context_child_revision_id == fixture.selected_family.child_revision_ids[1]
+        assert next_page.next_cursor is None
+        assert next_page.items[0].winner != accepted.items[0].winner
+
+
+def _ranked_family_definition() -> CustomImportDefinition:
+    document = json.loads(runner_fixture._decimal_root_key_definition().canonical)
+    document["schema"]["root"]["fields"][-1]["projection_slot"] = 5
+    document["query"]["root_fields"].append("rank")
+    document["selection_profiles"][0]["selection"] = [{"field": "rank", "direction": "desc", "nulls": "last"}]
+    return CustomImportDefinition.from_mapping(document)
+
+
+async def _run_ranked_families(case, amount_state: str) -> PinnedReadTarget:
+    seed = await runner_fixture._seed_case(case, "ranked", _ranked_family_definition())
+    execution_id, token = await runner_fixture._new_execution(case, seed, "ranked")
+    npi = "1234567893"
+    roots = [runner_fixture._root_with_rank(npi, name, rank) for name, rank in (("Older", 1), ("Latest", 2))]
+    child_rows = [
+        runner_fixture._rate_with_rank(npi, code, Decimal(amount), rank)
+        for code, amount, rank in (("A", "10", 1), ("B", "20", 1), ("A", "4", 2), ("B", "8", 2))
+    ]
+    if amount_state == "null":
+        child_rows[2]["amount"] = None
+    elif amount_state == "missing":
+        del child_rows[2]["amount"]
+    run_result = await run_candidate(
+        case.sessions, runner_fixture._request(seed, execution_id, token, roots, child_rows)
+    )
+    assert run_result.status == "activated"
+    assert run_result.generation_id is not None
+    assert run_result.accepted_family_count == 2
+    assert run_result.rejection_count == 0
+    assert run_result.seal is not None and run_result.seal.family_count == 2
+    return PinnedReadTarget(
+        dataset_id=seed.dataset_id,
+        generation_id=run_result.generation_id,
+        definition_revision_id=seed.definition_revision_id,
+        schema_revision_id=seed.schema_revision_id,
+        profile_id="default",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("amount_state", ("value", "null", "missing"))
+async def test_ranked_family_never_falls_back_after_metric_filtering(amount_state):
+    """Ranking, persistence and reads keep the latest family even when its metric fails."""
+
+    async with isolated_publication_case() as case:
+        pinned_target = await _run_ranked_families(case, amount_state)
+        service = _service()
+        authorization = ExtensionReadAuthorization("synthetic-ranked-read")
+        async with case.sessions() as session:
+            rejected = await service.search(
+                session,
+                authorization=authorization,
+                request=SearchRequest(
+                    target=pinned_target,
+                    filters=(ReadFilter("service_code", "eq", "A"), ReadFilter("amount", "gt", "5")),
+                    page_size=1,
+                ),
+            )
+            assert (rejected.total, rejected.items, rejected.next_cursor) == (0, (), None)
+            selected = await service.search(
+                session,
+                authorization=authorization,
+                request=SearchRequest(target=pinned_target, filters=(ReadFilter("service_code", "eq", "A"),)),
+            )
+            assert selected.total == len(selected.items) == 1
+            selected_item = selected.items[0]
+            assert (
+                next(field.value for field in selected_item.root_fields if field.field_id == "display_name") == "Latest"
+            )
+            assert (
+                next(field.state for field in selected_item.context_fields if field.field_id == "amount")
+                == amount_state
+            )
+            detail = await service.root_detail(
+                session, authorization=authorization, target=pinned_target, winner=selected_item.winner
+            )
+            amounts_by_code = {
+                next(field.value for field in child.fields if field.field_id == "service_code"): next(
+                    field.value for field in child.fields if field.field_id == "amount"
+                )
+                for child in detail.children
+            }
+            assert amounts_by_code == {"A": Decimal("4") if amount_state == "value" else None, "B": Decimal("8")}
 
 
 @pytest.mark.asyncio
@@ -765,6 +967,8 @@ async def test_read_core_enforces_one_cumulative_operation_deadline(monkeypatch)
 
             assert cache.set_calls == 0
             assert cache.values == {}
+            # The deadline may cancel database I/O, so the caller must roll back before reuse.
+            await session.rollback()
             assert await _statement_timeout_ms(session) == 0
             assert await session.scalar(text("SELECT 1")) == 1
 
@@ -880,9 +1084,141 @@ async def _sealed_empty_successor(session, fixture: _ReadFixture) -> GenerationA
     return successor
 
 
+async def _current_target(session, fixture: _ReadFixture) -> PinnedReadTarget:
+    pointer = await session.get(CustomImportCurrentGeneration, fixture.graph.dataset_id)
+    assert pointer is not None
+    return PinnedReadTarget(
+        dataset_id=pointer.dataset_id,
+        generation_id=pointer.generation_id,
+        definition_revision_id=pointer.definition_revision_id,
+        schema_revision_id=pointer.schema_revision_id,
+        profile_id=fixture.target.profile_id,
+    )
+
+
+async def _assert_retained_cursor_behavior(
+    read_session,
+    service,
+    authorization,
+    fixture: _ReadFixture,
+    successor: GenerationAttempt,
+    first_request: SearchRequest,
+    first_page,
+) -> None:
+    """Verify cache, cursor, and current-target behavior after supersession."""
+
+    assert (
+        await service.search(
+            read_session,
+            authorization=authorization,
+            request=first_request,
+        )
+        is first_page
+    )
+    resumed_page = await service.search(
+        read_session,
+        authorization=authorization,
+        request=SearchRequest(target=fixture.target, page_size=1, cursor=first_page.next_cursor),
+    )
+    assert resumed_page.total == 2
+    assert len(resumed_page.items) == 1
+    assert resumed_page.next_cursor is None
+
+    current_target = await _current_target(read_session, fixture)
+    assert current_target.generation_id == successor.generation_id
+    current_page = await service.search(
+        read_session,
+        authorization=authorization,
+        request=SearchRequest(target=current_target, page_size=1),
+    )
+    assert current_page.total == 0
+
+    for request, cursor_authorization in (
+        (
+            SearchRequest(
+                target=fixture.target,
+                filters=(ReadFilter("npi", "eq", "synthetic-root"),),
+                page_size=1,
+                cursor=first_page.next_cursor,
+            ),
+            authorization,
+        ),
+        (
+            SearchRequest(target=current_target, page_size=1, cursor=first_page.next_cursor),
+            authorization,
+        ),
+        (
+            SearchRequest(target=fixture.target, page_size=1, cursor=first_page.next_cursor),
+            ExtensionReadAuthorization("synthetic-other-token"),
+        ),
+    ):
+        with pytest.raises(CustomImportReadCursorError):
+            await service.search(read_session, authorization=cursor_authorization, request=request)
+
+
 @pytest.mark.asyncio
-async def test_read_core_rejects_publication_between_count_and_page(monkeypatch):
-    """A concurrent activation cannot produce or cache a torn exact-count page."""
+async def test_read_core_reads_retained_pinned_generation_after_publication():
+    """A retained pin and its cursor survive a newer current publication."""
+
+    async with isolated_publication_case() as case:
+        async with case.sessions() as seed_session, seed_session.begin():
+            fixture = await _seed_read_fixture(seed_session)
+            successor = await _sealed_empty_successor(seed_session, fixture)
+
+        cache = _RecordingCache()
+        service = _service(cache=cache, authorizer=_ScopedSyntheticRead())
+        authorization = ExtensionReadAuthorization("synthetic-read-token")
+        first_request = SearchRequest(target=fixture.target, page_size=1)
+
+        async with case.sessions() as read_session:
+            first_page = await service.search(
+                read_session,
+                authorization=authorization,
+                request=first_request,
+            )
+        assert first_page.total == 2
+        assert first_page.next_cursor is not None
+        assert cache.set_calls == 1
+
+        async with case.sessions() as publish_session, publish_session.begin():
+            await activate_generation(
+                publish_session,
+                dataset_id=fixture.graph.dataset_id,
+                target_generation_id=successor.generation_id,
+                expected_generation_id=fixture.current_attempt.generation_id,
+                expected_pointer_version=1,
+            )
+            rollback = await rollback_generation(
+                publish_session,
+                dataset_id=fixture.graph.dataset_id,
+                target_generation_id=fixture.current_attempt.generation_id,
+                expected_generation_id=successor.generation_id,
+                expected_pointer_version=2,
+            )
+            assert rollback.event_kind == "rolled_back"
+            await activate_generation(
+                publish_session,
+                dataset_id=fixture.graph.dataset_id,
+                target_generation_id=successor.generation_id,
+                expected_generation_id=fixture.current_attempt.generation_id,
+                expected_pointer_version=3,
+            )
+
+        async with case.sessions() as read_session:
+            await _assert_retained_cursor_behavior(
+                read_session,
+                service,
+                authorization,
+                fixture,
+                successor,
+                first_request,
+                first_page,
+            )
+
+
+@pytest.mark.asyncio
+async def test_read_core_keeps_retained_pin_after_pointer_move(monkeypatch):
+    """A pointer move cannot invalidate an already admitted retained target."""
 
     async with isolated_publication_case() as case:
         async with case.sessions() as seed_session, seed_session.begin():
@@ -900,15 +1236,12 @@ async def test_read_core_rejects_publication_between_count_and_page(monkeypatch)
             return total
 
         monkeypatch.setattr(read_core, "_exact_count", delayed_exact_count)
-        cache = _RecordingCache()
-        service = _service(cache=cache)
-        authorization = ExtensionReadAuthorization("synthetic-read-token")
-
         async with case.sessions() as read_session:
+            cache = _RecordingCache()
             read_task = asyncio.create_task(
-                service.search(
+                _service(cache=cache).search(
                     read_session,
-                    authorization=authorization,
+                    authorization=ExtensionReadAuthorization("synthetic-read-token"),
                     request=SearchRequest(target=fixture.target),
                 )
             )
@@ -925,8 +1258,80 @@ async def test_read_core_rejects_publication_between_count_and_page(monkeypatch)
             finally:
                 continue_read.set()
 
-            with pytest.raises(CustomImportReadUnavailableError, match="changed during"):
-                await asyncio.wait_for(read_task, timeout=5)
+            page = await asyncio.wait_for(read_task, timeout=5)
 
-        assert cache.set_calls == 0
-        assert cache.values == {}
+    assert page.total == 2
+    assert len(page.items) == 2
+    assert cache.set_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_read_core_rejects_unsealed_or_mismatched_pinned_targets():
+    """Only the exact sealed generation, dataset, schema, and profile may read."""
+
+    async with transaction_session() as session, session.begin():
+        fixture = await _seed_read_fixture(session)
+        unsealed = await seed_running_generation(
+            session,
+            fixture.graph,
+            suffix=f"read-core-unsealed-{uuid.uuid4().hex}",
+            base_generation_id=fixture.current_attempt.generation_id,
+        )
+        sealed_never_published = await _sealed_empty_successor(session, fixture)
+        service = _service()
+        authorization = ExtensionReadAuthorization("synthetic-read-token")
+        for target in (
+            replace(fixture.target, generation_id=2**62),
+            replace(fixture.target, generation_id=unsealed.generation_id),
+            replace(fixture.target, generation_id=sealed_never_published.generation_id),
+            replace(fixture.target, dataset_id=fixture.target.dataset_id + 1),
+            replace(fixture.target, definition_revision_id=fixture.target.definition_revision_id + 1),
+            replace(fixture.target, schema_revision_id=fixture.target.schema_revision_id + 1),
+            replace(fixture.target, profile_id="unknown_profile"),
+        ):
+            with pytest.raises(CustomImportReadUnavailableError):
+                await service.search(
+                    session,
+                    authorization=authorization,
+                    request=SearchRequest(target=target),
+                )
+
+
+@pytest.mark.asyncio
+async def test_read_identity_rejects_sealed_no_change_candidate_without_target_event():
+    """A no-change receipt publishes its retained base, never its candidate."""
+
+    async with transaction_session() as session, session.begin():
+        graph = await seed_publication_graph(session)
+        await activate_generation(
+            session,
+            dataset_id=graph.dataset_id,
+            target_generation_id=graph.first_generation_id,
+            expected_generation_id=None,
+            expected_pointer_version=0,
+        )
+        receipt = await record_no_change(
+            session,
+            dataset_id=graph.dataset_id,
+            execution_id=graph.no_change_execution_id,
+            expected_generation_id=graph.first_generation_id,
+            expected_pointer_version=1,
+            candidate_generation_id=graph.no_change_candidate_generation_id,
+            lease_fence=graph.no_change_fence,
+            lease_token=graph.no_change_token,
+        )
+        assert receipt.to_generation_id == graph.first_generation_id
+        pinned_target = PinnedReadTarget(
+            dataset_id=graph.dataset_id,
+            generation_id=graph.first_generation_id,
+            definition_revision_id=graph.definition_revision_id,
+            schema_revision_id=graph.schema_revision_id,
+            profile_id="synthetic_profile",
+        )
+
+        await read_identity.verify_published_generation(session, pinned_target)
+        with pytest.raises(CustomImportReadUnavailableError, match="pinned generation"):
+            await read_identity.verify_published_generation(
+                session,
+                replace(pinned_target, generation_id=graph.no_change_candidate_generation_id),
+            )

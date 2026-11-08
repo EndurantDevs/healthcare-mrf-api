@@ -35,7 +35,6 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_SHARED_GENERATION,
     SharedBlockReference,
     SharedLayoutBuildOwnership,
-    SharedMappingDigestSummary,
     _validate_authoritative_mapping_summary,
     seal_shared_layout,
     shared_support_digest,
@@ -144,6 +143,7 @@ from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
     publish_prepared_v4_inferred_taxonomy_candidates,
     stage_v4_inferred_taxonomy_compiler_copy,
 )
+from process.ptg_parts.ptg2_snapshot_candidates import attach_snapshot_candidates, copy_snapshot_candidate, snapshot_candidate_reads
 from process.ptg_parts.ptg2_tax_identity_source_artifact import (
     prepare_tax_identity_source_projection,
 )
@@ -2147,9 +2147,22 @@ async def _publish_v4_dictionary_stage_ranges(
     stage: _V4DenseDictionaryStage,
     progress_callback: Callable[[str, int], None] | None,
     heartbeat_callback: Callable[[], None] | None = None,
+    build_token: str | None = None,
 ) -> None:
-    """Publish one validated dictionary through bounded key-range statements."""
+    """Attach guarded dictionaries only after complete candidate validation."""
 
+    if stage.target_table != "ptg2_v3_provider_group":
+        if not build_token:
+            raise RuntimeError("PTG dictionary candidate requires its build token")
+        await _await_v4_dictionary_statement(copy_snapshot_candidate(
+            session, schema_name=schema[1:-1].replace('""', '"'),
+            table=stage.target_table, snapshot_key=snapshot_key, build_token=build_token,
+            stage_table=stage.stage_table, columns=stage.columns,
+            expected_count=stage.expected_count,
+        ), heartbeat_callback=heartbeat_callback)
+        if progress_callback is not None:
+            progress_callback("published_dictionary_rows", stage.expected_count)
+        return
     if stage.dense_keys:
         await _publish_v4_dense_dictionary_ranges(
             session,
@@ -2465,7 +2478,7 @@ async def _count_v4_target_keys(
             ),
             heartbeat_callback=heartbeat_callback,
         )
-        key_records = _v4_tax_result_rows(key_result)
+        key_records = tuple(key_result.all())
         if not key_records:
             return observed_count
         for key_record in key_records:
@@ -2813,154 +2826,6 @@ def _v4_tax_artifact_byte_count(
     return sum(int(artifact_by_name[name].byte_count) for name in expected_names)
 
 
-def _v4_tax_result_rows(result: Any) -> tuple[Any, ...]:
-    """Normalize the bounded SQLAlchemy row result used by publication."""
-
-    rows = result.all()
-    return tuple(rows)
-
-
-async def _v4_tax_token_batch(
-    session: Any,
-    *,
-    schema: str,
-    tax_stage: str,
-    range_start: int,
-    range_end: int,
-    heartbeat_callback: Callable[[], None] | None,
-) -> tuple[tuple[Any, ...], float]:
-    """Read one dense token batch in canonical key order."""
-
-    token_result, elapsed_seconds = await _await_v4_dictionary_statement(
-        session.execute(
-            db.text(
-                f"""
-                SELECT tin_key, tin_id_128, tin_hmac_sha256
-                  FROM {schema}.{tax_stage}
-                 WHERE tin_key >= :range_start
-                   AND tin_key < :range_end
-                 ORDER BY tin_key
-                """
-            ),
-            {"range_start": range_start, "range_end": range_end},
-        ),
-        heartbeat_callback=heartbeat_callback,
-    )
-    return _v4_tax_result_rows(token_result), elapsed_seconds
-
-
-def _append_v4_tax_token_rows(
-    token_rows: Iterable[Any],
-    *,
-    range_start: int,
-    content_digest: Any,
-) -> int:
-    """Validate and append one canonical token batch."""
-
-    observed_count = 0
-    for expected_key, token_row in enumerate(token_rows, range_start):
-        tin_key = int(token_row[0])
-        tin_id_128 = bytes(token_row[1])
-        tin_hmac_sha256 = bytes(token_row[2])
-        if (
-            tin_key != expected_key
-            or len(tin_id_128) != 16
-            or len(tin_hmac_sha256) != 32
-            or not hmac.compare_digest(tin_id_128, tin_hmac_sha256[:16])
-        ):
-            raise RuntimeError("PTG V4 tax identity dictionary changed")
-        content_digest.update(tin_hmac_sha256)
-        observed_count += 1
-    return observed_count
-
-
-async def _validate_v4_tax_token_rows(
-    session: Any,
-    *,
-    schema: str,
-    tax_identity_stage: str,
-    contract: _V4TaxIdentityContract,
-    content_digest: Any,
-    progress_callback: Callable[[str, int], None] | None,
-    heartbeat_callback: Callable[[], None] | None = None,
-) -> None:
-    """Authenticate the dense token dictionary and append it to the digest."""
-
-    tax_stage = _quote_ident(tax_identity_stage)
-    observed_token_count = 0
-    range_start = 0
-    sizer = _V4DictionaryBatchSizer(
-        estimated_row_bytes=_V4_DICTIONARY_ESTIMATED_ROW_BYTES,
-    )
-    while range_start < int(contract.tax_identity_count):
-        range_end = _v4_dictionary_range_end(
-            range_start=range_start,
-            expected_count=contract.tax_identity_count,
-            sizer=sizer,
-        )
-        token_rows, elapsed_seconds = await _v4_tax_token_batch(
-            session,
-            schema=schema,
-            tax_stage=tax_stage,
-            range_start=range_start,
-            range_end=range_end,
-            heartbeat_callback=heartbeat_callback,
-        )
-        if len(token_rows) != range_end - range_start:
-            raise RuntimeError("PTG V4 tax identity dictionary changed")
-        observed_token_count += _append_v4_tax_token_rows(
-            token_rows,
-            range_start=range_start,
-            content_digest=content_digest,
-        )
-        if progress_callback is not None:
-            progress_callback(
-                "validated_dictionary_rows",
-                len(token_rows),
-            )
-            progress_callback("publish_batches", 1)
-        sizer.observe(elapsed_seconds)
-        range_start = range_end
-    if observed_token_count != contract.tax_identity_count:
-        raise RuntimeError("PTG V4 tax identity dictionary changed")
-
-
-def _validated_v4_tax_group_row(
-    group_row: Any,
-    *,
-    previous_group_id: bytes,
-    contract: _V4TaxIdentityContract,
-) -> tuple[bytes, str, int | None, bytes]:
-    """Validate one ordered group row and its state-specific token reference."""
-
-    group_id = bytes(group_row[0])
-    tax_state = str(group_row[1])
-    raw_tin_key = group_row[2]
-    source_bitmap = bytes(group_row[3])
-    graph_group_present = bool(group_row[4])
-    tin_key = None if raw_tin_key is None else int(raw_tin_key)
-    if (
-        len(group_id) != 16
-        or group_id <= previous_group_id
-        or not graph_group_present
-        or tax_state not in _V4_TAX_STATE_CODE
-        or len(source_bitmap) != contract.source_bitmap_bytes
-        or not any(source_bitmap)
-        or (
-            tax_state == "matched_ein"
-            and (
-                tin_key is None or tin_key < 0 or tin_key >= contract.tax_identity_count
-            )
-        )
-        or (tax_state != "matched_ein" and tin_key is not None)
-    ):
-        raise RuntimeError("PTG V4 provider-group tax identity changed")
-    unused_bits = contract.source_bitmap_bytes * 8 - contract.source_shard_count
-    if unused_bits and (source_bitmap[-1] & (0xFF << (8 - unused_bits))):
-        raise RuntimeError("PTG V4 provider-group source bitmap changed")
-    return group_id, tax_state, tin_key, source_bitmap
-
-
 def _append_v4_tax_group_digest(
     content_digest: Any,
     *,
@@ -2980,150 +2845,6 @@ def _append_v4_tax_group_digest(
         content_digest.update(struct.pack(">I", tin_key))
     content_digest.update(struct.pack(">I", len(source_bitmap)))
     content_digest.update(source_bitmap)
-
-
-async def _v4_tax_group_rows_batch(
-    session: Any,
-    *,
-    schema: str,
-    group_tax_stage: str,
-    graph_group_stage: str,
-    previous_group_id: bytes,
-    batch_rows: int,
-    heartbeat_callback: Callable[[], None] | None,
-) -> tuple[tuple[Any, ...], float]:
-    """Read one ordered provider-group tax sidecar batch."""
-
-    group_result, elapsed_seconds = await _await_v4_dictionary_statement(
-        session.execute(
-            db.text(
-                f"""
-                SELECT sidecar.provider_group_global_id_128,
-                       sidecar.tax_identity_state,
-                       sidecar.tin_key, sidecar.source_bitmap,
-                       graph_group.provider_group_global_id_128 IS NOT NULL
-                  FROM {schema}.{group_tax_stage} AS sidecar
-                  LEFT JOIN {schema}.{graph_group_stage} AS graph_group
-                    ON graph_group.provider_group_global_id_128 =
-                       sidecar.provider_group_global_id_128
-                 WHERE sidecar.provider_group_global_id_128 >
-                       :previous_group_id
-                 ORDER BY sidecar.provider_group_global_id_128
-                 LIMIT :batch_rows
-                """
-            ),
-            {
-                "previous_group_id": previous_group_id,
-                "batch_rows": int(batch_rows),
-            },
-        ),
-        heartbeat_callback=heartbeat_callback,
-    )
-    return _v4_tax_result_rows(group_result), elapsed_seconds
-
-
-def _consume_v4_tax_group_rows(
-    group_rows: Iterable[Any],
-    *,
-    previous_group_id: bytes,
-    contract: _V4TaxIdentityContract,
-    content_digest: Any,
-    count_by_state: dict[str, int],
-    referenced_token_bits: bytearray,
-) -> tuple[bytes, int]:
-    """Authenticate one sidecar batch and count newly referenced tokens."""
-
-    latest_group_id = previous_group_id
-    newly_referenced_tokens = 0
-    for group_row in group_rows:
-        group_id, tax_state, tin_key, source_bitmap = _validated_v4_tax_group_row(
-            group_row,
-            previous_group_id=latest_group_id,
-            contract=contract,
-        )
-        _append_v4_tax_group_digest(
-            content_digest,
-            group_id=group_id,
-            tax_state=tax_state,
-            tin_key=tin_key,
-            source_bitmap=source_bitmap,
-        )
-        count_by_state[tax_state] += 1
-        if tin_key is not None:
-            byte_index, bit_index = divmod(tin_key, 8)
-            bit_mask = 1 << bit_index
-            if not referenced_token_bits[byte_index] & bit_mask:
-                referenced_token_bits[byte_index] |= bit_mask
-                newly_referenced_tokens += 1
-        latest_group_id = group_id
-    return latest_group_id, newly_referenced_tokens
-
-
-def _tax_group_row_estimate(
-    contract: _V4TaxIdentityContract,
-) -> int:
-    """Estimate one group-tax validation row including its source bitmap."""
-
-    return _V4_DICTIONARY_ESTIMATED_ROW_BYTES + int(contract.source_bitmap_bytes)
-
-
-async def _validate_v4_tax_group_rows(
-    session: Any,
-    *,
-    schema: str,
-    group_dictionary_stage: str,
-    group_tax_identity_stage: str,
-    contract: _V4TaxIdentityContract,
-    content_digest: Any,
-    progress_callback: Callable[[str, int], None] | None,
-    heartbeat_callback: Callable[[], None] | None = None,
-) -> Mapping[str, int]:
-    """Authenticate ordered provider-group sidecars in bounded batches."""
-
-    group_tax_stage = _quote_ident(group_tax_identity_stage)
-    graph_group_stage = _quote_ident(group_dictionary_stage)
-    previous_group_id = b""
-    observed_group_count = 0
-    referenced_token_count = 0
-    referenced_token_bits = bytearray((contract.tax_identity_count + 7) // 8)
-    count_by_state = {name: 0 for name in _V4_TAX_STATE_CODE}
-    sizer = _V4DictionaryBatchSizer(
-        estimated_row_bytes=_tax_group_row_estimate(contract),
-    )
-    while True:
-        group_rows, elapsed_seconds = await _v4_tax_group_rows_batch(
-            session,
-            schema=schema,
-            group_tax_stage=group_tax_stage,
-            graph_group_stage=graph_group_stage,
-            previous_group_id=previous_group_id,
-            batch_rows=sizer.current_rows,
-            heartbeat_callback=heartbeat_callback,
-        )
-        if not group_rows:
-            break
-        previous_group_id, new_token_count = _consume_v4_tax_group_rows(
-            group_rows,
-            previous_group_id=previous_group_id,
-            contract=contract,
-            content_digest=content_digest,
-            count_by_state=count_by_state,
-            referenced_token_bits=referenced_token_bits,
-        )
-        referenced_token_count += new_token_count
-        observed_group_count += len(group_rows)
-        if progress_callback is not None:
-            progress_callback(
-                "validated_dictionary_rows",
-                len(group_rows),
-            )
-            progress_callback("publish_batches", 1)
-        sizer.observe(elapsed_seconds)
-    return {
-        **count_by_state,
-        "provider_group_count": observed_group_count,
-        "referenced_tax_identity_count": referenced_token_count,
-    }
 
 
 def _v4_tax_content_hasher(
@@ -3150,49 +2871,80 @@ async def _validate_v4_tax_identity_stages(
     progress_callback: Callable[[str, int], None] | None,
     heartbeat_callback: Callable[[], None] | None = None,
 ) -> None:
+    """Keep the build heartbeat alive throughout set validation and digest encoding."""
+    await _await_v4_dictionary_statement(
+        _validate_v4_tax_identity_set(session, schema=schema,
+            group_dictionary_stage=group_dictionary_stage, tax_identity_stage=tax_identity_stage,
+            group_tax_identity_stage=group_tax_identity_stage, contract=contract,
+            progress_callback=progress_callback), heartbeat_callback=heartbeat_callback,
+    )
+
+
+async def _validate_v4_tax_identity_set(
+    session: Any,
+    *,
+    schema: str,
+    group_dictionary_stage: str,
+    tax_identity_stage: str,
+    group_tax_identity_stage: str,
+    contract: _V4TaxIdentityContract,
+    progress_callback: Callable[[str, int], None] | None,
+) -> None:
     """Recompute content and relational completeness from staged COPY rows."""
 
+    tokens = f"{schema}.{_quote_ident(tax_identity_stage)}"
+    groups = f"{schema}.{_quote_ident(group_tax_identity_stage)}"
+    dictionary = f"{schema}.{_quote_ident(group_dictionary_stage)}"
+    await session.execute(db.text(f"LOCK TABLE {tokens}, {groups}, {dictionary} IN SHARE MODE"))
+    token_summary = (await session.execute(db.text(f"""
+        SELECT count(*),count(DISTINCT tin_key),COALESCE(min(tin_key),0),COALESCE(max(tin_key),-1),
+          COALESCE(bool_and(octet_length(tin_id_128)=16 AND octet_length(tin_hmac_sha256)=32
+              AND tin_id_128=substring(tin_hmac_sha256 FROM 1 FOR 16)
+              AND (previous_hmac IS NULL OR previous_hmac<tin_hmac_sha256)),true)
+          FROM (SELECT *,lag(tin_hmac_sha256) OVER(ORDER BY tin_key) AS previous_hmac FROM {tokens}) ordered
+    """))).one()
+    count = contract.tax_identity_count
+    if tuple(token_summary) != (count, count, 0, count - 1, True):
+        raise RuntimeError("PTG V4 tax identity dictionary changed")
+    summary = (await session.execute(db.text(f"""
+        SELECT count(*),count(DISTINCT g.provider_group_global_id_128),
+          count(*) FILTER(WHERE g.tax_identity_state='matched_ein'),
+          count(*) FILTER(WHERE g.tax_identity_state='missing'),
+          count(*) FILTER(WHERE g.tax_identity_state='malformed'),
+          count(*) FILTER(WHERE g.tax_identity_state='unsupported_type'),count(DISTINCT g.tin_key),
+          COALESCE(bool_and(d.provider_group_global_id_128 IS NOT NULL
+            AND octet_length(g.provider_group_global_id_128)=16
+            AND ((g.tax_identity_state='matched_ein' AND t.tin_key IS NOT NULL)
+                 OR (g.tax_identity_state IN('missing','malformed','unsupported_type') AND g.tin_key IS NULL))
+            AND octet_length(g.source_bitmap)=:bitmap_bytes
+            AND g.source_bitmap<>decode(repeat('00',:bitmap_bytes),'hex')
+            AND CASE WHEN :unused_bits=0 THEN true ELSE
+              get_byte(g.source_bitmap,octet_length(g.source_bitmap)-1)<(1<<(8-:unused_bits)) END),true)
+          FROM {groups} g LEFT JOIN {dictionary} d USING(provider_group_global_id_128)
+          LEFT JOIN {tokens} t ON t.tin_key=g.tin_key
+    """), {"bitmap_bytes": contract.source_bitmap_bytes,
+            "unused_bits": contract.source_bitmap_bytes * 8 - contract.source_shard_count})).one()
+    expected = (contract.provider_group_count,contract.provider_group_count,contract.matched_ein_count,
+                contract.missing_count,contract.malformed_count,contract.unsupported_type_count,count,True)
+    if tuple(summary) != expected:
+        raise RuntimeError("PTG V4 provider-group tax identity changed")
+    await _verify_v4_tax_stage_digest(session, tokens, groups, contract)
+    if progress_callback is not None:
+        progress_callback("validated_dictionary_rows", count + contract.provider_group_count)
+
+
+async def _verify_v4_tax_stage_digest(session, tokens, groups, contract):
+    """Encode the already-validated staged rows in their canonical digest order."""
+    # The remaining row iteration is canonical digest encoding, not semantic validation.
     content_digest = _v4_tax_content_hasher(contract)
-    await _validate_v4_tax_token_rows(
-        session,
-        schema=schema,
-        tax_identity_stage=tax_identity_stage,
-        contract=contract,
-        content_digest=content_digest,
-        progress_callback=progress_callback,
-        heartbeat_callback=heartbeat_callback,
-    )
+    async for digest_row in await session.stream(db.text(f"SELECT tin_hmac_sha256 FROM {tokens} ORDER BY tin_key")):
+        content_digest.update(bytes(digest_row[0]))
     content_digest.update(struct.pack(">Q", contract.provider_group_count))
-    count_by_state = await _validate_v4_tax_group_rows(
-        session,
-        schema=schema,
-        group_dictionary_stage=group_dictionary_stage,
-        group_tax_identity_stage=group_tax_identity_stage,
-        contract=contract,
-        content_digest=content_digest,
-        progress_callback=progress_callback,
-        heartbeat_callback=heartbeat_callback,
-    )
-    expected_counts = (
-        contract.provider_group_count,
-        contract.matched_ein_count,
-        contract.missing_count,
-        contract.malformed_count,
-        contract.unsupported_type_count,
-        contract.tax_identity_count,
-    )
-    observed_counts = (
-        count_by_state["provider_group_count"],
-        count_by_state["matched_ein"],
-        count_by_state["missing"],
-        count_by_state["malformed"],
-        count_by_state["unsupported_type"],
-        count_by_state["referenced_tax_identity_count"],
-    )
-    if observed_counts != expected_counts or not hmac.compare_digest(
-        content_digest.digest(),
-        contract.content_digest,
-    ):
+    async for digest_row in await session.stream(db.text(f"""SELECT provider_group_global_id_128,
+        tax_identity_state,tin_key,source_bitmap FROM {groups} ORDER BY provider_group_global_id_128""")):
+        _append_v4_tax_group_digest(content_digest, group_id=bytes(digest_row[0]), tax_state=digest_row[1],
+            tin_key=digest_row[2], source_bitmap=bytes(digest_row[3]))
+    if not hmac.compare_digest(content_digest.digest(), contract.content_digest):
         raise RuntimeError("PTG V4 tax identity content digest changed")
 
 
@@ -3330,182 +3082,6 @@ async def _publish_v4_tax_identity_manifest(
     }
 
 
-async def _v4_tax_group_batch_boundary(
-    session: Any,
-    *,
-    schema: str,
-    stage: str,
-    previous_group_id: bytes,
-    batch_rows: int,
-    heartbeat_callback: Callable[[], None] | None,
-) -> tuple[int, bytes | None, float]:
-    """Return one bounded group batch count and inclusive upper key."""
-
-    batch_result, elapsed_seconds = await _await_v4_dictionary_statement(
-        session.execute(
-            db.text(
-                f"""
-                SELECT COUNT(*)::bigint,
-                       MAX(provider_group_global_id_128)
-                  FROM (
-                        SELECT provider_group_global_id_128
-                          FROM {schema}.{stage}
-                         WHERE provider_group_global_id_128 >
-                               :previous_group_id
-                         ORDER BY provider_group_global_id_128
-                         LIMIT :batch_rows
-                       ) AS batch
-                """
-            ),
-            {
-                "previous_group_id": previous_group_id,
-                "batch_rows": int(batch_rows),
-            },
-        ),
-        heartbeat_callback=heartbeat_callback,
-    )
-    batch_count, raw_last_group_id = batch_result.one()
-    return (
-        int(batch_count),
-        None if raw_last_group_id is None else bytes(raw_last_group_id),
-        elapsed_seconds,
-    )
-
-
-async def _publish_v4_tax_group_batch(
-    session: Any,
-    *,
-    schema: str,
-    stage: str,
-    parameters_by_name: Mapping[str, Any],
-    heartbeat_callback: Callable[[], None] | None,
-) -> tuple[int, float]:
-    """Insert one group batch and return its exact replay match count."""
-
-    _, insert_seconds = await _await_v4_dictionary_statement(
-        session.execute(
-            db.text(
-                f"""
-                INSERT INTO {schema}.ptg2_provider_group_tax_identity
-                    (snapshot_key, provider_group_global_id_128,
-                     tax_identity_state, tin_key, source_bitmap)
-                SELECT :snapshot_key, provider_group_global_id_128,
-                       tax_identity_state, tin_key, source_bitmap
-                  FROM {schema}.{stage}
-                 WHERE provider_group_global_id_128 > :previous_group_id
-                   AND provider_group_global_id_128 <= :last_group_id
-                 ORDER BY provider_group_global_id_128
-                ON CONFLICT DO NOTHING
-                """
-            ),
-            parameters_by_name,
-        ),
-        heartbeat_callback=heartbeat_callback,
-    )
-    matching_count, verification_seconds = await _await_v4_dictionary_statement(
-        session.scalar(
-            db.text(
-                f"""
-                    SELECT COUNT(*)::bigint
-                      FROM {schema}.{stage} AS staged
-                      JOIN {schema}.ptg2_provider_group_tax_identity AS stored
-                        ON stored.snapshot_key = :snapshot_key
-                       AND stored.provider_group_global_id_128 =
-                           staged.provider_group_global_id_128
-                       AND stored.tax_identity_state = staged.tax_identity_state
-                       AND stored.tin_key IS NOT DISTINCT FROM staged.tin_key
-                       AND stored.source_bitmap = staged.source_bitmap
-                     WHERE staged.provider_group_global_id_128 > :previous_group_id
-                       AND staged.provider_group_global_id_128 <= :last_group_id
-                    """
-            ),
-            parameters_by_name,
-        ),
-        heartbeat_callback=heartbeat_callback,
-    )
-    return (
-        int(matching_count or 0),
-        max(insert_seconds, verification_seconds),
-    )
-
-
-async def _reject_tax_group_count(
-    session: Any,
-    *,
-    schema: str,
-    snapshot_key: int,
-    expected_count: int,
-    published_count: int,
-    estimated_row_bytes: int,
-    heartbeat_callback: Callable[[], None] | None,
-) -> None:
-    """Reject missing or extra sidecars through adaptive key enumeration."""
-
-    target_count = await _count_v4_target_keys(
-        session,
-        schema=schema,
-        target_table="ptg2_provider_group_tax_identity",
-        key_name="provider_group_global_id_128",
-        snapshot_key=int(snapshot_key),
-        initial_key=b"",
-        estimated_row_bytes=estimated_row_bytes,
-        heartbeat_callback=heartbeat_callback,
-    )
-    if int(published_count) != int(expected_count) or int(target_count or 0) != int(
-        expected_count
-    ):
-        raise RuntimeError("PTG V4 persisted provider-group tax identity changed")
-
-
-async def _publish_tax_group_ranges(
-    session: Any,
-    *,
-    schema: str,
-    snapshot_key: int,
-    stage: str,
-    sizer: _V4DictionaryBatchSizer,
-    progress_callback: Callable[[str, int], None] | None,
-    heartbeat_callback: Callable[[], None] | None,
-) -> int:
-    """Publish every ordered provider-group tax batch and return its row count."""
-
-    previous_group_id = b""
-    published_count = 0
-    while True:
-        batch_count, last_group_id, boundary_seconds = (
-            await _v4_tax_group_batch_boundary(
-                session,
-                schema=schema,
-                stage=stage,
-                previous_group_id=previous_group_id,
-                batch_rows=sizer.current_rows,
-                heartbeat_callback=heartbeat_callback,
-            )
-        )
-        if batch_count == 0 or last_group_id is None:
-            return published_count
-        parameters_by_name = {
-            "snapshot_key": int(snapshot_key),
-            "previous_group_id": previous_group_id,
-            "last_group_id": last_group_id,
-        }
-        matching_count, publication_seconds = await _publish_v4_tax_group_batch(
-            session,
-            schema=schema,
-            stage=stage,
-            parameters_by_name=parameters_by_name,
-            heartbeat_callback=heartbeat_callback,
-        )
-        if matching_count != batch_count:
-            raise RuntimeError("PTG V4 persisted provider-group tax identity changed")
-        published_count += batch_count
-        previous_group_id = last_group_id
-        if progress_callback is not None:
-            progress_callback("published_dictionary_rows", batch_count)
-            progress_callback("publish_batches", 1)
-        sizer.observe(max(boundary_seconds, publication_seconds))
-
-
 async def _publish_v4_tax_group_ranges(
     session: Any,
     *,
@@ -3514,37 +3090,21 @@ async def _publish_v4_tax_group_ranges(
     stage_table: str,
     expected_count: int,
     progress_callback: Callable[[str, int], None] | None,
-    source_bitmap_bytes: int = 0,
+    build_token: str,
     heartbeat_callback: Callable[[], None] | None = None,
 ) -> None:
-    """Publish fixed-width group sidecars through bounded byte-key ranges."""
-
-    stage = _quote_ident(stage_table)
-    sizer = _V4DictionaryBatchSizer(
-        estimated_row_bytes=(
-            _V4_DICTIONARY_ESTIMATED_ROW_BYTES + max(int(source_bitmap_bytes), 0)
-        ),
-    )
-    published_count = await _publish_tax_group_ranges(
-        session,
-        schema=schema,
-        snapshot_key=snapshot_key,
-        stage=stage,
-        sizer=sizer,
-        progress_callback=progress_callback,
-        heartbeat_callback=heartbeat_callback,
-    )
-    await _reject_tax_group_count(
-        session,
-        schema=schema,
-        snapshot_key=snapshot_key,
+    """Attach a complete indexed provider-group candidate in the caller transaction."""
+    if not build_token:
+        raise RuntimeError("PTG tax candidate requires its build token")
+    await _await_v4_dictionary_statement(copy_snapshot_candidate(
+        session, schema_name=schema[1:-1].replace('""', '"'),
+        table="ptg2_provider_group_tax_identity", snapshot_key=snapshot_key,
+        build_token=build_token, stage_table=stage_table,
+        columns=("provider_group_global_id_128", "tax_identity_state", "tin_key", "source_bitmap"),
         expected_count=expected_count,
-        published_count=published_count,
-        estimated_row_bytes=(
-            _V4_DICTIONARY_ESTIMATED_ROW_BYTES + max(int(source_bitmap_bytes), 0)
-        ),
-        heartbeat_callback=heartbeat_callback,
-    )
+    ), heartbeat_callback=heartbeat_callback)
+    if progress_callback is not None:
+        progress_callback("published_dictionary_rows", expected_count)
 
 
 @dataclass(frozen=True)
@@ -4396,6 +3956,7 @@ async def _publish_v4_dictionaries_and_maps(
                     stage=dictionary_stage,
                     progress_callback=progress_callback,
                     heartbeat_callback=heartbeat_callback,
+                    build_token=build_token,
                 )
             await _publish_v4_dictionary_stage_ranges(
                 session,
@@ -4404,6 +3965,7 @@ async def _publish_v4_dictionaries_and_maps(
                 stage=tax_dictionary_stage,
                 progress_callback=progress_callback,
                 heartbeat_callback=heartbeat_callback,
+                build_token=build_token,
             )
             await _publish_v4_tax_group_ranges(
                 session,
@@ -4412,8 +3974,8 @@ async def _publish_v4_dictionaries_and_maps(
                 stage_table=group_tax_identity_stage,
                 expected_count=tax_identity_contract.provider_group_count,
                 progress_callback=progress_callback,
-                source_bitmap_bytes=tax_identity_contract.source_bitmap_bytes,
                 heartbeat_callback=heartbeat_callback,
+                build_token=build_token,
             )
             diagnostic_parameters_by_name = {
                 "snapshot_key": int(snapshot_key),
@@ -4705,9 +4267,6 @@ async def _publish_v4_dictionaries_and_maps(
                 ),
             )
 
-            # Candidate keys are snapshot-local NPI coordinates. Publish this
-            # immutable sidecar only after the dense dictionary and complete
-            # authenticated building graph are available in this transaction.
             taxonomy_publication = (
                 await publish_prepared_v4_inferred_taxonomy_candidates(
                     session,
@@ -4727,20 +4286,21 @@ async def _publish_v4_dictionaries_and_maps(
                     + int(taxonomy_publication.observe_only_rule_count),
                 )
                 progress_callback("publish_batches", 1)
-            tax_identity_source_publication = (
-                await publish_staged_tax_identity_source_projection(
-                    session,
-                    schema_name=schema_name,
-                    logical_snapshot_id=publication_context.logical_snapshot_id,
-                    snapshot_key=int(snapshot_key),
-                    staged=tax_identity_source_stage,
-                    prepared=prepared_tax_identity_source,
-                    heartbeat_callback=heartbeat_callback,
+            async with snapshot_candidate_reads(session, schema_name, int(snapshot_key), build_token):
+                tax_identity_source_publication = (
+                    (await _await_v4_dictionary_statement(publish_staged_tax_identity_source_projection(
+                        session,
+                        schema_name=schema_name,
+                        logical_snapshot_id=publication_context.logical_snapshot_id,
+                        snapshot_key=int(snapshot_key),
+                        staged=tax_identity_source_stage,
+                        prepared=prepared_tax_identity_source,
+                        heartbeat_callback=heartbeat_callback,
+                    ), heartbeat_callback=heartbeat_callback))[0]
+                    if prepared_tax_identity_source is not None
+                    and tax_identity_source_stage is not None
+                    else None
                 )
-                if prepared_tax_identity_source is not None
-                and tax_identity_source_stage is not None
-                else None
-            )
             pin_lease.require_live()
             deleted_pin_count = await delete_shared_block_build_pins(
                 session,
@@ -4753,6 +4313,7 @@ async def _publish_v4_dictionaries_and_maps(
             pin_lease = None
             if deleted_pin_count != cas_publication.unique_block_count:
                 raise RuntimeError("PTG V4 block pin set changed before map attach")
+            await attach_snapshot_candidates(session, schema_name, int(snapshot_key), build_token)
             return (
                 cas_publication,
                 map_summary,

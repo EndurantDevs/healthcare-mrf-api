@@ -65,13 +65,22 @@ MRF_CONTEXT_QUERY_TEMPLATES = (
         """,
     ),
     (
+        "plan_pin_records",
+        """
+        SELECT 'plan_release_serving_revision'::text AS owner_type,
+               serving_revision_id AS owner_id, snapshot_id, reason
+          FROM __SCHEMA__.plan_release_snapshot_pin
+         WHERE snapshot_id = :predecessor_snapshot_id
+         ORDER BY serving_revision_id
+        """,
+    ),
+    (
         "release_binding_records",
         """
         SELECT serving_revision_id, role, binding_ordinal
           FROM __SCHEMA__.plan_release_snapshot_binding
          WHERE snapshot_id = :predecessor_snapshot_id
          ORDER BY serving_revision_id, role, binding_ordinal
-         FOR UPDATE
         """,
     ),
 )
@@ -142,8 +151,10 @@ POSTCHECK_TEMPLATE = """
           WHERE snapshot_id = :predecessor_snapshot_id
              OR previous_snapshot_id = :predecessor_snapshot_id)
             AS plan_references,
-        (SELECT COUNT(*) FROM __SCHEMA__.ptg2_snapshot_pin
+        ((SELECT COUNT(*) FROM __SCHEMA__.ptg2_snapshot_pin
           WHERE snapshot_id = :predecessor_snapshot_id)
+         + (SELECT COUNT(*) FROM __SCHEMA__.plan_release_snapshot_pin
+          WHERE snapshot_id = :predecessor_snapshot_id))
             AS pin_references,
         (SELECT COUNT(*) FROM __SCHEMA__.plan_release_snapshot_binding
           WHERE snapshot_id = :predecessor_snapshot_id)

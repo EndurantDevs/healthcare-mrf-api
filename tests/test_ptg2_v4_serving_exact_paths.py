@@ -34,14 +34,17 @@ async def test_v4_projection_direct_empty_and_budget_guards(monkeypatch) -> None
     )
     monkeypatch.setattr(serving, "lookup_v4_relation_members", direct_lookup)
 
-    assert await serving._v4_members_through_projection(
-        object(),
-        _tables(),
-        owner_keys=(),
-        direct_relation="group_sets_direct",
-        projection_relation="group_patterns",
-        projected_member_relation="pattern_sets",
-    ) == {}
+    assert (
+        await serving._v4_members_through_projection(
+            object(),
+            _tables(),
+            owner_keys=(),
+            direct_relation="group_sets_direct",
+            projection_relation="group_patterns",
+            projected_member_relation="pattern_sets",
+        )
+        == {}
+    )
     assert await serving._v4_members_through_projection(
         object(),
         _tables(),
@@ -279,9 +282,9 @@ async def test_v4_factored_group_set_directions(
         AsyncMock(return_value={member_key: expected_member}),
     )
 
-    assert await serving._v4_shared_graph_members_many(
-        object(), _tables(), name, [owner_id], max_members=1
-    ) == {owner_id: (expected_member,)}
+    assert await serving._v4_shared_graph_members_many(object(), _tables(), name, [owner_id], max_members=1) == {
+        owner_id: (expected_member,)
+    }
     if name == "provider_inverted":
         assert projection.await_args.kwargs["projection_relation"] == "group_patterns"
     else:
@@ -305,18 +308,12 @@ async def test_v4_factored_directions_enforce_support_and_total_budget(monkeypat
     monkeypatch.setattr(serving, "_shared_provider_group_ids_for_keys", dictionary)
 
     with pytest.raises(serving.PTG2ManifestArtifactError, match="missing support"):
-        await serving._v4_shared_graph_members_many(
-            object(), _tables(), "provider_forward", [owner_id], max_members=2
-        )
+        await serving._v4_shared_graph_members_many(object(), _tables(), "provider_forward", [owner_id], max_members=2)
     dictionary.return_value = {7: "99" * 16, 8: "aa" * 16}
     with pytest.raises(serving.PTG2ManifestArtifactError, match="exceeds max_members"):
-        await serving._v4_shared_graph_members_many(
-            object(), _tables(), "provider_forward", [owner_id], max_members=1
-        )
+        await serving._v4_shared_graph_members_many(object(), _tables(), "provider_forward", [owner_id], max_members=1)
     with pytest.raises(serving.PTG2ManifestArtifactError, match="unsupported PTG V4"):
-        await serving._v4_shared_graph_members_many(
-            object(), _tables(), "unknown", [owner_id], max_members=None
-        )
+        await serving._v4_shared_graph_members_many(object(), _tables(), "unknown", [owner_id], max_members=None)
 
 
 @pytest.mark.asyncio
@@ -327,9 +324,7 @@ async def test_v4_set_keys_resolve_group_ids_without_flat_storage(monkeypatch) -
     monkeypatch.setattr(serving, "_shared_provider_group_ids_for_keys", dictionary)
 
     assert await serving._shared_group_ids_for_set_keys(object(), _tables(), ()) == ()
-    assert await serving._shared_group_ids_for_set_keys(
-        object(), _tables(), (4, 3, 4)
-    ) == ("bb" * 16, "cc" * 16)
+    assert await serving._shared_group_ids_for_set_keys(object(), _tables(), (4, 3, 4)) == ("bb" * 16, "cc" * 16)
     assert projection.await_args.kwargs["projection_relation"] == "set_patterns"
 
     dictionary.return_value = {7: "bb" * 16}
@@ -355,9 +350,7 @@ async def test_shared_graph_dispatches_v4_and_rejects_unknown_name(monkeypatch) 
         source_count=1,
     )
     with pytest.raises(serving.PTG2ManifestArtifactError, match="unsupported PTG2"):
-        await serving._shared_graph_members_many(
-            object(), v3_tables, "unknown", ["owner"], max_members=None
-        )
+        await serving._shared_graph_members_many(object(), v3_tables, "unknown", ["owner"], max_members=None)
 
 
 def test_shared_rate_scope_rejects_malformed_group_id() -> None:
@@ -369,15 +362,17 @@ def test_shared_rate_scope_rejects_malformed_group_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_knn_planner_settings_are_applied_and_restored() -> None:
+@pytest.mark.parametrize("jit", ["on", "off"])
+@pytest.mark.parametrize("plan_cache_mode", ["auto", "force_custom_plan"])
+async def test_knn_planner_settings_are_applied_and_restored(jit, plan_cache_mode) -> None:
     session = FakeSession(
         [
             FakeResult(
                 [
                     {
-                        "plan_cache_mode": "auto",
+                        "plan_cache_mode": plan_cache_mode,
                         "parallel_workers": "2",
-                        "jit": "on",
+                        "jit": jit,
                     }
                 ]
             ),
@@ -385,13 +380,13 @@ async def test_knn_planner_settings_are_applied_and_restored() -> None:
         ]
     )
     prior_settings = await serving._enable_serial_knn_planning(session)
-    assert prior_settings == ("auto", "2", "on")
+    assert prior_settings == (plan_cache_mode, "2", jit)
     await serving._restore_knn_planning(session, prior_settings)
     assert len(session.calls) == 2
     assert session.calls[1][0][1] == {
-        "plan_cache_mode": "auto",
+        "plan_cache_mode": plan_cache_mode,
         "parallel_workers": "2",
-        "jit": "on",
+        "jit": jit,
     }
 
 
@@ -406,12 +401,8 @@ async def test_project_graph_candidates_enriches_and_validates_dictionary(
         ],
         {11: {3, 4}, 12: {4}},
     )
-    provider_set_dictionary = AsyncMock(
-        return_value={3: "31" * 16, 4: "41" * 16}
-    )
-    monkeypatch.setattr(
-        serving, "_provider_set_ids_for_keys", provider_set_dictionary
-    )
+    provider_set_dictionary = AsyncMock(return_value={3: "31" * 16, 4: "41" * 16})
+    monkeypatch.setattr(serving, "_provider_set_ids_for_keys", provider_set_dictionary)
     monkeypatch.setattr(
         serving,
         "_enriched_provider_rows_for_npis",
@@ -432,10 +423,7 @@ async def test_project_graph_candidates_enriches_and_validates_dictionary(
         source_key=None,
     )
     assert provider_set_ids == {"31" * 16, "41" * 16}
-    assert [
-        provider_record["npi"]
-        for provider_record in providers_by_set["41" * 16]
-    ] == [11, 12]
+    assert [provider_record["npi"] for provider_record in providers_by_set["41" * 16]] == [11, 12]
     assert providers_by_set["31" * 16][0]["provider_name"] == "Eleven"
 
     provider_set_dictionary.return_value = {3: "31" * 16}
@@ -460,9 +448,7 @@ async def test_v4_explicit_npi_scope_handles_unscoped_and_scoped_requests(
         object(), _tables(), {"npi": "1234567890"}
     ) == serving._ExplicitNpiGraphScope(1234567890, (3, 5))
     assert graph_lookup.await_args.kwargs["allowed_provider_set_keys"] is None
-    rate_scope = AsyncMock(
-        side_effect=AssertionError("graph scope must not scan code rows")
-    )
+    rate_scope = AsyncMock(side_effect=AssertionError("graph scope must not scan code rows"))
     monkeypatch.setattr(serving, "_shared_rate_provider_set_keys", rate_scope)
     monkeypatch.setattr(
         serving,
@@ -489,11 +475,7 @@ async def test_v4_provider_sets_from_membership_graph_are_dictionary_backed(
     monkeypatch.setattr(serving, "_v4_sets_by_npi", graph_lookup)
     monkeypatch.setattr(serving, "_provider_set_ids_for_keys", dictionary)
 
-    assert await serving._provider_sets_from_membership_graph(
-        object(), _tables(), 1234567890
-    ) == ("31" * 16, "51" * 16)
+    assert await serving._provider_sets_from_membership_graph(object(), _tables(), 1234567890) == ("31" * 16, "51" * 16)
     dictionary.return_value = {3: "31" * 16}
     with pytest.raises(serving.PTG2ManifestArtifactError, match="missing provider-set"):
-        await serving._provider_sets_from_membership_graph(
-            object(), _tables(), 1234567890
-        )
+        await serving._provider_sets_from_membership_graph(object(), _tables(), 1234567890)

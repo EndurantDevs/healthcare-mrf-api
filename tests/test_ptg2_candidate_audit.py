@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sanic.exceptions import Forbidden
@@ -80,19 +81,14 @@ def test_candidate_audit_access_is_exact_and_user_scalars_are_ignored(monkeypatc
                 "plan_id": "12-3456789",
             },
         )
-    assert (
-        candidate_audit_access_from_args(
-            {PTG2_CANDIDATE_AUDIT_ACCESS_ARG: "candidate-snapshot"}
-        )
-        is None
-    )
+    assert candidate_audit_access_from_args({PTG2_CANDIDATE_AUDIT_ACCESS_ARG: "candidate-snapshot"}) is None
 
 
 @pytest.mark.asyncio
 async def test_candidate_snapshot_resolution_requires_matching_request_capability():
     class Result:
-        def scalar(self):
-            return "candidate-snapshot"
+        def one_or_none(self):
+            return "candidate-snapshot", False
 
     class Session:
         def __init__(self):
@@ -137,8 +133,8 @@ async def test_candidate_snapshot_resolution_requires_matching_request_capabilit
 @pytest.mark.asyncio
 async def test_published_snapshot_resolution_accepts_supported_attestation_contracts():
     class Result:
-        def scalar(self):
-            return "published-snapshot"
+        def one_or_none(self):
+            return "published-snapshot", False
 
     class Session:
         def __init__(self):
@@ -157,10 +153,44 @@ async def test_published_snapshot_resolution_accepts_supported_attestation_contr
 
     assert resolved == "published-snapshot"
     sql, _params = session.calls[0]
-    for supported_contract in (
-        ptg2_snapshot.PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
-    ):
+    for supported_contract in ptg2_snapshot.PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS:
         assert sql.count(f"'{supported_contract}'") == 2
+
+
+@pytest.mark.asyncio
+async def test_local_candidate_selector_preserves_exact_audit_capability(monkeypatch):
+    class Result:
+        def one_or_none(self):
+            return "candidate-snapshot", True
+
+    class Session:
+        async def execute(self, statement, params):
+            assert "status = 'validated'" in str(statement)
+            assert params["candidate_source_key"] == "source-a"
+            return Result()
+
+    session = Session()
+    access = _candidate_access()
+    resolver = AsyncMock(
+        return_value=SimpleNamespace(
+            snapshot_id="candidate-snapshot",
+            physical_binding=object(),
+        )
+    )
+    monkeypatch.setattr(ptg2_snapshot, "snapshot_serving_tables", resolver)
+
+    assert (
+        await ptg2_snapshot.current_snapshot_id(
+            session,
+            requested_snapshot_id="candidate-snapshot",
+            requested_source_key="source-a",
+            requested_plan_id="12-3456789",
+            requested_plan_market_type="group",
+            candidate_audit_access=access,
+        )
+        == "candidate-snapshot"
+    )
+    resolver.assert_awaited_once_with(session, "candidate-snapshot", candidate_audit_access=access)
 
 
 @pytest.mark.asyncio

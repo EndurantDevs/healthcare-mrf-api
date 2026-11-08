@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
+from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -28,6 +30,117 @@ from process.custom_import.publication import (
 )
 
 
+def test_verification_counts_refuse_boolean_population_before_reading_evidence():
+    with pytest.raises(PublicationConflict, match="invalid verification population"):
+        publication._validate_verification_counts({}, (True, 0, 0, 0))
+
+
+def test_publication_receipt_refuses_missing_persisted_material():
+    with pytest.raises(PublicationConflict, match="receipt is not canonical"):
+        publication.verify_publication_event_material(SimpleNamespace())
+
+
+async def test_finality_binding_refuses_an_unbound_control_schema_before_sql():
+    model_schema = custom_import_models.CustomImportGeneration.__table__.schema
+    session = SimpleNamespace(
+        in_transaction=lambda: True,
+        connection=AsyncMock(
+            return_value=SimpleNamespace(
+                sync_connection=SimpleNamespace(
+                    get_execution_options=lambda: {"schema_translate_map": {model_schema: None}}
+                )
+            )
+        ),
+        execute=AsyncMock(),
+    )
+    with pytest.raises(PublicationConflict, match="explicit model schema"):
+        await publication._finality_materialization_models(session, object())
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize("damage", ["unavailable", "different"])
+def test_seal_replay_refuses_unavailable_or_different_query_projection_evidence(damage):
+    generation, materialization, seal, _token = _generation_seal_fixtures()
+    if damage == "unavailable":
+        seal.query_projection_contract = "unknown-contract"
+    else:
+        materialization = replace(materialization, query_projection_evidence=object())
+    with pytest.raises(PublicationConflict, match="projection"):
+        publication._validate_generation_seal(seal, generation, materialization)
+
+
+async def test_projection_finality_failure_preserves_publication_error_contract(monkeypatch):
+    from process.custom_import import query_projection_finality, read_identity
+    from process.custom_import.query_projection_binding import (
+        QueryProjectionUnavailable,
+    )
+
+    failure = QueryProjectionUnavailable("synthetic projection unavailable")
+    monkeypatch.setattr(read_identity, "verify_generation_storage", AsyncMock())
+    monkeypatch.setattr(query_projection_finality, "validate_sealed_projection", AsyncMock(side_effect=failure))
+    with pytest.raises(PublicationConflict, match="synthetic projection unavailable") as caught:
+        await publication._validate_sealed_projection(object(), object(), object())
+    assert caught.value.__cause__ is failure
+
+
+async def test_family_materialization_refuses_a_missing_declared_child(monkeypatch):
+    from tests.test_custom_import_build_graph import _request
+    from tests.test_custom_import_build_output import _generation
+    from tests.test_custom_import_output_bulk_verification import _family
+
+    request = _request()
+    family, _children = _family(request, 1, ({"rate_npi": "0000000001", "service_code": "S", "amount": Decimal("1")},))
+    windows = iter([(family[:5],), ()])
+
+    async def records(*_args, **_kwargs):
+        for row in next(windows):
+            yield row
+
+    monkeypatch.setattr(publication, "_stream_materialization_records", records)
+    with pytest.raises(PublicationConflict, match="child count does not match exact membership"):
+        await publication._add_family_material(object(), publication._new_digest("test"), _generation(request))
+
+
+@pytest.mark.parametrize("caller_timeout", ["0", "1s", "250ms"])
+async def test_reserved_finality_timeout_binds_postgres_setting_as_text(monkeypatch, caller_timeout):
+    """The async driver must not try to encode a setting string as an interval."""
+
+    session = SimpleNamespace(info={}, execute=AsyncMock())
+    session.info[publication._FINALITY_SCAN_WINDOW_KEY] = publication._FinalityScanWindow(
+        expires_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        monotonic_deadline=20,
+        statement_timeout=caller_timeout,
+    )
+    monkeypatch.setattr(publication.time, "monotonic", lambda: 10)
+    await publication._prepare_bounded_materialization_statement(session, reserve_for_authority=True)
+    statement, parameters = session.execute.await_args.args
+    assert parameters == {"remaining_milliseconds": 5000, "caller_timeout": caller_timeout}
+    assert "CAST(CAST(:caller_timeout AS text) AS interval)" in str(statement)
+    assert "least(:remaining_milliseconds," in str(statement)
+
+
+@pytest.mark.parametrize("sealed", (False, True))
+def test_materialization_resolver_separates_live_finality_from_sealed_reads(sealed):
+    generation = SimpleNamespace(
+        generation_id=1,
+        dataset_id=2,
+        definition_revision_id=3,
+        schema_revision_id=4,
+        execution_id=5,
+        capture_bundle_id=6,
+        producing_fence=7,
+        producing_token_sha256=b"t" * 32,
+    )
+    resolver, parameters = publication._materialization_resolver(generation, sealed)
+    assert tuple(parameters.values())[:4] == (1, 2, 3, 4)
+    if sealed:
+        assert resolver == "resolve_custom_import_generation_snapshot"
+        assert len(parameters) == 4
+    else:
+        assert resolver == "resolve_custom_import_generation_finality_snapshot"
+        assert tuple(parameters.values())[4:] == (5, 6, 7, b"t" * 32)
+
+
 @pytest.mark.parametrize(
     ("revision", "source_ordinal"),
     (
@@ -45,6 +158,111 @@ def test_effective_output_revision_document_omits_only_source_position(revision,
     assert effective_output_document == {
         key: value for key, value in materialization_document.items() if key != "source_ordinal"
     }
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    (
+        (
+            custom_import_models.CustomImportCaptureBundle(
+                canonical_manifest='{"source":"synthetic"}', manifest_sha256=b"m" * 32, stream_count=2
+            ),
+            {"canonical_manifest": '{"source":"synthetic"}', "manifest_sha256": (b"m" * 32).hex(), "stream_count": 2},
+        ),
+        (
+            custom_import_models.CustomImportCapture(
+                stream_slot=1,
+                content_sha256=b"c" * 32,
+                byte_count=17,
+                canonical_manifest='{"stream":"synthetic"}',
+                manifest_sha256=b"m" * 32,
+                payload_contract="custom-import/parquet-parts/v1",
+                payload_part_count=1,
+                payload_set_sha256=b"p" * 32,
+            ),
+            {
+                "stream_slot": 1,
+                "content_sha256": (b"c" * 32).hex(),
+                "byte_count": 17,
+                "canonical_manifest": '{"stream":"synthetic"}',
+                "manifest_sha256": (b"m" * 32).hex(),
+                "payload_contract": "custom-import/parquet-parts/v1",
+                "payload_part_count": 1,
+                "payload_set_sha256": (b"p" * 32).hex(),
+            },
+        ),
+    ),
+    ids=("bundle", "stream"),
+)
+def test_capture_materialization_projection_preserves_retained_v1_bytes(model, expected, monkeypatch):
+    """Ignore added lifecycle columns without omitting any retained capture evidence."""
+
+    assert _materialization_document(model) == expected
+    monkeypatch.setattr(
+        type(model),
+        "__table__",
+        SimpleNamespace(columns=(*model.__table__.columns, SimpleNamespace(name="capture_lifecycle"))),
+    )
+    model.capture_lifecycle = "synthetic-new-lifecycle"
+    assert _materialization_document(model) == expected
+    old_digest = publication._new_digest("generation-materialization/v1")
+    new_digest = publication._new_digest("generation-materialization/v1")
+    publication._add_digest_record(old_digest, "capture", expected)
+    publication._add_digest_record(new_digest, "capture", _materialization_document(model))
+    assert new_digest.digest() == old_digest.digest()
+    model.manifest_sha256 = b"x" * 32
+    assert _materialization_document(model) != expected
+
+
+def test_digest_fanout_serializes_once_and_shares_framed_parts(monkeypatch):
+    document_by_field = {"z": None, "a": 'café\n"\\'}
+    serialized = b'{"a":"caf\xc3\xa9\\n\\"\\\\","z":null}'
+    expected_parts = (b"root_scalar", b"\x00", len(serialized).to_bytes(8, "big"), serialized)
+    digests = (Mock(), Mock())
+    serialize = Mock(wraps=publication.json.dumps)
+    monkeypatch.setattr(publication.json, "dumps", serialize)
+
+    publication._add_digest_record_to_all(digests, "root_scalar", document_by_field)
+
+    serialize.assert_called_once_with(
+        document_by_field, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+    for digest in digests:
+        assert tuple(call.args[0] for call in digest.update.call_args_list) == expected_parts
+    assert all(
+        first.args[0] is second.args[0]
+        for first, second in zip(digests[0].update.call_args_list, digests[1].update.call_args_list, strict=True)
+    )
+
+
+def test_digest_fanout_preserves_single_record_and_domain_bytes():
+    domains = ("generation-materialization/v1", "generation-effective-output/v1")
+    digests = tuple(publication._new_digest(domain) for domain in domains)
+    body = b'{"value":"12.000000000000"}'
+    frame = b"child_scalar\x00" + len(body).to_bytes(8, "big") + body
+    publication._add_digest_record_to_all(digests, "child_scalar", {"value": "12.000000000000"})
+    for digest, domain in zip(digests, domains, strict=True):
+        expected = hashlib.sha256(b"custom-import/v1\x00" + domain.encode("ascii") + b"\x00" + frame)
+        singleton = publication._new_digest(domain)
+        publication._add_digest_record(singleton, "child_scalar", {"value": "12.000000000000"})
+        assert digest.digest() == singleton.digest() == expected.digest()
+    assert digests[0].digest() != digests[1].digest()
+
+
+@pytest.mark.parametrize(
+    ("section", "document", "error"),
+    [
+        ("scalar", {"value": float("nan")}, ValueError),
+        ("scalar", {"value": object()}, TypeError),
+        ("é", {}, UnicodeError),
+    ],
+)
+def test_digest_encoding_failure_leaves_all_states_unchanged(section, document, error):
+    digests = (Mock(), Mock())
+    with pytest.raises(error):
+        publication._add_digest_record_to_all(digests, section, document)
+    for digest in digests:
+        digest.update.assert_not_called()
 
 
 def test_publication_event_is_canonical_and_domain_separated():
@@ -354,6 +572,49 @@ def test_expected_pointer_and_scalar_materialization_validation():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("capture_state", ("pending", None))
+async def test_capture_identity_loader_rejects_unsealed_bundle(capture_state):
+    bundle = custom_import_models.CustomImportCaptureBundle(capture_state=capture_state)
+    with pytest.raises(PublicationConflict, match="not sealed"):
+        await publication._capture_bundle_for_identity(
+            _ExecuteSession(_Result(bundle)),
+            capture_bundle_id=1,
+            dataset_id=2,
+            definition_revision_id=3,
+            schema_revision_id=4,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload_contract", (None, "custom-import/parquet-parts/v2"))
+async def test_capture_identity_loader_accepts_sealed_contracts(payload_contract):
+    bundle = custom_import_models.CustomImportCaptureBundle(capture_state="sealed", payload_contract=payload_contract)
+    assert (
+        await publication._capture_bundle_for_identity(
+            _ExecuteSession(_Result(bundle)),
+            capture_bundle_id=1,
+            dataset_id=2,
+            definition_revision_id=3,
+            schema_revision_id=4,
+        )
+        is bundle
+    )
+
+
+@pytest.mark.asyncio
+async def test_generation_identity_rejects_pending_capture_before_hashing():
+    bundle = custom_import_models.CustomImportCaptureBundle(capture_state="pending")
+    generation = SimpleNamespace(capture_bundle_id=1, dataset_id=2, definition_revision_id=3, schema_revision_id=4)
+    session = _ExecuteSession(_Result(bundle))
+    session.get = AsyncMock(return_value=SimpleNamespace(dataset_id=2))
+    digest = publication._new_digest("test-domain")
+    original_digest = digest.digest()
+    with pytest.raises(PublicationConflict, match="not sealed"):
+        await publication._add_generation_identity_material(session, digest, generation)
+    assert digest.digest() == original_digest
+
+
+@pytest.mark.asyncio
 async def test_materialization_identity_loaders_reject_missing_or_mismatched_sources(monkeypatch):
     missing = _ExecuteSession(_Result())
     with pytest.raises(PublicationConflict, match="immutable execution identity"):
@@ -422,6 +683,11 @@ def _generation_seal_fixtures():
     )
     seal = SimpleNamespace(
         seal_contract=publication._GENERATION_SEAL_CONTRACT,
+        query_projection_contract=None,
+        query_projection_capability_sha256=None,
+        query_projection_sha256=None,
+        query_projection_root_count=None,
+        query_projection_child_count=None,
         generation_id=9,
         dataset_id=1,
         definition_revision_id=2,
@@ -673,20 +939,37 @@ def test_no_change_candidate_must_belong_to_the_running_execution():
 
 
 @pytest.mark.asyncio
+async def test_no_change_rejects_stale_producer_before_materialization(monkeypatch):
+    request, execution, _base, candidate, *_rest = _no_change_fixtures()
+    candidate.producing_fence = request.lease_fence - 1
+    candidate.producing_token_sha256 = request.token_sha256
+    materialization = AsyncMock()
+    monkeypatch.setattr(publication, "_locked_generation_seal", AsyncMock(return_value=None))
+    monkeypatch.setattr(publication, "_materialization", materialization)
+
+    with pytest.raises(PublicationConflict, match="generation producing authority is stale"):
+        await publication._seal_no_change_candidate(SimpleNamespace(), request, execution, SimpleNamespace(), candidate)
+    materialization.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_existing_no_change_candidate_seal_requires_exact_authority(monkeypatch):
     request, execution, _base, candidate, _base_seal, _candidate_seal, seal = _no_change_fixtures()
     seal.sealing_fence = request.lease_fence
     seal.sealing_token_sha256 = request.token_sha256
     monkeypatch.setattr(publication, "_locked_generation_seal", AsyncMock(return_value=seal))
     monkeypatch.setattr(publication, "_validate_generation_seal_identity", lambda *_args: None)
+    monkeypatch.setattr(publication, "_validate_sealed_projection", AsyncMock())
     assert (
         await publication._seal_no_change_candidate(SimpleNamespace(), request, execution, SimpleNamespace(), candidate)
         is seal
     )
+    publication._validate_sealed_projection.assert_awaited_once()
 
     seal.sealing_fence += 1
     with pytest.raises(PublicationConflict, match="authority differs"):
         await publication._seal_no_change_candidate(SimpleNamespace(), request, execution, SimpleNamespace(), candidate)
+    publication._validate_sealed_projection.assert_awaited_once()
 
 
 def test_custom_import_schema_names_cannot_disagree(monkeypatch):
@@ -776,7 +1059,7 @@ async def test_root_scalar_materialization_hashes_each_retained_projection(monke
     async def _records(_session, _statement):
         yield SimpleNamespace(), SimpleNamespace(), scalar, root_record
 
-    monkeypatch.setattr(publication, "_root_scalar_material_statement", lambda _generation: object())
+    monkeypatch.setattr(publication, "_root_scalar_material_statement", lambda _generation, **_kwargs: object())
     monkeypatch.setattr(publication, "_stream_materialization_records", _records)
     digest = publication._new_digest("test-root-scalars")
     digest_before_materialization = digest.digest()
@@ -795,12 +1078,12 @@ async def test_generation_sealing_returns_a_replay_found_after_authority_lock(mo
     monkeypatch.setattr(
         publication,
         "_replayed_generation_seal",
-        AsyncMock(side_effect=(None, receipt)),
+        AsyncMock(return_value=receipt),
     )
     monkeypatch.setattr(
         publication,
         "_lock_generation_sealing_authority",
-        AsyncMock(return_value=(SimpleNamespace(), SimpleNamespace(), generation)),
+        AsyncMock(return_value=(SimpleNamespace(execution_id=4), SimpleNamespace(), generation)),
     )
     assert (
         await publication.seal_generation(

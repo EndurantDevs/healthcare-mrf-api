@@ -165,6 +165,7 @@ async def _insert_fixtures(database: Database, schema: str) -> None:
 async def _dataset_database(monkeypatch):
     schema = f"provider_directory_serving_{uuid.uuid4().hex[:12]}"
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
+    monkeypatch.setenv("DB_SCHEMA", schema)
     database = Database()
     is_schema_created = False
     try:

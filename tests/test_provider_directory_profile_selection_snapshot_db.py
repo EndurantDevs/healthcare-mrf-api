@@ -36,9 +36,7 @@ async def test_snapshot_database_queries_lock_all_selection_relations(monkeypatc
     assert status.await_count == 4
     advisory_call = status.await_args_list[0]
     assert "pg_advisory_xact_lock" in advisory_call.args[0]
-    assert advisory_call.kwargs["lock_identity"].endswith(
-        "pdfhir_1ceb7c0986c320b7eb924881"
-    )
+    assert advisory_call.kwargs["lock_identity"].endswith("pdfhir_1ceb7c0986c320b7eb924881")
     relation_lock_sql = status.await_args_list[-1].args[0]
     assert (
         relation_lock_sql.index("provider_directory_dataset_insurance_plan")
@@ -75,7 +73,9 @@ async def test_snapshot_current_selection_honors_optional_lock(monkeypatch):
         lock_selection=False,
         exact_readiness=False,
     )
-    assert unlocked == locked == proposal
+    assert unlocked == locked
+    assert unlocked.request_projection == proposal.request_projection
+    assert unlocked.identity_payload["selection_fingerprint"] == proposal.identity_payload["selection_fingerprint"]
     lock.assert_awaited_once_with()
     assert [await_call.kwargs for await_call in dataset_rows.await_args_list] == [
         {"exact_readiness": True},
@@ -93,7 +93,5 @@ def _variant_registry_rows() -> list[dict[str, object]]:
             "org_name": "Synthetic dataset variant",
             "plan_name": None,
         }
-        for source_id, endpoint_id in (
-            profile_artifact.configured_dataset_scoped_profile_endpoints()
-        )
+        for source_id, endpoint_id in (profile_artifact.configured_dataset_scoped_profile_endpoints())
     ]

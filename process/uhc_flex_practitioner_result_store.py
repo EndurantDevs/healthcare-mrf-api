@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from db.connection import db
@@ -46,38 +45,22 @@ async def _insert_resource_manifest(
     database: Any,
     claim: UHCFlexPractitionerWorkClaim,
     resource_fields_list: list[dict[str, object]],
+    *,
+    transaction: Any = None,
 ) -> None:
     if not resource_fields_list:
         return
-    await set_store_action(
-        database,
-        "resource",
-        claim.acquisition_id,
-        claim.lease_token,
-    )
-    inserted_count = await database.status(
-        f"""
-        INSERT INTO {table_ref(RESOURCE_TABLE)} (
-            acquisition_id, cohort_id, npi, attempt, resource_id,
-            payload_sha256, payload_json_text
-        )
-        SELECT :acquisition_id, :cohort_id, :npi, :attempt,
-               resource.resource_id, resource.payload_sha256,
-               resource.payload_json_text
-          FROM pg_catalog.jsonb_to_recordset(CAST(:resources_json AS jsonb))
-               AS resource(resource_id varchar(64),
-                           payload_sha256 varchar(64), payload_json_text text);
-        """,
+    from process.uhc_flex_practitioner_stage import copy_resource_stage
+
+    await copy_resource_stage(database, transaction, resource_fields_list)
+    inserted_count = await database.scalar(
+        f"SELECT {function_ref('admit_pd_uhc_flex_practitioner_stage')}"
+        "(:acquisition_id, :cohort_id, :npi, :attempt, :lease_token);",
         acquisition_id=claim.acquisition_id,
         cohort_id=claim.cohort_id,
         npi=claim.requested_npi,
         attempt=claim.attempt,
-        resources_json=json.dumps(
-            resource_fields_list,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ),
+        lease_token=claim.lease_token,
     )
     if inserted_count != len(resource_fields_list):
         raise UHCFlexPractitionerStoreError("state")
@@ -146,8 +129,10 @@ async def complete_uhc_flex_practitioner_result(
         resource_count=query_result.resource_count,
         error_code=None,
     )
-    async with database.transaction():
-        await _insert_resource_manifest(database, claim, resource_fields_list)
+    async with database.transaction() as transaction:
+        await _insert_resource_manifest(
+            database, claim, resource_fields_list, transaction=transaction,
+        )
         await _terminalize_query_result(database, claim, query_result, terminal_hash)
 
 

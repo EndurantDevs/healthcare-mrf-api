@@ -3,6 +3,55 @@
 This repository has multiple import pipelines. Each command below is a separate operational unit with its own source family and tables.
 For the canonical source website registry, see [../data-sources.md](../data-sources.md).
 
+## Provider and PTG candidate storage
+
+Rooted graph and practitioner acquisition, provider publication, and guarded PTG
+V4 snapshot maps, supporting dictionaries, and tax-identity output load isolated
+candidates with bounded native COPY. Set-based validation and aggregate accounting
+replace bulk foreign keys and custom per-record INSERT guards. Candidate indexes
+finish before indexed set-based anti-joins validate relationships and the
+complete snapshot is attached and published in its transaction. Existing snapshots
+remain available to readers.
+
+The PTG supporting dictionaries cover NPI scope, components, patterns, prefix
+ownership, heavy owners, and source tax observations. Relation manifests and snapshot diagnostics retain
+their bounded metadata state checks.
+
+Practitioner work lists are copied into detached acquisition candidates before
+their primary, unique, and claim indexes are built. Incremental acquisition work
+retains the indexes required for deduplication and lease selection. Native work
+state checks are installed after initial loading and continue to protect lease
+updates; historical work retains its original checks. Generic
+provider page merging likewise retains its existing indexed working storage;
+relationship checks run set-wise before its validation transition. This change
+does not claim an end-to-end speedup for that working layer.
+
+Before migrating these storage paths, stop affected old workers through their
+normal owner workflow and retain their run identities for audit. Unfinished old
+acquisitions and PTG builds require a fresh run or operation identity after the
+migration; do not resume their partially loaded storage. The explicit errors are
+`provider_directory_rooted_graph_rerun_required`,
+`practitioner_acquisition_rerun_required`, and `ptg_snapshot_rerun_required`.
+Completed historical storage and indexes remain intact. Failure rollback and
+exact retries on the new candidate path remain supported.
+
+Migration preparation commits write fences before validating historical bounds
+with reader-compatible locks. Internal bulk foreign keys are replaced with
+candidate relationship checks and explicit set-based deletion behavior. External
+relationships from separate writer contracts retain their existing enforcement.
+If preparation is interrupted,
+rerun the migration before restarting imports; do not remove its fences by hand.
+Only the final catalog changes require brief exclusive locks. Existing historical
+indexes are reused, and validation scans do not copy historical rows.
+
+The four candidate-storage revisions beginning with
+`20261005100000_rooted_graph_set_validation` require an online Alembic connection.
+They inspect actual catalog identities, constraints, and grants and commit
+preparation separately from validation and cutover. Offline `--sql` generation
+fails explicitly before their DDL or revision stamp; it remains supported for
+the historical prefix through `20261005020000_custom_import_sealed_append_plans`.
+Apply these conversions online; do not stamp them without running their work.
+
 ## Imports at a Glance
 
 | Import | Start command | Finish step | Purpose |
@@ -79,6 +128,8 @@ Configure these values before starting an import:
 The required budgets have no defaults. Size worker memory and storage for the registry snapshot, metadata inventory, serialization overhead, and retained history. The worker timeout covers the configured deadline plus five minutes; an external job deadline must also allow startup and cleanup. Budget exhaustion, cancellation, or incomplete acquisition leaves the previous publication in place. Provider limits and partial-source parameters are rejected.
 
 ## Shared Operational Rules
+
+- New or changed high-volume paths must follow [bulk loading and snapshot publication](./bulk-loading.md): replace per-row database validation with equivalent set-based checks, prepare indexes off the serving snapshot, and publish atomically with retained rollback.
 - Use `--test` where supported before large imports.
 - Publish style is importer-specific: direct load, validated direct replace, `_old` swap rollback, or snapshot pointer update.
 - Keep `_old` tables only for importers whose runbook documents them as rollback assets.

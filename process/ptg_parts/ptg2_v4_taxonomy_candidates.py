@@ -19,6 +19,7 @@ from sqlalchemy import text
 
 from api.ptg2_code_filters import InferredProviderTaxonomyRule
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_snapshot_candidates import snapshot_candidate_relation
 from process.ptg_parts.ptg2_manifest_artifacts import (
     PTG2ManifestArtifactError,
 )
@@ -2610,7 +2611,7 @@ async def publish_v4_inferred_taxonomy_candidates(
                            DISTINCT taxonomy.healthcare_provider_taxonomy_code
                            ORDER BY taxonomy.healthcare_provider_taxonomy_code
                        ) AS matched_taxonomy_codes
-                  FROM {schema}.{PTG2_V4_NPI_TABLE} AS scoped
+                  FROM {snapshot_candidate_relation(session, schema, PTG2_V4_NPI_TABLE)} AS scoped
                   JOIN {schema}.npi AS entity
                     ON entity.npi = scoped.npi
                    AND COALESCE(entity.entity_type_code, 0) = 1

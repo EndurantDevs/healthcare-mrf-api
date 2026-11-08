@@ -29,19 +29,23 @@ def test_scanner_binary_reuses_prebuilt(monkeypatch, tmp_path: Path) -> None:
     candidate.chmod(0o755)
     monkeypatch.setenv("CARGO_TARGET_DIR", str(target_root))
     monkeypatch.delenv("PREPUSH_RUST_BINARIES", raising=False)
+    monkeypatch.delenv("CI_RUST_BINARIES", raising=False)
 
     with mock.patch(
         "tests.ptg2_v4_graph_compiler_test_support.subprocess.run"
     ) as build:
         assert _binary() == candidate
         assert build.call_count == 1
-        monkeypatch.setenv("PREPUSH_RUST_BINARIES", "/exact-source-artifact")
-        assert _binary() == candidate
-        assert build.call_count == 1
-        candidate.chmod(0o644)
-        with pytest.raises(RuntimeError, match="test binary was not built"):
-            _binary()
-        assert build.call_count == 1
+        for variable in ("PREPUSH_RUST_BINARIES", "CI_RUST_BINARIES"):
+            monkeypatch.setenv(variable, "/exact-source-artifact")
+            assert _binary() == candidate
+            assert build.call_count == 1
+            candidate.chmod(0o644)
+            with pytest.raises(RuntimeError, match="test binary was not built"):
+                _binary()
+            assert build.call_count == 1
+            monkeypatch.delenv(variable)
+            candidate.chmod(0o755)
 
 
 def _progress_event(

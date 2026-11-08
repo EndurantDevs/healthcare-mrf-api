@@ -148,12 +148,11 @@ fn preflight_raw_bytes(rows: &[HospitalPriceFactRow]) -> HospitalPriceBlockResul
             (&mut allowed_counts, row.allowed_count.as_deref()),
             (&mut payer_notes, row.additional_payer_notes.as_deref()),
         ] {
-            if let Some(value) = value {
-                if dictionary.insert(value) {
+            if let Some(value) = value
+                && dictionary.insert(value) {
                     add_preflight_bytes(&mut total, 4);
                     add_preflight_bytes(&mut total, value.len());
                 }
-            }
         }
         for value in [
             row.negotiated_dollar.as_deref(),

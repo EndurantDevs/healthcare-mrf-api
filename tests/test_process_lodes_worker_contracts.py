@@ -202,6 +202,7 @@ async def test_shutdown_atomically_publishes_valid_stage(monkeypatch):
     )
     monkeypatch.setattr(lodes.db, "status", execute_status)
     monkeypatch.setattr(lodes.db, "transaction", lambda: transaction_spy)
+    monkeypatch.setattr(lodes, "publish_local_reference_family_generation", AsyncMock())
     monkeypatch.setattr(lodes, "mark_control_run", mark_run)
     monkeypatch.setattr(lodes, "print_time_info", lambda _start: None)
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "tenant")
@@ -219,6 +220,7 @@ async def test_shutdown_atomically_publishes_valid_stage(monkeypatch):
 
     assert transaction_spy.entered == 1
     assert transaction_spy.exited == 1
+    lodes.publish_local_reference_family_generation.assert_awaited_once()
     assert execute_status.await_count == 6
     mark_run.assert_awaited_once()
     published_metrics = mark_run.await_args.kwargs["metrics"]

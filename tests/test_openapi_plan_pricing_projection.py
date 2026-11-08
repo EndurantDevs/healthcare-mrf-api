@@ -3,14 +3,14 @@
 
 from pathlib import Path
 
-import yaml
+from tests.openapi_route_contract_support import load_openapi_document
 
 
 OPENAPI_PATH = Path("doc/openapi.yaml")
 
 
 def _openapi_spec():
-    return yaml.safe_load(OPENAPI_PATH.read_text())
+    return load_openapi_document(OPENAPI_PATH)
 
 
 def test_openapi_documents_projection_view_routing():

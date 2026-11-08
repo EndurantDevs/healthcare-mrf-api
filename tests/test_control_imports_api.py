@@ -13,18 +13,13 @@ from unittest.mock import AsyncMock, Mock, call
 import pytest
 import sqlalchemy as sa
 from arq.jobs import serialize_job as arq_serialize_job
+from sanic.exceptions import BadRequest, Forbidden, NotFound, SanicException
 from sqlalchemy.exc import IntegrityError
-from sanic.exceptions import Forbidden, SanicException
-from sanic.exceptions import BadRequest, NotFound
 
-from db.models import ImportRun
-
-from api import control
+from api import control, control_imports
 from api import control_ptg_v4_recovery as v4_recovery_control
 from api import metrics as api_metrics
 from api.control import _require_control_auth
-from api import control_imports
-from api.provider_directory_sources import provider_directory_source_catalog
 from api.control_imports import (
     _enqueue_import_start,
     _remove_queued_job,
@@ -35,6 +30,8 @@ from api.control_imports import (
     normalize_run,
     parse_ptg_toc_preview,
 )
+from api.provider_directory_sources import provider_directory_source_catalog
+from db.models import ImportRun
 from process.ext import utils as process_utils
 from process.ptg_allowed_amount_blank import ALLOWED_AMOUNT_BLANK_ERROR
 
@@ -45,6 +42,7 @@ CONTROL_HEADERS = {"Authorization": "Bearer secret"}
 
 def authed_request(**kwargs):
     kwargs.setdefault("headers", CONTROL_HEADERS)
+    kwargs.setdefault("args", {})
     return types.SimpleNamespace(**kwargs)
 
 
@@ -71,16 +69,11 @@ def _assert_alias_importer_contracts(importer_by_name):
     assert formatted_importer["family"] == "provider"
     assert formatted_importer["queue"] == "arq:AddressArchive"
     assert formatted_importer["cancelable"] is True
-    assert {
-        param["name"] for param in formatted_importer["params_schema"]
-    } >= {"batch_size"}
+    assert {param["name"] for param in formatted_importer["params_schema"]} >= {"batch_size"}
     assert importer_by_name["address-numeric-grid-alias"]["family"] == "provider"
     assert importer_by_name["address-numeric-grid-alias"]["queue"] == "arq:AddressArchive"
     assert importer_by_name["address-numeric-grid-alias"]["cancelable"] is True
-    assert {
-        param["name"]
-        for param in importer_by_name["address-numeric-grid-alias"]["params_schema"]
-    } >= {
+    assert {param["name"] for param in importer_by_name["address-numeric-grid-alias"]["params_schema"]} >= {
         "mode",
         "state_code",
         "zip_prefix",
@@ -90,30 +83,18 @@ def _assert_alias_importer_contracts(importer_by_name):
         "alias_kind",
     }
     assert importer_by_name["address-strict-source-backfill"]["family"] == "provider"
-    assert (
-        importer_by_name["address-strict-source-backfill"]["queue"]
-        == "arq:AddressArchive"
-    )
+    assert importer_by_name["address-strict-source-backfill"]["queue"] == "arq:AddressArchive"
     assert importer_by_name["address-strict-source-backfill"]["cancelable"] is True
-    assert {
-        param["name"]
-        for param in importer_by_name["address-strict-source-backfill"]["params_schema"]
-    } >= {
+    assert {param["name"] for param in importer_by_name["address-strict-source-backfill"]["params_schema"]} >= {
         "alias_run_id",
         "expected_candidate_sha256",
         "reviewed_by",
         "max_targets",
     }
     assert importer_by_name["address-numeric-grid-alias-revoke"]["family"] == "provider"
-    assert (
-        importer_by_name["address-numeric-grid-alias-revoke"]["queue"]
-        == "arq:AddressArchive"
-    )
+    assert importer_by_name["address-numeric-grid-alias-revoke"]["queue"] == "arq:AddressArchive"
     assert importer_by_name["address-numeric-grid-alias-revoke"]["cancelable"] is True
-    assert {
-        param["name"]
-        for param in importer_by_name["address-numeric-grid-alias-revoke"]["params_schema"]
-    } >= {
+    assert {param["name"] for param in importer_by_name["address-numeric-grid-alias-revoke"]["params_schema"]} >= {
         "source_address_key",
         "expected_target_address_key",
         "reason",
@@ -133,11 +114,10 @@ def _assert_provider_importer_contracts(importer_by_name):
     assert florida_profile["family"] == "provider"
     assert florida_profile["enqueue_adapter"] == "arq_single_job"
     assert florida_profile["queue"] == "arq:FloridaMQAProfile"
-    assert florida_profile["depends_on"] == ["npi"]
+    assert florida_profile["depends_on"] == []
+    assert florida_profile["dependency_authority"] == "scheduler"
     assert florida_profile["cancelable"] is False
-    assert {
-        param["name"] for param in florida_profile["params_schema"]
-    } >= {
+    assert {param["name"] for param in florida_profile["params_schema"]} >= {
         "sources",
         "max_providers",
         "only_matched",
@@ -155,19 +135,30 @@ def test_importer_registry_exposes_ptg_and_finish_lifecycle():
 
 
 def test_importer_registry_exposes_provider_directory_params():
+    """Provider acquisition exposes typed source inputs, refresh choices and limits."""
     importer_by_name = {entry["name"]: entry for entry in importer_registry()}
 
     resources_param = next(
-        param
-        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
-        if param["name"] == "resources"
+        param for param in importer_by_name["provider-directory-fhir"]["params_schema"] if param["name"] == "resources"
     )
     assert resources_param["type"] == "text"
     assert "JSON array" in resources_param["help"]
-    assert any(param["name"] == "source_query" and param["type"] == "text" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "retest_results_path" and param["type"] == "text" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "retest_results_url" and param["type"] == "text" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "credential_config_file" and param["type"] == "text" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(
+        param["name"] == "source_query" and param["type"] == "text"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "retest_results_path" and param["type"] == "text"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "retest_results_url" and param["type"] == "text"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "credential_config_file" and param["type"] == "text"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
     provider_directory_refresh_preset = next(
         param
         for param in importer_by_name["provider-directory-fhir"]["params_schema"]
@@ -175,31 +166,110 @@ def test_importer_registry_exposes_provider_directory_params():
     )
     assert provider_directory_refresh_preset["type"] == "choice"
     assert "monthly-full" in provider_directory_refresh_preset["choices"]
-    assert any(param["name"] == "include_supplemental_catalogs" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "resource_limit" and param["type"] == "integer" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "resource_deadline_seconds" and param["type"] == "integer" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "linked_resource_deadline_seconds" and param["type"] == "integer" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "full_refresh" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "stale_cleanup" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "publish_artifacts" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "publish_after_acquisition" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "canonical_backfill_only" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "contact_backfill_only" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "dataset_followup_only" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "publish_artifacts_only" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "full_address_artifact_rebuild" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "publish_artifacts_targets" and param["type"] == "text" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "publish_corroboration" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "stream_batch_size" and param["type"] == "integer" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "bulk_export" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "source_concurrency" and param["type"] == "integer" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "concurrency" and param["type"] == "integer" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "timeout" and param["type"] == "integer" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "open_only" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
-    assert any(param["name"] == "include_auth_required" and param["type"] == "boolean" for param in importer_by_name["provider-directory-fhir"]["params_schema"])
+    assert any(
+        param["name"] == "include_supplemental_catalogs" and param["type"] == "boolean"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "resource_limit" and param["type"] == "integer"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "resource_deadline_seconds" and param["type"] == "integer"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "linked_resource_deadline_seconds" and param["type"] == "integer"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+
+
+def test_importer_registry_exposes_provider_publication_params():
+    """Provider publication exposes refresh, backfill and artifact controls."""
+    importer_by_name = {entry["name"]: entry for entry in importer_registry()}
+
+    assert any(
+        param["name"] == "full_refresh" and param["type"] == "boolean"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "stale_cleanup" and param["type"] == "boolean"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "publish_artifacts" and param["type"] == "boolean"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "publish_after_acquisition" and param["type"] == "boolean"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "canonical_backfill_only" and param["type"] == "boolean"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "contact_backfill_only" and param["type"] == "boolean"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "dataset_followup_only" and param["type"] == "boolean"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "publish_artifacts_only" and param["type"] == "boolean"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "full_address_artifact_rebuild" and param["type"] == "boolean"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "publish_artifacts_targets" and param["type"] == "text"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "publish_corroboration" and param["type"] == "boolean"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+
+
+def test_importer_registry_exposes_provider_worker_params():
+    """Provider workers expose batch, concurrency, timeout and access controls."""
+    importer_by_name = {entry["name"]: entry for entry in importer_registry()}
+
+    assert any(
+        param["name"] == "stream_batch_size" and param["type"] == "integer"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "bulk_export" and param["type"] == "boolean"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "source_concurrency" and param["type"] == "integer"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "concurrency" and param["type"] == "integer"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "timeout" and param["type"] == "integer"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "open_only" and param["type"] == "boolean"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "include_auth_required" and param["type"] == "boolean"
+        for param in importer_by_name["provider-directory-fhir"]["params_schema"]
+    )
 
 
 def test_importer_registry_exposes_reference_and_discovery_params():
+    """Reference and graph importers retain lifecycle and source-input contracts."""
     importer_by_name = {entry["name"]: entry for entry in importer_registry()}
 
     assert importer_by_name["code-sets"]["enqueue_adapter"] == "arq_single_job"
@@ -209,50 +279,138 @@ def test_importer_registry_exposes_reference_and_discovery_params():
     assert importer_by_name["terminology-synonyms"]["family"] == "reference"
     assert importer_by_name["terminology-synonyms"]["enqueue_adapter"] == "arq_single_job"
     assert importer_by_name["terminology-synonyms"]["queue"] == "arq:TerminologySynonyms"
-    assert importer_by_name["terminology-synonyms"]["depends_on"] == [
-        "nucc",
-        "code-sets",
-        "clinical-reference",
-        "claims-pricing",
-        "drug-claims",
-    ]
+    assert importer_by_name["terminology-synonyms"]["depends_on"] == []
+    assert importer_by_name["terminology-synonyms"]["dependency_authority"] == "scheduler"
     assert importer_by_name["geo"]["enqueue_adapter"] == "arq_single_job"
     assert importer_by_name["geo-census"]["enqueue_adapter"] == "arq_single_job"
     assert importer_by_name["plan-attributes"]["enqueue_adapter"] == "arq_single_job"
     assert importer_by_name["npi"]["schedulable"] is True
-    assert importer_by_name["npi"]["depends_on"] == ["nucc"]
+    assert importer_by_name["npi"]["depends_on"] == []
     assert importer_by_name["ptg"]["cancelable"] is True
     assert importer_by_name["npi"]["cancelable"] is True
     assert importer_by_name["claims-pricing"]["cancelable"] is False
     assert any(param["name"] == "toc_url" and param["multiple"] for param in importer_by_name["ptg"]["params_schema"])
-    assert any(param["name"] == "check_urls" and param["is_flag"] for param in importer_by_name["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "concurrency" and param["type"] == "integer" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "crawl_target_limit" and param["type"] == "integer" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "source_entity_types" and param["type"] == "text" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "source_payer_query" and param["type"] == "text" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "probe_files" and param["is_flag"] for param in importer_by_name["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "file_probe_limit" and param["type"] == "integer" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "file_probe_types" and param["type"] == "text" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "file_probe_entity_types" and param["type"] == "text" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
-    assert any(param["name"] == "file_probe_payer_query" and param["type"] == "text" for param in importer_by_name["mrf-source-discovery"]["params_schema"])
+
+
+def test_importer_registry_exposes_discovery_params():
+    """Source discovery exposes bounded crawling and file-probe controls."""
+    importer_by_name = {entry["name"]: entry for entry in importer_registry()}
+
+    assert any(
+        param["name"] == "check_urls" and param["is_flag"]
+        for param in importer_by_name["mrf-source-discovery"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "concurrency" and param["type"] == "integer"
+        for param in importer_by_name["mrf-source-discovery"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "crawl_target_limit" and param["type"] == "integer"
+        for param in importer_by_name["mrf-source-discovery"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "source_entity_types" and param["type"] == "text"
+        for param in importer_by_name["mrf-source-discovery"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "source_payer_query" and param["type"] == "text"
+        for param in importer_by_name["mrf-source-discovery"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "probe_files" and param["is_flag"]
+        for param in importer_by_name["mrf-source-discovery"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "file_probe_limit" and param["type"] == "integer"
+        for param in importer_by_name["mrf-source-discovery"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "file_probe_types" and param["type"] == "text"
+        for param in importer_by_name["mrf-source-discovery"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "file_probe_entity_types" and param["type"] == "text"
+        for param in importer_by_name["mrf-source-discovery"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "file_probe_payer_query" and param["type"] == "text"
+        for param in importer_by_name["mrf-source-discovery"]["params_schema"]
+    )
 
 
 def test_importer_registry_exposes_archive_and_address_params():
     importer_by_name = {entry["name"]: entry for entry in importer_registry()}
 
-    assert any(param["name"] == "include_relationships" and param["type"] == "boolean" for param in importer_by_name["ms-drg"]["params_schema"])
-    assert any(param["name"] == "relationship_page_limit" and param["type"] == "integer" for param in importer_by_name["ms-drg"]["params_schema"])
-    assert any(param["name"] == "dry_run" and param["is_flag"] for param in importer_by_name["address-archive-v2-migrate"]["params_schema"])
-    assert any(param["name"] == "sample_limit" and param["type"] == "integer" for param in importer_by_name["address-archive-v2-migrate"]["params_schema"])
-    assert any(param["name"] == "source_concurrency" and param["type"] == "integer" for param in importer_by_name["openaddresses"]["params_schema"])
-    assert any(param["name"] == "backfill_concurrency" and param["type"] == "integer" for param in importer_by_name["openaddresses"]["params_schema"])
-    assert any(param["name"] == "backfill_zip_prefix_length" and param["type"] == "integer" for param in importer_by_name["openaddresses"]["params_schema"])
-    assert any(param["name"] == "zip_restore_concurrency" and param["type"] == "integer" for param in importer_by_name["openaddresses"]["params_schema"])
-    assert any(param["name"] == "zip_restore_shards" and param["type"] == "integer" for param in importer_by_name["openaddresses"]["params_schema"])
+    assert any(
+        param["name"] == "include_relationships" and param["type"] == "boolean"
+        for param in importer_by_name["ms-drg"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "relationship_page_limit" and param["type"] == "integer"
+        for param in importer_by_name["ms-drg"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "dry_run" and param["is_flag"]
+        for param in importer_by_name["address-archive-v2-migrate"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "sample_limit" and param["type"] == "integer"
+        for param in importer_by_name["address-archive-v2-migrate"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "source_concurrency" and param["type"] == "integer"
+        for param in importer_by_name["openaddresses"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "backfill_concurrency" and param["type"] == "integer"
+        for param in importer_by_name["openaddresses"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "backfill_zip_prefix_length" and param["type"] == "integer"
+        for param in importer_by_name["openaddresses"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "zip_restore_concurrency" and param["type"] == "integer"
+        for param in importer_by_name["openaddresses"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "zip_restore_shards" and param["type"] == "integer"
+        for param in importer_by_name["openaddresses"]["params_schema"]
+    )
     assert importer_by_name["openaddresses"]["family"] == "geo"
-    assert any(param["name"] == "import_id" and param["type"] == "text" for param in importer_by_name["openaddresses"]["params_schema"])
-    assert any(param["name"] == "local_files" and param["multiple"] for param in importer_by_name["openaddresses"]["params_schema"])
-    assert any(param["name"] == "resume_stage" and param["is_flag"] for param in importer_by_name["openaddresses"]["params_schema"])
+    assert any(
+        param["name"] == "import_id" and param["type"] == "text"
+        for param in importer_by_name["openaddresses"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "local_files" and param["multiple"]
+        for param in importer_by_name["openaddresses"]["params_schema"]
+    )
+    assert any(
+        param["name"] == "resume_stage" and param["is_flag"]
+        for param in importer_by_name["openaddresses"]["params_schema"]
+    )
+
+
+def test_importer_capabilities_do_not_claim_pending_adapters_or_dependency_policy():
+    entry_by_name = {entry["name"]: entry for entry in importer_registry()}
+    for entry in entry_by_name.values():
+        assert entry["depends_on"] == []
+        assert entry["dependency_authority"] == "scheduler"
+        if entry["schedulable"]:
+            assert entry["enqueue_adapter"] == "arq_single_job"
+    for name in (
+        "provider-directory-admission-backfill",
+        "provider-directory-selection-receipt-backfill",
+        "plan-pricing-em-distance",
+    ):
+        assert entry_by_name[name]["schedulable"] is False
+    assert "formulary-fhir" not in entry_by_name
+    projection = entry_by_name["plan-pricing-em-distance"]
+    assert {param["name"] for param in projection["params_schema"] if param["required"]} == {
+        "plan_release_id",
+        "serving_revision_id",
+    }
 
 
 def test_importer_registry_exposes_entity_address_params():
@@ -290,17 +448,20 @@ def test_importer_registry_exposes_entity_address_params():
         for param in importer_by_name["entity-address-unified"]["params_schema"]
     )
     assert any(
-        param["name"] == "provider_directory_dataset_id"
-        and param["type"] == "text"
+        param["name"] == "provider_directory_dataset_id" and param["type"] == "text"
         for param in importer_by_name["entity-address-unified"]["params_schema"]
     )
     entity_refresh_mode = next(
-        param for param in importer_by_name["entity-address-unified"]["params_schema"] if param["name"] == "refresh_mode"
+        param
+        for param in importer_by_name["entity-address-unified"]["params_schema"]
+        if param["name"] == "refresh_mode"
     )
     assert "full" in entity_refresh_mode["choices"]
     assert "provider-directory-partial" in entity_refresh_mode["choices"]
     assert "ptg-partial" not in entity_refresh_mode["choices"]
-    assert not any(param["name"] == "ptg_source_key" for param in importer_by_name["entity-address-unified"]["params_schema"])
+    assert not any(
+        param["name"] == "ptg_source_key" for param in importer_by_name["entity-address-unified"]["params_schema"]
+    )
 
 
 def test_provider_directory_runtime_contract_preflight_passes():
@@ -484,9 +645,7 @@ async def test_retry_import_run_preserves_mrf_discovery_root(monkeypatch):
     monkeypatch.setattr(control_imports, "get_import_run", fake_get)
     monkeypatch.setattr(control_imports, "create_import_run", fake_create)
 
-    _child, created = await control_imports.retry_import_run(
-        "run_parent", {"triggered_by": "api"}
-    )
+    _child, created = await control_imports.retry_import_run("run_parent", {"triggered_by": "api"})
 
     assert created is True
     assert created_payloads[0]["retry_of_run_id"] == "run_parent"
@@ -529,6 +688,7 @@ async def test_retry_import_run_merges_provider_directory_retry_params_into_chil
             "retry_params": {
                 "retry_of_run_id": "run_parent",
                 "provider_directory_pagination_root_run_id": "run_root",
+                "allow_retained_pagination_reset": False,
             },
         },
     )
@@ -543,6 +703,7 @@ async def test_retry_import_run_merges_provider_directory_retry_params_into_chil
                 "resource_limit": 100,
                 "retry_of_run_id": "run_parent",
                 "provider_directory_pagination_root_run_id": "run_root",
+                "allow_retained_pagination_reset": False,
             },
             "triggered_by": "api",
             "idempotency_key": "retry_provider_directory",
@@ -553,6 +714,23 @@ async def test_retry_import_run_merges_provider_directory_retry_params_into_chil
             "retry_of_run_id": "run_parent",
         }
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [None, 0, 1, "false", "true"])
+async def test_provider_directory_api_rejects_nonboolean_retained_reset_control(monkeypatch, value):
+    monkeypatch.setattr(control_imports, "importer_names", lambda: {"provider-directory-fhir"})
+    with pytest.raises(ValueError, match="allow_retained_pagination_reset_invalid"):
+        await control_imports.create_import_run(
+            {"importer": "provider-directory-fhir", "params": {"allow_retained_pagination_reset": value}}
+        )
+
+
+def test_provider_directory_retry_cannot_reenable_retained_reset():
+    parent_run_map = {"importer": "provider-directory-fhir", "params": {"allow_retained_pagination_reset": False}}
+    assert control_imports._retry_child_params(parent_run_map, "parent", {})["allow_retained_pagination_reset"] is False
+    with pytest.raises(ValueError, match="retained_pagination_reset_cannot_be_enabled"):
+        control_imports._retry_child_params(parent_run_map, "parent", {"allow_retained_pagination_reset": True})
 
 
 @pytest.mark.asyncio
@@ -928,19 +1106,14 @@ def test_parse_ptg_toc_preview_preserves_distinct_healthsparq_plan_hashes(
     }
     preview_payload = parse_ptg_toc_preview(
         {
-            "toc_url": (
-                "https://mrf.healthsparq.com/example/prd/mrf/"
-                "EXAMPLE_I/EXAMPLE/latest_metadata.json"
-            ),
+            "toc_url": ("https://mrf.healthsparq.com/example/prd/mrf/EXAMPLE_I/EXAMPLE/latest_metadata.json"),
             "plan_ids": ["123456789"],
             "toc": {"files": [source_file_values_by_field]},
         }
     )
 
     in_network_catalog_entries = [
-        catalog_entry
-        for catalog_entry in preview_payload["items"]
-        if catalog_entry["source_type"] == "in-network"
+        catalog_entry for catalog_entry in preview_payload["items"] if catalog_entry["source_type"] == "in-network"
     ]
     assert len(in_network_catalog_entries) == 1
     in_network_catalog_entry_by_field = in_network_catalog_entries[0]
@@ -951,9 +1124,7 @@ def test_parse_ptg_toc_preview_preserves_distinct_healthsparq_plan_hashes(
     ]
     discovery_plan_hashes = [
         plan_details_by_field["engine_plan_hash"]
-        for plan_details_by_field in mrf_source_discovery._healthsparq_plan_info(
-            source_file_values_by_field
-        )
+        for plan_details_by_field in mrf_source_discovery._healthsparq_plan_info(source_file_values_by_field)
     ]
     assert preview_plan_hashes == discovery_plan_hashes
     assert preview_plan_hashes == ["47b9fd15cbdb7b9b", "659b1b64eddc7362"]
@@ -1163,10 +1334,17 @@ async def test_enqueue_import_start_rejects_invalid_ptg_lane():
 
 @pytest.mark.asyncio
 async def test_enqueue_import_start_wraps_single_job_lifecycle(monkeypatch):
+    from api import nucc_source_control
+
+    @asynccontextmanager
+    async def legacy_source_action(_run_id):
+        yield None
+
+    monkeypatch.setattr(nucc_source_control, "source_action", legacy_source_action)
     calls = []
 
     class FakeJob:
-        job_id = "job_nucc"
+        job_id = "nucc_start_run_nucc"
 
     class FakeRedis:
         async def enqueue_job(self, *args, **kwargs):
@@ -1192,7 +1370,7 @@ async def test_enqueue_import_start_wraps_single_job_lifecycle(monkeypatch):
     assert args[1]["target_module"] == "process.nucc"
     assert args[1]["target_function"] == "process_data"
     assert args[1]["task"] == {"test_mode": True}
-    assert kwargs == {"_queue_name": "arq:NUCC"}
+    assert kwargs == {"_queue_name": "arq:NUCC", "_job_id": "nucc_start_run_nucc"}
 
 
 @pytest.mark.asyncio
@@ -1293,8 +1471,8 @@ async def test_enqueue_import_start_wraps_ms_drg_importer(monkeypatch):
     assert args[0] == "control_single_job_start"
     assert args[1]["run_id"] == "run_ms_drg"
     assert args[1]["target_module"] == "process.ms_drg"
-    assert args[1]["target_function"] == "main"
-    assert args[1]["call_style"] == "kwargs"
+    assert args[1]["target_function"] == "managed_main"
+    assert args[1]["call_style"] == "ctx_task"
     assert args[1]["task"] == {"test_mode": True, "include_relationships": True, "relationship_page_limit": 1}
     assert kwargs == {"_queue_name": "arq:MSDRG"}
 
@@ -1316,9 +1494,7 @@ async def test_enqueue_import_start_targets_exact_npi_job(monkeypatch):
 
     monkeypatch.setattr("api.control_imports.create_pool", fake_create_pool)
 
-    enqueue_result_map = await _enqueue_import_start(
-        {"run_id": "run_npi", "importer": "npi", "params": {}}
-    )
+    enqueue_result_map = await _enqueue_import_start({"run_id": "run_npi", "importer": "npi", "params": {}})
 
     assert enqueue_result_map["status"] == "queued"
     args, kwargs = calls[0]
@@ -1527,9 +1703,7 @@ async def test_remove_queued_job_refuses_identity_mismatch_without_mutation(
         monkeypatch,
         raw_job_bytes,
     )
-    mismatch_by_field = await _remove_queued_job(
-        {"run_id": "run_exact", "importer": "provider-directory-fhir"}
-    )
+    mismatch_by_field = await _remove_queued_job({"run_id": "run_exact", "importer": "provider-directory-fhir"})
 
     assert mismatch_by_field["identity_mismatch"] is True
     assert mismatch_by_field["removed"] is False
@@ -1550,9 +1724,7 @@ async def test_remove_queued_job_refuses_watched_job_change(monkeypatch):
     )
     pipeline.execute.side_effect = control_imports.WatchError("changed")
 
-    outcome_by_field = await _remove_queued_job(
-        {"run_id": "run_exact", "importer": "provider-directory-fhir"}
-    )
+    outcome_by_field = await _remove_queued_job({"run_id": "run_exact", "importer": "provider-directory-fhir"})
 
     assert outcome_by_field["redis"] is False
     assert outcome_by_field["removed"] is False
@@ -1565,9 +1737,7 @@ async def test_remove_queued_job_refuses_missing_identity_without_mutation(
 ):
     _, pipeline = _install_arq_cleanup_redis(monkeypatch, None)
 
-    outcome_by_field = await _remove_queued_job(
-        {"run_id": "run_exact", "importer": "provider-directory-fhir"}
-    )
+    outcome_by_field = await _remove_queued_job({"run_id": "run_exact", "importer": "provider-directory-fhir"})
 
     assert outcome_by_field["identity_unavailable"] is True
     assert outcome_by_field["removed"] is False
@@ -1582,9 +1752,7 @@ async def test_remove_queued_job_refuses_unresolvable_identity(monkeypatch):
     create_pool = AsyncMock()
     monkeypatch.setattr(control_imports, "create_pool", create_pool)
 
-    outcome_by_field = await _remove_queued_job(
-        {"run_id": "run_exact", "importer": "nucc", "metrics": {}}
-    )
+    outcome_by_field = await _remove_queued_job({"run_id": "run_exact", "importer": "code-sets", "metrics": {}})
 
     assert outcome_by_field["identity_unavailable"] is True
     assert outcome_by_field["removed"] is False
@@ -1650,11 +1818,13 @@ def test_import_run_migration_mirrors_model(monkeypatch):
             "import_run_provider_directory_retry_child_idx",
             "import_run_mrf_discovery_retry_child_idx",
             "import_run_plan_pricing_idempotency_idx",
+            "import_run_registry_source_check_idempotency_idx",
+            "import_run_plan_pricing_retry_census_idx",
+            "import_run_ptg_membership_idempotency_idx",
+            "import_run_code_pricing_idempotency_idx",
         }
     }
-    assert {name for name in recorder.indexes} == expected_model_indexes | {
-        "import_run_active_idempotency_idx"
-    }
+    assert {name for name in recorder.indexes} == expected_model_indexes | {"import_run_active_idempotency_idx"}
     idempotency_idx = recorder.indexes["import_run_active_idempotency_idx"]
     assert idempotency_idx["table"] == "import_run"
     assert idempotency_idx["unique"] is True
@@ -1662,6 +1832,73 @@ def test_import_run_migration_mirrors_model(monkeypatch):
     assert str(idempotency_idx["postgresql_where"]) == (
         "status IN ('queued', 'starting', 'running', 'finalizing', 'canceling')"
     )
+
+
+def _load_membership_idempotency_migration():
+    path = Path(__file__).parents[1] / "alembic" / "versions" / "20261021110000_ptg_membership_import_idempotency.py"
+    spec = importlib.util.spec_from_file_location("migration_ptg_membership_idempotency", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    return migration
+
+
+def test_membership_idempotency_migration_mirrors_model(monkeypatch):
+    migration = _load_membership_idempotency_migration()
+    recorder = _OpRecorder()
+    drops = []
+    recorder.drop_index = lambda name, **options: drops.append((name, options))
+    monkeypatch.setattr(migration, "op", recorder)
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    monkeypatch.delenv("HLTHPRT_DB_SCHEMA", raising=False)
+    index = next(
+        spec
+        for spec in ImportRun.__my_additional_indexes__
+        if spec["name"] == "import_run_ptg_membership_idempotency_idx"
+    )
+    assert index["unique"] is True
+    migration.upgrade()
+    created = recorder.indexes[index["name"]]
+    assert created["table"] == "import_run"
+    assert created["schema"] == "mrf"
+    assert created["unique"] is True
+    assert created["columns"] == list(index["index_elements"])
+    assert str(created["postgresql_where"]) == index["where"]
+    migration.downgrade()
+    assert drops == [(index["name"], {"table_name": "import_run", "schema": "mrf"})]
+
+
+@pytest.mark.parametrize("mismatch", [None, "columns", "predicate", "unique"])
+def test_membership_idempotency_migration_adopts_only_exact_index(monkeypatch, mismatch):
+    from dataclasses import replace
+
+    from db import migration_index_adoption
+
+    migration = _load_membership_idempotency_migration()
+    recorder = _OpRecorder()
+    monkeypatch.setattr(migration, "op", recorder)
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "membership_schema")
+    monkeypatch.setenv("DB_SCHEMA", "membership_schema")
+    shape = migration_index_adoption._fallback_expected_index_shape(
+        migration_index_adoption.IndexDefinition(
+            ("importer", "idempotency_key"),
+            predicate="importer = 'ptg-provider-membership-projection' AND idempotency_key IS NOT NULL",
+            unique=True,
+        ),
+        {},
+    )
+    if mismatch == "columns":
+        shape = replace(shape, key_columns=("idempotency_key", "importer"))
+    elif mismatch == "predicate":
+        shape = replace(shape, predicate="idempotency_key IS NOT NULL")
+    elif mismatch == "unique":
+        shape = replace(shape, unique=False)
+    monkeypatch.setattr(migration_index_adoption, "_existing_index_shape", lambda *_args: shape)
+    if mismatch:
+        with pytest.raises(RuntimeError, match="existing_schema_index_mismatch:membership_schema"):
+            migration.upgrade()
+    else:
+        migration.upgrade()
+    assert recorder.indexes == {}
 
 
 class _MigrationRows:
@@ -1730,9 +1967,7 @@ def test_provider_directory_retry_child_index_metadata_and_migration(monkeypatch
 
 def test_provider_directory_retry_child_migration_fails_on_duplicates(monkeypatch):
     module = _load_provider_directory_retry_child_migration()
-    recorder = _RetryChildMigrationRecorder(
-        [{"retry_of_run_id": "run_parent", "child_count": 2}]
-    )
+    recorder = _RetryChildMigrationRecorder([{"retry_of_run_id": "run_parent", "child_count": 2}])
     monkeypatch.setattr(module, "op", recorder)
 
     with pytest.raises(RuntimeError, match=r"run_parent \(2 children\).+no data was deleted"):
@@ -1754,9 +1989,7 @@ def test_provider_directory_retry_child_migration_skips_partial_schema(monkeypat
 
 def test_control_blueprint_registers_import_run_ensure_listener():
     listeners = [
-        item
-        for item in control.blueprint._future_listeners
-        if item.listener is control.control_ensure_import_run_table
+        item for item in control.blueprint._future_listeners if item.listener is control.control_ensure_import_run_table
     ]
 
     assert len(listeners) == 1
@@ -1890,10 +2123,7 @@ async def test_import_run_request_paths_do_not_run_ddl(monkeypatch):
 
     assert await control_imports.list_import_runs() == []
     assert await control_imports.get_import_run("run_missing") is None
-    assert (
-        await control_imports.find_active_run_by_idempotency_key("npi", "idem-1")
-        is None
-    )
+    assert await control_imports.find_active_run_by_idempotency_key("npi", "idem-1") is None
     source_row, created = await control_imports.create_import_run(
         {"importer": "npi", "params": {}, "idempotency_key": "idem-1"}
     )
@@ -1991,22 +2221,16 @@ async def test_allowed_amount_blank_projection_loads_exact_inner_rows(monkeypatc
     assert metrics["status"] == "blank"
     assert metrics["snapshot_status"] == "failed"
     assert execute.await_count == 2
-    query_params = [
-        call.args[0].compile().params for call in execute.await_args_list
-    ]
-    assert query_params[0]["import_run_id_1"] == (
-        f"ptg2:{state['run'].source_file_import_id}"
-    )
-    assert query_params[1]["snapshot_id_1"] == (
-        state["engine_snapshot"].snapshot_id
-    )
+    query_params = [call.args[0].compile().params for call in execute.await_args_list]
+    assert query_params[0]["import_run_id_1"] == (f"ptg2:{state['run'].source_file_import_id}")
+    assert query_params[1]["snapshot_id_1"] == (state["engine_snapshot"].snapshot_id)
 
 
 def test_normalize_triggered_by_bounds_database_value():
     assert control_imports._normalize_triggered_by("") == "api"
     assert (
-        control_imports._normalize_triggered_by("codex-retry-after-read-deadline-deploy")
-        == "codex-retry-after-read-deadline"
+        control_imports._normalize_triggered_by("batch-retry-after-read-deadline-deploy")
+        == "batch-retry-after-read-deadline"
     )
     assert len(control_imports._normalize_triggered_by("x" * 100)) == control_imports.MAX_TRIGGERED_BY_LENGTH
 
@@ -2083,9 +2307,7 @@ async def test_list_import_runs_page_filters_retry_parent(monkeypatch):
             connection = types.SimpleNamespace(
                 scalar=AsyncMock(return_value=None),
                 all=AsyncMock(return_value=[]),
-                status=AsyncMock(
-                    side_effect=lambda statement: statements.append(statement)
-                ),
+                status=AsyncMock(side_effect=lambda statement: statements.append(statement)),
             )
             yield connection
 
@@ -2117,9 +2339,7 @@ async def test_create_import_run_persists_enqueued_state(monkeypatch):
             connection = types.SimpleNamespace(
                 scalar=AsyncMock(return_value=None),
                 all=AsyncMock(return_value=[]),
-                status=AsyncMock(
-                    side_effect=lambda statement: statements.append(statement)
-                ),
+                status=AsyncMock(side_effect=lambda statement: statements.append(statement)),
             )
             yield connection
 
@@ -2231,9 +2451,7 @@ async def test_create_import_run_returns_active_same_importer_run(monkeypatch):
     monkeypatch.setattr(control_imports, "find_earliest_active_run_by_importer", fake_find_importer)
     monkeypatch.setattr(control_imports, "_enqueue_import_start", fail_enqueue)
 
-    created_run_map, created = await create_import_run(
-        {"run_id": "run_duplicate_npi", "importer": "npi"}
-    )
+    created_run_map, created = await create_import_run({"run_id": "run_duplicate_npi", "importer": "npi"})
 
     assert created is False
     assert created_run_map == active_run_map
@@ -2445,6 +2663,15 @@ def _provider_directory_seed_params(*source_ids, **overrides):
     return params_by_name
 
 
+def _provider_directory_recovery_params(source_id, **overrides):
+    return {
+        "provider_directory_serving_operation": "recover",
+        "provider_directory_serving_generation": "63c32ca4-f9c5-5395-9886-f075f7c0ccda",
+        "source_ids": [source_id],
+        **overrides,
+    }
+
+
 def _provider_directory_active_run(run_id, source_id, endpoint_scope):
     return {
         "run_id": run_id,
@@ -2565,12 +2792,16 @@ class _BlockingProviderEnqueue:
         }
 
 
-def _provider_retry_request(run_id):
-    return {
+def _provider_retry_request(run_id, lineage="outer"):
+    request_payload_map = {
         "run_id": run_id,
         "importer": "provider-directory-fhir",
-        "retry_of_run_id": "run_parent",
     }
+    if lineage in {"outer", "both"}:
+        request_payload_map["retry_of_run_id"] = "run_parent"
+    if lineage in {"nested", "both"}:
+        request_payload_map["params"] = {"retry_of_run_id": "run_parent"}
+    return request_payload_map
 
 
 def _install_provider_admission_stubs(monkeypatch, active_runs, *, idempotency_run=None):
@@ -2646,10 +2877,7 @@ async def test_concurrent_npi_admission_converges_on_one_active_run(monkeypatch)
     lock_events = [event for event in database.events if event[0] == "scalar"]
     assert len(lock_events) == 2
     assert all("pg_advisory_xact_lock" in str(event[1]) for event in lock_events)
-    assert all(
-        event[2] == {"lock_key": control_imports._NPI_ADMISSION_LOCK_KEY}
-        for event in lock_events
-    )
+    assert all(event[2] == {"lock_key": control_imports._NPI_ADMISSION_LOCK_KEY} for event in lock_events)
 
 
 @pytest.mark.parametrize(
@@ -2691,13 +2919,9 @@ def test_fhir_source_local_relation_artifact_classifier(
         publish_corroboration=publish_corroboration,
     )
 
-    operation_kind, source_ids, endpoint_scope = (
-        control_imports._provider_directory_operation(params_by_name)
-    )
+    operation_kind, source_ids, endpoint_scope = control_imports._provider_directory_operation(params_by_name)
 
-    assert operation_kind == (
-        control_imports._PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT
-    )
+    assert operation_kind == (control_imports._PROVIDER_DIRECTORY_SCOPED_RELATION_ARTIFACT)
     assert source_ids == frozenset({"pdfhir_summary"})
     assert endpoint_scope is None
 
@@ -2708,11 +2932,7 @@ def test_fhir_source_local_relation_artifact_classifier(
         {"publish_artifacts_targets": ""},
         {"publish_artifacts_targets": ","},
         {"publish_artifacts_targets": "dataset_network_plan,"},
-        {
-            "publish_artifacts_targets": (
-                "dataset_network_plan,dataset_network_plan"
-            )
-        },
+        {"publish_artifacts_targets": ("dataset_network_plan,dataset_network_plan")},
         {"publish_artifacts_targets": "network_catalog"},
         {"publish_artifacts_targets": ["dataset_network_plan"]},
         {
@@ -2735,9 +2955,7 @@ def test_fhir_relation_artifact_classifier_fails_closed(unsafe_overrides):
         **unsafe_overrides,
     )
 
-    operation_kind, source_ids, endpoint_scope = (
-        control_imports._provider_directory_operation(params_by_name)
-    )
+    operation_kind, source_ids, endpoint_scope = control_imports._provider_directory_operation(params_by_name)
 
     assert operation_kind == control_imports._PROVIDER_DIRECTORY_SCOPED_ARTIFACT
     assert source_ids == frozenset({"pdfhir_summary"})
@@ -2852,10 +3070,13 @@ def test_fhir_scoped_seed_conflicts_only_with_overlapping_or_exclusive_work():
     assert control_imports._provider_directory_blocking_run(other_seed, [artifact_run]) is None
     assert control_imports._provider_directory_blocking_run(artifact_seed, [artifact_run]) == artifact_run
     assert control_imports._provider_directory_blocking_run(other_seed, [second_seed_run]) is None
-    assert control_imports._provider_directory_blocking_run(
-        _provider_directory_seed_params("pdfhir_other"),
-        [second_seed_run],
-    ) == second_seed_run
+    assert (
+        control_imports._provider_directory_blocking_run(
+            _provider_directory_seed_params("pdfhir_other"),
+            [second_seed_run],
+        )
+        == second_seed_run
+    )
     assert control_imports._provider_directory_blocking_run(disjoint_acquisition, [seed_run]) is None
     assert control_imports._provider_directory_blocking_run(overlapping_acquisition, [seed_run]) == seed_run
     assert control_imports._provider_directory_blocking_run(verified_seed, [exclusive_run]) == exclusive_run
@@ -2907,10 +3128,27 @@ def test_fhir_artifact_conflicts():
     assert control_imports._provider_directory_blocking_run(overlapping_acquisition, [artifact_run]) == artifact_run
 
 
-def test_fhir_source_local_relation_artifacts_allow_only_disjoint_parallel_work():
-    relation_targets = (
-        "dataset_network_plan,dataset_affiliation_organization"
+@pytest.mark.parametrize("source_id,blocked", [("pdfhir_shared", True), ("pdfhir_other", False)])
+def test_fhir_recovery_classification_preserves_source_admission_scope(source_id, blocked):
+    params_by_name = _provider_directory_recovery_params(source_id)
+    acquisition = _provider_directory_active_run("run_acquisition", "pdfhir_shared", "https://shared.example.org/fhir")
+    recovery_run_by_field = {"run_id": "run_recovery", "params": params_by_name}
+
+    assert control_imports._provider_directory_operation(params_by_name) == (
+        control_imports._PROVIDER_DIRECTORY_SCOPED_ARTIFACT,
+        frozenset({source_id}),
+        None,
     )
+    assert control_imports._provider_directory_blocking_run(params_by_name, [acquisition]) == (
+        acquisition if blocked else None
+    )
+    assert control_imports._provider_directory_blocking_run(acquisition["params"], [recovery_run_by_field]) == (
+        recovery_run_by_field if blocked else None
+    )
+
+
+def test_fhir_source_local_relation_artifacts_allow_only_disjoint_parallel_work():
+    relation_targets = "dataset_network_plan,dataset_affiliation_organization"
     first_params = _provider_directory_artifact_params(
         "pdfhir_first",
         publish_artifacts_targets=relation_targets,
@@ -2944,18 +3182,27 @@ def test_fhir_source_local_relation_artifacts_allow_only_disjoint_parallel_work(
         )
         is None
     )
-    assert control_imports._provider_directory_blocking_run(
-        overlapping_params_by_name,
-        [first_run],
-    ) == first_run
-    assert control_imports._provider_directory_blocking_run(
-        general_artifact_params,
-        [first_run],
-    ) == first_run
-    assert control_imports._provider_directory_blocking_run(
-        disjoint_params,
-        [general_artifact_run],
-    ) == general_artifact_run
+    assert (
+        control_imports._provider_directory_blocking_run(
+            overlapping_params_by_name,
+            [first_run],
+        )
+        == first_run
+    )
+    assert (
+        control_imports._provider_directory_blocking_run(
+            general_artifact_params,
+            [first_run],
+        )
+        == first_run
+    )
+    assert (
+        control_imports._provider_directory_blocking_run(
+            disjoint_params,
+            [general_artifact_run],
+        )
+        == general_artifact_run
+    )
 
 
 def test_fhir_relation_artifacts_share_source_overlap_rules_with_other_work():
@@ -2977,24 +3224,33 @@ def test_fhir_relation_artifacts_share_source_overlap_rules_with_other_work():
         "https://relation.example.org/fhir",
     )
 
-    assert control_imports._provider_directory_blocking_run(
-        disjoint_acquisition,
-        [relation_run],
-    ) is None
-    assert control_imports._provider_directory_blocking_run(
-        overlapping_acquisition,
-        [relation_run],
-    ) == relation_run
-    assert control_imports._provider_directory_blocking_run(
-        relation_params,
-        [
-            _provider_directory_active_run(
-                "run_other",
-                "pdfhir_other",
-                "https://other.example.org/fhir",
-            )
-        ],
-    ) is None
+    assert (
+        control_imports._provider_directory_blocking_run(
+            disjoint_acquisition,
+            [relation_run],
+        )
+        is None
+    )
+    assert (
+        control_imports._provider_directory_blocking_run(
+            overlapping_acquisition,
+            [relation_run],
+        )
+        == relation_run
+    )
+    assert (
+        control_imports._provider_directory_blocking_run(
+            relation_params,
+            [
+                _provider_directory_active_run(
+                    "run_other",
+                    "pdfhir_other",
+                    "https://other.example.org/fhir",
+                )
+            ],
+        )
+        is None
+    )
 
 
 def test_provider_directory_legacy_active_group_scope_controls_parallel_admission(monkeypatch):
@@ -3037,7 +3293,8 @@ async def test_create_import_run_replays_provider_directory_idempotency_key(monk
 
 
 @pytest.mark.asyncio
-async def test_create_import_run_replays_terminal_provider_directory_retry_child(monkeypatch):
+@pytest.mark.parametrize("lineage", ["outer", "nested", "both"])
+async def test_create_import_run_replays_terminal_provider_directory_retry_child(monkeypatch, lineage):
     terminal_child_map = {
         "run_id": "run_child",
         "status": "failed",
@@ -3057,14 +3314,9 @@ async def test_create_import_run_replays_terminal_provider_directory_retry_child
     monkeypatch.setattr(control_imports, "_active_importer_runs", fail_active_lookup)
     monkeypatch.setattr(control_imports, "_enqueue_import_start", fail_enqueue)
 
-    replayed_run, created = await create_import_run(
-        {
-            "run_id": "run_second_child",
-            "importer": "provider-directory-fhir",
-            "retry_of_run_id": "run_parent",
-            "idempotency_key": "new-idempotency-key",
-        }
-    )
+    request_payload_map = _provider_retry_request("run_second_child", lineage)
+    request_payload_map["idempotency_key"] = "new-idempotency-key"
+    replayed_run, created = await create_import_run(request_payload_map)
 
     assert created is False
     assert replayed_run == terminal_child_map
@@ -3075,7 +3327,10 @@ async def test_create_import_run_replays_terminal_provider_directory_retry_child
 
 
 @pytest.mark.asyncio
-async def test_concurrent_provider_directory_retries_converge_on_one_child(monkeypatch):
+@pytest.mark.parametrize(
+    "first_lineage,second_lineage", [("outer", "outer"), ("nested", "nested"), ("nested", "outer"), ("outer", "nested")]
+)
+async def test_concurrent_provider_directory_retries_converge_on_one_child(monkeypatch, first_lineage, second_lineage):
     """Serialize concurrent admissions and return the first direct child."""
     database = _ConcurrentProviderAdmissionDb()
     enqueue = _BlockingProviderEnqueue()
@@ -3091,17 +3346,16 @@ async def test_concurrent_provider_directory_retries_converge_on_one_child(monke
     async def no_active_runs(_connection, _importer):
         return []
 
+    database.query_rows = [{"run_id": "run_parent", "importer": "provider-directory-fhir", "params": {}}]
     monkeypatch.setattr(control_imports, "db", database)
     monkeypatch.setattr(control_imports, "_provider_directory_retry_child", retry_child)
     monkeypatch.setattr(control_imports, "_active_idempotency_run", no_idempotency_run)
     monkeypatch.setattr(control_imports, "_active_importer_runs", no_active_runs)
     monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
 
-    first_task = asyncio.create_task(
-        create_import_run(_provider_retry_request("run_child_one"))
-    )
+    first_task = asyncio.create_task(create_import_run(_provider_retry_request("run_child_one", first_lineage)))
     await enqueue.started.wait()
-    second_result = await create_import_run(_provider_retry_request("run_child_two"))
+    second_result = await create_import_run(_provider_retry_request("run_child_two", second_lineage))
     enqueue.finish.set()
     first_result = await first_task
 
@@ -3110,6 +3364,204 @@ async def test_concurrent_provider_directory_retries_converge_on_one_child(monke
     assert first_result[0]["run_id"] == second_result[0]["run_id"] == "run_child_one"
     assert enqueue.calls == ["run_child_one"]
     assert [event[0] for event in database.events].count("status") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lineage", ["nested", "both"])
+async def test_provider_retry_normalizes_parent_without_changing_source_scope(monkeypatch, lineage):
+    database = _install_provider_admission_stubs(monkeypatch, [])
+    database.query_rows = [
+        {"run_id": run_id, "importer": "provider-directory-fhir", "params": {"allow_retained_pagination_reset": False}}
+        for run_id in ("run_parent", "run_root")
+    ]
+    retry_child = AsyncMock(return_value=None)
+    enqueue = AsyncMock(return_value={})
+    monkeypatch.setattr(control_imports, "_provider_directory_retry_child", retry_child)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+    request_payload_map = _provider_retry_request("run_child", lineage)
+    params_by_name = {
+        "retry_of_run_id": " run_parent ",
+        "provider_directory_pagination_root_run_id": "run_root",
+        "allow_retained_pagination_reset": False,
+        "source_ids": ["source_alias_a", "source_alias_b"],
+        "provider_directory_endpoint_scope": "https://directory.example.test/fhir",
+    }
+    request_payload_map["params"] = params_by_name
+    original_request = json.loads(json.dumps(request_payload_map))
+    created_run, created = await create_import_run(request_payload_map)
+    assert created is True
+    assert request_payload_map == original_request
+    assert created_run["retry_of_run_id"] == "run_parent"
+    retry_child.assert_awaited_once_with(database, "run_parent")
+    queued_run = enqueue.await_args.args[0]
+    assert queued_run["retry_of_run_id"] == "run_parent"
+    assert queued_run["params"] == params_by_name
+    inserted = next(event[1].compile().params for event in database.events if event[0] == "status")
+    assert inserted["retry_of_run_id"] == "run_parent"
+    assert inserted["params"] == params_by_name
+    adapter = control_imports._SINGLE_JOB_ADAPTERS["provider-directory-fhir"]
+    assert control_imports._adapter_payload(adapter, queued_run, queued_run["params"])["task"] == {
+        "test_mode": False,
+        **params_by_name,
+        "retry_of_run_id": "run_parent",
+    }
+
+
+@pytest.mark.asyncio
+async def test_provider_retry_rejects_conflicting_parents_before_replay(monkeypatch):
+    database = _install_provider_admission_stubs(monkeypatch, [])
+    replayed_run_map = {
+        "run_id": "run_existing",
+        "importer": "provider-directory-fhir",
+        "retry_of_run_id": "run_parent",
+    }
+    retry_child = AsyncMock(return_value=replayed_run_map)
+    idempotency_run = AsyncMock(return_value=replayed_run_map)
+    enqueue = AsyncMock()
+    monkeypatch.setattr(control_imports, "_provider_directory_retry_child", retry_child)
+    monkeypatch.setattr(control_imports, "_active_idempotency_run", idempotency_run)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+    with pytest.raises(ValueError, match="retry_parent_changed"):
+        await create_import_run(
+            {
+                "importer": "provider-directory-fhir",
+                "retry_of_run_id": "run_parent",
+                "params": {"retry_of_run_id": "run_other"},
+                "idempotency_key": "existing-key",
+            }
+        )
+    assert database.events == []
+    retry_child.assert_not_awaited()
+    idempotency_run.assert_not_awaited()
+    enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("importer", ["openaddresses", "mrf-source-discovery"])
+async def test_nested_retry_normalization_is_limited_to_provider_directory(monkeypatch, importer):
+    _install_provider_admission_stubs(monkeypatch, [])
+    monkeypatch.setattr(control_imports, "find_earliest_active_run_by_importer", AsyncMock(return_value=None))
+    monkeypatch.setattr(control_imports, "_has_isolated_pricing_admission", AsyncMock(return_value=False))
+    admission = AsyncMock(return_value=None)
+    enqueue = AsyncMock(return_value={})
+    monkeypatch.setattr(control_imports, "_admit_import_row", admission)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+    run, created = await create_import_run({"importer": importer, "params": {"retry_of_run_id": "run_parent"}})
+    assert created is True
+    assert run["retry_of_run_id"] is None
+    assert admission.await_args.args[1]["retry_of_run_id"] is None
+    assert enqueue.await_args.args[0]["params"] == {"retry_of_run_id": "run_parent"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("child_policy", [None, True, False])
+@pytest.mark.parametrize("lineage", ["outer", "nested", "root"])
+async def test_direct_provider_retry_preserves_retained_reset_policy(monkeypatch, child_policy, lineage):
+    """Reject widening before insert/enqueue; queue the explicit false policy unchanged."""
+    database = _install_provider_admission_stubs(monkeypatch, [])
+    database.query_rows = [
+        {
+            "run_id": "run_parent",
+            "importer": "provider-directory-fhir",
+            "params": {"allow_retained_pagination_reset": False},
+        }
+    ]
+    monkeypatch.setattr(control_imports, "_provider_directory_retry_child", AsyncMock(return_value=None))
+    enqueue = AsyncMock(return_value={})
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+    params_by_name = {} if child_policy is None else {"allow_retained_pagination_reset": child_policy}
+    request_payload_map = {"importer": "provider-directory-fhir", "params": params_by_name}
+    if lineage == "outer":
+        request_payload_map["retry_of_run_id"] = "run_parent"
+    else:
+        params_by_name["retry_of_run_id" if lineage == "nested" else "provider_directory_pagination_root_run_id"] = (
+            "run_parent"
+        )
+    if child_policy is not False:
+        with pytest.raises(ValueError, match="retained_pagination_reset_cannot_be_enabled"):
+            await create_import_run(request_payload_map)
+        assert not any(event[0] in {"status", "execute"} for event in database.events)
+        enqueue.assert_not_awaited()
+        return
+    created_run, created = await create_import_run(request_payload_map)
+    assert created is True
+    assert created_run["params"]["allow_retained_pagination_reset"] is False
+    assert enqueue.await_args.args[0]["params"]["allow_retained_pagination_reset"] is False
+    inserted = next(event[1].compile().params for event in database.events if event[0] == "status")
+    assert inserted["params"]["allow_retained_pagination_reset"] is False
+    lookup = next(event[1].compile().params for event in database.events if event[0] == "all")
+    assert lookup["importer_1"] == "provider-directory-fhir"
+    assert set(lookup["run_id_1"]) == {"run_parent"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["missing", "wrong-importer", "conflicting-parent", "root-no-reset", "self-root"])
+async def test_direct_provider_retry_rejects_unverified_or_restrictive_ancestors(monkeypatch, damage):
+    database = _install_provider_admission_stubs(monkeypatch, [])
+    parent_run_map = {"run_id": "run_parent", "importer": "provider-directory-fhir", "params": {}}
+    root_run_map = {"run_id": "run_root", "importer": "provider-directory-fhir", "params": {}}
+    params_by_name = {"retry_of_run_id": "run_parent", "provider_directory_pagination_root_run_id": "run_root"}
+    database.query_rows = [parent_run_map, root_run_map]
+    expected = "retry_ancestor_unavailable"
+    if damage == "missing":
+        database.query_rows = [parent_run_map]
+    elif damage == "wrong-importer":
+        root_run_map["importer"] = "npi"
+        database.query_rows = [parent_run_map]
+    elif damage == "conflicting-parent":
+        params_by_name["retry_of_run_id"] = "run_other"
+        expected = "retry_parent_changed"
+    elif damage == "self-root":
+        params_by_name["provider_directory_pagination_root_run_id"] = "run_child"
+        database.query_rows = [parent_run_map]
+    else:
+        root_run_map["params"]["allow_retained_pagination_reset"] = False
+        expected = "retained_pagination_reset_cannot_be_enabled"
+    monkeypatch.setattr(control_imports, "_provider_directory_retry_child", AsyncMock(return_value=None))
+    enqueue = AsyncMock()
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+    with pytest.raises(ValueError, match=expected):
+        await create_import_run(
+            {
+                "run_id": "run_child",
+                "importer": "provider-directory-fhir",
+                "retry_of_run_id": "run_parent",
+                "params": params_by_name,
+            }
+        )
+    assert not any(event[0] in {"status", "execute"} for event in database.events)
+    enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_provider_retry_keeps_legacy_permissive_policy(monkeypatch):
+    database = _install_provider_admission_stubs(monkeypatch, [])
+    database.query_rows = [{"run_id": "run_parent", "importer": "provider-directory-fhir", "params": {}}]
+    monkeypatch.setattr(control_imports, "_provider_directory_retry_child", AsyncMock(return_value=None))
+    enqueue = AsyncMock(return_value={})
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+    run, created = await create_import_run({"importer": "provider-directory-fhir", "retry_of_run_id": "run_parent"})
+    assert created is True
+    assert "allow_retained_pagination_reset" not in run["params"]
+    assert "allow_retained_pagination_reset" not in enqueue.await_args.args[0]["params"]
+
+
+@pytest.mark.asyncio
+async def test_fresh_provider_run_accepts_its_explicit_pagination_root(monkeypatch):
+    database = _install_provider_admission_stubs(monkeypatch, [])
+    enqueue = AsyncMock(return_value={})
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+    run, created = await create_import_run(
+        {
+            "run_id": "run_fresh",
+            "importer": "provider-directory-fhir",
+            "params": {"provider_directory_pagination_root_run_id": "run_fresh"},
+        }
+    )
+    assert created is True
+    assert run["params"]["provider_directory_pagination_root_run_id"] == "run_fresh"
+    assert not any(event[0] == "all" for event in database.events)
+    enqueue.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -3249,6 +3701,52 @@ async def test_create_import_run_blocks_overlapping_provider_directory_scope(
 
 
 @pytest.mark.asyncio
+async def test_create_import_run_blocks_recovery_during_same_source_acquisition(monkeypatch):
+    active = _provider_directory_active_run("run_acquisition", "pdfhir_shared", "https://shared.example.org/fhir")
+    database = _install_provider_admission_stubs(monkeypatch, [active])
+    enqueue = AsyncMock()
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+
+    row, created = await create_import_run(
+        {"importer": "provider-directory-fhir", "params": _provider_directory_recovery_params("pdfhir_shared")}
+    )
+
+    assert created is False
+    assert row == active
+    assert [event[0] for event in database.events] == ["acquire", "scalar", "commit"]
+    enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides,error",
+    [
+        ({"provider_directory_serving_generation": "invalid"}, "generation_invalid"),
+        ({"provider_directory_serving_operation": "rollback"}, "request_invalid"),
+        ({"import_resources": True}, "request_invalid"),
+    ],
+)
+async def test_create_import_run_rejects_malformed_recovery_before_admission(monkeypatch, overrides, error):
+    database = _ProviderAdmissionDb()
+    admit, enqueue = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(control_imports, "db", database)
+    monkeypatch.setattr(control_imports, "_admit_import_row", admit)
+    monkeypatch.setattr(control_imports, "_enqueue_import_start", enqueue)
+
+    with pytest.raises(ValueError, match=error):
+        await create_import_run(
+            {
+                "importer": "provider-directory-fhir",
+                "params": _provider_directory_recovery_params("pdfhir_shared", **overrides),
+            }
+        )
+
+    assert database.events == []
+    admit.assert_not_awaited()
+    enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "unsafe_override",
     [
@@ -3285,9 +3783,7 @@ async def test_create_import_run_blocks_unsafe_provider_directory_parallel_flags
     )
     params_by_name.update(unsafe_override)
 
-    blocked_run, created = await create_import_run(
-        {"importer": "provider-directory-fhir", "params": params_by_name}
-    )
+    blocked_run, created = await create_import_run({"importer": "provider-directory-fhir", "params": params_by_name})
 
     assert created is False
     assert blocked_run == active
@@ -3337,6 +3833,8 @@ def test_provider_directory_capacity_override_allows_third_disjoint_acquisition(
 class _CancelUpdateResult:
     """Minimal SQLAlchemy result stub for cancel update tests."""
 
+    rowcount = 1
+
     def scalar_one_or_none(self):
         return None
 
@@ -3349,7 +3847,12 @@ class _CancelDbUpdateRecorder:
         self.lookup_attempts = 0
 
     async def execute(self, statement):
-        self.update_parameters.append(statement.compile().params)
+        parameters = statement.compile().params
+        if "metrics" not in parameters:
+            metrics_expression = statement._values[ImportRun.__table__.c.metrics]
+            assert isinstance(metrics_expression, sa.sql.elements.Case)
+            parameters["metrics"] = metrics_expression.else_.clause.value
+        self.update_parameters.append(parameters)
         return _CancelUpdateResult()
 
     async def scalar(self, *_args, **_kwargs):
@@ -3357,6 +3860,8 @@ class _CancelDbUpdateRecorder:
         return None
 
     def merged_run(self, source_run: dict[str, object]) -> dict[str, object]:
+        # These fixtures exercise the non-pricing CASE branch; pricing has native coverage.
+        assert source_run.get("importer") not in control_imports.PRICING_IMPORTERS
         latest_update = self.update_parameters[-1]
         return {
             **source_run,
@@ -3442,9 +3947,7 @@ def _install_queued_cancel_stubs(
             "ttl_seconds": 10,
         }
     )
-    delete_active_worker_jobs = AsyncMock(
-        return_value=kubernetes_signal_by_name
-    )
+    delete_active_worker_jobs = AsyncMock(return_value=kubernetes_signal_by_name)
     monkeypatch.setattr(control_imports, "db", database_recorder)
     monkeypatch.setattr(control_imports, "get_import_run", fake_get_import_run)
     monkeypatch.setattr(control_imports, "_remove_queued_job", remove_queued_job)
@@ -3533,9 +4036,7 @@ def test_invalid_worker_delete_count_is_not_terminalized():
         }
     }
 
-    assert not control_imports._has_terminalized_active_worker_cancel_signal(
-        cancel_signal_map
-    )
+    assert not control_imports._has_terminalized_active_worker_cancel_signal(cancel_signal_map)
 
 
 @pytest.mark.asyncio
@@ -3592,19 +4093,17 @@ async def test_request_cancel_finishes_queued_arq_run(monkeypatch):
         "metrics": {"enqueue_adapter": "arq_single_job", "queue": "arq:NPI", "job_id": "job_1"},
         "finished_at": None,
     }
-    remove_queued_job, set_cancel_flag, delete_active_worker_jobs = (
-        _install_queued_cancel_stubs(
-            monkeypatch,
-            current_run_map,
-            {
-                "redis": True,
-                "queue": "arq:NPI",
-                "job_id": "job_1",
-                "removed": True,
-                "deleted_job_key": True,
-            },
-            {"enabled": True, "deleted": 0, "items": []},
-        )
+    remove_queued_job, set_cancel_flag, delete_active_worker_jobs = _install_queued_cancel_stubs(
+        monkeypatch,
+        current_run_map,
+        {
+            "redis": True,
+            "queue": "arq:NPI",
+            "job_id": "job_1",
+            "removed": True,
+            "deleted_job_key": True,
+        },
+        {"enabled": True, "deleted": 0, "items": []},
     )
 
     cancel_result_map = await control_imports.request_cancel("run_queued")
@@ -3633,29 +4132,25 @@ async def test_request_cancel_deletes_launched_worker_for_queued_arq_run(
         },
         "finished_at": None,
     }
-    remove_queued_job, set_cancel_flag, delete_active_worker_jobs = (
-        _install_queued_cancel_stubs(
-            monkeypatch,
-            source_run_map,
-            {
-                "redis": True,
-                "queue": "arq:ProviderDirectoryFHIR",
-                "job_id": "job_launched",
-                "removed": False,
-                "deleted_job_key": True,
-            },
-            {
-                "enabled": True,
-                "namespace": "healthporta-dev",
-                "deleted": 1,
-                "items": [{"job_name": "worker-job", "deleted": True}],
-            },
-        )
+    remove_queued_job, set_cancel_flag, delete_active_worker_jobs = _install_queued_cancel_stubs(
+        monkeypatch,
+        source_run_map,
+        {
+            "redis": True,
+            "queue": "arq:ProviderDirectoryFHIR",
+            "job_id": "job_launched",
+            "removed": False,
+            "deleted_job_key": True,
+        },
+        {
+            "enabled": True,
+            "namespace": "healthporta-dev",
+            "deleted": 1,
+            "items": [{"job_name": "worker-job", "deleted": True}],
+        },
     )
 
-    cancel_result_map = await control_imports.request_cancel(
-        "run_queued_launched"
-    )
+    cancel_result_map = await control_imports.request_cancel("run_queued_launched")
 
     assert cancel_result_map["status"] == "canceled"
     assert cancel_result_map["phase_detail"] == "canceled active worker"
@@ -3697,16 +4192,12 @@ async def test_request_cancel_keeps_uncertain_queued_worker_canceling(
         },
     )
 
-    cancel_result_map = await control_imports.request_cancel(
-        "run_queued_uncertain"
-    )
+    cancel_result_map = await control_imports.request_cancel("run_queued_uncertain")
 
     assert cancel_result_map["status"] == "canceling"
     assert cancel_result_map["phase_detail"] == "cancel requested"
     assert cancel_result_map["finished_at"] is None
-    assert cancel_result_map["metrics"]["cancel_signal"]["kubernetes"][
-        "errors"
-    ]
+    assert cancel_result_map["metrics"]["cancel_signal"]["kubernetes"]["errors"]
 
 
 @pytest.mark.parametrize("cleanup_key", ["identity_mismatch", "identity_unavailable"])
@@ -3738,12 +4229,8 @@ async def test_request_cancel_retries_unverified_queue_identity(
         {"enabled": True, "deleted": 0, "items": []},
     ]
 
-    first_cancel_result_map = await control_imports.request_cancel(
-        "run_queued_unverified"
-    )
-    retried_cancel_result_map = await control_imports.request_cancel(
-        "run_queued_unverified"
-    )
+    first_cancel_result_map = await control_imports.request_cancel("run_queued_unverified")
+    retried_cancel_result_map = await control_imports.request_cancel("run_queued_unverified")
 
     assert first_cancel_result_map["status"] == "canceling"
     assert first_cancel_result_map["phase_detail"] == "cancel requested"
@@ -3759,9 +4246,7 @@ def test_queued_arq_cancel_completion_requires_a_durable_fence():
         "kubernetes": {"enabled": True, "deleted": 0, "items": []},
     }
 
-    assert control_imports._is_queued_arq_cancel_completed(
-        no_worker_after_cancel_flag_map
-    )
+    assert control_imports._is_queued_arq_cancel_completed(no_worker_after_cancel_flag_map)
     assert not control_imports._is_queued_arq_cancel_completed(
         {
             **no_worker_after_cancel_flag_map,
@@ -3924,12 +4409,8 @@ async def test_arq_cancel_retains_flag_and_refuses_mutation_on_identity_mismatch
     monkeypatch,
 ):
     set_cancel_flag = AsyncMock(return_value={"redis": True})
-    remove_queued_job = AsyncMock(
-        return_value={"redis": True, "removed": False, "identity_mismatch": True}
-    )
-    delete_active_worker_jobs = AsyncMock(
-        return_value={"enabled": True, "deleted": 1}
-    )
+    remove_queued_job = AsyncMock(return_value={"redis": True, "removed": False, "identity_mismatch": True})
+    delete_active_worker_jobs = AsyncMock(return_value={"enabled": True, "deleted": 1})
     monkeypatch.setattr(control_imports, "_set_cancel_flag", set_cancel_flag)
     monkeypatch.setattr(control_imports, "_remove_queued_job", remove_queued_job)
     monkeypatch.setattr(
@@ -3975,9 +4456,7 @@ def test_cancel_progress_preserves_exact_worker_attempt_ownership():
     )
 
     assert progress_by_name["attempt_id"] == "run_running:0123456789abcdef"
-    assert progress_by_name["attempt_started_at"] == (
-        "2026-08-09T01:02:03.000000+00:00"
-    )
+    assert progress_by_name["attempt_started_at"] == ("2026-08-09T01:02:03.000000+00:00")
 
 
 @pytest.mark.parametrize(
@@ -4191,9 +4670,7 @@ async def test_finalize_import_run_enqueues_finish_and_marks_finalizing(monkeypa
     ],
 )
 def test_finish_function_resolves_each_supported_importer(importer, module_name):
-    assert control_imports._finish_function(importer) is importlib.import_module(
-        module_name
-    ).finish_main
+    assert control_imports._finish_function(importer) is importlib.import_module(module_name).finish_main
 
 
 def test_finish_function_rejects_unsupported_importer():
@@ -4257,71 +4734,69 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
     """Expose every reviewed source while preserving execution fences."""
     catalog = provider_directory_source_catalog()
     runnable_items = [entry for entry in catalog["items"] if entry["runnable"]]
-    nonrunnable_items = [
-        entry for entry in catalog["items"] if not entry["runnable"]
-    ]
+    nonrunnable_items = [entry for entry in catalog["items"] if not entry["runnable"]]
 
     assert (
         catalog["entry_count"],
         catalog["runnable_count"],
         catalog["profile_source_count"],
-    ) == (39, 25, 27)
+    ) == (47, 33, 35)
     assert len(catalog["catalog_digest"]) == 64
-    assert len(runnable_items) == 25
+    assert len(runnable_items) == 33
     assert all(entry["profile_enabled"] for entry in runnable_items)
-    assert all(
-        entry["supported_resources"] == entry["resources"]
-        for entry in runnable_items
-    )
+    assert all(entry["supported_resources"] == entry["resources"] for entry in runnable_items)
     assert len(nonrunnable_items) == 14
-    probe_items = [
-        entry
-        for entry in nonrunnable_items
-        if entry["classification"] == "probe_only"
-    ]
+    probe_items = [entry for entry in nonrunnable_items if entry["classification"] == "probe_only"]
     assert len(probe_items) == 13
     probe_by_id = {entry["entry_id"]: entry for entry in probe_items}
     runnable_by_id = {entry["entry_id"]: entry for entry in runnable_items}
+    assert runnable_by_id["anthem-provider-directory"]["resources"] == _FULL_PROVIDER_DIRECTORY_RESOURCE_SURFACE[:-1]
     assert probe_by_id["capital-blue-cross"]["resources"] == []
-    assert (
-        probe_by_id["capital-blue-cross"]["supported_resources"]
-        == _FULL_PROVIDER_DIRECTORY_RESOURCE_SURFACE
-    )
+    assert probe_by_id["capital-blue-cross"]["supported_resources"] == _FULL_PROVIDER_DIRECTORY_RESOURCE_SURFACE
     assert len(runnable_by_id["devoted-health"]["resources"]) == 7
     assert len(runnable_by_id["simpra-advantage"]["resources"]) == 6
     assert len(runnable_by_id["san-bernardino-county-dbh"]["resources"]) == 8
     assert len(runnable_by_id["san-mateo-county-bhrs"]["resources"]) == 8
     assert runnable_by_id["uhc-provider-files"]["resource_profile"] == "A6"
-    assert (
-        runnable_by_id["uhc-provider-files"]["resources"]
-        == _UHC_PROVIDER_DIRECTORY_RESOURCE_SURFACE
-    )
+    assert runnable_by_id["uhc-provider-files"]["resources"] == _UHC_PROVIDER_DIRECTORY_RESOURCE_SURFACE
     michigan = runnable_by_id["michigan"]
     assert michigan["resource_profile"] == "M5"
-    assert michigan["resources"] == michigan["supported_resources"] == [
-        "Location", "Organization", "OrganizationAffiliation", "Practitioner",
-        "PractitionerRole",
-    ]
-    assert probe_by_id["scan"]["resources"] == []
     assert (
-        probe_by_id["scan"]["supported_resources"]
-        == _FULL_PROVIDER_DIRECTORY_RESOURCE_SURFACE
+        michigan["resources"]
+        == michigan["supported_resources"]
+        == [
+            "Location",
+            "Organization",
+            "OrganizationAffiliation",
+            "Practitioner",
+            "PractitionerRole",
+        ]
     )
+    assert probe_by_id["scan"]["resources"] == []
+    assert probe_by_id["scan"]["supported_resources"] == _FULL_PROVIDER_DIRECTORY_RESOURCE_SURFACE
     assert {entry["entry_id"] for entry in runnable_items} >= {
         "aetna-commercial-medicare",
+        "anthem-provider-directory",
         "alohr",
         "caresource",
         "molina",
+        "pacificsource",
     }
+
+
+def test_provider_directory_catalog_enables_cms_profile_source():
+    cms = next(entry for entry in provider_directory_source_catalog()["items"] if entry["entry_id"] == "cms-npd")
+
+    assert cms["source_ids"] == ["cms-npd"]
+    assert cms["resource_profile"] == "R8"
+    assert cms["resources"] == _FULL_PROVIDER_DIRECTORY_RESOURCE_SURFACE
+    assert cms["profile_enabled"] is True
+    assert cms["runnable"] is True
 
 
 def test_uhc_catalog_reports_supported_resources_without_enabling_import():
     """Show the verified UHC surface while its census remains incomplete."""
-    uhc_entry = next(
-        entry
-        for entry in provider_directory_source_catalog()["items"]
-        if entry["entry_id"] == "uhc"
-    )
+    uhc_entry = next(entry for entry in provider_directory_source_catalog()["items"] if entry["entry_id"] == "uhc")
 
     assert uhc_entry["resources"] == []
     assert uhc_entry["runnable"] is False
@@ -4365,6 +4840,7 @@ async def test_control_ptg_parse_toc_preview_endpoint(monkeypatch):
         "parse_ptg_toc_preview",
         lambda _payload: {"status": "parsed", "counts": {"entries": 1}, "items": []},
     )
+
     async def fake_to_thread(func, payload):
         to_thread_calls.append(func)
         return func(payload)
@@ -4414,9 +4890,7 @@ async def test_control_ptg_source_snapshot_attest_endpoint(
     }
     if request_generation is not None:
         request_by_field["storage_generation"] = request_generation
-    response = await control.control_ptg_source_snapshot_attest(
-        authed_request(json=request_by_field)
-    )
+    response = await control.control_ptg_source_snapshot_attest(authed_request(json=request_by_field))
     response_by_field = json.loads(response.body)
 
     assert response.status == 200
@@ -4507,9 +4981,7 @@ async def test_control_ptg_source_snapshot_promote_threads_reviewed_hold_digest(
 async def test_control_ptg_source_snapshot_promote_maps_hold_conflict(monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
     promote = AsyncMock(
-        side_effect=control.SourceSnapshotConflict(
-            "candidate audit-only approval digest does not match"
-        )
+        side_effect=control.SourceSnapshotConflict("candidate audit-only approval digest does not match")
     )
     monkeypatch.setattr(control, "promote_ptg2_source_snapshot", promote)
 
@@ -4579,7 +5051,11 @@ async def test_control_ptg_source_snapshot_promote_endpoint_can_enqueue_address_
 
     async def fake_create_import_run(response_by_field):
         import_calls.append(response_by_field)
-        return {"run_id": "run_refresh", "importer": response_by_field["importer"], "params": response_by_field["params"]}, True
+        return {
+            "run_id": "run_refresh",
+            "importer": response_by_field["importer"],
+            "params": response_by_field["params"],
+        }, True
 
     monkeypatch.setattr(control, "promote_ptg2_source_snapshot", fake_promote)
     monkeypatch.setattr(control, "create_import_run", fake_create_import_run)
@@ -4633,9 +5109,7 @@ async def test_control_ptg_source_snapshot_promote_rejects_held_attestation(
     address_refresh = AsyncMock()
 
     async def reject_held_attestation(**_kwargs):
-        raise ValueError(
-            "candidate audit attestation is held for audit-only review"
-        )
+        raise ValueError("candidate audit attestation is held for audit-only review")
 
     monkeypatch.setattr(
         control,
@@ -4828,9 +5302,7 @@ async def test_control_ptg_v4_recovery_plan_maps_bad_request(monkeypatch):
     )
 
     with pytest.raises(BadRequest, match="invalid target"):
-        await v4_recovery_control.control_v4_recovery_plan(
-            authed_request(json={"snapshot_key": 0})
-        )
+        await v4_recovery_control.control_v4_recovery_plan(authed_request(json={"snapshot_key": 0}))
 
 
 @pytest.mark.parametrize(
@@ -4861,9 +5333,7 @@ async def test_control_ptg_v4_recover_maps_failures(
     )
 
     with pytest.raises(control.SanicException) as exc_info:
-        await v4_recovery_control.control_v4_recover(
-            authed_request(json={"expected_plan_digest": "bad"})
-        )
+        await v4_recovery_control.control_v4_recover(authed_request(json={"expected_plan_digest": "bad"}))
 
     assert exc_info.value.status_code == expected_status
 
@@ -4892,6 +5362,7 @@ async def test_control_ptg_source_snapshot_retire_endpoint(monkeypatch):
 @pytest.mark.asyncio
 async def test_control_create_import_returns_created(monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+
     async def fake_create(payload):
         return {"run_id": "run_1", "importer": payload["importer"], "status": "queued"}, True
 
@@ -4909,6 +5380,7 @@ async def test_control_create_import_returns_created(monkeypatch):
 @pytest.mark.asyncio
 async def test_control_create_import_returns_conflict_for_duplicate(monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+
     async def fake_create(_payload):
         return {"run_id": "run_existing", "status": "queued"}, False
 
@@ -4962,6 +5434,7 @@ async def test_control_list_imports_uses_cursor_list_envelope(monkeypatch):
 @pytest.mark.asyncio
 async def test_control_cancel_import_returns_accepted(monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+
     async def fake_cancel(run_id):
         return {"run_id": run_id, "status": "canceling"}
 
@@ -4995,9 +5468,7 @@ async def test_control_attestation_requires_report_object(monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
 
     with pytest.raises(BadRequest, match="report must be an object"):
-        await control.control_ptg_source_snapshot_attest(
-            authed_request(json={"report": []})
-        )
+        await control.control_ptg_source_snapshot_attest(authed_request(json={"report": []}))
 
 
 @pytest.mark.asyncio

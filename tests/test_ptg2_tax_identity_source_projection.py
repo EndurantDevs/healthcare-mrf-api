@@ -155,59 +155,20 @@ async def test_stage_rejects_copy_consumer_that_stops_before_eof(tmp_path):
 
 @pytest.mark.asyncio
 async def test_observation_publication_uses_multiple_bounded_batches(monkeypatch):
-    boundary_reader = AsyncMock(
-        side_effect=[
-            (2, 0, 1),
-            (2, 0, 3),
-            (1, 0, 4),
-            None,
-        ]
-    )
+    boundary_reader = AsyncMock(side_effect=[((0,1),2),((0,3),2),((0,4),1),(None,0)])
     batch_publisher = AsyncMock()
+    finisher = AsyncMock()
     heartbeat = Mock()
-    monkeypatch.setattr(observations, "_observation_boundary", boundary_reader)
-    monkeypatch.setattr(
-        observations,
-        "_publish_observation_batch",
-        batch_publisher,
-    )
-
-    await observations._publish_observations(
-        object(),
-        schema='"mrf"',
-        stage='"pg_temp"."source_stage"',
-        snapshot_key=17,
-        prepared=SimpleNamespace(provider_group_occurrence_count=5),
-        heartbeat_callback=heartbeat,
-    )
-
-    assert boundary_reader.await_count == 4
-    assert batch_publisher.await_count == 3
-    assert [
-        awaited_call.kwargs["expected_count"]
-        for awaited_call in batch_publisher.await_args_list
-    ] == [2, 2, 1]
-    assert [
-        awaited_call.kwargs["range_parameters_by_name"]
-        for awaited_call in batch_publisher.await_args_list
-    ] == [
-        {
-            "previous_source_key": -1,
-            "previous_ordinal": -1,
-            "last_source_key": 0,
-            "last_ordinal": 1,
-        },
-        {
-            "previous_source_key": 0,
-            "previous_ordinal": 1,
-            "last_source_key": 0,
-            "last_ordinal": 3,
-        },
-        {
-            "previous_source_key": 0,
-            "previous_ordinal": 3,
-            "last_source_key": 0,
-            "last_ordinal": 4,
-        },
-    ]
-    assert heartbeat.call_count == 3
+    monkeypatch.setattr(observations,"_observation_boundary",boundary_reader)
+    monkeypatch.setattr(observations,"_copy_observation_batch",batch_publisher)
+    monkeypatch.setattr(observations,"begin_snapshot_candidate",AsyncMock(return_value="candidate"))
+    monkeypatch.setattr(observations,"finish_snapshot_candidate",finisher)
+    monkeypatch.setattr(observations,"_count_witness_mismatches",AsyncMock(return_value=0))
+    session=SimpleNamespace(scalar=AsyncMock(return_value="owned"))
+    await observations._publish_observations(session,schema='"mrf"',stage='"pg_temp"."source_stage"',
+        snapshot_key=17,prepared=SimpleNamespace(provider_group_occurrence_count=5),heartbeat_callback=heartbeat)
+    assert boundary_reader.await_count==4
+    assert [call.kwargs["bounds"] for call in batch_publisher.await_args_list]==[
+        ((-1,-1),(0,1),2),((0,1),(0,3),2),((0,3),(0,4),1)]
+    finisher.assert_awaited_once_with(session,"mrf","candidate",5)
+    assert heartbeat.call_count==3

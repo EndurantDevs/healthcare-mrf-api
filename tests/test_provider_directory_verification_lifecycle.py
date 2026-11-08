@@ -7,8 +7,20 @@ from scripts.research import (
     provider_directory_endpoint_acquisition_cli as acquisition_cli,
 )
 from tests.provider_directory_endpoint_acquisition_test_support import (
-    successful_operator_input,
+    successful_operator_input, synthetic_catalog_confirmation,
 )
+
+
+@pytest.fixture(autouse=True)
+def reviewed_test_catalog(monkeypatch):
+    load_manifest = acquisition_cli.harness.load_manifest
+
+    def load_reviewed_manifest(*args, **kwargs):
+        manifest = load_manifest(*args, **kwargs)
+        manifest["catalog_confirmation"] = synthetic_catalog_confirmation()
+        return manifest
+
+    monkeypatch.setattr(acquisition_cli.harness, "load_manifest", load_reviewed_manifest)
 
 
 def _resource_manifest_entry():

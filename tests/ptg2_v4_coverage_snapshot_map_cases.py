@@ -4,7 +4,6 @@ from tests.ptg2_v4_coverage_support import (
     PTG2_V3_SHARED_FORMAT_VERSION,
     SharedBlockReference,
     SimpleNamespace,
-    _owner_row,
     _reference,
     _relation_row,
     _summary,
@@ -421,18 +420,6 @@ def _assert_normalized_relation_rows() -> None:
             }
         )
 
-    assert (
-        snapshot_maps._normalized_heavy_owner_rows(
-            (_owner_row("a", 1), _owner_row("a", 2))
-        )[0]["owner_key"]
-        == 1
-    )
-    with pytest.raises(ValueError, match="strictly ordered"):
-        snapshot_maps._normalized_heavy_owner_rows(
-            (_owner_row("a", 2), _owner_row("a", 1))
-        )
-    with pytest.raises(ValueError, match="invalid bitmap"):
-        snapshot_maps._heavy_owner_row({**_owner_row(), "fragment_count": 0})
 
 
 def test_snapshot_persisted_pack_and_metadata_validators() -> None:

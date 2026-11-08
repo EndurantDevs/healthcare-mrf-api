@@ -220,6 +220,23 @@ def validated_capacity_signing_guard_fields(
         lease_expires_at=parsed_by_field["expires_at"],
         lease_max_build_deadline=parsed_by_field["max_build_deadline"],
     )
+    binding = signing_guard["healthcare_receipt"].get("database_binding")
+    if binding is not None:
+        data_tablespace = next(
+            entry for entry in parsed_by_field["tablespaces"] if entry.usage == "data"
+        )
+        if any(
+            binding[name] != parsed_by_field[name]
+            for name in (
+                "database_system_identifier",
+                "database_oid",
+                "database_name",
+            )
+        ) or (binding["tablespace_oid"], binding["tablespace_name"]) != (
+            data_tablespace.tablespace_oid,
+            data_tablespace.tablespace_name,
+        ):
+            _fail("cms_database_binding_invalid")
     return {
         **parsed_by_field,
         "signing_preflight_guard": signing_guard,

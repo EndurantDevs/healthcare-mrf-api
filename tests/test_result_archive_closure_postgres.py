@@ -8,12 +8,17 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from db.migration_ptg2_frozen_source_file_binding import _create_immutable_guards
 from db.models._legacy import Base
 from process.ptg_parts import result_archive_closure as archive_closure
 from process.ptg_parts.frozen_rate_binding import frozen_rate_binding_sha256
@@ -850,9 +855,9 @@ async def test_native_source_clone_pin_defers_terminal_release() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("locked_table", ["ptg2_snapshot", "ptg2_frozen_source_file_binding", "ptg2_snapshot_pin"])
+@pytest.mark.parametrize("locked_table", ["ptg2_snapshot", "ptg2_snapshot_pin"])
 async def test_native_source_clone_defers_conflicting_row_locks(locked_table: str) -> None:
-    """Every retained source row has a bounded retryable lock acquisition."""
+    """Mutable snapshot and pin rows retain bounded retryable lock acquisition."""
 
     async with _database(source_authority=True) as (engine, schema_name, schema):
         snapshot_id, _ = await _seed(engine, schema, source_authority=True)
@@ -871,6 +876,118 @@ async def test_native_source_clone_defers_conflicting_row_locks(locked_table: st
                         ),
                         timeout=3,
                     )
+
+
+@asynccontextmanager
+async def _frozen_binding_reader(engine, schema: str):
+    """Rollback one disposable role and its exact grants after the read proof."""
+
+    role_name = "archive_binding_reader_" + uuid.uuid4().hex
+    async with engine.connect() as connection:
+        transaction = await connection.begin()
+        try:
+            await connection.exec_driver_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            await connection.exec_driver_sql(f'CREATE ROLE "{role_name}" NOLOGIN NOSUPERUSER NOCREATEROLE')
+            await connection.exec_driver_sql(f'GRANT USAGE ON SCHEMA {schema} TO "{role_name}"')
+            await connection.exec_driver_sql(
+                f"GRANT SELECT ON {schema}.ptg2_snapshot,{schema}.ptg2_snapshot_pin,"
+                f'{schema}.ptg2_frozen_source_file_binding TO "{role_name}"'
+            )
+            await connection.exec_driver_sql(
+                f'GRANT UPDATE(snapshot_id) ON {schema}.ptg2_snapshot,{schema}.ptg2_snapshot_pin TO "{role_name}"'
+            )
+            await connection.exec_driver_sql(f'SET LOCAL ROLE "{role_name}"')
+            sessions = async_sessionmaker(connection, expire_on_commit=False)
+            async with sessions() as session, session.begin():
+                yield session
+        finally:
+            if transaction.is_active:
+                await transaction.rollback()
+            assert (
+                await connection.scalar(text("SELECT count(*) FROM pg_roles WHERE rolname=:role"), {"role": role_name})
+                == 0
+            )
+
+
+async def _assert_binding_read_only(reader, schema: str) -> None:
+    """Require genuine SELECT-only evidence and prove its row-lock permission refusal."""
+
+    privileges = (
+        await reader.execute(
+            text(
+                "SELECT current_user<>session_user,"
+                "(SELECT rolsuper FROM pg_roles WHERE rolname=current_user),"
+                "has_table_privilege(current_user,:table,'SELECT'),"
+                "has_table_privilege(current_user,:table,'UPDATE'),"
+                "has_any_column_privilege(current_user,:table,'UPDATE')"
+            ),
+            {"table": f"{schema}.ptg2_frozen_source_file_binding"},
+        )
+    ).one()
+    assert tuple(privileges) == (True, False, True, False, False)
+    with pytest.raises(DBAPIError) as refused:
+        async with reader.begin_nested():
+            await reader.execute(text(f"SELECT * FROM {schema}.ptg2_frozen_source_file_binding FOR UPDATE"))
+    assert refused.value.orig.sqlstate == "42501"
+
+
+async def _assert_frozen_binding_immutable(engine, schema: str) -> None:
+    """Exercise the migration's real ALWAYS guards without disabling them."""
+
+    table = f"{schema}.ptg2_frozen_source_file_binding"
+    async with engine.begin() as connection:
+        modes = await connection.scalars(
+            text("SELECT tgenabled::text FROM pg_trigger WHERE tgrelid=to_regclass(:table) AND NOT tgisinternal"),
+            {"table": table},
+        )
+        assert list(modes) == ["A", "A"]
+        original = (await connection.exec_driver_sql(f"SELECT * FROM {table}")).one()
+        for statement in (
+            f"UPDATE {table} SET source_key=source_key",
+            f"DELETE FROM {table}",
+            f"TRUNCATE {table}",
+        ):
+            with pytest.raises(DBAPIError, match="PTG2_FROZEN_SOURCE_FILE_BINDING_IMMUTABLE") as refused:
+                async with connection.begin_nested():
+                    await connection.exec_driver_sql(statement)
+            assert refused.value.orig.sqlstate == "P0001"
+        assert (await connection.exec_driver_sql(f"SELECT * FROM {table}")).one() == original
+
+
+@pytest.mark.asyncio
+async def test_native_clone_reads_immutable_binding_without_update() -> None:
+    """SELECT-only immutable evidence stays readable, guarded and receipt-bound."""
+
+    async with _database(source_authority=True) as (engine, schema_name, schema):
+        snapshot_id, _ = await _seed(engine, schema, source_authority=True)
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                lambda sync: _create_immutable_guards(Operations(MigrationContext.configure(sync)), schema_name)
+            )
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as session, session.begin():
+            authority = await capture_ptg_result_archive_source_authority(
+                session, schema_name=schema_name, operation_id="immutable-binding-read", snapshot_id=snapshot_id
+            )
+        async with engine.begin() as holder:
+            await holder.execute(text(f"SELECT * FROM {schema}.ptg2_frozen_source_file_binding FOR UPDATE"))
+            async with _frozen_binding_reader(engine, schema) as reader:
+                await _assert_binding_read_only(reader, schema)
+                assert (
+                    await asyncio.wait_for(
+                        lock_ptg_result_archive_for_clone(
+                            reader, schema_name=schema_name, authority=authority.as_dict()
+                        ),
+                        timeout=3,
+                    )
+                    == authority
+                )
+                changed = replace(authority, frozen_binding_sha256="f" * 64)
+                with pytest.raises(PtgResultArchiveSourceAuthorityError, match="changed after capture"):
+                    await lock_ptg_result_archive_for_clone(
+                        reader, schema_name=schema_name, authority=changed.as_dict()
+                    )
+        await _assert_frozen_binding_immutable(engine, schema)
 
 
 @pytest.mark.asyncio

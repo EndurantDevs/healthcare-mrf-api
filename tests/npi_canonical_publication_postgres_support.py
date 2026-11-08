@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from process.npi import (
     _install_npi_postseal_guards,
+    _lock_npi_publication_relations,
     _rotate_npi_canonical_table,
 )
 from tests.public_evidence_nppes_admission_postgres_support import (
@@ -84,7 +85,10 @@ async def rotate_canonical_stage_tables(
             qualified(schema_name, stage_table)
             for stage_table in stage_table_by_live_table.values()
         )
-        + " IN ACCESS EXCLUSIVE MODE"
+        + " IN ACCESS EXCLUSIVE MODE NOWAIT"
+    )
+    await _lock_npi_publication_relations(
+        connection, schema=schema_name, stage_table_by_live_table=stage_table_by_live_table
     )
     await _install_npi_postseal_guards(
         connection,

@@ -23,12 +23,12 @@ from process.nppes_public_evidence_writer import _insert_single
 from process.nppes_public_evidence_writer_contract import (
     NppesPublicEvidenceWriterError,
 )
+from tests.nppes_candidate_postgres_support import nppes_candidate_schema
 from tests.nppes_public_evidence_process_support import prepared_archive
 from tests.public_evidence_nppes_admission_postgres_support import (
     DEFAULT_ROWS,
     NEW_TABLES,
     admit_replay,
-    nppes_admission_schema,
     prepared_replay,
     required_config,
 )
@@ -69,20 +69,15 @@ async def _assert_invalid_chain_rejected(
 @pytest.mark.asyncio
 async def test_writer_rejects_a_disabled_always_guard(tmp_path: Path) -> None:
     replay = await prepared_replay(tmp_path)
-    async with nppes_admission_schema() as (_engine, url, schema, _migration):
+    async with nppes_candidate_schema() as (_engine, url, schema, _migration):
         connection = await connect(url)
         try:
             await connection.execute(
-                f'ALTER TABLE "{schema}".'
-                '"public_evidence_nppes_registry_chain_archive" '
-                "DISABLE TRIGGER ALL"
+                f'ALTER TABLE "{schema}"."public_evidence_nppes_registry_chain_archive" DISABLE TRIGGER ALL'
             )
             with pytest.raises(NppesPublicEvidenceWriterError):
                 await admit_replay(connection, schema, replay)
-            assert await connection.fetchval(
-                f'SELECT count(*) FROM "{schema}".'
-                '"public_evidence_source_release"'
-            ) == 0
+            assert await connection.fetchval(f'SELECT count(*) FROM "{schema}"."public_evidence_source_release"') == 0
         finally:
             await connection.close()
 
@@ -104,7 +99,7 @@ async def test_reversed_self_consistent_chain_is_rejected(tmp_path: Path) -> Non
             for name, snapshot in specs
         ]
     )
-    async with nppes_admission_schema() as (_engine, url, schema, _migration):
+    async with nppes_candidate_schema() as (_engine, url, schema, _migration):
         connection = await connect(url)
         try:
             archive_receipts = tuple(

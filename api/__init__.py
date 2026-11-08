@@ -4,37 +4,62 @@ from sanic import response
 from sanic.blueprints import Blueprint
 from sanic.exceptions import SanicException
 
-from api.control import blueprint as control_blueprint, control_error
-from api.metrics import blueprint as metrics_blueprint
+from api.control import blueprint as control_blueprint
+from api.control import control_error
+from api.control_admission_batch import blueprint as admission_batch_blueprint
+from api.control_admission_batch import register_batch_response_deadline
+from api.control_build_continuation import blueprint as build_continuation_blueprint
+from api.control_capture_handoff import blueprint as capture_handoff_blueprint
+from api.control_execution_evidence import blueprint as execution_evidence_blueprint
+from api.control_execution_stop import blueprint as execution_stop_blueprint
+from api.control_query_projection_batch import blueprint as query_projection_batch_blueprint
+from api.control_registration_authority import blueprint as registration_authority_blueprint
+from api.control_registry_ptg_scope import blueprint as registry_ptg_scope_control_blueprint
+from api.control_rejection_evidence import blueprint as rejection_evidence_blueprint
+from api.control_rejection_evidence import register_rejection_private_responses
+from api.control_source_batch import blueprint as source_batch_blueprint
+from api.endpoint.clinical import blueprint as v1_clinical
+from api.endpoint.codes import blueprint as v1_codes
+from api.endpoint.coverage import blueprint as v1_coverage
+from api.endpoint.extension_reads import blueprint as v1_custom_import
 from api.endpoint.formulary import blueprint as v1_formulary
 from api.endpoint.formulary_fhir import blueprint as v1_formulary_fhir
-from api.endpoint.coverage import blueprint as v1_coverage
-from api.endpoint.codes import blueprint as v1_codes
-from api.endpoint.clinical import blueprint as v1_clinical
 from api.endpoint.geo import blueprint as v1_geo
 from api.endpoint.healthcheck import blueprint as v1_healthcheck
 from api.endpoint.hospital_prices import blueprint as v1_hospital_prices
 from api.endpoint.importer import blueprint as v1_import
 from api.endpoint.issuer import blueprint as v1_issuer
+from api.endpoint.network_catalog import blueprint as v1_network_catalog
+from api.endpoint.network_catalog import register_network_catalog_private_responses
+from api.endpoint.network_providers import blueprint as v1_network_providers
+from api.endpoint.network_serving import blueprint as v1_network_serving
 from api.endpoint.npi import blueprint as v1_npi
 from api.endpoint.nucc import blueprint as v1_nucc
-from api.endpoint.plan import blueprint as v1_plan
-from api.endpoint.pricing import blueprint as v1_pricing
 from api.endpoint.partd_formulary import blueprint as v1_partd_formulary
 from api.endpoint.pharmacy_license import blueprint as v1_pharmacy_license
+from api.endpoint.plan import blueprint as v1_plan
+from api.endpoint.pricing import blueprint as v1_pricing
+from api.endpoint.provider_directory_entities import blueprint as v1_provider_directory_entities
+from api.endpoint.registry_management import blueprint as v1_registry_management
+from api.endpoint.registry_publication import blueprint as v1_registry_publication
 from api.endpoint.reports import blueprint as v1_reports
 from api.endpoint.site_intelligence import blueprint as v1_site_intelligence
+from api.metrics import blueprint as metrics_blueprint
+from api.plan_release_read_boundary import require_internal_plan_release_read
+from api.provider_directory_profile_capacity_preflight import (
+    register_profile_capacity_preflight_route,
+)
 from api.ptg2_capacity_evidence import (
     CapacityEvidenceError,
     guard_isolated_capacity_process_request,
-)
-from api.provider_directory_profile_capacity_preflight import (
-    register_profile_capacity_preflight_route,
 )
 from api.runtime_identity import add_runtime_identity_headers
 from api.server_timing import register_server_timing
 from api.worker_memory import register_worker_memory_lifecycle
 from db.connection import db
+from process.registry_benefit_plan_runtime import register_registry_benefit_plan_runtime
+from process.registry_membership_refresh_api_runtime import register_registry_membership_refresh_runtime
+from process.registry_ptg_scope_runtime import register_registry_ptg_scope_runtime
 
 profile_capacity_blueprint = Blueprint("profile_capacity_control", url_prefix="/control")
 register_profile_capacity_preflight_route(profile_capacity_blueprint)
@@ -58,11 +83,28 @@ def init_api(api):
     """Register public API blueprints on the Sanic application."""
 
     register_server_timing(api)
+    register_batch_response_deadline(api)
+    register_registry_ptg_scope_runtime(api)
+    register_registry_benefit_plan_runtime(api)
+    register_registry_membership_refresh_runtime(api)
     db.init_app(api)
     register_worker_memory_lifecycle(api)
     api.register_middleware(_capacity_process_request_guard, "request")
+    api.register_middleware(require_internal_plan_release_read, "request")
     api.register_middleware(add_runtime_identity_headers, "response")
+    register_network_catalog_private_responses(api)
+    register_rejection_private_responses(api)
     api.blueprint(control_blueprint)
+    api.blueprint(admission_batch_blueprint)
+    api.blueprint(capture_handoff_blueprint)
+    api.blueprint(source_batch_blueprint)
+    api.blueprint(query_projection_batch_blueprint)
+    api.blueprint(execution_evidence_blueprint)
+    api.blueprint(rejection_evidence_blueprint)
+    api.blueprint(execution_stop_blueprint)
+    api.blueprint(build_continuation_blueprint)
+    api.blueprint(registry_ptg_scope_control_blueprint, url_prefix="/control/v1/registry/ptg-source-scopes")
+    api.blueprint(registration_authority_blueprint)
     api.blueprint(profile_capacity_blueprint)
     api.blueprint(metrics_blueprint)
     api_bluenprint = Blueprint.group(
@@ -75,6 +117,7 @@ def init_api(api):
             v1_formulary_fhir,
             v1_codes,
             v1_clinical,
+            v1_custom_import,
             v1_import,
             v1_issuer,
             v1_npi,
@@ -84,6 +127,12 @@ def init_api(api):
             v1_partd_formulary,
             v1_pharmacy_license,
             v1_reports,
+            v1_registry_management,
+            v1_network_serving,
+            v1_network_catalog,
+            v1_network_providers,
+            v1_registry_publication,
+            v1_provider_directory_entities,
             v1_site_intelligence,
         ],
         version_prefix="/api/v",

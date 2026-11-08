@@ -12,6 +12,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from process import provider_directory_generic_source_storage as source_storage
+from process.plan_release_storage_catalog import CATALOG_SQL
+from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
+from tests.test_provider_directory_generic_source_policy import synthetic_source_database
+from tests.test_provider_directory_generic_source_storage import _case, _catalog_row, _sequence_row
 from tests.test_provider_directory_organization_partition_v4 import (
     _context,
     _proof_rows,
@@ -21,7 +26,6 @@ from tests.test_provider_directory_organization_partition_v4_streaming import (
     _one_row_stage,
     _plan,
 )
-
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -82,25 +86,99 @@ def test_v4_partition_proof_decoder_rejects_malformed_record() -> None:
         )
 
 
+def _partition_source_catalog(context):
+    """Describe exact native input tables and their protected acquisition header."""
+    _, _, header_by_field = _case()
+    binding_by_field = header_by_field["candidate_storage_json"]
+    binding_by_field["ordinal"] = 1
+    metadata = {
+        "source_ids": list(context.source_ids),
+        "selected_resources": ["Organization"],
+        "resource_hash_contract": importer.SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
+        "semantic_projection_as_of": "2026-08-10",
+    }
+    header_by_field.update(
+        endpoint_id=context.endpoint_id,
+        acquisition_root_run_id=context.acquisition_root_run_id,
+        publication_metadata_json=metadata,
+    )
+    binding_by_field["identity"] = dict(
+        dataset_id=context.dataset_id,
+        endpoint_id=context.endpoint_id,
+        acquisition_root_run_id=context.acquisition_root_run_id,
+        metadata=metadata,
+    )
+    catalog_rows = []
+    for table in binding_by_field["tables"].values():
+        catalog_by_field = _catalog_row() | dict(relname=table["name"], oid=table["oid"], relowner=1, nspname="mrf")
+        table.update(source_storage._layout_proof(catalog_by_field))
+        if table["name"].endswith("_ri"):
+            table["layout_sha256"] = source_storage._input_layout_hash(
+                table["layout_sha256"], _sequence_row(owner=1, schema="mrf")
+            )
+        catalog_rows.append(catalog_by_field)
+
+    return header_by_field, catalog_rows
+
+
 @pytest.mark.asyncio
-async def test_v4_partition_proof_loader_retains_candidate_record() -> None:
+async def test_v4_partition_proof_loader_retains_candidate_record(monkeypatch) -> None:
     """Round-trip a non-null occurrence record through durable proof loading."""
 
     stage = await _one_row_stage()
     proof_rows = _proof_rows(stage, "window-a")
     database_executor = SimpleNamespace(all=AsyncMock(return_value=proof_rows))
 
-    loaded_proof = await importer._load_partition_pass_proof(
-        _context(),
-        "Organization",
-        "window-a",
-        2,
-        database_connection=database_executor,
-    )
+    context = _context()
+    header_by_field, catalog_rows = _partition_source_catalog(context)
 
-    assert loaded_proof.candidate_records_by_id == (
-        stage.candidate_proof_records_by_id
-    )
+    async with synthetic_source_database(monkeypatch, database_executor) as database, source_transaction(database):
+        monkeypatch.setattr(importer, "db", database)
+        native = bound_publisher().connection
+        role_fetch = native.fetch
+        native.fetchval.side_effect = lambda query, *args: (
+            "repeatable read" if query == "SHOW transaction_isolation" else 1
+        )
+        queries = []
+
+        async def fetch(query, *arguments):
+            queries.append(query)
+            if query == source_storage._INPUT_SEQUENCES_SQL:
+                return [_sequence_row(owner=1, schema="mrf")]
+            if query == CATALOG_SQL:
+                assert arguments == (
+                    [f'"mrf"."{catalog_by_field["relname"]}"' for catalog_by_field in catalog_rows],
+                    1,
+                    [],
+                )
+                return copy.deepcopy(catalog_rows)
+            if query.startswith("SELECT resource_id,payload_json FROM"):
+                assert arguments == (
+                    importer._last_updated_partition_fingerprint_resource_type("Organization", 2),
+                    0,
+                    importer._last_updated_partition_window_proof_hash("Organization", "window-a", 2),
+                    None,
+                    1,
+                )
+                return proof_rows
+            return await role_fetch(query, *arguments)
+
+        async def parent(query, *arguments):
+            if "candidate_storage_json FROM" in query:
+                assert arguments == (context.dataset_id,)
+                return copy.deepcopy(header_by_field)
+            assert query == "SELECT session_user::text AS session,current_user::text AS current"
+            return native.fetchrow.return_value
+
+        monkeypatch.setattr(native, "fetch", fetch)
+        native.fetchrow.side_effect = parent
+        loaded_proof = await importer._load_partition_pass_proof(
+            context, "Organization", "window-a", 2, database_connection=database_executor
+        )
+        native.copy_records_to_table.assert_not_awaited()
+        assert sum(query.startswith("SELECT resource_id,payload_json FROM") for query in queries) == 1
+    assert loaded_proof.candidate_records_by_id == stage.candidate_proof_records_by_id
+    database_executor.all.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -241,9 +319,7 @@ async def test_v4_candidate_rows_decode_json_and_reject_bad_rows() -> None:
         [serialized, duplicate, malformed_by_field]
     )
 
-    assert hashes == {
-        stage.rows[0]["resource_id"]: stage.rows[0]["payload_hash"]
-    }
+    assert hashes == {stage.rows[0]["resource_id"]: stage.rows[0]["payload_hash"]}
     assert set(records) == set(hashes)
     assert invalid_count == 2
 
@@ -257,10 +333,8 @@ async def test_v4_occurrence_records_reject_malformed_payload_and_identity() -> 
     invalid_identity = copy.deepcopy(valid_row)
     invalid_identity["payload_json"]["candidate_resource_id"] = "other"
 
-    records, occurrence_groups, invalid_count = (
-        importer._v4_partition_occurrence_records(
-            [{"payload_json": []}, invalid_identity]
-        )
+    records, occurrence_groups, invalid_count = importer._v4_partition_occurrence_records(
+        [{"payload_json": []}, invalid_identity]
     )
 
     assert records == {}
@@ -276,7 +350,7 @@ def test_v4_window_count_is_optional_without_a_partition_plan() -> None:
 
 @pytest.mark.asyncio
 async def test_dataset_accumulator_preserves_legacy_compatibility(monkeypatch) -> None:
-    """Fence then return non-semantic rows without semantic accumulation."""
+    """Authenticate Source, preserve rows, and issue no direct retained DML."""
 
     incoming_rows = [
         {
@@ -285,21 +359,24 @@ async def test_dataset_accumulator_preserves_legacy_compatibility(monkeypatch) -
             "resource_id": "organization-a",
         }
     ]
-    identity_lock = AsyncMock()
-    monkeypatch.setattr(
-        importer,
-        "_lock_endpoint_dataset_batch_identity",
-        identity_lock,
-    )
-
-    accumulated_rows = await importer._accumulated_endpoint_dataset_rows(
-        SimpleNamespace(),
-        incoming_rows,
-        resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
-    )
-
+    before = copy.deepcopy(incoming_rows)
+    executor = SimpleNamespace(first=AsyncMock(), all=AsyncMock(), scalar=AsyncMock(), status=AsyncMock())
+    async with synthetic_source_database(monkeypatch, executor) as database, source_transaction(database):
+        native = bound_publisher().connection
+        native.execute.reset_mock()
+        accumulated_rows = await importer._accumulated_endpoint_dataset_rows(
+            database,
+            incoming_rows,
+            resource_hash_contract=importer.LEGACY_RESOURCE_HASH_CONTRACT,
+        )
+        native.copy_records_to_table.assert_not_awaited()
+        native.execute.assert_not_awaited()
     assert accumulated_rows is incoming_rows
-    identity_lock.assert_awaited_once()
+    assert accumulated_rows == before
+    executor.first.assert_not_awaited()
+    executor.all.assert_not_awaited()
+    executor.scalar.assert_not_awaited()
+    executor.status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -314,9 +391,7 @@ async def test_v4_nonempty_partition_streams_verified_candidate(monkeypatch) -> 
         staged_candidate_count=1,
         invalid_candidate_count=0,
         orphan_proof_count=0,
-        candidate_hashes_by_id={
-            stage.rows[0]["resource_id"]: stage.rows[0]["payload_hash"]
-        },
+        candidate_hashes_by_id={stage.rows[0]["resource_id"]: stage.rows[0]["payload_hash"]},
     )
     monkeypatch.setattr(
         importer,

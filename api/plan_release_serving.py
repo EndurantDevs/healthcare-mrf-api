@@ -13,11 +13,20 @@ from sqlalchemy import text
 from api.plan_release_pricing_projection import (
     has_pricing_projection_relation,
     plan_release_serving_queries,
+    plan_release_serving_sql,
 )
+from api.plan_release_read_storage import is_retained_session_read
 from api.plan_release_readiness import is_release_binding_serving_ready
 from api.plan_release_serving_metadata import (
     plan_release_header_from_rows as _release_header_from_rows,
+)
+from api.plan_release_serving_metadata import (
     single_text_value as _single_text_value,
+)
+from api.plan_release_source_bindings import (
+    NOT_CURRENT_SOURCE_RELEASE,
+    discover_source_bindings,
+    load_source_binding_rows,
 )
 from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
@@ -29,22 +38,16 @@ def _projection_schema() -> str:
     runtime_schema = os.getenv("HLTHPRT_DB_SCHEMA")
     legacy_schema = os.getenv("DB_SCHEMA")
     if runtime_schema and legacy_schema and runtime_schema != legacy_schema:
-        raise RuntimeError(
-            "DB_SCHEMA and HLTHPRT_DB_SCHEMA must identify the same schema"
-        )
+        raise RuntimeError("DB_SCHEMA and HLTHPRT_DB_SCHEMA must identify the same schema")
     return runtime_schema or legacy_schema or "mrf"
 
 
 PTG2_SCHEMA = _projection_schema()
-PLAN_RELEASE_ID_PATTERN = re.compile(
-    r"^hprelease_[0-9A-HJKMNP-TV-Z]{26}$"
-)
+PLAN_RELEASE_ID_PATTERN = re.compile(r"^hprelease_[0-9A-HJKMNP-TV-Z]{26}$")
 PLAN_RELEASE_PIN_OWNER_TYPE = "plan_release_serving_revision"
 PLAN_RELEASE_IN_NETWORK_ROLE = "in_network"
 PLAN_RELEASE_ALLOWED_AMOUNTS_ROLE = "allowed_amounts"
-PLAN_RELEASE_BINDING_ROLES = frozenset(
-    {PLAN_RELEASE_IN_NETWORK_ROLE, PLAN_RELEASE_ALLOWED_AMOUNTS_ROLE}
-)
+PLAN_RELEASE_BINDING_ROLES = frozenset({PLAN_RELEASE_IN_NETWORK_ROLE, PLAN_RELEASE_ALLOWED_AMOUNTS_ROLE})
 
 (
     _PLAN_RELEASE_SERVING_SQL,
@@ -91,6 +94,7 @@ class PlanReleaseSnapshotBinding:
     plan_market_type: str
     role: str
     required: bool
+    logical_scope_present: bool = False
 
 
 @dataclass(frozen=True)
@@ -106,9 +110,7 @@ class PlanReleaseServingSelection:
     pricing_projection_id: str | None = None
     pricing_projection_contract: str | None = None
     serving_revision_published_at: str | None = None
-    _validated_serving_tables: tuple[tuple[str, PTG2ServingTables], ...] = field(
-        default=(), repr=False, compare=False
-    )
+    _validated_serving_tables: tuple[tuple[str, PTG2ServingTables], ...] = field(default=(), repr=False, compare=False)
     _includes_billing_tax_identity_source: bool = field(default=False, repr=False, compare=False)
 
     def bindings_for_role(
@@ -155,30 +157,39 @@ class PlanReleaseServingSelection:
         return next(
             (
                 serving_tables
-                for validated_snapshot_id, serving_tables in (
-                    self._validated_serving_tables
-                )
+                for validated_snapshot_id, serving_tables in (self._validated_serving_tables)
                 if validated_snapshot_id == snapshot_id
             ),
             None,
         )
 
-    def network_tables_by_snapshot(self) -> dict[str, PTG2ServingTables] | None:
+    def network_tables_by_snapshot(
+        self, *, contributing_bindings: tuple[PlanReleaseSnapshotBinding, ...] | None = None
+    ) -> dict[str, PTG2ServingTables] | None:
         """Return complete readiness descriptors or fail a partial release."""
 
-        serving_tables_by_snapshot_id = dict(
-            self._validated_serving_tables
-        )
-        validated_snapshot_ids = [
-            snapshot_id
-            for snapshot_id, _ in self._validated_serving_tables
-        ]
-        expected_snapshot_ids = {
-            binding.snapshot_id for binding in self.in_network_bindings
-        }
+        serving_tables_by_snapshot_id = dict(self._validated_serving_tables)
+        validated_snapshot_ids = [snapshot_id for snapshot_id, _ in self._validated_serving_tables]
+        full_snapshot_ids = {binding.snapshot_id for binding in self.in_network_bindings}
+        expected_snapshot_ids = full_snapshot_ids
+        if contributing_bindings is not None:
+            from api.network_address_scope import current_network_address_scope
+
+            if (
+                current_network_address_scope() is None and contributing_bindings != self.in_network_bindings
+            ) or not _is_original_network_binding_subset(self, contributing_bindings):
+                return None
+            expected_snapshot_ids = {binding.snapshot_id for binding in contributing_bindings}
+            if not set(serving_tables_by_snapshot_id) <= full_snapshot_ids:
+                return None
+            serving_tables_by_snapshot_id = {
+                identity: descriptor
+                for identity, descriptor in serving_tables_by_snapshot_id.items()
+                if identity in expected_snapshot_ids
+            }
         if (
-            len(validated_snapshot_ids) != len(serving_tables_by_snapshot_id)
-            or set(validated_snapshot_ids) != expected_snapshot_ids
+            len(validated_snapshot_ids) != len(set(validated_snapshot_ids))
+            or set(serving_tables_by_snapshot_id) != expected_snapshot_ids
         ):
             return None
         return serving_tables_by_snapshot_id
@@ -196,16 +207,12 @@ class PlanReleaseServingSelection:
             "plan_release_id": self.plan_release_id,
             "plan_version_id": self.plan_version_id,
             "serving_revision_id": self.serving_revision_id,
-            "serving_revision_published_at": (
-                self.serving_revision_published_at
-            ),
+            "serving_revision_published_at": (self.serving_revision_published_at),
             "release_month": self.release_month,
             "release_status": self.release_status,
             "is_current": True,
             "binding_set_digest": self.binding_set_digest,
-            "in_network_snapshot_ids": sorted(
-                {binding.snapshot_id for binding in self.in_network_bindings}
-            ),
+            "in_network_snapshot_ids": sorted({binding.snapshot_id for binding in self.in_network_bindings}),
         }
 
 
@@ -214,7 +221,7 @@ def _plan_release_binding_from_row(
 ) -> PlanReleaseSnapshotBinding | None:
     try:
         ordinal = int(release_row.get("binding_ordinal"))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     role = str(release_row.get("role") or "").strip()
     snapshot_id = str(release_row.get("snapshot_id") or "").strip()
@@ -226,8 +233,7 @@ def _plan_release_binding_from_row(
         or not snapshot_id
         or not source_key
         or not plan_id
-        or str(release_row.get("snapshot_status") or "").strip()
-        != "published"
+        or str(release_row.get("snapshot_status") or "").strip() != "published"
         or release_row.get("is_pinned") is not True
     ):
         return None
@@ -236,11 +242,10 @@ def _plan_release_binding_from_row(
         snapshot_id=snapshot_id,
         source_key=source_key,
         plan_id=plan_id,
-        plan_market_type=str(
-            release_row.get("plan_market_type") or ""
-        ).strip().lower(),
+        plan_market_type=str(release_row.get("plan_market_type") or "").strip().lower(),
         role=role,
         required=bool(release_row.get("required")),
+        logical_scope_present=release_row.get("logical_scope_present") is True,
     )
 
 
@@ -249,9 +254,7 @@ def _collect_plan_release_bindings(
 ) -> tuple[PlanReleaseSnapshotBinding, ...] | None:
     bindings: list[PlanReleaseSnapshotBinding] = []
     role_ordinals: set[tuple[str, int]] = set()
-    routing_by_snapshot: dict[
-        tuple[str, str, str], tuple[str, str]
-    ] = {}
+    routing_by_snapshot: dict[tuple[str, str, str], tuple[str, str]] = {}
     for release_row in release_rows:
         binding = _plan_release_binding_from_row(release_row)
         if binding is None:
@@ -265,8 +268,7 @@ def _collect_plan_release_bindings(
         routing_identity = (binding.plan_id, binding.plan_market_type)
         prior_routing_identity = routing_by_snapshot.get(snapshot_route)
         if role_ordinal in role_ordinals or (
-            prior_routing_identity is not None
-            and prior_routing_identity != routing_identity
+            prior_routing_identity is not None and prior_routing_identity != routing_identity
         ):
             return None
         role_ordinals.add(role_ordinal)
@@ -307,12 +309,8 @@ def _selection_from_rows(
         binding_set_digest=release_header.binding_set_digest,
         bindings=bindings,
         pricing_projection_id=release_header.pricing_projection_id,
-        pricing_projection_contract=(
-            release_header.pricing_projection_contract
-        ),
-        serving_revision_published_at=(
-            release_header.serving_revision_published_at
-        ),
+        pricing_projection_contract=(release_header.pricing_projection_contract),
+        serving_revision_published_at=(release_header.serving_revision_published_at),
     )
 
 
@@ -342,6 +340,24 @@ async def _is_release_binding_set_serving_ready(
     return True
 
 
+async def _legacy_plan_release_rows(session, plan_release_id, include_projection, *, retained):
+    """Keep the original retained/native storage decision and predicates intact."""
+    release_sql = (
+        plan_release_serving_sql(PTG2_SCHEMA, include_pricing_projection=include_projection, retained=True)
+        if retained
+        else _PLAN_RELEASE_SERVING_SQL
+        if include_projection
+        else _PLAN_RELEASE_SERVING_WITHOUT_PROJECTION_SQL
+    )
+    return await session.execute(
+        text(release_sql),
+        {
+            "plan_release_id": plan_release_id,
+            "pin_owner_type": PLAN_RELEASE_PIN_OWNER_TYPE,
+        },
+    )
+
+
 async def resolve_plan_release_serving(
     session: Any,
     plan_release_id: Any,
@@ -351,37 +367,38 @@ async def resolve_plan_release_serving(
 ) -> PlanReleaseServingSelection | None:
     """Load one exact, complete, optionally source-aware pinned release."""
 
-    if (
-        type(include_billing_tax_identity_source) is not bool
-        or type(projection_only) is not bool
-    ):
+    if type(include_billing_tax_identity_source) is not bool or type(projection_only) is not bool:
         return None
     normalized_release_id = normalize_plan_release_id(plan_release_id)
     if normalized_release_id is None:
         return None
-    release_sql = (
-        _PLAN_RELEASE_SERVING_SQL
-        if await has_pricing_projection_relation(session, PTG2_SCHEMA)
-        else _PLAN_RELEASE_SERVING_WITHOUT_PROJECTION_SQL
-    )
-    release_query_result = await session.execute(
-        text(release_sql),
-        {
-            "plan_release_id": normalized_release_id,
-            "pin_owner_type": PLAN_RELEASE_PIN_OWNER_TYPE,
-        },
-    )
+    retained = await is_retained_session_read(session, PTG2_SCHEMA)
+    admission = await discover_source_bindings(session, PTG2_SCHEMA, normalized_release_id)
+    if admission == NOT_CURRENT_SOURCE_RELEASE:
+        return None
+    include_projection = await has_pricing_projection_relation(session, PTG2_SCHEMA)
+    if admission is not None:
+        release_query_result = await load_source_binding_rows(
+            session,
+            PTG2_SCHEMA,
+            admission,
+            include_pricing_projection=include_projection,
+        )
+    else:
+        release_query_result = await _legacy_plan_release_rows(
+            session, normalized_release_id, include_projection, retained=retained
+        )
     selection = _selection_from_rows(
         normalized_release_id,
         release_query_result,
     )
     if selection is None:
         return None
-    if projection_only:
+    from api.network_address_scope import current_network_address_scope
+
+    if projection_only or current_network_address_scope() is not None:
         return selection
-    validated_serving_tables_by_snapshot_id: dict[
-        str, PTG2ServingTables
-    ] = {}
+    validated_serving_tables_by_snapshot_id: dict[str, PTG2ServingTables] = {}
     if not await _is_release_binding_set_serving_ready(
         session,
         selection,
@@ -397,6 +414,53 @@ async def resolve_plan_release_serving(
     if resolved_selection.network_tables_by_snapshot() is None:
         return None
     return resolved_selection
+
+
+def _is_original_network_binding_subset(selection, bindings):
+    """Require a unique, ordered subset of the original physical network bindings."""
+    return type(bindings) is tuple and bindings == tuple(
+        binding for binding in selection.in_network_bindings if binding in bindings
+    )
+
+
+async def prepare_plan_release_bindings(session, selection, bindings, *, include_billing_tax_identity_source=False):
+    """Validate only admitted original contributors without changing full release identity."""
+    from api.network_address_scope import current_network_address_scope
+    from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
+
+    if current_network_address_scope() is None:
+        return selection
+    if (
+        type(selection) is not PlanReleaseServingSelection
+        or type(include_billing_tax_identity_source) is not bool
+        or not _is_original_network_binding_subset(selection, bindings)
+    ):
+        raise PlanPricingProjectionUnavailable("admitted release binding identity is invalid")
+    serving_tables_by_snapshot_id = selection.network_tables_by_snapshot(contributing_bindings=bindings)
+    if serving_tables_by_snapshot_id is not None and (
+        not include_billing_tax_identity_source or selection.includes_billing_tax_identity_source
+    ):
+        return replace(selection, _validated_serving_tables=tuple(serving_tables_by_snapshot_id.items()))
+    serving_tables_by_snapshot_id = {}
+    try:
+        for binding in bindings:
+            if not await is_release_binding_serving_ready(
+                session,
+                binding,
+                validated_serving_tables_by_snapshot_id=serving_tables_by_snapshot_id,
+                include_billing_tax_identity_source=include_billing_tax_identity_source,
+            ):
+                raise PlanPricingProjectionUnavailable("admitted release binding is unavailable")
+    except PTG2ManifestArtifactError:
+        raise PlanPricingProjectionUnavailable("admitted release binding is unavailable") from None
+    prepared = replace(
+        selection,
+        _validated_serving_tables=tuple(serving_tables_by_snapshot_id.items()),
+        _includes_billing_tax_identity_source=include_billing_tax_identity_source,
+    )
+    if prepared.network_tables_by_snapshot(contributing_bindings=bindings) is None:
+        raise PlanPricingProjectionUnavailable("admitted release descriptors are incomplete")
+    return prepared
 
 
 def binding_query_args(
@@ -419,19 +483,21 @@ def binding_query_args(
 def annotate_plan_release_response(
     payload: dict[str, Any] | None,
     selection: PlanReleaseServingSelection,
+    *,
+    contributing_bindings: tuple[PlanReleaseSnapshotBinding, ...] | None = None,
 ) -> dict[str, Any] | None:
     """Attach immutable release coordinates to top-level and query metadata."""
 
     if payload is None:
         return None
     metadata = selection.response_metadata()
+    if contributing_bindings is not None:
+        metadata["in_network_snapshot_ids"] = sorted({binding.snapshot_id for binding in contributing_bindings})
     if payload.get("pricing_scope") == "plan_scoped_allowed_amounts":
         metadata.pop("in_network_snapshot_ids", None)
     else:
         # Preserve the established negotiated-response alias for API clients.
-        metadata["resolved_snapshot_ids"] = metadata[
-            "in_network_snapshot_ids"
-        ]
+        metadata["resolved_snapshot_ids"] = metadata["in_network_snapshot_ids"]
     payload.setdefault("resolved", True)
     payload.update(metadata)
     query_by_field = payload.get("query")
@@ -440,3 +506,49 @@ def annotate_plan_release_response(
         payload["query"] = query_by_field
     query_by_field.update(metadata)
     return payload
+
+
+def _plan_release_no_match_query(
+    selection: PlanReleaseServingSelection,
+    args: Mapping[str, Any],
+    *,
+    npi: int | None = None,
+    contributing_bindings: tuple[PlanReleaseSnapshotBinding, ...] | None = None,
+) -> dict[str, Any]:
+    release_bindings = selection.in_network_bindings if contributing_bindings is None else contributing_bindings
+    plan_ids = sorted({binding.plan_id for binding in release_bindings})
+    market_types = sorted({binding.plan_market_type for binding in release_bindings if binding.plan_market_type})
+    snapshots = [
+        {
+            "source_key": binding.source_key,
+            "snapshot_id": binding.snapshot_id,
+            "plan_id": binding.plan_id,
+            "plan_market_type": binding.plan_market_type,
+        }
+        for binding in release_bindings
+    ]
+    return {
+        "plan_id": plan_ids[0] if len(plan_ids) == 1 else None,
+        "plan_ids": plan_ids,
+        "plan_market_type": (market_types[0] if len(market_types) == 1 else None),
+        "plan_market_types": market_types,
+        "source": "ptg2",
+        "status": "no_match",
+        "source_key": (snapshots[0]["source_key"] if len(snapshots) == 1 else None),
+        "snapshot_id": (snapshots[0]["snapshot_id"] if len(snapshots) == 1 else None),
+        "snapshots": snapshots,
+        "code": args.get("code") or None,
+        "code_system": args.get("code_system") or None,
+        "q": args.get("q") or None,
+        "npi": npi,
+    }
+
+
+def _empty_plan_release_pagination(pagination) -> dict[str, Any]:
+    return {
+        "total": 0,
+        "limit": max(int(getattr(pagination, "limit", 25) or 25), 1),
+        "offset": max(int(getattr(pagination, "offset", 0) or 0), 0),
+        "page": max(int(getattr(pagination, "page", 1) or 1), 1),
+        "has_more": False,
+    }

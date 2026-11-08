@@ -7,11 +7,21 @@ from datetime import datetime, timezone
 from sanic import Blueprint, response
 from sqlalchemy import func, select, text
 
-from db.models import (ImportHistory, Issuer, NPIData, PartDPharmacyActivity, Plan,
-                       PlanDrugStats, PricingProcedure, PricingProvider,
-                       PricingProviderProcedure,
-                       PricingProviderPrescription, PricingProviderQualityScore,
-                       ProviderEnrichmentSummary)
+from api.network_read_execution import execute_network_read
+from db.models import (
+    ImportHistory,
+    Issuer,
+    NPIData,
+    PartDPharmacyActivity,
+    Plan,
+    PlanDrugStats,
+    PricingProcedure,
+    PricingProvider,
+    PricingProviderPrescription,
+    PricingProviderProcedure,
+    PricingProviderQualityScore,
+    ProviderEnrichmentSummary,
+)
 
 blueprint = Blueprint("coverage", url_prefix="/coverage", version=1)
 
@@ -42,7 +52,8 @@ def _qualified_table_name(table) -> str:
 
 
 async def _is_table_available(session, table) -> bool:
-    result = await session.execute(
+    result = await execute_network_read(
+        session,
         text("SELECT to_regclass(:name)"),
         {"name": _qualified_table_name(table)},
     )
@@ -50,17 +61,15 @@ async def _is_table_available(session, table) -> bool:
 
 
 async def _scalar_int(session, stmt) -> int:
-    result = await session.execute(stmt)
+    result = await execute_network_read(session, stmt)
     return int(result.scalar() or 0)
 
 
 async def _latest_snapshot_date(session, table_exists: dict[str, bool]) -> str:
     if table_exists.get(import_history_table.name):
         latest_when = (
-            await session.execute(
-                select(import_history_table.c.when)
-                .order_by(import_history_table.c.when.desc())
-                .limit(1)
+            await execute_network_read(
+                session, select(import_history_table.c.when).order_by(import_history_table.c.when.desc()).limit(1)
             )
         ).scalar()
         if latest_when is not None:
@@ -118,10 +127,14 @@ async def coverage_statistics(request):
     )
 
     if table_availability_by_name.get(plan_table.name):
-        coverage_by_field["marketplace_plans"] = await _scalar_int(session, select(func.count()).select_from(plan_table))
+        coverage_by_field["marketplace_plans"] = await _scalar_int(
+            session, select(func.count()).select_from(plan_table)
+        )
 
     if table_availability_by_name.get(issuer_table.name):
-        coverage_by_field["marketplace_issuers"] = await _scalar_int(session, select(func.count()).select_from(issuer_table))
+        coverage_by_field["marketplace_issuers"] = await _scalar_int(
+            session, select(func.count()).select_from(issuer_table)
+        )
 
     if table_availability_by_name.get(pricing_provider_table.name):
         coverage_by_field["provider_coverage_profiles"] = await _scalar_int(

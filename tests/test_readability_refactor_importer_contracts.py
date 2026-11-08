@@ -11,23 +11,54 @@ from __future__ import annotations
 
 import csv
 import datetime
-import gzip
 import importlib
 import io
 import sys
 import zipfile
-from pathlib import Path
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, create_autospec
+from unittest.mock import AsyncMock, Mock, create_autospec
 
 import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from tests.test_cms_doctors_organizations import _unit_source_transaction
 
 cms_doctors = importlib.import_module("process.cms_doctors")
 doctor_rows = importlib.import_module("process.cms_doctors_rows")
 lodes = importlib.import_module("process.lodes")
 places = importlib.import_module("process.places_zcta")
 attributes = importlib.import_module("process.attributes")
+_ARTIFACT_DIGEST = "a" * 64
+_ARTIFACT_RECEIPT = {
+    "content_sha256": _ARTIFACT_DIGEST,
+    "content_bytes": 4,
+    "file_name": f"{_ARTIFACT_DIGEST}.csv",
+    "source_url": "https://example.test/doctors.csv",
+}
+
+
+@pytest.fixture(autouse=True)
+def _doctors_source_unit_boundary(monkeypatch, request):
+    """Keep orchestration unit mocks distinct from native Publisher/role proof."""
+    if not request.node.name.startswith("test_cms_"):
+        return
+    monkeypatch.setattr(cms_doctors, "source_transaction", _unit_source_transaction)
+    monkeypatch.setattr(cms_doctors, "source_owner_transaction", _unit_source_transaction)
+    monkeypatch.setattr(cms_doctors, "publish_doctors_identities", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "capture_doctors_predecessor", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "seal_doctors_stages", AsyncMock())
+
+    async def create_stage(database, model, import_date, schema):
+        stage = cms_doctors.make_class(model, import_date)
+        await database.create_table(stage.__table__, checkfirst=False)
+        return stage
+
+    monkeypatch.setattr(cms_doctors, "create_doctors_stage", create_stage)
+    monkeypatch.setattr(cms_doctors, "_create_stage_indexes", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "require_doctors_identity_roots", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "bound_publisher", lambda: SimpleNamespace(connection=object(), policy=object()))
+    monkeypatch.setattr(cms_doctors.source_storage, "_close_grants", AsyncMock())
 
 
 class _AsyncResponse:
@@ -96,8 +127,14 @@ def _doctor_row(**overrides):
 
 def _places_csv(rows):
     fields = [
-        "Year", "LocationID", "MeasureId", "Measure", "Data_Value",
-        "Low_Confidence_Limit", "High_Confidence_Limit", "Data_Value_Type",
+        "Year",
+        "LocationID",
+        "MeasureId",
+        "Measure",
+        "Data_Value",
+        "Low_Confidence_Limit",
+        "High_Confidence_Limit",
+        "Data_Value_Type",
         "DataSource",
     ]
     buffer = io.StringIO()
@@ -109,12 +146,24 @@ def _places_csv(rows):
 
 def _benefit_row(**overrides):
     benefit_by_field = {
-        "BenefitName": "Office visit", "CopayInnTier1": "$1", "CopayInnTier2": "$2",
-        "CopayOutofNet": "$3", "CoinsInnTier1": "0.1", "CoinsInnTier2": "0.2",
-        "CoinsOutofNet": "0.3", "LimitUnit": "visit", "Exclusions": "none",
-        "Explanation": "standard", "EHBVarReason": "", "LimitQty": "3.5",
-        "BusinessYear": "2026", "IsEHB": "yes", "IsCovered": "covered",
-        "QuantLimitOnSvc": "no", "IsExclFromInnMOOP": "n", "IsExclFromOonMOOP": "y",
+        "BenefitName": "Office visit",
+        "CopayInnTier1": "$1",
+        "CopayInnTier2": "$2",
+        "CopayOutofNet": "$3",
+        "CoinsInnTier1": "0.1",
+        "CoinsInnTier2": "0.2",
+        "CoinsOutofNet": "0.3",
+        "LimitUnit": "visit",
+        "Exclusions": "none",
+        "Explanation": "standard",
+        "EHBVarReason": "",
+        "LimitQty": "3.5",
+        "BusinessYear": "2026",
+        "IsEHB": "yes",
+        "IsCovered": "covered",
+        "QuantLimitOnSvc": "no",
+        "IsExclFromInnMOOP": "n",
+        "IsExclFromOonMOOP": "y",
     }
     benefit_by_field.update(overrides)
     return benefit_by_field
@@ -163,8 +212,15 @@ def test_attribute_normalizers_preserve_only_meaningful_rows_and_fail_bad_years(
 
     objects = attributes._attribute_objects_from_row(
         {"StandardComponentId": None, "Plan Name": " Gold ", "Empty": " ", "Accenté": 7},
-        plan_id="plan", full_plan_id="plan-01", year=2026,
-        attribute_name_by_label={"StandardComponentId": "id", "Plan Name": "name", "Empty": "empty", "Accenté": "accenté"},
+        plan_id="plan",
+        full_plan_id="plan-01",
+        year=2026,
+        attribute_name_by_label={
+            "StandardComponentId": "id",
+            "Plan Name": "name",
+            "Empty": "empty",
+            "Accenté": "accenté",
+        },
     )
     assert objects == [
         {"plan_id": "plan", "full_plan_id": "plan-01", "year": 2026, "attr_name": "name", "attr_value": "Gold"},
@@ -230,7 +286,11 @@ async def test_attribute_streaming_flushes_large_batches_and_stops_test_sources(
 
     monkeypatch.setattr(attributes, "_enqueue_attribute_batch", enqueue)
     monkeypatch.setattr(attributes, "push_objects", AsyncMock())
-    monkeypatch.setattr(attributes, "AsyncDictReader", lambda *_args, **_kwargs: _AsyncRows([dict(standard_attribute_by_name) for _ in range(5001)]))
+    monkeypatch.setattr(
+        attributes,
+        "AsyncDictReader",
+        lambda *_args, **_kwargs: _AsyncRows([dict(standard_attribute_by_name) for _ in range(5001)]),
+    )
     await attributes.process_attributes(
         {"redis": object(), "import_date": "run", "context": {}},
         {"url": "https://example.test/attributes.zip", "year": "2026", "context": {"test_mode": False}},
@@ -239,8 +299,14 @@ async def test_attribute_streaming_flushes_large_batches_and_stops_test_sources(
 
     pushed = AsyncMock()
     monkeypatch.setattr(attributes, "push_objects", pushed)
-    monkeypatch.setattr(attributes, "AsyncDictReader", lambda *_args, **_kwargs: _AsyncRows([state_attribute_by_name, state_attribute_by_name]))
-    monkeypatch.setattr(attributes, "plan_attributes_labels_to_key", {"STANDARD COMPONENT ID": "component", "PLAN ID": "plan"})
+    monkeypatch.setattr(
+        attributes,
+        "AsyncDictReader",
+        lambda *_args, **_kwargs: _AsyncRows([state_attribute_by_name, state_attribute_by_name]),
+    )
+    monkeypatch.setattr(
+        attributes, "plan_attributes_labels_to_key", {"STANDARD COMPONENT ID": "component", "PLAN ID": "plan"}
+    )
     monkeypatch.setenv("HLTHPRT_ATTRIBUTES_TEST_ROW_LIMIT", "1")
     await attributes.process_state_attributes(
         {"redis": object(), "import_date": "run", "context": {}},
@@ -272,7 +338,7 @@ async def test_cms_reader_deduplicates_before_bounded_push_and_honors_test_limit
         pushed_batch_list.append((list(rows), stage_cls))
 
     cancelled = AsyncMock()
-    monkeypatch.setattr(cms_doctors, "push_objects", push)
+    monkeypatch.setattr(cms_doctors, "_copy_clinical_rows", push)
     monkeypatch.setattr(cms_doctors, "raise_if_cancelled", cancelled)
 
     accepted = await cms_doctors._consume_doctors_reader(
@@ -299,11 +365,16 @@ async def test_cms_reader_releases_exact_batch_without_a_second_empty_write(monk
 
     monkeypatch.setattr(cms_doctors, "doctor_address_row", lambda row, _now: row)
     pushed = AsyncMock()
-    monkeypatch.setattr(cms_doctors, "push_objects", pushed)
+    monkeypatch.setattr(cms_doctors, "_copy_clinical_rows", pushed)
     monkeypatch.setattr(cms_doctors, "raise_if_cancelled", AsyncMock())
     accepted = await cms_doctors._consume_doctors_reader(
-        [{"address_checksum": 1}], ctx={}, task={}, stage_cls="stage",
-        batch_size=1, test_mode=False, test_row_limit=100,
+        [{"address_checksum": 1}],
+        ctx={},
+        task={},
+        stage_cls="stage",
+        batch_size=1,
+        test_mode=False,
+        test_row_limit=100,
     )
     assert accepted == 1
     pushed.assert_awaited_once()
@@ -330,8 +401,12 @@ async def test_cms_source_opens_csv_and_zip_and_rejects_zip_without_csv(monkeypa
         archive.writestr("readme.txt", "no rows")
 
     import_kwargs_by_name = {
-        "ctx": {}, "task": {}, "stage_cls": "stage", "batch_size": 4,
-        "test_mode": True, "test_row_limit": 5,
+        "ctx": {},
+        "task": {},
+        "stage_cls": "stage",
+        "batch_size": 4,
+        "test_mode": True,
+        "test_row_limit": 5,
     }
     assert await cms_doctors._import_doctors_source(str(csv_path), **import_kwargs_by_name) == 7
     assert await cms_doctors._import_doctors_source(str(zip_path), **import_kwargs_by_name) == 7
@@ -358,17 +433,81 @@ async def test_cms_publish_fails_closed_below_minimum_and_skips_empty_worker(mon
     await cms_doctors.publish_cms_doctors_generation({"context": {"run": 0}})
 
 
-@pytest.mark.asyncio
-async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypatch):
-    """A valid stage atomically replaces the live generation and retains metrics."""
+def _assert_cms_publish_metrics(marked, terminal_result, address_stats):
+    assert cms_doctors.db._transaction_binding() is None
+    expected_metrics_by_name = {
+        "rows": 4,
+        "education": {
+            "education_rows": 4,
+            "source_rows": 4,
+            "content_sha256": _ARTIFACT_DIGEST,
+        },
+        "group_site": {"source_rows": 4},
+        "organization_groups": 2,
+        "sites": 3,
+        "artifact": _ARTIFACT_RECEIPT,
+        "address_resolve": address_stats.__dict__,
+    }
+    assert marked.await_args.kwargs["metrics"] == expected_metrics_by_name
+    assert marked.await_args.kwargs["progress"] == terminal_result["terminal_progress"]
+    assert terminal_result["terminal_progress"]["phase"] == "cms-doctors published"
 
-    status = AsyncMock()
-    worker_context_by_key = {
-        "import_date": "run", "context": {
-            "run": 1, "education": {"education_rows": 4},
-            "control_run_id": "control", "start": "started", "education_stage_owned": True,
+
+def _assert_cms_publication_transaction(*_args):
+    binding = cms_doctors.db._transaction_binding()
+    assert binding is not None
+    assert binding.session.in_transaction()
+
+
+@pytest.fixture
+def cms_publication_session(monkeypatch):
+    """Keep the real session transaction while supplying the unit-only SQL results."""
+    session = async_sessionmaker()()
+    inventory = Mock()
+
+    def execute_statement(_statement, params=None):
+        _assert_cms_publication_transaction()
+        if params is not None:
+            inventory.scalars.return_value.all.return_value = params["names"]
+        return inventory
+
+    execute = AsyncMock(side_effect=execute_statement)
+    monkeypatch.setattr(session, "execute", execute)
+    monkeypatch.setattr(cms_doctors.db, "session_factory", lambda: session)
+
+    @asynccontextmanager
+    async def _source_transaction(database, *, isolation="read committed"):
+        if isolation == "repeatable read":
+            async with database.transaction() as owner:
+                yield owner
+        else:
+            yield object()
+
+    monkeypatch.setattr(cms_doctors, "source_transaction", _source_transaction)
+    return execute
+
+
+def _cms_publish_worker_context():
+    return {
+        "import_date": "run",
+        "context": {
+            "run": 1,
+            "education": {"education_rows": 4, "source_rows": 4, "content_sha256": _ARTIFACT_DIGEST},
+            "group_site": {"source_rows": 4},
+            "artifact": _ARTIFACT_RECEIPT,
+            "control_run_id": "control",
+            "start": "started",
+            "education_stage_owned": True,
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypatch, cms_publication_session):
+    """A valid stage atomically replaces the live generation and retains metrics."""
+
+    status = AsyncMock(side_effect=_assert_cms_publication_transaction)
+    worker_context_by_key = _cms_publish_worker_context()
 
     def assert_stage_ownership_released(*_args, **_kwargs):
         assert not worker_context_by_key["context"].get("education_stage_owned")
@@ -390,7 +529,6 @@ async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypa
     monkeypatch.setattr(cms_doctors, "make_class", lambda *_args: stage)
     monkeypatch.setattr(cms_doctors.db, "scalar", AsyncMock(return_value=4))
     monkeypatch.setattr(cms_doctors.db, "status", status)
-    monkeypatch.setattr(cms_doctors.db, "transaction", lambda: _Transaction())
     monkeypatch.setattr(cms_doctors, "source_enabled", lambda _source: True)
     monkeypatch.setattr(cms_doctors, "stamp_address_keys", AsyncMock())
     monkeypatch.setattr(cms_doctors, "resolve_into_archive", AsyncMock(return_value=address_stats))
@@ -399,49 +537,113 @@ async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypa
     monkeypatch.setattr(cms_doctors, "print_time_info", lambda _value: None)
     monkeypatch.setattr(cms_doctors, "DEFAULT_MIN_ROWS", 1)
     monkeypatch.setattr(cms_doctors, "validate_education_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "validate_group_site_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "bind_group_site_organizations", AsyncMock(return_value=2))
+    monkeypatch.setattr(cms_doctors, "bind_cms_doctors_sites", AsyncMock(return_value=3))
+    verify_artifact = create_autospec(cms_doctors.verify_doctors_artifact)
+    monkeypatch.setattr(cms_doctors, "verify_doctors_artifact", verify_artifact)
     monkeypatch.setattr(cms_doctors, "swap_education_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "swap_group_site_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "publish_doctors_generation", AsyncMock())
 
     terminal_result = await cms_doctors.publish_cms_doctors_generation(worker_context_by_key)
-
     sql_statement_list = [call.args[0] for call in status.await_args_list]
     assert any("doctor_clinician_address_old" in statement for statement in sql_statement_list)
     assert any("doctor_stage_idx_site" in statement for statement in sql_statement_list)
-    assert terminal_result["address_resolve"] == address_stats.__dict__
-    assert terminal_result["terminal_progress"]["phase"] == "cms-doctors published"
-    assert marked.await_args.kwargs["metrics"] == {
-        "rows": 4,
-        "education": {"education_rows": 4},
-        "address_resolve": address_stats.__dict__,
-    }
-    assert marked.await_args.kwargs["progress"] == terminal_result["terminal_progress"]
+    assert "ACCESS EXCLUSIVE MODE NOWAIT" in str(cms_publication_session.await_args.args[0])
+    verify_artifact.assert_called_once_with(_ARTIFACT_RECEIPT)
+    _assert_cms_publish_metrics(marked, terminal_result, address_stats)
 
 
 @pytest.mark.asyncio
-async def test_cms_publish_production_stage_without_address_feature_still_swaps(monkeypatch):
+async def test_cms_publish_production_stage_without_address_feature_still_swaps(monkeypatch, cms_publication_session):
     """Address enrichment is optional, but production row admission remains mandatory."""
 
-    status = AsyncMock()
+    status = AsyncMock(side_effect=_assert_cms_publication_transaction)
     marked = AsyncMock()
     stage = SimpleNamespace(__tablename__="doctor_stage")
     monkeypatch.setattr(cms_doctors, "ensure_database", AsyncMock())
     monkeypatch.setattr(cms_doctors, "make_class", lambda *_args: stage)
     monkeypatch.setattr(cms_doctors.db, "scalar", AsyncMock(return_value=cms_doctors.DEFAULT_MIN_ROWS))
     monkeypatch.setattr(cms_doctors.db, "status", status)
-    monkeypatch.setattr(cms_doctors.db, "transaction", lambda: _Transaction())
     monkeypatch.setattr(cms_doctors, "source_enabled", lambda _source: False)
     monkeypatch.setattr(cms_doctors, "mark_control_run", marked)
     monkeypatch.setattr(cms_doctors, "print_time_info", lambda _value: None)
     monkeypatch.setattr(cms_doctors, "validate_education_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "validate_group_site_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "bind_group_site_organizations", AsyncMock(return_value=2))
+    monkeypatch.setattr(cms_doctors, "bind_cms_doctors_sites", AsyncMock(return_value=3))
+    verify_artifact = create_autospec(cms_doctors.verify_doctors_artifact)
+    monkeypatch.setattr(cms_doctors, "verify_doctors_artifact", verify_artifact)
     monkeypatch.setattr(cms_doctors, "swap_education_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "swap_group_site_stage", AsyncMock())
     monkeypatch.setattr(cms_doctors, "raise_if_cancelled", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "publish_doctors_generation", AsyncMock())
 
     await cms_doctors.publish_cms_doctors_generation(
-        {"import_date": "run", "context": {"run": 1, "education": {"education_rows": 10000}, "control_run_id": "control", "start": "start"}}
+        {
+            "import_date": "run",
+            "context": {
+                "run": 1,
+                "education": {"education_rows": 10000, "source_rows": 10000, "content_sha256": _ARTIFACT_DIGEST},
+                "group_site": {"source_rows": 10000},
+                "artifact": _ARTIFACT_RECEIPT,
+                "control_run_id": "control",
+                "start": "start",
+            },
+        }
     )
+    assert cms_doctors.db._transaction_binding() is None
+    assert "ACCESS EXCLUSIVE MODE NOWAIT" in str(cms_publication_session.await_args.args[0])
+    verify_artifact.assert_called_once_with(_ARTIFACT_RECEIPT)
     assert marked.await_args.kwargs["metrics"] == {
         "rows": cms_doctors.DEFAULT_MIN_ROWS,
-        "education": {"education_rows": 10000},
+        "education": {"education_rows": 10000, "source_rows": 10000, "content_sha256": _ARTIFACT_DIGEST},
+        "group_site": {"source_rows": 10000},
+        "organization_groups": 2,
+        "sites": 3,
+        "artifact": _ARTIFACT_RECEIPT,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("artifact_state", ("missing", "malformed", "digest_mismatch", "changed"))
+async def test_cms_publish_requires_intact_retained_artifact_before_swap(
+    monkeypatch,
+    artifact_state,
+):
+    """A staged generation cannot publish when its source artifact is unproved."""
+
+    run_context_by_key = {
+        "run": 1,
+        "education": {"source_rows": 4, "content_sha256": _ARTIFACT_DIGEST},
+        "group_site": {"source_rows": 4},
+        "artifact": _ARTIFACT_RECEIPT,
+    }
+    if artifact_state == "missing":
+        run_context_by_key.pop("artifact")
+    elif artifact_state == "malformed":
+        run_context_by_key["artifact"] = ["unexpected"]
+    elif artifact_state == "digest_mismatch":
+        run_context_by_key["artifact"] = {**_ARTIFACT_RECEIPT, "content_sha256": "b" * 64}
+    verify = create_autospec(cms_doctors.verify_doctors_artifact)
+    if artifact_state == "changed":
+        verify.side_effect = RuntimeError("cms_doctors_artifact_changed")
+    publish = AsyncMock()
+    monkeypatch.setattr(cms_doctors, "ensure_database", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "make_class", lambda *_args: SimpleNamespace(__tablename__="doctor_stage"))
+    monkeypatch.setattr(cms_doctors.db, "scalar", AsyncMock(return_value=4))
+    monkeypatch.setattr(cms_doctors, "DEFAULT_MIN_ROWS", 1)
+    monkeypatch.setattr(cms_doctors, "validate_education_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "validate_group_site_stage", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "verify_doctors_artifact", verify)
+    monkeypatch.setattr(cms_doctors, "_publish_cms_doctors_stage", publish)
+
+    expected = "artifact_changed" if artifact_state == "changed" else "artifact_receipt_mismatch"
+    with pytest.raises(RuntimeError, match=expected):
+        await cms_doctors.publish_cms_doctors_generation({"import_date": "run", "context": run_context_by_key})
+    publish.assert_not_awaited()
+    assert verify.call_count == int(artifact_state == "changed")
 
 
 @pytest.mark.asyncio
@@ -452,6 +654,7 @@ async def test_cms_test_run_discards_stages_without_publication(monkeypatch):
     stage_by_model = {
         cms_doctors.DoctorClinicianAddress: SimpleNamespace(__tablename__="doctor_stage"),
         cms_doctors.CMSDoctorEducation: SimpleNamespace(__tablename__="education_stage"),
+        cms_doctors.CMSDoctorGroupSite: SimpleNamespace(__tablename__="group_stage"),
     }
     marked = create_autospec(cms_doctors.mark_control_run)
     monkeypatch.setattr(cms_doctors, "ensure_database", AsyncMock())
@@ -468,7 +671,9 @@ async def test_cms_test_run_discards_stages_without_publication(monkeypatch):
     )
     assert result["published"] is False
     assert [call.args[0] for call in status.await_args_list] == [
-        "DROP TABLE IF EXISTS mrf.doctor_stage", "DROP TABLE IF EXISTS mrf.education_stage",
+        "DROP TABLE IF EXISTS mrf.doctor_stage",
+        "DROP TABLE IF EXISTS mrf.education_stage",
+        "DROP TABLE IF EXISTS mrf.group_stage",
     ]
     assert marked.await_args.kwargs["progress_message"] == "succeeded"
 
@@ -481,11 +686,15 @@ async def test_cms_worker_downloads_one_source_closes_client_and_marks_run(monke
     monkeypatch.setitem(sys.modules, "aiohttp", SimpleNamespace(ClientSession=lambda: client))
     monkeypatch.setattr(cms_doctors, "raise_if_cancelled", AsyncMock())
     monkeypatch.setattr(cms_doctors, "ensure_database", AsyncMock())
-    monkeypatch.setattr(cms_doctors, "make_class", lambda *_args: "stage")
-    monkeypatch.setattr(cms_doctors, "_fetch_doctors_download_url", AsyncMock(return_value="https://example.test/doctors.csv"))
+    monkeypatch.setattr(cms_doctors, "make_class", lambda *_args: SimpleNamespace(__tablename__="stage"))
+    monkeypatch.setattr(
+        cms_doctors, "_fetch_doctors_download_url", AsyncMock(return_value="https://example.test/doctors.csv")
+    )
     monkeypatch.setattr(cms_doctors, "_download_doctors_source", AsyncMock())
     monkeypatch.setattr(cms_doctors, "_import_doctors_source", AsyncMock(return_value=7))
     monkeypatch.setattr(cms_doctors, "import_doctor_education", AsyncMock(return_value={"education_rows": 7}))
+    monkeypatch.setattr(cms_doctors, "import_group_site_rows", AsyncMock(return_value={"source_rows": 7}))
+    monkeypatch.setattr(cms_doctors, "_create_stage_indexes", AsyncMock())
     monkeypatch.setattr(cms_doctors, "DEFAULT_DOCTORS_DATASET_ID", "synthetic-cms-dataset")
     worker_context_by_key = {"import_date": "run", "context": {}}
 
@@ -508,7 +717,6 @@ async def test_cms_startup_and_entrypoint_build_stage_and_enqueue_exact_task(mon
     monkeypatch.setattr(cms_doctors, "my_init_db", AsyncMock())
     monkeypatch.setattr(cms_doctors, "ensure_database", AsyncMock())
     monkeypatch.setattr(cms_doctors, "make_class", lambda *_args: stage)
-    monkeypatch.setattr(cms_doctors, "_ensure_schema_exists", AsyncMock())
     monkeypatch.setattr(cms_doctors, "_create_stage_indexes", AsyncMock())
     monkeypatch.setattr(cms_doctors.db, "status", status)
     monkeypatch.setattr(cms_doctors.db, "create_table", AsyncMock())
@@ -522,7 +730,59 @@ async def test_cms_startup_and_entrypoint_build_stage_and_enqueue_exact_task(mon
 
     assert worker_context_by_key["import_date"] == "run01"
     assert worker_context_by_key["context"]["run"] == 0
-    assert "DROP TABLE IF EXISTS" in status.await_args.args[0]
+    status.assert_not_awaited()
+    cms_doctors.db.create_table.assert_awaited_once_with("table", checkfirst=False)
+    cms_doctors.require_doctors_identity_roots.assert_awaited_once_with(cms_doctors.db)
+    cms_doctors._create_stage_indexes.assert_not_awaited()
     pool.enqueue_job.assert_awaited_once_with(
         "process_data", {"test_mode": True}, _queue_name=cms_doctors.CMS_DOCTORS_QUEUE_NAME
     )
+
+
+def test_cms_default_stage_ids_are_unique_per_worker(monkeypatch):
+    """Independent workers must never share a date-only staging table name."""
+    suffixes = iter(("11111111", "22222222"))
+    monkeypatch.setattr(cms_doctors.secrets, "token_hex", lambda _size: next(suffixes))
+    first = cms_doctors._normalize_import_id(None)
+    second = cms_doctors._normalize_import_id(None)
+    assert first != second
+    assert len(first) == len(second) == 22
+
+
+@pytest.mark.asyncio
+async def test_cms_artifact_root_is_checked_before_source_download(monkeypatch):
+    """Missing durable storage fails before the worker fetches source bytes."""
+    fetch_url = AsyncMock()
+    monkeypatch.setenv("HLTHPRT_CMS_DOCTORS_ARTIFACT_ROOT", "")
+    monkeypatch.delenv("HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT", raising=False)
+    monkeypatch.setattr(cms_doctors, "raise_if_cancelled", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "ensure_database", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "_fetch_doctors_download_url", fetch_url)
+    with pytest.raises(RuntimeError, match="artifact_root_required"):
+        await cms_doctors.import_cms_doctors_data({"import_date": "run", "context": {}}, {})
+    fetch_url.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cms_reader_caps_native_batches_even_when_requested_batch_is_larger(monkeypatch):
+    monkeypatch.setattr(cms_doctors, "doctor_address_row", lambda row, _now: row)
+    copied_batches = []
+
+    async def copy(rows, stage):
+        copied_batches.append([dict(row) for row in rows])
+
+    monkeypatch.setattr(cms_doctors, "_copy_clinical_rows", copy)
+    monkeypatch.setattr(cms_doctors, "raise_if_cancelled", AsyncMock())
+    rows = [{"address_checksum": number} for number in range(5001)]
+    accepted = await cms_doctors._consume_doctors_reader(
+        rows,
+        ctx={},
+        task={},
+        stage_cls="stage",
+        batch_size=10000,
+        test_mode=False,
+        test_row_limit=100,
+    )
+    assert accepted == 5001
+    assert [len(batch) for batch in copied_batches] == [5000, 1]
+    assert [row for batch in copied_batches for row in batch] == rows

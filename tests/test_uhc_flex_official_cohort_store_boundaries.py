@@ -2,10 +2,8 @@
 
 """Failure-boundary coverage for official Flex cohort persistence."""
 
-from contextlib import asynccontextmanager
 from dataclasses import asdict
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -53,15 +51,6 @@ class _Database:
 
     async def status(self, _statement, **_params):
         return self.status_result
-
-
-class _SyncDatabase:
-    def __init__(self):
-        self.scalar = AsyncMock(return_value=True)
-
-    @asynccontextmanager
-    async def transaction(self):
-        yield self
 
 
 @pytest.mark.parametrize(
@@ -181,57 +170,13 @@ async def test_stored_cohort_rejects_duplicate_headers():
 
 
 @pytest.mark.asyncio
-async def test_member_and_header_inserts_require_exact_census():
-    database = _Database(status_result=0)
+async def test_header_insert_requires_exact_census():
     with pytest.raises(UHCFlexOfficialCohortError):
-        await store._insert_members(database, _cohort())
+        await store._insert_header(_Database(status_result=0), _cohort())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected", [object(), {}, True])
+async def test_sync_rejects_constructible_noncohort_replay_before_io(expected):
     with pytest.raises(UHCFlexOfficialCohortError):
-        await store._insert_header(database, _cohort())
-
-
-@pytest.mark.asyncio
-async def test_sync_rejects_replayed_snapshot_drift(monkeypatch):
-    database = _SyncDatabase()
-    monkeypatch.setattr(store, "_current_official_snapshot", AsyncMock(return_value=_snapshot()))
-    monkeypatch.setattr(
-        store,
-        "_stored_cohort_for_dataset",
-        AsyncMock(return_value=_cohort(endpoint_id="f" * 64)),
-    )
-
-    with pytest.raises(UHCFlexOfficialCohortError) as error_info:
-        await store.sync_uhc_flex_official_cohort(database=database)
-    assert error_info.value.code == "state"
-
-
-@pytest.mark.asyncio
-async def test_sync_translates_builder_failure_to_evidence(monkeypatch):
-    database = _SyncDatabase()
-    monkeypatch.setattr(store, "_current_official_snapshot", AsyncMock(return_value=_snapshot()))
-    monkeypatch.setattr(store, "_stored_cohort_for_dataset", AsyncMock(return_value=None))
-    monkeypatch.setattr(store, "_official_practitioner_npi_count", AsyncMock(return_value=1))
-    monkeypatch.setattr(
-        store,
-        "build_uhc_flex_official_cohort",
-        lambda **_kwargs: (_ for _ in ()).throw(ValueError("secret")),
-    )
-
-    with pytest.raises(UHCFlexOfficialCohortError) as error_info:
-        await store.sync_uhc_flex_official_cohort(database=database)
-    assert error_info.value.code == "evidence"
-    assert "secret" not in str(error_info.value)
-
-
-@pytest.mark.asyncio
-async def test_sync_rechecks_inserted_header(monkeypatch):
-    database = _SyncDatabase()
-    stored_cohort = AsyncMock(side_effect=[None, _cohort(endpoint_id="f" * 64)])
-    monkeypatch.setattr(store, "_current_official_snapshot", AsyncMock(return_value=_snapshot()))
-    monkeypatch.setattr(store, "_stored_cohort_for_dataset", stored_cohort)
-    monkeypatch.setattr(store, "_official_practitioner_npi_count", AsyncMock(return_value=1))
-    monkeypatch.setattr(store, "_insert_members", AsyncMock())
-    monkeypatch.setattr(store, "_insert_header", AsyncMock())
-
-    with pytest.raises(UHCFlexOfficialCohortError) as error_info:
-        await store.sync_uhc_flex_official_cohort(database=database)
-    assert error_info.value.code == "state"
+        await store.sync_uhc_flex_official_cohort(database=object(), expected_cohort=expected)

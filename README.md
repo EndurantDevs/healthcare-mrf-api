@@ -4,6 +4,25 @@
 
 It combines multiple public programs into one operational service so applications can query provider directories, plan data, procedure pricing, pharmacy activity, quality benchmarks, and enrollment-derived enrichment from a consistent API layer.
 
+## Database read sessions
+
+`HLTHPRT_API_READER_ENABLED=true` routes pinned NPI, pricing, code and coverage
+statistics requests through a separate database login. Configure
+`HLTHPRT_DB_READER_USER` and `HLTHPRT_DB_READER_PASSWORD` for that login; the user
+must differ from `HLTHPRT_DB_USER`. Reader sessions never fall back to Writer
+credentials. Canonical network-filtered requests and registry serving reads
+require this Reader login independently of that flag, as do independent PTG
+network reads and provider-profile snapshots. Control mutations, imports and
+explicit background writes retain their Writer connection.
+
+The Reader pool uses `HLTHPRT_DB_READER_POOL_MIN_SIZE` (default 1) and
+`HLTHPRT_DB_READER_POOL_MAX_SIZE` (default 5), in addition to the existing Writer
+pool. Budget both pools per API worker, including the held request connection
+and independent network reads. Before enabling native snapshot reads, provision
+the Reader's schema usage and exact serving/catalog metadata SELECT privileges;
+missing login, identity or privileges fail closed. Reader transactions use
+repeatable-read isolation and read-only mode from their first statement.
+
 ## What This Repository Provides
 
 The service brings together:
@@ -76,7 +95,7 @@ Each importer is a separate operational pipeline. Together, they build the canon
 | `mrf-source-discovery` | `python main.py start mrf-source-discovery` | payer, network, and TPA-hosted TiC source registries | searchable MRF source, plan, and file metadata catalog for PTG targeting |
 | `code-sets` | `python main.py start code-sets` | CMS POS + CMS Blue Button RC code pages | readable Revenue Center and Place of Service labels in `code_catalog` |
 | `ms-drg` | `python main.py start ms-drg` | CMS MS-DRG definitions manual | MS-DRG labels and MS-DRG to ICD-10-CM/PCS grouping relationships |
-| `clinical-reference` | `python main.py start clinical-reference` | official condition/procedure code files | condition, treatment, clinical-area, and crosswalk tables for Ribbon-replacement APIs |
+| `clinical-reference` | `python main.py start clinical-reference` | official condition/procedure code files | condition, treatment, clinical-area, and crosswalk tables for clinical reference APIs |
 | `npi` | `python main.py start npi` | NPPES | provider identity, addresses, taxonomies, and directory search data |
 | `nucc` | `python main.py start nucc` | NUCC | provider taxonomy lookup tables |
 | `geo` | `python main.py start geo` | repository support files | ZIP/city/state/coordinate lookup tables |
@@ -216,6 +235,16 @@ Set the database credentials and Redis URL in `.env` to your local services.
 until you configure your own `HLTHPRT_CONTROL_API_TOKEN`; regular imports use
 the CLI directly. Most import-specific settings in `.env.example` are optional.
 
+Registry service clients may use a separate `HLTHPRT_REGISTRY_CONTROL_API_TOKEN`.
+This credential is accepted only on Registry management, publication, serving and
+Registry PTG-scope routes; it cannot authorize general importer actions.
+Existing operator credentials remain valid on Registry routes. Configure the
+client and receiver with the same dedicated secret through your runtime secret
+store; leave the setting blank when separate Registry access is not needed.
+
+See [initial network inventory publication](docs/network-initial-publication.md)
+for the administrator command that preserves existing drafts.
+
 Create a dedicated application role using your PostgreSQL administrator (shown
 as `postgres`), put its password in `.env`, then create the local database and
 run the bundled ZIP import. This reads the public
@@ -239,9 +268,13 @@ For a small synthetic check of CSV parsing, batching and failure handling that
 does not require running services:
 
 ```bash
-uv pip install -r requirements-dev.txt
+uv pip install -r requirements-dev.txt --upgrade-package pytest-boorst
 python -m pytest -q tests/test_process_geo_import_unit.py tests/test_public_runtime_packaging.py
 ```
+
+CI refreshes `pytest-boorst>=0.1.0a5,<1.0` from PyPI after verifying the hashed
+dependency baseline, and enables it with `PYTEST_BOORST=1`. Set it to `0` to use
+stock collection. Other locked dependency versions stay fixed.
 
 To build a local container, supply the source identity:
 
@@ -249,7 +282,7 @@ To build a local container, supply the source identity:
 docker build --build-arg HLTHPRT_SOURCE_COMMIT="$(git rev-parse HEAD)" -t healthcare-mrf-api:local .
 ```
 
-Maintainers regenerate and refresh the runtime/build locks with `uv 0.12.12` and
+Maintainers regenerate and refresh the runtime/build locks with `uv 0.12.17` and
 `uv run scripts/python_locks.py compile`. The locks retain artifact hashes
 for native platforms and record the hash of their requirement input; the build
 rejects stale inputs. CI dependencies are managed separately.

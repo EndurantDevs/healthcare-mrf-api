@@ -1,5 +1,8 @@
+use flate2::read::ZlibDecoder;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{Cursor, Read};
 use std::process::Command;
 
 const RAW_MRF: &[u8] = include_bytes!("fixtures/compact_v4_mrf.json");
@@ -120,11 +123,189 @@ fn framed_payload(stdout: &[u8], target: &str) -> serde_json::Value {
     panic!("missing {target} frame")
 }
 
-fn source_witness_header(path: &std::path::Path) -> serde_json::Value {
-    let bundle = fs::read(path).expect("read source witness bundle");
-    assert_eq!(&bundle[..8], b"PTG2SW03");
-    let header_length = u32::from_be_bytes(bundle[8..12].try_into().unwrap()) as usize;
-    serde_json::from_slice(&bundle[12..12 + header_length]).expect("source witness header")
+fn witness_array<const N: usize>(cursor: &mut Cursor<&[u8]>) -> [u8; N] {
+    let mut value = [0; N];
+    cursor
+        .read_exact(&mut value)
+        .expect("complete witness field");
+    value
+}
+
+fn witness_u32(cursor: &mut Cursor<&[u8]>) -> usize {
+    u32::from_be_bytes(witness_array(cursor)) as usize
+}
+
+fn witness_slice<'a>(cursor: &mut Cursor<&'a [u8]>, length: usize) -> &'a [u8] {
+    let start = cursor.position() as usize;
+    let end = start.checked_add(length).expect("witness field length");
+    let value = cursor
+        .get_ref()
+        .get(start..end)
+        .expect("complete witness field");
+    cursor.set_position(end as u64);
+    value
+}
+
+fn decoded_witness_frame(cursor: &mut Cursor<&[u8]>, raw_limit: usize, overhead: usize) -> Vec<u8> {
+    let length = witness_u32(cursor);
+    let framed_length = length
+        .checked_add(overhead)
+        .expect("stored witness frame length");
+    assert!(length > 0 && framed_length <= 8 * 1024 * 1024);
+    let mut decoder = ZlibDecoder::new(witness_slice(cursor, length));
+    let mut raw = Vec::new();
+    (&mut decoder)
+        .take(raw_limit as u64 + 1)
+        .read_to_end(&mut raw)
+        .expect("valid witness zlib frame");
+    assert!(raw.len() <= raw_limit);
+    assert_eq!(decoder.total_in(), length as u64);
+    raw
+}
+
+fn source_witness_header(witness: &serde_json::Value) -> serde_json::Value {
+    let bundle = fs::read(witness["path"].as_str().expect("witness path"))
+        .expect("read source witness bundle");
+    assert_eq!(witness["format_version"], 4);
+    assert_eq!(witness["byte_count"], bundle.len());
+    assert!(bundle.len() <= 512 * 1024 * 1024);
+    assert_eq!(witness["sha256"], sha256_hex(&bundle));
+    let mut cursor = Cursor::new(bundle.as_slice());
+    assert_eq!(&witness_array::<8>(&mut cursor), b"PTG2SW04");
+    let header_length = witness_u32(&mut cursor);
+    assert!((1..=8 * 1024 * 1024 - 4).contains(&header_length));
+    let header: serde_json::Value =
+        serde_json::from_slice(witness_slice(&mut cursor, header_length))
+            .expect("source witness header");
+    assert_eq!(header["format_version"], 4);
+    assert_eq!(header["raw_source_sha256"], witness["raw_source_sha256"]);
+    assert_eq!(header["evidence_encoding"], "fixed_byte_fragments_v1");
+    assert_eq!(header["fragment_byte_count"], 4096);
+
+    let fragment_count = witness_u32(&mut cursor);
+    assert!((1..=153072).contains(&fragment_count));
+    assert_eq!(header["fragment_count"], fragment_count);
+    let mut fragments = BTreeMap::new();
+    for _ in 0..fragment_count {
+        let digest = witness_array::<32>(&mut cursor);
+        assert!(fragments
+            .last_key_value()
+            .is_none_or(|(previous, _)| previous < &digest));
+        let raw_length = witness_u32(&mut cursor);
+        assert!((1..=4096).contains(&raw_length));
+        let raw = decoded_witness_frame(&mut cursor, raw_length, 40);
+        assert_eq!(raw.len(), raw_length);
+        assert_eq!(<[u8; 32]>::from(Sha256::digest(&raw)), digest);
+        fragments.insert(digest, raw);
+    }
+    assert!(fragments.values().map(Vec::len).sum::<usize>() <= 512 * 1024 * 1024);
+    let recipe_count = witness_u32(&mut cursor);
+    assert!((1..=22000).contains(&recipe_count));
+    let mut recipes = BTreeSet::new();
+    let mut used_fragments = BTreeSet::new();
+    let mut reference_count = 0usize;
+    let mut reconstructed_bytes = 0usize;
+    for _ in 0..recipe_count {
+        let digest = witness_array::<32>(&mut cursor);
+        assert!(recipes.last().is_none_or(|previous| previous < &digest));
+        let raw_length = witness_u32(&mut cursor);
+        assert!((1..=64 * 1024 * 1024).contains(&raw_length));
+        let count = witness_u32(&mut cursor);
+        assert_eq!(count, raw_length.div_ceil(4096));
+        let mut raw_digest = Sha256::new();
+        for index in 0..count {
+            let fragment_digest = witness_array::<32>(&mut cursor);
+            let raw = fragments
+                .get(&fragment_digest)
+                .expect("known recipe fragment");
+            assert_eq!(raw.len(), 4096.min(raw_length - index * 4096));
+            raw_digest.update(raw);
+            used_fragments.insert(fragment_digest);
+        }
+        assert_eq!(<[u8; 32]>::from(raw_digest.finalize()), digest);
+        recipes.insert(digest);
+        reference_count += count;
+        reconstructed_bytes += raw_length;
+    }
+    assert_eq!(used_fragments.len(), fragments.len());
+    assert!(reference_count <= 16777216);
+    assert!(reconstructed_bytes as u64 <= 64 * 1024 * 1024 * 1024);
+    assert_eq!(header["recipe_reference_count"], reference_count);
+    assert_eq!(header["evidence_reconstructed_bytes"], reconstructed_bytes);
+
+    let record_count = witness_u32(&mut cursor);
+    assert!((1..=11000).contains(&record_count));
+    assert_eq!(witness["row_count"], record_count);
+    let recipe_hex = recipes
+        .iter()
+        .map(|digest| lower_hex(digest))
+        .collect::<BTreeSet<_>>();
+    let mut used_recipes = BTreeSet::new();
+    let mut rate_count = 0usize;
+    let mut provider_count = 0usize;
+    for _ in 0..record_count {
+        let raw = decoded_witness_frame(&mut cursor, 64 * 1024 * 1024, 4);
+        let mut record = Cursor::new(raw.as_slice());
+        assert_eq!(&witness_array::<8>(&mut record), b"PTG2SWR2");
+        let metadata_length = witness_u32(&mut record);
+        let metadata: serde_json::Value =
+            serde_json::from_slice(witness_slice(&mut record, metadata_length))
+                .expect("witness record metadata");
+        assert_eq!(metadata["contract"], "ptg2_v3_source_witness_record_v2");
+        assert_eq!(witness_u32(&mut record), 0);
+        assert_eq!(witness_u32(&mut record), 0);
+        assert_eq!(record.position(), raw.len() as u64);
+        for field in ["raw_sha256", "linked_provider_sha256"] {
+            if field == "raw_sha256" || !metadata[field].is_null() {
+                let digest = metadata[field].as_str().expect("source token digest");
+                assert!(recipe_hex.contains(digest));
+                used_recipes.insert(digest.to_owned());
+            }
+        }
+        match metadata["kind"].as_str().expect("witness kind") {
+            "rate_occurrence" => {
+                assert_eq!(
+                    provider_count, 0,
+                    "rate witnesses precede provider witnesses"
+                );
+                rate_count += 1;
+            }
+            "provider_reference" => provider_count += 1,
+            kind => panic!("unexpected witness kind {kind}"),
+        }
+    }
+    assert_eq!(used_recipes, recipe_hex);
+    assert_eq!(cursor.position(), bundle.len() as u64);
+    assert_eq!(header["rate_occurrence"]["selected_count"], rate_count);
+    assert_eq!(
+        header["provider_reference"]["selected_count"],
+        provider_count
+    );
+    assert_eq!(witness["occurrence_witness_count"], rate_count);
+    assert_eq!(witness["provider_witness_count"], provider_count);
+    assert_eq!(
+        header["rate_occurrence"]["population_count"],
+        witness["queryable_occurrence_population_count"]
+    );
+    assert_eq!(
+        header["provider_reference"]["population_count"],
+        witness["provider_population_count"]
+    );
+    assert_eq!(
+        rate_count as u64,
+        witness["queryable_occurrence_population_count"]
+            .as_u64()
+            .unwrap()
+            .min(10000)
+    );
+    assert_eq!(
+        provider_count as u64,
+        witness["provider_population_count"]
+            .as_u64()
+            .unwrap()
+            .min(1000)
+    );
+    header
 }
 
 #[test]
@@ -203,6 +384,10 @@ fn legacy_compact_scan_applies_only_the_exact_invalid_price_exclusion() {
     assert!(price_copy.contains("2028-02-29"));
     assert!(price_copy.contains("2029-03-01"));
     assert!(!price_copy.contains("2027-02-30"));
+    source_witness_header(&framed_payload(
+        &completed.stdout,
+        "source_audit_witness_file",
+    ));
     assert!(fs::read_dir(&witness_scratch).unwrap().next().is_none());
 }
 
@@ -402,9 +587,7 @@ fn all_invalid_price_exclusion_records_one_unqueryable_rate() {
         1,
     );
     let witness = framed_payload(&completed.stdout, "source_audit_witness_file");
-    let witness_header = source_witness_header(std::path::Path::new(
-        witness["path"].as_str().expect("witness path"),
-    ));
+    let witness_header = source_witness_header(&witness);
     assert_eq!(
         witness_header["rate_occurrence"]["emitted_rate_row_count"],
         2,

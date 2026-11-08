@@ -18,20 +18,31 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         persist-credentials: false
-    - name: Install Python
-      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
-      with:
-        python-version: 3.14.7
     - name: Install pinned uv
-      run: "printf '%s\\n' 'uv==0.12.12 --hash=sha256:fa5df02fc619a3cc7a58810d6ffeb80ca1e01404b8ef7239bd1cf2103c02cacf' |\n\
-        \  python -m pip install --disable-pip-version-check --no-deps --only-binary=:all: --require-hashes -r /dev/stdin\n\
-        test \"$(uv --version | awk '{print $2}')\" = 0.12.12\n"
+      run: "#!/usr/bin/env bash\nset -euo pipefail\n\nuv_directory=$(mktemp -d \"$RUNNER_TEMP/uv-0.12.17.XXXXXX\")\ncleanup()\
+        \ {\n  local status=$?\n  rm -f -- \"$uv_directory/archive.tar.gz\"\n  if [ \"$status\" -ne 0 ]; then rm -rf -- \"\
+        $uv_directory\"; fi\n  exit \"$status\"\n}\ntrap cleanup EXIT\ncurl --fail --location --retry 3 \\\n  --output \"\
+        $uv_directory/archive.tar.gz\" \\\n  https://github.com/astral-sh/uv/releases/download/0.12.17/uv-x86_64-unknown-linux-gnu.tar.gz\n\
+        printf '%s  %s\\n' \\\n  fa82fd8dde8e8eefdecada6aa0889666556cfceb690d06e0c3bca49eb3070a63 \\\n  \"$uv_directory/archive.tar.gz\"\
+        \ | sha256sum --check --strict\ntar -xzf \"$uv_directory/archive.tar.gz\" -C \"$uv_directory\" --strip-components=1\
+        \ \\\n  uv-x86_64-unknown-linux-gnu/uv uv-x86_64-unknown-linux-gnu/uvx\ntest \"$(\"$uv_directory/uv\" --version |\
+        \ awk '{print $2}')\" = 0.12.17\nprintf '%s\\n' \"$uv_directory\" >> \"$GITHUB_PATH\"\n"
+    - name: Install uv-managed Python
+      run: "#!/usr/bin/env bash\nset -euo pipefail\n\ntest \"$(uv --no-config --version | awk '{print $2}')\" = 0.12.17\n\
+        python_directory=$(mktemp -d \"$RUNNER_TEMP/uv-python.XXXXXX\")\ncleanup() {\n  local status=$?\n  if [ \"$status\"\
+        \ -ne 0 ]; then rm -rf -- \"$python_directory\"; fi\n  exit \"$status\"\n}\ntrap cleanup EXIT\nuv --no-config venv\
+        \ --managed-python --python 3.14.7 \"$python_directory/venv\"\npython_library=$(\"$python_directory/venv/bin/python\"\
+        \ -c 'import sysconfig; print(sysconfig.get_config_var(\"LIBDIR\"))')\ntest -d \"$python_library\"\nprintf '%s\\n'\
+        \ \"$python_directory/venv/bin\" >> \"$GITHUB_PATH\"\nprintf 'VIRTUAL_ENV=%s\\nUV_PYTHON_PREFERENCE=only-managed\\\
+        n' \"$python_directory/venv\" >> \"$GITHUB_ENV\"\nprintf 'LD_LIBRARY_PATH=%s%s\\n' \"$python_library\" \"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"\
+        \ >> \"$GITHUB_ENV\"\n"
     - name: Create isolated Python environment
       run: uv venv --python 3.14.7 --no-python-downloads .venv
     - name: Check public repository hygiene
       run: .venv/bin/python scripts/ci/public_hygiene.py
     - name: Install runtime and test dependencies
-      run: uv pip install --python .venv/bin/python -r requirements.txt -c requirements-dev.txt pytest pytest-asyncio
+      run: uv pip install --python .venv/bin/python -r requirements.txt -c requirements-dev.txt pytest pytest-asyncio 'pytest-boorst>=0.1.0a5,<1.0'
+        --upgrade-package pytest-boorst
     - name: Run synthetic import and API checks
       run: .venv/bin/python -m pytest -q tests/test_process_nucc_unit.py tests/test_process_code_sets_unit.py tests/test_healthcheck.py
         tests/test_public_runtime_packaging.py tests/test_public_ci.py
@@ -58,13 +69,14 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8f8e0d26b4fb58fd99f322ad98b581a1b867ca41
+        ref: 9672504117a066c7ab6473fee58c4fe23dbfaea5
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
       uses: ./ci/scripts/healthcare/setup
       with:
         rust: 'true'
+        cargo-cache: hygiene
     - name: Run complete validation stage
       run: 'bash "$CI_ROOT/scripts/healthcare/check" hygiene &
 
@@ -88,7 +100,7 @@ jobs:
       run: "binary_directory=\"$GITHUB_WORKSPACE/rust-debug-binaries\"\nmkdir -p \"$binary_directory\"\ninstall -m 0755 \\\
         \n  support/ptg2_scanner/target/debug/ptg2_scanner \\\n  support/ptg2_scanner/target/debug/ptg2_provider_graph_v4\
         \ \\\n  support/ptg2_scanner/target/debug/raw_claim_check \\\n  support/ptg2_scanner/target/debug/uhc_semantic_facts\
-        \ \\\n  \"$binary_directory/\"\n"
+        \ \\\n  \"$binary_directory/\"\nbash \"$CI_ROOT/scripts/healthcare/check\" native-wheel \"$binary_directory\"\n"
     - name: Upload exact-source Rust test binaries
       id: rust-artifact
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -100,9 +112,13 @@ jobs:
 
           rust-debug-binaries/raw_claim_check
 
-          rust-debug-binaries/uhc_semantic_facts'
+          rust-debug-binaries/uhc_semantic_facts
+
+          rust-debug-binaries/*.whl
+
+          rust-debug-binaries/ptg2-address-canon-wheel.sha256'
         if-no-files-found: error
-        compression-level: 0
+        compression-level: 6
         retention-days: 1
     outputs:
       rust_artifact_id: ${{ steps.rust-artifact.outputs.artifact-id }}
@@ -122,7 +138,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8f8e0d26b4fb58fd99f322ad98b581a1b867ca41
+        ref: 9672504117a066c7ab6473fee58c4fe23dbfaea5
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -145,7 +161,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8f8e0d26b4fb58fd99f322ad98b581a1b867ca41
+        ref: 9672504117a066c7ab6473fee58c4fe23dbfaea5
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -163,6 +179,11 @@ jobs:
   python-tests:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
       && 'python-tests (metadata only)' || matrix.label }}
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      checks: read
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
@@ -177,7 +198,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8f8e0d26b4fb58fd99f322ad98b581a1b867ca41
+        ref: 9672504117a066c7ab6473fee58c4fe23dbfaea5
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -188,6 +209,12 @@ jobs:
         artifact-ids: ${{ needs.public-hygiene.outputs.rust_artifact_id || 'missing' }}
         digest-mismatch: error
         path: rust-debug-binaries
+    - name: Prepare read-only common-test evidence
+      env:
+        GH_TOKEN: ${{ github.token }}
+      working-directory: ${{ github.workspace }}
+      run: python3 "$CI_ROOT/scripts/common_test_broker.py" --source-root "$SOURCE_ROOT" --source-repository "$SOURCE_REPOSITORY"
+        --step "$COMMON_TEST_STEP" --directory "$RUNNER_TEMP/common-test-evidence"
     - name: Run complete validation stage
       env:
         CI_RUST_BINARIES: ${{ github.workspace }}/rust-debug-binaries
@@ -217,34 +244,57 @@ jobs:
       run: '[[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
 
         printf ''%s=%s\n'' "$ARTIFACT_OUTPUT" "$ARTIFACT_ID" >> "$GITHUB_OUTPUT"'
+    - name: Upload verified common-test measurements
+      if: success() && env.COMMON_TEST_ARTIFACT_NAME != ''
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: ${{ env.COMMON_TEST_ARTIFACT_NAME }}
+        path: ${{ runner.temp }}/common-test-measurements
+        if-no-files-found: error
+        retention-days: 1
     outputs:
       artifact_0: ${{ steps.coverage-output.outputs.artifact_0 }}
       artifact_1: ${{ steps.coverage-output.outputs.artifact_1 }}
       artifact_2: ${{ steps.coverage-output.outputs.artifact_2 }}
       artifact_3: ${{ steps.coverage-output.outputs.artifact_3 }}
+      artifact_4: ${{ steps.coverage-output.outputs.artifact_4 }}
+      artifact_5: ${{ steps.coverage-output.outputs.artifact_5 }}
     strategy:
       fail-fast: true
       matrix:
         include:
         - shard: '0'
-          label: Python tests (1/4)
+          label: Python tests (1/6)
           output: artifact_0
         - shard: '1'
-          label: Python tests (2/4)
+          label: Python tests (2/6)
           output: artifact_1
         - shard: '2'
-          label: Python tests (3/4)
+          label: Python tests (3/6)
           output: artifact_2
         - shard: '3'
-          label: Python tests (4/4)
+          label: Python tests (4/6)
           output: artifact_3
+        - shard: '4'
+          label: Python tests (5/6)
+          output: artifact_4
+        - shard: '5'
+          label: Python tests (6/6)
+          output: artifact_5
     env:
+      COMMON_TEST_EQUIVALENCE: 'true'
+      COMMON_TEST_STEP: Run complete validation stage
       CI_SHARD: ${{ matrix.shard }}
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
   capacity-evidence:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
       && 'Capacity tests (metadata only)' || 'Capacity tests' }}
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      checks: read
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
@@ -254,16 +304,25 @@ jobs:
       run:
         shell: bash
         working-directory: source
+    env:
+      COMMON_TEST_EQUIVALENCE: 'true'
+      COMMON_TEST_STEP: Run complete validation stage
     steps:
     - name: Check out pinned public CI
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8f8e0d26b4fb58fd99f322ad98b581a1b867ca41
+        ref: 9672504117a066c7ab6473fee58c4fe23dbfaea5
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
       uses: ./ci/scripts/healthcare/setup
+    - name: Prepare read-only common-test evidence
+      env:
+        GH_TOKEN: ${{ github.token }}
+      working-directory: ${{ github.workspace }}
+      run: python3 "$CI_ROOT/scripts/common_test_broker.py" --source-root "$SOURCE_ROOT" --source-repository "$SOURCE_REPOSITORY"
+        --step "$COMMON_TEST_STEP" --directory "$RUNNER_TEMP/common-test-evidence"
     - name: Run complete validation stage
       run: 'bash "$CI_ROOT/scripts/healthcare/check" capacity
 
@@ -283,6 +342,14 @@ jobs:
         retention-days: 1
         if-no-files-found: error
       id: coverage-artifact
+    - name: Upload verified common-test measurements
+      if: success() && env.COMMON_TEST_ARTIFACT_NAME != ''
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: ${{ env.COMMON_TEST_ARTIFACT_NAME }}
+        path: ${{ runner.temp }}/common-test-measurements
+        if-no-files-found: error
+        retention-days: 1
     outputs:
       artifact_id: ${{ steps.coverage-artifact.outputs.artifact-id }}
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
@@ -304,7 +371,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8f8e0d26b4fb58fd99f322ad98b581a1b867ca41
+        ref: 9672504117a066c7ab6473fee58c4fe23dbfaea5
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -336,13 +403,14 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8f8e0d26b4fb58fd99f322ad98b581a1b867ca41
+        ref: 9672504117a066c7ab6473fee58c4fe23dbfaea5
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
       uses: ./ci/scripts/healthcare/setup
       with:
         rust: 'true'
+        cargo-cache: rust
     - name: Install verified Rust validation tools
       run: 'tools_directory="$RUNNER_TEMP/healthcare-rust-tools"
 
@@ -388,7 +456,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8f8e0d26b4fb58fd99f322ad98b581a1b867ca41
+        ref: 9672504117a066c7ab6473fee58c4fe23dbfaea5
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -435,7 +503,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8f8e0d26b4fb58fd99f322ad98b581a1b867ca41
+        ref: 9672504117a066c7ab6473fee58c4fe23dbfaea5
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -473,7 +541,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8f8e0d26b4fb58fd99f322ad98b581a1b867ca41
+        ref: 9672504117a066c7ab6473fee58c4fe23dbfaea5
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -494,7 +562,7 @@ jobs:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
       && 'address-canonical-db-tests (metadata only)' || matrix.label }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: ${{ matrix.shard == 'cms-successor' && 30 || 20 }}
     needs:
     - public-hygiene
     - readability-preflight
@@ -506,6 +574,7 @@ jobs:
           POSTGRES_DB: ptg2_v3_lifecycle_test_ci_runner
         ports:
         - 5432:5432
+        - 5440:5432
         options: --health-cmd "pg_isready -U postgres -d ptg2_v3_lifecycle_test_ci_runner" --health-interval 2s --health-timeout
           5s --health-retries 25
     env:
@@ -529,24 +598,15 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8f8e0d26b4fb58fd99f322ad98b581a1b867ca41
+        ref: 9672504117a066c7ab6473fee58c4fe23dbfaea5
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
       uses: ./ci/scripts/healthcare/setup
+      with:
+        postgres-schema-cache: 'true'
     - name: Install PostgreSQL client
-      run: "sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq\nsudo\
-        \ apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install --yes --no-install-recommends\
-        \ ca-certificates curl\nsudo install -d -m 0755 /usr/share/postgresql-common/pgdg\nsudo curl --fail --location --silent\
-        \ --show-error --retry 3 --retry-delay 2 --retry-all-errors \\\n  --connect-timeout 15 --max-time 60 \\\n  --output\
-        \ /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \\\n  https://www.postgresql.org/media/keys/ACCC4CF8.asc\n\
-        . /etc/os-release\nprintf '%s\\n' \\\n  'Types: deb' \\\n  'URIs: https://apt.postgresql.org/pub/repos/apt' \\\n \
-        \ \"Suites: ${VERSION_CODENAME}-pgdg\" \\\n  'Components: main' \\\n  'Signed-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc'\
-        \ |\n  sudo tee /etc/apt/sources.list.d/pgdg.sources >/dev/null\nsudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30\
-        \ -o Acquire::https::Timeout=30 update -qq\nsudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30\
-        \ install --yes --no-install-recommends postgresql-client-18\nprintf '%s\\n' /usr/lib/postgresql/18/bin >> \"$GITHUB_PATH\"\
-        \nfor tool in psql pg_dump pg_restore; do\n  \"/usr/lib/postgresql/18/bin/$tool\" --version | grep -Eq \"^$tool \\\
-        \\(PostgreSQL\\\\) 18\\\\.\"\ndone\n"
+      run: bash "$CI_ROOT/scripts/install_postgres_client"
     - name: Download exact-source Rust test binaries
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
@@ -556,6 +616,7 @@ jobs:
     - name: Run complete validation stage
       env:
         HLTHPRT_DB_HOST: 127.0.0.1
+        CI_POSTGRES_SERVICE_ID: ${{ job.services.postgres.id }}
         CI_RUST_BINARIES: ${{ github.workspace }}/rust-debug-binaries
       run: 'bash "$CI_ROOT/scripts/healthcare/check" postgres "$CI_SHARD"
 
@@ -585,46 +646,352 @@ jobs:
         printf ''%s=%s\n'' "$ARTIFACT_OUTPUT" "$ARTIFACT_ID" >> "$GITHUB_OUTPUT"'
     outputs:
       artifact_core_services: ${{ steps.coverage-output.outputs.artifact_core_services }}
+      artifact_core_services_2: ${{ steps.coverage-output.outputs.artifact_core_services_2 }}
       artifact_core_imports: ${{ steps.coverage-output.outputs.artifact_core_imports }}
+      artifact_core_imports_2: ${{ steps.coverage-output.outputs.artifact_core_imports_2 }}
+      artifact_core_snapshots: ${{ steps.coverage-output.outputs.artifact_core_snapshots }}
+      artifact_core_snapshots_2: ${{ steps.coverage-output.outputs.artifact_core_snapshots_2 }}
       artifact_core_ptg: ${{ steps.coverage-output.outputs.artifact_core_ptg }}
+      artifact_registry_0: ${{ steps.coverage-output.outputs.artifact_registry_0 }}
+      artifact_registry_1: ${{ steps.coverage-output.outputs.artifact_registry_1 }}
+      artifact_registry_2: ${{ steps.coverage-output.outputs.artifact_registry_2 }}
+      artifact_registry_3: ${{ steps.coverage-output.outputs.artifact_registry_3 }}
+      artifact_registry_4: ${{ steps.coverage-output.outputs.artifact_registry_4 }}
+      artifact_registry_5: ${{ steps.coverage-output.outputs.artifact_registry_5 }}
+      artifact_registry_6: ${{ steps.coverage-output.outputs.artifact_registry_6 }}
+      artifact_registry_7: ${{ steps.coverage-output.outputs.artifact_registry_7 }}
+      artifact_registry_8: ${{ steps.coverage-output.outputs.artifact_registry_8 }}
+      artifact_registry_9: ${{ steps.coverage-output.outputs.artifact_registry_9 }}
+      artifact_registry_10: ${{ steps.coverage-output.outputs.artifact_registry_10 }}
+      artifact_registry_11: ${{ steps.coverage-output.outputs.artifact_registry_11 }}
+      artifact_registry_12: ${{ steps.coverage-output.outputs.artifact_registry_12 }}
+      artifact_registry_13: ${{ steps.coverage-output.outputs.artifact_registry_13 }}
+      artifact_registry_14: ${{ steps.coverage-output.outputs.artifact_registry_14 }}
+      artifact_registry_15: ${{ steps.coverage-output.outputs.artifact_registry_15 }}
+      artifact_registry_16: ${{ steps.coverage-output.outputs.artifact_registry_16 }}
+      artifact_registry_17: ${{ steps.coverage-output.outputs.artifact_registry_17 }}
+      artifact_registry_18: ${{ steps.coverage-output.outputs.artifact_registry_18 }}
+      artifact_registry_19: ${{ steps.coverage-output.outputs.artifact_registry_19 }}
+      artifact_registry_20: ${{ steps.coverage-output.outputs.artifact_registry_20 }}
+      artifact_registry_21: ${{ steps.coverage-output.outputs.artifact_registry_21 }}
+      artifact_registry_22: ${{ steps.coverage-output.outputs.artifact_registry_22 }}
+      artifact_registry_23: ${{ steps.coverage-output.outputs.artifact_registry_23 }}
+      artifact_registry_24: ${{ steps.coverage-output.outputs.artifact_registry_24 }}
+      artifact_registry_25: ${{ steps.coverage-output.outputs.artifact_registry_25 }}
+      artifact_registry_26: ${{ steps.coverage-output.outputs.artifact_registry_26 }}
+      artifact_registry_27: ${{ steps.coverage-output.outputs.artifact_registry_27 }}
+      artifact_registry_28: ${{ steps.coverage-output.outputs.artifact_registry_28 }}
+      artifact_registry_29: ${{ steps.coverage-output.outputs.artifact_registry_29 }}
+      artifact_registry_30: ${{ steps.coverage-output.outputs.artifact_registry_30 }}
+      artifact_registry_31: ${{ steps.coverage-output.outputs.artifact_registry_31 }}
+      artifact_registry_32: ${{ steps.coverage-output.outputs.artifact_registry_32 }}
+      artifact_registry_33: ${{ steps.coverage-output.outputs.artifact_registry_33 }}
+      artifact_registry_34: ${{ steps.coverage-output.outputs.artifact_registry_34 }}
+      artifact_registry_35: ${{ steps.coverage-output.outputs.artifact_registry_35 }}
+      artifact_registry_36: ${{ steps.coverage-output.outputs.artifact_registry_36 }}
+      artifact_registry_37: ${{ steps.coverage-output.outputs.artifact_registry_37 }}
+      artifact_registry_38: ${{ steps.coverage-output.outputs.artifact_registry_38 }}
+      artifact_registry_39: ${{ steps.coverage-output.outputs.artifact_registry_39 }}
+      artifact_registry_40: ${{ steps.coverage-output.outputs.artifact_registry_40 }}
+      artifact_registry_41: ${{ steps.coverage-output.outputs.artifact_registry_41 }}
+      artifact_registry_42: ${{ steps.coverage-output.outputs.artifact_registry_42 }}
+      artifact_registry_43: ${{ steps.coverage-output.outputs.artifact_registry_43 }}
+      artifact_registry_44: ${{ steps.coverage-output.outputs.artifact_registry_44 }}
+      artifact_registry_45: ${{ steps.coverage-output.outputs.artifact_registry_45 }}
+      artifact_registry_46: ${{ steps.coverage-output.outputs.artifact_registry_46 }}
+      artifact_registry_47: ${{ steps.coverage-output.outputs.artifact_registry_47 }}
       artifact_directory_source: ${{ steps.coverage-output.outputs.artifact_directory_source }}
+      artifact_directory_source_2: ${{ steps.coverage-output.outputs.artifact_directory_source_2 }}
       artifact_directory_storage: ${{ steps.coverage-output.outputs.artifact_directory_storage }}
       artifact_directory_address: ${{ steps.coverage-output.outputs.artifact_directory_address }}
       artifact_profile_storage: ${{ steps.coverage-output.outputs.artifact_profile_storage }}
       artifact_profile_publication: ${{ steps.coverage-output.outputs.artifact_profile_publication }}
+      artifact_cms_successor: ${{ steps.coverage-output.outputs.artifact_cms_successor }}
     strategy:
-      fail-fast: true
+      max-parallel: 48
+      fail-fast: false
       matrix:
         include:
+        - shard: cms-successor
+          label: Database tests (CMS successor)
+          output: artifact_cms_successor
+        - shard: registry-28
+          label: Database tests (registry 29)
+          output: artifact_registry_28
+        - shard: registry-19
+          label: Database tests (registry 20)
+          output: artifact_registry_19
+        - shard: registry-37
+          label: Database tests (registry 38)
+          output: artifact_registry_37
+        - shard: registry-31
+          label: Database tests (registry 32)
+          output: artifact_registry_31
+        - shard: registry-46
+          label: Database tests (registry 47)
+          output: artifact_registry_46
         - shard: core-services
           label: Database tests (services)
           output: artifact_core_services
-        - shard: core-imports
-          label: Database tests (imports)
-          output: artifact_core_imports
-        - shard: core-ptg
-          label: Database tests (PTG)
-          output: artifact_core_ptg
-        - shard: directory-source
-          label: Database tests (directory source)
-          output: artifact_directory_source
-        - shard: directory-storage
-          label: Database tests (directory storage)
-          output: artifact_directory_storage
-        - shard: directory-address
-          label: Database tests (directory address)
-          output: artifact_directory_address
-        - shard: profile-storage
-          label: Database tests (profile storage)
-          output: artifact_profile_storage
+        - shard: registry-35
+          label: Database tests (registry 36)
+          output: artifact_registry_35
+        - shard: registry-11
+          label: Database tests (registry 12)
+          output: artifact_registry_11
         - shard: profile-publication
           label: Database tests (profile publication)
           output: artifact_profile_publication
+        - shard: core-imports
+          label: Database tests (imports)
+          output: artifact_core_imports
+        - shard: registry-39
+          label: Database tests (registry 40)
+          output: artifact_registry_39
+        - shard: registry-41
+          label: Database tests (registry 42)
+          output: artifact_registry_41
+        - shard: directory-source-2
+          label: Database tests (directory source 2)
+          output: artifact_directory_source_2
+        - shard: registry-20
+          label: Database tests (registry 21)
+          output: artifact_registry_20
+        - shard: registry-4
+          label: Database tests (registry 5)
+          output: artifact_registry_4
+        - shard: core-snapshots-2
+          label: Database tests (snapshot imports 2)
+          output: artifact_core_snapshots_2
+        - shard: registry-14
+          label: Database tests (registry 15)
+          output: artifact_registry_14
+        - shard: registry-13
+          label: Database tests (registry 14)
+          output: artifact_registry_13
+        - shard: registry-32
+          label: Database tests (registry 33)
+          output: artifact_registry_32
+        - shard: core-ptg
+          label: Database tests (PTG)
+          output: artifact_core_ptg
+        - shard: registry-10
+          label: Database tests (registry 11)
+          output: artifact_registry_10
+        - shard: directory-address
+          label: Database tests (directory address)
+          output: artifact_directory_address
+        - shard: directory-source
+          label: Database tests (directory source)
+          output: artifact_directory_source
+        - shard: core-services-2
+          label: Database tests (services 2)
+          output: artifact_core_services_2
+        - shard: registry-40
+          label: Database tests (registry 41)
+          output: artifact_registry_40
+        - shard: registry-27
+          label: Database tests (registry 28)
+          output: artifact_registry_27
+        - shard: registry-9
+          label: Database tests (registry 10)
+          output: artifact_registry_9
+        - shard: registry-45
+          label: Database tests (registry 46)
+          output: artifact_registry_45
+        - shard: core-imports-2
+          label: Database tests (imports 2)
+          output: artifact_core_imports_2
+        - shard: registry-6
+          label: Database tests (registry 7)
+          output: artifact_registry_6
+        - shard: registry-22
+          label: Database tests (registry 23)
+          output: artifact_registry_22
+        - shard: registry-26
+          label: Database tests (registry 27)
+          output: artifact_registry_26
+        - shard: registry-0
+          label: Database tests (registry 1)
+          output: artifact_registry_0
+        - shard: registry-36
+          label: Database tests (registry 37)
+          output: artifact_registry_36
+        - shard: registry-3
+          label: Database tests (registry 4)
+          output: artifact_registry_3
+        - shard: registry-43
+          label: Database tests (registry 44)
+          output: artifact_registry_43
+        - shard: registry-42
+          label: Database tests (registry 43)
+          output: artifact_registry_42
+        - shard: registry-38
+          label: Database tests (registry 39)
+          output: artifact_registry_38
+        - shard: registry-44
+          label: Database tests (registry 45)
+          output: artifact_registry_44
+        - shard: registry-5
+          label: Database tests (registry 6)
+          output: artifact_registry_5
+        - shard: profile-storage
+          label: Database tests (profile storage)
+          output: artifact_profile_storage
+        - shard: registry-29
+          label: Database tests (registry 30)
+          output: artifact_registry_29
+        - shard: directory-storage
+          label: Database tests (directory storage)
+          output: artifact_directory_storage
+        - shard: registry-21
+          label: Database tests (registry 22)
+          output: artifact_registry_21
+        - shard: registry-16
+          label: Database tests (registry 17)
+          output: artifact_registry_16
+        - shard: registry-34
+          label: Database tests (registry 35)
+          output: artifact_registry_34
+        - shard: registry-15
+          label: Database tests (registry 16)
+          output: artifact_registry_15
+        - shard: registry-23
+          label: Database tests (registry 24)
+          output: artifact_registry_23
+        - shard: registry-30
+          label: Database tests (registry 31)
+          output: artifact_registry_30
+        - shard: registry-2
+          label: Database tests (registry 3)
+          output: artifact_registry_2
+        - shard: registry-17
+          label: Database tests (registry 18)
+          output: artifact_registry_17
+        - shard: registry-24
+          label: Database tests (registry 25)
+          output: artifact_registry_24
+        - shard: registry-33
+          label: Database tests (registry 34)
+          output: artifact_registry_33
+        - shard: registry-12
+          label: Database tests (registry 13)
+          output: artifact_registry_12
+        - shard: registry-18
+          label: Database tests (registry 19)
+          output: artifact_registry_18
+        - shard: registry-7
+          label: Database tests (registry 8)
+          output: artifact_registry_7
+        - shard: registry-8
+          label: Database tests (registry 9)
+          output: artifact_registry_8
+        - shard: registry-47
+          label: Database tests (registry 48)
+          output: artifact_registry_47
+        - shard: registry-1
+          label: Database tests (registry 2)
+          output: artifact_registry_1
+        - shard: registry-25
+          label: Database tests (registry 26)
+          output: artifact_registry_25
+        - shard: core-snapshots
+          label: Database tests (snapshot imports)
+          output: artifact_core_snapshots
+    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
+      && (success()) }}
+  fhir-catalog-integration:
+    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
+      && 'FHIR catalog integration (metadata only)' || 'FHIR catalog integration' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+    - public-hygiene
+    - readability-preflight
+    services:
+      postgres:
+        image: postgis/postgis:18-3.6@sha256:60f6ad1d21ea86a67d47780b9a0d1e1d200500f62b19293fa834d0dea80b8677
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ptg2_v3_lifecycle_test_ci_runner
+        ports:
+        - 5432:5432
+        - 5440:5432
+        options: --health-cmd "pg_isready -U postgres -d ptg2_v3_lifecycle_test_ci_runner" --health-interval 2s --health-timeout
+          5s --health-retries 25
+    env:
+      PYTEST_ADDOPTS: ''
+      HLTHPRT_DB_DRIVER: asyncpg
+      HLTHPRT_DB_PORT: '5432'
+      HLTHPRT_DB_USER: postgres
+      HLTHPRT_DB_PASSWORD: postgres
+      HLTHPRT_DB_DATABASE: ptg2_v3_lifecycle_test_ci_runner
+      HLTHPRT_DB_SCHEMA: mrf
+      DB_SCHEMA: mrf
+      HLTHPRT_REDIS_ADDRESS: redis://127.0.0.1:6379
+      CI_SHARD: fhir-catalog-integration
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+    - name: Check out pinned public CI
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: EndurantDevs/endurant-ci
+        ref: 9672504117a066c7ab6473fee58c4fe23dbfaea5
+        path: ci
+        persist-credentials: false
+    - name: Prepare source and toolchain
+      uses: ./ci/scripts/healthcare/setup
+    - name: Check catalog integration capability
+      id: catalog-capability
+      run: bash "$CI_ROOT/scripts/healthcare/check" fhir-catalog-capability >> "$GITHUB_OUTPUT"
+    - name: Install PostgreSQL client
+      run: bash "$CI_ROOT/scripts/install_postgres_client"
+      if: steps.catalog-capability.outputs.present == 'true'
+    - name: Download exact-source Rust test binaries
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        artifact-ids: ${{ needs.public-hygiene.outputs.rust_artifact_id || 'missing' }}
+        digest-mismatch: error
+        path: rust-debug-binaries
+      if: steps.catalog-capability.outputs.present == 'true'
+    - name: Run complete validation stage
+      env:
+        HLTHPRT_DB_HOST: 127.0.0.1
+        CI_POSTGRES_SERVICE_ID: ${{ job.services.postgres.id }}
+        CI_RUST_BINARIES: ${{ github.workspace }}/rust-debug-binaries
+      run: 'bash "$CI_ROOT/scripts/healthcare/check" postgres "$CI_SHARD"
+
+        git diff --exit-code
+
+        git diff --cached --exit-code
+
+        test -z "$(git ls-files --others --exclude-standard)"'
+      if: steps.catalog-capability.outputs.present == 'true'
+    - name: Upload exact-source catalog integration evidence
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: mrf-fhir-catalog-integration-${{ github.run_id }}-${{ github.run_attempt }}
+        path: '${{ runner.temp }}/healthcare-artifacts/fhir-catalog-integration.xml
+
+          ${{ runner.temp }}/healthcare-artifacts/fhir-catalog-integration.selection
+
+          ${{ runner.temp }}/healthcare-artifacts/fhir-catalog-integration.json'
+        retention-days: 1
+        if-no-files-found: error
+      if: steps.catalog-capability.outputs.present == 'true'
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
   measurement:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
       && 'Coverage results (metadata only)' || 'Coverage results' }}
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      checks: read
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs:
@@ -639,8 +1006,9 @@ jobs:
     - security
     - worker-queue-smoke
     - address-canonical-db-tests
+    - fhir-catalog-integration
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
-      && (always()) }}
+      && (!cancelled()) }}
     steps:
     - name: Require all validation jobs
       env:
@@ -650,28 +1018,68 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8f8e0d26b4fb58fd99f322ad98b581a1b867ca41
+        ref: 9672504117a066c7ab6473fee58c4fe23dbfaea5
         path: ci
         persist-credentials: false
+    - name: Install pinned uv
+      run: bash "$CI_ROOT/scripts/install_uv"
+      working-directory: ${{ github.workspace }}
+    - name: Install uv-managed Python
+      run: bash "$CI_ROOT/scripts/setup_python"
+      working-directory: ${{ github.workspace }}
     - name: Resolve exact source event
       id: identity
       env:
         GH_TOKEN: ${{ github.token }}
       run: python3 ci/scripts/source_identity.py
       working-directory: ${{ github.workspace }}
+    - name: Refresh current and original native test provenance
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 "$CI_ROOT/scripts/common_test_verify.py" --source-repository "$SOURCE_REPOSITORY" --source-sha "$SOURCE_SHA"
+        --output "$RUNNER_TEMP/common-test-current-verification.json"
     - name: Download immutable measurement artifacts
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
         artifact-ids: ${{ needs.python-tests.outputs.artifact_0 }},${{ needs.python-tests.outputs.artifact_1 }},${{ needs.python-tests.outputs.artifact_2
-          }},${{ needs.python-tests.outputs.artifact_3 }},${{ needs.capacity-evidence.outputs.artifact_id }},${{ needs.rust-scanner.outputs.artifact_id
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_core_services }},${{ needs.address-canonical-db-tests.outputs.artifact_core_imports
-          }},${{ needs.address-canonical-db-tests.outputs.artifact_core_ptg }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_source
+          }},${{ needs.python-tests.outputs.artifact_3 }},${{ needs.python-tests.outputs.artifact_4 }},${{ needs.python-tests.outputs.artifact_5
+          }},${{ needs.capacity-evidence.outputs.artifact_id }},${{ needs.rust-scanner.outputs.artifact_id }},${{ needs.address-canonical-db-tests.outputs.artifact_core_services
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_core_services_2 }},${{ needs.address-canonical-db-tests.outputs.artifact_core_imports
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_core_imports_2 }},${{ needs.address-canonical-db-tests.outputs.artifact_core_snapshots
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_core_snapshots_2 }},${{ needs.address-canonical-db-tests.outputs.artifact_core_ptg
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_0 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_1
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_2 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_3
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_4 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_5
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_6 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_7
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_8 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_9
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_10 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_11
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_12 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_13
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_14 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_15
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_16 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_17
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_18 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_19
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_20 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_21
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_22 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_23
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_24 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_25
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_26 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_27
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_28 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_29
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_30 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_31
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_32 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_33
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_34 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_35
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_36 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_37
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_38 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_39
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_40 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_41
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_42 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_43
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_44 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_45
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_46 }},${{ needs.address-canonical-db-tests.outputs.artifact_registry_47
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_source }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_source_2
           }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_storage }},${{ needs.address-canonical-db-tests.outputs.artifact_directory_address
           }},${{ needs.address-canonical-db-tests.outputs.artifact_profile_storage }},${{ needs.address-canonical-db-tests.outputs.artifact_profile_publication
-          }}
+          }},${{ needs.address-canonical-db-tests.outputs.artifact_cms_successor }}
         digest-mismatch: error
         path: ${{ runner.temp }}/healthcare-coverage-staging
         merge-multiple: false
+    - name: Install pinned coverage combiner
+      run: 'uv --no-config pip install --require-hashes --only-binary=:all: -r "$CI_ROOT/scripts/healthcare/requirements-coverage.lock"'
     - name: Validate and bind public measurement
       run: python3 ci/scripts/healthcare/measurement.py
     - name: Upload public measurement
@@ -689,7 +1097,7 @@ jobs:
     name: Validation complete
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     needs:
     - measurement
     permissions:
@@ -713,10 +1121,12 @@ jobs:
         \ // .created_at), .id, .run_attempt])\n        | last\n        | if . == null then \"pending\"\n          elif .status\
         \ != \"completed\" then \"pending\"\n          elif .conclusion == \"success\" then \"success\"\n          else \"\
         failed\"\n          end'\n  )\"; then\n    validation_state=pending\n  fi\n  case \"$validation_state\" in\n    success)\
-        \ exit 0 ;;\n    failed)\n      printf 'No successful full validation exists for source %s at base %s.\\n' \"$SOURCE_SHA\"\
+        \ exit 0 ;;\n    failed)\n      printf 'METADATA_VALIDATION_DEPENDENCY_FAILED source=%s base=%s\\n' \"$SOURCE_SHA\"\
+        \ \"$BASE_SHA\" >&2\n      printf 'No successful full validation exists for source %s at base %s.\\n' \"$SOURCE_SHA\"\
         \ \"$BASE_SHA\" >&2\n      exit 1\n      ;;\n    pending)\n      if (( SECONDS >= deadline )); then\n        printf\
-        \ 'Timed out waiting for full validation of source %s at base %s.\\n' \"$SOURCE_SHA\" \"$BASE_SHA\" >&2\n        exit\
-        \ 1\n      fi\n      sleep 15\n      ;;\n    *)\n      printf 'Unexpected full-validation state: %s.\\n' \"$validation_state\"\
+        \ 'METADATA_VALIDATION_DEPENDENCY_FAILED source=%s base=%s\\n' \"$SOURCE_SHA\" \"$BASE_SHA\" >&2\n        printf 'Timed\
+        \ out waiting for full validation of source %s at base %s.\\n' \"$SOURCE_SHA\" \"$BASE_SHA\" >&2\n        exit 1\n\
+        \      fi\n      sleep 15\n      ;;\n    *)\n      printf 'Unexpected full-validation state: %s.\\n' \"$validation_state\"\
         \ >&2\n      exit 1\n      ;;\n  esac\ndone\n"
   dev-image-publication:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
@@ -731,10 +1141,10 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-      actions: read
+      actions: write
       packages: write
     env:
-      CI_REVISION: 8f8e0d26b4fb58fd99f322ad98b581a1b867ca41
+      CI_REVISION: 9672504117a066c7ab6473fee58c4fe23dbfaea5
       PYTHONDONTWRITEBYTECODE: '1'
       IMAGE_ARTIFACT_ID: ${{ needs.container-package.outputs.image_artifact_id }}
       MEASUREMENT_ARTIFACT_ID: ${{ needs.measurement.outputs.measurement_artifact_id }}
@@ -743,9 +1153,13 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 8f8e0d26b4fb58fd99f322ad98b581a1b867ca41
+        ref: 9672504117a066c7ab6473fee58c4fe23dbfaea5
         path: ci
         persist-credentials: false
+    - name: Install pinned uv
+      run: bash ci/scripts/install_uv
+    - name: Install uv-managed Python
+      run: bash ci/scripts/setup_python
     - name: Authenticate DEV image input
       id: image
       env:
@@ -785,46 +1199,23 @@ jobs:
         name: healthcare-public-image-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/public-image-receipt/image.json
         if-no-files-found: error
-        retention-days: 1
+        retention-days: 90
     - name: Reconcile DEV image publication
       if: always() && steps.image.outputs.publish == 'true'
       env:
         GH_TOKEN: ${{ github.token }}
       run: python3 ci/scripts/source_image.py reconcile
+    - name: Queue independent artifact cleanup
+      if: success() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: timeout 15s gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/artifact-cleanup.yml/dispatches" -f
+        ref=dev -f "inputs[source_run_id]=$GITHUB_RUN_ID" -f "inputs[source_run_attempt]=$GITHUB_RUN_ATTEMPT"
     outputs:
       receipt_artifact_id: ${{ steps.receipt-artifact.outputs.artifact-id }}
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
-  artifact-cleanup:
-    name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
-      && 'CI artifact cleanup (metadata only)' || 'CI artifact cleanup' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    needs:
-    - dev-image-publication
-    - container-package
-    - measurement
-    if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
-      && (success()) }}
-    permissions:
-      contents: read
-      actions: write
-    steps:
-    - name: Check out trusted cleanup helper
-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      with:
-        repository: EndurantDevs/endurant-ci
-        ref: 8f8e0d26b4fb58fd99f322ad98b581a1b867ca41
-        path: ci
-        persist-credentials: false
-    - name: Remove validated CI intermediates
-      env:
-        GH_TOKEN: ${{ github.token }}
-        PYTHONDONTWRITEBYTECODE: '1'
-        IMAGE_ARTIFACT_ID: ${{ needs.container-package.outputs.image_artifact_id }}
-        MEASUREMENT_ARTIFACT_ID: ${{ needs.measurement.outputs.measurement_artifact_id }}
-        IMAGE_RECEIPT_ARTIFACT_ID: ${{ needs.dev-image-publication.outputs.receipt_artifact_id }}
-      run: python3 ci/scripts/artifact_cleanup.py
 'on':
   pull_request:
     types:
@@ -838,7 +1229,7 @@ jobs:
     - dev
 env:
   CI_ROOT: ${{ github.workspace }}/ci
-  CI_REVISION: 8f8e0d26b4fb58fd99f322ad98b581a1b867ca41
+  CI_REVISION: 9672504117a066c7ab6473fee58c4fe23dbfaea5
   SOURCE_ROOT: ${{ github.workspace }}/source
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: '1'

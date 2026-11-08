@@ -17,13 +17,24 @@ from process.provider_directory_resource_hash import (
     SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
     TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
 )
+from tests.provider_directory_proof_memory_support import proof_memory_authority as proof_memory_authority
 from tests.test_provider_directory_proof_store import (
     DATASET_ID as PROOF_DATASET_ID,
+)
+from tests.test_provider_directory_proof_store import (
     ENDPOINT_ID as PROOF_ENDPOINT_ID,
+)
+from tests.test_provider_directory_proof_store import (
     ROOT_RUN_ID as PROOF_ROOT_RUN_ID,
+)
+from tests.test_provider_directory_proof_store import (
     SOURCE_IDS as PROOF_SOURCE_IDS,
-    _MemoryProofConnection,
+)
+from tests.test_provider_directory_proof_store import (
     _dataset_resource as _legacy_dataset_resource,
+)
+from tests.test_provider_directory_proof_store import (
+    _MemoryProofConnection,
     _persist_rows_by_resource,
     _sample_dataset_resources,
 )
@@ -32,7 +43,6 @@ from tests.test_provider_directory_semantic_proof_v3 import (
     _dataset_row,
     _observation,
 )
-
 
 PROOF_RESOURCE_SCOPE = ["Practitioner"]
 HISTORICAL_RESOURCE_SCOPE = [
@@ -52,6 +62,7 @@ def _proof_identity(selected_resources):
         "source_ids": PROOF_SOURCE_IDS,
         "selected_resources": selected_resources,
     }
+
 
 def _semantic_proof_connection() -> _MemoryProofConnection:
     connection = _MemoryProofConnection()
@@ -83,9 +94,7 @@ async def _semantic_stored_proof(connection: _MemoryProofConnection):
         selected_resources=["Practitioner"],
         options=proof_store.ProviderDirectoryStoredProofOptions(
             proof_resource_scope=PROOF_RESOURCE_SCOPE,
-            expected_resource_hash_contract=(
-                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-            ),
+            expected_resource_hash_contract=(SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT),
             expected_semantic_projection_as_of=PROJECTION_AS_OF,
         ),
     )
@@ -98,13 +107,9 @@ async def _semantic_proof_with_one_row():
         "mrf",
         [_semantic_proof_row()],
         dataset_id=PROOF_DATASET_ID,
-        expected_resource_hash_contract=(
-            SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-        ),
+        expected_resource_hash_contract=(SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT),
     )
-    return semantic_connection, await _semantic_stored_proof(
-        semantic_connection
-    )
+    return semantic_connection, await _semantic_stored_proof(semantic_connection)
 
 
 async def _append_legacy_organization_shard(semantic_connection):
@@ -116,11 +121,7 @@ async def _append_legacy_organization_shard(semantic_connection):
                 {"resource_id": "organization-1", "name": "Example"},
             )
         ],
-        **{
-            key: value
-            for key, value in _proof_identity(["Organization"]).items()
-            if key != "selected_resources"
-        },
+        **{key: value for key, value in _proof_identity(["Organization"]).items() if key != "selected_resources"},
         resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT,
     )
     await semantic_connection.status(
@@ -148,29 +149,26 @@ async def test_v3_sealed_proof_binds_contract_and_projection_date():
     stored_proof = await _semantic_stored_proof(connection)
     sealed = stored_proof.metadata
 
-    assert sealed["contract_id"] == (
-        PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID
-    )
-    assert sealed["resource_hash_contract"] == (
-        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-    )
+    assert sealed["contract_id"] == (PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID)
+    assert sealed["resource_hash_contract"] == (SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT)
     assert sealed["semantic_projection_as_of"] == PROJECTION_AS_OF
-    assert PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY == (
-        "provider_directory_content_proof_v1"
+    assert PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY == ("provider_directory_content_proof_v1")
+    assert (
+        proof_store.validate_stored_dataset_proof_metadata(
+            sealed,
+            dataset_id=PROOF_DATASET_ID,
+            endpoint_id=PROOF_ENDPOINT_ID,
+            acquisition_root_run_id=PROOF_ROOT_RUN_ID,
+            source_ids=PROOF_SOURCE_IDS,
+            selected_resources=["Practitioner"],
+            options=proof_store.ProviderDirectoryStoredProofOptions(
+                proof_resource_scope=PROOF_RESOURCE_SCOPE,
+                expected_resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+                expected_semantic_projection_as_of=PROJECTION_AS_OF,
+            ),
+        )
+        == sealed
     )
-    assert proof_store.validate_stored_dataset_proof_metadata(
-        sealed,
-        dataset_id=PROOF_DATASET_ID,
-        endpoint_id=PROOF_ENDPOINT_ID,
-        acquisition_root_run_id=PROOF_ROOT_RUN_ID,
-        source_ids=PROOF_SOURCE_IDS,
-        selected_resources=["Practitioner"],
-        options=proof_store.ProviderDirectoryStoredProofOptions(
-            proof_resource_scope=PROOF_RESOURCE_SCOPE,
-            expected_resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
-            expected_semantic_projection_as_of=PROJECTION_AS_OF,
-        ),
-    ) == sealed
 
     with pytest.raises(
         ProviderDirectoryProofStoreError,
@@ -205,9 +203,7 @@ async def test_proof_contracts_reject_cross_version_and_mixed_shards():
             **_proof_identity(["Practitioner"]),
             options=proof_store.ProviderDirectoryStoredProofOptions(
                 proof_resource_scope=PROOF_RESOURCE_SCOPE,
-                expected_resource_hash_contract=(
-                    TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
-                ),
+                expected_resource_hash_contract=(TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT),
             ),
         )
 
@@ -222,9 +218,7 @@ async def test_proof_contracts_reject_cross_version_and_mixed_shards():
             **_proof_identity(["Practitioner"]),
             options=proof_store.ProviderDirectoryStoredProofOptions(
                 proof_resource_scope=["Organization", "Practitioner"],
-                expected_resource_hash_contract=(
-                    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-                ),
+                expected_resource_hash_contract=(SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT),
                 expected_semantic_projection_as_of=PROJECTION_AS_OF,
             ),
         )
@@ -258,9 +252,7 @@ async def test_historical_proof_shape_remains_readable_for_v1_and_v2():
         legacy_proof.metadata,
         **_proof_identity(HISTORICAL_RESOURCE_SCOPE),
         options=proof_store.ProviderDirectoryStoredProofOptions(
-            expected_resource_hash_contract=(
-                TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
-            ),
+            expected_resource_hash_contract=(TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT),
         ),
     )
     with pytest.raises(
@@ -271,9 +263,7 @@ async def test_historical_proof_shape_remains_readable_for_v1_and_v2():
             legacy_proof.metadata,
             **_proof_identity(HISTORICAL_RESOURCE_SCOPE),
             options=proof_store.ProviderDirectoryStoredProofOptions(
-                expected_resource_hash_contract=(
-                    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-                ),
+                expected_resource_hash_contract=(SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT),
                 expected_semantic_projection_as_of=PROJECTION_AS_OF,
             ),
         )

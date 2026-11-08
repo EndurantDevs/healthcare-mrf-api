@@ -67,37 +67,36 @@ Run focused checks for the behavior you change, for example:
 pytest tests/test_healthcheck.py -q
 ```
 
-Run the fast Python correctness and inference checks with the pinned developer
-tools:
+Run the fast Python correctness checks with pinned Ruff:
 
 ```bash
-uv pip install --only-binary=:all: ruff==0.16.6 pylint==4.0.8
+uv pip install --require-hashes --only-binary=:all: -r requirements-quality.lock
 ruff check main.py api db process public_evidence service alembic scripts support tests
-pylint \
-  api/billing_search_selector_contract.py \
-  api/billing_search_transport_contract.py \
-  api/mrf_discovery_catalog_manifest.py \
-  api/plan_pricing_state_scan_contract.py \
-  process/fhir_request_failure_policy.py \
-  process/formulary_fhir/uhc_drug_parser_contract.py \
-  process/formulary_fhir/uhc_drug_transport_contract.py \
-  process/provider_directory_rooted_graph_source_contract.py \
-  process/provider_directory_rooted_graph_twin_admission_contract.py \
-  process/provider_directory_rooted_graph_twin_contract.py \
-  process/provider_directory_validated_publication_contract.py \
-  public_evidence/evidence_record_token_policy.py
+ruff check --select I tests/test_public_ci.py
+ruff format --check tests/test_public_ci.py
 ```
 
-Install these tools in the activated, runtime-equipped development virtualenv.
-An isolated Pylint tool environment without the application's dependencies
-cannot provide the same inference; CI explicitly exposes its verified runtime
-dependencies to the separate lint environment.
+Run the import-order and formatting checks on the Python files you changed.
+CI requires sorted imports and formatting for added or modified Python files.
+Unrelated historical files keep their existing readability baseline. Runtime
+import smoke tests and the existing contract tests run against locked application
+dependencies; they validate actual dependency APIs and source-module imports.
 
-Ruff owns syntax and undefined-name checks across existing Python code. New
-Python files must also pass `ruff check --select I` and `ruff format --check`;
-this staged policy avoids a repository-wide formatting rewrite. Pylint covers
-the listed security, source, and publication contracts with inference checks
-that produce reliable results against the installed application dependencies.
+CI also checks eleven selected security, source, and publication contract modules
+with pinned ty 0.0.85 and its default diagnostics. uv manages the Python 3.14.7
+tool environment separately from the verified application dependencies, which ty
+uses to resolve real dependency APIs. A dependency-member canary checks that
+inference remains active before the pass. Ruff requires return annotations in
+these modules with ANN201, ANN202, ANN204, ANN205, and ANN206, including functions
+returning `None`; suppression comments cannot bypass this return guard.
+
+ty permits assigning a `None` result to an inferred variable, including results
+from functions annotated with `-> None`. This differs from Pylint's
+`assignment-from-no-return` warning. Return annotations and ty reject invalid
+consumption of those results, such as subscripting them or returning them from a
+function annotated to return `int`. Runtime import checks and contract tests remain
+part of CI alongside the static checks.
+
 The readability budget remains authoritative for naming, function size,
 complexity, and suppression policy.
 

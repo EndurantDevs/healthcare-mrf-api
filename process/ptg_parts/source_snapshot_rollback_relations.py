@@ -33,6 +33,8 @@ async def load_target_snapshot_scope(
     session: Any,
     schema: str,
     snapshot_id: str,
+    *,
+    is_readonly: bool = False,
 ) -> dict[str, Any]:
     """Lock the target snapshot's resolver scope."""
 
@@ -42,7 +44,7 @@ async def load_target_snapshot_scope(
         SELECT snapshot_id, plan_id, plan_market_type, coverage_scope_id
           FROM {schema}.ptg2_v3_snapshot_scope
          WHERE snapshot_id = :snapshot_id
-         FOR SHARE
+         {"" if is_readonly else "FOR SHARE"}
         """,
         snapshot_id,
     )
@@ -52,6 +54,8 @@ async def load_target_attestation(
     session: Any,
     schema: str,
     snapshot_id: str,
+    *,
+    is_readonly: bool = False,
 ) -> dict[str, Any]:
     """Lock the target snapshot's resolver attestation."""
 
@@ -62,7 +66,7 @@ async def load_target_attestation(
                plan_market_type, coverage_scope_id, contract, activated_at
           FROM {schema}.ptg2_v3_candidate_audit_attestation
          WHERE snapshot_id = :snapshot_id
-         FOR SHARE
+         {"" if is_readonly else "FOR SHARE"}
         """,
         snapshot_id,
     )
@@ -71,9 +75,7 @@ async def load_target_attestation(
 async def database_utc_timestamp(session: Any) -> datetime.datetime:
     """Read one database timestamp for all pointer mutations."""
 
-    query_result = await session.execute(
-        db.text("SELECT timezone('UTC', clock_timestamp())")
-    )
+    query_result = await session.execute(db.text("SELECT timezone('UTC', clock_timestamp())"))
     timestamp = query_result.scalar_one()
     if not isinstance(timestamp, datetime.datetime):
         raise RuntimeError("PostgreSQL did not return a rollback timestamp")

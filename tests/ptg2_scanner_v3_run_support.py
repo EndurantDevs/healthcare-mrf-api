@@ -28,6 +28,7 @@ from process.ptg_parts.ptg2_source_witness import (
     build_persisted_source_witness,
     decode_persisted_source_witness,
 )
+from process.ptg_parts.ptg2_source_witness_audit import map_source_witness_records
 
 from tests.ptg2_scanner_v3_release_support import (
     _AUDIT_CANDIDATE_RECORD,
@@ -405,8 +406,8 @@ def _assert_scanner_source_witness(run: dict) -> None:
         expected_raw_source_sha256=[source_digest],
         expected_metadata=metadata,
     )
-    assert len(loaded.occurrence_records) == 2
-    assert len(loaded.provider_records) == 1
+    record_kinds, _ = map_source_witness_records(loaded, lambda record, _evidence: record.kind)
+    assert Counter(record_kinds) == {"rate_occurrence": 2, "provider_reference": 1}
 
 
 def _assert_scanner_publication_files(run: dict) -> None:

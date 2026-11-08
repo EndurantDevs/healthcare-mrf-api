@@ -15,14 +15,12 @@ from sqlalchemy.exc import OperationalError
 
 from db.connection import Database
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 
 _POSTGRES_DSN_ENV = "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_POSTGRES_DSN"
 _RUN_ID = "run_" + "a" * 32
-_SELECTED_RESOURCE_TYPES = frozenset(
-    {"OrganizationAffiliation", "PractitionerRole"}
-)
+_SELECTED_RESOURCE_TYPES = frozenset({"OrganizationAffiliation", "PractitionerRole"})
+
 
 @dataclass(frozen=True)
 class _ArtifactFixture:
@@ -49,13 +47,8 @@ def _configure_database(monkeypatch: pytest.MonkeyPatch, dsn: str) -> None:
 
 async def _require_postgresql_18(database: Database) -> None:
     try:
-        server_version_num = int(
-            await database.scalar(
-                "SELECT current_setting('server_version_num')::integer;"
-            )
-            or 0
-        )
-    except (OSError, OperationalError):
+        server_version_num = int(await database.scalar("SELECT current_setting('server_version_num')::integer;") or 0)
+    except OSError, OperationalError:
         pytest.skip("artifact capacity tests need disposable PostgreSQL 18")
     if server_version_num < 180000:
         pytest.skip("artifact capacity tests require PostgreSQL 18")
@@ -64,10 +57,7 @@ async def _require_postgresql_18(database: Database) -> None:
 def _incompressible_text(seed: str, *, repetitions: int = 320) -> str:
     """Return deterministic high-entropy text that PostgreSQL must TOAST."""
 
-    return "".join(
-        hashlib.sha256(f"{seed}:{index}".encode("utf-8")).hexdigest()
-        for index in range(repetitions)
-    )
+    return "".join(hashlib.sha256(f"{seed}:{index}".encode("utf-8")).hexdigest() for index in range(repetitions))
 
 
 async def _create_artifact_fixture_tables(
@@ -139,9 +129,7 @@ async def _insert_artifact_source_and_dataset(
             CAST(:metadata_json AS json), now(), now()
         );
         """,
-        metadata_json=json.dumps(
-            {"catalog_evidence": _incompressible_text("source")}
-        ),
+        metadata_json=json.dumps({"catalog_evidence": _incompressible_text("source")}),
     )
     await database.status(
         f"""
@@ -207,15 +195,11 @@ def _affiliation_resource_payloads() -> tuple[
             {
                 "active": True,
                 "organization_ref": "InsurancePlan/plan-a",
-                "participating_organization_ref": (
-                    "Organization/organization-a"
-                ),
+                "participating_organization_ref": ("Organization/organization-a"),
                 "insurance_plan_refs": ["InsurancePlan/plan-a"],
                 "relationship_type": "payer_reported_provider_plan_membership",
                 "ownership_status": "not_asserted",
-                "source_lineage": {
-                    "raw_evidence": _incompressible_text("affiliation-a")
-                },
+                "source_lineage": {"raw_evidence": _incompressible_text("affiliation-a")},
             },
         ),
         (
@@ -224,15 +208,11 @@ def _affiliation_resource_payloads() -> tuple[
             {
                 "active": True,
                 "organization_ref": "InsurancePlan/plan-a",
-                "participating_organization_ref": (
-                    "Organization/organization-b"
-                ),
+                "participating_organization_ref": ("Organization/organization-b"),
                 "insurance_plan_refs": ["InsurancePlan/plan-a"],
                 "relationship_type": "payer_reported_provider_plan_membership",
                 "ownership_status": "not_asserted",
-                "source_lineage": {
-                    "raw_evidence": _incompressible_text("affiliation-b")
-                },
+                "source_lineage": {"raw_evidence": _incompressible_text("affiliation-b")},
             },
         ),
     )
@@ -296,21 +276,21 @@ async def _create_complete_empty_scope_layout(
     database: Database,
     schema: str,
 ) -> dict[str, str]:
+    """Create fully indexed empty fixtures for capacity and layout checks."""
     relation_by_table: dict[str, str] = {}
     models = (importer.ProviderDirectorySource, *importer.RESOURCE_MODELS)
     for model in models:
-        scope_table = (
-            importer._provider_directory_artifact_scope_table_prefix(
-                model.__tablename__
-            )
-            + "_pg"
-        )
+        scope_table = importer._provider_directory_artifact_scope_table_prefix(model.__tablename__) + "_pg"
         relation_by_table[model.__tablename__] = scope_table
         await importer._create_provider_directory_artifact_scope_layout(
             model,
             schema,
             scope_table,
         )
+
+    await importer._finish_artifact_scope_indexes(
+        schema, relation_by_table, {model.__tablename__: model for model in models}
+    )
 
     for model in models:
         scope_table = relation_by_table[model.__tablename__]

@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tests.provider_profile_snapshot_test_support import stub_provider_profile_snapshot as stub_provider_profile_snapshot
+
 from api.provider_education import canonicalize_education_category
 from api.provider_profile import compose_provider_profile, compose_provider_profile_evidence
 from api import provider_profile_composer_parts

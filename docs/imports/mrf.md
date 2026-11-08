@@ -87,6 +87,19 @@ Examples of canonical outputs populated by this pipeline include:
 - `mrf_address_evidence`
 - import history and import logs
 
+## Snapshot boundary
+
+MRF result archives exclude the shared `log` diagnostics table. Ordinary MRF and
+PTG logging and API log readers keep using that local table; receiving an archive
+does not replace its rows. Diagnostic writes do not change MRF result authority,
+while writes to the result relations still invalidate the captured generation.
+
+Archives with the earlier log-bearing table inventory are rejected, not silently
+adapted. The revision migration removes the diagnostic OID from legacy generation
+identity without marking that history revision-tracked. Existing publication
+receipts require a new genuine publication before guarded archive capture.
+Downgrade refuses to reconstruct a removed historical diagnostic identity.
+
 ## Notes
 - This is one of the original marketplace ingestion pipelines in the repo.
 - It works from configured CMS marketplace PUF families rather than one fixed file.

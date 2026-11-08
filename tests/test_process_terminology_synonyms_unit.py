@@ -271,6 +271,9 @@ async def test_publish_stage_swaps_snapshot_tables_in_order(monkeypatch):
     monkeypatch.setattr(terminology_synonyms.db, "status", status)
     monkeypatch.setattr(terminology_synonyms.db, "all", all_rows)
     monkeypatch.setattr(terminology_synonyms.db, "transaction", transaction)
+    monkeypatch.setattr(
+        terminology_synonyms, "publish_local_reference_family_generation", AsyncMock()
+    )
     stage_cls = SimpleNamespace(__tablename__="terminology_synonym_stage")
 
     await terminology_synonyms._publish_stage("tenant", stage_cls, 11)

@@ -58,6 +58,7 @@ Evaluate:
 
 ### 4. Performance Review
 Evaluate:
+- Compliance with [bulk loading and snapshot publication](../docs/imports/bulk-loading.md): replace per-row database validation with set-based checks, prepare candidate indexes away from serving reads, and preserve atomic cutover/rollback. Retaining the old row-trigger costs under larger COPY batches is not an accepted replacement.
 - Heavy SQL paths, index strategy, and query plan risks.
 - Long-running finalize bottlenecks and lock contention.
 - N+1 or repeated scan patterns.

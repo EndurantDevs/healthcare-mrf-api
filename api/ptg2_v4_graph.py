@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-import operator
+import json
 import os
 import struct
 import threading
@@ -21,6 +21,8 @@ from api.ptg2_shared_blocks import (
     _validated_physical_block,
 )
 from process.ptg_parts.db_tables import _quote_ident
+from process.ptg_parts.ptg2_physical_binding import PTG2PhysicalBinding
+from process.ptg_parts.ptg2_snapshot_candidates import snapshot_candidate_relation
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_MAP_BLOCK_KIND,
     PTG2_V4_MAP_FORMAT,
@@ -30,22 +32,11 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     decode_v4_snapshot_map_pack,
 )
 
-
-try:
-    from ptg2_address_canon import ptg2_decode_u32_le as _native_u32_decoder
-except (ImportError, AttributeError):
-    _native_u32_decoder = None
-
-
 PTG2_V4_MEMBER_PAGE_BYTES = 16 * 1024
 PTG2_V4_MEMBER_WIDTH_BYTES = 4
-PTG2_V4_MEMBERS_PER_PAGE = (
-    PTG2_V4_MEMBER_PAGE_BYTES // PTG2_V4_MEMBER_WIDTH_BYTES
-)
+PTG2_V4_MEMBERS_PER_PAGE = PTG2_V4_MEMBER_PAGE_BYTES // PTG2_V4_MEMBER_WIDTH_BYTES
 PTG2_V4_LOCATOR_WIDTH_BYTES = 12
-PTG2_V4_LOCATORS_PER_PAGE = (
-    PTG2_V4_MEMBER_PAGE_BYTES // PTG2_V4_LOCATOR_WIDTH_BYTES
-)
+PTG2_V4_LOCATORS_PER_PAGE = PTG2_V4_MEMBER_PAGE_BYTES // PTG2_V4_LOCATOR_WIDTH_BYTES
 PTG2_V4_MAX_MAP_PACK_RAW_BYTES = 4 * 1024 * 1024
 PTG2_V4_MAX_GRAPH_PAGE_BYTES = 4 * 1024 * 1024
 PTG2_V4_HOT_NPI_RELATION = "group_npis_exact"
@@ -54,10 +45,7 @@ PTG2_V4_HEAVY_BITMAP_MAGIC = b"PTG2V4BM"
 PTG2_V4_HEAVY_BITMAP_HEADER_BYTES = 24
 PTG2_V4_HEAVY_BITMAP_FRAGMENT_MAGIC = b"PTG2V4BF"
 PTG2_V4_HEAVY_BITMAP_FRAGMENT_HEADER_BYTES = 32
-_SET_BIT_POSITIONS = tuple(
-    tuple(bit for bit in range(8) if value & (1 << bit))
-    for value in range(256)
-)
+_SET_BIT_POSITIONS = tuple(tuple(bit for bit in range(8) if value & (1 << bit)) for value in range(256))
 
 PTG2_V4_COMMON_RELATIONS = frozenset(
     {
@@ -68,9 +56,7 @@ PTG2_V4_COMMON_RELATIONS = frozenset(
         "set_npi_prefix_override",
     }
 )
-PTG2_V4_DIRECT_RELATIONS = frozenset(
-    {"group_sets_direct", "set_groups_direct"}
-)
+PTG2_V4_DIRECT_RELATIONS = frozenset({"group_sets_direct", "set_groups_direct"})
 PTG2_V4_PATTERN_RELATIONS = frozenset(
     {
         "group_patterns",
@@ -80,14 +66,8 @@ PTG2_V4_PATTERN_RELATIONS = frozenset(
         "npi_patterns",
     }
 )
-PTG2_V4_RELATIONS = (
-    PTG2_V4_COMMON_RELATIONS
-    | PTG2_V4_DIRECT_RELATIONS
-    | PTG2_V4_PATTERN_RELATIONS
-)
-PTG2_V4_ORDER_PRESERVING_RELATIONS = frozenset(
-    {"set_npi_prefix_override"}
-)
+PTG2_V4_RELATIONS = PTG2_V4_COMMON_RELATIONS | PTG2_V4_DIRECT_RELATIONS | PTG2_V4_PATTERN_RELATIONS
+PTG2_V4_ORDER_PRESERVING_RELATIONS = frozenset({"set_npi_prefix_override"})
 PTG2_V4_HOT_SOURCE_RELATIONS = frozenset(
     {
         "set_groups_direct",
@@ -95,6 +75,8 @@ PTG2_V4_HOT_SOURCE_RELATIONS = frozenset(
         "set_components",
         "pattern_groups",
         "component_groups",
+        "group_patterns",
+        "pattern_sets",
     }
 )
 
@@ -110,18 +92,10 @@ def _env_positive_int(name: str, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
-_MAP_CACHE_MAX_BYTES = _env_positive_int(
-    "HLTHPRT_PTG2_V4_MAP_CACHE_BYTES", 64 * 1024 * 1024
-)
-_BLOCK_CACHE_MAX_BYTES = _env_positive_int(
-    "HLTHPRT_PTG2_V4_BLOCK_CACHE_BYTES", 256 * 1024 * 1024
-)
-_ROOT_CACHE_MAX_ENTRIES = _env_positive_int(
-    "HLTHPRT_PTG2_V4_ROOT_CACHE_ENTRIES", 1024
-)
-_HEAVY_OWNER_CACHE_MAX_ENTRIES = _env_positive_int(
-    "HLTHPRT_PTG2_V4_HEAVY_OWNER_CACHE_ENTRIES", 16_384
-)
+_MAP_CACHE_MAX_BYTES = _env_positive_int("HLTHPRT_PTG2_V4_MAP_CACHE_BYTES", 64 * 1024 * 1024)
+_BLOCK_CACHE_MAX_BYTES = _env_positive_int("HLTHPRT_PTG2_V4_BLOCK_CACHE_BYTES", 256 * 1024 * 1024)
+_ROOT_CACHE_MAX_ENTRIES = _env_positive_int("HLTHPRT_PTG2_V4_ROOT_CACHE_ENTRIES", 1024)
+_HEAVY_OWNER_CACHE_MAX_ENTRIES = _env_positive_int("HLTHPRT_PTG2_V4_HEAVY_OWNER_CACHE_ENTRIES", 16_384)
 _HEAVY_OWNER_NEGATIVE_CACHE_MAX_ENTRIES = _env_positive_int(
     "HLTHPRT_PTG2_V4_HEAVY_OWNER_NEGATIVE_CACHE_ENTRIES", 16_384
 )
@@ -159,9 +133,7 @@ class _ByteLRU:
         self._values[key] = (normalized_bytes, value)
         self._retained_bytes += normalized_bytes
         while self._retained_bytes > self._maximum_bytes and self._values:
-            _evicted_key, (evicted_bytes, _evicted_value) = self._values.popitem(
-                last=False
-            )
+            _evicted_key, (evicted_bytes, _evicted_value) = self._values.popitem(last=False)
             self._retained_bytes -= evicted_bytes
 
 
@@ -251,6 +223,7 @@ class _CachedPhysicalBlock:
 
 @dataclass
 class _V4GraphRequestIO:
+    read_budget: Any = None
     database_bytes: int = 0
     database_blocks: int = 0
     cache_hit_bytes: int = 0
@@ -305,9 +278,7 @@ class _V4HotSourceWork:
             or self.pages > self.maximum_pages
             or self.bytes > self.maximum_bytes
         ):
-            raise PTG2SharedBlockError(
-                "PTG V4 hot provider source work exceeds its sealed limit"
-            )
+            raise PTG2SharedBlockError("PTG V4 hot provider source work exceeds its sealed limit")
 
 
 @dataclass
@@ -348,9 +319,7 @@ class _V4HotNpiWork:
             or self.bytes > self.maximum_bytes
             or self.batches > self.maximum_batches
         ):
-            raise PTG2SharedBlockError(
-                "PTG V4 hot group-to-NPI work exceeds its sealed limit"
-            )
+            raise PTG2SharedBlockError("PTG V4 hot group-to-NPI work exceeds its sealed limit")
 
 
 @dataclass
@@ -383,34 +352,22 @@ class _V4TaxonomyProjectionWork:
         if self.members > self.maximum_members:
             raise PTG2OnlineWorkBudgetExceeded(
                 "graph_members",
-                message=(
-                    "PTG V4 inferred-taxonomy graph work exceeds its sealed "
-                    "member limit"
-                ),
+                message=("PTG V4 inferred-taxonomy graph work exceeds its sealed member limit"),
             )
         if self.pages > self.maximum_pages:
             raise PTG2OnlineWorkBudgetExceeded(
                 "graph_pages",
-                message=(
-                    "PTG V4 inferred-taxonomy graph work exceeds its sealed "
-                    "page limit"
-                ),
+                message=("PTG V4 inferred-taxonomy graph work exceeds its sealed page limit"),
             )
         if self.bytes > self.maximum_bytes:
             raise PTG2OnlineWorkBudgetExceeded(
                 "graph_bytes",
-                message=(
-                    "PTG V4 inferred-taxonomy graph work exceeds its sealed "
-                    "byte limit"
-                ),
+                message=("PTG V4 inferred-taxonomy graph work exceeds its sealed byte limit"),
             )
         if self.batches > self.maximum_batches:
             raise PTG2OnlineWorkBudgetExceeded(
                 "graph_batches",
-                message=(
-                    "PTG V4 inferred-taxonomy graph work exceeds its sealed "
-                    "batch limit"
-                ),
+                message=("PTG V4 inferred-taxonomy graph work exceeds its sealed batch limit"),
             )
 
 
@@ -545,18 +502,10 @@ class _V4GraphMetrics:
                 "hot_group_npi_bytes": self._hot_group_npi_bytes,
                 "hot_group_npi_batches": self._hot_group_npi_batches,
                 "hot_npi_dictionary_reads": self._hot_npi_dictionary_reads,
-                "provider_expansion_rate_rows": (
-                    self._provider_expansion_rate_rows
-                ),
-                "provider_expansion_provider_sets": (
-                    self._provider_expansion_provider_sets
-                ),
-                "provider_expansion_graph_batches": (
-                    self._provider_expansion_graph_batches
-                ),
-                "provider_expansion_rejections": (
-                    self._provider_expansion_rejections
-                ),
+                "provider_expansion_rate_rows": (self._provider_expansion_rate_rows),
+                "provider_expansion_provider_sets": (self._provider_expansion_provider_sets),
+                "provider_expansion_graph_batches": (self._provider_expansion_graph_batches),
+                "provider_expansion_rejections": (self._provider_expansion_rejections),
                 "buckets": dict(self._bucket_counts),
                 "infinite_bucket_count": self._infinite_bucket_count,
             }
@@ -565,39 +514,31 @@ class _V4GraphMetrics:
 _MAP_COORDINATE_CACHE = _ByteLRU(_MAP_CACHE_MAX_BYTES)
 _PHYSICAL_BLOCK_CACHE = _ByteLRU(_BLOCK_CACHE_MAX_BYTES)
 _ROOT_CACHE: OrderedDict[tuple[str, int], V4GraphRoot] = OrderedDict()
-_RELATION_CACHE: OrderedDict[
-    tuple[str, int, str], V4RelationManifest
-] = OrderedDict()
-_HEAVY_OWNER_CACHE: OrderedDict[
-    tuple[str, int, str, int], V4HeavyOwner
-] = OrderedDict()
-_HEAVY_OWNER_NEGATIVE_CACHE: OrderedDict[
-    tuple[str, int, str, int], None
-] = OrderedDict()
+_RELATION_CACHE: OrderedDict[tuple[str, int, str], V4RelationManifest] = OrderedDict()
+_HEAVY_OWNER_CACHE: OrderedDict[tuple[str, int, str, int], V4HeavyOwner] = OrderedDict()
+_HEAVY_OWNER_NEGATIVE_CACHE: OrderedDict[tuple[str, int, str, int], None] = OrderedDict()
 _V4_GRAPH_METRICS = _V4GraphMetrics()
 _ACTIVE_V4_GRAPH_REQUEST_IO: ContextVar[_V4GraphRequestIO | None] = ContextVar(
     "active_v4_graph_request_io", default=None
 )
-_ACTIVE_V4_HOT_SOURCE_WORK: ContextVar[_V4HotSourceWork | None] = ContextVar(
-    "active_v4_hot_source_work", default=None
+_ACTIVE_V4_HOT_SOURCE_WORK: ContextVar[_V4HotSourceWork | None] = ContextVar("active_v4_hot_source_work", default=None)
+_ACTIVE_V4_HOT_NPI_WORK: ContextVar[_V4HotNpiWork | None] = ContextVar("active_v4_hot_npi_work", default=None)
+_ACTIVE_V4_TAXONOMY_WORK: ContextVar[_V4TaxonomyProjectionWork | None] = ContextVar(
+    "active_v4_taxonomy_work", default=None
 )
-_ACTIVE_V4_HOT_NPI_WORK: ContextVar[_V4HotNpiWork | None] = ContextVar(
-    "active_v4_hot_npi_work", default=None
-)
-_ACTIVE_V4_TAXONOMY_WORK: ContextVar[
-    _V4TaxonomyProjectionWork | None
-] = ContextVar("active_v4_taxonomy_work", default=None)
 
 
 @contextmanager
-def v4_graph_request_scope() -> Iterator[_V4GraphRequestIO]:
+def v4_graph_request_scope(*, read_budget=None) -> Iterator[_V4GraphRequestIO]:
     """Aggregate all V4 graph reads into one API-request metric observation."""
 
     active = _ACTIVE_V4_GRAPH_REQUEST_IO.get()
     if active is not None:
+        if read_budget is not None and active.read_budget is not read_budget:
+            raise PTG2SharedBlockError("PTG V4 graph read budget changed")
         yield active
         return
-    request_io = _V4GraphRequestIO()
+    request_io = _V4GraphRequestIO(read_budget=read_budget)
     token = _ACTIVE_V4_GRAPH_REQUEST_IO.set(request_io)
     try:
         yield request_io
@@ -811,9 +752,7 @@ def v4_graph_taxonomy_projection_scope(
         int(maximum_batches),
     )
     if any(limit < 0 for limit in limits):
-        raise PTG2SharedBlockError(
-            "PTG V4 inferred-taxonomy graph limit is negative"
-        )
+        raise PTG2SharedBlockError("PTG V4 inferred-taxonomy graph limit is negative")
     work = _V4TaxonomyProjectionWork(*limits)
     token = _ACTIVE_V4_TAXONOMY_WORK.set(work)
     try:
@@ -872,9 +811,7 @@ def _validate_relation_for_root(root: V4GraphRoot, relation: str) -> None:
         return
     if root.representation == "pattern_v1" and relation in PTG2_V4_PATTERN_RELATIONS:
         return
-    raise PTG2SharedBlockError(
-        f"PTG V4 {root.representation} layout does not publish {relation}"
-    )
+    raise PTG2SharedBlockError(f"PTG V4 {root.representation} layout does not publish {relation}")
 
 
 async def load_v4_graph_root(
@@ -882,22 +819,28 @@ async def load_v4_graph_root(
     snapshot_key: int,
     *,
     schema_name: str,
+    refresh: bool = False,
 ) -> V4GraphRoot:
     """Load and fail-close one immutable completed V4 map root."""
 
     normalized_snapshot_key = int(snapshot_key)
-    cache_key = (str(schema_name), normalized_snapshot_key)
+    cache_key = (_graph_cache_scope(session, schema_name), normalized_snapshot_key)
     cached = _ROOT_CACHE.get(cache_key)
-    if cached is not None:
+    if cached is not None and not refresh:
         _ROOT_CACHE.move_to_end(cache_key)
         return cached
     schema = _quote_ident(schema_name)
+    from api.ptg2_code_scope import source_read_relation
+
+    root_relation = source_read_relation(
+        session, schema_name, "ptg2_v4_snapshot_map_root", default=f"{schema}.ptg2_v4_snapshot_map_root"
+    )
     query_result = await session.execute(
         text(
             f"""
             SELECT snapshot_key, representation, map_digest,
                    format_version, map_format, projection_id_scope
-              FROM {schema}.ptg2_v4_snapshot_map_root
+              FROM {root_relation}
              WHERE snapshot_key = :snapshot_key
                AND state = 'complete'
             """
@@ -912,8 +855,7 @@ async def load_v4_graph_root(
         or int(fields.get("format_version") or 0) != PTG2_V4_MAP_FORMAT_VERSION
         or fields.get("map_format") != PTG2_V4_MAP_FORMAT
         or fields.get("projection_id_scope") != PTG2_V4_PROJECTION_ID_SCOPE
-        or str(fields.get("representation") or "")
-        not in {"direct_v1", "pattern_v1"}
+        or str(fields.get("representation") or "") not in {"direct_v1", "pattern_v1"}
         or len(map_digest) != 32
     ):
         raise PTG2SharedBlockError("PTG V4 snapshot map root is unavailable or invalid")
@@ -937,8 +879,7 @@ def _is_building_v4_root_match(
 ) -> bool:
     return (
         int(fields.get("snapshot_key") or 0) == snapshot_key
-        and int(fields.get("format_version") or 0)
-        == PTG2_V4_MAP_FORMAT_VERSION
+        and int(fields.get("format_version") or 0) == PTG2_V4_MAP_FORMAT_VERSION
         and fields.get("map_format") == PTG2_V4_MAP_FORMAT
         and fields.get("projection_id_scope") == PTG2_V4_PROJECTION_ID_SCOPE
         and fields.get("build_token") == build_token
@@ -959,9 +900,7 @@ async def _load_building_v4_graph_root(
     normalized_snapshot_key = int(snapshot_key)
     normalized_build_token = str(build_token or "").strip()
     if normalized_snapshot_key <= 0 or not normalized_build_token:
-        raise PTG2SharedBlockError(
-            "PTG V4 building snapshot identity is unavailable"
-        )
+        raise PTG2SharedBlockError("PTG V4 building snapshot identity is unavailable")
     schema = _quote_ident(schema_name)
     query_result = await session.execute(
         text(
@@ -993,9 +932,7 @@ async def _load_building_v4_graph_root(
         normalized_build_token,
         representation,
     ):
-        raise PTG2SharedBlockError(
-            "PTG V4 building snapshot map root is unavailable or invalid"
-        )
+        raise PTG2SharedBlockError("PTG V4 building snapshot map root is unavailable or invalid")
     # A building root intentionally has no final map digest yet. The relation,
     # coordinate-pack, and CAS digests are still authenticated by the same
     # reader below; this sentinel never enters a cache or a sealed manifest.
@@ -1047,9 +984,7 @@ def _strict_manifest_int(
     try:
         normalized = int(value)
     except (TypeError, ValueError) as exc:
-        raise PTG2SharedBlockError(
-            f"PTG V4 relation manifest has invalid {name}"
-        ) from exc
+        raise PTG2SharedBlockError(f"PTG V4 relation manifest has invalid {name}") from exc
     if not minimum <= normalized <= maximum:
         raise PTG2SharedBlockError(f"PTG V4 relation manifest has invalid {name}")
     return normalized
@@ -1065,9 +1000,7 @@ def _normalized_u32_keys(
         if isinstance(raw_value, bool) or not isinstance(raw_value, int):
             raise PTG2SharedBlockError(f"PTG V4 {kind} key is not an integer")
         if raw_value < 0 or raw_value > 0xFFFFFFFF:
-            raise PTG2SharedBlockError(
-                f"PTG V4 {kind} key is outside uint32 range"
-            )
+            raise PTG2SharedBlockError(f"PTG V4 {kind} key is outside uint32 range")
         normalized_keys.add(int(raw_value))
     return tuple(sorted(normalized_keys))
 
@@ -1089,21 +1022,11 @@ def _relation_manifest_from_fields(
         relation=relation,
         member_object_kind=member_kind,
         locator_object_kind=locator_kind,
-        owner_base=_strict_manifest_int(
-            fields, "owner_base", maximum=0xFFFFFFFF
-        ),
-        owner_count=_strict_manifest_int(
-            fields, "owner_count", maximum=0x1_0000_0000
-        ),
-        logical_member_count=_strict_manifest_int(
-            fields, "logical_member_count"
-        ),
-        vector_member_count=_strict_manifest_int(
-            fields, "vector_member_count"
-        ),
-        member_width=_strict_manifest_int(
-            fields, "member_width", minimum=1, maximum=64
-        ),
+        owner_base=_strict_manifest_int(fields, "owner_base", maximum=0xFFFFFFFF),
+        owner_count=_strict_manifest_int(fields, "owner_count", maximum=0x1_0000_0000),
+        logical_member_count=_strict_manifest_int(fields, "logical_member_count"),
+        vector_member_count=_strict_manifest_int(fields, "vector_member_count"),
+        member_width=_strict_manifest_int(fields, "member_width", minimum=1, maximum=64),
         member_page_bytes=_strict_manifest_int(
             fields,
             "member_page_bytes",
@@ -1116,9 +1039,7 @@ def _relation_manifest_from_fields(
             minimum=PTG2_V4_LOCATOR_WIDTH_BYTES,
             maximum=PTG2_V4_MAX_GRAPH_PAGE_BYTES,
         ),
-        locator_owner_span=_strict_manifest_int(
-            fields, "locator_owner_span", minimum=1, maximum=0xFFFFFFFF
-        ),
+        locator_owner_span=_strict_manifest_int(fields, "locator_owner_span", minimum=1, maximum=0xFFFFFFFF),
     )
     _validate_relation_manifest_fields(fields, manifest)
     return manifest
@@ -1129,8 +1050,7 @@ def _validate_relation_manifest_fields(
     manifest: V4RelationManifest,
 ) -> None:
     has_identity_change = (
-        _strict_manifest_int(fields, "snapshot_key", minimum=1)
-        != manifest.snapshot_key
+        _strict_manifest_int(fields, "snapshot_key", minimum=1) != manifest.snapshot_key
         or fields.get("relation") != manifest.relation
         or fields.get("member_object_kind") != manifest.member_object_kind
         or fields.get("locator_object_kind") != manifest.locator_object_kind
@@ -1139,13 +1059,33 @@ def _validate_relation_manifest_fields(
         manifest.member_width != PTG2_V4_MEMBER_WIDTH_BYTES
         or manifest.member_page_bytes % manifest.member_width
         or manifest.locator_page_bytes % PTG2_V4_LOCATOR_WIDTH_BYTES
-        or manifest.locator_page_bytes
-        != manifest.locator_owner_span * PTG2_V4_LOCATOR_WIDTH_BYTES
+        or manifest.locator_page_bytes != manifest.locator_owner_span * PTG2_V4_LOCATOR_WIDTH_BYTES
         or manifest.owner_base + manifest.owner_count > 0x1_0000_0000
         or manifest.vector_member_count > manifest.logical_member_count
     )
     if has_identity_change or has_geometry_change:
         raise PTG2SharedBlockError("PTG V4 relation manifest is inconsistent")
+
+
+def _graph_cache_scope(session: Any, schema_name: str) -> str:
+    """Namespace caches by authenticated physical identity, never authorize reads."""
+    info = getattr(session, "info", None)
+    info = info if isinstance(info, dict) else {}
+    bindings = info.get("ptg_snapshot_candidate_reads", {})
+    bound_relations = bindings.get(_quote_ident(schema_name), {})
+    physical_binding = info.get("ptg2_local_read_bindings", {}).get(schema_name)
+    if physical_binding is not None:
+        catalog_sha256 = info.get("ptg2_local_read_catalog_sha256", {}).get(schema_name)
+        if not isinstance(physical_binding, PTG2PhysicalBinding) or physical_binding.schema_name != schema_name:
+            raise PTG2SharedBlockError("PTG physical graph cache identity differs")
+        if (
+            not isinstance(catalog_sha256, str)
+            or len(catalog_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in catalog_sha256)
+        ):
+            raise PTG2SharedBlockError("PTG physical graph cache catalog identity is unavailable")
+        return json.dumps((schema_name, bound_relations, repr(physical_binding), catalog_sha256), sort_keys=True)
+    return json.dumps((schema_name, bound_relations), sort_keys=True) if bound_relations else str(schema_name)
 
 
 async def load_v4_relation_manifest(
@@ -1159,7 +1099,7 @@ async def load_v4_relation_manifest(
 
     normalized_relation = str(relation or "").strip().lower()
     locator_kind, member_kind = _relation_kinds(normalized_relation)
-    cache_key = (str(schema_name), int(snapshot_key), normalized_relation)
+    cache_key = (_graph_cache_scope(session, schema_name), int(snapshot_key), normalized_relation)
     cached = _RELATION_CACHE.get(cache_key)
     if cached is not None:
         _RELATION_CACHE.move_to_end(cache_key)
@@ -1210,7 +1150,7 @@ async def load_v4_heavy_owners(
     requested = _normalized_owner_keys(owner_keys)
     if not requested:
         return {}
-    cache_prefix = (str(schema_name), int(snapshot_key), normalized_relation)
+    cache_prefix = (_graph_cache_scope(session, schema_name), int(snapshot_key), normalized_relation)
     heavy_by_owner, missing_owner_keys = _cached_v4_heavy_owners(
         cache_prefix,
         requested,
@@ -1252,7 +1192,7 @@ async def _query_v4_heavy_owner_rows(
             f"""
             SELECT snapshot_key, relation, owner_key, object_kind, member_count,
                    member_base, member_span, fragment_count
-              FROM {_quote_ident(schema_name)}.ptg2_v4_heavy_owner
+              FROM {snapshot_candidate_relation(session, _quote_ident(schema_name), "ptg2_v4_heavy_owner")}
              WHERE snapshot_key = :snapshot_key
                AND relation = :relation
                AND owner_key = ANY(CAST(:owner_keys AS bigint[]))
@@ -1314,11 +1254,7 @@ def _selected_v4_heavy_owners(
     requested_owner_keys: tuple[int, ...],
     heavy_by_owner: Mapping[int, V4HeavyOwner],
 ) -> dict[int, V4HeavyOwner]:
-    return {
-        owner_key: heavy_by_owner[owner_key]
-        for owner_key in requested_owner_keys
-        if owner_key in heavy_by_owner
-    }
+    return {owner_key: heavy_by_owner[owner_key] for owner_key in requested_owner_keys if owner_key in heavy_by_owner}
 
 
 def _v4_heavy_owner_from_fields(
@@ -1332,22 +1268,12 @@ def _v4_heavy_owner_from_fields(
 ) -> V4HeavyOwner:
     owner = V4HeavyOwner(
         relation=relation,
-        owner_key=_strict_manifest_int(
-            fields, "owner_key", maximum=0xFFFFFFFF
-        ),
+        owner_key=_strict_manifest_int(fields, "owner_key", maximum=0xFFFFFFFF),
         object_kind=expected_kind,
-        member_count=_strict_manifest_int(
-            fields, "member_count", maximum=0xFFFFFFFF
-        ),
-        member_base=_strict_manifest_int(
-            fields, "member_base", maximum=0xFFFFFFFF
-        ),
-        member_span=_strict_manifest_int(
-            fields, "member_span", minimum=1, maximum=0xFFFFFFFF
-        ),
-        fragment_count=_strict_manifest_int(
-            fields, "fragment_count", minimum=1, maximum=0x7FFFFFFF
-        ),
+        member_count=_strict_manifest_int(fields, "member_count", maximum=0xFFFFFFFF),
+        member_base=_strict_manifest_int(fields, "member_base", maximum=0xFFFFFFFF),
+        member_span=_strict_manifest_int(fields, "member_span", minimum=1, maximum=0xFFFFFFFF),
+        fragment_count=_strict_manifest_int(fields, "fragment_count", minimum=1, maximum=0x7FFFFFFF),
     )
     has_invalid_owner = (
         _strict_manifest_int(fields, "snapshot_key", minimum=1) != snapshot_key
@@ -1356,14 +1282,9 @@ def _v4_heavy_owner_from_fields(
         or owner.owner_key not in requested_owner_keys
         or owner.owner_key in loaded_owner_keys
     )
-    has_invalid_span = (
-        owner.member_count > owner.member_span
-        or owner.member_base + owner.member_span > 0x1_0000_0000
-    )
+    has_invalid_span = owner.member_count > owner.member_span or owner.member_base + owner.member_span > 0x1_0000_0000
     if has_invalid_owner or has_invalid_span:
-        raise PTG2SharedBlockError(
-            "PTG V4 heavy-owner manifest is inconsistent"
-        )
+        raise PTG2SharedBlockError("PTG V4 heavy-owner manifest is inconsistent")
     return owner
 
 
@@ -1404,9 +1325,13 @@ async def _load_map_coordinate_pairs(
 ) -> dict[tuple[int, int], Any]:
     """Load exact packed-map coordinates with bounded immutable caching."""
 
+    cache_scope = _graph_cache_scope(session, schema_name)
     requested_pairs = _normalized_map_coordinate_pairs(coordinate_pairs)
+    budget = getattr(_ACTIVE_V4_GRAPH_REQUEST_IO.get(), "read_budget", None)
+    if budget is not None:
+        budget.reserve([], len(requested_pairs))
     coordinates_by_pair, missing_pairs = _cached_map_coordinate_pairs(
-        schema_name=schema_name,
+        schema_name=cache_scope,
         snapshot_key=int(snapshot_key),
         object_kind=object_kind,
         requested_pairs=requested_pairs,
@@ -1426,40 +1351,26 @@ async def _load_map_coordinate_pairs(
         map_pack_row = _row_mapping(raw_row)
         pack_no = int(map_pack_row.get("pack_no") or 0)
         if pack_no in observed_pack_nos:
-            raise PTG2SharedBlockError(
-                "PTG V4 map query returned a duplicate pack"
-            )
+            raise PTG2SharedBlockError("PTG V4 map query returned a duplicate pack")
         observed_pack_nos.add(pack_no)
         _retain_map_pack_coordinates(
             map_pack_row,
-            schema_name=schema_name,
+            schema_name=cache_scope,
             snapshot_key=int(snapshot_key),
             object_kind=object_kind,
             missing_pairs=missing_pair_set,
             coordinates_by_pair=coordinates_by_pair,
         )
     if set(coordinates_by_pair) != set(requested_pairs):
-        raise PTG2SharedBlockError(
-            "PTG V4 snapshot map is missing a graph coordinate"
-        )
+        raise PTG2SharedBlockError("PTG V4 snapshot map is missing a graph coordinate")
     return coordinates_by_pair
 
 
 def _normalized_map_coordinate_pairs(
     coordinate_pairs: Iterable[tuple[int, int]],
 ) -> tuple[tuple[int, int], ...]:
-    requested_pairs = tuple(
-        sorted(
-            {
-                (int(block_key), int(fragment_no))
-                for block_key, fragment_no in coordinate_pairs
-            }
-        )
-    )
-    if any(
-        block_key < 0 or fragment_no < 0
-        for block_key, fragment_no in requested_pairs
-    ):
+    requested_pairs = tuple(sorted({(int(block_key), int(fragment_no)) for block_key, fragment_no in coordinate_pairs}))
+    if any(block_key < 0 or fragment_no < 0 for block_key, fragment_no in requested_pairs):
         raise PTG2SharedBlockError("PTG V4 graph coordinate is negative")
     return requested_pairs
 
@@ -1489,52 +1400,16 @@ def _cached_map_coordinate_pairs(
     return coordinates_by_pair, missing_pairs
 
 
-async def _query_v4_map_packs(
-    session: Any,
-    *,
-    schema_name: str,
-    snapshot_key: int,
-    object_kind: str,
-    missing_pairs: list[tuple[int, int]],
-) -> Any:
-    return await session.execute(
-        text(
-            f"""
-            SELECT pack.pack_no, pack.first_block_key, pack.first_fragment_no,
-                   pack.last_block_key, pack.last_fragment_no,
-                   pack.coordinate_count, pack.map_block_hash AS block_hash,
-                   block.format_version, block.object_kind, block.codec,
-                   block.entry_count AS block_entry_count,
-                   block.raw_byte_count, block.stored_byte_count, block.payload
-              FROM {_quote_ident(schema_name)}.ptg2_v4_snapshot_map_pack AS pack
-              JOIN {_quote_ident(schema_name)}.ptg2_v3_block AS block
-                ON block.block_hash = pack.map_block_hash
-             WHERE pack.snapshot_key = :snapshot_key
-               AND pack.object_kind = :object_kind
-               AND EXISTS (
-                   SELECT 1
-                     FROM unnest(
-                              CAST(:block_keys AS bigint[]),
-                              CAST(:fragment_nos AS integer[])
-                          ) AS wanted(block_key, fragment_no)
-                    WHERE ROW(wanted.block_key, wanted.fragment_no)
-                          BETWEEN ROW(
-                              pack.first_block_key,
-                              pack.first_fragment_no
-                          ) AND ROW(
-                              pack.last_block_key,
-                              pack.last_fragment_no
-                          )
-               )
-             ORDER BY pack.pack_no
-            """
-        ),
-        {
-            "snapshot_key": snapshot_key,
-            "object_kind": object_kind,
-            "block_keys": [pair[0] for pair in missing_pairs],
-            "fragment_nos": [pair[1] for pair in missing_pairs],
-        },
+async def _query_v4_map_packs(session, *, schema_name, snapshot_key, object_kind, missing_pairs):
+    from process.registry_ptg_graph_payload_read import query_v4_map_packs
+
+    return await query_v4_map_packs(
+        session,
+        schema_name=schema_name,
+        snapshot_key=snapshot_key,
+        object_kind=object_kind,
+        missing_pairs=missing_pairs,
+        budget=getattr(_ACTIVE_V4_GRAPH_REQUEST_IO.get(), "read_budget", None),
     )
 
 
@@ -1552,9 +1427,7 @@ def _retain_map_pack_coordinates(
         expected_kind=PTG2_V4_MAP_BLOCK_KIND,
         maximum_raw_bytes=PTG2_V4_MAX_MAP_PACK_RAW_BYTES,
     )
-    _request_io().database_bytes += int(
-        map_pack_row.get("stored_byte_count") or 0
-    )
+    _request_io().database_bytes += int(map_pack_row.get("stored_byte_count") or 0)
     _request_io().database_blocks += 1
     try:
         coordinates = decode_v4_snapshot_map_pack(
@@ -1564,9 +1437,7 @@ def _retain_map_pack_coordinates(
     except ValueError as exc:
         raise PTG2SharedBlockError(str(exc)) from exc
     if len(coordinates) != int(map_pack_row.get("coordinate_count") or 0):
-        raise PTG2SharedBlockError(
-            "PTG V4 map pack count does not match its root"
-        )
+        raise PTG2SharedBlockError("PTG V4 map pack count does not match its root")
     for coordinate in coordinates:
         pair = (int(coordinate.block_key), int(coordinate.fragment_no))
         cache_key = (
@@ -1597,10 +1468,7 @@ async def _load_map_coordinates(
         object_kind=object_kind,
         coordinate_pairs=((block_key, 0) for block_key in requested_keys),
     )
-    return {
-        block_key: coordinate_by_pair[(block_key, 0)]
-        for block_key in requested_keys
-    }
+    return {block_key: coordinate_by_pair[(block_key, 0)] for block_key in requested_keys}
 
 
 async def _load_physical_blocks(
@@ -1614,9 +1482,7 @@ async def _load_physical_blocks(
     """Fetch and authenticate distinct physical CAS blocks once per request."""
 
     coordinate_by_hash = _coordinates_by_physical_hash(coordinates)
-    blocks_by_hash, missing_hashes = _cached_physical_blocks(
-        coordinate_by_hash, object_kind
-    )
+    blocks_by_hash, missing_hashes = _cached_physical_blocks(coordinate_by_hash, object_kind)
     if missing_hashes:
         await _fetch_missing_physical_blocks(
             session,
@@ -1653,11 +1519,10 @@ def _cached_physical_blocks(
         if cached is None:
             missing_hashes.append(block_hash)
             continue
-        if (
-            cached.object_kind != object_kind
-            or cached.entry_count != int(coordinate.entry_count)
-        ):
+        if cached.object_kind != object_kind or cached.entry_count != int(coordinate.entry_count):
             raise PTG2SharedBlockError("PTG V4 cached block identity is inconsistent")
+        if _request_io().read_budget is not None:
+            _request_io().read_budget.reserve([{"raw_byte_count": len(cached.payload)}])
         blocks_by_hash[block_hash] = cached
         _request_io().cache_hit_bytes += len(cached.payload)
     return blocks_by_hash, missing_hashes
@@ -1673,18 +1538,26 @@ async def _fetch_missing_physical_blocks(
     missing_hashes: list[bytes],
 ) -> None:
     schema = _quote_ident(schema_name)
+    budget = _request_io().read_budget
+    payload_expression = "payload" if budget is None else "octet_length(payload) AS payload_byte_count"
     query_result = await session.execute(
         text(
             f"""
             SELECT block_hash, format_version, object_kind, codec,
                    entry_count AS block_entry_count,
-                   raw_byte_count, stored_byte_count, payload
+                   raw_byte_count, stored_byte_count, {payload_expression}
               FROM {schema}.ptg2_v3_block
              WHERE block_hash = ANY(CAST(:block_hashes AS bytea[]))
             """
         ),
         {"block_hashes": missing_hashes},
     )
+    if budget is not None:
+        from process.registry_ptg_graph_payload_read import budgeted_graph_payloads
+
+        query_result = await budgeted_graph_payloads(
+            session, query_result, schema_name, budget, object_kind, maximum_raw_bytes
+        )
     for raw_row in query_result:
         block_row = _row_mapping(raw_row)
         physical = _validated_physical_block(
@@ -1694,13 +1567,9 @@ async def _fetch_missing_physical_blocks(
         )
         coordinate = coordinate_by_hash.get(physical.block_hash)
         if coordinate is None or physical.block_hash in blocks_by_hash:
-            raise PTG2SharedBlockError(
-                "PTG V4 physical query returned an unexpected block"
-            )
+            raise PTG2SharedBlockError("PTG V4 physical query returned an unexpected block")
         if int(physical.entry_count or 0) != int(coordinate.entry_count):
-            raise PTG2SharedBlockError(
-                "PTG V4 physical block entry count is inconsistent"
-            )
+            raise PTG2SharedBlockError("PTG V4 physical block entry count is inconsistent")
         cached = _CachedPhysicalBlock(
             block_hash=physical.block_hash,
             object_kind=physical.object_kind,
@@ -1708,12 +1577,8 @@ async def _fetch_missing_physical_blocks(
             payload=physical.payload,
         )
         blocks_by_hash[cached.block_hash] = cached
-        _PHYSICAL_BLOCK_CACHE.put(
-            cached.block_hash, cached, len(cached.payload) + 128
-        )
-        _request_io().database_bytes += int(
-            block_row.get("stored_byte_count") or 0
-        )
+        _PHYSICAL_BLOCK_CACHE.put(cached.block_hash, cached, len(cached.payload) + 128)
+        _request_io().database_bytes += int(block_row.get("stored_byte_count") or 0)
         _request_io().database_blocks += 1
 
 
@@ -1744,31 +1609,13 @@ def _decode_member_page(
     """Decode one authenticated fixed-width member page."""
 
     expected_size = int(entry_count) * PTG2_V4_MEMBER_WIDTH_BYTES
-    if (
-        entry_count < 0
-        or entry_count > int(maximum_entries)
-        or len(member_page_payload) != expected_size
-    ):
+    if entry_count < 0 or entry_count > int(maximum_entries) or len(member_page_payload) != expected_size:
         raise PTG2SharedBlockError("PTG V4 member page is malformed")
     if not member_page_payload:
         return ()
-    if _native_u32_decoder is None:
-        return struct.unpack(f"<{entry_count}I", member_page_payload)
-    try:
-        decoded_members = tuple(
-            operator.index(member_value)
-            for member_value in _native_u32_decoder(member_page_payload)
-        )
-    except (OverflowError, TypeError, ValueError) as exc:
-        raise PTG2SharedBlockError("PTG V4 native member decoder failed") from exc
-    if len(decoded_members) != entry_count or any(
-        member_value < 0 or member_value > 0xFFFFFFFF
-        for member_value in decoded_members
-    ):
-        raise PTG2SharedBlockError("PTG V4 native member decoder changed framing")
     # Pages may straddle owners, so ordering is checked after each owner's
     # complete member span has been reconstructed below.
-    return decoded_members
+    return struct.unpack(f"<{entry_count}I", member_page_payload)
 
 
 def _validated_heavy_bitmap(
@@ -1779,16 +1626,11 @@ def _validated_heavy_bitmap(
     """Validate one complete heavy bitmap and return its logical bytes."""
 
     expected_bitmap_bytes = (heavy_owner.member_span + 7) // 8
-    if (
-        len(bitmap_payload)
-        != PTG2_V4_HEAVY_BITMAP_HEADER_BYTES + expected_bitmap_bytes
-    ):
+    if len(bitmap_payload) != PTG2_V4_HEAVY_BITMAP_HEADER_BYTES + expected_bitmap_bytes:
         raise PTG2SharedBlockError("PTG V4 heavy bitmap has an invalid size")
     if bitmap_payload[:8] != PTG2_V4_HEAVY_BITMAP_MAGIC:
         raise PTG2SharedBlockError("PTG V4 heavy bitmap has an invalid magic")
-    owner_key, member_base, member_span, member_count = struct.unpack_from(
-        "<IIII", bitmap_payload, 8
-    )
+    owner_key, member_base, member_span, member_count = struct.unpack_from("<IIII", bitmap_payload, 8)
     if (
         owner_key != heavy_owner.owner_key
         or member_base != heavy_owner.member_base
@@ -1878,23 +1720,14 @@ def _unframe_heavy_bitmap_fragment(
         or stored_fragment_no != int(fragment_no)
         or stored_entry_count != int(entry_count)
     ):
-        raise PTG2SharedBlockError(
-            "PTG V4 heavy bitmap fragment conflicts with its coordinate"
-        )
-    logical_payload = fragment_payload[
-        PTG2_V4_HEAVY_BITMAP_FRAGMENT_HEADER_BYTES:
-    ]
+        raise PTG2SharedBlockError("PTG V4 heavy bitmap fragment conflicts with its coordinate")
+    logical_payload = fragment_payload[PTG2_V4_HEAVY_BITMAP_FRAGMENT_HEADER_BYTES:]
     bitmap_offset = max(
         PTG2_V4_HEAVY_BITMAP_HEADER_BYTES - int(logical_offset),
         0,
     )
-    if (
-        sum(byte.bit_count() for byte in logical_payload[bitmap_offset:])
-        != int(entry_count)
-    ):
-        raise PTG2SharedBlockError(
-            "PTG V4 heavy bitmap fragment entry count changed"
-        )
+    if sum(byte.bit_count() for byte in logical_payload[bitmap_offset:]) != int(entry_count):
+        raise PTG2SharedBlockError("PTG V4 heavy bitmap fragment entry count changed")
     return logical_payload
 
 
@@ -1910,10 +1743,13 @@ async def _load_v4_heavy_bitmap_payloads(
 
     if not heavy_owners:
         return {}
+    budget = getattr(_ACTIVE_V4_GRAPH_REQUEST_IO.get(), "read_budget", None)
+    if budget is not None and sum(owner.fragment_count for owner in heavy_owners.values()) > min(
+        budget.maximum_pages - budget.read_pages, budget.maximum_coordinates - budget.coordinates
+    ):
+        raise PTG2SharedBlockError("PTG V4 graph selection exceeds the read budget")
     coordinate_pairs = [
-        (owner.owner_key, fragment_no)
-        for owner in heavy_owners.values()
-        for fragment_no in range(owner.fragment_count)
+        (owner.owner_key, fragment_no) for owner in heavy_owners.values() for fragment_no in range(owner.fragment_count)
     ]
     object_kinds = {owner.object_kind for owner in heavy_owners.values()}
     if len(object_kinds) != 1:
@@ -1934,9 +1770,7 @@ async def _load_v4_heavy_bitmap_payloads(
         coordinates=coordinates.values(),
         maximum_raw_bytes=relation_manifest.member_page_bytes,
     )
-    payloads_by_owner = _assemble_heavy_bitmap_payloads(
-        heavy_owners, coordinates, blocks
-    )
+    payloads_by_owner = _assemble_heavy_bitmap_payloads(heavy_owners, coordinates, blocks)
     _request_io().bitmap_owner_hits += len(payloads_by_owner)
     return payloads_by_owner
 
@@ -1993,9 +1827,7 @@ def _assemble_heavy_bitmap_payloads(
             logical_offset += len(logical_fragment)
             observed_entry_count += int(coordinate.entry_count)
         if observed_entry_count != owner.member_count:
-            raise PTG2SharedBlockError(
-                "PTG V4 heavy bitmap member count changed"
-            )
+            raise PTG2SharedBlockError("PTG V4 heavy bitmap member count changed")
         payloads_by_owner[owner_key] = b"".join(fragments)
     return payloads_by_owner
 
@@ -2030,14 +1862,9 @@ def _heavy_bitmap_fragment_content_bytes(
     relation_manifest: V4RelationManifest,
 ) -> int:
     """Return the logical bytes carried by one framed bitmap page."""
-    fragment_content_bytes = (
-        int(relation_manifest.member_page_bytes)
-        - PTG2_V4_HEAVY_BITMAP_FRAGMENT_HEADER_BYTES
-    )
+    fragment_content_bytes = int(relation_manifest.member_page_bytes) - PTG2_V4_HEAVY_BITMAP_FRAGMENT_HEADER_BYTES
     if fragment_content_bytes <= PTG2_V4_HEAVY_BITMAP_HEADER_BYTES:
-        raise PTG2SharedBlockError(
-            "PTG V4 heavy bitmap page cannot contain its logical header"
-        )
+        raise PTG2SharedBlockError("PTG V4 heavy bitmap page cannot contain its logical header")
     return fragment_content_bytes
 
 
@@ -2048,9 +1875,7 @@ def _selected_heavy_bitmap_keys_by_fragment(
 ) -> tuple[dict[tuple[int, int], tuple[int, ...]], int]:
     """Map allowed keys to the exact owner fragments that contain their bits."""
 
-    selected_keys_by_fragment: dict[
-        tuple[int, int], tuple[int, ...]
-    ] = {}
+    selected_keys_by_fragment: dict[tuple[int, int], tuple[int, ...]] = {}
     probe_count = 0
     for owner_key, owner in heavy_owners.items():
         member_limit = owner.member_base + owner.member_span
@@ -2060,21 +1885,14 @@ def _selected_heavy_bitmap_keys_by_fragment(
                 continue
             if member_key >= member_limit:
                 break
-            logical_byte_offset = (
-                PTG2_V4_HEAVY_BITMAP_HEADER_BYTES
-                + (member_key - owner.member_base) // 8
-            )
+            logical_byte_offset = PTG2_V4_HEAVY_BITMAP_HEADER_BYTES + (member_key - owner.member_base) // 8
             fragment_no = logical_byte_offset // fragment_content_bytes
             if fragment_no >= owner.fragment_count:
-                raise PTG2SharedBlockError(
-                    "PTG V4 heavy bitmap member falls outside its fragments"
-                )
+                raise PTG2SharedBlockError("PTG V4 heavy bitmap member falls outside its fragments")
             keys_by_fragment.setdefault(fragment_no, []).append(member_key)
             probe_count += 1
         for fragment_no, member_keys in keys_by_fragment.items():
-            selected_keys_by_fragment[(owner_key, fragment_no)] = tuple(
-                member_keys
-            )
+            selected_keys_by_fragment[(owner_key, fragment_no)] = tuple(member_keys)
     return selected_keys_by_fragment, probe_count
 
 
@@ -2100,9 +1918,7 @@ async def _load_selected_heavy_bitmap_fragments(
         coordinate_pairs=selected_pairs,
     )
     selected_page_count = len(coordinates)
-    selected_byte_count = (
-        selected_page_count * relation_manifest.member_page_bytes
-    )
+    selected_byte_count = selected_page_count * relation_manifest.member_page_bytes
     _charge_v4_hot_source_work(
         relation_manifest.relation,
         owner_count=len(heavy_owners),
@@ -2140,12 +1956,8 @@ def _decode_selected_heavy_bitmap_fragments(
 ) -> dict[int, tuple[int, ...]]:
     """Authenticate selected fragments and test the requested member bits."""
 
-    matches_by_owner: dict[int, list[int]] = {
-        owner_key: [] for owner_key in heavy_owners
-    }
-    for (owner_key, fragment_no), member_keys in (
-        selected_keys_by_fragment.items()
-    ):
+    matches_by_owner: dict[int, list[int]] = {owner_key: [] for owner_key in heavy_owners}
+    for (owner_key, fragment_no), member_keys in selected_keys_by_fragment.items():
         owner = heavy_owners[owner_key]
         coordinate = coordinates[(owner_key, fragment_no)]
         logical_offset = fragment_no * fragment_content_bytes
@@ -2157,24 +1969,14 @@ def _decode_selected_heavy_bitmap_fragments(
             logical_offset=logical_offset,
         )
         for member_key in member_keys:
-            bitmap_byte_offset = (
-                PTG2_V4_HEAVY_BITMAP_HEADER_BYTES
-                + (member_key - owner.member_base) // 8
-            )
+            bitmap_byte_offset = PTG2_V4_HEAVY_BITMAP_HEADER_BYTES + (member_key - owner.member_base) // 8
             fragment_byte_offset = bitmap_byte_offset - logical_offset
             if not 0 <= fragment_byte_offset < len(logical_fragment):
-                raise PTG2SharedBlockError(
-                    "PTG V4 heavy bitmap fragment is shorter than its member span"
-                )
-            if logical_fragment[fragment_byte_offset] & (
-                1 << ((member_key - owner.member_base) % 8)
-            ):
+                raise PTG2SharedBlockError("PTG V4 heavy bitmap fragment is shorter than its member span")
+            if logical_fragment[fragment_byte_offset] & (1 << ((member_key - owner.member_base) % 8)):
                 matches_by_owner[owner_key].append(member_key)
     _request_io().bitmap_owner_hits += len(heavy_owners)
-    return {
-        owner_key: tuple(matches_by_owner[owner_key])
-        for owner_key in heavy_owners
-    }
+    return {owner_key: tuple(matches_by_owner[owner_key]) for owner_key in heavy_owners}
 
 
 async def _lookup_v4_heavy_member_intersections(
@@ -2192,15 +1994,11 @@ async def _lookup_v4_heavy_member_intersections(
         return {}
     if not allowed_member_keys:
         return {owner_key: () for owner_key in heavy_owners}
-    fragment_content_bytes = _heavy_bitmap_fragment_content_bytes(
-        relation_manifest
-    )
-    selected_keys_by_fragment, probe_count = (
-        _selected_heavy_bitmap_keys_by_fragment(
-            heavy_owners,
-            allowed_member_keys,
-            fragment_content_bytes,
-        )
+    fragment_content_bytes = _heavy_bitmap_fragment_content_bytes(relation_manifest)
+    selected_keys_by_fragment, probe_count = _selected_heavy_bitmap_keys_by_fragment(
+        heavy_owners,
+        allowed_member_keys,
+        fragment_content_bytes,
     )
     if not selected_keys_by_fragment:
         return {owner_key: () for owner_key in heavy_owners}
@@ -2231,9 +2029,7 @@ def _decode_heavy_bitmap_prefix(
     """Decode an authenticated leading bitmap span after header validation."""
 
     expected_bitmap_bytes = (heavy_owner.member_span + 7) // 8
-    expected_payload_bytes = (
-        PTG2_V4_HEAVY_BITMAP_HEADER_BYTES + expected_bitmap_bytes
-    )
+    expected_payload_bytes = PTG2_V4_HEAVY_BITMAP_HEADER_BYTES + expected_bitmap_bytes
     if (
         len(bitmap_prefix_payload) < PTG2_V4_HEAVY_BITMAP_HEADER_BYTES
         or len(bitmap_prefix_payload) > expected_payload_bytes
@@ -2241,9 +2037,7 @@ def _decode_heavy_bitmap_prefix(
         raise PTG2SharedBlockError("PTG V4 heavy bitmap prefix has an invalid size")
     if bitmap_prefix_payload[:8] != PTG2_V4_HEAVY_BITMAP_MAGIC:
         raise PTG2SharedBlockError("PTG V4 heavy bitmap has an invalid magic")
-    owner_key, member_base, member_span, member_count = struct.unpack_from(
-        "<IIII", bitmap_prefix_payload, 8
-    )
+    owner_key, member_base, member_span, member_count = struct.unpack_from("<IIII", bitmap_prefix_payload, 8)
     if (
         owner_key != heavy_owner.owner_key
         or member_base != heavy_owner.member_base
@@ -2256,18 +2050,14 @@ def _decode_heavy_bitmap_prefix(
             bitmap_prefix_payload,
             heavy_owner=heavy_owner,
         )[:limit]
-    bitmap_prefix = bitmap_prefix_payload[
-        PTG2_V4_HEAVY_BITMAP_HEADER_BYTES:
-    ]
+    bitmap_prefix = bitmap_prefix_payload[PTG2_V4_HEAVY_BITMAP_HEADER_BYTES:]
     members = tuple(
         heavy_owner.member_base + byte_index * 8 + bit
         for byte_index, byte_value in enumerate(bitmap_prefix)
         for bit in _SET_BIT_POSITIONS[byte_value]
     )
     if len(members) < int(limit):
-        raise PTG2SharedBlockError(
-            "PTG V4 heavy bitmap prefix does not prove its requested members"
-        )
+        raise PTG2SharedBlockError("PTG V4 heavy bitmap prefix does not prove its requested members")
     return members[:limit]
 
 
@@ -2282,14 +2072,10 @@ async def _load_heavy_prefix_coordinates(
 ) -> dict[int, tuple[Any, ...]]:
     """Fetch only coordinate fragments needed to prove each owner prefix."""
 
-    coordinates_by_owner: dict[int, list[Any]] = {
-        owner_key: [] for owner_key in heavy_owners
-    }
+    coordinates_by_owner: dict[int, list[Any]] = {owner_key: [] for owner_key in heavy_owners}
     committed_count_by_owner = {owner_key: 0 for owner_key in heavy_owners}
     pending_owner_keys = set(heavy_owners)
-    maximum_fragments = max(
-        (owner.fragment_count for owner in heavy_owners.values()), default=0
-    )
+    maximum_fragments = max((owner.fragment_count for owner in heavy_owners.values()), default=0)
     for fragment_no in range(maximum_fragments):
         requested_pairs = tuple(
             (owner_key, fragment_no)
@@ -2311,26 +2097,18 @@ async def _load_heavy_prefix_coordinates(
             committed_count_by_owner[owner_key] += int(coordinate.entry_count)
             owner = heavy_owners[owner_key]
             is_owner_complete = pair_fragment_no + 1 == owner.fragment_count
-            is_prefix_proven = (
-                owner.member_count > int(limit_per_owner)
-                and committed_count_by_owner[owner_key] >= int(limit_per_owner)
+            is_prefix_proven = owner.member_count > int(limit_per_owner) and committed_count_by_owner[owner_key] >= int(
+                limit_per_owner
             )
             if is_owner_complete:
                 if committed_count_by_owner[owner_key] != owner.member_count:
-                    raise PTG2SharedBlockError(
-                        "PTG V4 heavy bitmap coordinate count changed"
-                    )
+                    raise PTG2SharedBlockError("PTG V4 heavy bitmap coordinate count changed")
                 pending_owner_keys.discard(owner_key)
             elif is_prefix_proven:
                 pending_owner_keys.discard(owner_key)
     if pending_owner_keys:
-        raise PTG2SharedBlockError(
-            "PTG V4 heavy bitmap prefix coordinates are incomplete"
-        )
-    return {
-        owner_key: tuple(owner_coordinates)
-        for owner_key, owner_coordinates in coordinates_by_owner.items()
-    }
+        raise PTG2SharedBlockError("PTG V4 heavy bitmap prefix coordinates are incomplete")
+    return {owner_key: tuple(owner_coordinates) for owner_key, owner_coordinates in coordinates_by_owner.items()}
 
 
 def _decode_heavy_owner_prefix(
@@ -2358,9 +2136,7 @@ def _decode_heavy_owner_prefix(
         observed_entry_count += int(coordinate.entry_count)
     selected_limit = min(owner.member_count, int(limit_per_owner))
     if observed_entry_count < selected_limit:
-        raise PTG2SharedBlockError(
-            "PTG V4 heavy bitmap prefix does not prove its requested members"
-        )
+        raise PTG2SharedBlockError("PTG V4 heavy bitmap prefix does not prove its requested members")
     return _decode_heavy_bitmap_prefix(
         b"".join(fragments),
         heavy_owner=owner,
@@ -2376,13 +2152,8 @@ def _charge_v4_heavy_prefix_work(
 ) -> None:
     """Charge shared physical work for selected heavy-owner fragments."""
 
-    selected_member_count = sum(
-        min(owner.member_count, selected_limit)
-        for owner in heavy_owners.values()
-    )
-    selected_byte_count = (
-        int(selected_page_count) * relation_manifest.member_page_bytes
-    )
+    selected_member_count = sum(min(owner.member_count, selected_limit) for owner in heavy_owners.values())
+    selected_byte_count = int(selected_page_count) * relation_manifest.member_page_bytes
     _charge_v4_hot_source_work(
         relation_manifest.relation,
         owner_count=len(heavy_owners),
@@ -2424,9 +2195,7 @@ async def _lookup_v4_heavy_member_prefixes(
         limit_per_owner=normalized_limit,
     )
     selected_coordinates = tuple(
-        coordinate
-        for owner_coordinates in selected_coordinates_by_owner.values()
-        for coordinate in owner_coordinates
+        coordinate for owner_coordinates in selected_coordinates_by_owner.values() for coordinate in owner_coordinates
     )
     _charge_v4_heavy_prefix_work(
         relation_manifest,
@@ -2467,9 +2236,7 @@ async def _lookup_v4_selected_heavy_members(
 
     if allowed_member_keys is not None:
         if per_owner_limit is not None:
-            raise PTG2SharedBlockError(
-                "PTG V4 graph intersection cannot combine with owner prefixes"
-            )
+            raise PTG2SharedBlockError("PTG V4 graph intersection cannot combine with owner prefixes")
         return await _lookup_v4_heavy_member_intersections(
             session,
             snapshot_key=int(snapshot_key),
@@ -2522,9 +2289,7 @@ async def _lookup_v4_relation_members_scoped(
     _enforce_v4_member_limit(lookup, total_members)
     if not lookup.regular_owner_keys:
         return await _lookup_v4_heavy_only(session, lookup)
-    locator_by_owner, locator_page_keys, total_members = (
-        await _load_v4_regular_locators(session, lookup, total_members)
-    )
+    locator_by_owner, locator_page_keys, total_members = await _load_v4_regular_locators(session, lookup, total_members)
     heavy_members, total_members = await _load_v4_lookup_heavy_members(
         session,
         lookup,
@@ -2566,13 +2331,9 @@ def _normalized_v4_lookup_request(
         relation=str(request.relation or "").strip().lower(),
         owner_keys=_normalized_owner_keys(request.owner_keys),
         schema_name=str(request.schema_name),
-        max_members=(
-            None if request.max_members is None else int(request.max_members)
-        ),
+        max_members=(None if request.max_members is None else int(request.max_members)),
         prefix_members_per_owner=(
-            None
-            if request.prefix_members_per_owner is None
-            else int(request.prefix_members_per_owner)
+            None if request.prefix_members_per_owner is None else int(request.prefix_members_per_owner)
         ),
         allowed_member_keys=allowed_member_keys,
         authenticated_root=request.authenticated_root,
@@ -2582,13 +2343,8 @@ def _normalized_v4_lookup_request(
 def _validate_v4_lookup_limits(request: _V4RelationLookupRequest) -> None:
     if request.max_members is not None and request.max_members < 0:
         raise PTG2SharedBlockError("PTG V4 max_members cannot be negative")
-    if (
-        request.prefix_members_per_owner is not None
-        and request.prefix_members_per_owner < 0
-    ):
-        raise PTG2SharedBlockError(
-            "PTG V4 prefix_members_per_owner cannot be negative"
-        )
+    if request.prefix_members_per_owner is not None and request.prefix_members_per_owner < 0:
+        raise PTG2SharedBlockError("PTG V4 prefix_members_per_owner cannot be negative")
 
 
 def _validate_v4_lookup_owner_scope(
@@ -2596,13 +2352,8 @@ def _validate_v4_lookup_owner_scope(
     owner_keys: Iterable[int],
 ) -> None:
     owner_limit = manifest.owner_base + manifest.owner_count
-    if any(
-        owner_key < manifest.owner_base or owner_key >= owner_limit
-        for owner_key in owner_keys
-    ):
-        raise PTG2SharedBlockError(
-            "PTG V4 relation owner is outside its manifest"
-        )
+    if any(owner_key < manifest.owner_base or owner_key >= owner_limit for owner_key in owner_keys):
+        raise PTG2SharedBlockError("PTG V4 relation owner is outside its manifest")
 
 
 def _validate_v4_heavy_owner_scope(
@@ -2610,18 +2361,11 @@ def _validate_v4_heavy_owner_scope(
     manifest: V4RelationManifest,
     heavy_owners: Mapping[int, V4HeavyOwner],
 ) -> None:
-    if (
-        manifest.relation in PTG2_V4_ORDER_PRESERVING_RELATIONS
-        and heavy_owners
-    ):
-        raise PTG2SharedBlockError(
-            "PTG V4 ordered prefix relation cannot use bitmap owners"
-        )
+    if manifest.relation in PTG2_V4_ORDER_PRESERVING_RELATIONS and heavy_owners:
+        raise PTG2SharedBlockError("PTG V4 ordered prefix relation cannot use bitmap owners")
     _validate_v4_lookup_owner_scope(manifest, heavy_owners)
     if any(owner_key not in lookup_owner_keys for owner_key in heavy_owners):
-        raise PTG2SharedBlockError(
-            "PTG V4 heavy-owner lookup returned an unrequested owner"
-        )
+        raise PTG2SharedBlockError("PTG V4 heavy-owner lookup returned an unrequested owner")
 
 
 async def _prepare_v4_relation_lookup(
@@ -2636,9 +2380,7 @@ async def _prepare_v4_relation_lookup(
         schema_name=request.schema_name,
     )
     if root.snapshot_key != request.snapshot_key:
-        raise PTG2SharedBlockError(
-            "PTG V4 authenticated root changed snapshot identity"
-        )
+        raise PTG2SharedBlockError("PTG V4 authenticated root changed snapshot identity")
     _validate_relation_for_root(root, request.relation)
     manifest = await load_v4_relation_manifest(
         session,
@@ -2672,11 +2414,7 @@ async def _prepare_v4_relation_lookup(
         allowed_member_keys=request.allowed_member_keys,
         manifest=manifest,
         heavy_owners=heavy_owners,
-        regular_owner_keys=tuple(
-            owner_key
-            for owner_key in request.owner_keys
-            if owner_key not in heavy_owners
-        ),
+        regular_owner_keys=tuple(owner_key for owner_key in request.owner_keys if owner_key not in heavy_owners),
     )
 
 
@@ -2684,9 +2422,7 @@ def _initial_v4_member_count(lookup: _V4RelationLookup) -> int:
     if lookup.is_intersection:
         return 0
     return sum(
-        owner.member_count
-        if lookup.per_owner_limit is None
-        else min(owner.member_count, lookup.per_owner_limit)
+        owner.member_count if lookup.per_owner_limit is None else min(owner.member_count, lookup.per_owner_limit)
         for owner in lookup.heavy_owners.values()
     )
 
@@ -2695,13 +2431,8 @@ def _enforce_v4_member_limit(
     lookup: _V4RelationLookup,
     total_members: int,
 ) -> None:
-    if (
-        lookup.max_members is not None
-        and total_members > lookup.max_members
-    ):
-        raise PTG2SharedBlockError(
-            "PTG V4 graph selection exceeds max_members"
-        )
+    if lookup.max_members is not None and total_members > lookup.max_members:
+        raise PTG2SharedBlockError("PTG V4 graph selection exceeds max_members")
 
 
 async def _load_v4_lookup_heavy_members(
@@ -2733,18 +2464,14 @@ async def _lookup_v4_heavy_only(
         lookup,
         _initial_v4_member_count(lookup),
     )
-    return {
-        owner_key: heavy_members[owner_key]
-        for owner_key in lookup.owner_keys
-    }
+    return {owner_key: heavy_members[owner_key] for owner_key in lookup.owner_keys}
 
 
 def _v4_locator_page_keys(lookup: _V4RelationLookup) -> set[int]:
     owner_base = lookup.manifest.owner_base
     owner_span = lookup.manifest.locator_owner_span
     return {
-        owner_base + ((owner_key - owner_base) // owner_span) * owner_span
-        for owner_key in lookup.regular_owner_keys
+        owner_base + ((owner_key - owner_base) // owner_span) * owner_span for owner_key in lookup.regular_owner_keys
     }
 
 
@@ -2766,14 +2493,8 @@ def _decode_v4_owner_locator(
         member_offset > 0xFFFFFFFFFFFFFFFF - member_count
         or member_offset + member_count > lookup.manifest.vector_member_count
     ):
-        raise PTG2SharedBlockError(
-            "PTG V4 locator range exceeds its manifest"
-        )
-    selected_count = (
-        member_count
-        if lookup.per_owner_limit is None
-        else min(member_count, lookup.per_owner_limit)
-    )
+        raise PTG2SharedBlockError("PTG V4 locator range exceeds its manifest")
+    selected_count = member_count if lookup.per_owner_limit is None else min(member_count, lookup.per_owner_limit)
     return member_offset, selected_count
 
 
@@ -2801,9 +2522,7 @@ async def _load_v4_regular_locators(
     for owner_key in lookup.regular_owner_keys:
         owner_base = lookup.manifest.owner_base
         owner_span = lookup.manifest.locator_owner_span
-        page_key = owner_base + (
-            (owner_key - owner_base) // owner_span
-        ) * owner_span
+        page_key = owner_base + ((owner_key - owner_base) // owner_span) * owner_span
         locator = _decode_v4_owner_locator(
             lookup,
             owner_key,
@@ -2828,12 +2547,8 @@ def _v4_member_page_keys(
         if member_count == 0:
             continue
         first_page = (member_offset // members_per_page) * members_per_page
-        last_page = (
-            (member_offset + member_count - 1) // members_per_page
-        ) * members_per_page
-        member_page_keys.update(
-            range(first_page, last_page + 1, members_per_page)
-        )
+        last_page = ((member_offset + member_count - 1) // members_per_page) * members_per_page
+        member_page_keys.update(range(first_page, last_page + 1, members_per_page))
     return member_page_keys
 
 
@@ -2910,14 +2625,10 @@ def _selected_v4_page_members(
     for member in members:
         if seen_members is not None:
             if member in seen_members:
-                raise PTG2SharedBlockError(
-                    "PTG V4 ordered relation members are not unique"
-                )
+                raise PTG2SharedBlockError("PTG V4 ordered relation members are not unique")
             seen_members.add(member)
         elif previous_member is not None and previous_member >= member:
-            raise PTG2SharedBlockError(
-                "PTG V4 relation members are not unique and ordered"
-            )
+            raise PTG2SharedBlockError("PTG V4 relation members are not unique and ordered")
         previous_member = member
         if allowed_members is None or member in allowed_members:
             selected_members.append(member)
@@ -2932,16 +2643,8 @@ def _decode_v4_owner_members(
 ) -> tuple[int, ...]:
     selected_members: list[int] = []
     previous_member: int | None = None
-    seen_members: set[int] | None = (
-        set()
-        if lookup.relation in PTG2_V4_ORDER_PRESERVING_RELATIONS
-        else None
-    )
-    allowed_members = (
-        None
-        if lookup.allowed_member_keys is None
-        else frozenset(lookup.allowed_member_keys)
-    )
+    seen_members: set[int] | None = set() if lookup.relation in PTG2_V4_ORDER_PRESERVING_RELATIONS else None
+    allowed_members = None if lookup.allowed_member_keys is None else frozenset(lookup.allowed_member_keys)
     remaining = int(member_count)
     cursor = int(member_offset)
     while remaining:
@@ -2950,14 +2653,12 @@ def _decode_v4_owner_members(
         local_offset = cursor - page_key
         page = members_by_page.get(page_key)
         if page is None or local_offset >= len(page):
-            raise PTG2SharedBlockError(
-                "PTG V4 locator points outside its member page"
-            )
+            raise PTG2SharedBlockError("PTG V4 locator points outside its member page")
         take = min(remaining, len(page) - local_offset)
         if take <= 0:
             raise PTG2SharedBlockError("PTG V4 member page cannot advance")
         selected, previous_member = _selected_v4_page_members(
-            page[local_offset:local_offset + take],
+            page[local_offset : local_offset + take],
             previous_member=previous_member,
             seen_members=seen_members,
             allowed_members=allowed_members,
@@ -3121,9 +2822,7 @@ async def lookup_v4_ordered_prefixes(
 
     normalized_max_members = int(max_members)
     if normalized_max_members < 0:
-        raise PTG2SharedBlockError(
-            "PTG V4 ordered prefix maximum cannot be negative"
-        )
+        raise PTG2SharedBlockError("PTG V4 ordered prefix maximum cannot be negative")
     request = _V4RelationLookupRequest(
         snapshot_key=snapshot_key,
         relation="set_npi_prefix_override",
@@ -3157,7 +2856,7 @@ async def v4_npi_keys_for_values(
         text(
             f"""
             SELECT npi_key, npi
-              FROM {schema}.{PTG2_V4_NPI_TABLE}
+              FROM {snapshot_candidate_relation(session, schema, PTG2_V4_NPI_TABLE)}
              WHERE snapshot_key = :snapshot_key
                AND npi = ANY(CAST(:npis AS bigint[]))
             """
@@ -3166,9 +2865,7 @@ async def v4_npi_keys_for_values(
     )
     return {
         int(npi_key_record["npi"]): int(npi_key_record["npi_key"])
-        for npi_key_record in (
-            _row_mapping(raw_row) for raw_row in key_lookup_result
-        )
+        for npi_key_record in (_row_mapping(raw_row) for raw_row in key_lookup_result)
     }
 
 
@@ -3187,9 +2884,7 @@ async def v4_npi_values_for_keys(
     _charge_v4_hot_npi_work(
         PTG2_V4_HOT_NPI_RELATION,
         member_count=len(normalized_keys),
-        byte_count=(
-            len(normalized_keys) * PTG2_V4_NPI_DICTIONARY_ENTRY_BYTES
-        ),
+        byte_count=(len(normalized_keys) * PTG2_V4_NPI_DICTIONARY_ENTRY_BYTES),
         dictionary_read_count=1,
     )
     schema = _quote_ident(schema_name)
@@ -3197,7 +2892,7 @@ async def v4_npi_values_for_keys(
         text(
             f"""
             SELECT npi_key, npi
-              FROM {schema}.{PTG2_V4_NPI_TABLE}
+              FROM {snapshot_candidate_relation(session, schema, PTG2_V4_NPI_TABLE)}
              WHERE snapshot_key = :snapshot_key
                AND npi_key = ANY(CAST(:npi_keys AS integer[]))
             """
@@ -3206,7 +2901,5 @@ async def v4_npi_values_for_keys(
     )
     return {
         int(npi_value_record["npi_key"]): int(npi_value_record["npi"])
-        for npi_value_record in (
-            _row_mapping(raw_row) for raw_row in value_lookup_result
-        )
+        for npi_value_record in (_row_mapping(raw_row) for raw_row in value_lookup_result)
     }

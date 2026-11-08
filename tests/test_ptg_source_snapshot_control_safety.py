@@ -80,12 +80,14 @@ def test_manual_removal_rejects_in_flight_snapshot(monkeypatch, snapshot_status)
             return_value={
                 "snapshot_id": "snap_retry",
                 "status": snapshot_status,
-                "manifest": {"serving_index": {
-                    "source_key": "source_a",
-                    "arch_version": "postgres_binary_v3",
-                    "storage_generation": "shared_blocks_v3",
-                    "shared_snapshot_key": 11,
-                }},
+                "manifest": {
+                    "serving_index": {
+                        "source_key": "source_a",
+                        "arch_version": "postgres_binary_v3",
+                        "storage_generation": "shared_blocks_v3",
+                        "shared_snapshot_key": 11,
+                    }
+                },
             }
         ),
     )
@@ -119,26 +121,30 @@ def test_manual_removal_allows_unreferenced_validated_candidate(monkeypatch):
             return_value={
                 "snapshot_id": "snap_validated",
                 "status": "validated",
-                "manifest": {"serving_index": {
-                    "source_key": "source_a",
-                    "arch_version": "postgres_binary_v3",
-                    "storage_generation": "shared_blocks_v3",
-                    "shared_snapshot_key": 11,
-                }},
+                "manifest": {
+                    "serving_index": {
+                        "source_key": "source_a",
+                        "arch_version": "postgres_binary_v3",
+                        "storage_generation": "shared_blocks_v3",
+                        "shared_snapshot_key": 11,
+                    }
+                },
             }
         ),
     )
     monkeypatch.setattr(
         source_snapshot_control,
         "_current_references",
-        AsyncMock(return_value={
-            "global_slots": [],
-            "source_keys": [],
-            "plan_source_keys": [],
-            "previous_global_slots": [],
-            "previous_source_keys": [],
-            "previous_plan_source_keys": [],
-        }),
+        AsyncMock(
+            return_value={
+                "global_slots": [],
+                "source_keys": [],
+                "plan_source_keys": [],
+                "previous_global_slots": [],
+                "previous_source_keys": [],
+                "previous_plan_source_keys": [],
+            }
+        ),
     )
     monkeypatch.setattr(
         source_snapshot_control,
@@ -205,12 +211,14 @@ def test_manual_retire_rejects_in_flight_snapshot(monkeypatch, snapshot_status):
             return_value={
                 "snapshot_id": "snap_retry",
                 "status": snapshot_status,
-                "manifest": {"serving_index": {
-                    "source_key": "source_a",
-                    "arch_version": "postgres_binary_v3",
-                    "storage_generation": "shared_blocks_v3",
-                    "shared_snapshot_key": 11,
-                }},
+                "manifest": {
+                    "serving_index": {
+                        "source_key": "source_a",
+                        "arch_version": "postgres_binary_v3",
+                        "storage_generation": "shared_blocks_v3",
+                        "shared_snapshot_key": 11,
+                    }
+                },
             }
         ),
     )
@@ -232,18 +240,19 @@ def test_manual_retire_rejects_legacy_manifest_before_pointer_mutation(monkeypat
     monkeypatch.setattr(
         source_snapshot_control,
         "_snapshot_row",
-        AsyncMock(return_value={
-            "snapshot_id": "snap_legacy",
-            "status": "published",
-            "manifest": {"serving_index": {"source_key": "source_a"}},
-        }),
+        AsyncMock(
+            return_value={
+                "snapshot_id": "snap_legacy",
+                "status": "published",
+                "manifest": {"serving_index": {"source_key": "source_a"}},
+            }
+        ),
     )
     monkeypatch.setattr(source_snapshot_control.db, "transaction", lambda: transaction)
 
     with pytest.raises(
         ValueError,
-        match="postgres_binary_v3/shared_blocks_v3 or "
-        "postgres_binary_v3/shared_blocks_v4",
+        match="postgres_binary_v3/shared_blocks_v3 or postgres_binary_v3/shared_blocks_v4",
     ):
         asyncio.run(
             source_snapshot_control.retire_ptg2_source_snapshot(
@@ -256,8 +265,14 @@ def test_manual_retire_rejects_legacy_manifest_before_pointer_mutation(monkeypat
 
 
 def test_current_references_include_previous_pointer_columns(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_PLAN_REGISTRY_SCHEMA", "registry_data")
+
     async def pointer_rows(statement, **params):
+        if "AS bindings_exist" in statement:
+            return [{"bindings_exist": True, "source_header_exists": True, "header_exists": True}]
         assert params == {"snapshot_id": "snap_a"}
+        if "hp_plan_release_binding" in statement:
+            return [{"serving_revision_id": "retained-source", "role": "in_network", "binding_ordinal": 1}]
         if "ptg2_snapshot_pin" in statement:
             return [
                 {
@@ -286,18 +301,15 @@ def test_current_references_include_previous_pointer_columns(monkeypatch):
 
     monkeypatch.setattr(source_snapshot_control.db, "all", pointer_rows)
 
-    references = asyncio.run(
-        source_snapshot_control._current_references("mrf", "snap_a")
-    )
+    references = asyncio.run(source_snapshot_control._current_references("mrf", "snap_a"))
 
     assert references["previous_global_slots"] == ["current"]
     assert references["previous_source_keys"] == ["source_a"]
     assert references["previous_plan_source_keys"] == ["plan_source_a"]
-    assert references["plan_release_pins"] == [
-        "plan_release_serving_revision:hpserve_example"
-    ]
+    assert references["plan_release_pins"] == ["plan_release_serving_revision:hpserve_example"]
     assert references["plan_release_bindings"] == [
-        "hpserve_example:in_network:0"
+        "hpserve_example:in_network:0",
+        "retained-source:in_network:1",
     ]
 
 
@@ -313,14 +325,8 @@ async def test_unscoped_pointer_delete_omits_source_filter(monkeypatch):
         snapshot_id="snapshot-a",
         source_key=None,
     ) == (2, 1)
-    assert all(
-        call.kwargs == {"snapshot_id": "snapshot-a"}
-        for call in status.await_args_list
-    )
-    assert all(
-        "source_key = :source_key" not in call.args[0]
-        for call in status.await_args_list
-    )
+    assert all(call.kwargs == {"snapshot_id": "snapshot-a"} for call in status.await_args_list)
+    assert all("source_key = :source_key" not in call.args[0] for call in status.await_args_list)
 
 
 def test_snapshot_cache_clear_uses_available_resolver_cache(monkeypatch):

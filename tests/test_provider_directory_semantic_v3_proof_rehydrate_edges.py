@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tests.provider_directory_proof_memory_support import proof_memory_authority as proof_memory_authority
 from tests.provider_directory_semantic_v3_coverage_support import (
     LEGACY_CONTRACT,
     PROJECTION_DATE,
@@ -20,14 +21,11 @@ from tests.provider_directory_semantic_v3_coverage_support import (
     semantic_parent_metadata,
 )
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 proof_store = importlib.import_module("process.provider_directory_proof_store")
 resource_hash = importlib.import_module("process.provider_directory_resource_hash")
 rehydrate = importlib.import_module("process.provider_directory_dataset_rehydrate")
-rehydrate_scope = importlib.import_module(
-    "process.provider_directory_dataset_rehydrate_scope"
-)
+rehydrate_scope = importlib.import_module("process.provider_directory_dataset_rehydrate_scope")
 
 
 def test_locked_candidate_translates_invalid_persisted_identity() -> None:
@@ -46,9 +44,7 @@ def test_twin_root_contract_rejects_proof_scope_mismatch(
         "_dataset_proof_resource_scope",
         lambda *_args: ("Location",),
     )
-    baseline_by_field = {
-        "publication_metadata_json": semantic_parent_metadata()
-    }
+    baseline_by_field = {"publication_metadata_json": semantic_parent_metadata()}
 
     with pytest.raises(RuntimeError, match="verification_baseline_incompatible"):
         importer._assert_twin_root_resource_hash_contract(
@@ -92,9 +88,7 @@ def test_proof_parent_metadata_rejects_invalid_json() -> None:
         proof_store.ProviderDirectoryProofStoreError,
         match="parent resource scope is invalid",
     ):
-        proof_store._decoded_proof_parent_metadata(
-            {"publication_metadata_json": "{"}
-        )
+        proof_store._decoded_proof_parent_metadata({"publication_metadata_json": "{"})
 
 
 def test_proof_parent_hash_identity_fences_contract_and_scope(
@@ -263,9 +257,7 @@ def test_practitioner_hash_helpers_reject_invalid_name_and_hash_shapes() -> None
         with pytest.raises(ValueError, match="practitioner_names_invalid"):
             resource_hash.canonical_practitioner_names(names)
 
-    assert resource_hash._practitioner_primary_name_projection(
-        [{"given": "Taylor"}]
-    )["given_names"] == []
+    assert resource_hash._practitioner_primary_name_projection([{"given": "Taylor"}])["given_names"] == []
 
     with pytest.raises(ValueError, match="practitioner_payload_invalid"):
         resource_hash.practitioner_semantic_base_payload({})

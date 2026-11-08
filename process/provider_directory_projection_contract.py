@@ -70,6 +70,7 @@ PROJECTION_REDUCER_PROOF_CONTRACT_ID = (
 PROJECTION_WINNER_POLICY_CONTRACT_ID = (
     "healthporta.provider-directory.minimum-source-rank-payload-hash-winner.v1"
 )
+CMS_NPD_NPI_IDENTITY_POLICY = "explicit-only-v1"
 _COMPLETENESS_FIELDS = frozenset(
     {
         "block_count",
@@ -532,11 +533,29 @@ def _validated_transform_context(
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_as_of_date_invalid"
         ) from error
+    if "npi_identity_policy" in transform_context:
+        policy = transform_context["npi_identity_policy"]
+        if policy != CMS_NPD_NPI_IDENTITY_POLICY:
+            raise ProviderDirectoryProjectionError(
+                "provider_directory_projection_npi_identity_policy_invalid"
+            )
+        normalized_context_map["npi_identity_policy"] = policy
     if set(transform_context) != set(normalized_context_map):
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_transform_context_invalid"
         )
     return normalized_context_map
+
+
+def _validate_cms_npi_policy(
+    normalized_sources: tuple[str, ...], normalized_context_map: Mapping[str, str]
+) -> None:
+    """Require an explicit CMS-only identity policy in physical recipes."""
+    if "cms-npd" in normalized_sources:
+        if normalized_sources != ("cms-npd",) or normalized_context_map.get("npi_identity_policy") != CMS_NPD_NPI_IDENTITY_POLICY:
+            raise ProviderDirectoryProjectionError("provider_directory_projection_cms_npd_npi_policy_required")
+    elif "npi_identity_policy" in normalized_context_map:
+        raise ProviderDirectoryProjectionError("provider_directory_projection_npi_identity_policy_source_invalid")
 
 
 def _recipe_components(
@@ -563,6 +582,7 @@ def _recipe_components(
         completeness_proof_map,
     ) = _validated_recipe_resources(source_ids, resource_profile)
     normalized_context_map = _validated_transform_context(transform_context)
+    _validate_cms_npi_policy(normalized_sources, normalized_context_map)
     return {
         "decoder_contract_id": required_text(
             decoder_contract_id,
@@ -751,23 +771,7 @@ def _physical_projection_recipe_fields(
 ) -> tuple[dict[str, str], tuple[str, ...], tuple[str, ...]]:
     """Validate the transform context and resource lists independently."""
 
-    context_map = {
-        "as_of_date": required_text(
-            recipe.transform_context.get("as_of_date"),
-            "as_of_date",
-            limit=10,
-        ),
-        "time_rule_contract_id": required_text(
-            recipe.transform_context.get("time_rule_contract_id"),
-            "time_rule_contract_id",
-        ),
-    }
-    try:
-        dt.date.fromisoformat(context_map["as_of_date"])
-    except ValueError as error:
-        raise ProviderDirectoryProjectionError(
-            "provider_directory_projection_as_of_date_invalid"
-        ) from error
+    context_map = _validated_transform_context(recipe.transform_context)
     selected_resources = sorted_unique_texts(
         recipe.selected_resources,
         "selected_resource",

@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -13,6 +15,7 @@ from process import uhc_flex_practitioner_result_store as result_store
 from process import uhc_flex_practitioner_store as store
 from process import uhc_flex_practitioner_store_contract as store_contract
 from process import uhc_flex_practitioner_store_support as store_support
+from process import uhc_flex_practitioner_stage as stage
 from tests.test_uhc_flex_practitioner_store import (
     _identity,
     _matched_result,
@@ -51,6 +54,61 @@ class _Database:
     async def all(self, statement, **parameters):
         self.statements.append((statement, parameters))
         return self.all_rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_transaction, count", ((False, 1), (True, 0), (True, 17)))
+async def test_resource_copy_requires_transaction_and_bounded_response(monkeypatch, has_transaction, count):
+    """Invalid response admission never prepares or copies a temporary heap."""
+    database = SimpleNamespace(scalar=AsyncMock())
+    copier = AsyncMock()
+    monkeypatch.setattr(stage, "_copy_driver", copier)
+    with pytest.raises(store_contract.UHCFlexPractitionerStoreError, match="state"):
+        await stage.copy_resource_stage(database, object() if has_transaction else None, [{}] * count)
+    database.scalar.assert_not_awaited()
+    copier.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", (None, b"{}", "x", "é" * 524289), ids=("missing", "bytes", "short", "utf8_bytes"))
+async def test_resource_copy_rejects_malformed_or_oversized_text_before_prepare(monkeypatch, payload):
+    """The payload cap measures UTF-8 bytes, including multibyte source text."""
+    database = SimpleNamespace(scalar=AsyncMock())
+    copier = AsyncMock()
+    monkeypatch.setattr(stage, "_copy_driver", copier)
+    with pytest.raises(store_contract.UHCFlexPractitionerStoreError, match="state"):
+        await stage.copy_resource_stage(database, object(), [{"payload_json_text": payload}])
+    database.scalar.assert_not_awaited()
+    copier.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resource_short_copy_never_admits_manifest(monkeypatch):
+    """A driver census mismatch stops before the trusted admission function."""
+    database = SimpleNamespace(scalar=AsyncMock())
+    driver = SimpleNamespace(copy_records_to_table=AsyncMock(return_value="COPY 0"))
+    monkeypatch.setattr(stage, "_copy_driver", AsyncMock(return_value=driver))
+    resources = [{"resource_id": "one", "payload_sha256": "a" * 64, "payload_json_text": "{}"}]
+    with pytest.raises(store_contract.UHCFlexPractitionerStoreError, match="state"):
+        await result_store._insert_resource_manifest(database, _terminal_claim("baseline"), resources, transaction=object())
+    database.scalar.assert_awaited_once()
+    assert "prepare_pd_uhc_flex_practitioner_stage" in database.scalar.call_args.args[0]
+    driver.copy_records_to_table.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("copy_status, expected_count", (("COPY 0", 1), ("COPY 1", 2)))
+async def test_work_copy_mismatch_never_finishes_candidate(monkeypatch, copy_status, expected_count):
+    """Both per-batch and whole-cohort counts must match before indexed admission."""
+    identity = SimpleNamespace(acquisition_id="acquisition", cohort_id="cohort", expected_npi_count=expected_count)
+    database = SimpleNamespace(scalar=AsyncMock(return_value="candidate_work"), all=AsyncMock(side_effect=[[(NPI,)], []]))
+    driver = SimpleNamespace(copy_records_to_table=AsyncMock(return_value=copy_status))
+    monkeypatch.setattr(stage, "_copy_driver", AsyncMock(return_value=driver))
+    with pytest.raises(store_contract.UHCFlexPractitionerStoreError, match="state"):
+        await store._insert_pending_workset(database, identity, object())
+    database.scalar.assert_awaited_once()
+    assert "prepare_pd_uhc_flex_practitioner_work" in database.scalar.call_args.args[0]
+    assert database.all.await_count == (1 if copy_status == "COPY 0" else 2)
 
 
 def _header_row(identity, *, status="building"):
@@ -214,21 +272,6 @@ async def test_claim_rejects_invalid_fresh_only_selection():
 
 
 @pytest.mark.asyncio
-async def test_initialize_rejects_an_inexact_workset():
-    identity = _identity()
-    header = _header_row(identity)
-    database = _Database(
-        first_rows=(header, {"work_count": 0, "exact_members": False}),
-        status_counts=(1, 1),
-    )
-    with pytest.raises(store_contract.UHCFlexPractitionerStoreError):
-        await store.initialize_uhc_flex_practitioner_acquisition(
-            identity,
-            database=database,
-        )
-
-
-@pytest.mark.asyncio
 async def test_result_store_rejects_invalid_inputs_and_lost_fences():
     claim = _terminal_claim("baseline")
     query_result = _matched_result()
@@ -288,9 +331,7 @@ async def test_seal_replay_and_manifest_cursor_boundaries():
     assert "cohort_complete = (census.error_count = 0)" in seal_sql
     assert "exhausted.attempt_count < :max_attempts" in seal_sql
     assert parameters["max_attempts"] == 8
-    assert parameters["retry_exhausted_error_code"] == (
-        "retry_exhausted_transport"
-    )
+    assert parameters["retry_exhausted_error_code"] == ("retry_exhausted_transport")
 
     summary = await result_store.seal_uhc_flex_practitioner_acquisition(
         identity,

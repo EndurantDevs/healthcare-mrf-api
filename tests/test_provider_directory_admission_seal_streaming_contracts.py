@@ -3,16 +3,19 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
 import hashlib
 import importlib
 import json
-from pathlib import Path
 import struct
+from decimal import Decimal
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from process import provider_directory_admission_stream as admission_stream
+from process import provider_directory_admission_validation as admission_validation
+from process import provider_directory_proof_store as proof_store
 from process.provider_directory_admission_seal import (
     ADMISSION_METADATA_SUMMARY_MAX_BYTES,
     AdmissionSealError,
@@ -31,7 +34,6 @@ from tests.test_provider_directory_dataset_selection_bounded_db import (
     _proof_line_hash,
 )
 from tests.uhc_final_publication_test_support import final_publication_fixture
-
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -59,6 +61,93 @@ def _reseal(proof: dict[str, object]) -> None:
             separators=(",", ":"),
         ).encode()
     ).hexdigest()
+
+
+@pytest.mark.parametrize("finalized_count", [1, 2, 3])
+@pytest.mark.parametrize(
+    "proof_contract,hash_contract",
+    [
+        (proof_store.PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID, "semantic_content_v3"),
+        (proof_store.PROVIDER_DIRECTORY_SEMANTIC_CONTENT_V4_PROOF_CONTRACT_ID, "semantic_content_v4"),
+    ],
+)
+def test_streamed_semantic_descriptor_occurrences_cover_finalized_identities(
+    tmp_path, finalized_count, proof_contract, hash_contract
+):
+    metadata = _large_metadata_by_field(2)
+    proof = metadata[importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY]
+    proof["contract_id"] = proof_contract
+    proof["resource_hash_contract"] = metadata["resource_hash_contract"] = hash_contract
+    proof["resource_count"] = finalized_count
+    proof["resource_counts"]["Location"] = finalized_count
+    _reseal(proof)
+    path = tmp_path / "metadata.copy"
+    _binary_copy(metadata, path)
+    if finalized_count <= 2:
+        receipt = _validate_copy(path, resource_count=finalized_count)
+        assert receipt.proof_sha256 == proof["proof_sha256"]
+    else:
+        with pytest.raises(AdmissionSealError, match="shard resource total changed"):
+            _validate_copy(path, resource_count=finalized_count)
+
+
+def _legacy_metadata(finalized_count, hash_contract):
+    metadata = _large_metadata_by_field(2)
+    proof = metadata["provider_directory_content_proof_v1"]
+    proof["contract_id"] = proof_store.PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID
+    for field in ("proof_resource_scope", "resource_hash_contract", "semantic_projection_as_of", "semantic_union"):
+        proof.pop(field)
+    metadata.pop("proof_resource_scope")
+    metadata.pop("semantic_projection_as_of")
+    metadata["resource_hash_contract"] = hash_contract
+    proof["resource_count"] = finalized_count
+    proof["resource_counts"]["Location"] = finalized_count
+    _reseal(proof)
+    return metadata
+
+
+@pytest.mark.parametrize("finalized_count", [1, 2, 3])
+@pytest.mark.parametrize("hash_contract", ["transport_bound_v1", "transport_neutral_v2"])
+def test_streamed_nonsemantic_proofs_require_exact_occurrence_counts(tmp_path, finalized_count, hash_contract):
+    metadata = _legacy_metadata(finalized_count, hash_contract)
+    path = tmp_path / "metadata.copy"
+    _binary_copy(metadata, path)
+    if finalized_count == 2:
+        assert _validate_copy(path).admission_kind == "generic"
+    else:
+        with pytest.raises(AdmissionSealError, match="shard resource total changed"):
+            _validate_copy(path, resource_count=finalized_count)
+
+
+def test_legacy_proof_identity_keeps_exact_counts_when_nonlegacy_flag_is_supplied():
+    metadata = _legacy_metadata(1, "transport_neutral_v2")
+    stream = SimpleNamespace(
+        metadata=metadata,
+        proof_header=metadata["provider_directory_content_proof_v1"],
+        resource_count=2,
+        resource_counts={"Location": 2},
+    )
+    expected = admission_validation._AdmissionCopyExpectation(
+        "dataset_shared", "endpoint_shared", "root-shared", "e" * 64, 1
+    )
+    lineage, is_legacy, _ = admission_validation._validated_lineage_context(stream, expected)
+    assert is_legacy
+    with pytest.raises(proof_store.ProviderDirectoryProofStoreError, match="shard resource total changed"):
+        admission_validation._require_exact_resource_scope(stream, expected, lineage, is_legacy_contract=False)
+
+
+@pytest.mark.parametrize("finalized_count", [1, 2, 3])
+def test_streamed_unknown_proof_contracts_remain_refused_before_counts(tmp_path, finalized_count):
+    metadata = _large_metadata_by_field(2)
+    proof = metadata["provider_directory_content_proof_v1"]
+    proof["contract_id"] = "unsupported-proof-contract"
+    proof["resource_count"] = finalized_count
+    proof["resource_counts"]["Location"] = finalized_count
+    _reseal(proof)
+    path = tmp_path / "metadata.copy"
+    _binary_copy(metadata, path)
+    with pytest.raises(AdmissionSealError, match="lineage is invalid"):
+        _validate_copy(path, resource_count=finalized_count)
 
 
 @pytest.mark.parametrize(
@@ -231,9 +320,7 @@ def test_receipt_digest_preserves_large_integer_identity():
     first = 10000000000000000000000000001
     second = first + 1
 
-    assert canonical_payload_sha256({"value": first}) != (
-        canonical_payload_sha256({"value": second})
-    )
+    assert canonical_payload_sha256({"value": first}) != (canonical_payload_sha256({"value": second}))
     assert canonical_payload_sha256({"value": 10**4300})
 
 
@@ -354,9 +441,7 @@ def test_streaming_copy_validates_bounded_legacy_canonical_proof(tmp_path: Path)
     )
 
     assert receipt.admission_kind == "uhc_canonical"
-    assert receipt.proof_sha256 == metadata[
-        "uhc_canonical_content_proof_v1"
-    ]["proof_sha256"]
+    assert receipt.proof_sha256 == metadata["uhc_canonical_content_proof_v1"]["proof_sha256"]
     assert "uhc_canonical_content_proof_v1" not in receipt.metadata_summary
 
 
@@ -391,12 +476,8 @@ def test_streaming_copy_rejects_canonical_root_lineage_change(
 
 
 def test_production_selection_prefers_fixed_receipts_and_caps_legacy_json():
-    projection, publication_lateral = (
-        importer._artifact_dataset_option_projection_parts(True)
-    )
-    candidate_ctes = importer._artifact_candidate_eligibility_ctes(
-        "dataset_table"
-    )
+    projection, publication_lateral = importer._artifact_dataset_option_projection_parts(True)
+    candidate_ctes = importer._artifact_candidate_eligibility_ctes("dataset_table")
     fence_sql = importer._artifact_fence_dataset_rows_sql(for_update=False)
 
     for sql in (projection, publication_lateral, candidate_ctes, fence_sql):

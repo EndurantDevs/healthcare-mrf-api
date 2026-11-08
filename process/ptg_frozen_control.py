@@ -24,6 +24,7 @@ from process.ptg_singleton_direct_control import (
     protected_singleton_direct_presence,
 )
 from process.ptg_singleton_direct_errors import SingletonDirectValidationError
+from process.ptg_parts.source_jobs import validated_in_network_urls
 
 
 def frozen_rate_failure_payload(
@@ -108,6 +109,7 @@ async def validated_worker_rate_params(
 ) -> dict[str, Any]:
     """Validate one protected singleton or multipart worker envelope."""
 
+    validated_in_network_urls(params_by_name)
     if protected_singleton_direct_presence(params_by_name):
         normalized_params = validated_worker_singleton_direct_params(
             task_payload,
@@ -126,6 +128,7 @@ def normalize_protected_rate_params(
 ) -> dict[str, Any]:
     """Validate exactly one protected singleton or multipart envelope."""
 
+    validated_in_network_urls(params_by_name)
     if protected_singleton_direct_presence(params_by_name):
         return normalize_protected_singleton_direct_params(params_by_name)
     return normalize_protected_frozen_rate_params(params_by_name)

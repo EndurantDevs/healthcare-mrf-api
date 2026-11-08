@@ -18,45 +18,52 @@ from api.ptg2_candidate_audit_coordinates import (
     validate_persisted_audit_graph_scope,
     validate_persisted_audit_price_scope,
 )
-from api.ptg2_candidate_audit_graph import provider_set_keys_by_npi
 from api.ptg2_candidate_audit_forward import (
     CandidatePriceLoaders,
     load_candidate_price_data,
 )
+from api.ptg2_candidate_audit_graph import provider_set_keys_by_npi
 from api.ptg2_candidate_audit_integrity import (
     PersistedAuditOccurrence,
     validate_candidate_source_scope,
 )
 from api.ptg2_candidate_audit_networks import (
     _network_record_fields as _record_fields,
+)
+from api.ptg2_candidate_audit_networks import (
     provider_network_digests_by_key as _network_digests_by_key,
+)
+from api.ptg2_candidate_audit_networks import (
     provider_network_names_by_key as _network_names_by_key,
 )
 from api.ptg2_candidate_audit_price_load import (
     CandidatePriceLoad as _CandidatePriceLoad,
 )
-from api.ptg2_candidate_audit_reverse import load_candidate_provider_scope
-from api.ptg2_db_sidecars import (
-    lookup_forward_price_index_from_db,
-    lookup_shared_graph_members_from_db,
-)
-from api.ptg2_shared_blocks import bind_shared_block_decoded_retention_budget
 from api.ptg2_candidate_audit_projection import (
     CandidatePriceData,
     _build_canonical_candidate_tuple,
     candidate_availability_index,
 )
+from api.ptg2_candidate_audit_reverse import load_candidate_provider_scope
 from api.ptg2_candidate_audit_selection import (
     load_candidate_provider_indexes as _load_candidate_provider_indexes,
+)
+from api.ptg2_candidate_audit_selection import (
     required_candidate_occurrence_keys as _required_candidate_occurrence_keys,
+)
+from api.ptg2_db_sidecars import (
+    lookup_forward_price_index_from_db,
+    lookup_shared_graph_members_from_db,
 )
 from api.ptg2_serving import (
     PTG2_SCHEMA,
+    _payload_schema,
     _required_shared_snapshot_key,
     _required_source_count,
     _version_three_forward_lookup_hints,
     _version_three_price_hydration,
 )
+from api.ptg2_shared_blocks import bind_shared_block_decoded_retention_budget
 from api.ptg2_tables import snapshot_serving_tables
 from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
@@ -102,9 +109,7 @@ class _CandidateScopeIndexes:
     provider_sets_by_npi_code: Mapping[tuple[int, int], tuple[int, ...]]
     provider_filters_by_code_key: Mapping[int, tuple[int, ...]]
     network_digests_by_key: Mapping[int, frozenset[str]]
-    preloaded_price_keys_by_occurrence: Mapping[
-        tuple[int, int, int], tuple[int, ...]
-    ] | None = None
+    preloaded_price_keys_by_occurrence: Mapping[tuple[int, int, int], tuple[int, ...]] | None = None
 
 
 async def _provider_set_keys_by_npi(
@@ -121,7 +126,7 @@ async def _provider_set_keys_by_npi(
         lookup_shared_graph_members_from_db,
         session,
         _required_shared_snapshot_key(serving_tables),
-        PTG2_SCHEMA,
+        _payload_schema(serving_tables, default_schema=PTG2_SCHEMA),
         challenges,
         persisted_audit_occurrences,
         retention_budget=retention_budget,
@@ -141,7 +146,7 @@ async def _provider_network_names_by_key(
         serving_tables,
         provider_set_keys,
         retention_budget,
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables, default_schema=PTG2_SCHEMA),
     )
 
 
@@ -161,7 +166,7 @@ async def _candidate_forward_price_keys(
         occurrence_keys=required_occurrence_keys,
         shared_snapshot_key=_required_shared_snapshot_key(serving_tables),
         source_count=_required_source_count(serving_tables),
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables, default_schema=PTG2_SCHEMA),
         retention_budget=retention_budget,
         **_version_three_forward_lookup_hints(serving_tables),
     )
@@ -184,6 +189,7 @@ async def _candidate_audit_data(
         session,
         serving_tables,
         audit_request,
+        candidate_audit_access=access,
     )
     return await _candidate_data_for_conditions(
         session,
@@ -224,9 +230,7 @@ async def _candidate_data_for_conditions(
         scope_indexes.provider_sets_by_npi_code,
         scope_indexes.provider_filters_by_code_key,
         persisted_audit_occurrences,
-        preloaded_price_keys_by_occurrence=(
-            scope_indexes.preloaded_price_keys_by_occurrence
-        ),
+        preloaded_price_keys_by_occurrence=(scope_indexes.preloaded_price_keys_by_occurrence),
         retention_budget=retention_budget,
     )
     validate_persisted_audit_price_scope(
@@ -265,9 +269,7 @@ async def _candidate_scope_indexes(
         serving_tables,
         access,
         challenges,
-        persisted_code_keys=(
-            occurrence.code_key for occurrence in persisted_audit_occurrences
-        ),
+        persisted_code_keys=(occurrence.code_key for occurrence in persisted_audit_occurrences),
         retention_budget=retention_budget,
     )
     provider_scope = await load_candidate_provider_scope(
@@ -277,7 +279,7 @@ async def _candidate_scope_indexes(
         challenges,
         persisted_audit_occurrences,
         code_index,
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables, default_schema=PTG2_SCHEMA),
         retention_budget=retention_budget,
     )
     provider_set_keys_by_npi = provider_scope.provider_set_keys_by_npi
@@ -293,7 +295,7 @@ async def _candidate_scope_indexes(
         code_index,
         provider_set_keys_by_npi,
         persisted_audit_occurrences,
-        schema_name=PTG2_SCHEMA,
+        schema_name=_payload_schema(serving_tables, default_schema=PTG2_SCHEMA),
         retention_budget=retention_budget,
     )
     network_digests_by_key = await _provider_network_digests_by_key(
@@ -332,9 +334,7 @@ async def _load_candidate_price_data(
     challenges: Sequence[AuditBatchChallenge],
     code_records_by_pair: Mapping[tuple[str, str], Sequence[Mapping[str, Any]]],
     *scope_arguments: Any,
-    preloaded_price_keys_by_occurrence: (
-        Mapping[tuple[int, int, int], tuple[int, ...]] | None
-    ) = None,
+    preloaded_price_keys_by_occurrence: (Mapping[tuple[int, int, int], tuple[int, ...]] | None) = None,
     retention_budget: CandidateAuditDecodedRetentionBudget | None = None,
 ) -> _CandidatePriceLoad:
     """Retain exact forward rows, then hydrate each retained price once."""
@@ -371,9 +371,7 @@ def _is_challenge_match(
             required_network_digests,
             candidate_network_digests,
         )
-        for candidate_network_digests in (
-            audit_data.network_digest_sets_by_condition.get(condition_key, ())
-        )
+        for candidate_network_digests in (audit_data.network_digest_sets_by_condition.get(condition_key, ()))
     )
 
 
@@ -393,9 +391,7 @@ async def audit_candidate_source_witness_batch(
         raise PTG2ManifestArtifactError("PTG2 candidate audit access mismatch")
     retention_budget = CandidateAuditDecodedRetentionBudget()
     bind_shared_block_decoded_retention_budget(retention_budget)
-    await session.execute(
-        text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-    )
+    await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
     audit_data = await _candidate_audit_data(
         session,
         audit_request,
@@ -403,25 +399,17 @@ async def audit_candidate_source_witness_batch(
         retention_budget,
     )
     unmatched_conditions = [
-        challenge
-        for challenge in audit_data.challenges
-        if not _is_challenge_match(challenge, audit_data)
+        challenge for challenge in audit_data.challenges if not _is_challenge_match(challenge, audit_data)
     ]
     if unmatched_conditions:
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate source witness is missing from the sealed serving layout"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate source witness is missing from the sealed serving layout")
     return CandidateAuditBatchResult(
-        matched_challenge_count=sum(
-            challenge.multiplicity for challenge in audit_data.challenges
-        ),
+        matched_challenge_count=sum(challenge.multiplicity for challenge in audit_data.challenges),
         unique_challenge_count=len(audit_data.challenges),
         witness_io=audit_data.witness_io,
         candidate_processing_io=audit_data.candidate_processing_io,
         persisted_audit_occurrence_count=(audit_data.persisted_audit_occurrence_count),
-        validated_persisted_audit_occurrence_count=(
-            audit_data.persisted_audit_occurrence_count
-        ),
+        validated_persisted_audit_occurrence_count=(audit_data.persisted_audit_occurrence_count),
     )
 
 

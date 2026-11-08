@@ -48,25 +48,25 @@ async def test_generic_ptg_launch_holds_capacity_lock_through_external_start(mon
 
     monkeypatch.setattr(control_workers.db, "acquire", acquire)
     monkeypatch.setattr(control_workers, "acquire_ptg_admission_lock", capacity_lock)
-    monkeypatch.setattr(
-        control_workers, "acquire_control_run_worker_action_lock", worker_action_lock
-    )
+    monkeypatch.setattr(control_workers, "acquire_control_run_worker_action_lock", worker_action_lock)
     monkeypatch.setattr(control_workers, "require_not_wave_owned_run", not_wave_owned)
     monkeypatch.setattr(control_workers, "require_no_capacity_owning_wave", no_wave)
     monkeypatch.setattr(control_workers, "_admit_worker_ensure", admit)
     monkeypatch.setattr(control_workers.asyncio, "to_thread", launch)
 
-    launch_result = await control_workers._guarded_ptg_family_ensure(
-        {"run_id": "run-unit", "importer": "ptg"},
-        run_id="run-unit",
-        importer="ptg",
-        selected_specs=[control_workers._BY_QUEUE["arq:PTGSmall"]],
+    launch_result = await control_workers.guarded_ensure_worker(
+        {"run_id": "run-unit", "importer": "ptg", "queue": "arq:PTGSmall"}
     )
 
     assert launch_result["status"] == "started"
     assert events == [
-        "transaction-enter", "capacity-lock", "worker-action-lock",
-        "ownership-check", "wave-check", "source-admission", "worker-launch",
+        "transaction-enter",
+        "capacity-lock",
+        "worker-action-lock",
+        "ownership-check",
+        "wave-check",
+        "source-admission",
+        "worker-launch",
         "transaction-exit",
     ]
 
@@ -110,16 +110,31 @@ async def test_generic_ptg_launch_does_not_start_when_wave_owns_capacity(monkeyp
 
 @pytest.mark.asyncio
 async def test_ptg_family_requires_run_identity_but_fhir_remains_unfenced(monkeypatch):
-    ptg = await control_workers.guarded_ensure_worker(
-        {"importer": "ptg", "queue": "arq:PTGSmall"}
-    )
+    ptg = await control_workers.guarded_ensure_worker({"importer": "ptg", "queue": "arq:PTGSmall"})
     assert ptg["status"] == "failed"
     assert ptg["message"] == "PTG-family worker launch requires run_id"
 
-    async def admit(*_args, **_kwargs):
+    events = []
+    connection = object()
+
+    @asynccontextmanager
+    async def acquire():
+        events.append("enter")
+        yield connection
+        events.append("exit")
+
+    async def lock(actual, run_id):
+        assert actual is connection and run_id == "fhir-run-unit"
+        events.append("run-lock")
+
+    async def admit(payload, **options):
+        assert payload["importer"] == "provider-directory-fhir"
+        assert options["run_id"] == "fhir-run-unit"
+        events.append("admit")
         return None
 
     async def launch(_function, _payload):
+        events.append("launch")
         return {"status": "already_running", "items": []}
 
     async def unexpected(*_args, **_kwargs):  # pragma: no cover - safety assertion
@@ -128,9 +143,14 @@ async def test_ptg_family_requires_run_identity_but_fhir_remains_unfenced(monkey
     monkeypatch.setattr(control_workers, "_admit_worker_ensure", admit)
     monkeypatch.setattr(control_workers.asyncio, "to_thread", launch)
     monkeypatch.setattr(control_workers, "_guarded_ptg_family_ensure", unexpected)
+    monkeypatch.setattr(control_workers.db, "acquire", acquire)
+    monkeypatch.setattr(control_workers, "acquire_control_run_worker_action_lock", lock)
 
-    fhir = await control_workers.guarded_ensure_worker({
-        "run_id": "fhir-run-unit",
-        "importer": "provider-directory-fhir",
-    })
+    fhir = await control_workers.guarded_ensure_worker(
+        {
+            "run_id": "fhir-run-unit",
+            "importer": "provider-directory-fhir",
+        }
+    )
     assert fhir["status"] == "already_running"
+    assert events == ["enter", "run-lock", "admit", "launch", "exit"]

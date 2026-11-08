@@ -34,17 +34,9 @@
               FROM {{PRACTITIONER_REF}} AS practitioner
               JOIN typed_source_context
                 ON typed_source_context.source_id = practitioner.source_id
-             WHERE practitioner.npi IS NOT NULL
+             WHERE practitioner.npi IS NOT NULL{{PRACTITIONER_NPI_SCOPE_SQL}}
         ), dataset_practitioner_rows AS MATERIALIZED (
-            SELECT (
-                       jsonb_populate_record(
-                           NULL::{{PRACTITIONER_REF}},
-                           resource.payload_json::jsonb
-                           || jsonb_build_object(
-                               'source_id', dataset_source_context.source_id
-                           )
-                       )
-                   ).*,
+            SELECT {{PRACTITIONER_RECORD_PROJECTION_SQL}},
                    dataset_source_context.endpoint_id,
                    dataset_source_context.dataset_id,
                    dataset_source_context.canonical_api_base,
@@ -53,9 +45,9 @@
               FROM {{DATASET_RESOURCE_REF}} AS resource
               JOIN dataset_source_context
                 ON dataset_source_context.dataset_id = resource.dataset_id
-             WHERE resource.resource_type = 'Practitioner'
+             {{PRACTITIONER_RECORD_JOIN_SQL}}WHERE resource.resource_type = 'Practitioner'
                AND resource.resource_id =
-                   resource.payload_json::jsonb ->> 'resource_id'
+                   resource.payload_json::jsonb ->> 'resource_id'{{DATASET_PRACTITIONER_NPI_SCOPE_SQL}}
         ), practitioner_rows AS MATERIALIZED (
             SELECT * FROM typed_practitioner_rows
             UNION ALL
@@ -71,15 +63,7 @@
               JOIN typed_source_context
                 ON typed_source_context.source_id = role.source_id
         ), dataset_role_rows AS NOT MATERIALIZED (
-            SELECT (
-                       jsonb_populate_record(
-                           NULL::{{ROLE_REF}},
-                           resource.payload_json::jsonb
-                           || jsonb_build_object(
-                               'source_id', dataset_source_context.source_id
-                           )
-                       )
-                   ).*,
+            SELECT {{ROLE_RECORD_PROJECTION_SQL}},
                    dataset_source_context.endpoint_id,
                    dataset_source_context.dataset_id,
                    dataset_source_context.canonical_api_base,
@@ -88,7 +72,7 @@
               FROM {{DATASET_RESOURCE_REF}} AS resource
               JOIN dataset_source_context
                 ON dataset_source_context.dataset_id = resource.dataset_id
-             WHERE resource.resource_type = 'PractitionerRole'
+             {{ROLE_RECORD_JOIN_SQL}}WHERE resource.resource_type = 'PractitionerRole'
                AND resource.resource_id =
                    resource.payload_json::jsonb ->> 'resource_id'
         ), role_resource_rows AS NOT MATERIALIZED (
@@ -104,7 +88,7 @@
                AND practitioner.dataset_id = role.dataset_id
                AND practitioner.resource_id = {{ROLE_PRACTITIONER_RESOURCE_ID_SQL}}
              WHERE COALESCE(role.npi, practitioner.npi) IS NOT NULL
-               AND {{ROLE_BUCKET_SQL}}
+               AND {{ROLE_BUCKET_SQL}}{{ROLE_NPI_SCOPE_SQL}}
         ), typed_organization_rows AS MATERIALIZED (
             SELECT organization.*, typed_source_context.endpoint_id,
                    typed_source_context.dataset_id,
@@ -115,15 +99,7 @@
               JOIN typed_source_context
                 ON typed_source_context.source_id = organization.source_id
         ), dataset_organization_rows AS MATERIALIZED (
-            SELECT (
-                       jsonb_populate_record(
-                           NULL::{{ORGANIZATION_REF}},
-                           resource.payload_json::jsonb
-                           || jsonb_build_object(
-                               'source_id', dataset_source_context.source_id
-                           )
-                       )
-                   ).*,
+            SELECT {{ORGANIZATION_RECORD_PROJECTION_SQL}},
                    dataset_source_context.endpoint_id,
                    dataset_source_context.dataset_id,
                    dataset_source_context.canonical_api_base,
@@ -132,7 +108,7 @@
               FROM {{DATASET_RESOURCE_REF}} AS resource
               JOIN dataset_source_context
                 ON dataset_source_context.dataset_id = resource.dataset_id
-             WHERE resource.resource_type = 'Organization'
+             {{ORGANIZATION_RECORD_JOIN_SQL}}WHERE resource.resource_type = 'Organization'
                AND resource.resource_id =
                    resource.payload_json::jsonb ->> 'resource_id'
         ), organization_rows AS MATERIALIZED (
@@ -149,15 +125,7 @@
               JOIN typed_source_context
                 ON typed_source_context.source_id = affiliation.source_id
         ), dataset_affiliation_rows AS NOT MATERIALIZED (
-            SELECT (
-                       jsonb_populate_record(
-                           NULL::{{AFFILIATION_REF}},
-                           resource.payload_json::jsonb
-                           || jsonb_build_object(
-                               'source_id', dataset_source_context.source_id
-                           )
-                       )
-                   ).*,
+            SELECT {{AFFILIATION_RECORD_PROJECTION_SQL}},
                    dataset_source_context.endpoint_id,
                    dataset_source_context.dataset_id,
                    dataset_source_context.canonical_api_base,
@@ -166,7 +134,7 @@
               FROM {{DATASET_RESOURCE_REF}} AS resource
               JOIN dataset_source_context
                 ON dataset_source_context.dataset_id = resource.dataset_id
-             WHERE resource.resource_type = 'OrganizationAffiliation'
+             {{AFFILIATION_RECORD_JOIN_SQL}}WHERE resource.resource_type = 'OrganizationAffiliation'
                AND resource.resource_id =
                    resource.payload_json::jsonb ->> 'resource_id'
         ), affiliation_resource_rows AS NOT MATERIALIZED (
@@ -183,15 +151,7 @@
               JOIN typed_source_context
                 ON typed_source_context.source_id = service.source_id
         ), dataset_service_resource_rows AS MATERIALIZED (
-            SELECT (
-                       jsonb_populate_record(
-                           NULL::{{SERVICE_REF}},
-                           resource.payload_json::jsonb
-                           || jsonb_build_object(
-                               'source_id', dataset_source_context.source_id
-                           )
-                       )
-                   ).*,
+            SELECT {{SERVICE_RECORD_PROJECTION_SQL}},
                    dataset_source_context.endpoint_id,
                    dataset_source_context.dataset_id,
                    dataset_source_context.canonical_api_base,
@@ -200,7 +160,7 @@
               FROM {{DATASET_RESOURCE_REF}} AS resource
               JOIN dataset_source_context
                 ON dataset_source_context.dataset_id = resource.dataset_id
-             WHERE resource.resource_type = 'HealthcareService'
+             {{SERVICE_RECORD_JOIN_SQL}}WHERE resource.resource_type = 'HealthcareService'
                AND resource.resource_id =
                    resource.payload_json::jsonb ->> 'resource_id'
         ), service_resource_rows AS MATERIALIZED (
@@ -217,15 +177,7 @@
               JOIN typed_source_context
                 ON typed_source_context.source_id = endpoint.source_id
         ), dataset_endpoint_rows AS MATERIALIZED (
-            SELECT (
-                       jsonb_populate_record(
-                           NULL::{{ENDPOINT_REF}},
-                           resource.payload_json::jsonb
-                           || jsonb_build_object(
-                               'source_id', dataset_source_context.source_id
-                           )
-                       )
-                   ).*,
+            SELECT {{ENDPOINT_RECORD_PROJECTION_SQL}},
                    dataset_source_context.endpoint_id,
                    dataset_source_context.dataset_id,
                    dataset_source_context.canonical_api_base,
@@ -234,7 +186,7 @@
               FROM {{DATASET_RESOURCE_REF}} AS resource
               JOIN dataset_source_context
                 ON dataset_source_context.dataset_id = resource.dataset_id
-             WHERE resource.resource_type = 'Endpoint'
+             {{ENDPOINT_RECORD_JOIN_SQL}}WHERE resource.resource_type = 'Endpoint'
                AND resource.resource_id =
                    resource.payload_json::jsonb ->> 'resource_id'
         ), endpoint_rows AS MATERIALIZED (
@@ -348,11 +300,34 @@
                    service.comment,
                    service.updated_at
               FROM service_resource_rows AS service
-             WHERE service.npi IS NOT NULL
+             WHERE service.npi IS NOT NULL{{SERVICE_NPI_SCOPE_SQL}}
         ), service_rows AS MATERIALIZED (
             SELECT * FROM role_service_rows
             UNION ALL
             SELECT * FROM direct_service_rows
+        ), endpoint_scope_rows AS MATERIALIZED (
+            SELECT DISTINCT source_id, dataset_id
+              FROM endpoint_rows
+        ), role_endpoint_reference_rows AS MATERIALIZED (
+            SELECT role_rows.resolved_npi,
+                   role_rows.source_id,
+                   role_rows.endpoint_id,
+                   role_rows.dataset_id,
+                   role_rows.canonical_api_base,
+                   role_rows.source_org_name,
+                   role_rows.source_plan_name,
+                   role_rows.resource_id AS role_resource_id,
+                   {{ROLE_ENDPOINT_RESOURCE_ID_SQL}} AS endpoint_resource_id
+              FROM role_rows
+              CROSS JOIN LATERAL jsonb_array_elements_text(
+                   CASE WHEN EXISTS (
+                       SELECT 1
+                         FROM endpoint_scope_rows AS endpoint_scope
+                        WHERE endpoint_scope.source_id = role_rows.source_id
+                          AND endpoint_scope.dataset_id = role_rows.dataset_id
+                   ) THEN COALESCE(role_rows.endpoint_refs::jsonb, '[]'::jsonb)
+                   ELSE '[]'::jsonb END
+              ) AS endpoint_reference(value)
         ), role_endpoint_rows AS MATERIALIZED (
             SELECT role_rows.resolved_npi AS npi,
                    role_rows.source_id,
@@ -361,7 +336,7 @@
                    role_rows.canonical_api_base,
                    role_rows.source_org_name,
                    role_rows.source_plan_name,
-                   role_rows.resource_id AS role_resource_id,
+                   role_rows.role_resource_id,
                    endpoint.resource_id, endpoint.status,
                    endpoint.connection_type_system,
                    endpoint.connection_type_code,
@@ -370,14 +345,11 @@
                    endpoint.contact, endpoint.period_start, endpoint.period_end,
                    endpoint.payload_type_codes, endpoint.payload_mime_types,
                    endpoint.address, endpoint.updated_at
-              FROM role_rows
-              CROSS JOIN LATERAL jsonb_array_elements_text(
-                   COALESCE(role_rows.endpoint_refs::jsonb, '[]'::jsonb)
-              ) AS endpoint_reference(value)
+              FROM role_endpoint_reference_rows AS role_rows
               JOIN endpoint_rows AS endpoint
                 ON endpoint.source_id = role_rows.source_id
                AND endpoint.dataset_id = role_rows.dataset_id
-               AND endpoint.resource_id = {{ROLE_ENDPOINT_RESOURCE_ID_SQL}}
+               AND endpoint.resource_id = role_rows.endpoint_resource_id
         ), affiliation_rows AS MATERIALIZED (
             SELECT role_rows.resolved_npi AS npi,
                    role_rows.source_id,
@@ -476,7 +448,7 @@
         ), membership_affiliation_rows AS MATERIALIZED (
             SELECT affiliation.*
               FROM affiliation_resource_rows AS affiliation
-             WHERE {{AFFILIATION_BUCKET_SQL}}
+             WHERE {{AFFILIATION_BUCKET_SQL}}{{MEMBERSHIP_NPI_SCOPE_SQL}}
         ), plan_membership_rows AS MATERIALIZED (
             SELECT organization.npi,
                    affiliation.source_id,
@@ -1227,7 +1199,7 @@
                    resource_id, role_resource_id, active, effective_start,
                    effective_end, observed_at
              FROM facts
-             WHERE npi IS NOT NULL
+             WHERE npi IS NOT NULL{{FACT_NPI_SCOPE_SQL}}
                AND {{VALID_NPI_SQL}}
                AND {{CURRENT_EVIDENCE_SQL}}
                AND {{FACT_TYPE_SCOPE_SQL}}

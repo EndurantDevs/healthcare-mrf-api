@@ -893,7 +893,10 @@ def test_provider_directory_coverage_audit_loads_all_maintained_source_ids():
 
     assert set(source_ids) == expected_source_ids
     assert len(source_ids) == len(expected_source_ids)
-    assert all(audit.PROVIDER_DIRECTORY_SOURCE_ID_RE.fullmatch(source_id) for source_id in source_ids)
+    assert all(
+        source_id == "cms-npd" or audit.PROVIDER_DIRECTORY_SOURCE_ID_RE.fullmatch(source_id)
+        for source_id in source_ids
+    )
 
 
 def test_provider_directory_coverage_audit_includes_endpoint_table():

@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import re
+from pathlib import Path
 
 import pytest
 
+from tests.ptg2_serving_address_evidence_postgres_allowed import (
+    test_allowed_page_preserves_rates_and_rejects_incoherent_locations,
+    test_allowed_state_city_page_rejects_postal_boxes,
+)
+from tests.ptg2_serving_address_evidence_postgres_capability import (
+    test_geo_capability_probe_requires_usable_zcta_zip_index,
+)
+from tests.ptg2_serving_address_evidence_postgres_coverage import (
+    test_provider_set_geo_candidate_scope_executes_beyond_old_prefix,
+)
+from tests.ptg2_serving_address_evidence_postgres_enrichment import (
+    test_provider_enrichment_selects_one_truthful_address_row,
+)
 from tests.ptg2_serving_address_evidence_postgres_geo import (
     test_knn_template_executes_precedence_and_empty_probe_shape,
     test_optimized_membership_rejects_npi_wide_cms_anchor,
@@ -18,24 +31,6 @@ from tests.ptg2_serving_address_evidence_postgres_knn import (
     test_knn_radius_fence_preserves_spheroid_boundary,
     test_knn_withholds_exact_zip_while_radius_source_is_capped,
 )
-from tests.ptg2_serving_address_evidence_postgres_coverage import (
-    test_provider_set_geo_candidate_scope_executes_beyond_old_prefix,
-)
-from tests.ptg2_serving_address_evidence_postgres_enrichment import (
-    test_provider_enrichment_selects_one_truthful_address_row,
-)
-from tests.ptg2_serving_address_evidence_postgres_allowed import (
-    test_allowed_page_preserves_rates_and_rejects_incoherent_locations,
-    test_allowed_state_city_page_rejects_postal_boxes,
-)
-from tests.ptg2_serving_address_evidence_postgres_capability import (
-    test_geo_capability_probe_requires_usable_zcta_zip_index,
-)
-from tests.ptg2_serving_address_evidence_postgres_spatial import (
-    test_exact_zip_accepts_coherent_points_and_rejects_incoherent_points,
-    test_radius_membership_rejects_incoherent_and_out_of_radius_points,
-    test_state_city_membership_rejects_evidenced_postal_boxes,
-)
 from tests.ptg2_serving_address_evidence_postgres_lineage import (
     _fetch_provenance,
     test_admitted_mrf_recovers_specific_lineage_without_fabrication,
@@ -46,11 +41,22 @@ from tests.ptg2_serving_address_evidence_postgres_lineage import (
     test_stored_compact_run_date_is_complete_without_timestamps,
     test_stored_only_lineage_does_not_consult_live_mrf_fallback,
 )
-from tests.ptg2_serving_address_evidence_postgres_support import _temporary_schema
+from tests.ptg2_serving_address_evidence_postgres_radius import (
+    test_exact_radius_precedes_raw_probe_limit_and_page_exhaustion,
+    test_radius_uses_exact_displayed_distance_boundary,
+    test_spherical_radius_rejects_spheroid_only_and_keeps_sphere_only,
+    test_zero_radius_keeps_only_the_origin,
+)
 from tests.ptg2_serving_address_evidence_postgres_ranking import (
     test_optimized_membership_requires_distinct_normalized_mrf_issuers,
     test_optimized_membership_uses_location_key_as_final_tie_breaker,
 )
+from tests.ptg2_serving_address_evidence_postgres_spatial import (
+    test_exact_zip_accepts_coherent_points_and_rejects_incoherent_points,
+    test_radius_membership_rejects_incoherent_and_out_of_radius_points,
+    test_state_city_membership_rejects_evidenced_postal_boxes,
+)
+from tests.ptg2_serving_address_evidence_postgres_support import _temporary_schema
 
 
 def _is_valid_npi_check_digit(npi_text: str) -> bool:
@@ -110,9 +116,7 @@ async def test_live_fallback_rejects_mismatched_stored_identity_without_live_row
 def test_fixture_npis_are_deliberately_checksum_invalid():
     fixture_source_paths = (
         Path(__file__),
-        *Path(__file__).parent.glob(
-            "ptg2_serving_address_evidence_postgres_*.py"
-        ),
+        *Path(__file__).parent.glob("ptg2_serving_address_evidence_postgres_*.py"),
     )
     fixture_npis = {
         npi_text

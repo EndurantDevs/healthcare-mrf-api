@@ -10,7 +10,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from db.models import ProviderDirectoryPractitioner
+from process import provider_directory_generic_source_storage as source_storage
+from process.provider_directory_generic_source_adapters import candidate_resource_count, source_retry_rows
+from process.provider_directory_generic_source_policy import source_transaction
 from process.provider_directory_resource_hash import (
     SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
     resource_payload_sha256_for_contract,
@@ -23,9 +25,11 @@ from tests.provider_directory_semantic_proof_v3_postgres_support import (
     V3_DATASET_CONCURRENT,
     V3_DATASET_FORWARD,
     V3_DATASET_REVERSE,
+    _completed_semantic_scope,
     _dataset_and_shard_counts,
     _dataset_row,
     _insert_parent,
+    _materialize_semantic_dataset,
     _observation,
     _organization_observation,
     _proof,
@@ -36,6 +40,9 @@ from tests.provider_directory_semantic_proof_v3_postgres_support import (
     _write_page,
     _write_partition_page,
     importer,
+)
+from tests.provider_directory_semantic_proof_v3_postgres_support import (
+    semantic_source_template as semantic_source_template,
 )
 
 
@@ -106,6 +113,12 @@ async def _assert_practitioner_materialization(
     expected_payload,
     expected_hash,
 ):
+    await _materialize_semantic_dataset(database, dataset_id)
+    async with source_transaction(database):
+        await _assert_materialized_practitioner_rows(database, schema, expected_payload, expected_hash)
+
+
+async def _assert_materialized_practitioner_rows(database, schema, expected_payload, expected_hash):
     typed_names = await database.scalar(
         f'SELECT names FROM "{schema}".provider_directory_practitioner '
         "WHERE source_id=:source_id AND resource_id=:resource_id;",
@@ -128,17 +141,17 @@ async def _assert_practitioner_materialization(
 async def _run_serialized_practitioner_writes(monkeypatch):
     first_at_typed_write = asyncio.Event()
     release_first_write = asyncio.Event()
-    original_upsert_rows = importer._upsert_rows
+    original_copy = source_storage._copy
     typed_write_state = SimpleNamespace(should_block=True)
 
-    async def controlled_upsert(model, rows, **kwargs):
-        if model is ProviderDirectoryPractitioner and typed_write_state.should_block:
+    async def controlled_copy(*args, **kwargs):
+        if typed_write_state.should_block:
             typed_write_state.should_block = False
             first_at_typed_write.set()
             await release_first_write.wait()
-        return await original_upsert_rows(model, rows, **kwargs)
+        return await original_copy(*args, **kwargs)
 
-    monkeypatch.setattr(importer, "_upsert_rows", controlled_upsert)
+    monkeypatch.setattr(source_storage, "_copy", controlled_copy)
     first_task = asyncio.create_task(
         _write_page(
             V3_DATASET_CONCURRENT,
@@ -195,24 +208,16 @@ async def _run_parallel_family_writes(monkeypatch, database, dataset_id):
     practitioner_family_locked = asyncio.Event()
     release_practitioner_family = asyncio.Event()
     organization_family_complete = asyncio.Event()
-    original_existing_resources = importer._existing_endpoint_dataset_resources
-    async def controlled_existing_resources(
-        executor,
-        observed_dataset_id,
-        resource_type,
-        resource_ids,
-    ):
-        if resource_type == "Practitioner":
+    original_copy = source_storage._copy
+
+    async def controlled_copy(*args, **kwargs):
+        if asyncio.current_task().get_name() == "practitioner-writer":
             practitioner_family_locked.set()
             await release_practitioner_family.wait()
-        return await original_existing_resources(
-            executor,
-            observed_dataset_id,
-            resource_type,
-            resource_ids,
-        )
+        return await original_copy(*args, **kwargs)
+
     async def write_rows(dataset_rows):
-        async with database.acquire() as connection:
+        async with source_transaction(database), database.acquire() as connection:
             await importer._upsert_dataset_resource_rows_on_connection(
                 connection,
                 dataset_rows,
@@ -220,20 +225,22 @@ async def _run_parallel_family_writes(monkeypatch, database, dataset_id):
                 resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
                 semantic_projection_as_of=PROJECTION_AS_OF,
             )
+
     async def write_organization_family():
         await write_rows([_organization_dataset_row(dataset_id)])
+        await _assert_sibling_reads(dataset_id)
         organization_family_complete.set()
 
     monkeypatch.setattr(
-        importer,
-        "_existing_endpoint_dataset_resources",
-        controlled_existing_resources,
+        source_storage,
+        "_copy",
+        controlled_copy,
     )
     practitioner_row = _dataset_row(
         dataset_id,
         _observation("Alex Example", page_number=1),
     )
-    practitioner_task = asyncio.create_task(write_rows([practitioner_row]))
+    practitioner_task = asyncio.create_task(write_rows([practitioner_row]), name="practitioner-writer")
     organization_task: asyncio.Task | None = None
     try:
         await asyncio.wait_for(practitioner_family_locked.wait(), timeout=2)
@@ -249,6 +256,22 @@ async def _run_parallel_family_writes(monkeypatch, database, dataset_id):
             *([organization_task] if organization_task is not None else []),
             return_exceptions=True,
         )
+
+
+async def _assert_sibling_reads(dataset_id):
+    """Read sibling counts and retry markers while another family holds COPY open."""
+    context = importer.PaginationCheckpointContext(
+        canonical_api_base=CANONICAL_BASE,
+        source_scope_hash="scope-parallel-families",
+        source_ids=(SOURCE_ID,),
+        owner_run_id="run-semantic-proof",
+        acquisition_root_run_id=f"root-{dataset_id}"[:64],
+        endpoint_id=f"endpoint-{dataset_id}"[:64],
+        dataset_id=dataset_id,
+        lineage_verified=True,
+    )
+    assert await candidate_resource_count(importer, context, "Organization") == 1
+    assert await source_retry_rows(importer, dataset_id, "LU:Organization:pass:2") == []
 
 
 @pytest.mark.asyncio
@@ -275,15 +298,14 @@ async def test_postgres_v3_union_is_page_order_independent_across_write_paths(
         assert forward_hash == reverse_hash
         assert len(forward_payload["names"]) == 2
         forward_proof = await _assert_union_proofs_match(database, schema)
-        direct_proof = await importer._endpoint_dataset_content_proof(
-            database,
-            V3_DATASET_FORWARD,
-            ("Practitioner",),
-            verify_payload_hashes=True,
-            resource_hash_contract=(
-                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-            ),
-        )
+        async with _completed_semantic_scope(database, V3_DATASET_FORWARD):
+            direct_proof = await importer._endpoint_dataset_content_proof(
+                database,
+                V3_DATASET_FORWARD,
+                ("Practitioner",),
+                verify_payload_hashes=True,
+                resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+            )
         assert direct_proof.dataset_hash == forward_proof.dataset_hash
         await _assert_union_shards_match(database, schema)
         await _assert_practitioner_materialization(
@@ -342,6 +364,19 @@ async def test_postgres_v3_distinct_resource_families_remain_parallel(
             schema,
             dataset_id,
         ) == (2, 2)
+        async with source_transaction(database):
+            binding = await database.scalar(
+                f'SELECT candidate_storage_json FROM "{schema}".provider_directory_endpoint_dataset '
+                "WHERE dataset_id=:dataset_id",
+                dataset_id=dataset_id,
+            )
+            binding = json.loads(binding) if isinstance(binding, str) else binding
+            assert binding["ordinal"] == 2
+            observations = await database.all(
+                f'SELECT resource_type,batch_ordinal FROM "{schema}".'
+                f'"{binding["tables"]["resource_input"]["name"]}" ORDER BY batch_ordinal'
+            )
+            assert [tuple(observation) for observation in observations] == [("Practitioner", 1), ("Organization", 2)]
 
 
 @pytest.mark.asyncio
@@ -369,39 +404,42 @@ async def test_postgres_v3_non_practitioner_materialization_uses_retained_winner
 
         await _write_organization_page(dataset_id, winning_observation)
         await _write_organization_page(dataset_id, losing_observation)
+        await _materialize_semantic_dataset(database, dataset_id)
+        async with source_transaction(database):
+            await _assert_organization_materialization(database, schema, dataset_id)
 
-        dataset_record = await database.first(
-            f'SELECT payload_hash, payload_json FROM "{schema}".'
-            "provider_directory_dataset_resource "
-            "WHERE dataset_id=:dataset_id AND resource_type='Organization' "
-            "AND resource_id=:resource_id;",
-            dataset_id=dataset_id,
-            resource_id="organization-semantic-proof",
-        )
-        dataset_payload = dataset_record[1]
-        if isinstance(dataset_payload, str):
-            dataset_payload = json.loads(dataset_payload)
-        typed_record = await database.first(
-            f'SELECT resource_url, fhir_meta FROM "{schema}".'
-            "provider_directory_organization WHERE source_id=:source_id "
-            "AND resource_id=:resource_id;",
-            source_id=SOURCE_ID,
-            resource_id="organization-semantic-proof",
-        )
-        canonical_record = await database.first(
-            f'SELECT resource_url, fhir_meta, payload_hash FROM "{schema}".'
-            "provider_directory_canonical_resource "
-            "WHERE canonical_api_base=:canonical_base "
-            "AND resource_type='Organization' AND resource_id=:resource_id;",
-            canonical_base=CANONICAL_BASE,
-            resource_id="organization-semantic-proof",
-        )
 
-        assert dataset_payload["resource_url"] == (
-            "https://z.example.test/organization-semantic-proof"
-        )
-        assert typed_record[0] == dataset_payload["resource_url"]
-        assert typed_record[1] == dataset_payload["fhir_meta"]
-        assert canonical_record[0] == dataset_payload["resource_url"]
-        assert canonical_record[1] == dataset_payload["fhir_meta"]
-        assert canonical_record[2] == dataset_record[0]
+async def _assert_organization_materialization(database, schema, dataset_id):
+    dataset_record = await database.first(
+        f'SELECT payload_hash, payload_json FROM "{schema}".'
+        "provider_directory_dataset_resource "
+        "WHERE dataset_id=:dataset_id AND resource_type='Organization' "
+        "AND resource_id=:resource_id;",
+        dataset_id=dataset_id,
+        resource_id="organization-semantic-proof",
+    )
+    dataset_payload = dataset_record[1]
+    if isinstance(dataset_payload, str):
+        dataset_payload = json.loads(dataset_payload)
+    typed_record = await database.first(
+        f'SELECT resource_url, fhir_meta FROM "{schema}".'
+        "provider_directory_organization WHERE source_id=:source_id "
+        "AND resource_id=:resource_id;",
+        source_id=SOURCE_ID,
+        resource_id="organization-semantic-proof",
+    )
+    canonical_record = await database.first(
+        f'SELECT resource_url, fhir_meta, payload_hash FROM "{schema}".'
+        "provider_directory_canonical_resource "
+        "WHERE canonical_api_base=:canonical_base "
+        "AND resource_type='Organization' AND resource_id=:resource_id;",
+        canonical_base=CANONICAL_BASE,
+        resource_id="organization-semantic-proof",
+    )
+
+    assert dataset_payload["resource_url"] == ("https://z.example.test/organization-semantic-proof")
+    assert typed_record[0] == dataset_payload["resource_url"]
+    assert typed_record[1] == dataset_payload["fhir_meta"]
+    assert canonical_record[0] == dataset_payload["resource_url"]
+    assert canonical_record[1] == dataset_payload["fhir_meta"]
+    assert canonical_record[2] == dataset_record[0]

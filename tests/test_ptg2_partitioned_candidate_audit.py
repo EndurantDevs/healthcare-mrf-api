@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import types
 from dataclasses import replace
@@ -163,6 +164,15 @@ async def test_partitioned_event_loop_contract():
     assert audit._event_loop_contract(require_uvloop=False)
 
 
+async def _parse_compact_request(web_request):
+    body = await web_request.read()
+    request = contract.parse_partitioned_candidate_audit_request(json.loads(body))
+    assert body == json.dumps(
+        request.payload, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+    return request
+
+
 @pytest.mark.asyncio
 async def test_executes_nine_requests_at_fifty_starts_per_second_with_overlap(
     unused_tcp_port,
@@ -177,9 +187,7 @@ async def test_executes_nine_requests_at_fifty_starts_per_second_with_overlap(
             counters_by_name["peak_active"],
             counters_by_name["active"],
         )
-        request = contract.parse_partitioned_candidate_audit_request(
-            await web_request.json()
-        )
+        request = await _parse_compact_request(web_request)
         await asyncio.sleep(0.03)
         counters_by_name["active"] -= 1
         result = contract.build_partitioned_candidate_audit_result(

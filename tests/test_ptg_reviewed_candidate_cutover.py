@@ -57,18 +57,17 @@ async def test_reviewed_cutover_pins_exact_published_predecessor():
 
 
 @pytest.mark.asyncio
-async def test_reviewed_cutover_requires_predecessor_before_pin_write():
+async def test_reviewed_first_publication_has_no_predecessor_pin():
     session = _Session()
 
-    with pytest.raises(ValueError, match="requires a published predecessor"):
-        await reviewed.pin_reviewed_activation_predecessor(
-            session,
-            schema_name="mrf",
-            activation_by_field=_activation_fields(None),
-            activated_at=datetime.datetime(2026, 7, 30, 12, 0),
-            rollback_owner_id="activation-operation",
-            is_reviewed_audit_only=True,
-        )
+    await reviewed.pin_reviewed_activation_predecessor(
+        session,
+        schema_name="mrf",
+        activation_by_field=_activation_fields(None),
+        activated_at=datetime.datetime(2026, 7, 30, 12, 0),
+        rollback_owner_id="activation-operation",
+        is_reviewed_audit_only=True,
+    )
 
     assert session.calls == []
 
@@ -236,7 +235,7 @@ async def test_reviewed_cutover_replay_leaves_validated_candidate_to_fresh_path(
 
 
 @pytest.mark.asyncio
-async def test_reviewed_cutover_replay_requires_digest_and_predecessor():
+async def test_reviewed_cutover_replay_requires_digest_and_allows_absent_predecessor():
     assert (
         await reviewed.completed_reviewed_activation(
             _Session(),
@@ -250,7 +249,7 @@ async def test_reviewed_cutover_replay_requires_digest_and_predecessor():
         is None
     )
 
-    with pytest.raises(ValueError, match="expected_current_snapshot_id"):
+    assert (
         await reviewed.completed_reviewed_activation(
             _Session(),
             schema_name="mrf",
@@ -260,6 +259,8 @@ async def test_reviewed_cutover_replay_requires_digest_and_predecessor():
             expected_audit_only_attestation_digest=bytes.fromhex("ab" * 32),
             rollback_owner_id="activation-operation",
         )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -330,4 +331,28 @@ def test_reviewed_cutover_exact_state_rejects_each_drift(
             snapshot_id="snap_new",
             predecessor_snapshot_id="snap_old",
             expected_attestation_digest=bytes.fromhex("ab" * 32),
+            rollback_owner_id="activation-operation",
+        )
+
+
+@pytest.mark.asyncio
+async def test_first_publication_replay_binds_null_predecessor_and_owner():
+    digest = bytes.fromhex("ab" * 32)
+    row = _completed_row(digest=digest)
+    row.update(previous_snapshot_id=None, current_previous_snapshot_id=None, rollback_pin_reason=None)
+    row["manifest"]["activation"]["first_publication_owner_id"] = "activation-operation"
+    activation_by_field = dict(
+        schema_name="mrf",
+        source_key="source_a",
+        snapshot_id="snap_new",
+        expected_current_snapshot_id=None,
+        expected_audit_only_attestation_digest=digest,
+        rollback_owner_id="activation-operation",
+    )
+    replay = await reviewed.completed_reviewed_activation(_Session(row), **activation_by_field)
+    assert replay["status"] == "already_promoted"
+    assert replay["previous_snapshot_id"] is None
+    with pytest.raises(reviewed.PTG2SourcePointerConflict):
+        await reviewed.completed_reviewed_activation(
+            _Session(row), **{**activation_by_field, "rollback_owner_id": "other-owner"}
         )

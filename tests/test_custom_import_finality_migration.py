@@ -5,10 +5,108 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 
+import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
+
 ROOT = Path(__file__).resolve().parents[1]
+_SEALED_APPEND_UPGRADE_TAIL = (
+    "20261005030000_source_profile_statement_pins",
+    "20261005100000_rooted_graph_set_validation",
+    "20261005110000_ptg_set_validation",
+    "20261005120000_practitioner_set_validation",
+    "20261005130000_provider_dataset_candidates",
+    "20261005030000_custom_import_snapshot_storage",
+    "20261005040000_custom_import_bulk_snapshot_writers",
+    "20261005050000_custom_import_legacy_snapshot_writers",
+    "20261005060000_custom_import_snapshot_finality",
+    "20261005070000_custom_import_materialization_storage",
+    "20261005080000_custom_import_writer_cutover",
+    "20261007000000_custom_import_rejection_anti_joins",
+    "20261006010000_nucc_reference_result_generation",
+    "20261009000000_custom_import_child_presence_decode",
+    "20261010000000_custom_import_admission_indexes",
+    "20261010010000_custom_import_materialization_contract",
+    "20261007010000_managed_network_registry",
+    "20261007020000_registry_revision_history",
+    "20261007030000_network_serving_control",
+    "20261007040000_registry_source_evidence",
+    "20261007050000_canonical_address_network_ids",
+    "20261007060000_registry_approved_selection",
+    "20261007070000_registry_company_links",
+    "20261007080000_manual_directory_registry",
+    "20261007090000_network_membership_drafts",
+    "20261007100000_registry_publication_requests",
+    "20261007110000_registry_site_bindings",
+    "20261007120000_company_network_assertions",
+    "20261007130000_registry_network_bindings",
+    "20261007140000_registry_source_recipes",
+    "20261007150000_provider_directory_content_cursor_index",
+    "20261009010000_registry_ptg_producer_scope",
+    "20261009020000_company_registry_assertions",
+    "20261009030000_network_catalog_evidence",
+    "20261009040000_registry_ptg_published_plan_scope",
+    "20261010010000_registry_ptg_office_approval",
+    "20261010020000_registry_ptg_office_retention",
+    "20261010030000_registry_source_admission_receipt",
+    "20261011010000_company_registry_group_assertions",
+    "20261012010000_company_registry_name_origin",
+    "20261013010000_registry_custom_history_events",
+    "20261015020000_custom_import_query_projections",
+    "20261016070000_registry_allowed_plan_scope",
+    "20261017010000_registry_cms_source_notifications",
+    "20261017210000_provider_directory_readiness_indexes",
+    "20261017010000_custom_import_raw_objects",
+    "20261019010000_custom_import_build_continuation",
+    "20261020150000_custom_import_staged_verification",
+    "20261020180000_custom_import_verification_arms",
+    "20261020190000_custom_import_verification_root_ranges",
+    "20261020200000_custom_import_manual_acceptance",
+    "20261021110000_ptg_membership_import_idempotency",
+    "20261015010000_plan_release_binding_cohorts",
+    "20261015015000_generic_source_candidates",
+    "20261016010000_cms_registry_source_pair_slot",
+    "20261016030000_cms_source_guard_argument_types",
+    "20261016040000_source_validator_argument_types",
+    "20261016050000_acquisition_validator_argument_types",
+    "20261016060000_uhc_official_cohort_snapshots",
+    "20261017020000_source_registry_snapshot_join",
+    "20261017030000_registry_ptg_office_recipe_selection",
+    "20261017040000_nppes_evidence_candidates",
+    "20261018011000_network_candidate_custody",
+    "20261018040000_registry_aca_source_notifications",
+    "20261019010000_registry_raw_object_join",
+    "20261019020000_registry_continuation_join",
+    "20261019030000_provider_directory_role_schema",
+    "20261019130000_cms_archive_transaction_guard",
+    "20261019140000_plan_pricing_attribution_idempotency",
+    "20261019150000_registry_source_check_idempotency",
+    "20261020160000_registry_staged_verification_join",
+    "20261020210000_registry_manual_acceptance_join",
+    "20261022110000_ptg_checker_execution",
+    "20261022120000_provider_directory_first_retirement",
+    "20261023110000_code_pricing_import_idempotency",
+    "20261023100000_provider_directory_retirement_parent_updates",
+    "20261023220000_merge_directory_pricing_controls",
+    "20261025010000_company_affiliation_states",
+    "20261024050000_provider_directory_first_retirement_owner_lineage",
+    "20261023100000_provider_directory_serving_recovery",
+    "20261025020000_company_affiliation_join",
+    "20261028010000_registry_fhir_catalog",
+    "20261028020000_registry_membership_refresh",
+    "20261029010000_registry_source_inventory",
+    "20261102010000_custom_import_snapshot_retirement",
+    "20261102030000_custom_import_build_scratch",
+    "20261102040000_custom_import_post_seal_audit",
+    "20261104010000_custom_import_unlogged_landing",
+    "20261107010000_custom_import_child_reference_aggregate",
+)
+
 MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260917130000_custom_import_generation_finality.py"
+PLANS_MIGRATION_PATH = ROOT / "alembic" / "versions" / "20261005020000_custom_import_sealed_append_plans.py"
 
 
 def _migration():
@@ -102,3 +200,221 @@ def test_finality_downgrade_removes_references_before_finality_tables(monkeypatc
     assert "DROP COLUMN IF EXISTS rejection_id" in normalized
     assert "code ~ '^[a-z][a-z0-9_]{0,62}$'" in normalized
     assert "{{0,62}}" not in normalized
+
+
+def _plans_migration():
+    spec = importlib.util.spec_from_file_location("custom_import_sealed_append_plans", PLANS_MIGRATION_PATH)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _append_body():
+    legacy = _migration()
+    return legacy._with_read_committed_guard(legacy._APPEND_GUARD_FUNCTION_BODY)
+
+
+@pytest.mark.parametrize("operation", ("upgrade", "downgrade"))
+def test_sealed_append_plans_replace_only_an_existing_function(monkeypatch, operation):
+    migration = _plans_migration()
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "synthetic_append")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    statements = []
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+    getattr(migration, operation)()
+
+    assert migration.revision == "20261005020000_custom_import_sealed_append_plans"
+    assert migration.down_revision == "20261001110000_profile_initial_publication"
+    assert len(statements) == 2
+    assert statements[0].startswith("DO $function$")
+    assert "pg_catalog.to_regprocedure" in statements[0]
+    assert "custom_import_sealed_append_function_missing" in statements[0]
+    assert 'E\'"synthetic_append"."guard_custom_import_sealed_append"()\'' in statements[0]
+    assert (
+        statements[1]
+        .lstrip()
+        .startswith('CREATE OR REPLACE FUNCTION "synthetic_append"."guard_custom_import_sealed_append"()')
+    )
+    for declaration in ("RETURNS trigger", "LANGUAGE plpgsql", "SECURITY DEFINER", "SET search_path = pg_catalog"):
+        assert statements[1].count(declaration) == 1
+    for forbidden in ("DROP ", "GRANT ", "REVOKE ", "CREATE TABLE", "CREATE TRIGGER", "ALTER TABLE", "CREATE INDEX"):
+        assert forbidden not in "\n".join(statements)
+    if operation == "downgrade":
+        original = _migration()._append_guard_function_sql("synthetic_append")
+        assert statements[1] == original.replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION", 1)
+
+
+def _assert_custom_import_manual_acceptance_lineage(script):
+    """Preserve the joined custom-import verification and acceptance ancestry."""
+    assert script.get_revision("20261020210000_registry_manual_acceptance_join").down_revision == (
+        "20261020160000_registry_staged_verification_join",
+        "20261021110000_ptg_membership_import_idempotency",
+    )
+    assert script.get_revision("20261021110000_ptg_membership_import_idempotency").down_revision == (
+        "20261020200000_custom_import_manual_acceptance"
+    )
+    assert script.get_revision("20261020200000_custom_import_manual_acceptance").down_revision == (
+        "20261020190000_custom_import_verification_root_ranges"
+    )
+    assert script.get_revision("20261020190000_custom_import_verification_root_ranges").down_revision == (
+        "20261020180000_custom_import_verification_arms"
+    )
+    assert script.get_revision("20261020180000_custom_import_verification_arms").down_revision == (
+        "20261020150000_custom_import_staged_verification"
+    )
+    assert script.get_revision("20261020150000_custom_import_staged_verification").down_revision == (
+        "20261019010000_custom_import_build_continuation"
+    )
+    assert script.get_revision("20261019010000_custom_import_build_continuation").down_revision == (
+        "20261017010000_custom_import_raw_objects"
+    )
+    assert script.get_revision("20261017010000_custom_import_raw_objects").down_revision == (
+        "20261017210000_provider_directory_readiness_indexes"
+    )
+    assert script.get_revision("20261017210000_provider_directory_readiness_indexes").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+
+
+def _assert_finality_migration_chain(script):
+    """Keep the exact accepted migration head and predecessor assertions."""
+    assert script.get_heads() == ["20261107010000_custom_import_child_reference_aggregate"]
+    assert script.get_revision("20261029010000_registry_source_inventory").down_revision == (
+        "20261028020000_registry_membership_refresh"
+    )
+    assert script.get_revision("20261028020000_registry_membership_refresh").down_revision == (
+        "20261028010000_registry_fhir_catalog"
+    )
+    _assert_custom_import_manual_acceptance_lineage(script)
+    assert (
+        script.get_revision("20261019030000_provider_directory_role_schema").down_revision
+        == "20261019020000_registry_continuation_join"
+    )
+    assert script.get_revision("20261019020000_registry_continuation_join").down_revision == (
+        "20261019010000_registry_raw_object_join",
+        "20261019010000_custom_import_build_continuation",
+    )
+    assert script.get_revision("20261019010000_custom_import_build_continuation").down_revision == (
+        "20261017010000_custom_import_raw_objects"
+    )
+    assert script.get_revision("20261017020000_source_registry_snapshot_join").down_revision == (
+        "20261016060000_uhc_official_cohort_snapshots",
+        "20261017010000_registry_cms_source_notifications",
+    )
+    assert script.get_revision("20261017010000_registry_cms_source_notifications").down_revision == (
+        "20261016070000_registry_allowed_plan_scope"
+    )
+    assert script.get_revision("20261016070000_registry_allowed_plan_scope").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+    assert script.get_revision("20261016060000_uhc_official_cohort_snapshots").down_revision == (
+        "20261016050000_acquisition_validator_argument_types"
+    )
+    assert script.get_revision("20261015010000_plan_release_binding_cohorts").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+    assert script.get_revision("20261015020000_custom_import_query_projections").down_revision == (
+        "20261013010000_registry_custom_history_events"
+    )
+    assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
+        "20261010000000_custom_import_admission_indexes"
+    )
+    assert script.get_revision("20261010030000_registry_source_admission_receipt").down_revision == (
+        "20261010020000_registry_ptg_office_retention"
+    )
+
+
+def test_sealed_append_plans_extend_the_single_installed_migration_head():
+    config = Config(str(ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    revision = _plans_migration().revision
+    _assert_finality_migration_chain(script)
+    assert tuple(
+        step.revision.revision for step in script._upgrade_revs("head", "20261001110000_profile_initial_publication")
+    ) == (revision, *_SEALED_APPEND_UPGRADE_TAIL)
+
+
+def test_sealed_append_plans_preserve_query_order_bindings_and_exact_dynamic_fallback():
+    migration = _plans_migration()
+    body = _append_body()
+    static = migration._static_body(body)
+    matches = list(migration._EXECUTE.finditer(body))
+    assert len(matches) == 27
+    restored = static
+    for match in matches:
+        query = "".join(re.findall(r"'([^']*)'", match["strings"]))
+        bindings = [binding.strip() for binding in match["using"].split(",")]
+        receivers = ", ".join(receiver.strip() for receiver in match["into"].split(","))
+        query = re.sub(r"\$(\d+)", lambda placeholder: f"({bindings[int(placeholder[1]) - 1]})", query)
+        query = query.replace("%I", migration._STATIC_SCHEMA)
+        if query.startswith("SELECT EXISTS ("):
+            query += f" INTO {receivers}"
+        else:
+            query = query.replace(" FROM ", f" INTO {receivers} FROM ", 1)
+        assert query + ";" in restored
+        restored = restored.replace(query + ";", match[0], 1)
+    assert restored == body
+    assert static.count("FOR UPDATE") == 3
+    assert static.count("clock_timestamp()") == 1
+    assert (
+        static.index("INTO locked_dataset_id")
+        < static.index("INTO authority_state")
+        < static.index("INTO authority_expires_at")
+    )
+    assert static.index("INTO authority_expires_at") < static.index("authority_expires_at <= clock_timestamp()")
+    planned = migration._planned_body(_migration(), body, "synthetic_append")
+    original_statements = body.split("    BEGIN\n", 1)[1].removesuffix("    END;\n")
+    assert "        ELSE\n" + original_statements + "        END IF;\n" in planned
+    assert planned.count(_migration()._read_committed_guard()) == 2
+
+
+@pytest.mark.parametrize("schema", ("mrf", 'synthetic"quoted', "synthetic'$1\\$function$__SEALED_APPEND_SCHEMA__"))
+def test_sealed_append_plans_quote_schema_only_after_rewriting(schema):
+    migration = _plans_migration()
+    legacy = _migration()
+    body = migration._planned_body(legacy, _append_body(), schema)
+    literal = "E'" + schema.replace("\\", "\\\\").replace("'", "''") + "'"
+    assert f"IF TG_TABLE_SCHEMA = {literal} THEN\n" in body
+    assert f"FROM {legacy._quote(schema)}.custom_import_dataset WHERE dataset_id = (NEW.dataset_id) FOR UPDATE;" in body
+    definition = migration._definition(legacy._qualified(schema, migration._FUNCTION_NAME), body)
+    delimiter = migration._delimiter(body)
+    assert delimiter not in body
+    assert f"    AS {delimiter}\n    {body}\n    {delimiter}" in definition
+    if "$function$" in schema:
+        assert delimiter != "$function$"
+    guard = migration._existing_function_guard(legacy._qualified(schema, migration._FUNCTION_NAME))
+    assert guard.startswith("DO " + migration._delimiter(guard.split("\n", 1)[1].rsplit("\n", 1)[0]))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        ("TG_TABLE_SCHEMA", "TG_TABLE_NAME"),
+        ("%I.custom_import_dataset", "%L.custom_import_dataset"),
+        ("NEW.dataset_id", "NEW.dataset_id + 1"),
+        ("WHERE dataset_id = $1 FOR UPDATE", "WHERE dataset_id = $9 FOR UPDATE"),
+        ("RETURN NEW;", "IF FOUND THEN RETURN NEW; END IF;"),
+        ("RETURN NEW;", "GET DIAGNOSTICS locked_dataset_id = ROW_COUNT; RETURN NEW;"),
+        ("clock_timestamp()", "now()"),
+    ),
+)
+def test_sealed_append_plans_reject_unrecognized_source_shapes(old, new):
+    migration = _plans_migration()
+    with pytest.raises(RuntimeError, match="source differs"):
+        migration._static_body(_append_body().replace(old, new, 1))
+
+
+@pytest.mark.parametrize("operation", ("upgrade", "downgrade"))
+def test_sealed_append_plans_reject_historical_source_drift_before_ddl(monkeypatch, operation):
+    migration = _plans_migration()
+    original_read = Path.read_bytes
+    statements = []
+    monkeypatch.setattr(migration.op, "execute", statements.append)
+    monkeypatch.setattr(
+        Path, "read_bytes", lambda path: original_read(path) + (b"\n" if path == MIGRATION_PATH else b"")
+    )
+    with pytest.raises(RuntimeError, match="source differs"):
+        getattr(migration, operation)()
+    assert statements == []

@@ -1,5 +1,6 @@
 // Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+use super::super::contracts::NpiIdentityPolicy;
 use super::*;
 use serde_json::json;
 
@@ -8,6 +9,7 @@ fn context() -> ProjectionCopyContext {
         recipe_id: "a".repeat(64),
         partition_id: "b".repeat(64),
         partition_ordinal: 7,
+        npi_identity_policy: NpiIdentityPolicy::Legacy,
     }
 }
 
@@ -214,7 +216,7 @@ fn summary_validation_checks_every_contract_shape_timing_and_copy_frame() {
     .expect("valid proof");
 
     macro_rules! reject {
-        ($field:ident, $value:expr) => {{
+        ($field:ident, $value:expr_2021) => {{
             let mut summary = spool.summary.clone();
             summary.$field = $value;
             assert_summary_rejected(summary, &spool.copy_bytes);

@@ -14,7 +14,6 @@ from db.models import (
     ProviderDirectorySource,
 )
 
-
 MIGRATION_PATH = (
     Path(__file__).resolve().parents[1]
     / "alembic"
@@ -118,24 +117,23 @@ def test_api_endpoint_model_keeps_transport_identity_distinct_from_fhir_endpoint
 def test_dataset_models_preserve_publication_and_resource_identity_contracts():
     endpoint_schema = ProviderDirectoryAPIEndpoint.__table__.schema
     dataset_endpoint_fk = _foreign_key(ProviderDirectoryEndpointDataset.__table__.c.endpoint_id)
-    resource_dataset_fk = _foreign_key(ProviderDirectoryDatasetResource.__table__.c.dataset_id)
 
     assert _primary_key_columns(ProviderDirectoryEndpointDataset) == ("dataset_id",)
     assert isinstance(
         ProviderDirectoryEndpointDataset.__table__.c.publication_metadata_json.type,
         postgresql.JSONB,
     )
-    assert dataset_endpoint_fk.target_fullname == (
-        f"{endpoint_schema}.provider_directory_api_endpoint.endpoint_id"
-    )
+    assert dataset_endpoint_fk.target_fullname == (f"{endpoint_schema}.provider_directory_api_endpoint.endpoint_id")
     assert _primary_key_columns(ProviderDirectoryDatasetResource) == (
         "dataset_id",
         "resource_type",
         "resource_id",
     )
-    assert resource_dataset_fk.target_fullname == (
-        f"{endpoint_schema}.provider_directory_endpoint_dataset.dataset_id"
-    )
+    assert not ProviderDirectoryDatasetResource.__table__.foreign_keys
+    assert ProviderDirectoryDatasetResource.__table__.c.dataset_id.nullable is False
+    assert ProviderDirectoryDatasetResource.__table__.info["managed_immutable_storage"] is True
+    assert ProviderDirectoryDatasetResource.__runtime_schema_sync__ is False
+    assert isinstance(ProviderDirectoryEndpointDataset.__table__.c.candidate_storage_json.type, postgresql.JSONB)
     assert ProviderDirectoryDatasetResource.__table__.c.payload_hash.nullable is False
     assert ProviderDirectoryDatasetResource.__table__.c.payload_json.nullable is False
     assert isinstance(
@@ -166,16 +164,12 @@ def test_receipt_migration_adds_one_nullable_jsonb_column(monkeypatch):
     monkeypatch.setattr(
         migration,
         "add_column_if_missing",
-        lambda _op, table_name, column, **options: added_columns.append(
-            (table_name, column, options)
-        ),
+        lambda _op, table_name, column, **options: added_columns.append((table_name, column, options)),
     )
 
     migration.upgrade()
 
-    assert migration.down_revision == (
-        "20260811140000_ptg_v12_provider_publication_merge"
-    )
+    assert migration.down_revision == ("20260811140000_ptg_v12_provider_publication_merge")
     assert len(added_columns) == 1
     table_name, column, options = added_columns[0]
     assert table_name == "provider_directory_endpoint_dataset"
@@ -214,6 +208,7 @@ def _assert_revision_model_columns(recorder, models_by_table):
             "completion_proof_required_version",
             "completion_proof_json",
             "completion_proof_sha256",
+            "candidate_storage_json",
         },
         "provider_directory_dataset_resource": {
             "acquired_resource_sha256",
@@ -221,9 +216,7 @@ def _assert_revision_model_columns(recorder, models_by_table):
     }
     for table_name, model_class in models_by_table.items():
         revision_columns = [
-            table_item.name
-            for table_item in recorder.tables[table_name]["items"]
-            if isinstance(table_item, sa.Column)
+            table_item.name for table_item in recorder.tables[table_name]["items"] if isinstance(table_item, sa.Column)
         ]
         expected_columns = [
             column_name
@@ -231,10 +224,7 @@ def _assert_revision_model_columns(recorder, models_by_table):
             if column_name not in later_columns_by_table.get(table_name, set())
         ]
         assert revision_columns == expected_columns
-        assert (
-            recorder.tables[table_name]["schema"]
-            == model_class.__table__.schema
-        )
+        assert recorder.tables[table_name]["schema"] == model_class.__table__.schema
 
 
 def test_endpoint_dataset_migration_mirrors_models(monkeypatch):

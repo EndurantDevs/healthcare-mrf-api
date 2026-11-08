@@ -1,0 +1,1049 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
+"""Focused checks for the concrete one-statement Snowflake Python adapter."""
+
+from __future__ import annotations
+
+import hashlib
+import subprocess
+import sys
+from asyncio import CancelledError
+from dataclasses import dataclass, replace
+from decimal import Decimal
+from io import BytesIO
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+import process.custom_import.snowflake_python as snowflake_python
+from process.custom_import.capture import CaptureError, capture_stream, iter_records, verify_capture
+from process.custom_import.capture_limits import CaptureLimits
+from process.custom_import.definition import CustomImportDefinition
+from process.custom_import.snowflake import (
+    SnowflakeConnectorError,
+    SnowflakeCredentialError,
+    SnowflakeDeclaredColumn,
+    SnowflakeKeyPairCredentials,
+    SnowflakeReadRequest,
+    SnowflakeReadStatement,
+    SnowflakeRelation,
+    SnowflakeResultColumn,
+)
+from process.custom_import.snowflake_bundle import (
+    SnowflakeBundleBinding,
+    SnowflakeBundleRequest,
+    SnowflakeBundleStatement,
+)
+from process.custom_import.snowflake_python import SnowflakePythonConnectorAdapter
+
+_PRIVATE_KEY = b"""-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIGf0q2V1QeH4rYk0uXf9ThwM3U7v6w9NfX3qf8wVv8oP
+-----END PRIVATE KEY-----
+"""
+
+
+@dataclass(frozen=True)
+class _Metadata:
+    name: str
+    type_name: str | None
+    is_nullable: bool | None
+    precision: int | None = None
+    scale: int | None = None
+    type_code: int | None = None
+
+
+class _Cursor:
+    def __init__(self, rows, *, description=None, query_id: str = "01abc") -> None:
+        self.description = _description() if description is None else description
+        self.sfqid = query_id
+        self._rows = list(rows)
+        self.executed: list[str] = []
+        self.fetch_count = 0
+        self.closed = False
+
+    def execute(self, sql: str) -> None:
+        self.executed.append(sql)
+
+    def fetchone(self):
+        self.fetch_count += 1
+        return self._rows.pop(0) if self._rows else None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _Connection:
+    def __init__(self, cursor: _Cursor) -> None:
+        self._cursor = cursor
+        self.closed = False
+
+    def cursor(self) -> _Cursor:
+        return self._cursor
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _definition() -> CustomImportDefinition:
+    return CustomImportDefinition.from_mapping(
+        {
+            "contract": "custom-import/v1",
+            "revision": {"definition": 1, "schema": 1},
+            "refresh_mode": "snapshot",
+            "streams": [
+                {
+                    "id": "root_source",
+                    "kind": "root",
+                    "format": "parquet",
+                    "compression": "none",
+                    "snapshot_token": "source_snapshot",
+                }
+            ],
+            "schema": {
+                "root": {
+                    "logical_key": ["npi"],
+                    "entity": {"adapter": "npi", "field": "npi"},
+                    "fields": [
+                        {"id": "npi", "slot": 1, "type": "string", "nullable": False},
+                        {"id": "specialty", "slot": 2, "type": "string", "nullable": True},
+                    ],
+                },
+                "children": [],
+            },
+            "aliases": {"root_source": {}},
+            "query": {"root_fields": [], "order": []},
+            "selection_profiles": [],
+        }
+    )
+
+
+def _bundle_statement() -> SnowflakeBundleStatement:
+    definition = _definition()
+    data_relation = SnowflakeRelation(database="demo", schema="curated", name="providers")
+    snapshot_relation = SnowflakeRelation(database="demo", schema="curated", name="snapshots")
+    request = SnowflakeBundleRequest(
+        definition=definition,
+        bindings=(
+            SnowflakeBundleBinding(
+                stream_id="root_source",
+                relation=data_relation,
+                source_snapshot_token_relation=snapshot_relation,
+                selected_field_ids=("npi", "specialty"),
+                semantic_token_metadata_key="source_snapshot",
+            ),
+        ),
+    )
+    return SnowflakeBundleStatement(
+        request=request,
+        selected_columns_by_stream=(
+            (
+                SnowflakeDeclaredColumn(field_id="npi", column_identifier="npi_num"),
+                SnowflakeDeclaredColumn(field_id="specialty", column_identifier="specialty_name"),
+            ),
+        ),
+        source_snapshot_token_columns_by_stream=(
+            SnowflakeDeclaredColumn(field_id="source_snapshot", column_identifier="snapshot_token"),
+        ),
+    )
+
+
+def _legacy_statement() -> SnowflakeReadStatement:
+    return SnowflakeReadStatement(
+        SnowflakeReadRequest(
+            relation=SnowflakeRelation(database="demo", schema="curated", name="providers"),
+            selected_columns=(SnowflakeDeclaredColumn(field_id="npi", column_identifier="npi_num"),),
+            definition_sha256="1" * 64,
+            schema_sha256="2" * 64,
+        )
+    )
+
+
+def _description(*, data_columns=None):
+    return (
+        _Metadata("__ci_bundle_row_kind", "FIXED", False, precision=1, scale=0),
+        _Metadata("__ci_stream_ordinal", "FIXED", False, precision=2, scale=0),
+        _Metadata("__ci_stream_id", "TEXT", False),
+        _Metadata("__ci_source_snapshot_token", "TEXT", True),
+        *(data_columns or (_Metadata("npi", "TEXT", False), _Metadata("specialty", "TEXT", True))),
+    )
+
+
+def _metadata_row() -> tuple[object, ...]:
+    return (0, 1, "root_source", "synthetic-snapshot", None, None)
+
+
+def _data_row(npi: object, specialty: object) -> tuple[object, ...]:
+    return (1, 1, "root_source", None, npi, specialty)
+
+
+@pytest.fixture
+def credentials(monkeypatch) -> SnowflakeKeyPairCredentials:
+    monkeypatch.setattr(snowflake_python, "_private_key_der", lambda _credentials: b"private-key-der")
+    return SnowflakeKeyPairCredentials(account="example", user="reader", private_key_pem=_PRIVATE_KEY)
+
+
+def _connect(monkeypatch, cursor: _Cursor):
+    connection = _Connection(cursor)
+    arguments_by_name = {}
+
+    def connect(**arguments):
+        arguments_by_name.update(arguments)
+        return connection
+
+    monkeypatch.setattr(snowflake_python.snowflake.connector, "connect", connect)
+    return connection, arguments_by_name
+
+
+def _parquet_tables(result) -> list[dict[str, list[object]]]:
+    parquet_result = result.stream_results[0].parquet_result
+    tables = []
+    for reader in parquet_result.consume_partition_sources():
+        parquet_result.claim_partition_source(reader)
+        tables.append(pq.read_table(BytesIO(reader.read())).to_pydict())
+        parquet_result.close_partition_source(reader)
+    return tables
+
+
+def test_connector_import_accepts_the_project_pyarrow_version():
+    completed = subprocess.run(
+        [sys.executable, "-W", "error::UserWarning", "-c", "import process.custom_import.snowflake_python"],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+    unrelated = subprocess.run(
+        [
+            sys.executable,
+            "-W",
+            "error::UserWarning",
+            "-c",
+            "import process.custom_import.snowflake_python; import warnings; warnings.warn('unrelated', UserWarning)",
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    assert unrelated.returncode != 0
+    assert "UserWarning: unrelated" in unrelated.stderr
+
+
+@pytest.mark.parametrize(
+    "result_rows",
+    (
+        (
+            ("1003000126", True, 7, Decimal("123456789012345678.123456789012")),
+            ("1234567893", False, -7, Decimal("-12.500000000000")),
+            ("1999999999", None, None, None),
+        ),
+        (
+            ("1003000126", True, 7, Decimal("123456789012345678.123456789012")),
+            ("1234567893", False, -7, Decimal("-12.500000000000")),
+        ),
+        (),
+    ),
+    ids=("scalar-null-values", "scalar-values", "empty-schema"),
+)
+@pytest.mark.parametrize("record_limits", [None, CaptureLimits()])
+def test_real_parquet_encoder_replays_exact_captured_scalars(result_rows, record_limits):
+    """Real encoder and sealed replay preserve scalar types, nulls and cleanup."""
+
+    result_schema = (
+        SnowflakeResultColumn(field_id="npi", source_type="TEXT", nullable=False),
+        SnowflakeResultColumn(field_id="active", source_type="BOOLEAN", nullable=True),
+        SnowflakeResultColumn(field_id="count", source_type="FIXED(18,0)", nullable=True),
+        SnowflakeResultColumn(field_id="amount", source_type="FIXED(38,12)", nullable=True),
+    )
+    stream = _definition().source_streams[0]
+    reader, arrow_bytes = snowflake_python._parquet_reader_with_metrics(
+        result_rows, result_schema, record_limits=record_limits
+    )
+    with reader:
+        captured = capture_stream(reader, stream, source_snapshot_token="synthetic-snapshot")
+        assert not reader.closed
+    assert reader.closed
+    assert captured.payload
+    assert captured.manifest.compressed_bytes == captured.manifest.decoded_bytes == len(captured.payload)
+    assert (
+        captured.manifest.compressed_sha256
+        == captured.manifest.decoded_sha256
+        == hashlib.sha256(captured.payload).hexdigest()
+    )
+    assert captured.manifest.source_snapshot_token == "synthetic-snapshot"
+    verify_capture(captured, stream)
+    captured_records = list(iter_records(captured, stream))
+    assert [captured_record.ordinal for captured_record in captured_records] == list(range(1, len(result_rows) + 1))
+    assert [dict(captured_record.values) for captured_record in captured_records] == [
+        dict(zip((column.field_id for column in result_schema), result_row, strict=True)) for result_row in result_rows
+    ]
+    for captured_record, result_row in zip(captured_records, result_rows, strict=True):
+        assert [type(scalar_value) for scalar_value in captured_record.values.values()] == [
+            type(scalar_value) for scalar_value in result_row
+        ]
+        if result_row[3] is not None:
+            assert captured_record.values["amount"].as_tuple() == result_row[3].as_tuple()
+    with BytesIO(captured.payload) as replay_source, pq.ParquetFile(replay_source) as parquet_file:
+        replayed = parquet_file.read()
+        assert replayed.num_rows == len(result_rows)
+        assert replayed.column_names == [column.field_id for column in result_schema]
+        assert replayed.schema.types == [snowflake_python._arrow_type(column) for column in result_schema]
+        assert [field.nullable for field in replayed.schema] == [column.nullable for column in result_schema]
+        encoded_table = pa.Table.from_arrays(
+            [
+                pa.array([result_row[index] for result_row in result_rows], type=snowflake_python._arrow_type(column))
+                for index, column in enumerate(result_schema)
+            ],
+            names=[column.field_id for column in result_schema],
+        )
+        assert encoded_table.nbytes == arrow_bytes
+    assert replay_source.closed and parquet_file.closed
+
+
+@pytest.mark.parametrize("record_count", [7, 8, 9, 33])
+@pytest.mark.parametrize("null_mode", ["none", "all", "mixed"])
+@pytest.mark.parametrize("row_group_size", [1, 3, 16])
+def test_generated_landing_one_row_bytes_match_generic_replay(record_count, null_mode, row_group_size):
+    scalar_values = (True, 7, "åλ中", Decimal("0.000000000001"))
+    scalar_types = (pa.bool_(), pa.int64(), pa.string(), pa.decimal128(30, 12))
+    columns = [
+        pa.array(
+            [
+                None if null_mode == "all" or (null_mode == "mixed" and index % 2) else value
+                for index in range(record_count)
+            ],
+            type=scalar_type,
+        )
+        for value, scalar_type in zip(scalar_values, scalar_types, strict=True)
+    ]
+    table = pa.Table.from_arrays(columns, names=["flag", "count", "text", "amount"])
+    with BytesIO() as reader:
+        pq.write_table(table, reader, row_group_size=row_group_size)
+        with pq.ParquetFile(reader) as parquet:
+            logical_bytes = sum(batch.nbytes for batch in parquet.iter_batches(batch_size=1, use_threads=False))
+            decoded = parquet.read(use_threads=False)
+    limits = CaptureLimits(maximum_decoded_bytes=logical_bytes, maximum_record_bytes=64)
+    snowflake_python._validate_generated_landing_records(decoded, limits)
+    with pytest.raises(CaptureError, match="decoded-byte limit"):
+        snowflake_python._validate_generated_landing_records(
+            decoded, replace(limits, maximum_decoded_bytes=logical_bytes - 1)
+        )
+
+
+@pytest.mark.parametrize("maximum_decoded_bytes", [262_144, 300_000], ids=("table-budget", "page-budget"))
+def test_generated_landing_falls_back_before_unbudgeted_full_table_read(monkeypatch, maximum_decoded_bytes):
+    def reject_full_table(*args, **kwargs):
+        raise AssertionError("full-table replay must not run without a memory reservation")
+
+    monkeypatch.setattr(pq.ParquetFile, "read", reject_full_table)
+    schema = (SnowflakeResultColumn(field_id="text", source_type="TEXT", nullable=False),)
+    records = [("x" * 4096,) for _ in range(32)]
+    limits = CaptureLimits(maximum_decoded_bytes=maximum_decoded_bytes, maximum_record_bytes=8192)
+    reader, arrow_bytes = snowflake_python._parquet_reader_with_metrics(records, schema, record_limits=limits)
+    with reader:
+        assert arrow_bytes == 32 * 4100
+        assert reader.read(4) == b"PAR1"
+    assert reader.closed
+
+
+@pytest.mark.parametrize(
+    ("maximum_decoded_bytes", "expected_error"),
+    [
+        (64, "source stream exceeds the decoded-byte limit"),
+        (65_536, "Parquet source payload exceeds the decoded-byte limit"),
+    ],
+    ids=("encoded-part-budget", "fallback-page-budget"),
+)
+def test_generated_landing_budget_failure_closes_reader_before_decode(
+    monkeypatch, maximum_decoded_bytes, expected_error
+):
+    write_table = pq.write_table
+    preflight = snowflake_python._validate_parquet_page_preflight
+    destinations = []
+    preflight_budgets = []
+
+    def tracked_write(table, destination, **options):
+        destinations.append(destination)
+        write_table(table, destination, **options)
+
+    def tracked_preflight(*arguments, maximum_decoded_bytes):
+        preflight_budgets.append(maximum_decoded_bytes)
+        preflight(*arguments, maximum_decoded_bytes=maximum_decoded_bytes)
+
+    def reject_decode(*args, **kwargs):
+        raise AssertionError("decoding must not run after a failed memory preflight")
+
+    monkeypatch.setattr(pq, "write_table", tracked_write)
+    monkeypatch.setattr(pq.ParquetFile, "read", reject_decode)
+    monkeypatch.setattr(snowflake_python, "_iter_parquet_batch_records", reject_decode)
+    monkeypatch.setattr(snowflake_python, "_validate_parquet_page_preflight", tracked_preflight)
+    schema = (SnowflakeResultColumn(field_id="text", source_type="TEXT", nullable=False),)
+    limits = CaptureLimits(maximum_decoded_bytes=maximum_decoded_bytes, maximum_record_bytes=64)
+    with pytest.raises(CaptureError, match=expected_error):
+        snowflake_python._parquet_reader_with_metrics([("original",)], schema, record_limits=limits)
+    assert len(destinations) == 1 and destinations[0].closed
+    if maximum_decoded_bytes == 64:
+        assert preflight_budgets == []
+    else:
+        assert len(preflight_budgets) == 2
+        assert 0 < preflight_budgets[0] < preflight_budgets[1] == maximum_decoded_bytes
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("drift", ["values", "schema"])
+def test_generated_landing_rejects_encoded_drift_and_closes_reader(monkeypatch, fallback, drift):
+    write_table = pq.write_table
+    destinations = []
+
+    def altered_write(table, destination, **options):
+        destinations.append(destination)
+        altered = table.set_column(0, table.schema.field(0), pa.array(["changed"] * table.num_rows, type=pa.string()))
+        if drift == "schema":
+            altered = table.cast(pa.schema([pa.field("text", pa.string(), nullable=True)]))
+        write_table(altered, destination, **options)
+
+    monkeypatch.setattr(pq, "write_table", altered_write)
+    schema = (SnowflakeResultColumn(field_id="text", source_type="TEXT", nullable=False),)
+    records = [("x" * 4096,)] * 32 if fallback else [("original",)]
+    limits = CaptureLimits(maximum_decoded_bytes=262_144, maximum_record_bytes=8192) if fallback else CaptureLimits()
+    with pytest.raises(CaptureError, match="encoded values" if drift == "values" else "schema or record count"):
+        snowflake_python._parquet_reader_with_metrics(records, schema, record_limits=limits)
+    assert len(destinations) == 1 and destinations[0].closed
+
+
+def test_adapter_fetches_one_generated_bundle_with_fixed_connection_policy(monkeypatch, credentials):
+    cursor = _Cursor((_metadata_row(), _data_row("1234567893", "Cardiology"), _data_row("1003000126", None)))
+    connection, arguments = _connect(monkeypatch, cursor)
+    statement = _bundle_statement()
+
+    bundle_result = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_bundle(
+        statement,
+        credentials,
+    )
+
+    assert cursor.executed == ["USE SECONDARY ROLES NONE", statement.sql]
+    assert arguments == {
+        "account": "example",
+        "user": "reader",
+        "authenticator": "SNOWFLAKE_JWT",
+        "private_key": b"private-key-der",
+        "role": "READER_ROLE",
+        "warehouse": "IMPORT_WH",
+        "autocommit": False,
+        "client_session_keep_alive": False,
+        "enable_server_session_keep_alive_auto_detection": True,
+        "client_store_temporary_credential": False,
+        "crl_check_mode": "ENABLED",
+        "crl_allow_certificates_without_crl_url": True,
+        "crl_connection_timeout": 10,
+        "crl_http_timeout": 10,
+        "login_timeout": 30,
+        "query_timeout": 120,
+        "request_timeout": 120,
+        "connect_timeout": 120,
+        "retry_timeout": 120,
+        "session_parameters": {
+            "QUERY_TAG": "custom-import/v1-snowflake",
+            "STATEMENT_TIMEOUT_IN_SECONDS": 120,
+        },
+    }
+    assert bundle_result.query_id == "01abc"
+    assert bundle_result.stream_results[0].parquet_result.source_snapshot_token == "synthetic-snapshot"
+    assert _parquet_tables(bundle_result) == [{"npi": ["1234567893", "1003000126"], "specialty": ["Cardiology", None]}]
+    bundle_result.close()
+    assert cursor.closed and connection.closed
+
+
+def test_adapter_emits_a_schema_bearing_empty_bundle_stream(monkeypatch, credentials):
+    cursor = _Cursor((_metadata_row(),))
+    connection, _arguments = _connect(monkeypatch, cursor)
+
+    result = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_bundle(
+        _bundle_statement(),
+        credentials,
+    )
+
+    assert _parquet_tables(result) == [{"npi": [], "specialty": []}]
+    result.close()
+    assert cursor.closed and connection.closed
+
+
+def test_adapter_resolves_type_codes_and_rejects_bad_result_boundaries(monkeypatch, credentials):
+    text_type_code = next(code for code, name in snowflake_python.SNOWFLAKE_FIELD_TYPES.items() if name == "TEXT")
+    cursor = _Cursor(
+        (_metadata_row(),),
+        description=_description(
+            data_columns=(
+                SimpleNamespace(name="npi", type_name=None, type_code=text_type_code, is_nullable=False),
+                SimpleNamespace(name="specialty", type_name=None, type_code=text_type_code, is_nullable=True),
+            )
+        ),
+    )
+    connection, _arguments = _connect(monkeypatch, cursor)
+    bundle_result = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_bundle(
+        _bundle_statement(), credentials
+    )
+    assert [column.source_type for column in bundle_result.stream_results[0].parquet_result.schema] == ["TEXT", "TEXT"]
+    bundle_result.close()
+    assert cursor.closed and connection.closed
+
+    for description, query_id, message in (
+        ((), "01abc", "result schema"),
+        (
+            _description(data_columns=(_Metadata("wrong", "TEXT", False), _Metadata("specialty", "TEXT", True))),
+            "01abc",
+            "result schema",
+        ),
+        (_description(), " ", "statement identity"),
+        (
+            _description(data_columns=(_Metadata("npi", "DATE", False), _Metadata("specialty", "TEXT", True))),
+            "01abc",
+            "not supported",
+        ),
+    ):
+        bad_cursor = _Cursor((_metadata_row(),), description=description, query_id=query_id)
+        bad_connection, _arguments = _connect(monkeypatch, bad_cursor)
+        with pytest.raises(SnowflakeConnectorError, match=message):
+            SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_bundle(
+                _bundle_statement(), credentials
+            )
+        assert bad_cursor.closed and bad_connection.closed
+
+
+def test_adapter_closes_when_result_construction_or_execute_fails(monkeypatch, credentials):
+    cursor = _Cursor((_metadata_row(),))
+    connection, _arguments = _connect(monkeypatch, cursor)
+    monkeypatch.setattr(
+        snowflake_python,
+        "SnowflakeBundleResult",
+        lambda **_arguments: (_ for _ in ()).throw(SnowflakeConnectorError("invalid adapter result")),
+    )
+
+    with pytest.raises(SnowflakeConnectorError, match="invalid adapter result"):
+        SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_bundle(
+            _bundle_statement(), credentials
+        )
+    assert cursor.closed and connection.closed
+
+    cursor = _Cursor(())
+    connection, _arguments = _connect(monkeypatch, cursor)
+
+    executed_statements = []
+
+    def fail_execute(sql: str) -> None:
+        executed_statements.append(sql)
+        if sql == "USE SECONDARY ROLES NONE":
+            return
+        raise RuntimeError("private server detail")
+
+    cursor.execute = fail_execute
+    with pytest.raises(SnowflakeConnectorError, match="Snowflake bundle read failed") as failure:
+        SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_bundle(
+            _bundle_statement(), credentials
+        )
+    assert "private server detail" not in str(failure.value)
+    assert executed_statements == ["USE SECONDARY ROLES NONE", _bundle_statement().sql]
+    assert cursor.closed and connection.closed
+
+
+@pytest.mark.parametrize(
+    ("method_name", "statement"),
+    (("fetch_parquet", _legacy_statement()), ("fetch_bundle", _bundle_statement())),
+)
+def test_adapter_closes_when_role_initialization_fails(monkeypatch, credentials, method_name, statement):
+    cursor = _Cursor(())
+    connection, _arguments = _connect(monkeypatch, cursor)
+    executed_statements = []
+
+    def fail_initialization(sql: str) -> None:
+        executed_statements.append(sql)
+        raise RuntimeError("synthetic initialization failure")
+
+    cursor.execute = fail_initialization
+    adapter = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh")
+    with pytest.raises(SnowflakeConnectorError, match=r"Snowflake (?:bundle )?read failed"):
+        getattr(adapter, method_name)(statement, credentials)
+    assert executed_statements == ["USE SECONDARY ROLES NONE"]
+    assert cursor.closed and connection.closed
+
+
+@pytest.mark.parametrize("interruption", (KeyboardInterrupt(), pytest.param(CancelledError(), id="cancelled")))
+def test_adapter_preserves_execute_interruptions_while_closing(monkeypatch, credentials, interruption):
+    cursor = _Cursor(())
+    connection, _arguments = _connect(monkeypatch, cursor)
+
+    def interrupt(_sql: str) -> None:
+        raise interruption
+
+    cursor.execute = interrupt
+    with pytest.raises(type(interruption)):
+        SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_bundle(
+            _bundle_statement(), credentials
+        )
+    assert cursor.closed and connection.closed
+
+
+def test_adapter_preserves_fetch_cancellation_when_cleanup_fails(monkeypatch, credentials):
+    cursor = _Cursor((_metadata_row(),))
+    connection, _arguments = _connect(monkeypatch, cursor)
+    result = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_bundle(
+        _bundle_statement(), credentials
+    )
+
+    def cancel():
+        raise CancelledError
+
+    def fail_close() -> None:
+        cursor.closed = True
+        raise RuntimeError("cleanup detail")
+
+    cursor.fetchone = cancel
+    cursor.close = fail_close
+    with pytest.raises(CancelledError):
+        next(result.stream_results[0].parquet_result.consume_partition_sources())
+    assert cursor.closed and connection.closed
+    result.close()
+
+
+def test_adapter_closes_after_a_deferred_fetch_error(monkeypatch, credentials):
+    cursor = _Cursor((_metadata_row(),))
+    connection, _arguments = _connect(monkeypatch, cursor)
+    result = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_bundle(
+        _bundle_statement(), credentials
+    )
+
+    def fail_fetch():
+        raise RuntimeError("synthetic fetch failure")
+
+    cursor.fetchone = fail_fetch
+    with pytest.raises(SnowflakeConnectorError, match="result fetch failed"):
+        next(result.stream_results[0].parquet_result.consume_partition_sources())
+    assert cursor.closed and connection.closed
+    result.close()
+
+
+def test_adapter_preserves_wide_decimals_and_bounds_partitions(monkeypatch, credentials):
+    cursor = _Cursor(
+        (_metadata_row(), _data_row(2**63, "Cardiology")),
+        description=_description(
+            data_columns=(
+                _Metadata("npi", "FIXED", False, precision=38, scale=0),
+                _Metadata("specialty", "TEXT", True),
+            )
+        ),
+    )
+    connection, _arguments = _connect(monkeypatch, cursor)
+    bundle_result = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_bundle(
+        _bundle_statement(), credentials
+    )
+    assert _parquet_tables(bundle_result)[0]["npi"] == [Decimal(2**63)]
+    bundle_result.close()
+    assert cursor.closed and connection.closed
+
+    cursor = _Cursor((_metadata_row(), *(_data_row(str(index).ljust(600, "x"), "Cardiology") for index in range(10))))
+    connection, _arguments = _connect(monkeypatch, cursor)
+    monkeypatch.setattr(snowflake_python, "MAX_RESULT_PARTITION_BYTES", 4_096)
+    bundle_result = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_bundle(
+        _bundle_statement(), credentials
+    )
+    assert [len(table["npi"]) for table in _parquet_tables(bundle_result)] == [6, 4]
+    bundle_result.close()
+    assert cursor.closed and connection.closed
+
+
+def _assert_scalar_validation_bounds() -> SnowflakeResultColumn:
+    text_column = SnowflakeResultColumn(field_id="value", source_type="TEXT", nullable=False)
+    boolean_column = SnowflakeResultColumn(field_id="value", source_type="BOOLEAN", nullable=True)
+    fixed_column = SnowflakeResultColumn(field_id="value", source_type="FIXED(10,0)", nullable=True)
+    scaled_column = SnowflakeResultColumn(field_id="value", source_type="FIXED(10,2)", nullable=True)
+
+    with pytest.raises(SnowflakeConnectorError, match="unavailable"):
+        snowflake_python._source_type(SimpleNamespace(type_name=None, type_code=True))
+    with pytest.raises(SnowflakeConnectorError, match="precision is invalid"):
+        snowflake_python._metadata_integer(SimpleNamespace(precision=True), "precision", minimum=1, maximum=38)
+    with pytest.raises(SnowflakeConnectorError, match="nullability is invalid"):
+        snowflake_python._is_nullable(SimpleNamespace(is_nullable="yes"))
+    with pytest.raises(SnowflakeConnectorError, match="does not match"):
+        snowflake_python._result_row_variable_bytes("x", (text_column,))
+    with pytest.raises(SnowflakeConnectorError, match="non-nullable"):
+        snowflake_python._variable_scalar_bytes(None, text_column)
+    with pytest.raises(SnowflakeConnectorError, match="TEXT result value"):
+        snowflake_python._variable_scalar_bytes(1, text_column)
+    with pytest.raises(SnowflakeConnectorError, match="valid UTF-8"):
+        snowflake_python._variable_scalar_bytes("\ud800", SnowflakeResultColumn("value", "TEXT", True))
+    with pytest.raises(SnowflakeConnectorError, match="BOOLEAN result value"):
+        snowflake_python._variable_scalar_bytes(1, boolean_column)
+    with pytest.raises(SnowflakeConnectorError, match="signed 64-bit"):
+        snowflake_python._variable_scalar_bytes(True, fixed_column)
+    with pytest.raises(SnowflakeConnectorError, match="FIXED result value"):
+        snowflake_python._variable_scalar_bytes("not-a-decimal", scaled_column)
+    assert snowflake_python._variable_scalar_bytes(Decimal("12.50"), scaled_column) == 0
+    assert snowflake_python._arrow_fixed_bytes("BOOLEAN", 1) == 2
+    assert snowflake_python._arrow_fixed_bytes("FIXED(10,0)", 1) == 9
+    assert snowflake_python._arrow_type(boolean_column) == snowflake_python.pa.bool_()
+    with pytest.raises(SnowflakeConnectorError, match="not supported by the Parquet encoder"):
+        snowflake_python._fixed_type_parts("invalid")
+
+    return text_column
+
+
+def test_adapter_validates_scalars_and_parquet_encoding_bounds(monkeypatch):
+    text_column = _assert_scalar_validation_bounds()
+
+    monkeypatch.setattr(snowflake_python, "MAX_RESULT_PARTITION_BYTES", 1)
+    with pytest.raises(SnowflakeConnectorError, match="decoded-byte limit"):
+        snowflake_python._validate_result_rows((("x",),), (text_column,))
+
+    fake_arrow = SimpleNamespace(
+        ArrowException=RuntimeError,
+        Table=SimpleNamespace(from_arrays=lambda *_args, **_kwargs: SimpleNamespace(nbytes=101)),
+        array=lambda *_args, **_kwargs: object(),
+        field=lambda *_args, **_kwargs: object(),
+        schema=lambda *_args, **_kwargs: object(),
+        string=lambda: object(),
+    )
+    monkeypatch.setattr(snowflake_python, "pa", fake_arrow)
+    monkeypatch.setattr(snowflake_python, "MAX_RESULT_PARTITION_BYTES", 100)
+    with pytest.raises(SnowflakeConnectorError, match="decoded-byte limit"):
+        snowflake_python._parquet_reader((("x",),), (text_column,))
+
+    def invalid_table(*_args, **_kwargs):
+        raise TypeError("synthetic Arrow failure")
+
+    fake_arrow.Table.from_arrays = invalid_table
+    with pytest.raises(SnowflakeConnectorError, match="cannot be encoded"):
+        snowflake_python._parquet_reader((("x",),), (text_column,))
+
+    fake_arrow.Table.from_arrays = lambda *_args, **_kwargs: SimpleNamespace(nbytes=0)
+    monkeypatch.setattr(
+        snowflake_python.pq,
+        "write_table",
+        lambda _table, destination, **_kwargs: destination.write(b"x" * 101),
+    )
+    with pytest.raises(SnowflakeConnectorError, match="Parquet partition exceeds"):
+        snowflake_python._parquet_reader((("x",),), (text_column,))
+
+
+def test_adapter_rejects_invalid_bundle_arguments_and_unsafe_connection_identifiers(credentials):
+    adapter = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh")
+    with pytest.raises(SnowflakeConnectorError, match="generated Snowflake bundle statement"):
+        adapter.fetch_bundle(object(), credentials)
+    with pytest.raises(SnowflakeCredentialError, match="key-pair credentials"):
+        adapter.fetch_bundle(_bundle_statement(), object())
+
+    for value in ("", "role name", "role;drop"):
+        with pytest.raises(SnowflakeConnectorError, match="simple identifier"):
+            SnowflakePythonConnectorAdapter(role=value, warehouse="warehouse")
+
+
+def test_adapter_fetches_legacy_single_stream_reads(monkeypatch, credentials):
+    cursor = _Cursor((("1003000126",),), description=(_Metadata("npi", "TEXT", False),))
+    connection, _arguments = _connect(monkeypatch, cursor)
+
+    result = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_parquet(
+        _legacy_statement(), credentials
+    )
+    iterator = result.consume_partition_sources()
+    reader = next(iterator)
+    result.claim_partition_source(reader)
+    assert result.source_snapshot_token == "snowflake-query:01abc"
+    assert pq.read_table(BytesIO(reader.read())).to_pydict() == {"npi": ["1003000126"]}
+    result.close_partition_source(reader)
+    with pytest.raises(StopIteration):
+        next(iterator)
+    result.close_partition_iterator()
+    result.close()
+    assert cursor.executed == ["USE SECONDARY ROLES NONE", _legacy_statement().sql]
+    assert cursor.closed and connection.closed
+
+
+@pytest.mark.parametrize("method", ("fetch_parquet", "open_bundle_landing"))
+@pytest.mark.parametrize("error_type", (RuntimeError, CancelledError))
+def test_open_failure_preserves_error_and_closes_owned_resources(monkeypatch, credentials, method, error_type):
+    cursor = _Cursor(())
+    connection, _arguments = _connect(monkeypatch, cursor)
+    failure = error_type("synthetic source-open failure")
+    execute = cursor.execute
+
+    def fail_select(sql):
+        if sql.startswith("USE "):
+            return execute(sql)
+        raise failure
+
+    monkeypatch.setattr(cursor, "execute", fail_select)
+    adapter = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh")
+    statement = _legacy_statement() if method == "fetch_parquet" else _bundle_statement()
+    options = (
+        {}
+        if method == "fetch_parquet"
+        else {
+            "part_limits": CaptureLimits(),
+            "maximum_part_arrow_bytes": 1024 * 1024,
+            "timeout_seconds": 17,
+        }
+    )
+    expected = CancelledError if error_type is CancelledError else SnowflakeConnectorError
+
+    with pytest.raises(expected) as caught:
+        getattr(adapter, method)(statement, credentials, **options)
+
+    if error_type is CancelledError:
+        assert caught.value is failure
+    else:
+        assert caught.value.__cause__ is failure
+        assert str(caught.value) == (
+            "Snowflake read failed" if method == "fetch_parquet" else "Snowflake bundle landing read failed"
+        )
+    assert cursor.closed and connection.closed
+
+
+@pytest.mark.parametrize("invalid_field", ("statement", "credentials"))
+def test_landing_contract_rejection_precedes_connection(monkeypatch, credentials, invalid_field):
+    adapter = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh")
+    connect = Mock(side_effect=AssertionError("invalid landing must not open a connection"))
+    monkeypatch.setattr(adapter, "_connect", connect)
+
+    with pytest.raises((SnowflakeConnectorError, SnowflakeCredentialError)):
+        adapter.open_bundle_landing(
+            None if invalid_field == "statement" else _bundle_statement(),
+            None if invalid_field == "credentials" else credentials,
+            part_limits=CaptureLimits(),
+            maximum_part_arrow_bytes=1024 * 1024,
+            timeout_seconds=17,
+        )
+
+    connect.assert_not_called()
+
+
+@pytest.mark.parametrize("error_type", (SnowflakeConnectorError, RuntimeError))
+def test_legacy_fetch_failure_closes_without_replacing_primary(monkeypatch, credentials, error_type):
+    cursor = _Cursor((), description=(_Metadata("npi", "TEXT", False),))
+    connection, _arguments = _connect(monkeypatch, cursor)
+    result = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_parquet(
+        _legacy_statement(), credentials
+    )
+    failure = error_type("synthetic fetch failure")
+    monkeypatch.setattr(cursor, "fetchone", Mock(side_effect=failure))
+    with pytest.raises(SnowflakeConnectorError) as caught:
+        next(result.consume_partition_sources())
+
+    assert (caught.value if error_type is SnowflakeConnectorError else caught.value.__cause__) is failure
+    assert cursor.closed and connection.closed
+    result.close()
+
+
+def test_legacy_byte_boundary_carries_one_unread_row_without_loss(monkeypatch):
+    schema = (SnowflakeResultColumn(field_id="npi", source_type="TEXT", nullable=False),)
+    cursor = _Cursor((("first",), ("second",)))
+    connection = _Connection(cursor)
+    sources = snowflake_python._SnowflakeParquetPartitionSources(
+        connection=connection, cursor=cursor, result_schema=schema
+    )
+    bound = snowflake_python._fixed_batch_bytes(schema, 1) + len("second")
+    monkeypatch.setattr(snowflake_python, "MAX_RESULT_PARTITION_BYTES", bound)
+    try:
+        first, pending, exhausted = sources._next_partition_rows(None)
+        assert first == [("first",)] and pending == ("second",) and not exhausted
+        assert cursor.fetch_count == 2
+        second, pending, exhausted = sources._next_partition_rows(pending)
+        assert second == [("second",)] and pending is None and exhausted
+    finally:
+        sources.close()
+
+    assert cursor.fetch_count == 3 and cursor.closed and connection.closed
+
+
+@pytest.mark.parametrize("value", (Decimal("NaN"), Decimal("1e30"), True))
+def test_invalid_converted_real_is_rejected_before_arrow_allocation(monkeypatch, value):
+    column = SnowflakeResultColumn(field_id="amount", source_type="REAL", nullable=False)
+    allocate = Mock(side_effect=AssertionError("invalid converted decimal must not allocate Arrow buffers"))
+    monkeypatch.setattr(snowflake_python.pa, "array", allocate)
+
+    with pytest.raises(SnowflakeConnectorError, match="converted REAL result is invalid"):
+        snowflake_python._parquet_reader(((value,),), (column,))
+
+    allocate.assert_not_called()
+
+
+def test_adapter_wraps_invalid_private_key_material(monkeypatch):
+    credentials = SnowflakeKeyPairCredentials(account="example", user="reader", private_key_pem=_PRIVATE_KEY)
+    monkeypatch.setattr(
+        snowflake_python.serialization,
+        "load_pem_private_key",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("synthetic invalid key")),
+    )
+
+    with pytest.raises(SnowflakeCredentialError, match="cannot be loaded"):
+        snowflake_python._private_key_der(credentials)
+
+
+def test_legacy_adapter_and_partition_sources_reject_invalid_transport_states(monkeypatch, credentials):
+    adapter = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh")
+    with pytest.raises(SnowflakeConnectorError, match="generated Snowflake statement"):
+        adapter.fetch_parquet(object(), credentials)
+    with pytest.raises(SnowflakeCredentialError, match="key-pair credentials"):
+        adapter.fetch_parquet(_legacy_statement(), object())
+
+    cursor = _Cursor((), description=(_Metadata("npi", "TEXT", False),), query_id=" ")
+    connection, _arguments = _connect(monkeypatch, cursor)
+    with pytest.raises(SnowflakeConnectorError, match="statement identity"):
+        adapter.fetch_parquet(_legacy_statement(), credentials)
+    assert cursor.closed and connection.closed
+
+    schema = (SnowflakeResultColumn(field_id="npi", source_type="TEXT", nullable=False),)
+    cursor = _Cursor((), description=(_Metadata("npi", "TEXT", False),))
+    connection = _Connection(cursor)
+    partition_sources = snowflake_python._SnowflakeParquetPartitionSources(
+        connection=connection,
+        cursor=cursor,
+        result_schema=schema,
+    )
+    reader = next(iter(partition_sources))
+    reader.close()
+    with pytest.raises(SnowflakeConnectorError, match="already consumed"):
+        next(iter(partition_sources))
+    partition_sources.close()
+    partition_sources.close()
+    assert cursor.closed and connection.closed
+
+    cursor = _Cursor((), description=(_Metadata("npi", "TEXT", False),))
+    partition_source = snowflake_python._SnowflakeParquetPartitionSources(
+        connection=_Connection(cursor), cursor=cursor, result_schema=schema
+    )
+    monkeypatch.setattr(snowflake_python, "_FETCH_ROWS", 1)
+    cursor._rows = [("1234567893",)]
+    assert partition_source._next_partition_rows(None) == ([("1234567893",)], None, False)
+    partition_source.close()
+
+    cursor = _Cursor((("",),), description=(_Metadata("npi", "TEXT", False),))
+    partition_source = snowflake_python._SnowflakeParquetPartitionSources(
+        connection=_Connection(cursor), cursor=cursor, result_schema=schema
+    )
+    monkeypatch.setattr(snowflake_python, "MAX_RESULT_PARTITION_BYTES", 4)
+    with pytest.raises(SnowflakeConnectorError, match="decoded-byte limit"):
+        partition_source._next_partition_rows(None)
+    partition_source.close()
+
+
+def test_bundle_transport_rejects_malformed_metadata():
+    statement = _bundle_statement()
+    valid_description = _description()
+    for description, message in (
+        (
+            valid_description[:0] + (replace(valid_description[0], scale=1),) + valid_description[1:],
+            "discriminator schema",
+        ),
+        (
+            valid_description[:1] + (replace(valid_description[1], scale=1),) + valid_description[2:],
+            "discriminator schema",
+        ),
+        (
+            valid_description[:2] + (replace(valid_description[2], is_nullable=True),) + valid_description[3:],
+            "discriminator schema",
+        ),
+        (
+            valid_description[:3] + (replace(valid_description[3], type_name="BOOLEAN"),) + valid_description[4:],
+            "snapshot metadata",
+        ),
+    ):
+        with pytest.raises(SnowflakeConnectorError, match=message):
+            snowflake_python._bundle_result_schemas(statement, description)
+
+    for metadata_rows, message in (
+        ((), "metadata observations are incomplete"),
+        (((0, 1, "wrong", "synthetic-snapshot", None, None),), "metadata row"),
+        ((_metadata_row(), _metadata_row()), "exactly one per stream"),
+    ):
+        with pytest.raises(SnowflakeConnectorError, match=message):
+            snowflake_python._bundle_stream_metadata(statement, _Cursor(metadata_rows))
+    with pytest.raises(SnowflakeConnectorError, match="row kind"):
+        snowflake_python._bundle_row_kind((True,))
+
+
+def test_bundle_transport_rejects_invalid_stream_ownership_and_result_rows():
+    statement = _bundle_statement()
+    valid_description = _description()
+    schemas = snowflake_python._bundle_result_schemas(statement, valid_description)
+    cursor = _Cursor(())
+    connection = _Connection(cursor)
+    owner = snowflake_python._SnowflakeBundlePartitionSources(
+        connection=connection,
+        cursor=cursor,
+        statement=statement,
+        schemas=schemas,
+        pending_row=None,
+    )
+    with pytest.raises(SnowflakeConnectorError, match="configured order"):
+        owner.next_partition_rows(1)
+    with pytest.raises(SnowflakeConnectorError, match="not contiguous"):
+        owner.finish_stream(1)
+    for result_row, message in (
+        ("bad", "result row"),
+        ((1,), "result row"),
+        ((0, 1, "root_source", None, "npi", None), "data row"),
+        ((1, True, "root_source", None, "npi", None), "stream ordinal"),
+        ((1, 2, "root_source", None, "npi", None), "stream ordinal"),
+        ((1, 1, "wrong", None, "npi", None), "stream identity"),
+        ((1, 1, "root_source", "unexpected-snapshot", "npi", None), "stream identity"),
+    ):
+        with pytest.raises(SnowflakeConnectorError, match=message):
+            owner._split_row(result_row, 0)
+    stream = owner.stream_sources(0)
+    stream.close()
+    stream.close()
+    owner.close()
+    with pytest.raises(SnowflakeConnectorError, match="result is closed"):
+        owner.next_partition_rows(0)
+    assert cursor.closed and connection.closed
+
+    with pytest.raises(SnowflakeConnectorError, match="selected fields"):
+        snowflake_python._result_schema(_legacy_statement(), ())
+    with pytest.raises(SnowflakeConnectorError, match="selected fields"):
+        snowflake_python._result_schema(_legacy_statement(), (_Metadata("wrong", "TEXT", False),))
+    assert snowflake_python._is_nullable(SimpleNamespace(is_nullable=None)) is True
+    assert snowflake_python._uses_decimal_storage("TEXT") is False
+    with pytest.raises(SnowflakeConnectorError, match="selected fields"):
+        snowflake_python._result_row_variable_bytes(("a", "b"), (SnowflakeResultColumn("value", "TEXT", True),))
+
+
+def test_bundle_partition_sources_are_single_use_and_close_on_replay_refusal(monkeypatch, credentials):
+    cursor = _Cursor((_metadata_row(), _data_row("1234567893", "Cardiology")))
+    connection, _ = _connect(monkeypatch, cursor)
+    result = SnowflakePythonConnectorAdapter(role="reader_role", warehouse="import_wh").fetch_bundle(
+        _bundle_statement(), credentials
+    )
+    sources = result.stream_results[0].parquet_result.partition_sources
+    readers = list(sources)
+    for reader in readers:
+        reader.close()
+    with pytest.raises(SnowflakeConnectorError, match="already consumed"):
+        list(sources)
+    result.close()
+    assert cursor.closed and connection.closed
+
+
+def test_bundle_source_ordinal_regression_closes_cursor_without_replay(monkeypatch):
+    from tests.test_custom_import_snowflake_bundle import _Credentials
+    from tests.test_custom_import_snowflake_shared_capture import _runtime, _shared_row
+
+    other_row = (1, 2, "other_source", None, None, None, None, None, None, None, "1003000126", "x", 2)
+    connector, request, adapter, cursor, connection = _runtime(
+        monkeypatch, (other_row, _shared_row() + (None, None, None)), interleaved=True
+    )
+    result = adapter.fetch_bundle(connector.build_statement(request), _Credentials().load_key_pair())
+    try:
+        with pytest.raises(SnowflakeConnectorError, match="not ordered by stream"):
+            for stream in result.stream_results:
+                for reader in stream.parquet_result.partition_sources:
+                    reader.close()
+        assert cursor.closed and connection.closed
+    finally:
+        result.close()

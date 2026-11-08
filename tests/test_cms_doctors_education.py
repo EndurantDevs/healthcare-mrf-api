@@ -4,16 +4,19 @@ import csv
 import hashlib
 import importlib
 import os
-import uuid
 import zipfile
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
 
 from process import cms_doctors_education as education
-
+from process.entity_address_cutover_contract import postgres_sqlstate
+from tests.test_cms_doctors_organizations import _unit_source_transaction
 
 NPI = "1000000004"
 SOURCE_URL = "https://example.test/cms-national.csv"
@@ -35,9 +38,13 @@ def staged_rows(monkeypatch):
     async def retain_batch(batch, _stage):
         rows.extend(dict(row) for row in batch)
 
+    async def create_stage(database, model, import_date, schema):
+        return await database.create_table(education.make_class(model, import_date).__table__, checkfirst=False)
+
+    monkeypatch.setattr(education, "create_doctors_stage", create_stage)
     monkeypatch.setattr(education.db, "create_table", AsyncMock())
     monkeypatch.setattr(education.db, "status", AsyncMock())
-    monkeypatch.setattr(education, "push_objects", retain_batch)
+    monkeypatch.setattr(education, "_copy_sidecar_rows", retain_batch)
     monkeypatch.setattr(education, "raise_if_cancelled", AsyncMock())
     return rows
 
@@ -55,7 +62,9 @@ def staged_rows(monkeypatch):
 )
 def test_education_keeps_source_partials_without_inventing_experience(school, year, expected):
     row = education.doctor_education_row(
-        {"npi": NPI, "med_sch": school, "grd_yr": year}, 12, MANIFEST,
+        {"npi": NPI, "med_sch": school, "grd_yr": year},
+        12,
+        MANIFEST,
     )
     if expected is None:
         assert row is None
@@ -97,7 +106,7 @@ def test_manifest_generation_and_future_year_flags_follow_observation_date(tmp_p
     first_manifest_by_name = education.education_source_manifest(source_path, SOURCE_URL)
     next_manifest_by_name = education.education_source_manifest(source_path, SOURCE_URL)
     assert first_manifest_by_name["content_sha256"] == next_manifest_by_name["content_sha256"]
-    assert first_manifest_by_name["generation_id"] != next_manifest_by_name["generation_id"]
+    assert first_manifest_by_name["generation_id"] == next_manifest_by_name["generation_id"]
     assert first_manifest_by_name["generation_id"] != first_manifest_by_name["content_sha256"]
     assert first_manifest_by_name["schema_version"] == "cms-doctor-education/v1"
     source_row_by_field = {"NPI": NPI, "Med_sch": "Example School", "Grd_yr": "2001"}
@@ -108,7 +117,24 @@ def test_manifest_generation_and_future_year_flags_follow_observation_date(tmp_p
     assert future["source_json"]["quality_flags"] == ["graduation_year_in_future"]
     assert not completed["source_json"].get("quality_flags")
     assert future["education_key"] == completed["education_key"]
-    assert future["generation_id"] != completed["generation_id"]
+    assert future["generation_id"] == completed["generation_id"]
+
+
+def test_manifest_generation_changes_only_with_source_identity_or_bytes(tmp_path, monkeypatch):
+    source_path = tmp_path / "national.csv"
+    source_path.write_text(f"NPI,Med_sch\n{NPI},Example School\n")
+    monkeypatch.setattr(
+        education,
+        "datetime",
+        SimpleNamespace(utcnow=Mock(side_effect=[datetime(2026, 1, 1)] * 3)),
+    )
+    first = education.education_source_manifest(source_path, "https://example.test/first.csv")
+    same_bytes = education.education_source_manifest(source_path, "https://example.test/second.csv")
+    assert first["generation_id"] == same_bytes["generation_id"]
+    assert first["source_url"] != same_bytes["source_url"]
+    source_path.write_text(f"NPI,Med_sch\n{NPI},Different School\n")
+    changed = education.education_source_manifest(source_path, "https://example.test/first.csv")
+    assert changed["generation_id"] != first["generation_id"]
 
 
 def test_education_identity_ignores_artifact_and_practice_location():
@@ -129,7 +155,10 @@ async def test_configured_dataset_identity_is_retained_in_rows_and_receipt(tmp_p
     source_path = tmp_path / "national.csv"
     source_path.write_text(f"NPI,Med_sch,Grd_yr\n{NPI},Example School,2001\n")
     receipt = await education.import_doctor_education(
-        source_path, SOURCE_URL, {"import_date": "educationtests", "context": {}}, {},
+        source_path,
+        SOURCE_URL,
+        {"import_date": "educationtests", "context": {}},
+        {},
         "synthetic-cms-dataset",
     )
     assert receipt["dataset_id"] == "synthetic-cms-dataset"
@@ -148,7 +177,10 @@ async def test_csv_and_zip_preserve_bom_quoted_fields_and_artifact_identity(tmp_
     else:
         source_path.write_bytes(payload)
     receipt = await education.import_doctor_education(
-        source_path, SOURCE_URL, {"import_date": "educationtests", "context": {}}, {},
+        source_path,
+        SOURCE_URL,
+        {"import_date": "educationtests", "context": {}},
+        {},
     )
     assert receipt["source_rows"] == receipt["education_rows"] == 1
     assert receipt["content_sha256"] == hashlib.sha256(source_path.read_bytes()).hexdigest()
@@ -184,7 +216,10 @@ async def test_import_rejects_changed_or_malformed_csv(tmp_path, staged_rows, pa
     source_path.write_text(payload, encoding="utf-8")
     with pytest.raises(error, match=match):
         await education.import_doctor_education(
-            source_path, SOURCE_URL, {"import_date": "educationtests", "context": {}}, {},
+            source_path,
+            SOURCE_URL,
+            {"import_date": "educationtests", "context": {}},
+            {},
         )
     assert staged_rows == []
     education.db.status.assert_awaited_once()
@@ -199,8 +234,10 @@ async def test_test_mode_limits_physical_input_rows(tmp_path, staged_rows, monke
         encoding="utf-8",
     )
     receipt = await education.import_doctor_education(
-        source_path, SOURCE_URL,
-        {"import_date": "educationtests", "context": {"test_mode": True}}, {},
+        source_path,
+        SOURCE_URL,
+        {"import_date": "educationtests", "context": {"test_mode": True}},
+        {},
     )
     assert receipt["source_rows"] == 2
     assert receipt["education_rows"] == len(staged_rows) == 1
@@ -212,7 +249,10 @@ async def test_existing_stage_creation_failure_never_drops_unowned_table(tmp_pat
     education.db.create_table.side_effect = RuntimeError("stage already exists")
     with pytest.raises(RuntimeError, match="stage already exists"):
         await education.import_doctor_education(
-            source_path, SOURCE_URL, {"import_date": "educationtests", "context": {}}, {},
+            source_path,
+            SOURCE_URL,
+            {"import_date": "educationtests", "context": {}},
+            {},
         )
     education.db.status.assert_not_awaited()
     assert staged_rows == []
@@ -221,7 +261,8 @@ async def test_existing_stage_creation_failure_never_drops_unowned_table(tmp_pat
 @pytest.mark.parametrize("is_owned", [False, True])
 async def test_discard_only_removes_owned_stage_once(staged_rows, is_owned):
     worker_context_by_key = {
-        "import_date": "educationtests", "context": {"education_stage_owned": is_owned},
+        "import_date": "educationtests",
+        "context": {"education_stage_owned": is_owned},
     }
     await education.discard_education_stage(worker_context_by_key)
     await education.discard_education_stage(worker_context_by_key)
@@ -233,7 +274,12 @@ async def test_discard_only_removes_owned_stage_once(staged_rows, is_owned):
 
 async def test_address_failure_discards_completed_education_stage(tmp_path, staged_rows, monkeypatch):
     import aiohttp
+
     cms_doctors = importlib.import_module("process.cms_doctors")
+    monkeypatch.setattr(cms_doctors, "source_transaction", _unit_source_transaction)
+    monkeypatch.setattr(cms_doctors, "_create_stage_indexes", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "bound_publisher", lambda: SimpleNamespace(connection=object(), policy=object()))
+    monkeypatch.setattr(cms_doctors.source_storage, "_close_grants", AsyncMock())
 
     async def download_source(_client, _url, source_path):
         with open(source_path, "w") as source_file:
@@ -243,8 +289,16 @@ async def test_address_failure_discards_completed_education_stage(tmp_path, stag
     monkeypatch.setattr(aiohttp, "ClientSession", lambda: client)
     monkeypatch.setattr(cms_doctors, "ensure_database", AsyncMock())
     monkeypatch.setattr(cms_doctors, "raise_if_cancelled", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "validate_doctors_artifact_root", lambda: None)
     monkeypatch.setattr(cms_doctors, "_fetch_doctors_download_url", AsyncMock(return_value=SOURCE_URL))
     monkeypatch.setattr(cms_doctors, "_download_doctors_source", download_source)
+    monkeypatch.setattr(
+        cms_doctors,
+        "retain_doctors_artifact",
+        lambda path, _url: {"content_sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()},
+    )
+    monkeypatch.setattr(cms_doctors, "import_group_site_rows", AsyncMock(return_value={"source_rows": 1}))
+    monkeypatch.setattr(cms_doctors, "_create_stage_indexes", AsyncMock())
     monkeypatch.setattr(cms_doctors, "_import_doctors_source", AsyncMock(side_effect=RuntimeError("address failure")))
     worker_context_by_key = {"import_date": "educationtests", "context": {}}
     with pytest.raises(RuntimeError, match="address failure"):
@@ -258,11 +312,18 @@ async def test_address_failure_discards_completed_education_stage(tmp_path, stag
 
 async def test_publication_validation_failure_discards_owned_stage(tmp_path, staged_rows, monkeypatch):
     cms_doctors = importlib.import_module("process.cms_doctors")
+    monkeypatch.setattr(cms_doctors, "source_transaction", _unit_source_transaction)
+    monkeypatch.setattr(cms_doctors, "_create_stage_indexes", AsyncMock())
+    monkeypatch.setattr(cms_doctors, "bound_publisher", lambda: SimpleNamespace(connection=object(), policy=object()))
+    monkeypatch.setattr(cms_doctors.source_storage, "_close_grants", AsyncMock())
     source_path = tmp_path / "national.csv"
     source_path.write_text(f"NPI,Med_sch,Grd_yr\n{NPI},Example School,2001\n")
     worker_context_by_key = {"import_date": "educationtests", "context": {"run": 1}}
     worker_context_by_key["context"]["education"] = await education.import_doctor_education(
-        source_path, SOURCE_URL, worker_context_by_key, {},
+        source_path,
+        SOURCE_URL,
+        worker_context_by_key,
+        {},
     )
     monkeypatch.setattr(cms_doctors, "ensure_database", AsyncMock())
     monkeypatch.setattr(cms_doctors.db, "scalar", AsyncMock(return_value=20_000))
@@ -286,7 +347,10 @@ async def test_import_retains_addressless_conflicts_and_deduplicates_across_batc
         writer.writerow([NPI, "Second Example School", "2001", ""])
         writer.writerow([NPI, "", "", ""])
     receipt = await education.import_doctor_education(
-        source_path, SOURCE_URL, {"import_date": "educationtests", "context": {}}, {},
+        source_path,
+        SOURCE_URL,
+        {"import_date": "educationtests", "context": {}},
+        {},
     )
     assert receipt["source_rows"] == 5_003
     assert receipt["education_rows"] == 2
@@ -326,59 +390,135 @@ async def test_validation_accepts_first_and_safe_refresh_but_blocks_volume_drop(
         await validation
 
 
-async def _create_publication_fixture(connection, schema):
-    marker_by_table = {
-        "doctor_clinician_address": "live_address",
-        "doctor_clinician_address_old": "old_address",
-        "doctor_stage": "new_address",
-        "cms_doctor_education": "live_education",
-        "cms_doctor_education_old": "old_education",
-    }
-    for table, marker in marker_by_table.items():
-        await connection.execute(f"CREATE TABLE {schema}.{table} (marker text)")
-        await connection.execute(f"INSERT INTO {schema}.{table} VALUES ($1)", marker)
-    return marker_by_table
+async def _assert_native_family_rollback(fixture):
+    from process import cms_doctors_preparation as preparation
+    from tests.cms_doctors_preparation_postgres_support import authority, native, stage_family, stage_oids
 
-
-async def _assert_publication_markers(connection, schema, marker_by_table):
-    for table, marker in marker_by_table.items():
-        assert await connection.fetchval(f"SELECT marker FROM {schema}.{table}") == marker
+    incumbent = await authority(fixture)
+    first = await stage_family(fixture.database, fixture.schema)
+    stages = await stage_oids(fixture, first)
+    async with fixture.database.transaction() as session:
+        await session.execute(education.text(f'DROP TABLE "{fixture.schema}"."{stages[1][1]}"'))
+    with pytest.raises(DBAPIError) as missing_stage:
+        await native._publish_cms_doctors_stage(
+            native.make_class(native.DoctorClinicianAddress, first["import_date"]), fixture.schema, first["import_date"]
+        )
+    assert postgres_sqlstate(missing_stage.value) == "42P01"
+    assert await authority(fixture) == incumbent
+    await preparation._drop_owned_stages(fixture.schema, stages)
+    ctx = await stage_family(fixture.database, fixture.schema)
+    async with preparation.prepare_cms_doctors_generation(ctx) as prepared:
+        async with fixture.engine.begin() as admin:
+            await admin.execute(
+                education.text(
+                    f'ALTER TABLE "{fixture.schema}".reference_family_result_generation ADD CONSTRAINT reject_advance '
+                    f"CHECK (importer_id<>'cms-doctors' OR local_generation={incumbent.local_generation})"
+                )
+            )
+        try:
+            with pytest.raises(DBAPIError) as rejected_generation:
+                async with fixture.database.transaction():
+                    await preparation.apply_prepared_cms_doctors_generation(prepared)
+            assert postgres_sqlstate(rejected_generation.value) == "23514"
+            assert await authority(fixture) == incumbent
+            assert await stage_oids(fixture, ctx) == prepared.stage_oids
+        finally:
+            async with fixture.engine.begin() as admin:
+                await admin.execute(
+                    education.text(
+                        f'ALTER TABLE "{fixture.schema}".reference_family_result_generation DROP CONSTRAINT reject_advance'
+                    )
+                )
+        async with fixture.database.transaction():
+            result_authority = await preparation.apply_prepared_cms_doctors_generation(prepared)
+        assert result_authority == await authority(fixture)
+        assert result_authority.local_generation == incumbent.local_generation + 1
+        for table, column in (
+            ("doctor_clinician_address", "city"),
+            ("cms_doctor_education", "medical_school"),
+            ("cms_doctor_group_site", "org_pac_id"),
+        ):
+            assert await fixture.database.scalar(f'SELECT {column} FROM "{fixture.schema}"."{table}"') == "prepared"
+            assert (
+                await fixture.database.scalar(f'SELECT {column} FROM "{fixture.schema}"."{table}_old"') == "incumbent"
+            )
 
 
 async def test_native_postgres_publication_rolls_back_both_tables_on_education_failure(monkeypatch):
+    """The native-role component rolls back all three heaps and the real ledger CAS."""
+    from tests.cms_doctors_preparation_postgres_support import doctors_database
+    from tests.cms_npd_admission_postgres_support import _owned_database
+
     dsn = os.getenv("HLTHPRT_CMS_EDUCATION_POSTGRES_DSN")
     if not dsn:
         pytest.skip("set HLTHPRT_CMS_EDUCATION_POSTGRES_DSN for the PostgreSQL proof")
-    import asyncpg
-    cms_doctors = importlib.import_module("process.cms_doctors")
+    url = make_url(dsn)
+    if url.host not in {"127.0.0.1", "localhost", "postgres"} or "test" not in (url.database or "").lower():
+        pytest.fail("CMS education proof requires an explicit local test database")
+    async with _owned_database(url.set(drivername="postgresql+asyncpg")) as (owned_url, _admin):
+        monkeypatch.setenv("HLTHPRT_CMS_NPD_ADMISSION_TEST_DSN", owned_url.render_as_string(hide_password=False))
+        async with doctors_database(monkeypatch, cms_active=False) as fixture:
+            await _assert_native_family_rollback(fixture)
 
-    connection = await asyncpg.connect(dsn, timeout=5)
-    schema = f"cms_education_test_{uuid.uuid4().hex[:12]}"
-    is_schema_created = False
-    try:
-        if "test" not in str(await connection.fetchval("SELECT current_database()")).lower():
-            pytest.fail("CMS education publication proof requires an explicit test database")
-        await connection.execute(f"CREATE SCHEMA {schema}")
-        is_schema_created = True
-        marker_by_table = await _create_publication_fixture(connection, schema)
-        database = SimpleNamespace(transaction=connection.transaction, status=connection.execute)
-        monkeypatch.setattr(cms_doctors, "db", database)
-        monkeypatch.setattr(education, "db", database)
-        stage = SimpleNamespace(__tablename__="doctor_stage")
-        with pytest.raises(asyncpg.UndefinedTableError):
-            await cms_doctors._publish_cms_doctors_stage(stage, schema, "educationtests")
-        await _assert_publication_markers(connection, schema, marker_by_table)
-        await connection.execute(f"CREATE TABLE {schema}.cms_doctor_education_educationtests (marker text)")
-        await connection.execute(f"INSERT INTO {schema}.cms_doctor_education_educationtests VALUES ('new_education')")
-        await cms_doctors._publish_cms_doctors_stage(stage, schema, "educationtests")
-        await _assert_publication_markers(connection, schema, {
-            "doctor_clinician_address": "new_address",
-            "cms_doctor_education": "new_education",
-            "doctor_clinician_address_old": "live_address",
-            "cms_doctor_education_old": "live_education",
-        })
-    finally:
-        if is_schema_created:
-            await connection.execute(f"DROP SCHEMA {schema} CASCADE")
-            assert await connection.fetchval("SELECT to_regnamespace($1)", schema) is None
-        await connection.close()
+
+@pytest.mark.asyncio
+async def test_clinical_copy_keeps_nullable_columns_and_never_uses_insert_fallback(monkeypatch):
+    from contextlib import asynccontextmanager
+
+    from db.models import DoctorClinicianAddress
+
+    clinical = importlib.import_module("process.cms_doctors")
+    from process import reference_family_archive as native
+
+    session = SimpleNamespace(execute=AsyncMock())
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    monkeypatch.setattr(education.db, "transaction", transaction)
+    copy = AsyncMock(return_value=1)
+    monkeypatch.setattr(native, "native_copy_record_batch", copy)
+    stage = clinical.make_class(DoctorClinicianAddress, "copyunit")
+    clinical_row = clinical.doctor_address_row(
+        {"NPI": NPI, "adr_ln_1": "1 Example Street", "zip_code": "10001"},
+        datetime(2026, 1, 1),
+    )
+    await clinical._copy_clinical_rows([clinical_row], stage)
+    columns = tuple(stage.__table__.columns.keys())
+    assert copy.await_args.kwargs["columns"] == columns
+    actual_by_column = dict(zip(columns, copy.await_args.kwargs["records"][0], strict=True))
+    assert actual_by_column == {**clinical_row, "latitude": None, "longitude": None, "address_key": None}
+    copy.side_effect = TypeError("native COPY failed")
+    with pytest.raises(TypeError, match="native COPY failed"):
+        await clinical._copy_clinical_rows([clinical_row], stage)
+    assert copy.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_sidecar_copy_splits_native_bytes_and_refuses_an_oversized_single_row(monkeypatch):
+    from contextlib import asynccontextmanager
+
+    from process import reference_family_archive as native
+
+    session = SimpleNamespace(execute=AsyncMock())
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    monkeypatch.setattr(education.db, "transaction", transaction)
+    copy = AsyncMock(return_value=1)
+    monkeypatch.setattr(native, "native_copy_record_batch", copy)
+    stage = SimpleNamespace(
+        __table__=SimpleNamespace(columns={"source_json": None}, schema="mrf"),
+        __tablename__="cms_doctor_education_copyunit",
+    )
+    wide_row_by_column = {"source_json": {"value": "x" * (8 * 1024 * 1024)}}
+    await education._copy_sidecar_rows([wide_row_by_column, wide_row_by_column], stage)
+    assert copy.await_count == 2
+    assert all(len(call.kwargs["records"]) == 1 for call in copy.await_args_list)
+    copy.reset_mock()
+    with pytest.raises(ValueError, match="copy_row_bytes_invalid"):
+        await education._copy_sidecar_rows([{"source_json": {"value": "x" * (16 * 1024 * 1024)}}], stage)
+    copy.assert_not_awaited()

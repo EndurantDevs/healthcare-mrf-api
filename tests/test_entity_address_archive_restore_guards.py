@@ -11,6 +11,19 @@ from process import entity_address_snapshot_receipt as receipt
 from process import entity_address_snapshot_restore as restore
 from tests.test_entity_address_archive_ownership_guards import _owner
 from tests.test_entity_address_snapshot_stage import _receipt
+from tests.test_geo_assurance_dependency_bindings import _example_bindings
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_only", (False, True))
+async def test_owned_catalog_read_keeps_share_nowait_and_mutations_keep_exclusive(read_only):
+    owner = _owner()
+    session = SimpleNamespace(execute=AsyncMock())
+    await restore._lock_owned_restore_relations(session, owner, read_only=read_only)
+    mode = "SHARE MODE NOWAIT" if read_only else "ACCESS EXCLUSIVE MODE"
+    targets = ", ".join(f'"{owner.schema_name}"."{name}"' for name, _oid in owner.relation_oids)
+    session.execute.assert_awaited_once()
+    assert str(session.execute.await_args.args[0]) == f"LOCK TABLE {targets} IN {mode}"
 
 
 def _stored_restore():
@@ -47,9 +60,19 @@ def test_valid_restore_record_round_trips_exact_owner_and_alias_generation():
     assert (schema, date) == ("mrf", "20260914")
     assert dict(stage_oids) == {names[name]: oid for name, oid in _owner().relation_oids}
     assert integrity.as_dict() == stored["stage_integrity"]
-    assert context == stored["context"] and validation == stored["native_validation"]
+    assert context == {
+        **stored["context"],
+        "result_generation_mode": "adoption",
+        "source_serving_generation": None,
+    }
+    assert validation == stored["native_validation"]
     context["address_alias_generation"] = 8
     assert stored["context"]["address_alias_generation"] == 7
+    stored["context"]["dependency_bindings"] = _example_bindings()
+    *_, context, _validation = restore._validated_rehydration_state(stored)
+    assert context["dependency_bindings"] == stored["context"]["dependency_bindings"]
+    context["dependency_bindings"]["mrf.npi_address"]["relation_oid"] += 1
+    assert context["dependency_bindings"] != stored["context"]["dependency_bindings"]
 
 
 @pytest.mark.asyncio
@@ -68,6 +91,7 @@ def test_valid_restore_record_round_trips_exact_owner_and_alias_generation():
         ("context", {"address_alias_generation": True, "stage_persistence": "p"}),
         ("context", {"address_alias_generation": 7, "stage_persistence": "u"}),
         ("context", {"address_alias_generation": 7, "stage_persistence": "p", "unexpected": 1}),
+        ("context", {"address_alias_generation": 7, "stage_persistence": "p", "dependency_bindings": {}}),
         ("context", {"address_alias_generation": 7, "stage_persistence": "p", "phase_timings": object()}),
         ("native_validation", {"address_alias_generation": 8}),
     ],

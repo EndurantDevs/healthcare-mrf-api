@@ -69,7 +69,6 @@ if str(_REPOSITORY_ROOT) not in sys.path:
 
 from api import ptg2_capacity_evidence as capacity_evidence
 
-
 SCRIPT_VERSION = "2.15.0"
 EXPECTED_ARCHITECTURE = "postgres_binary_v3"
 EXPECTED_STORAGE_GENERATION = "shared_blocks_v3"
@@ -89,25 +88,13 @@ AUDIT_SAMPLE_FORMAT_VERSION = 2
 AUDIT_SAMPLE_OCCURRENCE_IDENTITY = "sha256_candidate_ordinal_source_key_v2"
 AUDIT_SAMPLE_MULTIPLICITY = "source_multiset_v1"
 SOURCE_SET_CONTRACT = "sorted_raw_container_sha256_bytes_v1"
-PROVIDER_IDENTIFIER_QUARANTINE_CONTRACT = (
-    "ptg2_provider_identifier_quarantine_v1"
-)
-PROVIDER_IDENTIFIER_QUARANTINE_HASH_DOMAIN = (
-    b"PTG2_PROVIDER_IDENTIFIER_QUARANTINE_V1\0"
-)
-PROVIDER_IDENTIFIER_QUARANTINE_V2_CONTRACT = (
-    "ptg2_provider_identifier_quarantine_v2"
-)
-PROVIDER_IDENTIFIER_QUARANTINE_V2_HASH_DOMAIN = (
-    b"PTG2_PROVIDER_IDENTIFIER_QUARANTINE_V2\0"
-)
+PROVIDER_IDENTIFIER_QUARANTINE_CONTRACT = "ptg2_provider_identifier_quarantine_v1"
+PROVIDER_IDENTIFIER_QUARANTINE_HASH_DOMAIN = b"PTG2_PROVIDER_IDENTIFIER_QUARANTINE_V1\0"
+PROVIDER_IDENTIFIER_QUARANTINE_V2_CONTRACT = "ptg2_provider_identifier_quarantine_v2"
+PROVIDER_IDENTIFIER_QUARANTINE_V2_HASH_DOMAIN = b"PTG2_PROVIDER_IDENTIFIER_QUARANTINE_V2\0"
 PROVIDER_IDENTIFIER_TEXT_HASH_DOMAIN = b"PTG2_PROVIDER_IDENTIFIER_TEXT_V1\0"
-PROVIDER_GROUP_CONFLICT_HASH_DOMAIN = (
-    b"PTG2_PROVIDER_GROUP_CONFLICT_SOURCE_ID_V1\0"
-)
-SOURCE_AUDIT_PROVIDER_GROUP_DEFINITION_HASH_DOMAIN = (
-    b"PTG2_SOURCE_API_AUDIT_PROVIDER_GROUP_CONFLICT_DEFINITION_V1\0"
-)
+PROVIDER_GROUP_CONFLICT_HASH_DOMAIN = b"PTG2_PROVIDER_GROUP_CONFLICT_SOURCE_ID_V1\0"
+SOURCE_AUDIT_PROVIDER_GROUP_DEFINITION_HASH_DOMAIN = b"PTG2_SOURCE_API_AUDIT_PROVIDER_GROUP_CONFLICT_DEFINITION_V1\0"
 MAX_PROVIDER_IDENTIFIER_QUARANTINE_VALUES = 1_024
 MAX_PROVIDER_GROUP_CONFLICTS = 1_024
 MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS = 4_096
@@ -143,13 +130,9 @@ CAPACITY_MIN_NEGATIVE_ELIGIBLE_HTTP_REQUESTS = 250
 CAPACITY_MIN_RANDOM_ELIGIBLE_HTTP_REQUESTS = 2_500
 CAPACITY_MIN_DISTINCT_RANDOM_QUERIES = 2_500
 CAPACITY_MIN_ELIGIBLE_HTTP_REQUESTS = 3_000
-CAPACITY_CLIENT_LATENCY_SOURCE = (
-    "verified_eligible_client_end_to_end_http_duration_ms"
-)
+CAPACITY_CLIENT_LATENCY_SOURCE = "verified_eligible_client_end_to_end_http_duration_ms"
 CAPACITY_SIGNED_LATENCY_SOURCE = "api_signed_server_duration_ns_diagnostic_only"
-CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE = (
-    "unqualified_client_perf_counter_diagnostic_only"
-)
+CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE = "unqualified_client_perf_counter_diagnostic_only"
 CAPACITY_RANDOM_COHORT = "random_unique_without_replacement_v1"
 CAPACITY_POSITIVE_COHORT = "matched_positive_first_observation_v1"
 CAPACITY_NEGATIVE_COHORT = "negative_first_observation_v1"
@@ -221,8 +204,7 @@ CANONICALIZATION = {
     "nulls": "price-field JSON null and stripped empty scalar strings canonicalize to null",
     "strings": "trim Unicode surrounding whitespace; otherwise preserve case and content",
     "source_metadata": (
-        "billing code version, name, and description preserve trimmed empty string "
-        "distinctly from null"
+        "billing code version, name, and description preserve trimmed empty string distinctly from null"
     ),
     "network_names": (
         "rate names accept string, array, or null; referenced-provider names accept "
@@ -244,9 +226,7 @@ CANONICALIZATION = {
     "decimal": "finite base-10 value; expand exponent; remove leading/trailing insignificant zeroes; -0 becomes 0",
     "date": "strict ISO calendar date YYYY-MM-DD, emitted with date.isoformat()",
     "service_code": "scalar-or-list; POS canonicalization; sorted unique list",
-    "billing_code_modifier": (
-        "scalar-or-list; split payer-packed comma values; uppercase; sorted unique list"
-    ),
+    "billing_code_modifier": ("scalar-or-list; split payer-packed comma values; uppercase; sorted unique list"),
     "arrangement": "trim and uppercase; null remains null",
     "setting": "trim only; null remains null; exact case-sensitive comparison",
     "multiplicity": "count every source negotiated-price occurrence after provider membership union",
@@ -302,24 +282,16 @@ class CapacityEvidenceTrust:
     environment_id: str
 
     def __post_init__(self) -> None:
-        key_id_characters = set(
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
-        )
+        key_id_characters = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
         if (
             not self.api_evidence_key_id
             or len(self.api_evidence_key_id) > 64
             or not self.api_evidence_key_id[0].isascii()
             or not self.api_evidence_key_id[0].isalnum()
-            or any(
-                character not in key_id_characters
-                for character in self.api_evidence_key_id
-            )
+            or any(character not in key_id_characters for character in self.api_evidence_key_id)
         ):
             raise ConfigurationError("capacity_api_evidence_key_id_invalid")
-        if (
-            not isinstance(self.api_evidence_public_key, bytes)
-            or len(self.api_evidence_public_key) != 32
-        ):
+        if not isinstance(self.api_evidence_public_key, bytes) or len(self.api_evidence_public_key) != 32:
             raise ConfigurationError("capacity_api_evidence_public_key_invalid")
         for field_name, digest in (
             ("release_digest", self.release_digest),
@@ -338,9 +310,7 @@ class CapacityEvidenceTrust:
 
         return {
             "api_evidence_key_id": self.api_evidence_key_id,
-            "api_evidence_public_key_sha256": hashlib.sha256(
-                self.api_evidence_public_key
-            ).hexdigest(),
+            "api_evidence_public_key_sha256": hashlib.sha256(self.api_evidence_public_key).hexdigest(),
             "release_digest": self.release_digest,
             "environment_id": self.environment_id,
         }
@@ -412,10 +382,7 @@ class CapacityEvidenceCollector:
         if (
             len(self._contention_run_id) != 64
             or self._contention_run_id == "0" * 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in self._contention_run_id
-            )
+            or any(character not in "0123456789abcdef" for character in self._contention_run_id)
         ):
             raise ConfigurationError("capacity_contention_run_id_invalid")
         self._run_nonce = run_nonce or secrets.token_hex(32)
@@ -435,9 +402,7 @@ class CapacityEvidenceCollector:
         self._challenges: set[str] = set()
         self._next_plan_id = 1
         self._next_record_id = 1
-        self._next_selection_ordinal_by_cohort: collections.Counter[str] = (
-            collections.Counter()
-        )
+        self._next_selection_ordinal_by_cohort: collections.Counter[str] = collections.Counter()
         self._plans: dict[int, CapacityObservationIntent] = {}
         self._records: dict[int, CapacityHttpObservation] = {}
         self._semantic_success: dict[int, bool] = {}
@@ -470,23 +435,15 @@ class CapacityEvidenceCollector:
                 self._challenges.add(challenge)
                 return challenge
 
-    def request_headers(
-        self, plan: _CapacityObservationPlan, challenge: str
-    ) -> dict[str, str]:
+    def request_headers(self, plan: _CapacityObservationPlan, challenge: str) -> dict[str, str]:
         """Build request-local headers without exposing the run nonce elsewhere."""
 
         return {
             capacity_evidence.CAPACITY_CHALLENGE_HEADER: challenge,
             capacity_evidence.CAPACITY_RUN_NONCE_HEADER: self._run_nonce,
-            capacity_evidence.CAPACITY_CONTENTION_RUN_ID_HEADER: (
-                self._contention_run_id
-            ),
-            capacity_evidence.CAPACITY_SEMANTIC_CLASS_HEADER: (
-                _CAPACITY_SEMANTIC_CLASS_BY_COHORT[plan.intent.cohort]
-            ),
-            capacity_evidence.CAPACITY_SELECTION_ORDINAL_HEADER: str(
-                plan.selection_ordinal
-            ),
+            capacity_evidence.CAPACITY_CONTENTION_RUN_ID_HEADER: (self._contention_run_id),
+            capacity_evidence.CAPACITY_SEMANTIC_CLASS_HEADER: (_CAPACITY_SEMANTIC_CLASS_BY_COHORT[plan.intent.cohort]),
+            capacity_evidence.CAPACITY_SELECTION_ORDINAL_HEADER: str(plan.selection_ordinal),
         }
 
     def _store_attempt(
@@ -592,9 +549,7 @@ class CapacityEvidenceCollector:
                 expected_release_digest=self.trust.release_digest,
                 expected_environment_id=self.trust.environment_id,
                 expected_contention_run_id=self._contention_run_id,
-                expected_semantic_class=(
-                    _CAPACITY_SEMANTIC_CLASS_BY_COHORT[plan.intent.cohort]
-                ),
+                expected_semantic_class=(_CAPACITY_SEMANTIC_CLASS_BY_COHORT[plan.intent.cohort]),
                 expected_selection_ordinal=plan.selection_ordinal,
                 state=self._state,
             )
@@ -626,9 +581,7 @@ class CapacityEvidenceCollector:
 
     @staticmethod
     def _commitment(observations: Sequence[Mapping[str, Any]]) -> str:
-        digests = sorted(
-            sha256_text(canonical_json(observation)) for observation in observations
-        )
+        digests = sorted(sha256_text(canonical_json(observation)) for observation in observations)
         return sha256_text(canonical_json(digests))
 
     def report(
@@ -651,20 +604,13 @@ class CapacityEvidenceCollector:
             self._commitment,
             self._sampling_seed_evidence,
         )
-        if (
-            complete_request_http_requests is None
-            and complete_request_retries is None
-        ):
+        if complete_request_http_requests is None and complete_request_retries is None:
             return report
         for accounting_count in (
             complete_request_http_requests,
             complete_request_retries,
         ):
-            if (
-                isinstance(accounting_count, bool)
-                or not isinstance(accounting_count, int)
-                or accounting_count < 0
-            ):
+            if isinstance(accounting_count, bool) or not isinstance(accounting_count, int) or accounting_count < 0:
                 raise ConfigurationError("complete_request_accounting_invalid")
         report["complete_request_accounting"] = {
             "contract": "all_standard_http_attempts_v1",
@@ -699,36 +645,16 @@ class _CapacityReportMeasurements:
 
 @dataclass
 class _CapacityAttemptAccumulator:
-    physical_by_cohort: collections.Counter[str] = dataclasses.field(
-        default_factory=collections.Counter
-    )
-    verified_by_cohort: collections.Counter[str] = dataclasses.field(
-        default_factory=collections.Counter
-    )
-    eligible_by_cohort: collections.Counter[str] = dataclasses.field(
-        default_factory=collections.Counter
-    )
-    rejected_by_cohort: collections.Counter[str] = dataclasses.field(
-        default_factory=collections.Counter
-    )
-    status_counts: collections.Counter[str] = dataclasses.field(
-        default_factory=collections.Counter
-    )
-    rejection_counts: collections.Counter[str] = dataclasses.field(
-        default_factory=collections.Counter
-    )
-    structural_failure_counts: collections.Counter[str] = dataclasses.field(
-        default_factory=collections.Counter
-    )
-    verified_attempts: list[CapacityHttpObservation] = dataclasses.field(
-        default_factory=list
-    )
-    eligible_attempts: list[CapacityHttpObservation] = dataclasses.field(
-        default_factory=list
-    )
-    rejected_attempts: list[CapacityHttpObservation] = dataclasses.field(
-        default_factory=list
-    )
+    physical_by_cohort: collections.Counter[str] = dataclasses.field(default_factory=collections.Counter)
+    verified_by_cohort: collections.Counter[str] = dataclasses.field(default_factory=collections.Counter)
+    eligible_by_cohort: collections.Counter[str] = dataclasses.field(default_factory=collections.Counter)
+    rejected_by_cohort: collections.Counter[str] = dataclasses.field(default_factory=collections.Counter)
+    status_counts: collections.Counter[str] = dataclasses.field(default_factory=collections.Counter)
+    rejection_counts: collections.Counter[str] = dataclasses.field(default_factory=collections.Counter)
+    structural_failure_counts: collections.Counter[str] = dataclasses.field(default_factory=collections.Counter)
+    verified_attempts: list[CapacityHttpObservation] = dataclasses.field(default_factory=list)
+    eligible_attempts: list[CapacityHttpObservation] = dataclasses.field(default_factory=list)
+    rejected_attempts: list[CapacityHttpObservation] = dataclasses.field(default_factory=list)
     client_physical_latencies: list[float] = dataclasses.field(default_factory=list)
     eligible_client_latencies: list[float] = dataclasses.field(default_factory=list)
     eligible_client_latencies_by_cohort: dict[str, list[float]] = dataclasses.field(
@@ -772,11 +698,7 @@ class _CapacityAttemptTotals:
 
 def _signed_server_latency_ms(observation: Mapping[str, Any]) -> float:
     duration_ns = observation.get("server_duration_ns")
-    if (
-        isinstance(duration_ns, bool)
-        or not isinstance(duration_ns, int)
-        or duration_ns < 0
-    ):
+    if isinstance(duration_ns, bool) or not isinstance(duration_ns, int) or duration_ns < 0:
         raise ConfigurationError("capacity_signed_duration_missing")
     return duration_ns / 1_000_000.0
 
@@ -803,11 +725,7 @@ def _record_capacity_attempt_status(
     attempt_accumulator.client_physical_latencies.append(attempt_record.latency_ms)
     if attempt_record.response_status_code is None:
         attempt_accumulator.transport_error_count += 1
-        status_key = (
-            "timeout"
-            if attempt_record.verification_error == "request_timeout"
-            else "transport_error"
-        )
+        status_key = "timeout" if attempt_record.verification_error == "request_timeout" else "transport_error"
     else:
         status_key = str(attempt_record.response_status_code)
         if attempt_record.response_status_code != 200:
@@ -830,10 +748,7 @@ def _capacity_attempt_structural_reasons(
         structural_reasons.append("unknown_plan_id")
     else:
         attempt_accumulator.observed_plan_ids.add(attempt_record.plan_id)
-        if (
-            plan_intent.cohort != attempt_record.cohort
-            or plan_intent.first_for_query != attempt_record.first_for_query
-        ):
+        if plan_intent.cohort != attempt_record.cohort or plan_intent.first_for_query != attempt_record.first_for_query:
             structural_reasons.append("plan_intent_mismatch")
     if (
         isinstance(attempt_record.record_id, bool)
@@ -858,9 +773,7 @@ def _capacity_attempt_structural_reasons(
         else:
             attempt_accumulator.retry_attempt_count += 1
         if plan_intent is not None:
-            attempt_accumulator.attempt_indexes_by_plan[
-                attempt_record.plan_id
-            ].append(attempt_record.attempt_index)
+            attempt_accumulator.attempt_indexes_by_plan[attempt_record.plan_id].append(attempt_record.attempt_index)
             plan_attempt_coordinates = (
                 attempt_record.plan_id,
                 attempt_record.attempt_index,
@@ -888,28 +801,18 @@ def _record_capacity_attempt_outcome(
     if isinstance(attempt_record.observation, Mapping):
         attempt_accumulator.verified_attempts.append(attempt_record)
         attempt_accumulator.verified_by_cohort[attempt_record.cohort] += 1
-        attempt_accumulator.verified_server_latencies.append(
-            _signed_server_latency_ms(attempt_record.observation)
-        )
+        attempt_accumulator.verified_server_latencies.append(_signed_server_latency_ms(attempt_record.observation))
     if not rejection_reasons and isinstance(attempt_record.observation, Mapping):
         attempt_accumulator.eligible_attempts.append(attempt_record)
         attempt_accumulator.eligible_by_cohort[attempt_record.cohort] += 1
         attempt_accumulator.eligible_client_latencies.append(attempt_record.latency_ms)
-        attempt_accumulator.eligible_client_latencies_by_cohort[
-            attempt_record.cohort
-        ].append(attempt_record.latency_ms)
-        signed_server_latency_ms = _signed_server_latency_ms(
-            attempt_record.observation
+        attempt_accumulator.eligible_client_latencies_by_cohort[attempt_record.cohort].append(attempt_record.latency_ms)
+        signed_server_latency_ms = _signed_server_latency_ms(attempt_record.observation)
+        attempt_accumulator.eligible_server_latencies.append(signed_server_latency_ms)
+        attempt_accumulator.eligible_server_latencies_by_cohort[attempt_record.cohort].append(signed_server_latency_ms)
+        attempt_accumulator.distinct_query_digests_by_cohort[attempt_record.cohort].add(
+            str(attempt_record.observation["semantic_query_digest"])
         )
-        attempt_accumulator.eligible_server_latencies.append(
-            signed_server_latency_ms
-        )
-        attempt_accumulator.eligible_server_latencies_by_cohort[
-            attempt_record.cohort
-        ].append(signed_server_latency_ms)
-        attempt_accumulator.distinct_query_digests_by_cohort[
-            attempt_record.cohort
-        ].add(str(attempt_record.observation["semantic_query_digest"]))
     else:
         attempt_accumulator.rejected_attempts.append(attempt_record)
         attempt_accumulator.rejected_by_cohort[attempt_record.cohort] += 1
@@ -924,9 +827,7 @@ def _record_capacity_attempt(
     attempt_accumulator: _CapacityAttemptAccumulator,
 ) -> None:
     _record_capacity_attempt_status(attempt_record, attempt_accumulator)
-    structural_reasons = _capacity_attempt_structural_reasons(
-        attempt_record, plan_by_id, attempt_accumulator
-    )
+    structural_reasons = _capacity_attempt_structural_reasons(attempt_record, plan_by_id, attempt_accumulator)
     _record_capacity_attempt_outcome(
         attempt_record,
         semantic_success_by_record_id,
@@ -943,32 +844,18 @@ def _record_capacity_plan_gaps(
     for attempt_indexes in attempt_accumulator.attempt_indexes_by_plan.values():
         distinct_indexes = set(attempt_indexes)
         if 0 not in distinct_indexes:
-            attempt_accumulator.structural_failure_counts[
-                "plan_missing_initial_attempt"
-            ] += 1
-        if distinct_indexes and distinct_indexes != set(
-            range(max(distinct_indexes) + 1)
-        ):
-            attempt_accumulator.structural_failure_counts[
-                "attempt_sequence_gap"
-            ] += 1
-    missing_plan_count = len(
-        set(plan_by_id) - attempt_accumulator.observed_plan_ids
-    )
+            attempt_accumulator.structural_failure_counts["plan_missing_initial_attempt"] += 1
+        if distinct_indexes and distinct_indexes != set(range(max(distinct_indexes) + 1)):
+            attempt_accumulator.structural_failure_counts["attempt_sequence_gap"] += 1
+    missing_plan_count = len(set(plan_by_id) - attempt_accumulator.observed_plan_ids)
     if missing_plan_count:
-        attempt_accumulator.rejection_counts[
-            "planned_without_physical_attempt"
-        ] += missing_plan_count
-        attempt_accumulator.structural_failure_counts[
-            "planned_without_physical_attempt"
-        ] += missing_plan_count
-    semantic_outcome_without_physical = len(
-        set(semantic_success_by_record_id) - attempt_accumulator.seen_record_ids
-    )
+        attempt_accumulator.rejection_counts["planned_without_physical_attempt"] += missing_plan_count
+        attempt_accumulator.structural_failure_counts["planned_without_physical_attempt"] += missing_plan_count
+    semantic_outcome_without_physical = len(set(semantic_success_by_record_id) - attempt_accumulator.seen_record_ids)
     if semantic_outcome_without_physical:
-        attempt_accumulator.structural_failure_counts[
-            "semantic_outcome_without_physical_attempt"
-        ] += semantic_outcome_without_physical
+        attempt_accumulator.structural_failure_counts["semantic_outcome_without_physical_attempt"] += (
+            semantic_outcome_without_physical
+        )
     return missing_plan_count, semantic_outcome_without_physical
 
 
@@ -989,8 +876,7 @@ def _capacity_attempt_totals(
         eligible_count=eligible_count,
         rejected_count=rejected_count,
         verified_rejected_count=sum(
-            isinstance(attempt.observation, Mapping)
-            for attempt in attempt_accumulator.rejected_attempts
+            isinstance(attempt.observation, Mapping) for attempt in attempt_accumulator.rejected_attempts
         ),
         unclassified_count=physical_count - eligible_count - rejected_count,
         missing_plan_count=missing_plan_count,
@@ -1003,23 +889,16 @@ def _capacity_reconciliation_status(
     attempt_totals: _CapacityAttemptTotals,
 ) -> tuple[bool, bool]:
     accounting_checks = (
-        attempt_totals.planned_count
-        == len(attempt_accumulator.observed_plan_ids)
-        + attempt_totals.missing_plan_count,
+        attempt_totals.planned_count == len(attempt_accumulator.observed_plan_ids) + attempt_totals.missing_plan_count,
         attempt_totals.physical_count
         == attempt_accumulator.initial_attempt_count
         + attempt_accumulator.retry_attempt_count
         + attempt_accumulator.invalid_attempt_index_count,
-        attempt_totals.physical_count
-        == attempt_totals.eligible_count + attempt_totals.rejected_count,
-        attempt_totals.verified_count
-        == attempt_totals.eligible_count + attempt_totals.verified_rejected_count,
-        sum(attempt_accumulator.status_counts.values())
-        == attempt_totals.physical_count,
-        sum(attempt_accumulator.physical_by_cohort.values())
-        == attempt_totals.physical_count,
-        sum(attempt_accumulator.eligible_by_cohort.values())
-        == attempt_totals.eligible_count,
+        attempt_totals.physical_count == attempt_totals.eligible_count + attempt_totals.rejected_count,
+        attempt_totals.verified_count == attempt_totals.eligible_count + attempt_totals.verified_rejected_count,
+        sum(attempt_accumulator.status_counts.values()) == attempt_totals.physical_count,
+        sum(attempt_accumulator.physical_by_cohort.values()) == attempt_totals.physical_count,
+        sum(attempt_accumulator.eligible_by_cohort.values()) == attempt_totals.eligible_count,
         attempt_totals.unclassified_count == 0,
     )
     is_accounted = all(accounting_checks)
@@ -1045,9 +924,7 @@ def _capacity_reconciliation(
     attempt_accumulator: _CapacityAttemptAccumulator,
     attempt_totals: _CapacityAttemptTotals,
 ) -> dict[str, Any]:
-    is_accounted, is_release_clean = _capacity_reconciliation_status(
-        attempt_accumulator, attempt_totals
-    )
+    is_accounted, is_release_clean = _capacity_reconciliation_status(attempt_accumulator, attempt_totals)
     return {
         "contract": "planned_first_attempt_outcomes_v1",
         "accounted": is_accounted,
@@ -1057,21 +934,13 @@ def _capacity_reconciliation(
         "planned_without_physical_attempt": attempt_totals.missing_plan_count,
         "initial_physical_attempts": attempt_accumulator.initial_attempt_count,
         "retry_physical_attempts": attempt_accumulator.retry_attempt_count,
-        "invalid_attempt_index_records": (
-            attempt_accumulator.invalid_attempt_index_count
-        ),
+        "invalid_attempt_index_records": (attempt_accumulator.invalid_attempt_index_count),
         "eligible_physical_attempts": attempt_totals.eligible_count,
         "rejected_physical_attempts": attempt_totals.rejected_count,
         "unclassified_physical_attempts": attempt_totals.unclassified_count,
-        "verified_rejected_physical_attempts": (
-            attempt_totals.verified_rejected_count
-        ),
-        "semantic_outcomes_without_physical_attempt": (
-            attempt_totals.semantic_outcome_without_physical
-        ),
-        "structural_failures": dict(
-            sorted(attempt_accumulator.structural_failure_counts.items())
-        ),
+        "verified_rejected_physical_attempts": (attempt_totals.verified_rejected_count),
+        "semantic_outcomes_without_physical_attempt": (attempt_totals.semantic_outcome_without_physical),
+        "structural_failures": dict(sorted(attempt_accumulator.structural_failure_counts.items())),
     }
 
 
@@ -1091,33 +960,19 @@ def _freeze_capacity_measurements(
         verified_attempts=tuple(attempt_accumulator.verified_attempts),
         eligible_attempts=tuple(attempt_accumulator.eligible_attempts),
         rejected_attempts=tuple(attempt_accumulator.rejected_attempts),
-        client_physical_latencies=tuple(
-            attempt_accumulator.client_physical_latencies
-        ),
-        eligible_client_latencies=tuple(
-            attempt_accumulator.eligible_client_latencies
-        ),
+        client_physical_latencies=tuple(attempt_accumulator.client_physical_latencies),
+        eligible_client_latencies=tuple(attempt_accumulator.eligible_client_latencies),
         eligible_client_latencies_by_cohort={
             cohort: tuple(latencies)
-            for cohort, latencies in (
-                attempt_accumulator.eligible_client_latencies_by_cohort.items()
-            )
+            for cohort, latencies in (attempt_accumulator.eligible_client_latencies_by_cohort.items())
         },
-        verified_server_latencies=tuple(
-            attempt_accumulator.verified_server_latencies
-        ),
-        eligible_server_latencies=tuple(
-            attempt_accumulator.eligible_server_latencies
-        ),
+        verified_server_latencies=tuple(attempt_accumulator.verified_server_latencies),
+        eligible_server_latencies=tuple(attempt_accumulator.eligible_server_latencies),
         eligible_server_latencies_by_cohort={
             cohort: tuple(latencies)
-            for cohort, latencies in (
-                attempt_accumulator.eligible_server_latencies_by_cohort.items()
-            )
+            for cohort, latencies in (attempt_accumulator.eligible_server_latencies_by_cohort.items())
         },
-        distinct_query_digests_by_cohort=(
-            attempt_accumulator.distinct_query_digests_by_cohort
-        ),
+        distinct_query_digests_by_cohort=(attempt_accumulator.distinct_query_digests_by_cohort),
         reconciliation=reconciliation_map,
     )
 
@@ -1129,9 +984,7 @@ def _capacity_report_measurements(
 ) -> _CapacityReportMeasurements:
     """Reconcile every planned request with its physical attempt outcomes."""
 
-    planned_by_cohort = collections.Counter(
-        intent.cohort for intent in plan_by_id.values()
-    )
+    planned_by_cohort = collections.Counter(intent.cohort for intent in plan_by_id.values())
     attempt_accumulator = _CapacityAttemptAccumulator()
     for attempt_record in attempt_records:
         _record_capacity_attempt(
@@ -1140,12 +993,10 @@ def _capacity_report_measurements(
             semantic_success_by_record_id,
             attempt_accumulator,
         )
-    missing_plan_count, semantic_outcome_without_physical = (
-        _record_capacity_plan_gaps(
-            plan_by_id,
-            semantic_success_by_record_id,
-            attempt_accumulator,
-        )
+    missing_plan_count, semantic_outcome_without_physical = _record_capacity_plan_gaps(
+        plan_by_id,
+        semantic_success_by_record_id,
+        attempt_accumulator,
     )
     attempt_totals = _capacity_attempt_totals(
         plan_by_id,
@@ -1208,9 +1059,7 @@ def _capacity_report_cohorts(
             "verified": measurements.verified_by_cohort[cohort],
             "eligible": measurements.eligible_by_cohort[cohort],
             "rejected": measurements.rejected_by_cohort[cohort],
-            "distinct_semantic_queries": len(
-                measurements.distinct_query_digests_by_cohort[cohort]
-            ),
+            "distinct_semantic_queries": len(measurements.distinct_query_digests_by_cohort[cohort]),
         }
         for cohort in sorted(CAPACITY_COHORTS)
     }
@@ -1222,9 +1071,7 @@ def _capacity_report_counters(
     measurements: _CapacityReportMeasurements,
     cohort_report_by_name: Mapping[str, Mapping[str, int]],
 ) -> dict[str, Any]:
-    distinct_query_digests = set().union(
-        *measurements.distinct_query_digests_by_cohort.values()
-    )
+    distinct_query_digests = set().union(*measurements.distinct_query_digests_by_cohort.values())
     return {
         "planned": len(plan_by_id),
         "physical": len(attempt_records),
@@ -1233,24 +1080,14 @@ def _capacity_report_counters(
         "rejected": len(measurements.rejected_attempts),
         "distinct_semantic_queries": len(distinct_query_digests),
         "retries": measurements.reconciliation["retry_physical_attempts"],
-        "timeouts": sum(
-            attempt.verification_error == "request_timeout"
-            for attempt in attempt_records
-        ),
-        "transport_errors": sum(
-            attempt.response_status_code is None for attempt in attempt_records
-        ),
+        "timeouts": sum(attempt.verification_error == "request_timeout" for attempt in attempt_records),
+        "transport_errors": sum(attempt.response_status_code is None for attempt in attempt_records),
         "http_errors": sum(
-            attempt.response_status_code is not None
-            and attempt.response_status_code != 200
+            attempt.response_status_code is not None and attempt.response_status_code != 200
             for attempt in attempt_records
         ),
-        "verification_errors": sum(
-            attempt.verification_error is not None for attempt in attempt_records
-        ),
-        "redirects": sum(
-            attempt.response_redirect_count for attempt in attempt_records
-        ),
+        "verification_errors": sum(attempt.verification_error is not None for attempt in attempt_records),
+        "redirects": sum(attempt.response_redirect_count for attempt in attempt_records),
         "status": dict(sorted(measurements.status_counts.items())),
         "rejections": dict(sorted(measurements.rejection_counts.items())),
         "cohorts": dict(cohort_report_by_name),
@@ -1262,37 +1099,21 @@ def _capacity_report_latency(
     measurements: _CapacityReportMeasurements,
 ) -> dict[str, Any]:
     eligible_client_latency_by_cohort = {
-        cohort: _latency_gate_summary(
-            measurements.eligible_client_latencies_by_cohort.get(cohort, ())
-        )
+        cohort: _latency_gate_summary(measurements.eligible_client_latencies_by_cohort.get(cohort, ()))
         for cohort in sorted(CAPACITY_COHORTS)
     }
     eligible_server_latency_by_cohort = {
-        cohort: _latency_gate_summary(
-            measurements.eligible_server_latencies_by_cohort.get(cohort, ())
-        )
+        cohort: _latency_gate_summary(measurements.eligible_server_latencies_by_cohort.get(cohort, ()))
         for cohort in sorted(CAPACITY_COHORTS)
     }
     return {
         "gate_source": CAPACITY_CLIENT_LATENCY_SOURCE,
-        "client_physical_attempt_ms": latency_summary(
-            measurements.client_physical_latencies
-        ),
-        "eligible_verified_client_http_duration_ms": latency_summary(
-            measurements.eligible_client_latencies
-        ),
-        "eligible_verified_client_http_duration_ms_by_cohort": (
-            eligible_client_latency_by_cohort
-        ),
-        "verified_signed_server_duration_ms": latency_summary(
-            measurements.verified_server_latencies
-        ),
-        "eligible_signed_server_duration_ms": latency_summary(
-            measurements.eligible_server_latencies
-        ),
-        "eligible_signed_server_duration_ms_by_cohort": (
-            eligible_server_latency_by_cohort
-        ),
+        "client_physical_attempt_ms": latency_summary(measurements.client_physical_latencies),
+        "eligible_verified_client_http_duration_ms": latency_summary(measurements.eligible_client_latencies),
+        "eligible_verified_client_http_duration_ms_by_cohort": (eligible_client_latency_by_cohort),
+        "verified_signed_server_duration_ms": latency_summary(measurements.verified_server_latencies),
+        "eligible_signed_server_duration_ms": latency_summary(measurements.eligible_server_latencies),
+        "eligible_signed_server_duration_ms_by_cohort": (eligible_server_latency_by_cohort),
         "signed_server_measurement_source": CAPACITY_SIGNED_LATENCY_SOURCE,
         "signed_server_duration_diagnostic_only": True,
     }
@@ -1303,46 +1124,28 @@ def _capacity_report_commitments(
     commitment: Any,
 ) -> dict[str, Any]:
     verified_observations = [
-        attempt.observation
-        for attempt in measurements.verified_attempts
-        if attempt.observation is not None
+        attempt.observation for attempt in measurements.verified_attempts if attempt.observation is not None
     ]
     eligible_observations = [
-        attempt.observation
-        for attempt in measurements.eligible_attempts
-        if attempt.observation is not None
+        attempt.observation for attempt in measurements.eligible_attempts if attempt.observation is not None
     ]
-    run_digests = sorted(
-        {str(observation["run_digest"]) for observation in verified_observations}
-    )
-    distinct_query_digests = set().union(
-        *measurements.distinct_query_digests_by_cohort.values()
-    )
+    run_digests = sorted({str(observation["run_digest"]) for observation in verified_observations})
+    distinct_query_digests = set().union(*measurements.distinct_query_digests_by_cohort.values())
     return {
         "run_digest": run_digests[0] if len(run_digests) == 1 else None,
         "run_digest_count": len(run_digests),
         "verified_observations_sha256": commitment(verified_observations),
         "eligible_observations_sha256": commitment(eligible_observations),
-        "eligible_semantic_queries_sha256": sha256_text(
-            canonical_json(sorted(distinct_query_digests))
-        ),
+        "eligible_semantic_queries_sha256": sha256_text(canonical_json(sorted(distinct_query_digests))),
     }
 
 
 def _capacity_report_requirements() -> dict[str, int]:
     return {
-        "min_matched_positive_eligible_signed_http_requests": (
-            CAPACITY_MIN_MATCHED_POSITIVE_ELIGIBLE_HTTP_REQUESTS
-        ),
-        "min_negative_eligible_signed_http_requests": (
-            CAPACITY_MIN_NEGATIVE_ELIGIBLE_HTTP_REQUESTS
-        ),
-        "min_random_eligible_signed_http_requests": (
-            CAPACITY_MIN_RANDOM_ELIGIBLE_HTTP_REQUESTS
-        ),
-        "min_distinct_random_semantic_queries": (
-            CAPACITY_MIN_DISTINCT_RANDOM_QUERIES
-        ),
+        "min_matched_positive_eligible_signed_http_requests": (CAPACITY_MIN_MATCHED_POSITIVE_ELIGIBLE_HTTP_REQUESTS),
+        "min_negative_eligible_signed_http_requests": (CAPACITY_MIN_NEGATIVE_ELIGIBLE_HTTP_REQUESTS),
+        "min_random_eligible_signed_http_requests": (CAPACITY_MIN_RANDOM_ELIGIBLE_HTTP_REQUESTS),
+        "min_distinct_random_semantic_queries": (CAPACITY_MIN_DISTINCT_RANDOM_QUERIES),
         "min_eligible_signed_http_requests": CAPACITY_MIN_ELIGIBLE_HTTP_REQUESTS,
     }
 
@@ -1411,23 +1214,14 @@ def validate_capacity_evidence_preflight(
     """Fail before standard HTTP when a run cannot meet evidence floors."""
 
     counts = (distinct_random_queries, negative_queries, positive_queries)
-    if any(
-        isinstance(value, bool) or not isinstance(value, int) or value < 0
-        for value in counts
-    ):
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counts):
         raise ConfigurationError("capacity_preflight_count_invalid")
     if positive_queries < CAPACITY_MIN_MATCHED_POSITIVE_ELIGIBLE_HTTP_REQUESTS:
-        raise SourceCoverageError(
-            "capacity_matched_positive_query_population_below_minimum"
-        )
+        raise SourceCoverageError("capacity_matched_positive_query_population_below_minimum")
     if negative_queries < CAPACITY_MIN_NEGATIVE_ELIGIBLE_HTTP_REQUESTS:
-        raise SourceCoverageError(
-            "capacity_negative_query_population_below_minimum"
-        )
+        raise SourceCoverageError("capacity_negative_query_population_below_minimum")
     if distinct_random_queries < CAPACITY_MIN_DISTINCT_RANDOM_QUERIES:
-        raise SourceCoverageError(
-            "capacity_distinct_random_query_population_below_minimum"
-        )
+        raise SourceCoverageError("capacity_distinct_random_query_population_below_minimum")
     if sum(counts) < CAPACITY_MIN_ELIGIBLE_HTTP_REQUESTS:
         raise SourceCoverageError("capacity_planned_http_requests_below_minimum")
 
@@ -1449,9 +1243,7 @@ def _capacity_client_latency_release_failures(
     ):
         return ["capacity_client_latency_gate_missing"]
     overall = latency.get("eligible_verified_client_http_duration_ms")
-    by_cohort = latency.get(
-        "eligible_verified_client_http_duration_ms_by_cohort"
-    )
+    by_cohort = latency.get("eligible_verified_client_http_duration_ms_by_cohort")
     if not isinstance(overall, Mapping) or not isinstance(by_cohort, Mapping):
         return ["capacity_client_latency_gate_missing"]
     if overall.get("count") != counters.get("eligible"):
@@ -1459,11 +1251,7 @@ def _capacity_client_latency_release_failures(
     for cohort in CAPACITY_COHORTS:
         cohort_counts = cohorts.get(cohort)
         cohort_latency = by_cohort.get(cohort)
-        gate_p95_ms = (
-            cohort_latency.get("gate_p95_ms")
-            if isinstance(cohort_latency, Mapping)
-            else None
-        )
+        gate_p95_ms = cohort_latency.get("gate_p95_ms") if isinstance(cohort_latency, Mapping) else None
         if (
             not isinstance(cohort_counts, Mapping)
             or not isinstance(cohort_latency, Mapping)
@@ -1477,21 +1265,17 @@ def _capacity_client_latency_release_failures(
     return []
 
 
-def _is_complete_request_accounting_invalid(
-    report: Mapping[str, Any], counters: Mapping[str, Any]
-) -> bool:
+def _is_complete_request_accounting_invalid(report: Mapping[str, Any], counters: Mapping[str, Any]) -> bool:
     complete_accounting = report.get("complete_request_accounting")
     physical_attempt_count = counters.get("physical")
     return (
         not isinstance(complete_accounting, Mapping)
-        or complete_accounting.get("contract")
-        != "all_standard_http_attempts_v1"
+        or complete_accounting.get("contract") != "all_standard_http_attempts_v1"
         or isinstance(complete_accounting.get("actual_http_requests"), bool)
         or not isinstance(complete_accounting.get("actual_http_requests"), int)
         or isinstance(physical_attempt_count, bool)
         or not isinstance(physical_attempt_count, int)
-        or complete_accounting.get("actual_http_requests", -1)
-        < physical_attempt_count
+        or complete_accounting.get("actual_http_requests", -1) < physical_attempt_count
         or complete_accounting.get("retries") != 0
         or complete_accounting.get("release_clean") is not True
     )
@@ -1520,23 +1304,13 @@ def _capacity_cohort_floor_failures(
     failures: list[str] = []
     for cohort, minimum, reason in cohort_requirements:
         cohort_report = cohorts.get(cohort)
-        cohort_eligible = (
-            cohort_report.get("eligible")
-            if isinstance(cohort_report, Mapping)
-            else None
-        )
-        if (
-            isinstance(cohort_eligible, bool)
-            or not isinstance(cohort_eligible, int)
-            or cohort_eligible < minimum
-        ):
+        cohort_eligible = cohort_report.get("eligible") if isinstance(cohort_report, Mapping) else None
+        if isinstance(cohort_eligible, bool) or not isinstance(cohort_eligible, int) or cohort_eligible < minimum:
             failures.append(reason)
     return failures
 
 
-def _capacity_volume_release_failures(
-    counters: Mapping[str, Any], cohorts: Mapping[str, Any]
-) -> list[str]:
+def _capacity_volume_release_failures(counters: Mapping[str, Any], cohorts: Mapping[str, Any]) -> list[str]:
     failures: list[str] = []
     eligible_count = counters.get("eligible")
     if (
@@ -1548,9 +1322,7 @@ def _capacity_volume_release_failures(
     failures.extend(_capacity_cohort_floor_failures(cohorts))
     random_cohort = cohorts.get(CAPACITY_RANDOM_COHORT)
     distinct_random_queries = (
-        random_cohort.get("distinct_semantic_queries")
-        if isinstance(random_cohort, Mapping)
-        else None
+        random_cohort.get("distinct_semantic_queries") if isinstance(random_cohort, Mapping) else None
     )
     if (
         isinstance(distinct_random_queries, bool)
@@ -1577,13 +1349,8 @@ def _validated_capacity_counter_map(
         "verification_errors",
         "redirects",
     )
-    strict_count_map = {
-        name: counters.get(name) for name in strict_counter_names
-    }
-    if any(
-        isinstance(count, bool) or not isinstance(count, int) or count < 0
-        for count in strict_count_map.values()
-    ):
+    strict_count_map = {name: counters.get(name) for name in strict_counter_names}
+    if any(isinstance(count, bool) or not isinstance(count, int) or count < 0 for count in strict_count_map.values()):
         return None
     return strict_count_map
 
@@ -1594,8 +1361,7 @@ def _has_valid_capacity_reconciliation(
 ) -> bool:
     if not (
         isinstance(reconciliation_map, Mapping)
-        and reconciliation_map.get("contract")
-        == "planned_first_attempt_outcomes_v1"
+        and reconciliation_map.get("contract") == "planned_first_attempt_outcomes_v1"
         and reconciliation_map.get("accounted") is True
         and reconciliation_map.get("release_clean") is True
         and reconciliation_map.get("structural_failures") == {}
@@ -1603,31 +1369,22 @@ def _has_valid_capacity_reconciliation(
         return False
     return all(
         (
-            reconciliation_map.get("planned_first_physical_attempts")
-            == strict_count_map["planned"],
-            reconciliation_map.get("plans_with_physical_attempt")
-            == strict_count_map["planned"],
-            reconciliation_map.get("initial_physical_attempts")
-            == strict_count_map["planned"],
-            reconciliation_map.get("retry_physical_attempts")
-            == strict_count_map["retries"],
-            reconciliation_map.get("eligible_physical_attempts")
-            == strict_count_map["eligible"],
-            reconciliation_map.get("rejected_physical_attempts")
-            == strict_count_map["rejected"],
+            reconciliation_map.get("planned_first_physical_attempts") == strict_count_map["planned"],
+            reconciliation_map.get("plans_with_physical_attempt") == strict_count_map["planned"],
+            reconciliation_map.get("initial_physical_attempts") == strict_count_map["planned"],
+            reconciliation_map.get("retry_physical_attempts") == strict_count_map["retries"],
+            reconciliation_map.get("eligible_physical_attempts") == strict_count_map["eligible"],
+            reconciliation_map.get("rejected_physical_attempts") == strict_count_map["rejected"],
             reconciliation_map.get("planned_without_physical_attempt") == 0,
             reconciliation_map.get("invalid_attempt_index_records") == 0,
             reconciliation_map.get("unclassified_physical_attempts") == 0,
             reconciliation_map.get("verified_rejected_physical_attempts") == 0,
-            reconciliation_map.get("semantic_outcomes_without_physical_attempt")
-            == 0,
+            reconciliation_map.get("semantic_outcomes_without_physical_attempt") == 0,
         )
     )
 
 
-def _has_clean_capacity_top_level_counts(
-    counters: Mapping[str, Any], strict_count_map: Mapping[str, int]
-) -> bool:
+def _has_clean_capacity_top_level_counts(counters: Mapping[str, Any], strict_count_map: Mapping[str, int]) -> bool:
     status_counts = counters.get("status")
     rejection_counts = counters.get("rejections")
     return (
@@ -1649,31 +1406,21 @@ def _has_clean_capacity_top_level_counts(
     )
 
 
-def _has_clean_capacity_cohort_counts(
-    cohorts: Mapping[str, Any], strict_count_map: Mapping[str, int]
-) -> bool:
+def _has_clean_capacity_cohort_counts(cohorts: Mapping[str, Any], strict_count_map: Mapping[str, int]) -> bool:
     cohort_totals = collections.Counter()
     for cohort in CAPACITY_COHORTS:
         cohort_report = cohorts.get(cohort)
         if not isinstance(cohort_report, Mapping):
             return False
         cohort_counts = [
-            cohort_report.get(name)
-            for name in ("planned", "physical", "verified", "eligible", "rejected")
+            cohort_report.get(name) for name in ("planned", "physical", "verified", "eligible", "rejected")
         ]
         if (
             any(
-                isinstance(cohort_count, bool)
-                or not isinstance(cohort_count, int)
-                or cohort_count < 0
+                isinstance(cohort_count, bool) or not isinstance(cohort_count, int) or cohort_count < 0
                 for cohort_count in cohort_counts
             )
-            or not (
-                cohort_counts[0]
-                == cohort_counts[1]
-                == cohort_counts[2]
-                == cohort_counts[3]
-            )
+            or not (cohort_counts[0] == cohort_counts[1] == cohort_counts[2] == cohort_counts[3])
             or cohort_counts[4] != 0
         ):
             return False
@@ -1689,54 +1436,34 @@ def _has_clean_capacity_cohort_counts(
     )
 
 
-def _has_clean_capacity_reconciliation(
-    counters: Mapping[str, Any], cohorts: Mapping[str, Any]
-) -> bool:
+def _has_clean_capacity_reconciliation(counters: Mapping[str, Any], cohorts: Mapping[str, Any]) -> bool:
     strict_count_map = _validated_capacity_counter_map(counters)
     if strict_count_map is None:
         return False
     return (
-        _has_valid_capacity_reconciliation(
-            counters.get("reconciliation"), strict_count_map
-        )
+        _has_valid_capacity_reconciliation(counters.get("reconciliation"), strict_count_map)
         and _has_clean_capacity_top_level_counts(counters, strict_count_map)
         and _has_clean_capacity_cohort_counts(cohorts, strict_count_map)
     )
 
 
-def _capacity_release_seed_failure(
-    report: Mapping[str, Any], require_release_seed: bool
-) -> str | None:
+def _capacity_release_seed_failure(report: Mapping[str, Any], require_release_seed: bool) -> str | None:
     if not require_release_seed:
         return None
     try:
-        expected_selection = _release_seed_evidence_from_trust_report(
-            report.get("trust")
-        )
-    except (AuditError, TypeError, ValueError):
+        expected_selection = _release_seed_evidence_from_trust_report(report.get("trust"))
+    except AuditError, TypeError, ValueError:
         expected_selection = None
     selection = report.get("selection")
-    if (
-        expected_selection is None
-        or not isinstance(selection, Mapping)
-        or dict(selection) != expected_selection
-    ):
+    if expected_selection is None or not isinstance(selection, Mapping) or dict(selection) != expected_selection:
         return "capacity_release_seed_commitment_invalid"
     return None
 
 
 def _capacity_run_commitment_failure(report: Mapping[str, Any]) -> str | None:
     commitments = report.get("commitments")
-    run_digest = (
-        commitments.get("run_digest")
-        if isinstance(commitments, Mapping)
-        else None
-    )
-    run_digest_count = (
-        commitments.get("run_digest_count")
-        if isinstance(commitments, Mapping)
-        else None
-    )
+    run_digest = commitments.get("run_digest") if isinstance(commitments, Mapping) else None
+    run_digest_count = commitments.get("run_digest_count") if isinstance(commitments, Mapping) else None
     if (
         isinstance(run_digest_count, bool)
         or run_digest_count != 1
@@ -1766,9 +1493,7 @@ def capacity_evidence_release_failures(
     failures: list[str] = []
     if report.get("contract") != "signed_isolated_standard_http_capacity_v3":
         failures.append("capacity_evidence_contract_invalid")
-    failures.extend(
-        _capacity_client_latency_release_failures(report, counters, cohorts)
-    )
+    failures.extend(_capacity_client_latency_release_failures(report, counters, cohorts))
     if _is_complete_request_accounting_invalid(report, counters):
         failures.append("capacity_complete_request_accounting_failed")
     failures.extend(_capacity_volume_release_failures(counters, cohorts))
@@ -1841,29 +1566,21 @@ def _capacity_seed_authority_payload(
         or not key_id[0].isascii()
         or not key_id[0].isalnum()
         or any(
-            character
-            not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
-            for character in key_id
+            character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-" for character in key_id
         )
     ):
         raise ConfigurationError("capacity_seed_authority_invalid")
     for field_name in required_fields - {"api_evidence_key_id"}:
         if not _is_nonzero_lower_hex_digest(trust_report.get(field_name)):
             raise ConfigurationError("capacity_seed_authority_invalid")
-    return {
-        field_name: str(trust_report[field_name])
-        for field_name in sorted(required_fields)
-    }
+    return {field_name: str(trust_report[field_name]) for field_name in sorted(required_fields)}
 
 
 def _capacity_authoritative_release_seed(
     trust_report: Mapping[str, Any],
 ) -> str:
     authority_payload = _capacity_seed_authority_payload(trust_report)
-    return hashlib.sha256(
-        RELEASE_CAPACITY_SEED_DOMAIN
-        + canonical_json(authority_payload).encode("ascii")
-    ).hexdigest()
+    return hashlib.sha256(RELEASE_CAPACITY_SEED_DOMAIN + canonical_json(authority_payload).encode("ascii")).hexdigest()
 
 
 def authoritative_release_seed(
@@ -1913,9 +1630,7 @@ def sampling_seed_evidence(
             "contract": RELEASE_FIXED_SEED_CONTRACT,
             "precommitted": True,
             "authority": "versioned_audit_harness_constant",
-            "authority_sha256": sha256_text(
-                canonical_json(authority_payload_map)
-            ),
+            "authority_sha256": sha256_text(canonical_json(authority_payload_map)),
             "seed_sha256": sha256_text(seed),
         }
     if profile != "diagnostic":
@@ -2082,7 +1797,7 @@ def strict_source_integer(event: str, value: Any) -> int | None:
         return None
     try:
         number = Decimal(value)
-    except (InvalidOperation, TypeError, ValueError):
+    except InvalidOperation, TypeError, ValueError:
         return None
     if not number.is_finite() or number != number.to_integral_value():
         return None
@@ -2138,9 +1853,7 @@ def provider_group_conflict_identity(
     """Return the source-scoped redacted identity for one conflicting ID."""
 
     return hashlib.sha256(
-        PROVIDER_GROUP_CONFLICT_HASH_DOMAIN
-        + bytes.fromhex(raw_source_sha256)
-        + provider_group_id.encode("ascii")
+        PROVIDER_GROUP_CONFLICT_HASH_DOMAIN + bytes.fromhex(raw_source_sha256) + provider_group_id.encode("ascii")
     ).hexdigest()
 
 
@@ -2153,14 +1866,10 @@ def provider_group_scope_definition_identity(
     payload = canonical_json(
         {
             "network_names": sorted(set(network_names)),
-            "provider_group_scopes": [
-                list(scope) for scope in sorted(set(provider_group_scopes))
-            ],
+            "provider_group_scopes": [list(scope) for scope in sorted(set(provider_group_scopes))],
         }
     ).encode("utf-8")
-    return hashlib.sha256(
-        SOURCE_AUDIT_PROVIDER_GROUP_DEFINITION_HASH_DOMAIN + payload
-    ).hexdigest()
+    return hashlib.sha256(SOURCE_AUDIT_PROVIDER_GROUP_DEFINITION_HASH_DOMAIN + payload).hexdigest()
 
 
 _QuarantineKey = TypeVar("_QuarantineKey")
@@ -2171,14 +1880,8 @@ def _record_quarantined_provider_identifier(
     other_distinct_count: int,
     value: _QuarantineKey,
 ) -> None:
-    if (
-        value not in counts
-        and len(counts) + other_distinct_count
-        >= MAX_PROVIDER_IDENTIFIER_QUARANTINE_VALUES
-    ):
-        raise SourceFormatError(
-            "provider_identifier_quarantine_exceeds_1024_distinct_values"
-        )
+    if value not in counts and len(counts) + other_distinct_count >= MAX_PROVIDER_IDENTIFIER_QUARANTINE_VALUES:
+        raise SourceFormatError("provider_identifier_quarantine_exceeds_1024_distinct_values")
     counts[value] += 1
 
 
@@ -2191,9 +1894,7 @@ def _quarantined_provider_identifier_entries(
     occurrence_count = 0
     for identifier, count in sorted(counts.items()):
         if identifier == 0 or 1_000_000_000 <= identifier <= 9_999_999_999:
-            raise ValueError(
-                "provider identifier quarantine contains a non-malformed value"
-            )
+            raise ValueError("provider identifier quarantine contains a non-malformed value")
         if count <= 0 or count >= 2**64:
             raise ValueError("provider identifier quarantine count is invalid")
         occurrence_count += count
@@ -2201,9 +1902,7 @@ def _quarantined_provider_identifier_entries(
         digest.update(str(identifier).encode("ascii"))
         digest.update(b"\0")
         digest.update(int(count).to_bytes(8, "big"))
-        entries.append(
-            {"kind": "integer", "value": str(identifier), "occurrence_count": count}
-        )
+        entries.append({"kind": "integer", "value": str(identifier), "occurrence_count": count})
     for (value_sha256, byte_length), count in sorted(text_counts.items()):
         if (
             len(value_sha256) != 64
@@ -2228,9 +1927,7 @@ def _quarantined_provider_identifier_entries(
             }
         )
     if occurrence_count >= 2**64:
-        raise ValueError(
-            "provider identifier quarantine occurrence count overflows uint64"
-        )
+        raise ValueError("provider identifier quarantine occurrence count overflows uint64")
     return entries, occurrence_count
 
 
@@ -2261,31 +1958,22 @@ def _provider_group_conflict_entries(
         for provider_group_id_sha256 in provider_group_definition_conflicts
     ):
         raise ValueError("provider group conflict evidence is invalid")
-    for provider_group_id_sha256, raw_definitions in sorted(
-        provider_group_definition_conflicts.items()
-    ):
+    for provider_group_id_sha256, raw_definitions in sorted(provider_group_definition_conflicts.items()):
         if any(not isinstance(definition, str) for definition in raw_definitions):
             raise ValueError("provider group conflict evidence is invalid")
         definitions = sorted(set(raw_definitions))
         if (
             len(provider_group_id_sha256) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in provider_group_id_sha256
-            )
+            or any(character not in "0123456789abcdef" for character in provider_group_id_sha256)
             or len(definitions) < 2
             or any(
-                len(definition) != 64
-                or any(character not in "0123456789abcdef" for character in definition)
+                len(definition) != 64 or any(character not in "0123456789abcdef" for character in definition)
                 for definition in definitions
             )
         ):
             raise ValueError("provider group conflict evidence is invalid")
         conflicting_definition_count += len(definitions)
-        if (
-            conflicting_definition_count
-            > MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS
-        ):
+        if conflicting_definition_count > MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS:
             raise ValueError("provider group conflicts exceed 4096 definitions")
         _update_provider_group_conflict_digest(
             digest,
@@ -2314,11 +2002,9 @@ def _provider_identifier_quarantine_v2_payload(
         text_counts,
         digest,
     )
-    canonical_conflicts, conflicting_definition_count = (
-        _provider_group_conflict_entries(
-            provider_group_definition_conflicts,
-            digest,
-        )
+    canonical_conflicts, conflicting_definition_count = _provider_group_conflict_entries(
+        provider_group_definition_conflicts,
+        digest,
     )
     return {
         "contract": PROVIDER_IDENTIFIER_QUARANTINE_V2_CONTRACT,
@@ -2497,9 +2183,7 @@ class CanonicalTuple:
             code=query.code,
             npi=query.npi,
             negotiation_arrangement=canonical_code(arrangement),
-            billing_code_type_version=canonical_source_metadata_text(
-                billing_code_type_version
-            ),
+            billing_code_type_version=canonical_source_metadata_text(billing_code_type_version),
             name=canonical_source_metadata_text(name),
             description=canonical_source_metadata_text(description),
             network_names=tuple(canonical_list(network_names)),
@@ -2589,16 +2273,9 @@ class SourceIdentityRegistry:
             if existing_identity is not None and existing_identity != identity.mapping_key:
                 raise ApiSchemaError("source_artifact_key_mapping_changed_within_report")
             if identity.source_key is not None:
-                existing_logical_key = self._logical_source_key_by_artifact_key.get(
-                    artifact_key
-                )
-                if (
-                    existing_logical_key is not None
-                    and existing_logical_key != identity.source_key
-                ):
-                    raise ApiSchemaError(
-                        "source_artifact_key_logical_source_key_changed_within_report"
-                    )
+                existing_logical_key = self._logical_source_key_by_artifact_key.get(artifact_key)
+                if existing_logical_key is not None and existing_logical_key != identity.source_key:
+                    raise ApiSchemaError("source_artifact_key_logical_source_key_changed_within_report")
             for identity_index, mapping_value, reason in (
                 (
                     self._artifact_key_by_raw_sha256,
@@ -2644,11 +2321,7 @@ class BottomKSampler(Generic[T]):
 
     def _rank(self, stable_key: str) -> int:
         digest = hashlib.sha256(
-            self.seed.encode("utf-8")
-            + b"\x00"
-            + self.namespace.encode("utf-8")
-            + b"\x00"
-            + stable_key.encode("utf-8")
+            self.seed.encode("utf-8") + b"\x00" + self.namespace.encode("utf-8") + b"\x00" + stable_key.encode("utf-8")
         ).digest()
         return int.from_bytes(digest, "big")
 
@@ -2717,8 +2390,7 @@ def source_set_evidence(raw_container_sha256_values: Sequence[str]) -> SourceSet
     if len(raw_hashes) != len(set(raw_hashes)):
         raise SourceCoverageError("duplicate_source_content")
     if any(
-        len(raw_hash) != 64
-        or any(character not in "0123456789abcdef" for character in raw_hash)
+        len(raw_hash) != 64 or any(character not in "0123456789abcdef" for character in raw_hash)
         for raw_hash in raw_hashes
     ):
         raise SourceCoverageError("source_set_contains_invalid_sha256")
@@ -2914,9 +2586,7 @@ class ProviderReferenceState:
     network_name_values_seen: int = 0
     npi_values_seen: int = 0
     has_zero_npi_marker: bool = False
-    provider_group_scopes: set[tuple[str, str]] = dataclasses.field(
-        default_factory=set
-    )
+    provider_group_scopes: set[tuple[str, str]] = dataclasses.field(default_factory=set)
     current_tin_type: str = ""
     current_tin_value: str = ""
 
@@ -2989,15 +2659,9 @@ class SourceIndex:
         self.connection.execute(f"PRAGMA cache_size={-max(sqlite_cache_mb, 1) * 1024}")
         self._writes_since_commit = 0
         self.metrics: dict[str, int] = collections.defaultdict(int)
-        self.quarantined_provider_identifiers: collections.Counter[int] = (
-            collections.Counter()
-        )
-        self.quarantined_provider_identifier_texts: collections.Counter[
-            tuple[str, int]
-        ] = collections.Counter()
-        self.provider_group_definition_conflicts: dict[
-            tuple[int, str], set[str]
-        ] = {}
+        self.quarantined_provider_identifiers: collections.Counter[int] = collections.Counter()
+        self.quarantined_provider_identifier_texts: collections.Counter[tuple[str, int]] = collections.Counter()
+        self.provider_group_definition_conflicts: dict[tuple[int, str], set[str]] = {}
         self._provider_group_conflicting_definition_count = 0
         self.file_metrics: dict[int, dict[str, Any]] = {}
         self.raw_container_sha256_by_file_id: dict[int, str] = {}
@@ -3070,9 +2734,7 @@ class SourceIndex:
         tin_prefix = f"{base}.tin"
         if prefix == tin_prefix:
             return event == "start_map"
-        return prefix.startswith(f"{tin_prefix}.") and event in (
-            SCALAR_EVENTS | {"start_map", "start_array"}
-        )
+        return prefix.startswith(f"{tin_prefix}.") and event in (SCALAR_EVENTS | {"start_map", "start_array"})
 
     def index(self, specs: Sequence[SourceSpec]) -> None:
         """Index all source identities before streaming their in-network rates."""
@@ -3106,10 +2768,7 @@ class SourceIndex:
                 (file_id, ref_id),
             ).fetchone()
             if is_referenced is not None:
-                raise SourceFormatError(
-                    "referenced conflicting provider_group_id definition: "
-                    f"{ref_id}"
-                )
+                raise SourceFormatError(f"referenced conflicting provider_group_id definition: {ref_id}")
 
     def _start_provider_reference(
         self,
@@ -3201,24 +2860,15 @@ class SourceIndex:
     @staticmethod
     def _normalized_tin_value(event: str, raw_value: Any) -> str:
         value = canonical_scalar(raw_value) if event in SCALAR_EVENTS else None
-        return "".join(
-            character
-            for character in (value or "")
-            if character.isascii() and character.isalnum()
-        ).upper()
+        return "".join(character for character in (value or "") if character.isascii() and character.isalnum()).upper()
 
     def _finish_provider_group_scope(
         self,
         state: ProviderReferenceState,
     ) -> None:
         scope = (state.current_tin_type, state.current_tin_value)
-        if (
-            scope not in state.provider_group_scopes
-            and len(state.provider_group_scopes) >= self.max_list_values
-        ):
-            raise SourceCoverageError(
-                "provider_reference_scopes_exceed_configured_limit"
-            )
+        if scope not in state.provider_group_scopes and len(state.provider_group_scopes) >= self.max_list_values:
+            raise SourceCoverageError("provider_reference_scopes_exceed_configured_limit")
         state.provider_group_scopes.add(scope)
         state.current_tin_type = ""
         state.current_tin_value = ""
@@ -3247,9 +2897,7 @@ class SourceIndex:
         if cursor.rowcount:
             self._mark_write()
 
-    def _insert_pending_provider_npis(
-        self, spec: SourceSpec, state: ProviderReferenceState
-    ) -> int:
+    def _insert_pending_provider_npis(self, spec: SourceSpec, state: ProviderReferenceState) -> int:
         pending_npis = self.connection.execute(
             """SELECT npi FROM provider_ref_pending
                WHERE file_id = ? AND ref_ordinal = ? ORDER BY npi""",
@@ -3266,9 +2914,7 @@ class SourceIndex:
             self._mark_write()
         return inserted_count
 
-    def _insert_pending_provider_network_names(
-        self, spec: SourceSpec, state: ProviderReferenceState
-    ) -> int:
+    def _insert_pending_provider_network_names(self, spec: SourceSpec, state: ProviderReferenceState) -> int:
         pending_names = self.connection.execute(
             """SELECT network_name FROM provider_ref_network_name_pending
                WHERE file_id = ? AND ref_ordinal = ? ORDER BY network_name""",
@@ -3347,13 +2993,8 @@ class SourceIndex:
         if definitions is not None:
             if scope_sha256 in definitions:
                 return False
-            if (
-                self._provider_group_conflicting_definition_count
-                >= MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS
-            ):
-                raise SourceFormatError(
-                    "provider_group_conflicts_exceed_4096_definitions"
-                )
+            if self._provider_group_conflicting_definition_count >= MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS:
+                raise SourceFormatError("provider_group_conflicts_exceed_4096_definitions")
             definitions.add(scope_sha256)
             self._provider_group_conflicting_definition_count += 1
             return False
@@ -3361,16 +3002,9 @@ class SourceIndex:
         if scope_sha256 == first_scope_sha256:
             return True
         if len(self.provider_group_definition_conflicts) >= MAX_PROVIDER_GROUP_CONFLICTS:
-            raise SourceFormatError(
-                "provider_group_conflicts_exceed_1024_identifiers"
-            )
-        if (
-            self._provider_group_conflicting_definition_count
-            > MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS - 2
-        ):
-            raise SourceFormatError(
-                "provider_group_conflicts_exceed_4096_definitions"
-            )
+            raise SourceFormatError("provider_group_conflicts_exceed_1024_identifiers")
+        if self._provider_group_conflicting_definition_count > MAX_PROVIDER_GROUP_CONFLICTING_DEFINITIONS - 2:
+            raise SourceFormatError("provider_group_conflicts_exceed_4096_definitions")
         self.provider_group_definition_conflicts[conflict_key] = {
             first_scope_sha256,
             scope_sha256,
@@ -3473,7 +3107,7 @@ class SourceIndex:
     ) -> bool:
         network_name_prefix = f"{base_prefix}.network_name"
         if prefix == network_name_prefix:
-            if event in {"start_array", "end_array"}:
+            if event in {"start_array", "end_array", "null"}:
                 return True
             if event == "string":
                 self._capture_provider_reference_network_name(spec, state, raw_value)
@@ -3531,10 +3165,7 @@ class SourceIndex:
             elif prefix == f"{provider_group_prefix}.tin.value":
                 state.current_tin_value = self._normalized_tin_value(event, raw_value)
             return
-        if (
-            self._is_provider_npi_prefix(prefix, provider_group_prefix)
-            and event in SCALAR_EVENTS
-        ):
+        if self._is_provider_npi_prefix(prefix, provider_group_prefix) and event in SCALAR_EVENTS:
             self._capture_provider_reference_npi(spec, state, event, raw_value)
             return
         if self._is_provider_network_name_event_consumed(
@@ -3742,10 +3373,7 @@ class SourceIndex:
             """,
             (rate_id, rate_id),
         )
-        network_names = [
-            str(network_name_row["network_name"])
-            for network_name_row in network_name_rows
-        ]
+        network_names = [str(network_name_row["network_name"]) for network_name_row in network_name_rows]
         if len(network_names) > self.max_list_values:
             raise SourceCoverageError("rate_network_names_exceed_configured_limit")
         self.connection.execute(
@@ -3887,20 +3515,20 @@ class SourceIndex:
             "additional_information",
         )
         for field_name in string_fields:
-            if (
-                prefix == f"{NEGOTIATED_PRICE_PREFIX}.{field_name}"
-                and event in SCALAR_EVENTS | {"start_map", "start_array"}
-            ):
+            if prefix == f"{NEGOTIATED_PRICE_PREFIX}.{field_name}" and event in SCALAR_EVENTS | {
+                "start_map",
+                "start_array",
+            }:
                 if event not in {"string", "null"}:
                     self.metrics["invalid_field_types"] += 1
                     state.has_valid_price_types = False
                 else:
                     state.price_fields[field_name] = raw_value
                 return
-        if (
-            prefix == f"{NEGOTIATED_PRICE_PREFIX}.negotiated_rate"
-            and event in SCALAR_EVENTS | {"start_map", "start_array"}
-        ):
+        if prefix == f"{NEGOTIATED_PRICE_PREFIX}.negotiated_rate" and event in SCALAR_EVENTS | {
+            "start_map",
+            "start_array",
+        }:
             if event != "number" or isinstance(raw_value, bool):
                 self.metrics["invalid_field_types"] += 1
                 state.has_valid_price_types = False
@@ -3924,10 +3552,7 @@ class SourceIndex:
                     self.metrics["invalid_field_types"] += 1
                     state.has_valid_price_types = False
                 return
-            if (
-                prefix == f"{field_prefix}.item"
-                and event in SCALAR_EVENTS | {"start_map", "start_array"}
-            ):
+            if prefix == f"{field_prefix}.item" and event in SCALAR_EVENTS | {"start_map", "start_array"}:
                 if event != "string":
                     self.metrics["invalid_field_types"] += 1
                     state.has_valid_price_types = False
@@ -4025,14 +3650,10 @@ class SourceIndex:
         if event not in SCALAR_EVENTS | {"start_map", "start_array"}:
             return False
         if prefix in required_field_by_prefix:
-            self._capture_item_field(
-                state, required_field_by_prefix[prefix], event, raw_value
-            )
+            self._capture_item_field(state, required_field_by_prefix[prefix], event, raw_value)
             return True
         if prefix in optional_field_by_prefix:
-            self._capture_optional_item_field(
-                state, optional_field_by_prefix[prefix], event, raw_value
-            )
+            self._capture_optional_item_field(state, optional_field_by_prefix[prefix], event, raw_value)
             return True
         return False
 
@@ -4199,25 +3820,20 @@ class SourceIndex:
                 query,
                 occurrence_row["arrangement"],
                 json.loads(occurrence_row["price_json"]),
-                billing_code_type_version=occurrence_row[
-                    "billing_code_type_version"
-                ],
+                billing_code_type_version=occurrence_row["billing_code_type_version"],
                 name=occurrence_row["name"],
                 description=occurrence_row["description"],
                 network_names=json.loads(occurrence_row["network_names_json"]),
             )
             occurrence_id = sha256_text(
-                f"{occurrence_row['source_token']}:"
-                f"{int(occurrence_row['price_ordinal'])}:{query.npi}"
+                f"{occurrence_row['source_token']}:{int(occurrence_row['price_ordinal'])}:{query.npi}"
             )
             occurrence = SourceOccurrence(
                 occurrence_id=occurrence_id,
                 query=query,
                 tuple_key=canonical_occurrence_key(
                     canonical_tuple,
-                    self.raw_container_sha256_by_file_id[
-                        int(occurrence_row["file_id"])
-                    ],
+                    self.raw_container_sha256_by_file_id[int(occurrence_row["file_id"])],
                 ),
             )
             self.occurrence_sampler.offer(occurrence.stable_key, occurrence)
@@ -4227,9 +3843,7 @@ class SourceIndex:
         self.metrics["source_occurrences"] = occurrence_count
         self.metrics["sampled_source_occurrences"] = len(self.occurrence_sampler)
         if self.capacity_query_sampler is not None:
-            self.metrics["sampled_capacity_distinct_queries"] = len(
-                self.capacity_query_sampler
-            )
+            self.metrics["sampled_capacity_distinct_queries"] = len(self.capacity_query_sampler)
         self._occurrence_sample_prepared = True
 
     def prepare_occurrence_sample(self) -> None:
@@ -4255,9 +3869,7 @@ class SourceIndex:
             raise ConfigurationError("capacity_query_target_exceeds_sampler_capacity")
         occurrences = self.capacity_query_sampler.values()[:target]
         if len(occurrences) < target:
-            raise SourceCoverageError(
-                "capacity_distinct_random_query_population_below_minimum"
-            )
+            raise SourceCoverageError("capacity_distinct_random_query_population_below_minimum")
         return occurrences
 
     def has_query(self, query: QueryKey) -> bool:
@@ -4403,16 +4015,12 @@ class SourceIndex:
 
     def _provider_group_definition_conflicts(self) -> dict[str, set[str]]:
         definition_digests_by_conflict_id: dict[str, set[str]] = {}
-        for (file_id, ref_id), definitions in sorted(
-            self.provider_group_definition_conflicts.items()
-        ):
+        for (file_id, ref_id), definitions in sorted(self.provider_group_definition_conflicts.items()):
             conflict_id = provider_group_conflict_identity(
                 self.raw_container_sha256_by_file_id[file_id],
                 ref_id,
             )
-            definition_digests_by_conflict_id.setdefault(conflict_id, set()).update(
-                definitions
-            )
+            definition_digests_by_conflict_id.setdefault(conflict_id, set()).update(definitions)
         return definition_digests_by_conflict_id
 
     def source_report(self) -> dict[str, Any]:
@@ -4426,9 +4034,7 @@ class SourceIndex:
         return {
             "files": [self.file_metrics[file_id] for file_id in sorted(self.file_metrics)],
             "totals": dict(sorted(self.metrics.items())),
-            "source_set": source_set_evidence(
-                list(self.raw_container_sha256_by_file_id.values())
-            ).payload,
+            "source_set": source_set_evidence(list(self.raw_container_sha256_by_file_id.values())).payload,
             "provider_identifier_quarantine": (
                 provider_identifier_quarantine_payload(
                     self.quarantined_provider_identifiers,
@@ -4440,9 +4046,7 @@ class SourceIndex:
             "max_canonical_tuples_per_query": self.max_tuples_per_query,
             "source_occurrence_sampler_capacity": self.occurrence_sampler.capacity,
             "capacity_query_sampler_capacity": (
-                self.capacity_query_sampler.capacity
-                if self.capacity_query_sampler is not None
-                else 0
+                self.capacity_query_sampler.capacity if self.capacity_query_sampler is not None else 0
             ),
             "memory_model": "ijson_event_stream_plus_disk_backed_sqlite_plus_fixed_bottom_k_occurrence_sampler",
         }
@@ -4625,19 +4229,11 @@ def _validate_identity_evidence(
     field_prefix: str,
 ) -> None:
     if identity_kind == "logical_json_sha256_v1":
-        if (
-            is_logical_hash_deferred
-            or logical_sha256 is None
-            or logical_sha256 != identity_sha256
-        ):
+        if is_logical_hash_deferred or logical_sha256 is None or logical_sha256 != identity_sha256:
             raise ApiSchemaError(f"{field_prefix}_logical_identity_evidence_inconsistent")
         return
     if identity_kind == "raw_container_sha256_v1":
-        if (
-            not is_logical_hash_deferred
-            or logical_sha256 is not None
-            or raw_sha256 != identity_sha256
-        ):
+        if not is_logical_hash_deferred or logical_sha256 is not None or raw_sha256 != identity_sha256:
             raise ApiSchemaError(f"{field_prefix}_raw_identity_evidence_inconsistent")
         return
     raise ApiSchemaError(f"{field_prefix}_identity_kind_unsupported")
@@ -4736,11 +4332,7 @@ def extract_source_identity(
     )
     if source_artifact_key < 0:
         raise ApiSchemaError(f"{field_prefix}_source_artifact_key_out_of_range")
-    source_key = (
-        _strict_string(raw["source_key"], field=f"{field_prefix}_source_key")
-        if "source_key" in raw
-        else None
-    )
+    source_key = _strict_string(raw["source_key"], field=f"{field_prefix}_source_key") if "source_key" in raw else None
     source_type = _strict_string(raw.get("source_type"), field=f"{field_prefix}_source_type")
     if source_type != "in_network":
         raise ApiSchemaError(f"{field_prefix}_source_type_must_be_in_network")
@@ -4791,9 +4383,7 @@ class _FetchState:
     declared_total: int | None = None
     offset: int = 0
     retries: int = 0
-    capacity_observations: list[CapacityHttpObservation] = dataclasses.field(
-        default_factory=list
-    )
+    capacity_observations: list[CapacityHttpObservation] = dataclasses.field(default_factory=list)
 
 
 class _ExactResponseHeaders(Mapping[str, str]):
@@ -4898,9 +4488,7 @@ class HttpApiFetcher:
         if self.capacity_collector is None:
             raise ConfigurationError("capacity_collector_missing")
         challenge = self.capacity_collector.fresh_challenge()
-        return challenge, self.capacity_collector.request_headers(
-            capacity_plan, challenge
-        )
+        return challenge, self.capacity_collector.request_headers(capacity_plan, challenge)
 
     def _execute_page_request(
         self,
@@ -4920,11 +4508,35 @@ class HttpApiFetcher:
             except ApiError:
                 if capacity_plan is not None:
                     assert self.capacity_collector is not None
-                    capacity_observations.append(self.capacity_collector.record_unverified_response(capacity_plan, attempt_index=attempt, latency_ms=(time.perf_counter() - attempt_started) * 1000.0, response_status_code=status_code, response_redirect_count=response_redirect_count, reason="response_body_incomplete"))
+                    capacity_observations.append(
+                        self.capacity_collector.record_unverified_response(
+                            capacity_plan,
+                            attempt_index=attempt,
+                            latency_ms=(time.perf_counter() - attempt_started) * 1000.0,
+                            response_status_code=status_code,
+                            response_redirect_count=response_redirect_count,
+                            reason="response_body_incomplete",
+                        )
+                    )
                 raise
             if capacity_plan is not None:
                 assert self.capacity_collector is not None and challenge is not None
-                capacity_observations.append(self.capacity_collector.collect_response(capacity_plan, _CapacityResponseDetails(challenge=challenge, query_parameters=params, response_headers=_ExactResponseHeaders(response.headers.multi_items()), response_status_code=status_code, response_body=body, response_redirect_count=response_redirect_count, collector_received_at=dt.datetime.now(dt.timezone.utc), attempt_index=attempt, latency_ms=(time.perf_counter() - attempt_started) * 1000.0)))
+                capacity_observations.append(
+                    self.capacity_collector.collect_response(
+                        capacity_plan,
+                        _CapacityResponseDetails(
+                            challenge=challenge,
+                            query_parameters=params,
+                            response_headers=_ExactResponseHeaders(response.headers.multi_items()),
+                            response_status_code=status_code,
+                            response_body=body,
+                            response_redirect_count=response_redirect_count,
+                            collector_received_at=dt.datetime.now(dt.timezone.utc),
+                            attempt_index=attempt,
+                            latency_ms=(time.perf_counter() - attempt_started) * 1000.0,
+                        ),
+                    )
+                )
         return status_code, retry_after, response_redirect_count, body, tuple(capacity_observations)
 
     def _capacity_transport_failure(
@@ -4976,7 +4588,9 @@ class HttpApiFetcher:
                 self.request_count += 1
             attempt_started = time.perf_counter()
             try:
-                status_code, retry_after, response_redirect_count, body, attempt_observations = self._execute_page_request(params, capacity_plan, attempt, attempt_started)
+                status_code, retry_after, response_redirect_count, body, attempt_observations = (
+                    self._execute_page_request(params, capacity_plan, attempt, attempt_started)
+                )
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_transport_error = exc
                 capacity_observations.extend(
@@ -4984,11 +4598,7 @@ class HttpApiFetcher:
                         capacity_plan,
                         attempt,
                         attempt_started,
-                        (
-                            "request_timeout"
-                            if isinstance(exc, httpx.TimeoutException)
-                            else "transport_failure"
-                        ),
+                        ("request_timeout" if isinstance(exc, httpx.TimeoutException) else "transport_failure"),
                     )
                 )
                 if attempt >= self.retries:
@@ -5019,12 +4629,8 @@ class HttpApiFetcher:
     @staticmethod
     def _query_contract_fields(query: Mapping[str, Any]) -> dict[str, Any]:
         return {
-            "query_snapshot_id": str(
-                _strict_string(query.get("snapshot_id"), field="query_snapshot_id")
-            ),
-            "query_plan_id": str(
-                _strict_string(query.get("plan_id"), field="query_plan_id")
-            ),
+            "query_snapshot_id": str(_strict_string(query.get("snapshot_id"), field="query_snapshot_id")),
+            "query_plan_id": str(_strict_string(query.get("plan_id"), field="query_plan_id")),
             "query_mode": str(_strict_string(query.get("mode"), field="query_mode")),
             "query_source_key": (
                 None
@@ -5049,9 +4655,7 @@ class HttpApiFetcher:
             "transaction_snapshot_observed",
         ):
             if type(database_evidence.get(field_name)) is not bool:
-                raise ApiSchemaError(
-                    f"provenance_{field_name}_must_be_boolean"
-                )
+                raise ApiSchemaError(f"provenance_{field_name}_must_be_boolean")
         return {
             "provenance_database_evidence_contract": str(
                 _strict_string(
@@ -5062,9 +4666,7 @@ class HttpApiFetcher:
             "provenance_postgres_server_version_num": server_version_num,
             "provenance_database_selected": database_evidence["database_selected"],
             "provenance_backend_session_active": database_evidence["backend_session_active"],
-            "provenance_transaction_snapshot_observed": database_evidence[
-                "transaction_snapshot_observed"
-            ],
+            "provenance_transaction_snapshot_observed": database_evidence["transaction_snapshot_observed"],
         }
 
     @staticmethod
@@ -5088,15 +4690,11 @@ class HttpApiFetcher:
                 )
             ),
             **HttpApiFetcher._validated_database_evidence(provenance),
-            "provenance_plan_id": str(
-                _strict_string(provenance.get("plan_id"), field="provenance_plan_id")
-            ),
+            "provenance_plan_id": str(_strict_string(provenance.get("plan_id"), field="provenance_plan_id")),
             "provenance_snapshot_id": str(
                 _strict_string(provenance.get("snapshot_id"), field="provenance_snapshot_id")
             ),
-            "provenance_mode": str(
-                _strict_string(provenance.get("mode"), field="provenance_mode")
-            ),
+            "provenance_mode": str(_strict_string(provenance.get("mode"), field="provenance_mode")),
             "provenance_pricing_scope": str(
                 _strict_string(
                     provenance.get("pricing_scope"),
@@ -5125,12 +4723,8 @@ class HttpApiFetcher:
             field="provenance",
         )
         return PageContract(
-            result_state=str(
-                _strict_string(response_payload.get("result_state"), field="result_state")
-            ),
-            pricing_scope=str(
-                _strict_string(response_payload.get("pricing_scope"), field="pricing_scope")
-            ),
+            result_state=str(_strict_string(response_payload.get("result_state"), field="result_state")),
+            pricing_scope=str(_strict_string(response_payload.get("pricing_scope"), field="pricing_scope")),
             resolved_snapshot_id=str(
                 _strict_string(
                     response_payload.get("resolved_snapshot_id"),
@@ -5211,10 +4805,7 @@ class HttpApiFetcher:
         request_param_map.update({"limit": requested_page_size, "offset": state.offset})
         page_capacity_plan = capacity_plan if page_number == 1 and state.offset == 0 else None
         if page_capacity_plan is not None:
-            request_param_map = {
-                str(name): str(parameter_value)
-                for name, parameter_value in request_param_map.items()
-            }
+            request_param_map = {str(name): str(parameter_value) for name, parameter_value in request_param_map.items()}
         return request_param_map, page_capacity_plan
 
     def fetch_all(
@@ -5233,7 +4824,11 @@ class HttpApiFetcher:
             raise ConfigurationError("invalid_api_page_size")
         if capacity_intent is not None and requested_page_size != capacity_evidence.CAPACITY_PAGE_LIMIT:
             raise ConfigurationError("capacity_page_limit_must_be_100")
-        capacity_plan = self.capacity_collector.plan(capacity_intent) if capacity_intent is not None and self.capacity_collector is not None else None
+        capacity_plan = (
+            self.capacity_collector.plan(capacity_intent)
+            if capacity_intent is not None and self.capacity_collector is not None
+            else None
+        )
         if capacity_intent is not None and capacity_plan is None:
             raise ConfigurationError("capacity_collector_missing")
         state = _FetchState()
@@ -5490,9 +5085,7 @@ def _extract_api_item_tuples(
             )
         except (ApiSchemaError, SourceCoverageError, ValueError) as exc:
             schema_errors.append(
-                str(exc)
-                if isinstance(exc, ApiSchemaError)
-                else f"item_{item_index}_price_{price_index}_not_canonical"
+                str(exc) if isinstance(exc, ApiSchemaError) else f"item_{item_index}_price_{price_index}_not_canonical"
             )
             continue
         occurrence_key = canonical_occurrence_key(
@@ -5613,16 +5206,10 @@ class CounterComparison:
 @dataclass
 class _CounterComparisonState:
     exact_matches: int = 0
-    failure_counts: collections.Counter[str] = dataclasses.field(
-        default_factory=collections.Counter
-    )
+    failure_counts: collections.Counter[str] = dataclasses.field(default_factory=collections.Counter)
     examples: list[dict[str, Any]] = dataclasses.field(default_factory=list)
-    expected_only: collections.Counter[str] = dataclasses.field(
-        default_factory=collections.Counter
-    )
-    actual_only: collections.Counter[str] = dataclasses.field(
-        default_factory=collections.Counter
-    )
+    expected_only: collections.Counter[str] = dataclasses.field(default_factory=collections.Counter)
+    actual_only: collections.Counter[str] = dataclasses.field(default_factory=collections.Counter)
 
 
 def _partition_tuple_counts(
@@ -5639,9 +5226,7 @@ def _partition_tuple_counts(
         state.exact_matches += min(expected_count, actual_count)
         if expected_count and actual_count:
             if expected_count != actual_count:
-                state.failure_counts["duplicate_count"] += abs(
-                    expected_count - actual_count
-                )
+                state.failure_counts["duplicate_count"] += abs(expected_count - actual_count)
                 if len(state.examples) < example_limit:
                     state.examples.append(
                         {
@@ -5668,8 +5253,7 @@ def _nearest_alteration(
     for expected_key in expected_only:
         expected_payload = _tuple_payload(expected_key)
         has_different_identity = any(
-            expected_payload.get(field) != actual_payload.get(field)
-            for field in ("code_system", "code", "npi")
+            expected_payload.get(field) != actual_payload.get(field) for field in ("code_system", "code", "npi")
         )
         if has_different_identity:
             continue
@@ -5943,47 +5527,34 @@ class AuditConfig:
             or self.max_logical_query_p95_ms <= 0
         ):
             raise ConfigurationError("latency_limits_must_be_positive")
-        if not math.isfinite(self.min_resolved_rate_fraction) or not (
-            0.0 <= self.min_resolved_rate_fraction <= 1.0
-        ):
+        if not math.isfinite(self.min_resolved_rate_fraction) or not (0.0 <= self.min_resolved_rate_fraction <= 1.0):
             raise ConfigurationError("resolved_rate_fraction_out_of_range")
 
     def _validate_capacity_evidence_contract(self) -> None:
         if self.capacity_evidence_trust is None:
             if self.capacity_contention_run_id is not None:
-                raise ConfigurationError(
-                    "capacity_contention_run_requires_evidence_trust"
-                )
+                raise ConfigurationError("capacity_contention_run_requires_evidence_trust")
             return
         contention_run_id = self.capacity_contention_run_id
         if (
             not isinstance(contention_run_id, str)
             or len(contention_run_id) != 64
             or contention_run_id == "0" * 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in contention_run_id
-            )
+            or any(character not in "0123456789abcdef" for character in contention_run_id)
         ):
             raise ConfigurationError("capacity_contention_run_id_invalid")
         if self.validated_candidate:
-            raise ConfigurationError(
-                "capacity_evidence_requires_published_standard_route"
-            )
+            raise ConfigurationError("capacity_evidence_requires_published_standard_route")
         if self.api_path != DEFAULT_API_PATH:
             raise ConfigurationError("capacity_evidence_requires_standard_api_path")
         if self.plan_market_type is not None or self.source_key is not None:
-            raise ConfigurationError(
-                "capacity_evidence_rejects_optional_scope_parameters"
-            )
+            raise ConfigurationError("capacity_evidence_rejects_optional_scope_parameters")
         if self.page_size != capacity_evidence.CAPACITY_PAGE_LIMIT:
             raise ConfigurationError("capacity_page_limit_must_be_100")
         if self.random_api_max_limit != capacity_evidence.CAPACITY_PAGE_LIMIT:
             raise ConfigurationError("capacity_random_page_limit_must_be_100")
         if self.random_api_calls < CAPACITY_MIN_DISTINCT_RANDOM_QUERIES:
-            raise ConfigurationError(
-                "capacity_random_query_target_below_minimum"
-            )
+            raise ConfigurationError("capacity_random_query_target_below_minimum")
 
     def _release_rules_by_reason(self) -> dict[str, bool]:
         """Return release constraints keyed by their stable failure reason."""
@@ -5992,19 +5563,12 @@ class AuditConfig:
         return {
             **origin_rules_by_reason,
             "release_published_capacity_evidence_required": (
-                not self.validated_candidate
-                and self.capacity_evidence_trust is None
+                not self.validated_candidate and self.capacity_evidence_trust is None
             ),
             "release_tls_verification_required": not self.verify_tls,
             "release_standard_api_path_required": self.api_path
-            != (
-                DEFAULT_CANDIDATE_API_PATH
-                if self.validated_candidate
-                else DEFAULT_API_PATH
-            ),
-            "release_audit_api_path_required": (
-                self.api_audit_path != DEFAULT_API_AUDIT_PATH
-            ),
+            != (DEFAULT_CANDIDATE_API_PATH if self.validated_candidate else DEFAULT_API_PATH),
+            "release_audit_api_path_required": (self.api_audit_path != DEFAULT_API_AUDIT_PATH),
             "release_source_occurrence_sample_floor": (
                 self.source_occurrence_samples < RELEASE_MIN_SOURCE_OCCURRENCES
                 or self.min_source_occurrence_checks < RELEASE_MIN_SOURCE_OCCURRENCES
@@ -6024,9 +5588,7 @@ class AuditConfig:
             "release_first_page_latency_ceiling": (
                 self.max_first_page_first_observation_p95_ms > RELEASE_MAX_FIRST_PAGE_P95_MS
             ),
-            "release_logical_query_latency_ceiling": (
-                self.max_logical_query_p95_ms > RELEASE_MAX_LOGICAL_QUERY_P95_MS
-            ),
+            "release_logical_query_latency_ceiling": (self.max_logical_query_p95_ms > RELEASE_MAX_LOGICAL_QUERY_P95_MS),
             "release_resolved_rate_floor": self.min_resolved_rate_fraction != 1.0,
             "release_source_integrity_ceiling": any(
                 configured_value != 0
@@ -6044,21 +5606,13 @@ class AuditConfig:
 
         is_https_origin = _is_https_api_origin(self.api_base_url)
         is_cluster_http_origin = _is_cluster_http_api_origin(self.api_base_url)
-        is_trusted_cluster_origin = (
-            self.validated_candidate
-            and self.trusted_cluster_http
-            and is_cluster_http_origin
-        )
+        is_trusted_cluster_origin = self.validated_candidate and self.trusted_cluster_http and is_cluster_http_origin
         return {
-            "release_api_base_url_must_be_https_origin": not (
-                is_https_origin or is_trusted_cluster_origin
-            ),
+            "release_api_base_url_must_be_https_origin": not (is_https_origin or is_trusted_cluster_origin),
             "release_cluster_http_requires_validated_candidate": (
                 self.trusted_cluster_http and not self.validated_candidate
             ),
-            "release_cluster_http_origin_required": (
-                self.trusted_cluster_http and not is_cluster_http_origin
-            ),
+            "release_cluster_http_origin_required": (self.trusted_cluster_http and not is_cluster_http_origin),
         }
 
     def api_params(self, query: QueryKey) -> dict[str, Any]:
@@ -6108,9 +5662,7 @@ class AuditConfig:
         origin = f"{parsed.scheme}://{parsed.netloc}"
         is_https_origin = _is_https_api_origin(self.api_base_url)
         is_trusted_cluster_origin = (
-            self.validated_candidate
-            and self.trusted_cluster_http
-            and _is_cluster_http_api_origin(self.api_base_url)
+            self.validated_candidate and self.trusted_cluster_http and _is_cluster_http_api_origin(self.api_base_url)
         )
         return {
             "expected_architecture": EXPECTED_ARCHITECTURE,
@@ -6126,9 +5678,7 @@ class AuditConfig:
             "snapshot_id_sha256": sha256_text(self.snapshot_id),
             "market_type_sha256": sha256_text(self.plan_market_type) if self.plan_market_type else None,
             "source_key_sha256": sha256_text(self.source_key) if self.source_key else None,
-            "expected_snapshot_lifecycle": (
-                "validated" if self.validated_candidate else "published"
-            ),
+            "expected_snapshot_lifecycle": ("validated" if self.validated_candidate else "published"),
             "tls_verified": self.verify_tls and is_https_origin,
             "transport_contract": (
                 VERIFIED_HTTPS_TRANSPORT
@@ -6202,8 +5752,7 @@ def _validate_contracts(
         if contract.provenance_database_backend != EXPECTED_DATABASE_BACKEND:
             errors.append("provenance_database_backend_mismatch")
         if (
-            contract.provenance_database_evidence_contract
-            != DATABASE_EVIDENCE_CONTRACT
+            contract.provenance_database_evidence_contract != DATABASE_EVIDENCE_CONTRACT
             or contract.provenance_postgres_server_version_num < 10000
             or not contract.provenance_database_selected
             or not contract.provenance_backend_session_active
@@ -6284,9 +5833,7 @@ class _AuditSampleMetadata:
 @dataclass
 class _ApiSampleState:
     sampler: BottomKSampler[ApiOccurrence]
-    identity_registry: SourceIdentityRegistry = dataclasses.field(
-        default_factory=SourceIdentityRegistry
-    )
+    identity_registry: SourceIdentityRegistry = dataclasses.field(default_factory=SourceIdentityRegistry)
     offset: int = 0
     retries: int = 0
     declared_total: int | None = None
@@ -6318,9 +5865,7 @@ class HttpApiOccurrenceSource:
     ) -> SourceSetEvidence:
         observed = extract_source_set_evidence(response_payload)
         if observed != self.expected_source_set:
-            raise ApiSchemaError(
-                "snapshot_source_set_does_not_match_supplied_sources"
-            )
+            raise ApiSchemaError("snapshot_source_set_does_not_match_supplied_sources")
         self._source_set_validated = True
         return observed
 
@@ -6331,9 +5876,7 @@ class HttpApiOccurrenceSource:
             return True
         request_params = self.config.api_audit_params()
         request_params.update({"limit": 1, "offset": 0})
-        response_payload, _latency_ms, retries, _capacity_observations = (
-            self.fetcher._request_page(request_params)
-        )
+        response_payload, _latency_ms, retries, _capacity_observations = self.fetcher._request_page(request_params)
         self._preflight_retries += retries
         preflight_items = response_payload.get("items")
         if not isinstance(preflight_items, list) or len(preflight_items) > 1:
@@ -6508,10 +6051,7 @@ class HttpApiOccurrenceSource:
                 raw_occurrence,
                 registry=state.identity_registry,
             )
-            if (
-                state.last_occurrence_id is not None
-                and occurrence.occurrence_id <= state.last_occurrence_id
-            ):
+            if state.last_occurrence_id is not None and occurrence.occurrence_id <= state.last_occurrence_id:
                 raise ApiSchemaError("audit_occurrence_ids_not_strictly_increasing")
             digest_coordinate_bytes = _audit_digest_coordinate_bytes(
                 raw_occurrence,
@@ -6555,15 +6095,11 @@ class HttpApiOccurrenceSource:
     ) -> ApiOccurrenceSample:
         """Validate the persisted sample and select deterministic occurrences."""
 
-        state = _ApiSampleState(
-            BottomKSampler(sample_target, seed=seed, namespace="api-occurrence-id")
-        )
+        state = _ApiSampleState(BottomKSampler(sample_target, seed=seed, namespace="api-occurrence-id"))
         base_params = self.config.api_audit_params()
         for page_number in range(1, self.config.api_audit_max_pages + 1):
             request_param_map = dict(base_params)
-            request_param_map.update(
-                {"limit": self.config.api_audit_page_size, "offset": state.offset}
-            )
+            request_param_map.update({"limit": self.config.api_audit_page_size, "offset": state.offset})
             (
                 response_payload,
                 _latency_ms,
@@ -6576,10 +6112,7 @@ class HttpApiOccurrenceSource:
                 state,
             )
             source_set = self._validated_source_set(response_payload)
-            if (
-                state.declared_source_set is not None
-                and source_set != state.declared_source_set
-            ):
+            if state.declared_source_set is not None and source_set != state.declared_source_set:
                 raise ApiSchemaError("source_set_changed_between_pages")
             state.declared_source_set = source_set
             metadata = self._extract_sample_metadata(response_payload)
@@ -6592,18 +6125,14 @@ class HttpApiOccurrenceSource:
             self._validate_audit_contract(response_payload, total)
             self._consume_audit_items(page_items, state)
             if not has_more:
-                return self._completed_api_occurrence_sample(
-                    state, page_number, metadata, total
-                )
+                return self._completed_api_occurrence_sample(state, page_number, metadata, total)
             state.offset += len(page_items)
         raise ApiSchemaError("audit_pagination_exceeded_max_pages")
 
 
 @dataclass
 class _QueryAuditState:
-    failure_counts: collections.Counter[str] = dataclasses.field(
-        default_factory=collections.Counter
-    )
+    failure_counts: collections.Counter[str] = dataclasses.field(default_factory=collections.Counter)
     examples: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     schema_errors: list[str] = dataclasses.field(default_factory=list)
     first_page_first_observation_ms: list[float] = dataclasses.field(default_factory=list)
@@ -6614,9 +6143,7 @@ class _QueryAuditState:
     retries: int = 0
     matched_initial_traversal: bool = False
     matched_first_observation: bool = False
-    capacity_observations: list[CapacityHttpObservation] = dataclasses.field(
-        default_factory=list
-    )
+    capacity_observations: list[CapacityHttpObservation] = dataclasses.field(default_factory=list)
 
 
 def _fetch_all_with_capacity_intent(
@@ -6663,9 +6190,7 @@ def _record_query_fetch(
     state.capacity_observations.extend(fetch_result.capacity_observations)
     if is_cold:
         if fetch_result.page_latencies_ms:
-            state.first_page_first_observation_ms.append(
-                fetch_result.page_latencies_ms[0]
-            )
+            state.first_page_first_observation_ms.append(fetch_result.page_latencies_ms[0])
         state.cold_page_ms.extend(fetch_result.page_latencies_ms)
         state.cold_query_ms.append(fetch_result.total_latency_ms)
         return
@@ -6779,9 +6304,7 @@ def _record_positive_schema_errors(
         )
 
 
-def _positive_capacity_intent(
-    config: AuditConfig, initial_phase: str
-) -> CapacityObservationIntent | None:
+def _positive_capacity_intent(config: AuditConfig, initial_phase: str) -> CapacityObservationIntent | None:
     if config.capacity_evidence_trust is None or initial_phase != "cold":
         return None
     return CapacityObservationIntent(
@@ -6800,12 +6323,8 @@ def _record_initial_positive_contract(
     state.matched_initial_traversal = bool(initial.contracts) and all(
         contract.result_state == "matched" for contract in initial.contracts
     )
-    state.matched_first_observation = (
-        initial_phase == "cold" and state.matched_initial_traversal
-    )
-    state.schema_errors.extend(
-        _validate_contracts(initial.contracts, config, positive=True)
-    )
+    state.matched_first_observation = initial_phase == "cold" and state.matched_initial_traversal
+    state.schema_errors.extend(_validate_contracts(initial.contracts, config, positive=True))
 
 
 def _record_positive_capacity_outcome(
@@ -6817,11 +6336,7 @@ def _record_positive_capacity_outcome(
     _mark_capacity_semantic_outcome(
         fetcher,
         initial.capacity_observations,
-        successful=(
-            state.matched_initial_traversal
-            and not state.schema_errors
-            and not comparison.failure_counts
-        ),
+        successful=(state.matched_initial_traversal and not state.schema_errors and not comparison.failure_counts),
     )
 
 
@@ -6913,9 +6428,7 @@ def _audit_negative_warm_repeats(
             state.examples.append(_safe_http_example(query, exc))
             continue
         _record_query_fetch(state, warm, is_cold=False)
-        state.schema_errors.extend(
-            _validate_contracts(warm.contracts, config, positive=False)
-        )
+        state.schema_errors.extend(_validate_contracts(warm.contracts, config, positive=False))
         if warm.items:
             state.failure_counts["extra_fake"] += max(len(warm.items), 1)
         if warm.response_fingerprint != cold.response_fingerprint:
@@ -6960,11 +6473,7 @@ def _audit_negative_query(
         return _failed_query_audit_result(query, empty_counts, state)
     _record_query_fetch(state, cold, is_cold=True)
     state.schema_errors.extend(_validate_contracts(cold.contracts, config, positive=False))
-    extracted = (
-        extract_api_tuples(cold.items, registry=identity_registry)
-        if cold.items
-        else extracted
-    )
+    extracted = extract_api_tuples(cold.items, registry=identity_registry) if cold.items else extracted
     state.schema_errors.extend(extracted.schema_errors)
     if cold.items:
         fake_count = max(sum(extracted.counter.values()), len(cold.items), 1)
@@ -7070,11 +6579,7 @@ def _seeded_index(seed: str, namespace: str, index: int, modulus: int) -> int:
     if modulus < 1:
         raise ConfigurationError("random_api_sampling_population_empty")
     digest = hashlib.sha256(
-        seed.encode("utf-8")
-        + b"\x00"
-        + namespace.encode("utf-8")
-        + b"\x00"
-        + str(index).encode("ascii")
+        seed.encode("utf-8") + b"\x00" + namespace.encode("utf-8") + b"\x00" + str(index).encode("ascii")
     ).digest()
     return int.from_bytes(digest[:8], "big") % modulus
 
@@ -7093,9 +6598,7 @@ def build_random_api_requests(
     requests: list[RandomApiRequest] = []
     seen_queries: set[str] = set()
     for index in range(count):
-        occurrence = occurrences[
-            _seeded_index(seed, "random-api-occurrence", index, len(occurrences))
-        ]
+        occurrence = occurrences[_seeded_index(seed, "random-api-occurrence", index, len(occurrences))]
         query_key = occurrence.query.stable_key
         phase = "cold" if query_key not in seen_queries else "warm"
         seen_queries.add(query_key)
@@ -7122,9 +6625,7 @@ def build_capacity_random_api_requests(
     for occurrence in occurrences:
         unique_by_query.setdefault(occurrence.query.stable_key, occurrence)
     if len(unique_by_query) < count:
-        raise SourceCoverageError(
-            "capacity_distinct_random_query_population_below_minimum"
-        )
+        raise SourceCoverageError("capacity_distinct_random_query_population_below_minimum")
     return [
         RandomApiRequest(
             index=index,
@@ -7188,9 +6689,7 @@ def _successful_random_audit_result(
         request=request,
         response_occurrences=sum(extracted.counter.values()),
         latency_ms=response.total_latency_ms,
-        first_page_latency_ms=(
-            response.page_latencies_ms[0] if response.page_latencies_ms else None
-        ),
+        first_page_latency_ms=(response.page_latencies_ms[0] if response.page_latencies_ms else None),
         retries=response.retries,
         http_requests=response.pages + response.retries,
         failure_counts=dict(failure_counts),
@@ -7200,9 +6699,7 @@ def _successful_random_audit_result(
     )
 
 
-def _random_capacity_intent(
-    config: AuditConfig, request: RandomApiRequest
-) -> CapacityObservationIntent | None:
+def _random_capacity_intent(config: AuditConfig, request: RandomApiRequest) -> CapacityObservationIntent | None:
     if config.capacity_evidence_trust is None:
         return None
     return CapacityObservationIntent(
@@ -7264,9 +6761,7 @@ def _audit_random_api_request(
         response.capacity_observations,
         successful=not failures,
     )
-    return _successful_random_audit_result(
-        request, response, extracted, failures, examples, config
-    )
+    return _successful_random_audit_result(request, response, extracted, failures, examples, config)
 
 
 def _fetcher_request_count(fetcher: ApiFetcher) -> int | None:
@@ -7293,9 +6788,7 @@ class _AuditSamples:
 
 @dataclass
 class _AuditProgress:
-    failure_counts: collections.Counter[str] = dataclasses.field(
-        default_factory=collections.Counter
-    )
+    failure_counts: collections.Counter[str] = dataclasses.field(default_factory=collections.Counter)
     failure_examples: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     coverage_reasons: list[str] = dataclasses.field(default_factory=list)
     checks: collections.Counter[str] = dataclasses.field(default_factory=collections.Counter)
@@ -7308,9 +6801,7 @@ class _AuditProgress:
     warm_page_ms: list[float] = dataclasses.field(default_factory=list)
     warm_query_ms: list[float] = dataclasses.field(default_factory=list)
     retries: int = 0
-    random_failure_counts: collections.Counter[str] = dataclasses.field(
-        default_factory=collections.Counter
-    )
+    random_failure_counts: collections.Counter[str] = dataclasses.field(default_factory=collections.Counter)
     random_cold_latency_ms: list[float] = dataclasses.field(default_factory=list)
     random_cold_first_page_ms: list[float] = dataclasses.field(default_factory=list)
     random_warm_latency_ms: list[float] = dataclasses.field(default_factory=list)
@@ -7432,9 +6923,7 @@ class AuditRunner:
         list[QueryKey],
         list[QueryKey],
     ]:
-        source_occurrences_by_query: dict[str, list[SourceOccurrence]] = (
-            collections.defaultdict(list)
-        )
+        source_occurrences_by_query: dict[str, list[SourceOccurrence]] = collections.defaultdict(list)
         api_occurrences_by_query: dict[str, list[ApiOccurrence]] = collections.defaultdict(list)
         queries_by_key: dict[str, QueryKey] = {}
         for occurrence in source_occurrences:
@@ -7446,9 +6935,7 @@ class AuditRunner:
             api_occurrences_by_query[query_key].append(occurrence)
             queries_by_key[query_key] = occurrence.query
         positive_queries = [queries_by_key[key] for key in sorted(queries_by_key)]
-        source_positive_queries = [
-            queries_by_key[key] for key in sorted(source_occurrences_by_query)
-        ]
+        source_positive_queries = [queries_by_key[key] for key in sorted(source_occurrences_by_query)]
         return (
             source_occurrences_by_query,
             api_occurrences_by_query,
@@ -7472,19 +6959,13 @@ class AuditRunner:
         }
         plan_fingerprint = hashlib.sha256()
         for request in random_requests:
-            plan_fingerprint.update(
-                f"{request.index}:{request.stable_key}\n".encode("utf-8")
-            )
+            plan_fingerprint.update(f"{request.index}:{request.stable_key}\n".encode("utf-8"))
         return random_query_keys, random_request_shape_keys, plan_fingerprint.hexdigest()
 
-    def _select_random_requests(
-        self, source_occurrences: Sequence[SourceOccurrence]
-    ) -> list[RandomApiRequest]:
+    def _select_random_requests(self, source_occurrences: Sequence[SourceOccurrence]) -> list[RandomApiRequest]:
         if self.config.capacity_evidence_trust is not None:
             return build_capacity_random_api_requests(
-                self.source_index.capacity_query_occurrences(
-                    self.config.random_api_calls
-                ),
+                self.source_index.capacity_query_occurrences(self.config.random_api_calls),
                 count=self.config.random_api_calls,
             )
         return build_random_api_requests(
@@ -7519,9 +7000,7 @@ class AuditRunner:
         if self.api_occurrence_source.is_source_set_valid() is not True:
             raise ApiSchemaError("snapshot_source_set_was_not_validated")
         self.source_index.prepare_occurrence_sample()
-        source_occurrences = self.source_index.source_occurrences(
-            self.config.source_occurrence_samples
-        )
+        source_occurrences = self.source_index.source_occurrences(self.config.source_occurrence_samples)
         random_requests = self._select_random_requests(source_occurrences)
         api_sample, api_occurrences = self._validated_api_occurrence_sample()
         grouped = self._group_occurrences(source_occurrences, api_occurrences)
@@ -7533,15 +7012,9 @@ class AuditRunner:
         random_details = self._random_plan_details(random_requests)
         random_query_keys = random_details[0]
         positive_first_observation_queries = [
-            query
-            for query in positive_queries
-            if query.stable_key not in random_query_keys
+            query for query in positive_queries if query.stable_key not in random_query_keys
         ]
-        positive_reserved_queries = [
-            query
-            for query in positive_queries
-            if query.stable_key in random_query_keys
-        ]
+        positive_reserved_queries = [query for query in positive_queries if query.stable_key in random_query_keys]
         if self.config.capacity_evidence_trust is not None:
             validate_capacity_evidence_preflight(
                 distinct_random_queries=len(random_query_keys),
@@ -7558,9 +7031,7 @@ class AuditRunner:
             positive_queries=positive_queries,
             positive_first_observation_queries=positive_first_observation_queries,
             positive_reserved_queries=positive_reserved_queries,
-            negative_jobs=[
-                (query, collections.Counter()) for query in negative_queries
-            ],
+            negative_jobs=[(query, collections.Counter()) for query in negative_queries],
             random_query_keys=random_query_keys,
             random_request_shape_keys=random_details[1],
             random_plan_sha256=random_details[2],
@@ -7569,9 +7040,7 @@ class AuditRunner:
     def _initial_progress(self, samples: _AuditSamples) -> _AuditProgress:
         progress = _AuditProgress()
         checks = progress.checks
-        checks["source_occurrence_population"] = self.source_index.metrics.get(
-            "source_occurrences", 0
-        )
+        checks["source_occurrence_population"] = self.source_index.metrics.get("source_occurrences", 0)
         checks["persisted_api_audit_sample_count"] = samples.api_sample.sample_count
         checks["source_occurrence_ids"] = len(samples.source_occurrences)
         checks["api_occurrence_ids"] = len(samples.api_occurrences)
@@ -7580,21 +7049,15 @@ class AuditRunner:
         checks["source_sample_query_keys"] = len(samples.source_occurrences_by_query)
         checks["api_sample_query_keys"] = len(samples.api_occurrences_by_query)
         checks["positive_queries"] = len(samples.positive_queries)
-        checks["positive_first_observation_query_keys"] = len(
-            samples.positive_first_observation_queries
-        )
-        checks["positive_reserved_for_random_query_keys"] = len(
-            samples.positive_reserved_queries
-        )
+        checks["positive_first_observation_query_keys"] = len(samples.positive_first_observation_queries)
+        checks["positive_reserved_for_random_query_keys"] = len(samples.positive_reserved_queries)
         checks["positive_queries_executed"] = 0
         checks["positive_matched_query_keys"] = 0
         checks["positive_matched_first_observation_query_keys"] = 0
         checks["random_api_logical_requests_target"] = len(samples.random_requests)
         checks["random_api_requests_executed"] = 0
         checks["random_api_distinct_query_keys"] = len(samples.random_query_keys)
-        checks["random_api_repeated_query_requests"] = len(
-            samples.random_requests
-        ) - len(samples.random_query_keys)
+        checks["random_api_repeated_query_requests"] = len(samples.random_requests) - len(samples.random_query_keys)
         return progress
 
     def _append_failure_examples(
@@ -7619,17 +7082,13 @@ class AuditRunner:
         if positive and audit_result.matched_initial_traversal:
             progress.checks["positive_matched_query_keys"] += 1
         if positive and audit_result.matched_first_observation:
-            progress.first_page_first_observation_ms.extend(
-                audit_result.first_page_first_observation_ms
-            )
+            progress.first_page_first_observation_ms.extend(audit_result.first_page_first_observation_ms)
             progress.checks["positive_matched_first_observation_query_keys"] += 1
         if positive:
             progress.positive_cold_query_ms.extend(audit_result.cold_query_ms)
         else:
             if audit_result.cold_page_ms:
-                progress.negative_first_page_ms.append(
-                    audit_result.cold_page_ms[0]
-                )
+                progress.negative_first_page_ms.append(audit_result.cold_page_ms[0])
             progress.negative_cold_query_ms.extend(audit_result.cold_query_ms)
         progress.cold_page_ms.extend(audit_result.cold_page_ms)
         progress.cold_query_ms.extend(audit_result.cold_query_ms)
@@ -7647,9 +7106,7 @@ class AuditRunner:
             try:
                 expected_counts = self.source_index.expected_tuples(query)
             except SourceCoverageError:
-                progress.coverage_reasons.append(
-                    "source_query_exceeds_canonical_tuple_limit"
-                )
+                progress.coverage_reasons.append("source_query_exceeds_canonical_tuple_limit")
                 self._append_failure_examples(
                     progress,
                     [
@@ -7673,16 +7130,13 @@ class AuditRunner:
     ) -> None:
         query_key = audit_result.query.stable_key
         source_sample_counts = collections.Counter(
-            occurrence.tuple_key
-            for occurrence in samples.source_occurrences_by_query.get(query_key, ())
+            occurrence.tuple_key for occurrence in samples.source_occurrences_by_query.get(query_key, ())
         )
         for tuple_key, sampled_count in source_sample_counts.items():
             expected_count = audit_result.expected.get(tuple_key, 0)
             actual_count = audit_result.actual.get(tuple_key, 0)
             if expected_count <= 0:
-                progress.coverage_reasons.append(
-                    "source_occurrence_missing_from_source_counter"
-                )
+                progress.coverage_reasons.append("source_occurrence_missing_from_source_counter")
             elif actual_count == expected_count:
                 progress.checks["source_to_api_exact_matches"] += sampled_count
 
@@ -7694,8 +7148,7 @@ class AuditRunner:
     ) -> None:
         query_key = audit_result.query.stable_key
         api_sample_counts = collections.Counter(
-            occurrence.tuple_key
-            for occurrence in samples.api_occurrences_by_query.get(query_key, ())
+            occurrence.tuple_key for occurrence in samples.api_occurrences_by_query.get(query_key, ())
         )
         for tuple_key, sampled_count in api_sample_counts.items():
             source_count = audit_result.expected.get(tuple_key, 0)
@@ -7717,9 +7170,7 @@ class AuditRunner:
                     ],
                 )
             if sampled_count > actual_count:
-                progress.failure_counts["api_sample_inconsistent"] += (
-                    sampled_count - actual_count
-                )
+                progress.failure_counts["api_sample_inconsistent"] += sampled_count - actual_count
                 self._append_failure_examples(
                     progress,
                     [
@@ -7769,13 +7220,9 @@ class AuditRunner:
             query_key = request.query.stable_key
             if query_key not in expected_counts_by_query:
                 try:
-                    expected_counts_by_query[query_key] = (
-                        self.source_index.expected_tuples(request.query)
-                    )
+                    expected_counts_by_query[query_key] = self.source_index.expected_tuples(request.query)
                 except SourceCoverageError:
-                    progress.coverage_reasons.append(
-                        "random_api_query_exceeds_canonical_tuple_limit"
-                    )
+                    progress.coverage_reasons.append("random_api_query_exceeds_canonical_tuple_limit")
                     expected_counts_by_query[query_key] = collections.Counter()
             random_jobs.append((request, expected_counts_by_query[query_key]))
         return random_jobs
@@ -7791,9 +7238,7 @@ class AuditRunner:
         progress.random_retries += audit_result.retries
         progress.random_http_requests_fallback += audit_result.http_requests
         progress.random_response_fingerprint.update(
-            f"{audit_result.request.index}:{audit_result.response_fingerprint}\n".encode(
-                "ascii"
-            )
+            f"{audit_result.request.index}:{audit_result.response_fingerprint}\n".encode("ascii")
         )
         if audit_result.latency_ms is not None:
             latency_samples = (
@@ -7802,13 +7247,8 @@ class AuditRunner:
                 else progress.random_warm_latency_ms
             )
             latency_samples.append(audit_result.latency_ms)
-        if (
-            audit_result.request.phase == "cold"
-            and audit_result.first_page_latency_ms is not None
-        ):
-            progress.random_cold_first_page_ms.append(
-                audit_result.first_page_latency_ms
-            )
+        if audit_result.request.phase == "cold" and audit_result.first_page_latency_ms is not None:
+            progress.random_cold_first_page_ms.append(audit_result.first_page_latency_ms)
         self._append_failure_examples(progress, audit_result.examples)
 
     def _run_random_checks(
@@ -7821,15 +7261,9 @@ class AuditRunner:
         audit_results: list[RandomApiResult] = []
         planned_jobs = self._random_jobs(samples.random_requests, progress)
         for phase in ("cold", "warm"):
-            phase_jobs = [
-                job
-                for job in planned_jobs
-                if job[0].phase == phase
-            ]
+            phase_jobs = [job for job in planned_jobs if job[0].phase == phase]
             for batch_start in range(0, len(phase_jobs), batch_size):
-                random_jobs = phase_jobs[
-                    batch_start : batch_start + batch_size
-                ]
+                random_jobs = phase_jobs[batch_start : batch_start + batch_size]
                 audit_results.extend(self._run_random_jobs(random_jobs))
         for audit_result in sorted(
             audit_results,
@@ -7919,11 +7353,7 @@ class AuditRunner:
             "rates_with_provider_structure",
             0,
         )
-        return (
-            rates_with_provider_structure / negotiated_rates
-            if negotiated_rates
-            else 0.0
-        )
+        return rates_with_provider_structure / negotiated_rates if negotiated_rates else 0.0
 
     def _standard_http_request_count(
         self,
@@ -7952,12 +7382,9 @@ class AuditRunner:
             progress.coverage_reasons.append("random_api_calls_below_minimum")
         if (
             self.config.profile == "release"
-            and checks["positive_matched_query_keys"]
-            < RELEASE_MIN_DISTINCT_MATCHED_QUERY_KEYS
+            and checks["positive_matched_query_keys"] < RELEASE_MIN_DISTINCT_MATCHED_QUERY_KEYS
         ):
-            progress.coverage_reasons.append(
-                "distinct_matched_positive_query_keys_below_release_minimum"
-            )
+            progress.coverage_reasons.append("distinct_matched_positive_query_keys_below_release_minimum")
 
     def _check_source_integrity(
         self,
@@ -7966,14 +7393,10 @@ class AuditRunner:
     ) -> None:
         source_totals = self.source_index.metrics
         if source_totals.get("unresolved_provider_references", 0) > self.config.max_unresolved_provider_references:
-            progress.coverage_reasons.append(
-                "unresolved_provider_references_above_maximum"
-            )
+            progress.coverage_reasons.append("unresolved_provider_references_above_maximum")
         if source_totals.get("invalid_prices", 0) > self.config.max_invalid_prices:
             progress.coverage_reasons.append("invalid_prices_above_maximum")
-        invalid_npis = source_totals.get("invalid_provider_npis", 0) + source_totals.get(
-            "invalid_inline_npis", 0
-        )
+        invalid_npis = source_totals.get("invalid_provider_npis", 0) + source_totals.get("invalid_inline_npis", 0)
         if invalid_npis > self.config.max_invalid_npis:
             progress.coverage_reasons.append("invalid_npis_above_maximum")
         if source_totals.get("invalid_field_types", 0) > self.config.max_invalid_field_types:
@@ -7981,9 +7404,7 @@ class AuditRunner:
         if source_totals.get("invalid_rate_provider_references", 0):
             progress.coverage_reasons.append("invalid_rate_provider_references")
         if self.config.profile == "release" and source_totals.get("tin_only_rates", 0):
-            progress.coverage_reasons.append(
-                "tin_only_rates_not_npi_verifiable"
-            )
+            progress.coverage_reasons.append("tin_only_rates_not_npi_verifiable")
         if source_totals.get("items_without_valid_code", 0):
             progress.coverage_reasons.append("source_items_without_valid_code")
         if resolved_fraction < self.config.min_resolved_rate_fraction:
@@ -8005,17 +7426,10 @@ class AuditRunner:
         capacity_report: Mapping[str, Any],
     ) -> None:
         self._check_sample_minimums(progress)
-        if (
-            self.config.profile == "release"
-            and standard_http_requests < RELEASE_MIN_TOTAL_API_CALLS
-        ):
-            progress.coverage_reasons.append(
-                "actual_http_requests_below_release_minimum"
-            )
+        if self.config.profile == "release" and standard_http_requests < RELEASE_MIN_TOTAL_API_CALLS:
+            progress.coverage_reasons.append("actual_http_requests_below_release_minimum")
         if self.config.profile == "release" and progress.retries:
-            progress.coverage_reasons.append(
-                "standard_http_retries_observed"
-            )
+            progress.coverage_reasons.append("standard_http_retries_observed")
         if self.config.capacity_evidence_trust is not None:
             progress.coverage_reasons.extend(
                 capacity_evidence_release_failures(
@@ -8030,10 +7444,7 @@ class AuditRunner:
         progress.failure_counts["coverage"] += len(progress.coverage_reasons)
         self._append_failure_examples(
             progress,
-            [
-                {"category": "coverage", "reason": coverage_reason}
-                for coverage_reason in progress.coverage_reasons
-            ],
+            [{"category": "coverage", "reason": coverage_reason} for coverage_reason in progress.coverage_reasons],
         )
 
     def _record_latency_failure(
@@ -8077,11 +7488,7 @@ class AuditRunner:
             """Summarize one latency class and record its p95 gate result."""
 
             report = latency_summary(samples)
-            p95_ms = (
-                _percentile(sorted(samples), 0.95)
-                if samples
-                else None
-            )
+            p95_ms = _percentile(sorted(samples), 0.95) if samples else None
             if p95_ms is not None:
                 report["gate_p95_ms"] = round(p95_ms, 6)
                 self._record_latency_failure(
@@ -8097,9 +7504,7 @@ class AuditRunner:
             """Return client timing as explicitly nongating diagnostics."""
 
             report = latency_summary(samples)
-            report["measurement_source"] = (
-                CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE
-            )
+            report["measurement_source"] = CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE
             report["diagnostic_only"] = True
             return report
 
@@ -8111,30 +7516,15 @@ class AuditRunner:
         ) -> dict[str, Any]:
             """Gate client HTTP timing only for API-verified cold responses."""
 
-            latency_section = (
-                capacity_report.get("latency")
-                if isinstance(capacity_report, Mapping)
-                else None
-            )
+            latency_section = capacity_report.get("latency") if isinstance(capacity_report, Mapping) else None
             latency_by_cohort = (
-                latency_section.get(
-                    "eligible_verified_client_http_duration_ms_by_cohort"
-                )
+                latency_section.get("eligible_verified_client_http_duration_ms_by_cohort")
                 if isinstance(latency_section, Mapping)
-                and latency_section.get("gate_source")
-                == CAPACITY_CLIENT_LATENCY_SOURCE
+                and latency_section.get("gate_source") == CAPACITY_CLIENT_LATENCY_SOURCE
                 else None
             )
-            cohort_report = (
-                latency_by_cohort.get(cohort)
-                if isinstance(latency_by_cohort, Mapping)
-                else None
-            )
-            report = (
-                dict(cohort_report)
-                if isinstance(cohort_report, Mapping)
-                else {"count": 0}
-            )
+            cohort_report = latency_by_cohort.get(cohort) if isinstance(latency_by_cohort, Mapping) else None
+            report = dict(cohort_report) if isinstance(cohort_report, Mapping) else {"count": 0}
             raw_p95_ms = report.get("gate_p95_ms")
             gate_p95_ms = (
                 float(raw_p95_ms)
@@ -8145,17 +7535,13 @@ class AuditRunner:
                 else None
             )
             report["measurement_source"] = CAPACITY_CLIENT_LATENCY_SOURCE
-            report["maximum_p95_ms"] = (
-                self.config.max_first_page_first_observation_p95_ms
-            )
+            report["maximum_p95_ms"] = self.config.max_first_page_first_observation_p95_ms
             self._record_latency_failure(
                 progress,
                 category=category,
                 reason=reason,
                 observed_p95_ms=gate_p95_ms,
-                maximum_p95_ms=(
-                    self.config.max_first_page_first_observation_p95_ms
-                ),
+                maximum_p95_ms=(self.config.max_first_page_first_observation_p95_ms),
             )
             return report
 
@@ -8164,9 +7550,7 @@ class AuditRunner:
             positive_first_page = verified_client_gated_report(
                 CAPACITY_POSITIVE_COHORT,
                 category="first_page_latency",
-                reason=(
-                    "matched_positive_first_observation_first_page_p95_above_limit"
-                ),
+                reason=("matched_positive_first_observation_first_page_p95_above_limit"),
             )
             negative_first_page = verified_client_gated_report(
                 CAPACITY_NEGATIVE_COHORT,
@@ -8182,28 +7566,20 @@ class AuditRunner:
             positive_first_page = client_gated_report(
                 progress.first_page_first_observation_ms,
                 category="first_page_latency",
-                reason=(
-                    "matched_positive_first_observation_first_page_p95_above_limit"
-                ),
-                maximum_p95_ms=(
-                    self.config.max_first_page_first_observation_p95_ms
-                ),
+                reason=("matched_positive_first_observation_first_page_p95_above_limit"),
+                maximum_p95_ms=(self.config.max_first_page_first_observation_p95_ms),
             )
             negative_first_page = client_gated_report(
                 progress.negative_first_page_ms,
                 category="negative_first_page_latency",
                 reason="negative_first_observation_first_page_p95_above_limit",
-                maximum_p95_ms=(
-                    self.config.max_first_page_first_observation_p95_ms
-                ),
+                maximum_p95_ms=(self.config.max_first_page_first_observation_p95_ms),
             )
             random_first_page = client_gated_report(
                 progress.random_cold_first_page_ms,
                 category="random_first_page_latency",
                 reason="random_first_observation_first_page_p95_above_limit",
-                maximum_p95_ms=(
-                    self.config.max_first_page_first_observation_p95_ms
-                ),
+                maximum_p95_ms=(self.config.max_first_page_first_observation_p95_ms),
             )
         first_page_report_map = dict(positive_first_page)
         first_page_report_map["by_class"] = {
@@ -8212,34 +7588,20 @@ class AuditRunner:
             "random_positive": random_first_page,
         }
         if uses_signed_capacity_gate:
-            first_page_report_map["measurement_source"] = (
-                CAPACITY_CLIENT_LATENCY_SOURCE
-            )
+            first_page_report_map["measurement_source"] = CAPACITY_CLIENT_LATENCY_SOURCE
             first_page_report_map["client_diagnostics"] = {
                 "measurement_source": CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE,
                 "by_class": {
-                    "matched_positive": client_diagnostic_report(
-                        progress.first_page_first_observation_ms
-                    ),
-                    "negative": client_diagnostic_report(
-                        progress.negative_first_page_ms
-                    ),
-                    "random_positive": client_diagnostic_report(
-                        progress.random_cold_first_page_ms
-                    ),
+                    "matched_positive": client_diagnostic_report(progress.first_page_first_observation_ms),
+                    "negative": client_diagnostic_report(progress.negative_first_page_ms),
+                    "random_positive": client_diagnostic_report(progress.random_cold_first_page_ms),
                 },
             }
 
         if uses_signed_capacity_gate:
-            positive_logical_query = client_diagnostic_report(
-                progress.positive_cold_query_ms
-            )
-            negative_logical_query = client_diagnostic_report(
-                progress.negative_cold_query_ms
-            )
-            random_logical_query = client_diagnostic_report(
-                progress.random_cold_latency_ms
-            )
+            positive_logical_query = client_diagnostic_report(progress.positive_cold_query_ms)
+            negative_logical_query = client_diagnostic_report(progress.negative_cold_query_ms)
+            random_logical_query = client_diagnostic_report(progress.random_cold_latency_ms)
         else:
             positive_logical_query = client_gated_report(
                 progress.positive_cold_query_ms,
@@ -8267,13 +7629,9 @@ class AuditRunner:
         }
         cold_page_report = latency_summary(progress.cold_page_ms)
         if uses_signed_capacity_gate:
-            logical_query_report_map["measurement_source"] = (
-                CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE
-            )
+            logical_query_report_map["measurement_source"] = CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE
             logical_query_report_map["diagnostic_only"] = True
-            cold_page_report["measurement_source"] = (
-                CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE
-            )
+            cold_page_report["measurement_source"] = CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE
             cold_page_report["diagnostic_only"] = True
         return _LatencyReports(
             first_page=first_page_report_map,
@@ -8295,9 +7653,7 @@ class AuditRunner:
             "api_sample_count": samples.api_sample.sample_count,
             "api_sample_complete_population": samples.api_sample.complete_population,
             "api_sample_digest_validated": samples.api_sample.sample_digest_validated,
-            "source_set_validated_before_sampling": (
-                samples.api_sample.source_set_validated
-            ),
+            "source_set_validated_before_sampling": (samples.api_sample.source_set_validated),
             "api_sample_source": "persisted_publish_time_served_occurrences",
             "independence": "API sampling receives no source-selected query keys",
             "negative_strategy": "seeded_recombination_of_individually_positive_codes_and_npis",
@@ -8340,18 +7696,14 @@ class AuditRunner:
                 "min_negative_checks": self.config.min_negative_checks,
                 "min_random_api_calls": self.config.min_random_api_calls,
                 "min_distinct_matched_positive_query_keys": (
-                    RELEASE_MIN_DISTINCT_MATCHED_QUERY_KEYS
-                    if self.config.profile == "release"
-                    else 0
+                    RELEASE_MIN_DISTINCT_MATCHED_QUERY_KEYS if self.config.profile == "release" else 0
                 ),
                 "min_resolved_rate_fraction": self.config.min_resolved_rate_fraction,
                 "max_unresolved_provider_references": self.config.max_unresolved_provider_references,
                 "max_invalid_prices": self.config.max_invalid_prices,
                 "max_invalid_npis": self.config.max_invalid_npis,
                 "max_invalid_field_types": self.config.max_invalid_field_types,
-                "max_first_page_first_observation_p95_ms": (
-                    self.config.max_first_page_first_observation_p95_ms
-                ),
+                "max_first_page_first_observation_p95_ms": (self.config.max_first_page_first_observation_p95_ms),
                 "max_logical_query_p95_ms": self.config.max_logical_query_p95_ms,
             },
             "failures": sorted(set(progress.coverage_reasons)),
@@ -8370,25 +7722,17 @@ class AuditRunner:
                 random_cold_latency,
                 random_warm_latency,
             ):
-                diagnostic_report["measurement_source"] = (
-                    CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE
-                )
+                diagnostic_report["measurement_source"] = CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE
                 diagnostic_report["diagnostic_only"] = True
         return {
             "planned_logical_request_count": progress.checks["random_api_requests_executed"],
             "actual_http_request_count": random_http_requests,
             "distinct_query_count": len(samples.random_query_keys),
-            "first_observation_query_count": sum(
-                request.phase == "cold" for request in samples.random_requests
-            ),
-            "reserved_from_positive_first_observation_count": len(
-                samples.positive_reserved_queries
-            ),
-            "repeated_query_request_count": len(samples.random_requests)
-            - len(samples.random_query_keys),
+            "first_observation_query_count": sum(request.phase == "cold" for request in samples.random_requests),
+            "reserved_from_positive_first_observation_count": len(samples.positive_reserved_queries),
+            "repeated_query_request_count": len(samples.random_requests) - len(samples.random_query_keys),
             "distinct_request_shape_count": len(samples.random_request_shape_keys),
-            "repeated_request_shape_count": len(samples.random_requests)
-            - len(samples.random_request_shape_keys),
+            "repeated_request_shape_count": len(samples.random_requests) - len(samples.random_request_shape_keys),
             "response_occurrence_count": progress.random_response_occurrences,
             "failures": dict(sorted(progress.random_failure_counts.items())),
             "latency": {
@@ -8405,9 +7749,7 @@ class AuditRunner:
                 "request_plan_sha256": samples.random_plan_sha256,
                 "ordered_responses_sha256": progress.random_response_fingerprint.hexdigest(),
                 "distinct_query_keys_sha256": sha256_text(
-                    canonical_json(
-                        sorted(sha256_text(key) for key in samples.random_query_keys)
-                    )
+                    canonical_json(sorted(sha256_text(key) for key in samples.random_query_keys))
                 ),
             },
         }
@@ -8441,24 +7783,17 @@ class AuditRunner:
         """Describe signed cold gates and nongating warm diagnostics."""
 
         uses_signed_capacity_gate = (
-            latency_reports.first_page.get("measurement_source")
-            == CAPACITY_CLIENT_LATENCY_SOURCE
+            latency_reports.first_page.get("measurement_source") == CAPACITY_CLIENT_LATENCY_SOURCE
         )
         warm_page_report = latency_summary(progress.warm_page_ms)
         warm_query_report = latency_summary(progress.warm_query_ms)
         if uses_signed_capacity_gate:
             for diagnostic_report in (warm_page_report, warm_query_report):
-                diagnostic_report["measurement_source"] = (
-                    CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE
-                )
+                diagnostic_report["measurement_source"] = CAPACITY_UNQUALIFIED_CLIENT_LATENCY_SOURCE
                 diagnostic_report["diagnostic_only"] = True
         latency_semantics = _latency_gate_semantics(uses_signed_capacity_gate)
         return {
-            "gate_source": (
-                CAPACITY_CLIENT_LATENCY_SOURCE
-                if uses_signed_capacity_gate
-                else "client_perf_counter"
-            ),
+            "gate_source": (CAPACITY_CLIENT_LATENCY_SOURCE if uses_signed_capacity_gate else "client_perf_counter"),
             "cold": {
                 "first_page_first_observation": latency_reports.first_page,
                 "all_pages": latency_reports.cold_pages,
@@ -8494,14 +7829,10 @@ class AuditRunner:
             "status": "pass" if not progress.failure_counts else "fail",
             "profile": self.config.profile,
             "release_profile_enforced": self.config.profile == "release",
-            "release_gate_eligible": (
-                self.config.profile == "release" and not progress.failure_counts
-            ),
+            "release_gate_eligible": (self.config.profile == "release" and not progress.failure_counts),
             "started_at": context.started_at.isoformat(),
             "completed_at": context.completed_at.isoformat(),
-            "duration_seconds": round(
-                (context.completed_at - context.started_at).total_seconds(), 3
-            ),
+            "duration_seconds": round((context.completed_at - context.started_at).total_seconds(), 3),
             "target": self.config.redacted_target(),
             "reproducibility": self._reproducibility_report(samples),
             "source": self.source_index.source_report(),
@@ -8517,9 +7848,7 @@ class AuditRunner:
             },
             "coverage": self._coverage_report(progress, context.resolved_fraction),
             "checks": dict(sorted(progress.checks.items())),
-            "random_api_requests": self._random_api_report(
-                samples, progress, context.random_http_requests
-            ),
+            "random_api_requests": self._random_api_report(samples, progress, context.random_http_requests),
             "http": self._http_report(
                 samples,
                 progress,
@@ -8601,9 +7930,7 @@ class AuditRunner:
         capacity_counters = capacity_report.get("counters")
         if not isinstance(capacity_counters, Mapping):
             return
-        progress.checks["capacity_evidence_eligible_http_requests"] = int(
-            capacity_counters.get("eligible", 0)
-        )
+        progress.checks["capacity_evidence_eligible_http_requests"] = int(capacity_counters.get("eligible", 0))
         cohorts_by_name = capacity_counters.get("cohorts")
         if isinstance(cohorts_by_name, Mapping):
             for check_name, cohort in (
@@ -8613,14 +7940,10 @@ class AuditRunner:
             ):
                 cohort_report = cohorts_by_name.get(cohort)
                 if isinstance(cohort_report, Mapping):
-                    progress.checks[
-                        f"capacity_evidence_{check_name}_eligible_http_requests"
-                    ] = int(cohort_report.get("eligible", 0))
-        random_cohort = (
-            cohorts_by_name.get(CAPACITY_RANDOM_COHORT)
-            if isinstance(cohorts_by_name, Mapping)
-            else None
-        )
+                    progress.checks[f"capacity_evidence_{check_name}_eligible_http_requests"] = int(
+                        cohort_report.get("eligible", 0)
+                    )
+        random_cohort = cohorts_by_name.get(CAPACITY_RANDOM_COHORT) if isinstance(cohorts_by_name, Mapping) else None
         if isinstance(random_cohort, Mapping):
             progress.checks["capacity_evidence_distinct_random_query_keys"] = int(
                 random_cohort.get("distinct_semantic_queries", 0)
@@ -8872,13 +8195,9 @@ def _validate_args(args: argparse.Namespace) -> None:
         or not canonical_scalar(args.source_key)
         or not canonical_scalar(args.plan_market_type)
     ):
-        raise ConfigurationError(
-            "validated_candidate_requires_auth_source_and_market"
-        )
+        raise ConfigurationError("validated_candidate_requires_auth_source_and_market")
     if args.trusted_cluster_http and not args.validated_candidate:
-        raise ConfigurationError(
-            "trusted_cluster_http_requires_validated_candidate"
-        )
+        raise ConfigurationError("trusted_cluster_http_requires_validated_candidate")
 
 
 def _capacity_evidence_trust(
@@ -8895,10 +8214,7 @@ def _capacity_evidence_trust(
     if any(value in (None, "") for value in raw_values):
         raise ConfigurationError("capacity_evidence_trust_incomplete")
     public_key_hex = str(args.capacity_api_evidence_public_key_hex)
-    if (
-        len(public_key_hex) != 64
-        or any(character not in "0123456789abcdef" for character in public_key_hex)
-    ):
+    if len(public_key_hex) != 64 or any(character not in "0123456789abcdef" for character in public_key_hex):
         raise ConfigurationError("capacity_api_evidence_public_key_invalid")
     return CapacityEvidenceTrust(
         api_evidence_key_id=str(args.capacity_api_evidence_key_id),
@@ -8962,15 +8278,11 @@ def _audit_config(args: argparse.Namespace) -> AuditConfig:
         verify_tls=not args.insecure,
         validated_candidate=bool(args.validated_candidate),
         trusted_cluster_http=bool(args.trusted_cluster_http),
-        max_first_page_first_observation_p95_ms=(
-            args.max_first_page_first_observation_p95_ms
-        ),
+        max_first_page_first_observation_p95_ms=(args.max_first_page_first_observation_p95_ms),
         max_logical_query_p95_ms=args.max_logical_query_p95_ms,
         capacity_evidence_trust=capacity_trust,
         capacity_contention_run_id=(
-            str(args.capacity_contention_run_id)
-            if args.capacity_contention_run_id not in (None, "")
-            else None
+            str(args.capacity_contention_run_id) if args.capacity_contention_run_id not in (None, "") else None
         ),
     )
 
@@ -9011,9 +8323,7 @@ def fatal_report(
         "duration_seconds": round((completed_at - started_at).total_seconds(), 3),
         "target": config.redacted_target() if config else {"expected_architecture": EXPECTED_ARCHITECTURE},
         "reproducibility": {
-            "seed_profile": (
-                "default_v1" if config and config.seed == DEFAULT_SEED else "custom" if config else None
-            ),
+            "seed_profile": ("default_v1" if config and config.seed == DEFAULT_SEED else "custom" if config else None),
             "seed_sha256": sha256_text(config.seed) if config else None,
             "seed_contract": (
                 sampling_seed_evidence(
@@ -9074,8 +8384,16 @@ def _execute_indexed_audit(
 ) -> dict[str, Any]:
     source_index.index(specs)
     verify_sources_unchanged(specs)
-    standard_options = _http_fetcher_options(args, config, api_path=config.api_path, page_size=config.page_size, max_pages=config.max_pages)
-    audit_options = _http_fetcher_options(args, config, api_path=config.api_audit_path, page_size=config.api_audit_page_size, max_pages=config.api_audit_max_pages)
+    standard_options = _http_fetcher_options(
+        args, config, api_path=config.api_path, page_size=config.page_size, max_pages=config.max_pages
+    )
+    audit_options = _http_fetcher_options(
+        args,
+        config,
+        api_path=config.api_audit_path,
+        page_size=config.api_audit_page_size,
+        max_pages=config.api_audit_max_pages,
+    )
     capacity_collector = (
         CapacityEvidenceCollector(
             config.capacity_evidence_trust,
@@ -9086,9 +8404,14 @@ def _execute_indexed_audit(
         if config.capacity_evidence_trust is not None
         else None
     )
-    with HttpApiFetcher(standard_options, capacity_collector=capacity_collector) as fetcher, HttpApiFetcher(audit_options) as audit_fetcher:
+    with (
+        HttpApiFetcher(standard_options, capacity_collector=capacity_collector) as fetcher,
+        HttpApiFetcher(audit_options) as audit_fetcher,
+    ):
         occurrence_source = HttpApiOccurrenceSource(audit_fetcher, config, source_set_evidence_from_specs(specs))
-        return AuditRunner(source_index, fetcher, occurrence_source, config, capacity_collector=capacity_collector).execute_audit(started_at=started_at)
+        return AuditRunner(
+            source_index, fetcher, occurrence_source, config, capacity_collector=capacity_collector
+        ).execute_audit(started_at=started_at)
 
 
 def _execute_configured_audit(
@@ -9107,18 +8430,12 @@ def _execute_configured_audit(
             database_path,
             seed=config.seed,
             source_occurrence_sample_target=config.source_occurrence_samples,
-            capacity_query_sample_target=(
-                config.random_api_calls
-                if config.capacity_evidence_trust is not None
-                else 0
-            ),
+            capacity_query_sample_target=(config.random_api_calls if config.capacity_evidence_trust is not None else 0),
             sqlite_cache_mb=args.sqlite_cache_mb,
             max_list_values=args.max_list_values,
             max_tuples_per_query=args.max_tuples_per_query,
         ) as source_index:
-            return _execute_indexed_audit(
-                args, config, specs, source_index, started_at=started_at
-            )
+            return _execute_indexed_audit(args, config, specs, source_index, started_at=started_at)
 
 
 def _print_audit_summary(

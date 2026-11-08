@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import os
-from pathlib import Path
 import struct
 import uuid
+from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
@@ -29,12 +29,21 @@ from process.ptg_parts import (
     ptg2_shared_publish,
     ptg2_v4_snapshot_maps,
 )
+from process.ptg_parts.ptg2_lifecycle_lock import (
+    PTG2LifecycleLockDeferred,
+    acquire_ptg2_lifecycle_lock,
+)
 from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_DENSE_LAYOUT_TABLES,
     SharedBlock,
 )
 from process.ptg_parts.ptg2_shared_publish import (
     _publish_v4_cas_block_stage_compatibility,
+)
+from process.ptg_parts.ptg2_snapshot_candidates import (
+    attach_snapshot_candidates,
+    snapshot_candidate_reads,
+    snapshot_candidate_relation,
 )
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS,
@@ -55,29 +64,30 @@ from process.ptg_parts.ptg2_v4_snapshot_maps import (
     seal_v4_shared_layout,
     summarize_persisted_v4_snapshot_maps,
     summarize_v4_snapshot_map_packs,
+    touch_v4_shared_layout_build,
     v4_layout_fingerprint,
     v4_map_pack_target_hashes,
-    touch_v4_shared_layout_build,
 )
 from process.ptg_parts.ptg2_v4_taxonomy_candidates import (
     publish_v4_inferred_taxonomy_candidates,
+)
+from tests.ptg2_provider_tax_identity_postgres_support import (
+    load_migration as load_tax_identity_migration,
+)
+from tests.ptg2_provider_tax_identity_postgres_support import (
+    manifest_parameters,
+)
+from tests.ptg2_v4_coverage_support import (
+    synthetic_adaptive_layout_decision,
 )
 from tests.ptg2_v4_migration_catalog_support import (
     attempt_guard_prerequisite_ddl,
     v3_provider_set_prerequisite_ddl,
 )
-from tests.ptg2_v4_coverage_support import (
-    synthetic_adaptive_layout_decision,
-)
-
 
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION_PATH = (
-    ROOT / "alembic" / "versions" / "20260723100000_ptg2_v4_snapshot_map_pack.py"
-)
-TAXONOMY_MIGRATION_PATH = (
-    ROOT / "alembic" / "versions" / "20260724120000_ptg2_v4_taxonomy_candidates.py"
-)
+MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260723100000_ptg2_v4_snapshot_map_pack.py"
+TAXONOMY_MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260724120000_ptg2_v4_taxonomy_candidates.py"
 
 
 def _load_migration():
@@ -127,9 +137,7 @@ def _references():
 def _sealed_graph_blocks():
     member_payload = struct.pack("<IIIII", 10, 11, 12, 13, 14)
     locator_payload = struct.pack("<QI", 0, 0) + struct.pack("<QI", 0, 5)
-    heavy_payload = (
-        b"PTG2V4BM" + struct.pack("<IIII", 1, 0, 10, 5) + bytes((0x1F, 0x00))
-    )
+    heavy_payload = b"PTG2V4BM" + struct.pack("<IIII", 1, 0, 10, 5) + bytes((0x1F, 0x00))
     return tuple(
         sorted(
             (
@@ -177,9 +185,7 @@ def _v4_graph_diagnostic_fields(
 ) -> dict[str, object]:
     """Build a constraint-valid empty prefix diagnostic."""
 
-    diagnostic_by_field: dict[str, object] = {
-        field_name: 0 for field_name in PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS
-    }
+    diagnostic_by_field: dict[str, object] = {field_name: 0 for field_name in PTG2_V4_GRAPH_DIAGNOSTIC_FIELDS}
     diagnostic_by_field.update(_v4_positive_diagnostic_limits())
     diagnostic_by_field.update(
         {
@@ -212,9 +218,7 @@ async def _insert_v4_graph_diagnostic_fixture(
 ) -> None:
     """Persist a constraint-valid diagnostic for the synthetic alpha graph."""
 
-    stored_graph_bytes = sum(
-        int(graph_block.stored_byte_count) for graph_block in graph_blocks
-    )
+    stored_graph_bytes = sum(int(graph_block.stored_byte_count) for graph_block in graph_blocks)
     diagnostic_by_field = _v4_graph_diagnostic_fields(
         snapshot_key,
         stored_graph_bytes,
@@ -273,19 +277,10 @@ def test_v4_migration_is_additive_after_the_current_head(monkeypatch):
     recorder.executed.clear()
     migration.downgrade()
     downgrade_sql = " ".join(_normalized(statement) for statement in recorder.executed)
-    assert (
-        'DROP TABLE IF EXISTS "ptg_v4_test"."ptg2_v4_snapshot_map_pack"'
-        in downgrade_sql
-    )
-    assert (
-        'DROP TABLE IF EXISTS "ptg_v4_test"."ptg2_v4_snapshot_map_root"'
-        in downgrade_sql
-    )
+    assert 'DROP TABLE IF EXISTS "ptg_v4_test"."ptg2_v4_snapshot_map_pack"' in downgrade_sql
+    assert 'DROP TABLE IF EXISTS "ptg_v4_test"."ptg2_v4_snapshot_map_root"' in downgrade_sql
     assert 'DROP TABLE IF EXISTS "ptg_v4_test"."ptg2_v4_heavy_owner"' in downgrade_sql
-    assert (
-        'DROP TABLE IF EXISTS "ptg_v4_test"."ptg2_v4_relation_manifest"'
-        in downgrade_sql
-    )
+    assert 'DROP TABLE IF EXISTS "ptg_v4_test"."ptg2_v4_relation_manifest"' in downgrade_sql
     assert 'DROP TABLE IF EXISTS "ptg_v4_test"."ptg2_v4_npi_scope"' in downgrade_sql
     assert "ptg2_v3_npi_scope" not in downgrade_sql
 
@@ -306,9 +301,7 @@ def test_v4_models_match_root_pack_and_dense_npi_contracts():
     pack = PTG2V4SnapshotMapPack.__table__
     npi = PTG2V4NPIScope.__table__
 
-    assert tuple(column.name for column in root.primary_key.columns) == (
-        "snapshot_key",
-    )
+    assert tuple(column.name for column in root.primary_key.columns) == ("snapshot_key",)
     assert tuple(column.name for column in pack.primary_key.columns) == (
         "snapshot_key",
         "object_kind",
@@ -380,9 +373,7 @@ def test_v4_projection_models_match_metadata_contracts():
 def test_v4_map_pack_round_trip_and_gc_reachability_are_exact():
     packs = tuple(iter_v4_snapshot_map_packs(_references(), max_coordinates_per_pack=2))
 
-    assert [
-        (pack.object_kind, pack.pack_no, pack.coordinate_count) for pack in packs
-    ] == [
+    assert [(pack.object_kind, pack.pack_no, pack.coordinate_count) for pack in packs] == [
         ("alpha_v1", 0, 2),
         ("alpha_v1", 1, 1),
         ("beta_v1", 0, 2),
@@ -404,12 +395,8 @@ def test_v4_map_pack_round_trip_and_gc_reachability_are_exact():
 
 
 def test_v4_mapping_digest_does_not_depend_on_pack_boundaries():
-    small_packs = tuple(
-        iter_v4_snapshot_map_packs(_references(), max_coordinates_per_pack=1)
-    )
-    wide_packs = tuple(
-        iter_v4_snapshot_map_packs(_references(), max_coordinates_per_pack=4)
-    )
+    small_packs = tuple(iter_v4_snapshot_map_packs(_references(), max_coordinates_per_pack=1))
+    wide_packs = tuple(iter_v4_snapshot_map_packs(_references(), max_coordinates_per_pack=4))
     small = summarize_v4_snapshot_map_packs(small_packs)
     wide = summarize_v4_snapshot_map_packs(wide_packs)
 
@@ -454,9 +441,7 @@ class _V4PostgresScenario:
         migration.upgrade()
         taxonomy_migration = _load_taxonomy_migration()
         self.monkeypatch.setattr(taxonomy_migration, "op", self.recorder)
-        self.monkeypatch.setattr(
-            taxonomy_migration, "_schema", lambda: self.schema_name
-        )
+        self.monkeypatch.setattr(taxonomy_migration, "_schema", lambda: self.schema_name)
         taxonomy_migration.upgrade()
 
     async def _create_base_schema(self):
@@ -636,11 +621,69 @@ class _V4PostgresScenario:
                 "ptg2_v3_provider_set",
             }:
                 continue
-            await self.database.execute_ddl(
-                f'CREATE TABLE {self.schema}."{table_name}" (snapshot_key bigint)'
-            )
+            await self.database.execute_ddl(f'CREATE TABLE {self.schema}."{table_name}" (snapshot_key bigint)')
         for statement in self.recorder.executed:
             await self.database.execute_ddl(statement)
+
+    async def _create_tax_prerequisites(self):
+        """Install the genuine tax completion contract for an empty scoped dictionary."""
+        await self.database.execute_ddl(
+            f"ALTER TABLE {self.schema}.ptg2_v3_provider_group ADD COLUMN provider_group_global_id_128 bytea, "
+            "ADD PRIMARY KEY(snapshot_key,provider_group_global_id_128)"
+        )
+        migration = load_tax_identity_migration()
+        recorder = _OpRecorder()
+        self.monkeypatch.setattr(migration, "op", recorder)
+        self.monkeypatch.setattr(migration, "_schema", lambda: self.schema_name)
+        migration.upgrade()
+        async with self.database.transaction() as session:
+            connection = await session.connection()
+            for statement in recorder.executed:
+                await connection.exec_driver_sql(statement)
+
+    async def _publish_empty_tax_manifest(self, session):
+        """Declare zero groups under one valid source without a legacy exemption."""
+        await session.execute(
+            sa.text(f"""
+            INSERT INTO {self.schema}.ptg2_provider_tax_identity_manifest(
+                snapshot_key,contract,token_policy_id,token_policy_descriptor_sha256,
+                normalization_contract,hmac_contract,source_ordinal_contract,source_ordinal_map,
+                source_ordinal_map_digest,source_shard_count,provider_group_count,tax_identity_count,
+                matched_ein_count,missing_count,malformed_count,unsupported_type_count,content_digest
+            ) VALUES(:snapshot_key,'ptg2_provider_group_tax_identity_v1',:token_policy_id,
+                decode(:token_policy_descriptor_sha256,'hex'),:normalization_contract,:hmac_contract,
+                'snapshot_shard_id_sorted_lsb0_bitmap_v1',CAST(:source_map AS jsonb),
+                decode(repeat('22',32),'hex'),:source_shard_count,0,0,0,0,0,0,decode(repeat('33',32),'hex'))
+        """),
+            {"snapshot_key": self.snapshot_key, **manifest_parameters()},
+        )
+
+    async def _install_candidates(self):
+        """Use the current candidate publisher against the migrated map relation."""
+        from tests.ptg_snapshot_candidate_support import apply_candidate_migration
+
+        self.sealed_writer_role = "ptg_enrolled_writer_" + uuid.uuid4().hex
+        async with self.database.transaction() as session:
+            await session.execute(sa.text(f'CREATE ROLE "{self.sealed_writer_role}" NOLOGIN'))
+            await session.execute(sa.text(f'GRANT USAGE ON SCHEMA {self.schema} TO "{self.sealed_writer_role}"'))
+            for table_name in ("ptg2_v4_snapshot_map_pack", "ptg2_v4_heavy_owner"):
+                await session.execute(
+                    sa.text(f'GRANT SELECT,INSERT ON {self.schema}."{table_name}" TO "{self.sealed_writer_role}"')
+                )
+            await apply_candidate_migration(
+                await session.connection(),
+                self.schema_name,
+                (
+                    "ptg2_v4_snapshot_map_pack",
+                    "ptg2_v4_npi_scope",
+                    "ptg2_v4_provider_component",
+                    "ptg2_v4_pattern",
+                    "ptg2_v4_provider_set_npi_prefix",
+                    "ptg2_v4_heavy_owner",
+                    "ptg2_provider_tax_identity",
+                    "ptg2_provider_group_tax_identity",
+                ),
+            )
 
     async def _create_schema(self):
         await self._create_base_schema()
@@ -648,6 +691,8 @@ class _V4PostgresScenario:
         await self._create_source_prerequisites()
         await self._create_shared_prerequisites()
         await self._finish_schema()
+        await self._create_tax_prerequisites()
+        await self._install_candidates()
 
     async def _reserve_and_store_blocks(self, session):
         reservation = await reserve_v4_shared_layout(
@@ -663,12 +708,7 @@ class _V4PostgresScenario:
             snapshot_key=self.snapshot_key,
             build_token="build-v4",
         )
-        await session.execute(
-            sa.text(
-                f"INSERT INTO {self.schema}.ptg2_snapshot (snapshot_id) "
-                "VALUES ('snapshot-v4')"
-            )
-        )
+        await session.execute(sa.text(f"INSERT INTO {self.schema}.ptg2_snapshot (snapshot_id) VALUES ('snapshot-v4')"))
         for graph_block in self.graph_blocks:
             await session.execute(
                 sa.text(
@@ -776,9 +816,7 @@ class _V4PostgresScenario:
                 {
                     "relation": "set_npi_prefix_override",
                     "member_object_kind": ("v4_set_npi_prefix_override_members_v1"),
-                    "locator_object_kind": (
-                        "v4_set_npi_prefix_override_locators_v1"
-                    ),
+                    "locator_object_kind": ("v4_set_npi_prefix_override_locators_v1"),
                     "owner_base": 0,
                     "owner_count": 0,
                     "logical_member_count": 0,
@@ -937,7 +975,7 @@ class _V4PostgresScenario:
                 await session.execute(
                     sa.text(
                         f"""
-                        DELETE FROM {self.schema}.ptg2_v4_heavy_owner
+                        DELETE FROM {snapshot_candidate_relation(session, self.schema, "ptg2_v4_heavy_owner")}
                          WHERE snapshot_key = :snapshot_key
                         """
                     ),
@@ -973,9 +1011,7 @@ class _V4PostgresScenario:
                         "format": "postgres_binary_v3",
                         "price_dictionary": {"preserved": True},
                     },
-                    "provider_graph": {
-                        "adaptive_layout": (synthetic_adaptive_layout_decision())
-                    },
+                    "provider_graph": {"adaptive_layout": (synthetic_adaptive_layout_decision())},
                 }
             },
             summary_batch_rows=1,
@@ -996,47 +1032,93 @@ class _V4PostgresScenario:
             await self._reject_hostile_publication(session)
             await self._publish_core_metadata(session)
             await self._publish_relation_metadata(session)
-            await self._publish_diagnostic_and_taxonomy(session)
-            await self._reject_changed_entry_count(session)
-            await self._reject_changed_object_kind(session)
-            await self._reject_changed_codec(session)
-            await self._reject_changed_raw_size(session)
-            await self._reject_missing_heavy_owner(session)
-            await self._seal_and_bind(session)
+            await self._publish_empty_tax_manifest(session)
+            async with snapshot_candidate_reads(session, self.schema_name, self.snapshot_key, "build-v4"):
+                await self._publish_diagnostic_and_taxonomy(session)
+                await self._reject_changed_entry_count(session)
+                await self._reject_changed_object_kind(session)
+                await self._reject_changed_codec(session)
+                await self._reject_changed_raw_size(session)
+                await self._reject_missing_heavy_owner(session)
+                await self._seal_and_bind(session)
         assert self.persisted_summary == self.summary
         assert self.sealed.snapshot_key == self.snapshot_key
         assert not self.sealed.reused
 
     async def _assert_sealed_delete_guards(self):
+        """Runtime roles cannot mutate sealed bulk or metadata snapshots."""
+        role_name = "ptg_sealed_writer_" + uuid.uuid4().hex
         async with self.database.transaction() as session:
-            guarded_deletes = (
-                (
-                    "ptg2_v4_snapshot_map_pack",
-                    "ptg2_v4_snapshot_map_pack_sealed_delete",
-                ),
-                (
-                    "ptg2_v4_relation_manifest",
-                    "ptg2_v4_snapshot_metadata_sealed_delete",
-                ),
-                (
-                    "ptg2_v4_heavy_owner",
-                    "ptg2_v4_snapshot_metadata_sealed_delete",
-                ),
-                (
-                    "ptg2_v4_snapshot_map_root",
-                    "ptg2_v4_snapshot_map_root_sealed_delete",
-                ),
-            )
-            for table_name, error_match in guarded_deletes:
-                with pytest.raises(sa.exc.DBAPIError, match=error_match):
+            await session.execute(sa.text(f'CREATE ROLE "{role_name}" NOLOGIN'))
+            await session.execute(sa.text(f'GRANT USAGE ON SCHEMA {self.schema} TO "{role_name}"'))
+            await session.execute(sa.text(f'GRANT pg_write_all_data TO "{role_name}"'))
+            await session.execute(sa.text(f'GRANT SELECT ON ALL TABLES IN SCHEMA {self.schema} TO "{role_name}"'))
+            for table_name, error_match in (
+                ("ptg2_v4_snapshot_map_pack", "permission denied for function check_ptg_snapshot_write"),
+                ("ptg2_v4_heavy_owner", "permission denied for function check_ptg_snapshot_write"),
+                ("ptg2_v4_relation_manifest", "ptg2_v4_snapshot_metadata_sealed_delete"),
+                ("ptg2_v4_snapshot_map_root", "ptg2_v4_snapshot_map_root_sealed_delete"),
+            ):
+                with pytest.raises(sa.exc.DBAPIError, match=error_match) as denied:
                     async with session.begin_nested():
+                        await session.execute(sa.text(f'SET LOCAL ROLE "{role_name}"'))
                         await session.execute(
-                            sa.text(
-                                f'DELETE FROM {self.schema}."{table_name}" '
-                                "WHERE snapshot_key = :snapshot_key"
-                            ),
-                            {"snapshot_key": self.snapshot_key},
+                            sa.text(f'DELETE FROM {self.schema}."{table_name}" WHERE snapshot_key=:key'),
+                            {"key": self.snapshot_key},
                         )
+                if table_name in {"ptg2_v4_snapshot_map_pack", "ptg2_v4_heavy_owner"}:
+                    assert denied.value.orig.sqlstate == "42501"
+            await session.execute(sa.text(f'REVOKE SELECT ON ALL TABLES IN SCHEMA {self.schema} FROM "{role_name}"'))
+            await session.execute(sa.text(f'REVOKE USAGE ON SCHEMA {self.schema} FROM "{role_name}"'))
+            await session.execute(sa.text(f'DROP ROLE "{role_name}"'))
+
+    async def _assert_enrolled_writer_delete_guards(self):
+        """An enrolled non-owner reaches the guard on both sealed bulk parents."""
+        async with self.database.transaction() as session:
+            for table_name in ("ptg2_v4_snapshot_map_pack", "ptg2_v4_heavy_owner"):
+                authority = (
+                    await session.execute(
+                        sa.text(f"""
+                        SELECT boundary.writer_roles,pg_get_userbyid(parent.relowner),
+                               pg_get_userbyid(publisher.proowner),
+                               has_function_privilege(:writer,:checker,'EXECUTE')
+                        FROM {self.schema}.ptg2_snapshot_partition_boundary boundary
+                        JOIN pg_class parent ON parent.oid=CAST(:relation AS regclass)
+                        JOIN pg_proc publisher ON publisher.oid=CAST(:publisher AS regprocedure)
+                        WHERE boundary.table_name=:table
+                        """),
+                        {
+                            "writer": self.sealed_writer_role,
+                            "checker": f"{self.schema}.check_ptg_snapshot_write(oid,text,name)",
+                            "relation": f'{self.schema}."{table_name}"',
+                            "publisher": f"{self.schema}.begin_ptg_snapshot_candidate(text,bigint,text)",
+                            "table": table_name,
+                        },
+                    )
+                ).one()
+                assert self.sealed_writer_role in authority[0]
+                assert self.sealed_writer_role not in authority[1:3]
+                assert authority[3] is True
+                await session.execute(
+                    sa.text(f'GRANT DELETE ON {self.schema}."{table_name}" TO "{self.sealed_writer_role}"')
+                )
+                with pytest.raises(sa.exc.DBAPIError, match="ptg_snapshot_direct_write") as denied:
+                    async with session.begin_nested():
+                        await session.execute(sa.text(f'SET LOCAL ROLE "{self.sealed_writer_role}"'))
+                        assert (
+                            await session.execute(sa.text("SELECT current_user"))
+                        ).scalar_one() == self.sealed_writer_role
+                        assert (
+                            await session.execute(
+                                sa.text(f'SELECT count(*) FROM {self.schema}."{table_name}" WHERE snapshot_key=:key'),
+                                {"key": self.snapshot_key},
+                            )
+                        ).scalar_one() > 0
+                        await session.execute(
+                            sa.text(f'DELETE FROM {self.schema}."{table_name}" WHERE snapshot_key=:key'),
+                            {"key": self.snapshot_key},
+                        )
+                assert denied.value.orig.sqlstate == "42501"
 
     async def _assert_layout_reuse(self):
         async with self.database.transaction() as session:
@@ -1082,47 +1164,23 @@ class _V4PostgresScenario:
         )
 
     async def _assert_overlap_rejected(self, session):
-        first_target_hash = self.references[0].block_hash
-        await session.execute(
-            sa.text(
-                f"""
-                INSERT INTO {self.schema}.ptg2_v4_snapshot_map_pack
-                    (snapshot_key, object_kind, pack_no,
-                     first_block_key, first_fragment_no,
-                     last_block_key, last_fragment_no,
-                     coordinate_count, entry_count, logical_byte_count,
-                     map_block_hash)
-                VALUES
-                    (:snapshot_key, 'overlap_v1', 0, 1, 0, 2, 0,
-                     1, 1, 1, :map_block_hash)
-                """
-            ),
-            {
-                "snapshot_key": self.overlap_snapshot_key,
-                "map_block_hash": first_target_hash,
-            },
-        )
-        with pytest.raises(sa.exc.DBAPIError, match="map_pack_overlap"):
+        """Reject overlapping ranges with one window check on the detached set."""
+        from process.ptg_parts.ptg2_snapshot_candidates import begin_snapshot_candidate, finish_snapshot_candidate
+
+        with pytest.raises(sa.exc.DBAPIError, match="candidate_overlap"):
             async with session.begin_nested():
-                await session.execute(
-                    sa.text(
-                        f"""
-                        INSERT INTO {self.schema}.ptg2_v4_snapshot_map_pack
-                            (snapshot_key, object_kind, pack_no,
-                             first_block_key, first_fragment_no,
-                             last_block_key, last_fragment_no,
-                             coordinate_count, entry_count, logical_byte_count,
-                             map_block_hash)
-                        VALUES
-                            (:snapshot_key, 'overlap_v1', 1, 1, 1, 3, 0,
-                             1, 1, 1, :map_block_hash)
-                        """
-                    ),
-                    {
-                        "snapshot_key": self.overlap_snapshot_key,
-                        "map_block_hash": first_target_hash,
-                    },
+                candidate = await begin_snapshot_candidate(
+                    session, self.schema_name, "ptg2_v4_snapshot_map_pack", self.overlap_snapshot_key, "overlap-v4"
                 )
+                await session.execute(
+                    sa.text(f"""INSERT INTO {self.schema}."{candidate}"
+                    (snapshot_key,object_kind,pack_no,first_block_key,first_fragment_no,
+                     last_block_key,last_fragment_no,coordinate_count,entry_count,logical_byte_count,map_block_hash)
+                    VALUES (:key,'overlap_v1',0,1,0,2,0,1,1,1,:hash),
+                           (:key,'overlap_v1',1,1,1,3,0,1,1,1,:hash)"""),
+                    {"key": self.overlap_snapshot_key, "hash": self.references[0].block_hash},
+                )
+                await finish_snapshot_candidate(session, self.schema_name, candidate, 2)
 
     async def _exercise_overlap_guard(self):
         async with self.database.transaction() as session:
@@ -1130,16 +1188,12 @@ class _V4PostgresScenario:
             await self._assert_overlap_rejected(session)
         async with self.database.transaction() as session:
             await session.execute(
-                sa.text(
-                    f"DELETE FROM {self.schema}.ptg2_v3_snapshot_layout "
-                    "WHERE snapshot_key = :snapshot_key"
-                ),
+                sa.text(f"DELETE FROM {self.schema}.ptg2_v3_snapshot_layout WHERE snapshot_key = :snapshot_key"),
                 {"snapshot_key": self.overlap_snapshot_key},
             )
         assert (
             await self.database.scalar(
-                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v4_snapshot_map_root "
-                "WHERE snapshot_key = :snapshot_key",
+                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v4_snapshot_map_root WHERE snapshot_key = :snapshot_key",
                 snapshot_key=self.overlap_snapshot_key,
             )
             == 0
@@ -1153,8 +1207,7 @@ class _V4PostgresScenario:
         assert self.heavy_owner_publication.row_count == 1
         assert (
             await self.database.scalar(
-                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v4_npi_scope "
-                "WHERE snapshot_key = :snapshot_key",
+                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v4_npi_scope WHERE snapshot_key = :snapshot_key",
                 snapshot_key=self.snapshot_key,
             )
             == 2
@@ -1162,23 +1215,20 @@ class _V4PostgresScenario:
         assert self.summary.coordinate_count == 3
         assert (
             await self.database.scalar(
-                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v4_snapshot_map_pack "
-                "WHERE snapshot_key = :snapshot_key",
+                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v4_snapshot_map_pack WHERE snapshot_key = :snapshot_key",
                 snapshot_key=self.snapshot_key,
             )
             == 3
         )
         assert (
             await self.database.scalar(
-                f"SELECT state FROM {self.schema}.ptg2_v4_snapshot_map_root "
-                "WHERE snapshot_key = :snapshot_key",
+                f"SELECT state FROM {self.schema}.ptg2_v4_snapshot_map_root WHERE snapshot_key = :snapshot_key",
                 snapshot_key=self.snapshot_key,
             )
             == "complete"
         )
         manifest = await self.database.scalar(
-            f"SELECT layout_manifest FROM {self.schema}.ptg2_v3_snapshot_layout "
-            "WHERE snapshot_key = :snapshot_key",
+            f"SELECT layout_manifest FROM {self.schema}.ptg2_v3_snapshot_layout WHERE snapshot_key = :snapshot_key",
             snapshot_key=self.snapshot_key,
         )
         self.serving_index = manifest["serving_index"]
@@ -1189,9 +1239,7 @@ class _V4PostgresScenario:
         assert self.serving_index["type"] == "ptg2_shared_blocks_v4"
         assert self.serving_index["provider_scope_strategy"] == "postgres_packed_graph_v4"
         assert self.serving_index["shared_block_layout"] == "packed_snapshot_maps_v4"
-        assert self.serving_index["serving_binary"]["price_dictionary"] == {
-            "preserved": True
-        }
+        assert self.serving_index["serving_binary"]["price_dictionary"] == {"preserved": True}
         provider_graph_by_field = self.serving_index["serving_binary"]["provider_graph_v4"]
         assert provider_graph_by_field["map_digest"] == self.summary.map_digest.hex()
         assert provider_graph_by_field["resource_admission"] == {
@@ -1203,9 +1251,7 @@ class _V4PostgresScenario:
         assert self.taxonomy_publication.rule_count == len(INFERRED_PROVIDER_TAXONOMY_RULES)
         assert self.taxonomy_publication.member_count == 0
         assert self.taxonomy_publication.observe_only_rule_count == 0
-        assert provider_graph_by_field["inferred_taxonomy_candidates"] == dict(
-            self.taxonomy_publication.manifest
-        )
+        assert provider_graph_by_field["inferred_taxonomy_candidates"] == dict(self.taxonomy_publication.manifest)
         assert provider_graph_by_field["hot_prefix"]["override_owner_count"] == 0
         snapshot_map = self.serving_index["snapshot_map"]
         assert snapshot_map["component_count"] == 1
@@ -1218,8 +1264,7 @@ class _V4PostgresScenario:
         assert snapshot_map["npi_table"] == "ptg2_v4_npi_scope"
         assert (
             await self.database.scalar(
-                f"SELECT snapshot_key FROM {self.schema}.ptg2_v3_snapshot_binding "
-                "WHERE snapshot_id = 'snapshot-v4'"
+                f"SELECT snapshot_key FROM {self.schema}.ptg2_v3_snapshot_binding WHERE snapshot_id = 'snapshot-v4'"
             )
             == self.snapshot_key
         )
@@ -1253,10 +1298,7 @@ class _V4PostgresScenario:
                 max_rows=10,
             )
         assert protected.selected_hashes == ()
-        assert (
-            await self.database.scalar(f"SELECT COUNT(*) FROM {self.schema}.ptg2_v3_gc_candidate")
-            == 0
-        )
+        assert await self.database.scalar(f"SELECT COUNT(*) FROM {self.schema}.ptg2_v3_gc_candidate") == 0
         assert (
             await self.database.scalar(
                 f"SELECT COUNT(*) FROM {self.schema}.ptg2_v3_block "
@@ -1267,10 +1309,8 @@ class _V4PostgresScenario:
         )
 
     async def _create_gc_race_fixture(self):
-        # A publisher that already holds target KEY SHARE must make the
-        # candidate/block FOR UPDATE SKIP LOCKED sweep skip that target.  The
-        # same packed map must then keep both its target and map block until
-        # the unbound expired layout is released and queues both hashes.
+        # The publisher's shared lifecycle fence protects target CAS until the
+        # fully indexed map attaches; the sweeper requires its exclusive peer.
         self.race_block = SharedBlock(
             "gc_race_v1",
             0,
@@ -1322,24 +1362,25 @@ class _V4PostgresScenario:
             )
 
     async def _exercise_gc_race_lock(self):
-        self.target_locked = asyncio.Event()
+        self.candidate_checked = asyncio.Event()
         self.continue_publication = asyncio.Event()
-        self.verify_target_blocks = ptg2_v4_snapshot_maps._verify_target_blocks
+        self.finish_candidate = ptg2_v4_snapshot_maps.finish_snapshot_candidate
 
-        async def _pause_with_target_lock(*args, **kwargs):
-            await self.verify_target_blocks(*args, **kwargs)
-            self.target_locked.set()
+        async def _pause_after_candidate_checks(*args, **kwargs):
+            result = await self.finish_candidate(*args, **kwargs)
+            self.candidate_checked.set()
             await self.continue_publication.wait()
+            return result
 
         self.monkeypatch.setattr(
             ptg2_v4_snapshot_maps,
-            "_verify_target_blocks",
-            _pause_with_target_lock,
+            "finish_snapshot_candidate",
+            _pause_after_candidate_checks,
         )
 
         async def _publish_race_map():
             async with self.database.transaction() as session:
-                return await publish_v4_snapshot_maps(
+                summary = await publish_v4_snapshot_maps(
                     session,
                     schema_name=self.schema_name,
                     snapshot_key=self.race_reservation.snapshot_key,
@@ -1348,38 +1389,35 @@ class _V4PostgresScenario:
                     references=(self.race_block.reference(),),
                     max_coordinates_per_pack=1,
                 )
+                await attach_snapshot_candidates(
+                    session, self.schema_name, self.race_reservation.snapshot_key, "gc-race-v4"
+                )
+                return summary
 
         self.publication_task = asyncio.create_task(_publish_race_map())
-        await asyncio.wait_for(self.target_locked.wait(), timeout=2)
-        async with self.database.acquire() as connection:
-            skipped = await ptg2_shared_gc._sweep_ready(
-                connection,
-                schema_name=self.schema_name,
-                max_bytes=10_000_000,
-                max_rows=10,
-            )
-        assert skipped.selected_hashes == ()
+        await asyncio.wait_for(self.candidate_checked.wait(), timeout=2)
+        with pytest.raises(PTG2LifecycleLockDeferred):
+            async with self.database.acquire() as connection:
+                await acquire_ptg2_lifecycle_lock(connection)
         self.continue_publication.set()
         self.race_summary = await asyncio.wait_for(self.publication_task, timeout=2)
         self.monkeypatch.setattr(
             ptg2_v4_snapshot_maps,
-            "_verify_target_blocks",
-            self.verify_target_blocks,
+            "finish_snapshot_candidate",
+            self.finish_candidate,
         )
 
     async def _assert_gc_race_publication(self):
         assert self.race_summary.coordinate_count == 1
         assert (
             await self.database.scalar(
-                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v3_gc_candidate "
-                "WHERE block_hash = :block_hash",
+                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v3_gc_candidate WHERE block_hash = :block_hash",
                 block_hash=self.race_block.block_hash,
             )
             == 0
         )
         self.race_map_hash = await self.database.scalar(
-            f"SELECT map_block_hash FROM {self.schema}.ptg2_v4_snapshot_map_pack "
-            "WHERE snapshot_key = :snapshot_key",
+            f"SELECT map_block_hash FROM {self.schema}.ptg2_v4_snapshot_map_pack WHERE snapshot_key = :snapshot_key",
             snapshot_key=self.race_reservation.snapshot_key,
         )
 
@@ -1408,16 +1446,14 @@ class _V4PostgresScenario:
         assert released_race.candidate_hash_count == 2
         assert (
             await self.database.scalar(
-                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v4_snapshot_map_root "
-                "WHERE snapshot_key = :snapshot_key",
+                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v4_snapshot_map_root WHERE snapshot_key = :snapshot_key",
                 snapshot_key=self.race_reservation.snapshot_key,
             )
             == 0
         )
         assert (
             await self.database.scalar(
-                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v4_snapshot_map_pack "
-                "WHERE snapshot_key = :snapshot_key",
+                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v4_snapshot_map_pack WHERE snapshot_key = :snapshot_key",
                 snapshot_key=self.race_reservation.snapshot_key,
             )
             == 0
@@ -1514,8 +1550,7 @@ class _V4PostgresScenario:
         assert cas_publication.unique_stored_byte_count == 3
         assert (
             await self.database.scalar(
-                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v3_snapshot_block "
-                "WHERE snapshot_key = :snapshot_key",
+                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v3_snapshot_block WHERE snapshot_key = :snapshot_key",
                 snapshot_key=self.cas_snapshot_key,
             )
             == 0
@@ -1580,8 +1615,7 @@ class _V4PostgresScenario:
         assert reused_cas_publication.unique_block_count == 1
         assert (
             await self.database.scalar(
-                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v3_block "
-                "WHERE block_hash = :block_hash",
+                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v3_block WHERE block_hash = :block_hash",
                 block_hash=self.cas_block.block_hash,
             )
             == 1
@@ -1596,31 +1630,23 @@ class _V4PostgresScenario:
     async def _delete_published_layout(self):
         async with self.database.transaction() as session:
             await session.execute(
-                sa.text(
-                    f"DELETE FROM {self.schema}.ptg2_v3_snapshot_binding "
-                    "WHERE snapshot_key = :snapshot_key"
-                ),
+                sa.text(f"DELETE FROM {self.schema}.ptg2_v3_snapshot_binding WHERE snapshot_key = :snapshot_key"),
                 {"snapshot_key": self.snapshot_key},
             )
             await session.execute(
-                sa.text(
-                    f"DELETE FROM {self.schema}.ptg2_v3_snapshot_layout "
-                    "WHERE snapshot_key = :snapshot_key"
-                ),
+                sa.text(f"DELETE FROM {self.schema}.ptg2_v3_snapshot_layout WHERE snapshot_key = :snapshot_key"),
                 {"snapshot_key": self.snapshot_key},
             )
         assert (
             await self.database.scalar(
-                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v4_snapshot_map_root "
-                "WHERE snapshot_key = :snapshot_key",
+                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v4_snapshot_map_root WHERE snapshot_key = :snapshot_key",
                 snapshot_key=self.snapshot_key,
             )
             == 0
         )
         assert (
             await self.database.scalar(
-                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v4_snapshot_map_pack "
-                "WHERE snapshot_key = :snapshot_key",
+                f"SELECT COUNT(*) FROM {self.schema}.ptg2_v4_snapshot_map_pack WHERE snapshot_key = :snapshot_key",
                 snapshot_key=self.snapshot_key,
             )
             == 0
@@ -1630,6 +1656,7 @@ class _V4PostgresScenario:
         await self._create_schema()
         await self._publish_initial_snapshot()
         await self._assert_sealed_delete_guards()
+        await self._assert_enrolled_writer_delete_guards()
         await self._assert_layout_reuse()
         await self._exercise_overlap_guard()
         await self._assert_publication_counts()
@@ -1640,8 +1667,14 @@ class _V4PostgresScenario:
         await self._delete_published_layout()
 
     async def cleanup(self):
+        publication_task = getattr(self, "publication_task", None)
+        if publication_task is not None and not publication_task.done():
+            publication_task.cancel()
+            await asyncio.gather(publication_task, return_exceptions=True)
         try:
             await self.database.execute_ddl(f"DROP SCHEMA IF EXISTS {self.schema} CASCADE")
+            if hasattr(self, "sealed_writer_role"):
+                await self.database.execute_ddl(f'DROP ROLE IF EXISTS "{self.sealed_writer_role}"')
         finally:
             await self.database.disconnect()
 

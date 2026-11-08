@@ -281,6 +281,7 @@ async def ptg_control_start(ctx, task: dict[str, Any] | None = None):
                 ),
                 toc_list=params_by_name.get("toc_list"),
                 in_network_url=params_by_name.get("in_network_url"),
+                **({"in_network_urls": params_by_name["in_network_urls"]} if "in_network_urls" in params_by_name else {}),
                 allowed_url=params_by_name.get("allowed_url"),
                 **protected_rate_main_kwargs(params_by_name),
                 provider_ref_url=params_by_name.get("provider_ref_url"),

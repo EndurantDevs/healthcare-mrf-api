@@ -6,7 +6,7 @@ This module deliberately has no HTTP registration or policy implementation.
 An extension-facing adapter verifies its own authorization material, supplies a
 stable authorization scope through :class:`ExtensionReadAuthorizer`, and maps
 these typed results to its transport.  The read core then permits only an
-explicit current, sealed generation and one exact selection profile.
+explicit sealed generation and one exact selection profile.
 
 Search starts from a persisted ``CustomImportWinner``.  A child predicate or
 order therefore always addresses that winner's one selected context child; it
@@ -27,22 +27,26 @@ import asyncio
 import datetime as dt
 import hashlib
 import hmac
+import re
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import and_, exists, func, not_, select, text
+from sqlalchemy import Integer, String, and_, exists, func, not_, select, text, tuple_
+from sqlalchemy.engine import Row
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import Select
+from sqlalchemy.sql.selectable import CTE
 
 from db.models.custom_import import (
     CustomImportChildCollection,
     CustomImportChildRevision,
     CustomImportChildScalar,
-    CustomImportCurrentGeneration,
     CustomImportDefinitionRevision,
+    CustomImportEntityBinding,
     CustomImportFamilyChild,
     CustomImportFamilyRevision,
     CustomImportField,
@@ -57,6 +61,7 @@ from db.models.custom_import import (
 )
 from process.custom_import.definition import (
     CustomImportDefinition,
+    DerivedQueryField,
     Field,
     canonical_json,
     canonical_sha256,
@@ -66,15 +71,23 @@ from process.custom_import.read_contracts import (
     DEFAULT_READ_TIMEOUT_MS,
     MAX_CURSOR_TTL_SECONDS,
     MAX_DETAIL_CHILDREN,
+    MAX_FAMILY_RESPONSE_BYTES,
     MAX_FILTER_TERMS,
+    MAX_FULL_FAMILY_PAGE_SIZE,
+    MAX_GROUPED_CHILD_PREDICATE_TERMS,
+    MAX_GROUPED_PREDICATE_TERMS,
+    MAX_NPI_PAGE_SIZE,
     MAX_ORDER_TERMS,
     MAX_PAGE_OFFSET,
     MAX_PAGE_SIZE,
+    MAX_PROVIDER_FILTER_TERMS,
+    MAX_PROVIDER_ORDER_TERMS,
     MAX_READ_TIMEOUT_MS,
     READ_CORE_CONTRACT,
     CustomImportReadAuthorizationError,
     CustomImportReadCache,
     CustomImportReadCursorError,
+    CustomImportReadEntityAbsentError,
     CustomImportReadError,
     CustomImportReadRequestError,
     CustomImportReadUnavailableError,
@@ -94,13 +107,17 @@ from process.custom_import.read_cursor import (
     ReadCursorState,
 )
 from process.custom_import.read_identity import (
+    resolve_generation_snapshot,
     verified_definition,
-    verify_current_generation,
+    verify_published_generation,
 )
+from process.custom_import.read_payload import full_family_payload
+from process.custom_import.storage_layout import snapshot_models
 
 _VALUE_STATES = frozenset({"value", "null", "missing"})
 _FILTER_OPERATORS = frozenset({"eq", "neq", "gt", "gte", "lt", "lte", "is_null", "is_missing"})
 _RANGE_FIELD_TYPES = frozenset({"integer", "decimal", "date", "timestamp"})
+_DECIMAL_FILTER_NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+(?:[eE][+-]?[0-9]+)?|[eE][+-]?[0-9]+)")
 _SCALAR_COLUMNS = {
     "string": "string_value",
     "integer": "integer_value",
@@ -112,11 +129,16 @@ _SCALAR_COLUMNS = {
 _READ_TIMEOUT_SETTINGS = text(
     """
     SELECT current_setting('statement_timeout') AS timeout_text,
-           setting AS timeout_milliseconds
+           setting AS timeout_milliseconds,
+           current_setting('transaction_isolation') AS transaction_isolation,
+           current_setting('transaction_read_only') AS transaction_read_only
     FROM pg_catalog.pg_settings
     WHERE name = 'statement_timeout'
     """
 )
+_MAX_ENTITY_VALUE_BYTES = 512
+_FULL_FAMILY_ENTITLEMENT = "full_family"
+_NPI_ENTITY_RELATION_FINGERPRINT_DOMAIN = b"custom-import-read-core/v1\x00npi-entity-relation/v1\x00"
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,7 +165,12 @@ class ReadOrderTerm:
 
     def __post_init__(self) -> None:
         _bounded_identifier(self.field_id, "order field_id")
-        if self.direction not in {"asc", "desc"} or self.nulls not in {"first", "last"}:
+        if (
+            type(self.direction) is not str
+            or type(self.nulls) is not str
+            or self.direction not in {"asc", "desc"}
+            or self.nulls not in {"first", "last"}
+        ):
             raise CustomImportReadRequestError("order term is malformed")
 
 
@@ -171,6 +198,25 @@ class SearchRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class EntityLocator:
+    """One adapter-qualified entity value used to select a root family."""
+
+    adapter_id: str
+    value: str
+
+    def __post_init__(self) -> None:
+        _bounded_identifier(self.adapter_id, "entity adapter_id")
+        if type(self.value) is not str:
+            raise CustomImportReadRequestError("entity value is malformed")
+        try:
+            value_size = len(self.value.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise CustomImportReadRequestError("entity value is malformed") from None
+        if not 1 <= value_size <= _MAX_ENTITY_VALUE_BYTES:
+            raise CustomImportReadRequestError("entity value is malformed")
+
+
+@dataclass(frozen=True, slots=True)
 class WinnerLocator:
     """The exact persisted winner used to select a root-family detail view."""
 
@@ -185,6 +231,28 @@ class WinnerLocator:
         _positive_integer(self.entity_binding_id, "entity_binding_id")
         if type(self.context_key_sha256) is not bytes or len(self.context_key_sha256) != 32:
             raise CustomImportReadRequestError("winner context key is malformed")
+
+
+@dataclass(frozen=True, slots=True)
+class RootDetailRequest:
+    """One exact target, entity selector, and full-family entitlement."""
+
+    target: PinnedReadTarget
+    entity: EntityLocator
+    family_entitlement: str
+    context_filters: tuple[ReadFilter, ...] | None = None
+    grouped_entity_selection: dict[str, object] | None = None
+    grouped_child_query: dict[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.target) is not PinnedReadTarget
+            or type(self.entity) is not EntityLocator
+            or type(self.family_entitlement) is not str
+            or self.family_entitlement != _FULL_FAMILY_ENTITLEMENT
+        ):
+            raise CustomImportReadRequestError("root detail request is malformed")
+        _verify_grouped_child_shape(self.grouped_child_query, self.grouped_entity_selection)
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,11 +282,12 @@ class SearchItem:
     root_fields: tuple[ReadFieldValue, ...]
     context_child_revision_id: int | None
     context_fields: tuple[ReadFieldValue, ...]
+    children: tuple[ReadChild, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class SearchPage:
-    """One exact-count page over a sealed, current winner selection."""
+    """One exact-count page over a sealed winner selection."""
 
     target: PinnedReadTarget
     total: int
@@ -237,6 +306,20 @@ class RootDetail:
     winner: WinnerLocator
     root_fields: tuple[ReadFieldValue, ...]
     children: tuple[ReadChild, ...]
+    authorization_scope_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class EntityFamilySet:
+    """At most two independently projected families at one selected value."""
+
+    target: PinnedReadTarget
+    projection: str
+    selection_field_id: str
+    selection_value: int
+    families: tuple[tuple[str, SearchItem | RootDetail], ...]
+    missing_group_values: tuple[str, ...]
+    query_fingerprint: str
     authorization_scope_sha256: str
 
 
@@ -267,6 +350,59 @@ class _SearchPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class PreparedNpiEntityRelation:
+    """One unpaged imported-NPI relation prepared for one host request.
+
+    A host must compose this only in the same request's bounded SQL window.
+    Its count and page statements must use the same pinned target, predicates,
+    and bound parameters; this result has no cursor, cache, or source read.
+    """
+
+    statement: Select
+    normalized_order_terms: tuple[ReadOrderTerm, ...]
+    query_fingerprint: str
+    authorization_scope_sha256: str
+    effective_require_match: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NpiEntityRelationQuery:
+    """Separate selected-context and metric predicates for one provider relation."""
+
+    context_filters: tuple[ReadFilter, ...] | None = None
+    filters: tuple[ReadFilter, ...] = ()
+    order_terms: tuple[ReadOrderTerm, ...] | None = None
+    require_match: bool = True
+    require_exact_context: bool = False
+    grouped_entity_selection: dict[str, object] | None = None
+    family_entitlement: str | None = None
+    grouped_child_query: dict[str, object] | None = None
+    entity_values: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.family_entitlement is not None and (
+            type(self.family_entitlement) is not str
+            or self.family_entitlement != _FULL_FAMILY_ENTITLEMENT
+            or type(self.grouped_entity_selection) is not dict
+        ):
+            raise CustomImportReadRequestError("page family entitlement requires grouped entity selection")
+        _verify_grouped_child_shape(self.grouped_child_query, self.grouped_entity_selection)
+
+
+def _verify_grouped_child_shape(child, grouped):
+    if child is not None and (type(child) is not dict or type(grouped) is not dict):
+        raise CustomImportReadRequestError("grouped child queries require grouped entity selection")
+
+
+def _relation_predicate_limit(query):
+    """Bound input before loading; pinned capability verification follows."""
+
+    if query.grouped_child_query is not None:
+        return MAX_GROUPED_CHILD_PREDICATE_TERMS
+    return MAX_GROUPED_PREDICATE_TERMS if query.grouped_entity_selection is not None else MAX_FILTER_TERMS
+
+
+@dataclass(frozen=True, slots=True)
 class _PageWindow:
     """The exact page window used to derive one bounded next cursor."""
 
@@ -282,12 +418,29 @@ class _ReadContext:
     """Definition, profile, and P1 identities verified for one pinned read."""
 
     target: PinnedReadTarget
-    pointer_version: int
     definition: CustomImportDefinition
     profile_slot: int
     profile_context_slot: int
     collection_slots_by_name: Mapping[str, int]
     collection_names_by_slot: Mapping[int, str]
+    default_profile_slot: int | None = None
+    storage_models: Mapping | None = None
+    projection_tables: Mapping | None = None
+
+    def model(self, canonical_model):
+        """Bind hot reads to this verified family without redirecting control rows."""
+
+        return canonical_model if self.storage_models is None else self.storage_models[canonical_model]
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _PreparedReadContext:
+    """Service-owned metadata retained only for one exact prepared transaction."""
+
+    prepared: PreparedNpiEntityRelation
+    session: AsyncSession
+    transactions: tuple[object | None, ...]
+    context: _ReadContext
 
 
 class CustomImportReadService:
@@ -297,7 +450,7 @@ class CustomImportReadService:
         self,
         *,
         authorizer: ExtensionReadAuthorizer | None,
-        cursor_secret: bytes,
+        cursor_secret: bytes | None = None,
         cache: CustomImportReadCache | None = None,
         cursor_ttl_seconds: int = 300,
         statement_timeout_ms: int = DEFAULT_READ_TIMEOUT_MS,
@@ -309,10 +462,11 @@ class CustomImportReadService:
             raise CustomImportReadRequestError("statement_timeout_ms is outside the read-core limit")
         self._authorizer = authorizer
         self._cache = cache
-        self._cursor_codec = ReadCursorCodec(cursor_secret)
+        self._cursor_codec = None if cursor_secret is None else ReadCursorCodec(cursor_secret)
         self._cursor_ttl_seconds = cursor_ttl_seconds
         self._statement_timeout_ms = statement_timeout_ms
         self._now = time.time if now is None else now
+        self._prepared_read_context: _PreparedReadContext | None = None
 
     async def search(
         self,
@@ -324,6 +478,8 @@ class CustomImportReadService:
         """Search persisted winners after auth, eligibility, filtering, and exact count."""
 
         authorization_scope = self._authorize(authorization, request.target)
+        if self._cursor_codec is None:
+            raise CustomImportReadUnavailableError("search cursor is unavailable")
         async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms):
             context = await _load_read_context(session, request.target)
             plan = _normalize_search_plan(request, context)
@@ -333,13 +489,13 @@ class CustomImportReadService:
             cache_key = _cache_key("search", context.target, plan.fingerprint, scope_digest, offset)
             cached_page = await _cached_search_page(self._cache, cache_key, context, plan, scope_digest, trusted_now)
             if cached_page is not None:
-                await verify_current_generation(session, context.target, context.pointer_version)
+                await verify_published_generation(session, context.target)
                 return cached_page
             statement = _filtered_winner_statement(context, plan.filters)
             total = await _exact_count(session, statement)
             selected_rows = await _page_winner_rows(session, statement, context, plan, offset)
             page_items = await _hydrate_search_page_items(session, context, selected_rows)
-            await verify_current_generation(session, context.target, context.pointer_version)
+            await verify_published_generation(session, context.target)
             expires_at = trusted_now + self._cursor_ttl_seconds
             next_cursor = self._next_search_cursor(
                 context,
@@ -365,6 +521,221 @@ class CustomImportReadService:
         await _cache_result(self._cache, cache_key, page, expires_at)
         return page
 
+    async def prepare_npi_entity_relation(
+        self,
+        session: AsyncSession,
+        *,
+        authorization: ExtensionReadAuthorization,
+        target: PinnedReadTarget,
+        query: NpiEntityRelationQuery = NpiEntityRelationQuery(),
+    ) -> PreparedNpiEntityRelation:
+        """Prepare one unpaged NPI relation; ``None`` order is filter-only."""
+
+        self._prepared_read_context = None
+        authorization_scope = self._authorize(authorization, target)
+        if type(query) is not NpiEntityRelationQuery:
+            raise CustomImportReadRequestError("imported membership mode is invalid")
+        return await self._prepare_npi_entity_relation(
+            session,
+            pinned_target=target,
+            query=query,
+            authorization_scope=authorization_scope,
+        )
+
+    async def _prepare_npi_entity_relation(
+        self,
+        session: AsyncSession,
+        *,
+        pinned_target: PinnedReadTarget,
+        query: NpiEntityRelationQuery,
+        authorization_scope: ExtensionReadScope,
+    ) -> PreparedNpiEntityRelation:
+        """Normalize one validated query and construct its unpaged relation."""
+
+        _validate_npi_relation_query(query)
+        async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms) as is_repeatable_read_only:
+            transactions = await _read_transaction_identity(session) if is_repeatable_read_only else None
+            context = await _load_read_context(session, pinned_target)
+            if context.definition.query.entity_selection is not None or query.grouped_entity_selection is not None:
+                from process.custom_import.grouped_read import prepare_relation
+
+                prepared = prepare_relation(context, query, authorization_scope)
+            else:
+                prepared = _prepare_single_family_relation(context, query, authorization_scope)
+            current_transactions = await _read_transaction_identity(session) if transactions is not None else None
+            retained = (
+                _PreparedReadContext(prepared, session, transactions, context)
+                if context.target == pinned_target and _is_same_read_transaction(transactions, current_transactions)
+                else None
+            )
+        if retained is not None and all(
+            transaction is None or transaction.is_active for transaction in retained.transactions
+        ):
+            self._prepared_read_context = retained
+        return prepared
+
+    async def scope_npi_entity_relation(
+        self,
+        session: AsyncSession,
+        *,
+        authorization: ExtensionReadAuthorization,
+        pinned_target: PinnedReadTarget,
+        prepared: PreparedNpiEntityRelation,
+        query: NpiEntityRelationQuery,
+        native_entity_scope: Select | CTE,
+    ) -> PreparedNpiEntityRelation:
+        """Intersect a prepared request with its complete trusted native eligibility."""
+
+        retained = self._prepared_read_context
+        self._prepared_read_context = None
+        authorization_scope = self._authorize(authorization, pinned_target)
+        if type(query) is not NpiEntityRelationQuery:
+            raise CustomImportReadRequestError("imported membership mode is invalid")
+        if native_entity_scope is None:
+            raise CustomImportReadRequestError("native entity scope must be an unpaged SQL relation")
+        _validate_npi_relation_query(query)
+        async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms) as is_repeatable_read_only:
+            if not (
+                is_repeatable_read_only
+                and retained is not None
+                and retained.prepared is prepared
+                and retained.session is session
+                and retained.context.target == pinned_target
+                and _is_same_read_transaction(retained.transactions, await _read_transaction_identity(session))
+            ):
+                raise CustomImportReadUnavailableError("provider native scope context is unavailable")
+            context = retained.context
+            if context.definition.query.entity_selection is not None or query.grouped_entity_selection is not None:
+                from process.custom_import.grouped_read import prepare_relation
+
+                scoped = prepare_relation(context, query, authorization_scope, native_entity_scope=native_entity_scope)
+            else:
+                scoped = _prepare_single_family_relation(
+                    context, query, authorization_scope, native_entity_scope=native_entity_scope
+                )
+            if (
+                scoped.query_fingerprint != prepared.query_fingerprint
+                or scoped.authorization_scope_sha256 != prepared.authorization_scope_sha256
+                or scoped.normalized_order_terms != prepared.normalized_order_terms
+                or scoped.effective_require_match != prepared.effective_require_match
+                or not _is_same_read_transaction(retained.transactions, await _read_transaction_identity(session))
+            ):
+                raise CustomImportReadUnavailableError("provider native scope query identity is unavailable")
+        if any(transaction is not None and not transaction.is_active for transaction in retained.transactions):
+            raise CustomImportReadUnavailableError("provider native scope context is unavailable")
+        self._prepared_read_context = replace(retained, prepared=scoped)
+        return scoped
+
+    async def hydrate_npi_page(
+        self,
+        session: AsyncSession,
+        *,
+        authorization: ExtensionReadAuthorization,
+        pinned_target: PinnedReadTarget,
+        prepared: PreparedNpiEntityRelation,
+        entity_values: tuple[str, ...],
+        query: NpiEntityRelationQuery = NpiEntityRelationQuery(),
+        full_family: bool = False,
+    ) -> dict[str, SearchItem | RootDetail | EntityFamilySet]:
+        """Batch the same eligible winners with the default query projection.
+
+        Exact detail batches opt into complete ordinary root and child
+        projections with ``full_family``; grouped reads retain their entitlement.
+        """
+
+        authorization_scope = self._authorize(authorization, pinned_target)
+        if type(query) is not NpiEntityRelationQuery or type(full_family) is not bool:
+            raise CustomImportReadRequestError("provider relation query is invalid")
+        _validate_npi_entity_relation_request(
+            query.filters,
+            query.order_terms,
+            context_filters=query.context_filters,
+            maximum_terms=_relation_predicate_limit(query),
+        )
+        _validate_npi_page(entity_values)
+        if query.entity_values is not None:
+            _validate_npi_page(query.entity_values)
+            if not set(entity_values) <= set(query.entity_values):
+                raise CustomImportReadUnavailableError("provider page identities exceed the native query scope")
+        if full_family and len(entity_values) > MAX_FULL_FAMILY_PAGE_SIZE:
+            raise CustomImportReadRequestError("full-family provider page exceeds its bound")
+        async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms) as is_repeatable_read_only:
+            retained = self._prepared_read_context
+            if (
+                is_repeatable_read_only
+                and retained is not None
+                and retained.prepared is prepared
+                and retained.session is session
+                and retained.context.target == pinned_target
+                and _is_same_read_transaction(retained.transactions, await _read_transaction_identity(session))
+            ):
+                context = retained.context
+            else:
+                context = await _load_read_context(session, pinned_target)
+            if context.definition.query.entity_selection is not None or query.grouped_entity_selection is not None:
+                from process.custom_import.grouped_read import hydrate_page
+
+                return await hydrate_page(session, context, query, prepared, entity_values, authorization_scope)
+            return await self._hydrate_single_family_page(
+                session, context, query, prepared, entity_values, authorization_scope, full_family=full_family
+            )
+
+    async def _hydrate_single_family_page(
+        self, session, context, query, prepared, entity_values, authorization_scope, *, full_family=False
+    ):
+        """Retain the legacy single-family page selection and fingerprint."""
+
+        entity_model = context.model(CustomImportEntityBinding)
+
+        normalized_context_filters, normalized_filters, normalized_order = _normalized_npi_query(
+            context, query.context_filters, query.filters, query.order_terms
+        )
+        if (
+            type(prepared) is not PreparedNpiEntityRelation
+            or prepared.query_fingerprint
+            != _npi_entity_relation_fingerprint(
+                context.target,
+                normalized_filters,
+                normalized_order,
+                context_filters=normalized_context_filters,
+                entity_values=query.entity_values,
+            )
+            or prepared.authorization_scope_sha256 != _scope_digest(authorization_scope)
+        ):
+            raise CustomImportReadUnavailableError("provider page query identity is unavailable")
+        statement = (
+            _filtered_npi_winner_statement(context, normalized_filters, context_filters=normalized_context_filters)
+            .add_columns(entity_model.canonical_value)
+            .where(entity_model.canonical_value.in_(entity_values))
+        )
+        if full_family and entity_values:
+            await _require_unambiguous_npi_families(session, context, statement)
+        statement = statement.distinct(entity_model.canonical_value).order_by(
+            entity_model.canonical_value, *_winner_order_terms(context, ())
+        )
+        selected_rows = (await session.execute(statement)).all() if entity_values else ()
+        winners = tuple(
+            _winner_row(selected_row[:-1], context.profile_context_slot > 0) for selected_row in selected_rows
+        )
+        if full_family:
+            hydrated_items = await _hydrate_complete_family_entities(
+                session,
+                context,
+                winners,
+                tuple(selected_row[-1] for selected_row in selected_rows),
+                _scope_digest(authorization_scope),
+                is_page=True,
+            )
+        else:
+            hydrated_items = await _hydrate_provider_page_items(
+                session, context, winners, _scope_digest(authorization_scope)
+            )
+        await verify_published_generation(session, context.target)
+        return {
+            selected_row[-1]: hydrated_item
+            for selected_row, hydrated_item in zip(selected_rows, hydrated_items, strict=True)
+        }
+
     async def root_detail(
         self,
         session: AsyncSession,
@@ -376,20 +747,79 @@ class CustomImportReadService:
         """Hydrate all children in the exact family selected by one persisted winner."""
 
         authorization_scope = self._authorize(authorization, target)
+        return await self._root_detail(
+            session,
+            target=target,
+            winner=winner,
+            authorization_scope=authorization_scope,
+        )
+
+    async def root_detail_for_entity(
+        self,
+        session: AsyncSession,
+        *,
+        authorization: ExtensionReadAuthorization,
+        request: RootDetailRequest,
+    ) -> RootDetail | EntityFamilySet:
+        """Hydrate one unambiguous entity family through the normal detail path."""
+
+        if type(request) is not RootDetailRequest:
+            raise CustomImportReadRequestError("root detail request is malformed")
+        authorization_scope = self._authorize(authorization, request.target)
+        async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms):
+            context = await _load_read_context(session, request.target)
+            if context.definition.query.entity_selection is not None or request.grouped_entity_selection is not None:
+                from process.custom_import.grouped_read import hydrate_detail
+
+                return await hydrate_detail(session, context, request, authorization_scope)
+            if request.context_filters is not None:
+                raise CustomImportReadRequestError("detail context requires grouped entity selection")
+            winner = await _entity_winner_locator(session, context, request.entity)
+            trusted_now = self._trusted_now()
+            detail, cache_key = await self._root_detail_from_context(session, context, winner, authorization_scope)
+        if cache_key is not None:
+            await _cache_result(self._cache, cache_key, detail, trusted_now + self._cursor_ttl_seconds)
+        return detail
+
+    async def _root_detail(
+        self,
+        session: AsyncSession,
+        *,
+        target: PinnedReadTarget,
+        winner: WinnerLocator,
+        authorization_scope: ExtensionReadScope,
+    ) -> RootDetail:
+        """Run one authorized detail hydration under one bounded read window."""
+
         async with _bounded_read_window(session, timeout_ms=self._statement_timeout_ms):
             context = await _load_read_context(session, target)
             trusted_now = self._trusted_now()
-            scope_digest = _scope_digest(authorization_scope)
-            cache_key = _detail_cache_key(context.target, winner, scope_digest)
-            cached_detail = await _cached_root_detail(self._cache, cache_key, context, winner, scope_digest)
-            if cached_detail is not None:
-                await verify_current_generation(session, context.target, context.pointer_version)
-                return cached_detail
-            selected_row = await _selected_winner_row(session, context, winner)
-            detail = await _hydrate_root_detail(session, context, selected_row, scope_digest)
-            await verify_current_generation(session, context.target, context.pointer_version)
-        await _cache_result(self._cache, cache_key, detail, trusted_now + self._cursor_ttl_seconds)
+            detail, cache_key = await self._root_detail_from_context(session, context, winner, authorization_scope)
+        if cache_key is not None:
+            await _cache_result(self._cache, cache_key, detail, trusted_now + self._cursor_ttl_seconds)
         return detail
+
+    async def _root_detail_from_context(
+        self,
+        session: AsyncSession,
+        context: _ReadContext,
+        winner: WinnerLocator,
+        authorization_scope: ExtensionReadScope,
+    ) -> tuple[RootDetail, str | None]:
+        """Reuse exact winner hydration after a target context is verified."""
+
+        if context.definition.query.entity_selection is not None:
+            raise CustomImportReadRequestError("grouped entity detail requires an entity selector")
+        scope_digest = _scope_digest(authorization_scope)
+        cache_key = _detail_cache_key(context.target, winner, scope_digest)
+        cached_detail = await _cached_root_detail(self._cache, cache_key, context, winner, scope_digest)
+        if cached_detail is not None:
+            await verify_published_generation(session, context.target)
+            return cached_detail, None
+        selected_row = await _selected_winner_row(session, context, winner)
+        detail = await _hydrate_root_detail(session, context, selected_row, scope_digest)
+        await verify_published_generation(session, context.target)
+        return detail, cache_key
 
     def _authorize(
         self,
@@ -435,6 +865,8 @@ class CustomImportReadService:
 
         if request.cursor is None:
             return 0
+        if self._cursor_codec is None:
+            raise CustomImportReadUnavailableError("search cursor is unavailable")
         state = self._cursor_codec.open(
             request.cursor,
             pinned_target=request.target,
@@ -456,6 +888,8 @@ class CustomImportReadService:
         next_offset = page_window.offset + page_window.returned_count
         if page_window.returned_count == 0 or next_offset >= page_window.total or next_offset > MAX_PAGE_OFFSET:
             return None
+        if self._cursor_codec is None:
+            raise CustomImportReadUnavailableError("search cursor is unavailable")
         return self._cursor_codec.issue(
             ReadCursorState(
                 target=context.target,
@@ -563,14 +997,14 @@ async def _cache_result(cache: CustomImportReadCache | None, cache_key: str, val
 
 
 @asynccontextmanager
-async def _bounded_read_window(session: AsyncSession, *, timeout_ms: int) -> AsyncIterator[None]:
+async def _bounded_read_window(session: AsyncSession, *, timeout_ms: int) -> AsyncIterator[bool]:
     """Apply one cumulative, caller-transaction-local database read budget."""
 
     monotonic_deadline = time.monotonic() + timeout_ms / 1_000
     try:
         async with asyncio.timeout(timeout_ms / 1_000):
-            async with _local_statement_timeout(session, timeout_ms=timeout_ms):
-                yield
+            async with _local_statement_timeout(session, timeout_ms=timeout_ms) as is_repeatable_read_only:
+                yield is_repeatable_read_only
                 if time.monotonic() >= monotonic_deadline:
                     raise TimeoutError
     except TimeoutError:
@@ -582,15 +1016,15 @@ async def _bounded_read_window(session: AsyncSession, *, timeout_ms: int) -> Asy
 
 
 @asynccontextmanager
-async def _local_statement_timeout(session: AsyncSession, *, timeout_ms: int) -> AsyncIterator[None]:
+async def _local_statement_timeout(session: AsyncSession, *, timeout_ms: int) -> AsyncIterator[bool]:
     """Temporarily narrow the caller's transaction-local statement timeout."""
 
-    previous_timeout_text, previous_timeout_ms = await _current_statement_timeout(session)
+    previous_timeout_text, previous_timeout_ms, is_repeatable_read_only = await _current_statement_timeout(session)
     effective_timeout_ms = timeout_ms if previous_timeout_ms == 0 else min(timeout_ms, previous_timeout_ms)
     await session.execute(select(func.set_config("statement_timeout", str(effective_timeout_ms), True)))
     has_read_failed = False
     try:
-        yield
+        yield is_repeatable_read_only
     except BaseException:
         has_read_failed = True
         raise
@@ -598,7 +1032,7 @@ async def _local_statement_timeout(session: AsyncSession, *, timeout_ms: int) ->
         await _restore_statement_timeout(session, previous_timeout_text, has_read_failed=has_read_failed)
 
 
-async def _current_statement_timeout(session: AsyncSession) -> tuple[str, int]:
+async def _current_statement_timeout(session: AsyncSession) -> tuple[str, int, bool]:
     timeout_row = (await session.execute(_READ_TIMEOUT_SETTINGS)).one_or_none()
     if timeout_row is None or not isinstance(timeout_row.timeout_text, str):
         raise CustomImportReadUnavailableError("bounded read is unavailable")
@@ -608,7 +1042,11 @@ async def _current_statement_timeout(session: AsyncSession) -> tuple[str, int]:
         raise CustomImportReadUnavailableError("bounded read is unavailable") from None
     if previous_timeout_ms < 0:
         raise CustomImportReadUnavailableError("bounded read is unavailable")
-    return timeout_row.timeout_text, previous_timeout_ms
+    is_repeatable_read_only = (
+        getattr(timeout_row, "transaction_isolation", None) in {"repeatable read", "serializable"}
+        and getattr(timeout_row, "transaction_read_only", None) == "on"
+    )
+    return timeout_row.timeout_text, previous_timeout_ms, is_repeatable_read_only
 
 
 async def _restore_statement_timeout(
@@ -631,35 +1069,153 @@ def _is_statement_timeout(error: DBAPIError) -> bool:
     return any(getattr(driver_error, attribute, None) == "57014" for attribute in ("sqlstate", "pgcode"))
 
 
-async def _load_read_context(session: AsyncSession, target: PinnedReadTarget) -> _ReadContext:
-    definition_row, schema_row, pointer_version = await _eligible_definition_rows(session, target)
-    if type(pointer_version) is not int or pointer_version <= 0:
-        raise CustomImportReadUnavailableError("current generation pointer is invalid")
+def _validate_npi_relation_query(query):
+    _validate_npi_entity_relation_request(
+        query.filters,
+        query.order_terms,
+        context_filters=query.context_filters,
+        maximum_terms=_relation_predicate_limit(query),
+    )
+    if type(query.require_match) is not bool or type(query.require_exact_context) is not bool:
+        raise CustomImportReadRequestError("imported membership mode is invalid")
+    if query.entity_values is not None:
+        _validate_npi_page(query.entity_values)
+
+
+def _native_entity_values(native_entity_scope, entity_values):
+    """Intersect a trusted complete SQL identity set without a Python page bound."""
+
+    if not isinstance(native_entity_scope, (Select, CTE)):
+        raise CustomImportReadRequestError("native entity scope must be an unpaged SQL relation")
+    statement = native_entity_scope
+    while isinstance(statement, CTE):
+        statement = statement.element
+    if any(getattr(statement, name, None) is not None for name in ("_limit_clause", "_offset_clause", "_fetch_clause")):
+        raise CustomImportReadRequestError("native entity scope must be an unpaged SQL relation")
+    columns = native_entity_scope.c if isinstance(native_entity_scope, CTE) else native_entity_scope.selected_columns
+    if len(columns) != 1 or not isinstance(columns[0].type, (Integer, String)):
+        raise CustomImportReadRequestError("native entity scope requires one text or integer NPI column")
+    source = (
+        native_entity_scope
+        if isinstance(native_entity_scope, CTE)
+        else native_entity_scope.cte("native_score_entities").prefix_with("MATERIALIZED")
+    )
+    canonical_value = source.c[0].cast(String)
+    statement = select(canonical_value.label("entity_value"))
+    if entity_values is not None:
+        statement = statement.where(canonical_value.in_(entity_values))
+    return statement
+
+
+def _prepare_single_family_relation(context, query, authorization_scope, *, native_entity_scope=None):
+    """Keep ordinary query normalization and identity independent of context reuse."""
+
+    normalized_context_filters, normalized_filters, normalized_order_terms = _normalized_npi_query(
+        context, query.context_filters, query.filters, query.order_terms, query.require_exact_context
+    )
+    if not query.require_match:
+        if query.context_filters is None:
+            _require_context_only_filters(normalized_filters, context)
+        elif normalized_filters:
+            raise CustomImportReadRequestError("metric predicates require imported membership")
+    query_sha256 = _npi_entity_relation_fingerprint(
+        context.target,
+        normalized_filters,
+        normalized_order_terms,
+        context_filters=normalized_context_filters,
+        entity_values=query.entity_values,
+    )
+    entity_values = query.entity_values
+    if native_entity_scope is not None:
+        entity_values = _native_entity_values(native_entity_scope, entity_values)
+    return PreparedNpiEntityRelation(
+        statement=_npi_entity_relation_statement(
+            context,
+            normalized_filters,
+            normalized_order_terms,
+            context_filters=normalized_context_filters,
+            entity_values=entity_values,
+        ),
+        normalized_order_terms=normalized_order_terms,
+        query_fingerprint=query_sha256,
+        authorization_scope_sha256=_scope_digest(authorization_scope),
+    )
+
+
+async def _read_transaction_identity(session) -> tuple[object | None, ...] | None:
+    """Include the connection root so externally ended transactions cannot reuse metadata."""
+
+    if not all(
+        callable(getattr(session, name, None)) for name in ("get_transaction", "get_nested_transaction", "connection")
+    ):
+        return None
+    transaction = session.get_transaction()
+    if transaction is None or not transaction.is_active:
+        return None
+    connection = await session.connection()
+    if not all(callable(getattr(connection, name, None)) for name in ("get_transaction", "get_nested_transaction")):
+        return None
+    transactions = (
+        transaction,
+        session.get_nested_transaction(),
+        connection.get_transaction(),
+        connection.get_nested_transaction(),
+    )
+    if transactions[2] is None or any(value is not None and not value.is_active for value in transactions):
+        return None
+    return transactions
+
+
+def _is_same_read_transaction(first, second) -> bool:
+    return (
+        first is not None
+        and second is not None
+        and all(left is right for left, right in zip(first, second, strict=True))
+    )
+
+
+async def _load_read_context(session: AsyncSession, pinned_target: PinnedReadTarget) -> _ReadContext:
+    definition_row, schema_row = await _eligible_definition_rows(session, pinned_target)
     definition = verified_definition(definition_row, schema_row)
-    collection_slots = await _collection_slots(session, target, definition)
-    profile = await _exact_profile(session, target)
+    collection_slots = await _collection_slots(session, pinned_target, definition)
+    profile = await _exact_profile(session, pinned_target)
     profile_slot, profile_context_slot = _verified_profile(profile, definition, collection_slots)
-    await _verified_field_rows(session, target, definition, collection_slots)
-    return _ReadContext(
-        target=target,
-        pointer_version=pointer_version,
+    await _verified_field_rows(session, pinned_target, definition, collection_slots)
+    snapshot_family_id = await resolve_generation_snapshot(session, pinned_target)
+    from process.custom_import.query_projection_evidence import QueryProjectionUnavailable, read_projection_tables
+
+    try:
+        projection_tables = await read_projection_tables(
+            session, pinned_target, definition, snapshot_family_id=snapshot_family_id
+        )
+    except QueryProjectionUnavailable:
+        raise CustomImportReadUnavailableError("pinned query projection is unavailable") from None
+    context = _ReadContext(
+        target=pinned_target,
         definition=definition,
         profile_slot=profile_slot,
         profile_context_slot=profile_context_slot,
         collection_slots_by_name=collection_slots,
         collection_names_by_slot={slot: name for name, slot in collection_slots.items()},
+        storage_models=None if snapshot_family_id is None else snapshot_models(snapshot_family_id),
+        projection_tables=projection_tables,
     )
+    if definition.query.entity_selection is not None:
+        from process.custom_import.grouped_read import bind_default_profile
+
+        return await bind_default_profile(session, context)
+    return context
 
 
 async def _eligible_definition_rows(
     session: AsyncSession,
     pinned_target: PinnedReadTarget,
-) -> tuple[CustomImportDefinitionRevision, CustomImportSchemaRevision, int]:
+) -> tuple[CustomImportDefinitionRevision, CustomImportSchemaRevision]:
+    await verify_published_generation(session, pinned_target)
     statement = (
         select(
             CustomImportDefinitionRevision,
             CustomImportSchemaRevision,
-            CustomImportCurrentGeneration.pointer_version,
         )
         .select_from(CustomImportDefinitionRevision)
         .join(
@@ -670,38 +1226,27 @@ async def _eligible_definition_rows(
             ),
         )
         .join(
-            CustomImportCurrentGeneration,
-            and_(
-                CustomImportCurrentGeneration.dataset_id == CustomImportDefinitionRevision.dataset_id,
-                CustomImportCurrentGeneration.definition_revision_id
-                == CustomImportDefinitionRevision.definition_revision_id,
-                CustomImportCurrentGeneration.schema_revision_id == CustomImportDefinitionRevision.schema_revision_id,
-            ),
-        )
-        .join(
             CustomImportGeneration,
             and_(
-                CustomImportGeneration.generation_id == CustomImportCurrentGeneration.generation_id,
-                CustomImportGeneration.dataset_id == CustomImportCurrentGeneration.dataset_id,
-                CustomImportGeneration.definition_revision_id == CustomImportCurrentGeneration.definition_revision_id,
-                CustomImportGeneration.schema_revision_id == CustomImportCurrentGeneration.schema_revision_id,
+                CustomImportGeneration.generation_id == pinned_target.generation_id,
+                CustomImportGeneration.dataset_id == CustomImportDefinitionRevision.dataset_id,
+                CustomImportGeneration.definition_revision_id == CustomImportDefinitionRevision.definition_revision_id,
+                CustomImportGeneration.schema_revision_id == CustomImportDefinitionRevision.schema_revision_id,
             ),
         )
         .join(
             CustomImportGenerationSeal,
             and_(
-                CustomImportGenerationSeal.generation_id == CustomImportCurrentGeneration.generation_id,
-                CustomImportGenerationSeal.dataset_id == CustomImportCurrentGeneration.dataset_id,
-                CustomImportGenerationSeal.definition_revision_id
-                == CustomImportCurrentGeneration.definition_revision_id,
-                CustomImportGenerationSeal.schema_revision_id == CustomImportCurrentGeneration.schema_revision_id,
+                CustomImportGenerationSeal.generation_id == CustomImportGeneration.generation_id,
+                CustomImportGenerationSeal.dataset_id == CustomImportGeneration.dataset_id,
+                CustomImportGenerationSeal.definition_revision_id == CustomImportGeneration.definition_revision_id,
+                CustomImportGenerationSeal.schema_revision_id == CustomImportGeneration.schema_revision_id,
             ),
         )
         .where(
             CustomImportDefinitionRevision.dataset_id == pinned_target.dataset_id,
             CustomImportDefinitionRevision.definition_revision_id == pinned_target.definition_revision_id,
             CustomImportDefinitionRevision.schema_revision_id == pinned_target.schema_revision_id,
-            CustomImportCurrentGeneration.generation_id == pinned_target.generation_id,
             CustomImportGenerationSeal.seal_contract == "custom-import-generation-seal/v1",
         )
     )
@@ -848,48 +1393,158 @@ async def _verified_field_rows(
 
 
 def _normalize_search_plan(request: SearchRequest, context: _ReadContext) -> _SearchPlan:
+    if context.definition.query.entity_selection is not None:
+        raise CustomImportReadRequestError("grouped entity selection is not supported by generic search")
     if type(request) is not SearchRequest or request.target != context.target:
         raise CustomImportReadRequestError("search target does not match the verified read context")
-    filters = _normalized_filters(request.filters, context)
+    normalized_filters = _normalized_filters(request.filters, context)
+    _verify_filter_permissions(normalized_filters, context, allow_context_selectors=True)
     declared_order_terms = tuple(
         ReadOrderTerm(field_id=term.field_id, direction=term.direction, nulls=term.nulls)
         for term in context.definition.query.order_terms
     )
-    requested_order_terms = declared_order_terms if request.order_terms is None else request.order_terms
-    if (
-        len(declared_order_terms) > MAX_ORDER_TERMS
-        or len(requested_order_terms) > MAX_ORDER_TERMS
-        or requested_order_terms != declared_order_terms
-    ):
-        raise CustomImportReadRequestError("order terms must exactly match the bounded definition order")
-    _verify_order_context(requested_order_terms, context)
+    requested_order_terms = _normalize_query_order_terms(
+        declared_order_terms if request.order_terms is None else request.order_terms,
+        context,
+        explicit=request.order_terms is not None,
+    )
+
     search_shape_map = {
-        "filters": [item.descriptor for item in filters],
+        "filters": [normalized_filter.descriptor for normalized_filter in normalized_filters],
         "order": [
             {"field": term.field_id, "direction": term.direction, "nulls": term.nulls} for term in requested_order_terms
         ],
         "page_size": request.page_size,
     }
     return _SearchPlan(
-        filters=filters,
+        filters=normalized_filters,
         order_terms=requested_order_terms,
         page_size=request.page_size,
         fingerprint=hashlib.sha256(_canonical_bytes(search_shape_map)).hexdigest(),
     )
 
 
-def _normalized_filters(raw_filters: tuple[ReadFilter, ...], context: _ReadContext) -> tuple[_NormalizedFilter, ...]:
-    if len(raw_filters) > MAX_FILTER_TERMS:
+def _normalize_query_order_terms(
+    raw_order_terms: tuple[ReadOrderTerm, ...],
+    context: _ReadContext,
+    *,
+    explicit: bool,
+    query_child_collection: str | None = None,
+    maximum_terms: int = MAX_ORDER_TERMS,
+    allow_derived: bool = False,
+) -> tuple[ReadOrderTerm, ...]:
+    """Normalize and validate an explicit order against the query contract."""
+
+    if type(raw_order_terms) is not tuple:
+        raise CustomImportReadRequestError("order_terms must be a tuple")
+    declared_order_terms = tuple(
+        ReadOrderTerm(field_id=term.field_id, direction=term.direction, nulls=term.nulls)
+        for term in context.definition.query.order_terms
+    )
+    requested_order_terms = _normalized_order_terms(raw_order_terms, context)
+    if len(declared_order_terms) > maximum_terms or len(requested_order_terms) > maximum_terms:
+        raise CustomImportReadRequestError("order term count exceeds the read-core limit")
+    if explicit and context.definition.query.sortable_fields:
+        sortable_field_ids = set(context.definition.query.sortable_fields)
+        requested_field_ids = [term.field_id for term in requested_order_terms]
+        if (
+            not requested_order_terms
+            or len(requested_field_ids) != len(set(requested_field_ids))
+            or any(term.field_id not in sortable_field_ids or term.nulls != "last" for term in requested_order_terms)
+        ):
+            raise CustomImportReadRequestError("order terms are not permitted by the query contract")
+    elif requested_order_terms != declared_order_terms:
+        raise CustomImportReadRequestError("order terms must exactly match the bounded definition order")
+    _verify_order_context(
+        requested_order_terms, context, query_child_collection=query_child_collection, allow_derived=allow_derived
+    )
+    return requested_order_terms
+
+
+def _validate_npi_entity_relation_request(
+    filters: tuple[ReadFilter, ...],
+    order_terms: tuple[ReadOrderTerm, ...] | None,
+    *,
+    context_filters: tuple[ReadFilter, ...] | None = None,
+    maximum_terms: int = MAX_FILTER_TERMS,
+) -> None:
+    """Reject unbounded relation shapes before context loading."""
+
+    if type(filters) is not tuple:
+        raise CustomImportReadRequestError("filters must be a tuple")
+    metric_limit = MAX_PROVIDER_FILTER_TERMS if maximum_terms > MAX_FILTER_TERMS else MAX_FILTER_TERMS
+    order_limit = MAX_PROVIDER_ORDER_TERMS if maximum_terms > MAX_FILTER_TERMS else MAX_ORDER_TERMS
+    if len(filters) > metric_limit:
+        raise CustomImportReadRequestError("filter count exceeds the read-core limit")
+    if context_filters is not None and (type(context_filters) is not tuple or len(context_filters) > MAX_FILTER_TERMS):
+        raise CustomImportReadRequestError("context filter count exceeds the read-core limit")
+    if context_filters is not None and len(filters) + len(context_filters) > maximum_terms:
+        raise CustomImportReadRequestError("filter count exceeds the read-core limit")
+    if order_terms is not None and type(order_terms) is not tuple:
+        raise CustomImportReadRequestError("order_terms must be a tuple")
+    if order_terms is not None and len(order_terms) > order_limit:
+        raise CustomImportReadRequestError("order term count exceeds the read-core limit")
+
+
+def _validate_npi_page(entity_values: tuple[str, ...]) -> None:
+    """Accept only bounded unique canonical NPI values from a native page."""
+
+    if (
+        type(entity_values) is not tuple
+        or len(entity_values) > MAX_NPI_PAGE_SIZE
+        or any(
+            type(value) is not str or len(value) != 10 or not value.isascii() or not value.isdigit()
+            for value in entity_values
+        )
+        or len(set(entity_values)) != len(entity_values)
+    ):
+        raise CustomImportReadRequestError("provider page identities are invalid")
+
+
+def _normalized_npi_query(context, context_filters, filters, order_terms, require_exact_context=False):
+    """Normalize legacy combined filters or v2 context and metric roles."""
+
+    normalized_filters = _normalized_filters(filters, context)
+    normalized_order = () if order_terms is None else _normalize_query_order_terms(order_terms, context, explicit=True)
+    if context_filters is None:
+        _verify_filter_permissions(normalized_filters, context, allow_context_selectors=True)
+        _require_order_context_filters(
+            normalized_order, normalized_filters, context, require_exact_context=require_exact_context
+        )
+        return (), normalized_filters, normalized_order
+    normalized_context_filters = _normalized_filters(context_filters, context)
+    context_dimensions = _verify_context_filters(normalized_context_filters, context)
+    _verify_metric_filters(normalized_filters, context_dimensions)
+    _verify_filter_permissions(normalized_filters, context)
+    _require_order_context_filters(
+        normalized_order, normalized_context_filters, context, require_exact_context=require_exact_context
+    )
+    return normalized_context_filters, normalized_filters, normalized_order
+
+
+def _normalized_filters(
+    raw_filters: tuple[ReadFilter, ...],
+    context: _ReadContext,
+    *,
+    query_child_collection: str | None = None,
+    maximum_terms: int = MAX_FILTER_TERMS,
+    allow_derived: bool = False,
+) -> tuple[_NormalizedFilter, ...]:
+    if len(raw_filters) > maximum_terms:
         raise CustomImportReadRequestError("filter count exceeds the read-core limit")
     normalized_filters: list[_NormalizedFilter] = []
-    permitted_ids = set(context.definition.query.root_fields) | set(context.definition.query.child_fields)
     for raw_filter in raw_filters:
-        if type(raw_filter) is not ReadFilter or raw_filter.field_id not in permitted_ids:
+        if type(raw_filter) is not ReadFilter:
             raise CustomImportReadRequestError("filter field is not declared by the query contract")
-        field = context.definition.fields_by_id.get(raw_filter.field_id)
+        field_id = context.definition.query.resolve_field_id(raw_filter.field_id)
+        if field_id is None:
+            raise CustomImportReadRequestError("filter field is not declared by the query contract")
+        field = context.definition.fields_by_id.get(field_id)
+        if field is None and allow_derived:
+            field = context.definition.query.derived_by_id.get(field_id)
         if field is None:
             raise CustomImportReadUnavailableError("declared query field has no persisted binding")
-        _verify_field_context(field, context)
+        _verify_field_context(field, context, query_child_collection=query_child_collection)
         typed_filter_value, canonical_value = _normalized_filter_value(field, raw_filter.operator, raw_filter.value)
         normalized_filters.append(
             _NormalizedFilter(
@@ -911,21 +1566,115 @@ def _normalized_filters(raw_filters: tuple[ReadFilter, ...], context: _ReadConte
     )
 
 
-def _verify_order_context(order_terms: tuple[ReadOrderTerm, ...], context: _ReadContext) -> None:
+def _verify_filter_permissions(filters, context, *, allow_context_selectors=False):
+    """Enforce canonical metric grants while preserving exact context selectors."""
+
+    permitted_fields = context.definition.query.filterable_fields
+    if permitted_fields is None:
+        return
+    context_dimensions = ()
+    if allow_context_selectors:
+        profile = next(
+            (item for item in context.definition.selection_profiles if item.profile_id == context.target.profile_id),
+            None,
+        )
+        if profile is None:
+            raise CustomImportReadUnavailableError("selection profile is not declared by the definition")
+        context_dimensions = profile.context_dimensions
+    for predicate in filters:
+        if predicate.field.field_id in permitted_fields:
+            continue
+        if (
+            predicate.field.field_id in context_dimensions
+            and predicate.operator == "eq"
+            and predicate.value is not None
+            and (predicate.field.value_type != "integer" or type(predicate.value) is int)
+        ):
+            continue
+        raise CustomImportReadRequestError("filter field is not opted in by the query contract")
+
+
+def _verify_context_filters(filters: tuple[_NormalizedFilter, ...], context: _ReadContext) -> tuple[str, ...]:
+    """Accept only one non-null equality selector for each declared context dimension."""
+
+    profile = next(
+        (
+            profile_candidate
+            for profile_candidate in context.definition.selection_profiles
+            if profile_candidate.profile_id == context.target.profile_id
+        ),
+        None,
+    )
+    if profile is None:
+        raise CustomImportReadUnavailableError("selection profile is not declared by the definition")
+    if len({predicate.field.field_id for predicate in filters}) != len(filters) or any(
+        predicate.field.field_id not in profile.context_dimensions
+        or predicate.operator != "eq"
+        or predicate.value is None
+        or (predicate.field.value_type == "integer" and type(predicate.value) is not int)
+        for predicate in filters
+    ):
+        raise CustomImportReadRequestError("context selectors are invalid")
+    return profile.context_dimensions
+
+
+def _verify_metric_filters(filters: tuple[_NormalizedFilter, ...], context_dimensions: tuple[str, ...]) -> None:
+    """Limit v2 metric predicates to the metric comparison operators."""
+
+    if any(
+        predicate.operator not in {"eq", "gt", "gte", "lt", "lte"} or predicate.field.field_id in context_dimensions
+        for predicate in filters
+    ):
+        raise CustomImportReadRequestError("metric filters are invalid")
+
+
+def _normalized_order_terms(
+    raw_order_terms: tuple[ReadOrderTerm, ...],
+    context: _ReadContext,
+) -> tuple[ReadOrderTerm, ...]:
+    """Resolve query aliases to canonical order field identifiers."""
+
+    normalized_terms: list[ReadOrderTerm] = []
+    for raw_term in raw_order_terms:
+        if type(raw_term) is not ReadOrderTerm:
+            raise CustomImportReadRequestError("order field is not declared by the query contract")
+        field_id = context.definition.query.resolve_field_id(raw_term.field_id)
+        if field_id is None:
+            raise CustomImportReadRequestError("order field is not declared by the query contract")
+        normalized_terms.append(ReadOrderTerm(field_id, raw_term.direction, raw_term.nulls))
+    return tuple(normalized_terms)
+
+
+def _verify_order_context(
+    order_terms: tuple[ReadOrderTerm, ...],
+    context: _ReadContext,
+    *,
+    query_child_collection: str | None = None,
+    allow_derived: bool = False,
+) -> None:
     permitted_ids = set(context.definition.query.root_fields) | set(context.definition.query.child_fields)
+    if allow_derived:
+        permitted_ids.update(context.definition.query.derived_by_id)
     for term in order_terms:
         if type(term) is not ReadOrderTerm or term.field_id not in permitted_ids:
             raise CustomImportReadRequestError("order field is not declared by the query contract")
         field = context.definition.fields_by_id.get(term.field_id)
+        if field is None and allow_derived:
+            field = context.definition.query.derived_by_id.get(term.field_id)
         if field is None:
             raise CustomImportReadUnavailableError("declared order field has no persisted binding")
-        _verify_field_context(field, context)
+        _verify_field_context(field, context, query_child_collection=query_child_collection)
 
 
-def _verify_field_context(field: Field, context: _ReadContext) -> None:
+def _verify_field_context(field: Field, context: _ReadContext, *, query_child_collection: str | None = None) -> None:
     if field.collection is None:
         return
     expected_slot = context.collection_slots_by_name.get(field.collection)
+    if (
+        expected_slot is not None
+        and field.collection == query_child_collection == context.definition.query.child_collection
+    ):
+        return
     if expected_slot is None or context.profile_context_slot != expected_slot:
         raise CustomImportReadRequestError("selected profile has no permitted context for this child field")
 
@@ -941,12 +1690,16 @@ def _normalized_filter_value(
         raise CustomImportReadRequestError("range predicates require a metric-compatible field")
     if raw_value is None:
         raise CustomImportReadRequestError("comparison predicates require a typed value")
+    if field.value_type in {"integer", "decimal"} and type(raw_value) is dict:
+        raw_value = _decoded_decimal_filter(raw_value, field.field_id)
     if field.value_type == "string":
         return _normalized_string(raw_value, field.field_id)
     if field.value_type == "integer":
-        return _normalized_integer(raw_value, field.field_id)
+        return _normalized_integer_filter(raw_value, field.field_id)
     if field.value_type == "decimal":
-        return _normalized_decimal(raw_value, field.field_id)
+        return _normalized_decimal(
+            raw_value, field.field_id, maximum_integer_digits=19 if isinstance(field, DerivedQueryField) else 18
+        )
     if field.value_type == "boolean":
         return _normalized_boolean(raw_value, field.field_id)
     if field.value_type == "date":
@@ -974,7 +1727,36 @@ def _normalized_integer(value: object, field_id: str) -> tuple[int, int]:
     return value, value
 
 
-def _normalized_decimal(value: object, field_id: str) -> tuple[Decimal, str]:
+def _decoded_decimal_filter(value: dict, field_id: str) -> Decimal:
+    """Decode the signed transport's exact JSON-number envelope without floats."""
+
+    number = value.get("decimal")
+    if (
+        set(value) != {"decimal"}
+        or type(number) is not str
+        or len(number) > 2_048
+        or _DECIMAL_FILTER_NUMBER.fullmatch(number) is None
+    ):
+        raise CustomImportReadRequestError(f"filter value for {field_id} is not an exact decimal number")
+    try:
+        return Decimal(number)
+    except InvalidOperation, ValueError:
+        raise CustomImportReadRequestError(f"filter value for {field_id} is not an exact decimal number") from None
+
+
+def _normalized_integer_filter(value: object, field_id: str) -> tuple[int | Decimal, int | str]:
+    """Compare integer storage to exact numeric operands without rounding either."""
+
+    if not isinstance(value, Decimal):
+        return _normalized_integer(value, field_id)
+    if not value.is_finite() or _decimal_scale(value) > 12 or not -(2**63) <= value < 2**63:
+        raise CustomImportReadRequestError(f"filter value for {field_id} exceeds integer comparison bounds")
+    if value == value.to_integral_value():
+        return _normalized_integer(int(value), field_id)
+    return value, format(value, "f")
+
+
+def _normalized_decimal(value: object, field_id: str, *, maximum_integer_digits: int = 18) -> tuple[Decimal, str]:
     if isinstance(value, (bool, float)):
         raise CustomImportReadRequestError(f"filter value for {field_id} is not a decimal")
     try:
@@ -984,7 +1766,7 @@ def _normalized_decimal(value: object, field_id: str) -> tuple[Decimal, str]:
     if (
         not decimal_value.is_finite()
         or _decimal_scale(decimal_value) > 12
-        or _decimal_integer_digits(decimal_value) > 18
+        or _decimal_integer_digits(decimal_value) > maximum_integer_digits
     ):
         raise CustomImportReadRequestError(f"filter value for {field_id} exceeds decimal storage")
     if decimal_value.is_zero():
@@ -1007,12 +1789,32 @@ def _normalized_boolean(value: object, field_id: str) -> tuple[bool, bool]:
 
 
 def _normalized_date(value: object, field_id: str) -> tuple[dt.date, str]:
+    if type(value) is str:
+        try:
+            parsed = dt.date.fromisoformat(value)
+        except ValueError:
+            parsed = None
+        if parsed is None or parsed.isoformat() != value:
+            raise CustomImportReadRequestError(f"filter value for {field_id} is not a date")
+        return parsed, value
     if not isinstance(value, dt.date) or isinstance(value, dt.datetime):
         raise CustomImportReadRequestError(f"filter value for {field_id} is not a date")
     return value, value.isoformat()
 
 
 def _normalized_timestamp(value: object, field_id: str) -> tuple[dt.datetime, str]:
+    if type(value) is str:
+        try:
+            parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+        if parsed is None or parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise CustomImportReadRequestError(f"filter value for {field_id} is not a timezone-aware timestamp")
+        normalized = parsed.astimezone(dt.UTC)
+        canonical = normalized.isoformat().replace("+00:00", "Z")
+        if canonical != value:
+            raise CustomImportReadRequestError(f"filter value for {field_id} is not a timezone-aware timestamp")
+        return normalized, canonical
     if not isinstance(value, dt.datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise CustomImportReadRequestError(f"filter value for {field_id} is not a timezone-aware timestamp")
     normalized = value.astimezone(dt.UTC)
@@ -1026,129 +1828,283 @@ def _filtered_winner_statement(context: _ReadContext, filters: tuple[_Normalized
     return statement
 
 
+def _require_order_context_filters(
+    order_terms: tuple[ReadOrderTerm, ...],
+    filters: tuple[_NormalizedFilter, ...],
+    context: _ReadContext,
+    *,
+    require_exact_context: bool = False,
+) -> None:
+    """Require an exact context for imported order or an explicit host contract."""
+
+    if not order_terms and not require_exact_context:
+        return
+    profile = next(
+        (
+            profile_candidate
+            for profile_candidate in context.definition.selection_profiles
+            if profile_candidate.profile_id == context.target.profile_id
+        ),
+        None,
+    )
+    if profile is None:
+        raise CustomImportReadUnavailableError("selection profile is not declared by the definition")
+    if not profile.context_dimensions:
+        return
+    context_equality_by_field: dict[str, object] = {}
+    for predicate in filters:
+        if predicate.field.field_id not in profile.context_dimensions or predicate.operator != "eq":
+            continue
+        if predicate.value is None:
+            continue
+        if predicate.field.value_type == "integer" and type(predicate.value) is not int:
+            raise CustomImportReadRequestError("context_required")
+        previous_value = context_equality_by_field.get(predicate.field.field_id)
+        if previous_value is not None and previous_value != predicate.canonical_value:
+            raise CustomImportReadRequestError("context_required")
+        context_equality_by_field[predicate.field.field_id] = predicate.canonical_value
+    if any(field_id not in context_equality_by_field for field_id in profile.context_dimensions):
+        raise CustomImportReadRequestError("context_required")
+
+
+def _require_context_only_filters(filters: tuple[_NormalizedFilter, ...], context: _ReadContext) -> None:
+    """Keep optional membership limited to declared context equality selectors."""
+
+    profile = next(
+        item for item in context.definition.selection_profiles if item.profile_id == context.target.profile_id
+    )
+    if any(
+        predicate.field.field_id not in profile.context_dimensions
+        or predicate.operator != "eq"
+        or predicate.value is None
+        or (predicate.field.value_type == "integer" and type(predicate.value) is not int)
+        for predicate in filters
+    ):
+        raise CustomImportReadRequestError("metric predicates require imported membership")
+
+
+def _npi_entity_relation_fingerprint(
+    target: PinnedReadTarget,
+    filters: tuple[_NormalizedFilter, ...],
+    order_terms: tuple[ReadOrderTerm, ...],
+    *,
+    context_filters: tuple[_NormalizedFilter, ...] = (),
+    entity_values: tuple[str, ...] | None = None,
+) -> str:
+    """Bind normalized imported query shape to the NPI relation domain."""
+
+    query_shape_map = {
+        "target": _target_document(target),
+        "adapter": "npi",
+        "context": [normalized_filter.descriptor for normalized_filter in context_filters],
+        "filters": [normalized_filter.descriptor for normalized_filter in filters],
+        "order": [{"field": term.field_id, "direction": term.direction, "nulls": term.nulls} for term in order_terms],
+    }
+    if entity_values is not None:
+        query_shape_map["entity_values"] = sorted(entity_values)
+    return hashlib.sha256(_NPI_ENTITY_RELATION_FINGERPRINT_DOMAIN + _canonical_bytes(query_shape_map)).hexdigest()
+
+
+def _npi_entity_relation_statement(
+    context: _ReadContext,
+    filters: tuple[_NormalizedFilter, ...],
+    order_terms: tuple[ReadOrderTerm, ...],
+    *,
+    context_filters: tuple[_NormalizedFilter, ...] = (),
+    entity_values: tuple[str, ...] | None = None,
+) -> Select:
+    """Project exact NPI bindings and optional winner-local typed sort values."""
+
+    entity_model = context.model(CustomImportEntityBinding)
+
+    statement = _filtered_npi_winner_statement(context, filters, context_filters=context_filters)
+    if entity_values is not None:
+        statement = statement.where(entity_model.canonical_value.in_(entity_values))
+    columns: list[object] = [entity_model.canonical_value.label("entity_value")]
+    for ordinal, term in enumerate(order_terms):
+        field = context.definition.fields_by_id[term.field_id]
+        columns.append(_order_scalar_expression(field, context).label(f"sort_{ordinal}"))
+    statement = statement.with_only_columns(*columns, maintain_column_froms=True)
+    return statement if order_terms else statement.distinct()
+
+
+def _filtered_npi_winner_statement(
+    context: _ReadContext,
+    filters: tuple[_NormalizedFilter, ...],
+    *,
+    context_filters: tuple[_NormalizedFilter, ...] = (),
+) -> Select:
+    """Apply metric predicates only after one selected winner and context relation."""
+
+    winner_model = context.model(CustomImportWinner)
+    entity_model = context.model(CustomImportEntityBinding)
+
+    statement = (
+        _filtered_winner_statement(context, context_filters)
+        .join(
+            entity_model,
+            and_(
+                entity_model.entity_binding_id == winner_model.entity_binding_id,
+                entity_model.dataset_id == winner_model.dataset_id,
+            ),
+        )
+        .where(
+            entity_model.dataset_id == context.target.dataset_id,
+            entity_model.adapter_id == "npi",
+        )
+    )
+    for predicate in filters:
+        statement = statement.where(_predicate_condition(predicate, context))
+    return statement
+
+
 def _winner_statement(context: _ReadContext):
     """Return only winners eligible for this pinned profile and context shape."""
 
-    winner_statement = _winner_identity_statement()
-    winner_statement = _current_generation_winner_statement(winner_statement, context)
+    winner_model = context.model(CustomImportWinner)
+
+    winner_statement = _winner_identity_statement(context)
+    winner_statement = _pinned_generation_winner_statement(winner_statement, context)
     if context.profile_context_slot == 0:
         return winner_statement.where(
-            CustomImportWinner.context_collection_slot == 0,
-            CustomImportWinner.context_child_revision_id.is_(None),
+            winner_model.context_collection_slot == 0,
+            winner_model.context_child_revision_id.is_(None),
         )
     return _context_child_winner_statement(winner_statement, context)
 
 
-def _winner_identity_statement():
+def _winner_identity_statement(context: _ReadContext):
     """Join each persisted winner to its exact generated family and root revision."""
 
+    winner_model = context.model(CustomImportWinner)
+    family_model = context.model(CustomImportFamilyRevision)
+    root_model = context.model(CustomImportRootRevision)
+    generation_family_model = context.model(CustomImportGenerationFamily)
+
     return (
-        select(CustomImportWinner, CustomImportFamilyRevision, CustomImportRootRevision)
-        .select_from(CustomImportWinner)
+        select(winner_model, family_model, root_model)
+        .select_from(winner_model)
         .join(
-            CustomImportGenerationFamily,
+            generation_family_model,
             and_(
-                CustomImportGenerationFamily.generation_id == CustomImportWinner.generation_id,
-                CustomImportGenerationFamily.dataset_id == CustomImportWinner.dataset_id,
-                CustomImportGenerationFamily.family_revision_id == CustomImportWinner.family_revision_id,
+                generation_family_model.generation_id == winner_model.generation_id,
+                generation_family_model.dataset_id == winner_model.dataset_id,
+                generation_family_model.family_revision_id == winner_model.family_revision_id,
             ),
         )
         .join(
-            CustomImportFamilyRevision,
+            family_model,
             and_(
-                CustomImportFamilyRevision.family_revision_id == CustomImportWinner.family_revision_id,
-                CustomImportFamilyRevision.dataset_id == CustomImportWinner.dataset_id,
-                CustomImportFamilyRevision.schema_revision_id == CustomImportWinner.schema_revision_id,
-                CustomImportFamilyRevision.root_record_id == CustomImportGenerationFamily.root_record_id,
+                family_model.family_revision_id == winner_model.family_revision_id,
+                family_model.entity_binding_id == winner_model.entity_binding_id,
+                family_model.dataset_id == winner_model.dataset_id,
+                family_model.schema_revision_id == winner_model.schema_revision_id,
+                family_model.root_record_id == generation_family_model.root_record_id,
             ),
         )
         .join(
-            CustomImportRootRevision,
+            root_model,
             and_(
-                CustomImportRootRevision.root_revision_id == CustomImportFamilyRevision.root_revision_id,
-                CustomImportRootRevision.dataset_id == CustomImportFamilyRevision.dataset_id,
-                CustomImportRootRevision.schema_revision_id == CustomImportFamilyRevision.schema_revision_id,
-                CustomImportRootRevision.root_record_id == CustomImportFamilyRevision.root_record_id,
+                root_model.root_revision_id == family_model.root_revision_id,
+                root_model.dataset_id == family_model.dataset_id,
+                root_model.schema_revision_id == family_model.schema_revision_id,
+                root_model.root_record_id == family_model.root_record_id,
             ),
         )
     )
 
 
-def _current_generation_winner_statement(winner_statement, context: _ReadContext):
-    """Restrict winner rows to the exact current and sealed pinned generation."""
+def _pinned_generation_winner_statement(winner_statement, context: _ReadContext):
+    """Restrict winner rows to the exact sealed pinned generation."""
+
+    winner_model = context.model(CustomImportWinner)
 
     pinned_target = context.target
-    return (
-        winner_statement.join(
-            CustomImportCurrentGeneration,
-            and_(
-                CustomImportCurrentGeneration.dataset_id == CustomImportWinner.dataset_id,
-                CustomImportCurrentGeneration.generation_id == CustomImportWinner.generation_id,
-                CustomImportCurrentGeneration.definition_revision_id == CustomImportWinner.definition_revision_id,
-                CustomImportCurrentGeneration.schema_revision_id == CustomImportWinner.schema_revision_id,
-            ),
-        )
-        .join(
-            CustomImportGenerationSeal,
-            and_(
-                CustomImportGenerationSeal.generation_id == CustomImportWinner.generation_id,
-                CustomImportGenerationSeal.dataset_id == CustomImportWinner.dataset_id,
-                CustomImportGenerationSeal.definition_revision_id == CustomImportWinner.definition_revision_id,
-                CustomImportGenerationSeal.schema_revision_id == CustomImportWinner.schema_revision_id,
-            ),
-        )
+    generation_is_pinned = (
+        select(1)
         .where(
-            CustomImportWinner.dataset_id == pinned_target.dataset_id,
-            CustomImportWinner.generation_id == pinned_target.generation_id,
-            CustomImportWinner.definition_revision_id == pinned_target.definition_revision_id,
-            CustomImportWinner.schema_revision_id == pinned_target.schema_revision_id,
-            CustomImportWinner.profile_slot == context.profile_slot,
+            CustomImportGeneration.dataset_id == pinned_target.dataset_id,
+            CustomImportGeneration.generation_id == pinned_target.generation_id,
+            CustomImportGeneration.definition_revision_id == pinned_target.definition_revision_id,
+            CustomImportGeneration.schema_revision_id == pinned_target.schema_revision_id,
+        )
+        .correlate(None)
+        .exists()
+    )
+    seal_is_pinned = (
+        select(1)
+        .where(
+            CustomImportGenerationSeal.dataset_id == pinned_target.dataset_id,
+            CustomImportGenerationSeal.generation_id == pinned_target.generation_id,
+            CustomImportGenerationSeal.definition_revision_id == pinned_target.definition_revision_id,
+            CustomImportGenerationSeal.schema_revision_id == pinned_target.schema_revision_id,
             CustomImportGenerationSeal.seal_contract == "custom-import-generation-seal/v1",
         )
+        .correlate(None)
+        .exists()
+    )
+    return winner_statement.where(
+        winner_model.dataset_id == pinned_target.dataset_id,
+        winner_model.generation_id == pinned_target.generation_id,
+        winner_model.definition_revision_id == pinned_target.definition_revision_id,
+        winner_model.schema_revision_id == pinned_target.schema_revision_id,
+        winner_model.profile_slot == context.profile_slot,
+        generation_is_pinned,
+        seal_is_pinned,
     )
 
 
 def _context_child_winner_statement(winner_statement, context: _ReadContext):
     """Join the one winner-selected context child, never an arbitrary sibling."""
 
+    winner_model = context.model(CustomImportWinner)
+    family_model = context.model(CustomImportFamilyRevision)
+    family_child_model = context.model(CustomImportFamilyChild)
+    child_model = context.model(CustomImportChildRevision)
+
     return (
-        winner_statement.add_columns(CustomImportChildRevision)
+        winner_statement.add_columns(child_model)
         .join(
-            CustomImportFamilyChild,
+            family_child_model,
             and_(
-                CustomImportFamilyChild.family_revision_id == CustomImportWinner.family_revision_id,
-                CustomImportFamilyChild.dataset_id == CustomImportWinner.dataset_id,
-                CustomImportFamilyChild.schema_revision_id == CustomImportWinner.schema_revision_id,
-                CustomImportFamilyChild.root_record_id == CustomImportFamilyRevision.root_record_id,
-                CustomImportFamilyChild.collection_slot == CustomImportWinner.context_collection_slot,
-                CustomImportFamilyChild.child_revision_id == CustomImportWinner.context_child_revision_id,
+                family_child_model.family_revision_id == winner_model.family_revision_id,
+                family_child_model.dataset_id == winner_model.dataset_id,
+                family_child_model.schema_revision_id == winner_model.schema_revision_id,
+                family_child_model.root_record_id == family_model.root_record_id,
+                family_child_model.collection_slot == winner_model.context_collection_slot,
+                family_child_model.child_revision_id == winner_model.context_child_revision_id,
             ),
         )
         .join(
-            CustomImportChildRevision,
+            child_model,
             and_(
-                CustomImportChildRevision.child_revision_id == CustomImportWinner.context_child_revision_id,
-                CustomImportChildRevision.dataset_id == CustomImportWinner.dataset_id,
-                CustomImportChildRevision.schema_revision_id == CustomImportWinner.schema_revision_id,
-                CustomImportChildRevision.root_record_id == CustomImportFamilyRevision.root_record_id,
-                CustomImportChildRevision.collection_slot == CustomImportWinner.context_collection_slot,
+                child_model.child_revision_id == winner_model.context_child_revision_id,
+                child_model.dataset_id == winner_model.dataset_id,
+                child_model.schema_revision_id == winner_model.schema_revision_id,
+                child_model.root_record_id == family_model.root_record_id,
+                child_model.collection_slot == winner_model.context_collection_slot,
             ),
         )
-        .where(CustomImportWinner.context_collection_slot == context.profile_context_slot)
+        .where(winner_model.context_collection_slot == context.profile_context_slot)
     )
 
 
 def _predicate_condition(predicate: _NormalizedFilter, context: _ReadContext):
+    winner_model = context.model(CustomImportWinner)
+    family_model = context.model(CustomImportFamilyRevision)
+    root_scalar_model = context.model(CustomImportRootScalar)
+    child_scalar_model = context.model(CustomImportChildScalar)
+
     if predicate.field.collection is None:
         return _scalar_predicate(
-            CustomImportRootScalar,
+            root_scalar_model,
             predicate,
-            _root_scalar_conditions(predicate.field, CustomImportFamilyRevision.root_revision_id, context),
+            _root_scalar_conditions(predicate.field, family_model.root_revision_id, context),
         )
     return _scalar_predicate(
-        CustomImportChildScalar,
+        child_scalar_model,
         predicate,
-        _child_scalar_conditions(predicate.field, CustomImportWinner.context_child_revision_id, context),
+        _child_scalar_conditions(predicate.field, winner_model.context_child_revision_id, context),
     )
 
 
@@ -1185,25 +2141,31 @@ def _has_scalar_comparison(column, operator: str, value: object | None):
 
 
 def _root_scalar_conditions(field: Field, root_revision_id, context: _ReadContext) -> tuple[object, ...]:
+    family_model = context.model(CustomImportFamilyRevision)
+    root_scalar_model = context.model(CustomImportRootScalar)
+
     return (
-        CustomImportRootScalar.root_revision_id == root_revision_id,
-        CustomImportRootScalar.dataset_id == context.target.dataset_id,
-        CustomImportRootScalar.schema_revision_id == context.target.schema_revision_id,
-        CustomImportRootScalar.root_record_id == CustomImportFamilyRevision.root_record_id,
-        CustomImportRootScalar.field_slot == field.field_slot,
+        root_scalar_model.root_revision_id == root_revision_id,
+        root_scalar_model.dataset_id == context.target.dataset_id,
+        root_scalar_model.schema_revision_id == context.target.schema_revision_id,
+        root_scalar_model.root_record_id == family_model.root_record_id,
+        root_scalar_model.field_slot == field.field_slot,
     )
 
 
 def _child_scalar_conditions(field: Field, child_revision_id, context: _ReadContext) -> tuple[object, ...]:
+    family_model = context.model(CustomImportFamilyRevision)
+    child_scalar_model = context.model(CustomImportChildScalar)
+
     assert field.collection is not None
     collection_slot = context.collection_slots_by_name[field.collection]
     return (
-        CustomImportChildScalar.child_revision_id == child_revision_id,
-        CustomImportChildScalar.dataset_id == context.target.dataset_id,
-        CustomImportChildScalar.schema_revision_id == context.target.schema_revision_id,
-        CustomImportChildScalar.root_record_id == CustomImportFamilyRevision.root_record_id,
-        CustomImportChildScalar.collection_slot == collection_slot,
-        CustomImportChildScalar.field_slot == field.field_slot,
+        child_scalar_model.child_revision_id == child_revision_id,
+        child_scalar_model.dataset_id == context.target.dataset_id,
+        child_scalar_model.schema_revision_id == context.target.schema_revision_id,
+        child_scalar_model.root_record_id == family_model.root_record_id,
+        child_scalar_model.collection_slot == collection_slot,
+        child_scalar_model.field_slot == field.field_slot,
     )
 
 
@@ -1233,6 +2195,9 @@ async def _page_winner_rows(
 
 
 def _winner_order_terms(context: _ReadContext, order_terms: tuple[ReadOrderTerm, ...]) -> tuple[object, ...]:
+    winner_model = context.model(CustomImportWinner)
+    family_model = context.model(CustomImportFamilyRevision)
+
     expressions: list[object] = []
     for term in order_terms:
         field = context.definition.fields_by_id[term.field_id]
@@ -1243,21 +2208,26 @@ def _winner_order_terms(context: _ReadContext, order_terms: tuple[ReadOrderTerm,
         )
     expressions.extend(
         (
-            CustomImportFamilyRevision.root_record_id.asc(),
-            CustomImportWinner.entity_binding_id.asc(),
-            CustomImportWinner.context_key_sha256.asc(),
+            family_model.root_record_id.asc(),
+            winner_model.entity_binding_id.asc(),
+            winner_model.context_key_sha256.asc(),
         )
     )
     return tuple(expressions)
 
 
 def _order_scalar_expression(field: Field, context: _ReadContext):
+    winner_model = context.model(CustomImportWinner)
+    family_model = context.model(CustomImportFamilyRevision)
+    root_scalar_model = context.model(CustomImportRootScalar)
+    child_scalar_model = context.model(CustomImportChildScalar)
+
     if field.collection is None:
-        scalar_model = CustomImportRootScalar
-        conditions = _root_scalar_conditions(field, CustomImportFamilyRevision.root_revision_id, context)
+        scalar_model = root_scalar_model
+        conditions = _root_scalar_conditions(field, family_model.root_revision_id, context)
     else:
-        scalar_model = CustomImportChildScalar
-        conditions = _child_scalar_conditions(field, CustomImportWinner.context_child_revision_id, context)
+        scalar_model = child_scalar_model
+        conditions = _child_scalar_conditions(field, winner_model.context_child_revision_id, context)
     value_column = getattr(scalar_model, _SCALAR_COLUMNS[field.value_type])
     return select(value_column).where(*conditions, scalar_model.value_state == "value").scalar_subquery()
 
@@ -1272,6 +2242,28 @@ def _winner_row(
         return winner, family, root_revision, context_child
     winner, family, root_revision = values
     return winner, family, root_revision, None
+
+
+async def _hydrate_provider_page_items(session, context, selected_rows, scope_digest) -> tuple[SearchItem, ...]:
+    """Attach all children from the distinct exact selected provider families."""
+
+    unique_rows = tuple({selected_row[1].family_revision_id: selected_row for selected_row in selected_rows}.values())
+    if len(unique_rows) > MAX_FULL_FAMILY_PAGE_SIZE:
+        raise CustomImportReadUnavailableError("full-family provider page exceeds its bound")
+    details = await _hydrate_complete_family_entities(
+        session,
+        context,
+        unique_rows,
+        tuple(selected_row[1].family_revision_id for selected_row in unique_rows),
+        scope_digest,
+        is_page=True,
+    )
+    children_by_family = {detail.winner.family_revision_id: detail.children for detail in details}
+    provider_items = await _hydrate_search_page_items(session, context, selected_rows)
+    return tuple(
+        replace(provider_item, children=children_by_family[provider_item.winner.family_revision_id])
+        for provider_item in provider_items
+    )
 
 
 async def _hydrate_search_page_items(
@@ -1314,23 +2306,27 @@ async def _root_scalar_rows(
     context: _ReadContext,
     root_revision_ids: tuple[int, ...],
     fields: tuple[Field, ...],
-) -> dict[tuple[int, int], CustomImportRootScalar]:
+) -> dict[tuple[int, int], Row]:
+    root_scalar_model = context.model(CustomImportRootScalar)
+
     if not fields:
         return {}
     rows = (
-        (
-            await session.execute(
-                select(CustomImportRootScalar).where(
-                    CustomImportRootScalar.dataset_id == context.target.dataset_id,
-                    CustomImportRootScalar.schema_revision_id == context.target.schema_revision_id,
-                    CustomImportRootScalar.root_revision_id.in_(root_revision_ids),
-                    CustomImportRootScalar.field_slot.in_(tuple(field.field_slot for field in fields)),
-                )
+        await session.execute(
+            select(
+                root_scalar_model.root_revision_id,
+                root_scalar_model.field_slot,
+                root_scalar_model.field_type,
+                root_scalar_model.value_state,
+                *(getattr(root_scalar_model, column_name) for column_name in _SCALAR_COLUMNS.values()),
+            ).where(
+                root_scalar_model.dataset_id == context.target.dataset_id,
+                root_scalar_model.schema_revision_id == context.target.schema_revision_id,
+                root_scalar_model.root_revision_id.in_(root_revision_ids),
+                root_scalar_model.field_slot.in_(tuple(field.field_slot for field in fields)),
             )
         )
-        .scalars()
-        .all()
-    )
+    ).all()
     return {(row.root_revision_id, row.field_slot): row for row in rows}
 
 
@@ -1339,23 +2335,27 @@ async def _child_scalar_rows(
     context: _ReadContext,
     child_revision_ids: tuple[int, ...],
     fields: tuple[Field, ...],
-) -> dict[tuple[int, int], CustomImportChildScalar]:
+) -> dict[tuple[int, int], Row]:
+    child_scalar_model = context.model(CustomImportChildScalar)
+
     if not fields or not child_revision_ids:
         return {}
     rows = (
-        (
-            await session.execute(
-                select(CustomImportChildScalar).where(
-                    CustomImportChildScalar.dataset_id == context.target.dataset_id,
-                    CustomImportChildScalar.schema_revision_id == context.target.schema_revision_id,
-                    CustomImportChildScalar.child_revision_id.in_(child_revision_ids),
-                    CustomImportChildScalar.field_slot.in_(tuple(field.field_slot for field in fields)),
-                )
+        await session.execute(
+            select(
+                child_scalar_model.child_revision_id,
+                child_scalar_model.field_slot,
+                child_scalar_model.field_type,
+                child_scalar_model.value_state,
+                *(getattr(child_scalar_model, column_name) for column_name in _SCALAR_COLUMNS.values()),
+            ).where(
+                child_scalar_model.dataset_id == context.target.dataset_id,
+                child_scalar_model.schema_revision_id == context.target.schema_revision_id,
+                child_scalar_model.child_revision_id.in_(child_revision_ids),
+                child_scalar_model.field_slot.in_(tuple(field.field_slot for field in fields)),
             )
         )
-        .scalars()
-        .all()
-    )
+    ).all()
     return {(row.child_revision_id, row.field_slot): row for row in rows}
 
 
@@ -1365,8 +2365,8 @@ def _selected_row_to_search_item(
     ],
     root_fields: tuple[Field, ...],
     child_fields: tuple[Field, ...],
-    root_rows_by_key: Mapping[tuple[int, int], CustomImportRootScalar],
-    child_rows_by_key: Mapping[tuple[int, int], CustomImportChildScalar],
+    root_rows_by_key: Mapping[tuple[int, int], Row],
+    child_rows_by_key: Mapping[tuple[int, int], Row],
 ) -> SearchItem:
     winner, family, root_revision, context_child = selected_row
     locator = _winner_locator(winner, family)
@@ -1422,16 +2422,100 @@ async def _selected_winner_row(
     context: _ReadContext,
     locator: WinnerLocator,
 ) -> tuple[CustomImportWinner, CustomImportFamilyRevision, CustomImportRootRevision, CustomImportChildRevision | None]:
+    winner_model = context.model(CustomImportWinner)
+    family_model = context.model(CustomImportFamilyRevision)
+
     statement = _winner_statement(context).where(
-        CustomImportWinner.entity_binding_id == locator.entity_binding_id,
-        CustomImportWinner.family_revision_id == locator.family_revision_id,
-        CustomImportFamilyRevision.root_record_id == locator.root_record_id,
-        CustomImportWinner.context_key_sha256 == locator.context_key_sha256,
+        winner_model.entity_binding_id == locator.entity_binding_id,
+        winner_model.family_revision_id == locator.family_revision_id,
+        family_model.root_record_id == locator.root_record_id,
+        winner_model.context_key_sha256 == locator.context_key_sha256,
     )
     row = (await session.execute(statement)).one_or_none()
     if row is None:
         raise CustomImportReadUnavailableError("selected winner is not eligible for root detail")
     return _winner_row(row, context.profile_context_slot > 0)
+
+
+async def _require_unambiguous_npi_families(session, context, statement):
+    """Apply the scalar detail family identity rule to the complete NPI page."""
+
+    entity_model = context.model(CustomImportEntityBinding)
+    family_model = context.model(CustomImportFamilyRevision)
+    winner_model = context.model(CustomImportWinner)
+    family_count = func.count(
+        func.distinct(
+            tuple_(family_model.root_record_id, winner_model.family_revision_id, winner_model.entity_binding_id)
+        )
+    )
+    ambiguity_statement = (
+        statement.with_only_columns(entity_model.canonical_value, maintain_column_froms=True)
+        .group_by(entity_model.canonical_value)
+        .having(family_count > 1)
+        .limit(1)
+    )
+    if (await session.execute(ambiguity_statement)).first() is not None:
+        raise CustomImportReadUnavailableError("selected entity is not eligible for root detail")
+
+
+async def _entity_winner_locator(
+    session: AsyncSession,
+    context: _ReadContext,
+    entity: EntityLocator,
+) -> WinnerLocator:
+    """Resolve one entity only when its pinned profile has one root family."""
+
+    winner_model = context.model(CustomImportWinner)
+    family_model = context.model(CustomImportFamilyRevision)
+    entity_model = context.model(CustomImportEntityBinding)
+
+    entity_statement = (
+        _winner_statement(context)
+        .join(
+            entity_model,
+            and_(
+                entity_model.entity_binding_id == winner_model.entity_binding_id,
+                entity_model.dataset_id == winner_model.dataset_id,
+            ),
+        )
+        .where(
+            entity_model.adapter_id == entity.adapter_id,
+            entity_model.canonical_value == entity.value,
+        )
+    )
+    family_rows = (
+        await session.execute(
+            entity_statement.with_only_columns(
+                family_model.root_record_id,
+                winner_model.family_revision_id,
+                winner_model.entity_binding_id,
+                maintain_column_froms=True,
+            )
+            .distinct()
+            .limit(2)
+        )
+    ).all()
+    if not family_rows:
+        await verify_published_generation(session, context.target)
+        raise CustomImportReadEntityAbsentError("selected entity has no eligible root family")
+    if len(family_rows) != 1:
+        raise CustomImportReadUnavailableError("selected entity is not eligible for root detail")
+    root_record_id, family_revision_id, entity_binding_id = family_rows[0]
+    selected_row = (
+        await session.execute(
+            entity_statement.where(
+                family_model.root_record_id == root_record_id,
+                winner_model.family_revision_id == family_revision_id,
+                winner_model.entity_binding_id == entity_binding_id,
+            )
+            .order_by(winner_model.context_key_sha256)
+            .limit(1)
+        )
+    ).one_or_none()
+    if selected_row is None:
+        raise CustomImportReadUnavailableError("selected entity is not eligible for root detail")
+    winner, family = _winner_row(selected_row, context.profile_context_slot > 0)[:2]
+    return _winner_locator(winner, family)
 
 
 async def _hydrate_root_detail(
@@ -1442,13 +2526,88 @@ async def _hydrate_root_detail(
     ],
     scope_digest: str,
 ) -> RootDetail:
-    winner, family, root_revision, _context_child = selected_row
-    if family.child_count > MAX_DETAIL_CHILDREN:
-        raise CustomImportReadUnavailableError("selected family exceeds the bounded detail child limit")
+    return (await _hydrate_selected_families(session, context, (selected_row,), scope_digest))[0]
+
+
+async def _hydrate_complete_family_entities(
+    session, context, selected_rows, entity_values, scope_digest, *, is_page=False
+):
+    """Preflight every entity and bound projections retained for ASCII-wire pages.
+
+    Each scalar/membership batch keeps the existing detail child bound; a page
+    cannot multiply the size of an unchecked database hydration by its row count.
+    Detail keeps its existing final UTF-8 response bound instead.
+    """
+
+    rows_by_entity = {}
+    for index, (selected_row, entity_value) in enumerate(zip(selected_rows, entity_values, strict=True)):
+        rows_by_entity.setdefault(entity_value, []).append((index, selected_row))
+    batches = [[]]
+    batch_children = 0
+    for entity_rows in rows_by_entity.values():
+        children = sum(selected_row[1].child_count for _, selected_row in entity_rows)
+        if any(selected_row[1].child_count < 0 for _, selected_row in entity_rows) or children > MAX_DETAIL_CHILDREN:
+            raise CustomImportReadUnavailableError("selected families exceed the bounded detail child limit")
+        if batch_children + children > MAX_DETAIL_CHILDREN:
+            batches.append([])
+            batch_children = 0
+        batches[-1].append(entity_rows)
+        batch_children += children
+    projections = [None] * len(selected_rows)
+    for batch in batches:
+        batch_rows = [selected_row for entity_rows in batch for _, selected_row in entity_rows]
+        hydrated = iter(
+            await _hydrate_selected_families(
+                session,
+                context,
+                tuple(batch_rows),
+                scope_digest,
+            )
+        )
+        for entity_rows in batch:
+            families = tuple(next(hydrated) for _ in entity_rows)
+            if is_page and (
+                len(_canonical_bytes({"families": [full_family_payload(family) for family in families]}))
+                > MAX_FAMILY_RESPONSE_BYTES
+            ):
+                raise CustomImportReadUnavailableError("selected family response exceeds its bound")
+            for (index, _), family in zip(entity_rows, families, strict=True):
+                projections[index] = family
+    return tuple(projections)
+
+
+async def _hydrate_selected_families(
+    session: AsyncSession,
+    context: _ReadContext,
+    selected_rows: tuple[
+        tuple[
+            CustomImportWinner, CustomImportFamilyRevision, CustomImportRootRevision, CustomImportChildRevision | None
+        ],
+        ...,
+    ],
+    scope_digest: str,
+) -> tuple[RootDetail, ...]:
+    """Hydrate a bounded selected page with batched scalar and membership reads."""
+
+    if not selected_rows:
+        return ()
+    if (
+        any(selected_row[1].child_count < 0 for selected_row in selected_rows)
+        or sum(selected_row[1].child_count for selected_row in selected_rows) > MAX_DETAIL_CHILDREN
+    ):
+        raise CustomImportReadUnavailableError("selected families exceed the bounded detail child limit")
     root_fields = _detail_root_fields(context.definition)
-    root_rows_by_key = await _root_scalar_rows(session, context, (root_revision.root_revision_id,), root_fields)
-    child_rows = await _family_child_rows(session, context, family)
-    if len(child_rows) != family.child_count:
+    root_rows_by_key = await _root_scalar_rows(
+        session, context, tuple(selected_row[2].root_revision_id for selected_row in selected_rows), root_fields
+    )
+    child_rows = await _family_child_rows(session, context, *(selected_row[1] for selected_row in selected_rows))
+    children_by_family = {selected_row[1].family_revision_id: [] for selected_row in selected_rows}
+    for family_child, child in child_rows:
+        children_by_family[family_child.family_revision_id].append((family_child, child))
+    if any(
+        len(children_by_family[selected_row[1].family_revision_id]) != selected_row[1].child_count
+        for selected_row in selected_rows
+    ):
         raise CustomImportReadUnavailableError("selected family child membership is incomplete")
     child_fields_by_slot = _detail_child_fields_by_slot(context)
     projected_child_fields = tuple(field for fields in child_fields_by_slot.values() for field in fields)
@@ -1458,16 +2617,18 @@ async def _hydrate_root_detail(
         tuple(child.child_revision_id for _, child in child_rows),
         projected_child_fields,
     )
-    family_child_records = tuple(
-        _detail_child(family_child, child, context, child_fields_by_slot, child_scalar_rows)
-        for family_child, child in child_rows
-    )
-    return RootDetail(
-        target=context.target,
-        winner=_winner_locator(winner, family),
-        root_fields=_project_field_values(root_fields, root_revision.root_revision_id, root_rows_by_key),
-        children=family_child_records,
-        authorization_scope_sha256=scope_digest,
+    return tuple(
+        RootDetail(
+            target=context.target,
+            winner=_winner_locator(winner, family),
+            root_fields=_project_field_values(root_fields, root_revision.root_revision_id, root_rows_by_key),
+            children=tuple(
+                _detail_child(family_child, child, context, child_fields_by_slot, child_scalar_rows)
+                for family_child, child in children_by_family[family.family_revision_id]
+            ),
+            authorization_scope_sha256=scope_digest,
+        )
+        for winner, family, root_revision, _context_child in selected_rows
     )
 
 
@@ -1500,33 +2661,37 @@ def _detail_child_fields_by_slot(context: _ReadContext) -> dict[int, tuple[Field
 async def _family_child_rows(
     session: AsyncSession,
     context: _ReadContext,
-    family: CustomImportFamilyRevision,
+    *families: CustomImportFamilyRevision,
 ) -> tuple[tuple[CustomImportFamilyChild, CustomImportChildRevision], ...]:
-    if family.child_count == 0:
+    family_child_model = context.model(CustomImportFamilyChild)
+    child_model = context.model(CustomImportChildRevision)
+
+    family_keys = tuple((family.family_revision_id, family.root_record_id) for family in families if family.child_count)
+    if not family_keys:
         return ()
     statement = (
-        select(CustomImportFamilyChild, CustomImportChildRevision)
-        .select_from(CustomImportFamilyChild)
+        select(family_child_model, child_model)
+        .select_from(family_child_model)
         .join(
-            CustomImportChildRevision,
+            child_model,
             and_(
-                CustomImportChildRevision.child_revision_id == CustomImportFamilyChild.child_revision_id,
-                CustomImportChildRevision.dataset_id == CustomImportFamilyChild.dataset_id,
-                CustomImportChildRevision.schema_revision_id == CustomImportFamilyChild.schema_revision_id,
-                CustomImportChildRevision.root_record_id == CustomImportFamilyChild.root_record_id,
-                CustomImportChildRevision.collection_slot == CustomImportFamilyChild.collection_slot,
+                child_model.child_revision_id == family_child_model.child_revision_id,
+                child_model.dataset_id == family_child_model.dataset_id,
+                child_model.schema_revision_id == family_child_model.schema_revision_id,
+                child_model.root_record_id == family_child_model.root_record_id,
+                child_model.collection_slot == family_child_model.collection_slot,
             ),
         )
         .where(
-            CustomImportFamilyChild.family_revision_id == family.family_revision_id,
-            CustomImportFamilyChild.dataset_id == context.target.dataset_id,
-            CustomImportFamilyChild.schema_revision_id == context.target.schema_revision_id,
-            CustomImportFamilyChild.root_record_id == family.root_record_id,
+            tuple_(family_child_model.family_revision_id, family_child_model.root_record_id).in_(family_keys),
+            family_child_model.dataset_id == context.target.dataset_id,
+            family_child_model.schema_revision_id == context.target.schema_revision_id,
         )
         .order_by(
-            CustomImportFamilyChild.collection_slot,
-            CustomImportChildRevision.source_ordinal,
-            CustomImportChildRevision.child_revision_id,
+            family_child_model.family_revision_id,
+            family_child_model.collection_slot,
+            child_model.source_ordinal,
+            child_model.child_revision_id,
         )
     )
     return tuple((family_child, child) for family_child, child in (await session.execute(statement)).all())
@@ -1537,7 +2702,7 @@ def _detail_child(
     child: CustomImportChildRevision,
     context: _ReadContext,
     fields_by_slot: Mapping[int, tuple[Field, ...]],
-    scalar_rows_by_key: Mapping[tuple[int, int], CustomImportChildScalar],
+    scalar_rows_by_key: Mapping[tuple[int, int], Row],
 ) -> ReadChild:
     fields = fields_by_slot.get(family_child.collection_slot)
     collection_name = context.collection_names_by_slot.get(family_child.collection_slot)
@@ -1554,11 +2719,14 @@ __all__ = (
     "CustomImportReadAuthorizationError",
     "CustomImportReadCache",
     "CustomImportReadCursorError",
+    "CustomImportReadEntityAbsentError",
     "CustomImportReadError",
     "CustomImportReadRequestError",
     "CustomImportReadService",
     "CustomImportReadUnavailableError",
     "DEFAULT_READ_TIMEOUT_MS",
+    "EntityFamilySet",
+    "EntityLocator",
     "ExtensionReadAuthorization",
     "ExtensionReadAuthorizer",
     "ExtensionReadScope",
@@ -1568,7 +2736,9 @@ __all__ = (
     "MAX_ORDER_TERMS",
     "MAX_PAGE_SIZE",
     "MAX_READ_TIMEOUT_MS",
+    "NpiEntityRelationQuery",
     "PinnedReadTarget",
+    "PreparedNpiEntityRelation",
     "READ_CORE_CONTRACT",
     "ReadChild",
     "ReadCursorCodec",
@@ -1576,6 +2746,7 @@ __all__ = (
     "ReadFieldValue",
     "ReadFilter",
     "ReadOrderTerm",
+    "RootDetailRequest",
     "RootDetail",
     "SearchItem",
     "SearchPage",

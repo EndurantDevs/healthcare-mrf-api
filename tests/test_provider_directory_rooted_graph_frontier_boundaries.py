@@ -134,15 +134,16 @@ async def test_registration_sets_action_before_sorted_specs(monkeypatch) -> None
     async def record_action(_database, action, *_args):
         events.append(("action", action))
 
-    async def record_spec(_database, _acquisition_id, spec):
-        events.append(("spec", spec.query_id))
+    async def record_specs(_database, _acquisition_id, specs, *, action):
+        events.append(("specs", tuple(spec.query_id for spec in specs)))
+        assert action == "derive"
 
     monkeypatch.setattr(frontier, "set_store_action", record_action)
-    monkeypatch.setattr(frontier, "insert_work_spec", record_spec)
+    monkeypatch.setattr(frontier, "admit_work_specs", record_specs)
     await frontier.register_rooted_graph_frontier(
         _Database({"canonical_api_base": API_BASE}),
         claim,
         result,
     )
     assert events[0] == ("action", "derive")
-    assert events[1][0] == "spec"
+    assert events[1][0] == "specs"

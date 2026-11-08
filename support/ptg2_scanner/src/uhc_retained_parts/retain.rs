@@ -137,17 +137,15 @@ pub fn retain_uhc_artifact(request: &UHCRetainRequest) -> io::Result<UHCRetainSu
     let raw_reverification = Duration::ZERO;
 
     let raw_publish_started = Instant::now();
-    let (raw_reused, authoritative_raw_identity) = if let Some(temporary) = raw_temporary.take()
-    {
-        publish_or_verify_raw(
+    let (raw_reused, authoritative_raw_identity) = match raw_temporary.take() {
+        Some(temporary) => publish_or_verify_raw(
             &root,
             &raw_name,
             temporary,
             &expected_sha256,
             request.expected_byte_count,
-        )?
-    } else {
-        (true, input_identity)
+        )?,
+        None => (true, input_identity),
     };
     let raw_publish = raw_publish_started.elapsed();
     root.verify_path_identity()?;

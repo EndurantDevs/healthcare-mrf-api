@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
-import re
 from typing import Any
 
 from api.billing_search_cursor import (
@@ -38,6 +38,7 @@ _ZIP5_PATTERN = re.compile(r"[0-9]{5}", flags=re.ASCII)
 _MODIFIER_PATTERN = re.compile(r"[A-Z0-9]{1,8}", flags=re.ASCII)
 _PLACE_OF_SERVICE_PATTERN = re.compile(r"[0-9]{2}", flags=re.ASCII)
 _CURSOR_PATTERN = re.compile(r"[A-Za-z0-9_-]+", flags=re.ASCII)
+_ADMISSION_PARAMETERS = frozenset({"plan_release_serving_revision_id", "plan_release_binding_set_digest"})
 _ALLOWED_PARAMETERS = frozenset(
     {
         "billing_entity_ref",
@@ -102,7 +103,7 @@ def _accessor_values(
             continue
         try:
             return list(accessor(field_name))
-        except (KeyError, TypeError):
+        except KeyError, TypeError:
             continue
         except Exception:
             raise request_failure() from None
@@ -136,7 +137,7 @@ def _closed_parameter_names(
         raise request_failure()
     name_set = frozenset(parameter_names)
     if not _REQUIRED_PARAMETERS.issubset(name_set) or not name_set.issubset(
-        _ALLOWED_PARAMETERS
+        _ALLOWED_PARAMETERS | _ADMISSION_PARAMETERS
     ):
         raise request_failure()
     return tuple(sorted(parameter_names))
@@ -226,9 +227,7 @@ def _canonical_geo(
         raise request_failure()
     return (
         None,
-        _canonical_decimal(
-            values_by_name["lat"], minimum=Decimal("-90"), maximum=Decimal("90")
-        ),
+        _canonical_decimal(values_by_name["lat"], minimum=Decimal("-90"), maximum=Decimal("90")),
         _canonical_decimal(
             values_by_name["long"],
             minimum=Decimal("-180"),
@@ -294,10 +293,7 @@ def _optional_cursor(values_by_name: Mapping[str, Any]) -> str | None:
         values_by_name["cursor"],
         maximum_characters=BILLING_SEARCH_CURSOR_MAX_CHARACTERS,
     )
-    if (
-        not token.startswith(f"{BILLING_SEARCH_CURSOR_PREFIX}_")
-        or _CURSOR_PATTERN.fullmatch(token) is None
-    ):
+    if not token.startswith(f"{BILLING_SEARCH_CURSOR_PREFIX}_") or _CURSOR_PATTERN.fullmatch(token) is None:
         raise request_failure()
     return token
 
@@ -307,16 +303,22 @@ def _query_values(
 ) -> tuple[dict[str, Any], tuple[tuple[str, str], ...]]:
     parameter_names = _closed_parameter_names(parameters)
     values_by_name = {
-        parameter_name: _single_parameter(parameters, parameter_name)
-        for parameter_name in parameter_names
+        parameter_name: _single_parameter(parameters, parameter_name) for parameter_name in parameter_names
     }
+    if _ADMISSION_PARAMETERS.intersection(parameter_names):
+        if not _ADMISSION_PARAMETERS.issubset(parameter_names):
+            raise request_failure()
+        for name, pattern in (
+            ("plan_release_serving_revision_id", r"hpserve_[0-9A-HJKMNP-TV-Z]{26}"),
+            ("plan_release_binding_set_digest", r"[0-9a-f]{64}"),
+        ):
+            if re.fullmatch(pattern, _strict_ascii_scalar(values_by_name[name])) is None:
+                raise request_failure()
     query_pairs = normalize_billing_search_query_pairs(
         tuple(
             (
                 parameter_name,
-                _strict_ascii_scalar(
-                    values_by_name[parameter_name], maximum_characters=2048
-                ),
+                _strict_ascii_scalar(values_by_name[parameter_name], maximum_characters=2048),
             )
             for parameter_name in parameter_names
         )
@@ -328,7 +330,9 @@ def _request_fingerprint_sha256(
     query_pairs: tuple[tuple[str, str], ...],
 ) -> str:
     filter_pairs = tuple(
-        query_pair for query_pair in query_pairs if query_pair[0] != "cursor"
+        query_pair
+        for query_pair in query_pairs
+        if query_pair[0] != "cursor" and query_pair[0] not in _ADMISSION_PARAMETERS
     )
     return _framed_sha256(
         _REQUEST_FINGERPRINT_DOMAIN,
@@ -369,14 +373,10 @@ def _request_fields(
     values_by_name: Mapping[str, Any],
     query_pairs: tuple[tuple[str, str], ...],
 ) -> dict[str, Any]:
-    code_system, code = _canonical_code_fields(
-        values_by_name["code_system"], values_by_name["code"]
-    )
+    code_system, code = _canonical_code_fields(values_by_name["code_system"], values_by_name["code"])
     zip5, latitude, longitude, radius_miles = _canonical_geo(values_by_name)
     return {
-        "billing_entity_ref": _canonical_billing_entity_ref(
-            values_by_name["billing_entity_ref"]
-        ),
+        "billing_entity_ref": _canonical_billing_entity_ref(values_by_name["billing_entity_ref"]),
         "plan_release_id": _canonical_plan_release(values_by_name["plan_release_id"]),
         "code_system": code_system,
         "code": code,

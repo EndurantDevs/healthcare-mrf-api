@@ -7,8 +7,10 @@ import pytest
 
 
 class _CatalogResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, status=200):
         self.payload = payload
+        self.status = status
+        self.content = self
 
     async def __aenter__(self):
         return self
@@ -19,13 +21,17 @@ class _CatalogResponse:
     async def json(self, **_kwargs):
         return self.payload
 
+    async def iter_chunked(self, _size):
+        yield self.payload
+
 
 class _CatalogClient:
-    def __init__(self, payload):
+    def __init__(self, payload, status=200):
         self.payload = payload
+        self.status = status
 
     def get(self, *_args, **_kwargs):
-        return _CatalogResponse(self.payload)
+        return _CatalogResponse(self.payload, self.status)
 
 
 @pytest.fixture
@@ -58,6 +64,7 @@ async def test_source_catalog_selects_latest_reviewed_csvs(monkeypatch, econ_mod
                 "title": "State Drug Utilization Data 2025",
                 "distribution": [{"downloadURL": "https://example.invalid/sdud-2025.csv"}],
             },
+            {"title": "State Drug Utilization Data 2027", "distribution": []},
             {
                 "title": "NADAC (National Average Drug Acquisition Cost) 2024",
                 "distribution": [{"downloadURL": "https://example.invalid/nadac-2024.csv"}],
@@ -65,6 +72,10 @@ async def test_source_catalog_selects_latest_reviewed_csvs(monkeypatch, econ_mod
             {
                 "title": "NADAC (National Average Drug Acquisition Cost) 2026",
                 "distribution": [{"accessURL": "https://example.invalid/nadac-2026.csv"}],
+            },
+            {
+                "title": "ACA Federal Upper Limits",
+                "distribution": [],
             },
             {
                 "title": "ACA Federal Upper Limits",
@@ -192,6 +203,68 @@ async def test_fetch_sdud_uses_prescription_counts_only(monkeypatch, econ_module
     assert result["IL"]["12345678901"]["volume"] == 150
     assert "12345678902" not in result["IL"]
     assert "XX" not in result
+
+
+@pytest.mark.asyncio
+async def test_source_csvs_reject_invalid_prices_and_sum_duplicate_utilization(
+    monkeypatch, econ_module
+):
+    csv_by_name = {
+        "sdud.csv": (
+            "state,ndc,product_name,number_of_prescriptions\n"
+            "IL,12345-6789-01,Example,2\n"
+            "IL,12345678901,Duplicate,3\n"
+            "IL,123,Short,4\n"
+            "IL,12345678904,Whitespace,   \n"
+        ),
+        "nadac.csv": (
+            "ndc,nadac_per_unit\n"
+            "12345-6789-01,1.25\n"
+            "123,3\n"
+            "12345678902,0\n"
+            ",5\n"
+            "12345678903,invalid\n"
+            "12345678904, \n"
+            "12345678905,   \n"
+        ),
+        "ful.csv": (
+            "NDC,ACA FUL\n"
+            "12345-6789-01,1\n"
+            "123,2\n"
+            "12345678902,-1\n"
+            ",5\n"
+            "12345678903,invalid\n"
+        ),
+    }
+
+    async def _fake_download(_client, _url, tmp_dir, file_name):
+        path = Path(tmp_dir) / file_name
+        path.write_text(csv_by_name[file_name], encoding="utf-8")
+        return str(path)
+
+    monkeypatch.setattr(econ_module, "_download_to_temp_csv", _fake_download)
+    sdud = await econ_module._fetch_sdud(None, "https://example.invalid/sdud.csv")
+    nadac = await econ_module._fetch_nadac(None, "https://example.invalid/nadac.csv")
+    ful = await econ_module._fetch_ful(None, "https://example.invalid/ful.csv")
+
+    assert sdud == {"IL": {"12345678901": {"name": "Example", "volume": 5}}}
+    assert nadac == {"12345678901": 1.25}
+    assert ful == {"12345678901": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_source_csv_download_rejects_http_failure_before_writing(tmp_path, econ_module):
+    client = _CatalogClient(b"state,ndc\n", status=503)
+    with pytest.raises(ValueError, match="HTTP 503"):
+        await econ_module._download_to_temp_csv(
+            client, "https://example.invalid/data.csv", str(tmp_path), "failed.csv"
+        )
+    assert not (tmp_path / "failed.csv").exists()
+    client.status = 200
+    path = await econ_module._download_to_temp_csv(
+        client, "https://example.invalid/data.csv", str(tmp_path), "valid.csv"
+    )
+    assert Path(path).read_bytes() == b"state,ndc\n"
 
 
 def test_pharmacy_economics_rows_preserve_margin_inputs(econ_module):

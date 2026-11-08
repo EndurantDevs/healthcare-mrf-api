@@ -20,13 +20,12 @@ from process import provider_directory_profile as profile
 from process import provider_directory_profile as profile_artifact
 from process import provider_directory_profile_capacity_attestation as lease
 from process import provider_directory_profile_runtime_observation as runtime
-from tests.provider_directory_profile_capacity_runtime_test_support import (
-    PROFILE_RUNTIME_WITNESS_MIGRATION_REVISION,
-)
+from tests import provider_directory_profile_delta_test_support as delta_support
 from tests.provider_directory_profile_delta_schema_fixtures import (
     _create_delta_contract_tables,
 )
 from tests.provider_directory_profile_delta_test_support import _delta_database
+from tests.test_company_registry_group_assertion_migration import _assert_source_inventory_migration_head
 from tests.test_provider_directory_profile_capacity_preflight import _serving_state
 from tests.test_provider_directory_profile_capacity_preflight_postgres import (
     _POSTGRES_DSN_ENV,
@@ -37,6 +36,52 @@ from tests.test_provider_directory_profile_capacity_preflight_postgres import (
 )
 
 _ALEMBIC_ADOPTION_BASE_REVISION = "20260610143000_address_checksums_bigint"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_cleanup_failing", [False, True])
+async def test_delta_schema_cleanup_is_scoped_and_always_disconnects(monkeypatch, is_cleanup_failing):
+    """Drop owned tables separately and close even when cleanup fails."""
+    statements = []
+
+    async def record_status(statement):
+        """Record cleanup and simulate a failed table drop."""
+        statements.append(statement)
+        if is_cleanup_failing and statement.startswith("DROP TABLE"):
+            raise RuntimeError("cleanup failed")
+
+    database = types.SimpleNamespace(
+        connect=AsyncMock(),
+        scalar=AsyncMock(return_value="profile_delta_test"),
+        all=AsyncMock(return_value=[('leaf"table',), ("parent",)]),
+        status=AsyncMock(side_effect=record_status),
+        disconnect=AsyncMock(),
+    )
+    monkeypatch.setattr(delta_support, "Database", lambda: database)
+    if is_cleanup_failing:
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            async with _delta_database(monkeypatch) as (yielded_database, schema):
+                assert yielded_database is database
+    else:
+        async with _delta_database(monkeypatch) as (yielded_database, schema):
+            assert yielded_database is database
+    query = database.all.await_args.args[0]
+    assert "WHERE n.nspname = :schema" in query
+    assert "ORDER BY c.relkind DESC, c.oid" in query
+    assert database.all.await_args.kwargs == {"schema": schema}
+    expected_statements = [
+        f"CREATE SCHEMA {profile.quote_identifier(schema)};",
+        f"DROP TABLE IF EXISTS {profile.qualified_table(schema, 'leaf"table')} CASCADE;",
+    ]
+    if not is_cleanup_failing:
+        expected_statements.extend(
+            [
+                f"DROP TABLE IF EXISTS {profile.qualified_table(schema, 'parent')} CASCADE;",
+                f"DROP SCHEMA IF EXISTS {profile.quote_identifier(schema)} CASCADE;",
+            ]
+        )
+    assert statements == expected_statements
+    database.disconnect.assert_awaited_once_with()
 
 
 def _install_invalid_lease_admission_stubs(monkeypatch, virtual_state):
@@ -249,8 +294,7 @@ async def test_runtime_observation_reads_migrated_postgres_snapshot(monkeypatch)
         pytest.skip(f"{_POSTGRES_DSN_ENV} is required")
     _configure_database(monkeypatch, dsn)
     monkeypatch.setattr(runtime, "build_baked_healthcare_source_commit", lambda: "d" * 40)
-    expected_heads = set(ScriptDirectory.from_config(Config("alembic.ini")).get_heads())
-    assert expected_heads == {"20260917130000_custom_import_generation_finality"}
+    expected_heads = _assert_registry_migration_lineage()
     async with _delta_database(monkeypatch) as (database, schema):
         monkeypatch.setenv("DB_SCHEMA", schema)
         await _upgrade_disposable_schema_to_head(dsn, schema)
@@ -263,9 +307,102 @@ async def test_runtime_observation_reads_migrated_postgres_snapshot(monkeypatch)
     assert observation == {
         "contract_id": runtime.PROFILE_RUNTIME_OBSERVATION_CONTRACT_ID,
         "healthcare_source_commit": "d" * 40,
-        "profile_migration_revision": PROFILE_RUNTIME_WITNESS_MIGRATION_REVISION,
+        "profile_migration_revision": next(iter(expected_heads)),
         "profile_schema_version": profile_artifact.PROFILE_SCHEMA_VERSION,
         "profile_strategy_version": profile_artifact.PROFILE_BUILD_STRATEGY_VERSION,
         "postgres_server_version_num": observation["postgres_server_version_num"],
     }
     assert observation["postgres_server_version_num"] >= 180000
+
+
+def _assert_custom_import_manual_acceptance_lineage(script):
+    """Preserve the joined custom-import verification and acceptance ancestry."""
+    assert script.get_revision("20261020210000_registry_manual_acceptance_join").down_revision == (
+        "20261020160000_registry_staged_verification_join",
+        "20261021110000_ptg_membership_import_idempotency",
+    )
+    assert script.get_revision("20261021110000_ptg_membership_import_idempotency").down_revision == (
+        "20261020200000_custom_import_manual_acceptance"
+    )
+    assert script.get_revision("20261020200000_custom_import_manual_acceptance").down_revision == (
+        "20261020190000_custom_import_verification_root_ranges"
+    )
+    assert script.get_revision("20261020190000_custom_import_verification_root_ranges").down_revision == (
+        "20261020180000_custom_import_verification_arms"
+    )
+    assert script.get_revision("20261020180000_custom_import_verification_arms").down_revision == (
+        "20261020150000_custom_import_staged_verification"
+    )
+    assert script.get_revision("20261020150000_custom_import_staged_verification").down_revision == (
+        "20261019010000_custom_import_build_continuation"
+    )
+    assert script.get_revision("20261019010000_custom_import_build_continuation").down_revision == (
+        "20261017010000_custom_import_raw_objects"
+    )
+    assert script.get_revision("20261017010000_custom_import_raw_objects").down_revision == (
+        "20261017210000_provider_directory_readiness_indexes"
+    )
+    assert script.get_revision("20261017210000_provider_directory_readiness_indexes").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+
+
+def _assert_registry_migration_lineage():
+    """Require the current joined head and every protected registry parent edge."""
+    script = ScriptDirectory.from_config(Config("alembic.ini"))
+    expected_heads = set(script.get_heads())
+    _assert_source_inventory_migration_head(script)
+    _assert_custom_import_manual_acceptance_lineage(script)
+    assert (
+        script.get_revision("20261019030000_provider_directory_role_schema").down_revision
+        == "20261019020000_registry_continuation_join"
+    )
+    assert script.get_revision("20261019020000_registry_continuation_join").down_revision == (
+        "20261019010000_registry_raw_object_join",
+        "20261019010000_custom_import_build_continuation",
+    )
+    assert script.get_revision("20261019010000_custom_import_build_continuation").down_revision == (
+        "20261017010000_custom_import_raw_objects"
+    )
+    assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
+        "20261010000000_custom_import_admission_indexes"
+    )
+    assert script.get_revision("20261019010000_registry_raw_object_join").down_revision == (
+        "20261018040000_registry_aca_source_notifications",
+        "20261017010000_custom_import_raw_objects",
+    )
+    assert script.get_revision("20261017010000_custom_import_raw_objects").down_revision == (
+        "20261017210000_provider_directory_readiness_indexes"
+    )
+    assert script.get_revision("20261018011000_network_candidate_custody").down_revision == (
+        "20261017040000_nppes_evidence_candidates",
+        "20261017210000_provider_directory_readiness_indexes",
+    )
+    assert script.get_revision("20261017210000_provider_directory_readiness_indexes").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+    assert script.get_revision("20261015020000_custom_import_query_projections").down_revision == (
+        "20261013010000_registry_custom_history_events"
+    )
+    assert script.get_revision("20261013010000_registry_custom_history_events").down_revision == (
+        "20261012010000_company_registry_name_origin"
+    )
+    assert script.get_revision("20261012010000_company_registry_name_origin").down_revision == (
+        "20261011010000_company_registry_group_assertions"
+    )
+    assert script.get_revision("20261010030000_registry_source_admission_receipt").down_revision == (
+        "20261010020000_registry_ptg_office_retention"
+    )
+    assert script.get_revision("20261010020000_registry_ptg_office_retention").down_revision == (
+        "20261010010000_registry_ptg_office_approval"
+    )
+    assert script.get_revision("20261010010000_registry_ptg_office_approval").down_revision == (
+        "20261009040000_registry_ptg_published_plan_scope"
+    )
+    assert script.get_revision("20261009040000_registry_ptg_published_plan_scope").down_revision == (
+        "20261009030000_network_catalog_evidence"
+    )
+    assert script.get_revision("20261006010000_nucc_reference_result_generation").down_revision == (
+        "20261007000000_custom_import_rejection_anti_joins"
+    )
+    return expected_heads

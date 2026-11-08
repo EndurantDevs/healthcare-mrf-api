@@ -104,9 +104,72 @@ def test_factorized_downgrade_refuses_immutable_v3_candidates(monkeypatch) -> No
     assert "CHECK (contract_version = 'plan_pricing_card_v2')" in sql
 
 
+def _assert_current_registry_head(script):
+    """Keep the complete catalog refresh and inventory revision chain explicit."""
+    assert script.get_heads() == ["20261107010000_custom_import_child_reference_aggregate"]
+    assert (
+        script.get_revision("20261029010000_registry_source_inventory").down_revision
+        == "20261028020000_registry_membership_refresh"
+    )
+    assert (
+        script.get_revision("20261028020000_registry_membership_refresh").down_revision
+        == "20261028010000_registry_fhir_catalog"
+    )
+
+
 def test_factorized_projection_precedes_the_unique_repository_head() -> None:
+    """Preserve factorized pricing ancestry through the current unique registry head."""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == ["20260917130000_custom_import_generation_finality"]
+    _assert_current_registry_head(script)
+    assert (
+        script.get_revision("20261019030000_provider_directory_role_schema").down_revision
+        == "20261019020000_registry_continuation_join"
+    )
+    assert script.get_revision("20261019020000_registry_continuation_join").down_revision == (
+        "20261019010000_registry_raw_object_join",
+        "20261019010000_custom_import_build_continuation",
+    )
+    assert script.get_revision("20261019010000_custom_import_build_continuation").down_revision == (
+        "20261017010000_custom_import_raw_objects"
+    )
+    assert script.get_revision("20261017020000_source_registry_snapshot_join").down_revision == (
+        "20261016060000_uhc_official_cohort_snapshots",
+        "20261017010000_registry_cms_source_notifications",
+    )
+    assert script.get_revision("20261017010000_registry_cms_source_notifications").down_revision == (
+        "20261016070000_registry_allowed_plan_scope"
+    )
+    assert script.get_revision("20261016070000_registry_allowed_plan_scope").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+    assert script.get_revision("20261016060000_uhc_official_cohort_snapshots").down_revision == (
+        "20261016050000_acquisition_validator_argument_types"
+    )
+    assert script.get_revision("20261015010000_plan_release_binding_cohorts").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+    assert script.get_revision("20261015020000_custom_import_query_projections").down_revision == (
+        "20261013010000_registry_custom_history_events"
+    )
+    assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
+        "20261010000000_custom_import_admission_indexes"
+    )
+    assert script.get_revision("20261010030000_registry_source_admission_receipt").down_revision == (
+        "20261010020000_registry_ptg_office_retention"
+    )
+    assert script.get_revision("20261010020000_registry_ptg_office_retention").down_revision == (
+        "20261010010000_registry_ptg_office_approval"
+    )
+    assert script.get_revision("20261010010000_registry_ptg_office_approval").down_revision == (
+        "20261009040000_registry_ptg_published_plan_scope"
+    )
+    assert script.get_revision("20261009040000_registry_ptg_published_plan_scope").down_revision == (
+        "20261009030000_network_catalog_evidence"
+    )
+    assert (
+        script.get_revision("20261006010000_nucc_reference_result_generation").down_revision
+        == "20261007000000_custom_import_rejection_anti_joins"
+    )
     factorized = script.get_revision("20260828120000_plan_pricing_factorized_projection")
     assert factorized.down_revision == ("20260829100000_activate_import_run_idempotency_scope")
     assert (

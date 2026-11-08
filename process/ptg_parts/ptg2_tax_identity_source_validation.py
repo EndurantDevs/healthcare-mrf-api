@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from db.connection import db
+from process.ptg_parts.ptg2_snapshot_candidates import snapshot_candidate_relation
 from process.ptg_parts.db_tables import _quote_ident
 from process.ptg_parts.ptg2_tax_identity_source_aggregate_reuse import (
     validate_reused_tax_identity_aggregate_manifest,
@@ -56,7 +57,7 @@ async def validate_stored_tax_identity_source_counts(
                        COUNT(*) FILTER (
                            WHERE tax_identity_state = 'unsupported_type'
                        )::bigint
-                  FROM {schema}.ptg2_provider_group_tax_identity_source
+                  FROM {snapshot_candidate_relation(session, schema, "ptg2_provider_group_tax_identity_source")}
                  WHERE snapshot_key = :snapshot_key
                 """),
             {"snapshot_key": _strict_int(snapshot_key)},
@@ -80,7 +81,7 @@ async def validate_stored_tax_identity_source_counts(
     merged_group_count = await session.scalar(
         db.text(f"""
             SELECT COUNT(*)::bigint
-              FROM {schema}.ptg2_provider_group_tax_identity
+              FROM {snapshot_candidate_relation(session, schema, "ptg2_provider_group_tax_identity")}
              WHERE snapshot_key = :snapshot_key
             """),
         {"snapshot_key": _strict_int(snapshot_key)},
@@ -137,7 +138,7 @@ async def _count_reduction_mismatches(
                        MAX(stored.tin_key) FILTER (
                            WHERE stored.tax_identity_state = 'matched_ein'
                        ) AS maximum_tin_key
-                  FROM {schema}.ptg2_provider_group_tax_identity_source AS stored
+                  FROM {snapshot_candidate_relation(session, schema, "ptg2_provider_group_tax_identity_source")}  AS stored
                  WHERE stored.snapshot_key = :snapshot_key
                    AND stored.provider_group_global_id_128 > :previous_group_id
                    AND stored.provider_group_global_id_128 <= :last_group_id
@@ -145,7 +146,7 @@ async def _count_reduction_mismatches(
             )
             SELECT COUNT(*)::bigint
               FROM local
-              LEFT JOIN {schema}.ptg2_provider_group_tax_identity AS merged
+              LEFT JOIN {snapshot_candidate_relation(session, schema, "ptg2_provider_group_tax_identity")}  AS merged
                 ON merged.snapshot_key = :snapshot_key
                AND merged.provider_group_global_id_128 = local.group_id
              WHERE merged.snapshot_key IS NULL

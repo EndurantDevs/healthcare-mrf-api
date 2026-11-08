@@ -7,6 +7,18 @@ from __future__ import annotations
 import datetime
 from collections.abc import Mapping, Sequence
 from typing import Any
+from process import provider_directory_profile_initial_contract as initial
+
+from process.provider_directory_cms_capacity_contract import (
+    CMS_ADMISSION_FIELD,
+    CMS_CONTROL_CONTRACT,
+    CMS_CONTROL_REQUEST_CONTRACT,
+    CMS_PREFLIGHT_CONTRACT,
+    CMS_PREFLIGHT_REQUEST_CONTRACT,
+    assert_cms_geometry_matches_request,
+    validated_cms_capacity_geometry,
+    validated_cms_database_binding,
+)
 
 from process.provider_directory_profile_capacity_preflight_contract import (
     CAPACITY_CONTROL_PLANE_RECEIPT_SHA256_FIELD,
@@ -114,16 +126,28 @@ def _validated_control_plane_request(
     raw: Any,
     healthcare_request: Any,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    request = _exact(
-        raw, _CONTROL_PLANE_REQUEST_FIELDS, "control_plane_request_invalid"
+    admission = healthcare_request.cms_nonprofile_admission
+    fields = (
+        _CONTROL_PLANE_REQUEST_FIELDS | {CMS_ADMISSION_FIELD}
+        if admission is not None
+        else _CONTROL_PLANE_REQUEST_FIELDS
     )
+    if initial.is_initial_request(healthcare_request):
+        fields = fields | {"profile_materialization"}
+    request = _exact(raw, fields, "control_plane_request_invalid")
     intent = _exact(
         request.get("signing_intent"),
         _SIGNING_INTENT_FIELDS,
         "control_plane_intent_invalid",
     )
     if (
-        request.get("contract_id") != CONTROL_PLANE_PREFLIGHT_REQUEST_CONTRACT_ID
+        request.get("contract_id")
+        != (
+            CMS_CONTROL_REQUEST_CONTRACT
+            if admission is not None
+            else (initial.CONTROL_REQUEST_CONTRACT if initial.is_initial_request(healthcare_request)
+                  else CONTROL_PLANE_PREFLIGHT_REQUEST_CONTRACT_ID)
+        )
         or intent.get("contract_id") != CONTROL_PLANE_SIGNING_INTENT_CONTRACT_ID
     ):
         _fail("control_plane_request_contract_invalid")
@@ -132,6 +156,8 @@ def _validated_control_plane_request(
         request.get("profile_execution") != healthcare_request.execution_payload
         or request.get("provider_directory_profile_capacity_limits")
         != healthcare_request.limits_payload
+        or request.get(CMS_ADMISSION_FIELD) != admission
+        or request.get("profile_materialization") != healthcare_request.request_payload.get("profile_materialization")
     ):
         _fail("execution_or_limits_mismatch")
     storage = _validated_storage_observation(request.get("storage_observation"))
@@ -185,9 +211,16 @@ def _expected_control_plane_receipt_fields(
         for field_name, field_value in receipt_by_field.items()
         if field_name != "receipt_sha256"
     }
+    receipt_contract = (
+        CMS_CONTROL_CONTRACT
+        if healthcare_request.cms_nonprofile_admission is not None
+        else (initial.CONTROL_RECEIPT_CONTRACT if initial.is_initial_request(healthcare_request)
+              else CONTROL_PLANE_PREFLIGHT_CONTRACT_ID)
+    )
     return {
-        "contract_id": CONTROL_PLANE_PREFLIGHT_CONTRACT_ID,
-        "request_contract_id": CONTROL_PLANE_PREFLIGHT_REQUEST_CONTRACT_ID,
+        "contract_id": receipt_contract,
+        **({"profile_materialization": initial.MATERIALIZATION} if initial.is_initial_request(healthcare_request) else {}),
+        "request_contract_id": request["contract_id"],
         "request_sha256": preflight_domain_sha256(
             CONTROL_PLANE_REQUEST_DIGEST_DOMAIN, request
         ),
@@ -206,7 +239,7 @@ def _expected_control_plane_receipt_fields(
             CONTROL_PLANE_QUIESCENCE_DIGEST_DOMAIN, quiescence
         ),
         "receipt_sha256": preflight_domain_sha256(
-            CONTROL_PLANE_PREFLIGHT_CONTRACT_ID, receipt_digest_by_field
+            receipt_contract, receipt_digest_by_field
         ),
     }
 
@@ -219,9 +252,8 @@ def _validated_control_plane_receipt(
 ) -> dict[str, Any]:
     """Validate one control_plane receipt and its held follow-up proof."""
 
-    receipt_by_field = _exact(
-        raw, _CONTROL_PLANE_RECEIPT_FIELDS, "control_plane_receipt_invalid"
-    )
+    fields = _CONTROL_PLANE_RECEIPT_FIELDS | ({"profile_materialization"} if initial.is_initial_request(healthcare_request) else set())
+    receipt_by_field = _exact(raw, fields, "control_plane_receipt_invalid")
     expires_at = _timestamp(
         receipt_by_field.get("expires_at"), "control_plane_expiry_invalid"
     )
@@ -264,9 +296,15 @@ def _expected_healthcare_receipt_fields(
         for field_name, field_value in receipt_by_field.items()
         if field_name != "receipt_sha256"
     }
+    receipt_contract = (
+        CMS_PREFLIGHT_CONTRACT
+        if healthcare_request.cms_nonprofile_admission is not None
+        else (initial.RECEIPT_CONTRACT if initial.is_initial_request(healthcare_request) else CAPACITY_PREFLIGHT_CONTRACT_ID)
+    )
     return {
-        "contract_id": CAPACITY_PREFLIGHT_CONTRACT_ID,
-        "request_contract_id": CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID,
+        "contract_id": receipt_contract,
+        **({"profile_materialization": initial.MATERIALIZATION} if initial.is_initial_request(healthcare_request) else {}),
+        "request_contract_id": healthcare_request.request_payload["contract_id"],
         "request_sha256": healthcare_request.request_sha256,
         "request_nonce": healthcare_request.request_nonce,
         CAPACITY_CONTROL_PLANE_RECEIPT_SHA256_FIELD: control_plane_receipt[
@@ -279,13 +317,14 @@ def _expected_healthcare_receipt_fields(
         "capacity_limits": healthcare_request.limits_payload,
         "capacity_limits_sha256": healthcare_request.limits_sha256,
         "serving_generation_preflight_sha256": preflight_domain_sha256(
-            CAPACITY_SERVING_PREFLIGHT_DIGEST_DOMAIN, dict(serving)
+            initial.TARGET_CONTRACT if initial.initial_profile_for_request(healthcare_request) else CAPACITY_SERVING_PREFLIGHT_DIGEST_DOMAIN,
+            dict(serving)
         ),
         "quiescence_sha256": preflight_domain_sha256(
             CAPACITY_QUIESCENCE_DIGEST_DOMAIN, quiescence
         ),
         "receipt_sha256": preflight_domain_sha256(
-            CAPACITY_PREFLIGHT_CONTRACT_ID, receipt_digest_by_field
+            receipt_contract, receipt_digest_by_field
         ),
     }
 
@@ -297,9 +336,14 @@ def _validated_healthcare_receipt(
 ) -> dict[str, Any]:
     """Validate one durable healthcare receipt and every embedded digest."""
 
-    receipt_by_field = _exact(
-        raw, _HEALTHCARE_RECEIPT_FIELDS, "healthcare_receipt_invalid"
+    fields = (
+        _HEALTHCARE_RECEIPT_FIELDS | {"database_binding"}
+        if healthcare_request.cms_nonprofile_admission is not None
+        else _HEALTHCARE_RECEIPT_FIELDS
     )
+    if initial.is_initial_request(healthcare_request):
+        fields = fields | {"profile_materialization"}
+    receipt_by_field = _exact(raw, fields, "healthcare_receipt_invalid")
     quiescence = _exact(
         receipt_by_field.get("quiescence"),
         _HEALTHCARE_QUIESCENCE_FIELDS,
@@ -340,7 +384,49 @@ def _validated_healthcare_receipt(
         receipt_by_field.get("capacity_geometry_hash"),
         "capacity_geometry_hash_invalid",
     )
+    _assert_capacity_receipt_geometry(receipt_by_field, healthcare_request)
     return receipt_by_field
+
+
+def _assert_capacity_receipt_geometry(receipt: Mapping[str, Any], request: Any) -> None:
+    """Keep purposes separate and bind CMS costs and database to their plan."""
+    if initial.is_initial_request(request):
+        from process import provider_directory_profile_capacity as capacity
+
+        try:
+            geometry = capacity.validated_capacity_geometry(receipt["capacity_geometry"])
+            snapshot = initial.validated_target_state(receipt["serving_generation_preflight"])
+        except ValueError:
+            _fail("initial_geometry_invalid")
+        if (not isinstance(geometry, initial.InitialCapacityGeometry)
+            or geometry.initial_target_state_sha256 != initial.target_state_sha256(snapshot)
+            or receipt["capacity_geometry_hash"] != capacity.capacity_geometry_hash(geometry)
+            or geometry.profile_as_of != request.execution.attestation.desired_profile_as_of
+            or receipt["required_reservation_bytes_by_storage_class"] != geometry.reservation_bytes_by_storage_class):
+            _fail("initial_geometry_binding_invalid")
+        return
+    if request.cms_nonprofile_admission is None:
+        geometry = receipt["capacity_geometry"]
+        if isinstance(geometry, Mapping) and (
+            geometry.get("contract_id") == "provider-directory-cms-nonprofile-capacity.v1"
+            or "admission_purpose" in geometry
+        ):
+            _fail("cms_geometry_requires_cms_request")
+        return
+    try:
+        plan = validated_cms_capacity_geometry(receipt["capacity_geometry"])
+        validated_cms_database_binding(receipt["database_binding"])
+        assert_cms_geometry_matches_request(plan, request)
+    except ValueError:
+        _fail("cms_geometry_invalid")
+    projection = receipt["artifact_scope_projection"]
+    if not isinstance(projection, Mapping) or (
+        receipt["capacity_geometry_hash"] != plan.capacity_geometry_hash
+        or receipt["required_reservation_bytes_by_storage_class"]
+        != dict(plan.reservation_bytes)
+        or projection.get("projection_hash") != plan.artifact_scope_projection_hash
+    ):
+        _fail("cms_geometry_binding_invalid")
 
 
 __all__ = (

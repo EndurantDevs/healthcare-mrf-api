@@ -8,11 +8,15 @@ reads, then chooses the one winning family/context for each declared profile.
 It does not accept query predicates: selection happens here, before a later
 read path can apply a threshold or result filter.
 
-The caller owns the surrounding transaction.  It must persist the immutable
-definition profile rows before candidate work and call :func:`seal_generation`
-only after the projection and winner helpers below have flushed.  P3 finality
-then recomputes its receipt from the P1 scalar and winner tables; this module
-never writes a second materialization seal.
+The caller owns the surrounding transaction. The persistence helpers validate
+their entire input before flushing pending work, then append protected native
+pages without committing. SQL derives current producer authority from immutable
+lineage; an actual runner binding adds an expectation but is not required. Empty
+inputs still flush and return zero. The caller must persist immutable definition
+profiles before candidate work and seal only after these helpers return. For a
+segmented build, its existing page-completion calls remain required in that same
+transaction. Finality recomputes its receipt from the scalar and winner tables;
+this module never writes a second materialization seal.
 """
 
 from __future__ import annotations
@@ -68,6 +72,7 @@ __all__ = (
     "WinnerCandidate",
     "WinnerMaterialization",
     "WinnerMaterializationError",
+    "iter_ordered_profile_winners",
     "materialize_winners",
     "persist_scalar_projections",
     "persist_selection_profiles",
@@ -407,12 +412,24 @@ def scalar_projection_models(
 ) -> tuple[CustomImportRootScalar | CustomImportChildScalar, ...]:
     """Build definition-verified immutable ORM rows for scalar persistence."""
 
+    root_rows, child_rows = _scalar_projection_rows(definition, root_scalars, child_scalars, child_collection_slots)
+    return tuple(_root_scalar_model(row) for row in root_rows) + tuple(_child_scalar_model(row) for row in child_rows)
+
+
+def _scalar_projection_values(definition, *, root_scalars=(), child_scalars=(), child_collection_slots=None):
+    """Apply the same complete row validation before native array encoding."""
+
+    root_rows, child_rows = _scalar_projection_rows(definition, root_scalars, child_scalars, child_collection_slots)
+    return tuple(_root_scalar_values(row) for row in root_rows) + tuple(_child_scalar_values(row) for row in child_rows)
+
+
+def _scalar_projection_rows(definition, root_scalars, child_scalars, child_collection_slots):
     _validated_definition(definition)
     root_rows = tuple(root_scalars)
     child_rows = tuple(child_scalars)
     slots = _validated_child_collection_slots(definition, child_collection_slots) if child_rows else {}
     _validate_scalar_projection_rows(definition, root_rows, child_rows, slots)
-    return tuple(_root_scalar_model(row) for row in root_rows) + tuple(_child_scalar_model(row) for row in child_rows)
+    return root_rows, child_rows
 
 
 async def persist_scalar_projections(
@@ -431,9 +448,9 @@ async def persist_scalar_projections(
         child_scalars=child_scalars,
         child_collection_slots=child_collection_slots,
     )
-    _add_models(session, models, "scalar projection")
-    await _flush(session, "scalar projection")
-    return len(models)
+    from process.custom_import.materialization_store import persist_scalar_models
+
+    return await persist_scalar_models(session, models)
 
 
 def selection_profile_models(
@@ -553,6 +570,67 @@ def _select_winners(
     return selected_winner_by_context
 
 
+def iter_ordered_profile_winners(
+    definition: CustomImportDefinition,
+    *,
+    generation: GenerationIdentity,
+    profile_slot: int,
+    candidates: ValidatedWinnerCandidateStream,
+    child_collection_slots: Mapping[str, int] | None = None,
+) -> Iterator[MaterializedWinner]:
+    """Reduce one trusted profile ordered by entity, context digest, and text.
+
+    Skip other valid scopes. Winners are provisional until actual exhaustion;
+    later validation failures must prevent sealing the unpublished generation.
+    """
+
+    _validated_definition(definition)
+    if not isinstance(generation, GenerationIdentity):
+        raise WinnerMaterializationError("generation identity is malformed")
+    if not isinstance(candidates, ValidatedWinnerCandidateStream):
+        raise WinnerMaterializationError("winner candidates require a validated generation stream")
+    if candidates.generation != generation:
+        raise WinnerMaterializationError("winner candidate stream generation does not match materialization")
+    if type(profile_slot) is not int or not 1 <= profile_slot <= len(definition.selection_profiles):
+        raise WinnerMaterializationError("winner profile slot is outside the materialization profile range")
+    profile_scopes = _profile_scopes(definition, child_collection_slots)
+    candidate_contract = _winner_candidate_contract(definition, profile_scopes)
+    profile = definition.selection_profiles[profile_slot - 1]
+    scope = profile_scopes[profile_slot - 1]
+    selected: _SelectedWinner | None = None
+    previous_key = None
+    for raw_candidate in candidates.consume():
+        candidate = _normalize_winner_candidate(raw_candidate, candidate_contract)
+        if candidate.candidate.context_collection_slot != scope.collection_slot:
+            continue
+        _validate_selection_values(profile, candidate, candidate_contract.fields_by_id)
+        canonical_context_key, context_key_sha256 = _context_key(profile, candidate, candidate_contract.fields_by_id)
+        key = (candidate.candidate.entity_binding_id, context_key_sha256, canonical_context_key)
+        if selected is not None:
+            assert previous_key is not None
+            if key[:2] == previous_key[:2] and key[2] != previous_key[2]:
+                raise WinnerMaterializationError("winner context digest collision has different canonical context")
+            if key < previous_key:
+                raise WinnerMaterializationError("winner candidates are not in entity/context order")
+            if key != previous_key:
+                _raise_selected_winner_tie_conflicts({(profile_slot, previous_key[0], previous_key[2]): selected})
+                yield _winner_from_selection(generation, selected)
+                selected = None
+        selected = _reduce_selected_winner(
+            selected,
+            profile,
+            profile_slot,
+            candidate,
+            candidate_contract.fields_by_id,
+            canonical_context_key,
+            context_key_sha256,
+        )
+        previous_key = key
+    if selected is not None:
+        _raise_selected_winner_tie_conflicts({(profile_slot, key[0], key[2]): selected})
+        yield _winner_from_selection(generation, selected)
+
+
 def _materialized_winners(
     generation: GenerationIdentity,
     selected_winner_by_context: Mapping[tuple[int, int, str], _SelectedWinner],
@@ -624,9 +702,9 @@ async def persist_winner_materialization(session: Any, materialization: WinnerMa
     """
 
     models = winner_materialization_models(materialization)
-    _add_models(session, models, "winner materialization")
-    await _flush(session, "winner materialization")
-    return len(models)
+    from process.custom_import.materialization_store import persist_winner_models
+
+    return await persist_winner_models(session, materialization, models)
 
 
 def _validated_definition(value: object) -> CustomImportDefinition:
@@ -743,43 +821,42 @@ def _typed_scalar(field: Field, raw_scalar: object) -> TypedScalar:
         if not field.nullable:
             raise ScalarProjectionError(f"projected field {field.field_id} cannot be null")
         return TypedScalar(field_type=field.value_type, value_state="null")
-    if field.value_type == "string":
+    field_type, value = _normalized_scalar_value(field.value_type, raw_scalar, field.field_id)
+    return TypedScalar(field_type=field_type, value_state="value", **{f"{field_type}_value": value})
+
+
+def _normalized_scalar_value(field_type: str, raw_scalar: object, field_id: str) -> tuple[str, object]:
+    if field_type == "string":
         if (
             not isinstance(raw_scalar, str)
             or "\x00" in raw_scalar
-            or _utf8_size(raw_scalar, field.field_id) > MAX_SCALAR_STRING_UTF8_BYTES
+            or _utf8_size(raw_scalar, field_id) > MAX_SCALAR_STRING_UTF8_BYTES
         ):
-            raise ScalarProjectionError(f"projected string field {field.field_id} exceeds its storage shape")
-        return TypedScalar(field_type="string", value_state="value", string_value=raw_scalar)
-    if field.value_type == "integer":
+            raise ScalarProjectionError(f"projected string field {field_id} exceeds its storage shape")
+        return "string", raw_scalar
+    if field_type == "integer":
         if (
             isinstance(raw_scalar, bool)
             or not isinstance(raw_scalar, int)
             or not MIN_SCALAR_INTEGER <= raw_scalar <= MAX_SCALAR_INTEGER
         ):
-            raise ScalarProjectionError(f"projected integer field {field.field_id} is outside BIGINT storage")
-        return TypedScalar(field_type="integer", value_state="value", integer_value=raw_scalar)
-    if field.value_type == "decimal":
-        return TypedScalar(
-            field_type="decimal", value_state="value", decimal_value=_decimal(raw_scalar, field.field_id)
-        )
-    if field.value_type == "boolean":
+            raise ScalarProjectionError(f"projected integer field {field_id} is outside BIGINT storage")
+        return "integer", raw_scalar
+    if field_type == "decimal":
+        return "decimal", _decimal(raw_scalar, field_id)
+    if field_type == "boolean":
         if not isinstance(raw_scalar, bool):
-            raise ScalarProjectionError(f"projected boolean field {field.field_id} is not boolean")
-        return TypedScalar(field_type="boolean", value_state="value", boolean_value=raw_scalar)
-    if field.value_type == "date":
+            raise ScalarProjectionError(f"projected boolean field {field_id} is not boolean")
+        return "boolean", raw_scalar
+    if field_type == "date":
         if not isinstance(raw_scalar, dt.date) or isinstance(raw_scalar, dt.datetime):
-            raise ScalarProjectionError(f"projected date field {field.field_id} is not a date")
-        return TypedScalar(field_type="date", value_state="value", date_value=raw_scalar)
-    if field.value_type == "timestamp":
+            raise ScalarProjectionError(f"projected date field {field_id} is not a date")
+        return "date", raw_scalar
+    if field_type == "timestamp":
         if not isinstance(raw_scalar, dt.datetime) or raw_scalar.tzinfo is None or raw_scalar.utcoffset() is None:
-            raise ScalarProjectionError(f"projected timestamp field {field.field_id} must be timezone-aware")
-        return TypedScalar(
-            field_type="timestamp",
-            value_state="value",
-            timestamp_value=raw_scalar.astimezone(dt.UTC),
-        )
-    raise ScalarProjectionError(f"projected field {field.field_id} has an unsupported type")
+            raise ScalarProjectionError(f"projected timestamp field {field_id} must be timezone-aware")
+        return "timestamp", raw_scalar.astimezone(dt.UTC)
+    raise ScalarProjectionError(f"projected field {field_id} has an unsupported type")
 
 
 def _decimal(value: object, field_id: str) -> Decimal:
@@ -903,14 +980,18 @@ def _validate_typed_scalar(scalar: TypedScalar) -> None:
         if any(value is not None for value in values):
             raise ScalarProjectionError("null scalar rows cannot contain a typed value")
         return
-    if scalar.logical_value is None or sum(value is not None for value in values) != 1:
+    logical_value = scalar.logical_value
+    if logical_value is None or sum(value is not None for value in values) != 1:
         raise ScalarProjectionError("value scalar rows require exactly one typed value")
-    field = Field("synthetic", 1, scalar.field_type, False, 1, None)
-    _typed_scalar(field, scalar.logical_value)
+    _normalized_scalar_value(scalar.field_type, logical_value, "synthetic")
 
 
 def _root_scalar_model(row: RootScalarProjection) -> CustomImportRootScalar:
-    return CustomImportRootScalar(
+    return CustomImportRootScalar(**_root_scalar_values(row))
+
+
+def _root_scalar_values(row: RootScalarProjection) -> dict[str, object | None]:
+    return dict(
         root_revision_id=row.target.root_revision_id,
         dataset_id=row.target.dataset_id,
         schema_revision_id=row.target.schema_revision_id,
@@ -925,7 +1006,11 @@ def _root_scalar_model(row: RootScalarProjection) -> CustomImportRootScalar:
 
 
 def _child_scalar_model(row: ChildScalarProjection) -> CustomImportChildScalar:
-    return CustomImportChildScalar(
+    return CustomImportChildScalar(**_child_scalar_values(row))
+
+
+def _child_scalar_values(row: ChildScalarProjection) -> dict[str, object | None]:
+    return dict(
         child_revision_id=row.target.child_revision_id,
         dataset_id=row.target.dataset_id,
         schema_revision_id=row.target.schema_revision_id,
@@ -1065,7 +1150,26 @@ def _replace_winner_when_better(
     context_key_sha256: bytes,
 ) -> None:
     winner_context = (profile_slot, candidate.candidate.entity_binding_id, canonical_context_key)
-    selected_winner = selected_winner_by_context.get(winner_context)
+    selected_winner_by_context[winner_context] = _reduce_selected_winner(
+        selected_winner_by_context.get(winner_context),
+        profile,
+        profile_slot,
+        candidate,
+        fields_by_id,
+        canonical_context_key,
+        context_key_sha256,
+    )
+
+
+def _reduce_selected_winner(
+    selected_winner: _SelectedWinner | None,
+    profile: SelectionProfile,
+    profile_slot: int,
+    candidate: _NormalizedWinnerCandidate,
+    fields_by_id: Mapping[str, Field],
+    canonical_context_key: str,
+    context_key_sha256: bytes,
+) -> _SelectedWinner:
     if selected_winner is not None:
         comparison = _compare_candidates(
             profile,
@@ -1075,7 +1179,7 @@ def _replace_winner_when_better(
         )
         if comparison == 0:
             physical_conflict, typed_conflict = _winner_tie_conflicts(selected_winner.candidate, candidate)
-            selected_winner_by_context[winner_context] = _SelectedWinner(
+            return _SelectedWinner(
                 profile_id=selected_winner.profile_id,
                 profile_slot=selected_winner.profile_slot,
                 canonical_context_key=selected_winner.canonical_context_key,
@@ -1084,10 +1188,9 @@ def _replace_winner_when_better(
                 has_physical_tie_conflict=selected_winner.has_physical_tie_conflict or physical_conflict,
                 has_typed_tie_conflict=selected_winner.has_typed_tie_conflict or typed_conflict,
             )
-            return
         if comparison > 0:
-            return
-    selected_winner_by_context[winner_context] = _SelectedWinner(
+            return selected_winner
+    return _SelectedWinner(
         profile_id=profile.profile_id,
         profile_slot=profile_slot,
         canonical_context_key=canonical_context_key,

@@ -26,7 +26,6 @@ from process.ptg_parts.ptg_source_attempt_guard import (
     source_file_import_id_from_payload,
 )
 
-
 _ACTION_KINDS = frozenset(
     {
         "start_admitted",
@@ -36,13 +35,12 @@ _ACTION_KINDS = frozenset(
         "worker_start_admitted",
     }
 )
-_TERMINAL_OUTER_STATUSES = frozenset(
-    {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}
-)
+_TERMINAL_OUTER_STATUSES = frozenset({"succeeded", "failed", "canceled", "cancelled", "dead_letter"})
 _OUTER_RUN_FIELDS = """
     run_id,
     importer,
     status,
+    phase_detail,
     params,
     metrics,
     source_file_import_id,
@@ -50,9 +48,7 @@ _OUTER_RUN_FIELDS = """
     retry_of_run_id,
     heartbeat_at
 """
-_ALLOWED_STATE_UPDATES = frozenset(
-    {"status", "phase_detail", "heartbeat_at", "progress", "import_id"}
-)
+_ALLOWED_STATE_UPDATES = frozenset({"status", "phase_detail", "heartbeat_at", "progress", "import_id"})
 _UNSET_SOURCE_ID = object()
 
 
@@ -79,7 +75,7 @@ class _SourceActionAdmission:
 
 
 def _schema_table(schema_name: str, table_name: str) -> str:
-    return f'{_quote_ident(schema_name)}.{_quote_ident(table_name)}'
+    return f"{_quote_ident(schema_name)}.{_quote_ident(table_name)}"
 
 
 async def _load_outer_run(
@@ -122,11 +118,7 @@ async def _execute_statement(
         if "unexpected keyword argument" not in str(error):
             raise
         bindparams = getattr(statement, "bindparams", None)
-        bound_statement = (
-            bindparams(**dict(parameters))
-            if callable(bindparams)
-            else statement
-        )
+        bound_statement = bindparams(**dict(parameters)) if callable(bindparams) else statement
         return await status(bound_statement)
 
 
@@ -149,13 +141,9 @@ def _event_state(
         "retry_of_run_id": outer_run.get("retry_of_run_id"),
         "source_file_import_id": outer_run.get("source_file_import_id"),
         "import_id": outer_run.get("import_id"),
-        "params_source_file_import_id": params_by_name.get(
-            "source_file_import_id"
-        ),
+        "params_source_file_import_id": params_by_name.get("source_file_import_id"),
         "params_import_id": params_by_name.get("import_id"),
-        "metrics_source_file_import_id": metrics_by_name.get(
-            "source_file_import_id"
-        ),
+        "metrics_source_file_import_id": metrics_by_name.get("source_file_import_id"),
         "metrics_import_id": metrics_by_name.get("import_id"),
         "attempt_id": attempt_id,
     }
@@ -265,11 +253,7 @@ async def _apply_state_updates(
             default=str,
         )
     await session.execute(
-        text(
-            f"UPDATE {outer_run_table} SET "
-            + ", ".join(assignment_clauses)
-            + " WHERE run_id = :run_id"
-        ),
+        text(f"UPDATE {outer_run_table} SET " + ", ".join(assignment_clauses) + " WHERE run_id = :run_id"),
         bind_values_by_name,
     )
     outer_run.update(state_updates)
@@ -291,15 +275,9 @@ def _validate_locked_outer_run(
         admission.expected_source_file_import_id is not _UNSET_SOURCE_ID
         and locked_source_id != admission.expected_source_file_import_id
     ):
-        raise PTGSourceAttemptIdentityError(
-            "queued PTG source-attempt identity changed"
-        )
-    if str(outer_run.get("status") or "").strip().lower() in (
-        _TERMINAL_OUTER_STATUSES
-    ):
-        raise PTGSourceAttemptTerminalError(
-            "terminal PTG source attempt cannot admit remote work"
-        )
+        raise PTGSourceAttemptIdentityError("queued PTG source-attempt identity changed")
+    if str(outer_run.get("status") or "").strip().lower() in (_TERMINAL_OUTER_STATUSES):
+        raise PTGSourceAttemptTerminalError("terminal PTG source attempt cannot admit remote work")
     _validate_worker_selection(outer_run, admission.worker_selection)
 
 
@@ -317,6 +295,12 @@ def _validate_worker_selection(
         if persisted_status == "finalizing"
         or (
             persisted_status == "running"
+            and persisted_importer == "mrf"
+            and str(outer_run.get("phase_detail") or "").strip().lower()
+            in {"mrf finalizing", "mrf finalizing parser queue drained"}
+        )
+        or (
+            persisted_status == "running"
             and persisted_importer != "ptg"
             and isinstance(metrics, Mapping)
             and type(metrics.get("total_chunks")) is int
@@ -328,14 +312,9 @@ def _validate_worker_selection(
         not persisted_importer
         or persisted_importer not in worker_selection.allowed_importers
         or required_role not in worker_selection.allowed_roles
-        or (
-            worker_selection.request_importer is not None
-            and worker_selection.request_importer != persisted_importer
-        )
+        or (worker_selection.request_importer is not None and worker_selection.request_importer != persisted_importer)
     ):
-        raise PTGSourceAttemptIdentityError(
-            "worker selector does not match durable import run"
-        )
+        raise PTGSourceAttemptIdentityError("worker selector does not match durable import run")
 
 
 async def _admit_source_backed_action(
@@ -425,13 +404,8 @@ async def admit_existing_outer_run_action(
             outer_run,
             required=False,
         )
-        if (
-            expected_source_file_import_id is not _UNSET_SOURCE_ID
-            and source_id != expected_source_file_import_id
-        ):
-            raise PTGSourceAttemptIdentityError(
-                "queued PTG source-attempt identity changed"
-            )
+        if expected_source_file_import_id is not _UNSET_SOURCE_ID and source_id != expected_source_file_import_id:
+            raise PTGSourceAttemptIdentityError("queued PTG source-attempt identity changed")
         if source_id is None:
             return outer_run
         return await _admit_source_backed_action(

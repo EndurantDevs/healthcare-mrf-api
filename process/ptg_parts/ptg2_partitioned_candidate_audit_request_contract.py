@@ -3,13 +3,15 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from process.ptg_parts.ptg2_partitioned_candidate_audit_types import (
     PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_ITEMS,
     PTG2_PARTITIONED_CANDIDATE_AUDIT_TARGET_ITEMS,
     PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_NETWORK_DIGESTS,
+    PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_REQUEST_BYTES,
     PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT,
     PartitionedCandidateAuditBinding,
     PartitionedCandidateAuditPlan,
@@ -25,6 +27,22 @@ from process.ptg_parts.ptg2_partitioned_candidate_audit_types import (
 
 
 AuditPlanItem = PartitionedSourceChallenge | PartitionedPersistedOccurrence
+
+
+def _validate_request_size(payload: Mapping[str, Any]) -> None:
+    """Enforce the existing wire limit without retaining a second JSON body."""
+
+    byte_count = 0
+    try:
+        encoder = json.JSONEncoder(
+            separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        )
+        for fragment in encoder.iterencode(payload):
+            byte_count += len(fragment.encode("utf-8"))
+            if byte_count > PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_REQUEST_BYTES:
+                raise ValueError("partitioned_audit_request_too_large")
+    except (TypeError, UnicodeEncodeError) as exc:
+        raise ValueError("partitioned_audit_request_fields_invalid") from exc
 
 
 def _validated_binding(
@@ -79,6 +97,11 @@ def _validated_binding(
 def _validated_source_challenge(
     challenge: PartitionedSourceChallenge,
 ) -> PartitionedSourceChallenge:
+    if (
+        len(challenge.network_name_digests)
+        > PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_NETWORK_DIGESTS
+    ):
+        raise ValueError("partitioned_audit_network_digests_invalid")
     network_digests = tuple(
         lower_hex(
             digest,
@@ -86,11 +109,7 @@ def _validated_source_challenge(
         )
         for digest in challenge.network_name_digests
     )
-    if (
-        len(network_digests)
-        > PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_NETWORK_DIGESTS
-        or network_digests != tuple(sorted(set(network_digests)))
-    ):
+    if network_digests != tuple(sorted(set(network_digests))):
         raise ValueError("partitioned_audit_network_digests_invalid")
     return PartitionedSourceChallenge(
         ordinal=nonnegative_integer(
@@ -400,10 +419,12 @@ def _partition_request(
         partition_digest=partition_digest,
         request_digest="0" * 64,
     )
-    return replace(
+    audit_request = replace(
         provisional_request,
         request_digest=canonical_digest(provisional_request.unsigned_payload),
     )
+    _validate_request_size(audit_request.payload)
+    return audit_request
 
 
 def build_partitioned_candidate_audit_plan(
@@ -431,17 +452,11 @@ def build_partitioned_candidate_audit_plan(
     plan_digest = canonical_digest(
         _plan_payload(validated_binding, source_count, audit_items)
     )
-    partitions = _partition_items(audit_items)
-    requests = tuple(
-        _partition_request(
-            binding=validated_binding,
-            source_challenge_count=source_count,
-            plan_digest=plan_digest,
-            partition_index=partition_index,
-            partition_count=len(partitions),
-            partition_items=partition,
-        )
-        for partition_index, partition in enumerate(partitions)
+    requests = _bounded_partition_requests(
+        binding=validated_binding,
+        source_count=source_count,
+        plan_digest=plan_digest,
+        audit_items=audit_items,
     )
     return PartitionedCandidateAuditPlan(
         binding=validated_binding,
@@ -451,6 +466,43 @@ def build_partitioned_candidate_audit_plan(
         source_occurrence_count=source_occurrence_count,
         persisted_occurrence_count=persisted_count,
     )
+
+
+def _bounded_partition_requests(
+    *,
+    binding: PartitionedCandidateAuditBinding,
+    source_count: int,
+    plan_digest: str,
+    audit_items: Sequence[AuditPlanItem],
+) -> tuple[PartitionedCandidateAuditRequest, ...]:
+    """Split oversized count partitions without splitting any audit item."""
+
+    partitions = _partition_items(audit_items)
+    while True:
+        requests: list[PartitionedCandidateAuditRequest] = []
+        next_partitions: list[tuple[AuditPlanItem, ...]] = []
+        for partition_index, partition in enumerate(partitions):
+            try:
+                audit_request = _partition_request(
+                    binding=binding,
+                    source_challenge_count=source_count,
+                    plan_digest=plan_digest,
+                    partition_index=partition_index,
+                    partition_count=len(partitions),
+                    partition_items=partition,
+                )
+            except ValueError as exc:
+                if str(exc) != "partitioned_audit_request_too_large" or len(partition) == 1:
+                    raise
+                midpoint = len(partition) // 2
+                next_partitions.extend((partition[:midpoint], partition[midpoint:]))
+            else:
+                requests.append(audit_request)
+                next_partitions.append(partition)
+        if len(next_partitions) == len(partitions):
+            return tuple(requests)
+        # Rebind every partition to the final count before sending any request.
+        partitions = tuple(next_partitions)
 
 
 __all__ = ["build_partitioned_candidate_audit_plan"]

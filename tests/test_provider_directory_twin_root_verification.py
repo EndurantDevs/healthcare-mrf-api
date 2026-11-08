@@ -355,6 +355,89 @@ class _VerificationStateConnection:
         return None
 
 
+def _private_header(**changes):
+    """Use an existing complete synthetic content proof for private admission parity."""
+    from tests.test_provider_directory_dataset_selection_bounded_db import _large_metadata_by_field
+
+    return dict(
+        dataset_id="dataset_shared", endpoint_id="endpoint_shared", import_run_id="root-shared",
+        acquisition_root_run_id="root-shared", status=importer.ENDPOINT_DATASET_VALIDATED,
+        dataset_hash="e" * 64, resource_count=1, verification_baseline_count=0,
+        publication_metadata_json=_large_metadata_by_field(1), completion_proof_required_version=None,
+        completion_proof_json=None, completion_proof_sha256=None, has_admission_receipt=False,
+        retired_candidate=False,
+    ) | changes
+
+
+@pytest.mark.parametrize("change", [
+    {}, {"has_admission_receipt": True, "publication_metadata_json": object()},
+    {"publication_metadata_json": None}, {"publication_metadata_json": []}, {"publication_metadata_json": {}},
+])
+def test_private_admission_keeps_valid_or_unproven_contenders(change):
+    """Sealed, unavailable and valid legacy evidence continue to block acquisition."""
+    assert importer._is_private_candidate_blocking(_private_header(**change)) is True
+
+
+@pytest.mark.parametrize("field,replacement", [
+    ("dataset_id", "another_dataset"), ("endpoint_id", "another_endpoint"),
+    ("acquisition_root_run_id", "another_run"), ("dataset_hash", "f" * 64), ("resource_count", 2),
+])
+def test_private_admission_binds_complete_header_identity(field, replacement):
+    """A complete proof for a different header is provably invalid."""
+    assert importer._is_private_candidate_blocking(_private_header(**{field: replacement})) is False
+
+
+def test_private_admission_preserves_root_fallback_and_shard_bound():
+    """Legacy root fallback and oversized proof treatment match the existing predicate."""
+    assert importer._is_private_candidate_blocking(_private_header(acquisition_root_run_id=None)) is True
+    state_by_field = _private_header()
+    proof = state_by_field["publication_metadata_json"][importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY]
+    proof["shards"] = [{}] * (importer.ADMISSION_LEGACY_SHARD_MAX_COUNT + 1)
+    assert importer._is_private_candidate_blocking(state_by_field) is True
+    assert importer._is_private_candidate_blocking(_private_header(retired_candidate=True)) is False
+
+
+@pytest.mark.parametrize("field,replacement", [
+    ("proof_sha256", "0" * 64), ("contract_id", "unknown"), ("shards", []),
+    ("resource_hash_contract", "unknown"), ("semantic_projection_as_of", "2020-01-01"),
+])
+def test_private_admission_reuses_full_proof_validation(field, replacement):
+    """Malformed stored evidence cannot become a valid blocker by retaining its header."""
+    state_by_field = _private_header()
+    proof = state_by_field["publication_metadata_json"][importer.PROVIDER_DIRECTORY_CONTENT_PROOF_METADATA_KEY]
+    proof[field] = replacement
+    assert importer._is_private_candidate_blocking(state_by_field) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("next_state", [None, "validated", "acquiring", "incomplete"])
+async def test_private_admission_keeps_locked_order_and_resumes_after_invalid(next_state):
+    """Skip one invalid contender while retaining active and validated conflicts."""
+    from types import SimpleNamespace
+
+    invalid = _private_header(dataset_hash="f" * 64)
+    contender = _private_header(dataset_id="next_dataset", status=next_state, has_admission_receipt=True)
+    observations = []
+
+    async def first(query, **parameters):
+        """Record immutable query arguments before the rejection list advances."""
+        observations.append((query, list(parameters["rejected_dataset_ids"])))
+        return invalid if len(observations) == 1 else contender if next_state else None
+
+    selected = await importer._locked_private_verification_state(
+        SimpleNamespace(first=first), '"private_source"."provider_directory_endpoint_dataset"',
+        {"include_twin_states": False},
+    )
+    assert [rejected for _, rejected in observations] == [[], ["dataset_shared"]]
+    assert all("LIMIT 1 FOR UPDATE" in query and "dataset.dataset_id <> :dataset_id" in query
+               for query, _ in observations)
+    if next_state:
+        assert selected["dataset_id"] == "next_dataset" and selected["status"] == next_state
+        assert selected["publication_metadata_json"] is None
+    else:
+        assert selected == {}
+
+
 @pytest.mark.asyncio
 async def test_terminal_successor_lookup_is_enabled_only_for_twin_candidates():
     connection = _VerificationStateConnection()

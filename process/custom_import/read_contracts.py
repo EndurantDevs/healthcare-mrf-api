@@ -12,11 +12,18 @@ from typing import Protocol
 
 READ_CORE_CONTRACT = "custom-import-read-core/v1"
 MAX_FILTER_TERMS = 3
+MAX_PROVIDER_FILTER_TERMS = 4
+MAX_PROVIDER_ORDER_TERMS = 4
+MAX_GROUPED_PREDICATE_TERMS = 6
+MAX_GROUPED_CHILD_PREDICATE_TERMS = 7
 MAX_ORDER_TERMS = 3
 MAX_PAGE_SIZE = 100
+MAX_NPI_PAGE_SIZE = 200
 MAX_PAGE_OFFSET = 1_000_000
 MAX_CURSOR_TTL_SECONDS = 900
 MAX_DETAIL_CHILDREN = 1_000
+MAX_FULL_FAMILY_PAGE_SIZE = 50
+MAX_FAMILY_RESPONSE_BYTES = 256 * 1024
 DEFAULT_READ_TIMEOUT_MS = 10_000
 MAX_READ_TIMEOUT_MS = 30_000
 
@@ -35,6 +42,10 @@ class CustomImportReadAuthorizationError(CustomImportReadError):
 
 class CustomImportReadCursorError(CustomImportReadError):
     """The page cursor is malformed, stale, or bound to another request."""
+
+
+class CustomImportReadEntityAbsentError(CustomImportReadError):
+    """An authorized entity has no eligible family in the pinned target."""
 
 
 class CustomImportReadRequestError(CustomImportReadError):
@@ -135,6 +146,7 @@ __all__ = (
     "CustomImportReadAuthorizationError",
     "CustomImportReadCache",
     "CustomImportReadCursorError",
+    "CustomImportReadEntityAbsentError",
     "CustomImportReadError",
     "CustomImportReadRequestError",
     "CustomImportReadUnavailableError",
@@ -145,6 +157,11 @@ __all__ = (
     "MAX_CURSOR_TTL_SECONDS",
     "MAX_DETAIL_CHILDREN",
     "MAX_FILTER_TERMS",
+    "MAX_PROVIDER_FILTER_TERMS",
+    "MAX_PROVIDER_ORDER_TERMS",
+    "MAX_GROUPED_PREDICATE_TERMS",
+    "MAX_GROUPED_CHILD_PREDICATE_TERMS",
+    "MAX_NPI_PAGE_SIZE",
     "MAX_ORDER_TERMS",
     "MAX_PAGE_OFFSET",
     "MAX_PAGE_SIZE",

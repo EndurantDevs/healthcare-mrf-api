@@ -28,11 +28,20 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import declared_attr
 
 from db.connection import Base, db
 from db.json_mixin import JSONOutputMixin
+from db.models.address_archive import AddressArchiveV2 as AddressArchiveV2
+from db.models.entity_address_unified import EntityAddressUnified
+from db.models.plan_release_storage import (
+    PlanReleaseSnapshotBinding as PlanReleaseSnapshotBinding,
+)
+from db.models.plan_release_storage import (
+    PlanReleaseSnapshotPin as PlanReleaseSnapshotPin,
+)
 from db.ptg2_v4_attempt_schema import (
     ATTEMPT_FENCE_TABLE,
     ATTEMPT_STAGE_RUN_INDEX,
@@ -46,9 +55,7 @@ def _resolve_ptg2_database_schema() -> str:
     runtime_schema = os.getenv("HLTHPRT_DB_SCHEMA")
     legacy_schema = os.getenv("DB_SCHEMA")
     if runtime_schema and legacy_schema and runtime_schema != legacy_schema:
-        raise RuntimeError(
-            "DB_SCHEMA and HLTHPRT_DB_SCHEMA must identify the same schema"
-        )
+        raise RuntimeError("DB_SCHEMA and HLTHPRT_DB_SCHEMA must identify the same schema")
     return runtime_schema or legacy_schema or "mrf"
 
 
@@ -69,13 +76,13 @@ NAME_SEARCH_VECTOR_WITH_OP = f"{NAME_SEARCH_VECTOR} gin_trgm_ops"
 
 
 class Issuer(Base, JSONOutputMixin):
-    __tablename__ = 'issuer'
+    __tablename__ = "issuer"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('issuer_id'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("issuer_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['issuer_id']
+    __my_index_elements__ = ["issuer_id"]
     state = Column(String(2))
     issuer_id = Column(Integer)
     issuer_name = Column(String)
@@ -83,14 +90,15 @@ class Issuer(Base, JSONOutputMixin):
     mrf_url = Column(String)
     data_contact_email = Column(String)
 
+
 class PlanFormulary(Base, JSONOutputMixin):
-    __tablename__ = 'plan_formulary'
+    __tablename__ = "plan_formulary"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('plan_id', 'year', 'drug_tier', 'pharmacy_type'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("plan_id", "year", "drug_tier", "pharmacy_type"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['plan_id', 'year', 'drug_tier', 'pharmacy_type']
+    __my_index_elements__ = ["plan_id", "year", "drug_tier", "pharmacy_type"]
     plan_id = Column(String(14), nullable=False)
     year = Column(Integer)
     drug_tier = Column(String)
@@ -166,7 +174,10 @@ class PartDMedicationCost(Base, JSONOutputMixin):
     __my_index_elements__ = ["canonical_id"]
     __my_additional_indexes__ = [
         {"index_elements": ("snapshot_id",), "name": "partd_med_cost_v2_snapshot_idx"},
-        {"index_elements": ("code_system", "code", "year", "effective_from"), "name": "partd_med_cost_v2_code_year_effective_idx"},
+        {
+            "index_elements": ("code_system", "code", "year", "effective_from"),
+            "name": "partd_med_cost_v2_code_year_effective_idx",
+        },
         {"index_elements": ("rxnorm_id", "year"), "name": "partd_med_cost_v2_rxnorm_year_idx"},
         {"index_elements": ("ndc11", "year"), "name": "partd_med_cost_v2_ndc11_year_idx"},
         {"index_elements": ("plan_ids",), "using": "gin", "name": "partd_med_cost_v2_plan_ids_gin_idx"},
@@ -516,14 +527,14 @@ class PharmacyLicenseRecordHistory(Base, JSONOutputMixin):
 
 
 class PlanIndividual(Base, JSONOutputMixin):
-    __tablename__ = 'plan_individual'
+    __tablename__ = "plan_individual"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('plan_id', 'year', 'drug_tier', 'pharmacy_type'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("plan_id", "year", "drug_tier", "pharmacy_type"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['plan_id', 'year', 'drug_tier', 'pharmacy_type']
-    __my_additional_indexes__ = [{'index_elements': ('int_code',)}, {'index_elements': ('display_name',)}]
+    __my_index_elements__ = ["plan_id", "year", "drug_tier", "pharmacy_type"]
+    __my_additional_indexes__ = [{"index_elements": ("int_code",)}, {"index_elements": ("display_name",)}]
     plan_id = Column(String(14), nullable=False)
     year = Column(Integer)
     drug_tier = Column(String)
@@ -536,14 +547,14 @@ class PlanIndividual(Base, JSONOutputMixin):
 
 
 class PlanFacility(Base, JSONOutputMixin):
-    __tablename__ = 'plan_facility'
+    __tablename__ = "plan_facility"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('plan_id', 'year', 'drug_tier', 'pharmacy_type'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("plan_id", "year", "drug_tier", "pharmacy_type"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['plan_id', 'year', 'drug_tier', 'pharmacy_type']
-    __my_additional_indexes__ = [{'index_elements': ('int_code',)}, {'index_elements': ('display_name',)}]
+    __my_index_elements__ = ["plan_id", "year", "drug_tier", "pharmacy_type"]
+    __my_additional_indexes__ = [{"index_elements": ("int_code",)}, {"index_elements": ("display_name",)}]
     plan_id = Column(String(14), nullable=False)
     year = Column(Integer)
     drug_tier = Column(String)
@@ -554,19 +565,20 @@ class PlanFacility(Base, JSONOutputMixin):
     coinsurance_rate = Column(Float)
     coinsurance_opt = Column(String)
 
+
 class Plan(Base, JSONOutputMixin):
-    __tablename__ = 'plan'
+    __tablename__ = "plan"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('plan_id', 'year'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("plan_id", "year"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['plan_id', 'year']
+    __my_index_elements__ = ["plan_id", "year"]
     __my_additional_indexes__ = [
-        {'index_elements': ('state',), 'name': 'plan_lookup_by_state'},
-        {'index_elements': ('issuer_id',), 'name': 'plan_lookup_by_issuer'},
-        {'index_elements': ('year',), 'name': 'plan_lookup_by_year'},
-        {'index_elements': ('issuer_id', 'year'), 'name': 'plan_lookup_by_issuer_year'},
+        {"index_elements": ("state",), "name": "plan_lookup_by_state"},
+        {"index_elements": ("issuer_id",), "name": "plan_lookup_by_issuer"},
+        {"index_elements": ("year",), "name": "plan_lookup_by_year"},
+        {"index_elements": ("issuer_id", "year"), "name": "plan_lookup_by_issuer_year"},
     ]
     plan_id = Column(String(14), nullable=False)  # len == 14
     year = Column(Integer)
@@ -583,27 +595,28 @@ class Plan(Base, JSONOutputMixin):
     last_updated_on = Column(TIMESTAMP)
     checksum = Column(Integer)
 
+
 class PlanAttributes(Base, JSONOutputMixin):
-    __tablename__ = 'plan_attributes'
+    __tablename__ = "plan_attributes"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('full_plan_id', 'year', 'attr_name'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("full_plan_id", "year", "attr_name"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['full_plan_id', 'year', 'attr_name']
+    __my_index_elements__ = ["full_plan_id", "year", "attr_name"]
     __my_additional_indexes__ = [
         {
-            'index_elements': ('full_plan_id gin_trgm_ops', 'year'),
-            'using': 'gin',
-            'name': 'find_all_variants',
+            "index_elements": ("full_plan_id gin_trgm_ops", "year"),
+            "using": "gin",
+            "name": "find_all_variants",
         },
         {
-            'index_elements': ('plan_id', 'year', 'attr_name'),
-            'name': 'plan_attributes_plan_year_attr_idx',
+            "index_elements": ("plan_id", "year", "attr_name"),
+            "name": "plan_attributes_plan_year_attr_idx",
         },
         {
-            'index_elements': ('plan_id', 'year'),
-            'name': 'plan_attributes_plan_year_idx',
+            "index_elements": ("plan_id", "year"),
+            "name": "plan_attributes_plan_year_idx",
         },
     ]
     plan_id = Column(String(14))
@@ -612,22 +625,23 @@ class PlanAttributes(Base, JSONOutputMixin):
     attr_name = Column(String)
     attr_value = Column(String)
 
+
 class PlanBenefits(Base, JSONOutputMixin):
-    __tablename__ = 'plan_benefits'
+    __tablename__ = "plan_benefits"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('full_plan_id', 'year', 'benefit_name'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("full_plan_id", "year", "benefit_name"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['full_plan_id', 'year', 'benefit_name']
+    __my_index_elements__ = ["full_plan_id", "year", "benefit_name"]
     __my_additional_indexes__ = [
         {
-            'index_elements': ('plan_id', 'year', 'benefit_name'),
-            'name': 'plan_benefits_plan_year_benefit_idx',
+            "index_elements": ("plan_id", "year", "benefit_name"),
+            "name": "plan_benefits_plan_year_benefit_idx",
         },
         {
-            'index_elements': ('plan_id', 'year'),
-            'name': 'plan_benefits_plan_year_idx',
+            "index_elements": ("plan_id", "year"),
+            "name": "plan_benefits_plan_year_idx",
         },
     ]
     plan_id = Column(String(14), nullable=False)
@@ -691,13 +705,13 @@ class PlanBenefitsMarketplace(Base, JSONOutputMixin):
 
 
 class PlanRatingAreas(Base, JSONOutputMixin):
-    __tablename__ = 'plan_rating_areas'
+    __tablename__ = "plan_rating_areas"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('county', 'zip3', 'state', 'market'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("county", "zip3", "state", "market"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['county', 'zip3', 'state', 'market']
+    __my_index_elements__ = ["county", "zip3", "state", "market"]
 
     state = Column(String(2))
     rating_area_id = Column(String)
@@ -707,20 +721,25 @@ class PlanRatingAreas(Base, JSONOutputMixin):
 
 
 class GeoZipLookup(Base, JSONOutputMixin):
-    __tablename__ = 'geo_zip_lookup'
+    __tablename__ = "geo_zip_lookup"
+    __runtime_schema_sync__ = False
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('zip_code'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("zip_code"),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
-    __my_index_elements__ = ['zip_code']
+    __my_index_elements__ = ["zip_code"]
     __my_additional_indexes__ = [
-        {'index_elements': ('state',), 'name': 'geo_zip_lookup_state_idx'},
-        {'index_elements': ('city_lower', 'state'), 'name': 'geo_zip_lookup_city_state_idx'},
-        {'index_elements': ('city_lower',), 'name': 'geo_zip_lookup_city_idx'},
-        {'index_elements': ('latitude', 'longitude'), 'name': 'geo_zip_lookup_lat_lng_idx'},
+        {"index_elements": ("state",), "name": "geo_zip_lookup_state_idx"},
+        {"index_elements": ("city_lower", "state"), "name": "geo_zip_lookup_city_state_idx"},
+        {"index_elements": ("city_lower",), "name": "geo_zip_lookup_city_idx"},
+        {"index_elements": ("latitude", "longitude"), "name": "geo_zip_lookup_lat_lng_idx"},
+        {"index_elements": ("latitude", "longitude", "zip_code"), "name": "geo_zip_lookup_coordinates_idx"},
     ]
-
     zip_code = Column(String(5), nullable=False)
     city = Column(String(128))
     city_lower = Column(String(128))
@@ -796,17 +815,24 @@ class GeoZipCensusProfile(Base, JSONOutputMixin):
 
 
 class PlanPrices(Base, JSONOutputMixin):
-    __tablename__ = 'plan_prices'
+    __tablename__ = "plan_prices"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('plan_id', 'year', 'checksum'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("plan_id", "year", "checksum"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['plan_id', 'year', 'checksum', ]
+    __my_index_elements__ = [
+        "plan_id",
+        "year",
+        "checksum",
+    ]
     __my_additional_indexes__ = [
-        {'index_elements': ('state', 'year', 'min_age', 'max_age', 'rating_area_id', 'couple'),
-            'using': 'gin',
-            'name': 'find_plan'}]
+        {
+            "index_elements": ("state", "year", "min_age", "max_age", "rating_area_id", "couple"),
+            "using": "gin",
+            "name": "find_plan",
+        }
+    ]
 
     plan_id = Column(String(14), nullable=False)
     year = Column(Integer)
@@ -822,25 +848,29 @@ class PlanPrices(Base, JSONOutputMixin):
     individual_tobacco_rate = Column(Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
     couple = Column(Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
     primary_subscriber_and_one_dependent = Column(
-        Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
+        Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None)
+    )
     primary_subscriber_and_two_dependents = Column(
-        Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
+        Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None)
+    )
     primary_subscriber_and_three_or_more_dependents = Column(
-        Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
+        Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None)
+    )
     couple_and_one_dependent = Column(Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
     couple_and_two_dependents = Column(Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
     couple_and_three_or_more_dependents = Column(
-        Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None))
+        Numeric(scale=2, precision=8, asdecimal=False, decimal_return_scale=None)
+    )
 
 
 class PlanTransparency(Base, JSONOutputMixin):
-    __tablename__ = 'plan_transparency'
+    __tablename__ = "plan_transparency"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('plan_id', 'year'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("plan_id", "year"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['plan_id', 'year']
+    __my_index_elements__ = ["plan_id", "year"]
     state = Column(String(2))
     issuer_name = Column(String)
     issuer_id = Column(Integer)
@@ -855,20 +885,20 @@ class PlanTransparency(Base, JSONOutputMixin):
 
 
 class PlanNPIRaw(Base, JSONOutputMixin):
-    __tablename__ = 'plan_npi_raw'
+    __tablename__ = "plan_npi_raw"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('npi', 'checksum_network'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("npi", "checksum_network"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['npi', 'checksum_network']
+    __my_index_elements__ = ["npi", "checksum_network"]
     __my_additional_indexes__ = [
-        {'index_elements': ('issuer_id', 'network_tier', 'year'), 'using': 'gin'},]
-
+        {"index_elements": ("issuer_id", "network_tier", "year"), "using": "gin"},
+    ]
 
     npi = Column(BigInteger)
     checksum_network = Column(BigInteger)
-    type =  Column(String)
+    type = Column(String)
     last_updated_on = Column(TIMESTAMP)
     network_tier = Column(String)
     issuer_id = Column(Integer)
@@ -886,19 +916,18 @@ class PlanNPIRaw(Base, JSONOutputMixin):
     languages = Column(ARRAY(String))
 
 
-
 class PlanNetworkTierRaw(Base, JSONOutputMixin):
-    __tablename__ = 'plan_networktier'
+    __tablename__ = "plan_networktier"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('plan_id', 'checksum_network'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("plan_id", "checksum_network"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['plan_id', 'checksum_network']
+    __my_index_elements__ = ["plan_id", "checksum_network"]
     __my_additional_indexes__ = [
-        {'index_elements': ('issuer_id', 'network_tier', 'year'), 'using': 'gin'},
-        {'index_elements': ('checksum_network',), 'using': 'gin'}, ]
-
+        {"index_elements": ("issuer_id", "network_tier", "year"), "using": "gin"},
+        {"index_elements": ("checksum_network",), "using": "gin"},
+    ]
 
     plan_id = Column(String(14))
     network_tier = Column(String)
@@ -908,22 +937,22 @@ class PlanNetworkTierRaw(Base, JSONOutputMixin):
 
 
 class PlanDrugRaw(Base, JSONOutputMixin):
-    __tablename__ = 'plan_drug_raw'
+    __tablename__ = "plan_drug_raw"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('plan_id', 'rxnorm_id'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("plan_id", "rxnorm_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['plan_id', 'rxnorm_id']
+    __my_index_elements__ = ["plan_id", "rxnorm_id"]
     __my_additional_indexes__ = [
         {
-            'index_elements': ('plan_id', 'drug_tier'),
-            'using': 'gin',
-            'name': 'plan_drug_tier_lookup',
+            "index_elements": ("plan_id", "drug_tier"),
+            "using": "gin",
+            "name": "plan_drug_tier_lookup",
         },
         {
-            'index_elements': ('rxnorm_id',),
-            'name': 'plan_drug_rxnorm_lookup',
+            "index_elements": ("rxnorm_id",),
+            "name": "plan_drug_rxnorm_lookup",
         },
     ]
 
@@ -939,13 +968,13 @@ class PlanDrugRaw(Base, JSONOutputMixin):
 
 
 class PlanDrugStats(Base, JSONOutputMixin):
-    __tablename__ = 'plan_drug_stats'
+    __tablename__ = "plan_drug_stats"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('plan_id'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("plan_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['plan_id']
+    __my_index_elements__ = ["plan_id"]
     plan_id = Column(String(14), nullable=False)
     total_drugs = Column(Integer, nullable=False, default=0)
     auth_required = Column(Integer, nullable=False, default=0)
@@ -958,29 +987,29 @@ class PlanDrugStats(Base, JSONOutputMixin):
 
 
 class PlanDrugTierStats(Base, JSONOutputMixin):
-    __tablename__ = 'plan_drug_tier_stats'
+    __tablename__ = "plan_drug_tier_stats"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('plan_id', 'drug_tier'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("plan_id", "drug_tier"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['plan_id', 'drug_tier']
+    __my_index_elements__ = ["plan_id", "drug_tier"]
     plan_id = Column(String(14), nullable=False)
     drug_tier = Column(String, nullable=False)
     drug_count = Column(Integer, nullable=False, default=0)
 
 
 class PlanSearchSummary(Base, JSONOutputMixin):
-    __tablename__ = 'plan_search_summary'
+    __tablename__ = "plan_search_summary"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('plan_id', 'year'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("plan_id", "year"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['plan_id', 'year']
+    __my_index_elements__ = ["plan_id", "year"]
     __my_additional_indexes__ = [
-        {'index_elements': ('state', 'year'), 'name': 'plan_search_summary_state_year_idx'},
-        {'index_elements': ('issuer_id', 'year'), 'name': 'plan_search_summary_issuer_year_idx'},
+        {"index_elements": ("state", "year"), "name": "plan_search_summary_state_year_idx"},
+        {"index_elements": ("issuer_id", "year"), "name": "plan_search_summary_issuer_year_idx"},
     ]
 
     plan_id = Column(String(14), nullable=False)
@@ -1012,51 +1041,51 @@ class PlanSearchSummary(Base, JSONOutputMixin):
 
 
 class NPIData(Base, JSONOutputMixin):
-    __tablename__ = 'npi'
+    __tablename__ = "npi"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('npi'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("npi"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['npi']
+    __my_index_elements__ = ["npi"]
     __my_additional_indexes__ = [
         {
-            'index_elements': (NAME_SEARCH_VECTOR_WITH_OP,),
-            'using': 'gin',
-            'name': 'name_search_trgm',
+            "index_elements": (NAME_SEARCH_VECTOR_WITH_OP,),
+            "using": "gin",
+            "name": "name_search_trgm",
         },
         {
-            'index_elements': (
+            "index_elements": (
                 "LOWER(COALESCE(provider_organization_name,'') || ' ' || "
                 "COALESCE(provider_other_organization_name,'') || ' ' || "
                 "COALESCE(do_business_as_text,'')) gin_trgm_ops",
             ),
-            'using': 'gin',
-            'name': 'organization_search_trgm',
+            "using": "gin",
+            "name": "organization_search_trgm",
         },
         {
-            'index_elements': ("LOWER(COALESCE(provider_first_name,'')) gin_trgm_ops",),
-            'using': 'gin',
-            'name': 'first_name_trgm',
+            "index_elements": ("LOWER(COALESCE(provider_first_name,'')) gin_trgm_ops",),
+            "using": "gin",
+            "name": "first_name_trgm",
         },
         {
-            'index_elements': ("LOWER(COALESCE(provider_last_name,'')) gin_trgm_ops",),
-            'using': 'gin',
-            'name': 'last_name_trgm',
+            "index_elements": ("LOWER(COALESCE(provider_last_name,'')) gin_trgm_ops",),
+            "using": "gin",
+            "name": "last_name_trgm",
         },
         {
-            'index_elements': ('entity_type_code',),
-            'name': 'entity_type_code',
+            "index_elements": ("entity_type_code",),
+            "name": "entity_type_code",
         },
         {
-            'index_elements': ('search_taxonomy_codes',),
-            'using': 'gin',
-            'name': 'search_taxonomy_codes',
+            "index_elements": ("search_taxonomy_codes",),
+            "using": "gin",
+            "name": "search_taxonomy_codes",
         },
         {
-            'index_elements': ('npi', 'provider_sex_code'),
-            'where': 'provider_sex_code IS NOT NULL',
-            'name': 'npi_idx_npi_provider_sex_code',
+            "index_elements": ("npi", "provider_sex_code"),
+            "where": "provider_sex_code IS NOT NULL",
+            "name": "npi_idx_npi_provider_sex_code",
         },
     ]
     npi = Column(BigInteger, primary_key=True)
@@ -1114,14 +1143,21 @@ class NPIData(Base, JSONOutputMixin):
 
 
 class NPIDataTaxonomy(Base, JSONOutputMixin):
-    __tablename__ = 'npi_taxonomy'
+    __tablename__ = "npi_taxonomy"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('npi', 'checksum'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("npi", "checksum"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['npi', 'checksum']
-    __my_additional_indexes__ = [{'index_elements': ('healthcare_provider_taxonomy_code', 'npi',)}, ]
+    __my_index_elements__ = ["npi", "checksum"]
+    __my_additional_indexes__ = [
+        {
+            "index_elements": (
+                "healthcare_provider_taxonomy_code",
+                "npi",
+            )
+        },
+    ]
 
     npi = Column(BigInteger)
     checksum = Column(Integer)
@@ -1130,14 +1166,15 @@ class NPIDataTaxonomy(Base, JSONOutputMixin):
     provider_license_number_state_code = Column(String)
     healthcare_provider_primary_taxonomy_switch = Column(String)
 
+
 class NPIDataOtherIdentifier(Base, JSONOutputMixin):
-    __tablename__ = 'npi_other_identifier'
+    __tablename__ = "npi_other_identifier"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('npi', 'checksum'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("npi", "checksum"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['npi', 'checksum']
+    __my_index_elements__ = ["npi", "checksum"]
 
     npi = Column(BigInteger, primary_key=True)
     checksum = Column(Integer, primary_key=True)
@@ -1146,14 +1183,15 @@ class NPIDataOtherIdentifier(Base, JSONOutputMixin):
     other_provider_identifier_state = Column(String)
     other_provider_identifier_issuer = Column(String)
 
+
 class NPIDataTaxonomyGroup(Base, JSONOutputMixin):
-    __tablename__ = 'npi_taxonomy_group'
+    __tablename__ = "npi_taxonomy_group"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('npi', 'checksum'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("npi", "checksum"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['npi', 'checksum']
+    __my_index_elements__ = ["npi", "checksum"]
 
     npi = Column(BigInteger)
     checksum = Column(Integer)
@@ -1161,15 +1199,18 @@ class NPIDataTaxonomyGroup(Base, JSONOutputMixin):
 
 
 class NUCCTaxonomy(Base, JSONOutputMixin):
-    __tablename__ = 'nucc_taxonomy'
+    __tablename__ = "nucc_taxonomy"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('code'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("code"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['code']
-    __my_additional_indexes__ = [{'index_elements': ('int_code',)}, {'index_elements': ('display_name',)},
-        {'index_elements': ('classification','section'), 'using': 'gin'} ]
+    __my_index_elements__ = ["code"]
+    __my_additional_indexes__ = [
+        {"index_elements": ("int_code",)},
+        {"index_elements": ("display_name",)},
+        {"index_elements": ("classification", "section"), "using": "gin"},
+    ]
 
     int_code = Column(Integer)
     code = Column(String)
@@ -1182,17 +1223,16 @@ class NUCCTaxonomy(Base, JSONOutputMixin):
     section = Column(String)
 
 
-
 class AddressPrototype(Base, JSONOutputMixin):
     __abstract__ = True
 
     @declared_attr
     def __table_args__(cls):
-        return {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True}
+        return {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True}
 
     checksum = Column(BigInteger, primary_key=True, autoincrement=False)
     first_line = Column(String)
-    second_line  = Column(String)
+    second_line = Column(String)
     city_name = Column(String)
     state_name = Column(String)
     postal_code = Column(String)
@@ -1207,70 +1247,10 @@ class AddressPrototype(Base, JSONOutputMixin):
 
 
 class AddressArchive(AddressPrototype):
-    __tablename__ = 'address_archive'
+    __tablename__ = "address_archive"
     __main_table__ = __tablename__
-    __my_index_elements__ = ['checksum']
+    __my_index_elements__ = ["checksum"]
     # __my_additional_indexes__ = [{'index_elements': ('healthcare_provider_taxonomy_code', 'npi',)}, ]
-
-
-class AddressArchiveV2(Base, JSONOutputMixin):
-    __tablename__ = "address_archive_v2"
-    __main_table__ = __tablename__
-    __table_args__ = (
-        PrimaryKeyConstraint("address_key"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
-    )
-    __my_index_elements__ = ["address_key"]
-
-    address_key = Column(PG_UUID(as_uuid=True), nullable=False)
-    identity_key = Column(TEXT, nullable=False)
-    identity_version = Column(SMALLINT, nullable=False)
-    precision = Column(TEXT, nullable=False)
-    premise_key = Column(PG_UUID(as_uuid=True))
-    line1_norm = Column(TEXT)
-    unit_norm = Column(TEXT)
-    city_norm = Column(TEXT)
-    state_code = Column(String(32))
-    zip5 = Column(String(5))
-    zip4 = Column(String(4))
-    country_code = Column(String(8), nullable=False)
-    first_line = Column(TEXT)
-    second_line = Column(TEXT)
-    city_name = Column(TEXT)
-    state_name = Column(TEXT)
-    postal_code = Column(TEXT)
-    telephone_number = Column(TEXT)
-    fax_number = Column(TEXT)
-    formatted_address = Column(TEXT)
-    formatted_address_version = Column(SMALLINT)
-    formatted_address_source = Column(String(32))
-    lat = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None))
-    long = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None))
-    place_id = Column(TEXT)
-    geo_source = Column(
-        Enum(
-            "mapbox",
-            "google",
-            "tiger",
-            "manual",
-            "openaddresses",
-            name="address_archive_geo_source",
-            native_enum=True,
-            create_type=False,
-            schema=os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
-        )
-    )
-    geocode_source = Column(TEXT)
-    geocode_quality = Column(TEXT)
-    postal_validation_status = Column(TEXT)
-    geocoded_at = Column(TIMESTAMP(timezone=True))
-    source_bits = Column(Integer, nullable=False)
-    strict_source_bits = Column(Integer, nullable=False)
-    first_seen_at = Column(TIMESTAMP(timezone=True), nullable=False)
-    last_seen_at = Column(TIMESTAMP(timezone=True), nullable=False)
-    date_added = Column(DATE)
-    display_priority = Column(SMALLINT, nullable=False)
-    merged_into = Column(PG_UUID(as_uuid=True))
 
 
 class AddressAliasStateV1(Base, JSONOutputMixin):
@@ -1290,6 +1270,7 @@ class AddressAliasStateV1(Base, JSONOutputMixin):
 
 
 class AddressAliasArtifactStateV1(Base, JSONOutputMixin):
+    __runtime_schema_sync__ = False
     __tablename__ = "address_alias_artifact_state_v1"
     __main_table__ = __tablename__
     __table_args__ = (
@@ -1418,7 +1399,11 @@ class OpenAddressesGeocode(Base, JSONOutputMixin):
             "index_elements": ("state_code", "zip5", "house_number", "street_match_key"),
             "name": "openaddresses_exact_idx",
         },
-        {"index_elements": ("address_key",), "name": "openaddresses_address_key_idx", "where": "address_key IS NOT NULL"},
+        {
+            "index_elements": ("address_key",),
+            "name": "openaddresses_address_key_idx",
+            "where": "address_key IS NOT NULL",
+        },
         {"index_elements": ("source",), "name": "openaddresses_source_idx"},
     ]
 
@@ -1475,85 +1460,83 @@ class OpenAddressesZipRecovery(Base, JSONOutputMixin):
 
 
 class NPIAddress(AddressPrototype):
-    __tablename__ = 'npi_address'
+    __tablename__ = "npi_address"
     __main_table__ = __tablename__
-    __my_index_elements__ = ['npi', 'type', 'checksum']
-    #__my_initial_indexes__ = [{'index_elements': ('npi', 'type'), 'unique': True, 'where': "type='primary'"}] #  or type='secondary'
-    __my_initial_indexes__ = [{'index_elements': ('checksum',)}]
+    __my_index_elements__ = ["npi", "type", "checksum"]
+    # __my_initial_indexes__ = [{'index_elements': ('npi', 'type'), 'unique': True, 'where': "type='primary'"}] #  or type='secondary'
+    __my_initial_indexes__ = [{"index_elements": ("checksum",)}]
 
     __my_additional_indexes__ = [
-        {'index_elements': ('type', 'npi'), 'name': 'type_npi'},
-        {'index_elements': ('type', 'state_name', 'city_name', 'npi'), 'name': 'type_state_city_npi'},
+        {"index_elements": ("type", "npi"), "name": "type_npi"},
+        {"index_elements": ("type", "state_name", "city_name", "npi"), "name": "type_state_city_npi"},
         {
-            'index_elements': ('state_name', 'city_name', 'npi'),
-            'name': 'primary_state_city_npi',
-            'where': "type='primary'",
+            "index_elements": ("state_name", "city_name", "npi"),
+            "name": "primary_state_city_npi",
+            "where": "type='primary'",
         },
         {
-            'index_elements': ('lat', 'long', 'npi'),
-            'name': 'primary_lat_long_npi',
-            'where': "type='primary' AND lat IS NOT NULL AND long IS NOT NULL",
+            "index_elements": ("lat", "long", "npi"),
+            "name": "primary_lat_long_npi",
+            "where": "type='primary' AND lat IS NOT NULL AND long IS NOT NULL",
         },
         {
-            'index_elements': ("LEFT(postal_code, 5)", 'npi'),
-            'name': 'primary_postal_code_5_npi',
-            'where': "type='primary'",
+            "index_elements": ("LEFT(postal_code, 5)", "npi"),
+            "name": "primary_postal_code_5_npi",
+            "where": "type='primary'",
         },
         {
-            'index_elements': (
+            "index_elements": (
                 "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
-                'npi',
+                "npi",
             ),
-            'name': 'primary_phone_digits_npi',
-            'where': "type='primary'",
+            "name": "primary_phone_digits_npi",
+            "where": "type='primary'",
         },
         {
-            'index_elements': ('phone_number', 'npi'),
-            'name': 'primary_phone_number_npi',
-            'where': "type='primary' AND phone_number IS NOT NULL AND phone_number <> ''",
+            "index_elements": ("phone_number", "npi"),
+            "name": "primary_phone_number_npi",
+            "where": "type='primary' AND phone_number IS NOT NULL AND phone_number <> ''",
         },
         {
-            'index_elements': ('npi',),
-            'name': 'primary_with_coverage_npi',
-            'where': "type='primary' AND NOT (plans_network_array @@ '0'::query_int)",
+            "index_elements": ("npi",),
+            "name": "primary_with_coverage_npi",
+            "where": "type='primary' AND NOT (plans_network_array @@ '0'::query_int)",
         },
         {
-            'index_elements': ('taxonomy_array gin__int_ops',),
-            'using': 'gin',
-            'name': 'taxonomy_array',
+            "index_elements": ("taxonomy_array gin__int_ops",),
+            "using": "gin",
+            "name": "taxonomy_array",
         },
         {
-            'index_elements': ('plans_network_array gin__int_ops',),
-            'using': 'gin',
-            'name': 'plans_network_array',
+            "index_elements": ("plans_network_array gin__int_ops",),
+            "using": "gin",
+            "name": "plans_network_array",
         },
         {
-            'index_elements': ('procedures_array gin__int_ops',),
-            'using': 'gin',
-            'name': 'procedures_array',
+            "index_elements": ("procedures_array gin__int_ops",),
+            "using": "gin",
+            "name": "procedures_array",
         },
         {
-            'index_elements': ('medications_array gin__int_ops',),
-            'using': 'gin',
-            'name': 'medications_array',
+            "index_elements": ("medications_array gin__int_ops",),
+            "using": "gin",
+            "name": "medications_array",
         },
         {
-            'index_elements': (
-            'taxonomy_array gin__int_ops',
-            'plans_network_array gin__int_ops',
-        ),
-            'using': 'gin',
-            'name': 'taxonomy_plans_network',
-        },
-        {
-            'index_elements': (
-                'Geography(ST_MakePoint((long)::double precision, (lat)::double precision))',
+            "index_elements": (
+                "taxonomy_array gin__int_ops",
+                "plans_network_array gin__int_ops",
             ),
-            'using': 'gist',
-            'name': 'geo_idx',
-            'where': "type='primary' OR type='secondary'",
+            "using": "gin",
+            "name": "taxonomy_plans_network",
         },
-        {'index_elements': ('address_key',), 'name': 'address_key'},
+        {
+            "index_elements": ("Geography(ST_MakePoint((long)::double precision, (lat)::double precision))",),
+            "using": "gist",
+            "name": "geo_idx",
+            "where": "type='primary' OR type='secondary'",
+        },
+        {"index_elements": ("address_key",), "name": "address_key"},
     ]
 
     npi = Column(BigInteger, primary_key=True)
@@ -1698,13 +1681,13 @@ class MRFAddressEvidence(Base, JSONOutputMixin):
 
 
 class NPIPhoneStaffing(Base, JSONOutputMixin):
-    __tablename__ = 'npi_phone_staffing'
+    __tablename__ = "npi_phone_staffing"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('state_name', 'telephone_number'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("state_name", "telephone_number"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['state_name', 'telephone_number']
+    __my_index_elements__ = ["state_name", "telephone_number"]
 
     state_name = Column(String, primary_key=True)
     telephone_number = Column(String, primary_key=True)
@@ -1713,16 +1696,16 @@ class NPIPhoneStaffing(Base, JSONOutputMixin):
 
 
 class PTGFile(Base, JSONOutputMixin):
-    __tablename__ = 'ptg_file'
+    __tablename__ = "ptg_file"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('file_id'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("file_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['file_id']
+    __my_index_elements__ = ["file_id"]
     __my_additional_indexes__ = [
-        {'index_elements': ('file_type',), 'name': 'ptg_file_type_idx'},
-        {'index_elements': ('url',), 'name': 'ptg_file_url_idx'},
+        {"index_elements": ("file_type",), "name": "ptg_file_type_idx"},
+        {"index_elements": ("url",), "name": "ptg_file_url_idx"},
     ]
 
     file_id = Column(BigInteger)
@@ -1743,16 +1726,16 @@ class PTGFile(Base, JSONOutputMixin):
 
 
 class PTGProviderGroup(Base, JSONOutputMixin):
-    __tablename__ = 'ptg_provider_group'
+    __tablename__ = "ptg_provider_group"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('provider_group_hash'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("provider_group_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['provider_group_hash']
+    __my_index_elements__ = ["provider_group_hash"]
     __my_additional_indexes__ = [
-        {'index_elements': ('provider_group_ref',), 'name': 'ptg_provider_group_ref_idx'},
-        {'index_elements': ('tin_value',), 'name': 'ptg_provider_group_tin_idx'},
+        {"index_elements": ("provider_group_ref",), "name": "ptg_provider_group_ref_idx"},
+        {"index_elements": ("tin_value",), "name": "ptg_provider_group_tin_idx"},
     ]
 
     provider_group_hash = Column(BigInteger)
@@ -1766,16 +1749,16 @@ class PTGProviderGroup(Base, JSONOutputMixin):
 
 
 class PTGInNetworkItem(Base, JSONOutputMixin):
-    __tablename__ = 'ptg_in_network_item'
+    __tablename__ = "ptg_in_network_item"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('item_hash'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("item_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['item_hash']
+    __my_index_elements__ = ["item_hash"]
     __my_additional_indexes__ = [
-        {'index_elements': ('billing_code',), 'name': 'ptg_item_billing_code_idx'},
-        {'index_elements': ('billing_code_type',), 'name': 'ptg_item_code_type_idx'},
+        {"index_elements": ("billing_code",), "name": "ptg_item_billing_code_idx"},
+        {"index_elements": ("billing_code_type",), "name": "ptg_item_code_type_idx"},
     ]
 
     item_hash = Column(BigInteger)
@@ -1796,14 +1779,14 @@ class PTGInNetworkItem(Base, JSONOutputMixin):
 
 
 class PTGBillingCode(Base, JSONOutputMixin):
-    __tablename__ = 'ptg_billing_code'
+    __tablename__ = "ptg_billing_code"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('code_hash'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("code_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['code_hash']
-    __my_additional_indexes__ = [{'index_elements': ('item_hash',), 'name': 'ptg_billing_code_item_idx'}]
+    __my_index_elements__ = ["code_hash"]
+    __my_additional_indexes__ = [{"index_elements": ("item_hash",), "name": "ptg_billing_code_item_idx"}]
 
     code_hash = Column(BigInteger)
     item_hash = Column(BigInteger)
@@ -1815,16 +1798,16 @@ class PTGBillingCode(Base, JSONOutputMixin):
 
 
 class PTGNegotiatedRate(Base, JSONOutputMixin):
-    __tablename__ = 'ptg_negotiated_rate'
+    __tablename__ = "ptg_negotiated_rate"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('rate_hash'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("rate_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['rate_hash']
+    __my_index_elements__ = ["rate_hash"]
     __my_additional_indexes__ = [
-        {'index_elements': ('item_hash',), 'name': 'ptg_negotiated_item_idx'},
-        {'index_elements': ('provider_group_hash',), 'name': 'ptg_negotiated_group_idx'},
+        {"index_elements": ("item_hash",), "name": "ptg_negotiated_item_idx"},
+        {"index_elements": ("provider_group_hash",), "name": "ptg_negotiated_group_idx"},
     ]
 
     rate_hash = Column(BigInteger)
@@ -1834,16 +1817,16 @@ class PTGNegotiatedRate(Base, JSONOutputMixin):
 
 
 class PTGNegotiatedPrice(Base, JSONOutputMixin):
-    __tablename__ = 'ptg_negotiated_price'
+    __tablename__ = "ptg_negotiated_price"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('price_hash'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("price_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['price_hash']
+    __my_index_elements__ = ["price_hash"]
     __my_additional_indexes__ = [
-        {'index_elements': ('rate_hash',), 'name': 'ptg_price_rate_idx'},
-        {'index_elements': ('billing_class',), 'name': 'ptg_price_class_idx'},
+        {"index_elements": ("rate_hash",), "name": "ptg_price_rate_idx"},
+        {"index_elements": ("billing_class",), "name": "ptg_price_class_idx"},
     ]
 
     price_hash = Column(BigInteger)
@@ -1859,16 +1842,16 @@ class PTGNegotiatedPrice(Base, JSONOutputMixin):
 
 
 class PTGAllowedItem(Base, JSONOutputMixin):
-    __tablename__ = 'ptg_allowed_item'
+    __tablename__ = "ptg_allowed_item"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('allowed_item_hash'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("allowed_item_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['allowed_item_hash']
+    __my_index_elements__ = ["allowed_item_hash"]
     __my_additional_indexes__ = [
-        {'index_elements': ('billing_code',), 'name': 'ptg_allowed_code_idx'},
-        {'index_elements': ('plan_id', 'plan_market_type', 'billing_code'), 'name': 'ptg_allowed_plan_code_idx'},
+        {"index_elements": ("billing_code",), "name": "ptg_allowed_code_idx"},
+        {"index_elements": ("plan_id", "plan_market_type", "billing_code"), "name": "ptg_allowed_plan_code_idx"},
     ]
 
     allowed_item_hash = Column(BigInteger)
@@ -1887,17 +1870,17 @@ class PTGAllowedItem(Base, JSONOutputMixin):
 
 
 class PTGAllowedPayment(Base, JSONOutputMixin):
-    __tablename__ = 'ptg_allowed_payment'
+    __tablename__ = "ptg_allowed_payment"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('payment_hash'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("payment_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['payment_hash']
+    __my_index_elements__ = ["payment_hash"]
     __my_additional_indexes__ = [
-        {'index_elements': ('allowed_item_hash',), 'name': 'ptg_allowed_payment_item_idx'},
-        {'index_elements': ('tin_value',), 'name': 'ptg_allowed_payment_tin_idx'},
-        {'index_elements': ('allowed_item_hash', 'tin_value'), 'name': 'ptg_allowed_payment_item_tin_idx'},
+        {"index_elements": ("allowed_item_hash",), "name": "ptg_allowed_payment_item_idx"},
+        {"index_elements": ("tin_value",), "name": "ptg_allowed_payment_tin_idx"},
+        {"index_elements": ("allowed_item_hash", "tin_value"), "name": "ptg_allowed_payment_item_tin_idx"},
     ]
 
     payment_hash = Column(BigInteger)
@@ -1914,16 +1897,16 @@ class PTGAllowedPayment(Base, JSONOutputMixin):
 
 
 class PTGAllowedProviderPayment(Base, JSONOutputMixin):
-    __tablename__ = 'ptg_allowed_provider_payment'
+    __tablename__ = "ptg_allowed_provider_payment"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('provider_payment_hash'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("provider_payment_hash"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['provider_payment_hash']
+    __my_index_elements__ = ["provider_payment_hash"]
     __my_additional_indexes__ = [
-        {'index_elements': ('payment_hash',), 'name': 'ptg_allowed_provider_payment_idx'},
-        {'index_elements': ('npi',), 'name': 'ptg_allowed_provider_payment_npi_gin_idx', 'using': 'gin'},
+        {"index_elements": ("payment_hash",), "name": "ptg_allowed_provider_payment_idx"},
+        {"index_elements": ("npi",), "name": "ptg_allowed_provider_payment_npi_gin_idx", "using": "gin"},
     ]
 
     provider_payment_hash = Column(BigInteger)
@@ -2027,6 +2010,7 @@ class PlanReleaseServingRevision(Base, JSONOutputMixin):
 
     __tablename__ = "plan_release_serving_revision"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("serving_revision_id"),
         CheckConstraint(
@@ -2034,8 +2018,7 @@ class PlanReleaseServingRevision(Base, JSONOutputMixin):
             name="plan_release_serving_binding_count_check",
         ),
         CheckConstraint(
-            "NOT is_current OR (serving_status = 'published' AND "
-            "release_status = 'published')",
+            "NOT is_current OR (serving_status = 'published' AND release_status = 'published')",
             name="plan_release_serving_current_state_check",
         ),
         Index(
@@ -2076,51 +2059,6 @@ class PlanReleaseServingRevision(Base, JSONOutputMixin):
     retired_at = Column(DateTime(timezone=True))
 
 
-class PlanReleaseSnapshotBinding(Base, JSONOutputMixin):
-    """One ordinal member of a frozen physical plan-release binding set."""
-
-    __tablename__ = "plan_release_snapshot_binding"
-    __main_table__ = __tablename__
-    __table_args__ = (
-        PrimaryKeyConstraint(
-            "serving_revision_id",
-            "role",
-            "binding_ordinal",
-        ),
-        ForeignKeyConstraint(
-            ["serving_revision_id"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}.plan_release_serving_revision."
-                "serving_revision_id"
-            ],
-            ondelete="CASCADE",
-        ),
-        {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
-    )
-    __my_index_elements__ = [
-        "serving_revision_id",
-        "role",
-        "binding_ordinal",
-    ]
-    __my_additional_indexes__ = [
-        {
-            "index_elements": ("snapshot_id",),
-            "name": "plan_release_snapshot_binding_snapshot_idx",
-        },
-    ]
-
-    serving_revision_id = Column(String(64), nullable=False)
-    binding_ordinal = Column(Integer, nullable=False)
-    snapshot_id = Column(String(128), nullable=False)
-    source_key = Column(String(128), nullable=False)
-    plan_id = Column(String(128), nullable=False)
-    plan_market_type = Column(String(64))
-    role = Column(String(32), nullable=False)
-    required = Column(Boolean, nullable=False, default=True)
-    metadata_json = Column(JSON, nullable=False)
-    created_at = Column(DateTime(timezone=True))
-
-
 class PTG2SnapshotPin(Base, JSONOutputMixin):
     """Owner-qualified retention pin for a published PTG2 snapshot."""
 
@@ -2131,23 +2069,23 @@ class PTG2SnapshotPin(Base, JSONOutputMixin):
         ForeignKeyConstraint(
             ["snapshot_id"],
             [f"{_PTG2_DATABASE_SCHEMA}.ptg2_snapshot.snapshot_id"],
+            name="ptg2_snapshot_pin_snapshot_fkey",
             ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "btrim(owner_type) <> '' AND btrim(owner_id) <> ''",
+            name="ptg2_snapshot_pin_owner_check",
         ),
         {"schema": _PTG2_DATABASE_SCHEMA, "extend_existing": True},
     )
     __my_index_elements__ = ["owner_type", "owner_id", "snapshot_id"]
-    __my_additional_indexes__ = [
-        {
-            "index_elements": ("snapshot_id",),
-            "name": "ptg2_snapshot_pin_snapshot_idx",
-        },
-    ]
+    __my_additional_indexes__ = [{"index_elements": ("snapshot_id",), "name": "ptg2_snapshot_pin_snapshot_idx"}]
 
     owner_type = Column(String(48), nullable=False)
     owner_id = Column(String(96), nullable=False)
     snapshot_id = Column(String(128), nullable=False)
     reason = Column(String(256))
-    created_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("transaction_timestamp()"))
 
 
 class PTG2PredecessorRetirementAudit(Base, JSONOutputMixin):
@@ -2434,7 +2372,10 @@ class PTG2CurrentPlanSource(Base, JSONOutputMixin):
     __my_index_elements__ = ["plan_source_key"]
     __my_additional_indexes__ = [
         {"index_elements": ("plan_id",), "name": "ptg2_current_plan_source_plan_idx"},
-        {"index_elements": ("plan_id", "plan_market_type", "import_month"), "name": "ptg2_current_plan_source_lookup_idx"},
+        {
+            "index_elements": ("plan_id", "plan_market_type", "import_month"),
+            "name": "ptg2_current_plan_source_lookup_idx",
+        },
         {"index_elements": ("source_key",), "name": "ptg2_current_plan_source_source_idx"},
         {
             "index_elements": ("source_key", "snapshot_id"),
@@ -2692,10 +2633,7 @@ class PTG2V3SnapshotLayout(Base, JSONOutputMixin):
             "mapping_digest",
             "support_digest",
             unique=True,
-            postgresql_where=text(
-                "state = 'sealed' AND mapping_digest IS NOT NULL "
-                "AND support_digest IS NOT NULL"
-            ),
+            postgresql_where=text("state = 'sealed' AND mapping_digest IS NOT NULL AND support_digest IS NOT NULL"),
         ),
         {
             "schema": _PTG2_DATABASE_SCHEMA,
@@ -2740,10 +2678,7 @@ class PTG2V3LayoutFingerprint(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_key"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v3_snapshot_layout.snapshot_key"
-            ],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v3_snapshot_layout.snapshot_key"],
             name="ptg2_v3_layout_fingerprint_snapshot_key_fkey",
             ondelete="CASCADE",
         ),
@@ -2786,10 +2721,7 @@ class PTG2V3SnapshotBinding(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_key"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v3_snapshot_layout.snapshot_key"
-            ],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v3_snapshot_layout.snapshot_key"],
             name="ptg2_v3_snapshot_binding_snapshot_key_fkey",
             ondelete="RESTRICT",
         ),
@@ -2868,10 +2800,7 @@ class PTG2V3SnapshotPlanScope(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_id"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v3_snapshot_scope.snapshot_id"
-            ],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v3_snapshot_scope.snapshot_id"],
             name="ptg2_v3_snapshot_plan_scope_snapshot_id_fkey",
             ondelete="CASCADE",
         ),
@@ -2911,19 +2840,13 @@ class PTG2V3CandidateAuditAttestation(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_id"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v3_snapshot_scope.snapshot_id"
-            ],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v3_snapshot_scope.snapshot_id"],
             name="ptg2_v3_candidate_audit_attestation_snapshot_id_fkey",
             ondelete="CASCADE",
         ),
         ForeignKeyConstraint(
             ["snapshot_key"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v3_snapshot_layout.snapshot_key"
-            ],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v3_snapshot_layout.snapshot_key"],
             name="ptg2_v3_candidate_audit_attestation_snapshot_key_fkey",
             ondelete="RESTRICT",
         ),
@@ -2940,8 +2863,7 @@ class PTG2V3CandidateAuditAttestation(Base, JSONOutputMixin):
             name="ptg2_v3_candidate_audit_attestation_sample_check",
         ),
         CheckConstraint(
-            "source_witness_digest IS NULL "
-            "OR octet_length(source_witness_digest) = 32",
+            "source_witness_digest IS NULL OR octet_length(source_witness_digest) = 32",
             name="ptg2_v3_candidate_audit_attestation_witness_check",
         ),
         CheckConstraint(
@@ -3014,19 +2936,13 @@ class PTG2V3SnapshotSource(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_id"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v3_snapshot_scope.snapshot_id"
-            ],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v3_snapshot_scope.snapshot_id"],
             name="ptg2_v3_snapshot_source_snapshot_id_fkey",
             ondelete="CASCADE",
         ),
         ForeignKeyConstraint(
             ["source_trace_set_hash"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_source_trace_set.source_trace_set_hash"
-            ],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_source_trace_set.source_trace_set_hash"],
             name="ptg2_v3_snapshot_source_trace_set_hash_fkey",
             ondelete="RESTRICT",
         ),
@@ -3154,19 +3070,13 @@ class PTG2V3SnapshotBlock(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_key"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v3_snapshot_layout.snapshot_key"
-            ],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v3_snapshot_layout.snapshot_key"],
             name="ptg2_v3_snapshot_block_snapshot_key_fkey",
             ondelete="CASCADE",
         ),
         ForeignKeyConstraint(
             ["block_hash"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v3_block.block_hash"
-            ],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v3_block.block_hash"],
             name="ptg2_v3_snapshot_block_block_hash_fkey",
         ),
         CheckConstraint(
@@ -3212,10 +3122,7 @@ class PTG2V4SnapshotMapRoot(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_key"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v3_snapshot_layout.snapshot_key"
-            ],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v3_snapshot_layout.snapshot_key"],
             name="ptg2_v4_snapshot_map_root_layout_fkey",
             ondelete="CASCADE",
         ),
@@ -3232,8 +3139,7 @@ class PTG2V4SnapshotMapRoot(Base, JSONOutputMixin):
             name="ptg2_v4_snapshot_map_root_map_format_check",
         ),
         CheckConstraint(
-            "representation IN "
-            "('direct_v1', 'pattern_v1', 'source_component_v1')",
+            "representation IN ('direct_v1', 'pattern_v1', 'source_component_v1')",
             name="ptg2_v4_snapshot_map_root_representation_check",
         ),
         CheckConstraint(
@@ -3323,10 +3229,7 @@ class PTG2V4SnapshotMapPack(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_key"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v4_snapshot_map_root.snapshot_key"
-            ],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v4_snapshot_map_root.snapshot_key"],
             name="ptg2_v4_snapshot_map_pack_root_fkey",
             ondelete="CASCADE",
         ),
@@ -3352,8 +3255,7 @@ class PTG2V4SnapshotMapPack(Base, JSONOutputMixin):
             name="ptg2_v4_snapshot_map_pack_range_check",
         ),
         CheckConstraint(
-            "coordinate_count > 0 AND entry_count >= 0 "
-            "AND logical_byte_count >= 0",
+            "coordinate_count > 0 AND entry_count >= 0 AND logical_byte_count >= 0",
             name="ptg2_v4_snapshot_map_pack_counts_check",
         ),
         CheckConstraint(
@@ -3395,12 +3297,7 @@ class PTG2V4FinalizerMapRoot(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_key"],
-            [
-                (
-                    f"{_PTG2_DATABASE_SCHEMA}."
-                    "ptg2_v3_snapshot_layout.snapshot_key"
-                )
-            ],
+            [(f"{_PTG2_DATABASE_SCHEMA}.ptg2_v3_snapshot_layout.snapshot_key")],
             name="ptg2_v4_finalizer_map_root_layout_fkey",
             ondelete="CASCADE",
         ),
@@ -3502,12 +3399,7 @@ class PTG2V4FinalizerMapPack(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_key"],
-            [
-                (
-                    f"{_PTG2_DATABASE_SCHEMA}."
-                    "ptg2_v4_finalizer_map_root.snapshot_key"
-                )
-            ],
+            [(f"{_PTG2_DATABASE_SCHEMA}.ptg2_v4_finalizer_map_root.snapshot_key")],
             name="ptg2_v4_finalizer_map_pack_root_fkey",
             ondelete="CASCADE",
         ),
@@ -3536,8 +3428,7 @@ class PTG2V4FinalizerMapPack(Base, JSONOutputMixin):
             name="ptg2_v4_finalizer_map_pack_range_check",
         ),
         CheckConstraint(
-            "coordinate_count BETWEEN 1 AND 256 AND entry_count >= 0 "
-            "AND logical_byte_count >= 0",
+            "coordinate_count BETWEEN 1 AND 256 AND entry_count >= 0 AND logical_byte_count >= 0",
             name="ptg2_v4_finalizer_map_pack_counts_check",
         ),
         CheckConstraint(
@@ -3580,12 +3471,7 @@ class PTG2V4FinalizerMapTarget(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_key"],
-            [
-                (
-                    f"{_PTG2_DATABASE_SCHEMA}."
-                    "ptg2_v4_finalizer_map_root.snapshot_key"
-                )
-            ],
+            [(f"{_PTG2_DATABASE_SCHEMA}.ptg2_v4_finalizer_map_root.snapshot_key")],
             name="ptg2_v4_finalizer_map_target_root_fkey",
             ondelete="CASCADE",
         ),
@@ -3626,10 +3512,7 @@ class PTG2V4NPIScope(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_key"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v4_snapshot_map_root.snapshot_key"
-            ],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v4_snapshot_map_root.snapshot_key"],
             name="ptg2_v4_npi_scope_root_fkey",
             ondelete="CASCADE",
         ),
@@ -3668,10 +3551,7 @@ class PTG2V4ProviderComponent(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_key"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v4_snapshot_map_root.snapshot_key"
-            ],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v4_snapshot_map_root.snapshot_key"],
             name="ptg2_v4_provider_component_root_fkey",
             ondelete="CASCADE",
         ),
@@ -3715,10 +3595,7 @@ class PTG2V4Pattern(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_key"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v4_snapshot_map_root.snapshot_key"
-            ],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v4_snapshot_map_root.snapshot_key"],
             name="ptg2_v4_pattern_root_fkey",
             ondelete="CASCADE",
         ),
@@ -3772,10 +3649,7 @@ class PTG2V4RelationManifest(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_key"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v4_snapshot_map_root.snapshot_key"
-            ],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v4_snapshot_map_root.snapshot_key"],
             name="ptg2_v4_relation_manifest_root_fkey",
             ondelete="CASCADE",
         ),
@@ -3831,20 +3705,15 @@ class PTG2V4HeavyOwner(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_key"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v4_snapshot_map_root.snapshot_key"
-            ],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v4_snapshot_map_root.snapshot_key"],
             name="ptg2_v4_heavy_owner_root_fkey",
             ondelete="CASCADE",
         ),
         ForeignKeyConstraint(
             ["snapshot_key", "relation"],
             [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v4_relation_manifest.snapshot_key",
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v4_relation_manifest.relation",
+                f"{_PTG2_DATABASE_SCHEMA}.ptg2_v4_relation_manifest.snapshot_key",
+                f"{_PTG2_DATABASE_SCHEMA}.ptg2_v4_relation_manifest.relation",
             ],
             name="ptg2_v4_heavy_owner_relation_fkey",
             ondelete="CASCADE",
@@ -3854,8 +3723,7 @@ class PTG2V4HeavyOwner(Base, JSONOutputMixin):
             name="ptg2_v4_heavy_owner_names_check",
         ),
         CheckConstraint(
-            "owner_key >= 0 AND member_count >= 0 AND member_base >= 0 "
-            "AND member_span > 0 AND fragment_count > 0",
+            "owner_key >= 0 AND member_count >= 0 AND member_base >= 0 AND member_span > 0 AND fragment_count > 0",
             name="ptg2_v4_heavy_owner_counts_check",
         ),
         {
@@ -4250,10 +4118,7 @@ class PTG2WitnessPart(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["snapshot_key"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v3_source_audit_witness.snapshot_key"
-            ],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v3_source_audit_witness.snapshot_key"],
             name="ptg2_v3_source_audit_witness_part_parent_fkey",
             ondelete="CASCADE",
         ),
@@ -4296,10 +4161,7 @@ class PTG2V3GCCandidate(Base, JSONOutputMixin):
         ),
         ForeignKeyConstraint(
             ["block_hash"],
-            [
-                f"{_PTG2_DATABASE_SCHEMA}."
-                "ptg2_v3_block.block_hash"
-            ],
+            [f"{_PTG2_DATABASE_SCHEMA}.ptg2_v3_block.block_hash"],
             name="ptg2_v3_gc_candidate_block_hash_fkey",
             ondelete="CASCADE",
         ),
@@ -4579,7 +4441,10 @@ class PTG2ProviderSetComponent(Base, JSONOutputMixin):
     )
     __my_index_elements__ = ["provider_set_hash", "provider_group_hash"]
     __my_additional_indexes__ = [
-        {"index_elements": ("provider_group_hash", "provider_set_hash"), "name": "ptg2_provider_set_component_group_idx"},
+        {
+            "index_elements": ("provider_group_hash", "provider_set_hash"),
+            "name": "ptg2_provider_set_component_group_idx",
+        },
     ]
 
     provider_set_hash = Column(String(64))
@@ -4658,7 +4523,10 @@ class PTG2ServingRateCompact(Base, JSONOutputMixin):
     )
     __my_index_elements__ = ["serving_rate_id"]
     __my_additional_indexes__ = [
-        {"index_elements": ("snapshot_id", "plan_id", "reported_code"), "name": "ptg2_serving_rate_compact_reported_idx"},
+        {
+            "index_elements": ("snapshot_id", "plan_id", "reported_code"),
+            "name": "ptg2_serving_rate_compact_reported_idx",
+        },
         {"index_elements": ("snapshot_id", "plan_id", "procedure_code"), "name": "ptg2_serving_rate_compact_hp_idx"},
         {
             "index_elements": (
@@ -4734,7 +4602,10 @@ class PTG2ServingRate(Base, JSONOutputMixin):
         },
         {"index_elements": ("snapshot_id", "plan_id"), "name": "ptg2_serving_rate_plan_idx"},
         {"index_elements": ("snapshot_id", "billing_code"), "name": "ptg2_serving_rate_code_idx"},
-        {"index_elements": ("snapshot_id", "reported_code_system", "reported_code"), "name": "ptg2_serving_rate_reported_code_idx"},
+        {
+            "index_elements": ("snapshot_id", "reported_code_system", "reported_code"),
+            "name": "ptg2_serving_rate_reported_code_idx",
+        },
         {
             "index_elements": (
                 "snapshot_id",
@@ -4821,7 +4692,9 @@ class PTG2Procedure(Base, JSONOutputMixin):
         {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
     __my_index_elements__ = ["procedure_hash"]
-    __my_additional_indexes__ = [{"index_elements": ("billing_code_type", "billing_code"), "name": "ptg2_procedure_code_idx"}]
+    __my_additional_indexes__ = [
+        {"index_elements": ("billing_code_type", "billing_code"), "name": "ptg2_procedure_code_idx"}
+    ]
 
     procedure_hash = Column(String(64))
     billing_code_type = Column(String(64))
@@ -5033,11 +4906,17 @@ class PricingProvider(Base, JSONOutputMixin):
         {"index_elements": ("year", "npi"), "name": "pricing_provider_year_npi_idx"},
         {"index_elements": ("state", "city"), "name": "pricing_provider_state_city_idx"},
         {"index_elements": ("year", "state", "city"), "name": "pricing_provider_year_state_city_idx"},
-        {"index_elements": ("year", "state", "city", "provider_type"), "name": "pricing_provider_year_state_city_type_idx"},
+        {
+            "index_elements": ("year", "state", "city", "provider_type"),
+            "name": "pricing_provider_year_state_city_type_idx",
+        },
         {"index_elements": ("provider_type",), "name": "pricing_provider_type_idx"},
         {"index_elements": ("year", "lower(provider_type)"), "name": "pricing_provider_year_provider_type_lower_idx"},
         {"index_elements": ("year", "lower(provider_name)"), "name": "pricing_provider_year_provider_name_lower_idx"},
-        {"index_elements": ("year", "total_allowed_amount DESC"), "name": "pricing_provider_year_total_allowed_amount_desc_idx"},
+        {
+            "index_elements": ("year", "total_allowed_amount DESC"),
+            "name": "pricing_provider_year_total_allowed_amount_desc_idx",
+        },
         {"index_elements": ("year", "total_services DESC"), "name": "pricing_provider_year_total_services_desc_idx"},
     ]
 
@@ -5073,7 +4952,10 @@ class PricingProcedure(Base, JSONOutputMixin):
         {"index_elements": ("reported_code",), "name": "pricing_procedure_reported_code_idx"},
         {"index_elements": ("lower(service_description)",), "name": "pricing_procedure_service_description_lower_idx"},
         {"index_elements": ("lower(reported_code)",), "name": "pricing_procedure_reported_code_lower_idx"},
-        {"index_elements": ("source_year", "lower(service_description)"), "name": "pricing_procedure_year_service_description_lower_idx"},
+        {
+            "index_elements": ("source_year", "lower(service_description)"),
+            "name": "pricing_procedure_year_service_description_lower_idx",
+        },
     ]
 
     procedure_code = Column(BigInteger)
@@ -5103,9 +4985,18 @@ class PricingProviderProcedure(Base, JSONOutputMixin):
         {"index_elements": ("year", "procedure_code", "npi"), "name": "pricing_provider_proc_year_npi_idx"},
         {"index_elements": ("reported_code",), "name": "pricing_provider_proc_reported_code_idx"},
         {"index_elements": ("service_description",), "name": "pricing_provider_proc_service_description_idx"},
-        {"index_elements": ("year", "lower(reported_code)"), "name": "pricing_provider_proc_year_reported_code_lower_idx"},
-        {"index_elements": ("year", "lower(service_description)"), "name": "pricing_provider_proc_year_service_description_lower_idx"},
-        {"index_elements": ("year", "npi", "total_allowed_amount DESC"), "name": "pricing_provider_proc_year_npi_total_allowed_amount_desc_idx"},
+        {
+            "index_elements": ("year", "lower(reported_code)"),
+            "name": "pricing_provider_proc_year_reported_code_lower_idx",
+        },
+        {
+            "index_elements": ("year", "lower(service_description)"),
+            "name": "pricing_provider_proc_year_service_description_lower_idx",
+        },
+        {
+            "index_elements": ("year", "npi", "total_allowed_amount DESC"),
+            "name": "pricing_provider_proc_year_npi_total_allowed_amount_desc_idx",
+        },
         {
             "index_elements": ("year", "procedure_code", "total_allowed_amount DESC", "npi"),
             "name": "pricing_provider_proc_amount_page_idx",
@@ -5182,7 +5073,14 @@ class PricingProviderProcedureCostProfile(Base, JSONOutputMixin):
     __my_additional_indexes__ = [
         {"index_elements": ("npi", "procedure_code", "year"), "name": "pricing_provider_proc_cost_npi_proc_year_idx"},
         {
-            "index_elements": ("procedure_code", "setting_key", "specialty_key", "geography_scope", "geography_value", "year"),
+            "index_elements": (
+                "procedure_code",
+                "setting_key",
+                "specialty_key",
+                "geography_scope",
+                "geography_value",
+                "year",
+            ),
             "name": "pricing_provider_proc_cost_lookup_idx",
         },
         {
@@ -5248,11 +5146,25 @@ class PricingProcedurePeerStats(Base, JSONOutputMixin):
     ]
     __my_additional_indexes__ = [
         {
-            "index_elements": ("procedure_code", "setting_key", "specialty_key", "geography_scope", "geography_value", "year"),
+            "index_elements": (
+                "procedure_code",
+                "setting_key",
+                "specialty_key",
+                "geography_scope",
+                "geography_value",
+                "year",
+            ),
             "name": "pricing_proc_peer_stats_lookup_idx",
         },
         {
-            "index_elements": ("geography_scope", "geography_value", "setting_key", "specialty_key", "year", "procedure_code"),
+            "index_elements": (
+                "geography_scope",
+                "geography_value",
+                "setting_key",
+                "specialty_key",
+                "year",
+                "procedure_code",
+            ),
             "name": "pricing_proc_peer_stats_geo_idx",
         },
     ]
@@ -5285,8 +5197,14 @@ class PricingProcedureGeoBenchmark(Base, JSONOutputMixin):
     )
     __my_index_elements__ = ["procedure_code", "year", "geography_scope", "geography_value"]
     __my_additional_indexes__ = [
-        {"index_elements": ("year", "procedure_code", "geography_scope"), "name": "pricing_proc_geo_year_proc_scope_idx"},
-        {"index_elements": ("year", "geography_scope", "geography_value"), "name": "pricing_proc_geo_year_scope_value_idx"},
+        {
+            "index_elements": ("year", "procedure_code", "geography_scope"),
+            "name": "pricing_proc_geo_year_proc_scope_idx",
+        },
+        {
+            "index_elements": ("year", "geography_scope", "geography_value"),
+            "name": "pricing_proc_geo_year_scope_value_idx",
+        },
     ]
 
     procedure_code = Column(BigInteger, nullable=False)
@@ -5342,9 +5260,15 @@ class PricingProviderPrescription(Base, JSONOutputMixin):
     __my_index_elements__ = ["npi", "year", "rx_code_system", "rx_code"]
     __my_additional_indexes__ = [
         {"index_elements": ("year", "rx_code_system", "rx_code"), "name": "pricing_provider_rx_year_code_idx"},
-        {"index_elements": ("year", "rx_code_system", "rx_code", "npi"), "name": "pricing_provider_rx_year_code_npi_idx"},
+        {
+            "index_elements": ("year", "rx_code_system", "rx_code", "npi"),
+            "name": "pricing_provider_rx_year_code_npi_idx",
+        },
         {"index_elements": ("year", "state", "city"), "name": "pricing_provider_rx_year_state_city_idx"},
-        {"index_elements": ("year", "state", "city", "provider_type"), "name": "pricing_provider_rx_year_state_city_type_idx"},
+        {
+            "index_elements": ("year", "state", "city", "provider_type"),
+            "name": "pricing_provider_rx_year_state_city_type_idx",
+        },
         {"index_elements": ("rx_name",), "name": "pricing_provider_rx_name_idx"},
         {"index_elements": ("generic_name",), "name": "pricing_provider_rx_generic_idx"},
         {"index_elements": ("brand_name",), "name": "pricing_provider_rx_brand_idx"},
@@ -5363,8 +5287,14 @@ class PricingProviderPrescription(Base, JSONOutputMixin):
             "name": "pricing_provider_rx_autocomplete_trgm_idx",
             "staging_name": "rx_ac_gin",
         },
-        {"index_elements": ("year", "npi", "total_drug_cost DESC"), "name": "pricing_provider_rx_year_npi_total_drug_cost_desc_idx"},
-        {"index_elements": ("year", "total_drug_cost DESC"), "name": "pricing_provider_rx_year_total_drug_cost_desc_idx"},
+        {
+            "index_elements": ("year", "npi", "total_drug_cost DESC"),
+            "name": "pricing_provider_rx_year_npi_total_drug_cost_desc_idx",
+        },
+        {
+            "index_elements": ("year", "total_drug_cost DESC"),
+            "name": "pricing_provider_rx_year_total_drug_cost_desc_idx",
+        },
     ]
 
     npi = Column(BigInteger, nullable=False)
@@ -5422,9 +5352,7 @@ class PricingProviderPrescriptionAutocomplete(Base, JSONOutputMixin):
     generic_name = Column(String)
     brand_name = Column(String)
     total_claims = Column(Float)
-    total_drug_cost = Column(
-        Numeric(asdecimal=False, decimal_return_scale=None)
-    )
+    total_drug_cost = Column(Numeric(asdecimal=False, decimal_return_scale=None))
     total_benes = Column(Float)
     source_relation_fingerprint = Column(String(128), nullable=False)
 
@@ -5519,7 +5447,10 @@ class PricingProviderQualityFeature(Base, JSONOutputMixin):
         {"index_elements": ("year", "provider_class"), "name": "pricing_quality_feature_year_provider_class_idx"},
         {"index_elements": ("year", "specialty_key"), "name": "pricing_quality_feature_year_specialty_idx"},
         {"index_elements": ("year", "taxonomy_code"), "name": "pricing_quality_feature_year_taxonomy_code_idx"},
-        {"index_elements": ("year", "taxonomy_classification"), "name": "pricing_quality_feature_year_taxonomy_class_idx"},
+        {
+            "index_elements": ("year", "taxonomy_classification"),
+            "name": "pricing_quality_feature_year_taxonomy_class_idx",
+        },
     ]
 
     npi = Column(BigInteger, nullable=False)
@@ -5789,7 +5720,10 @@ class PricingProviderQualityScore(Base, JSONOutputMixin):
             "name": "pricing_quality_score_year_mode_borderline_idx",
         },
         {"index_elements": ("run_id",), "name": "pricing_quality_score_run_id_idx"},
-        {"index_elements": ("year", "benchmark_mode", "model_version"), "name": "pricing_quality_score_year_benchmark_model_idx"},
+        {
+            "index_elements": ("year", "benchmark_mode", "model_version"),
+            "name": "pricing_quality_score_year_benchmark_model_idx",
+        },
         {
             "index_elements": (
                 "year",
@@ -6187,7 +6121,10 @@ class CodeCatalog(Base, JSONOutputMixin):
         {"index_elements": ("lower(short_description)",), "name": "code_catalog_short_description_lower_idx"},
         {"index_elements": ("source",), "name": "code_catalog_source_idx"},
         {"index_elements": ("code_system", "source"), "name": "code_catalog_system_source_idx"},
-        {"index_elements": ("source", "code_system", "lower(display_name)"), "name": "code_catalog_source_system_display_lower_idx"},
+        {
+            "index_elements": ("source", "code_system", "lower(display_name)"),
+            "name": "code_catalog_source_system_display_lower_idx",
+        },
     ]
 
     code_system = Column(String(32), nullable=False)
@@ -6429,11 +6366,16 @@ class MedicareEnrollmentStats(Base, JSONOutputMixin):
 
 
 class DoctorClinicianAddress(Base, JSONOutputMixin):
+    __runtime_schema_sync__ = False
     __tablename__ = "doctor_clinician_address"
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("npi", "address_checksum"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["npi", "address_checksum"]
     __my_additional_indexes__ = [
@@ -6564,256 +6506,6 @@ class FacilityAnchorNPICandidate(Base, JSONOutputMixin):
     reviewed_at = Column(DateTime)
     source_run_id = Column(String(32), nullable=False)
     updated_at = Column(DateTime)
-
-
-class EntityAddressUnified(Base, JSONOutputMixin):
-    __tablename__ = "entity_address_unified"
-    __main_table__ = __tablename__
-    __table_args__ = (
-        PrimaryKeyConstraint("location_key"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
-    )
-    __my_index_elements__ = ["location_key"]
-    __my_additional_indexes__ = [
-        {"index_elements": ("npi",), "name": "npi"},
-        {"index_elements": ("npi",), "name": "primary_npi", "where": "type='primary'"},
-        {"index_elements": ("inferred_npi",), "name": "inferred_npi", "where": "inferred_npi IS NOT NULL"},
-        {"index_elements": ("coalesce(npi, inferred_npi)",), "name": "coalesced_npi"},
-        {"index_elements": ("entity_type", "coalesce(npi, inferred_npi)"), "name": "entity_type_coalesced_npi"},
-        {"index_elements": ("state_name", "city_name", "npi"), "name": "primary_state_city_npi", "where": "type='primary'"},
-        {"index_elements": ("zip5", "npi"), "name": "primary_zip5_npi", "where": "type='primary'"},
-        # Serving-type ZIP lookup for group-plan provider enumeration: the
-        # expression must match the query's zip5 fallback exactly so the
-        # planner can use it, and the WHERE mirrors the serving address types.
-        {
-            "index_elements": (
-                "(COALESCE(zip5, LEFT(COALESCE(postal_code, ''), 5)))",
-                "npi",
-            ),
-            "name": "serving_zip5_npi",
-            "where": "type IN ('practice','site','primary','secondary')",
-        },
-        {
-            "index_elements": (
-                "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
-                "npi",
-            ),
-            "name": "primary_phone_digits_npi",
-            "where": "type='primary'",
-        },
-        {
-            "index_elements": ("telephone_number", "npi"),
-            "name": "primary_phone_npi",
-            "where": "type='primary' AND telephone_number IS NOT NULL AND telephone_number <> ''",
-        },
-        {
-            "index_elements": ("phone_number", "npi"),
-            "name": "primary_phone_number_npi",
-            "where": "type='primary' AND phone_number IS NOT NULL AND phone_number <> ''",
-        },
-        {
-            "index_elements": (
-                "COALESCE(NULLIF(phone_number, ''), regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g'))",
-                "npi",
-            ),
-            "name": "service_phone_lookup_npi",
-            "where": (
-                "type IN ('primary', 'secondary', 'practice', 'site') "
-                "AND COALESCE(NULLIF(phone_number, ''), regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')) <> ''"
-            ),
-        },
-        {
-            "index_elements": (
-                "regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g')",
-                "npi",
-            ),
-            "name": "service_phone_digits_npi",
-            "where": (
-                "type IN ('primary', 'secondary', 'practice', 'site') "
-                "AND regexp_replace(COALESCE(telephone_number, ''), '[^0-9]', '', 'g') <> ''"
-            ),
-        },
-        {
-            "index_elements": ("phone_number", "npi"),
-            "name": "service_phone_number_npi",
-            "where": (
-                "type IN ('primary', 'secondary', 'practice', 'site') "
-                "AND phone_number IS NOT NULL AND phone_number <> ''"
-            ),
-        },
-        {
-            "index_elements": ("address_key", "npi"),
-            "name": "service_address_key_npi",
-            "where": "type IN ('primary', 'secondary', 'practice', 'site') AND address_key IS NOT NULL",
-        },
-        {
-            "index_elements": ("premise_key", "npi"),
-            "name": "service_premise_key_npi",
-            "where": "type IN ('primary', 'secondary', 'practice', 'site') AND premise_key IS NOT NULL",
-        },
-        {"index_elements": ("address_sources",), "using": "gin", "name": "address_sources"},
-        {"index_elements": ("row_origin",), "name": "row_origin"},
-        {"index_elements": ("address_precision",), "name": "address_precision"},
-        {"index_elements": ("archive_identity_version",), "name": "archive_identity_version"},
-        {"index_elements": ("premise_key",), "name": "premise_key"},
-        {"index_elements": ("zip5",), "name": "zip5"},
-        {"index_elements": ("state_code", "city_norm"), "name": "state_city_norm"},
-        {"index_elements": ("ptg_plan_array",), "using": "gin", "name": "ptg_plan_array"},
-        {"index_elements": ("ptg_source_array",), "using": "gin", "name": "ptg_source_array"},
-        {"index_elements": ("group_plan_array",), "using": "gin", "name": "group_plan_array"},
-        {
-            "index_elements": ("taxonomy_array gin__int_ops", "plans_network_array gin__int_ops"),
-            "using": "gin",
-            "name": "taxonomy_plans_network",
-            "where": "type='primary'",
-        },
-        # Composite ZIP+taxonomy lookup (requires the btree_gin extension) for
-        # group-plan specialty enumeration: both the zip5 fallback expression
-        # and the taxonomy overlap resolve inside ONE Index Cond, so a
-        # dense-metro specialty+radius query reads ~1k matching rows instead
-        # of heap-fetching every address in the radius (measured 114ms -> 58ms
-        # on dev). A standalone taxonomy GIN is deliberately NOT registered:
-        # the planner prefers it alone and regresses to a 300k-row scan.
-        {
-            "index_elements": (
-                "(COALESCE(zip5, LEFT(COALESCE(postal_code, ''), 5)))",
-                "taxonomy_array gin__int_ops",
-            ),
-            "using": "gin",
-            "name": "serving_zip5_taxonomy",
-            "where": "type IN ('practice','site','primary','secondary')",
-        },
-        {
-            "index_elements": ("procedures_array gin__int_ops",),
-            "using": "gin",
-            "name": "procedures_array",
-            "where": "type='primary'",
-        },
-        {
-            "index_elements": ("medications_array gin__int_ops",),
-            "using": "gin",
-            "name": "medications_array",
-            "where": "type='primary'",
-        },
-        {
-            # Geo GiST index over every geocoded SERVICE location, not just the
-            # NPPES primary/secondary -- so a radius search finds providers at their
-            # TiC/PTG and ACA practice/site locations too. city_zip-precision rows
-            # have no exact point and are intentionally excluded. The query-side type
-            # filter (api/endpoint/npi.py geo path) MUST match this predicate for the
-            # index to be used; widening the geo query is gated on a rebuild that
-            # recreates this partial index (CREATE INDEX IF NOT EXISTS on a fresh
-            # stage table, _create_stage_indexes), so the index lands before the
-            # query that depends on it is activated.
-            "index_elements": ("Geography(ST_MakePoint((long)::double precision, (lat)::double precision))",),
-            "using": "gist",
-            "name": "geo_idx",
-            "where": (
-                "type IN ('primary', 'secondary', 'practice', 'site') "
-                "AND COALESCE(address_precision, '') <> 'city_zip' "
-                "AND lat IS NOT NULL AND long IS NOT NULL"
-            ),
-        },
-        {
-            # Let radius+taxonomy searches apply both selective predicates in
-            # one GiST scan instead of filtering every address in the radius.
-            "index_elements": (
-                "public.Geography(public.ST_MakePoint((long)::double precision, (lat)::double precision))",
-                "taxonomy_array public.gist__intbig_ops",
-            ),
-            "using": "gist",
-            "name": "geo_taxonomy",
-            "where": (
-                "type IN ('primary', 'secondary', 'practice', 'site') "
-                "AND COALESCE(address_precision, '') <> 'city_zip' "
-                "AND lat IS NOT NULL AND long IS NOT NULL"
-            ),
-        },
-        {
-            # Cheaper serving index for /npi/near/. The query applies a lat/long
-            # bounding box before exact ST_DWithin distance filtering, so this
-            # preserves exact results while avoiding the full GiST build on each
-            # serving-only refresh. The GiST geo_idx stays available in the full
-            # index profile for workloads that need expression-index radius scans.
-            "index_elements": ("lat", "long"),
-            "include": ("npi", "address_key"),
-            "name": "geo_bbox",
-            "where": (
-                "type IN ('primary', 'secondary', 'practice', 'site') "
-                "AND COALESCE(address_precision, '') <> 'city_zip' "
-                "AND lat IS NOT NULL AND long IS NOT NULL"
-            ),
-        },
-        {"index_elements": ("address_key",), "name": "address_key"},
-    ]
-
-    entity_type = Column(String(64), nullable=False)
-    entity_id = Column(String(128), nullable=False)
-    npi = Column(BigInteger)
-    inferred_npi = Column(BigInteger)
-    inference_confidence = Column(Float)
-    inference_method = Column(String(64))
-    entity_name = Column(String(256))
-    entity_subtype = Column(String(64))
-    location_key = Column(String(64), nullable=False)
-    row_origin = Column(String(32), nullable=False, server_default="base")
-    archive_identity_version = Column(String(16), nullable=False, server_default="v2")
-    address_precision = Column(String(32), nullable=False, server_default="unknown")
-    premise_key = Column(PG_UUID(as_uuid=True))
-    zip5 = Column(String(5))
-    state_code = Column(String(2))
-    city_norm = Column(String)
-    county_fips = Column(String(5))
-    source_mask = Column(BigInteger, nullable=False, server_default="0")
-    address_source_mask = Column(BigInteger, nullable=False, server_default="0")
-    geo_evidence_source_id = Column(SMALLINT)
-    geo_identity_coherent = Column(Boolean)
-    geo_point_coherent = Column(Boolean)
-    geo_assurance_version = Column(SMALLINT)
-    source_count = Column(Integer, nullable=False, server_default="0")
-    independent_source_count = Column(Integer, nullable=False, server_default="0")
-    multi_source_confirmed = Column(Boolean, nullable=False, server_default="false")
-    location_confidence_id = Column(SMALLINT, nullable=False, server_default="0")
-    confidence_score = Column(SMALLINT)
-    freshness_score = Column(SMALLINT)
-    address_sources = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
-    source_record_ids = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
-    aca_plan_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
-    aca_network_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
-    ptg_plan_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
-    ptg_source_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
-    group_plan_array = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
-    base_address_version = Column(String(64))
-
-    checksum = Column(BigInteger, nullable=False)
-    type = Column(String(32), nullable=False)
-    taxonomy_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
-    plans_network_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
-    procedures_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
-    medications_array = Column(ARRAY(Integer), nullable=False, server_default="{0}")
-
-    first_line = Column(String)
-    second_line = Column(String)
-    city_name = Column(String)
-    state_name = Column(String)
-    postal_code = Column(String)
-    country_code = Column(String)
-    telephone_number = Column(String)
-    phone_number = Column(String(15))
-    phone_extension = Column(String(16))
-    fax_number = Column(String)
-    fax_number_digits = Column(String(15))
-    fax_extension = Column(String(16))
-    formatted_address = Column(String)
-    formatted_address_version = Column(SMALLINT)
-    formatted_address_source = Column(String(32))
-    lat = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None))
-    long = Column(Numeric(scale=8, precision=11, asdecimal=False, decimal_return_scale=None))
-    date_added = Column(DATE)
-    place_id = Column(String)
-    updated_at = Column(DateTime)
-    last_seen_at = Column(DateTime)
-    address_key = Column(PG_UUID(as_uuid=True))
 
 
 class EntityAddressEvidence(Base, JSONOutputMixin):

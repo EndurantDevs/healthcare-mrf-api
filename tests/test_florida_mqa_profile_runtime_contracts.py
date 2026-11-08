@@ -303,15 +303,18 @@ async def test_projection_batches_emit_empty_loaded_categories_without_facts(
 
 
 def _retention_database_responses(
-    *, live_run, rollback_run, completed_run, expired_failed_run, current_run
+    *, live_run, rollback_run, completed_run, expired_failed_run, current_run,
+    pinned_run=None,
 ):
     old_finished_at = florida._utcnow() - timedelta(days=30)
     live_name = ProviderProfileProjection.__tablename__
     return iter(
         (
-            [_Row(tablename=live_name), _Row(tablename=f"{live_name}_old")],
+            [_Row(tablename=live_name), _Row(tablename=f"{live_name}_old")]
+            + ([_Row(tablename="provider_profile_source_pin")] if pinned_run else []),
             [_Row(generation_id=live_run)],
             [_Row(generation_id=rollback_run)],
+            *([[_Row(run_id=pinned_run)]] if pinned_run else []),
             [
                 _Row(
                     run_id=completed_run,
@@ -333,6 +336,8 @@ def _retention_database_responses(
                     status="completed",
                     finished_at=old_finished_at,
                 ),
+                *([_Row(run_id=pinned_run, status="completed", finished_at=old_finished_at)]
+                  if pinned_run else []),
             ],
         )
     )
@@ -391,6 +396,48 @@ async def test_post_success_retention_protects_live_and_rollback_generations(
     assert (tmp_path / live_run).is_dir()
     assert (tmp_path / rollback_run).is_dir()
     delete_rows.assert_awaited_once_with([completed_run, expired_failed_run])
+
+
+@pytest.mark.asyncio
+async def test_post_success_retention_skips_pinned_run_and_cleans_unpinned_run(
+    monkeypatch, tmp_path,
+):
+    live_run = "a" * 32
+    rollback_run = "b" * 32
+    unpinned_run = "c" * 32
+    failed_run = "d" * 32
+    current_run = "e" * 32
+    pinned_run = "f" * 32
+    responses = _retention_database_responses(
+        live_run=live_run, rollback_run=rollback_run,
+        completed_run=unpinned_run, expired_failed_run=failed_run,
+        current_run=current_run, pinned_run=pinned_run,
+    )
+
+    class RetentionDb:
+        scalar = AsyncMock(return_value=1)
+
+        def transaction(self):
+            return _Transaction()
+
+        async def all(self, _statement, **_parameters):
+            return next(responses)
+
+    delete_rows = AsyncMock(return_value={"facts": 1, "source_records": 1, "artifacts": 1})
+    monkeypatch.setattr(florida, "db", RetentionDb())
+    monkeypatch.setattr(florida, "_delete_retained_payload_rows", delete_rows)
+    for run_id in (pinned_run, unpinned_run):
+        (tmp_path / run_id).mkdir()
+
+    retention_outcome = await florida._post_success_retention(
+        run_id=current_run, artifact_root=tmp_path, failed_retention_days=7,
+    )
+
+    assert retention_outcome["protected_audit_run_ids"] == sorted((live_run, rollback_run, pinned_run))
+    assert retention_outcome["deleted_run_ids"] == sorted((unpinned_run, failed_run))
+    assert (tmp_path / pinned_run).is_dir()
+    assert not (tmp_path / unpinned_run).exists()
+    delete_rows.assert_awaited_once_with(sorted((unpinned_run, failed_run)))
 
 
 @pytest.mark.asyncio

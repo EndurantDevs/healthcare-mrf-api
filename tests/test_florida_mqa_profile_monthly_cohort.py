@@ -9,6 +9,9 @@ from tests.test_florida_mqa_profile_publication_contracts import (
     _source_metrics,
     florida,
 )
+from tests.test_florida_mqa_profile_publication_contracts import (
+    native_projection_copy as native_projection_copy,
+)
 
 
 def _cohort_metrics(rows):

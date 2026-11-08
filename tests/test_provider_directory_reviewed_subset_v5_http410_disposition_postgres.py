@@ -6,17 +6,16 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from contextlib import AsyncExitStack
 from pathlib import Path
 
 import pytest
 
 from process import (
-    provider_directory_fhir_subset_terminal_disposition_v4_selection
-    as v4_selection,
+    provider_directory_fhir_subset_terminal_disposition_v4_selection as v4_selection,
 )
 from process import (
-    provider_directory_fhir_subset_terminal_disposition_v5_selection
-    as v5_selection,
+    provider_directory_fhir_subset_terminal_disposition_v5_selection as v5_selection,
 )
 from process.provider_directory_fhir_subset_terminal_disposition_contract import (
     TERMINAL_DISPOSITION_METADATA_KEY,
@@ -29,8 +28,8 @@ from process.provider_directory_fhir_subset_terminal_disposition_v5_selection im
     selected_direct_v5_terminal_disposition,
 )
 from tests.provider_directory_fhir_subset_abandonment_pg_support import (
+    _current_writer,
     close_abandonment_scenario,
-    runtime_database,
 )
 from tests.provider_directory_fhir_subset_terminal_disposition_v4_pg_support import (
     seed_direct_v4_terminal_root,
@@ -46,24 +45,27 @@ from tests.provider_directory_subset_completion_pg_concurrency import (
 )
 from tests.test_provider_directory_reviewed_subset_direct_v4_disposition_postgres import (
     SYNTHETIC_MARKER_SHA256 as SYNTHETIC_V4_MARKER_SHA256,
+)
+from tests.test_provider_directory_reviewed_subset_direct_v4_disposition_postgres import (
     _install_terminal_stack,
     _object_identity_by_kind,
 )
 from tests.test_provider_directory_reviewed_subset_terminal_window_postgres import (
     DIRECT_DISPOSITION_MIGRATION_PATH,
-    MIGRATION_PATH as TERMINAL_WINDOW_MIGRATION_PATH,
-    _load_migration as load_profile_migration,
     _run_migration,
 )
-
+from tests.test_provider_directory_reviewed_subset_terminal_window_postgres import (
+    MIGRATION_PATH as TERMINAL_WINDOW_MIGRATION_PATH,
+)
+from tests.test_provider_directory_reviewed_subset_terminal_window_postgres import (
+    _load_migration as load_profile_migration,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION_PATH = ROOT / "alembic/versions" / (
-    "20260811120000_provider_directory_reviewed_subset_v5_http410_disposition.py"
+MIGRATION_PATH = (
+    ROOT / "alembic/versions" / ("20260811120000_provider_directory_reviewed_subset_v5_http410_disposition.py")
 )
-SYNTHETIC_V5_MARKER_SHA256 = (
-    "f419b51652df88f110e7f1f8ea61298c7342d19427e9f6209d839ce54434eb83"
-)
+SYNTHETIC_V5_MARKER_SHA256 = "f419b51652df88f110e7f1f8ea61298c7342d19427e9f6209d839ce54434eb83"
 
 
 def _load_migration(path=MIGRATION_PATH, module_name="v5_http410_migration"):
@@ -138,8 +140,9 @@ async def _synthetic_v5_marker() -> dict:
 
 
 async def _assert_helper_is_private(scenario, migration) -> None:
-    assert await scenario.connection.fetchval(
-        """
+    assert (
+        await scenario.connection.fetchval(
+            """
         SELECT count(*)
           FROM pg_catalog.pg_proc AS helper
           CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
@@ -150,8 +153,10 @@ async def _assert_helper_is_private(scenario, migration) -> None:
            AND helper_acl.privilege_type = 'EXECUTE'
            AND helper_acl.grantee <> helper.proowner
         """,
-        f'{scenario.schema}."{migration._HELPER}"(text)',
-    ) == 0
+            f'{scenario.schema}."{migration._HELPER}"(text)',
+        )
+        == 0
+    )
 
 
 async def _assert_partial_bypass_is_rejected(
@@ -207,14 +212,20 @@ async def _assert_v5_seal_and_replay(
     second = await sync_v5_terminal_disposition(database, "source-a")
     assert first.disposed is True
     assert second.disposed is False
-    assert await scenario.connection.fetchval(
-        f'SELECT {scenario.quoted_schema}."{migration._HELPER}"($1)',
-        "dataset-a",
-    ) is True
-    assert await scenario.connection.fetchval(
-        f'SELECT {scenario.quoted_schema}."{direct._VALID}"($1)',
-        "dataset-a",
-    ) is True
+    assert (
+        await scenario.connection.fetchval(
+            f'SELECT {scenario.quoted_schema}."{migration._HELPER}"($1)',
+            "dataset-a",
+        )
+        is True
+    )
+    assert (
+        await scenario.connection.fetchval(
+            f'SELECT {scenario.quoted_schema}."{direct._VALID}"($1)',
+            "dataset-a",
+        )
+        is True
+    )
     sealed_checkpoints = await scenario.connection.fetchval(
         f"""
         SELECT count(*)
@@ -263,9 +274,7 @@ async def _assert_v3_downgrade_is_blocked(
     with pytest.raises(AssertionError) as downgrade_error:
         async with scenario.connection.transaction():
             await _run_migration(scenario, migration, "downgrade")
-    assert "provider_directory_v5_http410_downgrade_blocked" in str(
-        downgrade_error.value.__cause__
-    )
+    assert "provider_directory_v5_http410_downgrade_blocked" in str(downgrade_error.value.__cause__)
 
 
 @pytest.mark.asyncio
@@ -282,9 +291,10 @@ async def test_v5_http410_guard_rollback_seal_replay_and_downgrade_fence(
         "DIRECT_V5_TERMINAL_MARKER_SHA256",
         SYNTHETIC_V5_MARKER_SHA256,
     )
-    database = runtime_database()
+    writer_scope = AsyncExitStack()
     try:
         direct, _terminal_window = await _install_v5_predecessor(scenario)
+        database = await writer_scope.enter_async_context(_current_writer(scenario, monkeypatch))
         before_identity = await _object_identity_by_kind(scenario, direct)
         await seed_direct_v5_terminal_root(scenario)
         immutable_before = await _immutable_fingerprints(scenario)
@@ -306,7 +316,7 @@ async def test_v5_http410_guard_rollback_seal_replay_and_downgrade_fence(
         await _assert_v3_downgrade_is_blocked(scenario, migration)
         assert await _object_identity_by_kind(scenario, direct) == before_identity
     finally:
-        await database.engine.dispose()
+        await writer_scope.aclose()
         await close_abandonment_scenario(scenario)
 
 
@@ -321,16 +331,15 @@ async def test_v2_replay_survives_v3_upgrade_and_clean_downgrade(monkeypatch):
         "DIRECT_V4_TERMINAL_MARKER_SHA256",
         SYNTHETIC_V4_MARKER_SHA256,
     )
-    database = runtime_database()
+    writer_scope = AsyncExitStack()
     try:
         direct, _terminal_window = await _install_v5_predecessor(
             scenario,
             v4_marker_sha256=SYNTHETIC_V4_MARKER_SHA256,
         )
+        database = await writer_scope.enter_async_context(_current_writer(scenario, monkeypatch))
         migration._direct()._MARKER_SHA256 = SYNTHETIC_V4_MARKER_SHA256
-        migration._terminal_window()._direct_disposition()._MARKER_SHA256 = (
-            SYNTHETIC_V4_MARKER_SHA256
-        )
+        migration._terminal_window()._direct_disposition()._MARKER_SHA256 = SYNTHETIC_V4_MARKER_SHA256
         await seed_direct_v4_terminal_root(scenario)
         assert (await sync_v4_terminal_disposition(database, "source-a")).disposed
         before_identity = await _object_identity_by_kind(scenario, direct)
@@ -345,5 +354,5 @@ async def test_v2_replay_survives_v3_upgrade_and_clean_downgrade(monkeypatch):
         assert await _object_identity_by_kind(scenario, direct) == before_identity
         assert not (await sync_v4_terminal_disposition(database, "source-a")).disposed
     finally:
-        await database.engine.dispose()
+        await writer_scope.aclose()
         await close_abandonment_scenario(scenario)

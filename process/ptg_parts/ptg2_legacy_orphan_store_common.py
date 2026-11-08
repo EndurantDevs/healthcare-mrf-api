@@ -24,13 +24,13 @@ from process.ptg_parts.ptg2_lifecycle_lock import (
     PTG2_SOURCE_POINTER_GC_LOCK_KEY,
 )
 
-
 _BARE_SUFFIX_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _INTERNAL_RUN_PATTERN = re.compile(r"^ptg2:([0-9a-f]{32})$")
 _EMBEDDED_RELATION_PATTERN = r"_[0-9a-f]{32}(_|$)"
 _MRF_REQUIRED_TABLES = (
     "import_run",
     "plan_release_snapshot_binding",
+    "plan_release_snapshot_pin",
     "ptg2_allowed_amount_item",
     "ptg2_allowed_amount_payment",
     "ptg2_allowed_amount_plan",
@@ -112,7 +112,7 @@ def _normalized_json(value: Any) -> Any:
     if isinstance(value, str):
         try:
             return json.loads(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return {}
     return value if isinstance(value, (dict, list)) else {}
 
@@ -121,10 +121,7 @@ def _catalog_json_value(value: Any) -> Any:
     if isinstance(value, bytes):
         return {"bytea_hex": value.hex()}
     if isinstance(value, Mapping):
-        return {
-            str(key): _catalog_json_value(nested)
-            for key, nested in value.items()
-        }
+        return {str(key): _catalog_json_value(nested) for key, nested in value.items()}
     if isinstance(value, (list, tuple)):
         return [_catalog_json_value(nested) for nested in value]
     return value
@@ -161,9 +158,7 @@ def _snapshot_manifest_suffixes(
     root_suffix_by_name: Mapping[str, str],
 ) -> tuple[str, ...]:
     suffixes: set[str] = set()
-    for key, value in _walk_manifest_identities(
-        _normalized_json(manifest)
-    ):
+    for key, value in _walk_manifest_identities(_normalized_json(manifest)):
         if value in root_suffix_by_name:
             suffixes.add(root_suffix_by_name[value])
             continue
@@ -206,9 +201,7 @@ class _OwnershipAccumulator:
     declared_snapshot_ids: set[str] = field(default_factory=set)
     internal_run_statuses: set[tuple[str, str]] = field(default_factory=set)
     mirror_run_statuses: set[tuple[str, str]] = field(default_factory=set)
-    control_import_statuses: set[tuple[str, str]] = field(
-        default_factory=set
-    )
+    control_import_statuses: set[tuple[str, str]] = field(default_factory=set)
     placement_statuses: set[tuple[str, str]] = field(default_factory=set)
     active_references: set[str] = field(default_factory=set)
     fence_states: set[tuple[str, str]] = field(default_factory=set)

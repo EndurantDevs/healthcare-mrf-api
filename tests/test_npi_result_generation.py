@@ -12,21 +12,337 @@ from alembic.script import ScriptDirectory
 from process import npi_result_archive as archive
 from process import npi_result_generation as generation
 
+_HOSPITAL_UPGRADE_REVISIONS = (
+    "20260914100000_entity_address_result_generation",
+    "20260914110000_reference_family_result_generation",
+    "20260914120000_npi_result_generation",
+    "20260917130000_custom_import_generation_finality",
+    "20260917120000_entity_address_service_network",
+    "20260914130000_mrf_result_generation",
+    "20260920100000_cms_doctors_result_generation",
+    "20260920110000_tiger_result_generation",
+    "20260920120000_mrf_address_result_generation",
+    "20260920130000_geo_result_generation",
+    "20260920140000_pharmacy_economics_result_generation",
+    "20260920150000_terminology_result_generation",
+    "20260920160000_geo_census_result_generation",
+    "20260920170000_mrf_publication_receipt",
+    "20260921000000_provider_quality_result_generation",
+    "20260922000000_custom_import_durable_parquet_capture",
+    "20260922010000_source_profile_archive_pins",
+    "20260923000000_facility_address_contribution",
+    "20260923010000_code_sets_result_generation",
+    "20260923021000_ms_drg_result_generation",
+    "20260922010000_custom_import_execution_request_identity",
+    "20260923030000_custom_import_source_binding",
+    "20260929000000_cms_doctor_group_site",
+    "20260929010000_provider_directory_entity_identity",
+    "20260929020000_provider_directory_insurance_network_identity",
+    "20260929030000_provider_directory_mrf_payer_binding",
+    "20260930010000_provider_directory_resource_identity",
+    "20260930020000_cms_npd_serving_coverage",
+    "20260930030000_custom_import_registration_authority",
+    "20260930030000_cms_npd_stale_candidate",
+    "20260930040000_cms_npd_resource_witness",
+    "20260930050000_cms_npd_relationship",
+    "20260930060000_cms_doctors_site_binding",
+    "20260930070000_provider_directory_entity_redirect",
+    "20260930080000_cms_npd_coverage_version",
+    "20260930090000_cms_npd_candidate_coverage",
+    "20260930100000_cms_npd_serving_receipt",
+    "20260930110000_cms_npd_nonprofile_capacity",
+    "20260930120000_cms_native_input_revision",
+    "20260930130000_cms_doctors_prepared_seal",
+    "20260930140000_cms_capacity_preflight_receipt",
+    "20260929040000_reference_source_generation_guard",
+    "20261002000000_custom_import_segmented_capture",
+    "20261002010000_custom_import_bounded_build",
+    "20261002020000_custom_import_processing_policy",
+    "20261002030000_custom_import_identical_children",
+    "20261002040000_custom_import_child_memberships",
+    "20261003000000_address_alias_generation_guard",
+    "20261004000000_geo_assurance_dependency_bindings",
+    "20261001100000_profile_failed_cleanup_claim",
+    "20261001110000_profile_initial_publication",
+    "20261005020000_custom_import_sealed_append_plans",
+    "20261005030000_source_profile_statement_pins",
+    "20261005100000_rooted_graph_set_validation",
+    "20261005110000_ptg_set_validation",
+    "20261005120000_practitioner_set_validation",
+    "20261005130000_provider_dataset_candidates",
+    "20261005030000_custom_import_snapshot_storage",
+    "20261005040000_custom_import_bulk_snapshot_writers",
+    "20261005050000_custom_import_legacy_snapshot_writers",
+    "20261005060000_custom_import_snapshot_finality",
+    "20261005070000_custom_import_materialization_storage",
+    "20261005080000_custom_import_writer_cutover",
+    "20261007000000_custom_import_rejection_anti_joins",
+    "20261006010000_nucc_reference_result_generation",
+    "20261009000000_custom_import_child_presence_decode",
+    "20261010000000_custom_import_admission_indexes",
+    "20261010010000_custom_import_materialization_contract",
+    "20261007010000_managed_network_registry",
+    "20261007020000_registry_revision_history",
+    "20261007030000_network_serving_control",
+    "20261007040000_registry_source_evidence",
+    "20261007050000_canonical_address_network_ids",
+    "20261007060000_registry_approved_selection",
+    "20261007070000_registry_company_links",
+    "20261007080000_manual_directory_registry",
+    "20261007090000_network_membership_drafts",
+    "20261007100000_registry_publication_requests",
+    "20261007110000_registry_site_bindings",
+    "20261007120000_company_network_assertions",
+    "20261007130000_registry_network_bindings",
+    "20261007140000_registry_source_recipes",
+    "20261007150000_provider_directory_content_cursor_index",
+    "20261009010000_registry_ptg_producer_scope",
+    "20261009020000_company_registry_assertions",
+    "20261009030000_network_catalog_evidence",
+    "20261009040000_registry_ptg_published_plan_scope",
+    "20261010010000_registry_ptg_office_approval",
+    "20261010020000_registry_ptg_office_retention",
+    "20261010030000_registry_source_admission_receipt",
+    "20261011010000_company_registry_group_assertions",
+    "20261012010000_company_registry_name_origin",
+    "20261013010000_registry_custom_history_events",
+    "20261015020000_custom_import_query_projections",
+    "20261016070000_registry_allowed_plan_scope",
+    "20261017010000_registry_cms_source_notifications",
+    "20261017210000_provider_directory_readiness_indexes",
+    "20261017010000_custom_import_raw_objects",
+    "20261019010000_custom_import_build_continuation",
+    "20261020150000_custom_import_staged_verification",
+    "20261020180000_custom_import_verification_arms",
+    "20261020190000_custom_import_verification_root_ranges",
+    "20261020200000_custom_import_manual_acceptance",
+    "20261021110000_ptg_membership_import_idempotency",
+    "20261015010000_plan_release_binding_cohorts",
+    "20261015015000_generic_source_candidates",
+    "20261016010000_cms_registry_source_pair_slot",
+    "20261016030000_cms_source_guard_argument_types",
+    "20261016040000_source_validator_argument_types",
+    "20261016050000_acquisition_validator_argument_types",
+    "20261016060000_uhc_official_cohort_snapshots",
+    "20261017020000_source_registry_snapshot_join",
+    "20261017030000_registry_ptg_office_recipe_selection",
+    "20261017040000_nppes_evidence_candidates",
+    "20261018011000_network_candidate_custody",
+    "20261018040000_registry_aca_source_notifications",
+    "20261019010000_registry_raw_object_join",
+    "20261019020000_registry_continuation_join",
+    "20261019030000_provider_directory_role_schema",
+    "20261019130000_cms_archive_transaction_guard",
+    "20261019140000_plan_pricing_attribution_idempotency",
+    "20261019150000_registry_source_check_idempotency",
+    "20261020160000_registry_staged_verification_join",
+    "20261020210000_registry_manual_acceptance_join",
+    "20261022110000_ptg_checker_execution",
+    "20261022120000_provider_directory_first_retirement",
+    "20261023110000_code_pricing_import_idempotency",
+    "20261023100000_provider_directory_retirement_parent_updates",
+    "20261023220000_merge_directory_pricing_controls",
+    "20261025010000_company_affiliation_states",
+    "20261024050000_provider_directory_first_retirement_owner_lineage",
+    "20261023100000_provider_directory_serving_recovery",
+    "20261025020000_company_affiliation_join",
+    "20261028010000_registry_fhir_catalog",
+    "20261028020000_registry_membership_refresh",
+    "20261029010000_registry_source_inventory",
+    "20261102010000_custom_import_snapshot_retirement",
+    "20261102030000_custom_import_build_scratch",
+    "20261102040000_custom_import_post_seal_audit",
+    "20261104010000_custom_import_unlogged_landing",
+    "20261107010000_custom_import_child_reference_aggregate",
+)
+_SERVICE_NETWORK_UPGRADE_REVISIONS = (
+    "20260914100000_entity_address_result_generation",
+    "20260914110000_reference_family_result_generation",
+    *_HOSPITAL_UPGRADE_REVISIONS[5:],
+)
+
+
+def _assert_custom_import_manual_acceptance_lineage(script):
+    """Preserve the joined custom-import verification and acceptance ancestry."""
+    assert script.get_revision("20261020210000_registry_manual_acceptance_join").down_revision == (
+        "20261020160000_registry_staged_verification_join",
+        "20261021110000_ptg_membership_import_idempotency",
+    )
+    assert script.get_revision("20261021110000_ptg_membership_import_idempotency").down_revision == (
+        "20261020200000_custom_import_manual_acceptance"
+    )
+    assert script.get_revision("20261020200000_custom_import_manual_acceptance").down_revision == (
+        "20261020190000_custom_import_verification_root_ranges"
+    )
+    assert script.get_revision("20261020190000_custom_import_verification_root_ranges").down_revision == (
+        "20261020180000_custom_import_verification_arms"
+    )
+    assert script.get_revision("20261020180000_custom_import_verification_arms").down_revision == (
+        "20261020150000_custom_import_staged_verification"
+    )
+    assert script.get_revision("20261020150000_custom_import_staged_verification").down_revision == (
+        "20261019010000_custom_import_build_continuation"
+    )
+    assert script.get_revision("20261019010000_custom_import_build_continuation").down_revision == (
+        "20261017010000_custom_import_raw_objects"
+    )
+    assert script.get_revision("20261017010000_custom_import_raw_objects").down_revision == (
+        "20261017210000_provider_directory_readiness_indexes"
+    )
+    assert script.get_revision("20261017210000_provider_directory_readiness_indexes").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+
+
+def _assert_legacy_capture_lineage(script):
+    """Preserve the reference and capture ancestors beneath the registry chain."""
+    assert script.get_revision("20261006010000_nucc_reference_result_generation").down_revision == (
+        "20261007000000_custom_import_rejection_anti_joins"
+    )
+    assert script.get_revision("20261009000000_custom_import_child_presence_decode").down_revision == (
+        "20261006010000_nucc_reference_result_generation"
+    )
+    assert script.get_revision("20261010000000_custom_import_admission_indexes").down_revision == (
+        "20261009000000_custom_import_child_presence_decode"
+    )
+    assert script.get_revision("20261007010000_managed_network_registry").down_revision == (
+        "20261010010000_custom_import_materialization_contract"
+    )
+
+
+def _assert_current_registry_head(script: ScriptDirectory) -> None:
+    """Require one registry head after the unchanged published custom-import chain."""
+    assert script.get_heads() == ["20261107010000_custom_import_child_reference_aggregate"]
+    assert (
+        script.get_revision("20261029010000_registry_source_inventory").down_revision
+        == "20261028020000_registry_membership_refresh"
+    )
+    assert (
+        script.get_revision("20261028020000_registry_membership_refresh").down_revision
+        == "20261028010000_registry_fhir_catalog"
+    )
+    _assert_custom_import_manual_acceptance_lineage(script)
+    assert (
+        script.get_revision("20261019030000_provider_directory_role_schema").down_revision
+        == "20261019020000_registry_continuation_join"
+    )
+    assert script.get_revision("20261019020000_registry_continuation_join").down_revision == (
+        "20261019010000_registry_raw_object_join",
+        "20261019010000_custom_import_build_continuation",
+    )
+    assert script.get_revision("20261019010000_custom_import_build_continuation").down_revision == (
+        "20261017010000_custom_import_raw_objects"
+    )
+    assert script.get_revision("20261017020000_source_registry_snapshot_join").down_revision == (
+        "20261016060000_uhc_official_cohort_snapshots",
+        "20261017010000_registry_cms_source_notifications",
+    )
+    assert script.get_revision("20261017010000_registry_cms_source_notifications").down_revision == (
+        "20261016070000_registry_allowed_plan_scope"
+    )
+    assert script.get_revision("20261016070000_registry_allowed_plan_scope").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+    assert script.get_revision("20261016060000_uhc_official_cohort_snapshots").down_revision == (
+        "20261016050000_acquisition_validator_argument_types"
+    )
+    assert script.get_revision("20261015010000_plan_release_binding_cohorts").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+    assert script.get_revision("20261015020000_custom_import_query_projections").down_revision == (
+        "20261013010000_registry_custom_history_events"
+    )
+    assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
+        "20261010000000_custom_import_admission_indexes"
+    )
+    assert script.get_revision("20261010030000_registry_source_admission_receipt").down_revision == (
+        "20261010020000_registry_ptg_office_retention"
+    )
+    assert script.get_revision("20261010020000_registry_ptg_office_retention").down_revision == (
+        "20261010010000_registry_ptg_office_approval"
+    )
+    assert script.get_revision("20261010010000_registry_ptg_office_approval").down_revision == (
+        "20261009040000_registry_ptg_published_plan_scope"
+    )
+    assert script.get_revision("20261009040000_registry_ptg_published_plan_scope").down_revision == (
+        "20261009030000_network_catalog_evidence"
+    )
+    _assert_legacy_capture_lineage(script)
+
 
 def test_npi_migration_appends_to_the_deployed_hospital_head() -> None:
+    """The archive migrations retain one ordered head from deployed schemas."""
+
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     hospital_revision = "20260917100000_hospital_price_csv_v3_label"
     npi_revision = "20260914120000_npi_result_generation"
     finality_revision = "20260917130000_custom_import_generation_finality"
-
-    assert script.get_heads() == [finality_revision]
+    service_network_revision = "20260917120000_entity_address_service_network"
+    entity_address_revision = "20260914100000_entity_address_result_generation"
+    reference_revision = "20260914110000_reference_family_result_generation"
+    mrf_revision = "20260914130000_mrf_result_generation"
+    cms_revision = "20260920100000_cms_doctors_result_generation"
+    tiger_revision = "20260920110000_tiger_result_generation"
+    mrf_address_revision = "20260920120000_mrf_address_result_generation"
+    geo_revision = "20260920130000_geo_result_generation"
+    receipt_revision = "20260920170000_mrf_publication_receipt"
+    provider_quality_revision = "20260921000000_provider_quality_result_generation"
+    durable_capture_revision = "20260922000000_custom_import_durable_parquet_capture"
+    source_profile_revision = "20260922010000_source_profile_archive_pins"
+    facility_revision = "20260923000000_facility_address_contribution"
+    code_sets_revision = "20260923010000_code_sets_result_generation"
+    ms_drg_revision = "20260923021000_ms_drg_result_generation"
+    request_identity_revision = "20260922010000_custom_import_execution_request_identity"
+    source_binding_revision = "20260923030000_custom_import_source_binding"
+    doctors_revision = "20260929000000_cms_doctor_group_site"
+    _assert_current_registry_head(script)
+    assert script.get_revision("20260930080000_cms_npd_coverage_version").down_revision == (
+        "20260930070000_provider_directory_entity_redirect"
+    )
+    assert (
+        script.get_revision("20260929020000_provider_directory_insurance_network_identity").down_revision
+        == "20260929010000_provider_directory_entity_identity"
+    )
+    assert script.get_revision("20260929010000_provider_directory_entity_identity").down_revision == doctors_revision
+    assert script.get_revision(doctors_revision).down_revision == source_binding_revision
+    assert script.get_revision(source_binding_revision).down_revision == request_identity_revision
+    assert script.get_revision(request_identity_revision).down_revision == ms_drg_revision
+    assert script.get_revision(ms_drg_revision).down_revision == code_sets_revision
+    assert script.get_revision(code_sets_revision).down_revision == facility_revision
+    assert script.get_revision(facility_revision).down_revision == source_profile_revision
+    assert script.get_revision(source_profile_revision).down_revision == durable_capture_revision
+    assert script.get_revision(durable_capture_revision).down_revision == provider_quality_revision
+    assert script.get_revision(provider_quality_revision).down_revision == receipt_revision
+    assert script.get_revision(receipt_revision).down_revision == "20260920160000_geo_census_result_generation"
+    assert script.get_revision(geo_revision).down_revision == mrf_address_revision
+    assert script.get_revision(mrf_address_revision).down_revision == tiger_revision
+    assert script.get_revision(tiger_revision).down_revision == cms_revision
+    assert script.get_revision(cms_revision).down_revision == mrf_revision
     assert script.get_revision(hospital_revision).down_revision == "20260914120000_custom_import_v1_schema"
     assert script.get_revision(npi_revision).down_revision == hospital_revision
     assert script.get_revision(finality_revision).down_revision == npi_revision
-    assert [step.revision.revision for step in script._upgrade_revs("head", hospital_revision)] == [
-        npi_revision,
-        finality_revision,
-    ]
+    assert script.get_revision(service_network_revision).down_revision == finality_revision
+    assert script.get_revision(reference_revision).down_revision == entity_address_revision
+    assert script.get_revision(mrf_revision).down_revision == (service_network_revision, reference_revision)
+    assert tuple(step.revision.revision for step in script._upgrade_revs("head", hospital_revision)) == (
+        _HOSPITAL_UPGRADE_REVISIONS
+    )
+    assert tuple(step.revision.revision for step in script._upgrade_revs("head", service_network_revision)) == (
+        _SERVICE_NETWORK_UPGRADE_REVISIONS
+    )
+
+
+def test_profile_migrations_follow_custom_import_processing_policy() -> None:
+    """The initial publication upgrade extends the prior migration head in order."""
+    script = ScriptDirectory.from_config(Config("alembic.ini"))
+    followup_index = _HOSPITAL_UPGRADE_REVISIONS.index("20261002030000_custom_import_identical_children")
+    assert (
+        tuple(
+            step.revision.revision
+            for step in script._upgrade_revs("head", "20261002020000_custom_import_processing_policy")
+        )
+        == _HOSPITAL_UPGRADE_REVISIONS[followup_index:]
+    )
 
 
 def _serving(lineage_id: str, revision: int) -> dict[str, object]:
@@ -350,3 +666,17 @@ async def test_source_capture_requires_exactly_one_metadata_input() -> None:
             schema_name="mrf",
             source_metadata=None,
         )
+
+
+def test_cms_candidate_coverage_appends_to_serving_coverage():
+    """Keep candidate sealing on the existing linear migration chain."""
+    script = ScriptDirectory.from_config(Config("alembic.ini"))
+    assert script.get_revision("20260930030000_cms_npd_stale_candidate").down_revision == (
+        "20260930030000_custom_import_registration_authority"
+    )
+    assert script.get_revision("20260930090000_cms_npd_candidate_coverage").down_revision == (
+        "20260930080000_cms_npd_coverage_version"
+    )
+    assert script.get_revision("20260930100000_cms_npd_serving_receipt").down_revision == (
+        "20260930090000_cms_npd_candidate_coverage"
+    )

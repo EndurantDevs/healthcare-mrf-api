@@ -3,15 +3,14 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 import importlib.util
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 import asyncpg
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from public_evidence import evidence_record_primitives as record_primitives
 from process.nppes_public_evidence_chain import (
     NppesPublicEvidenceChainReceipt,
     _finished_chain_receipt,
@@ -43,6 +42,7 @@ from process.nppes_public_evidence_writer import (
 from process.nppes_public_evidence_writer_contract import (
     NppesRegistryAdmissionReceipt,
 )
+from public_evidence import evidence_record_primitives as record_primitives
 from tests.nppes_public_evidence_process_support import prepared_archive
 from tests.public_evidence_npi_enumeration_postgres_support import (
     npi_enumeration_schema,
@@ -53,20 +53,9 @@ from tests.public_evidence_nppes_registry_support import (
 )
 from tests.public_evidence_storage_postgres_support import run_migration_action
 
-
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION_PATH = (
-    ROOT
-    / "alembic"
-    / "versions"
-    / "20260808220000_public_evidence_nppes_registry_admission.py"
-)
-LIFECYCLE_MIGRATION_PATH = (
-    ROOT
-    / "alembic"
-    / "versions"
-    / "20260809020000_nppes_lifecycle_date_tolerance.py"
-)
+MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260808220000_public_evidence_nppes_registry_admission.py"
+LIFECYCLE_MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260809020000_nppes_lifecycle_date_tolerance.py"
 ARCHIVE_NAME = "NPPES_Data_Dissemination_July_2026_V2.zip"
 PRIMARY_SNAPSHOT = "20260712"
 NEW_TABLES = (
@@ -150,17 +139,6 @@ DEFAULT_ROWS = (
 )
 
 
-class ConnectionDatabase:
-    """Expose one exact asyncpg connection through the production DB seam."""
-
-    def __init__(self, connection: asyncpg.Connection) -> None:
-        self.connection = connection
-
-    @asynccontextmanager
-    async def acquire_driver(self) -> AsyncIterator[asyncpg.Connection]:
-        yield self.connection
-
-
 def load_admission_migration() -> Any:
     """Load the task migration without importing it as package state."""
 
@@ -213,9 +191,7 @@ class _NppesAdmissionMigrationStack:
 
 
 @asynccontextmanager
-async def nppes_admission_schema() -> (
-    AsyncIterator[tuple[AsyncEngine, Any, str, Any]]
-):
+async def nppes_admission_schema() -> AsyncIterator[tuple[AsyncEngine, Any, str, Any]]:
     """Install the NPI, admission, and lifecycle revisions."""
 
     async with npi_enumeration_schema() as (
@@ -255,12 +231,13 @@ async def admit_replay(
     replay: PreparedNppesRegistryReplay,
 ) -> NppesRegistryAdmissionReceipt:
     """Run the exact production archive writer against one disposable schema."""
+    from tests.nppes_candidate_postgres_support import candidate_component
 
     return await admit_nppes_registry_archive(
         replay,
         required_config(),
         schema=schema_name,
-        database=ConnectionDatabase(connection),
+        database=candidate_component(schema_name).database,
     )
 
 
@@ -286,11 +263,12 @@ async def admit_chain(
     chain: NppesPublicEvidenceChainReceipt,
 ) -> NppesPublicEvidenceChainReceipt:
     """Run the production listing-chain writer in the disposable schema."""
+    from tests.nppes_candidate_postgres_support import candidate_component
 
     return await admit_nppes_public_evidence_chain(
         chain,
         schema=schema_name,
-        database=ConnectionDatabase(connection),
+        database=candidate_component(schema_name).database,
     )
 
 
@@ -304,9 +282,7 @@ def alternate_source_record_values(
         release,
         {
             "record_kind": "nppes_registry_record",
-            "identity_contract_id": (
-                replay.manifest.identity.record_identity_contract_id
-            ),
+            "identity_contract_id": (replay.manifest.identity.record_identity_contract_id),
             "record_hmac_sha256": "5a" * 32,
             "payload_sha256": "6b" * 32,
         },
@@ -332,17 +308,10 @@ async def _assert_altered_admission_columns(
         schema,
         list(altered_tables),
     )
+    assert {altered_column_row["relname"] for altered_column_row in altered_columns} == set(altered_tables)
+    assert all(altered_column_row["data_type"] == "character varying(50)" for altered_column_row in altered_columns)
     assert {
-        altered_column_row["relname"] for altered_column_row in altered_columns
-    } == set(altered_tables)
-    assert all(
-        altered_column_row["data_type"] == "character varying(50)"
-        for altered_column_row in altered_columns
-    )
-    assert {
-        altered_column_row["relname"]
-        for altered_column_row in altered_columns
-        if not altered_column_row["attnotnull"]
+        altered_column_row["relname"] for altered_column_row in altered_columns if not altered_column_row["attnotnull"]
     } == {altered_tables[0]}
 
 
@@ -369,11 +338,7 @@ async def assert_admission_catalog(
         list(NEW_TABLES),
     )
     assert {
-        table_name: tuple(
-            column_row["attname"]
-            for column_row in column_rows
-            if column_row["relname"] == table_name
-        )
+        table_name: tuple(column_row["attname"] for column_row in column_rows if column_row["relname"] == table_name)
         for table_name in NEW_TABLES
     } == EXPECTED_COLUMNS_BY_TABLE
     nullable_member_columns = {
@@ -386,18 +351,11 @@ async def assert_admission_catalog(
         "evidence_ref",
     }
     for column_row in column_rows:
-        assert column_row["data_type"] == EXPECTED_TYPE_BY_COLUMN[
-            column_row["attname"]
-        ]
+        assert column_row["data_type"] == EXPECTED_TYPE_BY_COLUMN[column_row["attname"]]
         assert column_row["attnotnull"] is (
-            column_row["relname"] != NEW_TABLES[2]
-            or column_row["attname"] not in nullable_member_columns
+            column_row["relname"] != NEW_TABLES[2] or column_row["attname"] not in nullable_member_columns
         )
-        expected_default = (
-            "transaction_timestamp()"
-            if column_row["attname"] in {"created_at", "sealed_at"}
-            else None
-        )
+        expected_default = "transaction_timestamp()" if column_row["attname"] in {"created_at", "sealed_at"} else None
         assert column_row["default_expr"] == expected_default
     await _assert_altered_admission_columns(connection, schema, altered_tables)
 
@@ -413,7 +371,6 @@ __all__ = (
     "EXPECTED_COLUMNS_BY_TABLE",
     "EXPECTED_TYPE_BY_COLUMN",
     "NEW_TABLES",
-    "ConnectionDatabase",
     "admit_chain",
     "admit_replay",
     "alternate_source_record_values",

@@ -13,8 +13,8 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     Column,
-    Integer,
     Index,
+    Integer,
     PrimaryKeyConstraint,
     String,
     UniqueConstraint,
@@ -25,12 +25,14 @@ from db.json_mixin import JSONOutputMixin
 
 __all__ = (
     "CMSDoctorEducation",
+    "CMSDoctorGroupSite",
     "ProviderProfileArtifact",
     "ProviderProfileFact",
     "ProviderProfileImportRun",
     "ProviderProfileProjection",
     "ProviderProfileSourceRecord",
     "ProviderProfileSourcePublication",
+    "ProviderProfileSourcePin",
 )
 
 _SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA") or os.getenv("DB_SCHEMA") or "mrf"
@@ -39,11 +41,16 @@ _SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA") or os.getenv("DB_SCHEMA") or "mrf"
 class CMSDoctorEducation(Base, JSONOutputMixin):
     """Distinct education assertions from one published CMS source file."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = "cms_doctor_education"
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("npi", "education_key"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["npi", "education_key"]
 
@@ -54,6 +61,41 @@ class CMSDoctorEducation(Base, JSONOutputMixin):
     generation_id = Column(String(64), nullable=False)
     source_json = Column(JSON, nullable=False)
     imported_at = Column(TIMESTAMP, nullable=False)
+
+
+class CMSDoctorGroupSite(Base, JSONOutputMixin):
+    """One source row at clinician, enrollment, group, and site grain."""
+
+    __runtime_schema_sync__ = False
+    __tablename__ = "cms_doctor_group_site"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("row_number"),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
+    )
+    __my_additional_indexes__ = [
+        {"index_elements": ("npi",), "name": "npi"},
+        {"index_elements": ("org_pac_id",), "name": "org"},
+        {"index_elements": ("adrs_id",), "name": "adrs"},
+    ]
+
+    row_number = Column(BigInteger, nullable=False, autoincrement=False)
+    npi = Column(BigInteger, nullable=False)
+    ind_enrl_id = Column(String(64))
+    org_pac_id = Column(String(64))
+    adrs_id = Column(TEXT)
+    facility_name = Column(TEXT)
+    num_org_mem = Column(Integer)
+    address_checksum = Column(BigInteger)
+    generation_id = Column(String(64), nullable=False)
+    source_json = Column(JSON, nullable=False)
+    observed_at = Column(TIMESTAMP, nullable=False)
+    membership_start_at = Column(TIMESTAMP)
+    membership_end_at = Column(TIMESTAMP)
 
 
 class ProviderProfileImportRun(Base, JSONOutputMixin):
@@ -88,6 +130,23 @@ class ProviderProfileSourcePublication(Base, JSONOutputMixin):
     current_run_id = Column(String(64), nullable=False)
     previous_run_id = Column(String(64))
     published_at = Column(TIMESTAMP, nullable=False)
+
+
+class ProviderProfileSourcePin(Base, JSONOutputMixin):
+    """Local archive/activation authority; never part of the portable result."""
+
+    __tablename__ = "provider_profile_source_pin"
+    __table_args__ = (
+        PrimaryKeyConstraint("pin_id", "run_id"),
+        Index("provider_profile_source_pin_run_idx", "run_id"),
+        {"schema": _SCHEMA, "extend_existing": True},
+    )
+
+    pin_id = Column(String(36), nullable=False)
+    source_key = Column(String(96), nullable=False)
+    run_id = Column(String(64), nullable=False)
+    purpose = Column(String(16), nullable=False)
+    authority_json = Column(JSON, nullable=False)
 
 
 class ProviderProfileArtifact(Base, JSONOutputMixin):
