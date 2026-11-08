@@ -17,6 +17,11 @@ from process import provider_directory_generic_source_policy as source_policy
 
 QUALIFICATION_API_BASE = contextvars.ContextVar("provider_directory_qualification_api_base", default=None)
 CREDENTIAL_REQUEST_LOCKS = contextvars.ContextVar("provider_directory_credential_request_locks", default=None)
+CENSUS_REQUEST_DEFERRED_ERROR = "source_request_cooldown"
+
+
+class CensusRequestDeferred(Exception):
+    """A queued census request must retain its shared cooldown without sending."""
 
 
 def is_credentialed_rest_source(directory, source_record):
@@ -26,8 +31,41 @@ def is_credentialed_rest_source(directory, source_record):
 
 
 def retry_after_limit(directory, source_record):
-    """Retain the reviewed provider's full delay without changing other sources."""
-    return None if is_credentialed_rest_source(directory, source_record) else 600.0
+    """Retain full server delays for reviewed transport and explicit census contracts."""
+    return (
+        None
+        if is_credentialed_rest_source(directory, source_record) or uses_census_retry_policy(directory, source_record)
+        else 600.0
+    )
+
+
+def uses_census_retry_policy(directory, source_record):
+    """Identify explicit census contracts independently of legacy transport policy."""
+    if directory._source_metadata(source_record).get("provider_directory_opaque_cursor_census") is True:
+        return True
+    return any(
+        isinstance(settings_by_field, dict) and settings_by_field.get("census_mode") == directory.leaf_census.CONTRACT
+        for settings_by_field in directory._last_updated_partition_resource_configs(source_record).values()
+    )
+
+
+def should_defer_census_retry(directory, source_record, response_by_field):
+    """Let durable census callers retain server and shared cooldowns without sleeping."""
+    if not uses_census_retry_policy(directory, source_record):
+        return False
+    return (
+        directory._source_retry_after_seconds(response_by_field, max_delay_seconds=None) or 0
+    ) > 0 or has_census_cooldown(directory, source_record)
+
+
+def has_census_cooldown(directory, source_record):
+    """Leave explicit census cooldowns to durable checkpoints, including queued sends."""
+    if directory.current_version_census_contract(source_record) is not None or not uses_census_retry_policy(
+        directory, source_record
+    ):
+        return False
+    pacing_by_field = source_record.get("_provider_directory_request_pacing_state", source_record)
+    return pacing_by_field.get("retry_after_monotonic", 0) > directory.time.monotonic()
 
 
 def is_pagination_cooldown_failure(directory, status_code, fetch_error, *, source_record=None):
@@ -126,6 +164,7 @@ def requires_verified_session(directory, source_record):
     return bool(
         directory.current_version_census_contract(source_record) is not None
         or directory.capped_partition.enabled(directory, source_record)
+        or uses_census_retry_policy(directory, source_record)
         or is_credentialed_rest_source(directory, source_record)
         or directory._source_metadata(source_record).get("provider_directory_pagination_same_collection") is True
     )
@@ -314,10 +353,40 @@ def is_trusted_fhir_pagination_url(
         and parsed_next.password is None
         and not parsed_next.fragment
         and (
+            not uses_census_retry_policy(directory, source_record)
+            or census_pagination_url_allowed(directory, source_record, next_url)
+        )
+        and (
             directory._source_metadata(source_record).get("provider_directory_pagination_same_collection") is not True
             or parsed_next.path == urllib.parse.urlsplit(current_url).path
         )
     )
+
+
+def census_pagination_url_allowed(directory, source_record, next_url):
+    """Limit explicit directory census cursors to their exact public API and resource paths."""
+    api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    if not api_base:
+        return False
+    try:
+        parsed_next = urllib.parse.urlsplit(next_url)
+        base_path = urllib.parse.urlsplit(api_base).path.rstrip("/")
+        resources = directory._source_supported_resource_types(source_record)
+        resources = directory.DEFAULT_RESOURCES if resources is None else resources
+        allowed_paths = {base_path, base_path + "/", *(f"{base_path}/{resource}" for resource in resources)}
+        return bool(
+            parsed_next.scheme == "https"
+            and directory._pagination_host_key(next_url) == directory._pagination_host_key(api_base)
+            and parsed_next.path in allowed_paths
+            and (
+                parsed_next.path not in {base_path, base_path + "/"} or directory._has_fhir_continuation_query(next_url)
+            )
+            and "%" not in parsed_next.path
+            and "\\" not in next_url
+            and not any(ord(character) < 33 for character in next_url)
+        )
+    except ValueError:
+        return False
 
 
 class QualificationURLRejected(ValueError):
@@ -734,6 +803,10 @@ async def fetch_source_candidate(directory, source_record, candidate_url, *, tim
         if should_try_smaller_page and not is_last_candidate:
             return directory._source_fetch_result_with_elapsed(fetch_result, total_elapsed_ms), True, retry_count
         if not should_retry_fetch or attempt_index + 1 >= attempt_count:
+            break
+        if fetch_error == CENSUS_REQUEST_DEFERRED_ERROR or should_defer_census_retry(
+            directory, source_record, fhir_payload
+        ):
             break
         retry_count += 1
         await directory.asyncio.sleep(

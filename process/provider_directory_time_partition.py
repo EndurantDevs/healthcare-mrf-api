@@ -65,8 +65,8 @@ class CountObservation:
             if self.detail is not None:
                 raise PartitionPlanError("an overflow observation cannot include an error detail")
         elif self.kind is CountKind.SPLIT:
-            if self.count is not None or self.detail != "timeout":
-                raise PartitionPlanError("an uncounted split requires a timeout reason and no count")
+            if self.count is not None or self.detail not in ("timeout", "planned"):
+                raise PartitionPlanError("an uncounted split requires a timeout reason or planned reason and no count")
         elif self.count is not None:
             raise PartitionPlanError("an error or unknown count cannot include a count")
 
@@ -82,7 +82,7 @@ class CountObservation:
 
     @classmethod
     def split(cls, reason: str = "timeout") -> CountObservation:
-        """Subdivide a timed-out count only under a caller's exhaustive contract."""
+        """Subdivide without a count only under a caller's exhaustive contract."""
         return cls(CountKind.SPLIT, detail=reason)
 
     @classmethod
@@ -431,9 +431,11 @@ class PartitionPlan:
     def _split_or_fail(self, window: TimeWindow) -> None:
         if window.end - window.start < 2 * self.config.minimum_width:
             self._fail(
-                "minimum_width_overflow",
+                "minimum_width_planned_split" if window.split_reason == "planned" else "minimum_width_overflow",
                 (
-                    "timed-out count cannot be split above the minimum width"
+                    "uncounted window cannot be split above the minimum width"
+                    if window.split_reason == "planned"
+                    else "timed-out count cannot be split above the minimum width"
                     if window.split_reason is not None
                     else "window exceeds the ceiling and cannot be split above the minimum width"
                 ),
@@ -559,13 +561,13 @@ class PartitionPlan:
             or reason is not None
         ):
             raise PartitionPlanError("checkpoint overflow lower bound is invalid")
-        if reason is not None and reason != "timeout":
+        if reason is not None and reason not in ("timeout", "planned"):
             raise PartitionPlanError("checkpoint uncounted split reason is invalid")
         if window.count is not None or window.passes:
             raise PartitionPlanError("checkpoint uncounted split contains an exact count or passes")
         if (
             self.failure is not None
-            and self.failure.code == "minimum_width_overflow"
+            and self.failure.code in {"minimum_width_overflow", "minimum_width_planned_split"}
             and self.failure.window_id == window.window_id
             and window.state is WindowState.NEEDS_COUNT
             and window.end - window.start < 2 * self.config.minimum_width

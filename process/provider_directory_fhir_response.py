@@ -101,6 +101,58 @@ def is_access_denied_outcome(resource_payload: dict[str, Any] | None) -> bool:
     return any(marker in issue_text for marker in ("access denied", "not authorized", "not authorised", "forbidden"))
 
 
+def resource_search_payload_error(
+    directory,
+    source_record: dict[str, Any],
+    request_url: str,
+    status_code: int | None,
+    payload_by_field: dict[str, Any] | None,
+) -> str | None:
+    """Reject errored or ambiguous successful collection responses."""
+    aetna_error = directory._aetna_resource_search_payload_error(
+        source_record,
+        request_url,
+        status_code,
+        payload_by_field,
+    )
+    if aetna_error:
+        return aetna_error
+    resource_type = directory._fhir_collection_search_resource_type(
+        source_record,
+        request_url,
+    )
+    api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    is_root_continuation = bool(
+        api_base
+        and directory._canonical_base(request_url) == api_base
+        and directory._has_fhir_continuation_query(request_url)
+    )
+    if status_code != 200 or not (resource_type or is_root_continuation) or not isinstance(payload_by_field, dict):
+        return None
+    if payload_by_field.get("resourceType") == "OperationOutcome":
+        return directory.RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR
+    if not directory._is_bundle_payload(payload_by_field):
+        return None
+    if (
+        resource_type
+        and api_base == directory.CIGNA_PROVIDER_DIRECTORY_BASE
+        and directory._has_fhir_continuation_query(request_url)
+        and directory._is_empty_fhir_search_set(status_code, payload_by_field, None)
+        and type(payload_by_field.get("total")) is int
+        and payload_by_field["total"] == 0
+    ):
+        return directory.CIGNA_AMBIGUOUS_EMPTY_CONTINUATION_ERROR
+    entry_resources = [entry["resource"] for entry in directory._bundle_entries(payload_by_field)]
+    outcome_resources = [resource for resource in entry_resources if resource.get("resourceType") == "OperationOutcome"]
+    resource_types = (resource_type,) if resource_type else directory.DEFAULT_RESOURCES
+    if outcome_resources and (
+        not any(resource.get("resourceType") in resource_types for resource in entry_resources)
+        or any(directory._has_operation_outcome_error(outcome) for outcome in outcome_resources)
+    ):
+        return directory.RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR
+    return None
+
+
 async def fetch_paced_source_response(directory, source_record, url, *, timeout):
     """Gate queued sends before pacing and publish cooldown before releasing a slot."""
     if directory.current_version_census_contract(source_record) is not None:
@@ -128,7 +180,10 @@ async def fetch_paced_source_response(directory, source_record, url, *, timeout)
         request_slots = slot_map[slot_key]
     while True:
         async with request_slots, total_slots:
-            await directory._pace_source_request(source_record)
+            try:
+                await directory._pace_source_request(source_record, allow_census_defer=True)
+            except directory.source_selection.CensusRequestDeferred:
+                return None, None, directory.source_selection.CENSUS_REQUEST_DEFERRED_ERROR, 0
             if isinstance(request_slots, AdaptiveRequestSlots) and request_slots.active > request_slots.limit:
                 continue
             response = await directory._fetch_source_json_unpaced(source_record, url, timeout=timeout)
@@ -399,3 +454,117 @@ def read_sync_error_body(directory, response, *, timeout, allow_gzip):
         )
     except Exception:
         return b""
+
+
+async def fetch_last_updated_partition_count(directory, source_record, request_url, *, timeout, deadline_at=None):
+    """Fetch one exact, non-paginated partition count observation."""
+    retry_delays = directory.LAST_UPDATED_PARTITION_COUNT_ENVELOPE_RETRY_DELAYS_SECONDS
+    attempt_index = 0
+    while True:
+        fetch_result, is_deadline_blocked = await directory._fetch_cooldown_checkpoint_page(
+            source_record,
+            request_url,
+            (None, None, "TimeoutError: census deadline reached", 0),
+            timeout=timeout,
+            deadline_at=deadline_at,
+        )
+        status_code, response_payload, error, _elapsed = fetch_result
+        split_observation = None
+        if not is_deadline_blocked:
+            split_observation = directory.capped_partition.split_observation(
+                directory, source_record, request_url, status_code, response_payload, error
+            )
+        if split_observation is not None:
+            return directory.LastUpdatedCountFetch(split_observation, pages_fetched=attempt_index + 1)
+        pages_fetched = attempt_index + int(error != directory.source_selection.CENSUS_REQUEST_DEFERRED_ERROR)
+        if status_code != 200 or error:
+            failure_error = error or f"http_{status_code}"
+            is_transient = directory._is_transient_source_fetch_failure(status_code, error)
+            return directory.LastUpdatedCountFetch(
+                observation=(None if is_transient else directory.CountObservation.error(failure_error)),
+                pages_fetched=pages_fetched,
+                error=failure_error,
+                transient=is_transient,
+                retry_not_before=(
+                    directory._last_updated_partition_retry_not_before(
+                        source_record,
+                        request_url,
+                        status_code,
+                        response_payload,
+                        error,
+                        max_delay_seconds=directory.source_selection.retry_after_limit(directory, source_record),
+                    )
+                    if is_transient
+                    else None
+                ),
+            )
+        count_fetch = directory._validate_last_updated_partition_count_payload(response_payload)
+        if count_fetch.error != "non_searchset_count_bundle":
+            return directory.replace(count_fetch, pages_fetched=pages_fetched)
+        if attempt_index == len(retry_delays):
+            return directory.replace(
+                count_fetch,
+                pages_fetched=pages_fetched,
+                error="non_searchset_count_bundle_retry_exhausted",
+            )
+        delay = retry_delays[attempt_index]
+        if deadline_at is not None:
+            delay = min(delay, max(0, deadline_at - directory.time.monotonic()))
+        await directory.asyncio.sleep(delay)
+        attempt_index += 1
+
+
+def opaque_terminal_proof(directory, proof_by_field, request_url, pages_processed, rows_processed):
+    """Bind an observed terminal page to its exact issued request and committed counters."""
+    return {
+        **proof_by_field,
+        "terminal_page": {
+            "request_sha256": directory.hashlib.sha256(request_url.encode("utf-8")).hexdigest(),
+            "pages_processed": pages_processed,
+            "rows_processed": rows_processed,
+            "has_next": False,
+        },
+    }
+
+
+async def opaque_terminal_resume_error(directory, context, resource_type, resume_state):
+    """Permit count-only recovery only for an intact terminal receipt and candidate."""
+    if "terminal_page" not in resume_state.completeness or resume_state.complete:
+        return None
+    receipt_by_field = resume_state.completeness["terminal_page"]
+    if (
+        not isinstance(receipt_by_field, dict)
+        or set(receipt_by_field) != {"request_sha256", "pages_processed", "rows_processed", "has_next"}
+        or receipt_by_field["has_next"] is not False
+        or type(receipt_by_field["pages_processed"]) is not int
+        or receipt_by_field["pages_processed"] < 1
+        or type(receipt_by_field["rows_processed"]) is not int
+        or receipt_by_field["rows_processed"] < 0
+        or receipt_by_field["pages_processed"] != resume_state.pages_processed
+        or receipt_by_field["rows_processed"] != resume_state.rows_processed
+        or not resume_state.next_url
+        or receipt_by_field["request_sha256"]
+        != directory.hashlib.sha256(resume_state.next_url.encode("utf-8")).hexdigest()
+    ):
+        return "terminal_receipt_invalid"
+    if await directory._caresource_unique_candidate_count(context, resource_type) != resume_state.rows_processed:
+        return "terminal_candidate_count_mismatch"
+    return None
+
+
+def retained_census_retry_boundary(directory, source_record, retry_at):
+    """Keep an observed shared cooldown when a queued census exhausts its deadline."""
+    if (
+        retry_at is None
+        or not directory.source_selection.uses_census_retry_policy(directory, source_record)
+        or directory.current_version_census_contract(source_record) is not None
+    ):
+        return retry_at
+    pacing_by_field = source_record.get("_provider_directory_request_pacing_state", source_record)
+    remaining = pacing_by_field.get("retry_after_monotonic", 0) - directory.time.monotonic()
+    if remaining <= 0:
+        return retry_at
+    return max(
+        retry_at,
+        directory._retry_not_before_timestamp(directory.datetime.datetime.now(directory.datetime.UTC), remaining),
+    )

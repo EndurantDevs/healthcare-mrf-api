@@ -5,6 +5,7 @@ import asyncio
 import copy
 import dataclasses
 import json
+import types
 import urllib.parse
 from unittest.mock import AsyncMock
 
@@ -414,6 +415,9 @@ async def test_deadline_retains_proof_and_resumes_without_restarting_chunks(monk
     harness = _LastUpdatedPartitionFetchHarness(directory_source, fingerprints_by_window_and_pass)
     prepare = importer._prepare_partition_state
     monkeypatch.setattr(importer, "_last_updated_partition_monotonic", lambda: monotonic_values[0])
+    monkeypatch.setattr(
+        importer, "time", types.SimpleNamespace(**{**vars(importer.time), "monotonic": lambda: monotonic_values[0]})
+    )
 
     async def prepared(*args, **kwargs):
         state = await prepare(*args, **kwargs)

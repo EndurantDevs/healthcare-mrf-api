@@ -14,6 +14,10 @@ try:
     from scripts.research.provider_directory_endpoint_acquisition_support import (
         CAPPED_LAST_UPDATED_COUNT_METRIC_NAMES,
         CAPPED_LAST_UPDATED_ZERO_METRIC_NAMES,
+        CARESOURCE_PROOF_METRIC_NAMES,
+        LEAF_SUM_LAST_UPDATED_COUNT_METRIC_NAMES,
+        LEAF_SUM_LAST_UPDATED_SOURCE_METRIC_NAMES,
+        LEAF_SUM_LAST_UPDATED_ZERO_METRIC_NAMES,
         RUN_ID_PATTERN,
     )
 except ModuleNotFoundError:
@@ -23,6 +27,10 @@ except ModuleNotFoundError:
     from provider_directory_endpoint_acquisition_support import (
         CAPPED_LAST_UPDATED_COUNT_METRIC_NAMES,
         CAPPED_LAST_UPDATED_ZERO_METRIC_NAMES,
+        CARESOURCE_PROOF_METRIC_NAMES,
+        LEAF_SUM_LAST_UPDATED_COUNT_METRIC_NAMES,
+        LEAF_SUM_LAST_UPDATED_SOURCE_METRIC_NAMES,
+        LEAF_SUM_LAST_UPDATED_ZERO_METRIC_NAMES,
         RUN_ID_PATTERN,
     )
     from provider_directory_support_contract import RESOURCE_TYPES
@@ -59,6 +67,8 @@ RESOURCE_STAT_FIELDS = frozenset(
         "caresource_opaque_cursor_unique_candidate_rows",
         "caresource_opaque_cursor_verified_sources",
         "collection_complete_sources",
+        *LEAF_SUM_LAST_UPDATED_COUNT_METRIC_NAMES,
+        *LEAF_SUM_LAST_UPDATED_SOURCE_METRIC_NAMES,
         "last_updated_capped_sources",
         "last_updated_capped_verified_sources",
         "last_updated_capped_versioned_sources",
@@ -134,6 +144,14 @@ def _safe_resource_outcomes(metrics_by_name: dict[str, Any]) -> dict[str, Any]:
             and (
                 field_name in ALWAYS_PRESERVED_RESOURCE_STAT_FIELDS
                 or field_value != 0
+                or (
+                    (_safe_count(resource_outcome_by_field.get("caresource_opaque_cursor_sources")) or 0) > 0
+                    and field_name in CARESOURCE_PROOF_METRIC_NAMES
+                )
+                or (
+                    resource_outcome_by_field.get("last_updated_leaf_sum_sources") not in (None, 0)
+                    and field_name in LEAF_SUM_LAST_UPDATED_COUNT_METRIC_NAMES + LEAF_SUM_LAST_UPDATED_ZERO_METRIC_NAMES
+                )
                 or (
                     resource_outcome_by_field.get("last_updated_capped_sources") not in (None, 0)
                     and field_name in CAPPED_LAST_UPDATED_COUNT_METRIC_NAMES + CAPPED_LAST_UPDATED_ZERO_METRIC_NAMES

@@ -47,12 +47,17 @@ def test_pacificsource_seed_matches_catalog_without_product_claims(monkeypatch):
     assert source_by_field["auth_type"] == "none"
     assert not source_by_field["requires_registration"] and not source_by_field["requires_api_key"]
     metadata = source_by_field["metadata_json"]
+    assert metadata["provider_directory_opaque_cursor_census"] is True
     assert metadata["provider_directory_plan_provenance_neutralized"] is True
     assert metadata["provider_directory_expected_nonempty_resources"] == [
         resource for resource in importer.DEFAULT_RESOURCES if resource != "Endpoint"
     ]
     for resource in importer.DEFAULT_RESOURCES:
-        cap = {"PractitionerRole": 10, "OrganizationAffiliation": 50}.get(resource, 100)
+        cap = {
+            "PractitionerRole": 1,
+            "OrganizationAffiliation": 50,
+            **{name: 200 for name in ("Practitioner", "Location", "Organization", "HealthcareService")},
+        }.get(resource, 100)
         assert importer._source_resource_timeout(source_by_field, resource, 15) == 90
         assert (
             importer._resource_start_url(source_by_field, resource, page_count=1000)
@@ -89,6 +94,45 @@ def test_pacificsource_uses_the_existing_durable_checkpoint_scope():
     assert context.canonical_api_base == BASE and context.source_ids == (SOURCE_ID,)
     assert context.owner_run_id == context.acquisition_root_run_id == "run-first"
     assert importer._pagination_checkpoint_scope_identity(source, [SOURCE_ID]) == (BASE, context.source_scope_hash)
+    assert importer._is_caresource_opaque_cursor_census(source, dataclasses.replace(context, dataset_id="candidate"))
+    previous_source_by_field = {**source, "metadata_json": {**source["metadata_json"]}}
+    previous_source_by_field["metadata_json"].pop("provider_directory_opaque_cursor_census")
+    assert importer._pagination_checkpoint_scope_identity(previous_source_by_field, [SOURCE_ID]) != (
+        BASE,
+        context.source_scope_hash,
+    )
+    assert importer._twin_root_source_acquisition_contract(source) != importer._twin_root_source_acquisition_contract(
+        previous_source_by_field
+    )
+    for artifact in (False, True):
+        assert importer._source_contract_metadata_keys(source["metadata_json"], artifact=artifact) == (
+            *importer._source_contract_metadata_keys(previous_source_by_field["metadata_json"], artifact=artifact),
+            "provider_directory_opaque_cursor_census",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resource", ["Practitioner", "Location", "Organization", "HealthcareService", "PractitionerRole"]
+)
+async def test_large_collections_use_existing_verified_partition_acquisition(monkeypatch, resource):
+    from unittest.mock import AsyncMock
+
+    source = importer._source_row_from_seed(importer.pacificsource.seed_rows()[0])
+    partition_fetch = AsyncMock(return_value=object())
+    monkeypatch.setattr(importer, "_fetch_last_updated_partition_resource_rows", partition_fetch)
+    result = await importer._fetch_resource_rows(
+        source, resource, per_resource_limit=0, page_limit=0, page_count=100, timeout=60, run_id="example"
+    )
+    assert result is partition_fetch.return_value
+    actual_source, actual_resource, _model, config, _options = partition_fetch.await_args.args
+    assert actual_source is source and actual_resource == resource
+    assert config.start == importer.datetime.datetime(1900, 1, 1, tzinfo=importer.datetime.UTC)
+    assert config.end is None and config.end_mode == "resolved_now"
+    assert config.minimum_width == config.boundary_precision == importer.datetime.timedelta(seconds=1)
+    assert config.census_mode == "unfiltered-leaf-sum-v1"
+    assert config.volatile_metadata_paths == ()
+    assert config.page_count <= config.ceiling
 
 
 @pytest.mark.parametrize(
@@ -223,6 +267,7 @@ async def test_pacificsource_checkpoint_resume_exceeds_noncheckpoint_page_ceilin
     from unittest.mock import AsyncMock
 
     source_row_map = importer._source_row_from_seed(importer.pacificsource.seed_rows()[0])
+    source_row_map["metadata_json"].pop(importer.LAST_UPDATED_PARTITION_METADATA_KEY)
     context = importer._pagination_checkpoint_context(
         source_row_map, [SOURCE_ID], run_id="run-example", retry_of_run_id=None
     )
