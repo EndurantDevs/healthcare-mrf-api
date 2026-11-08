@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Batch authority, immutable native identities and no per-resource SQL."""
 
+import importlib
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from types import SimpleNamespace
@@ -21,8 +22,12 @@ def test_legacy_constraint_trigger_is_omitted_only_from_template_shape(root):
     guarded_by_field = dict(
         plain_by_field, constraints=[["legacy_guard", "t", "TRIGGER DEFERRABLE INITIALLY DEFERRED", True]]
     )
-    assert _isolated_layout_shape(guarded_by_field, template=True) == _isolated_layout_shape(plain_by_field, template=False)
-    assert _isolated_layout_shape(guarded_by_field, template=False) != _isolated_layout_shape(plain_by_field, template=False)
+    assert _isolated_layout_shape(guarded_by_field, template=True) == _isolated_layout_shape(
+        plain_by_field, template=False
+    )
+    assert _isolated_layout_shape(guarded_by_field, template=False) != _isolated_layout_shape(
+        plain_by_field, template=False
+    )
 
 
 def _case():
@@ -333,6 +338,157 @@ async def test_reset_advances_cutoff_without_payload_update_or_delete(harness):
     assert h.header["candidate_storage_json"]["resets"] == {"Organization": 1}
     assert len(h.copies) == 1
     assert all("pg_advisory_xact_lock" in query or query.startswith("UPDATE") for query in h.sql)
+
+
+@pytest.fixture
+def partition_directory(harness):
+    directory = importlib.import_module("process.provider_directory_fhir")
+
+    for name in (
+        "_last_updated_partition_checkpoint_resource_type",
+        "_last_updated_partition_fingerprint_resource_type",
+    ):
+        setattr(harness.directory, name, getattr(directory, name))
+    return directory
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pass_number", (None, 1, 2))
+async def test_selected_partition_reset_preserves_exact_cutoffs_and_input_identity(
+    harness, partition_directory, pass_number
+):
+    resource_type = (
+        partition_directory._last_updated_partition_checkpoint_resource_type("Organization")
+        if pass_number is None
+        else partition_directory._last_updated_partition_fingerprint_resource_type("Organization", pass_number)
+    )
+    harness.header["candidate_storage_json"].update(
+        ordinal=7,
+        resets={"*": 1, "Organization": 2, "Location": 3, "LU:Organization:pass:2": 4},
+    )
+    previous = deepcopy(harness.header["candidate_storage_json"])
+
+    await storage.reset_generic_source_family(object(), harness.directory, harness.candidate, resource_type)
+
+    expected_by_field = {**previous, "resets": {**previous["resets"], resource_type: 7}}
+    assert harness.header["candidate_storage_json"] == expected_by_field
+    assert harness.copies == []
+    assert len(harness.sql) == 2
+    assert "pg_advisory_xact_lock" in harness.sql[0] and harness.sql[1].startswith("UPDATE")
+    assert '"source_schema"."provider_directory_endpoint_dataset"' in harness.sql[1]
+    lock = harness.connection.execute.await_args_list[0]
+    lock_family = resource_type if pass_number is None else "Organization"
+    assert storage._encoded(["source_schema", "dataset", lock_family]) in lock.args[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resource_type",
+    (
+        "Location",
+        "Location:LastUpdatedPartition",
+        "LU:Location:pass:1",
+        "LU:Location:pass:2",
+        "Organization:LastUpdatedPartition:extra",
+        "Organization:lastupdatedpartition",
+        "LU:Organization:pass:0",
+        "LU:Organization:pass:3",
+        "LU:Organization:pass:01",
+        "LU:Organization:pass:1:extra",
+        "LU:Organization:other:1",
+        "LU:Organization",
+        "*",
+        "",
+    ),
+)
+async def test_reset_refuses_unselected_or_malformed_partition_family_before_database(
+    harness, partition_directory, monkeypatch, resource_type
+):
+    owner = AsyncMock(side_effect=AssertionError("owner transaction must not open"))
+    monkeypatch.setattr(storage, "source_owner_transaction", owner)
+    previous = deepcopy(harness.header)
+
+    with pytest.raises(GenericCandidateError, match="reset_scope_changed"):
+        await storage.reset_generic_source_family(object(), harness.directory, harness.candidate, resource_type)
+
+    owner.assert_not_called()
+    harness.connection.fetchrow.assert_not_awaited()
+    harness.connection.execute.assert_not_awaited()
+    harness.connection.copy_records_to_table.assert_not_awaited()
+    assert harness.header == previous and harness.sql == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pass_number", (1, 2))
+async def test_partition_reset_uses_the_payload_append_family_lock(harness, partition_directory, pass_number):
+    marker = partition_directory._last_updated_partition_fingerprint_resource_type("Organization", pass_number)
+    rows = [*_rows(1), {**_rows(1)[0], "resource_type": marker}]
+    await storage.append_generic_source_batch(object(), harness.directory, harness.candidate, rows)
+    append_lock = harness.connection.execute.await_args_list[0].args
+    harness.connection.execute.reset_mock()
+
+    await storage.reset_generic_source_family(object(), harness.directory, harness.candidate, marker)
+
+    reset_lock = harness.connection.execute.await_args_list[0].args
+    assert reset_lock == append_lock
+    assert harness.header["candidate_storage_json"]["resets"] == {marker: 1}
+    assert harness.header["candidate_storage_json"]["ordinal"] == 1
+    assert len(harness.copies) == 1 and len(harness.copies[0][1]["records"]) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retained", (False, True))
+async def test_new_partition_candidate_reaches_real_reset_while_retained_candidate_is_untouched(
+    harness, partition_directory, monkeypatch, retained
+):
+    from process import provider_directory_generic_source_policy as policy
+
+    directory = partition_directory
+    candidate = harness.candidate
+    candidate.reused_from_checkpoint = retained
+    candidate.identity = storage.candidate_identity(harness.directory, candidate)
+    context = directory.PaginationCheckpointContext(
+        canonical_api_base="https://directory.example/fhir",
+        source_scope_hash="scope",
+        source_ids=("source",),
+        owner_run_id="root",
+        acquisition_root_run_id="root",
+        dataset_id=candidate.dataset_id,
+    )
+    candidate.checkpoint_context = context
+    marker = directory._last_updated_partition_checkpoint_resource_type("Organization")
+    initialization = directory.LastUpdatedPartitionInitialization("Organization", marker, "start_hash", "plan")
+    previous = deepcopy(harness.header)
+
+    @asynccontextmanager
+    async def transaction(*args, **kwargs):
+        yield harness.connection
+
+    for name in ("_schema", "_endpoint_dataset_candidate_metadata"):
+        monkeypatch.setattr(directory, name, getattr(harness.directory, name))
+    monkeypatch.setattr(directory, "source_checkpoint_transaction", transaction)
+    monkeypatch.setattr(directory, "_mutable_endpoint_dataset_resource_mutation", transaction)
+    monkeypatch.setattr(policy, "source_transaction", transaction)
+    monkeypatch.setattr(directory, "_require_source_native_connection", AsyncMock())
+    monkeypatch.setattr(directory, "_lock_endpoint_dataset_resource_family", AsyncMock())
+    monkeypatch.setattr(storage, "resolve_existing_source_candidate", AsyncMock(return_value=candidate))
+    monkeypatch.setattr(directory, "delete_dataset_proof_shards", AsyncMock())
+    monkeypatch.setattr(directory, "delete_dataset_resource_proof_shards", AsyncMock())
+    harness.connection.status = AsyncMock()
+
+    await directory._reset_new_endpoint_candidate(harness.connection, candidate, (initialization,))
+
+    if retained:
+        assert harness.header == previous and harness.sql == [] and harness.copies == []
+        harness.connection.status.assert_not_awaited()
+    else:
+        assert harness.header["candidate_storage_json"]["resets"] == {"*": 0, marker: 0}
+        checkpoint = harness.connection.status.await_args.kwargs
+        assert checkpoint["resource_type"] == marker and checkpoint["next_url"] == "plan"
+        assert checkpoint["dataset_id"] == candidate.dataset_id
+        assert checkpoint["acquisition_root_run_id"] == candidate.acquisition_root_run_id
+        assert harness.header["candidate_storage_json"]["tables"] == previous["candidate_storage_json"]["tables"]
+        assert harness.copies == []
 
 
 @pytest.mark.asyncio
