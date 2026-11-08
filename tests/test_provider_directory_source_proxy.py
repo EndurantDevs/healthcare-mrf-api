@@ -204,6 +204,22 @@ async def test_unselected_run_never_opens_pool_or_emits_proxy_audit(monkeypatch,
 
 
 @pytest.mark.asyncio
+async def test_terminal_audit_retains_connector_cooldown_without_another_request(monkeypatch):
+    configure(monkeypatch)
+    async with scope(monkeypatch, []) as (run, session):
+        metrics_by_name = {}
+        run.attach_audit(metrics_by_name)
+        binding = run.bindings[SOURCE["source_id"]]
+        selection = binding.select(URL, "example")
+        until = datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=5)
+        binding.defer(selection.proxy_id, until.isoformat())
+        run.attach_audit({})
+        assert metrics_by_name["source_http_proxy"]["cooldowns"] == binding.cooldown_snapshot()
+        assert len(metrics_by_name["source_http_proxy"]["cooldowns"]["cooldowns"]) == 1
+        assert session.requests == []
+
+
+@pytest.mark.asyncio
 async def test_enabled_dispatch_requires_prepared_scope_before_network(monkeypatch):
     configure(monkeypatch)
     token, _run = adapter.enter_run(importer)

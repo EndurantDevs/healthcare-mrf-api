@@ -12,6 +12,7 @@ from process import provider_directory_profile_source_inputs as inputs
 from process import provider_directory_published_replacement_inputs as serving_inputs
 from process import provider_directory_published_source_replacement as replacement
 from process import provider_directory_serving_recovery as recovery
+from process import vsp_directory_integration as vsp_directory
 from process.provider_directory_artifact_scratch_inputs import (
     _loading_projection,
     _repair_loading_rows,
@@ -187,7 +188,8 @@ def source_publication_request(directory, source_records, enabled):
         and source_record_by_field.get("source_id") not in {None, "cms-npd", directory.UHC_RETAINED_SOURCE_ID}
         and not directory.is_uhc_flex_profile_source(source_record_by_field["source_id"])
         and not directory._uses_alohr_graphql_connector(source_record_by_field)
-        and not directory._uses_uhc_official_file_connector(source_record_by_field),
+        and not directory._uses_uhc_official_file_connector(source_record_by_field)
+        and not vsp_directory.is_source(source_record_by_field),
         "rest_source_publication_source_invalid",
     )
     request_lifecycle_by_field = {"active": True}
