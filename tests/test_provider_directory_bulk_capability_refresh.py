@@ -472,3 +472,62 @@ async def test_validate_refresh_propagates_probe_error(monkeypatch):
 
     assert error == "bulk_export_output_http_500"
     persist_refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("length", "etag"), [(20, '"stable"'), (21, '"stable"'), (20, '"changed"')])
+async def test_refreshed_capability_requires_same_bytes_before_resume(monkeypatch, length, etag):
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_KEY", "bulk-refresh-test-key")
+    identity, checkpoint = _refresh_identity(), _refresh_checkpoint()
+    output = _refresh_output_checkpoint(etag_ciphertext=importer._encrypt_bulk_capability('"stable"'))
+    manifest = importer._bulk_export_manifest_from_payload(
+        _manifest_payload(output=[{"type": "Practitioner", "url": "https://storage.googleapis.com/example"}]),
+        "Practitioner",
+    )
+    headers_by_name = {"content-length": "1", "content-range": f"bytes 0-0/{length}", "etag": etag}
+    persist_refresh = AsyncMock()
+    monkeypatch.setattr(importer, "_bulk_http_probe_output", AsyncMock(return_value=(206, headers_by_name, None)))
+    monkeypatch.setattr(importer, "_persist_bulk_capability_refresh", persist_refresh)
+
+    error = await importer._validate_and_persist_bulk_capabilities(
+        object(),
+        _source(),
+        identity,
+        checkpoint,
+        manifest,
+        [output],
+        _fetch_options(),
+        AsyncMock(),
+    )
+
+    if length != 20 or etag != '"stable"':
+        assert error == "bulk_export_output_validator_mismatch"
+        assert importer._is_bulk_export_error_terminal(error)
+        persist_refresh.assert_not_awaited()
+        return
+    assert error is None
+    persist_refresh.assert_awaited_once()
+    assert persist_refresh.await_args.args[:3] == (identity, checkpoint, manifest)
+    output_pairs, validators = persist_refresh.await_args.args[3:]
+    assert output_pairs == [(manifest.outputs[0], output)]
+    assert validators[0].etag_hash == output["etag_hash"]
+    assert validators[0].content_length_bytes == output["content_length_bytes"]
+
+    stream = AsyncMock(return_value=([], 0, 0, False, None))
+    monkeypatch.setattr(importer, "_stream_bulk_export_output_rows", stream)
+    await importer._request_checkpointed_bulk_output(
+        object(),
+        _source(),
+        identity,
+        manifest,
+        manifest.outputs[0],
+        output,
+        _stream_options(range_resume_enabled=True),
+        AsyncMock(),
+    )
+
+    assert stream.await_args.args[2] == manifest.outputs[0].url
+    resume_options = stream.await_args.kwargs["resume_options"]
+    assert resume_options.resume_offset == 10
+    assert resume_options.expected_content_length == 20
+    assert resume_options.expected_etag == '"stable"'

@@ -47,7 +47,7 @@ _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _SPOOL_ROWS = 65_536
 _MERGE_FAN_IN = 32
 # Keep serial I/O checks responsive while proof work shares the event loop.
-_PROOF_CHECKPOINT_ROWS = 64
+_PROOF_CHECKPOINT_ROWS = 32
 _NPI_RESOURCE_TYPES = {
     "HealthcareService",
     "Organization",
