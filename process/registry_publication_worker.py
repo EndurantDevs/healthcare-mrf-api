@@ -126,10 +126,18 @@ def parse_publication_consumer_config(configured):
     if (
         type(configured) is not dict
         or not required <= set(configured)
-        or set(configured) - required - {"loader_roles", "reader_roles"}
+        or set(configured) - required - {"loader_roles", "reader_roles", "only_request_id"}
     ):
         _invalid()
     roles_by_name = dict(configured)
+    if "only_request_id" in configured:
+        request_id_text = configured["only_request_id"]
+        if type(request_id_text) is not str:
+            _invalid()
+        request_id = UUID(request_id_text)
+        if not request_id.int or str(request_id) != request_id_text:
+            _invalid()
+        roles_by_name["only_request_id"] = request_id
     for name in ("loader_roles", "reader_roles"):
         roles = configured.get(name, [])
         if (

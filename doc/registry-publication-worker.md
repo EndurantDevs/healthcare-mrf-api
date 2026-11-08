@@ -56,6 +56,10 @@ role names each. The five principal roles must be distinct. The application
 origin accepts only an HTTP or HTTPS origin without user information, path,
 query or fragment. The service token is never printed.
 
+Optional `consumer.only_request_id` restricts claims to one canonical, nonzero
+UUID string, including lease-expiry recovery. Omit it to retain ordinary queue
+selection; explicit `null` is invalid. It does not change authorization or leases.
+
 For an ordinary first publication at serving head zero, provide an explicitly
 admitted protected base-address artifact:
 

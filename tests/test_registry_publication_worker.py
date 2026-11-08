@@ -59,6 +59,47 @@ def test_publication_custody_census_matches_existing_role_contract():
     assert parsed.consumer.custody_roles == worker._custody_roles(parsed) == expected
 
 
+def test_optional_request_selector_preserves_existing_consumer_and_authority():
+    configured = configuration()
+    legacy = worker.parse_registry_publication_worker_config(json.dumps(configured))
+    assert legacy.consumer.only_request_id is None
+    configured["consumer"]["only_request_id"] = _ID
+    original = deepcopy(configured)
+    selected = worker.parse_registry_publication_worker_config(json.dumps(configured))
+    assert selected == replace(legacy, consumer=replace(legacy.consumer, only_request_id=UUID(_ID)))
+    assert configured == original
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        True,
+        1,
+        [],
+        {},
+        "",
+        "invalid",
+        str(UUID(int=0)),
+        _ID.upper(),
+        _ID.replace("-", ""),
+        "{" + _ID + "}",
+        "urn:uuid:" + _ID,
+        " " + _ID,
+    ],
+)
+def test_request_selector_refuses_noncanonical_identity_before_resources(monkeypatch, capsys, value):
+    configured = configuration()
+    configured["consumer"]["only_request_id"] = value
+    monkeypatch.setenv(worker.CONFIG_ENV, json.dumps(configured))
+    run = AsyncMock(side_effect=AssertionError("invalid request reached runtime"))
+    monkeypatch.setattr(worker, "run_registry_publication_worker", run)
+    assert worker.run_command() == 2
+    run.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err == '{"state":"error","code":"invalid_configuration"}\n'
+
+
 @pytest.mark.parametrize("mode", [None, "require", "verify-full"])
 def test_configuration_matches_database_roles_and_tls_without_exposing_credentials(mode):
     configured = configuration()

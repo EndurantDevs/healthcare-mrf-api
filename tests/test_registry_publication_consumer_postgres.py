@@ -5,7 +5,7 @@ import asyncio
 import hashlib
 import json
 from contextlib import AsyncExitStack, aclosing, asynccontextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
@@ -347,27 +347,93 @@ async def test_retained_operation_rejection_remains_readable(worker_permissions,
         assert await _head(fixture) == current_head
 
 
-async def test_expired_lease_restarts_exact_request_after_transient_authority_failure(worker_permissions):
-    fixture = worker_permissions
-    is_unavailable = True
+def _exact_worker_config(fixture, arguments, request_id):
+    """Build the public worker configuration for one queued request."""
+    configured = _deadline_worker_config(fixture, arguments)
+    return {
+        "lifecycle_dsn": configured.lifecycle_url.render_as_string(hide_password=False),
+        "execution_dsn": configured.execution_url.render_as_string(hide_password=False),
+        "app_origin": configured.app_origin,
+        "service_token": configured.service_token,
+        "consumer": {
+            **_options(fixture),
+            "reader_roles": list(configured.consumer.reader_roles),
+            "only_request_id": request_id,
+        },
+        "initial_address_sources": {"base_source": asdict(arguments["initial_address_sources"].base_source)},
+        "operation_seconds": 30,
+    }
+
+
+async def _assert_request_rows_preserved(fixture, queued, other, immutable, untouched):
+    """Preserve the selected request inputs and every field of the unrelated request."""
+    table = f'"{fixture.fixture.control_schema}".registry_publication_request'
+    identity_sql = f"SELECT request_sha256,command_json,actor_json FROM {table} WHERE request_id=$1"
+    assert await fixture.fixture.connection.fetchrow(identity_sql, UUID(queued["request_id"])) == immutable
+    assert (
+        await fixture.fixture.connection.fetchrow(
+            f"SELECT * FROM {table} WHERE request_id=$1", UUID(other["request_id"])
+        )
+        == untouched
+    )
+
+
+async def test_expired_lease_restarts_exact_request_after_transient_authority_failure(
+    bounded_worker_permissions, monkeypatch, capsys
+):
+    """Resume only the selected request after failure and cancellation, leaving other work untouched."""
+    from process import registry_publication_worker as worker
+
+    fixture = bounded_worker_permissions
+    failure = "authority"
 
     async def unavailable(_payload, _count):
-        return 503 if is_unavailable else None
+        if failure == "cancel":
+            raise asyncio.CancelledError
+        return 503 if failure == "authority" else None
 
-    async with _consumer(fixture, authority_hook=unavailable) as (arguments, _):
+    async with _consumer(fixture, authority_hook=unavailable) as (arguments, calls):
+        other = await _enqueue_ordinary(fixture)
         queued = await _enqueue_ordinary(fixture)
-        with pytest.raises(RuntimeError):
-            await consume_registry_publication_once(**arguments)
-        await fixture.fixture.connection.execute(
-            f'UPDATE "{fixture.fixture.control_schema}".registry_publication_request '
-            "SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE request_id=$1",
-            UUID(queued["request_id"]),
+        table = f'"{fixture.fixture.control_schema}".registry_publication_request'
+        untouched = await fixture.fixture.connection.fetchrow(
+            f"SELECT * FROM {table} WHERE request_id=$1", UUID(other["request_id"])
         )
-        is_unavailable = False
-        completed = await consume_registry_publication_once(**arguments)
-        assert (
-            completed["request_id"] == queued["request_id"] and (await _status(fixture, queued))["state"] == "completed"
+        identity_sql = f"SELECT request_sha256,command_json,actor_json FROM {table} WHERE request_id=$1"
+        immutable = await fixture.fixture.connection.fetchrow(identity_sql, UUID(queued["request_id"]))
+
+        @asynccontextmanager
+        async def authority_client(_origin, _token):
+            yield arguments["authorize"]
+
+        monkeypatch.setattr(worker, "RegistryPublicationAuthorityClient", authority_client)
+        monkeypatch.setenv(
+            worker.CONFIG_ENV, json.dumps(_exact_worker_config(fixture, arguments, queued["request_id"]))
         )
+        for failure, exit_code, code in (("authority", 1, "worker_failed"), ("cancel", 130, "canceled")):
+            before_calls = len(calls)
+            assert await asyncio.to_thread(worker.run_command) == exit_code
+            output = capsys.readouterr()
+            assert output.out == "" and json.loads(output.err) == {"state": "error", "code": code}
+            assert len(calls) > before_calls and (await _status(fixture, queued))["state"] == "running"
+            assert await _head(fixture) is None
+            await _assert_request_rows_preserved(fixture, queued, other, immutable, untouched)
+            await fixture.fixture.connection.execute(
+                f"UPDATE {table} SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE request_id=$1",
+                UUID(queued["request_id"]),
+            )
+        failure = None
+        assert await asyncio.to_thread(worker.run_command) == 0
+        output = capsys.readouterr()
+        assert output.err == "" and json.loads(output.out) == {"state": "completed", "request_id": queued["request_id"]}
+        assert (await _status(fixture, queued))["state"] == "completed" and await _head(fixture) > 0
+        await _assert_request_rows_preserved(fixture, queued, other, immutable, untouched)
+        before_calls = len(calls)
+        assert await asyncio.to_thread(worker.run_command) == 0
+        output = capsys.readouterr()
+        assert output.err == "" and json.loads(output.out) == {"state": "no_work"}
+        assert len(calls) == before_calls
+        await _assert_request_rows_preserved(fixture, queued, other, immutable, untouched)
 
 
 @asynccontextmanager
