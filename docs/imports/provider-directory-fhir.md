@@ -905,6 +905,25 @@ REST pagination checkpoints are keyed by canonical API base, resource type,
 source scope, and acquisition root. A direct retry may adopt only its immediate
 predecessor's row within the same root and candidate; a guarded fresh root gets
 an independent row while failed-root evidence remains available for audit.
+Unbounded deferred REST scans with a bound checkpoint and retained resets
+disabled can retry transient fetch failures independently while sibling scans
+continue. Each attempt resumes its existing cursor and releases its resource
+slot while it waits for the next attempt. Page-fetch retries inside an attempt
+follow the source's existing policy, including full server Retry-After
+boundaries, and keep the slot until that attempt settles. Retry boundaries
+follow each source's existing policy; the configured resource deadline spans
+attempts. Consecutive failures without durable page/row advancement use the
+existing fetch-attempt budget. With no resource deadline, that budget also
+limits total attempts, even when progress advances. Without a resource
+deadline, waits over 600 seconds between attempts defer to the existing
+continuation path while retaining the boundary returned by the source's
+existing retry policy. Anthem and explicit census policies retain full server
+boundaries; the ordinary REST policy keeps its existing 600-second Retry-After
+cap. Exhaustion remains explicitly incomplete and retains partial data.
+The existing progress channel reports sanitized per-resource `resource_scans`
+state, error class, attempt and `retry_not_before`; live fences also populate
+the ordinary durable retry metrics. Specialized census and bulk paths retain
+their existing policies.
 For a current-version census, a direct retry resets an expired continuation or
 terminally drifted resource slice once, re-establishes its pre-count proof, and
 re-fetches that slice from its canonical start URL. It never treats the failed
@@ -1769,8 +1788,9 @@ native plan, network and office participation evidence.
 The shared scheduler excludes explicitly unsupported types from its parallel
 wave. With deferred isolated acquisition, the seven supported Anthem types can
 scan independently, each owning its cursor; existing transport, storage and
-capacity checks may lower concurrency. An Anthem HTTP 500 page can use at most
-two existing cooldown cycles after its quick retries. Each cycle keeps the same
+capacity checks may lower concurrency. Within each fetch attempt, an Anthem
+HTTP 500 page can use at most two existing cooldown cycles after its quick
+retries. Each cycle keeps the same
 URL and honors `Retry-After` and the resource deadline. Exhausted scans retain
 their checkpoints and remain incomplete and non-current.
 
