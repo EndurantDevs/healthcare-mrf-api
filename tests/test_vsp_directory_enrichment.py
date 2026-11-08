@@ -22,7 +22,7 @@ from process.vsp_directory_contract import (
     canonical_json,
     request_key,
 )
-from process.vsp_directory_enrichment import enrich_capture, write_normalized_capture
+from process.vsp_directory_enrichment import _add_resource, enrich_capture, write_normalized_capture
 from process.vsp_directory_store import VSPCaptureStore
 
 
@@ -134,6 +134,44 @@ async def test_repair_uses_missing_doctors_network_instead_of_office_discovery_s
     run.remember(office(52, FIRST), "Signature", "a" * 64)
     await enrich_capture(run)
     assert run.http.calls[-1] == SEARCH_URL + "/52?networkNames=Choice" and run.http.requests == 2
+
+
+@pytest.mark.asyncio
+async def test_unselected_doctor_does_not_trigger_an_identity_request_or_a_membership(tmp_path):
+    run = VSPCapture(
+        VSPCaptureStore(tmp_path, "outside-network"), HTTP(repair=False, missing_doctor_codes=["other"]), noop, noop
+    )
+    run.remember(office(52, FIRST), "Signature", "a" * 64)
+    await enrich_capture(run)
+    counts = dict.fromkeys(run.memberships, 1)
+    completed = await write_normalized_capture(run, counts, counts)
+    assert len(run.http.calls) == 1 and not run.http.calls[0].startswith(SEARCH_URL)
+    assert completed.proof["outside_profile_count"] == completed.proof["other_network_id_count"] == 1
+    assert completed.resource_counts["PractitionerRole"] == completed.resource_counts["Practitioner"] == 1
+
+
+def test_repeated_location_identity_must_keep_the_same_resource():
+    resources_by_type = {"Location": {}}
+    site_by_field = {"resourceType": "Location", "id": "site_by_field", "name": "Example Office"}
+    size = _add_resource(resources_by_type, site_by_field, 0)
+    assert _add_resource(resources_by_type, dict(site_by_field), size) == size
+    with pytest.raises(VSPDirectoryError, match="^vsp_normalized_identity_conflict$"):
+        _add_resource(resources_by_type, {**site_by_field, "name": "Different Office"}, size)
+    assert list(resources_by_type["Location"].values()) == [(canonical_json(site_by_field) + "\n").encode()]
+
+
+@pytest.mark.asyncio
+async def test_later_partial_office_keeps_proven_identity_and_reuses_profile(tmp_path):
+    run = VSPCapture(
+        VSPCaptureStore(tmp_path, "partial-office"), HTTP(repair=False, missing_doctor_codes=["other"]), noop, noop
+    )
+    run.remember(office(52, FIRST), "Signature", "a" * 64)
+    await enrich_capture(run)
+    run.remember(office(52, {"pid": 2, "npi": None}), "Choice", "b" * 64)
+    await enrich_capture(run)
+    assert run.http.requests == 1 and run.offices["52"]["providerSummaries"] == [FIRST]
+    assert run.identities["2"]["request_key"] == "a" * 64
+    assert run.memberships == {name: {"52"} for name in ("Signature", "Choice", "Advantage")}
 
 
 @pytest.mark.asyncio

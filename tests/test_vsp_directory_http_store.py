@@ -6,6 +6,7 @@ import hashlib
 import json
 import ssl
 from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from types import SimpleNamespace
 
 import aiohttp
@@ -119,6 +120,25 @@ async def test_rate_limit_waits_globally_without_rotating_proxy():
     assert [call[0] for call in session.calls] == [0.0, 17.0, 18.0]
     assert binding.selections[0] == binding.selections[1] and binding.deferrals == []
     assert clock.sleeps[:2] == [15.0, 2.0] and len(pauses) == 4
+
+
+def test_retry_after_preserves_dated_deadlines_and_rejects_ambiguous_dates():
+    now = datetime(2035, 1, 1, tzinfo=UTC)
+    assert http.retry_delay(format_datetime(now + timedelta(seconds=75), usegmt=True), now=now) == 75
+    assert http.retry_delay(format_datetime(now - timedelta(seconds=10), usegmt=True), now=now) == 1
+    for invalid in ("invalid", "Mon, 01 Jan 2035 00:03:00"):
+        with pytest.raises(VSPDirectoryError, match="^vsp_retry_after_invalid$"):
+            http.retry_delay(invalid, now=now)
+
+
+@pytest.mark.asyncio
+async def test_repeated_throttling_preserves_default_pause_without_a_fourth_attempt():
+    transport, session, binding, clock, pauses = client([Response(status=429) for _ in range(3)])
+    with pytest.raises(VSPDirectoryError, match="^vsp_http_retry_exhausted$"):
+        await transport.request("POST", SEARCH_URL, PAYLOAD)
+    assert transport.requests == len(session.calls) == 3
+    assert [call[0] for call in session.calls] == [0, 60, 120]
+    assert sum(clock.sleeps) == 120 and len(pauses) == 6 and not binding.deferrals
 
 
 @pytest.mark.asyncio
@@ -267,6 +287,24 @@ def test_invalid_retained_identity_is_rejected_before_writing(tmp_path, field, v
     with pytest.raises(VSPDirectoryError, match=f"^{code}$"):
         store.retain(BODY, {**provenance(BODY), field: value})
     assert list(store.requests()) == [] and not (store.path / "raw").exists()
+
+
+def test_artifact_root_refuses_temporary_storage_and_creates_only_the_durable_child(tmp_path, monkeypatch):
+    temporary = tmp_path / "scratch"
+    root = tmp_path / "volume"
+    setting = "HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT"
+    monkeypatch.setattr(retained.tempfile, "gettempdir", lambda: str(temporary))
+    monkeypatch.delenv(setting, raising=False)
+    with pytest.raises(VSPDirectoryError, match="^vsp_artifact_root_required$"):
+        retained.configured_root()
+    for invalid in ("/", temporary / "child"):
+        monkeypatch.setenv(setting, str(invalid))
+        with pytest.raises(VSPDirectoryError, match="^vsp_artifact_root_invalid$"):
+            retained.configured_root()
+    monkeypatch.setenv(setting, str(root))
+    path = retained.configured_root()
+    assert path == root / "vsp-directory" and path.stat().st_mode & 0o7777 == 0o2770
+    assert not temporary.exists()
 
 
 def test_fresh_census_keeps_both_receipts_and_first_cached_observation(tmp_path):

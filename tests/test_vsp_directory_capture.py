@@ -3,7 +3,10 @@
 
 import hashlib
 from collections import Counter
+from contextlib import asynccontextmanager
 from copy import deepcopy
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -11,8 +14,10 @@ import pytest
 from process import vsp_directory_capture as acquisition
 from process.vsp_directory_contract import (
     API_BASE,
+    ENDPOINT_SCOPE,
     NETWORKS,
     SEARCH_URL,
+    SOURCE_ID,
     VSPDirectoryError,
     canonical_json,
     request_key,
@@ -231,3 +236,78 @@ async def test_real_writer_round_trip_preserves_network_and_resource_counts(smal
     assert completed.proof["network_npis"] == {name: 1 for name in NETWORKS.values()}
     assert completed.proof["retained_response_count"] == completed.proof["http_attempts"] == 10
     assert store.load_checkpoint("complete") == completed.manifest
+
+
+@pytest.mark.asyncio
+async def test_probe_and_capture_share_retained_response_and_respect_origin_pause(small_domain, tmp_path, monkeypatch):
+    offline_http = HTTP(Source())
+    sessions = []
+
+    @asynccontextmanager
+    async def offline_session(*, auto_decompress, trust_env, cookie_jar):
+        assert not auto_decompress and not trust_env and isinstance(cookie_jar, acquisition.aiohttp.DummyCookieJar)
+        sessions.append(True)
+        yield None
+
+    async def exchange(_http, method, url, body, selection):
+        assert selection is None
+        return await offline_http.request(method, url, body), None
+
+    wait = AsyncMock()
+    monkeypatch.setattr(acquisition.aiohttp, "ClientSession", offline_session)
+    monkeypatch.setattr(acquisition.VSPHTTP, "_exchange", exchange)
+    monkeypatch.setattr(acquisition.VSPHTTP, "wait", wait)
+    monkeypatch.setattr(acquisition, "configured_root", lambda: tmp_path)
+    arguments_by_name = {
+        "source_record": {"source_id": SOURCE_ID, "canonical_api_base": ENDPOINT_SCOPE},
+        "root_run_id": "probe-and-capture",
+        "proxy_binding": None,
+    }
+    probe = await acquisition.probe_vsp_directory(**arguments_by_name)
+    store = VSPCaptureStore(tmp_path, arguments_by_name["root_run_id"])
+    (first_receipt,) = store.requests()
+    assert probe == {
+        "complete": False,
+        "network": "Signature",
+        "total_count": 3,
+        "capture_sha256": first_receipt["sha256"],
+    }
+    assert store.load_checkpoint("complete") is None
+    await store.pause((datetime.now(UTC) + timedelta(minutes=20)).isoformat(), None)
+    wait.reset_mock()
+    completed = await acquisition.capture_vsp_directory(**arguments_by_name, progress_callback=noop, cancel_check=noop)
+    assert 1190 < wait.await_args_list[0].args[0] <= 1200
+    assert len(sessions) == 2
+    assert len(list(completed.iter_resources())) == 10
+    assert completed.proof["http_attempts"] == offline_http.requests == 10
+    assert offline_http.source.observations == dict.fromkeys(NETWORKS.values(), 2)
+
+
+@pytest.mark.asyncio
+async def test_saturated_tile_splits_until_source_offices_account_for_the_census(small_domain):
+    first_offices = [office(i) for i in range(101, 151)]
+    for site in first_offices:
+        site["addr"].update(latitude=7.0, longitude=7.0)
+    first_offices[-1]["addr"]["latitude"] = 8.0
+    missing = office(151)
+    missing["addr"].update(latitude=2.0, longitude=7.0)
+    source = Source()
+    run, transport = capture(source, Store())
+    children = TILE.split()
+    queries = [TILE, *children[:2]]
+    results = [
+        {"totalCounts": 51, "locations": first_offices},
+        {"totalCounts": 0, "locations": []},
+        {"totalCounts": 1, "locations": [missing]},
+    ]
+
+    def response(method, url, payload):
+        tile = queries.pop(0)
+        assert method == "POST" and url == SEARCH_URL and payload == tile.request("Signature")
+        return results.pop(0)
+
+    source.response = response
+    await run.discover("Signature", 51)
+    assert transport.requests == 3 and not results and not queries
+    assert [part["count"] for part in run.partitions] == [0, 1]
+    assert run.partitions[-1]["closed_by_global_census"] and len(run.memberships["Signature"]) == 51
