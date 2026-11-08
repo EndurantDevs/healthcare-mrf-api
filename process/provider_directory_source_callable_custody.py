@@ -5,7 +5,7 @@ import asyncio
 from copy import deepcopy
 
 from db.migration_cms_noncurrent_seal import GUARD as _CMS_SEAL_GUARD
-from db.migration_cms_noncurrent_seal import ORIGINAL_SHA256, lifecycle_guard_bodies
+from db.migration_cms_noncurrent_seal import ORIGINAL_SHA256
 from db.plan_release_storage import storage_identifier, storage_relation
 from process.plan_release_storage_custody import storage_roles
 from process.provider_directory_cms_callable_custody import (
@@ -800,7 +800,9 @@ def _is_approved_body(definition, schema, digest):
     if _body_digest(definition["prosrc"], schema) == digest:
         return True
     if definition["proname"] == _CMS_SEAL_GUARD and digest == ORIGINAL_SHA256:
-        return definition["prosrc"] == lifecycle_guard_bodies(schema)[1]
+        from db.migration_fhir_source_rollback import rollback_guard_bodies
+
+        return definition["prosrc"] in rollback_guard_bodies(schema)[1:]
     from db import migration_cms_snapshot_allocator as allocator
 
     if definition["proname"] == "prepare_pd_generic_dataset_storage" and digest == allocator.ORIGINAL_ALLOCATOR_SHA256:

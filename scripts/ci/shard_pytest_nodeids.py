@@ -199,6 +199,11 @@ def _registry_shard_index(nodeid: str, shard_count: int) -> int:
         "tests/test_registry_fhir_catalog_metadata_reader_postgres.py::test_api_reader_successor_preserves_incumbent"
     ):
         return 12
+    if shard_count == 48 and nodeid == (
+        "tests/test_registry_source_inventory_publication_postgres.py"
+        "::test_typed_binding_parity_dense_aliases_custom_preservation_and_corruption"
+    ):
+        return 33
     exclusive = EXCLUSIVE_REGISTRY_TEST_SHARDS.get(nodeid)
     if exclusive is not None:
         return exclusive

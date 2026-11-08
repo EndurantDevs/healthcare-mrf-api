@@ -778,13 +778,14 @@ def _typed_terminal_digest(name, schema):
 
 def _cms_lifecycle_digests(name, schema):
     """Bind exact typed/CMS lifecycle alternatives to both retained predecessor pins."""
-    from db.migration_cms_noncurrent_seal import GUARD, _migration, lifecycle_guard_bodies
+    from db.migration_cms_noncurrent_seal import GUARD, _migration
+    from db.migration_fhir_source_rollback import rollback_guard_bodies
 
     if name != GUARD:
         return ()
     compact = _migration("20260818020000_provider_directory_terminal_publication_compact_guard.py")
     original = compact._function_body(compact._endpoint_guard_sql(schema, compact=True))
-    bodies = [original, *lifecycle_guard_bodies(schema)]
+    bodies = [original, *rollback_guard_bodies(schema)]
     bodies = [body.replace(_identifier(schema) + ".", '"__schema__".') for body in bodies]
     predecessor = hashlib.sha256(_normalized(bodies[0]).encode()).hexdigest()
     if predecessor != _REACHABLE_FUNCTIONS[GUARD][0] or predecessor != _FUNCTION_HASHES[GUARD]:

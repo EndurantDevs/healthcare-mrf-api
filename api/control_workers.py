@@ -611,6 +611,8 @@ def _exact_worker_spec(payload: dict[str, Any]) -> WorkerSpec:
     worker_class = str(payload.get("worker_class") or "").strip()
     if (queue and queue != spec.queue) or (worker_class and worker_class != spec.worker_class):
         raise ValueError("exact worker selector conflicts with importer")
+    if payload.get("role") == provider_directory_source_publication.ROLE:
+        return provider_directory_source_publication.selected_spec(spec, payload)
     return spec
 
 
