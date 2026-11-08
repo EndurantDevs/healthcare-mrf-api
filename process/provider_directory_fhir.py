@@ -60132,24 +60132,11 @@ def _is_private_candidate_blocking(state_by_field: dict[str, Any]) -> bool:
 
 async def _locked_private_verification_state(connection, dataset_ref, parameters_by_name):
     """Keep each examined contender locked while selecting the first blocking state."""
-    query = _private_verification_state_sql(dataset_ref)
-    rejected_dataset_ids = []
-    while True:
-        state_record = await connection.first(query, **parameters_by_name, rejected_dataset_ids=rejected_dataset_ids)
-        state_by_field = _pagination_checkpoint_row_mapping(state_record)
-        if not state_by_field:
-            return {}
-        if (
-            parameters_by_name["include_twin_states"]
-            or state_by_field["status"] != ENDPOINT_DATASET_VALIDATED
-            or _is_private_candidate_blocking(state_by_field)
-        ):
-            for field in ("import_run_id", "has_admission_receipt", "retired_candidate"):
-                state_by_field.pop(field)
-            if not parameters_by_name["include_twin_states"]:
-                state_by_field["publication_metadata_json"] = None
-            return state_by_field
-        rejected_dataset_ids.append(state_by_field["dataset_id"])
+    import sys
+
+    from process.provider_directory_source_candidate_admission import locked_private_verification_state
+
+    return await locked_private_verification_state(sys.modules[__name__], connection, dataset_ref, parameters_by_name)
 
 
 def _compatible_twin_root_baseline(
