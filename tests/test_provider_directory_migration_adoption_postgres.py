@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import asyncpg
 import pytest
 import sqlalchemy as sa
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -21,12 +26,9 @@ from tests.provider_directory_subset_abandonment_adoption_support import (
     assert_abandonment_object_shapes,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
 OPT_IN_DSN_ENV = "HLTHPRT_PROVIDER_DIRECTORY_MIGRATION_POSTGRES_DSN"
-DISPOSABLE_DATABASE_PATTERN = re.compile(
-    r"^ptg2_v3_lifecycle_test_[a-z0-9][a-z0-9_]{7,}$"
-)
+DISPOSABLE_DATABASE_PATTERN = re.compile(r"^ptg2_v3_lifecycle_test_[a-z0-9][a-z0-9_]{7,}$")
 BASELINE_REVISION = "20260610143000_address_checksums_bigint"
 RUNTIME_SEED_REVISION = "20260709110000_provider_directory_overlay_coordinates"
 PRE_REPAIR_REVISION = "20260714120000_ptg2_v3_schema_gc_consistency"
@@ -121,6 +123,25 @@ async def main():
         def seed(sync_connection):
             models_by_table = _model_by_table_fullname()
             future_strict_tables = {
+                "provider_directory_dataset_resource",
+                "provider_directory_dataset_insurance_plan",
+                "provider_directory_dataset_network_plan",
+                "provider_directory_dataset_affiliation_organization",
+                "provider_directory_organization_identity",
+                "provider_directory_site_identity",
+                "provider_directory_entity_source_binding",
+                "provider_directory_entity_release_evidence",
+                "provider_directory_entity_redirect_decision",
+                "provider_directory_entity_redirect",
+                "provider_directory_cms_serving_coverage",
+                "provider_directory_resource_identity",
+                "provider_directory_cms_doctors_group_binding",
+                "provider_directory_cms_doctors_site_binding",
+                "provider_directory_insurance_network_identity",
+                "provider_directory_insurance_network_source_binding",
+                "provider_directory_insurance_network_plan_evidence",
+                "provider_directory_mrf_payer_review_decision",
+                "provider_directory_mrf_payer_binding",
                 "provider_directory_profile_build_checkpoint",
                 "provider_directory_profile_capacity_lease_consumption",
                 "provider_directory_profile_capacity_preflight_receipt",
@@ -143,12 +164,14 @@ async def main():
                 "provider_directory_rooted_graph_twin_admission",
                 "provider_directory_rooted_graph_dataset",
                 "provider_directory_rooted_graph_dataset_resource",
+                "provider_directory_cms_npd_stale_candidate",
+                "provider_directory_cms_npd_resource_witness",
             }
             target_tables = [
                 table
                 for table in Base.metadata.sorted_tables
                 if (
-                    table.name == "import_run"
+                    table.name in {"import_run", "mrf_payer"}
                     or table.name.startswith("provider_directory_")
                 )
                 and table.name not in future_strict_tables
@@ -163,6 +186,9 @@ async def main():
                 model = models_by_table.get(table.fullname)
                 if model is not None:
                     _ensure_indexes(sync_connection, inspector, table, model, summary)
+            header = next(table for table in target_tables if table.name == "provider_directory_endpoint_dataset")
+            header_sql = sync_connection.dialect.identifier_preparer.format_table(header)
+            sync_connection.exec_driver_sql(f"ALTER TABLE {header_sql} DROP COLUMN candidate_storage_json")
 
         await connection.run_sync(seed)
     await db.disconnect()
@@ -181,9 +207,7 @@ def _database_url():
         pytest.fail(f"{OPT_IN_DSN_ENV} must use PostgreSQL")
     database_name = str(url.database or "")
     if not DISPOSABLE_DATABASE_PATTERN.fullmatch(database_name):
-        pytest.fail(
-            f"refusing non-disposable PostgreSQL database {database_name!r}"
-        )
+        pytest.fail(f"refusing non-disposable PostgreSQL database {database_name!r}")
     if not url.host or not url.username:
         pytest.fail(f"{OPT_IN_DSN_ENV} must include an explicit host and user")
     return url
@@ -215,6 +239,20 @@ def _run_alembic(environment: dict[str, str], *arguments: str) -> None:
         env=environment,
         check=True,
     )
+
+
+def _seed_runtime_schema(environment: dict[str, str], target_revision: str) -> None:
+    """Build one disposable adoption schema at the requested revision."""
+
+    _run_alembic(environment, "stamp", BASELINE_REVISION)
+    _run_alembic(environment, "upgrade", RUNTIME_SEED_REVISION)
+    subprocess.run(
+        [sys.executable, "-c", RUNTIME_SCHEMA_SEED],
+        cwd=ROOT,
+        env=environment,
+        check=True,
+    )
+    _run_alembic(environment, "upgrade", target_revision)
 
 
 async def _connect(url):
@@ -334,33 +372,16 @@ async def _activation_object_shape_records(
 def _assert_activation_function_shapes(function_records) -> None:
     """Require the three hardened activation functions."""
 
-    assert {
-        function_record["proname"] for function_record in function_records
-    } == (
-        _EXPECTED_ACTIVATION_FUNCTIONS
-    )
-    assert all(
-        function_record["prosecdef"] is True
-        for function_record in function_records
-    )
-    assert all(
-        function_record["proconfig"] == ["search_path=pg_catalog"]
-        for function_record in function_records
-    )
+    assert {function_record["proname"] for function_record in function_records} == (_EXPECTED_ACTIVATION_FUNCTIONS)
+    assert all(function_record["prosecdef"] is True for function_record in function_records)
+    assert all(function_record["proconfig"] == ["search_path=pg_catalog"] for function_record in function_records)
 
 
 def _assert_activation_trigger_shapes(trigger_records) -> None:
     """Require the four activation triggers to remain ENABLE ALWAYS."""
 
-    assert {
-        trigger_record["tgname"] for trigger_record in trigger_records
-    } == (
-        _EXPECTED_ACTIVATION_TRIGGERS
-    )
-    assert all(
-        trigger_record["tgenabled"] == "A"
-        for trigger_record in trigger_records
-    )
+    assert {trigger_record["tgname"] for trigger_record in trigger_records} == (_EXPECTED_ACTIVATION_TRIGGERS)
+    assert all(trigger_record["tgenabled"] == "A" for trigger_record in trigger_records)
 
 
 async def _assert_activation_object_shapes(
@@ -386,6 +407,48 @@ async def _assert_adopted_schema(database_url, schema_name: str) -> None:
     await assert_abandonment_object_shapes(database_url, schema_name)
 
 
+async def _drop_adoption_schema(url) -> None:
+    """Release cleanup locks between tables in the disposable adoption schema."""
+    connection = await _connect(url)
+    try:
+        tables = await connection.fetch(
+            "SELECT format('%I.%I', n.nspname, c.relname) AS qualified_name "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "WHERE n.nspname=$1 AND c.relkind IN ('r','p') "
+            "ORDER BY c.relkind DESC,c.oid",
+            ADOPTION_SCHEMA,
+        )
+        for table in tables:
+            await connection.execute(f"DROP TABLE IF EXISTS {table['qualified_name']} CASCADE")
+        await connection.execute(f'DROP SCHEMA IF EXISTS "{ADOPTION_SCHEMA}" CASCADE')
+    finally:
+        await connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_drop_failure", [False, True])
+async def test_adoption_cleanup_releases_locks_per_table_and_always_closes(monkeypatch, has_drop_failure):
+    connection = SimpleNamespace(
+        fetch=AsyncMock(return_value=[{"qualified_name": '"owned"."leaf"'}, {"qualified_name": '"owned"."parent"'}]),
+        execute=AsyncMock(side_effect=RuntimeError("drop failed") if has_drop_failure else None),
+        close=AsyncMock(),
+    )
+    monkeypatch.setattr(sys.modules[__name__], "_connect", AsyncMock(return_value=connection))
+    if has_drop_failure:
+        with pytest.raises(RuntimeError, match="drop failed"):
+            await _drop_adoption_schema(object())
+    else:
+        await _drop_adoption_schema(object())
+        assert [call.args[0] for call in connection.execute.await_args_list] == [
+            'DROP TABLE IF EXISTS "owned"."leaf" CASCADE',
+            'DROP TABLE IF EXISTS "owned"."parent" CASCADE',
+            f'DROP SCHEMA IF EXISTS "{ADOPTION_SCHEMA}" CASCADE',
+        ]
+    assert "WHERE n.nspname=$1" in connection.fetch.await_args.args[0]
+    assert connection.fetch.await_args.args[1] == ADOPTION_SCHEMA
+    connection.close.assert_awaited_once_with()
+
+
 def test_provider_directory_runtime_schema_adoption_and_index_repair_cycle():
     """Adopt current ORM columns and preserve the exact repair cycle."""
 
@@ -394,41 +457,25 @@ def test_provider_directory_runtime_schema_adoption_and_index_repair_cycle():
     environment = _database_environment(url, ADOPTION_SCHEMA)
 
     async def reset_adoption_schema() -> None:
+        await _drop_adoption_schema(url)
         connection = await _connect(url)
         try:
-            await connection.execute(f'DROP SCHEMA IF EXISTS "{ADOPTION_SCHEMA}" CASCADE')
             await connection.execute(f'CREATE SCHEMA "{ADOPTION_SCHEMA}"')
-        finally:
-            await connection.close()
-
-    async def drop_adoption_schema() -> None:
-        connection = await _connect(url)
-        try:
-            await connection.execute(f'DROP SCHEMA IF EXISTS "{ADOPTION_SCHEMA}" CASCADE')
         finally:
             await connection.close()
 
     asyncio.run(reset_adoption_schema())
     try:
-        _run_alembic(environment, "stamp", BASELINE_REVISION)
-        _run_alembic(environment, "upgrade", RUNTIME_SEED_REVISION)
-        subprocess.run(
-            [sys.executable, "-c", RUNTIME_SCHEMA_SEED],
-            cwd=ROOT,
-            env=environment,
-            check=True,
-        )
-        _run_alembic(environment, "upgrade", "head")
+        _seed_runtime_schema(environment, "head")
         asyncio.run(_assert_adopted_schema(url, ADOPTION_SCHEMA))
 
-        _run_alembic(environment, "downgrade", PRE_REPAIR_REVISION)
+        asyncio.run(reset_adoption_schema())
+        _seed_runtime_schema(environment, PRE_REPAIR_REVISION)
 
         async def install_legacy_index() -> None:
             connection = await _connect(url)
             try:
-                await connection.execute(
-                    f'DROP INDEX "{ADOPTION_SCHEMA}"."{ACTIVE_INDEX}"'
-                )
+                await connection.execute(f'DROP INDEX "{ADOPTION_SCHEMA}"."{ACTIVE_INDEX}"')
                 await connection.execute(
                     f'CREATE INDEX "{ACTIVE_INDEX}" '
                     f'ON "{ADOPTION_SCHEMA}"."{PLAN_TABLE}" '
@@ -441,4 +488,95 @@ def test_provider_directory_runtime_schema_adoption_and_index_repair_cycle():
         _run_alembic(environment, "upgrade", "head")
         asyncio.run(_assert_adopted_schema(url, ADOPTION_SCHEMA))
     finally:
-        asyncio.run(drop_adoption_schema())
+        asyncio.run(_drop_adoption_schema(url))
+
+
+def test_membership_idempotency_index_creation_adoption_and_drift_refusal(monkeypatch):
+    """Preserve matching runtime indexes and refuse a conflicting definition."""
+    url = _database_url()
+    schema = "membership_index_adoption_" + uuid4().hex
+    path = ROOT / "alembic" / "versions" / "20261021110000_ptg_membership_import_idempotency.py"
+    spec = importlib.util.spec_from_file_location("membership_index_adoption_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
+    monkeypatch.setenv("DB_SCHEMA", schema)
+    index = "import_run_ptg_membership_idempotency_idx"
+
+    async def exercise():
+        engine = create_async_engine(url.set(drivername="postgresql+asyncpg"))
+        has_created_schema = False
+
+        def upgrade(connection):
+            monkeypatch.setattr(migration, "op", Operations(MigrationContext.configure(connection)))
+            migration.upgrade()
+
+        async def index_oid(connection):
+            return await connection.scalar(sa.text("SELECT to_regclass(:name)::oid"), {"name": f'"{schema}".{index}'})
+
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+                await connection.execute(
+                    sa.text(f'CREATE TABLE "{schema}".import_run (importer text,idempotency_key text)')
+                )
+            has_created_schema = True
+            async with engine.begin() as connection:
+                await connection.run_sync(upgrade)
+                oid = await index_oid(connection)
+                assert oid is not None
+            async with engine.begin() as connection:
+                await connection.run_sync(upgrade)
+                assert await index_oid(connection) == oid
+                await connection.execute(sa.text(f'DROP INDEX "{schema}".{index}'))
+                await connection.execute(sa.text(f'CREATE INDEX {index} ON "{schema}".import_run (idempotency_key)'))
+                wrong_oid = await index_oid(connection)
+                assert wrong_oid is not None
+            with pytest.raises(RuntimeError, match="existing_schema_index_mismatch"):
+                async with engine.begin() as connection:
+                    await connection.run_sync(upgrade)
+            async with engine.connect() as connection:
+                assert await index_oid(connection) == wrong_oid
+        finally:
+            try:
+                if has_created_schema:
+                    async with engine.begin() as connection:
+                        await connection.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
+            finally:
+                await engine.dispose()
+
+    asyncio.run(exercise())
+
+
+def test_reviewed_cms_payer_contract_in_database_lane(monkeypatch):
+    """Run reviewed payer transitions in an isolated local database."""
+
+    from tests.test_provider_directory_mrf_payer_binding import (
+        test_concurrent_reviews_cannot_bind_two_payers_to_one_organization,
+        test_reviewed_payer_binding_replay_conflict_closure_and_source_isolation,
+    )
+
+    url = _database_url()
+    database_name = f"cms_payer_binding_test_{uuid4().hex}"
+    payer_url = url.set(drivername="postgresql+asyncpg", database=database_name)
+
+    async def run_contract() -> None:
+        admin = await asyncpg.connect(
+            host=url.host,
+            port=url.port or 5432,
+            user=url.username,
+            password=url.password,
+            database="postgres",
+        )
+        try:
+            await admin.execute(f'CREATE DATABASE "{database_name}"')
+            try:
+                monkeypatch.setenv("CMS_PAYER_BINDING_TEST_DATABASE", payer_url.render_as_string(hide_password=False))
+                await test_reviewed_payer_binding_replay_conflict_closure_and_source_isolation()
+                await test_concurrent_reviews_cannot_bind_two_payers_to_one_organization()
+            finally:
+                await admin.execute(f'DROP DATABASE IF EXISTS "{database_name}"')
+        finally:
+            await admin.close()
+
+    asyncio.run(run_contract())

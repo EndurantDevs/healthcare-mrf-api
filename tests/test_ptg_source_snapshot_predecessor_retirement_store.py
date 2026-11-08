@@ -13,8 +13,8 @@ from process.ptg_parts.source_snapshot_predecessor_retirement import (
     normalized_predecessor_retirement_request,
 )
 from process.ptg_parts.source_snapshot_predecessor_retirement_types import (
-    PTG2PredecessorRetirementConflict,
     PredecessorRetirementDecision,
+    PTG2PredecessorRetirementConflict,
 )
 
 
@@ -263,9 +263,7 @@ def test_database_row_and_sqlstate_adapters_preserve_driver_boundaries():
     """Accept supported driver rows and safely unwrap nested database errors."""
 
     assert store._row_mapping(None) == {}
-    assert store._row_mapping(SimpleNamespace(_mapping={"value": 1})) == {
-        "value": 1
-    }
+    assert store._row_mapping(SimpleNamespace(_mapping={"value": 1})) == {"value": 1}
     assert store._row_mapping((("value", 2),)) == {"value": 2}
 
     lock_error = RuntimeError("lock unavailable")
@@ -307,9 +305,7 @@ async def test_store_read_adapters_keep_driver_rows_as_plain_mappings():
         {"surface": "source"},
         {"surface": "plan"},
     )
-    assert await store._one(session, "SELECT surface", {}) == {
-        "surface": "source"
-    }
+    assert await store._one(session, "SELECT surface", {}) == {"surface": "source"}
 
 
 @pytest.mark.asyncio
@@ -354,6 +350,7 @@ async def test_retirement_context_translates_only_retryable_lock_contention(
 ):
     """Expose retryable lock races without hiding unrelated database failures."""
 
+    monkeypatch.setattr(store, "_require_source_lifecycle_fence", AsyncMock())
     monkeypatch.setattr(
         store,
         "_load_context_surfaces",

@@ -4,12 +4,14 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 import copy
 import json
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from process import provider_directory_fhir_subset_activation as activation
 from process import provider_directory_fhir_subset_activation_evidence as evidence_api
@@ -32,8 +34,9 @@ from tests.test_provider_directory_fhir_subset_runtime_boundaries import (
     _reviewed_source_record,
     importer,
 )
+from tests.test_provider_directory_profile_initial import _geometry as _initial_geometry
 from tests.test_provider_directory_trust_boundaries import (
-    _artifact_stage,
+    _initial_profile_stages,
     _promotion_dataset,
 )
 
@@ -70,8 +73,7 @@ def _authorize_activation(monkeypatch, tmp_path, source_record, evidence):
     _authorize_sync(monkeypatch, tmp_path, evidence)
     monkeypatch.setenv(activation.STATE_SYNC_ENABLED_ENV, "true")
     monkeypatch.setattr(
-        "process.provider_directory_fhir_manual_catalog."
-        "reviewed_manual_census_source_id",
+        "process.provider_directory_fhir_manual_catalog.reviewed_manual_census_source_id",
         lambda: source_record["source_id"],
     )
 
@@ -84,13 +86,9 @@ def test_v1_identities_project_configured_endpoint_across_serving_cutover():
         CUTOFF,
     )
     metadata = source_record["metadata_json"]
-    configured_endpoint_id = metadata[
-        subset_identity.CONFIGURED_ENDPOINT_ID_METADATA_FIELD
-    ]
+    configured_endpoint_id = metadata[subset_identity.CONFIGURED_ENDPOINT_ID_METADATA_FIELD]
     source_ids = (source_record["source_id"],)
-    activation_payload = (
-        subset_identity.subset_activation_source_contract_payload(source_record)
-    )
+    activation_payload = subset_identity.subset_activation_source_contract_payload(source_record)
     scope_payload = subset_identity.server_issued_subset_source_scope_payload(
         source_record,
         source_ids,
@@ -112,9 +110,7 @@ def test_v1_identities_project_configured_endpoint_across_serving_cutover():
         [published_source],
         list(source_ids),
     )
-    campaign_id = source_record[
-        importer.CURRENT_VERSION_CENSUS_CONTRACT_FIELD
-    ].campaign_id
+    campaign_id = source_record[importer.CURRENT_VERSION_CENSUS_CONTRACT_FIELD].campaign_id
     artifact_contract_by_field = {
         "verification_campaign_id": campaign_id,
         "verification_source_scope_hash": scope_sha256,
@@ -136,9 +132,7 @@ def test_v1_identities_require_both_endpoint_domains(missing_identity):
     if missing_identity == "serving":
         source_record["endpoint_id"] = None
     else:
-        source_record["metadata_json"].pop(
-            subset_identity.CONFIGURED_ENDPOINT_ID_METADATA_FIELD
-        )
+        source_record["metadata_json"].pop(subset_identity.CONFIGURED_ENDPOINT_ID_METADATA_FIELD)
 
     with pytest.raises(ValueError, match="endpoint_identity_invalid"):
         subset_identity.subset_source_endpoint_identity(source_record)
@@ -167,25 +161,13 @@ async def test_activation_uses_configured_endpoint_and_serving_snapshot_cas(
         evidence,
     )
 
-    activation_result = await activation.sync_reviewed_subset_verified_state(
-        database=database
-    )
+    activation_result = await activation.sync_reviewed_subset_verified_state(database=database)
 
     assert activation_result.activated is True
-    advisory_call = next(
-        call for call in database.calls if "pg_try_advisory_xact_lock" in call[1]
-    )
-    endpoint_call = next(
-        call for call in database.calls if "provider_directory_api_endpoint" in call[1]
-    )
-    dataset_call = next(
-        call for call in database.calls if "SELECT dataset.*" in call[1]
-    )
-    update_call = next(
-        call
-        for call in database.calls
-        if call[0] == "status" and "UPDATE" in call[1]
-    )
+    advisory_call = next(call for call in database.calls if "pg_try_advisory_xact_lock" in call[1])
+    endpoint_call = next(call for call in database.calls if "provider_directory_api_endpoint" in call[1])
+    dataset_call = next(call for call in database.calls if "SELECT dataset.*" in call[1])
+    update_call = next(call for call in database.calls if call[0] == "status" and "UPDATE" in call[1])
     assert advisory_call[2]["endpoint_id"] == "endpoint-a"
     assert endpoint_call[2]["endpoint_id"] == "endpoint-a"
     assert dataset_call[2]["endpoint_id"] == "endpoint-a"
@@ -209,12 +191,8 @@ async def test_activation_replay_is_idempotent_after_serving_alias_cutover(
         evidence=evidence,
     )
     source_metadata = source_record["metadata_json"]
-    source_metadata["provider_directory_candidate_status"] = (
-        activation.VERIFIED_STATUS
-    )
-    source_metadata[activation.ACTIVATION_METADATA_KEY] = (
-        selection.metadata_marker()
-    )
+    source_metadata["provider_directory_candidate_status"] = activation.VERIFIED_STATUS
+    source_metadata[activation.ACTIVATION_METADATA_KEY] = selection.metadata_marker()
     source_record["endpoint_id"] = "endpoint-a"
     dataset_rows[1].update(
         status="published",
@@ -229,15 +207,10 @@ async def test_activation_replay_is_idempotent_after_serving_alias_cutover(
         evidence,
     )
 
-    activation_result = await activation.sync_reviewed_subset_verified_state(
-        database=database
-    )
+    activation_result = await activation.sync_reviewed_subset_verified_state(database=database)
 
     assert activation_result.is_already_applied is True
-    assert not any(
-        call[0] == "status" and "UPDATE" in call[1]
-        for call in database.calls
-    )
+    assert not any(call[0] == "status" and "UPDATE" in call[1] for call in database.calls)
 
 
 @pytest.mark.asyncio
@@ -247,14 +220,11 @@ async def test_evidence_reader_uses_configured_endpoint_from_serving_snapshot(
     source_record, dataset_rows, expected_evidence = _split_endpoint_inputs()
     database = _ConfiguredEvidenceDatabase(source_record, dataset_rows)
     monkeypatch.setattr(
-        "process.provider_directory_fhir_manual_catalog."
-        "reviewed_manual_census_source_id",
+        "process.provider_directory_fhir_manual_catalog.reviewed_manual_census_source_id",
         lambda: source_record["source_id"],
     )
 
-    observed_evidence = await evidence_api.reviewed_subset_activation_evidence(
-        database=database
-    )
+    observed_evidence = await evidence_api.reviewed_subset_activation_evidence(database=database)
 
     assert observed_evidence == expected_evidence
     assert database.endpoint_parameters == ["endpoint-a", "endpoint-a"]
@@ -271,39 +241,29 @@ async def test_reviewed_artifact_alias_cutover_requires_configured_cas(
     status = AsyncMock(return_value=1)
     monkeypatch.setattr(importer.db, "status", status)
 
-    relation_token = (
-        importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
-            {"provider_directory_source": "private_source_scope"}
-        )
+    relation_token = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
+        {"provider_directory_source": "private_source_scope"}
     )
     try:
         await importer._cutover_provider_directory_artifact_sources(
-            importer.ProviderDirectoryArtifactDatasetFence(
-                (reviewed_dataset,)
-            )
+            importer.ProviderDirectoryArtifactDatasetFence((reviewed_dataset,))
         )
     finally:
-        importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(
-            relation_token
-        )
+        importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(relation_token)
 
     statement = status.await_args.args[0]
     assert '"mrf"."provider_directory_source"' in statement
     assert '"mrf"."private_source_scope"' not in statement
     assert subset_identity.CONFIGURED_ENDPOINT_ID_METADATA_FIELD in statement
     assert status.await_args.kwargs["endpoint_id"] == "candidate_endpoint"
-    assert status.await_args.kwargs["serving_endpoint_id"] == (
-        "serving_endpoint_old"
-    )
+    assert status.await_args.kwargs["serving_endpoint_id"] == ("serving_endpoint_old")
 
     status.reset_mock()
     ordinary_dataset = _promotion_dataset()
     await importer._cutover_provider_directory_artifact_sources(
         importer.ProviderDirectoryArtifactDatasetFence((ordinary_dataset,))
     )
-    assert subset_identity.CONFIGURED_ENDPOINT_ID_METADATA_FIELD not in (
-        status.await_args.args[0]
-    )
+    assert subset_identity.CONFIGURED_ENDPOINT_ID_METADATA_FIELD not in (status.await_args.args[0])
 
 
 @pytest.mark.asyncio
@@ -313,19 +273,11 @@ async def test_artifact_alias_cas_failure_stops_before_publication(monkeypatch):
     supersede = AsyncMock()
     publish = AsyncMock()
     cutover = AsyncMock(
-        side_effect=importer.ProviderDirectoryArtifactBuildStale(
-            "provider_directory_source_endpoint_dataset_changed"
-        )
+        side_effect=importer.ProviderDirectoryArtifactBuildStale("provider_directory_source_endpoint_dataset_changed")
     )
-    monkeypatch.setattr(
-        importer, "_supersede_artifact_dataset_incumbent", supersede
-    )
-    monkeypatch.setattr(
-        importer, "_publish_validated_artifact_dataset", publish
-    )
-    monkeypatch.setattr(
-        importer, "_cutover_provider_directory_artifact_sources", cutover
-    )
+    monkeypatch.setattr(importer, "_supersede_artifact_dataset_incumbent", supersede)
+    monkeypatch.setattr(importer, "_publish_validated_artifact_dataset", publish)
+    monkeypatch.setattr(importer, "_cutover_provider_directory_artifact_sources", cutover)
 
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
@@ -338,23 +290,51 @@ async def test_artifact_alias_cas_failure_stops_before_publication(monkeypatch):
     publish.assert_not_awaited()
 
 
+def _mock_initial_profile_admission(monkeypatch, stages):
+    """Supply a matching initial admission while keeping lock writes in memory."""
+    build = stages[0].profile_initial_build
+    admission = SimpleNamespace(
+        geometry=_initial_geometry(),
+        wal_tracker=importer._ProviderDirectoryProfileWalTracker(),
+        admitted_identity=SimpleNamespace(initial_targets=object()),
+        run_id=build.owner_run_id,
+        build_id=importer._provider_directory_profile_build_id(build),
+    )
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_admission", lambda: admission)
+    monkeypatch.setattr(importer, "_profile_capacity_remaining_ms", AsyncMock())
+    monkeypatch.setattr(importer, "_lock_profile_capacity_preflight_state", AsyncMock())
+    monkeypatch.setattr(importer.db, "status", AsyncMock())
+
+
 @pytest.mark.asyncio
 async def test_atomic_artifact_promotion_failure_rolls_back_transaction(
     monkeypatch,
 ):
     events = []
+    database_transaction = importer.db.transaction
+    receipt_exists = AsyncMock(return_value=False)
+    monkeypatch.setattr(importer.db, "session_factory", async_sessionmaker())
+    monkeypatch.setattr(importer.db, "scalar", receipt_exists)
 
     @asynccontextmanager
     async def transaction():
         events.append("begin")
         try:
-            yield
+            async with database_transaction():
+                yield
         except RuntimeError:
             events.append("rollback")
             raise
         events.append("commit")
 
-    stage = _artifact_stage()
+    async def fail_publication(*_args, before_swaps=None, extra_live_relations=()):
+        assert before_swaps is None
+        assert extra_live_relations == ()
+        assert importer.db._transaction_binding() is not None
+        raise RuntimeError("publication failed")
+
+    stages = _initial_profile_stages()
+    _mock_initial_profile_admission(monkeypatch, stages)
     monkeypatch.setattr(importer.db, "transaction", transaction)
     monkeypatch.setattr(
         importer,
@@ -374,12 +354,14 @@ async def test_atomic_artifact_promotion_failure_rolls_back_transaction(
     monkeypatch.setattr(
         importer,
         "_apply_locked_provider_directory_artifact_bundle",
-        AsyncMock(side_effect=RuntimeError("publication failed")),
+        AsyncMock(side_effect=fail_publication),
     )
 
     with pytest.raises(RuntimeError, match="publication failed"):
-        await importer._promote_provider_directory_artifact_bundle_transaction(
-            (stage,)
-        )
+        async with database_transaction():
+            await importer._promote_provider_directory_artifact_bundle_transaction(stages)
 
     assert events == ["begin", "rollback"]
+    assert importer.db._transaction_binding() is None
+    receipt_exists.assert_awaited_once()
+    assert "to_regclass(:table)" in receipt_exists.await_args.args[0]

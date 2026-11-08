@@ -53,7 +53,7 @@ async def _copy_provider_states(session: Any, projection_id: str) -> None:
             INSERT INTO {table('plan_pricing_provider_state')} (
                 projection_id, state, npi, provider_fragment
             )
-            SELECT :projection_id,
+            SELECT projection_id,
                    upper(
                        convert_from(state_fragment, 'UTF8')::jsonb
                        -> 'provider' ->> 'state'

@@ -10,12 +10,18 @@ from sqlalchemy import text
 
 from api import plan_release_serving
 from api.plan_release_pricing_projection import plan_release_serving_sql
+from api.plan_release_read_storage import is_retained_session_read
 from api.plan_release_serving import (
     PLAN_RELEASE_PIN_OWNER_TYPE,
     PTG2_SCHEMA,
     PlanReleaseServingSelection,
     _selection_from_rows,
     normalize_plan_release_id,
+)
+from api.plan_release_source_bindings import (
+    NOT_CURRENT_SOURCE_RELEASE,
+    discover_source_bindings,
+    load_source_binding_rows,
 )
 from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
@@ -52,10 +58,24 @@ SELECT revision.serving_revision_id,
        snapshot.status AS snapshot_status,
        EXISTS (
            SELECT 1
+             FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_plan_scope scope
+            WHERE scope.snapshot_id = binding.snapshot_id
+              AND scope.plan_id = binding.plan_id
+              AND scope.plan_market_type = binding.plan_market_type
+       ) AS logical_scope_present,
+       EXISTS (
+           SELECT 1
              FROM {PTG2_SCHEMA}.ptg2_snapshot_pin pin
             WHERE pin.owner_type = :pin_owner_type
               AND pin.owner_id = revision.serving_revision_id
               AND pin.snapshot_id = binding.snapshot_id
+       ) OR (
+           :pin_owner_type = 'plan_release_serving_revision'
+           AND EXISTS (
+               SELECT 1 FROM {PTG2_SCHEMA}.plan_release_snapshot_pin pin
+                WHERE pin.serving_revision_id = revision.serving_revision_id
+                  AND pin.snapshot_id = binding.snapshot_id
+           )
        ) AS is_pinned
   FROM {PTG2_SCHEMA}.plan_release_serving_revision revision
   JOIN {PTG2_SCHEMA}.plan_release_snapshot_binding binding
@@ -94,9 +114,7 @@ class PlanReleaseServingResolution:
     def __post_init__(self) -> None:
         is_ready = self.state == PLAN_RELEASE_RESOLUTION_READY
         has_selection = type(self.selection) is PlanReleaseServingSelection
-        if self.state not in PLAN_RELEASE_RESOLUTION_STATES or (
-            is_ready != has_selection
-        ):
+        if self.state not in PLAN_RELEASE_RESOLUTION_STATES or (is_ready != has_selection):
             raise ValueError("invalid plan release serving resolution")
 
     def __repr__(self) -> str:
@@ -114,14 +132,33 @@ async def _load_release_rows(
     session: Any,
     plan_release_id: str,
 ) -> list[Any]:
-    result = await session.execute(
-        text(_PLAN_RELEASE_SERVING_SQL),
+    retained = await is_retained_session_read(session, PTG2_SCHEMA)
+    admission = await discover_source_bindings(session, PTG2_SCHEMA, plan_release_id)
+    if admission == NOT_CURRENT_SOURCE_RELEASE:
+        return []
+    if admission is not None:
+        if admission.expected_binding_count > MAX_BILLING_SEARCH_RELEASE_BINDINGS:
+            return []
+        return await load_source_binding_rows(
+            session,
+            PTG2_SCHEMA,
+            admission,
+            include_pricing_projection=False,
+        )
+    sql = (
+        plan_release_serving_sql(PTG2_SCHEMA, include_pricing_projection=False, retained=True)
+        + f"\n LIMIT {MAX_BILLING_SEARCH_RELEASE_BINDINGS + 1}"
+        if retained
+        else _PLAN_RELEASE_SERVING_SQL
+    )
+    release_query_result = await session.execute(
+        text(sql),
         {
             "plan_release_id": plan_release_id,
             "pin_owner_type": PLAN_RELEASE_PIN_OWNER_TYPE,
         },
     )
-    return list(result)
+    return list(release_query_result)
 
 
 def _release_market_type_for_guard(
@@ -131,9 +168,7 @@ def _release_market_type_for_guard(
 
     market_types = {
         binding.plan_market_type.strip().lower()
-        for binding in (
-            selection.in_network_bindings if selection is not None else ()
-        )
+        for binding in (selection.in_network_bindings if selection is not None else ())
         if binding.plan_market_type.strip()
     }
     if "group" in market_types:
@@ -150,11 +185,28 @@ async def resolve_plan_release_guard_selection(
     normalized = normalize_plan_release_id(plan_release_id)
     if normalized is None:
         return None
-    result = await session.execute(
-        text(_PLAN_RELEASE_GUARD_SQL),
+    retained = await is_retained_session_read(session, PTG2_SCHEMA)
+    admission = await discover_source_bindings(session, PTG2_SCHEMA, normalized)
+    if admission == NOT_CURRENT_SOURCE_RELEASE:
+        return None
+    if admission is not None:
+        canonical_rows = await load_source_binding_rows(
+            session,
+            PTG2_SCHEMA,
+            admission,
+            include_pricing_projection=False,
+        )
+        return _selection_from_rows(normalized, canonical_rows)
+    sql = (
+        plan_release_serving_sql(PTG2_SCHEMA, include_pricing_projection=False, retained=True)
+        if retained
+        else _PLAN_RELEASE_GUARD_SQL
+    )
+    release_query_result = await session.execute(
+        text(sql),
         {"plan_release_id": normalized, "pin_owner_type": PLAN_RELEASE_PIN_OWNER_TYPE},
     )
-    return _selection_from_rows(normalized, result)
+    return _selection_from_rows(normalized, release_query_result)
 
 
 async def _has_release_revision(session: Any, plan_release_id: str) -> bool:
@@ -205,10 +257,11 @@ async def resolve_plan_release_serving_resolution(
     plan_release_id: Any,
     *,
     include_billing_tax_identity_source: bool = False,
+    projection_only: bool = False,
 ) -> PlanReleaseServingResolution:
     """Resolve one release while preserving absent versus unavailable state."""
 
-    if type(include_billing_tax_identity_source) is not bool:
+    if type(include_billing_tax_identity_source) is not bool or type(projection_only) is not bool:
         return _resolution(PLAN_RELEASE_RESOLUTION_UNAVAILABLE)
     normalized_release_id = normalize_plan_release_id(plan_release_id)
     if normalized_release_id is None:
@@ -226,6 +279,8 @@ async def resolve_plan_release_serving_resolution(
     selection = _selection_from_rows(normalized_release_id, release_rows)
     if selection is None:
         return _resolution(PLAN_RELEASE_RESOLUTION_UNAVAILABLE)
+    if projection_only:
+        return _resolution(PLAN_RELEASE_RESOLUTION_READY, selection)
     validated_selection = await _validate_release_bindings(
         session,
         selection,

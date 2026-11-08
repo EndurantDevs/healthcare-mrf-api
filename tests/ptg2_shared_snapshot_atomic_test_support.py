@@ -142,6 +142,9 @@ class _AtomicSourceTransactionFixture:
         assert kwargs["prepared"] is self.prepared
         assert kwargs["staged"] is self.staged
         assert kwargs["logical_snapshot_id"] == "synthetic-snapshot"
+        assert actual_session.info["ptg_snapshot_candidate_reads"] == {
+            '"mrf"': {"ptg2_provider_group_tax_identity": "candidate_tax_groups"}
+        }
         self.publication_events.append(("source-local-tax", actual_session))
         raise RuntimeError("post-source graph failure")
 
@@ -155,10 +158,17 @@ class _AtomicSourceResult:
 
 
 class _AtomicSourceSession:
+    def __init__(self):
+        self.info = {}
+        self.candidate_read_calls = []
+
     async def execute(self, *_args, **_kwargs):
         return _AtomicSourceResult()
 
-    async def scalar(self, *_args, **_kwargs):
+    async def scalar(self, statement, parameters=None):
+        if "read_ptg_snapshot_candidates(" in str(statement):
+            self.candidate_read_calls.append(dict(parameters))
+            return {"ptg2_provider_group_tax_identity": "candidate_tax_groups"}
         return 0
 
 
@@ -208,6 +218,7 @@ def _install_atomic_source_transaction_mocks(monkeypatch, atomic_fixture) -> Non
                 observe_only_rule_count=0,
             )
         ),
+        "attach_snapshot_candidates": AsyncMock(),
         "publish_staged_tax_identity_source_projection": (
             atomic_fixture.publish_source
         ),

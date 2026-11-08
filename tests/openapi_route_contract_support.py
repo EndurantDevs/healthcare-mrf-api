@@ -1,6 +1,23 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Route visibility and query-parser exceptions for OpenAPI parity tests."""
 
+from copy import deepcopy
+from functools import lru_cache
+from pathlib import Path
+
+import yaml
+
+
+@lru_cache(maxsize=1)
+def _parse_openapi_document(text: str) -> dict:
+    return yaml.safe_load(text)
+
+
+def load_openapi_document(path: Path) -> dict:
+    """Reuse parsing for current file contents while keeping callers independent."""
+    return deepcopy(_parse_openapi_document(path.read_text(encoding="utf-8")))
+
+
 HIDDEN_RUNTIME_ALIASES = {
     # Control-authenticated candidate validation is intentionally excluded
     # from the public OpenAPI contract.
@@ -31,6 +48,93 @@ HIDDEN_RUNTIME_ALIASES = {
     ("get", "/pricing/physicians/{npi}/prescriptions/{rx_code_system}/{rx_code}"),
 }
 ROUTE_QUERY_PARAM_ADDITIONS = {
+    # The market route delegates these reads to _market_list_request.
+    ("get", "/reports/pharmacies/markets"): {
+        "as_of",
+        "chain",
+        "city",
+        "county",
+        "include_staffing",
+        "limit",
+        "offset",
+        "order",
+        "page",
+        "page_size",
+        "scope",
+        "sort",
+        "start",
+        "state",
+        "zip",
+    },
+    # The detail wrapper delegates native arguments to read_npi_detail.
+    ("get", "/npi/id/{npi}"): {
+        "address_grouping",
+        "address_key",
+        "address_limit",
+        "address_offset",
+        "address_site_key",
+        "debug",
+        "extra_info",
+        "force_address_update",
+        "include_address_total",
+        "include_evidence",
+        "include_profile",
+        "include_sources",
+        "lookup_stored_geocode",
+        "show",
+        "sync_geocode",
+        "view",
+    },
+    # Registry parsers reject unknown/duplicate fields before reading a snapshot.
+    ("get", "/registry/manage/{kind}"): {"limit", "offset", "record_ids", "custom_revision"},
+    ("get", "/registry/manage/{kind}/{record_id}"): {"custom_revision"},
+    ("get", "/registry/manage/{kind}/{record_id}/history"): {"limit", "offset"},
+    ("get", "/registry/publication/approved-companies"): {"limit", "offset", "approved_revision"},
+    ("get", "/registry/serving/manifest"): {"network_generation"},
+    ("get", "/plan/network/id/{checksum}"): {"network_ids", "network_generation"},
+    ("get", "/registry/serving/providers"): {
+        "network_ids",
+        "network_generation",
+        "membership_level",
+        "limit",
+        "offset",
+        "location_id",
+        "lat",
+        "long",
+        "radius_miles",
+    },
+    ("get", "/registry/serving/providers/{provider_system}/{provider_id}"): {
+        "network_ids",
+        "network_generation",
+        "location_id",
+        "lat",
+        "long",
+        "radius_miles",
+    },
+    ("get", "/issuer/registry"): {"issuer_ids", "reporting_year"},
+    # The shared directory request parser validates these outside the route AST.
+    ("get", "/provider-directory/entities/{kind}"): {
+        "source_id",
+        "generation_id",
+        "limit",
+        "cursor",
+        "network_ids",
+        "network_generation",
+    },
+    ("get", "/provider-directory/entities/{kind}/{entity_id}"): {
+        "source_id",
+        "generation_id",
+        "network_ids",
+        "network_generation",
+    },
+    ("get", "/provider-directory/entities/{kind}/{entity_id}/relationships"): {
+        "source_id",
+        "generation_id",
+        "limit",
+        "cursor",
+        "network_ids",
+        "network_generation",
+    },
     ("get", "/hospital-prices/facilities"): {
         "cursor",
         "include_metadata",
@@ -39,7 +143,9 @@ ROUTE_QUERY_PARAM_ADDITIONS = {
         "q",
     },
     ("get", "/hospital-prices/facilities/{hospital_id}/payer-plans"): {
-        "version_id", "cursor", "limit",
+        "version_id",
+        "cursor",
+        "limit",
     },
     # The taxonomy filter helper parses these outside the decorated route's AST.
     ("get", "/nucc/all"): {"code", "q"},

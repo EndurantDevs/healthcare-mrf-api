@@ -20,6 +20,7 @@ from process.provider_directory_fhir_subset_abandonment_contract import (
 from process.provider_directory_fhir_subset_abandonment_selection import (
     selected_reviewed_subset_abandonment,
 )
+from process.provider_directory_source_checkpoint_control import source_checkpoint_transaction
 
 _CHECKPOINT_GUARD = "provider_directory_subset_abandonment_checkpoint_guard"
 _DATASET_GUARD = "pd_subset_abandonment_dataset_consistency_guard"
@@ -28,9 +29,7 @@ _VALID_FUNCTION = "provider_directory_subset_abandonment_valid"
 
 async def _force_abandonment_guards(database: Any, dataset_id: str) -> None:
     await database.status(
-        "SET CONSTRAINTS "
-        f'"{_schema_name()}"."{_CHECKPOINT_GUARD}", '
-        f'"{_schema_name()}"."{_DATASET_GUARD}" IMMEDIATE;'
+        f'SET CONSTRAINTS "{_schema_name()}"."{_CHECKPOINT_GUARD}", "{_schema_name()}"."{_DATASET_GUARD}" IMMEDIATE;'
     )
     is_valid = await database.scalar(
         f"SELECT {_quoted_relation(_VALID_FUNCTION)}(:dataset_id);",
@@ -48,7 +47,7 @@ async def _abandon_checkpoints(
     for checkpoint_row in checkpoint_rows:
         updated_count = await database.status(
             f"""
-            UPDATE {_quoted_relation('provider_directory_pagination_checkpoint')}
+            UPDATE {_quoted_relation("provider_directory_pagination_checkpoint")}
                SET state = :abandoned_state,
                    completed_at = COALESCE(
                        completed_at,
@@ -100,7 +99,7 @@ async def _abandon_candidate(
 
     updated_count = await database.status(
         f"""
-        UPDATE {_quoted_relation('provider_directory_endpoint_dataset')}
+        UPDATE {_quoted_relation("provider_directory_endpoint_dataset")}
            SET status = :abandoned_status,
                resource_count = :resource_count,
                publication_metadata_json =
@@ -156,10 +155,8 @@ async def sync_reviewed_subset_abandonment_transaction(
 ) -> ReviewedSubsetAbandonmentResult:
     """Lock and seal the sole expired reviewed subset root."""
 
-    async with database.transaction():
-        isolation = await database.scalar(
-            "SELECT pg_catalog.current_setting('transaction_isolation');"
-        )
+    async with source_checkpoint_transaction(database, schema=_schema_name()):
+        isolation = await database.scalar("SELECT pg_catalog.current_setting('transaction_isolation');")
         if isolation != "read committed":
             raise ReviewedSubsetAbandonmentError("state")
         selection, checkpoint_rows = await selected_reviewed_subset_abandonment(

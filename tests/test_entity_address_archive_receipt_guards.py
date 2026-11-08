@@ -40,6 +40,68 @@ def _stage_names():
     return {model.__tablename__: f"{model.__tablename__}_20260914" for model in receipt._models()}
 
 
+def _set_receipt():
+    from process.entity_address_snapshot_alias import EntityAddressAliasAuthority
+
+    tables = tuple(
+        receipt.EntityAddressArchiveTableReceipt(model.__name__, model.__tablename__, "a" * 64, 1)
+        for model in (*receipt._models(), EntityAddressAliasAuthority)
+    )
+    return receipt.EntityAddressArchiveReceipt(
+        tables, receipt._table_schema_digest(tables), contract=receipt.CONTRACT
+    ).as_dict()
+
+
+def test_v2_descriptor_closed_inventory():
+    stored = _set_receipt()
+    validated = receipt.validate_entity_address_archive_receipt(stored)
+    assert validated.as_dict() == stored
+    assert set(stored) == {"contract", "receipt_version", "tables", "schema_sha256"}
+    assert len(stored["tables"]) == 8
+    assert all(set(entry) == {"model_name", "table_name", "schema_sha256", "row_count"} for entry in stored["tables"])
+
+
+async def test_v2_alias_requires_typed_content():
+    from process import entity_address_snapshot_alias as aliases
+
+    descriptor_by_field = {
+        "contract": aliases.SET_CONTRACT,
+        "receipt_version": aliases.SET_CONTRACT,
+        "alias_schema_version": 2,
+        "active_ruleset_version": 1,
+        "local_generation": 3,
+        "active_alias_count": 1,
+    }
+    validated = aliases.validate_entity_address_alias_semantic_receipt(descriptor_by_field)
+    assert validated.as_dict() == descriptor_by_field
+    with pytest.raises(aliases.EntityAddressSnapshotAliasError, match="actual alias set authority"):
+        aliases.require_matching_entity_address_alias_semantics(validated, validated)
+    session = SimpleNamespace(scalar=AsyncMock(return_value=False))
+    with pytest.raises(aliases.EntityAddressSnapshotAliasError, match="authority differs"):
+        await aliases.require_matching_entity_address_alias_authority(
+            session, authority_schema="isolated", alias_schema="example"
+        )
+    statement = str(session.scalar.await_args.args[0])
+    assert "FULL JOIN" in statement and "revoked_at IS NULL" in statement
+    assert all(f'a."{name}" IS DISTINCT FROM b."{name}"' in statement for name in aliases._SEMANTIC_COLUMNS)
+    assert "sha" not in statement.lower()
+
+
+@pytest.mark.parametrize("mutation", ["legacy_version", "payload_hash", "missing_auxiliary", "extra_auxiliary"])
+def test_v2_descriptor_rejects_mixed_versions_and_open_inventory(mutation):
+    stored = _set_receipt()
+    if mutation == "legacy_version":
+        stored["receipt_version"] = receipt.LEGACY_CONTRACT
+    elif mutation == "payload_hash":
+        stored["tables"][0]["row_sha256"] = "b" * 64
+    elif mutation == "missing_auxiliary":
+        stored["tables"].pop()
+    else:
+        stored["tables"].append(dict(stored["tables"][-1]))
+    with pytest.raises(receipt.EntityAddressArchiveReceiptError):
+        receipt.validate_entity_address_archive_receipt(stored)
+
+
 @pytest.mark.parametrize("entry", [None, {}, {"unexpected": True}])
 @pytest.mark.parametrize("stage", [False, True])
 def test_receipt_table_entries_must_be_closed_records(entry, stage):
@@ -108,11 +170,18 @@ async def test_receipt_without_transaction_cannot_acquire_locks():
 @pytest.mark.parametrize(
     "group,key", [(0, "default_expression"), (1, "check_expression"), (2, "predicate"), (2, "expressions")]
 )
-def test_schema_bound_expressions_are_not_portable(group, key):
+@pytest.mark.parametrize("expression", ["source_stage.table_name", '"source_stage".table_name'])
+def test_schema_bound_expressions_are_not_portable(group, key, expression):
     catalogs = [[], [], []]
-    catalogs[group].append({key: "source_stage.table_name"})
+    catalogs[group].append({key: expression})
     with pytest.raises(receipt.EntityAddressArchiveReceiptError, match="expression is unsupported"):
         receipt._reject_schema_qualified_expressions("source_stage", *catalogs)
+
+
+def test_schema_name_inside_unqualified_owned_sequence_is_portable():
+    catalogs = [[{"default_expression": "nextval('mrf_address_id_seq'::regclass)"}], [], []]
+
+    receipt._reject_schema_qualified_expressions("mrf", *catalogs)
 
 
 @pytest.mark.asyncio
@@ -127,17 +196,12 @@ async def test_schema_receipt_rejects_relation_without_columns(monkeypatch):
 @pytest.mark.parametrize(
     "changes", [{"chunk_ordinal": 1}, {"chunk_row_count": 0}, {"chunk_row_count": 4097}, {"chunk_sha256": "invalid"}]
 )
-async def test_invalid_row_chunks_close_the_stream_before_failing(changes):
+async def test_invalid_row_chunks_fail_closed(changes):
     chunk_by_field = {"chunk_ordinal": 0, "chunk_row_count": 1, "chunk_sha256": "a" * 64, **changes}
-
-    async def chunks():
-        yield chunk_by_field
-
-    result = SimpleNamespace(mappings=chunks, close=AsyncMock())
-    session = SimpleNamespace(stream=AsyncMock(return_value=result))
+    result = SimpleNamespace(mappings=lambda: [chunk_by_field])
+    session = SimpleNamespace(execute=AsyncMock(return_value=result))
     with pytest.raises(receipt.EntityAddressArchiveReceiptError, match="row receipt is invalid"):
         await receipt._row_identity(session, "stage", "address")
-    result.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -147,7 +211,12 @@ async def test_inconsistent_main_input_census_cannot_produce_receipt(monkeypatch
     monkeypatch.setattr(receipt, "_schema_identity", AsyncMock(return_value="a" * 64))
     monkeypatch.setattr(receipt, "_row_identity", AsyncMock(return_value=(1, "b" * 64)))
     monkeypatch.setattr(receipt, "_main_input_identity", AsyncMock(return_value=(2, "c" * 64)))
-    session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
+
+    async def scalar(statement):
+        assert str(statement) in {"SHOW transaction_read_only", "SHOW transaction_isolation"}
+        return "off" if str(statement) == "SHOW transaction_read_only" else "repeatable read"
+
+    session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock(), scalar=scalar)
     with pytest.raises(receipt.EntityAddressArchiveReceiptError, match="main input receipt is invalid"):
         if stage:
             await receipt.capture_entity_address_stage_integrity_receipt(

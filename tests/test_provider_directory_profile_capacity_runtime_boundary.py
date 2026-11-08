@@ -127,14 +127,14 @@ async def test_cross_runtime_lease_fails_inside_transaction_before_consume(
         await importer._consume_admission_transaction(
             "run_" + "1" * 32,
             _execution(),
-            SimpleNamespace(serving_state=serving_state),
+            SimpleNamespace(serving_state=serving_state, initial_targets=None),
             object(),
             object(),
             SimpleNamespace(
                 database_identity=object(),
                 control_wal_plan_input=object(),
             ),
-            object(),
+            SimpleNamespace(bounded_admission=False),
         )
 
     preflight_state_lock.assert_awaited_once_with(importer._schema())

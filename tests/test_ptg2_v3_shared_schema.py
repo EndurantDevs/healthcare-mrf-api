@@ -1,40 +1,16 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-import importlib.util
 import os
-import re
 import subprocess
 import sys
 import uuid
 from pathlib import Path
 
 import pytest
-import sqlalchemy as sa
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy.dialects.postgresql import JSONB
 
 from db.connection import Database
-from db.models import (
-    PTG2V3AuditOccurrence,
-    PTG2V3Block,
-    PTG2V3CandidateAuditAttestation,
-    PTG2V3Code,
-    PTG2V3GCCandidate,
-    PTG2V3GraphOwner,
-    PTG2V3LayoutFingerprint,
-    PTG2V3NPIScope,
-    PTG2V3PriceAttr,
-    PTG2V3ProviderGroup,
-    PTG2V3ProviderSet,
-    PTG2V3SnapshotBinding,
-    PTG2V3SnapshotBlock,
-    PTG2V3SnapshotLayout,
-    PTG2V3SnapshotScope,
-    PTG2V3SnapshotSource,
-    PTG2V3SourceAuditWitness,
-    PTG2WitnessPart,
-)
 from db.models._legacy import (
     _move_address_key_column_to_end,
     _resolve_ptg2_database_schema,
@@ -65,14 +41,9 @@ from tests.ptg2_v3_shared_schema_assertions import (
     _assert_v3_sealed_mapping_index,
     _assert_v3_timezone_column_types,
     _assert_v3_unique_constraints,
-    _constraints,
-    _expected_v3_foreign_key_shapes,
-    _foreign_key_shapes,
-    _index_shapes,
     _load_migration,
     _normalized,
     _OpRecorder,
-    _primary_key,
     _record_upgrade,
 )
 from tests.ptg2_v3_shared_schema_migrations import (
@@ -80,6 +51,7 @@ from tests.ptg2_v3_shared_schema_migrations import (
     HOLD_MIGRATION_PATH,
     MIGRATION_PATH,
 )
+from tests.test_company_registry_group_assertion_migration import _assert_source_inventory_migration_head
 
 
 @pytest.mark.parametrize(
@@ -148,10 +120,65 @@ def test_v3_followup_migration_repairs_attestation_snapshot_index(monkeypatch):
 
 
 def test_repository_has_single_alembic_head():
+    """Require one inventory head while preserving every historical parent edge."""
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
 
-    assert ScriptDirectory.from_config(config).get_heads() == ["20260917130000_custom_import_generation_finality"]
+    script = ScriptDirectory.from_config(config)
+    _assert_source_inventory_migration_head(script)
+    assert (
+        script.get_revision("20261019150000_registry_source_check_idempotency").down_revision
+        == "20261019140000_plan_pricing_attribution_idempotency"
+    )
+    assert (
+        script.get_revision("20261019030000_provider_directory_role_schema").down_revision
+        == "20261019020000_registry_continuation_join"
+    )
+    assert script.get_revision("20261019020000_registry_continuation_join").down_revision == (
+        "20261019010000_registry_raw_object_join",
+        "20261019010000_custom_import_build_continuation",
+    )
+    assert script.get_revision("20261019010000_custom_import_build_continuation").down_revision == (
+        "20261017010000_custom_import_raw_objects"
+    )
+    assert script.get_revision("20261017020000_source_registry_snapshot_join").down_revision == (
+        "20261016060000_uhc_official_cohort_snapshots",
+        "20261017010000_registry_cms_source_notifications",
+    )
+    assert script.get_revision("20261017010000_registry_cms_source_notifications").down_revision == (
+        "20261016070000_registry_allowed_plan_scope"
+    )
+    assert script.get_revision("20261016070000_registry_allowed_plan_scope").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+    assert script.get_revision("20261016060000_uhc_official_cohort_snapshots").down_revision == (
+        "20261016050000_acquisition_validator_argument_types"
+    )
+    assert script.get_revision("20261015010000_plan_release_binding_cohorts").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+    assert script.get_revision("20261015020000_custom_import_query_projections").down_revision == (
+        "20261013010000_registry_custom_history_events"
+    )
+    assert script.get_revision("20261010010000_custom_import_materialization_contract").down_revision == (
+        "20261010000000_custom_import_admission_indexes"
+    )
+    assert script.get_revision("20261010030000_registry_source_admission_receipt").down_revision == (
+        "20261010020000_registry_ptg_office_retention"
+    )
+    assert script.get_revision("20261010020000_registry_ptg_office_retention").down_revision == (
+        "20261010010000_registry_ptg_office_approval"
+    )
+    assert script.get_revision("20261010010000_registry_ptg_office_approval").down_revision == (
+        "20261009040000_registry_ptg_published_plan_scope"
+    )
+    assert script.get_revision("20261009040000_registry_ptg_published_plan_scope").down_revision == (
+        "20261009030000_network_catalog_evidence"
+    )
+    assert (
+        script.get_revision("20261006010000_nucc_reference_result_generation").down_revision
+        == "20261007000000_custom_import_rejection_anti_joins"
+    )
 
 
 def test_candidate_audit_hold_migration_matches_runtime_digest():

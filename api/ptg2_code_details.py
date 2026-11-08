@@ -8,11 +8,12 @@ from typing import Any
 
 from sqlalchemy import text
 
+from api.network_read_execution import direct_heap_relation_sql, execute_network_read, has_network_read_inventory
 from api.ptg2_response import (
     _catalog_detail,
     _catalog_key,
-    _missing_modifier_detail,
     _is_request_flag_enabled,
+    _missing_modifier_detail,
     _summarize_price_payload,
 )
 from api.ptg2_serving_utils import _row_mapping
@@ -97,9 +98,7 @@ async def _enrich_ptg2_code_details(
     if not _is_request_flag_enabled(args.get("include_code_details")):
         return response_payload
 
-    response_items = [
-        dict(response_item) for response_item in response_payload.get("items", [])
-    ]
+    response_items = [dict(response_item) for response_item in response_payload.get("items", [])]
     lookup_keys = _code_detail_lookup_keys(response_items)
 
     if not lookup_keys:
@@ -111,11 +110,15 @@ async def _enrich_ptg2_code_details(
         clauses.append(f"(code_system = :code_system_{idx} AND code = :code_{idx})")
         query_params_by_name[f"code_system_{idx}"] = code_system
         query_params_by_name[f"code_{idx}"] = code
-    query_result = await session.execute(
+    relation = f"{PTG2_SCHEMA}.code_catalog"
+    if has_network_read_inventory(session):
+        relation = direct_heap_relation_sql(session, PTG2_SCHEMA, "code_catalog")
+    query_result = await execute_network_read(
+        session,
         text(
             f"""
             SELECT code_system, code, display_name, short_description
-            FROM {PTG2_SCHEMA}.code_catalog
+            FROM {relation}
             WHERE {" OR ".join(clauses)}
             """
         ),
@@ -126,9 +129,7 @@ async def _enrich_ptg2_code_details(
             str(catalog_row.get("code_system") or ""),
             str(catalog_row.get("code") or ""),
         ): _catalog_detail(catalog_row)
-        for catalog_row in (
-            _row_mapping(query_row) for query_row in query_result
-        )
+        for catalog_row in (_row_mapping(query_row) for query_row in query_result)
     }
 
     _apply_code_details(response_items, detail_map)

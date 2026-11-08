@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from process.provider_directory_resource_hash import (
     RESOURCE_TRANSPORT_PAYLOAD_FIELDS,
     SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
+    _SHA256_HEX_RE,
     _payload_sha256,
     _stable_json,
     semantic_resource_content_hash_payload,
@@ -166,7 +167,7 @@ def composed_organization_semantic_sha256(
     if any(
         type(hash_value) is not str
         or len(hash_value) != 64
-        or any(character not in "0123456789abcdef" for character in hash_value)
+        or _SHA256_HEX_RE.fullmatch(hash_value) is None
         for hash_value in hashes
     ):
         raise ValueError("provider_directory_organization_hash_invalid")

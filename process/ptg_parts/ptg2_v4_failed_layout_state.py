@@ -14,7 +14,6 @@ from process.ptg_parts.ptg2_v4_finalizer_maps import (
     PTG2_V4_FINALIZER_MAP_TARGET_TABLE,
 )
 
-
 _REFERENCE_FENCE_NAMES = (
     "bindings",
     "attestations",
@@ -37,22 +36,18 @@ async def _has_finalizer_map_tables(executor: Any, schema_name: str) -> bool:
 
     schema = _quote_ident(schema_name)
     relation_name_by_table = {
-        table_name: f"{schema}.{_quote_ident(table_name)}"
-        for table_name in _FINALIZER_MAP_TABLES
+        table_name: f"{schema}.{_quote_ident(table_name)}" for table_name in _FINALIZER_MAP_TABLES
     }
     fields_by_name = row_mapping(
         await executor.first(
             "SELECT "
             + ", ".join(
-                f"to_regclass(:{table_name}) IS NOT NULL AS {table_name}"
-                for table_name in _FINALIZER_MAP_TABLES
+                f"to_regclass(:{table_name}) IS NOT NULL AS {table_name}" for table_name in _FINALIZER_MAP_TABLES
             ),
             **relation_name_by_table,
         )
     )
-    present_count = sum(
-        bool(fields_by_name.get(table_name)) for table_name in _FINALIZER_MAP_TABLES
-    )
+    present_count = sum(bool(fields_by_name.get(table_name)) for table_name in _FINALIZER_MAP_TABLES)
     if present_count not in (0, len(_FINALIZER_MAP_TABLES)):
         raise RuntimeError("packed finalizer map storage extension is partial")
     return present_count == len(_FINALIZER_MAP_TABLES)
@@ -85,10 +80,7 @@ def json_mapping(raw_json: Any) -> dict[str, Any]:
 def _finalizer_count_sql(schema: str, table_name: str, enabled: bool) -> str:
     if not enabled:
         return ""
-    return (
-        f" + (SELECT COUNT(*) FROM {schema}.{_quote_ident(table_name)} "
-        "WHERE snapshot_key = :snapshot_key)"
-    )
+    return f" + (SELECT COUNT(*) FROM {schema}.{_quote_ident(table_name)} WHERE snapshot_key = :snapshot_key)"
 
 
 async def _load_snapshot_record(
@@ -210,6 +202,12 @@ async def load_recovery_records(
     return snapshot_by_field, run_by_field, layout_by_field
 
 
+def _pin_reference_count_sql(schema):
+    """Keep both immutable plan pins and unrelated legacy owner pins visible."""
+    return f"""((SELECT COUNT(*) FROM {schema}.ptg2_snapshot_pin WHERE snapshot_id=:snapshot_id)
+    + (SELECT COUNT(*) FROM {schema}.plan_release_snapshot_pin WHERE snapshot_id=:snapshot_id))"""
+
+
 async def load_reference_counts(
     executor: Any,
     *,
@@ -221,12 +219,8 @@ async def load_reference_counts(
 
     schema = _quote_ident(schema_name)
     has_finalizer_maps = await _has_finalizer_map_tables(executor, schema_name)
-    finalizer_targets = _finalizer_count_sql(
-        schema, PTG2_V4_FINALIZER_MAP_TARGET_TABLE, has_finalizer_maps
-    )
-    finalizer_packs = _finalizer_count_sql(
-        schema, PTG2_V4_FINALIZER_MAP_PACK_TABLE, has_finalizer_maps
-    )
+    finalizer_targets = _finalizer_count_sql(schema, PTG2_V4_FINALIZER_MAP_TARGET_TABLE, has_finalizer_maps)
+    finalizer_packs = _finalizer_count_sql(schema, PTG2_V4_FINALIZER_MAP_PACK_TABLE, has_finalizer_maps)
     count_record = await executor.first(
         f"""
         SELECT
@@ -250,8 +244,7 @@ async def load_reference_counts(
             (SELECT COUNT(*) FROM {schema}.ptg2_current_plan_source
               WHERE snapshot_id = :snapshot_id
                  OR previous_snapshot_id = :snapshot_id) AS plan_pointers,
-            (SELECT COUNT(*) FROM {schema}.ptg2_snapshot_pin
-              WHERE snapshot_id = :snapshot_id) AS pins,
+            {_pin_reference_count_sql(schema)} AS pins,
             (SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_scope
               WHERE snapshot_id = :snapshot_id) AS scopes,
             (SELECT COUNT(*) FROM {schema}.ptg2_v3_snapshot_source
@@ -266,10 +259,7 @@ async def load_reference_counts(
         snapshot_id=snapshot_id,
         snapshot_key=snapshot_key,
     )
-    return {
-        count_name: int(raw_count or 0)
-        for count_name, raw_count in row_mapping(count_record).items()
-    }
+    return {count_name: int(raw_count or 0) for count_name, raw_count in row_mapping(count_record).items()}
 
 
 async def load_block_stats(
@@ -318,10 +308,7 @@ async def load_block_stats(
         snapshot_key=snapshot_key,
         v4_hashes=sorted(v4_hashes),
     )
-    return {
-        stat_name: int(raw_stat or 0)
-        for stat_name, raw_stat in row_mapping(stats_record).items()
-    }
+    return {stat_name: int(raw_stat or 0) for stat_name, raw_stat in row_mapping(stats_record).items()}
 
 
 async def load_recovery_postconditions(
@@ -334,20 +321,11 @@ async def load_recovery_postconditions(
 
     schema = _quote_ident(schema_name)
     has_finalizer_maps = await _has_finalizer_map_tables(executor, schema_name)
-    finalizer_targets = _finalizer_count_sql(
-        schema, PTG2_V4_FINALIZER_MAP_TARGET_TABLE, has_finalizer_maps
-    )
-    finalizer_roots = _finalizer_count_sql(
-        schema, PTG2_V4_FINALIZER_MAP_ROOT_TABLE, has_finalizer_maps
-    )
-    finalizer_packs = _finalizer_count_sql(
-        schema, PTG2_V4_FINALIZER_MAP_PACK_TABLE, has_finalizer_maps
-    )
+    finalizer_targets = _finalizer_count_sql(schema, PTG2_V4_FINALIZER_MAP_TARGET_TABLE, has_finalizer_maps)
+    finalizer_roots = _finalizer_count_sql(schema, PTG2_V4_FINALIZER_MAP_ROOT_TABLE, has_finalizer_maps)
+    finalizer_packs = _finalizer_count_sql(schema, PTG2_V4_FINALIZER_MAP_PACK_TABLE, has_finalizer_maps)
     dense_rows_sql = " + ".join(
-        (
-            f"(SELECT COUNT(*) FROM {schema}.{_quote_ident(table_name)} "
-            "WHERE snapshot_key = :snapshot_key)"
-        )
+        (f"(SELECT COUNT(*) FROM {schema}.{_quote_ident(table_name)} WHERE snapshot_key = :snapshot_key)")
         for table_name in PTG2_V3_DENSE_LAYOUT_TABLES
     )
     count_record = await executor.first(
@@ -377,10 +355,7 @@ async def load_recovery_postconditions(
         """,
         snapshot_key=snapshot_key,
     )
-    return {
-        count_name: int(raw_count or 0)
-        for count_name, raw_count in row_mapping(count_record).items()
-    }
+    return {count_name: int(raw_count or 0) for count_name, raw_count in row_mapping(count_record).items()}
 
 
 __all__ = [

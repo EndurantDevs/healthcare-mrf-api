@@ -17,17 +17,28 @@ from arq import create_pool
 
 from db.models import PricingPlacesZcta, db
 from process.control_cancel import raise_if_cancelled
-from process.ext.utils import (download_it_and_save, ensure_database, make_class,
-                               my_init_db, print_time_info, push_objects)
+from process.ext.utils import (
+    download_it_and_save,
+    ensure_database,
+    make_class,
+    my_init_db,
+    print_time_info,
+    push_objects,
+)
 from process.redis_config import build_redis_settings
+from process.places_zcta_handoff import (
+    cleanup_places_attempt,
+    handoff_places_stage,
+    is_protected_places_publication_enabled,
+)
+from process.reference_family_result_generation import (
+    publish_local_reference_family_generation,
+)
 from process.serialization import deserialize_job, serialize_job
 
 PLACES_ZCTA_QUEUE_NAME = "arq:PlacesZcta"
 POSTGRES_IDENTIFIER_MAX_LENGTH = 63
-DEFAULT_DOWNLOAD_URL = (
-    "https://chronicdata.cdc.gov/api/views/"
-    "qnzd-25i4/rows.csv?accessType=DOWNLOAD"
-)
+DEFAULT_DOWNLOAD_URL = "https://chronicdata.cdc.gov/api/views/qnzd-25i4/rows.csv?accessType=DOWNLOAD"
 SOURCE_DOWNLOAD_CHUNK_SIZE = 10 * 1024 * 1024
 DEFAULT_BATCH_SIZE = 5000
 DEFAULT_TEST_ROWS = 1500
@@ -42,7 +53,7 @@ def _env_positive_int(name: str, default: int) -> int:
     try:
         value = int(raw)
         return value if value > 0 else default
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default
 
 
@@ -76,7 +87,7 @@ def _safe_int(value: Any) -> int | None:
         return None
     try:
         return int(float(text.replace(",", "")))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -86,7 +97,7 @@ def _safe_float(value: Any) -> float | None:
         return None
     try:
         return float(text.replace(",", ""))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -204,20 +215,45 @@ async def _read_places_rows(
     return processed_rows, accepted_rows
 
 
-async def import_places_zcta_data(ctx, task=None):
-    """Process one queued places-to-ZCTA import task."""
-    task = task or {}
-    await raise_if_cancelled(ctx, task)
-    ctx.setdefault("context", {})
-
+async def _prepare_places_attempt(ctx, task):
+    """Isolate controlled attempts while preserving the manual load/finish workflow."""
+    context = ctx.setdefault("context", {})
     if "test_mode" in task:
         ctx["context"]["test_mode"] = bool(task.get("test_mode"))
     test_mode = bool(ctx["context"].get("test_mode", False))
+    if is_protected_places_publication_enabled() and (test_mode or not ctx["context"].get("_control_attempt_id")):
+        raise RuntimeError("Protected PLACES publication requires a complete controlled attempt")
 
     await ensure_database(test_mode)
+    attempt_id = context.get("_control_attempt_id")
+    if not attempt_id:
+        return ctx, make_class(PricingPlacesZcta, ctx["import_date"])
+    context["run"] = 0
+    ctx["import_date"] = hashlib.sha256(str(attempt_id).encode()).hexdigest()[:20]
+    target_cls = make_class(PricingPlacesZcta, ctx["import_date"])
+    await _create_places_stage(target_cls, context=context)
+    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    ctx["context"]["_places_incumbent_oid"] = await db.scalar(
+        "SELECT to_regclass(:relation)::oid::bigint", relation=f"{db_schema}.pricing_places_zcta"
+    )
+    return ctx, target_cls
 
-    import_date = ctx["import_date"]
-    target_cls = make_class(PricingPlacesZcta, import_date)
+
+async def import_places_zcta_data(ctx, task=None):
+    """Process and finalize one isolated places-to-ZCTA import attempt."""
+    task = task or {}
+    await raise_if_cancelled(ctx, task)
+    try:
+        ctx, target_cls = await _prepare_places_attempt(ctx, task)
+        return await _load_places_attempt(ctx, task, target_cls)
+    except Exception, asyncio.CancelledError:
+        await cleanup_places_attempt(db, ctx)
+        raise
+
+
+async def _load_places_attempt(ctx, task, target_cls):
+    """Load one source and publish only an explicitly controlled attempt."""
+    test_mode = bool(ctx["context"].get("test_mode", False))
 
     batch_size = _env_positive_int("HLTHPRT_PLACES_ZCTA_BATCH_SIZE", DEFAULT_BATCH_SIZE)
     test_row_limit = _env_positive_int("HLTHPRT_PLACES_ZCTA_TEST_ROWS", DEFAULT_TEST_ROWS)
@@ -245,9 +281,7 @@ async def import_places_zcta_data(ctx, task=None):
         )
 
     if accepted_rows <= 0:
-        raise RuntimeError(
-            f"CDC PLACES import produced no rows for latest year={latest_year}; aborting stage publish"
-        )
+        raise RuntimeError(f"CDC PLACES import produced no rows for latest year={latest_year}; aborting stage publish")
 
     ctx["context"]["audit"] = {
         "source_url": source_url,
@@ -257,10 +291,10 @@ async def import_places_zcta_data(ctx, task=None):
     }
     ctx["context"]["run"] = ctx["context"].get("run", 0) + 1
 
-    print(
-        "PLACES ZCTA import done: "
-        f"latest_year={latest_year} processed={processed_rows:,} accepted={accepted_rows:,}"
-    )
+    print(f"PLACES ZCTA import done: latest_year={latest_year} processed={processed_rows:,} accepted={accepted_rows:,}")
+    await raise_if_cancelled(ctx, task)
+    if ctx["context"].get("_control_attempt_id"):
+        return await publish_places_zcta_generation(ctx)
 
 
 process_data = import_places_zcta_data
@@ -275,17 +309,28 @@ async def startup(ctx):  # pragma: no cover
     ctx["context"]["run"] = 0
     ctx["context"]["test_mode"] = False
     await ensure_database(False)
-
-    override_import_id = os.getenv("HLTHPRT_IMPORT_ID_OVERRIDE")
-    ctx["import_date"] = _normalize_import_id(override_import_id)
-    import_date = ctx["import_date"]
-    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
-
-    stage_cls = make_class(PricingPlacesZcta, import_date)
-
+    if is_protected_places_publication_enabled():
+        return
+    ctx["import_date"] = _normalize_import_id(os.getenv("HLTHPRT_IMPORT_ID_OVERRIDE"))
+    stage_cls = make_class(PricingPlacesZcta, ctx["import_date"])
+    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")
     await db.status(f"DROP TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__};")
-    await db.create_table(stage_cls.__table__, checkfirst=True)
+    await _create_places_stage(stage_cls)
+
+
+async def _create_places_stage(stage_cls, *, context=None):
+    """Create an attempt-owned stage without replacing an existing relation."""
+    db_schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+
+    await db.status(f"CREATE SCHEMA IF NOT EXISTS {db_schema};")
+    await db.create_table(stage_cls.__table__, checkfirst=False)
+    if context is not None:
+        context["_places_stage_oid"] = await db.scalar(
+            "SELECT to_regclass(:relation)::oid::bigint", relation=f"{db_schema}.{stage_cls.__tablename__}"
+        )
+        context["_places_stage_schema"] = db_schema
+        context["_places_stage_table"] = stage_cls.__tablename__
 
     if hasattr(stage_cls, "__my_index_elements__") and stage_cls.__my_index_elements__:
         await db.status(
@@ -293,11 +338,6 @@ async def startup(ctx):  # pragma: no cover
             f"ON {db_schema}.{stage_cls.__tablename__} "
             f"({', '.join(stage_cls.__my_index_elements__)});"
         )
-
-    print(
-        f"PLACES ZCTA startup ready for schema={db_schema} "
-        f"import_date={import_date}"
-    )
 
 
 async def _is_table_available(schema: str, table_name: str) -> bool:
@@ -312,12 +352,7 @@ async def _validated_places_stage_rows(stage_cls, db_schema: str, context) -> in
             f"Staging table {db_schema}.{stage_cls.__tablename__} is missing; cannot finalize PLACES publish."
         )
 
-    stage_rows = int(
-        await db.scalar(
-            f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};"
-        )
-        or 0
-    )
+    stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {db_schema}.{stage_cls.__tablename__};") or 0)
     min_rows = _env_positive_int("HLTHPRT_PLACES_ZCTA_MIN_ROWS", DEFAULT_MIN_ROWS)
 
     if context.get("test_mode"):
@@ -332,21 +367,25 @@ async def _validated_places_stage_rows(stage_cls, db_schema: str, context) -> in
 async def _create_places_stage_indexes(stage_cls, db_schema: str) -> None:
     """Create the configured additional indexes before PLACES cutover."""
     async with db.transaction():
-        if (
-            hasattr(PricingPlacesZcta, "__my_additional_indexes__")
-            and PricingPlacesZcta.__my_additional_indexes__
-        ):
-            for index in PricingPlacesZcta.__my_additional_indexes__:
-                index_name = index.get("name", "_".join(index.get("index_elements")))
+        if hasattr(PricingPlacesZcta, "__my_additional_indexes__") and PricingPlacesZcta.__my_additional_indexes__:
+            for position, index in enumerate(PricingPlacesZcta.__my_additional_indexes__):
+                staged_name = _places_stage_index_name(stage_cls.__tablename__, position)
                 using = f"USING {index.get('using')} " if index.get("using") else ""
                 where_clause = f" WHERE {index.get('where')}" if index.get("where") else ""
                 create_index_sql = (
-                    f"CREATE INDEX IF NOT EXISTS {stage_cls.__tablename__}_idx_{index_name} "
+                    f"CREATE INDEX IF NOT EXISTS {staged_name} "
                     f"ON {db_schema}.{stage_cls.__tablename__} {using}"
                     f"({', '.join(index.get('index_elements'))}){where_clause};"
                 )
                 print(create_index_sql)
                 await db.status(create_index_sql)
+
+
+def _places_stage_index_name(stage_table: str, position: int) -> str:
+    name = f"{stage_table}_idx_{position}"
+    if len(name.encode("utf-8")) > POSTGRES_IDENTIFIER_MAX_LENGTH:
+        raise RuntimeError("PLACES stage index name exceeds PostgreSQL's identifier limit")
+    return name
 
 
 async def publish_places_zcta_generation(ctx):
@@ -359,42 +398,47 @@ async def publish_places_zcta_generation(ctx):
     await ensure_database(bool(context.get("test_mode")))
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
     stage_cls = make_class(PricingPlacesZcta, import_date)
-    await _validated_places_stage_rows(stage_cls, db_schema, context)
+    stage_rows = await _validated_places_stage_rows(stage_cls, db_schema, context)
     await _create_places_stage_indexes(stage_cls, db_schema)
     await db.execute_ddl(f"ANALYZE {db_schema}.{stage_cls.__tablename__};")
+    if is_protected_places_publication_enabled():
+        return await handoff_places_stage(
+            db, ctx, schema=db_schema, table_name=stage_cls.__tablename__, row_count=stage_rows
+        )
 
     async def archive_index(index_name: str) -> str:
         """Archive one canonical index before renaming its staged replacement."""
         archived_name = _archived_identifier(index_name)
         await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_name};")
-        await db.status(
-            f"ALTER INDEX IF EXISTS {db_schema}.{index_name} RENAME TO {archived_name};"
-        )
+        await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{index_name} RENAME TO {archived_name};")
         return archived_name
 
     async with db.transaction():
         table = stage_cls.__main_table__
         await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
         await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
-        await db.status(
-            f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};"
-        )
+        await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{stage_cls.__tablename__} RENAME TO {table};")
 
         await archive_index(f"{table}_idx_primary")
         await db.status(
-            f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary "
-            f"RENAME TO {table}_idx_primary;"
+            f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary RENAME TO {table}_idx_primary;"
         )
 
-        for index in PricingPlacesZcta.__my_additional_indexes__:
+        for position, index in enumerate(PricingPlacesZcta.__my_additional_indexes__):
             index_name = index.get("name", "_".join(index.get("index_elements")))
             await archive_index(f"{table}_idx_{index_name}")
             await db.status(
-                f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_{index_name} "
+                f"ALTER INDEX IF EXISTS {db_schema}.{_places_stage_index_name(stage_cls.__tablename__, position)} "
                 f"RENAME TO {table}_idx_{index_name};"
             )
+        await publish_local_reference_family_generation(
+            db,
+            importer_id="places-zcta",
+            schema_name=db_schema,
+        )
 
     print_time_info(context.get("start"))
+    context["run"] = 0
 
 
 shutdown = publish_places_zcta_generation

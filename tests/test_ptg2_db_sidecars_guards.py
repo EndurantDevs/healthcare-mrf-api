@@ -34,9 +34,7 @@ def test_sidecar_scalar_guards_fail_closed(operation, operation_args):
 
 def test_sidecar_safe_name_and_row_mapping_paths():
     assert sidecars._safe_qualified_table_name("mrf.blocks") == '"mrf"."blocks"'
-    assert sidecars._row_mapping(SimpleNamespace(_mapping={"key": 1})) == {
-        "key": 1
-    }
+    assert sidecars._row_mapping(SimpleNamespace(_mapping={"key": 1})) == {"key": 1}
     assert sidecars._row_mapping({"key": 2}) == {"key": 2}
     assert sidecars._row_mapping((("key", 3),)) == {"key": 3}
     assert sidecars._row_mapping(None) == {}
@@ -54,21 +52,20 @@ def test_sidecar_id_and_uvarint_guards():
 
 def test_sidecar_payload_decode_guards():
     raw_payload = b"payload"
-    assert sidecars._decode_serving_binary_payload(
-        {
-            "payload": zlib.compress(raw_payload),
-            "payload_compression": "zlib",
-            "raw_payload_bytes": len(raw_payload),
-        }
-    ) == raw_payload
+    assert (
+        sidecars._decode_serving_binary_payload(
+            {
+                "payload": zlib.compress(raw_payload),
+                "payload_compression": "zlib",
+                "raw_payload_bytes": len(raw_payload),
+            }
+        )
+        == raw_payload
+    )
     with pytest.raises(sidecars.PTG2ManifestArtifactError, match="corrupt"):
-        sidecars._decode_serving_binary_payload(
-            {"payload": b"bad-zlib", "payload_compression": "zlib"}
-        )
+        sidecars._decode_serving_binary_payload({"payload": b"bad-zlib", "payload_compression": "zlib"})
     with pytest.raises(sidecars.PTG2ManifestArtifactError, match="unsupported"):
-        sidecars._decode_serving_binary_payload(
-            {"payload": b"", "payload_compression": "gzip"}
-        )
+        sidecars._decode_serving_binary_payload({"payload": b"", "payload_compression": "gzip"})
     with pytest.raises(sidecars.PTG2ManifestArtifactError, match="byte count"):
         sidecars._decode_serving_binary_payload(
             {
@@ -82,17 +79,18 @@ def test_sidecar_payload_decode_guards():
 @pytest.mark.asyncio
 async def test_forward_shard_discovery_empty_and_unexpected_rows():
     empty_session = SimpleNamespace(execute=AsyncMock())
-    assert await sidecars._discover_forward_shard_keys(
-        empty_session,
-        shared_snapshot_key=1,
-        schema_name="mrf",
-        code_keys=(),
-    ) == {}
+    assert (
+        await sidecars._discover_forward_shard_keys(
+            empty_session,
+            shared_snapshot_key=1,
+            schema_name="mrf",
+            code_keys=(),
+        )
+        == {}
+    )
     empty_session.execute.assert_not_awaited()
 
-    unexpected_session = SimpleNamespace(
-        execute=AsyncMock(return_value=({"code_key": 2, "block_key": 0},))
-    )
+    unexpected_session = SimpleNamespace(execute=AsyncMock(return_value=({"code_key": 2, "block_key": 0},)))
     with pytest.raises(sidecars.PTG2ManifestArtifactError, match="unexpected"):
         await sidecars._discover_forward_shard_keys(
             unexpected_session,
@@ -156,24 +154,30 @@ async def test_shared_fragment_adapter_rejects_legacy_table(monkeypatch):
         "_shared_serving_binary_payload_rows_for_keys",
         shared_reader,
     )
-    assert await sidecars._serving_binary_payload_rows_for_keys(
-        object(),
-        artifact_kind="kind",
-        block_keys=(0,),
-        shared_snapshot_key=1,
-    ) == expected_rows
+    assert (
+        await sidecars._serving_binary_payload_rows_for_keys(
+            object(),
+            artifact_kind="kind",
+            block_keys=(0,),
+            shared_snapshot_key=1,
+        )
+        == expected_rows
+    )
 
 
 @pytest.mark.asyncio
 async def test_shared_dictionary_front_guards():
-    assert await sidecars._serving_binary_dictionary_values_for_keys(
-        object(),
-        shared_snapshot_key=1,
-        artifact_kind="kind",
-        item_keys=(),
-        item_count=0,
-        block_bytes=16,
-    ) == {}
+    assert (
+        await sidecars._serving_binary_dictionary_values_for_keys(
+            object(),
+            shared_snapshot_key=1,
+            artifact_kind="kind",
+            item_keys=(),
+            item_count=0,
+            block_bytes=16,
+        )
+        == {}
+    )
     with pytest.raises(sidecars.PTG2ManifestArtifactError, match="item count"):
         await sidecars._serving_binary_dictionary_values_for_keys(
             object(),
@@ -256,7 +260,7 @@ def test_shared_dictionary_rejects_malformed_shape():
         sidecars._dictionary_alias_values(
             b"h" * 32,
             [malformed_fragment],
-            (),
+            {0: []},
             {0},
             item_count=1,
             entries_per_fragment=1,
@@ -310,6 +314,33 @@ def test_shared_dictionary_rebases_valid_physical_aliases():
     assert values_by_key[0] == values_by_key[1]
 
 
+def test_shared_dictionary_selects_disjoint_offsets_across_physical_aliases(monkeypatch):
+    payload = b"a" * 16 + b"b" * 16 + b"c" * 16
+    fragments = (
+        _dictionary_fragment(block_no=0, entry_count=3, payload=payload, raw_payload_bytes=48),
+        _dictionary_fragment(block_no=1, entry_count=3, payload=payload, raw_payload_bytes=48),
+        _dictionary_fragment(block_no=2, _block_hash=b"s" * 32),
+    )
+    decode = Mock(wraps=sidecars._decode_serving_binary_payload)
+    monkeypatch.setattr(sidecars, "_decode_serving_binary_payload", decode)
+
+    values = sidecars._shared_dictionary_values_for_keys(
+        reversed(fragments),
+        (0, 2, 4, 6),
+        item_count=7,
+        entries_per_fragment=3,
+        schema_name="mrf",
+    )
+
+    assert values == {
+        0: sidecars._id_text(b"a" * 16),
+        2: sidecars._id_text(b"c" * 16),
+        4: sidecars._id_text(b"b" * 16),
+        6: sidecars._id_text(b"x" * 16),
+    }
+    assert decode.call_count == 2
+
+
 def test_shared_dictionary_checks_alias_decoder_contract(monkeypatch):
     monkeypatch.setattr(
         sidecars,
@@ -328,9 +359,7 @@ def test_shared_dictionary_checks_alias_decoder_contract(monkeypatch):
 
 def test_forward_fragments_must_be_contiguous():
     with pytest.raises(sidecars.PTG2ManifestArtifactError, match="contiguous"):
-        sidecars._ordered_forward_fragments(
-            ({"block_no": 0}, {"block_no": 2})
-        )
+        sidecars._ordered_forward_fragments(({"block_no": 0}, {"block_no": 2}))
 
 
 def test_forward_source_filter_is_checked_against_observed_header(monkeypatch):
@@ -432,19 +461,25 @@ async def test_single_forward_read_empty_paths_do_not_hydrate(monkeypatch):
         "price_dictionary_item_count": 128,
         "price_dictionary_block_bytes": 32,
     }
-    assert await sidecars.lookup_code_rows_from_db(
-        object(),
-        7,
-        provider_set_keys=(),
-        **required_options_by_name,
-    ) == ()
-    assert await sidecars.lookup_code_prefix_rows_from_db(
-        object(),
-        7,
-        limit=1,
-        provider_set_keys=(),
-        **required_options_by_name,
-    ) == ()
+    assert (
+        await sidecars.lookup_code_rows_from_db(
+            object(),
+            7,
+            provider_set_keys=(),
+            **required_options_by_name,
+        )
+        == ()
+    )
+    assert (
+        await sidecars.lookup_code_prefix_rows_from_db(
+            object(),
+            7,
+            limit=1,
+            provider_set_keys=(),
+            **required_options_by_name,
+        )
+        == ()
+    )
 
     fragment_reader = AsyncMock(return_value=[])
     monkeypatch.setattr(
@@ -452,12 +487,15 @@ async def test_single_forward_read_empty_paths_do_not_hydrate(monkeypatch):
         "_shared_serving_binary_payload_rows_for_keys",
         fragment_reader,
     )
-    assert await sidecars.lookup_code_rows_from_db(
-        object(),
-        7,
-        provider_set_keys=(5,),
-        **required_options_by_name,
-    ) == ()
+    assert (
+        await sidecars.lookup_code_rows_from_db(
+            object(),
+            7,
+            provider_set_keys=(5,),
+            **required_options_by_name,
+        )
+        == ()
+    )
     fragment_reader.assert_awaited_once()
 
 

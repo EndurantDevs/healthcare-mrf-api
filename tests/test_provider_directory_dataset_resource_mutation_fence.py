@@ -5,11 +5,16 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import importlib
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
+from process.provider_directory_generic_candidate import GenericCandidateError
+from process.provider_directory_generic_source_policy import source_transaction
+from process.provider_directory_generic_source_storage import candidate_identity
+from tests.test_provider_directory_generic_source_policy import synthetic_source_database, synthetic_source_factory
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -112,6 +117,40 @@ def _checkpoint_context(dataset_id: str = "dataset_sealed"):
     )
 
 
+@contextlib.asynccontextmanager
+async def _sealed_source(monkeypatch, candidate, status):
+    executor = _RecordingExecutor([])
+    identity = candidate_identity(importer, candidate)
+    header_by_field = {
+        **identity,
+        "status": status,
+        "is_current": False,
+        "publication_metadata_json": identity["metadata"],
+        "candidate_storage_json": {"identity": identity},
+    }
+    async with synthetic_source_database(monkeypatch, executor) as database:
+        monkeypatch.setattr(importer, "db", database)
+        async with source_transaction(database) as connection:
+            connection.fetchrow.side_effect = lambda sql, *args: (
+                header_by_field if "provider_directory_endpoint_dataset" in sql else connection.fetchrow.return_value
+            )
+            original_scalar = connection.fetchval.side_effect
+
+            def native_control(query, *args):
+                if "SELECT count(*) FROM pg_class c" in query:
+                    return 6
+                if "FROM pg_attribute" in query:
+                    return True
+                if "FROM pg_trigger" in query:
+                    return False
+                return original_scalar(query, *args)
+
+            connection.fetchval.side_effect = native_control
+            borrowed_binding = SimpleNamespace(session=connection, borrowed=True)
+            monkeypatch.setattr(database, "_transaction_binding", lambda *, borrowed_only=False: borrowed_binding)
+            yield database, executor, connection
+
+
 @pytest.mark.asyncio
 async def test_parent_lock_is_exact_sorted_and_accepts_mutable_statuses():
     executor = _RecordingExecutor(
@@ -146,16 +185,11 @@ async def test_parent_lock_is_exact_sorted_and_accepts_mutable_statuses():
     importer.IMMUTABLE_ENDPOINT_DATASET_STATUSES,
 )
 async def test_parent_lock_rejects_every_immutable_status(immutable_status):
-    executor = _RecordingExecutor(
-        [{"dataset_id": "dataset_sealed", "status": immutable_status}]
-    )
+    executor = _RecordingExecutor([{"dataset_id": "dataset_sealed", "status": immutable_status}])
 
     with pytest.raises(
         RuntimeError,
-        match=(
-            "provider_directory_endpoint_dataset_resource_parent_immutable:"
-            f"dataset_sealed={immutable_status}"
-        ),
+        match=(f"provider_directory_endpoint_dataset_resource_parent_immutable:dataset_sealed={immutable_status}"),
     ):
         await importer._lock_mutable_endpoint_dataset_resource_parents(
             executor,
@@ -165,18 +199,14 @@ async def test_parent_lock_rejects_every_immutable_status(immutable_status):
 
 @pytest.mark.asyncio
 async def test_parent_lock_rejects_missing_parent_and_unscoped_row():
-    executor = _RecordingExecutor(
-        [{"dataset_id": None, "status": importer.ENDPOINT_DATASET_ACQUIRING}]
-    )
+    executor = _RecordingExecutor([{"dataset_id": None, "status": importer.ENDPOINT_DATASET_ACQUIRING}])
     with pytest.raises(RuntimeError, match="parent_missing:dataset_missing"):
         await importer._lock_mutable_endpoint_dataset_resource_parents(
             executor,
             ["dataset_missing"],
         )
     with pytest.raises(RuntimeError, match="parent_id_missing"):
-        importer._endpoint_dataset_resource_parent_ids(
-            [_dataset_resource_row(None, "practitioner_1")]
-        )
+        importer._endpoint_dataset_resource_parent_ids([_dataset_resource_row(None, "practitioner_1")])
 
 
 @pytest.mark.asyncio
@@ -189,7 +219,7 @@ async def test_normalized_dataset_upsert_requires_transaction(monkeypatch):
         guard,
     )
 
-    with pytest.raises(RuntimeError, match="resource_transaction_missing"):
+    with pytest.raises(RuntimeError, match="isolated_copy_required"):
         await importer._upsert_normalized_rows(
             importer.ProviderDirectoryDatasetResource,
             [_dataset_resource_row("dataset_a", "practitioner_1")],
@@ -204,7 +234,7 @@ async def test_normalized_dataset_upsert_requires_transaction(monkeypatch):
 async def test_generic_upsert_locks_all_parents_once_for_all_value_batches(
     monkeypatch,
 ):
-    """One generic call holds one fence across every values batch."""
+    """The legacy generic route refuses before parent locks or payload batches."""
     harness = _BoundSessionTransactionHarness()
     monkeypatch.setattr(importer.db, "transaction", harness.transaction)
     monkeypatch.setattr(importer.db, "all", harness.locked_parents)
@@ -216,22 +246,15 @@ async def test_generic_upsert_locks_all_parents_once_for_all_value_batches(
     monkeypatch.setattr(importer, "_is_copy_upsert_enabled", lambda: False)
     monkeypatch.setattr(importer, "_max_rows_per_statement", lambda _count: 1)
 
-    written = await importer._upsert_rows(
-        importer.ProviderDirectoryDatasetResource,
-        [
-            _dataset_resource_row("dataset_b", "practitioner_2"),
-            _dataset_resource_row("dataset_a", "practitioner_1"),
-        ],
-    )
-
-    assert written == 2
-    assert harness.events == [
-        "begin",
-        "lock:dataset_a,dataset_b",
-        "write",
-        "write",
-        "commit",
-    ]
+    with pytest.raises(RuntimeError, match="isolated_copy_required"):
+        await importer._upsert_rows(
+            importer.ProviderDirectoryDatasetResource,
+            [
+                _dataset_resource_row("dataset_b", "practitioner_2"),
+                _dataset_resource_row("dataset_a", "practitioner_1"),
+            ],
+        )
+    assert harness.events == ["begin", "rollback"] and harness.bound_session() is None
 
 
 @pytest.mark.asyncio
@@ -279,20 +302,12 @@ async def test_generic_copy_upsert_uses_savepoint_inside_parent_fence(monkeypatc
     monkeypatch.setattr(importer, "_copy_upsert_min_rows", lambda: 1)
     monkeypatch.setattr(importer, "_copy_upsert_rows", copy_upsert)
 
-    written = await importer._upsert_rows(
-        importer.ProviderDirectoryDatasetResource,
-        [_dataset_resource_row("dataset_a", "practitioner_1")],
-    )
-
-    assert written == 1
-    assert events == [
-        "begin",
-        "lock",
-        "savepoint",
-        "copy",
-        "savepoint_commit",
-        "begin_commit",
-    ]
+    with pytest.raises(RuntimeError, match="isolated_copy_required"):
+        await importer._upsert_rows(
+            importer.ProviderDirectoryDatasetResource,
+            [_dataset_resource_row("dataset_a", "practitioner_1")],
+        )
+    assert events == ["begin", "begin_rollback"] and transaction_depths == [0]
 
 
 @pytest.mark.asyncio
@@ -311,19 +326,15 @@ async def test_direct_connection_upsert_locks_once_before_all_batches(monkeypatc
     )
     monkeypatch.setattr(importer, "_max_rows_per_statement", lambda _count: 1)
 
-    await importer._upsert_dataset_resource_rows_on_connection(
-        executor,
-        [
-            _dataset_resource_row("dataset_b", "practitioner_2"),
-            _dataset_resource_row("dataset_a", "practitioner_1"),
-        ],
-    )
-
-    assert executor.events == ["lock", "write", "write"]
-    assert executor.all_calls[0][1]["dataset_ids"] == [
-        "dataset_a",
-        "dataset_b",
-    ]
+    with pytest.raises(GenericCandidateError, match="publisher_connection_required"):
+        await importer._upsert_dataset_resource_rows_on_connection(
+            executor,
+            [
+                _dataset_resource_row("dataset_b", "practitioner_2"),
+                _dataset_resource_row("dataset_a", "practitioner_1"),
+            ],
+        )
+    assert executor.events == [] and executor.status_calls == []
 
 
 @pytest.mark.asyncio
@@ -371,71 +382,58 @@ async def test_candidate_initial_clear_rejects_sealed_parent_before_delete(
         AsyncMock(),
     )
 
-    with pytest.raises(RuntimeError, match="parent_immutable"):
-        await importer._ensure_endpoint_dataset_candidate(candidate)
-    assert executor.status_calls == []
+    async with _sealed_source(monkeypatch, candidate, importer.ENDPOINT_DATASET_VALIDATED) as (_, executor, native):
+        with pytest.raises(GenericCandidateError, match="header_sealed"):
+            await importer._ensure_endpoint_dataset_candidate(candidate)
+        assert executor.status_calls == []
+        assert all(
+            call.args[0] in ("SET LOCAL search_path=pg_catalog,pg_temp", 'SET LOCAL ROLE "source_owner"', "RESET ROLE")
+            for call in native.execute.await_args_list
+        )
 
 
 @pytest.mark.asyncio
-async def test_uncheckpointed_clear_rejects_sealed_parent_before_delete(
-    monkeypatch,
-):
+async def test_uncheckpointed_clear_rejects_sealed_parent_before_delete(monkeypatch):
     candidate = _candidate()
-    executor = _RecordingExecutor(
-        [
-            {
-                "dataset_id": candidate.dataset_id,
-                "status": importer.ENDPOINT_DATASET_PUBLISHED,
-            }
-        ]
-    )
-
-    @contextlib.asynccontextmanager
-    async def transaction():
-        yield object()
-
-    monkeypatch.setattr(importer.db, "transaction", transaction)
-    monkeypatch.setattr(importer.db, "all", executor.all)
-    monkeypatch.setattr(importer.db, "status", executor.status)
-
-    with pytest.raises(RuntimeError, match="parent_immutable"):
-        await importer._clear_uncheckpointed_endpoint_dataset_candidate(
-            candidate
+    async with _sealed_source(monkeypatch, candidate, importer.ENDPOINT_DATASET_PUBLISHED) as (_, executor, native):
+        with pytest.raises(GenericCandidateError, match="header_sealed"):
+            await importer._clear_uncheckpointed_endpoint_dataset_candidate(candidate)
+        assert executor.status_calls == []
+        assert all(
+            call.args[0] in ("SET LOCAL search_path=pg_catalog,pg_temp", 'SET LOCAL ROLE "source_owner"', "RESET ROLE")
+            for call in native.execute.await_args_list
         )
-    assert executor.status_calls == []
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mutation_name", ["checkpoint_reset", "checkpoint_clear"])
-async def test_checkpoint_deletes_reject_sealed_parent_before_dml(
-    mutation_name,
-):
+async def test_checkpoint_deletes_reject_sealed_parent_before_dml(mutation_name, monkeypatch):
     context = _checkpoint_context()
-    executor = _RecordingExecutor(
-        [
-            {
-                "dataset_id": context.dataset_id,
-                "status": importer.ENDPOINT_DATASET_SUPERSEDED,
-            }
-        ]
-    )
-
-    with pytest.raises(RuntimeError, match="parent_immutable"):
-        if mutation_name == "checkpoint_reset":
-            await importer._reset_pagination_checkpoint(
-                context,
-                "Practitioner",
-                "https://payer.example/fhir/Practitioner",
-                "start_hash",
-                database_connection=executor,
-            )
-        else:
-            await importer._clear_checkpoint_dataset_resource_type(
-                context,
-                "Practitioner",
-                database_connection=executor,
-            )
-    assert executor.status_calls == []
+    async with _sealed_source(monkeypatch, _candidate(), importer.ENDPOINT_DATASET_SUPERSEDED) as (
+        database,
+        executor,
+        native,
+    ):
+        with pytest.raises(GenericCandidateError, match="header_sealed"):
+            if mutation_name == "checkpoint_reset":
+                await importer._reset_pagination_checkpoint(
+                    context,
+                    "Practitioner",
+                    "https://payer.example/fhir/Practitioner",
+                    "start_hash",
+                    database_connection=native,
+                )
+            else:
+                await importer._clear_checkpoint_dataset_resource_type(
+                    context,
+                    "Practitioner",
+                    database_connection=native,
+                )
+        assert executor.status_calls == []
+        assert all(
+            call.args[0] in ("SET LOCAL search_path=pg_catalog,pg_temp", 'SET LOCAL ROLE "source_owner"', "RESET ROLE")
+            for call in native.execute.await_args_list
+        )
 
 
 @pytest.mark.asyncio
@@ -447,17 +445,13 @@ async def test_finalized_retry_cleanup_remains_narrow_immutable_exception(
     monkeypatch.setattr(importer.db, "status", status)
     monkeypatch.setattr(importer, "_lock_mutable_endpoint_dataset_resource_parents", guard)
 
-    await importer._delete_endpoint_dataset_retry_state(["dataset_final"])
-
-    retry_resource_sql = status.await_args_list[0].args[0]
-    retry_resource_predicate = "resource_type = ANY(CAST(:retry_resource_types AS varchar[]))"
-    assert retry_resource_predicate in retry_resource_sql
-    assert "resource_type LIKE" not in retry_resource_sql
-    assert status.await_args_list[0].kwargs["dataset_ids"] == ["dataset_final"]
-    assert (
-        status.await_args_list[0].kwargs["retry_resource_types"]
-        == importer._last_updated_partition_retry_resource_types()
-    )
+    async with synthetic_source_factory(monkeypatch, importer.db, schema=importer._schema()):
+        await importer._delete_endpoint_dataset_retry_state(["dataset_final"])
+    status.assert_awaited_once()
+    statement = status.await_args.args[0]
+    assert "provider_directory_pagination_checkpoint" in statement
+    assert "provider_directory_dataset_resource" not in statement
+    assert status.await_args.kwargs["dataset_ids"] == ["dataset_final"]
     guard.assert_not_awaited()
 
 
@@ -475,25 +469,14 @@ async def test_matched_baseline_retirement_remains_proof_scoped_exception(
         verification_baseline_dataset_id="dataset_baseline",
     )
     executor = _RecordingExecutor([])
-    guard = AsyncMock(
-        side_effect=AssertionError("baseline exception used mutable guard")
-    )
+    guard = AsyncMock(side_effect=AssertionError("baseline exception used mutable guard"))
     monkeypatch.setattr(
         importer,
         "_lock_mutable_endpoint_dataset_resource_parents",
         guard,
     )
 
-    deleted = await importer._delete_matched_baseline_resource_rows(
-        executor,
-        candidate,
-        "dataset_baseline",
-    )
-
-    delete_sql, params = executor.status_calls[0]
-    assert "baseline.status = :baseline_status" in delete_sql
-    assert "successor.status = :validated_status" in delete_sql
-    assert "->> 'result' = 'matched'" in delete_sql
-    assert params["baseline_dataset_id"] == "dataset_baseline"
-    assert deleted == 1
+    with pytest.raises(RuntimeError, match="explicit_retirement_required"):
+        await importer._delete_matched_baseline_resource_rows(executor, candidate, "dataset_baseline")
+    assert executor.status_calls == []
     guard.assert_not_awaited()

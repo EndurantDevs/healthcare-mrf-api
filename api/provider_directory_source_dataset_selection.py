@@ -2,8 +2,8 @@
 
 """Bounded dataset selection for Provider Directory source scopes."""
 
-from sqlalchemy import and_, case, cast, func, or_, select, true, union_all
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import Integer, String, and_, any_, case, cast, column, func, or_, select, true, values
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 
 from db.models import ProviderDirectoryEndpointDataset, ProviderDirectorySource, db
 from process.provider_directory_admission_seal import (
@@ -27,9 +27,7 @@ def _source_endpoint_id(source_model, *, current_published_only):
     if current_published_only:
         return source_model.endpoint_id
     configured_endpoint_id = func.nullif(
-        cast(source_model.metadata_json, JSONB).op("->>")(
-            CONFIGURED_ENDPOINT_ID_METADATA_FIELD
-        ),
+        cast(source_model.metadata_json, JSONB).op("->>")(CONFIGURED_ENDPOINT_ID_METADATA_FIELD),
         "",
     )
     return func.coalesce(configured_endpoint_id, source_model.endpoint_id)
@@ -44,12 +42,9 @@ def _catalog_publication_metadata(dataset_model):
     )
     sealed = and_(
         dataset_model.content_proof_admission_version == ADMISSION_SEAL_VERSION,
-        dataset_model.content_proof_admission_kind.in_(
-            (ADMISSION_KIND_GENERIC, ADMISSION_KIND_UHC_CANONICAL)
-        ),
+        dataset_model.content_proof_admission_kind.in_((ADMISSION_KIND_GENERIC, ADMISSION_KIND_UHC_CANONICAL)),
         dataset_model.content_proof_admission_sha256.op("~")(r"^[0-9a-f]{64}$"),
-        func.jsonb_typeof(dataset_model.publication_metadata_summary_json)
-        == "object",
+        func.jsonb_typeof(dataset_model.publication_metadata_summary_json) == "object",
         dataset_model.publication_metadata_sha256
         == digest(
             dataset_model.publication_metadata_summary_json,
@@ -67,13 +62,13 @@ def _catalog_publication_metadata(dataset_model):
 
 def _exact_source_scope_predicate(publication_metadata, source_ids):
     metadata_source_ids = publication_metadata.op("->")("source_ids")
-    requested_source_ids = cast(list(source_ids), JSONB)
+    requested_source_ids = func.to_jsonb(source_ids)
     return and_(
         case(
-            (func.jsonb_typeof(metadata_source_ids) == "array",
-             func.jsonb_array_length(metadata_source_ids)),
+            (func.jsonb_typeof(metadata_source_ids) == "array", func.jsonb_array_length(metadata_source_ids)),
             else_=-1,
-        ) == len(source_ids),
+        )
+        == func.cardinality(source_ids),
         metadata_source_ids.op("@>")(requested_source_ids),
         requested_source_ids.op("@>")(metadata_source_ids),
     )
@@ -92,11 +87,9 @@ def _sealed_dataset_predicate(dataset_model):
         ),
         and_(
             dataset_model.status.in_(("published", "superseded")),
-            dataset_model.is_current
-            == (dataset_model.status == "published"),
+            dataset_model.is_current == (dataset_model.status == "published"),
             dataset_model.published_at.is_not(None),
-            dataset_model.superseded_at.is_not(None)
-            == (dataset_model.status == "superseded"),
+            dataset_model.superseded_at.is_not(None) == (dataset_model.status == "superseded"),
         ),
     )
 
@@ -130,46 +123,57 @@ def _scope_publication_metadata(
         dataset_model.content_proof_admission_kind.is_(None),
         dataset_model.content_proof_admission_sha256.is_(None),
         dataset_model.content_proof_resource_types.is_(None),
-        ~select(source_model.source_id).where(
+        ~select(source_model.source_id)
+        .where(
             source_model.endpoint_id == dataset_model.endpoint_id,
-            source_model.source_id.in_(other_profile_source_ids),
-        ).correlate(dataset_model).exists(),
+            source_model.source_id == any_(other_profile_source_ids),
+        )
+        .correlate_except(source_model)
+        .exists(),
     )
     return case(
         (func.jsonb_typeof(admitted_metadata) == "object", admitted_metadata),
         (
             unsealed_legacy_current,
-            func.jsonb_build_object("source_ids", cast(list(source_ids), JSONB)),
+            func.jsonb_build_object("source_ids", func.to_jsonb(source_ids)),
         ),
         else_=cast(None, JSONB),
     )
 
 
+def _bound_source_endpoint_ids(source_ids, *, current_published_only):
+    """Require every requested source alias to share one endpoint."""
+    source_model = ProviderDirectorySource
+    endpoint_id = _source_endpoint_id(source_model, current_published_only=current_published_only)
+    return (
+        select(endpoint_id)
+        .where(source_model.source_id == any_(source_ids), endpoint_id.is_not(None))
+        .group_by(endpoint_id)
+        .having(func.count(source_model.source_id) == func.cardinality(source_ids))
+        .correlate_except(source_model)
+    )
+
+
 def _source_scope_dataset_statement(
-    source_ids, current_source_ids, *, current_published_only=False, other_profile_source_ids=(),
+    source_ids,
+    current_source_ids,
+    *,
+    current_published_only=False,
+    other_profile_source_ids=(),
 ):
     """Select one bounded dataset while retaining valid legacy incumbents."""
     dataset_model, source_model = ProviderDirectoryEndpointDataset, ProviderDirectorySource
     publication_metadata = _scope_publication_metadata(
-        dataset_model, source_model, source_ids, other_profile_source_ids,
-        current_published_only=current_published_only,
-    )
-    catalog_metadata = select(
-        publication_metadata.label("publication_metadata")
-    ).correlate(dataset_model).lateral("catalog_metadata")
-    publication_metadata = catalog_metadata.c.publication_metadata
-    source_endpoint_id = _source_endpoint_id(
+        dataset_model,
         source_model,
+        source_ids,
+        other_profile_source_ids,
         current_published_only=current_published_only,
     )
-    bound_endpoint_ids = (
-        select(source_endpoint_id)
-        .where(
-            source_model.source_id.in_(source_ids), source_endpoint_id.is_not(None)
-        )
-        .group_by(source_endpoint_id)
-        .having(func.count(source_model.source_id) == len(source_ids))
+    catalog_metadata = (
+        select(publication_metadata.label("publication_metadata")).correlate_except().lateral("catalog_metadata")
     )
+    publication_metadata = catalog_metadata.c.publication_metadata
     return (
         select(
             dataset_model.endpoint_id.label("endpoint_id"),
@@ -188,7 +192,9 @@ def _source_scope_dataset_statement(
         )
         .join(catalog_metadata, true())
         .where(
-            dataset_model.endpoint_id.in_(bound_endpoint_ids),
+            dataset_model.endpoint_id.in_(
+                _bound_source_endpoint_ids(source_ids, current_published_only=current_published_only)
+            ),
             _exact_source_scope_predicate(publication_metadata, source_ids),
             dataset_model.resource_count >= 0,
             _current_published_dataset_predicate(dataset_model)
@@ -224,25 +230,40 @@ def _source_local_dataset_statement(
         .correlate(dataset_model)
         .scalar_subquery()
     )
-    profile_source_ids = {
-        source_id
-        for source_ids in source_id_groups
-        for source_id in source_ids
-    }
-    scope_statements = [
-        _source_scope_dataset_statement(
-            source_ids,
+    profile_source_ids = {source_id for source_ids in source_id_groups for source_id in source_ids}
+    if len(source_id_groups) == 1:
+        return _source_scope_dataset_statement(
+            cast(list(next(iter(source_id_groups))), ARRAY(String)),
             current_source_ids,
             current_published_only=current_published_only,
-            other_profile_source_ids=tuple(
-                sorted(profile_source_ids.difference(source_ids))
-            ),
+            other_profile_source_ids=cast([], ARRAY(String)),
         )
-        for source_ids in sorted(source_id_groups)
-    ]
-    if len(scope_statements) == 1:
-        return scope_statements[0]
-    return union_all(*scope_statements)
+    source_scopes = values(
+        column("scope_order", Integer),
+        column("source_ids", ARRAY(String)),
+        column("other_profile_source_ids", ARRAY(String)),
+        name="source_scopes",
+    ).data(
+        [
+            (scope_order, list(source_ids), sorted(profile_source_ids.difference(source_ids)))
+            for scope_order, source_ids in enumerate(sorted(source_id_groups))
+        ]
+    )
+    selected_dataset = (
+        _source_scope_dataset_statement(
+            source_scopes.c.source_ids,
+            current_source_ids,
+            current_published_only=current_published_only,
+            other_profile_source_ids=source_scopes.c.other_profile_source_ids,
+        )
+        .correlate(source_scopes)
+        .lateral("selected_dataset")
+    )
+    return (
+        select(*selected_dataset.c)
+        .select_from(source_scopes.join(selected_dataset, true()))
+        .order_by(source_scopes.c.scope_order)
+    )
 
 
 def _source_local_current_published_dataset_statement(source_id_groups):
@@ -278,9 +299,7 @@ async def _current_dataset_identities_by_id(dataset_ids):
 
     if not dataset_ids:
         return {}
-    query_result = await db.execute(
-        _current_dataset_identity_statement(dataset_ids)
-    )
+    query_result = await db.execute(_current_dataset_identity_statement(dataset_ids))
     identities_by_id = {}
     for dataset_record in query_result.mappings().all():
         try:
@@ -289,9 +308,7 @@ async def _current_dataset_identities_by_id(dataset_ids):
                     "endpoint_id": dataset_record.get("endpoint_id"),
                     "dataset_id": dataset_record.get("dataset_id"),
                     "dataset_hash": dataset_record.get("dataset_hash"),
-                    "acquisition_root_run_id": dataset_record.get(
-                        "acquisition_root_run_id"
-                    ),
+                    "acquisition_root_run_id": dataset_record.get("acquisition_root_run_id"),
                 }
             )
         except ValueError:

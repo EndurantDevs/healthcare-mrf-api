@@ -32,3 +32,10 @@ python main.py start geo-census --test
   - `HLTHPRT_CENSUS_DECENNIAL_YEAR` (default `2020`)
   - `HLTHPRT_CENSUS_CBP_YEAR` (default `2023`)
 - API key is read from `HLTHPRT_CENSUS_API_KEY`.
+
+The native reference-family archive contains only `geo_zip_census_profile` and
+declares `geo` as its prerequisite. A controller can supply a dependency capture
+callback to bind exact portable package hashes while the source is locked. The
+frozen clone, exported manifest and validation receipt retain that identity.
+Existing manual manifests without a dependency map remain compatible; dependency
+installation checks and retention pins belong to the publishing controller.

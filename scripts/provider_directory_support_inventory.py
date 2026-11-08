@@ -166,11 +166,13 @@ def _validated_current_dataset_audit_records(
     current_dataset_audit: dict[str, Any],
     acquisition_manifest: dict[str, Any],
     verification_snapshot: dict[str, Any] | None = None,
-) -> tuple[str, list[dict[str, Any]]]:
+) -> tuple[str | None, list[dict[str, Any]]]:
     """Validate one dated operational snapshot independently of acquisition config."""
     if current_dataset_audit.get("schema_version") != 1:
         raise SupportDocumentationError("current dataset audit schema_version must be 1")
     audit_date = current_dataset_audit.get("as_of")
+    if "as_of" in current_dataset_audit and audit_date is None and current_dataset_audit.get("records") == []:
+        return None, []
     try:
         dt.date.fromisoformat(audit_date)
     except (TypeError, ValueError) as exc:
@@ -220,6 +222,12 @@ def render_current_dataset_audit_section(
     audit_date, audit_records = _validated_current_dataset_audit_records(
         current_dataset_audit, acquisition_manifest, verification_snapshot
     )
+    if audit_date is None:
+        return [
+            "", "## Current Published Dataset Audit", "",
+            "Current dataset evidence is not recorded in this public artifact. "
+            "Configured acquisition support does not establish a published dataset or serving readiness.",
+        ]
     audit_lines = [
         "",
         "## Current Published Dataset Audit",

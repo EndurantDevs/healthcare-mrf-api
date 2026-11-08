@@ -16,14 +16,74 @@ from io import TextIOWrapper
 from sqlalchemy import text
 
 from db.models import CMSDoctorEducation, db
+from process.cms_doctors_immutable import create_doctors_stage
 from process.control_cancel import raise_if_cancelled
-from process.ext.utils import make_class, push_objects
+from process.ext.utils import make_class
 from process.provider_directory_profile import is_valid_npi
 
 CMS_EDUCATION_SOURCE_KEY = "cms-doctors"
 CMS_EDUCATION_DATASET_ID = "mj5m-pzi6"
 MIN_EDUCATION_ROWS = 10_000
 MIN_EDUCATION_PUBLISH_RATIO = 0.80
+
+
+def _copy_record_bytes(record):
+    row_bytes = 2
+    for value in record:
+        if value is None:
+            size = 0
+        elif type(value) is str:
+            size = len(value.encode("utf-8")) + 1
+        elif type(value) in (int, float, datetime):
+            size = 8
+        else:
+            raise ValueError("cms_doctors_copy_value_invalid")
+        row_bytes += 4 + size
+    return row_bytes
+
+
+def _bounded_copy_records(records):
+    batch, batch_bytes = [], 21
+    for record in records:
+        row_bytes = _copy_record_bytes(record)
+        if 21 + row_bytes > 16 * 1024 * 1024:
+            raise ValueError("cms_doctors_copy_row_bytes_invalid")
+        if batch and batch_bytes + row_bytes > 16 * 1024 * 1024:
+            yield batch
+            batch, batch_bytes = [], 21
+        batch.append(record)
+        batch_bytes += row_bytes
+    if batch:
+        yield batch
+
+
+async def _copy_sidecar_rows(rows, stage):
+    """Append validated sidecar rows through bounded COPY without INSERT fallback."""
+    if not rows:
+        return
+    from process import reference_family_archive as native
+
+    columns = tuple(stage.__table__.columns.keys())
+    if len(rows) > 5000 or any(set(row) != set(columns) for row in rows):
+        raise ValueError("cms_doctors_sidecar_batch_shape_invalid")
+    records = (
+        tuple(
+            native._canonical_json(row[name]).decode("ascii") if name == "source_json" else row[name]
+            for name in columns
+        )
+        for row in rows
+    )
+    async with db.transaction() as session:
+        await session.execute(text("SELECT pg_current_xact_id()"))
+        for batch in _bounded_copy_records(records):
+            await native.native_copy_record_batch(
+                session,
+                stage,
+                schema_name=str(stage.__table__.schema),
+                table_name=str(stage.__tablename__),
+                columns=columns,
+                records=batch,
+            )
 
 
 @contextmanager
@@ -43,7 +103,9 @@ def open_doctors_csv(source_path):
 
 
 def education_source_manifest(
-    source_path, source_url: str, dataset_id: str = CMS_EDUCATION_DATASET_ID,
+    source_path,
+    source_url: str,
+    dataset_id: str = CMS_EDUCATION_DATASET_ID,
 ) -> dict:
     """Bind education assertions to the exact downloaded artifact."""
     with open(source_path, "rb") as source_file:
@@ -56,8 +118,11 @@ def education_source_manifest(
         "content_sha256": content_sha256,
         "downloaded_at": datetime.utcnow().isoformat(),
     }
+    generation_by_field = {
+        key: manifest_by_name[key] for key in ("source_key", "dataset_id", "schema_version", "content_sha256")
+    }
     manifest_by_name["generation_id"] = hashlib.sha256(
-        json.dumps(manifest_by_name, sort_keys=True).encode()
+        json.dumps(generation_by_field, sort_keys=True).encode()
     ).hexdigest()
     return manifest_by_name
 
@@ -74,12 +139,7 @@ def doctor_education_row(source_row, row_number: int, manifest: dict) -> dict | 
     medical_school = None if school_text.upper() in {"", "OTHER"} else school_text
     graduation_year = None
     if year_text:
-        if (
-            len(year_text) != 4
-            or not year_text.isascii()
-            or not year_text.isdigit()
-            or int(year_text) < 1800
-        ):
+        if len(year_text) != 4 or not year_text.isascii() or not year_text.isdigit() or int(year_text) < 1800:
             raise ValueError(f"cms_education_invalid_graduation_year:row={row_number}")
         graduation_year = int(year_text)
     if medical_school is None and graduation_year is None:
@@ -121,12 +181,22 @@ async def discard_education_stage(ctx) -> None:
 
 
 async def import_doctor_education(
-    source_path, source_url: str, ctx, task, dataset_id: str = CMS_EDUCATION_DATASET_ID,
+    source_path,
+    source_url: str,
+    ctx,
+    task,
+    dataset_id: str = CMS_EDUCATION_DATASET_ID,
+    *,
+    source_manifest: dict | None = None,
 ) -> dict:
     """Stage all distinct education tuples before allowing generation publication."""
     stage_cls = make_class(CMSDoctorEducation, ctx["import_date"])
-    manifest = education_source_manifest(source_path, source_url, dataset_id)
-    await db.create_table(stage_cls.__table__, checkfirst=False)
+    manifest = (
+        education_source_manifest(source_path, source_url, dataset_id)
+        if source_manifest is None
+        else dict(source_manifest)
+    )
+    await create_doctors_stage(db, CMSDoctorEducation, ctx["import_date"], str(stage_cls.__table__.schema))
     ctx.setdefault("context", {})["education_stage_owned"] = True
     try:
         return await _stage_education_rows(source_path, stage_cls, manifest, ctx, task)
@@ -141,8 +211,7 @@ async def _stage_education_rows(source_path, stage_cls, manifest, ctx, task) -> 
     seen_education_keys = set()
     source_rows = 0
     row_limit = (
-        int(os.getenv("HLTHPRT_CMS_DOCTORS_TEST_ROWS", "5000"))
-        if ctx.get("context", {}).get("test_mode") else None
+        int(os.getenv("HLTHPRT_CMS_DOCTORS_TEST_ROWS", "5000")) if ctx.get("context", {}).get("test_mode") else None
     )
     with open_doctors_csv(source_path) as reader:
         fieldnames = [str(name).lower() for name in reader.fieldnames or []]
@@ -159,22 +228,24 @@ async def _stage_education_rows(source_path, stage_cls, manifest, ctx, task) -> 
                 education_rows.append(education_row)
             if source_rows % 5_000 == 0:
                 await raise_if_cancelled(ctx, task)
-                await push_objects(education_rows, stage_cls)
+                await _copy_sidecar_rows(education_rows, stage_cls)
                 education_rows.clear()
             if row_limit is not None and source_rows >= row_limit:
                 break
         await raise_if_cancelled(ctx, task)
-        await push_objects(education_rows, stage_cls)
+        await _copy_sidecar_rows(education_rows, stage_cls)
     return {"source_rows": source_rows, "education_rows": len(seen_education_keys), **manifest}
 
 
 async def validate_education_stage(import_date: str, schema: str, manifest: dict) -> None:
     """Reject incomplete or sharply smaller generations before either table swap."""
     stage_cls = make_class(CMSDoctorEducation, import_date)
-    counts = await db.first(text(
-        f"SELECT count(*) AS rows, count(DISTINCT generation_id) AS generations, "
-        f"min(generation_id) AS generation_id FROM {schema}.{stage_cls.__tablename__}"
-    ))
+    counts = await db.first(
+        text(
+            f"SELECT count(*) AS rows, count(DISTINCT generation_id) AS generations, "
+            f"min(generation_id) AS generation_id FROM {schema}.{stage_cls.__tablename__}"
+        )
+    )
     counts_by_name = counts._mapping
     if (
         counts_by_name["rows"] < MIN_EDUCATION_ROWS

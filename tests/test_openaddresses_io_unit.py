@@ -250,6 +250,53 @@ async def test_openaddresses_remote_sources_load_in_parallel(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selection", "expected_sources", "error"),
+    (
+        ({"start_index": 2, "end_index": 3}, ["us/tx/source-2", "us/tx/source-3"], None),
+        ({"start_source": "us/tx/source-2"}, ["us/tx/source-2", "us/tx/source-3"], None),
+        ({"start_index": 2, "end_index": 3, "start_source": "us/tx/source-3"}, ["us/tx/source-3"], None),
+        ({"start_index": "invalid"}, [], "Invalid OpenAddresses start index"),
+        ({"start_index": 4}, [], "exceeds source count"),
+        ({"end_index": "invalid"}, [], "Invalid OpenAddresses end index"),
+        ({"start_index": 2, "end_index": 1}, [], "is before start index"),
+        ({"start_source": "us/tx/missing"}, [], "start source not found"),
+    ),
+)
+async def test_openaddresses_remote_resume_selects_only_requested_sources(
+    monkeypatch, selection, expected_sources, error
+):
+    source_items = [
+        {"source": f"us/tx/source-{index}", "layer": "addresses", "output": {"output": True}} for index in range(1, 4)
+    ]
+    loaded_sources = []
+
+    async def fake_fetch_json(_client, _url, _token):
+        return source_items
+
+    async def fake_load_source_item(**kwargs):
+        source = kwargs["source_item"]["source"]
+        loaded_sources.append(source)
+        return source, 1, 1, 0, {}
+
+    monkeypatch.setenv("HLTHPRT_OPENADDRESSES_API_TOKEN", "synthetic-token")
+    for name in ("LOCAL_FILES", "START_INDEX", "END_INDEX", "START_SOURCE"):
+        monkeypatch.delenv(f"HLTHPRT_OPENADDRESSES_{name}", raising=False)
+    monkeypatch.setattr(openaddresses, "_fetch_json", fake_fetch_json)
+    monkeypatch.setattr(openaddresses, "_load_source_item", fake_load_source_item)
+    monkeypatch.setattr(openaddresses, "_emit_load_progress", lambda **_payload: None)
+
+    task_map = {"source_concurrency": 1, **selection}
+    if error:
+        with pytest.raises(RuntimeError, match=error):
+            await openaddresses._load_openaddresses_data({"context": {"test_mode": False}}, task_map, object, object)
+    else:
+        stats = await openaddresses._load_openaddresses_data({"context": {"test_mode": False}}, task_map, object, object)
+        assert stats["processed_files"] == len(expected_sources)
+    assert loaded_sources == expected_sources
+
+
+@pytest.mark.asyncio
 async def test_openaddresses_remote_tempdir_ignores_cleanup_errors(monkeypatch, tmp_path):
     tempdir_kwargs = []
     source_entries = [

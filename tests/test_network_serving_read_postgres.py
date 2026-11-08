@@ -1,0 +1,483 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+"""Native immutable serving pins through protected candidate writer closure."""
+
+import json
+from dataclasses import FrozenInstanceError
+from uuid import UUID, uuid4
+
+import asyncpg
+import pytest
+
+from process.network_address_projection import _identifier
+from process.network_membership_writer_closure import NetworkWriterClosureError
+from process.network_serving_read import (
+    NetworkServingReadUnavailable,
+    parse_canonical_network_ids,
+    resolve_network_serving_manifest,
+)
+from tests.test_network_address_projection_postgres import projection_db
+from tests.test_network_membership_candidate_indexes_postgres import indexed_db
+from tests.test_network_membership_publication_postgres import (
+    _candidate_writer_roles as _component_owner,
+)
+from tests.test_network_membership_publication_postgres import (
+    _publish,
+    _second_candidate,
+    _snapshot,
+    _write_report,
+    publication_db,
+    qualified_publication_db,
+)
+from tests.test_network_membership_serving_indexes_postgres import _prepare, serving_indexes_db
+from tests.test_network_membership_validation_postgres import validation_db
+from tests.test_network_serving_schema_postgres import serving_schema
+
+
+@pytest.fixture
+async def read_component_db(publication_db):
+    """Publish an actually frozen candidate through its native publisher role."""
+    async with _component_owner(publication_db) as fixture:
+        async with fixture.connection.transaction():
+            fixture.read_manifest = await _publish(fixture)
+        yield fixture
+
+
+async def _resolve(fixture, generation_id=None, connection=None):
+    connection = connection or fixture.connection
+    async with connection.transaction():
+        return await resolve_network_serving_manifest(
+            connection, generation_id=generation_id, control_schema=fixture.control_schema
+        )
+
+
+async def test_retained_resolver_authenticates_unsealed_legacy_generation(read_component_db):
+    from process.network_membership_publication import _candidate_custody
+    from process.registry_retained_generation import resolve_registry_retained_generation
+
+    fixture = read_component_db
+    before = await _snapshot(fixture)
+    retained_locator_by_field = {
+        "source_generations": {"retained_network_source": fixture.read_manifest["manifest_sha256"]}
+    }
+    async with fixture.observer.transaction(isolation="repeatable_read", readonly=True):
+        manifest, candidate = await resolve_registry_retained_generation(
+            fixture.observer, retained_locator_by_field, control_schema=fixture.control_schema
+        )
+        assert await _candidate_custody(fixture.observer, candidate, fixture.control_schema) is None
+        assert manifest == await resolve_network_serving_manifest(
+            fixture.observer, generation_id=manifest.generation_id, control_schema=fixture.control_schema
+        )
+        catalog_rows = await fixture.observer.fetch(
+            "SELECT namespace.nspname,relation.relname,relation.oid::bigint "
+            "FROM pg_catalog.pg_class relation "
+            "JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace "
+            "WHERE namespace.nspname=$1 AND relation.relkind='r' ORDER BY relation.relname",
+            manifest.schema_name,
+        )
+        catalog_pins = tuple(map(tuple, catalog_rows))
+        assert catalog_pins
+        assert (
+            tuple((pin.schema_name, pin.table_name, pin.table_oid) for pin in manifest.candidate_relation_pins)
+            == catalog_pins
+        )
+        assert manifest.address_table_oid == next(
+            table_oid for _, table_name, table_oid in catalog_pins if table_name == "entity_address_unified"
+        )
+        assert manifest.custody_control is None and not hasattr(manifest, "_custody_seal_sha256")
+    assert await _snapshot(fixture) == before
+
+
+@pytest.mark.parametrize(
+    "damage,error_type,message",
+    [
+        (
+            "runtime_write",
+            NetworkServingReadUnavailable,
+            "^Network serving physical owner or runtime privileges are not protected$",
+        ),
+        ("closure_oid", NetworkWriterClosureError, "^Retained candidate object identity changed$"),
+    ],
+)
+async def test_retained_resolver_refuses_unsealed_legacy_closure_drift(read_component_db, damage, error_type, message):
+    from process.registry_retained_generation import resolve_registry_retained_generation
+
+    fixture = read_component_db
+    if damage == "runtime_write":
+        await fixture.connection.execute(
+            f'GRANT UPDATE ON "{fixture.copy_target.schema_name}".network_membership '
+            f'TO "{fixture.writer_roles["reader"]}"'
+        )
+    else:
+        namespace = _identifier(fixture.copy_target.schema_name)
+        await fixture.connection.execute(
+            f"ALTER TABLE {namespace}.entity_address_unified RENAME TO previous_address_identity"
+        )
+        await fixture.connection.execute(
+            f"CREATE TABLE {namespace}.entity_address_unified (LIKE {namespace}.previous_address_identity INCLUDING ALL)"
+        )
+        await fixture.connection.execute(
+            f'ALTER TABLE {namespace}.entity_address_unified OWNER TO "{fixture.writer_roles["owner"]}"'
+        )
+    retained_locator_by_field = {
+        "source_generations": {"retained_network_source": fixture.read_manifest["manifest_sha256"]}
+    }
+    async with fixture.observer.transaction(isolation="repeatable_read", readonly=True):
+        with pytest.raises(error_type, match=message):
+            await resolve_registry_retained_generation(
+                fixture.observer, retained_locator_by_field, control_schema=fixture.control_schema
+            )
+
+
+@pytest.mark.asyncio
+async def test_current_and_retained_pin_after_concurrent_head_advance(read_component_db):
+    fixture = read_component_db
+    first = await _resolve(fixture)
+    second_fixture = await _second_candidate(fixture, expected_head=first.generation_id)
+    async with fixture.observer.transaction(isolation="repeatable_read", readonly=True):
+        assert await resolve_network_serving_manifest(fixture.observer, control_schema=fixture.control_schema) == first
+        async with fixture.connection.transaction():
+            second_manifest = await _publish(second_fixture)
+        assert await resolve_network_serving_manifest(fixture.observer, control_schema=fixture.control_schema) == first
+    assert (await _resolve(fixture)).generation_id == second_manifest["generation_id"]
+    assert await _resolve(fixture, first.generation_id) == first
+    assert first.candidate_id == fixture.copy_target.candidate_id
+    assert first.source_generations == fixture.read_manifest["source_generations"]
+    assert first.approved_custom_revision == fixture.read_manifest["approved_custom_revision"]
+    assert first.manifest_sha256 == fixture.read_manifest["manifest_sha256"]
+    with pytest.raises(FrozenInstanceError):
+        first.generation_id = second_manifest["generation_id"]
+
+
+@pytest.mark.asyncio
+async def test_resolver_uses_bounded_metadata_reads_with_no_state_or_sequence_writes(read_component_db):
+    fixture = read_component_db
+    before = await _snapshot(fixture)
+    sequence = f'"{fixture.control_schema}".network_serving_manifest_generation_id_seq'
+    sequence_before = await fixture.connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}")
+
+    custody_relation = f'"{fixture.control_schema}".network_candidate_custody'
+    custody_table_oid = await fixture.connection.fetchval("SELECT to_regclass($1)::oid", custody_relation)
+    seal_sql = f"SELECT seal_sha256,receipt_json::text AS receipt_json FROM {custody_relation} WHERE candidate_id=$1"
+
+    class ReadOnlyConnection:
+        def __init__(self):
+            self.requests = []
+
+        def is_in_transaction(self):
+            return fixture.connection.is_in_transaction()
+
+        async def fetchrow(self, statement, *parameters):
+            assert statement.lstrip().startswith("SELECT")
+            assert "FOR UPDATE" not in statement and "FOR SHARE" not in statement
+            if statement == seal_sql:
+                assert parameters == (UUID(fixture.copy_target.candidate_id),)
+                self.requests.append("seal_row")
+                row = await fixture.connection.fetchrow(statement, *parameters)
+                assert row is None, "This component fixture must remain an unsealed legacy candidate"
+                return row
+            assert statement.lstrip().startswith("SELECT to_jsonb(candidate)::text AS candidate_json")
+            assert f'FROM "{fixture.control_schema}".network_serving_manifest manifest' in statement
+            assert f'JOIN "{fixture.control_schema}".network_membership_candidate candidate' in statement
+            assert statement.count("LIMIT 129") == 1
+            assert "octet_length(candidate.validation_json::text)<=1048576" in statement
+            assert f'"{fixture.copy_target.schema_name}".' not in statement
+            self.requests.append("manifest")
+            return await fixture.connection.fetchrow(statement, *parameters)
+
+        async def fetchval(self, statement, *parameters):
+            assert statement == "SELECT to_regclass($1)::oid"
+            assert parameters == (custody_relation,)
+            self.requests.append("seal_table")
+            return await fixture.connection.fetchval(statement, *parameters)
+
+    connection = ReadOnlyConnection()
+    async with fixture.connection.transaction(readonly=True):
+        first = await resolve_network_serving_manifest(connection, control_schema=fixture.control_schema)
+        second = await resolve_network_serving_manifest(
+            connection, generation_id=first.generation_id, control_schema=fixture.control_schema
+        )
+    expected_requests = ["manifest", "seal_table"] + (["seal_row"] if custody_table_oid is not None else [])
+    assert first == second and connection.requests == expected_requests * 2
+    assert await _snapshot(fixture) == before
+    assert await fixture.connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}") == sequence_before
+
+
+async def test_readonly_reader_needs_no_owner_set_privilege(read_component_db):
+    fixture = read_component_db
+    connection = fixture.observer
+    await connection.execute(f'SET ROLE "{fixture.writer_roles["reader"]}"')
+    try:
+        assert not await connection.fetchval(
+            "SELECT pg_has_role(current_user,$1::name,'SET')", fixture.writer_roles["owner"]
+        )
+        async with connection.transaction(readonly=True):
+            pin = await resolve_network_serving_manifest(connection, control_schema=fixture.control_schema)
+        assert pin.generation_id == fixture.read_manifest["generation_id"]
+    finally:
+        await connection.execute("RESET ROLE")
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["schema_public", "table_write", "column_write", "grant_option", "owner_member", "createrole", "default_acl"],
+)
+async def test_current_and_retained_native_acl_drift_is_unavailable(read_component_db, damage):
+    fixture = read_component_db
+    namespace = _identifier(fixture.copy_target.schema_name)
+    command_by_damage = {
+        "schema_public": f"GRANT USAGE ON SCHEMA {namespace} TO PUBLIC",
+        "table_write": f'GRANT UPDATE ON {namespace}.network_membership TO "{fixture.writer_roles["loader"]}"',
+        "column_write": f"GRANT UPDATE(network_id) ON {namespace}.network_membership TO PUBLIC",
+        "grant_option": f'GRANT SELECT ON {namespace}.network_membership TO "{fixture.writer_roles["reader"]}" WITH GRANT OPTION',
+        "owner_member": f'GRANT "{fixture.writer_roles["owner"]}" TO "{fixture.writer_roles["reader"]}"',
+        "createrole": f'ALTER ROLE "{fixture.writer_roles["reader"]}" CREATEROLE',
+        "default_acl": f'ALTER DEFAULT PRIVILEGES FOR ROLE "{fixture.writer_roles["owner"]}" '
+        f"IN SCHEMA {namespace} GRANT INSERT ON TABLES TO PUBLIC",
+    }
+    await fixture.connection.execute(command_by_damage[damage])
+    for generation_id in (None, fixture.read_manifest["generation_id"]):
+        with pytest.raises(NetworkServingReadUnavailable):
+            await _resolve(fixture, generation_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["digest", "source", "custom", "schema_revision", "retired", "candidate_state"])
+async def test_changed_manifest_scope_digest_or_eligibility_is_unavailable(read_component_db, damage):
+    fixture = read_component_db
+    changes_by_name = {
+        "digest": "manifest_sha256='" + "0" * 64 + "'",
+        "source": "source_generations='{}'::jsonb",
+        "custom": "approved_custom_revision=1",
+        "schema_revision": "schema_revision=2",
+        "retired": "eligible=false",
+    }
+    if damage == "candidate_state":
+        await fixture.connection.execute(
+            f"UPDATE \"{fixture.control_schema}\".network_membership_candidate SET state='rejected'"
+        )
+    else:
+        await fixture.connection.execute(
+            f'UPDATE "{fixture.control_schema}".network_serving_manifest SET {changes_by_name[damage]}'
+        )
+    for generation_id in (None, fixture.read_manifest["generation_id"]):
+        with pytest.raises(NetworkServingReadUnavailable):
+            await _resolve(fixture, generation_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "damage", ["missing", "scope", "schema_oid", "address_oid", "bool_oid", "readiness", "owner_login"]
+)
+async def test_closure_and_readiness_damage_is_unavailable(read_component_db, damage):
+    fixture = read_component_db
+    report = json.loads(
+        await fixture.connection.fetchval(
+            f'SELECT validation_json FROM "{fixture.control_schema}".network_membership_candidate'
+        )
+    )
+    match damage:
+        case "owner_login":
+            await fixture.connection.execute(f"ALTER ROLE {_identifier(fixture.read_owner_role)} LOGIN")
+        case "missing":
+            report.pop("writer_closure")
+        case "scope":
+            report["writer_closure"]["scope"]["producer_id"] = str(uuid4())
+        case "schema_oid":
+            report["writer_closure"]["schema_oid"] += 1
+        case "address_oid" | "bool_oid":
+            report["writer_closure"]["relation_oids"]["entity_address_unified"] = True if damage == "bool_oid" else 1
+        case _:
+            report["serving_readiness"]["ready"] = False
+    await _write_report(fixture, report)
+    with pytest.raises(NetworkServingReadUnavailable):
+        await _resolve(fixture)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["address_oid", "address_owner", "index_oid", "view"])
+async def test_current_physical_oid_type_and_owner_must_match(read_component_db, damage):
+    fixture = read_component_db
+    namespace = _identifier(fixture.copy_target.schema_name)
+    if damage in {"address_oid", "view"}:
+        await fixture.connection.execute(f"ALTER TABLE {namespace}.entity_address_unified RENAME TO retained_address")
+        replacement = "TABLE" if damage == "address_oid" else "VIEW"
+        await fixture.connection.execute(
+            f"CREATE {replacement} {namespace}.entity_address_unified AS SELECT * FROM {namespace}.retained_address"
+        )
+    elif damage == "index_oid":
+        await fixture.connection.execute(f"DROP INDEX {namespace}.canonical_network_ids_gin")
+        await fixture.connection.execute(
+            f"CREATE INDEX canonical_network_ids_gin ON {namespace}.entity_address_unified USING GIN(canonical_network_ids gin__int_ops)"
+        )
+    else:
+        original_owner = await fixture.connection.fetchval("SELECT current_user")
+        await fixture.connection.execute(
+            f"ALTER TABLE {namespace}.entity_address_unified OWNER TO {_identifier(original_owner)}"
+        )
+    with pytest.raises(NetworkServingReadUnavailable):
+        await _resolve(fixture)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["null", "missing"])
+async def test_missing_current_never_falls_back_and_retained_remains_explicit(read_component_db, damage):
+    fixture = read_component_db
+    operation = "UPDATE" if damage == "null" else "DELETE FROM"
+    statement = "SET generation_id=NULL" if damage == "null" else ""
+    await fixture.connection.execute(f'{operation} "{fixture.control_schema}".network_serving_control {statement}')
+    with pytest.raises(NetworkServingReadUnavailable):
+        await _resolve(fixture)
+    assert (await _resolve(fixture, fixture.read_manifest["generation_id"])).generation_id == fixture.read_manifest[
+        "generation_id"
+    ]
+    with pytest.raises(NetworkServingReadUnavailable):
+        await _resolve(fixture, 9223372036854775807)
+
+
+@pytest.mark.asyncio
+async def test_generation_type_transaction_and_namespace_are_required(read_component_db):
+    fixture = read_component_db
+    with pytest.raises(NetworkServingReadUnavailable, match="caller-owned"):
+        await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
+    for generation_id in (True, False, 0, -1, 1.0, "1", 9223372036854775808):
+        with pytest.raises(NetworkServingReadUnavailable, match="generation is invalid"):
+            await _resolve(fixture, generation_id)
+    async with fixture.connection.transaction():
+        with pytest.raises(NetworkServingReadUnavailable):
+            await resolve_network_serving_manifest(fixture.connection, control_schema='invalid";DROP SCHEMA public;')
+
+
+@pytest.mark.asyncio
+async def test_actual_full_serving_gate_resolves_with_native_closure(serving_indexes_db):
+    fixture = serving_indexes_db
+    async with fixture.connection.transaction():
+        await _prepare(fixture)
+    async with _component_owner(fixture):
+        async with fixture.connection.transaction():
+            manifest = await _publish(fixture)
+        pin = await _resolve(fixture)
+        assert pin.generation_id == manifest["generation_id"]
+        assert pin.address_table_oid == await fixture.connection.fetchval(
+            "SELECT to_regclass($1)::oid::bigint", fixture.copy_target.schema_name + ".entity_address_unified"
+        )
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("42", (42,)),
+        ("2147483647,1,42", (1, 42, 2147483647)),
+        (",".join(str(number) for number in range(100, 0, -1)), tuple(range(1, 101))),
+    ],
+)
+def test_canonical_selector_is_sorted_bounded_integer_namespace(value, expected):
+    assert parse_canonical_network_ids(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        True,
+        42,
+        42.0,
+        "",
+        "0",
+        "-1",
+        "+42",
+        "042",
+        "42.0",
+        "42,42",
+        "42,",
+        ",42",
+        "42,,7",
+        " 42",
+        "42 ",
+        "42, 7",
+        "４２",
+        "٤٢",
+        "42\n",
+        "2147483648",
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        ",".join(str(number) for number in range(1, 102)),
+        "1" * 1100,
+    ],
+)
+def test_canonical_selector_rejects_ambiguous_or_noncanonical_values(value):
+    with pytest.raises(ValueError, match="canonical_network_ids_invalid"):
+        parse_canonical_network_ids(value)
+
+
+@pytest.mark.asyncio
+async def test_positive_legacy_42_does_not_expand_canonical_selector(read_component_db):
+    fixture = read_component_db
+    pin = await _resolve(fixture)
+    selector = parse_canonical_network_ids("42")
+    table = f"{_identifier(pin.schema_name)}.entity_address_unified"
+    canonical = await fixture.connection.fetch(
+        f"SELECT location_key FROM {table} WHERE canonical_network_ids && $1::integer[] ORDER BY location_key",
+        selector,
+    )
+    legacy = await fixture.connection.fetch(
+        f"SELECT location_key FROM {table} WHERE plans_network_array && $1::integer[] ORDER BY location_key",
+        selector,
+    )
+    assert [row["location_key"] for row in canonical] == ["a" * 64]
+    assert [row["location_key"] for row in legacy] == ["a" * 64, "c" * 64]
+
+
+@pytest.fixture
+async def qualified_read_db(qualified_publication_db):
+    fixture = qualified_publication_db
+    async with fixture.connection.transaction():
+        fixture.read_manifest = await _publish(fixture)
+    yield fixture
+
+
+async def test_qualified_current_and_retained_reader_pins_include_fixed_source_heap(qualified_read_db):
+    fixture = qualified_read_db
+    first = await _resolve(fixture)
+    assert await _resolve(fixture, first.generation_id) == first
+    assert "registry_source_retention" in first.source_generations
+    await fixture.observer.execute(f'SET ROLE "{fixture.writer_roles["reader"]}"')
+    try:
+        assert not await fixture.observer.fetchval(
+            "SELECT pg_has_role(current_user,$1::name,'SET')", fixture.writer_roles["owner"]
+        )
+        assert await _resolve(fixture, connection=fixture.observer) == first
+        assert await _resolve(fixture, first.generation_id, fixture.observer) == first
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await fixture.observer.execute(
+                f'UPDATE "{fixture.copy_target.schema_name}".network_membership_source SET evidence_id=evidence_id'
+            )
+    finally:
+        await fixture.observer.execute("RESET ROLE")
+
+
+@pytest.mark.parametrize(
+    "tamper", ["source_write", "owner_set", "extra_heap", "missing_heap", "source_oid", "orphan_hash"]
+)
+async def test_qualified_current_and_retained_resolvers_refuse_source_tampering(qualified_read_db, tamper):
+    fixture = qualified_read_db
+    namespace = _identifier(fixture.copy_target.schema_name)
+    source_table = namespace + ".network_membership_source"
+    commands_by_tamper = {
+        "source_write": [f'GRANT UPDATE ON {source_table} TO "{fixture.writer_roles["loader"]}"'],
+        "owner_set": [
+            f'GRANT "{fixture.writer_roles["owner"]}" TO "{fixture.writer_roles["reader"]}" WITH INHERIT FALSE, SET TRUE'
+        ],
+        "extra_heap": [f"CREATE TABLE {namespace}.unregistered_source(id integer)"],
+        "missing_heap": [f"DROP TABLE {source_table}"],
+        "source_oid": [
+            f"DROP TABLE {source_table}",
+            f"CREATE TABLE {source_table} (LIKE {namespace}.network_membership INCLUDING CONSTRAINTS)",
+        ],
+        "orphan_hash": [
+            f"UPDATE \"{fixture.control_schema}\".network_membership_candidate SET validation_json=validation_json-'registry_source_retention'"
+        ],
+    }
+    for statement in commands_by_tamper[tamper]:
+        await fixture.connection.execute(statement)
+    for generation in (None, fixture.read_manifest["generation_id"]):
+        with pytest.raises(NetworkServingReadUnavailable):
+            await _resolve(fixture, generation)

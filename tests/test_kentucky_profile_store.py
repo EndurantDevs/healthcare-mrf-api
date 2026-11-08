@@ -3,10 +3,10 @@
 """Keep Kentucky publication isolated while retaining Massachusetts store behavior."""
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from dataclasses import FrozenInstanceError
 from datetime import timedelta
-import json
 
 import pytest
 
@@ -21,14 +21,19 @@ def _kentucky_run(**options):
     candidate_run.update(source_key=kentucky.SOURCE_KEY, schema_version=kentucky.SCHEMA_VERSION, jurisdiction="KY")
     manifest_by_field = candidate_run["source_manifest"]
     manifest_by_field["categories"] = ["education"]
-    manifest_by_field["source"] = {"source_key": kentucky.SOURCE_KEY, "source_kind": "state_regulator", "jurisdiction": "KY"}
+    manifest_by_field["source"] = {
+        "source_key": kentucky.SOURCE_KEY,
+        "source_kind": "state_regulator",
+        "jurisdiction": "KY",
+    }
     return candidate_run
 
 
 async def _seed_kentucky_payloads(database, run_id, count):
     source_table = kentucky._table(shared_store.ProviderProfileSourceRecord)
     fact_table = kentucky._table(shared_store.ProviderProfileFact)
-    await database.status(f"""
+    await database.status(
+        f"""
         INSERT INTO {source_table} (record_id,run_id,artifact_id,source_key,source_record_key,
           license_number,raw_payload,normalized_payload,matched_npi,match_status)
         SELECT :run_id || lpad(i::text,6,'0'), :run_id, :run_id, :source_key, i::text, i::text,
@@ -36,8 +41,14 @@ async def _seed_kentucky_payloads(database, run_id, count):
             'License',i::text,'Name','Alex Example','Medical School','Synthetic School','Year Graduated','2001'))),
           json_build_object('schema_version',CAST(:schema_version AS text),'visibility','public'),1000000000+i,'deterministic'
           FROM generate_series(1,:count) i
-    """, run_id=run_id, count=count, source_key=kentucky.SOURCE_KEY, schema_version=kentucky.SCHEMA_VERSION)
-    await database.status(f"""
+    """,
+        run_id=run_id,
+        count=count,
+        source_key=kentucky.SOURCE_KEY,
+        schema_version=kentucky.SCHEMA_VERSION,
+    )
+    await database.status(
+        f"""
         INSERT INTO {fact_table} (fact_id,run_id,npi,source_record_id,logical_fact_key,category,
           fact_type,display,value_json,availability,assertion_type,verification_status,source_json,sensitive,public_default)
         SELECT record_id,run_id,matched_npi,record_id,record_id,'education','education_history',
@@ -45,13 +56,19 @@ async def _seed_kentucky_payloads(database, run_id, count):
           json_build_object('source_key',CAST(:source_key AS text),'schema_version',CAST(:schema_version AS text),
                             'source_record_id',record_id),false,true
           FROM {source_table} WHERE run_id=:run_id
-    """, run_id=run_id, source_key=kentucky.SOURCE_KEY, schema_version=kentucky.SCHEMA_VERSION)
+    """,
+        run_id=run_id,
+        source_key=kentucky.SOURCE_KEY,
+        schema_version=kentucky.SCHEMA_VERSION,
+    )
 
 
 async def _seed_kentucky_run(database, **options):
     candidate_run = _kentucky_run(**options)
     await kentucky.claim_run(candidate_run)
-    await _seed_kentucky_payloads(database, candidate_run["run_id"], candidate_run["source_manifest"]["requested_licenses"])
+    await _seed_kentucky_payloads(
+        database, candidate_run["run_id"], candidate_run["source_manifest"]["requested_licenses"]
+    )
     return candidate_run
 
 
@@ -81,28 +98,38 @@ def test_exact_kentucky_scopes_remain_readable(scope):
     candidate_run = _kentucky_run()
     candidate_run["source_manifest"]["categories"] = list(scope)
     assert kentucky._manifest(candidate_run)["categories"] == list(scope)
-    candidate_run["source_manifest"]["source"] = {"source_key": massachusetts.SOURCE_KEY,
-                                                "source_kind": "state_regulator", "jurisdiction": "MA"}
+    candidate_run["source_manifest"]["source"] = {
+        "source_key": massachusetts.SOURCE_KEY,
+        "source_kind": "state_regulator",
+        "jurisdiction": "MA",
+    }
     with pytest.raises(ValueError, match="massachusetts_profile_manifest_categories_invalid"):
         massachusetts._manifest(candidate_run)
 
 
-@pytest.mark.parametrize(("scope", "category", "fact_type", "invalid"), [
-    (kentucky.LEGACY_CATEGORIES, "specialties", "specialty", 1),
-    (kentucky.LEGACY_CATEGORIES, "services", "practice_type", 1),
-    (kentucky.PROFILE_CATEGORIES, "specialties", "specialty", 0),
-    (kentucky.PROFILE_CATEGORIES, "services", "practice_type", 0),
-    (kentucky.PROFILE_CATEGORIES, "specialties", "board_certification", 1),
-])
+@pytest.mark.parametrize(
+    ("scope", "category", "fact_type", "invalid"),
+    [
+        (kentucky.LEGACY_CATEGORIES, "specialties", "specialty", 1),
+        (kentucky.LEGACY_CATEGORIES, "services", "practice_type", 1),
+        (kentucky.PROFILE_CATEGORIES, "specialties", "specialty", 0),
+        (kentucky.PROFILE_CATEGORIES, "services", "practice_type", 0),
+        (kentucky.PROFILE_CATEGORIES, "specialties", "board_certification", 1),
+    ],
+)
 async def test_facts_match_frozen_scope(monkeypatch, scope, category, fact_type, invalid):
     async with _database(monkeypatch) as database:
         candidate = _kentucky_run(limit=1)
         candidate["source_manifest"]["categories"] = list(scope)
         await kentucky.claim_run(candidate)
         await _seed_kentucky_payloads(database, candidate["run_id"], 1)
-        await database.status(f"UPDATE {kentucky._table(shared_store.ProviderProfileFact)} "
-                              "SET category=:category,fact_type=:fact_type WHERE run_id=:run_id",
-                              category=category, fact_type=fact_type, run_id=candidate["run_id"])
+        await database.status(
+            f"UPDATE {kentucky._table(shared_store.ProviderProfileFact)} "
+            "SET category=:category,fact_type=:fact_type WHERE run_id=:run_id",
+            category=category,
+            fact_type=fact_type,
+            run_id=candidate["run_id"],
+        )
         counts = await kentucky.retained_counts(candidate["run_id"])
         assert counts["invalid_facts"] == invalid
         assert counts["matched_public_providers"] == 0
@@ -139,26 +166,47 @@ async def test_practice_facts_cannot_mask_education_loss(monkeypatch):
         candidate["source_manifest"]["categories"] = list(kentucky.PROFILE_CATEGORIES)
         await kentucky.claim_run(candidate)
         await _seed_kentucky_payloads(database, candidate["run_id"], 10000)
-        await database.status(f"UPDATE {kentucky._table(shared_store.ProviderProfileFact)} "
-                              "SET category='services',fact_type='practice_type' WHERE run_id=:run_id",
-                              run_id=candidate["run_id"])
+        await database.status(
+            f"UPDATE {kentucky._table(shared_store.ProviderProfileFact)} "
+            "SET category='services',fact_type='practice_type' WHERE run_id=:run_id",
+            run_id=candidate["run_id"],
+        )
         counts = await kentucky.retained_counts(candidate["run_id"])
         assert counts["received_profiles"] == 10000 and counts["matched_public_providers"] == 0
         assert counts["invalid_facts"] == 0
         with pytest.raises(RuntimeError, match="publication_volume_drop:matched_public_providers"):
-            await kentucky.publish_run(candidate["run_id"], expected_current_run_id=incumbent["run_id"], metrics=_metrics())
+            await kentucky.publish_run(
+                candidate["run_id"], expected_current_run_id=incumbent["run_id"], metrics=_metrics()
+            )
         assert (await kentucky.read_publication())["current_run_id"] == incumbent["run_id"]
         assert (await kentucky._read_run(candidate["run_id"]))["status"] == "running"
 
 
-@pytest.mark.parametrize(("metrics", "incumbent", "reason"), [
-    ({"received_profiles": 4999, "requested_licenses": 10000, "matched_public_providers": 10000}, None, "received_profile_ratio"),
-    ({"received_profiles": 10000, "requested_licenses": 10000, "matched_public_providers": 9999}, None, "first_publication_too_small"),
-    ({"received_profiles": 7999, "requested_licenses": 10000, "matched_public_providers": 10000},
-     {"received_profiles": 10000, "matched_public_providers": 10000}, "publication_volume_drop:received_profiles"),
-    ({"received_profiles": 10000, "requested_licenses": 10000, "matched_public_providers": 7999},
-     {"received_profiles": 10000, "matched_public_providers": 10000}, "publication_volume_drop:matched_public_providers"),
-])
+@pytest.mark.parametrize(
+    ("metrics", "incumbent", "reason"),
+    [
+        (
+            {"received_profiles": 4999, "requested_licenses": 10000, "matched_public_providers": 10000},
+            None,
+            "received_profile_ratio",
+        ),
+        (
+            {"received_profiles": 10000, "requested_licenses": 10000, "matched_public_providers": 9999},
+            None,
+            "first_publication_too_small",
+        ),
+        (
+            {"received_profiles": 7999, "requested_licenses": 10000, "matched_public_providers": 10000},
+            {"received_profiles": 10000, "matched_public_providers": 10000},
+            "publication_volume_drop:received_profiles",
+        ),
+        (
+            {"received_profiles": 10000, "requested_licenses": 10000, "matched_public_providers": 7999},
+            {"received_profiles": 10000, "matched_public_providers": 10000},
+            "publication_volume_drop:matched_public_providers",
+        ),
+    ],
+)
 def test_kentucky_keeps_conservative_publication_guards(metrics, incumbent, reason):
     with pytest.raises(RuntimeError, match="^kentucky_profile_" + reason + "$"):
         kentucky._publication_volume(metrics, incumbent)
@@ -181,13 +229,22 @@ async def test_received_profiles_require_one_exact_visible_identity(monkeypatch)
             (9, "public", [{"License": "\t C0007 \n"}], "C0007"),
         ]
         for number, visibility, profiles, license_number in variants:
-            await database.status(f"""UPDATE {source_table}
+            await database.status(
+                f"""UPDATE {source_table}
                 SET license_number=:license_number, raw_payload=CAST(:raw AS json), normalized_payload=CAST(:normalized AS json)
-                WHERE record_id=:record_id""", license_number=license_number, record_id=run_id + f"{number:06d}",
+                WHERE record_id=:record_id""",
+                license_number=license_number,
+                record_id=run_id + f"{number:06d}",
                 raw=json.dumps({"html": "retained HTML", "profiles": profiles}),
-                normalized=json.dumps({"schema_version": kentucky.SCHEMA_VERSION, "visibility": visibility}))
-        await database.status(f"DELETE FROM {fact_table} WHERE run_id=:run_id AND right(fact_id,6) BETWEEN '000002' AND '000008'", run_id=run_id)
-        await database.status(f"UPDATE {fact_table} SET sensitive=true WHERE fact_id=:fact_id", fact_id=run_id + "000010")
+                normalized=json.dumps({"schema_version": kentucky.SCHEMA_VERSION, "visibility": visibility}),
+            )
+        await database.status(
+            f"DELETE FROM {fact_table} WHERE run_id=:run_id AND right(fact_id,6) BETWEEN '000002' AND '000008'",
+            run_id=run_id,
+        )
+        await database.status(
+            f"UPDATE {fact_table} SET sensitive=true WHERE fact_id=:fact_id", fact_id=run_id + "000010"
+        )
         counts = await kentucky.retained_counts(run_id)
         assert counts["received_profiles"] == 5 and counts["retained_source_records"] == 10
         assert counts["matched_public_providers"] == 2 and counts["retained_facts"] == 3
@@ -200,22 +257,33 @@ async def test_massachusetts_training_remains_valid(monkeypatch):
     async with _database(monkeypatch) as database:
         candidate_run = await _seed_run(database, limit=1)
         fact_table = massachusetts._table(shared_store.ProviderProfileFact)
-        await database.status(f"UPDATE {fact_table} SET category='training',fact_type='postgraduate_training' WHERE run_id=:run_id",
-                              run_id=candidate_run["run_id"])
+        await database.status(
+            f"UPDATE {fact_table} SET category='training',fact_type='postgraduate_training' WHERE run_id=:run_id",
+            run_id=candidate_run["run_id"],
+        )
         assert (await massachusetts.retained_counts(candidate_run["run_id"]))["invalid_facts"] == 0
         assert not (await massachusetts.finish_unpublished_run(candidate_run["run_id"], _metrics(1)))["published"]
 
 
-@pytest.mark.parametrize(("category", "fact_type"), [
-    ("training", "postgraduate_training"), ("training", "education_history"), ("education", "clinical_experience"),
-])
+@pytest.mark.parametrize(
+    ("category", "fact_type"),
+    [
+        ("training", "postgraduate_training"),
+        ("training", "education_history"),
+        ("education", "clinical_experience"),
+    ],
+)
 async def test_kentucky_fact_types_block_completion_and_cleanup(monkeypatch, tmp_path, category, fact_type):
     async with _database(monkeypatch) as database:
         candidate_run = await _seed_kentucky_run(database, limit=1)
         run_id = candidate_run["run_id"]
         fact_table = kentucky._table(shared_store.ProviderProfileFact)
-        await database.status(f"UPDATE {fact_table} SET category=:category,fact_type=:fact_type WHERE run_id=:run_id",
-                              category=category, fact_type=fact_type, run_id=run_id)
+        await database.status(
+            f"UPDATE {fact_table} SET category=:category,fact_type=:fact_type WHERE run_id=:run_id",
+            category=category,
+            fact_type=fact_type,
+            run_id=run_id,
+        )
         assert (await kentucky.retained_counts(run_id))["invalid_facts"] == 1
         with pytest.raises(RuntimeError, match="^kentucky_profile_retained_integrity_invalid$"):
             await kentucky.finish_unpublished_run(run_id, _metrics(1))
@@ -223,8 +291,11 @@ async def test_kentucky_fact_types_block_completion_and_cleanup(monkeypatch, tmp
         assert await kentucky.read_publication() is None
         await kentucky.mark_run_failed(run_id, "synthetic invalid fact")
         run_table = kentucky._table(shared_store.ProviderProfileImportRun)
-        await database.status(f"UPDATE {run_table} SET finished_at=:finished_at WHERE run_id=:run_id",
-                              finished_at=kentucky._now() - timedelta(days=8), run_id=run_id)
+        await database.status(
+            f"UPDATE {run_table} SET finished_at=:finished_at WHERE run_id=:run_id",
+            finished_at=kentucky._now() - timedelta(days=8),
+            run_id=run_id,
+        )
         await kentucky.claim_run(_kentucky_run(limit=1))
         (tmp_path / run_id).mkdir()
         with pytest.raises(RuntimeError, match="^kentucky_profile_retention_foreign_payload$"):
@@ -270,8 +341,11 @@ async def test_publications_and_retention_are_source_isolated(monkeypatch, tmp_p
         failed_id = failed_run["run_id"]
         await kentucky.mark_run_failed(failed_id, "synthetic acquisition failure")
         run_table = kentucky._table(shared_store.ProviderProfileImportRun)
-        await database.status(f"UPDATE {run_table} SET finished_at=:finished_at WHERE run_id=:run_id",
-                              finished_at=kentucky._now() - timedelta(days=8), run_id=failed_id)
+        await database.status(
+            f"UPDATE {run_table} SET finished_at=:finished_at WHERE run_id=:run_id",
+            finished_at=kentucky._now() - timedelta(days=8),
+            run_id=failed_id,
+        )
         await kentucky.claim_run(_kentucky_run(limit=1, predecessor=ky_id))
         for run_id in (ma_id, ky_id, failed_id):
             (tmp_path / run_id).mkdir()
@@ -295,12 +369,22 @@ async def test_kentucky_failure_rolls_back_both_pointer_and_facts(monkeypatch):
 
         @asynccontextmanager
         async def fail_before_commit():
-            async with original_transaction():
-                yield
-                assert await database.scalar(f"SELECT current_run_id FROM {publication_table} WHERE source_key=:source_key",
-                                             source_key=kentucky.SOURCE_KEY) == ky_run["run_id"]
-                assert await database.scalar(f"SELECT count(*) FROM {fact_table} WHERE run_id=:run_id AND published_at IS NOT NULL",
-                                             run_id=ky_run["run_id"]) == 10000
+            async with original_transaction() as session:
+                yield session
+                assert (
+                    await database.scalar(
+                        f"SELECT current_run_id FROM {publication_table} WHERE source_key=:source_key",
+                        source_key=kentucky.SOURCE_KEY,
+                    )
+                    == ky_run["run_id"]
+                )
+                assert (
+                    await database.scalar(
+                        f"SELECT count(*) FROM {fact_table} WHERE run_id=:run_id AND published_at IS NOT NULL",
+                        run_id=ky_run["run_id"],
+                    )
+                    == 10000
+                )
                 raise RuntimeError("synthetic completion failure")
 
         with monkeypatch.context() as patch:
@@ -309,8 +393,15 @@ async def test_kentucky_failure_rolls_back_both_pointer_and_facts(monkeypatch):
                 await kentucky.publish_run(ky_run["run_id"], expected_current_run_id=None, metrics=_metrics())
         assert await kentucky.read_publication() is None
         assert (await kentucky._read_run(ky_run["run_id"]))["status"] == "running"
-        assert await database.scalar(f"SELECT count(*) FROM {fact_table} WHERE run_id=:run_id AND published_at IS NOT NULL",
-                                     run_id=ky_run["run_id"]) == 0
+        assert (
+            await database.scalar(
+                f"SELECT count(*) FROM {fact_table} WHERE run_id=:run_id AND published_at IS NOT NULL",
+                run_id=ky_run["run_id"],
+            )
+            == 0
+        )
         assert (await massachusetts.read_publication())["current_run_id"] == ma_run["run_id"]
         assert (await massachusetts.retained_counts(ma_run["run_id"]))["retained_facts"] == 10000
-        assert (await kentucky.publish_run(ky_run["run_id"], expected_current_run_id=None, metrics=_metrics()))["published"]
+        assert (await kentucky.publish_run(ky_run["run_id"], expected_current_run_id=None, metrics=_metrics()))[
+            "published"
+        ]

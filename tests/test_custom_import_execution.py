@@ -67,6 +67,7 @@ class _SyntheticSession:
         self.executions: dict[int, SimpleNamespace] = {}
         self.execution_by_request: dict[tuple[int, str], SimpleNamespace] = {}
         self.leases: dict[int, SimpleNamespace] = {}
+        self.capture_state = "sealed"
         self.statements: list[Any] = []
         self._next_execution_id = 1
 
@@ -107,6 +108,8 @@ class _SyntheticSession:
                 mechanism=column_values["mechanism"],
                 state=column_values["state"],
                 capture_bundle_id=column_values.get("capture_bundle_id"),
+                request_identity_sha256=column_values.get("request_identity_sha256"),
+                source_binding_revision_id=column_values.get("source_binding_revision_id"),
                 terminal_reason=None,
                 started_at=None,
                 finished_at=None,
@@ -144,6 +147,8 @@ class _SyntheticSession:
             return _Result(self.execution_by_request.get((where["definition_revision_id"], where["idempotency_key"])))
         if table_name == "custom_import_lease":
             return _Result(self.leases.get(where["execution_id"]))
+        if table_name == "custom_import_capture_bundle":
+            return _Result(SimpleNamespace(capture_state=self.capture_state))
         raise AssertionError(f"unexpected select table: {table_name}")
 
     def _update(self, statement: Any) -> _Result:
@@ -164,6 +169,7 @@ async def _submission(session: _SyntheticSession, *, key: str = "synthetic-reque
         idempotency_key=key,
         mechanism="queued",
         capture_bundle_id=None,
+        request_identity_sha256=None,
     )
 
 
@@ -187,6 +193,483 @@ async def test_duplicate_submission_returns_the_same_execution_and_rejects_drift
             idempotency_key="synthetic-request",
             mechanism="external",
         )
+
+
+@pytest.mark.asyncio
+async def test_request_identity_is_exact_and_checked_before_execution_writes():
+    session = _SyntheticSession()
+    identity = hashlib.sha256(b"synthetic-request-identity").digest()
+    reservation = await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-request-identity",
+        mechanism="local",
+        request_identity_sha256=bytearray(identity),
+    )
+
+    replay = await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-request-identity",
+        mechanism="local",
+        request_identity_sha256=memoryview(identity),
+    )
+    assert replay.execution_id == reservation.execution_id
+    assert session.executions[reservation.execution_id].request_identity_sha256 == identity
+
+    with pytest.raises(lifecycle.IdempotencyConflict):
+        await lifecycle.reserve_execution(
+            session,
+            dataset_id=11,
+            definition_revision_id=22,
+            schema_revision_id=33,
+            idempotency_key="synthetic-request-identity",
+            mechanism="local",
+            request_identity_sha256=hashlib.sha256(b"different-identity").digest(),
+        )
+
+    statements_before_invalid_identity = len(session.statements)
+    with pytest.raises(ValueError, match="exactly 32 bytes"):
+        await lifecycle.reserve_execution(
+            session,
+            dataset_id=11,
+            definition_revision_id=22,
+            schema_revision_id=33,
+            idempotency_key="synthetic-invalid-request-identity",
+            mechanism="local",
+            request_identity_sha256=b"short",
+        )
+    assert len(session.statements) == statements_before_invalid_identity
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_reservation_retains_an_exact_request_tombstone():
+    session = _SyntheticSession()
+    request_by_name = {
+        "dataset_id": 11,
+        "definition_revision_id": 22,
+        "schema_revision_id": 33,
+        "idempotency_key": "synthetic-cancel-first",
+        "mechanism": "local",
+        "request_identity_sha256": hashlib.sha256(b"synthetic-cancel-first").digest(),
+    }
+    assert await lifecycle.lookup_execution_request(session, **request_by_name) is None
+    statements_before_invalid_reason = len(session.statements)
+    with pytest.raises(ValueError, match="terminal_reason"):
+        await lifecycle.cancel_execution_request(session, **request_by_name, terminal_reason=" invalid")
+    assert len(session.statements) == statements_before_invalid_reason
+
+    canceled = await lifecycle.cancel_execution_request(session, **request_by_name)
+    lookup = await lifecycle.lookup_execution_request(session, **request_by_name)
+    replay = await lifecycle.reserve_execution(session, **request_by_name)
+    assert canceled.state == lookup.state == replay.state == "canceled"
+    assert canceled.execution_id == lookup.execution_id == replay.execution_id
+    assert canceled.changed is True and replay.created is False
+    assert await lifecycle.claim_execution(session, execution_id=canceled.execution_id, token=_WORKER) is None
+    assert (await lifecycle.cancel_execution_request(session, **request_by_name)).changed is False
+
+    with pytest.raises(lifecycle.IdempotencyConflict):
+        await lifecycle.lookup_execution_request(
+            session, **{**request_by_name, "request_identity_sha256": hashlib.sha256(b"different").digest()}
+        )
+    with pytest.raises(lifecycle.IdempotencyConflict):
+        await lifecycle.cancel_execution_request(
+            session, **{**request_by_name, "request_identity_sha256": hashlib.sha256(b"different").digest()}
+        )
+    assert session.executions[canceled.execution_id].state == "canceled"
+
+
+@pytest.mark.asyncio
+async def test_bound_cancellation_retains_tombstone_before_worker_reservation():
+    session = _SyntheticSession()
+    request_dict = {
+        "dataset_id": 11,
+        "definition_revision_id": 22,
+        "schema_revision_id": 33,
+        "source_binding_revision_id": 44,
+        "idempotency_key": "synthetic-stopped-request",
+        "request_identity_sha256": hashlib.sha256(b"synthetic-stopped-request").digest(),
+    }
+
+    with pytest.raises(lifecycle.ExecutionNotFound):
+        await lifecycle.finalize_stopped_execution_request(session, **request_dict)
+    assert not session.executions
+
+    canceled = await lifecycle.request_bound_execution_cancellation(
+        session, **request_dict, terminal_reason="operator_request"
+    )
+    replay = await lifecycle.reserve_execution(session, **request_dict, mechanism="local")
+    stopped = await lifecycle.finalize_stopped_execution_request(session, **request_dict)
+    assert canceled.state == stopped.state == replay.state == "canceled"
+    assert canceled.changed is True and stopped.changed is False and replay.created is False
+    assert canceled.execution_id == stopped.execution_id == replay.execution_id
+    assert session.executions[canceled.execution_id].source_binding_revision_id == 44
+    assert session.executions[canceled.execution_id].terminal_reason == "operator_request"
+    assert await lifecycle.claim_execution(session, execution_id=canceled.execution_id, token=_WORKER) is None
+    assert (await lifecycle.request_bound_execution_cancellation(session, **request_dict)).changed is False
+
+    for changed in (
+        {"source_binding_revision_id": 45},
+        {"request_identity_sha256": hashlib.sha256(b"different-request").digest()},
+    ):
+        with pytest.raises(lifecycle.IdempotencyConflict):
+            await lifecycle.request_bound_execution_cancellation(session, **{**request_dict, **changed})
+    assert session.executions[canceled.execution_id].state == "canceled"
+
+
+@pytest.mark.asyncio
+async def test_stopped_bound_request_expires_a_previously_claimed_lease():
+    session = _SyntheticSession()
+    request_dict = {
+        "dataset_id": 11,
+        "definition_revision_id": 22,
+        "schema_revision_id": 33,
+        "source_binding_revision_id": 44,
+        "idempotency_key": "synthetic-claimed-request",
+        "request_identity_sha256": hashlib.sha256(b"synthetic-claimed-request").digest(),
+    }
+    reserved = await lifecycle.reserve_execution(session, **request_dict, mechanism="local")
+    grant = await lifecycle.claim_execution(session, execution_id=reserved.execution_id, token=_WORKER)
+    assert grant is not None
+
+    with pytest.raises(lifecycle.ExecutionLifecycleError, match="request bound cancellation"):
+        await lifecycle.finalize_stopped_execution_request(session, **request_dict)
+    requested = await lifecycle.request_bound_execution_cancellation(session, **request_dict)
+    lease = session.leases[reserved.execution_id]
+    assert requested.state == "canceling" and requested.changed is True
+    assert lease.expires_at is not None and lease.expires_at > session.now
+    assert (await lifecycle.request_bound_execution_cancellation(session, **request_dict)).changed is False
+
+    stopped = await lifecycle.finalize_stopped_execution_request(session, **request_dict)
+    assert stopped.state == "canceled" and stopped.changed is True
+    assert stopped.execution_id == reserved.execution_id
+    assert lease.fence == grant.fence and lease.expires_at == session.now
+    assert (
+        await lifecycle.finish_execution(
+            session,
+            execution_id=reserved.execution_id,
+            fence=grant.fence,
+            token=_WORKER,
+            terminal_state="completed",
+        )
+    ).state == "canceled"
+
+
+@pytest.mark.asyncio
+async def test_bound_cancellation_preserves_a_prior_completed_outcome():
+    session = _SyntheticSession()
+    request_dict = {
+        "dataset_id": 11,
+        "definition_revision_id": 22,
+        "schema_revision_id": 33,
+        "source_binding_revision_id": 44,
+        "idempotency_key": "synthetic-terminal-before-cancel",
+        "request_identity_sha256": hashlib.sha256(b"synthetic-terminal-before-cancel").digest(),
+    }
+    reserved = await lifecycle.reserve_execution(session, **request_dict, mechanism="local")
+    grant = await lifecycle.claim_execution(session, execution_id=reserved.execution_id, token=_WORKER)
+    assert grant is not None
+    completed = await lifecycle.finish_execution(
+        session, execution_id=reserved.execution_id, fence=grant.fence, token=_WORKER, terminal_state="completed"
+    )
+
+    requested = await lifecycle.request_bound_execution_cancellation(session, **request_dict)
+    stopped = await lifecycle.finalize_stopped_execution_request(session, **request_dict)
+    assert completed.state == requested.state == stopped.state == "completed"
+    assert requested.changed is False and stopped.changed is False
+
+
+@pytest.mark.asyncio
+async def test_lookup_rejects_dirty_sessions_before_refreshing_execution():
+    session = _SyntheticSession()
+    identity = hashlib.sha256(b"synthetic-pending-lookup").digest()
+    submission = await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-pending-lookup",
+        mechanism="local",
+        request_identity_sha256=identity,
+    )
+    execution = session.executions[submission.execution_id]
+    execution.terminal_reason = "pending-edit"
+    session.dirty = [execution]
+    statement_count = len(session.statements)
+
+    with pytest.raises(lifecycle.ExecutionInvariantError, match="clean session"):
+        await lifecycle.lookup_execution_request(
+            session,
+            dataset_id=11,
+            definition_revision_id=22,
+            schema_revision_id=33,
+            idempotency_key="synthetic-pending-lookup",
+            mechanism="local",
+            request_identity_sha256=identity,
+        )
+
+    assert len(session.statements) == statement_count
+    assert execution.terminal_reason == "pending-edit"
+
+
+@pytest.mark.asyncio
+async def test_lookup_requires_the_exact_optional_source_binding_revision():
+    session = _SyntheticSession()
+    identity = hashlib.sha256(b"synthetic-bound-lookup").digest()
+    await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-bound-lookup",
+        mechanism="local",
+        request_identity_sha256=identity,
+        source_binding_revision_id=44,
+    )
+
+    exact = await lifecycle.lookup_execution_request(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-bound-lookup",
+        mechanism="local",
+        request_identity_sha256=identity,
+        source_binding_revision_id=44,
+    )
+    assert exact is not None and exact.execution_id == 1
+
+    with pytest.raises(lifecycle.IdempotencyConflict):
+        await lifecycle.lookup_execution_request(
+            session,
+            dataset_id=11,
+            definition_revision_id=22,
+            schema_revision_id=33,
+            idempotency_key="synthetic-bound-lookup",
+            mechanism="local",
+            request_identity_sha256=identity,
+            source_binding_revision_id=45,
+        )
+
+
+@pytest.mark.asyncio
+async def test_reservation_replays_its_bound_execution():
+    """A reservation replays its running execution with the retained bundle."""
+
+    session = _SyntheticSession()
+
+    reserved = await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-reservation",
+        mechanism="local",
+    )
+    first_owner = await lifecycle.claim_execution(
+        session,
+        execution_id=reserved.execution_id,
+        token=_WORKER_A,
+    )
+    assert first_owner is not None
+    bound = await lifecycle.bind_execution_capture_bundle(
+        session,
+        execution_id=reserved.execution_id,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        capture_bundle_id=44,
+        fence=first_owner.fence,
+        token=_WORKER_A,
+    )
+    replay = await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-reservation",
+        mechanism="local",
+    )
+
+    assert reserved.created is True and reserved.capture_bundle_id is None
+    assert bound is not None
+    assert bound.execution_id == reserved.execution_id and bound.capture_bundle_id == 44
+    assert replay == lifecycle.ExecutionSubmission(
+        execution_id=reserved.execution_id,
+        state="running",
+        created=False,
+        capture_bundle_id=44,
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_capture_cannot_be_submitted_or_bound():
+    session = _SyntheticSession()
+    session.capture_state = "pending"
+    with pytest.raises(lifecycle.ExecutionInvariantError, match="sealed"):
+        await lifecycle.create_execution(
+            session,
+            dataset_id=11,
+            definition_revision_id=22,
+            schema_revision_id=33,
+            idempotency_key="synthetic-pending-capture",
+            mechanism="local",
+            capture_bundle_id=44,
+        )
+    assert session.executions == {}
+    reserved = await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-pending-reservation",
+        mechanism="local",
+    )
+    lease = await lifecycle.claim_execution(session, execution_id=reserved.execution_id, token=_WORKER_A)
+    assert lease is not None
+    with pytest.raises(lifecycle.ExecutionInvariantError, match="sealed"):
+        await lifecycle.bind_execution_capture_bundle(
+            session,
+            execution_id=reserved.execution_id,
+            dataset_id=11,
+            definition_revision_id=22,
+            schema_revision_id=33,
+            capture_bundle_id=44,
+            fence=lease.fence,
+            token=_WORKER_A,
+        )
+    assert session.executions[reserved.execution_id].capture_bundle_id is None
+
+
+@pytest.mark.asyncio
+async def test_bound_reservation_rejects_bundle_replacement():
+    """A live owner cannot replace a capture bundle bound to its execution."""
+
+    session = _SyntheticSession()
+    reserved = await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-bound-reservation",
+        mechanism="local",
+    )
+    owner = await lifecycle.claim_execution(
+        session,
+        execution_id=reserved.execution_id,
+        token=_WORKER_A,
+    )
+    assert owner is not None
+    bound = await lifecycle.bind_execution_capture_bundle(
+        session,
+        execution_id=reserved.execution_id,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        capture_bundle_id=44,
+        fence=owner.fence,
+        token=_WORKER_A,
+    )
+    assert bound is not None
+    with pytest.raises(lifecycle.IdempotencyConflict):
+        await lifecycle.bind_execution_capture_bundle(
+            session,
+            execution_id=reserved.execution_id,
+            dataset_id=11,
+            definition_revision_id=22,
+            schema_revision_id=33,
+            capture_bundle_id=45,
+            fence=owner.fence,
+            token=_WORKER_A,
+        )
+
+
+@pytest.mark.asyncio
+async def test_canceled_reservation_rejects_capture_binding():
+    """Cancellation prevents a lease owner from binding a capture bundle."""
+
+    session = _SyntheticSession()
+    canceled = await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-canceled-reservation",
+        mechanism="local",
+    )
+    canceled_owner = await lifecycle.claim_execution(
+        session,
+        execution_id=canceled.execution_id,
+        token=_WORKER_A,
+    )
+    assert canceled_owner is not None
+    await lifecycle.request_cancellation(session, execution_id=canceled.execution_id)
+    unavailable = await lifecycle.bind_execution_capture_bundle(
+        session,
+        execution_id=canceled.execution_id,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        capture_bundle_id=46,
+        fence=canceled_owner.fence,
+        token=_WORKER_A,
+    )
+    assert unavailable is None
+
+
+@pytest.mark.asyncio
+async def test_reservation_binding_rejects_a_stale_owner_after_lease_takeover():
+    session = _SyntheticSession()
+    reserved = await lifecycle.reserve_execution(
+        session,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        idempotency_key="synthetic-reservation-takeover",
+        mechanism="local",
+    )
+    first_owner = await lifecycle.claim_execution(
+        session,
+        execution_id=reserved.execution_id,
+        token=_WORKER_A,
+        lease_seconds=60,
+    )
+    assert first_owner is not None
+    session.now = first_owner.expires_at
+    recovery_owner = await lifecycle.claim_execution(
+        session,
+        execution_id=reserved.execution_id,
+        token=_WORKER_B,
+    )
+    assert recovery_owner is not None and recovery_owner.fence == first_owner.fence + 1
+
+    stale = await lifecycle.bind_execution_capture_bundle(
+        session,
+        execution_id=reserved.execution_id,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        capture_bundle_id=44,
+        fence=first_owner.fence,
+        token=_WORKER_A,
+    )
+    recovered = await lifecycle.bind_execution_capture_bundle(
+        session,
+        execution_id=reserved.execution_id,
+        dataset_id=11,
+        definition_revision_id=22,
+        schema_revision_id=33,
+        capture_bundle_id=44,
+        fence=recovery_owner.fence,
+        token=_WORKER_B,
+    )
+
+    assert stale is None
+    assert recovered is not None and recovered.capture_bundle_id == 44
 
 
 @pytest.mark.asyncio
@@ -666,13 +1149,11 @@ async def test_root_transaction_and_clean_session_guards_fail_closed():
 
 @pytest.mark.asyncio
 async def test_lifecycle_storage_guards_cover_disappearing_rows_and_exhausted_authority():
+    """Reject missing storage and exhausted authority without manufacturing state."""
     session = _SyntheticSession()
     submission = await _submission(session)
     await lifecycle._lock_execution_by_request(
-        session,
-        dataset_id=11,
-        definition_revision_id=22,
-        idempotency_key="synthetic-request",
+        session, dataset_id=11, definition_revision_id=22, idempotency_key="synthetic-request"
     )
 
     class _MissingDatasetSession(_SyntheticSession):
@@ -702,6 +1183,7 @@ async def test_lifecycle_storage_guards_cover_disappearing_rows_and_exhausted_au
         idempotency_key="missing",
         mechanism="queued",
         capture_bundle_id=None,
+        request_identity_sha256=None,
     )
     assert await lifecycle._locked_submission_execution(empty, request, None) is None
 
@@ -807,3 +1289,62 @@ async def test_lifecycle_storage_fails_when_required_rows_disappear(monkeypatch)
             idempotency_key="disappearing-row",
             mechanism="queued",
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation,override_by_field,message",
+    [
+        ("reserve_execution", {"request_identity_sha256": "synthetic-identity"}, "must be bytes-like"),
+        ("reserve_execution", {"source_binding_revision_id": 44}, "requires request_identity_sha256"),
+        ("lookup_execution_request", {"request_identity_sha256": None}, "request_identity_sha256 is required"),
+        ("cancel_execution_request", {"request_identity_sha256": None}, "request_identity_sha256 is required"),
+    ],
+)
+async def test_request_identity_refusals_leave_storage_untouched(operation, override_by_field, message):
+    session = _SyntheticSession()
+    request_by_field = {
+        "dataset_id": 11,
+        "definition_revision_id": 22,
+        "schema_revision_id": 33,
+        "idempotency_key": "synthetic-invalid-request",
+        "mechanism": "queued",
+        **override_by_field,
+    }
+
+    with pytest.raises(ValueError, match=message):
+        await getattr(lifecycle, operation)(session, **request_by_field)
+
+    assert session.statements == []
+    assert session.executions == {}
+    assert session.execution_by_request == {}
+    assert session.leases == {}
+
+
+@pytest.mark.asyncio
+async def test_capture_binding_replays_without_rewriting_execution_or_lease():
+    session = _SyntheticSession()
+    submission = await _submission(session)
+    grant = await lifecycle.claim_execution(session, execution_id=submission.execution_id, token=_WORKER)
+    assert grant is not None
+    binding_by_field = {
+        "execution_id": submission.execution_id,
+        "dataset_id": 11,
+        "definition_revision_id": 22,
+        "schema_revision_id": 33,
+        "capture_bundle_id": 44,
+        "fence": grant.fence,
+        "token": _WORKER,
+    }
+    first = await lifecycle.bind_execution_capture_bundle(session, **binding_by_field)
+    assert first is not None and first.capture_bundle_id == 44
+    before_execution_by_field = vars(session.executions[submission.execution_id]).copy()
+    before_lease_by_field = vars(session.leases[submission.execution_id]).copy()
+    statement_count = len(session.statements)
+
+    replay = await lifecycle.bind_execution_capture_bundle(session, **binding_by_field)
+
+    assert replay == first and replay.created is False
+    assert vars(session.executions[submission.execution_id]) == before_execution_by_field
+    assert vars(session.leases[submission.execution_id]) == before_lease_by_field
+    assert all(statement.is_select for statement in session.statements[statement_count:])

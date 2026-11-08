@@ -165,67 +165,65 @@ async def test_stage_rejects_wrong_input_count_and_generic_failures(
 
 
 @pytest.mark.asyncio
-async def test_observation_batches_reject_unresolved_and_mismatched_rows(
-    monkeypatch,
-):
-    monkeypatch.setattr(
-        observations,
-        "_count_unresolved_identities",
-        AsyncMock(return_value=1),
-    )
-    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
-        await observations._publish_observation_batch(
-            object(),
-            schema='"mrf"',
-            stage='"pg_temp"."stage"',
-            snapshot_key=7,
-            range_parameters_by_name={},
-            expected_count=1,
-        )
-
-    monkeypatch.setattr(
-        observations,
-        "_count_unresolved_identities",
-        AsyncMock(return_value=0),
-    )
-    monkeypatch.setattr(observations, "_insert_observation_range", AsyncMock())
-    monkeypatch.setattr(
-        observations,
-        "_count_matching_observations",
-        AsyncMock(return_value=0),
-    )
-    monkeypatch.setattr(
-        observations,
-        "_count_witness_mismatches",
-        AsyncMock(return_value=1),
-    )
-    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
-        await observations._publish_observation_batch(
-            object(),
-            schema='"mrf"',
-            stage='"pg_temp"."stage"',
-            snapshot_key=7,
-            range_parameters_by_name={},
-            expected_count=1,
-        )
+@pytest.mark.parametrize("expected_count,witness_mismatches", [(1,0),(0,1)])
+async def test_observation_publication_rejects_incomplete_or_inconsistent_sets(monkeypatch,expected_count,witness_mismatches):
+    monkeypatch.setattr(observations,"_observation_boundary",AsyncMock(return_value=(None,0)))
+    monkeypatch.setattr(observations,"begin_snapshot_candidate",AsyncMock(return_value="candidate"))
+    monkeypatch.setattr(observations,"finish_snapshot_candidate",AsyncMock())
+    monkeypatch.setattr(observations,"_count_witness_mismatches",AsyncMock(return_value=witness_mismatches))
+    with pytest.raises(TaxIdentitySourceProjectionError,match=_ERROR):
+        await observations._publish_observations(SimpleNamespace(scalar=AsyncMock(return_value="owned")),
+            schema='"mrf"',stage='"pg_temp"."stage"',snapshot_key=7,
+            prepared=SimpleNamespace(provider_group_occurrence_count=expected_count),heartbeat_callback=None)
 
 
 @pytest.mark.asyncio
-async def test_observation_publication_requires_the_complete_count(monkeypatch):
-    monkeypatch.setattr(
-        observations,
-        "_observation_boundary",
-        AsyncMock(return_value=None),
+async def test_observation_window_reserves_framing_and_stops_before_oversized_row(monkeypatch):
+    monkeypatch.setattr(observations, "COPY_MAX_BYTES", 41)
+    rows = [(2, 4, 10), (2, 5, 10), (3, 0, 1)]
+    session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(all=lambda: rows)))
+    assert await observations._observation_boundary(session, "stage", (2, 3)) == ((2, 5), 2)
+    assert session.execute.await_args.args[1] == {
+        "source": 2, "ordinal": 3, "rows": observations.COPY_MAX_ROWS,
+    }
+    rows[:] = [(3, 0, 21)]
+    with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
+        await observations._observation_boundary(session, "stage", (2, 5))
+    rows.clear()
+    assert await observations._observation_boundary(session, "stage", (2, 5)) == (None, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["export_count", "export_bytes", "import_count"])
+async def test_observation_copy_failure_prevents_seal_and_witness_publication(monkeypatch, failure):
+    """Actual binary bytes and both COPY counts fence the publication boundary."""
+    async def export(*_args, output, **_kwargs):
+        output.write(b"x" * (33 if failure == "export_bytes" else 21))
+        return "COPY 1" if failure == "export_count" else "COPY 2"
+
+    driver = SimpleNamespace(
+        copy_from_query=AsyncMock(side_effect=export),
+        copy_to_table=AsyncMock(return_value="COPY 1"),
     )
+    finish, witnesses, heartbeat = AsyncMock(), AsyncMock(), Mock()
+    monkeypatch.setattr(observations, "COPY_MAX_BYTES", 32)
+    monkeypatch.setattr(observations, "candidate_driver", AsyncMock(return_value=driver))
+    monkeypatch.setattr(observations, "begin_snapshot_candidate", AsyncMock(return_value="candidate"))
+    monkeypatch.setattr(observations, "finish_snapshot_candidate", finish)
+    monkeypatch.setattr(observations, "_count_witness_mismatches", witnesses)
+    monkeypatch.setattr(observations, "_observation_boundary", AsyncMock(return_value=((1, 2), 2)))
+    session = SimpleNamespace(scalar=AsyncMock(return_value="owned"))
     with pytest.raises(TaxIdentitySourceProjectionError, match=_ERROR):
         await observations._publish_observations(
-            object(),
-            schema='"mrf"',
-            stage='"pg_temp"."stage"',
-            snapshot_key=7,
-            prepared=SimpleNamespace(provider_group_occurrence_count=1),
-            heartbeat_callback=None,
+            session, schema='"synthetic"', stage='"stage"', snapshot_key=7,
+            prepared=SimpleNamespace(provider_group_occurrence_count=2),
+            heartbeat_callback=heartbeat,
         )
+    finish.assert_not_awaited()
+    witnesses.assert_not_awaited()
+    heartbeat.assert_not_called()
+    assert driver.copy_from_query.await_count == 1
+    assert driver.copy_to_table.await_count == int(failure == "import_count")
 
 
 @pytest.mark.asyncio

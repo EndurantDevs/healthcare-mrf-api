@@ -6,23 +6,24 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
-from pathlib import Path
 import signal
 import sys
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
+from process import provider_directory_fhir_subset_activation_evidence as evidence_api
+from process.provider_directory_fhir_subset_abandonment_contract import (
+    ABANDONMENT_ENABLED_ENV,
+    ReviewedSubsetAbandonmentError,
+    ReviewedSubsetAbandonmentResult,
+)
 from process.provider_directory_fhir_subset_activation import (
     ReviewedSubsetActivationError,
 )
 from process.provider_directory_fhir_subset_activation_contract import (
     STATE_SYNC_ENABLED_ENV,
-)
-from process.provider_directory_fhir_subset_abandonment_contract import (
-    ABANDONMENT_ENABLED_ENV,
-    ReviewedSubsetAbandonmentError,
-    ReviewedSubsetAbandonmentResult,
 )
 from process.provider_directory_fhir_subset_terminal_disposition_contract import (
     TERMINAL_DISPOSITION_ENABLED_ENV,
@@ -32,20 +33,11 @@ from process.provider_directory_fhir_subset_terminal_disposition_profile import 
     DIRECT_V4_TERMINAL_DISPOSITION_ENABLED_ENV,
     DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_ENABLED_ENV,
 )
-from process import provider_directory_fhir_subset_activation_evidence as evidence_api
 from tests.provider_directory_fhir_subset_activation_support import activation_inputs
 
-
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_PATH = (
-    ROOT
-    / "scripts"
-    / "smoke"
-    / "provider_directory_fhir_reviewed_subset_state.py"
-)
-RUNBOOK_PATH = (
-    ROOT / "docs/imports/provider-directory-reviewed-subset-activation.md"
-)
+SCRIPT_PATH = ROOT / "scripts" / "smoke" / "provider_directory_fhir_reviewed_subset_state.py"
+RUNBOOK_PATH = ROOT / "docs/imports/provider-directory-reviewed-subset-activation.md"
 
 
 def test_operator_is_packaged_and_absent_from_ordinary_runtime_paths():
@@ -65,14 +57,11 @@ def test_operator_is_packaged_and_absent_from_ordinary_runtime_paths():
         "HLTHPRT_PROVIDER_DIRECTORY_SUBSET_STATE_SYNC_ENABLED",
         "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_ABANDONMENT_ENABLED",
         "dispose_reviewed_subset_census_drift_root",
-        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_"
-        "TERMINAL_DISPOSITION_ENABLED",
+        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_TERMINAL_DISPOSITION_ENABLED",
         "dispose_v4_census_drift_root",
-        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V4_"
-        "TERMINAL_DISPOSITION_ENABLED",
+        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V4_TERMINAL_DISPOSITION_ENABLED",
         "dispose_v5_terminal_root",
-        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V5_HTTP410_"
-        "TERMINAL_DISPOSITION_ENABLED",
+        "HLTHPRT_PROVIDER_DIRECTORY_REVIEWED_SUBSET_DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_ENABLED",
     )
     for runtime_path in runtime_paths:
         runtime_source = runtime_path.read_text(encoding="utf-8")
@@ -92,9 +81,7 @@ def test_runbook_binds_neutral_review_and_separate_publication():
     """Keep the one-shot activation boundary operationally explicit."""
 
     runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
-    provider_guide = (
-        ROOT / "docs/imports/provider-directory-fhir.md"
-    ).read_text(encoding="utf-8")
+    provider_guide = (ROOT / "docs/imports/provider-directory-fhir.md").read_text(encoding="utf-8")
     for required_text in (
         "source_contract_sha256",
         "verification_source_scope_sha256",
@@ -116,10 +103,7 @@ def test_runbook_binds_neutral_review_and_separate_publication():
     ):
         assert required_text in runbook
     assert "provider-directory-reviewed-subset-activation.md" in provider_guide
-    assert (
-        "HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH_SERVER_ISSUED_SUBSET=true"
-        in provider_guide
-    )
+    assert "HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH_SERVER_ISSUED_SUBSET=true" in provider_guide
 
 
 def _script_module():
@@ -147,52 +131,26 @@ def test_parser_accepts_only_fixed_command_and_no_selectors(capsys):
 
     parsed = script_module._parser().parse_args([script_module.COMMAND])
     assert vars(parsed) == {"command": script_module.COMMAND}
-    evidence_arguments = script_module._parser().parse_args(
-        [script_module.EVIDENCE_COMMAND]
-    )
-    assert vars(evidence_arguments) == {
-        "command": script_module.EVIDENCE_COMMAND
-    }
-    abandonment_arguments = script_module._parser().parse_args(
-        [script_module.ABANDON_COMMAND]
-    )
-    assert vars(abandonment_arguments) == {
-        "command": script_module.ABANDON_COMMAND
-    }
-    terminal_arguments = script_module._parser().parse_args(
-        [script_module.TERMINAL_DISPOSITION_COMMAND]
-    )
-    assert vars(terminal_arguments) == {
-        "command": script_module.TERMINAL_DISPOSITION_COMMAND
-    }
-    direct_v4_arguments = script_module._parser().parse_args(
-        [script_module.DIRECT_V4_TERMINAL_DISPOSITION_COMMAND]
-    )
-    assert vars(direct_v4_arguments) == {
-        "command": script_module.DIRECT_V4_TERMINAL_DISPOSITION_COMMAND
-    }
+    evidence_arguments = script_module._parser().parse_args([script_module.EVIDENCE_COMMAND])
+    assert vars(evidence_arguments) == {"command": script_module.EVIDENCE_COMMAND}
+    abandonment_arguments = script_module._parser().parse_args([script_module.ABANDON_COMMAND])
+    assert vars(abandonment_arguments) == {"command": script_module.ABANDON_COMMAND}
+    terminal_arguments = script_module._parser().parse_args([script_module.TERMINAL_DISPOSITION_COMMAND])
+    assert vars(terminal_arguments) == {"command": script_module.TERMINAL_DISPOSITION_COMMAND}
+    direct_v4_arguments = script_module._parser().parse_args([script_module.DIRECT_V4_TERMINAL_DISPOSITION_COMMAND])
+    assert vars(direct_v4_arguments) == {"command": script_module.DIRECT_V4_TERMINAL_DISPOSITION_COMMAND}
     direct_v5_arguments = script_module._parser().parse_args(
         [script_module.DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_COMMAND]
     )
-    assert vars(direct_v5_arguments) == {
-        "command": script_module.DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_COMMAND
-    }
+    assert vars(direct_v5_arguments) == {"command": script_module.DIRECT_V5_HTTP410_TERMINAL_DISPOSITION_COMMAND}
     with pytest.raises(SystemExit) as error:
-        script_module._parser().parse_args(
-            [script_module.COMMAND, "--source-id", "private"]
-        )
+        script_module._parser().parse_args([script_module.COMMAND, "--source-id", "private"])
     assert error.value.code == 2
-    assert capsys.readouterr().err == (
-        '{"code":"invalid_arguments","status":"error"}\n'
-    )
+    assert capsys.readouterr().err == ('{"code":"invalid_arguments","status":"error"}\n')
     with pytest.raises(SystemExit) as abandonment_error:
-        script_module._parser().parse_args(
-            [script_module.ABANDON_COMMAND, "--dataset-id", "private"]
-        )
+        script_module._parser().parse_args([script_module.ABANDON_COMMAND, "--dataset-id", "private"])
     assert abandonment_error.value.code == 2
-    assert capsys.readouterr().err == (
-        '{"code":"invalid_arguments","status":"error"}\n'
-    )
+    assert capsys.readouterr().err == ('{"code":"invalid_arguments","status":"error"}\n')
 
 
 @pytest.mark.parametrize(
@@ -265,9 +223,7 @@ async def test_runner_returns_result_and_always_disconnects(monkeypatch):
         database=database,
     )
 
-    assert rendered_result == (
-        '{"activated":true,"already_applied":false,"status":"ok"}'
-    )
+    assert rendered_result == ('{"activated":true,"already_applied":false,"status":"ok"}')
     assert database.disconnected is True
 
 
@@ -291,21 +247,16 @@ async def test_evidence_command_renders_only_the_neutral_manifest(monkeypatch):
     evidence_reader.assert_awaited_once_with(database=database)
     assert source_record["source_id"] not in rendered_manifest
     assert source_record["endpoint_id"] not in rendered_manifest
-    assert '"desired_candidate_status":"verified_two_matching_' in (
-        rendered_manifest
-    )
+    assert '"desired_candidate_status":"verified_two_matching_' in (rendered_manifest)
 
 
 @pytest.mark.asyncio
 async def test_abandonment_command_renders_only_closed_disposition(monkeypatch):
     script_module = _script_module()
     database = _Database()
-    abandonment_call = AsyncMock(
-        return_value=ReviewedSubsetAbandonmentResult(abandoned=True)
-    )
+    abandonment_call = AsyncMock(return_value=ReviewedSubsetAbandonmentResult(abandoned=True))
     monkeypatch.setattr(
-        "process.provider_directory_fhir_subset_abandonment."
-        "abandon_reviewed_subset_expired_root",
+        "process.provider_directory_fhir_subset_abandonment.abandon_reviewed_subset_expired_root",
         abandonment_call,
     )
 
@@ -315,20 +266,14 @@ async def test_abandonment_command_renders_only_closed_disposition(monkeypatch):
     )
 
     abandonment_call.assert_awaited_once_with(database=database)
-    assert rendered_result == (
-        '{"abandoned":true,"already_applied":false,"status":"ok"}'
-    )
+    assert rendered_result == ('{"abandoned":true,"already_applied":false,"status":"ok"}')
 
-    abandonment_call.return_value = ReviewedSubsetAbandonmentResult(
-        abandoned=False
-    )
+    abandonment_call.return_value = ReviewedSubsetAbandonmentResult(abandoned=False)
     replay_result = await script_module._execute_operation(
         database,
         script_module.ABANDON_COMMAND,
     )
-    assert replay_result == (
-        '{"abandoned":false,"already_applied":true,"status":"ok"}'
-    )
+    assert replay_result == ('{"abandoned":false,"already_applied":true,"status":"ok"}')
 
 
 @pytest.mark.asyncio
@@ -337,12 +282,9 @@ async def test_terminal_command_renders_only_closed_disposition(monkeypatch):
 
     script_module = _script_module()
     database = _Database()
-    disposition_call = AsyncMock(
-        return_value=ReviewedSubsetTerminalDispositionResult(disposed=True)
-    )
+    disposition_call = AsyncMock(return_value=ReviewedSubsetTerminalDispositionResult(disposed=True))
     monkeypatch.setattr(
-        "process.provider_directory_fhir_subset_terminal_disposition."
-        "dispose_reviewed_subset_census_drift_root",
+        "process.provider_directory_fhir_subset_terminal_disposition.dispose_reviewed_subset_census_drift_root",
         disposition_call,
     )
 
@@ -352,9 +294,7 @@ async def test_terminal_command_renders_only_closed_disposition(monkeypatch):
     )
 
     disposition_call.assert_awaited_once_with(database=database)
-    assert rendered_result == (
-        '{"already_applied":false,"disposed":true,"status":"ok"}'
-    )
+    assert rendered_result == ('{"already_applied":false,"disposed":true,"status":"ok"}')
 
 
 @pytest.mark.asyncio
@@ -363,12 +303,9 @@ async def test_direct_v4_terminal_command_reuses_closed_disposition(monkeypatch)
 
     script_module = _script_module()
     database = _Database()
-    disposition_call = AsyncMock(
-        return_value=ReviewedSubsetTerminalDispositionResult(disposed=True)
-    )
+    disposition_call = AsyncMock(return_value=ReviewedSubsetTerminalDispositionResult(disposed=True))
     monkeypatch.setattr(
-        "process.provider_directory_fhir_subset_terminal_disposition."
-        "dispose_v4_census_drift_root",
+        "process.provider_directory_fhir_subset_terminal_disposition.dispose_v4_census_drift_root",
         disposition_call,
     )
 
@@ -378,9 +315,7 @@ async def test_direct_v4_terminal_command_reuses_closed_disposition(monkeypatch)
     )
 
     disposition_call.assert_awaited_once_with(database=database)
-    assert rendered_result == (
-        '{"already_applied":false,"disposed":true,"status":"ok"}'
-    )
+    assert rendered_result == ('{"already_applied":false,"disposed":true,"status":"ok"}')
 
 
 @pytest.mark.asyncio
@@ -389,12 +324,9 @@ async def test_v5_http410_command_reuses_closed_disposition(monkeypatch):
 
     script_module = _script_module()
     database = _Database()
-    disposition_call = AsyncMock(
-        return_value=ReviewedSubsetTerminalDispositionResult(disposed=True)
-    )
+    disposition_call = AsyncMock(return_value=ReviewedSubsetTerminalDispositionResult(disposed=True))
     monkeypatch.setattr(
-        "process.provider_directory_fhir_subset_terminal_disposition."
-        "dispose_v5_terminal_root",
+        "process.provider_directory_fhir_subset_terminal_disposition.dispose_v5_terminal_root",
         disposition_call,
     )
 
@@ -404,9 +336,7 @@ async def test_v5_http410_command_reuses_closed_disposition(monkeypatch):
     )
 
     disposition_call.assert_awaited_once_with(database=database)
-    assert rendered_result == (
-        '{"already_applied":false,"disposed":true,"status":"ok"}'
-    )
+    assert rendered_result == ('{"already_applied":false,"disposed":true,"status":"ok"}')
 
 
 @pytest.mark.parametrize(
@@ -429,9 +359,7 @@ def test_command_projects_closed_errors(monkeypatch, capsys, error, expected_cod
     assert script_module.run_command([script_module.COMMAND]) == 1
     output = capsys.readouterr()
     assert output.out == ""
-    assert output.err == (
-        f'{{"code":"{expected_code}","status":"error"}}\n'
-    )
+    assert output.err == (f'{{"code":"{expected_code}","status":"error"}}\n')
     assert "private" not in output.err
 
 
@@ -453,3 +381,29 @@ def test_command_projects_cancellation(monkeypatch, capsys, signal_number, expec
     output = capsys.readouterr()
     assert output.out == ""
     assert output.err == '{"code":"canceled","status":"error"}\n'
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sync-verified-state",
+        "abandon-expired-root",
+        "seal-terminal-root",
+        "seal-direct-v4-terminal-root",
+        "seal-direct-v5-http410-root",
+    ],
+)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_issued_runner_stays_behind_each_mutation_gate(monkeypatch, capsys, command, enabled):
+    script_module = _script_module()
+    runner = AsyncMock(return_value='{"status":"ok"}')
+    monkeypatch.setenv(script_module._ENABLED_ENV_BY_COMMAND[command], "true" if enabled else "false")
+    monkeypatch.setattr(script_module, "_run_operator", AsyncMock(side_effect=AssertionError("unbound operator")))
+    assert script_module.run_command([command], operation_runner=runner) == (0 if enabled else 1)
+    if enabled:
+        runner.assert_awaited_once_with(command)
+    else:
+        runner.assert_not_awaited()
+    output = capsys.readouterr()
+    assert output.out == ('{"status":"ok"}\n' if enabled else "")
+    assert output.err == ("" if enabled else '{"code":"disabled","status":"error"}\n')

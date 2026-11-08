@@ -25,11 +25,9 @@ from process.provider_directory_fhir_subset_terminal_disposition_util import (
     quoted_relation,
     schema_name,
 )
+from process.provider_directory_source_checkpoint_control import source_checkpoint_transaction
 
-
-_CHECKPOINT_GUARD = (
-    "provider_directory_subset_terminal_disposition_checkpoint_guard"
-)
+_CHECKPOINT_GUARD = "provider_directory_subset_terminal_disposition_checkpoint_guard"
 _DATASET_GUARD = "pd_subset_terminal_disposition_dataset_consistency_guard"
 _VALID_FUNCTION = "provider_directory_subset_terminal_disposition_valid"
 
@@ -39,9 +37,7 @@ async def _force_terminal_disposition_guards(
     dataset_id: str,
 ) -> None:
     await database.status(
-        "SET CONSTRAINTS "
-        f'"{schema_name()}"."{_CHECKPOINT_GUARD}", '
-        f'"{schema_name()}"."{_DATASET_GUARD}" IMMEDIATE;'
+        f'SET CONSTRAINTS "{schema_name()}"."{_CHECKPOINT_GUARD}", "{schema_name()}"."{_DATASET_GUARD}" IMMEDIATE;'
     )
     is_valid = await database.scalar(
         f"SELECT {quoted_relation(_VALID_FUNCTION)}(:dataset_id);",
@@ -59,7 +55,7 @@ async def _seal_checkpoints(
     for checkpoint in checkpoint_rows:
         updated_count = await database.status(
             f"""
-            UPDATE {quoted_relation('provider_directory_pagination_checkpoint')}
+            UPDATE {quoted_relation("provider_directory_pagination_checkpoint")}
                SET state = :disposed_state,
                    completed_at = COALESCE(
                        completed_at,
@@ -109,7 +105,7 @@ async def _seal_candidate(
 ) -> None:
     updated_count = await database.status(
         f"""
-        UPDATE {quoted_relation('provider_directory_endpoint_dataset')}
+        UPDATE {quoted_relation("provider_directory_endpoint_dataset")}
            SET status = :disposed_status,
                resource_count = :resource_count,
                publication_metadata_json =
@@ -177,10 +173,8 @@ async def _sync_terminal_disposition_transaction(
     expected_source_id: str,
     selection_function: _SelectionFunction,
 ) -> ReviewedSubsetTerminalDispositionResult:
-    async with database.transaction():
-        isolation = await database.scalar(
-            "SELECT pg_catalog.current_setting('transaction_isolation');"
-        )
+    async with source_checkpoint_transaction(database, schema=schema_name()):
+        isolation = await database.scalar("SELECT pg_catalog.current_setting('transaction_isolation');")
         if isolation != "read committed":
             raise ReviewedSubsetTerminalDispositionError("state")
         selection, checkpoint_rows = await selection_function(

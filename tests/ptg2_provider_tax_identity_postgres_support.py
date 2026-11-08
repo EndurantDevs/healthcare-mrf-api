@@ -277,6 +277,7 @@ async def assert_layout_cascade(
                 "WHERE snapshot_key = 11"
             )
         )
+    async with engine.connect() as connection:
         remaining_count_by_table = {
             table_name: int(
                 await connection.scalar(

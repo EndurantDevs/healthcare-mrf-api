@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import importlib
 from types import SimpleNamespace
@@ -12,32 +13,34 @@ from unittest.mock import AsyncMock
 import pytest
 
 from db.models import ProviderDirectoryPractitioner
+from process.provider_directory_generic_source_policy import source_transaction
 from process.provider_directory_resource_hash import (
     LEGACY_RESOURCE_HASH_CONTRACT,
     SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
     TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
     persisted_resource_hash_contract,
 )
+from tests.test_provider_directory_generic_source_policy import synthetic_source_database
 from tests.test_provider_directory_semantic_proof_v3 import (
     PROJECTION_AS_OF,
     _dataset_row,
     _observation,
 )
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 PROOF_RESOURCE_SCOPE = ["Practitioner"]
 
+
 def test_contract_reader_keeps_markerless_v1_and_explicit_v2():
-    assert persisted_resource_hash_contract(None) == (
-        LEGACY_RESOURCE_HASH_CONTRACT
+    assert persisted_resource_hash_contract(None) == (LEGACY_RESOURCE_HASH_CONTRACT)
+    assert (
+        persisted_resource_hash_contract({"resource_hash_contract": TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT})
+        == TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
     )
-    assert persisted_resource_hash_contract(
-        {"resource_hash_contract": TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT}
-    ) == TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT
-    assert persisted_resource_hash_contract(
-        {"resource_hash_contract": SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT}
-    ) == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    assert (
+        persisted_resource_hash_contract({"resource_hash_contract": SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT})
+        == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+    )
 
 
 def _semantic_candidate_selection():
@@ -55,9 +58,7 @@ def _semantic_candidate_state(
 ) -> dict[str, dict[str, object]]:
     return {
         "publication_metadata_json": {
-            "resource_hash_contract": (
-                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-            ),
+            "resource_hash_contract": (SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT),
             "semantic_projection_as_of": projection_as_of,
             "selected_resources": ["Practitioner"],
             "proof_resource_scope": PROOF_RESOURCE_SCOPE,
@@ -126,9 +127,7 @@ def test_twin_successor_inherits_and_fences_projection_date(monkeypatch):
     baseline_by_field = {
         "dataset_id": "dataset-baseline",
         "publication_metadata_json": {
-            "resource_hash_contract": (
-                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-            ),
+            "resource_hash_contract": (SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT),
             "semantic_projection_as_of": PROJECTION_AS_OF,
             "selected_resources": ["Practitioner"],
             "proof_resource_scope": PROOF_RESOURCE_SCOPE,
@@ -173,9 +172,7 @@ def _fresh_twin_successor(selected_resources):
         verification_source_scope_hash="scope-1",
         resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
         semantic_projection_as_of="2026-08-10",
-        proof_resource_scope=importer._provider_directory_proof_resource_scope(
-            selected_resources
-        ),
+        proof_resource_scope=importer._provider_directory_proof_resource_scope(selected_resources),
     )
 
 
@@ -199,12 +196,8 @@ def _baseline_identity(
     if baseline_contract != LEGACY_RESOURCE_HASH_CONTRACT:
         metadata_by_field["resource_hash_contract"] = baseline_contract
     if baseline_projection_date is not None:
-        metadata_by_field["semantic_projection_as_of"] = (
-            baseline_projection_date
-        )
-        proof_by_field["semantic_projection_as_of"] = (
-            baseline_projection_date
-        )
+        metadata_by_field["semantic_projection_as_of"] = baseline_projection_date
+        proof_by_field["semantic_projection_as_of"] = baseline_projection_date
     if baseline_scope is not None:
         metadata_by_field["proof_resource_scope"] = list(baseline_scope)
         proof_by_field["proof_resource_scope"] = list(baseline_scope)
@@ -291,9 +284,7 @@ async def test_finalization_lock_rejects_projection_date_tamper():
                     "completion_proof_json": None,
                     "completion_proof_sha256": None,
                     "publication_metadata_json": {
-                        "resource_hash_contract": (
-                            SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-                        ),
+                        "resource_hash_contract": (SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT),
                         "semantic_projection_as_of": "2026-08-10",
                         "selected_resources": ["Practitioner"],
                         "proof_resource_scope": PROOF_RESOURCE_SCOPE,
@@ -328,6 +319,7 @@ async def test_finalization_lock_rejects_projection_date_tamper():
     ],
 )
 async def test_v3_accumulator_rejects_partial_or_wrong_date_projection(
+    monkeypatch,
     projection_fields,
 ):
     observation = _observation()
@@ -341,9 +333,7 @@ async def test_v3_accumulator_rejects_partial_or_wrong_date_projection(
                 "is_current": False,
                 "publication_metadata_json": {
                     "selected_resources": ["Practitioner"],
-                    "resource_hash_contract": (
-                        SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-                    ),
+                    "resource_hash_contract": (SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT),
                     "semantic_projection_as_of": PROJECTION_AS_OF,
                     "proof_resource_scope": PROOF_RESOURCE_SCOPE,
                 },
@@ -353,29 +343,28 @@ async def test_v3_accumulator_rejects_partial_or_wrong_date_projection(
         scalar=AsyncMock(return_value=None),
     )
 
-    with pytest.raises(ValueError, match="semantic_.*projection"):
-        await importer._accumulated_endpoint_dataset_rows(
-            connection,
-            [incoming_row],
-            dataset_id="dataset-1",
-            resource_hash_contract=(
-                SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-            ),
-            semantic_projection_as_of=PROJECTION_AS_OF,
-        )
+    before = copy.deepcopy(incoming_row)
+    async with synthetic_source_database(monkeypatch, connection) as database, source_transaction(database):
+        with pytest.raises(ValueError, match="semantic_.*projection"):
+            await importer._accumulated_endpoint_dataset_rows(
+                database,
+                [incoming_row],
+                dataset_id="dataset-1",
+                resource_hash_contract=SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+                semantic_projection_as_of=PROJECTION_AS_OF,
+            )
+    assert incoming_row == before
+    connection.first.assert_not_awaited()
     connection.all.assert_not_awaited()
-    connection.scalar.assert_awaited_once()
+    connection.scalar.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_accumulator_rejects_resource_outside_parent_scope(
-):
+async def test_parent_proof_scope_rejects_resource_outside_selected_scope(monkeypatch):
     resource_hash_contract = SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
     incoming_row = _dataset_row(_observation(), resource_hash_contract)
     semantic_projection_as_of = (
-        PROJECTION_AS_OF
-        if resource_hash_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
-        else None
+        PROJECTION_AS_OF if resource_hash_contract == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT else None
     )
     connection = SimpleNamespace(
         first=AsyncMock(
@@ -388,11 +377,7 @@ async def test_accumulator_rejects_resource_outside_parent_scope(
                     "resource_hash_contract": resource_hash_contract,
                     "proof_resource_scope": ["Endpoint", "Organization"],
                     **(
-                        {
-                            "semantic_projection_as_of": (
-                                semantic_projection_as_of
-                            )
-                        }
+                        {"semantic_projection_as_of": (semantic_projection_as_of)}
                         if semantic_projection_as_of is not None
                         else {}
                     ),
@@ -403,15 +388,22 @@ async def test_accumulator_rejects_resource_outside_parent_scope(
         scalar=AsyncMock(return_value=None),
     )
 
-    with pytest.raises(RuntimeError, match="resource_scope_changed"):
-        await importer._accumulated_endpoint_dataset_rows(
-            connection,
+    before = copy.deepcopy(incoming_row)
+    async with synthetic_source_database(monkeypatch, connection) as database, source_transaction(database):
+        assert await importer._accumulated_endpoint_dataset_rows(
+            database,
             [incoming_row],
             dataset_id="dataset-1",
-            resource_hash_contract=(
-                resource_hash_contract
-            ),
+            resource_hash_contract=resource_hash_contract,
             semantic_projection_as_of=semantic_projection_as_of,
-        )
+        ) == [before]
+        with pytest.raises(RuntimeError, match="resource_scope_invalid"):
+            importer._dataset_proof_resource_scope(
+                connection.first.return_value,
+                [incoming_row["resource_type"]],
+                resource_hash_contract,
+            )
+    assert incoming_row == before
+    connection.first.assert_not_awaited()
     connection.all.assert_not_awaited()
     connection.scalar.assert_not_awaited()

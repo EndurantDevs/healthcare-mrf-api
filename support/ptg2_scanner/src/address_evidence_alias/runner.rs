@@ -13,11 +13,10 @@ pub fn derive_evidence_alias_candidates(
     let rows = parse_archive(archive_path)?;
     let mut key_index = HashMap::new();
     for (index, row) in rows.iter().enumerate() {
-        if let Some(key) = &row.key {
-            if key_index.insert(key.clone(), index as u32).is_some() {
+        if let Some(key) = &row.key
+            && key_index.insert(key.clone(), index as u32).is_some() {
                 return Err(invalid("duplicate address archive key"));
             }
-        }
     }
     let (active_sources, active_targets) = load_aliases(aliases_path)?;
     let memberships =

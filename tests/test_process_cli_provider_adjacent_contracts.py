@@ -129,6 +129,7 @@ def test_ptg_failure_retention_alias_and_filters_reach_importer(monkeypatch) -> 
             ],
             "toc_list": None,
             "in_network_url": None,
+            "in_network_urls": None,
             "allowed_url": None,
             "provider_ref_url": None,
             "import_id": None,

@@ -13,13 +13,11 @@ from db.connection import Database
 from db.migration_ptg2_predecessor_retirement_audit import (
     install_predecessor_retirement_audit,
 )
-from process.ptg_parts import ptg2_legacy_global_projection_queue
-from process.ptg_parts import source_snapshot_control
+from process.ptg_parts import ptg2_legacy_global_projection_queue, source_snapshot_control
 from process.ptg_parts import source_snapshot_predecessor_retirement as retirement
 from process.ptg_parts.source_snapshot_predecessor_retirement_types import (
     PTG2PredecessorRetirementConflict,
 )
-
 
 SOURCE_KEY = "synthetic-source"
 CURRENT_SNAPSHOT_ID = "snapshot-current"
@@ -94,6 +92,14 @@ MRF_TABLE_STATEMENTS = (
         snapshot_id varchar(96) NOT NULL,
         reason varchar(256),
         PRIMARY KEY (owner_type, owner_id, snapshot_id)
+    )
+    """,
+    """
+    CREATE TABLE {schema}.plan_release_snapshot_pin (
+        serving_revision_id varchar(64) NOT NULL,
+        snapshot_id varchar(128) NOT NULL,
+        reason varchar(256),
+        PRIMARY KEY (serving_revision_id, snapshot_id)
     )
     """,
     """
@@ -193,14 +199,8 @@ async def create_schema(
     control_schema = quote_identifier(control_schema_name)
     audit_operations = CollectingOperations()
     install_predecessor_retirement_audit(audit_operations, schema_name)
-    statements = [
-        statement.format(schema=schema)
-        for statement in MRF_TABLE_STATEMENTS
-    ]
-    statements.extend(
-        statement.format(control_schema=control_schema)
-        for statement in CONTROL_TABLE_STATEMENTS
-    )
+    statements = [statement.format(schema=schema) for statement in MRF_TABLE_STATEMENTS]
+    statements.extend(statement.format(control_schema=control_schema) for statement in CONTROL_TABLE_STATEMENTS)
     async with database.acquire() as connection:
         await connection.status(f"CREATE SCHEMA {schema}")
         await connection.status(f"CREATE SCHEMA {control_schema}")
@@ -336,9 +336,7 @@ def request_params(
     return {
         **pair_params(),
         "rollback_pin_mode": rollback_pin_mode,
-        "rollback_owner_id": (
-            ROLLBACK_OWNER_ID if rollback_pin_mode == "owned" else None
-        ),
+        "rollback_owner_id": (ROLLBACK_OWNER_ID if rollback_pin_mode == "owned" else None),
         "actor": "operator@example.invalid",
         "reason": "retention window complete",
         "idempotency_key": IDEMPOTENCY_KEY,
@@ -351,11 +349,7 @@ async def count_rows(
     table: str,
 ) -> int:
     return int(
-        await database.scalar(
-            f"SELECT COUNT(*) FROM "
-            f"{quote_identifier(schema_name)}.{quote_identifier(table)}"
-        )
-        or 0
+        await database.scalar(f"SELECT COUNT(*) FROM {quote_identifier(schema_name)}.{quote_identifier(table)}") or 0
     )
 
 
@@ -371,10 +365,7 @@ async def pointer_pairs(
          ORDER BY 1, 2 NULLS FIRST
         """
     )
-    return [
-        (str(row[0]), str(row[1]) if row[1] is not None else None)
-        for row in rows
-    ]
+    return [(str(row[0]), str(row[1]) if row[1] is not None else None) for row in rows]
 
 
 def configure_operation(
@@ -395,9 +386,7 @@ def configure_operation(
 
 
 async def drop_schema(database: Database, schema_name: str) -> None:
-    await database.status(
-        f"DROP SCHEMA IF EXISTS {quote_identifier(schema_name)} CASCADE"
-    )
+    await database.status(f"DROP SCHEMA IF EXISTS {quote_identifier(schema_name)} CASCADE")
 
 
 async def assert_seeded_state_unchanged(
@@ -411,10 +400,7 @@ async def assert_seeded_state_unchanged(
             pair == (CURRENT_SNAPSHOT_ID, PREDECESSOR_SNAPSHOT_ID)
             for pair in await pointer_pairs(database, schema_name, table)
         )
-    assert (
-        await count_rows(database, schema_name, "ptg2_snapshot_pin")
-        == expected_pin_count
-    )
+    assert await count_rows(database, schema_name, "ptg2_snapshot_pin") == expected_pin_count
     assert (
         await count_rows(
             database,
@@ -455,9 +441,7 @@ async def require_control_pin_blocks_without_mutation(
         schema_name,
         "non-target retention pin",
     )
-    await database.status(
-        f"DELETE FROM {quote_identifier(control_schema_name)}.hp_snapshot_pin"
-    )
+    await database.status(f"DELETE FROM {quote_identifier(control_schema_name)}.hp_snapshot_pin")
 
 
 async def require_release_bindings_block_without_mutation(
@@ -495,6 +479,4 @@ async def require_release_bindings_block_without_mutation(
         schema_name,
         "release binding",
     )
-    await database.status(
-        f"DELETE FROM {control_schema}.hp_plan_release_binding"
-    )
+    await database.status(f"DELETE FROM {control_schema}.hp_plan_release_binding")

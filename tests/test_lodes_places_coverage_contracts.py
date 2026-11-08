@@ -49,8 +49,14 @@ class _Transaction:
 
 def _places_csv(row_list):
     field_name_list = [
-        "Year", "LocationID", "MeasureId", "Measure", "Data_Value",
-        "Low_Confidence_Limit", "High_Confidence_Limit", "Data_Value_Type",
+        "Year",
+        "LocationID",
+        "MeasureId",
+        "Measure",
+        "Data_Value",
+        "Low_Confidence_Limit",
+        "High_Confidence_Limit",
+        "Data_Value_Type",
         "DataSource",
     ]
     buffer = io.StringIO()
@@ -66,10 +72,7 @@ async def test_lodes_crosswalk_falls_back_from_short_local_file_to_census(monkey
 
     local_path = tmp_path / "short.csv"
     local_path.write_text("TRACT,ZIP\n17031010100,60654\n", encoding="utf-8")
-    census_text = (
-        "GEOID_TRACT_20|GEOID_ZCTA5_20|AREALAND_PART\n"
-        "17031010100|60654|1\n17031010200|60655|2\n"
-    ).encode()
+    census_text = ("GEOID_TRACT_20|GEOID_ZCTA5_20|AREALAND_PART\n17031010100|60654|1\n17031010200|60655|2\n").encode()
     monkeypatch.setattr(lodes, "MIN_TRACT_CROSSWALK_ROWS", 2)
     monkeypatch.setenv("HLTHPRT_LODES_CROSSWALK_FILE", str(local_path))
     monkeypatch.delenv("HLTHPRT_HUD_API_TOKEN", raising=False)
@@ -79,9 +82,7 @@ async def test_lodes_crosswalk_falls_back_from_short_local_file_to_census(monkey
             assert url == lodes.CENSUS_TRACT_ZCTA_REL_URL
             return _AsyncResponse(body=census_text)
 
-    assert await lodes._load_tract_to_zip_crosswalk(CensusClient()) == {
-        "17031010100": "60654", "17031010200": "60655"
-    }
+    assert await lodes._load_tract_to_zip_crosswalk(CensusClient()) == {"17031010100": "60654", "17031010200": "60655"}
 
 
 @pytest.mark.asyncio
@@ -92,9 +93,7 @@ async def test_lodes_hud_requires_the_documented_object_payload_and_rejects_non_
 
     class HudClient:
         def get(self, *_args, **_kwargs):
-            return _AsyncResponse(
-                json_payload={"data": {"results": [{"geoid": "17031010100", "zip": "60654"}]}}
-            )
+            return _AsyncResponse(json_payload={"data": {"results": [{"geoid": "17031010100", "zip": "60654"}]}})
 
     zip_by_tract_geoid = {}
     assert await lodes._has_loaded_hud_tract_crosswalk(HudClient(), "token", zip_by_tract_geoid)
@@ -165,10 +164,7 @@ async def test_lodes_census_keeps_first_equal_area_and_rejects_unavailable_year(
     """Equal-area rows retain deterministic first order; unavailable artifacts resolve to none."""
 
     monkeypatch.setattr(lodes, "MIN_TRACT_CROSSWALK_ROWS", 1)
-    census_text = (
-        "GEOID_TRACT_20|GEOID_ZCTA5_20|AREALAND_PART\n"
-        "17031010100|60654|5\n17031010100|60655|5\n"
-    ).encode()
+    census_text = ("GEOID_TRACT_20|GEOID_ZCTA5_20|AREALAND_PART\n17031010100|60654|5\n17031010100|60655|5\n").encode()
 
     class CensusClient:
         def get(self, *_args, **_kwargs):
@@ -201,9 +197,7 @@ async def test_lodes_census_keeps_first_equal_area_and_rejects_unavailable_year(
 async def test_lodes_state_aggregates_valid_workers_in_bounded_batches(monkeypatch):
     """Invalid counts and unmapped blocks never enter the staged aggregate."""
 
-    payload = gzip.compress(
-        b"w_geocode,C000\n170310101001234,2\n170310101001235,3\nbad,9\n170310102001234,nope\n"
-    )
+    payload = gzip.compress(b"w_geocode,C000\n170310101001234,2\n170310101001235,3\nbad,9\n170310102001234,nope\n")
     pushed_batch_list = []
 
     class Client:
@@ -214,9 +208,7 @@ async def test_lodes_state_aggregates_valid_workers_in_bounded_batches(monkeypat
         pushed_batch_list.append((list(rows), stage))
 
     monkeypatch.setattr(lodes, "push_objects", push)
-    total = await lodes._process_lodes_state(
-        Client(), "il", 2021, {"17031010100": "60654"}, "stage", 1
-    )
+    total = await lodes._process_lodes_state(Client(), "il", 2021, {"17031010100": "60654"}, "stage", 1)
     assert total == 1
     assert pushed_batch_list[0][0][0]["zcta_code"] == "60654"
     assert pushed_batch_list[0][0][0]["total_workers"] == 5
@@ -247,9 +239,7 @@ async def test_lodes_state_rejects_http_failures_and_parser_errors_without_stagi
 async def test_lodes_state_flushes_residual_batch_and_preserves_largest_census_overlap(monkeypatch):
     """Residual aggregate rows are staged after the source stream ends, using the strongest tract match."""
 
-    payload = gzip.compress(
-        b"w_geocode,C000\n170310101001234,2\n170310102001234,3\n"
-    )
+    payload = gzip.compress(b"w_geocode,C000\n170310101001234,2\n170310102001234,3\n")
     pushed_batch_list = []
 
     class Client:
@@ -260,10 +250,17 @@ async def test_lodes_state_flushes_residual_batch_and_preserves_largest_census_o
         pushed_batch_list.append(list(rows))
 
     monkeypatch.setattr(lodes, "push_objects", push)
-    assert await lodes._process_lodes_state(
-        Client(), "il", 2021,
-        {"17031010100": "60654", "17031010200": "60655"}, "stage", 3,
-    ) == 2
+    assert (
+        await lodes._process_lodes_state(
+            Client(),
+            "il",
+            2021,
+            {"17031010100": "60654", "17031010200": "60655"},
+            "stage",
+            3,
+        )
+        == 2
+    )
     assert {staged_record["zcta_code"] for staged_record in pushed_batch_list[0]} == {"60654", "60655"}
 
 
@@ -280,9 +277,7 @@ async def test_lodes_publish_error_paths_mark_control_failure_without_swapping(m
     monkeypatch.setattr(lodes, "mark_control_run", marked)
 
     with pytest.raises(RuntimeError, match="geo_zip_lookup"):
-        await lodes.publish_lodes_generation(
-            {"import_date": "run", "context": {"run": 1, "control_run_id": "control"}}
-        )
+        await lodes.publish_lodes_generation({"import_date": "run", "context": {"run": 1, "control_run_id": "control"}})
     assert marked.await_args.kwargs["status"] == "failed"
 
     marked.reset_mock()
@@ -290,9 +285,7 @@ async def test_lodes_publish_error_paths_mark_control_failure_without_swapping(m
     monkeypatch.setattr(lodes.db, "scalar", AsyncMock(side_effect=[6000, 5500, 5000]))
     monkeypatch.setattr(lodes.db, "transaction", lambda: (_ for _ in ()).throw(RuntimeError("swap failed")))
     with pytest.raises(RuntimeError, match="swap failed"):
-        await lodes.publish_lodes_generation(
-            {"import_date": "run", "context": {"run": 1, "control_run_id": "control"}}
-        )
+        await lodes.publish_lodes_generation({"import_date": "run", "context": {"run": 1, "control_run_id": "control"}})
     assert marked.await_args.kwargs["error"]["code"] == "lodes_publish_failed"
 
 
@@ -317,12 +310,15 @@ async def test_lodes_publish_missing_stage_modes_and_test_geo(monkeypatch):
         marked_run_list.append(mark_kwargs)
 
     monkeypatch.setattr(lodes, "ensure_database", AsyncMock())
+    generation_writer = AsyncMock()
+    monkeypatch.setattr(lodes, "publish_local_reference_family_generation", generation_writer)
     monkeypatch.setattr(lodes, "make_class", lambda *_args: stage)
     monkeypatch.setattr(lodes, "mark_control_run", mark_run)
     monkeypatch.setattr(lodes, "_table_exists", AsyncMock(return_value=False))
     await lodes.publish_lodes_generation(
         {"import_date": "run", "context": {"run": 1, "test_mode": True, "control_run_id": "test"}}
     )
+    generation_writer.assert_not_awaited()
     assert marked_run_list[-1]["metrics"]["stage_rows"] == 0
 
     monkeypatch.setattr(lodes, "_table_exists", AsyncMock(return_value=False))
@@ -339,6 +335,11 @@ async def test_lodes_publish_missing_stage_modes_and_test_geo(monkeypatch):
     monkeypatch.setattr(lodes, "print_time_info", lambda _start: None)
     await lodes.publish_lodes_generation(
         {"import_date": "run", "context": {"run": 1, "test_mode": True, "control_run_id": "test"}}
+    )
+    generation_writer.assert_awaited_once_with(
+        lodes.db,
+        importer_id="lodes",
+        schema_name="mrf",
     )
     assert marked_run_list[-1]["metrics"]["geo_match_ratio"] == 0.0
 
@@ -362,7 +363,9 @@ async def test_lodes_production_thresholds_each_fail_closed(monkeypatch):
         await lodes.publish_lodes_generation({"import_date": "run", "context": {"run": 1}})
 
     monkeypatch.setattr(lodes, "_table_exists", AsyncMock(side_effect=[True, True]))
-    monkeypatch.setattr(lodes.db, "scalar", AsyncMock(side_effect=[lodes.DEFAULT_MIN_ROWS, lodes.DEFAULT_MIN_DISTINCT_ZCTAS, 0]))
+    monkeypatch.setattr(
+        lodes.db, "scalar", AsyncMock(side_effect=[lodes.DEFAULT_MIN_ROWS, lodes.DEFAULT_MIN_DISTINCT_ZCTAS, 0])
+    )
     with pytest.raises(RuntimeError, match="geo match ratio"):
         await lodes.publish_lodes_generation({"import_date": "run", "context": {"run": 1}})
 

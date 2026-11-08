@@ -1,0 +1,1079 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
+"""Bounded graph pages preserve existing family and projection semantics."""
+
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import json
+from contextlib import asynccontextmanager, contextmanager, nullcontext
+from dataclasses import replace
+from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+from sqlalchemy import select
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import DBAPIError
+
+from db.models.custom_import import (
+    CustomImportBuildCandidateContext,
+    CustomImportBuildFamily,
+    CustomImportChildRevision,
+    CustomImportChildScalar,
+    CustomImportFamilyChild,
+    CustomImportFamilyRevision,
+    CustomImportPack,
+    CustomImportRootRecord,
+    CustomImportRootRevision,
+)
+from process.custom_import import build_graph as graph
+from process.custom_import import build_source as staging
+from process.custom_import.build_source import SourceBuildRequest
+from process.custom_import.definition import CustomImportDefinition
+from process.custom_import.family import assemble_root_families
+from process.custom_import.runner_codec import (
+    child_key_document,
+    child_key_hash,
+    digest_text,
+    fields_by_collection,
+    new_family_hash,
+    record_payload,
+    root_key_document,
+    root_key_hash,
+)
+from process.custom_import.runner_types import (
+    CancellationRequested,
+    CandidateRegistry,
+    CandidateRunnerError,
+    LeaseAuthorityLost,
+)
+from tests.test_custom_import_definition import _raw_definition, _root
+from tests.test_custom_import_snowflake_shared_capture import _shared_definition
+
+
+def _request(**changes):
+    arguments_by_name = dict(
+        dataset_id=1,
+        definition_revision_id=2,
+        schema_revision_id=3,
+        execution_id=4,
+        lease_token=b"synthetic-owner",
+        fence=1,
+        definition=CustomImportDefinition.from_mapping(_raw_definition()),
+        expected_base_generation_id=None,
+        expected_pointer_version=0,
+        complete_scope=False,
+        page_row_limit=16,
+        page_byte_limit=65_536,
+        statement_timeout_ms=1000,
+        build_deadline_at=dt.datetime(2030, 1, 1, tzinfo=dt.UTC),
+        lease_seconds=120,
+    )
+    return SourceBuildRequest(**(arguments_by_name | changes))
+
+
+def _registry(definition):
+    return CandidateRegistry(
+        {collection.name: slot for slot, collection in enumerate(definition.child_collections, 1)},
+        {stream.stream_id: slot for slot, stream in enumerate(definition.source_streams, 1)},
+        1,
+    )
+
+
+def _revision(definition, collection, child_values, child_id=9, collection_slot=1):
+    payload = record_payload(fields_by_collection(definition)[collection], child_values)
+    return CustomImportChildRevision(
+        child_revision_id=child_id,
+        collection_slot=collection_slot,
+        canonical_child_key=child_key_document(definition, collection, child_values),
+        child_key_sha256=child_key_hash(definition, collection, child_values),
+        canonical_payload=payload,
+        payload_sha256=digest_text("child-payload", payload),
+        canonical_parent_key="synthetic-parent",
+        parent_key_sha256=b"p" * 32,
+    )
+
+
+def test_metadata_admission_stops_before_over_budget_payload():
+    assert graph._admitted_keys([(1, 2), (2, 3), (3, 4)], 5) == [(1,), (2,)]
+    with pytest.raises(CandidateRunnerError, match="one build record"):
+        graph._admitted_keys([(1, 6)], 5)
+
+
+@pytest.mark.parametrize(
+    "state,failure_type",
+    [("canceling", CancellationRequested), ("failed", LeaseAuthorityLost), ("completed", LeaseAuthorityLost)],
+)
+def test_read_authority_preserves_cancellation_before_payload_fetch(monkeypatch, state, failure_type):
+    request = _request()
+    build, execution = object(), SimpleNamespace(state=state)
+    identity_row = build, execution, object(), dt.datetime(2030, 1, 1, tzinfo=dt.UTC), "read committed"
+    session = SimpleNamespace(
+        begin=nullcontext,
+        execute=Mock(side_effect=[None, SimpleNamespace(one=lambda: identity_row)]),
+    )
+    verify_identity = Mock()
+    monkeypatch.setattr(graph, "_verify_request", verify_identity)
+    with pytest.raises(failure_type), graph._read_transaction(session, request, 7):
+        raise AssertionError("a non-running execution cannot read payloads")
+    verify_identity.assert_called_once_with(build, request, execution)
+    assert session.execute.call_count == 2
+
+
+def test_page_fanout_accounts_for_each_model_and_utf8_copy():
+    revision = CustomImportRootRevision(canonical_payload="é", payload_sha256=b"x" * 32)
+    assert graph._model_bytes([revision, revision]) == 68
+    graph._page_cost(_request(page_row_limit=2, page_byte_limit=68), [revision, revision])
+    with pytest.raises(CandidateRunnerError, match="byte page"):
+        graph._page_cost(_request(page_row_limit=2, page_byte_limit=67), [revision, revision])
+    with pytest.raises(CandidateRunnerError, match="row page"):
+        graph._page_cost(_request(page_row_limit=1), [revision, revision])
+    with pytest.raises(CandidateRunnerError, match="row page"):
+        graph._page_cost(_request(page_row_limit=2), [revision], reserved_rows=2)
+
+
+def _read_session(monkeypatch, pages):
+    session = SimpleNamespace(
+        info={}, execute=Mock(side_effect=[SimpleNamespace(all=lambda part=part: part) for part in pages])
+    )
+
+    @contextmanager
+    def _transaction(*_args):
+        session.info["custom_import_build_read_deadline"] = 20
+        yield None, 20
+
+    monkeypatch.setattr(graph, "_read_transaction", _transaction)
+    monkeypatch.setattr(graph, "_prepare_read", Mock())
+    monkeypatch.setattr(graph.time, "monotonic", lambda: 10)
+    return session
+
+
+def test_read_pages_fetch_only_admitted_keys_and_resume(monkeypatch):
+    session = _read_session(monkeypatch, [[(1, 3), (2, 3)], [("first",)], [(2, 3)], [("second",)], []])
+    root = CustomImportRootRevision
+    assert list(
+        graph._read_rows(session, _request(page_byte_limit=5), 7, select(root), (root.root_revision_id,), (root,))
+    ) == [("first",), ("second",)]
+    queries = [call.args[0].compile(dialect=postgresql.dialect()) for call in session.execute.call_args_list]
+    assert queries[0].params["param_1"] == 16
+    assert "octet_length" in str(queries[0])
+    assert list(queries[1].params.values()) == [[(1,)]]
+    assert any(value == 1 for value in queries[2].params.values())
+
+
+def test_changed_frozen_page_closes_before_yielding_any_payload(monkeypatch):
+    session = _read_session(monkeypatch, [[(1, 3), (2, 3)], [("first",)]])
+    original_transaction = graph._read_transaction
+    closed_pages = []
+
+    @contextmanager
+    def transaction(*args):
+        try:
+            with original_transaction(*args) as page:
+                yield page
+        finally:
+            closed_pages.append(True)
+
+    monkeypatch.setattr(graph, "_read_transaction", transaction)
+    root, received_payloads = CustomImportRootRevision, []
+    with pytest.raises(CandidateRunnerError, match="frozen build page changed during its read"):
+        received_payloads.extend(
+            graph._read_rows(session, _request(), 7, select(root), (root.root_revision_id,), (root,))
+        )
+    assert received_payloads == [] and closed_pages == [True]
+    assert session.execute.call_count == 2
+    assert all(call.args[0].is_select for call in session.execute.call_args_list)
+
+
+def test_one_read_page_stops_at_the_metadata_byte_boundary(monkeypatch):
+    session = _read_session(monkeypatch, [[(1, 3), (2, 3)], [("first",)]])
+    root = CustomImportRootRevision
+    assert list(
+        graph._read_rows(
+            session,
+            _request(page_byte_limit=5),
+            7,
+            select(root),
+            (root.root_revision_id,),
+            (root,),
+            bounds=graph._ReadPage(single_page=True),
+        )
+    ) == [("first",)]
+    assert session.execute.call_count == 2
+
+
+def test_child_batch_limit_reserves_all_scalar_and_context_rows():
+    request = _request(page_row_limit=256)
+    registry = _registry(request.definition)
+    plan = CustomImportBuildFamily(selection_kind="source")
+    child_values_by_field = dict(rate_npi="1234567893", service_code="A100", amount=Decimal("12.50"))
+    child = _revision(request.definition, "rates", child_values_by_field)
+    family = CustomImportFamilyRevision(
+        family_revision_id=7, entity_binding_id=8, root_record_id=9, root_revision_id=10, family_sha256=b"f" * 32
+    )
+    projections = graph._child_models(request, registry, 6, family, _root(), child, child_values_by_field, "rates")
+    assert graph._child_page_limit(request, registry, plan) == 256 // (len(projections) + 2)
+    plan.selection_kind = "retained"
+    assert graph._child_page_limit(request, registry, plan) == 255 // (len(projections) + 2)
+
+
+@pytest.mark.parametrize("driver", ["asyncpg", "psycopg"])
+@pytest.mark.parametrize(
+    "message,sqlstate,expected",
+    [
+        ("custom_import_build_page_too_large", "P0001", True),
+        ("custom_import_build_page_too_large", "57014", False),
+        ("custom_import_build_page_too_large", None, False),
+        ("custom_import_build_structure_mismatch", "P0001", False),
+        ("prefix custom_import_build_page_too_large", "P0001", False),
+        (None, "P0001", False),
+    ],
+)
+def test_child_batch_retries_only_the_exact_database_bound(driver, message, sqlstate, expected):
+    driver_error = RuntimeError(message)
+    driver_error.sqlstate = sqlstate
+    if driver == "asyncpg":
+        driver_error.__cause__ = RuntimeError(message)
+        driver_error.__cause__.message = message
+    else:
+        driver_error.diag = SimpleNamespace(message_primary=message)
+    assert graph._is_child_page_bound_error(DBAPIError(None, None, driver_error)) is expected
+    assert not graph._is_child_page_bound_error(CandidateRunnerError("build child payload digest differs"))
+
+
+@pytest.mark.parametrize(
+    "child_count,message,retry",
+    [
+        (4, "record projection fanout exceeds the admitted row page", True),
+        (4, "record projection fanout exceeds the admitted byte page", True),
+        (1, "record projection fanout exceeds the admitted row page", False),
+        (4, "build child payload digest differs", False),
+        (4, "prefix record projection fanout exceeds the admitted row page", False),
+    ],
+)
+async def test_child_batch_retry_preserves_the_cursor_and_exact_failure(monkeypatch, child_count, message, retry):
+    request = _request()
+    family_input = SimpleNamespace(plan=CustomImportBuildFamily(selection_kind="source"))
+    current = SimpleNamespace(attached_child_count=0, complete_at=None)
+    finished = SimpleNamespace(complete_at=dt.datetime(2030, 1, 1, tzinfo=dt.UTC))
+    child_revisions = [object() for _ in range(child_count)]
+    reads = Mock(side_effect=[(current, child_revisions), (current, child_revisions[:2]), (finished, [])])
+    failure = CandidateRunnerError(message)
+    append = AsyncMock(side_effect=[failure, None])
+    heartbeat = AsyncMock()
+    session = SimpleNamespace(run_sync=AsyncMock(side_effect=lambda callback: callback(None)))
+    monkeypatch.setattr(graph, "_session", lambda _factory: nullcontext(session))
+    monkeypatch.setattr(graph, "_child_page_limit", Mock(return_value=4))
+    monkeypatch.setattr(graph, "_next_children", reads)
+    monkeypatch.setattr(graph, "_append_child_batch", append)
+    monkeypatch.setattr(graph, "_heartbeat", heartbeat)
+    if retry:
+        await graph._append_children(None, request, None, family_input)
+        assert [call.args[-1] for call in reads.call_args_list] == [4, 2, 2]
+        assert all(call.args[-2] is current for call in append.await_args_list)
+        assert [len(call.args[-1]) for call in append.await_args_list] == [4, 2]
+        heartbeat.assert_awaited_once_with(None, request)
+    else:
+        with pytest.raises(CandidateRunnerError) as caught:
+            await graph._append_children(None, request, None, family_input)
+        assert caught.value is failure
+        assert reads.call_count == append.await_count == 1
+        heartbeat.assert_not_awaited()
+
+
+def _retry_page_error(database_error):
+    """Build an admitted page-limit error, retaining a normal driver cause chain."""
+    if not database_error:
+        return CandidateRunnerError("record projection fanout exceeds the admitted row page")
+    driver_error = RuntimeError("custom_import_build_page_too_large")
+    driver_error.sqlstate = "P0001"
+    driver_error.__cause__ = RuntimeError("custom_import_build_page_too_large")
+    driver_error.__cause__.message = "custom_import_build_page_too_large"
+    primary = DBAPIError(None, None, driver_error)
+    primary.__cause__ = driver_error
+    return primary
+
+
+def _owned_cleanup(cleanup_stage, cancelled):
+    """Control one real page-owned exit without replacing its cleanup machinery."""
+    cleanup = SimpleNamespace(
+        error=RuntimeError("synthetic cleanup failure"), entered=asyncio.Event(), release=asyncio.Event()
+    )
+
+    async def exit_owned(*_args):
+        if cancelled:
+            cleanup.entered.set()
+            await cleanup.release.wait()
+        else:
+            raise cleanup.error
+
+    cleanup.transaction_exit = AsyncMock(side_effect=exit_owned if cleanup_stage == "transaction" else None)
+    cleanup.session_exit = AsyncMock(side_effect=exit_owned if cleanup_stage == "session" else None)
+    cleanup.factory = _session_contexts(cleanup.transaction_exit, cleanup.session_exit)
+    return cleanup
+
+
+@pytest.mark.parametrize(
+    "cleanup_stage,cancelled",
+    [(None, False), ("transaction", False), ("session", False), ("transaction", True), ("session", True)],
+)
+@pytest.mark.parametrize("database_error", [False, True])
+async def test_child_batch_retry_requires_uninterrupted_owned_cleanup(
+    monkeypatch, cleanup_stage, cancelled, database_error
+):
+    """Only clean, uninterrupted page exits permit a smaller retry."""
+    primary = _retry_page_error(database_error)
+    original_cause = primary.__cause__
+    cleanup = _owned_cleanup(cleanup_stage, cancelled)
+    request = _request()
+    family_input = SimpleNamespace(plan=CustomImportBuildFamily(build_id=7, selection_kind="source"))
+    current = SimpleNamespace(attached_child_count=0, complete_at=None)
+    finished = SimpleNamespace(complete_at=dt.datetime(2030, 1, 1, tzinfo=dt.UTC))
+    child_revisions = [object() for _ in range(4)]
+    reads = Mock(side_effect=[(current, child_revisions), (current, child_revisions[:2]), (finished, [])])
+    read_session = SimpleNamespace(run_sync=AsyncMock(side_effect=lambda callback: callback(None)))
+
+    async def append_page(_factory, _request, _registry, _family_input, _current, batch):
+        if len(batch) == 4:
+            async with graph._page_session(cleanup.factory, request, 7):
+                raise primary
+
+    append = AsyncMock(side_effect=append_page)
+    heartbeat = AsyncMock()
+    monkeypatch.setattr(staging, "_lock_page", AsyncMock())
+    monkeypatch.setattr(graph, "_session", lambda _factory: nullcontext(read_session))
+    monkeypatch.setattr(graph, "_child_page_limit", Mock(return_value=4))
+    monkeypatch.setattr(graph, "_next_children", reads)
+    monkeypatch.setattr(graph, "_append_child_batch", append)
+    monkeypatch.setattr(graph, "_heartbeat", heartbeat)
+    if cleanup_stage is not None:
+        task = asyncio.create_task(graph._append_children(cleanup.factory, request, None, family_input))
+        if cancelled:
+            await cleanup.entered.wait()
+            task.cancel("secondary cancellation")
+            await asyncio.sleep(0)
+            task.cancel("repeated cancellation")
+            await asyncio.sleep(0)
+            assert not task.done()
+            cleanup.release.set()
+        with pytest.raises(type(primary)) as caught:
+            await task
+        assert caught.value is primary
+        assert primary.__cause__ is (original_cause if cancelled else cleanup.error)
+        assert reads.call_count == append.await_count == 1
+        heartbeat.assert_not_awaited()
+    else:
+        await graph._append_children(cleanup.factory, request, None, family_input)
+        assert [call.args[-1] for call in reads.call_args_list] == [4, 2, 2]
+        assert append.await_count == 2
+        assert primary.__cause__ is original_cause
+        heartbeat.assert_awaited_once_with(cleanup.factory, request)
+    cleanup.transaction_exit.assert_awaited_once()
+    cleanup.session_exit.assert_awaited_once()
+
+
+@pytest.mark.parametrize("completed", [False, True])
+async def test_child_batch_skips_progress_changed_after_the_read(monkeypatch, completed):
+    plan = CustomImportBuildFamily(build_id=7, root_record_id=8)
+    progress = SimpleNamespace(attached_child_count=0 if completed else 1, complete_at=object() if completed else None)
+    session = SimpleNamespace(get=AsyncMock(return_value=progress))
+    prepare = AsyncMock()
+    monkeypatch.setattr(graph, "_page_session", lambda *_args: nullcontext((session, object())))
+    monkeypatch.setattr(graph, "_prepare_statement", prepare)
+    await graph._append_child_batch(
+        None, _request(), None, SimpleNamespace(plan=plan), SimpleNamespace(attached_child_count=0), [object()]
+    )
+    session.get.assert_awaited_once_with(CustomImportBuildFamily, (7, 8), with_for_update=True)
+    prepare.assert_awaited_once_with(session)
+
+
+@pytest.mark.parametrize("completed,has_child", [(True, False), (False, False), (False, True)])
+def test_child_page_preserves_completion_and_admitted_children(monkeypatch, completed, has_child):
+    request = _request()
+    current = CustomImportBuildFamily(
+        build_id=7,
+        root_record_id=8,
+        selection_kind="source",
+        complete_at=dt.datetime(2030, 1, 1, tzinfo=dt.UTC) if completed else None,
+    )
+    family_input = SimpleNamespace(plan=current, root=CustomImportRootRevision(), record=CustomImportRootRecord())
+    child = object()
+    reads = Mock(side_effect=lambda *_args, **_kwargs: ((child,) for _ in range(int(has_child))))
+    monkeypatch.setattr(graph, "_one_row", Mock(return_value=(current,)))
+    monkeypatch.setattr(graph, "_read_rows", reads)
+    assert graph._next_children(None, request, _registry(request.definition), family_input, 3) == (
+        current,
+        [child] if has_child else [],
+    )
+    if completed:
+        reads.assert_not_called()
+    else:
+        assert reads.call_count == len(request.definition.child_collections)
+        assert all(call.kwargs["bounds"].row_limit == 3 for call in reads.call_args_list)
+        assert all(call.kwargs["bounds"].single_page for call in reads.call_args_list)
+
+
+@pytest.mark.parametrize("completed", [False, True])
+async def test_exhausted_child_input_requires_sql_completion(monkeypatch, completed):
+    plan = CustomImportBuildFamily(build_id=7, root_record_id=8, selection_kind="source")
+    progress = SimpleNamespace(attached_child_count=0, complete_at=None, family_revision_id=9)
+    family = SimpleNamespace(family_revision_id=9)
+    session = SimpleNamespace(get=AsyncMock(side_effect=[progress, family]), add_all=Mock())
+    commit = AsyncMock(return_value=SimpleNamespace(complete=completed))
+    monkeypatch.setattr(graph, "_page_session", lambda *_args: nullcontext((session, object())))
+    monkeypatch.setattr(graph, "_prepare_statement", AsyncMock())
+    monkeypatch.setattr(graph, "_flush_page", AsyncMock())
+    monkeypatch.setattr(graph, "append_source_child_page", commit)
+    operation = graph._append_child_batch(None, _request(), None, SimpleNamespace(plan=plan), progress, [])
+    if completed:
+        await operation
+    else:
+        with pytest.raises(CandidateRunnerError, match="family input ended before SQL completion"):
+            await operation
+    commit.assert_awaited_once_with(session, plan, progress, family, [], [])
+    assert not any(list(call.args[0]) for call in session.add_all.call_args_list)
+
+
+def test_oversize_metadata_prevents_payload_query(monkeypatch):
+    session = _read_session(monkeypatch, [[(1, 100)]])
+    root = CustomImportRootRevision
+    with pytest.raises(CandidateRunnerError, match="byte page"):
+        list(
+            graph._read_rows(session, _request(page_byte_limit=20), 7, select(root), (root.root_revision_id,), (root,))
+        )
+    assert session.execute.call_count == 1
+
+
+def test_projected_page_charges_only_explicit_variable_columns(monkeypatch):
+    session = _read_session(monkeypatch, [[(1, 3)], [(1, "one")], []])
+    root = CustomImportRootRevision
+    rows = graph._read_rows(
+        session,
+        _request(page_byte_limit=3),
+        7,
+        select(root.root_revision_id, root.canonical_payload),
+        (root.root_revision_id,),
+        (root,),
+        bounds=graph._ReadPage(variable_columns=(root.canonical_payload,)),
+    )
+    assert list(rows) == [(1, "one")]
+    metadata = str(session.execute.call_args_list[0].args[0])
+    assert "custom_import_root_revision.canonical_payload)" in metadata
+    assert "payload_sha256" not in metadata and "producing_token_sha256" not in metadata
+
+
+@pytest.mark.parametrize("metadata", [[], [(1, 1)]])
+def test_zero_remaining_payload_budget_reads_only_empty_eof(monkeypatch, metadata):
+    session = _read_session(monkeypatch, [metadata])
+    root = CustomImportRootRevision
+    rows = graph._read_rows(
+        session,
+        _request(page_byte_limit=20),
+        7,
+        select(root),
+        (root.root_revision_id,),
+        (root,),
+        bounds=graph._ReadPage(reserve_bytes=20),
+    )
+    if metadata:
+        with pytest.raises(CandidateRunnerError, match="byte page"):
+            list(rows)
+    else:
+        assert list(rows) == []
+    assert session.execute.call_count == 1
+
+
+def test_consumer_work_must_fit_latest_bounded_read_window(monkeypatch):
+    session = _read_session(monkeypatch, [[(1, 3)], [("first",)]])
+    root = CustomImportRootRevision
+    iterator = graph._read_rows(session, _request(), 7, select(root), (root.root_revision_id,), (root,))
+    assert next(iterator) == ("first",)
+    monkeypatch.setattr(graph.time, "monotonic", lambda: 21)
+    with pytest.raises(LeaseAuthorityLost):
+        next(iterator)
+
+
+def test_nested_pages_can_refresh_the_read_window(monkeypatch):
+    session = _read_session(monkeypatch, [[(1, 3)], [("first",)], []])
+    root = CustomImportRootRevision
+    iterator = graph._read_rows(session, _request(), 7, select(root), (root.root_revision_id,), (root,))
+    assert next(iterator) == ("first",)
+    session.info["custom_import_build_read_deadline"] = 30
+    monkeypatch.setattr(graph.time, "monotonic", lambda: 21)
+    assert next(iterator, None) is None
+
+
+def test_family_retry_requests_one_pending_page_after_the_durable_root(monkeypatch):
+    from process.custom_import import build_graph_prepare_page as preparation
+
+    request, registry, session = _request(), object(), object()
+    chosen = (object(), object())
+    family_page = Mock(return_value=chosen)
+    monkeypatch.setattr(preparation, "prepare_family_page", family_page)
+    assert graph._next_family_inputs(session, request, registry, 7, 10) is chosen
+    family_page.assert_called_once_with(session, request, registry, 7, 10, physical=True, prepared=None)
+
+
+def test_retained_copy_order_uses_membership_not_typed_hash():
+    plan = CustomImportBuildFamily(build_id=7, root_record_id=8, selection_kind="retained", base_family_revision_id=6)
+    statement, keys = graph._child_statement(plan, _request().definition)
+    assert [column.key for column in keys] == ["collection_slot", "child_revision_id"]
+    assert "custom_import_family_child" in str(statement)
+    statement, keys = graph._child_statement(plan, _request().definition, canonical=True)
+    assert [column.key for column in keys] == ["collection_slot", "child_key_sha256", "child_revision_id"]
+    assert statement.compile().params["origin_1"] == "retained"
+
+
+def test_source_append_cursor_uses_collection_name_not_slot():
+    registry = CandidateRegistry({"zebra": 1, "details": 3, "other": 2}, {}, 1)
+    plan = CustomImportBuildFamily(
+        build_id=7,
+        root_record_id=8,
+        selection_kind="source",
+        last_child_collection_slot=3,
+        last_child_key_sha256=b"c" * 32,
+        last_input_child_revision_id=9,
+    )
+    assert list(graph._child_ranges(registry, plan)) == [(3, (3, b"c" * 32, 9)), (2, None), (1, None)]
+    plan.last_child_collection_slot = 2
+    assert list(graph._child_ranges(registry, plan)) == [(2, (2, b"c" * 32, 9)), (1, None)]
+    plan.selection_kind = "retained"
+    assert list(graph._child_ranges(registry, plan)) == [(None, (2, 9))]
+
+
+def test_source_family_hash_uses_names_despite_reversed_collection_slots(monkeypatch):
+    document = json.loads(_shared_definition(interleaved=True).canonical)
+    document["schema"]["children"].reverse()
+    definition = CustomImportDefinition.from_mapping(document)
+    registry = _registry(definition)
+    request = _request(definition=definition)
+    root_values_by_field = dict(npi="1003000126", score=Decimal("1"), enabled=True)
+    children_by_collection = {
+        "other": [dict(other_npi="1003000126", other_id="z", other_amount=Decimal("4"))],
+        "details": [dict(detail_npi="1003000126", detail_id="a", amount=Decimal("2"))],
+    }
+    children_by_slot = {
+        registry.child_collection_slots[name]: _revision(
+            definition, name, children[0], collection_slot=registry.child_collection_slots[name]
+        )
+        for name, children in children_by_collection.items()
+    }
+    visited_slots = []
+
+    def _children(_session, _request, _build, statement, *_args, **_kwargs):
+        slot = statement.compile().params["collection_slot_1"]
+        visited_slots.append(slot)
+        yield (children_by_slot[slot],)
+
+    monkeypatch.setattr(graph, "_read_rows", _children)
+    root = CustomImportRootRevision(canonical_payload=record_payload(definition.root_fields, root_values_by_field))
+    plan = CustomImportBuildFamily(build_id=7, root_record_id=8, selection_kind="source")
+    digest, count = graph._source_family_digest(
+        None, request, registry, plan, root, CustomImportRootRecord(), root_values_by_field
+    )
+    assembled = assemble_root_families(definition, [root_values_by_field], children_by_collection)
+    assert digest == new_family_hash(definition, assembled.families[0])
+    assert count == 2
+    assert visited_slots == [registry.child_collection_slots[name] for name in sorted(children_by_collection)]
+
+
+def test_copy_models_preserve_payload_but_use_local_pack_position():
+    request = _request()
+    original = CustomImportRootRevision(
+        root_revision_id=12, canonical_payload="synthetic-payload", payload_sha256=b"p" * 32, source_ordinal=89
+    )
+    plan = CustomImportBuildFamily(build_id=7, root_record_id=8, base_family_revision_id=6, selection_kind="retained")
+    pack = CustomImportPack(pack_id=10, stream_slot=1)
+    copied = graph._copy_record(request, SimpleNamespace(plan=plan), original, pack, None)
+    copied.root_revision_id = 13
+    occurrence = graph._copy_occurrence(SimpleNamespace(build_id=7), plan, original, copied, pack, None)
+    assert copied.source_ordinal == 0 and copied.pack_id == 10
+    assert copied.canonical_payload == original.canonical_payload
+    assert occurrence.base_root_revision_id == 12 and occurrence.root_revision_id == 13
+    assert occurrence.source_ordinal is None and occurrence.origin == "retained"
+
+
+@pytest.mark.parametrize("uses_child_context", [False, True])
+def test_projection_contexts_follow_declared_profile_scope(uses_child_context):
+    document = _raw_definition()
+    if not uses_child_context:
+        for profile in document["selection_profiles"]:
+            profile["selection"] = [{"field": "display_name", "direction": "asc", "nulls": "last"}]
+            profile["context_dimensions"] = []
+    request = _request(definition=CustomImportDefinition.from_mapping(document))
+    registry = _registry(request.definition)
+    child_values_by_field = dict(rate_npi="1234567893", service_code="A100", amount=Decimal("12.50"))
+    child = _revision(request.definition, "rates", child_values_by_field)
+    family = CustomImportFamilyRevision(
+        family_revision_id=7, entity_binding_id=8, root_record_id=9, root_revision_id=10, family_sha256=b"f" * 32
+    )
+    projections = graph._child_models(request, registry, 6, family, _root(), child, child_values_by_field, "rates")
+    contexts = [model for model in projections if isinstance(model, CustomImportBuildCandidateContext)]
+    profile_count = len(request.definition.selection_profiles)
+    assert len(contexts) == (profile_count if uses_child_context else 0)
+    assert all(context.context_child_revision_id == child.child_revision_id for context in contexts)
+    assert any(isinstance(model, CustomImportFamilyChild) for model in projections)
+    assert {model.field_slot for model in projections if isinstance(model, CustomImportChildScalar)} == {
+        field.field_slot for field in request.definition.child_fields if field.projection_slot is not None
+    }
+    root_models = graph._root_models(request, registry, 6, family, _root())
+    root_contexts = [model for model in root_models if isinstance(model, CustomImportBuildCandidateContext)]
+    assert len(root_contexts) == (0 if uses_child_context else profile_count)
+    assert all(context.context_child_revision_id is None for context in root_contexts)
+
+
+def test_read_statement_budget_is_strictly_inside_remaining_window(monkeypatch):
+    session = SimpleNamespace(execute=Mock())
+    monkeypatch.setattr(graph.time, "monotonic", lambda: 10)
+    graph._prepare_read(session, _request(), 10.020)
+    timeout = next(
+        value
+        for value in session.execute.call_args.args[0].compile().params.values()
+        if type(value) is str and value.isdigit()
+    )
+    assert 0 < int(timeout) < 20
+    with pytest.raises(LeaseAuthorityLost):
+        graph._prepare_read(session, _request(), 10.001)
+
+
+@pytest.mark.asyncio
+async def test_scan_renewal_preserves_the_primary_error():
+    primary = CandidateRunnerError("synthetic page failure")
+    with pytest.raises(CandidateRunnerError) as failure:
+        async with graph._renew_while_reading(None, _request()):
+            raise primary
+    assert failure.value is primary
+
+
+def _session_contexts(transaction_exit, session_exit):
+    transaction = SimpleNamespace(__aenter__=AsyncMock(), __aexit__=transaction_exit)
+    session = SimpleNamespace(begin=lambda: transaction)
+    context = SimpleNamespace(__aenter__=AsyncMock(return_value=session), __aexit__=session_exit)
+    return lambda: context
+
+
+@pytest.mark.asyncio
+async def test_terminal_context_drains_repeated_cancellation():
+    entered, release = asyncio.Event(), asyncio.Event()
+    primary = CandidateRunnerError("first body error")
+
+    async def _transaction_exit(*_args):
+        entered.set()
+        await release.wait()
+        raise RuntimeError("late rollback failure")
+
+    session_exit = AsyncMock(side_effect=RuntimeError("late session close failure"))
+    factory = _session_contexts(_transaction_exit, session_exit)
+
+    async def _operation():
+        async with graph._session(factory, transaction=True):
+            raise primary
+
+    task = asyncio.create_task(_operation())
+    await entered.wait()
+    task.cancel("second")
+    await asyncio.sleep(0)
+    task.cancel("third")
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    with pytest.raises(CandidateRunnerError) as failure:
+        await task
+    assert failure.value is primary
+    session_exit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_terminal_context_keeps_first_commit_error():
+    primary = ConnectionError("commit acknowledgement lost")
+    commit_exit = AsyncMock(side_effect=primary)
+    session_exit = AsyncMock(side_effect=RuntimeError("session close failed"))
+    with pytest.raises(ConnectionError) as failure:
+        async with graph._session(_session_contexts(commit_exit, session_exit), transaction=True) as session:
+            assert session.begin is not None
+    assert failure.value is primary
+    assert isinstance(primary.__cause__, RuntimeError)
+    session_exit.assert_awaited_once()
+
+
+def _retained_case(*, root_profile=False):
+    document = _raw_definition()
+    if root_profile:
+        document["selection_profiles"][0].update(
+            selection=[{"field": "display_name", "direction": "asc", "nulls": "last"}], context_dimensions=["npi"]
+        )
+    request = _request(definition=CustomImportDefinition.from_mapping(document), page_row_limit=256)
+    registry = _registry(request.definition)
+    plan = CustomImportBuildFamily(
+        build_id=7,
+        root_record_id=8,
+        selection_kind="retained",
+        base_family_revision_id=6,
+        family_revision_id=90,
+        attached_child_count=0,
+    )
+    root_values = _root()
+    root_payload = record_payload(request.definition.root_fields, root_values)
+    root = CustomImportRootRevision(
+        root_revision_id=80,
+        root_record_id=8,
+        canonical_payload=root_payload,
+        payload_sha256=digest_text("root-payload", root_payload),
+    )
+    root_record = CustomImportRootRecord(
+        root_record_id=8,
+        canonical_logical_key=root_key_document(request.definition, root_values),
+        logical_key_sha256=root_key_hash(request.definition, root_values),
+    )
+    family_input = SimpleNamespace(
+        plan=plan,
+        root=root,
+        record=root_record,
+        values=root_values,
+        family_sha256=b"f" * 32,
+        child_count=2,
+        entity_binding_id=9,
+    )
+    family = CustomImportFamilyRevision(
+        family_revision_id=90,
+        root_record_id=8,
+        root_revision_id=81,
+        entity_binding_id=9,
+        family_sha256=b"f" * 32,
+    )
+    child_revisions = [
+        _revision(
+            request.definition,
+            "rates",
+            dict(rate_npi=root_values["npi"], service_code=key, amount=Decimal("1")),
+            child_id,
+        )
+        for key, child_id in (("a", 10), ("b", 20))
+    ]
+    for child in child_revisions:
+        child.canonical_parent_key = root_record.canonical_logical_key
+        child.parent_key_sha256 = root_record.logical_key_sha256
+    return request, registry, family_input, family, child_revisions
+
+
+@pytest.mark.parametrize("root_profile", [False, True])
+def test_retained_root_arguments_reuse_current_contexts_and_exact_budget(monkeypatch, root_profile):
+    request, registry, family_input, _family, _children = _retained_case(root_profile=root_profile)
+    cost = Mock(wraps=graph._page_cost)
+    monkeypatch.setattr(graph, "_page_cost", cost)
+    arguments = graph._retained_root_arguments(request, registry, family_input)
+    assert arguments[4:10] == (
+        ("bigint", 8),
+        ("bigint", 6),
+        ("bigint", 80),
+        ("bigint", 9),
+        ("bytea", b"f" * 32),
+        ("bigint", 2),
+    )
+    assert arguments[-2] == ("smallint[]", (1,) if root_profile else ())
+    assert len(arguments[-1][1]) == int(root_profile)
+    models = cost.call_args.args[1]
+    models = [
+        *models,
+        *(
+            (graph.CustomImportRootScalar if "field_slot" in row else CustomImportBuildCandidateContext)(**row)
+            for row in cost.call_args.kwargs["projection_values"]
+        ),
+    ]
+    rows, size = len(models), graph._model_bytes(models)
+    assert sum(isinstance(model, CustomImportPack) for model in models) == 1
+    graph._retained_root_arguments(replace(request, page_row_limit=rows, page_byte_limit=size), registry, family_input)
+    for changed in (replace(request, page_row_limit=rows - 1), replace(request, page_byte_limit=size - 1)):
+        with pytest.raises(CandidateRunnerError, match="fanout exceeds"):
+            graph._retained_root_arguments(changed, registry, family_input)
+
+
+@pytest.mark.parametrize("failure", [None, asyncio.CancelledError(), ConnectionError("uncertain commit")])
+async def test_retained_root_uses_one_protected_call_and_page_cleanup(monkeypatch, failure):
+    request, registry, family_input, _family, _children = _retained_case(root_profile=True)
+    events = []
+    session = SimpleNamespace(get=AsyncMock(), add=Mock(), add_all=Mock())
+
+    @asynccontextmanager
+    async def page(*_args):
+        events.append("enter")
+        try:
+            yield session, object()
+        finally:
+            events.append("exit")
+
+    call = AsyncMock(side_effect=failure, return_value=SimpleNamespace(scalar_one=lambda: 90))
+    monkeypatch.setattr(graph, "_page_session", page)
+    monkeypatch.setattr(graph, "_source_call", call)
+    if failure is None:
+        await graph._start_family(None, request, registry, family_input)
+        first_arguments = call.await_args.args[2]
+        await graph._start_family(None, request, registry, family_input)
+        assert call.await_args.args[2] == first_arguments
+        assert events == ["enter", "exit", "enter", "exit"]
+    else:
+        with pytest.raises(type(failure)) as caught:
+            await graph._start_family(None, request, registry, family_input)
+        assert caught.value is failure
+        assert events == ["enter", "exit"]
+    assert call.await_args.args[:2] == (session, "retained_root_finalize")
+    session.get.assert_not_awaited()
+    session.add.assert_not_called()
+    session.add_all.assert_not_called()
+    assert not hasattr(graph, "_commit_family")
+
+
+async def test_retained_children_use_one_call_without_per_child_writes(monkeypatch):
+    request, registry, family_input, family, children = _retained_case()
+    current = family_input.plan
+    session = SimpleNamespace(get=AsyncMock(side_effect=[current, family]), add_all=Mock())
+    call = AsyncMock(return_value=SimpleNamespace(one=lambda: SimpleNamespace(complete=False)))
+    old_projection = AsyncMock()
+    monkeypatch.setattr(graph, "_page_session", lambda *_args: nullcontext((session, object())))
+    monkeypatch.setattr(graph, "_prepare_statement", AsyncMock())
+    monkeypatch.setattr(graph, "_source_call", call)
+    monkeypatch.setattr(graph, "_child_page_models", old_projection)
+    await graph._append_child_batch(None, request, registry, family_input, current, children)
+    assert call.await_count == 1
+    assert call.await_args.args[:2] == (session, "retained_array_finalize")
+    assert call.await_args.args[2][9] == ("bigint[]", (10, 20))
+    session.add_all.assert_not_called()
+    assert not hasattr(graph, "_commit_family")
+    old_projection.assert_not_awaited()
+
+
+async def test_retained_cursor_change_with_same_count_restarts_before_call(monkeypatch):
+    request, registry, family_input, _family, children = _retained_case()
+    progress = CustomImportBuildFamily(
+        attached_child_count=0, family_revision_id=90, last_child_collection_slot=1, last_input_child_revision_id=5
+    )
+    session = SimpleNamespace(get=AsyncMock(return_value=progress))
+    call = AsyncMock()
+    monkeypatch.setattr(graph, "_page_session", lambda *_args: nullcontext((session, object())))
+    monkeypatch.setattr(graph, "_prepare_statement", AsyncMock())
+    monkeypatch.setattr(graph, "_source_call", call)
+    await graph._append_child_batch(None, request, registry, family_input, family_input.plan, children)
+    assert session.get.await_count == 1
+    call.assert_not_awaited()
+
+
+def test_retained_read_stops_at_collection_boundary_and_closes_before_resume(monkeypatch):
+    request, registry, family_input, _family, _children = _retained_case()
+    current = family_input.plan
+    rows = [
+        SimpleNamespace(collection_slot=slot, child_revision_id=child_id)
+        for slot, child_id in ((1, 10), (1, 20), (2, 5), (2, 15))
+    ]
+    closed, cursors = [], []
+
+    def read(*_args, **kwargs):
+        cursor = kwargs["after"]
+        cursors.append(cursor)
+        try:
+            for child in rows:
+                if cursor is None or (child.collection_slot, child.child_revision_id) > cursor:
+                    yield (child,)
+        finally:
+            closed.append(cursor)
+
+    monkeypatch.setattr(graph, "_one_row", Mock(return_value=(current,)))
+    monkeypatch.setattr(graph, "_read_rows", read)
+    assert graph._next_children(None, request, registry, family_input, 4)[1] == rows[:2]
+    assert closed == [None]
+    current.last_child_collection_slot, current.last_input_child_revision_id = 1, 20
+    assert graph._next_children(None, request, registry, family_input, 4)[1] == rows[2:]
+    assert cursors == closed == [None, (1, 20)]
+
+
+@pytest.mark.parametrize(
+    "metadata,physical_rows,reserve_bytes,message",
+    [
+        ([(1, None)], 100, 0, "invalid byte metadata"),
+        ([(1, True)], 100, 0, "invalid byte metadata"),
+        ([(1, -1)], 100, 0, "invalid byte metadata"),
+        ([(1, 0), (1, 0)], 100, 0, "duplicate keys"),
+        ([(1, 0), (2, 0)], 3, 0, "metadata exceeds"),
+        ([], 100, graph.MAX_BATCH_BYTES + 1, "no remaining payload budget"),
+    ],
+)
+def test_physical_metadata_failure_prevents_payload_read(monkeypatch, metadata, physical_rows, reserve_bytes, message):
+    session = _read_session(monkeypatch, [metadata])
+    monkeypatch.setattr(graph, "MAX_BATCH_ROWS", physical_rows)
+    root = CustomImportRootRevision
+    with pytest.raises(CandidateRunnerError, match=message):
+        list(
+            graph._read_rows(
+                session,
+                _request(),
+                7,
+                select(root),
+                (root.root_revision_id,),
+                (root,),
+                bounds=graph._ReadPage(physical=True, reserve_bytes=reserve_bytes),
+            )
+        )
+    assert session.execute.call_count == int(not reserve_bytes)
+
+
+def test_physical_read_rejects_unbounded_keys_before_metadata(monkeypatch):
+    session = _read_session(monkeypatch, [])
+    root = CustomImportRootRevision
+    with pytest.raises(CandidateRunnerError, match="bounded key columns"):
+        list(
+            graph._read_rows(
+                session,
+                _request(),
+                7,
+                select(root),
+                (root.canonical_payload,),
+                (root,),
+                bounds=graph._ReadPage(physical=True),
+            )
+        )
+    session.execute.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["partial_cursor", "source_cursor", "duplicate", "regression", "native_id", "collection", "boundary"],
+)
+def test_retained_page_rejects_invalid_cursor_or_child_order(corruption):
+    request = _request(definition=_shared_definition(interleaved=True))
+    registry = _registry(request.definition)
+    current = CustomImportBuildFamily()
+    first_slot, second_slot = registry.child_collection_slots.values()
+    child_rows = [SimpleNamespace(collection_slot=first_slot, child_revision_id=10)]
+    match corruption:
+        case "partial_cursor":
+            current.last_child_collection_slot = first_slot
+        case "source_cursor":
+            current.last_child_key_sha256 = b"x" * 32
+        case "duplicate":
+            child_rows *= 2
+        case "regression":
+            current.last_child_collection_slot, current.last_input_child_revision_id = first_slot, 10
+        case "native_id":
+            child_rows[0].child_revision_id = True
+        case "collection":
+            child_rows[0].collection_slot = 0
+        case "boundary":
+            child_rows.append(SimpleNamespace(collection_slot=second_slot, child_revision_id=20))
+    with pytest.raises(CandidateRunnerError, match="retained (child order|page crosses)"):
+        graph._retained_page_scope(request, registry, current, child_rows)
+    assert graph._retained_page_scope(request, registry, CustomImportBuildFamily(), []) == (None, None)
+
+
+@pytest.mark.parametrize("corruption", ["selection", "complete", "build", "binding", "row_limit", "payload_hash"])
+def test_retained_array_rejects_unrelated_or_corrupt_page(corruption):
+    request, registry, family_input, family, child_rows = _retained_case()
+    current = family_input.plan
+    match corruption:
+        case "selection":
+            current.selection_kind = "source"
+        case "complete":
+            current.complete_at = dt.datetime(2030, 1, 1, tzinfo=dt.UTC)
+        case "build":
+            family_input.plan = SimpleNamespace(selection_kind="retained", build_id=99, root_record_id=8)
+        case "binding":
+            family.entity_binding_id += 1
+        case "row_limit":
+            request = replace(request, page_row_limit=1)
+        case "payload_hash":
+            child_rows[0].payload_sha256 = b"x" * 32
+    message = "fanout exceeds" if corruption == "row_limit" else "retained (page identity|child payload digest) differs"
+    with pytest.raises(CandidateRunnerError, match=message):
+        graph._retained_array_arguments(request, registry, family_input, current, family, child_rows)
+
+
+async def test_unknown_family_selection_never_calls_protected_writer(monkeypatch):
+    request, registry, family_input, _family, _children = _retained_case()
+    family_input.plan.selection_kind = "unknown"
+    call = AsyncMock()
+    monkeypatch.setattr(graph, "_page_session", lambda *_args: nullcontext((object(), object())))
+    monkeypatch.setattr(graph, "_source_call", call)
+    with pytest.raises(CandidateRunnerError, match="family selection differs"):
+        await graph._start_family(None, request, registry, family_input)
+    call.assert_not_awaited()
+
+
+@pytest.mark.parametrize("complete", [False, True])
+async def test_retained_eof_requires_sql_completion(monkeypatch, complete):
+    request, registry, family_input, family, _children = _retained_case()
+    current = family_input.plan
+    session = SimpleNamespace(get=AsyncMock(side_effect=[current, family]))
+    call = AsyncMock(return_value=SimpleNamespace(one=lambda: SimpleNamespace(complete=complete)))
+    monkeypatch.setattr(graph, "_page_session", lambda *_args: nullcontext((session, object())))
+    monkeypatch.setattr(graph, "_prepare_statement", AsyncMock())
+    monkeypatch.setattr(graph, "_source_call", call)
+    operation = graph._append_child_batch(None, request, registry, family_input, current, [])
+    if complete:
+        await operation
+    else:
+        with pytest.raises(CandidateRunnerError, match="ended before SQL completion"):
+            await operation
+    call.assert_awaited_once()
+    assert call.await_args.args[:2] == (session, "retained_array_finalize")
+    assert call.await_args.args[2][9:] == (("bigint[]", ()), ("bigint[]", ()), ("smallint[]", ()), ("text[]", ()))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("capture_state", "pending"), ("dataset_id", 99), ("definition_revision_id", 99), ("schema_revision_id", 99)],
+)
+def test_source_digest_refuses_unsealed_or_foreign_capture_before_scanning(monkeypatch, field, value):
+    request = _request()
+    bundle = SimpleNamespace(
+        capture_state="sealed",
+        dataset_id=request.dataset_id,
+        definition_revision_id=request.definition_revision_id,
+        schema_revision_id=request.schema_revision_id,
+    )
+    setattr(bundle, field, value)
+    before = vars(bundle).copy()
+    lookup, scan = Mock(return_value=(bundle,)), Mock()
+    monkeypatch.setattr(graph, "_one_row", lookup)
+    monkeypatch.setattr(graph, "_read_rows", scan)
+    with pytest.raises(CandidateRunnerError, match="build capture identity is not sealed"):
+        graph._source_digest(None, request, 7, 20)
+    lookup.assert_called_once()
+    scan.assert_not_called()
+    assert vars(bundle) == before
+
+
+@pytest.mark.asyncio
+async def test_open_output_replay_reuses_generation_without_allocating_or_advancing(monkeypatch):
+    request = _request()
+    build = SimpleNamespace(generation_id=10, capture_bundle_id=20, base_generation_id=None, phase="output")
+    before_build_state = vars(build).copy()
+    read_session = SimpleNamespace(run_sync=AsyncMock(side_effect=lambda operation: operation(read_session)))
+    write_session = SimpleNamespace(add=Mock(), execute=AsyncMock(), flush=AsyncMock())
+    closed_pages = []
+
+    @asynccontextmanager
+    async def page(*_args):
+        try:
+            yield write_session, build
+        finally:
+            closed_pages.append(True)
+
+    candidate = Mock(return_value=(b"c" * 32, 1))
+    source_digest_probe, writer = Mock(return_value=b"s" * 32), AsyncMock()
+    monkeypatch.setattr(graph, "_session", lambda *_args: nullcontext(read_session))
+    monkeypatch.setattr(graph, "_page_session", page)
+    monkeypatch.setattr(graph, "_candidate_digest", candidate)
+    monkeypatch.setattr(graph, "_source_digest", source_digest_probe)
+    monkeypatch.setattr(graph, "_call", writer)
+
+    assert await graph._open_output(None, request, 7, 20) == 10
+
+    candidate.assert_called_once_with(read_session, request, 7, bounds=graph._ReadPage(physical=True))
+    source_digest_probe.assert_called_once_with(read_session, request, 7, 20)
+    assert read_session.run_sync.await_count == 2 and closed_pages == [True]
+    assert vars(build) == before_build_state
+    write_session.add.assert_not_called()
+    write_session.execute.assert_not_awaited()
+    write_session.flush.assert_not_awaited()
+    writer.assert_not_awaited()

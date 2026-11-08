@@ -9,6 +9,10 @@ from dataclasses import dataclass, field
 import hashlib
 import os
 from typing import Any, AsyncIterable, Awaitable, Callable, Mapping
+from process.provider_directory_projection_contract import (
+    CMS_NPD_NPI_IDENTITY_POLICY,
+    validated_physical_projection_recipe_identity,
+)
 
 from process.provider_directory_projection_copy_summary import (
     NATIVE_CANONICAL_ROW_CONTRACT_ID,
@@ -235,10 +239,13 @@ def validate_native_projection_recipe(recipe: Any) -> None:
         getattr(recipe, "decoder_contract_id", None) != NATIVE_DECODER_CONTRACT_ID
         or getattr(recipe, "transform_contract_id", None)
         != NATIVE_TRANSFORM_CONTRACT_ID
+        or getattr(recipe, "transform_context", {}).get("npi_identity_policy")
+        not in (None, CMS_NPD_NPI_IDENTITY_POLICY)
     ):
         raise ProviderDirectoryProjectionError(
             "provider_directory_projection_native_input_invalid"
         )
+    validated_physical_projection_recipe_identity(recipe)
 
 
 async def _launch_native_copy_process(
@@ -246,6 +253,8 @@ async def _launch_native_copy_process(
     framing: str,
     settings: _NativeExecutionSettings,
 ) -> Any:
+    policy = claim.recipe_lease.recipe.transform_context.get("npi_identity_policy")
+    policy_args = (CMS_NPD_NPI_IDENTITY_POLICY,) if policy == CMS_NPD_NPI_IDENTITY_POLICY else ()
     process = await asyncio.create_subprocess_exec(
         settings.executable,
         "--provider-directory-materialize-stdio-v2",
@@ -253,6 +262,7 @@ async def _launch_native_copy_process(
         claim.shard.partition_id,
         str(claim.shard.partition_ordinal),
         framing,
+        *policy_args,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

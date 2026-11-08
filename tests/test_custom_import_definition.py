@@ -28,6 +28,38 @@ from process.custom_import import (
 FIXTURES = Path(__file__).with_name("fixtures") / "custom_import"
 
 
+def test_yaml_numeric_keys_are_rejected_before_definition_parsing():
+    with pytest.raises(DefinitionError, match="YAML object keys must be strings"):
+        load_yaml_definition("1: synthetic\n")
+
+
+@pytest.mark.parametrize(
+    "mutate,message",
+    [
+        (lambda raw: raw["revision"].update(definition=True), "integer >= 1"),
+        (lambda raw: raw.update(contract="custom-import/unknown"), "definition.contract"),
+        (lambda raw: raw["query"].update(aliases=[]), "aliases must be an object"),
+    ],
+)
+def test_definition_refuses_invalid_contract_schema_and_query_shapes(mutate, message):
+    _assert_invalid_definition(mutate, message)
+
+
+def test_grouped_selection_refuses_an_incomplete_root_identity():
+    from tests.custom_import_grouped_support import definition_document
+
+    document = definition_document()
+    document["schema"]["root"]["logical_key"].pop()
+    document["schema"]["children"][0]["parent_key"].pop()
+    with pytest.raises(DefinitionError, match="complete entity, selection, and group root key"):
+        CustomImportDefinition.from_mapping(document)
+
+
+def test_field_identity_validation_requires_a_root_scope():
+    with pytest.raises(DefinitionError, match="root.fields must not be empty"):
+        custom_import_definition._validate_field_identity((), ())
+
+
 @pytest.fixture
 def definition():
     return CustomImportDefinition.from_json((FIXTURES / "v1_valid.json").read_text())
@@ -246,6 +278,22 @@ def test_definition_rejects_incomplete_child_identity_mappings(mutate, message):
             "permitted query fields",
         ),
         (
+            lambda raw: raw["query"].update({"aliases": {"metric": "rate_npi"}}),
+            "target permitted query fields",
+        ),
+        (
+            lambda raw: raw["query"].update({"aliases": {"npi": "amount"}}),
+            "collide with canonical field ids",
+        ),
+        (
+            lambda raw: raw["query"].update({"sortable_fields": ["amount", "amount"]}),
+            "unique permitted query fields",
+        ),
+        (
+            lambda raw: raw["query"].update({"sortable_fields": ["rate_npi"]}),
+            "unique permitted query fields",
+        ),
+        (
             lambda raw: raw["selection_profiles"][0].update({"context_dimensions": ["service_code", "service_code"]}),
             "at most two unique",
         ),
@@ -289,16 +337,57 @@ def test_definition_permits_root_only_query_contexts():
     assert definition.query.child_fields == ()
 
 
+def test_definition_declares_separate_query_aliases_and_sortable_fields():
+    raw = _raw_definition()
+    raw["query"].update(
+        {
+            "aliases": {"metric": "amount", "provider": "display_name"},
+            "sortable_fields": ["amount", "display_name"],
+        }
+    )
+
+    definition = CustomImportDefinition.from_mapping(raw)
+
+    assert definition.query.resolve_field_id("amount") == "amount"
+    assert definition.query.resolve_field_id("metric") == "amount"
+    assert definition.query.resolve_field_id("missing") is None
+    assert definition.query.sortable_fields == ("amount", "display_name")
+
+
+def test_query_contract_constructor_keeps_legacy_defaults():
+    query = custom_import_definition.QueryContract(("npi",), None, (), ())
+
+    assert query.aliases == ()
+    assert query.sortable_fields == ()
+
+
 def test_alias_only_revision_keeps_schema_and_stable_slots():
     first = CustomImportDefinition.from_mapping(_raw_definition())
     second_raw = _raw_definition()
     second_raw["revision"]["definition"] = 2
     second_raw["aliases"]["providers"]["Provider Identifier"] = "npi"
+    second_raw["query"]["aliases"] = {"provider": "display_name"}
+    second_raw["query"]["sortable_fields"] = ["display_name"]
     second = CustomImportDefinition.from_mapping(second_raw, previous=first)
 
     assert second.schema_revision == first.schema_revision
     assert second.schema_digest == first.schema_digest
     assert {field.field_slot for field in second.fields} == {1, 2, 3, 4, 5}
+
+
+@pytest.mark.parametrize(
+    "change", (lambda aliases: aliases.pop("metric"), lambda aliases: aliases.update(metric="display_name"))
+)
+def test_published_query_alias_cannot_be_removed_or_rebound(change):
+    first_raw = _raw_definition()
+    first_raw["query"]["aliases"] = {"metric": "amount"}
+    first = CustomImportDefinition.from_mapping(first_raw)
+    second_raw = copy.deepcopy(first_raw)
+    second_raw["revision"]["definition"] = 2
+    change(second_raw["query"]["aliases"])
+
+    with pytest.raises(DefinitionError, match="cannot be removed or rebound"):
+        CustomImportDefinition.from_mapping(second_raw, previous=first)
 
 
 def test_definition_revision_cannot_move_an_existing_field_to_a_new_slot():
@@ -441,6 +530,14 @@ def test_source_tokens_reject_empty_stream_observations(definition):
         validate_source_snapshot_tokens(
             definition,
             {"providers": [], "rates": ["snapshot-1"]},
+        )
+
+
+def test_source_tokens_reject_duplicate_identical_observations(definition):
+    with pytest.raises(SourceSnapshotError, match="exactly one snapshot token observation"):
+        validate_source_snapshot_tokens(
+            definition,
+            {"providers": ["snapshot-1", "snapshot-1"], "rates": ["snapshot-1"]},
         )
 
 

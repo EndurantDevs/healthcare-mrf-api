@@ -5,10 +5,10 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
 import datetime as dt
 import hashlib
 import json
+from contextlib import asynccontextmanager
 
 from process import uhc_flex_practitioner_acquisition as acquisition
 from process.uhc_flex_official_cohort_contract import (
@@ -21,8 +21,8 @@ from process.uhc_flex_practitioner_query import (
     validate_uhc_flex_practitioner_search_bundle,
 )
 from process.uhc_flex_practitioner_registration import (
-    uhc_flex_practitioner_endpoint_identity,
     UHCFlexPractitionerRegistrationResult,
+    uhc_flex_practitioner_endpoint_identity,
 )
 from process.uhc_flex_practitioner_store import (
     UHCFlexPractitionerAcquisitionSummary,
@@ -30,11 +30,10 @@ from process.uhc_flex_practitioner_store import (
     UHCFlexPractitionerWorkClaim,
 )
 from process.uhc_flex_practitioner_twin_store_contract import (
+    UHCFlexPractitionerSealedRoot,
     build_uhc_flex_practitioner_twin_admission,
     build_uhc_flex_practitioner_twin_attempt,
-    UHCFlexPractitionerSealedRoot,
 )
-
 
 OPERATION_KEY = "a" * 64
 PROJECTION_DATE = "2026-08-10"
@@ -111,9 +110,11 @@ class FakeDatabase:
     def __init__(self) -> None:
         self.commits = 0
         self.rollbacks = 0
+        self.depth = 0
 
     @asynccontextmanager
     async def transaction(self):
+        self.depth += 1
         try:
             yield self
         except BaseException:
@@ -121,6 +122,8 @@ class FakeDatabase:
             raise
         else:
             self.commits += 1
+        finally:
+            self.depth -= 1
 
 
 class AcquisitionHarness:
@@ -163,7 +166,8 @@ class AcquisitionHarness:
         index = min(self.events.count("register") - 1, len(self.registrations) - 1)
         return self.registrations[index]
 
-    async def sync_cohort(self, *, database):
+    async def sync_cohort(self, *, database, expected_cohort=None):
+        assert (expected_cohort is not None) is (database.depth > 0)
         self.events.append("cohort")
         index = min(self.events.count("cohort") - 1, len(self.cohorts) - 1)
         return UHCFlexOfficialCohortSyncResult(self.cohorts[index], False)
@@ -191,16 +195,10 @@ class AcquisitionHarness:
     ):
         pending = self.pending[acquisition_id]
         if requested_npi is None:
-            eligible_npis = [
-                npi for npi in pending if npi not in excluded_npis
-            ]
+            eligible_npis = [npi for npi in pending if npi not in excluded_npis]
             if not eligible_npis:
                 return None
-            fresh_npis = [
-                npi
-                for npi in eligible_npis
-                if self.attempts.get((acquisition_id, npi), 0) == 0
-            ]
+            fresh_npis = [npi for npi in eligible_npis if self.attempts.get((acquisition_id, npi), 0) == 0]
             candidates = fresh_npis if fresh_only is True else fresh_npis or eligible_npis
             if not candidates:
                 return None
@@ -214,9 +212,7 @@ class AcquisitionHarness:
         attempt_key = (acquisition_id, npi)
         attempt = self.attempts.get(attempt_key, 0) + 1
         self.attempts[attempt_key] = attempt
-        lease_token = hashlib.sha256(
-            f"{acquisition_id}:{npi}:{attempt}".encode()
-        ).hexdigest()
+        lease_token = hashlib.sha256(f"{acquisition_id}:{npi}:{attempt}".encode()).hexdigest()
         claim = UHCFlexPractitionerWorkClaim(
             acquisition_id=acquisition_id,
             cohort_id=self.identities[acquisition_id].cohort_id,
@@ -249,9 +245,7 @@ class AcquisitionHarness:
                     self.fetch_barrier.set()
                 await self.fetch_barrier.wait()
                 await asyncio.sleep(0)
-            planned_error = self.fetch_failures.get(
-                (role, requested_npi, call_number)
-            )
+            planned_error = self.fetch_failures.get((role, requested_npi, call_number))
             if planned_error is not None:
                 raise planned_error
             return query_result_fixture(requested_npi)
@@ -272,9 +266,7 @@ class AcquisitionHarness:
             query_result.resource_count,
             None,
         )
-        self.events.append(
-            f"complete:{self.acquisition_role(claim.acquisition_id)}"
-        )
+        self.events.append(f"complete:{self.acquisition_role(claim.acquisition_id)}")
 
     async def complete_error(self, claim, *, error_code, database):
         claim_key = self.active_claim_key(claim)
@@ -285,27 +277,18 @@ class AcquisitionHarness:
             0,
             error_code,
         )
-        self.events.append(
-            f"error:{self.acquisition_role(claim.acquisition_id)}:{error_code}"
-        )
+        self.events.append(f"error:{self.acquisition_role(claim.acquisition_id)}:{error_code}")
 
     async def release_work(self, claim, *, database):
         claim_key = self.active_claim_key(claim)
         self.active.pop(claim_key)
         self.pending[claim.acquisition_id].append(claim.requested_npi)
         self.pending[claim.acquisition_id].sort()
-        self.events.append(
-            f"release:{self.acquisition_role(claim.acquisition_id)}"
-        )
+        self.events.append(f"release:{self.acquisition_role(claim.acquisition_id)}")
 
     def terminal_hash(self, acquisition_id: str) -> str:
-        terminal_rows = [
-            (npi, *self.terminal[acquisition_id][npi])
-            for npi in sorted(self.terminal[acquisition_id])
-        ]
-        return hashlib.sha256(
-            json.dumps(terminal_rows, separators=(",", ":")).encode()
-        ).hexdigest()
+        terminal_rows = [(npi, *self.terminal[acquisition_id][npi]) for npi in sorted(self.terminal[acquisition_id])]
+        return hashlib.sha256(json.dumps(terminal_rows, separators=(",", ":")).encode()).hexdigest()
 
     async def seal_root(self, identity, *, database):
         role = identity.acquisition_role
@@ -313,10 +296,7 @@ class AcquisitionHarness:
         if identity.acquisition_id in self.summaries:
             return self.summaries[identity.acquisition_id]
         terminal = self.terminal[identity.acquisition_id]
-        error_count = sum(
-            terminal_value[0] == "error"
-            for terminal_value in terminal.values()
-        )
+        error_count = sum(terminal_value[0] == "error" for terminal_value in terminal.values())
         if (
             self.pending[identity.acquisition_id]
             or any(key[0] == identity.acquisition_id for key in self.active)
@@ -327,19 +307,10 @@ class AcquisitionHarness:
         summary = UHCFlexPractitionerAcquisitionSummary(
             acquisition_id=identity.acquisition_id,
             expected_npi_count=identity.expected_npi_count,
-            matched_count=sum(
-                terminal_value[0] == "matched"
-                for terminal_value in terminal.values()
-            ),
-            unmatched_count=sum(
-                terminal_value[0] == "unmatched"
-                for terminal_value in terminal.values()
-            ),
+            matched_count=sum(terminal_value[0] == "matched" for terminal_value in terminal.values()),
+            unmatched_count=sum(terminal_value[0] == "unmatched" for terminal_value in terminal.values()),
             error_count=0,
-            resource_count=sum(
-                terminal_value[2]
-                for terminal_value in terminal.values()
-            ),
+            resource_count=sum(terminal_value[2] for terminal_value in terminal.values()),
             terminal_set_sha256=self.terminal_hash(identity.acquisition_id),
             cohort_complete=True,
             endpoint_collection_complete=False,

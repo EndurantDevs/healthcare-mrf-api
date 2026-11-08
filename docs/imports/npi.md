@@ -16,6 +16,26 @@ python main.py start npi
 python main.py worker process.NPI --burst
 ```
 
+Managed launches use `HLTHPRT_NPI_SOURCE_WORKER_IMAGE` when set; its value must
+be an immutable image digest reference. When unset,
+`HLTHPRT_REFERENCE_SOURCE_WORKER_IMAGE` remains the fallback. An explicitly empty
+NPI override is rejected. This override applies only to NPI workers.
+
+### Ownership-sealed publication
+
+An issued isolated worker keeps source evidence, candidate tables and its publication
+record in dedicated namespaces. It publishes the six NPI table families, canonical
+address contribution and terminal import result atomically while preserving the
+previous snapshot for existing readers and rollback.
+
+Before switching to ownership-sealed NPI tables, set
+`HLTHPRT_NPI_API_UPDATE_GEOCODE=0` so API geocoding does not update immutable import
+rows. Cached coordinates and synchronous geocoding responses remain available.
+When no legacy seal matches the current tables, API cache keys require the native
+generation, all six current relation OIDs and canonical publication provenance.
+This mode uses its protected native publication record; the legacy seal proof below
+applies to ordinary publication.
+
 ## Required Evidence Configuration
 Every controlled NPI run fails closed unless all four settings are present:
 

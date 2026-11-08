@@ -75,6 +75,10 @@ async def _create_tables(database: Database, schema: str) -> None:
         """
     )
     await database.status(
+        f"CREATE TABLE {schema}.provider_directory_cms_npd_stale_candidate "
+        "(dataset_id varchar(96) PRIMARY KEY);"
+    )
+    await database.status(
         f"""
         CREATE FUNCTION {schema}.provider_directory_endpoint_dataset_admission_metadata_sha256(
             jsonb, smallint, text, text, varchar[]

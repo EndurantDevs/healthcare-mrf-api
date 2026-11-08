@@ -179,6 +179,18 @@ def test_npi_cli_has_no_live_test_mode_and_dispatches_without_parameters(
     assert "No such option '--test'" in rejected.output
 
 
+def test_cms_doctors_retained_manifest_cli_forwards_exact_file(monkeypatch, tmp_path):
+    manifest = tmp_path / "source-manifest.json"
+    manifest.write_text("{}")
+    _assert_cli_forwards(
+        monkeypatch,
+        command=process_cli.cms_doctors,
+        target_name="initiate_cms_doctors",
+        args=["--retained-source-manifest", str(manifest)],
+        expected={"test_mode": False, "retained_source_manifest": str(manifest)},
+    )
+
+
 def test_npi_worker_registers_only_the_control_wrapper():
     assert process_cli.NPI.functions == [process_cli.control_single_job_start]
     assert not hasattr(process_cli, "NPI_finish")

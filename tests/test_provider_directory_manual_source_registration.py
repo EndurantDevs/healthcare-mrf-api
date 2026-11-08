@@ -7,6 +7,7 @@ from scripts import generate_provider_directory_support_docs as generator
 from scripts.research import (
     provider_directory_endpoint_acquisition_harness as harness,
 )
+from tests.provider_directory_endpoint_acquisition_test_support import synthetic_current_dataset_audit
 
 
 def _manual_manifest_entry(manifest):
@@ -81,17 +82,33 @@ def test_reviewed_manual_source_separates_current_dataset_from_acquisition_proof
     audit = generator.load_current_dataset_audit(
         generator.DEFAULT_CURRENT_DATASET_AUDIT
     )
-    audit_record = next(
-        candidate_record
-        for candidate_record in audit["records"]
-        if candidate_record.get("entry_id") == manual_entry["entry_id"]
+    assert audit == {"schema_version": 1, "as_of": None, "records": []}
+    rendered = "\n".join(
+        generator.render_current_dataset_audit_section(audit, manifest)
     )
-    assert audit_record["dataset_state"] == "current-published"
-    assert audit_record["dataset_id"] == (
-        "pdds_35600ed11ba3a119aa75352d01086f47a9615110585ebe28326352559e010f23"
+    assert "Current dataset evidence is not recorded" in rendered
+
+
+def test_manual_current_dataset_observation_does_not_prove_acquisition(tmp_path):
+    """A recorded dataset observation leaves separate acquisition proof unrecorded."""
+    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    manual_entry = _manual_manifest_entry(manifest)
+    snapshot = generator.load_verification_snapshot(generator.DEFAULT_VERIFICATION_SNAPSHOT)
+    audit_path = tmp_path / "audit.json"
+    synthetic_audit = synthetic_current_dataset_audit({"entries": [manual_entry]})
+    synthetic_audit["records"][0].update(
+        dataset_state="current-published", dataset_id="pdds_" + "a" * 64,
+        resource_count=3, observed_at=synthetic_audit["as_of"] + "T00:00:00Z",
     )
-    assert audit_record["resource_count"] == 1_948_923
-    assert audit_record["downstream_evidence"] == "not-proven"
+    audit_path.write_text(json.dumps(synthetic_audit), encoding="utf-8")
+    audit = generator.load_current_dataset_audit(audit_path)
+    assert audit == synthetic_audit
+    rendered = "\n".join(
+        generator.render_current_dataset_audit_section(audit, {"entries": [manual_entry]}, snapshot)
+    )
+    assert "Current published" in rendered
+    assert "Not proven" in rendered
+    assert snapshot["entries"][manual_entry["entry_id"]]["proof_state"] == "not_recorded"
 
 
 def test_manual_source_is_excluded_from_generic_harness():

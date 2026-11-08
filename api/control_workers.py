@@ -6,26 +6,29 @@ import asyncio
 import hashlib
 import json
 import os
+import ssl
 import subprocess
 import sys
-import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from db.models import db
-from process.control_lifecycle import acquire_control_run_worker_action_lock
-from process.ptg_parts.ptg_wave_admission_fence import (
-    PTG_WAVE_FENCED_IMPORTERS,
-    PTGWaveCapacityConflict,
-    PTGWaveOwnershipConflict,
-    acquire_ptg_admission_lock,
-    require_no_capacity_owning_wave,
-    require_not_wave_owned_run,
+from api import (
+    npi_source_worker,
+    provider_directory_cms_registry_stop,
+    provider_directory_source_publication,
+    provider_directory_source_worker,
+    reference_source_worker,
+    registry_aca_source_worker,
 )
+from db.models import db
+from process.control_lifecycle import _SOURCE_PROFILE_IMPORTERS_BY_MODULE, acquire_control_run_worker_action_lock
 from process.ptg_parts.ptg_source_attempt_actions import (
     PTGSourceAttemptIdentityError,
     PTGWorkerActionSelection,
@@ -34,6 +37,14 @@ from process.ptg_parts.ptg_source_attempt_actions import (
 from process.ptg_parts.ptg_source_attempt_guard import (
     PTGSourceAttemptTerminalError,
     source_file_import_id_from_payload,
+)
+from process.ptg_parts.ptg_wave_admission_fence import (
+    PTG_WAVE_FENCED_IMPORTERS,
+    PTGWaveCapacityConflict,
+    PTGWaveOwnershipConflict,
+    acquire_ptg_admission_lock,
+    require_no_capacity_owning_wave,
+    require_not_wave_owned_run,
 )
 
 
@@ -45,11 +56,31 @@ class WorkerSpec:
     role: str = "start"
 
 
+class _AdmittedWorkerRequest(dict[str, Any]):
+    """Carry an observed queue identity outside the serialized launch request."""
+
+    admitted_job: tuple[str, str, str, str, str] | None = None
+    cms_registry_launch: object | None = None
+    reference_source_launch: object | None = None
+    aca_source_launch: object | None = None
+    fhir_source_launch: object | None = None
+    ordinary_fhir_overlay_job: tuple[str, str, str, str, str] | None = None
+    ordinary_fhir_profile_job: tuple[str, str, str, str, str] | None = None
+    ordinary_fhir_profile_lease: object | None = None
+    npi_source_launch: object | None = None
+    pricing_control_admission: object | None = None
+
+
 _PROVIDER_DIRECTORY_WORKER_CLASS = "process.ProviderDirectoryFHIR"
 _PROVIDER_DIRECTORY_MIN_ACTIVE_DEADLINE_SECONDS = 144 * 60 * 60
 
 
 _START_WORKERS: tuple[WorkerSpec, ...] = (
+    WorkerSpec("arq:RegistryFHIRCatalogSync", "process.RegistryFHIRCatalogSync", ("registry-fhir-catalog-sync",)),
+    WorkerSpec("arq:RegistrySourceCheck", "process.RegistrySourceCheck", ("registry-source-check",)),
+    WorkerSpec("arq:RegistryACASource", "process.RegistryACASource", ("registry-aca-source-worker",)),
+    WorkerSpec("arq:RegistryPTGSource", "process.RegistryPTGSource", ("registry-ptg-source-worker",)),
+    WorkerSpec("arq:RegistryCMSSource", "process.RegistryCMSSource", ("registry-cms-source-worker",)),
     WorkerSpec("arq:PTG", "process.PTG", ("ptg",)),
     WorkerSpec("arq:PTGSmall", "process.PTGSmall", ("ptg",)),
     WorkerSpec("arq:PTGNormal", "process.PTGNormal", ("ptg",)),
@@ -59,10 +90,14 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
         "arq:PTGCandidateAudit",
         "process.PTGCandidateAudit",
         (
+            "registry-publication-worker",
             "ptg-candidate-audit",
             "plan-pricing-projection",
             "plan-pricing-prewarm",
             "plan-pricing-em-distance",
+            "ptg-provider-membership-projection",
+            "plan-pricing-code-projection",
+            "plan-pricing-em-attribution",
         ),
     ),
     WorkerSpec("arq:MRF", "process.MRF", ("mrf",)),
@@ -112,11 +147,27 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
 )
 
 _FINISH_WORKERS: tuple[WorkerSpec, ...] = (
+    WorkerSpec(
+        "arq:SourceProfile_finish",
+        "process.SourceProfile_finish",
+        tuple(_SOURCE_PROFILE_IMPORTERS_BY_MODULE.values()),
+        role="finish",
+    ),
     WorkerSpec("arq:MRF_finish", "process.MRF_finish", ("mrf",), role="finish"),
-    WorkerSpec("arq:ClaimsPricing_finish", "process.ClaimsPricing_finish", ("claims-pricing", "claims-procedures"), role="finish"),
+    WorkerSpec(
+        "arq:ClaimsPricing_finish",
+        "process.ClaimsPricing_finish",
+        ("claims-pricing", "claims-procedures"),
+        role="finish",
+    ),
     WorkerSpec("arq:DrugClaims_finish", "process.DrugClaims_finish", ("drug-claims",), role="finish"),
     WorkerSpec("arq:ProviderQuality_finish", "process.ProviderQuality_finish", ("provider-quality",), role="finish"),
-    WorkerSpec("arq:PartDFormularyNetwork_finish", "process.PartDFormularyNetwork_finish", ("partd-formulary-network",), role="finish"),
+    WorkerSpec(
+        "arq:PartDFormularyNetwork_finish",
+        "process.PartDFormularyNetwork_finish",
+        ("partd-formulary-network",),
+        role="finish",
+    ),
     WorkerSpec("arq:PharmacyLicense_finish", "process.PharmacyLicense_finish", ("pharmacy-license",), role="finish"),
 )
 
@@ -127,16 +178,13 @@ _BY_IMPORTER_ROLE: dict[tuple[str, str], WorkerSpec] = {}
 for _spec in _WORKERS:
     for _importer in _spec.importers:
         _BY_IMPORTER_ROLE.setdefault((_importer, _spec.role), _spec)
+_NUCC_ACTION_DEADLINE: ContextVar[float | None] = ContextVar("nucc_action_deadline", default=None)
 _ENGINE_LABEL = "mrf"
 _K8S_API_TOKEN = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
 _K8S_API_CA = Path("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
 _K8S_API_NAMESPACE = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-_NON_LAUNCHABLE_CONTROL_RUN_STATUSES = frozenset(
-    {"canceling", "succeeded", "failed", "canceled", "dead_letter"}
-)
-WORKER_ENSURE_RUN_IDENTITY_CONTRACT = (
-    "healthporta.worker-ensure-run-identity.v1"
-)
+_NON_LAUNCHABLE_CONTROL_RUN_STATUSES = frozenset({"canceling", "succeeded", "failed", "canceled", "dead_letter"})
+WORKER_ENSURE_RUN_IDENTITY_CONTRACT = "healthporta.worker-ensure-run-identity.v1"
 
 
 async def _await_worker_launch(task: asyncio.Task[dict[str, Any]]) -> dict[str, Any]:
@@ -171,10 +219,7 @@ def ensure_worker(payload: dict[str, Any]) -> dict[str, Any]:
             payload,
             status="unsupported",
             items=[],
-            message=(
-                "no worker is registered for "
-                f"{queue or importer or 'request'}"
-            ),
+            message=(f"no worker is registered for {queue or importer or 'request'}"),
         )
 
     items = [_ensure_spec(spec, payload) for spec in specs]
@@ -197,13 +242,9 @@ def _worker_action_selection(
     return PTGWorkerActionSelection(
         request_importer=importer or None,
         allowed_importers=frozenset(
-            selected_importer
-            for worker_spec in selected_specs
-            for selected_importer in worker_spec.importers
+            selected_importer for worker_spec in selected_specs for selected_importer in worker_spec.importers
         ),
-        allowed_roles=frozenset(
-            worker_spec.role for worker_spec in selected_specs
-        ),
+        allowed_roles=frozenset(worker_spec.role for worker_spec in selected_specs),
     )
 
 
@@ -240,7 +281,7 @@ async def _admit_worker_ensure(
                 selected_specs,
             ),
         )
-    except (PTGSourceAttemptIdentityError, ValueError):
+    except PTGSourceAttemptIdentityError, ValueError:
         return _failed_worker_admission(
             worker_payload,
             "PTG source-attempt identity is invalid or changed",
@@ -258,15 +299,81 @@ async def _admit_worker_ensure(
             worker_payload,
             f"control run is not launchable: {admitted_status}",
         )
-    if (
-        str(admitted_run.get("importer") or "") != "ptg"
-        and requested_source_id is not None
-    ):
+    if str(admitted_run.get("importer") or "") != "ptg" and requested_source_id is not None:
         return _failed_worker_admission(
             worker_payload,
             "source-attempt identity requires a PTG import",
         )
+    _bind_admitted_job(worker_payload, admitted_run)
+    return await _admit_source_worker_launches(worker_payload, admitted_run)
+
+
+async def _admit_source_worker_launches(worker_payload, admitted_run):
+    """Capture exact source-image capabilities only after native job admission."""
+    if isinstance(worker_payload, _AdmittedWorkerRequest):
+        from api.provider_directory_cms_registry_worker import admit_cms_registry_worker_launch
+
+        try:
+            worker_payload.cms_registry_launch = await admit_cms_registry_worker_launch(admitted_run)
+        except ValueError, RuntimeError:
+            return _failed_worker_admission(worker_payload, "CMS registry worker admission is unavailable")
+        if worker_payload.cms_registry_launch is None:
+            try:
+                worker_payload.ordinary_fhir_profile_job = provider_directory_source_worker.admit_ordinary_profile_job(
+                    admitted_run, worker_payload
+                )
+                if worker_payload.ordinary_fhir_profile_job is None:
+                    worker_payload.fhir_source_launch = (
+                        provider_directory_source_worker.admit_fhir_source_worker_launch(admitted_run)
+                    )
+                    worker_payload.ordinary_fhir_overlay_job = (
+                        worker_payload.admitted_job
+                        if admitted_run.get("importer") == "provider-directory-fhir"
+                        and worker_payload.fhir_source_launch is None
+                        else None
+                    )
+            except ValueError, RuntimeError:
+                return _failed_worker_admission(worker_payload, "FHIR source worker admission is unavailable")
+        try:
+            worker_payload.npi_source_launch = npi_source_worker.admit_npi_source_worker_launch(admitted_run)
+        except ValueError, RuntimeError:
+            return _failed_worker_admission(worker_payload, "NPI source worker admission is unavailable")
+        try:
+            worker_payload.reference_source_launch = reference_source_worker.admit_reference_source_worker_launch(
+                admitted_run
+            )
+        except ValueError, RuntimeError:
+            return _failed_worker_admission(worker_payload, "Reference source worker admission is unavailable")
+        try:
+            worker_payload.aca_source_launch = registry_aca_source_worker.admit_aca_source_worker_launch(admitted_run)
+        except ValueError, RuntimeError:
+            return _failed_worker_admission(worker_payload, "ACA source worker admission is unavailable")
     return None
+
+
+def _bind_admitted_job(payload: dict[str, Any], admitted_run: dict[str, Any]) -> None:
+    """Retain only real admission coordinates for scoped secret selection."""
+
+    if not isinstance(payload, _AdmittedWorkerRequest):
+        return
+    metrics = admitted_run.get("metrics")
+    if not isinstance(metrics, dict):
+        return
+    identity = tuple(admitted_run.get(name) for name in ("run_id", "importer")) + tuple(
+        metrics.get(name) for name in ("queue", "function", "job_id")
+    )
+    if all(isinstance(value, str) and value and value == value.strip() for value in identity):
+        payload.admitted_job = identity
+        params = admitted_run.get("params")
+        if (
+            identity[1] == "plan-pricing-code-projection"
+            and isinstance(params, dict)
+            and params.get("operation") == "calibrate"
+        ):
+            from api.plan_pricing_code_contract import validate_params
+
+            validate_params(params)
+            payload.code_calibration_job = identity
 
 
 async def guarded_ensure_worker(
@@ -274,25 +381,24 @@ async def guarded_ensure_worker(
 ) -> dict[str, Any]:
     """Persist run/selector admission before any worker launch."""
 
+    worker_payload = _AdmittedWorkerRequest(worker_payload)
     importer = str(worker_payload.get("importer") or "").strip()
     run_id = str(worker_payload.get("run_id") or "").strip()
     selected_specs = _resolve_specs(worker_payload)
     selects_ptg = any("ptg" in spec.importers for spec in selected_specs)
-    selects_ptg_family = any(
-        PTG_WAVE_FENCED_IMPORTERS.intersection(spec.importers)
-        for spec in selected_specs
-    )
-    if (selects_ptg and importer and importer != "ptg") or (
-        importer == "ptg" and selected_specs and not selects_ptg
-    ):
-        return _failed_worker_admission(
-            worker_payload,
-            "PTG worker selector conflicts with importer",
-        )
+    if failure := _nucc_worker_selection_failure(worker_payload, selected_specs, importer, run_id):
+        return failure
+    selects_ptg_family = any(PTG_WAVE_FENCED_IMPORTERS.intersection(spec.importers) for spec in selected_specs)
+    if (selects_ptg and importer and importer != "ptg") or (importer == "ptg" and selected_specs and not selects_ptg):
+        return _failed_worker_admission(worker_payload, "PTG worker selector conflicts with importer")
     if selects_ptg_family and not run_id:
-        return _failed_worker_admission(
+        return _failed_worker_admission(worker_payload, "PTG-family worker launch requires run_id")
+    if importer == "nucc" or any("nucc" in spec.importers for spec in selected_specs):
+        return await _guarded_nucc_ensure(
             worker_payload,
-            "PTG-family worker launch requires run_id",
+            run_id=run_id,
+            importer=importer,
+            selected_specs=selected_specs,
         )
     if run_id:
         if selects_ptg_family:
@@ -302,11 +408,15 @@ async def guarded_ensure_worker(
                 importer=importer,
                 selected_specs=selected_specs,
             )
-        admission_failure = await _admit_worker_ensure(
-            worker_payload,
-            run_id=run_id,
-            importer=importer,
-            selected_specs=selected_specs,
+        if any("provider-directory-fhir" in spec.importers for spec in selected_specs):
+            return await provider_directory_cms_registry_stop.guarded_ensure(
+                worker_payload,
+                run_id=run_id,
+                importer=importer,
+                selected_specs=selected_specs,
+            )
+        admission_failure = await _admit_importer_worker_ensure(
+            worker_payload, run_id=run_id, importer=importer, selected_specs=selected_specs
         )
         if admission_failure is not None:
             return admission_failure
@@ -326,6 +436,42 @@ async def guarded_ensure_worker(
     return await asyncio.to_thread(ensure_worker, worker_payload)
 
 
+async def _guarded_nucc_ensure(worker_payload, *, run_id, selected_specs, importer=""):
+    """Hold the authenticated action fence until the existing launcher settles."""
+    from api.nucc_source_control import require_unpublished_source
+
+    if (
+        importer not in {"", "nucc"}
+        or selected_specs != [_BY_IMPORTER_ROLE[("nucc", "start")]]
+        or str(worker_payload.get("importer") or "") not in {"", "nucc"}
+        or source_file_import_id_from_payload(worker_payload, required=False) is not None
+    ):
+        return _failed_worker_admission(worker_payload, "NUCC worker selector conflicts with importer")
+    async with _nucc_action_transaction(run_id) as (current, receipt, protected):
+        if current is None:
+            launch_result = _failed_worker_admission(worker_payload, "control run was not found")
+        elif (
+            receipt is not None
+            or current.get("status") not in {"queued", "starting", "running"}
+            or any(
+                (current.get("metrics") or {}).get(key) is not None
+                for key in ("nucc_handoff", "nucc_native_publication")
+            )
+        ):
+            launch_result = _failed_worker_admission(worker_payload, "NUCC control run is not launchable")
+        else:
+            if protected:
+                require_unpublished_source(current)
+            _bind_admitted_job(worker_payload, current)
+            launch_task = asyncio.create_task(asyncio.to_thread(ensure_worker, worker_payload))
+            launch_result = await _await_worker_launch(launch_task)
+    if receipt is not None:
+        from api.control_imports import get_import_run
+
+        _publish_nucc_run(await get_import_run(run_id))
+    return launch_result
+
+
 async def _guarded_ptg_family_ensure(
     worker_payload: dict[str, Any],
     *,
@@ -335,6 +481,7 @@ async def _guarded_ptg_family_ensure(
 ) -> dict[str, Any]:
     """Hold the shared capacity lock through PTG admission and worker launch."""
 
+    worker_payload = _AdmittedWorkerRequest(worker_payload)
     async with db.acquire() as connection:
         await acquire_ptg_admission_lock(connection)
         await acquire_control_run_worker_action_lock(connection, run_id)
@@ -351,9 +498,13 @@ async def _guarded_ptg_family_ensure(
         )
         if admission_failure is not None:
             return admission_failure
-        launch_task = asyncio.create_task(
-            asyncio.to_thread(ensure_worker, worker_payload)
-        )
+        if any("plan-pricing-projection" in spec.importers for spec in selected_specs):
+            from api.plan_pricing_worker_policy import admit_pricing_worker
+
+            worker_payload.pricing_control_admission = await admit_pricing_worker(
+                connection.raw_connection.driver_connection, run_id, worker_payload
+            )
+        launch_task = asyncio.create_task(asyncio.to_thread(ensure_worker, worker_payload))
         return await _await_worker_launch(launch_task)
 
 
@@ -409,7 +560,7 @@ def worker_state(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def exact_worker_presence(payload: dict[str, Any]) -> dict[str, Any]:
-    """Return exact-run Kubernetes Job and Pod counts without mutation."""
+    """Return exact-run Job and Pod counts and terminal-stop proof without mutation."""
 
     spec = _exact_worker_spec(payload)
     if _launcher_mode() != "kubernetes" or not _is_kubernetes_configured():
@@ -417,36 +568,48 @@ def exact_worker_presence(payload: dict[str, Any]) -> dict[str, Any]:
     namespace = _kubernetes_namespace()
     selector = _kubernetes_label_selector(spec, payload)
     query = urllib.parse.urlencode({"labelSelector": selector})
-    jobs = _kubernetes_job_records(
-        _kubernetes_request(
-            "GET",
-            f"/apis/batch/v1/namespaces/{namespace}/jobs?{query}",
-        )
-    )
-    pods = _kubernetes_pod_records(
-        _kubernetes_request(
-            "GET",
-            f"/api/v1/namespaces/{namespace}/pods?{query}",
-        )
-    )
+    jobs = _exact_worker_records(f"/apis/batch/v1/namespaces/{namespace}/jobs?{query}")
+    pods = _exact_worker_records(f"/api/v1/namespaces/{namespace}/pods?{query}")
     return {
         "enabled": True,
         "job_count": len(jobs),
         "pod_count": len(pods),
+        "stopped": all(_is_terminal_worker_job(job) for job in jobs)
+        and all((pod.get("status") or {}).get("phase") in {"Succeeded", "Failed"} for pod in pods),
     }
+
+
+def _exact_worker_records(path: str) -> list[dict[str, Any]]:
+    """Keep malformed API responses from being mistaken for worker absence."""
+    response = _kubernetes_request("GET", path)
+    records = response.get("items") if isinstance(response, dict) else None
+    if not isinstance(records, list) or any(not isinstance(record, dict) for record in records):
+        raise RuntimeError("exact worker inventory is unavailable")
+    return records
+
+
+def _is_terminal_worker_job(job: dict[str, Any]) -> bool:
+    """Require a terminal Job condition, including after failed retries."""
+    status = job.get("status") or {}
+    active = status.get("active", 0)
+    conditions = status.get("conditions")
+    if type(active) is not int or active != 0 or not isinstance(conditions, list):
+        return False
+    return all(isinstance(condition, dict) for condition in conditions) and any(
+        condition.get("type") in {"Complete", "Failed"} and condition.get("status") == "True"
+        for condition in conditions
+    )
 
 
 def _exact_worker_spec(payload: dict[str, Any]) -> WorkerSpec:
     run_id = str(payload.get("run_id") or "").strip()
     importer = str(payload.get("importer") or "").strip()
-    spec = _BY_IMPORTER_ROLE.get((importer, "start"))
-    if not run_id or spec is None:
-        raise RuntimeError("exact worker identity is unavailable")
     queue = str(payload.get("queue") or "").strip()
+    spec = _BY_QUEUE.get(queue) if importer == "ptg" and queue else _BY_IMPORTER_ROLE.get((importer, "start"))
+    if not run_id or spec is None or importer not in spec.importers or spec.role != "start":
+        raise RuntimeError("exact worker identity is unavailable")
     worker_class = str(payload.get("worker_class") or "").strip()
-    if (queue and queue != spec.queue) or (
-        worker_class and worker_class != spec.worker_class
-    ):
+    if (queue and queue != spec.queue) or (worker_class and worker_class != spec.worker_class):
         raise ValueError("exact worker selector conflicts with importer")
     return spec
 
@@ -454,6 +617,23 @@ def _exact_worker_spec(payload: dict[str, Any]) -> WorkerSpec:
 def _resolve_specs(launch_request: dict[str, Any]) -> list[WorkerSpec]:
     worker_class = str(launch_request.get("worker_class") or "").strip()
     queue = str(launch_request.get("queue") or "").strip()
+    importer = str(launch_request.get("importer") or "").strip()
+    if launch_request.get("role") == provider_directory_source_publication.ROLE:
+        try:
+            return [
+                provider_directory_source_publication.selected_spec(
+                    _BY_WORKER_CLASS[_PROVIDER_DIRECTORY_WORKER_CLASS], launch_request
+                )
+            ]
+        except ValueError:
+            return []
+    if importer in _SOURCE_PROFILE_IMPORTERS_BY_MODULE.values() and (
+        launch_request.get("role") == "finish" or launch_request.get("status") == "finalizing"
+    ):
+        selected = _BY_WORKER_CLASS.get(worker_class) if worker_class else None
+        if worker_class and (selected is None or importer not in selected.importers):
+            return []
+        return [_BY_IMPORTER_ROLE[(importer, "finish")]]
     if worker_class:
         spec = _BY_WORKER_CLASS.get(worker_class)
         if spec is None:
@@ -462,7 +642,6 @@ def _resolve_specs(launch_request: dict[str, Any]) -> list[WorkerSpec]:
             return []
         return [spec]
 
-    importer = str(launch_request.get("importer") or "").strip()
     role = str(launch_request.get("role") or "").strip().lower()
     explicit_role = bool(role)
     status = str(launch_request.get("status") or "").strip().lower()
@@ -500,20 +679,62 @@ def _finish_spec_after_completed_start(importer: str, payload: dict[str, Any]) -
     return None
 
 
-def _ensure_spec(spec: WorkerSpec, payload: dict[str, Any]) -> dict[str, Any]:
-    state = _worker_state(spec, payload)
+def _ensure_spec(spec: WorkerSpec, launch_request: dict[str, Any]) -> dict[str, Any]:
+    from api.provider_directory_cms_registry_worker import authorized_cms_registry_worker_launch
+
+    reference_launch = reference_source_worker.authorized_reference_source_worker_launch(spec, launch_request)
+    aca_launch = registry_aca_source_worker.authorized_aca_source_worker_launch(spec, launch_request)
+    cms_launch = authorized_cms_registry_worker_launch(spec, launch_request)
+    fhir_launch = provider_directory_source_worker.authorized_fhir_source_worker_launch(spec, launch_request)
+    ordinary_job_id = provider_directory_source_worker.admitted_ordinary_fhir_job(spec, launch_request)
+    npi_launch = npi_source_worker.authorized_npi_source_worker_launch(spec, launch_request)
+    try:
+        provider_directory_source_publication.require_original_stopped(fhir_launch)
+    except ValueError, RuntimeError, _KubernetesApiError:
+        return {"status": "failed", "message": "FHIR publication requires the original worker to be stopped"}
+    if spec.worker_class == "process.NPI" and npi_launch is None:
+        return {"status": "failed", "message": "NPI source worker requires exact admitted job"}
+    if (
+        spec.worker_class == "process.ProviderDirectoryFHIR"
+        and cms_launch is None
+        and fhir_launch is None
+        and ordinary_job_id is None
+    ):
+        return {"status": "failed", "message": "FHIR source worker requires exact admitted job"}
+    if spec.worker_class == "process.RegistryACASource" and aca_launch is None:
+        return {"status": "failed", "message": "ACA source worker requires exact admitted job"}
+    if spec.worker_class == "process.Geo" and reference_launch is None:
+        return {"status": "failed", "message": "Reference source worker requires exact admitted job"}
+    if (
+        cms_launch is not None
+        or fhir_launch is not None
+        or ordinary_job_id is not None
+        or npi_launch is not None
+        or reference_launch is not None
+        or aca_launch is not None
+    ) and _launcher_mode() != "kubernetes":
+        return {"status": "failed", "message": "Source worker requires the configured isolated launcher"}
+    state = _worker_state(spec, launch_request)
+    if state.get("job_status") == "purpose_mismatch":
+        return {**state, "status": "failed", "message": "Existing worker purpose does not match admission"}
     if state["running"]:
         return {**state, "status": "already_running"}
     if _launcher_mode() == "kubernetes":
-        return _ensure_kubernetes_job(spec, payload, state)
+        return _ensure_kubernetes_job(spec, launch_request, state)
 
-    if spec.worker_class == "process.DrugClaims_finish" and _worker_state(_BY_QUEUE["arq:ClaimsPricing_finish"])["running"]:
+    if (
+        spec.worker_class == "process.DrugClaims_finish"
+        and _worker_state(_BY_QUEUE["arq:ClaimsPricing_finish"])["running"]
+    ):
         return {**state, "status": "blocked", "message": "ClaimsPricing_finish is already running"}
-    if spec.worker_class == "process.ClaimsPricing_finish" and _worker_state(_BY_QUEUE["arq:DrugClaims_finish"])["running"]:
+    if (
+        spec.worker_class == "process.ClaimsPricing_finish"
+        and _worker_state(_BY_QUEUE["arq:DrugClaims_finish"])["running"]
+    ):
         return {**state, "status": "blocked", "message": "DrugClaims_finish is already running"}
 
     try:
-        pid = _start_process(spec, payload)
+        pid = _start_process(spec, launch_request)
     except Exception as exc:
         return {**state, "status": "failed", "message": str(exc)}
     return {**_worker_state(spec), "status": "started", "pid": pid}
@@ -534,6 +755,7 @@ def _start_process(spec: WorkerSpec, payload: dict[str, Any]) -> int:
         env["HLTHPRT_CONTROL_RUN_ID"] = run_id
     if _uses_single_job_worker(spec):
         env["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] = _single_job_worker_target(spec, payload) or ""
+    _nucc_remaining_seconds()
     with _log_path(spec).open("ab") as log_handle:
         process = subprocess.Popen(
             cmd,
@@ -585,32 +807,68 @@ def _launcher_mode() -> str:
     return os.getenv("HLTHPRT_WORKER_LAUNCHER", "process").strip().lower()
 
 
+def _configured_worker_job_image(spec: WorkerSpec, launch_request: dict[str, Any] | None = None) -> str:
+    """Select optional worker images while preserving the shared fallback."""
+    generic_image = os.getenv("HLTHPRT_WORKER_JOB_IMAGE", "").strip()
+    if (
+        type(launch_request) is _AdmittedWorkerRequest
+        and launch_request.ordinary_fhir_profile_job is not None
+        and provider_directory_source_worker.admitted_ordinary_fhir_job(spec, launch_request) is not None
+    ):
+        image = os.getenv(provider_directory_source_worker.PROFILE_IMAGE_ENV, "").strip() or generic_image
+        if provider_directory_source_worker._IMAGE.fullmatch(image) is None:
+            raise ValueError("fhir_profile_worker_image_unavailable")
+        return image
+    if (spec.worker_class, spec.importers) == ("process.RegistryFHIRCatalogSync", ("registry-fhir-catalog-sync",)):
+        return os.getenv("HLTHPRT_REGISTRY_FHIR_CATALOG_WORKER_IMAGE", "").strip() or generic_image
+    if spec.importers == ("mrf-source-discovery",):
+        return os.getenv("HLTHPRT_MRF_SOURCE_DISCOVERY_WORKER_IMAGE", "").strip() or generic_image
+    return generic_image
+
+
 def _ensure_kubernetes_job(
     spec: WorkerSpec,
-    payload: dict[str, Any],
+    launch_request: dict[str, Any],
     state: dict[str, Any],
 ) -> dict[str, Any]:
-    image = os.getenv("HLTHPRT_WORKER_JOB_IMAGE", "").strip()
+    from api.provider_directory_cms_registry_worker import authorized_cms_registry_worker_launch
+
+    try:
+        provider_directory_source_worker.require_fresh_ordinary_profile_launch(spec, launch_request)
+    except ValueError, RuntimeError:
+        return {**state, "status": "failed", "message": "Profile worker requires fresh launch capacity"}
+    launch = authorized_cms_registry_worker_launch(spec, launch_request)
+    fhir_launch = provider_directory_source_worker.authorized_fhir_source_worker_launch(spec, launch_request)
+    launch = fhir_launch if fhir_launch is not None else launch
+    npi_launch = npi_source_worker.authorized_npi_source_worker_launch(spec, launch_request)
+    launch = npi_launch if npi_launch is not None else launch
+    reference_launch = reference_source_worker.authorized_reference_source_worker_launch(spec, launch_request)
+    launch = reference_launch if reference_launch is not None else launch
+    aca_launch = registry_aca_source_worker.authorized_aca_source_worker_launch(spec, launch_request)
+    launch = aca_launch if aca_launch is not None else launch
+    image = launch.image if launch is not None else _configured_worker_job_image(spec, launch_request)
     if not image:
         return {**state, "status": "failed", "message": "HLTHPRT_WORKER_JOB_IMAGE is not configured"}
 
+    job = _worker_job_manifest(spec, launch_request, image)
     namespace = _kubernetes_namespace()
     if state.get("job_status") in {"succeeded", "failed"}:
         try:
-            _delete_terminal_kubernetes_worker_jobs(namespace, spec, payload)
+            _delete_terminal_kubernetes_worker_jobs(namespace, spec, launch_request)
         except _KubernetesApiError as exc:
             if exc.status != 404:
                 return {**state, "status": "failed", "message": str(exc)}
 
-    job = _worker_job_manifest(spec, payload, image)
     try:
         _kubernetes_request("POST", f"/apis/batch/v1/namespaces/{namespace}/jobs", job)
     except _KubernetesApiError as exc:
         if exc.status == 409:
-            refreshed = _worker_state(spec, payload)
+            refreshed = _worker_state(spec, launch_request)
+            if refreshed.get("job_status") == "purpose_mismatch":
+                return {**refreshed, "status": "failed", "message": "Existing worker purpose does not match admission"}
             return {**refreshed, "status": "already_running" if refreshed.get("running") else "exists"}
         return {**state, "status": "failed", "message": str(exc)}
-    return {**_worker_state(spec, payload), "status": "started"}
+    return {**_worker_state(spec, launch_request), "status": "started"}
 
 
 def _delete_terminal_kubernetes_worker_jobs(namespace: str, spec: WorkerSpec, payload: dict[str, Any]) -> None:
@@ -736,7 +994,12 @@ def _delete_kubernetes_worker_job_record(
     except _KubernetesApiError as exc:
         if exc.status == 404:
             return _kubernetes_delete_record(job_name, worker_spec, deleted=False, reason="not_found"), None
-        return None, {"job_name": job_name, "worker_class": worker_spec.worker_class, "status": exc.status, "error": str(exc)}
+        return None, {
+            "job_name": job_name,
+            "worker_class": worker_spec.worker_class,
+            "status": exc.status,
+            "error": str(exc),
+        }
     return _kubernetes_delete_record(job_name, worker_spec, deleted=True), None
 
 
@@ -758,9 +1021,9 @@ def _kubernetes_delete_record(
     return deletion_summary_dict
 
 
-def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Summarize Kubernetes jobs matching a worker spec and optional run."""
-    state_base_dict = {
+def _kubernetes_worker_base(spec: WorkerSpec) -> dict[str, Any]:
+    """Build the common state fields before querying Kubernetes jobs."""
+    return {
         "queue": spec.queue,
         "worker_class": spec.worker_class,
         "importers": list(spec.importers),
@@ -770,8 +1033,17 @@ def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | 
         "launcher": "kubernetes",
         "command": " ".join(_worker_command(_worker_python(), spec)),
     }
+
+
+def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Summarize Kubernetes jobs matching a worker spec and optional run."""
+    state_base_dict = _kubernetes_worker_base(spec)
     if not _is_kubernetes_configured():
-        return {**state_base_dict, "job_name": _worker_job_name(spec, launch_request or {}), "job_status": "unconfigured"}
+        return {
+            **state_base_dict,
+            "job_name": _worker_job_name(spec, launch_request or {}),
+            "job_status": "unconfigured",
+        }
 
     selector = _kubernetes_label_selector(spec, launch_request or {})
     namespace = _kubernetes_namespace()
@@ -779,15 +1051,64 @@ def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | 
     try:
         body = _kubernetes_request("GET", path)
     except _KubernetesApiError as exc:
-        return {**state_base_dict, "job_name": _worker_job_name(spec, launch_request or {}), "job_status": "error", "message": str(exc)}
+        return {
+            **state_base_dict,
+            "job_name": _worker_job_name(spec, launch_request or {}),
+            "job_status": "error",
+            "message": str(exc),
+        }
 
     raw_job_records = body.get("items") if isinstance(body, dict) else []
     jobs = [job_record for job_record in raw_job_records if isinstance(job_record, dict)]
+    if any(_has_broad_proxy_pool_reference(job) for job in jobs):
+        return {**state_base_dict, "job_status": "purpose_mismatch"}
+    from api.provider_directory_cms_registry_worker import (
+        authorized_cms_registry_worker_launch,
+        is_cms_registry_job_matching,
+    )
+
+    launch = authorized_cms_registry_worker_launch(spec, launch_request)
+    if launch is not None and any(not is_cms_registry_job_matching(job, launch) for job in jobs):
+        return {**state_base_dict, "job_status": "purpose_mismatch"}
+    reference_launch = reference_source_worker.authorized_reference_source_worker_launch(spec, launch_request)
+    if reference_launch is not None and any(
+        not reference_source_worker.is_reference_source_job_matching(job, reference_launch) for job in jobs
+    ):
+        return {**state_base_dict, "job_status": "purpose_mismatch"}
+    aca_launch = registry_aca_source_worker.authorized_aca_source_worker_launch(spec, launch_request)
+    if aca_launch is not None and any(
+        not registry_aca_source_worker.is_aca_source_job_matching(job, aca_launch) for job in jobs
+    ):
+        return {**state_base_dict, "job_status": "purpose_mismatch"}
+    if not provider_directory_source_worker.is_fhir_job_set_matching(spec, launch_request, jobs):
+        return {**state_base_dict, "job_status": "purpose_mismatch"}
+    npi_launch = npi_source_worker.authorized_npi_source_worker_launch(spec, launch_request)
+    if npi_launch is not None and any(
+        not npi_source_worker.is_npi_source_job_matching(job, npi_launch) for job in jobs
+    ):
+        return {**state_base_dict, "job_status": "purpose_mismatch"}
+    state_map = _kubernetes_job_state(state_base_dict, jobs, spec, launch_request or {})
+    if state_map["job_status"] == "failed":
+        failure = _kubernetes_worker_failure(namespace, selector)
+        if failure:
+            state_map["failure"] = failure
+    return state_map
+
+
+def _kubernetes_job_state(
+    state_base_dict: dict[str, Any],
+    jobs: list[dict[str, Any]],
+    spec: WorkerSpec,
+    launch_request: dict[str, Any],
+) -> dict[str, Any]:
+    """Summarize counts and the latest matching Kubernetes job."""
     active = sum(int((job.get("status") or {}).get("active") or 0) for job in jobs)
     succeeded = sum(int((job.get("status") or {}).get("succeeded") or 0) for job in jobs)
     failed = sum(int((job.get("status") or {}).get("failed") or 0) for job in jobs)
     latest = jobs[-1] if jobs else {}
-    latest_name = ((latest.get("metadata") or {}).get("name") if isinstance(latest, dict) else None) or _worker_job_name(spec, launch_request or {})
+    latest_name = (
+        (latest.get("metadata") or {}).get("name") if isinstance(latest, dict) else None
+    ) or _worker_job_name(spec, launch_request or {})
     if active:
         job_status = "active"
     elif failed:
@@ -796,7 +1117,7 @@ def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | 
         job_status = "succeeded"
     else:
         job_status = "missing"
-    state_map = {
+    return {
         **state_base_dict,
         "running": active > 0,
         "job_name": latest_name,
@@ -805,11 +1126,6 @@ def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | 
         "succeeded_jobs": succeeded,
         "failed_jobs": failed,
     }
-    if job_status == "failed":
-        failure = _kubernetes_worker_failure(namespace, selector)
-        if failure:
-            state_map["failure"] = failure
-    return state_map
 
 
 def _kubernetes_worker_failure(namespace: str, selector: str) -> dict[str, Any] | None:
@@ -888,6 +1204,26 @@ def _kubernetes_label_selector(spec: WorkerSpec, payload: dict[str, Any]) -> str
     return ",".join(f"{key}={value}" for key, value in selector_label_map.items())
 
 
+def _is_code_calibration_job(spec, payload):
+    """Only persisted exact admission can select the fixed diagnostic deadline."""
+    identity = getattr(payload, "code_calibration_job", None)
+    return (
+        isinstance(payload, _AdmittedWorkerRequest)
+        and identity is not None
+        and identity == getattr(payload, "admitted_job", None)
+        and identity
+        == (
+            payload.get("run_id"),
+            "plan-pricing-code-projection",
+            "arq:PTGCandidateAudit",
+            "control_single_job_start",
+            "plan_pricing_code_projection_" + payload.get("run_id", ""),
+        )
+        and spec.worker_class == "process.PTGCandidateAudit"
+        and spec.queue == "arq:PTGCandidateAudit"
+    )
+
+
 def _worker_job_environment(
     spec: WorkerSpec,
     launch_request: dict[str, Any],
@@ -906,14 +1242,18 @@ def _worker_job_environment(
     run_id = str(launch_request.get("run_id") or "").strip()
     if run_id:
         env_list.append({"name": "HLTHPRT_CONTROL_RUN_ID", "value": run_id})
+    if set(spec.importers).intersection(_SOURCE_PROFILE_IMPORTERS_BY_MODULE.values()) or (
+        provider_directory_source_worker.authorized_fhir_source_worker_launch(spec, launch_request) is not None
+        or npi_source_worker.authorized_npi_source_worker_launch(spec, launch_request) is not None
+    ):
+        policy_setting = "HLTHPRT_SOURCE_PROFILE_ROLE_POLICY_FILE"
+        if policy_path := os.environ.get(policy_setting):
+            env_list.append({"name": policy_setting, "value": policy_path})
+    if _is_code_calibration_job(spec, launch_request):
+        env_list.append({"name": "HLTHPRT_PTG_CANDIDATE_AUDIT_JOB_TIMEOUT", "value": "385"})
     target_job_id = _single_job_worker_target(spec, launch_request)
     if target_job_id:
-        env_list.append(
-            {
-                "name": "HLTHPRT_WORKER_ONCE_TARGET_JOB_ID",
-                "value": target_job_id,
-            }
-        )
+        env_list.append({"name": "HLTHPRT_WORKER_ONCE_TARGET_JOB_ID", "value": target_job_id})
     if spec.worker_class == "process.PTGHuge":
         env_list.append(
             {
@@ -934,7 +1274,11 @@ def _worker_job_environment(
                 ),
             }
         )
-    env_list.extend(_worker_job_secret_env(spec.worker_class))
+    env_list.extend(_worker_job_secret_env(spec.worker_class, launch_request=launch_request))
+    env_list.extend(provider_directory_source_worker.source_proxy_environment(spec, launch_request, env_list))
+    from api.plan_pricing_worker_policy import pricing_worker_policy_environment
+
+    env_list.extend(pricing_worker_policy_environment(launch_request))
     return env_list, run_id
 
 
@@ -956,6 +1300,31 @@ def _worker_job_container(
         "env": env_list,
         "securityContext": _worker_job_container_security_context(),
     }
+    from api.provider_directory_cms_registry_worker import COMMAND, authorized_cms_registry_worker_launch
+
+    launch = authorized_cms_registry_worker_launch(spec, launch_request)
+    if launch is not None:
+        container_dict.update(image=launch.image, command=list(COMMAND), workingDir="/app")
+    fhir_launch = provider_directory_source_worker.authorized_fhir_source_worker_launch(spec, launch_request)
+    if fhir_launch is not None:
+        container_dict.update(
+            image=fhir_launch.image, command=list(provider_directory_source_worker.COMMAND), workingDir="/app"
+        )
+        if type(fhir_launch) is provider_directory_source_worker.FHIRSourcePublicationLaunch:
+            container_dict["args"] = ["publish"]
+    npi_launch = npi_source_worker.authorized_npi_source_worker_launch(spec, launch_request)
+    if npi_launch is not None:
+        container_dict.update(image=npi_launch.image, command=list(npi_source_worker.COMMAND), workingDir="/app")
+    reference_launch = reference_source_worker.authorized_reference_source_worker_launch(spec, launch_request)
+    if reference_launch is not None:
+        container_dict.update(
+            image=reference_launch.image, command=list(reference_source_worker.COMMAND), workingDir="/app"
+        )
+    aca_launch = registry_aca_source_worker.authorized_aca_source_worker_launch(spec, launch_request)
+    if aca_launch is not None:
+        container_dict.update(
+            image=aca_launch.image, command=list(registry_aca_source_worker.COMMAND), workingDir="/app"
+        )
     env_from_list = _worker_job_env_from()
     if env_from_list:
         container_dict["envFrom"] = env_from_list
@@ -963,7 +1332,13 @@ def _worker_job_container(
     if resource_dict:
         container_dict["resources"] = resource_dict
     pvc_volumes = _worker_job_pvc_volumes()
-    volumes = [*pvc_volumes, *_worker_job_secret_volumes(spec)]
+    from api.plan_pricing_worker_policy import pricing_worker_policy_volumes
+
+    volumes = [
+        *pvc_volumes,
+        *_worker_job_secret_volumes(spec, fhir_launch),
+        *pricing_worker_policy_volumes(spec, launch_request),
+    ]
     if volumes:
         container_dict["volumeMounts"] = [volume_spec["volumeMount"] for volume_spec in volumes]
     return container_dict, volumes, run_id
@@ -1014,15 +1389,14 @@ def _worker_job_spec(
         },
     }
     active_deadline_seconds = int(os.getenv("HLTHPRT_WORKER_JOB_ACTIVE_DEADLINE_SECONDS", "0") or "0")
-    if (
-        active_deadline_seconds > 0
-        and spec.worker_class == _PROVIDER_DIRECTORY_WORKER_CLASS
+    if active_deadline_seconds > 0 and spec.worker_class == _PROVIDER_DIRECTORY_WORKER_CLASS:
+        active_deadline_seconds = max(active_deadline_seconds, _PROVIDER_DIRECTORY_MIN_ACTIVE_DEADLINE_SECONDS)
+    if _is_code_calibration_job(spec, launch_request):
+        active_deadline_seconds = min(active_deadline_seconds, 415) if active_deadline_seconds > 0 else 415
+    if active_deadline_seconds > 0 and (spec.worker_class, spec.importers) != (
+        "process.RegistryFHIRCatalogSync",
+        ("registry-fhir-catalog-sync",),
     ):
-        active_deadline_seconds = max(
-            active_deadline_seconds,
-            _PROVIDER_DIRECTORY_MIN_ACTIVE_DEADLINE_SECONDS,
-        )
-    if active_deadline_seconds > 0:
         job_spec_dict["activeDeadlineSeconds"] = active_deadline_seconds
     replicas = _worker_start_replicas(spec)
     if replicas > 1:
@@ -1057,19 +1431,41 @@ def _worker_job_manifest(
         volumes,
         run_id,
     )
+    from api.provider_directory_cms_registry_worker import apply_cms_registry_worker_spec
 
+    apply_cms_registry_worker_spec(spec, launch_request, labels_by_key, job_spec_dict["template"]["spec"])
+    provider_directory_source_worker.apply_fhir_source_worker_spec(
+        spec, launch_request, labels_by_key, job_spec_dict["template"]["spec"]
+    )
+    npi_source_worker.apply_npi_source_worker_spec(
+        spec, launch_request, labels_by_key, job_spec_dict["template"]["spec"]
+    )
+    reference_source_worker.apply_reference_source_worker_spec(
+        spec, launch_request, labels_by_key, job_spec_dict["template"]["spec"]
+    )
+
+    registry_aca_source_worker.apply_aca_source_worker_spec(
+        spec, launch_request, labels_by_key, job_spec_dict["template"]["spec"]
+    )
+
+    fhir_launch = provider_directory_source_worker.authorized_fhir_source_worker_launch(spec, launch_request)
+    annotations_by_key = {
+        "healthporta.com/queue": spec.queue,
+        "healthporta.com/worker-class": spec.worker_class,
+        "healthporta.com/importers": ",".join(spec.importers),
+        "healthporta.com/run-id": run_id,
+    }
+    if fhir_launch is not None and fhir_launch.retry_of_run_id:
+        annotations_by_key["healthporta.com/source-root-run-id"] = fhir_launch.root_run_id
+    annotations_by_key.update(provider_directory_source_worker.fresh_route_annotations(spec, launch_request))
+    annotations_by_key.update(provider_directory_source_worker.source_proxy_annotations(spec, launch_request))
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
         "metadata": {
             "name": job_name,
             "labels": labels_by_key,
-            "annotations": {
-                "healthporta.com/queue": spec.queue,
-                "healthporta.com/worker-class": spec.worker_class,
-                "healthporta.com/importers": ",".join(spec.importers),
-                "healthporta.com/run-id": run_id,
-            },
+            "annotations": annotations_by_key,
         },
         "spec": job_spec_dict,
     }
@@ -1080,12 +1476,49 @@ def _worker_job_env_from() -> list[dict[str, Any]]:
     for name in _csv(os.getenv("HLTHPRT_WORKER_JOB_ENV_FROM_CONFIGMAP", "")):
         env_from_list.append({"configMapRef": {"name": name}})
     for name in _csv(os.getenv("HLTHPRT_WORKER_JOB_ENV_FROM_SECRET", "")):
+        _reject_broad_proxy_pool_secret(name)
         env_from_list.append({"secretRef": {"name": name}})
     return env_from_list
 
 
+def _reject_broad_proxy_pool_secret(secret_name):
+    """Keep the configured pool available only through its explicit Source keyref."""
+    pool_secret = os.getenv(provider_directory_source_worker.PROXY_POOL_SECRET_ENV, "").strip()
+    if pool_secret and secret_name == pool_secret:
+        raise ValueError("worker_proxy_pool_broad_secret_forbidden")
+
+
+def _has_broad_proxy_pool_reference(job):
+    """Refuse inherited pool env or mounted pool data before reusing any worker Job."""
+    pool_secret = os.getenv(provider_directory_source_worker.PROXY_POOL_SECRET_ENV, "").strip()
+    if not pool_secret:
+        return False
+    try:
+        pod = job["spec"]["template"]["spec"]
+        containers = [*pod.get("containers", []), *pod.get("initContainers", []), *pod.get("ephemeralContainers", [])]
+        if any(
+            reference.get("secretRef", {}).get("name") == pool_secret
+            for container in containers
+            for reference in container.get("envFrom", [])
+        ):
+            return True
+        for volume in pod.get("volumes", []):
+            if volume.get("secret", {}).get("secretName") == pool_secret:
+                return True
+            if any(
+                reference.get("secret", {}).get("name") == pool_secret
+                for reference in volume.get("projected", {}).get("sources", [])
+            ):
+                return True
+        return False
+    except KeyError, AttributeError, TypeError:
+        return True
+
+
 def _worker_job_secret_env(
     worker_class: str | None = None,
+    *,
+    launch_request: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Build explicitly named worker environment values from secret keys."""
 
@@ -1105,12 +1538,10 @@ def _worker_job_secret_env(
             continue
         if not _is_worker_class_selected(secret_env_spec, worker_class):
             continue
+        if not _is_admitted_importer_selected(secret_env_spec, worker_class, launch_request):
+            continue
         environment_name = str(secret_env_spec.get("name") or "").strip()
-        secret_name = str(
-            secret_env_spec.get("secretName")
-            or secret_env_spec.get("secret_name")
-            or ""
-        ).strip()
+        secret_name = str(secret_env_spec.get("secretName") or secret_env_spec.get("secret_name") or "").strip()
         secret_key = str(secret_env_spec.get("key") or "").strip()
         if not environment_name or not secret_name or not secret_key:
             continue
@@ -1122,11 +1553,66 @@ def _worker_job_secret_env(
             secret_key_reference_by_field["optional"] = True
         environment_by_name[environment_name] = {
             "name": environment_name,
-            "valueFrom": {
-                "secretKeyRef": secret_key_reference_by_field
-            },
+            "valueFrom": {"secretKeyRef": secret_key_reference_by_field},
         }
     return list(environment_by_name.values())
+
+
+def _is_admitted_importer_selected(selection_spec, worker_class, launch_request) -> bool:
+    """Require exact single-job admission before selecting importer-scoped secrets."""
+
+    from api.provider_directory_cms_registry_worker import is_cms_registry_secret_selected
+
+    if selection_spec.get("purposes") == [
+        provider_directory_source_worker.PURPOSE
+    ] or provider_directory_source_worker.requires_source_proxy_admission(selection_spec):
+        return provider_directory_source_worker.is_fhir_source_secret_selected(
+            selection_spec, worker_class, launch_request
+        )
+    if selection_spec.get("purposes") == [npi_source_worker.PURPOSE]:
+        return npi_source_worker.is_npi_source_secret_selected(selection_spec, worker_class, launch_request)
+    if selection_spec.get("purposes") == [registry_aca_source_worker.PURPOSE]:
+        return registry_aca_source_worker.is_aca_source_secret_selected(selection_spec, worker_class, launch_request)
+    if selection_spec.get("purposes") == [reference_source_worker.PURPOSE]:
+        return reference_source_worker.is_reference_source_secret_selected(selection_spec, worker_class, launch_request)
+    if not is_cms_registry_secret_selected(selection_spec, worker_class, launch_request):
+        return False
+
+    if "importers" not in selection_spec:
+        return True
+    selected = selection_spec["importers"]
+    if (
+        not isinstance(selected, list)
+        or not selected
+        or any(not isinstance(name, str) or not name or name != name.strip() for name in selected)
+        or not ("workerClasses" in selection_spec or "worker_classes" in selection_spec)
+    ):
+        raise ValueError("importer-scoped worker secret selector is invalid")
+    if launch_request is None:
+        return False
+    admission = launch_request.admitted_job if isinstance(launch_request, _AdmittedWorkerRequest) else None
+    importer = admission[1] if admission else launch_request.get("importer")
+    if importer not in selected:
+        return False
+    from api.control_imports import _SINGLE_JOB_ADAPTERS, _enqueue_job_options
+
+    spec = _BY_WORKER_CLASS.get(worker_class)
+    adapter = _SINGLE_JOB_ADAPTERS.get(importer, {})
+    if (
+        admission is None
+        or spec is None
+        or spec.role != "start"
+        or not _uses_single_job_worker(spec)
+        or importer not in spec.importers
+        or launch_request.get("importer", importer) != importer
+        or admission[:4] != (launch_request.get("run_id"), importer, spec.queue, "control_single_job_start")
+        or admission[4] != _single_job_worker_target(spec, launch_request)
+        or adapter.get("queue") != spec.queue
+        or not adapter.get("job_prefix")
+        or admission[4] != _enqueue_job_options(adapter, {"run_id": admission[0]})["_job_id"]
+    ):
+        raise ValueError("importer-scoped worker secret requires exact admitted job")
+    return True
 
 
 def _worker_job_container_security_context() -> dict[str, Any]:
@@ -1157,11 +1643,13 @@ def _worker_job_resources(spec: WorkerSpec, payload_by_field: dict[str, Any] | N
     if profile:
         return profile
     if spec.worker_class == "process.TennesseeTDHProfile":
-        return {"requests": {"cpu": "1", "memory": "4Gi"},
-                "limits": {"cpu": "4", "memory": "8Gi"}}
-    if spec.worker_class in {"process.MassachusettsBORIMProfile", "process.KentuckyKBMLProfile", "process.RhodeIslandDOHProfile"}:
-        return {"requests": {"cpu": "500m", "memory": "512Mi"},
-                "limits": {"cpu": "4", "memory": "4Gi"}}
+        return {"requests": {"cpu": "1", "memory": "4Gi"}, "limits": {"cpu": "4", "memory": "8Gi"}}
+    if spec.worker_class in {
+        "process.MassachusettsBORIMProfile",
+        "process.KentuckyKBMLProfile",
+        "process.RhodeIslandDOHProfile",
+    }:
+        return {"requests": {"cpu": "500m", "memory": "512Mi"}, "limits": {"cpu": "4", "memory": "4Gi"}}
     requests_dict = {
         key: resource_value
         for key, resource_value in {
@@ -1221,9 +1709,7 @@ def _normalize_resource_profile(profile: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(values, dict):
             continue
         normalized_resource_dict = {
-            key: str(value).strip()
-            for key, value in values.items()
-            if key in {"cpu", "memory"} and str(value).strip()
+            key: str(value).strip() for key, value in values.items() if key in {"cpu", "memory"} and str(value).strip()
         }
         if normalized_resource_dict:
             resources_by_section[section] = normalized_resource_dict
@@ -1261,9 +1747,7 @@ def _is_worker_class_selected(
         return False
     if not has_worker_classes and not has_worker_classes_alias:
         return True
-    selected_worker_classes = selection_spec[
-        "workerClasses" if has_worker_classes else "worker_classes"
-    ]
+    selected_worker_classes = selection_spec["workerClasses" if has_worker_classes else "worker_classes"]
     if (
         not isinstance(selected_worker_classes, list)
         or not selected_worker_classes
@@ -1273,15 +1757,14 @@ def _is_worker_class_selected(
         )
     ):
         return False
-    return bool(worker_class) and worker_class in {
-        selected_class.strip() for selected_class in selected_worker_classes
-    }
+    return bool(worker_class) and worker_class in {selected_class.strip() for selected_class in selected_worker_classes}
 
 
 def _worker_job_secret_source(
     mount_spec: dict[str, Any],
     secret_name: str,
 ) -> dict[str, Any] | None:
+    _reject_broad_proxy_pool_secret(secret_name)
     secret_source_by_field: dict[str, Any] = {"secretName": secret_name}
     if bool(mount_spec.get("optional", False)):
         secret_source_by_field["optional"] = True
@@ -1291,20 +1774,14 @@ def _worker_job_secret_source(
         return None
     if not has_default_mode and not has_default_mode_alias:
         return secret_source_by_field
-    default_mode = mount_spec[
-        "defaultMode" if has_default_mode else "default_mode"
-    ]
-    if (
-        isinstance(default_mode, bool)
-        or not isinstance(default_mode, int)
-        or not 0 <= default_mode <= 0o777
-    ):
+    default_mode = mount_spec["defaultMode" if has_default_mode else "default_mode"]
+    if isinstance(default_mode, bool) or not isinstance(default_mode, int) or not 0 <= default_mode <= 0o777:
         return None
     secret_source_by_field["defaultMode"] = default_mode
     return secret_source_by_field
 
 
-def _worker_job_secret_volumes(spec: WorkerSpec) -> list[dict[str, Any]]:
+def _worker_job_secret_volumes(spec: WorkerSpec, fhir_source_launch=None) -> list[dict[str, Any]]:
     """Build validated secret mounts selected for one worker class."""
 
     raw = os.getenv("HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON", "").strip()
@@ -1325,6 +1802,10 @@ def _worker_job_secret_volumes(spec: WorkerSpec) -> list[dict[str, Any]]:
         if not _is_worker_class_selected(mount_spec, spec.worker_class):
             continue
         secret_name = str(mount_spec.get("secretName") or mount_spec.get("secret_name") or "").strip()
+        if "purposes" in mount_spec and not provider_directory_source_worker.is_fhir_source_volume_selected(
+            mount_spec, spec.worker_class, fhir_source_launch
+        ):
+            continue
         mount_path = str(mount_spec.get("mountPath") or mount_spec.get("mount_path") or "").strip()
         if not secret_name or not mount_path:
             continue
@@ -1369,29 +1850,57 @@ def _uses_single_job_worker(spec: WorkerSpec) -> bool:
         spec.worker_class.startswith("process.PTG")
         or spec.worker_class
         in {
-            "process.HospitalPrices", "process.MRFSourceDiscovery",
+            "process.HospitalPrices",
+            "process.MRFSourceDiscovery",
             "process.NPI",
+            "process.RegistryACASource",
             "process.ProviderDirectoryFHIR",
+            "process.Geo",
         }
     )
 
 
+def _admitted_source_job_target(spec, payload):
+    """Use only a native observed job for each fixed source-worker capability."""
+    npi_launch = npi_source_worker.authorized_npi_source_worker_launch(spec, payload)
+    if npi_launch is not None:
+        return npi_launch.job_id
+    reference_launch = reference_source_worker.authorized_reference_source_worker_launch(spec, payload)
+    if reference_launch is not None:
+        return reference_launch.job_id
+    aca_launch = registry_aca_source_worker.authorized_aca_source_worker_launch(spec, payload)
+    if aca_launch is not None:
+        return aca_launch.job_id
+    fhir_launch = provider_directory_source_worker.authorized_fhir_source_worker_launch(spec, payload)
+    if fhir_launch is not None:
+        return fhir_launch.job_id
+    return None
+
+
 def _single_job_worker_target(
     spec: WorkerSpec,
-    payload: dict[str, Any],
+    launch_payload: dict[str, Any],
 ) -> str | None:
+    source_job_id = _admitted_source_job_target(
+        spec, launch_payload
+    ) or provider_directory_source_worker.admitted_ordinary_fhir_job(spec, launch_payload)
+    if source_job_id is not None:
+        return source_job_id
     if not _uses_single_job_worker(spec):
         return None
-    queued_job_id = str(payload.get("job_id") or "").strip()
+    queued_job_id = str(launch_payload.get("job_id") or "").strip()
     if queued_job_id:
         return queued_job_id
-    run_id = str(payload.get("run_id") or "").strip()
+    run_id = str(launch_payload.get("run_id") or "").strip()
     projection_job_prefix_by_importer = {
+        "ptg-provider-membership-projection": "ptg_provider_membership_projection",
+        "plan-pricing-code-projection": "plan_pricing_code_projection",
         "plan-pricing-projection": "plan_pricing_projection",
         "plan-pricing-prewarm": "plan_pricing_prewarm",
         "plan-pricing-em-distance": "plan_pricing_em_distance",
+        "plan-pricing-em-attribution": "plan_pricing_em_attribution",
     }
-    importer = str(payload.get("importer") or "").strip()
+    importer = str(launch_payload.get("importer") or "").strip()
     if importer in projection_job_prefix_by_importer and run_id:
         return f"{projection_job_prefix_by_importer[importer]}_{run_id}"
     if spec.worker_class.startswith("process.PTG") and run_id:
@@ -1427,7 +1936,12 @@ class _KubernetesApiError(RuntimeError):
         self.status = status
 
 
-def _kubernetes_request(method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+def _kubernetes_request(
+    method: str, path: str, body: dict[str, Any] | None = None, *, timeout_seconds: float = 10
+) -> dict[str, Any]:
+    remaining = _nucc_remaining_seconds()
+    if remaining is not None:
+        timeout_seconds = min(timeout_seconds, remaining)
     host = os.getenv("KUBERNETES_SERVICE_HOST", "").strip()
     port = os.getenv("KUBERNETES_SERVICE_PORT", "443").strip()
     if not host:
@@ -1436,9 +1950,7 @@ def _kubernetes_request(method: str, path: str, body: dict[str, Any] | None = No
         token = _K8S_API_TOKEN.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise _KubernetesApiError(0, f"cannot read Kubernetes service account token: {exc}") from exc
-    request_body_bytes = (
-        None if body is None else json.dumps(body).encode("utf-8")
-    )
+    request_body_bytes = None if body is None else json.dumps(body).encode("utf-8")
     request = urllib.request.Request(
         f"https://{host}:{port}{path}",
         data=request_body_bytes,
@@ -1449,9 +1961,11 @@ def _kubernetes_request(method: str, path: str, body: dict[str, Any] | None = No
             "Content-Type": "application/json",
         },
     )
-    context = ssl.create_default_context(cafile=str(_K8S_API_CA)) if _K8S_API_CA.exists() else ssl.create_default_context()
+    context = (
+        ssl.create_default_context(cafile=str(_K8S_API_CA)) if _K8S_API_CA.exists() else ssl.create_default_context()
+    )
     try:
-        with urllib.request.urlopen(request, context=context, timeout=10) as response:  # nosec B310 - in-cluster API URL
+        with urllib.request.urlopen(request, context=context, timeout=timeout_seconds) as response:  # nosec B310 - in-cluster API URL
             raw = response.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -1515,10 +2029,14 @@ def _is_pid_spec_match(pid: int | None, spec: WorkerSpec) -> bool:
     if not pid:
         return False
     try:
-        output = subprocess.check_output(["ps", "eww", "-p", str(pid), "-o", "command="], text=True)
+        output = subprocess.check_output(
+            ["ps", "eww", "-p", str(pid), "-o", "command="], text=True, **_nucc_subprocess_options()
+        )
     except Exception:
         try:
-            output = subprocess.check_output(["ps", "-p", str(pid), "-o", "command="], text=True)
+            output = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "command="], text=True, **_nucc_subprocess_options()
+            )
         except Exception:
             return True
     return _is_process_worker_spec_match(output, spec)
@@ -1528,10 +2046,14 @@ def _is_pid_on_current_node(pid: int | None) -> bool:
     if not pid:
         return False
     try:
-        output = subprocess.check_output(["ps", "eww", "-p", str(pid), "-o", "command="], text=True)
+        output = subprocess.check_output(
+            ["ps", "eww", "-p", str(pid), "-o", "command="], text=True, **_nucc_subprocess_options()
+        )
     except Exception:
         try:
-            output = subprocess.check_output(["ps", "-p", str(pid), "-o", "command="], text=True)
+            output = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "command="], text=True, **_nucc_subprocess_options()
+            )
         except Exception:
             return True
     return _is_current_node_match(output)
@@ -1539,10 +2061,12 @@ def _is_pid_on_current_node(pid: int | None) -> bool:
 
 def _find_running_pid(spec: WorkerSpec) -> int | None:
     try:
-        output = subprocess.check_output(["ps", "eww", "-axo", "pid=,command="], text=True)
+        output = subprocess.check_output(
+            ["ps", "eww", "-axo", "pid=,command="], text=True, **_nucc_subprocess_options()
+        )
     except Exception:
         try:
-            output = subprocess.check_output(["ps", "-axo", "pid=,command="], text=True)
+            output = subprocess.check_output(["ps", "-axo", "pid=,command="], text=True, **_nucc_subprocess_options())
         except Exception:
             return None
     for line in output.splitlines():
@@ -1564,7 +2088,11 @@ def _is_process_worker_spec_match(process_text: str, spec: WorkerSpec) -> bool:
         return False
     parts = process_text.split()
     for index, part in enumerate(parts[:-2]):
-        if part.endswith("main.py") and parts[index + 1] in {"worker", "worker-once"} and parts[index + 2] == spec.worker_class:
+        if (
+            part.endswith("main.py")
+            and parts[index + 1] in {"worker", "worker-once"}
+            and parts[index + 2] == spec.worker_class
+        ):
             return True
     return False
 
@@ -1615,3 +2143,245 @@ def _log_path(spec: WorkerSpec) -> Path:
 
 
 __all__ = ["ensure_worker", "exact_worker_presence", "worker_registry"]
+
+
+@asynccontextmanager
+async def _legacy_nucc_action(run_id):
+    """Keep the existing plain-storage row fence outside the protected Source protocol."""
+    from api import control_imports as imports
+
+    async with imports.db.transaction():
+        current_record = (
+            await imports.db.execute(
+                imports.select(imports.ImportRun.__table__).where(imports.ImportRun.run_id == run_id).with_for_update()
+            )
+        ).first()
+        current = imports._raw_connection_run(current_record) if current_record is not None else None
+        if current is not None and current.get("importer") != "nucc":
+            raise RuntimeError("NUCC action run identity changed")
+        yield current
+
+
+@asynccontextmanager
+async def _nucc_action_transaction(run_id: str):
+    """Keep launch deadlines and all actions inside the same authenticated original Source transaction."""
+    from api import control_imports as imports
+    from api.nucc_source_control import source_action
+
+    deadline_token = _NUCC_ACTION_DEADLINE.set(time.monotonic() + 45)
+    try:
+        async with asyncio.timeout(60), source_action(run_id) as protected:
+            if protected is None:
+                async with _legacy_nucc_action(run_id) as current:
+                    yield current, None, False
+            else:
+                current, receipt = protected
+                binding = imports.db._transaction_binding()
+                if binding is None:
+                    raise RuntimeError("NUCC original Source transaction is unavailable")
+                budget = await _nucc_action_budget(binding.session)
+                _NUCC_ACTION_DEADLINE.set(min(_NUCC_ACTION_DEADLINE.get(), time.monotonic() + budget))
+                yield current, receipt, True
+    finally:
+        _NUCC_ACTION_DEADLINE.reset(deadline_token)
+
+
+def _publish_nucc_run(current):
+    """Project only the durable outcome after its transaction has committed."""
+    from api import control_imports as imports
+
+    public = imports.normalize_run(current) if current is not None else None
+    if public is not None:
+        imports.enqueue_status_event(public)
+        imports._write_run_live_progress(public, publish_event=False)
+    return public
+
+
+async def _enqueue_nucc_run(run_values_by_field, enqueue_params):
+    """Keep the action fence until Redis settles and acknowledge the exact queued current_record."""
+    from api import control_imports as imports
+
+    run_id = run_values_by_field["run_id"]
+    async with _nucc_action_transaction(run_id) as (current, receipt, protected):
+        if current is None:
+            raise RuntimeError("NUCC run disappeared before enqueue")
+        if receipt is None and _nucc_run_is_unclaimed(current):
+            if current.get("params") != run_values_by_field.get("params"):
+                raise RuntimeError("NUCC enqueue parameters changed")
+            task = asyncio.create_task(
+                asyncio.wait_for(
+                    imports._enqueue_selected_import(
+                        {**current, "params": enqueue_params, "family": imports._importer_family("nucc")}
+                    ),
+                    timeout=min(30, _nucc_remaining_seconds()),
+                )
+            )
+            enqueue_result = await _await_worker_launch(task)
+            acknowledged_by_field = {
+                **run_values_by_field,
+                **enqueue_result,
+                "metrics": {**(current.get("metrics") or {}), **enqueue_result.get("metrics", {})},
+            }
+            await imports._write_enqueue_result(run_id, "nucc", acknowledged_by_field)
+            if protected:
+                from process.nucc_protected_control import _locked_source_run
+
+                current = await _locked_source_run(imports.db._transaction_binding().session, run_id)
+            else:
+                current_record = (
+                    await imports.db.execute(
+                        imports.select(imports.ImportRun.__table__).where(imports.ImportRun.run_id == run_id)
+                    )
+                ).first()
+                current = imports._raw_connection_run(current_record) if current_record is not None else None
+    return _publish_nucc_run(await imports.get_import_run(run_id))
+
+
+def _nucc_run_is_unclaimed(current):
+    progress = current.get("progress") or {}
+    metrics = current.get("metrics") or {}
+    return (
+        current.get("status") == "queued"
+        and current.get("phase_detail") == "created"
+        and current.get("finished_at") is None
+        and all(progress.get(key) is None for key in ("attempt_id", "attempt_started_at"))
+        and all(metrics.get(key) is None for key in ("nucc_handoff", "nucc_native_publication"))
+        and metrics.get("job_id") in {None, f"nucc_start_{current['run_id']}"}
+    )
+
+
+async def _request_nucc_cancel(run_id):
+    """Fence exact cancellation before signaling; a publication handoff stays Publisher-owned."""
+    from api import control_imports as imports
+    from api.nucc_source_control import require_source_attempt
+
+    async with _nucc_action_transaction(run_id) as (current_by_field, receipt, protected):
+        if (
+            current_by_field is not None
+            and receipt is None
+            and current_by_field.get("status") not in imports.TERMINAL_STATUSES
+        ):
+            handoff = (current_by_field.get("metrics") or {}).get("nucc_handoff")
+            if protected:
+                require_source_attempt(current_by_field)
+                if handoff is not None and current_by_field["status"] not in {"finalizing", "canceling"}:
+                    raise RuntimeError("NUCC Source handoff state differs")
+            canceled_at = imports.utc_now()
+            statement = (
+                imports.update(imports.ImportRun)
+                .where(
+                    imports.ImportRun.run_id == run_id,
+                    imports.ImportRun.node_id == current_by_field["node_id"],
+                    imports.ImportRun.engine == current_by_field["engine"],
+                    imports.ImportRun.importer == "nucc",
+                    imports.ImportRun.status == current_by_field["status"],
+                    imports.ImportRun.progress
+                    == imports.literal(current_by_field.get("progress") or {}, type_=imports.JSONB),
+                    imports.ImportRun.metrics
+                    == imports.literal(current_by_field.get("metrics") or {}, type_=imports.JSONB),
+                )
+                .values(status="canceling", phase_detail="cancel requested", heartbeat_at=canceled_at)
+            )
+            if await imports.db.status(statement) != 1:
+                raise RuntimeError("NUCC cancellation attempt changed")
+            if protected and handoff is not None:
+                current_by_field = {
+                    **current_by_field,
+                    "status": "canceling",
+                    "phase_detail": "cancel requested",
+                    "heartbeat_at": canceled_at,
+                }
+            else:
+                metrics = current_by_field.get("metrics") or {}
+                signal_task = asyncio.create_task(
+                    imports._cancel_signal_for_run(
+                        current_by_field,
+                        run_id=run_id,
+                        is_pending_adapter=current_by_field["status"] == "queued"
+                        and metrics.get("enqueue_adapter") == "pending",
+                        is_queued_arq=imports._is_queued_arq_cancel(current_by_field, metrics),
+                        nucc_redis_timeout=min(30, _nucc_remaining_seconds()),
+                    )
+                )
+                signal = await _await_worker_launch(signal_task)
+                current_by_field = await imports._request_worker_cancel(
+                    current_by_field, cancel_signal=signal, publish=False
+                )
+    return _publish_nucc_run(await imports.get_import_run(run_id))
+
+
+def _nucc_worker_selection_failure(payload, selected_specs, importer, run_id):
+    selects_nucc = any("nucc" in spec.importers for spec in selected_specs)
+    if (selects_nucc and importer not in {"", "nucc"}) or (importer == "nucc" and not selects_nucc):
+        return _failed_worker_admission(payload, "NUCC worker selector conflicts with importer")
+    if selects_nucc and not run_id:
+        return _failed_worker_admission(payload, "NUCC worker launch requires run_id")
+    return None
+
+
+async def _admit_importer_worker_ensure(worker_payload, *, run_id, importer, selected_specs):
+    if any("provider-directory-fhir" in spec.importers for spec in selected_specs):
+        return await provider_directory_cms_registry_stop.guarded_ensure(
+            worker_payload,
+            run_id=run_id,
+            importer=importer,
+            selected_specs=selected_specs,
+        )
+    if any("nucc" in spec.importers for spec in selected_specs):
+        return await _guarded_nucc_ensure(worker_payload, run_id=run_id, selected_specs=selected_specs)
+    admission_failure = await _admit_worker_ensure(
+        worker_payload,
+        run_id=run_id,
+        importer=importer,
+        selected_specs=selected_specs,
+    )
+    return admission_failure
+
+
+def _nucc_remaining_seconds():
+    deadline = _NUCC_ACTION_DEADLINE.get()
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("NUCC worker action deadline expired")
+    return remaining
+
+
+def _nucc_subprocess_options():
+    remaining = _nucc_remaining_seconds()
+    return {} if remaining is None else {"timeout": remaining}
+
+
+async def _nucc_action_budget(session):
+    from sqlalchemy import text
+
+    limits = await session.scalar(
+        text(
+            "SELECT jsonb_build_object('idle_ms',EXTRACT(EPOCH FROM "
+            "current_setting('idle_in_transaction_session_timeout')::interval)*1000,"
+            "'transaction_remaining_ms',CASE WHEN COALESCE(current_setting('transaction_timeout',true),'0')::interval "
+            "= interval '0' THEN NULL ELSE EXTRACT(EPOCH FROM "
+            "COALESCE(current_setting('transaction_timeout',true),'0')::interval "
+            "- (clock_timestamp()-transaction_timestamp()))*1000 END)"
+        )
+    )
+    return _bounded_nucc_action_budget(limits)
+
+
+def _bounded_nucc_action_budget(limits):
+    if not isinstance(limits, dict) or set(limits) != {"idle_ms", "transaction_remaining_ms"}:
+        raise RuntimeError("NUCC transaction timeout limits are unavailable")
+    budget = 45.0
+    for key in ("idle_ms", "transaction_remaining_ms"):
+        value = limits[key]
+        if value is None and key == "transaction_remaining_ms":
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise RuntimeError("NUCC transaction timeout limit is invalid")
+        if key == "idle_ms" and value == 0:
+            continue
+        budget = min(budget, value / 1000 - 2)
+    if budget <= 0:
+        raise RuntimeError("NUCC transaction timeout margin is exhausted")
+    return budget

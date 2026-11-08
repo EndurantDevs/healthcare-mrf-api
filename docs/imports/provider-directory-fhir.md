@@ -9,6 +9,193 @@ Maintained endpoint support and configuration are listed in
 That generated matrix is deliberately separate from current runtime and import
 status, which is recorded in the endpoint-acquisition campaign report.
 
+Stale-row cleanup defaults to off for manual resource imports and the
+`monthly-full` preset. Enable it explicitly with `--stale-cleanup` when a
+completed source/resource scan supplies the required seen-row evidence.
+This option does not retire immutable editions or their retained inputs.
+
+## Issued Source command lifecycle
+
+Protected Source work requires the deployment's issued transaction factory.
+Starting the ordinary command or registered worker alone does not create that
+authority. The authorized launcher must bind the existing
+`bind_generic_source_transaction_factory` context around startup, the command or
+worker jobs, and shutdown. It must use separately issued publisher credentials,
+the verified role policy and runtime manifest; ordinary database credentials are
+not a fallback.
+
+Retained ordinary acquisition and control operations use the configured Builder
+role's native delegation model.
+Enrollment validates the complete admitted role
+graph, exact table and column grants, callable custody and privilege boundaries.
+Required preparation-role memberships retain only the existing Builder
+capability. Immutable Source payload writes still require the separately issued
+Source Publisher and Owner; a legacy catalog observation issues no authority.
+
+Before native-input registration and signed CMS preparation, the canonical
+`address_archive_v2` table must be enrolled under the declared Source Owner,
+with only SELECT access for ordinary runtime roles. Preserve its exact native
+OID, data and ALWAYS mutation guard; the common publication transaction merges
+prepared archive rows under that Owner. Source preflight refuses an archive
+owned by another role.
+
+A command launcher reuses the existing Click parser by invoking
+`provider_directory_fhir.main(arguments, standalone_mode=False, obj={
+"provider_directory_operation_runner": issued_operation_runner})`.
+The runner receives the original command callable and its normalized options,
+and awaits that command inside the issued factory context. This preserves all
+public options and admission checks. The command examples below describe those
+forwarded options; they require that authorized launcher context rather than an
+unbound standalone invocation. A worker launcher must select the actual
+`process.ProviderDirectoryFHIR` settings and keep the same factory context across
+its complete lifecycle, without holding one physical transaction across jobs.
+
+Resource-acquisition API and scheduled launches require a native stored-job admission for
+the exact Provider Directory importer, queue, function and enqueue ID. That
+server-held capability selects the fixed Source worker purpose and immutable
+paired image; serialized request fields cannot select its credentials or
+command. Set `HLTHPRT_PROVIDER_DIRECTORY_SOURCE_WORKER_IMAGE` to the immutable
+FHIR Source image. When that setting is absent, the existing
+`HLTHPRT_REFERENCE_SOURCE_WORKER_IMAGE` remains the fallback. An explicitly empty
+or invalid FHIR image setting refuses admission; it does not use the fallback.
+The FHIR setting does not change the reference worker's image selection.
+For a retained candidate that must resume with a newly issued producer, the
+server may configure `HLTHPRT_PROVIDER_DIRECTORY_SOURCE_WORKER_ROUTES_JSON` as
+a list of exact `root_run_id`, `source_id`, `endpoint_scope`, immutable `image`,
+and `secret_name` records. The launcher verifies the admitted stored run's
+failed-parent chain back to that root. Other roots keep the default image and
+purpose-scoped secrets; a mismatched run within a configured root is refused.
+An explicit `root_run_id: null` selects a fresh-root route for only the exact
+singleton source and endpoint. It requires a stored run with no retry parent
+and no retry or pagination-root parameters. Other sources retain their default
+route; a changed or multiple-source identity containing the configured source
+is refused. Fresh routes do not select retained retries, which still require
+an exact string-root route and the existing failed-parent ancestry checks.
+Fresh routed Jobs expose the admitted coordinates in
+`healthporta.com/source-id` and `healthporta.com/source-endpoint-scope`
+annotations, while keeping `healthporta.com/source-root-run-id` absent. Request
+fields cannot supply these annotations; admission policy can bind them to the
+specific immutable fresh-route image and its runtime Secret.
+Publisher secret selectors must name only that exact purpose,
+importer and worker class. Missing image configuration or an existing worker
+with changed purpose, target or process isolation is refused. The separately
+signed CMS Registry launch retains precedence and its own admission boundary.
+
+Non-CMS global Profile follow-ups use the ordinary worker command after the
+stored job and existing signed capacity lease are verified. Their complete
+execution parameters must match the authenticated preflight request. Set the
+optional `HLTHPRT_PROVIDER_DIRECTORY_PROFILE_WORKER_IMAGE` to an immutable
+normal-worker image with the matching Profile registry and schema/strategy
+versions. An unset or blank value uses `HLTHPRT_WORKER_JOB_IMAGE`. Job creation
+and reuse use the same selector; Source-purpose credentials remain excluded.
+An exact active Job may be reused after the capacity observation ages, while
+current signature/trust and the build deadline remain valid. A new or replacement
+Job still requires a fresh observation. The ordinary worker checks registered
+selection and runtime capacity. An explicitly dated non-CMS selection uses
+the existing v2 proof with both CMS fields null; the date is part of its identity.
+When a populated legacy target has no recorded snapshot date, use the existing
+guarded initial full swap rather than inferring a date or adopting that target.
+
+An issued isolated-storage manifest keeps ordinary REST acquisition in private
+tables. The existing worker closes candidate writes, validates the complete
+candidate, and copies verified rows through the Catalog Publisher before changing
+the retained-generation and canonical dataset pointers in one transaction.
+Acquisition success and source publication are reported separately. Publication
+failure leaves the incumbent serving; exact same-job recovery reuses the persisted
+candidate and does not fetch it again. API/search readiness still requires the
+existing Profile and Address follow-ups and live read verification.
+
+To finish publication after a successful acquisition, use the authenticated
+`POST /control/v1/workers/ensure` endpoint with the original run identifier:
+
+```json
+{
+  "importer": "provider-directory-fhir",
+  "run_id": "run_11111111111111111111111111111111",
+  "role": "source-publication"
+}
+```
+
+This mode is disabled by default. The server must configure
+`HLTHPRT_PROVIDER_DIRECTORY_SOURCE_PUBLICATION_ROUTES_JSON` with an exact
+`root_run_id`, `source_id`, `endpoint_scope`, immutable `image`, and `secret_name`
+route. Its field format matches the acquisition routes above, but publication
+routes require a string root identifier; fresh-root routes with a null root are
+refused. The stored run must have succeeded without an error, retain one
+unchanged candidate handoff and its acquisition attempt, and report
+`source_publication.state=incomplete`. The original acquisition Job and Pods must
+be stopped before the separate publication Job can start.
+
+Admission reads the native run under its existing action fence and preserves
+the original run, queue-job identity, candidate and producer. The server selects
+the fixed `fhir-source-worker publish` command and supplies
+`HLTHPRT_PROVIDER_DIRECTORY_SOURCE_PUBLICATION_HANDOFF_SHA256` and
+`HLTHPRT_PROVIDER_DIRECTORY_SOURCE_PUBLICATION_ATTEMPT_ID` from the stored proof.
+The request cannot supply an image, credentials, command or replacement proof.
+The Source worker must independently verify its executor and original-producer
+manifests and retained data before publishing. Repeated ensure requests reuse a
+matching active publication Job; while publication remains incomplete, a terminal
+publication Job may be replaced without deleting the original acquisition Job.
+An accepted ensure response is
+worker-launch evidence; publication and downstream readiness require their own
+completed receipts and verification.
+
+This isolated route requires deferred typed materialization and disables direct
+artifact publication, bulk export, and `publish_source_dataset_only`. The legacy
+source-only option below retains its separate issued-storage contract.
+
+The boolean task parameter `publish_source_dataset_only=true` selects a
+single-source REST refresh under that issued factory. It requires
+`import_resources=true`, `defer_typed_materialization=true`,
+`publish_artifacts=false` and `bulk_export=false`. The source must use the
+ordinary REST connector; specialized connectors and CMS preparation keep their
+existing contracts. The default remains false. A successful request validates
+the complete candidate, atomically publishes its Source dataset, and returns the
+exact `dataset_followup` descriptor. Missing follow-up identity fails the request.
+
+The descriptor supports a separate `address_overlay` follow-up and then the
+ordinary partial Address job. The overlay reads the issued immutable Source
+through bounded COPY into private scratch tables, completes indexes and
+set-based parity checks, and uses the existing atomic artifact publication.
+Source metadata locks remain held by the ordinary committing transaction, so a
+concurrent source refresh cannot invalidate its selected dataset during cutover.
+The partial Address job retains the same source fence through its own commit.
+Other sources remain available while that replacement is prepared.
+
+Ordinary nearby-provider queries keep page results, totals, late metadata reads
+and response encoding inside one authenticated read-only snapshot. Publication
+waits for that request's serving-table locks; the next request can then use the
+replacement. Source publication, Address publication and public search acceptance
+remain separate checks. None of these steps creates canonical network aliases.
+
+Source-only publication also returns `dataset_followup.serving_recovery_generation`.
+The existing overlay and partial Address follow-ups carry that identifier as
+`provider_directory_serving_generation`. Their ordinary publication transactions
+retain the previous heaps and indexes and append a fixed native recovery journal.
+Complete content receipts are prepared under reader-compatible locks before the
+short exclusive cutover. The preparation budget is bounded separately from the
+two-second cutover and commit budget; it is not an expected refresh duration.
+
+An authorized Import Control `provider-directory-fhir` run can request recovery
+with exactly these parameters:
+
+```json
+{
+  "provider_directory_serving_operation": "recover",
+  "provider_directory_serving_generation": "6b75740a-7c8a-556a-8e3c-21a9718c88f1",
+  "source_ids": ["source_example"]
+}
+```
+
+Use the actual identifier and source returned by the completed publication.
+Recovery restores the verified previous serving heaps while advancing the Address
+generation. The latest acquired Source dataset stays current and immutable.
+The result reports `serving_recovery`, without scheduling another forward
+`dataset_followup`. Repeating the same recovery resolves its committed result;
+changing its parameters is refused. Unrelated serving or Source changes also
+refuse recovery. Existing populated common-receipt guards still apply: the
+generic overlay does not supply the attested Profile delta required by that path.
+
 ## Support Documentation Lifecycle
 
 Keep these authorities separate when reviewing Provider Directory coverage:
@@ -320,6 +507,20 @@ If a candidate publishes a valid CapabilityStatement, that resolved base is
 persisted back to `provider_directory_source.api_base` and used for the same
 run's resource fetches.
 
+For a reviewed REST source without metadata, source metadata can explicitly set
+`provider_directory_probe_resource` to a supported collection. The probe reuses
+the normal credential checks and requests one resource through the shared HTTP
+client. Only a valid search Bundle admits the source; no CapabilityStatement is
+invented. The collection request and its normal hard deadline honor the resource
+timeout floor. Endpoint-only sources retain the base derived from their configured
+resource URL. This option does not override census contracts or establish complete
+acquisition or publication.
+
+PacificSource full acquisition uses the existing durable checkpoint path. Its
+Practitioner and Location collections exceed the non-checkpointed full-refresh
+page ceiling; bounded direct fetches do not establish complete acquisition.
+Checkpointed scans keep source-issued cursors and do not use that page ceiling.
+
 The importer can also consume a pinned `provider-directory-db`
 `retest_results.json` snapshot as a supplemental source list:
 `--retest-results-path /path/to/retest_results.json` or
@@ -625,10 +826,12 @@ The request must name exactly one source, its current published dataset, and
 the acquisition root. Before writes, it verifies source-to-endpoint identity,
 current/published state, source provenance in publication metadata, the
 declared resource count, and the ordered retained-payload digest. It repeats
-the digest after processing. Each batch restores typed, canonical, and
-source-edge rows through the normal upsert path and commits its checkpoint in
-the same transaction. Interrupted runs resume from the committed resource ID;
-a completed run proves exact membership and does no writes.
+the digest after processing. Bounded COPY prepares isolated typed, canonical,
+and source-edge replacements while the immutable Source reader stays pinned.
+Exact row parity and native receipts precede one atomic output/checkpoint cut.
+Interrupted preparation retains resumable custody. A completed replay requires
+the same admitted operation except for the control run ID, exact output
+membership, and fresh native catalog receipts; it performs no Source writes.
 
 The checkpoint migration adopts a relation created by runtime schema sync only
 after validating its columns, primary key, foreign keys, and supporting indexes.
@@ -710,6 +913,12 @@ capability ciphertext while retaining hashes and audit data. A retry can adopt
 an expired/retryable checkpoint only from its direct prior owner through the
 same root and candidate identity; a fresh run receives a different checkpoint
 and cannot adopt the old snapshot.
+
+While consuming bulk bytes, the worker checks cancellation, deadlines and its
+held checkpoint lock without reopening Source custody transactions for each
+chunk. Full ownership and custody checks remain at bounded writes, including a
+recheck after COPY before payload and byte-offset progress commit atomically.
+Cancellation, deadline expiry or loss of ownership or the lock rolls back that batch.
 
 The candidate is published only when every selected resource reports a
 complete, unbounded, error-free scan with no next page remaining. Publication
@@ -1210,9 +1419,39 @@ optionally bounds the linked fallback per source so a slow remote endpoint does
 not hold the whole import chain after the direct resource collections have been
 captured.
 
-The REST page-prefetch pilot is default-off. Enable it only with both
-`HLTHPRT_PROVIDER_DIRECTORY_REST_KEEPALIVE=true` and
-`HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH=true`. It is fail-closed to the
+During REST acquisition, each active source group's `resource_fetch_timing` map
+contains a snapshot per resource type. Check `timing_available`, `fetch_mode` and
+`timing_scope` before using numeric fields. Generic page-loop snapshots expose
+current-attempt elapsed time, fetched pages/rows, written rows, HTTP duration,
+write/checkpoint duration, prefetch and cooldown counters. Resumed offsets and
+lineage totals are separate: work retained by a previous attempt must not inflate
+the current attempt's throughput. Attempt work remains cumulative if an expired
+cursor causes a traversal restart. These snapshots use the existing throttled
+progress updates and add no per-page status writes.
+
+For `paged_acquisition_loop`, `attempt_elapsed_seconds` starts after initial
+resume/census setup and includes traversal and terminal completion, including
+post-counts and proof/checkpoint work. `source_fetch_elapsed_ms` covers page HTTP
+calls; it excludes census requests and retry backoff sleeps.
+`checkpoint_persist_elapsed_seconds` measures in-loop page persistence, including
+its page writes; it excludes deferred terminal census/checkpoint work.
+`stream_write_elapsed_seconds` includes terminal writes and each write's progress
+callback. Prefetch can overlap HTTP and persistence, so these durations must not
+be added together. Bulk export, partitioned scans, GraphQL and official
+file connectors explicitly report timing as unavailable where equivalent
+measurements are not implemented; unavailable values do not mean zero cost.
+Compare complete acquisition, validation and publication on identical data
+before claiming an end-to-end speed improvement.
+
+The REST page-prefetch pilot is default-off. It requires
+`HLTHPRT_PROVIDER_DIRECTORY_REST_KEEPALIVE=true` and either
+`HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH=true` or the boolean task parameter
+`rest_page_prefetch=true`. An explicitly false or invalid global prefetch setting
+disables it for every task. A task setting of `false` disables it for that task;
+an absent or `null` task setting preserves the environment default. Request settings
+are task-local and restored after completion, failure or cancellation. Persist
+source-qualified settings with the request so retries retain their original profile.
+It is fail-closed to the
 pilot source allowlist and only a generic, single-start, checkpointed, unbounded
 streaming scan that does not retain rows. Any declared or configured credential,
 partitions, bounded scans, and specialized acquisition paths stay sequential
@@ -1236,7 +1475,8 @@ for the campaign's single fresh root. The overlap changes only
 request timing: the next
 validated source-issued GET may run while the current page's rows, proof shard,
 and checkpoint are committed, but it is never parsed or consumed before that
-commit succeeds. Unset either prefetch switch to restore sequential transport;
+commit succeeds. Disable the subset switch or set the global prefetch switch to
+`false` to restore sequential transport;
 no proof, checkpoint, or campaign identity changes.
 
 After the pilot is verified, set
@@ -1251,29 +1491,63 @@ expansion can be enabled or rolled back without changing the pilot.
 To roll back only the deterministic expansion, unset
 `HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH_DETERMINISTIC` or set it to
 `false` and restart the worker; the pilot remains enabled. To disable both,
-unset `HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH` or set it to `false`.
+set `HLTHPRT_PROVIDER_DIRECTORY_REST_PAGE_PREFETCH=false`. Unsetting it restores
+the request's setting, which may still enable the qualified pilot.
 No schema or checkpoint-format change is involved, so the existing durable
 checkpoint resumes on the sequential path.
 
-Resource-cursor concurrency is a separate default-off pilot. Set
+Resource-cursor concurrency is opt-in. Set
 `HLTHPRT_PROVIDER_DIRECTORY_RESOURCE_SCAN_CONCURRENCY=2` (or pass
-`resource_scan_concurrency=2`) to overlap independent resource collections for
-the exact pilot allowlist; accepted values are `1` through `3`. The importer
-falls back to `1` unless the scan is anonymous, keepalive-backed, unbounded,
-streaming, checkpointed, deferred-materialization acquisition with one source
-worker, one start URL per resource, sufficient database pool capacity, and no
-partition, linked-resource, reverse-lookup, effective Bulk, or stale-cleanup
-path. A schedule-level Bulk request does not disable this REST pilot when
-source-level selection has already rejected Bulk as ineligible; any source that
-can actually enter Bulk remains serial. The foundation collections may overlap,
-while the dependency-sensitive role collection remains a serial tail. Each
-resource retains its own durable cursor, so a retry skips completed collections
-and resumes only incomplete ones. This does not fan out pages within an opaque
-cursor or scan archive rows in parallel. Progress and persisted resource
-diagnostics report requested and effective resource-scan concurrency so a
-fail-closed fallback to `1` remains visible.
-Rollback is immediate: set the value back to `1` and restart the worker; durable
-checkpoint identities and formats are unchanged.
+`resource_scan_concurrency=2`). Accepted values are `1` through `8`; the default
+request value remains `1`. Optional source metadata
+`provider_directory_resource_scan_concurrency` may lower the requested cap.
+Isolated Source storage retains its existing two-connection write pool while
+resource downloads overlap; ordinary storage requires one spare database
+connection. No new source
+enrollment or catalog edit is required to use the existing request option.
+
+The importer falls back to `1` unless the scan is anonymous, keepalive-backed,
+unbounded, streaming, checkpointed and deferred-materialization acquisition
+with one source worker and one start URL per resource. Linked-resource,
+reverse-lookup, effective Bulk, stale-cleanup and reviewed census paths keep
+existing serial behavior. A rejected source-level Bulk selection can still use
+parallel REST acquisition. Dependency-ready collections start largest first,
+using the previous published snapshot's resource counts as estimates. Unknown
+sizes keep their existing relative order; the role collection remains a serial
+tail. Counts influence scheduling only, never completion or validation.
+
+Request concurrency starts at the configured transport allowance. A throttling
+or unavailable response (`429`, `503`, `504`), or a transport timeout, halves
+that origin's allowance down to one, without resetting or restarting any
+resource cursor. Valid `Retry-After` deadlines delay subsequent requests.
+Already active requests finish before the lower allowance admits another send.
+The reduced allowance lasts for the transport's lifetime. Source aliases on the
+same origin share it; other origins retain their own allowance.
+
+Each collection retains its own sequential server-issued cursor. For sources
+already qualified for complete last-updated partitions, up to two independent
+window downloads may overlap within the same request budget. One writer commits
+window results and checkpoints; a second proof pass follows the first committed
+pass. Completed windows survive retries, and failed or uncommitted downloads
+can be fetched again. This cannot renew an expired opaque cursor or establish
+coverage for a source that lacks a verified partition contract.
+
+Retries, prefetch and windows share the endpoint request allowance, including
+shared rate-limit cooldown. Independent source groups retain their separate
+allowance within the run's bounded total. Existing worker admission controls
+still govern concurrent imports. Progress records requested/effective resource
+concurrency. Set the value back to `1` for subsequent workers to restore serial
+acquisition; do not restart active imports just to change this setting.
+Checkpoint identities and formats remain unchanged.
+
+Set `allow_retained_pagination_reset=false` to preserve downloaded pages when a
+continuation would require restarting its collection. The importer refuses that
+restart and retains the existing checkpoint. The retry endpoint inherits the
+setting and cannot enable resets for the same acquisition root. Direct create
+requests reusing that parent or root must also explicitly keep the value false;
+omission or true is refused. Fresh requests without this field keep their
+previous behavior. This setting does not renew vendor cursors or establish
+collection completeness.
 
 If resource rows were imported before canonical resource storage was enabled,
 populate the canonical resource and source-edge tables from existing
@@ -1443,6 +1717,64 @@ Live `DELETE FROM entity_address_unified ...` patch publishing is intentionally
 disabled because those deletes can lock the serving table and block API reads.
 
 ## Credentialed API Access
+
+Anthem's registered production Provider Directory uses the exact base
+`https://totalview.healthos.elevancehealth.com/resources/unregistered/api/v1/fhir/cms_mandate/mcd`.
+The additive `anthem-provider-directory` catalog entry supports InsurancePlan,
+PractitionerRole, Practitioner, Organization, Location, HealthcareService and
+OrganizationAffiliation. It does not rewrite historical Availity or affiliated
+insurer entries. Acquisition requires explicit source-ID selection; broad
+scheduled imports exclude this endpoint, including catalog aliases, before
+probing or downloading resources. The endpoint path alone establishes neither
+Medicaid-only
+coverage nor coverage of every affiliated insurer, product or state; preserve
+native plan, network and office participation evidence.
+
+The shared scheduler excludes explicitly unsupported types from its parallel
+wave. With deferred isolated acquisition, the seven supported Anthem types can
+scan independently, each owning its cursor; existing transport, storage and
+capacity checks may lower concurrency. An Anthem HTTP 500 page can use at most
+two existing cooldown cycles after its quick retries. Each cycle keeps the same
+URL and honors `Retry-After` and the resource deadline. Exhausted scans retain
+their checkpoints and remain incomplete and non-current.
+
+Configure an exact `api_bases` or `sources` credential rule using the existing
+secret-mounted JSON format below. Anthem uses OAuth2 `client_credentials` with
+Basic client authentication at
+`https://totalview.healthos.elevancehealth.com/client.oauth2/unregistered/api/v1/token`,
+then Bearer authorization for directory reads. Developer-portal credentials are
+not API credentials. The client ID and secret must belong to an approved
+production application; keep their values outside source definitions and import
+parameters.
+
+The source follows server-issued REST next links using the shared durable
+checkpoints. Full refreshes prefer 1,000 rows per page for six collections and
+500 for PractitionerRole, whose larger payloads benefit from smaller pages;
+bounded probes preserve their requested page size. These exact-source caps
+remain subject to the shared page and response-body limits. Requests negotiate
+gzip for this source while decoded responses retain the same body limit.
+Unsorted production pages were
+observed to overlap. Starts therefore require `_sort=_id`; continuations must
+retain the sort and page count and advance a server-issued `_offset` on the
+exact collection by the returned entry count. Saved cursors undergo separate
+scope validation on resume. The importer preserves the issued URL unchanged and refuses
+malformed, unsorted or overlapping resource IDs before staging the page. The
+last sorted ID is committed with each page's existing checkpoint and checked
+again on resume. Sorted page pairs for all seven collections had strictly
+increasing IDs and retained the issued sort. No reliable collection totals were
+observed. The sampled plans included
+Medicare, Medicaid and other product codes and multiple insurer brands; those
+samples do not establish complete product or geographic coverage.
+Bulk Data export and Endpoint are not advertised. Metadata also advertises
+Specimen, but bounded reads of Specimen and Endpoint returned HTTP 400 and
+neither is acquired. The operator plan requests up to eight independent
+resource scans and retains partial checkpoints when continuation recovery
+would require a reset. Effective parallelism remains subject to the shared
+transport, candidate-storage and connection-capacity gates, and cannot exceed
+the seven supported collections; a bounded concurrent probe reached seven
+successful collection requests. Bounded metadata
+and collection probes establish access only; full acquisition, atomic
+publication and Profile/API verification remain separate acceptance steps.
 
 CMS requires these Provider Directory APIs to be public at the user-data level,
 but payer API servers can still require app registration or API keys. The
@@ -1647,11 +1979,24 @@ Molina seed rows can point at the developer portal
 working Provider Directory metadata base at
 `https://api.interop.molinahealthcare.com/providerdirectory`, so the importer
 maps those rows to that concrete base and records the portal and metadata URLs
-in source metadata. Fresh dev probes validate all five configured resource
-searches and the source-specific rewrite of
-`molina.sapphirethreesixtyfive.com` cursor continuations. Molina remains
-acquisition-configured, but endpoint-wide completeness is not claimed until an
-unbounded exact-source run reaches a terminal success.
+in source metadata. The source uses the shared eight-resource acquisition profile,
+including InsurancePlan, even when capability metadata omits collection routes.
+InsurancePlan uses a broad status search. HealthcareService exhausts both
+`name:missing=false` and `name:missing=true` through one durable cursor, including
+when the second search resumes after a quota stop. Continuations and retained
+positions must preserve the search phase. Endpoint uses a persisted-ID presence
+search. The shared paginator retains both same-origin `starting_after` links and
+the source-specific rewrite of `molina.sapphirethreesixtyfive.com` cursor
+continuations. Source request handling and endpoint-wide completeness require
+separate verification; completeness is not claimed until an unbounded exact-source
+run reaches a terminal success.
+
+The [shared Source HTTP proxy](source-http-proxy.md) can opt an exact Source and
+canonical endpoint into a versioned pool of fixed proxy routes. Its policy belongs
+to trusted deployment configuration; imported metadata cannot enable it. The
+shared FHIR importer preserves encoded continuation URLs and keeps upstream
+credentials separate from proxy credentials. Changing transport does not change
+the Source identity or increase an upstream quota.
 
 UnitedHealthcare seed rows can point at the UHC interoperability landing page
 `https://www.uhc.com/legal/interoperability-apis` or stale retest bases such as
@@ -1760,10 +2105,42 @@ keep any legacy full-rebuild schedule held and dispatch only the signed,
 capacity-admitted source-delta geometry; the intermediate dataset checkpoint
 must never be reported as a completed UHC Profile import.
 
+The shared network catalog reads the official dataset's existing
+`uhc_canonical` admission seal and complete `source_summary_v1`; it does not
+require or fabricate a generic FHIR proof. Its plan-tier projection retains the
+source's exact plan scope, year and tier instead of synthesizing network
+Organization references. Ordinary catalog reconciliation upgrades an older
+`fhir-catalog/v1` snapshot to `fhir-catalog/plan-tier-v2` from the same retained
+publication, without another provider import. Metadata availability is a
+separate checkpoint: approved source bindings, exact provider-location
+membership, pinned addresses and serving publication are still required before
+network-filtered provider search can use those identities. Missing plan details
+and unknown jurisdictions remain explicit; plan/tier labels do not establish
+an employer product or nationwide network equivalence.
+
 The official-file, Flex-cohort, formulary, and release boundaries are recorded
 in [Provider-directory and formulary source acceptance](provider-directory-formulary-source-acceptance.md).
 
-Capital Blue Cross publishes seven populated Plan-Net collections and an empty
+Florida Blue's official Provider Directory OAS
+(`https://developer.bcbsfl.com/interop/interop-developer-portal/product/758/api/749`)
+declares anonymous access to seven collections at
+`https://apigw.bcbsfl.com/interop/interop-developer-portal/emr/api/v1/fhir`.
+The maintained source uses issued opaque next links, durable checkpoints,
+100-row pages and shared pacing below the documented 12 requests per second.
+Source metadata prioritizes the largest observed collections without changing
+the requested resource set or splitting a cursor chain. `Endpoint` is excluded;
+an explicit zero `OrganizationAffiliation` total is allowed. The separate
+metadata service
+(`https://developer.bcbsfl.com/interop/interop-developer-portal/product/758/api/461`)
+advertises a broader capability set and does not change the confirmed directory
+base, resource scope or anonymous access. The maintained qualification probe
+reads the declared `Practitioner` collection at the directory base, including
+stale isolated-source qualification. Existing Availity and other catalog aliases retain their separate endpoint and product
+contracts. Native plan, role and affiliation references remain the membership
+evidence; bounded probes do not establish complete acquisition, publication or
+Profile/API readiness.
+
+The legacy Capital Blue Cross source publishes seven populated Plan-Net collections and an empty
 `Endpoint` collection at `https://providerdirectory-api.capbluecross.com/r4`.
 US-dev probes succeed over normal verified TLS, but broad exact census requests
 return an HTTP-200 OperationOutcome requiring a search predicate. A `ge1900`
@@ -1771,8 +2148,41 @@ return an HTTP-200 OperationOutcome requiring a search predicate. A `ge1900`
 `ge0001`, `_lastUpdated:missing`, and `_id:missing`, however. The advertised
 CapabilityStatement offers only read, vread, and type search, with no history or
 Bulk Export operation. Because no endpoint-wide witness can cover older or
-missing `meta.lastUpdated` values, Capital remains probe-only, resource
+missing `meta.lastUpdated` values, that legacy source remains probe-only, resource
 acquisition stays disabled, and it cannot be published to Profile.
+
+The current [official developer page](https://www.capbluecross.com/wps/portal/cap/about/developer)
+lists separate 1upHealth product endpoints: Medicare at
+`https://api.capitalbluecrossfhir.com/r4/public-ma` and CHIP at
+`https://api.capitalbluecrossfhir.com/r4/public-chip`. These are additive
+`capital-blue-cross-medicare` and `capital-blue-cross-chip` source contracts;
+they do not replace the legacy identity or establish commercial coverage.
+Both configure all eight directory collections through the common REST importer,
+with seven expected nonempty collections and an independently empty `Endpoint`.
+Unfiltered searches and successive issued continuations work anonymously in
+bounded checks; pages are capped at 100. `_summary=count` also returns resources,
+so it is not a count-only transport. The advertised generic CapabilityStatement
+and registration notice do not establish an OAuth requirement for these public
+directory routes. Bulk Export is not enabled or proven for either product.
+
+The source metadata opt-in `provider_directory_pagination_same_collection`
+requires next links to retain the current collection path in addition to the
+common HTTPS origin checks. It preserves opaque query bytes and participates in
+the durable checkpoint and publication contract identities. Acquisition forces
+the existing verified-TLS asynchronous session, preserves query bytes at the HTTP
+boundary and refuses redirects; standalone calls without an anonymous session
+fail closed. The products use
+existing candidate storage, checkpoints, adaptive throttling, bounded COPY and
+atomic publication; no synthetic offsets or timestamp filters are configured.
+Normal acquisition requests up to eight independent resource cursors per source,
+subject to the existing global admission and durable-storage gates. The scoped
+`provider_directory_resource_fetch_order` orders a first crawl by observed collection
+size; existing published-count estimates take precedence on later acquisitions.
+Bounded
+access and paging checks do not establish completed acquisition, validated
+publication, Profile/search readiness or network participation. Only native plan,
+role and affiliation references can establish network evidence; an Organization
+alone does not establish membership.
 
 SCAN Health Plan seed rows can point at the developer portal
 `https://developer.scanhealthplan.com`. The portal's embedded Provider Directory
@@ -1794,6 +2204,38 @@ available for that reverse lookup. The reverse-lookup path uses the same
 streaming flush behavior as direct resource reads and honors the configured
 `linked_resource_deadline_seconds`; when the deadline is reached, stale cleanup
 for SCAN roles is skipped because the resource is incomplete.
+
+## Versioned directories with capped searches
+
+An explicitly configured `versioned_search_limit` enables capped time chunks
+inside the existing last-updated acquisition path. The collection must be an
+unfiltered anonymous HTTPS search on an R4 server advertising versioned create
+and update interactions, whose REST contract populates `meta.lastUpdated`.
+This requirement is checked before and after acquisition. Every returned record
+must have a valid timestamp inside its half-open window. Name prefixes are not
+used, so missing names, punctuation and non-Latin names remain included.
+
+Exact-zero count witnesses before the configured start and at or after the
+root's frozen end are required before acquisition and after the final leaf
+recount. Nonempty, unknown or errored tails prevent completion. A recognized
+`SearchTooCostly` response retains a lower bound, not a fabricated exact total.
+A transport timeout can subdivide an uncounted window without asserting its
+size. Authentication failures, throttling and unrelated errors retain their
+normal handling. Windows that cannot be subdivided fail closed.
+
+Every leaf requires an exact count below the configured chunk ceiling, complete
+sequential issued cursors, two equal content passes and an unchanged final
+count. The leaf sum must reconcile with both passes and the staged candidate.
+The separately reported capped census never substitutes that sum for an
+unfiltered server total. Durable checkpoints include the contract and split
+evidence; earlier exact-census contracts retain their existing identity.
+
+MVP's direct Provider Directory configures this path for Organization, Location,
+PractitionerRole and Practitioner, with chunks of at most 10,000 rows and
+100-row pages. The other four advertised collections use the ordinary REST
+path. Source metadata is distinct from the older transport alias and does not
+infer product, state or network participation. Publication and downstream
+Profile/API readiness require their ordinary validation gates.
 
 ## Self-Harness
 
@@ -2192,3 +2634,8 @@ unscoped rebuild, pass `provider_directory_partial_scope=all`, or pass
 known run. Use `provider_directory_source_batch_size` (or
 `--provider-directory-source-batch-size` for manual CLI launches) to tune source
 batching; `0` disables source batching for deliberate one-off runs.
+
+Apply the current forward migration atomically before using the updated Source custody checks.
+The nullable transaction stamp preserves existing revision history; an unstamped baseline does
+not prove a fresh archive mutation. Serving snapshot rollback is independent of binary or
+schema downgrade compatibility.

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import gc
 import json
 import logging
@@ -20,14 +19,136 @@ import orjson
 import sanic.exceptions
 from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage
-from sqlalchemy import (Column, Float, Integer, MetaData, String, Table, and_, case, cast,
-                        func, literal, literal_column, or_, select, text)
+from sqlalchemy import (
+    Column,
+    Float,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    and_,
+    case,
+    cast,
+    func,
+    literal,
+    literal_column,
+    or_,
+    select,
+    text,
+)
 
 from api.billing_search_access_contract import BILLING_SEARCH_CACHE_CONTROL
+from api.billing_search_cursor import (
+    BillingSearchCursorError,
+    BillingSearchCursorGenerationExpired,
+)
+from api.billing_search_cursor_keys import BillingSearchCursorKeyringError
 from api.billing_search_http import serve_billing_search_get
+from api.billing_search_transport_contract import BILLING_SEARCH_TRANSPORT_PATH
 from api.code_systems import INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
 from api.control_auth import require_control_auth
+from api.custom_import_provider_service_sql import (
+    ProviderServiceImportQuery,
+    build_provider_service_claims_statements,
+    provider_service_native_args,
+    provider_service_zip_filter,
+)
 from api.endpoint.pagination import PaginationParams, parse_pagination
+from api.network_address_scope import canonical_network_read
+from api.network_read_execution import direct_heap_relation_sql, execute_network_read, has_network_read_inventory
+from api.plan_pricing_em_distance import (
+    _request_code_index as _em_distance_request_code_index,
+)
+from api.plan_pricing_em_distance import (
+    em_distance_retry_option,
+    is_em_distance_projection_ready,
+)
+from api.plan_pricing_projection import (
+    PlanPricingProjectionUnavailable,
+    PlanPricingProjectionUnsupported,
+    projection_result_type,
+)
+from api.plan_pricing_state_scan import (
+    PlanPricingStateScanBudgetExceeded,
+    is_plan_pricing_state_scan,
+    search_plan_pricing_state_scan,
+    validate_state_scan_transport,
+)
+from api.plan_release_readiness import is_release_binding_serving_scope_exact
+from api.plan_release_serving import (
+    PlanReleaseServingSelection,
+    annotate_plan_release_response,
+    binding_query_args,
+    has_conflicting_release_selectors,
+    normalize_plan_release_id,
+    prepare_plan_release_bindings,
+    resolve_plan_release_serving,
+)
+from api.plan_release_serving_resolution import (
+    _release_market_type_for_guard,
+    resolve_plan_release_guard_selection,
+)
+from api.pricing_provider_scope import _is_bounded_provider_expansion, _raise_broad_group_plan_provider_expansion
+from api.provider_demographic_filters import (
+    normalize_provider_sex_code,
+    provider_sex_exists_sql,
+)
+from api.provider_group_plan_network_read import (
+    group_plan_address_source,
+    group_plan_arguments,
+    group_plan_release_bindings,
+)
+from api.provider_quality_values import (
+    as_bool as _as_bool,
+)
+from api.provider_quality_values import (
+    empty_domain_payload as _empty_domain_payload,
+)
+from api.provider_quality_values import (
+    estimated_benchmark_modes_for_profile as _estimated_benchmark_modes_for_profile,
+)
+from api.provider_quality_values import (
+    geography_priority_for_benchmark_mode as _geography_priority_for_benchmark_mode,
+)
+from api.provider_quality_values import (
+    is_value_match_or_generic as _is_value_match_or_generic,
+)
+from api.provider_quality_values import (
+    normalize_cohort_level as _normalize_cohort_level,
+)
+from api.provider_quality_values import (
+    normalize_peer_geography_scope as _normalize_peer_geography_scope,
+)
+from api.provider_quality_values import (
+    provider_quality_unavailable_reasons as _provider_quality_unavailable_reasons,
+)
+from api.provider_quality_values import (
+    quality_peer_target_query_variants as _quality_peer_target_query_variants,
+)
+from api.provider_service_code_coverage import add_provider_service_summary
+from api.provider_service_scope import (
+    _canonical_network_procedure_clause,
+    _canonical_procedure_location_filter,
+    _canonical_procedure_locations,
+    _canonical_procedure_zip_anchor,
+    _provider_service_evidence,
+    _reject_resolver_only_procedure_search_params,
+)
+from api.provider_specialty_filters import (
+    ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
+    PRIMARY_CARE_TAXONOMY_CODES,
+    DynamicSpecialtyResolutionError,
+    provider_specialty_taxonomy_exists_sql,
+    resolve_provider_specialty_filter,
+    resolve_ptg_provider_specialty_filter,
+)
+from api.ptg2_address_policy import (
+    PTG2_UNIFIED_ADDRESS_COLUMNS,
+    PTG_NO_DISPLAY_ADDRESS_FIELDS,
+    address_display_rank_sql,
+    postal_box_address_sql,
+)
+from api.ptg2_audit_occurrences import audit_occurrences_payload
 from api.ptg2_candidate_audit import (
     PTG2_CANDIDATE_AUDIT_HEADER,
     attach_candidate_audit_access,
@@ -37,24 +158,25 @@ from api.ptg2_candidate_audit import (
 from api.ptg2_candidate_audit_batch import (
     audit_candidate_source_witness_batch,
 )
-from api.ptg2_candidate_audit_partition import audit_candidate_partition
 from api.ptg2_candidate_audit_capacity import (
+    PTG2_CANDIDATE_AUDIT_DEFAULT_PROCESS_BYTES,
+    PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES,
     CandidateAuditProcessAdmission,
     CandidateAuditProcessAdmissionError,
     CandidateAuditProcessConfigurationError,
-    PTG2_CANDIDATE_AUDIT_DEFAULT_PROCESS_BYTES,
-    PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES,
 )
-from api.ptg2_online_work import PTG2OnlineWorkBudgetExceeded
-from api.ptg2_shared_blocks import (
-    PTG2SharedBlockError,
-    shared_block_read_once_scope,
-)
-from api.ptg2_audit_occurrences import audit_occurrences_payload
+from api.ptg2_candidate_audit_partition import audit_candidate_partition
 from api.ptg2_capacity_evidence import (
     begin_capacity_evidence,
     maybe_attach_capacity_evidence_headers,
 )
+from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
+from api.ptg2_geo_policy import (
+    is_provider_address_geo_capability_available,
+    provider_address_location_filter_sql,
+)
+from api.ptg2_online_work import PTG2OnlineWorkBudgetExceeded
+from api.ptg2_response import _normalize_filter_string_list
 from api.ptg2_serving import (
     PTG2LocationScopeError,
     PTG2ProviderFilterScopeError,
@@ -72,81 +194,38 @@ from api.ptg2_serving import (
     search_current_ptg2_index,
     search_ptg2_provider_procedures,
 )
-from api.ptg2_geo_policy import (
-    is_provider_address_geo_capability_available,
-    provider_address_location_filter_sql,
-)
-from api.ptg2_snapshot import current_source_snapshot_id_for_plan, current_network_snapshots_for_plan
-from api.ptg2_response import _normalize_filter_string_list
-from api.ptg2_address_policy import (
-    PTG_NO_DISPLAY_ADDRESS_FIELDS,
-    PTG2_UNIFIED_ADDRESS_COLUMNS,
-    address_display_rank_sql,
-    postal_box_address_sql,
-)
 from api.ptg2_serving_utils import ein_plan_id_variants
-from api.plan_release_serving import (
-    PlanReleaseServingSelection,
-    annotate_plan_release_response,
-    binding_query_args,
-    has_conflicting_release_selectors,
-    normalize_plan_release_id,
-    resolve_plan_release_serving,
+from api.ptg2_shared_blocks import (
+    PTG2SharedBlockError,
+    shared_block_read_once_scope,
 )
-from api.plan_release_serving_resolution import (
-    _release_market_type_for_guard,
-    resolve_plan_release_guard_selection,
-)
-from api.plan_release_readiness import is_release_binding_serving_scope_exact
-from api.plan_pricing_projection import (
-    PlanPricingProjectionUnavailable,
-    PlanPricingProjectionUnsupported,
-    projection_result_type,
-)
-from api.plan_pricing_em_distance import (
-    _request_code_index as _em_distance_request_code_index,
-    em_distance_retry_option,
-    is_em_distance_projection_ready,
-)
-from api.billing_search_cursor import (
-    BillingSearchCursorError,
-    BillingSearchCursorGenerationExpired,
-)
-from api.billing_search_cursor_keys import BillingSearchCursorKeyringError
-from api.billing_search_transport_contract import BILLING_SEARCH_TRANSPORT_PATH
-from api.plan_pricing_state_scan import (
-    PlanPricingStateScanBudgetExceeded,
-    is_plan_pricing_state_scan,
-    search_plan_pricing_state_scan,
-)
+from api.ptg2_snapshot import current_network_snapshots_for_plan, current_source_snapshot_id_for_plan
 from api.ptg2_tables import _safe_table_name, snapshot_serving_tables
-from api.ptg2_code_filters import INFERRED_PROVIDER_TAXONOMY_RULES
-from api.provider_demographic_filters import (
-    normalize_provider_sex_code,
-    provider_sex_exists_sql,
+from api.reference_family_reads import _query_catalog_neighbors, claims_dictionary_tables
+from api.signed_request_reader import is_owned_reader
+from db.connection import db, gather_reader_calls
+from db.models import (
+    DoctorClinicianAddress,
+    EntityAddressUnified,
+    GeoZipLookup,
+    NPIAddress,
+    NPIData,
+    NPIDataTaxonomy,
+    NUCCTaxonomy,
+    PricingPrescription,
+    PricingProcedure,
+    PricingProcedureGeoBenchmark,
+    PricingProcedurePeerStats,
+    PricingProcedureTaxonomySignal,
+    PricingProvider,
+    PricingProviderPrescription,
+    PricingProviderPrescriptionAutocomplete,
+    PricingProviderProcedure,
+    PricingProviderProcedureCostProfile,
+    PricingProviderProcedureLocation,
+    ProviderEnrichmentSummary,
+    TerminologySynonym,
 )
-from api.provider_specialty_filters import (
-    DynamicSpecialtyResolutionError,
-    ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
-    PRIMARY_CARE_TAXONOMY_CODES,
-    provider_specialty_taxonomy_exists_sql,
-    resolve_ptg_provider_specialty_filter,
-    resolve_provider_specialty_filter,
-)
-from api.provider_service_code_coverage import add_provider_service_summary
-from db.models import (CodeCatalog, CodeCrosswalk, PricingProcedure,
-                       PricingProcedureGeoBenchmark,
-                       DoctorClinicianAddress, EntityAddressUnified,
-                       GeoZipLookup, NPIAddress, NPIData, NPIDataTaxonomy,
-                       NUCCTaxonomy, ProviderEnrichmentSummary,
-                       PricingPrescription, PricingProvider,
-                       PricingProviderPrescription,
-                       PricingProviderPrescriptionAutocomplete,
-                       PricingProviderProcedure,
-                       PricingProviderProcedureCostProfile,
-                       PricingProviderProcedureLocation,
-                       PricingProcedureTaxonomySignal,
-                       PricingProcedurePeerStats, TerminologySynonym)
 from db.prescription_autocomplete_rollup_sql import (
     prescription_autocomplete_source_fingerprint_sql,
 )
@@ -154,16 +233,17 @@ from db.procedure_taxonomy_signal_sql import (
     procedure_taxonomy_signal_fingerprint_sql,
 )
 from process.ptg_parts.allowed_amounts import PTG2_ALLOWED_AMOUNT_CONTRACT
-from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
-from process.ptg_parts.ptg2_partitioned_candidate_audit_contract import (
-    PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT,
-    build_partitioned_candidate_audit_result,
-    parse_partitioned_candidate_audit_request,
-)
 from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
     PTG2_AUDIT_BATCH_RESPONSE_CONTRACT,
     matched_audit_batch_digest,
     parse_audit_batch_request,
+)
+from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+from process.ptg_parts.ptg2_partitioned_candidate_audit_contract import (
+    PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_REQUEST_BYTES,
+    PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT,
+    build_partitioned_candidate_audit_result,
+    parse_partitioned_candidate_audit_request,
 )
 
 blueprint = Blueprint("pricing", url_prefix="/pricing", version=1)
@@ -202,18 +282,14 @@ def _state_scan_generation_expired_response(request: Any):
         {
             "error": {
                 "code": "billing_search_cursor_generation_expired",
-                "message": (
-                    "Billing search cursor generation is no longer available."
-                ),
+                "message": ("Billing search cursor generation is no longer available."),
             }
         },
         status=409,
     )
 
 
-def _state_scan_projection_unavailable_response(
-    request: Any, message: str
-):
+def _state_scan_projection_unavailable_response(request: Any, message: str):
     """Return a first-page projection-readiness failure."""
 
     return _ptg_json_response(
@@ -250,11 +326,7 @@ procedure_peer_stats_table = PricingProcedurePeerStats.__table__
 procedure_taxonomy_signal_table = PricingProcedureTaxonomySignal.__table__
 prescription_table = PricingPrescription.__table__
 provider_prescription_table = PricingProviderPrescription.__table__
-provider_prescription_autocomplete_table = (
-    PricingProviderPrescriptionAutocomplete.__table__
-)
-code_catalog_table = CodeCatalog.__table__
-code_crosswalk_table = CodeCrosswalk.__table__
+provider_prescription_autocomplete_table = PricingProviderPrescriptionAutocomplete.__table__
 terminology_synonym_table = TerminologySynonym.__table__
 geo_zip_table = GeoZipLookup.__table__
 provider_enrichment_summary_table = ProviderEnrichmentSummary.__table__
@@ -305,10 +377,9 @@ PROCEDURE_TAXONOMY_HIGH_NPI_SHARE = min(
     max(float(os.getenv("HLTHPRT_PROCEDURE_TAXONOMY_HIGH_NPI_SHARE", "0.60")), 0.0),
     1.0,
 )
-PROCEDURE_TAXONOMY_HARD_FILTER_REQUIRES_ALLOW = (
-    str(os.getenv("HLTHPRT_PROCEDURE_TAXONOMY_HARD_FILTER_REQUIRES_ALLOW", "true")).strip().lower()
-    not in {"0", "false", "no", "off"}
-)
+PROCEDURE_TAXONOMY_HARD_FILTER_REQUIRES_ALLOW = str(
+    os.getenv("HLTHPRT_PROCEDURE_TAXONOMY_HARD_FILTER_REQUIRES_ALLOW", "true")
+).strip().lower() not in {"0", "false", "no", "off"}
 PROCEDURE_TAXONOMY_OFFICE_EM_CODES = frozenset(str(code) for code in range(99201, 99216))
 PROCEDURE_TAXONOMY_KNOWN_YOUNG_SKEW_CODES = frozenset({"29888"})
 PROCEDURE_TAXONOMY_PRIMARY_CARE_INTENT_TERMS = frozenset(
@@ -432,8 +503,7 @@ _US_STATE_NAME_TO_CODE = {
 def _state_code_sql(expr: str) -> str:
     normalized = f"UPPER(NULLIF(BTRIM(COALESCE({expr}, '')), ''))"
     mapping_cases = "\n".join(
-        f"            WHEN {normalized} = '{name}' THEN '{code}'"
-        for name, code in _US_STATE_NAME_TO_CODE.items()
+        f"            WHEN {normalized} = '{name}' THEN '{code}'" for name, code in _US_STATE_NAME_TO_CODE.items()
     )
     return f"""
         CASE
@@ -493,21 +563,17 @@ def _parse_pricing_default_year() -> int | None:
 
 PRICING_DEFAULT_YEAR = _parse_pricing_default_year()
 PRICING_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
-_PROCEDURE_TAXONOMY_SIGNAL_FINGERPRINT_SQL = (
-    procedure_taxonomy_signal_fingerprint_sql(
-        schema=PRICING_SCHEMA,
-        provider_table=PricingProvider.__tablename__,
-        provider_procedure_table=PricingProviderProcedure.__tablename__,
-        quality_feature_table=QUALITY_FEATURE_TABLE_NAME,
-        npi_taxonomy_table=NPIDataTaxonomy.__tablename__,
-        nucc_taxonomy_table=NUCCTaxonomy.__tablename__,
-    )
+_PROCEDURE_TAXONOMY_SIGNAL_FINGERPRINT_SQL = procedure_taxonomy_signal_fingerprint_sql(
+    schema=PRICING_SCHEMA,
+    provider_table=PricingProvider.__tablename__,
+    provider_procedure_table=PricingProviderProcedure.__tablename__,
+    quality_feature_table=QUALITY_FEATURE_TABLE_NAME,
+    npi_taxonomy_table=NPIDataTaxonomy.__tablename__,
+    nucc_taxonomy_table=NUCCTaxonomy.__tablename__,
 )
-_PRESCRIPTION_AUTOCOMPLETE_FINGERPRINT_SQL = (
-    prescription_autocomplete_source_fingerprint_sql(
-        schema=PRICING_SCHEMA,
-        provider_table=PricingProviderPrescription.__tablename__,
-    )
+_PRESCRIPTION_AUTOCOMPLETE_FINGERPRINT_SQL = prescription_autocomplete_source_fingerprint_sql(
+    schema=PRICING_SCHEMA,
+    provider_table=PricingProviderPrescription.__tablename__,
 )
 ADDRESS_SERVING_SOURCE_ENV = "HLTHPRT_ADDRESS_SERVING_SOURCE"
 ADDRESS_SERVING_SOURCE_UNIFIED = "entity_address_unified"
@@ -629,36 +695,16 @@ def _normalize_service_totals(service_payload_by_field: dict[str, Any]) -> None:
 
 
 def _add_legacy_service_fields(service_payload_by_field: dict[str, Any]) -> None:
-    service_payload_by_field["generic_name"] = service_payload_by_field.get(
-        "service_description"
-    )
-    service_payload_by_field["brand_name"] = service_payload_by_field.get(
-        "reported_code"
-    )
-    service_payload_by_field["total_claims"] = service_payload_by_field.get(
-        "total_services"
-    )
-    service_payload_by_field["total_30day_fills"] = service_payload_by_field.get(
-        "total_beneficiary_day_services"
-    )
-    service_payload_by_field["total_day_supply"] = service_payload_by_field.get(
-        "total_submitted_charges"
-    )
-    service_payload_by_field["total_benes"] = service_payload_by_field.get(
-        "total_beneficiaries"
-    )
-    service_payload_by_field["total_drug_cost"] = service_payload_by_field.get(
-        "total_allowed_amount"
-    )
-    service_payload_by_field["ge65_total_claims"] = service_payload_by_field.get(
-        "ge65_total_services"
-    )
-    service_payload_by_field["ge65_total_benes"] = service_payload_by_field.get(
-        "ge65_total_beneficiaries"
-    )
-    service_payload_by_field["ge65_total_drug_cost"] = service_payload_by_field.get(
-        "ge65_total_allowed_amount"
-    )
+    service_payload_by_field["generic_name"] = service_payload_by_field.get("service_description")
+    service_payload_by_field["brand_name"] = service_payload_by_field.get("reported_code")
+    service_payload_by_field["total_claims"] = service_payload_by_field.get("total_services")
+    service_payload_by_field["total_30day_fills"] = service_payload_by_field.get("total_beneficiary_day_services")
+    service_payload_by_field["total_day_supply"] = service_payload_by_field.get("total_submitted_charges")
+    service_payload_by_field["total_benes"] = service_payload_by_field.get("total_beneficiaries")
+    service_payload_by_field["total_drug_cost"] = service_payload_by_field.get("total_allowed_amount")
+    service_payload_by_field["ge65_total_claims"] = service_payload_by_field.get("ge65_total_services")
+    service_payload_by_field["ge65_total_benes"] = service_payload_by_field.get("ge65_total_beneficiaries")
+    service_payload_by_field["ge65_total_drug_cost"] = service_payload_by_field.get("ge65_total_allowed_amount")
 
 
 def _drop_legacy_service_fields(service_payload_by_field: dict[str, Any]) -> None:
@@ -784,18 +830,24 @@ def _add_legacy_provider_totals(provider_payload_by_field: dict[str, Any]) -> No
         "total_drug_cost": "total_allowed_amount",
     }
     for legacy_field, canonical_field in legacy_field_by_canonical_field.items():
-        provider_payload_by_field[legacy_field] = provider_payload_by_field.get(
-            canonical_field
-        )
+        provider_payload_by_field[legacy_field] = provider_payload_by_field.get(canonical_field)
 
 
 def _normalize_provider_service_aggregate(service_summary_map: dict[str, Any], include_legacy: bool) -> dict[str, Any]:
     """Normalize provider service totals and derive comparable averages."""
 
-    service_summary_map["total_services"] = _coalesce_value(service_summary_map.get("total_services"), service_summary_map.get("total_claims"))
-    service_summary_map["total_beneficiaries"] = _coalesce_value(service_summary_map.get("total_beneficiaries"), service_summary_map.get("total_benes"))
-    service_summary_map["total_submitted_charges"] = _coalesce_value(service_summary_map.get("total_submitted_charges"), service_summary_map.get("total_day_supply"))
-    service_summary_map["total_allowed_amount"] = _coalesce_value(service_summary_map.get("total_allowed_amount"), service_summary_map.get("total_drug_cost"))
+    service_summary_map["total_services"] = _coalesce_value(
+        service_summary_map.get("total_services"), service_summary_map.get("total_claims")
+    )
+    service_summary_map["total_beneficiaries"] = _coalesce_value(
+        service_summary_map.get("total_beneficiaries"), service_summary_map.get("total_benes")
+    )
+    service_summary_map["total_submitted_charges"] = _coalesce_value(
+        service_summary_map.get("total_submitted_charges"), service_summary_map.get("total_day_supply")
+    )
+    service_summary_map["total_allowed_amount"] = _coalesce_value(
+        service_summary_map.get("total_allowed_amount"), service_summary_map.get("total_drug_cost")
+    )
     total_services = _as_float(service_summary_map.get("total_services"))
     total_submitted_charges = _as_float(service_summary_map.get("total_submitted_charges"))
     total_allowed_amount = _as_float(service_summary_map.get("total_allowed_amount"))
@@ -823,15 +875,8 @@ def _normalize_provider_service_aggregate(service_summary_map: dict[str, Any], i
         "average_price": "avg_allowed_amount",
     }
     if include_legacy:
-        service_summary_map["total_claims"] = service_summary_map.get("total_services")
-        service_summary_map["total_day_supply"] = service_summary_map.get("total_submitted_charges")
-        service_summary_map["total_benes"] = service_summary_map.get("total_beneficiaries")
-        service_summary_map["total_drug_cost"] = service_summary_map.get("total_allowed_amount")
-        service_summary_map["charge_per_service_avg"] = service_summary_map.get("avg_submitted_charge")
-        service_summary_map["medicare_avg_submitted_charge_per_service"] = service_summary_map.get("avg_submitted_charge")
-        service_summary_map["medicare_avg_allowed_amount_per_service"] = service_summary_map.get("avg_allowed_amount")
-        service_summary_map["medicare_average_price_per_service"] = service_summary_map.get("avg_allowed_amount")
-        service_summary_map["average_price"] = service_summary_map.get("avg_allowed_amount")
+        for legacy_field, canonical_field in service_summary_map["legacy_field_aliases"].items():
+            service_summary_map[legacy_field] = service_summary_map.get(canonical_field)
     if not include_legacy:
         for key in (
             "total_claims",
@@ -930,15 +975,12 @@ def _parse_zip_radius_miles(raw: Any, *, param: str, default: float) -> float:
 
 
 def _distance_miles_expression(anchor_lat: float, anchor_long: float):
-    return (
-        69.0
-        * func.sqrt(
-            func.pow(geo_zip_table.c.latitude - anchor_lat, 2)
-            + func.pow(
-                (geo_zip_table.c.longitude - anchor_long)
-                * func.cos(func.radians((geo_zip_table.c.latitude + anchor_lat) / 2.0)),
-                2,
-            )
+    return 69.0 * func.sqrt(
+        func.pow(geo_zip_table.c.latitude - anchor_lat, 2)
+        + func.pow(
+            (geo_zip_table.c.longitude - anchor_long)
+            * func.cos(func.radians((geo_zip_table.c.latitude + anchor_lat) / 2.0)),
+            2,
         )
     )
 
@@ -996,7 +1038,8 @@ async def _lookup_zip_context(session, zip5: str | None) -> dict[str, Any] | Non
     normalized_zip = _normalize_zip5(zip5)
     if not normalized_zip:
         return None
-    lookup_result = await session.execute(
+    lookup_result = await execute_network_read(
+        session,
         select(
             geo_zip_table.c.zip_code.label("zip5"),
             geo_zip_table.c.state.label("state"),
@@ -1005,7 +1048,7 @@ async def _lookup_zip_context(session, zip5: str | None) -> dict[str, Any] | Non
             geo_zip_table.c.longitude.label("longitude"),
         )
         .where(geo_zip_table.c.zip_code == normalized_zip)
-        .limit(1)
+        .limit(1),
     )
     row = lookup_result.first()
     if row is None:
@@ -1019,36 +1062,8 @@ async def _lookup_zip_context(session, zip5: str | None) -> dict[str, Any] | Non
     return payload
 
 
-async def _query_zip_radius_rows(
-    session,
-    *,
-    normalized_zip: str,
-    radius_miles: float,
-    state_filter: str | None,
-    anchor: dict[str, Any],
-    limit: int,
-) -> list[dict[str, Any]]:
-    distance_expr = _distance_miles_expression(
-        _as_float(anchor.get("latitude")), _as_float(anchor.get("longitude"))
-    ).label("distance_miles")
-    filters = [
-        geo_zip_table.c.latitude.isnot(None),
-        geo_zip_table.c.longitude.isnot(None),
-        distance_expr <= max(radius_miles, 0.0),
-    ]
-    if state_filter:
-        filters.append(geo_zip_table.c.state == state_filter)
-    query_result = await session.execute(
-        select(
-            geo_zip_table.c.zip_code.label("zip5"),
-            geo_zip_table.c.state.label("state"),
-            geo_zip_table.c.city_lower.label("city_lower"),
-            distance_expr,
-        )
-        .where(and_(*filters))
-        .order_by(distance_expr.asc(), geo_zip_table.c.zip_code.asc())
-        .limit(limit)
-    )
+def _zip_radius_entries(query_result, normalized_zip, state_filter, anchor):
+    """Shape ordered ZIP rows, retaining the requested anchor when it is absent."""
     radius_zip_entries: list[dict[str, Any]] = []
     seen_zip_codes: set[str] = set()
     for zip_query_row in query_result:
@@ -1080,6 +1095,41 @@ async def _query_zip_radius_rows(
     return radius_zip_entries
 
 
+async def _query_zip_radius_rows(
+    session,
+    *,
+    normalized_zip: str,
+    radius_miles: float,
+    state_filter: str | None,
+    anchor: dict[str, Any],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Read distance-ordered ZIPs without dropping the requested anchor."""
+    distance_expr = _distance_miles_expression(
+        _as_float(anchor.get("latitude")), _as_float(anchor.get("longitude"))
+    ).label("distance_miles")
+    filters = [
+        geo_zip_table.c.latitude.isnot(None),
+        geo_zip_table.c.longitude.isnot(None),
+        distance_expr <= max(radius_miles, 0.0),
+    ]
+    if state_filter:
+        filters.append(geo_zip_table.c.state == state_filter)
+    query_result = await execute_network_read(
+        session,
+        select(
+            geo_zip_table.c.zip_code.label("zip5"),
+            geo_zip_table.c.state.label("state"),
+            geo_zip_table.c.city_lower.label("city_lower"),
+            distance_expr,
+        )
+        .where(and_(*filters))
+        .order_by(distance_expr.asc(), geo_zip_table.c.zip_code.asc())
+        .limit(limit),
+    )
+    return _zip_radius_entries(query_result, normalized_zip, state_filter, anchor)
+
+
 async def _uncached_zip_radius_rows(
     session,
     *,
@@ -1091,8 +1141,7 @@ async def _uncached_zip_radius_rows(
 ) -> list[dict[str, Any]]:
     anchor = (
         anchor_context
-        if anchor_context is not None
-        and _normalize_zip5(anchor_context.get("zip5")) == normalized_zip
+        if anchor_context is not None and _normalize_zip5(anchor_context.get("zip5")) == normalized_zip
         else None
     )
     if anchor is None:
@@ -1230,7 +1279,7 @@ def _as_float(value: Any) -> float | None:
         return None
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -1261,7 +1310,7 @@ def _is_broad_office_visit_cpt(code_system: Any, code: Any) -> bool:
         return False
     try:
         value = int(str(code or "").strip())
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return False
     return 99202 <= value <= 99215
 
@@ -1275,8 +1324,7 @@ def _validated_plan_release_id(args: Mapping[str, Any]) -> str:
     normalized_release_id = normalize_plan_release_id(raw_release_id)
     if normalized_release_id is None:
         raise InvalidUsage(
-            "Parameter 'plan_release_id' must be hprelease_ followed by "
-            "26 uppercase Crockford base32 characters"
+            "Parameter 'plan_release_id' must be hprelease_ followed by 26 uppercase Crockford base32 characters"
         )
     if has_conflicting_release_selectors(args):
         raise InvalidUsage(
@@ -1284,39 +1332,6 @@ def _validated_plan_release_id(args: Mapping[str, Any]) -> str:
             "plan_external_id, plan_id_type, source_key, or snapshot_id"
         )
     return normalized_release_id
-
-
-def _raise_broad_group_plan_provider_expansion(
-    *,
-    has_taxonomy_scope: bool,
-) -> None:
-    """Raise the actionable error for an unbounded provider expansion."""
-
-    if has_taxonomy_scope:
-        raise InvalidUsage(
-            "Statewide taxonomy-scoped CPT office-visit provider expansion is too broad; "
-            "add zip5 with zip_radius_miles (or lat, long, and radius_miles).",
-            context={
-                "fix_it": {
-                    "reason": (
-                        "A statewide taxonomy search expands too many provider-rate "
-                        "candidates for an interactive request."
-                    ),
-                    "retry_options": [
-                        {
-                            "zip5": "<member ZIP>",
-                            "zip_radius_miles": 10,
-                            "note": "Retry inside a bounded ZIP radius.",
-                        }
-                    ],
-                }
-            },
-        )
-    raise InvalidUsage(
-        "Broad CPT office-visit provider expansion for a group plan is a provider-directory request; "
-        "use /api/v1/pricing/group-plan-providers with specialty/classification/location filters, or add "
-        "specialty/taxonomy/npi and use procedure pricing only when the user asks for office-visit cost."
-    )
 
 
 def _has_provider_expansion_location(
@@ -1356,9 +1371,7 @@ def _reject_broad_group_plan_provider_expansion(
         return
     specialty_filter = specialty_filter or resolve_provider_specialty_filter(args)
     has_taxonomy_scope = bool(
-        specialty_filter.is_active
-        or args.get("taxonomy_code")
-        or args.get("taxonomy_classification")
+        specialty_filter.is_active or args.get("taxonomy_code") or args.get("taxonomy_classification")
     )
     if not (
         _parse_bool(
@@ -1378,19 +1391,8 @@ def _reject_broad_group_plan_provider_expansion(
         if has_taxonomy_scope:
             _raise_broad_group_plan_provider_expansion(has_taxonomy_scope=True)
         return
-    has_bounded_location = bool(
-        zip5 or (latitude is not None and longitude is not None)
-    )
-    if has_bounded_location and (
-        has_taxonomy_scope
-        or (
-            str(args.get("order_by") or "").strip().lower()
-            in {"distance", "distance_miles"}
-            and (
-                _request_value_or_none(args.get("order")) is None
-                or str(args.get("order")).strip().lower() == "asc"
-            )
-        )
+    if _is_bounded_provider_expansion(
+        args, zip5=zip5, latitude=latitude, longitude=longitude, has_taxonomy_scope=has_taxonomy_scope
     ):
         return
     _raise_broad_group_plan_provider_expansion(has_taxonomy_scope=has_taxonomy_scope)
@@ -1548,25 +1550,22 @@ async def _build_dynamic_zip_peer_stats(
             provider_procedure_cost_profile_table.c.setting_key == setting_key,
             provider_procedure_cost_profile_table.c.geography_scope == "zip5",
             provider_procedure_cost_profile_table.c.geography_value.in_(zip_candidates),
-            provider_procedure_cost_profile_table.c.claim_count
-            >= PROCEDURE_COST_DYNAMIC_MIN_PEER_CLAIMS,
+            provider_procedure_cost_profile_table.c.claim_count >= PROCEDURE_COST_DYNAMIC_MIN_PEER_CLAIMS,
             provider_procedure_cost_profile_table.c.avg_submitted_charge > 0,
         ]
         if specialty_candidate != "__all__":
             filters.append(provider_procedure_cost_profile_table.c.specialty_key == specialty_candidate)
 
-        candidate_result = await session.execute(
+        candidate_result = await execute_network_read(
+            session,
             select(
                 provider_procedure_cost_profile_table.c.npi,
                 provider_procedure_cost_profile_table.c.claim_count,
                 provider_procedure_cost_profile_table.c.avg_submitted_charge,
                 provider_procedure_cost_profile_table.c.geography_value,
-            ).where(and_(*filters))
+            ).where(and_(*filters)),
         )
-        candidate_rows = [
-            _row_to_dict(cost_profile_row)
-            for cost_profile_row in candidate_result
-        ]
+        candidate_rows = [_row_to_dict(cost_profile_row) for cost_profile_row in candidate_result]
         if len(candidate_rows) < PROCEDURE_COST_DYNAMIC_MIN_PEER_PROVIDERS:
             continue
 
@@ -1602,10 +1601,7 @@ def _dynamic_zip_peer_statistics(
     )
     if len(charges) < min_providers:
         return None
-    claim_counts = [
-        float(_as_float(charge_row.get("claim_count")) or 0.0)
-        for charge_row in trimmed_charge_rows
-    ]
+    claim_counts = [float(_as_float(charge_row.get("claim_count")) or 0.0) for charge_row in trimmed_charge_rows]
     return {
         "provider_count": len(trimmed_charge_rows),
         "min_claim_count": min(claim_counts) if claim_counts else None,
@@ -1673,9 +1669,7 @@ def _validate_removed_variants_param(raw: Any, param_name: str = "variants") -> 
     text = str(raw or "").strip().lower()
     if not text:
         return
-    raise InvalidUsage(
-        f"Parameter '{param_name}' is no longer supported; use 'variants_scope=provider'."
-    )
+    raise InvalidUsage(f"Parameter '{param_name}' is no longer supported; use 'variants_scope=provider'.")
 
 
 def _parse_probability_clamped(raw: Any, param: str, default: float) -> float:
@@ -1768,7 +1762,7 @@ def _provider_cost_geography_scope(
             continue
         try:
             npi = int(str(npi_raw).strip())
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
         if npi <= 0:
             continue
@@ -1793,11 +1787,7 @@ def _provider_cost_geography_clauses(
     geography_clauses = []
     for geography_scope, geography_values in geography_values_by_scope.items():
         sanitized_values = sorted(
-            {
-                str(geography_value).strip()
-                for geography_value in geography_values
-                if str(geography_value).strip()
-            }
+            {str(geography_value).strip() for geography_value in geography_values if str(geography_value).strip()}
         )
         if not sanitized_values:
             continue
@@ -1819,18 +1809,17 @@ async def _load_provider_cost_profiles(
     geography_clauses: list[Any],
 ) -> list[dict[str, Any]]:
     """Load provider profiles admitted by the requested geography scope."""
-    profile_result = await session.execute(
+    profile_result = await execute_network_read(
+        session,
         select(provider_procedure_cost_profile_table).where(
             and_(
                 provider_procedure_cost_profile_table.c.year == year,
-                provider_procedure_cost_profile_table.c.npi.in_(
-                    sorted(geography_candidates_by_npi.keys())
-                ),
+                provider_procedure_cost_profile_table.c.npi.in_(sorted(geography_candidates_by_npi.keys())),
                 provider_procedure_cost_profile_table.c.procedure_code.in_(internal_codes),
                 provider_procedure_cost_profile_table.c.setting_key == "all",
                 or_(*geography_clauses),
             )
-        )
+        ),
     )
     return [_row_to_dict(profile_row) for profile_row in profile_result]
 
@@ -1847,15 +1836,13 @@ def _select_provider_cost_profiles(
             continue
         try:
             npi = int(npi_raw)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
         geography_scope = str(profile_row.get("geography_scope") or "").strip()
         geography_value = str(profile_row.get("geography_value") or "").strip()
         if not geography_scope or not geography_value:
             continue
-        profiles_by_npi_and_geo.setdefault((npi, geography_scope, geography_value), []).append(
-            profile_row
-        )
+        profiles_by_npi_and_geo.setdefault((npi, geography_scope, geography_value), []).append(profile_row)
 
     selected_profile_by_npi: dict[int, dict[str, Any]] = {}
     for npi, geography_candidates in geography_candidates_by_npi.items():
@@ -1890,13 +1877,10 @@ def _provider_cost_peer_key(
     try:
         procedure_code = int(profile.get("procedure_code"))
         profile_year = int(profile.get("year"))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     normalized_specialty = str(profile.get("specialty_key") or "").strip().lower()
-    setting_key = (
-        str(profile.get("setting_key") or "").strip().lower()
-        or default_setting_key
-    )
+    setting_key = str(profile.get("setting_key") or "").strip().lower() or default_setting_key
     return (
         procedure_code,
         profile_year,
@@ -1922,9 +1906,7 @@ def _collect_provider_cost_peer_keys(
     return peer_key_candidates
 
 
-async def _load_provider_cost_peers(
-    session, peer_key_candidates: set[_ProviderCostPeerKey]
-) -> list[dict[str, Any]]:
+async def _load_provider_cost_peers(session, peer_key_candidates: set[_ProviderCostPeerKey]) -> list[dict[str, Any]]:
     """Load peer thresholds for the selected provider profiles."""
     peer_clauses = [
         and_(
@@ -1944,7 +1926,7 @@ async def _load_provider_cost_peers(
             setting_key,
         ) in peer_key_candidates
     ]
-    peer_result = await session.execute(select(procedure_peer_stats_table).where(or_(*peer_clauses)))
+    peer_result = await execute_network_read(session, select(procedure_peer_stats_table).where(or_(*peer_clauses)))
     return [_row_to_dict(peer_stats_row) for peer_stats_row in peer_result]
 
 
@@ -1954,9 +1936,7 @@ def _provider_cost_peers_by_key(
     """Index valid peer rows by their normalized lookup key."""
     peers_by_key: dict[_ProviderCostPeerKey, dict[str, Any]] = {}
     for peer_stats_row in peer_rows:
-        peer_key = _provider_cost_peer_key(
-            peer_stats_row, default_setting_key=""
-        )
+        peer_key = _provider_cost_peer_key(peer_stats_row, default_setting_key="")
         if peer_key is not None:
             peers_by_key[peer_key] = peer_stats_row
     return peers_by_key
@@ -1974,7 +1954,7 @@ def _apply_provider_service_cost_indices(
             continue
         try:
             npi = int(str(npi_raw).strip())
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             continue
 
         profile = selected_profile_by_npi.get(npi)
@@ -1985,9 +1965,7 @@ def _apply_provider_service_cost_indices(
             continue
         peer_row = peers_by_key.get(peer_key)
         if peer_row is None:
-            peer_row = peers_by_key.get(
-                (*peer_key[:4], "__all__", peer_key[5])
-            )
+            peer_row = peers_by_key.get((*peer_key[:4], "__all__", peer_key[5]))
         if peer_row is None:
             continue
 
@@ -2035,9 +2013,7 @@ async def _enrich_provider_service_cost_indices(
         geography_candidates_by_npi=geography_candidates_by_npi,
         geography_clauses=geography_clauses,
     )
-    selected_profile_by_npi = _select_provider_cost_profiles(
-        profile_rows, geography_candidates_by_npi
-    )
+    selected_profile_by_npi = _select_provider_cost_profiles(profile_rows, geography_candidates_by_npi)
     peer_key_candidates = _collect_provider_cost_peer_keys(selected_profile_by_npi)
     if not peer_key_candidates:
         return
@@ -2050,7 +2026,7 @@ async def _enrich_provider_service_cost_indices(
 
 
 async def _default_year(session, table) -> int:
-    result = await session.execute(select(func.max(table.c.year)))
+    result = await execute_network_read(session, select(func.max(table.c.year)))
     year = result.scalar()
     if year is None:
         raise sanic.exceptions.NotFound("No pricing data available")
@@ -2066,32 +2042,35 @@ async def _resolve_year(session, table, requested_year: int | None) -> tuple[int
 
 
 async def _is_table_available(session, table_name: str) -> bool:
+    use_cache = ENABLE_PRICING_SCHEMA_CACHE and not has_network_read_inventory(session)
     qualified_name = table_name if "." in table_name else f"{PRICING_SCHEMA}.{table_name}"
-    if ENABLE_PRICING_SCHEMA_CACHE:
+    if use_cache:
         cached = _PRICING_TABLE_EXISTS_CACHE.get(qualified_name)
         if cached is not None:
             cached_at, cached_value = cached
             if (time.monotonic() - cached_at) <= _PRICING_SCHEMA_CACHE_TTL_SECONDS:
                 return bool(cached_value)
             _PRICING_TABLE_EXISTS_CACHE.pop(qualified_name, None)
-    result = await session.execute(text("SELECT to_regclass(:name)"), {"name": qualified_name})
+    result = await execute_network_read(session, text("SELECT to_regclass(:name)"), {"name": qualified_name})
     exists = bool(result.scalar())
-    if ENABLE_PRICING_SCHEMA_CACHE:
+    if use_cache:
         _PRICING_TABLE_EXISTS_CACHE[qualified_name] = (time.monotonic(), exists)
     return exists
 
 
 async def _table_columns(session, table_name: str) -> set[str]:
+    use_cache = ENABLE_PRICING_SCHEMA_CACHE and not has_network_read_inventory(session)
     qualified_name = table_name if "." in table_name else f"{PRICING_SCHEMA}.{table_name}"
     schema_name, simple_name = qualified_name.split(".", 1)
-    if ENABLE_PRICING_SCHEMA_CACHE:
+    if use_cache:
         cached = _PRICING_TABLE_COLUMNS_CACHE.get(qualified_name)
         if cached is not None:
             cached_at, cached_columns = cached
             if (time.monotonic() - cached_at) <= _PRICING_SCHEMA_CACHE_TTL_SECONDS:
                 return set(cached_columns)
             _PRICING_TABLE_COLUMNS_CACHE.pop(qualified_name, None)
-    result = await session.execute(
+    result = await execute_network_read(
+        session,
         text(
             """
             SELECT column_name
@@ -2103,7 +2082,7 @@ async def _table_columns(session, table_name: str) -> set[str]:
         {"schema_name": schema_name, "table_name": simple_name},
     )
     columns = tuple(str(row[0]).strip() for row in result.fetchall() if row and row[0])
-    if ENABLE_PRICING_SCHEMA_CACHE:
+    if use_cache:
         _PRICING_TABLE_COLUMNS_CACHE[qualified_name] = (time.monotonic(), columns)
     return set(columns)
 
@@ -2126,7 +2105,9 @@ async def _group_plan_provider_address_source(session) -> tuple[str, bool, bool,
         return legacy_table, False, False, False
 
     coverage_supported = {"group_plan_array", "ptg_plan_array"}.issubset(columns)
-    plan_bridge_supported = "location_key" in columns and await _is_table_available(session, "entity_address_plan_bridge")
+    plan_bridge_supported = "location_key" in columns and await _is_table_available(
+        session, "entity_address_plan_bridge"
+    )
     return unified_table, True, coverage_supported, plan_bridge_supported
 
 
@@ -2138,12 +2119,12 @@ def _group_plan_provider_coverage_match_sql(
 ) -> str:
     clauses: list[str] = []
     if array_coverage_supported:
-        clauses.extend((
-            f"{address_alias}.group_plan_array "
-            "&& CAST(:plan_ids AS varchar[])",
-            f"{address_alias}.ptg_plan_array "
-            "&& CAST(:plan_ids AS varchar[])",
-        ))
+        clauses.extend(
+            (
+                f"{address_alias}.group_plan_array && CAST(:plan_ids AS varchar[])",
+                f"{address_alias}.ptg_plan_array && CAST(:plan_ids AS varchar[])",
+            )
+        )
     if plan_bridge_supported:
         clauses.append(
             f"""EXISTS (
@@ -2175,7 +2156,7 @@ def _terminology_item(row: dict[str, Any]) -> dict[str, Any]:
     if metadata_raw:
         try:
             metadata = json.loads(metadata_raw)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             metadata = {"raw": metadata_raw}
     return {
         "domain": row.get("domain"),
@@ -2209,6 +2190,8 @@ async def _query_terminology(
     include_broad: bool = True,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
+    """Find bounded terminology matches with exact and broad-match controls."""
+
     term_text = str(term or "").strip()
     term_key = _normalize_term_key(term_text)
     if not term_key or not await _is_terminology_available(session):
@@ -2230,7 +2213,8 @@ async def _query_terminology(
             )
         )
     if target_systems:
-        filters.append(func.upper(terminology_synonym_table.c.target_system).in_(tuple(system.upper() for system in target_systems)))
+        systems = tuple(system.upper() for system in target_systems)
+        filters.append(func.upper(terminology_synonym_table.c.target_system).in_(systems))
     if not include_broad:
         filters.append(terminology_synonym_table.c.is_broad.is_(False))
 
@@ -2253,11 +2237,8 @@ async def _query_terminology(
         )
         .limit(limit)
     )
-    terminology_result = await session.execute(query)
-    return [
-        _terminology_item(_row_to_dict(terminology_row))
-        for terminology_row in terminology_result
-    ]
+    terminology_result = await execute_network_read(session, query)
+    return [_terminology_item(_row_to_dict(terminology_row)) for terminology_row in terminology_result]
 
 
 _PROCEDURE_AUTOCOMPLETE_TERMINOLOGY_SQL = text(
@@ -2328,11 +2309,10 @@ _PROCEDURE_AUTOCOMPLETE_TERMINOLOGY_SQL = text(
 )
 
 
-_PROCEDURE_AUTOCOMPLETE_CATALOG_SQL = text(
-    f"""
+_PROCEDURE_AUTOCOMPLETE_CATALOG_TEMPLATE = f"""
     WITH matched_source AS MATERIALIZED (
         SELECT p.procedure_code, p.reported_code, p.service_description
-          FROM {procedure_table.fullname} AS p
+          FROM {{procedure_relation}} AS p
          WHERE (CAST(:year AS integer) IS NULL
                 OR p.source_year <= CAST(:year AS integer))
            AND (lower(coalesce(nullif(p.service_description, ''),
@@ -2394,6 +2374,8 @@ _PROCEDURE_AUTOCOMPLETE_CATALOG_SQL = text(
         display_name ASC NULLS LAST, target_system ASC, target_code ASC
      LIMIT :limit
     """
+_PROCEDURE_AUTOCOMPLETE_CATALOG_SQL = text(
+    _PROCEDURE_AUTOCOMPLETE_CATALOG_TEMPLATE.replace("{procedure_relation}", procedure_table.fullname)
 )
 
 
@@ -2406,12 +2388,12 @@ async def _query_procedure_autocomplete_terminology(
     limit: int,
 ) -> list[dict[str, Any]] | None:
     normalized_tokens = _normalize_term_key(search_query).split()
-    # ponytail: Three tokens bound latency; add trigram indexes before raising this.
-    search_tokens = tuple(dict.fromkeys(
-        token
-        for token in normalized_tokens
-        if len(token) > 1 and token not in _PROCEDURE_AUTOCOMPLETE_STOPWORDS
-    ))[-3:]
+    # shortcut: Three tokens bound latency; add trigram indexes before raising this.
+    search_tokens = tuple(
+        dict.fromkeys(
+            token for token in normalized_tokens if len(token) > 1 and token not in _PROCEDURE_AUTOCOMPLETE_STOPWORDS
+        )
+    )[-3:]
     full_term = " ".join(normalized_tokens)
     if len(normalized_tokens) < 2 or full_phrase_only:
         return await _query_terminology(
@@ -2428,7 +2410,8 @@ async def _query_procedure_autocomplete_terminology(
     if not await _is_terminology_available(session):
         return None
 
-    terminology_result = await session.execute(
+    terminology_result = await execute_network_read(
+        session,
         _PROCEDURE_AUTOCOMPLETE_TERMINOLOGY_SQL,
         {
             "search_terms": json.dumps((full_term, *search_tokens)),
@@ -2439,10 +2422,7 @@ async def _query_procedure_autocomplete_terminology(
             "limit": limit,
         },
     )
-    return [
-        _terminology_item(_row_to_dict(terminology_row))
-        for terminology_row in terminology_result
-    ]
+    return [_terminology_item(_row_to_dict(terminology_row)) for terminology_row in terminology_result]
 
 
 async def _query_procedure_autocomplete_catalog(
@@ -2455,8 +2435,17 @@ async def _query_procedure_autocomplete_catalog(
 ) -> list[dict[str, Any]]:
     """Query the live procedure catalog with literal substring semantics."""
     escaped_query = search_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    catalog_result = await session.execute(
-        _PROCEDURE_AUTOCOMPLETE_CATALOG_SQL,
+    catalog_query = _PROCEDURE_AUTOCOMPLETE_CATALOG_SQL
+    if has_network_read_inventory(session):
+        catalog_query = text(
+            _PROCEDURE_AUTOCOMPLETE_CATALOG_TEMPLATE.replace(
+                "{procedure_relation}",
+                direct_heap_relation_sql(session, PRICING_SCHEMA, PricingProcedure.__tablename__),
+            )
+        )
+    catalog_result = await execute_network_read(
+        session,
+        catalog_query,
         {
             "q_like": f"%{escaped_query}%",
             "q_prefix": f"{escaped_query}%",
@@ -2498,9 +2487,7 @@ async def _resolve_provider_type_terms(
                 if str(terminology_match.get("target_system") or "").upper() != "NUCC":
                     continue
                 provider_type = str(
-                    terminology_match.get("canonical_term")
-                    or terminology_match.get("target_display")
-                    or ""
+                    terminology_match.get("canonical_term") or terminology_match.get("target_display") or ""
                 ).strip()
             else:
                 provider_type = str(terminology_match.get("target_code") or "").strip()
@@ -2539,7 +2526,9 @@ def _provider_type_search_terms(args, specialty: str | None) -> list[str]:
     return deduped_terms
 
 
-async def _provider_type_filter_clause(session, args, provider_type_column, specialty: str | None) -> tuple[Any | None, dict[str, Any] | None]:
+async def _provider_type_filter_clause(
+    session, args, provider_type_column, specialty: str | None
+) -> tuple[Any | None, dict[str, Any] | None]:
     terms = _provider_type_search_terms(args, specialty)
     if not terms:
         return None, None
@@ -2547,9 +2536,7 @@ async def _provider_type_filter_clause(session, args, provider_type_column, spec
     provider_types = resolution.get("provider_types") or []
     if provider_types:
         lowered_provider_types = [
-            str(provider_type).strip().lower()
-            for provider_type in provider_types
-            if str(provider_type).strip()
+            str(provider_type).strip().lower() for provider_type in provider_types if str(provider_type).strip()
         ]
         return (
             func.lower(func.trim(provider_type_column)).in_(lowered_provider_types),
@@ -2577,18 +2564,23 @@ async def _internal_procedure_codes_from_terminology(session, rows: list[dict[st
             continue
         try:
             context = await _resolve_code_context(session, system, code, expand_codes=False)
+        except sanic.exceptions.ServiceUnavailable:
+            raise
         except Exception:  # pragma: no cover - defensive fallback for migrating code tables
             continue
-        internal_codes.update(int(value) for value in context.get("internal_codes", []) if INT_PATTERN.fullmatch(str(value)))
+        internal_codes.update(
+            int(value) for value in context.get("internal_codes", []) if INT_PATTERN.fullmatch(str(value))
+        )
     return sorted(internal_codes)
 
 
-async def _internal_rx_codes_from_terminology(session, rows: list[dict[str, Any]]) -> list[str]:
+def _rx_terminology_candidates(terminology_rows, code_crosswalk_table):
+    """Build bounded internal codes and external crosswalk predicates."""
     internal_codes: set[str] = set()
     external_clauses = []
-    for row in rows[:60]:
-        system = str(row.get("target_system") or "").strip().upper()
-        code = str(row.get("target_code") or "").strip().upper()
+    for terminology_row in terminology_rows[:60]:
+        system = str(terminology_row.get("target_system") or "").strip().upper()
+        code = str(terminology_row.get("target_code") or "").strip().upper()
         if not system or not code:
             continue
         if system == INTERNAL_RX_CODE_SYSTEM:
@@ -2601,29 +2593,30 @@ async def _internal_rx_codes_from_terminology(session, rows: list[dict[str, Any]
                     func.upper(code_crosswalk_table.c.to_system) == INTERNAL_RX_CODE_SYSTEM,
                 )
             )
+    return internal_codes, external_clauses
+
+
+async def _internal_rx_codes_from_terminology(session, rows: list[dict[str, Any]]) -> list[str]:
+    code_crosswalk_table = claims_dictionary_tables(session)[1]
+    internal_codes, external_clauses = _rx_terminology_candidates(rows, code_crosswalk_table)
     if external_clauses:
         try:
-            result = await session.execute(select(code_crosswalk_table.c.to_code).where(or_(*external_clauses)))
-            for row in result:
-                value = str(row[0] if not isinstance(row, dict) else row.get("to_code") or "").strip().upper()
-                if value:
-                    internal_codes.add(value)
+            crosswalk_query = await execute_network_read(
+                session, select(code_crosswalk_table.c.to_code).where(or_(*external_clauses))
+            )
+            for crosswalk_row in crosswalk_query:
+                internal_code = (
+                    str(crosswalk_row[0] if not isinstance(crosswalk_row, dict) else crosswalk_row.get("to_code") or "")
+                    .strip()
+                    .upper()
+                )
+                if internal_code:
+                    internal_codes.add(internal_code)
+        except sanic.exceptions.ServiceUnavailable:
+            raise
         except Exception as exc:  # pragma: no cover - defensive fallback for migrating code tables
             logger.debug("Skipping rx terminology crosswalk expansion: %s", exc)
     return sorted(internal_codes)
-
-
-def _as_bool(value: Any) -> bool | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    text_value = str(value).strip().lower()
-    if text_value in {"1", "true", "yes", "y", "on"}:
-        return True
-    if text_value in {"0", "false", "no", "n", "off"}:
-        return False
-    return None
 
 
 def _ci_payload(low: Any, high: Any) -> dict[str, float | None]:
@@ -2638,8 +2631,8 @@ async def _resolve_quality_year(session, requested_year: int | None) -> tuple[in
         return requested_year, "request"
     if PRICING_DEFAULT_YEAR is not None:
         return PRICING_DEFAULT_YEAR, "env"
-    result = await session.execute(
-        text(f"SELECT MAX(year) FROM {PRICING_SCHEMA}.{QUALITY_SCORE_TABLE_NAME}")
+    result = await execute_network_read(
+        session, text(f"SELECT MAX(year) FROM {PRICING_SCHEMA}.{QUALITY_SCORE_TABLE_NAME}")
     )
     year = result.scalar()
     if year is None:
@@ -2666,7 +2659,8 @@ async def _resolve_quality_benchmark_mode(
 ) -> tuple[str, str]:
     if requested_mode in QUALITY_BENCHMARK_MODE_ORDER:
         return requested_mode, "request"
-    result = await session.execute(
+    benchmark_query = await execute_network_read(
+        session,
         text(
             f"""
             SELECT benchmark_mode
@@ -2684,20 +2678,10 @@ async def _resolve_quality_benchmark_mode(
         ),
         {"year": year},
     )
-    mode = str(result.scalar() or "").strip().lower()
+    mode = str(benchmark_query.scalar() or "").strip().lower()
     if mode in QUALITY_BENCHMARK_MODE_ORDER:
         return mode, "data_priority"
     return "national", "default"
-
-
-def _empty_domain_payload() -> dict[str, Any]:
-    return {
-        "risk_ratio_point": None,
-        "score_0_100": None,
-        "evidence_n": None,
-        "ci_75": {"low": None, "high": None},
-        "ci_90": {"low": None, "high": None},
-    }
 
 
 def _empty_domain_payloads_by_name() -> dict[str, dict[str, Any]]:
@@ -2752,7 +2736,7 @@ def _as_int(value: Any) -> int | None:
         return None
     try:
         return int(float(value))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -2768,17 +2752,6 @@ def _pick_first_from_lowered(payload_lower: dict[str, Any], *keys: str) -> Any:
     return None
 
 
-def _normalize_cohort_level(raw: Any) -> str | None:
-    text = str(raw or "").strip().upper()
-    if not text:
-        return None
-    if text in {"L0", "L1", "L2", "L3"}:
-        return text
-    if text in {"0", "1", "2", "3"}:
-        return f"L{text}"
-    return None
-
-
 def _cohort_context_from_score_row(
     score_data: dict[str, Any],
     *,
@@ -2791,29 +2764,23 @@ def _cohort_context_from_score_row(
         context_map = dict(context_raw)
     else:
         selected_scope = _normalize_peer_geography_scope(
-            score_data.get("cohort_geography_scope")
-            or score_data.get("cohort_geo_scope")
+            score_data.get("cohort_geography_scope") or score_data.get("cohort_geo_scope")
         )
-        selected_value = (
-            score_data.get("cohort_geography_value")
-            or score_data.get("cohort_geo_value")
-        )
+        selected_value = score_data.get("cohort_geography_value") or score_data.get("cohort_geo_value")
         context_map = {
             "selected_geography": score_data.get("selected_geography")
             or _selected_geography_label(selected_scope, selected_value),
             "selected_cohort_level": score_data.get("selected_cohort_level")
             or score_data.get("cohort_level")
             or score_data.get("cohort_tier"),
-            "peer_count": score_data.get("peer_count")
-            or score_data.get("cohort_peer_n"),
+            "peer_count": score_data.get("peer_count") or score_data.get("cohort_peer_n"),
             "specialty_key": score_data.get("specialty_key")
             or score_data.get("cohort_specialty_key")
             or score_data.get("cohort_specialty"),
             "taxonomy_code": score_data.get("taxonomy_code")
             or score_data.get("cohort_taxonomy_code")
             or score_data.get("cohort_taxonomy"),
-            "procedure_bucket": score_data.get("procedure_bucket")
-            or score_data.get("cohort_procedure_bucket"),
+            "procedure_bucket": score_data.get("procedure_bucket") or score_data.get("cohort_procedure_bucket"),
             "procedure_match_threshold": score_data.get("procedure_match_threshold"),
         }
         if not any(context_entry is not None for context_entry in context_map.values()):
@@ -2964,11 +2931,7 @@ def _build_provider_quality_response_payload(
     variants_scope: str | None = None,
     variants_by_benchmark_mode: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
-    available_modes = [
-        mode
-        for mode in QUALITY_BENCHMARK_MODE_ORDER
-        if scores_by_benchmark_mode.get(mode) is not None
-    ]
+    available_modes = [mode for mode in QUALITY_BENCHMARK_MODE_ORDER if scores_by_benchmark_mode.get(mode) is not None]
     response_payload_map = {
         "npi": identity.provider_npi,
         "year_used": identity.year_used,
@@ -3006,8 +2969,7 @@ def _build_provider_quality_response_payload(
     if variants_scope == SCORE_VARIANTS_SCOPE_PROVIDER:
         response_payload_map["variants_scope"] = variants_scope
         response_payload_map["variants_by_benchmark_mode"] = variants_by_benchmark_mode or {
-            mode: []
-            for mode in QUALITY_BENCHMARK_MODE_ORDER
+            mode: [] for mode in QUALITY_BENCHMARK_MODE_ORDER
         }
     return response_payload_map
 
@@ -3046,17 +3008,6 @@ def _parse_token_list(raw_tokens: Any) -> list[str]:
         else:
             normalized_tokens.append(token)
     return normalized_tokens
-
-
-def _normalize_peer_geography_scope(raw: Any) -> str | None:
-    text = str(raw or "").strip().lower()
-    if text in {"zip", "zip5", "zip_code", "zipcode", "postal", "postal_code", "zip_ring"}:
-        return "zip"
-    if text in {"state", "state_key", "region", "province"}:
-        return "state"
-    if text in {"national", "country", "us", "usa", "all"}:
-        return "national"
-    return text or None
 
 
 def _extract_peer_target_geography(payload_lower: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
@@ -3114,30 +3065,6 @@ def _extract_peer_target_geography(payload_lower: dict[str, Any]) -> tuple[str |
     return scope, value_text, selected_geography_text or (f"{scope}:{value_text}" if value_text else None)
 
 
-def _geography_priority_for_benchmark_mode(
-    benchmark_mode: str,
-    *,
-    state_key: str | None,
-    zip5: str | None,
-) -> list[tuple[str, str]]:
-    candidates: list[tuple[str, str]] = []
-    if benchmark_mode == "zip" and zip5:
-        candidates.append(("zip", zip5))
-    if benchmark_mode in {"zip", "state"} and state_key:
-        candidates.append(("state", state_key))
-    candidates.append(("national", "US"))
-
-    deduped_geographies: list[tuple[str, str]] = []
-    seen_geographies: set[tuple[str, str]] = set()
-    for scope, value in candidates:
-        item = (scope, str(value).strip())
-        if item in seen_geographies:
-            continue
-        seen_geographies.add(item)
-        deduped_geographies.append(item)
-    return deduped_geographies
-
-
 def _is_row_geography_match(
     row_scope: str | None,
     row_value: str | None,
@@ -3169,21 +3096,9 @@ def _is_row_geography_match(
     return row_value_text == target_value_text
 
 
-def _is_value_match_or_generic(row_value: Any, requested_value: str | None, *, upper: bool) -> bool:
-    if requested_value is None:
-        return True
-    text = str(row_value or "").strip()
-    if not text:
-        return True
-    normalized = text.upper() if upper else text.lower()
-    generic_values = {"__all__", "all", "any", "*", "n/a", "na", "none", "null"}
-    if normalized.lower() in generic_values:
-        return True
-    request_normalized = requested_value.upper() if upper else requested_value.lower()
-    return normalized == request_normalized
-
-
-def _procedure_match_ratio(payload_lower: dict[str, Any], requested_procedure_codes: set[str]) -> tuple[float, str | None]:
+def _procedure_match_ratio(
+    payload_lower: dict[str, Any], requested_procedure_codes: set[str]
+) -> tuple[float, str | None]:
     bucket_raw = _pick_first_from_lowered(
         payload_lower,
         "procedure_bucket",
@@ -3239,9 +3154,7 @@ def _matched_peer_target_geography(
     payload_lower: dict[str, Any],
     geography_priority: list[tuple[str, str]],
 ) -> tuple[int, str] | None:
-    row_scope, row_value, row_geography_label = _extract_peer_target_geography(
-        payload_lower
-    )
+    row_scope, row_value, row_geography_label = _extract_peer_target_geography(payload_lower)
     for index, (target_scope, target_value) in enumerate(geography_priority):
         if _is_row_geography_match(
             row_scope,
@@ -3250,9 +3163,7 @@ def _matched_peer_target_geography(
             target_value,
         ):
             selected_geography = row_geography_label or (
-                "national"
-                if target_scope == "national"
-                else f"{target_scope}:{target_value}"
+                "national" if target_scope == "national" else f"{target_scope}:{target_value}"
             )
             return index, selected_geography
     return None
@@ -3274,9 +3185,7 @@ def _collect_peer_target_candidates(
 
     for peer_target_row in peer_target_rows:
         payload_lower = _get_cached_lowercase_payload(peer_target_row)
-        row_mode = str(
-            _pick_first_from_lowered(payload_lower, "benchmark_mode", "mode") or ""
-        ).strip().lower()
+        row_mode = str(_pick_first_from_lowered(payload_lower, "benchmark_mode", "mode") or "").strip().lower()
         if row_mode and row_mode in QUALITY_BENCHMARK_MODE_ORDER and row_mode != benchmark_mode:
             continue
         geography_match = _matched_peer_target_geography(
@@ -3286,9 +3195,12 @@ def _collect_peer_target_candidates(
         if geography_match is None:
             continue
         geography_rank, selected_geography = geography_match
-        cohort_level = _normalize_cohort_level(
-            _pick_first_from_lowered(payload_lower, "cohort_level", "cohort_tier", "cohort", "level")
-        ) or "L3"
+        cohort_level = (
+            _normalize_cohort_level(
+                _pick_first_from_lowered(payload_lower, "cohort_level", "cohort_tier", "cohort", "level")
+            )
+            or "L3"
+        )
         is_specialty_match = _is_value_match_or_generic(
             _pick_first_from_lowered(payload_lower, "specialty_key", "specialty"),
             specialty_key,
@@ -3334,11 +3246,7 @@ def _variant_scope_inputs_from_mode_payload(
 
     specialty_key = _parse_specialty_key(context.get("specialty_key")) or fallback_specialty_key
     taxonomy_raw = context.get("taxonomy_code")
-    taxonomy_code = (
-        str(taxonomy_raw).strip().upper()
-        if taxonomy_raw not in (None, "")
-        else fallback_taxonomy_code
-    )
+    taxonomy_code = str(taxonomy_raw).strip().upper() if taxonomy_raw not in (None, "") else fallback_taxonomy_code
     procedure_bucket = context.get("procedure_bucket")
     procedure_codes = set(_parse_token_list(procedure_bucket))
     if not procedure_codes:
@@ -3359,9 +3267,7 @@ def _collect_provider_scope_variant_candidates(
         if not isinstance(payload_lower, dict):
             continue
 
-        row_specialty = _parse_specialty_key(
-            _pick_first_from_lowered(payload_lower, "specialty_key", "specialty")
-        )
+        row_specialty = _parse_specialty_key(_pick_first_from_lowered(payload_lower, "specialty_key", "specialty"))
         row_taxonomy_raw = _pick_first_from_lowered(payload_lower, "taxonomy_code", "taxonomy")
         row_taxonomy = str(row_taxonomy_raw).strip().upper() if row_taxonomy_raw not in (None, "") else None
 
@@ -3626,9 +3532,7 @@ def _provider_quality_doctor_address_cte(is_available: bool) -> str:
         """
 
 
-def _provider_quality_unified_address_cte(
-    is_available: bool, available_columns: set[str]
-) -> str:
+def _provider_quality_unified_address_cte(is_available: bool, available_columns: set[str]) -> str:
     if not is_available:
         return """
             unified_address_choice AS (
@@ -3638,16 +3542,11 @@ def _provider_quality_unified_address_cte(
         """
     confirmed_order_sql = (
         "CASE WHEN COALESCE(e.multi_source_confirmed, FALSE) THEN 0 ELSE 1 END,"
-        if "multi_source_confirmed" in available_columns else ""
+        if "multi_source_confirmed" in available_columns
+        else ""
     )
-    source_count_order_sql = (
-        "COALESCE(e.source_count, 0) DESC,"
-        if "source_count" in available_columns else ""
-    )
-    checksum_order_sql = (
-        "e.checksum" if "checksum" in available_columns
-        else "COALESCE(e.entity_id, 0)"
-    )
+    source_count_order_sql = "COALESCE(e.source_count, 0) DESC," if "source_count" in available_columns else ""
+    checksum_order_sql = "e.checksum" if "checksum" in available_columns else "COALESCE(e.entity_id, 0)"
     return f"""
             unified_address_choice AS (
                 SELECT ({_state_code_sql("e.state_name")})::varchar AS state_key,
@@ -3691,9 +3590,7 @@ def _provider_quality_npi_address_cte(is_available: bool) -> str:
         """
 
 
-def _provider_quality_classification_cte(
-    is_available: bool, available_columns: set[str]
-) -> str:
+def _provider_quality_classification_cte(is_available: bool, available_columns: set[str]) -> str:
     if not is_available or "classification" not in available_columns:
         return """
             taxonomy_classification_choice AS (
@@ -3716,30 +3613,14 @@ def _provider_quality_classification_cte(
 async def _provider_quality_profile_ctes(
     session,
 ) -> tuple[str, str, str, str, str, str]:
-    taxonomy_available = await _is_table_available(
-        session, NPIDataTaxonomy.__tablename__
-    )
+    taxonomy_available = await _is_table_available(session, NPIDataTaxonomy.__tablename__)
     nucc_available = await _is_table_available(session, NUCCTaxonomy.__tablename__)
-    enrichment_available = await _is_table_available(
-        session, ProviderEnrichmentSummary.__tablename__
-    )
-    doctor_available = await _is_table_available(
-        session, DoctorClinicianAddress.__tablename__
-    )
-    unified_available = await _is_table_available(
-        session, EntityAddressUnified.__tablename__
-    )
-    npi_address_available = await _is_table_available(
-        session, NPIAddress.__tablename__
-    )
-    unified_columns = (
-        await _table_columns(session, EntityAddressUnified.__tablename__)
-        if unified_available else set()
-    )
-    nucc_columns = (
-        await _table_columns(session, NUCCTaxonomy.__tablename__)
-        if nucc_available else set()
-    )
+    enrichment_available = await _is_table_available(session, ProviderEnrichmentSummary.__tablename__)
+    doctor_available = await _is_table_available(session, DoctorClinicianAddress.__tablename__)
+    unified_available = await _is_table_available(session, EntityAddressUnified.__tablename__)
+    npi_address_available = await _is_table_available(session, NPIAddress.__tablename__)
+    unified_columns = await _table_columns(session, EntityAddressUnified.__tablename__) if unified_available else set()
+    nucc_columns = await _table_columns(session, NUCCTaxonomy.__tablename__) if nucc_available else set()
     return (
         _provider_quality_taxonomy_cte(taxonomy_available),
         _provider_quality_enrichment_cte(enrichment_available),
@@ -3756,7 +3637,7 @@ _PROVIDER_QUALITY_PROFILE_QUERY_TEMPLATE = f"""
                 p.provider_type, '')), ''))::varchar AS specialty_key,
             ({_state_code_sql("p.state")})::varchar AS claims_state,
             NULLIF(BTRIM(COALESCE(p.zip5, '')), '')::varchar AS claims_zip5
-        FROM {PRICING_SCHEMA}.{PricingProvider.__tablename__} p
+        FROM {{provider_relation}} p
         WHERE p.npi = :npi {{provider_year_filter}}
         ORDER BY p.year DESC
         LIMIT 1
@@ -3810,34 +3691,36 @@ _PROVIDER_QUALITY_PROFILE_QUERY_TEMPLATE = f"""
 
 
 def _provider_quality_profile_query(
-    year: int | None, ctes: tuple[str, str, str, str, str, str]
+    year: int | None, ctes: tuple[str, str, str, str, str, str], *, session=None
 ) -> str:
     cte_names = (
-        "taxonomy_cte", "enrichment_cte", "classification_cte",
-        "doctor_address_cte", "unified_address_cte", "npi_address_cte",
+        "taxonomy_cte",
+        "enrichment_cte",
+        "classification_cte",
+        "doctor_address_cte",
+        "unified_address_cte",
+        "npi_address_cte",
     )
+    provider_relation = f"{PRICING_SCHEMA}.{PricingProvider.__tablename__}"
+    if has_network_read_inventory(session):
+        provider_relation = direct_heap_relation_sql(session, PRICING_SCHEMA, PricingProvider.__tablename__)
     return _PROVIDER_QUALITY_PROFILE_QUERY_TEMPLATE.format(
+        provider_relation=provider_relation,
         provider_year_filter="AND p.year = :year" if year is not None else "",
         **dict(zip(cte_names, ctes, strict=True)),
     )
 
 
-def _provider_quality_profile_from_row(
-    npi: int, row_data: Mapping[str, Any]
-) -> dict[str, Any]:
+def _provider_quality_profile_from_row(npi: int, row_data: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "npi": npi,
         "specialty_key": _parse_specialty_key(row_data.get("specialty_key")),
         "taxonomy_code": str(row_data.get("taxonomy_code") or "").strip().upper() or None,
-        "taxonomy_classification": str(
-            row_data.get("taxonomy_classification") or ""
-        ).strip().lower() or None,
+        "taxonomy_classification": str(row_data.get("taxonomy_classification") or "").strip().lower() or None,
         "zip5": str(row_data.get("zip5") or "").strip()[:5] or None,
         "state_key": str(row_data.get("state_key") or "").strip().upper() or None,
-        "provider_class": _normalize_provider_class(row_data.get("provider_class"))
-        or "unknown",
-        "location_source": str(row_data.get("location_source") or "").strip()
-        or "unknown",
+        "provider_class": _normalize_provider_class(row_data.get("provider_class")) or "unknown",
+        "location_source": str(row_data.get("location_source") or "").strip() or "unknown",
         "has_enrollment": bool(_as_bool(row_data.get("has_enrollment"))),
         "has_medicare_claims": bool(_as_bool(row_data.get("has_medicare_claims"))),
     }
@@ -3850,57 +3733,15 @@ async def _load_provider_quality_profile(
     year: int | None,
 ) -> dict[str, Any] | None:
     """Load provider identity, location, taxonomy, and enrichment attributes."""
-    profile_query_result = await session.execute(
-        text(_provider_quality_profile_query(
-            year, await _provider_quality_profile_ctes(session)
-        )),
+    profile_query_result = await execute_network_read(
+        session,
+        text(_provider_quality_profile_query(year, await _provider_quality_profile_ctes(session), session=session)),
         {"npi": npi, "year": year},
     )
     profile_row = profile_query_result.first()
     if profile_row is None:
         return None
     return _provider_quality_profile_from_row(npi, _row_to_dict(profile_row))
-
-
-def _provider_quality_unavailable_reasons(
-    profile: dict[str, Any] | None,
-    *,
-    benchmark_mode: str | None = None,
-) -> list[str]:
-    if profile is None:
-        return ["provider_profile_not_found"]
-
-    reasons: list[str] = []
-    if not profile.get("specialty_key") and not profile.get("taxonomy_code"):
-        reasons.append("missing_specialty_or_taxonomy")
-    if not profile.get("state_key") and not profile.get("zip5"):
-        reasons.append("missing_geography")
-    if benchmark_mode == "zip" and not profile.get("zip5"):
-        reasons.append("missing_zip5_for_zip_benchmark")
-    if benchmark_mode == "state" and not profile.get("state_key"):
-        reasons.append("missing_state_for_state_benchmark")
-    return reasons
-
-
-def _estimated_benchmark_modes_for_profile(
-    profile: dict[str, Any],
-    *,
-    benchmark_mode: str | None = None,
-) -> list[str]:
-    if benchmark_mode is not None:
-        if benchmark_mode == "zip":
-            return ["zip"] if profile.get("zip5") else []
-        if benchmark_mode == "state":
-            return ["state"] if profile.get("state_key") else []
-        return ["national"]
-
-    modes: list[str] = []
-    if profile.get("zip5"):
-        modes.append("zip")
-    if profile.get("state_key"):
-        modes.append("state")
-    modes.append("national")
-    return modes
 
 
 class _EstimatedQualityCohort(NamedTuple):
@@ -3929,14 +3770,10 @@ def _estimated_quality_identity(
 ) -> _EstimatedQualityIdentity:
     """Normalize the provider identity used by estimated peer cohorts."""
 
-    taxonomy_code = str(
-        taxonomy_code_override or profile.get("taxonomy_code") or ""
-    ).strip().upper() or None
+    taxonomy_code = str(taxonomy_code_override or profile.get("taxonomy_code") or "").strip().upper() or None
     return _EstimatedQualityIdentity(
         taxonomy_code=taxonomy_code,
-        specialty_key=_parse_specialty_key(
-            specialty_key_override or profile.get("specialty_key")
-        ),
+        specialty_key=_parse_specialty_key(specialty_key_override or profile.get("specialty_key")),
         provider_class=_normalize_provider_class(profile.get("provider_class")),
     )
 
@@ -3952,20 +3789,13 @@ def _estimated_quality_cohort(
     feature_filters: list[str] = []
     parameter_map: dict[str, Any] = {"year": year, "benchmark_mode": mode}
     if identity.provider_class not in {None, "unknown"}:
-        feature_filters.append(
-            "COALESCE(LOWER(BTRIM(COALESCE(f.provider_class, ''))), "
-            "'unknown') = :provider_class"
-        )
+        feature_filters.append("COALESCE(LOWER(BTRIM(COALESCE(f.provider_class, ''))), 'unknown') = :provider_class")
         parameter_map["provider_class"] = identity.provider_class
     if identity.taxonomy_code:
-        feature_filters.append(
-            "UPPER(BTRIM(COALESCE(f.taxonomy_code, ''))) = :taxonomy_code"
-        )
+        feature_filters.append("UPPER(BTRIM(COALESCE(f.taxonomy_code, ''))) = :taxonomy_code")
         parameter_map["taxonomy_code"] = identity.taxonomy_code
     elif identity.specialty_key:
-        feature_filters.append(
-            "LOWER(BTRIM(COALESCE(f.specialty_key, ''))) = :specialty_key"
-        )
+        feature_filters.append("LOWER(BTRIM(COALESCE(f.specialty_key, ''))) = :specialty_key")
         parameter_map["specialty_key"] = identity.specialty_key
     else:
         return None
@@ -3973,9 +3803,7 @@ def _estimated_quality_cohort(
         feature_filters.append("f.zip5 = :zip5")
         parameter_map["zip5"] = profile.get("zip5")
     elif mode == "state":
-        feature_filters.append(
-            "UPPER(BTRIM(COALESCE(f.state, ''))) = :state_key"
-        )
+        feature_filters.append("UPPER(BTRIM(COALESCE(f.state, ''))) = :state_key")
         parameter_map["state_key"] = profile.get("state_key")
     return _EstimatedQualityCohort(
         mode=mode,
@@ -3995,11 +3823,11 @@ async def _load_estimated_score_row(
     score_filters = [
         "s.year = :year",
         "s.benchmark_mode = :benchmark_mode",
-        "COALESCE(LOWER(BTRIM(COALESCE(s.score_method, 'direct'))), "
-        "'direct') <> 'unavailable'",
+        "COALESCE(LOWER(BTRIM(COALESCE(s.score_method, 'direct'))), 'direct') <> 'unavailable'",
     ]
     where_sql = " AND ".join([*score_filters, *cohort.feature_filters])
-    score_result = await session.execute(
+    score_result = await execute_network_read(
+        session,
         text(
             f"""
             SELECT
@@ -4040,7 +3868,8 @@ async def _load_estimated_domain_payloads(
     """Load per-domain medians for one estimated peer cohort."""
 
     domain_payloads_by_name = _empty_domain_payloads_by_name()
-    domain_result = await session.execute(
+    domain_result = await execute_network_read(
+        session,
         text(
             f"""
             SELECT
@@ -4058,7 +3887,7 @@ async def _load_estimated_domain_payloads(
              AND f.year = d.year
             WHERE d.year = :year
               AND d.benchmark_mode = :benchmark_mode
-              AND {' AND '.join(cohort.feature_filters)}
+              AND {" AND ".join(cohort.feature_filters)}
             GROUP BY d.domain
             """
         ),
@@ -4072,9 +3901,7 @@ async def _load_estimated_domain_payloads(
         domain_payloads_by_name[domain_name] = {
             "risk_ratio_point": _as_float(domain_data.get("risk_ratio")),
             "score_0_100": _as_float(domain_data.get("score_0_100")),
-            "evidence_n": float(
-                _as_int(domain_data.get("peer_count")) or peer_count
-            ),
+            "evidence_n": float(_as_int(domain_data.get("peer_count")) or peer_count),
             "ci_75": _ci_payload(
                 domain_data.get("ci75_low"),
                 domain_data.get("ci75_high"),
@@ -4096,9 +3923,7 @@ def _estimated_quality_score_map(
     """Shape the stable public score fields for one estimated cohort."""
 
     score_row_by_field = score.row_by_field
-    cost_risk_ratio = _as_float(
-        domain_payloads_by_name["cost"].get("risk_ratio_point")
-    )
+    cost_risk_ratio = _as_float(domain_payloads_by_name["cost"].get("risk_ratio_point"))
     confidence_0_100 = _estimated_confidence_score(profile, score.peer_count)
     risk_ratio_point = _as_float(score_row_by_field.get("risk_ratio_point"))
     ci75_high = _as_float(score_row_by_field.get("ci75_high"))
@@ -4113,11 +3938,8 @@ def _estimated_quality_score_map(
             confidence_0_100=confidence_0_100,
         ),
         "borderline_status": False,
-        "score_0_100": _as_float(score_row_by_field.get("score_0_100"))
-        or _score_from_risk_ratio(risk_ratio_point),
-        "estimated_cost_level": _estimated_cost_level_from_risk_ratio(
-            cost_risk_ratio
-        ),
+        "score_0_100": _as_float(score_row_by_field.get("score_0_100")) or _score_from_risk_ratio(risk_ratio_point),
+        "estimated_cost_level": _estimated_cost_level_from_risk_ratio(cost_risk_ratio),
         "score_method": "estimated",
         "confidence_0_100": confidence_0_100,
         "confidence_band": "low",
@@ -4138,9 +3960,7 @@ def _estimated_quality_score_map(
         "low_score_threshold_failed": (risk_ratio_point or 0.0) >= 1.12,
         "low_confidence_threshold_failed": (ci90_low or 0.0) >= 1.08,
         "high_score_threshold_passed": (risk_ratio_point or 1.0) <= 0.88,
-        "high_confidence_threshold_passed": (
-            ci75_high is not None and (ci75_high or 0.0) < 1.0
-        ),
+        "high_confidence_threshold_passed": (ci75_high is not None and (ci75_high or 0.0) < 1.0),
     }
 
 
@@ -4154,11 +3974,7 @@ def _estimated_quality_cohort_context(
     geography_value = (
         "US"
         if cohort.mode == "national"
-        else (
-            profile.get("zip5")
-            if cohort.mode == "zip"
-            else profile.get("state_key")
-        )
+        else (profile.get("zip5") if cohort.mode == "zip" else profile.get("state_key"))
     )
     return {
         "selected_geography": _selected_geography_label(
@@ -4186,12 +4002,8 @@ async def _load_estimated_quality_modes(
 ) -> dict[str, dict[str, Any] | None]:
     """Load estimated quality scores for the profile's eligible benchmark modes."""
 
-    scores_by_benchmark_mode: dict[str, dict[str, Any] | None] = dict.fromkeys(
-        QUALITY_BENCHMARK_MODE_ORDER
-    )
-    candidate_modes = _estimated_benchmark_modes_for_profile(
-        profile, benchmark_mode=benchmark_mode
-    )
+    scores_by_benchmark_mode: dict[str, dict[str, Any] | None] = dict.fromkeys(QUALITY_BENCHMARK_MODE_ORDER)
+    candidate_modes = _estimated_benchmark_modes_for_profile(profile, benchmark_mode=benchmark_mode)
     if not candidate_modes:
         return scores_by_benchmark_mode
     identity = _estimated_quality_identity(
@@ -4254,6 +4066,8 @@ async def _resolve_procedure_override_codes(
     for code in normalized_codes:
         try:
             code_context = await _resolve_code_context(session, procedure_code_system, code, expand_codes=False)
+        except sanic.exceptions.ServiceUnavailable:
+            raise
         except Exception:
             continue
         for internal_code in code_context.get("internal_codes", []):
@@ -4270,7 +4084,8 @@ async def _load_provider_qpp_scores(
     year: int,
 ) -> tuple[float | None, float | None]:
     try:
-        qpp_result = await session.execute(
+        qpp_result = await execute_network_read(
+            session,
             text(
                 f"""
                 SELECT quality_score, cost_score
@@ -4289,6 +4104,8 @@ async def _load_provider_qpp_scores(
             _as_float(qpp_payload.get("quality_score")),
             _as_float(qpp_payload.get("cost_score")),
         )
+    except sanic.exceptions.ServiceUnavailable:
+        raise
     except Exception:
         return None, None
 
@@ -4300,7 +4117,8 @@ async def _load_provider_rx_totals(
     year: int,
 ) -> tuple[float, float]:
     try:
-        rx_result = await session.execute(
+        rx_result = await execute_network_read(
+            session,
             select(
                 func.coalesce(func.sum(provider_prescription_table.c.total_claims), 0.0).label("total_rx_claims"),
                 func.coalesce(func.sum(provider_prescription_table.c.total_benes), 0.0).label("total_rx_beneficiaries"),
@@ -4309,7 +4127,7 @@ async def _load_provider_rx_totals(
                     provider_prescription_table.c.npi == npi,
                     provider_prescription_table.c.year == year,
                 )
-            )
+            ),
         )
         rx_row = rx_result.first()
         if rx_row is None:
@@ -4319,6 +4137,8 @@ async def _load_provider_rx_totals(
             _as_float(rx_payload.get("total_rx_claims")) or 0.0,
             _as_float(rx_payload.get("total_rx_beneficiaries")) or 0.0,
         )
+    except sanic.exceptions.ServiceUnavailable:
+        raise
     except Exception:
         return 0.0, 0.0
 
@@ -4327,7 +4147,8 @@ async def _load_provider_svi(session, *, zip5: str | None, year: int) -> float:
     if not zip5:
         return PROVIDER_QUALITY_DEFAULT_SVI
     try:
-        svi_result = await session.execute(
+        svi_result = await execute_network_read(
+            session,
             text(
                 f"""
                 SELECT svi_overall
@@ -4341,6 +4162,8 @@ async def _load_provider_svi(session, *, zip5: str | None, year: int) -> float:
         svi_value = _as_float(svi_result.scalar())
         if svi_value is not None:
             return min(1.0, max(0.0, svi_value))
+    except sanic.exceptions.ServiceUnavailable:
+        raise
     except Exception:
         return PROVIDER_QUALITY_DEFAULT_SVI
     return PROVIDER_QUALITY_DEFAULT_SVI
@@ -4348,8 +4171,8 @@ async def _load_provider_svi(session, *, zip5: str | None, year: int) -> float:
 
 async def _load_provider_quality_observed(session, *, npi: int, year: int) -> dict[str, Any] | None:
     """Load observed utilization, cost, prescription, and QPP measures for a provider and year."""
-    provider_result = await session.execute(
-        select(provider_table).where(and_(provider_table.c.npi == npi, provider_table.c.year == year))
+    provider_result = await execute_network_read(
+        session, select(provider_table).where(and_(provider_table.c.npi == npi, provider_table.c.year == year))
     )
     provider_row = provider_result.first()
     if provider_row is None:
@@ -4361,17 +4184,11 @@ async def _load_provider_quality_observed(session, *, npi: int, year: int) -> di
     total_allowed_amount = _as_float(provider_payload.get("total_allowed_amount")) or 0.0
     state_key = str(provider_payload.get("state") or "").strip().upper() or None
     zip5 = str(provider_payload.get("zip5") or "").strip() or None
-    qpp_quality_score, qpp_cost_score = await _load_provider_qpp_scores(
-        session, npi=npi, year=year
-    )
-    total_rx_claims, total_rx_beneficiaries = await _load_provider_rx_totals(
-        session, npi=npi, year=year
-    )
+    qpp_quality_score, qpp_cost_score = await _load_provider_qpp_scores(session, npi=npi, year=year)
+    total_rx_claims, total_rx_beneficiaries = await _load_provider_rx_totals(session, npi=npi, year=year)
     svi_overall = await _load_provider_svi(session, zip5=zip5, year=year)
 
-    utilization_rate = (
-        total_services / total_beneficiaries if total_beneficiaries > 0 else None
-    )
+    utilization_rate = total_services / total_beneficiaries if total_beneficiaries > 0 else None
     svi_adjustment = 1.0 + 0.2 * (svi_overall - 0.5)
     if svi_adjustment == 0:
         svi_adjustment = 1.0
@@ -4405,9 +4222,7 @@ def _quality_peer_target_query_context(
     zip5: str | None = None,
 ) -> tuple[str, dict[str, Any], bool, bool]:
     normalized_modes = [
-        mode
-        for mode in (benchmark_modes or QUALITY_BENCHMARK_MODE_ORDER)
-        if mode in QUALITY_BENCHMARK_MODE_ORDER
+        mode for mode in (benchmark_modes or QUALITY_BENCHMARK_MODE_ORDER) if mode in QUALITY_BENCHMARK_MODE_ORDER
     ]
     if not normalized_modes:
         normalized_modes = list(QUALITY_BENCHMARK_MODE_ORDER)
@@ -4454,38 +4269,6 @@ def _quality_peer_target_query_context(
     return select_sql, parameter_map, state_enabled, zip_enabled
 
 
-def _quality_peer_target_query_variants(
-    select_sql: str, state_enabled: bool, zip_enabled: bool
-) -> tuple[str, str]:
-    # Fast path: run index-friendly scope-specific probes.
-    query_parts = [select_sql + "\n          AND geography_scope = 'national'"]
-    if state_enabled:
-        query_parts.append(
-            select_sql + "\n          AND geography_scope = 'state'\n          AND geography_value = :state_key"
-        )
-    if zip_enabled:
-        query_parts.append(
-            select_sql + "\n          AND geography_scope = 'zip'\n          AND geography_value = :zip5"
-        )
-    geography_clause = """
-          AND (
-                geography_scope IS NULL
-                OR geography_scope = 'national'
-                OR (
-                    :state_enabled
-                    AND geography_scope = 'state'
-                    AND geography_value = :state_key
-                )
-                OR (
-                    :zip_enabled
-                    AND geography_scope = 'zip'
-                    AND geography_value = :zip5
-                )
-          )
-    """
-    return "\n        UNION ALL\n".join(query_parts), select_sql + geography_clause
-
-
 async def _load_quality_peer_targets(
     session,
     *,
@@ -4495,41 +4278,28 @@ async def _load_quality_peer_targets(
     zip5: str | None = None,
 ) -> list[dict[str, Any]]:
     """Load quality peer targets for the requested benchmark modes and geographic scopes."""
-    select_sql, parameter_map, state_enabled, zip_enabled = (
-        _quality_peer_target_query_context(
-            year=year,
-            benchmark_modes=benchmark_modes,
-            state_key=state_key,
-            zip5=zip5,
-        )
+    select_sql, parameter_map, state_enabled, zip_enabled = _quality_peer_target_query_context(
+        year=year,
+        benchmark_modes=benchmark_modes,
+        state_key=state_key,
+        zip5=zip5,
     )
-    fast_query, scoped_fallback_query = _quality_peer_target_query_variants(
-        select_sql, state_enabled, zip_enabled
-    )
+    fast_query, scoped_fallback_query = _quality_peer_target_query_variants(select_sql, state_enabled, zip_enabled)
 
     try:
-        peer_target_query_result = await session.execute(text(fast_query), parameter_map)
-        peer_target_rows = [
-            _row_to_dict(peer_target_row)
-            for peer_target_row in peer_target_query_result
-        ]
+        peer_target_query_result = await execute_network_read(session, text(fast_query), parameter_map)
+        peer_target_rows = [_row_to_dict(peer_target_row) for peer_target_row in peer_target_query_result]
         if peer_target_rows:
             return peer_target_rows
         # Safety fallback for unexpected geography-key formats.
-        fallback_result = await session.execute(
-            text(scoped_fallback_query), parameter_map
-        )
-        fallback_rows = [
-            _row_to_dict(peer_target_row)
-            for peer_target_row in fallback_result
-        ]
+        fallback_result = await execute_network_read(session, text(scoped_fallback_query), parameter_map)
+        fallback_rows = [_row_to_dict(peer_target_row) for peer_target_row in fallback_result]
         if fallback_rows:
             return fallback_rows
-        fallback_result = await session.execute(text(select_sql), parameter_map)
-        return [
-            _row_to_dict(peer_target_row)
-            for peer_target_row in fallback_result
-        ]
+        fallback_result = await execute_network_read(session, text(select_sql), parameter_map)
+        return [_row_to_dict(peer_target_row) for peer_target_row in fallback_result]
+    except sanic.exceptions.ServiceUnavailable:
+        raise
     except Exception:
         return []
 
@@ -4641,13 +4411,8 @@ def _combined_live_ratio(
     effectiveness: float,
     cost: float,
 ) -> float:
-    clinical = math.sqrt(
-        max(appropriateness, 0.0001) * max(effectiveness, 0.0001)
-    )
-    return math.exp(
-        0.5 * math.log(max(clinical, 0.0001))
-        + 0.5 * math.log(max(cost, 0.0001))
-    )
+    clinical = math.sqrt(max(appropriateness, 0.0001) * max(effectiveness, 0.0001))
+    return math.exp(0.5 * math.log(max(clinical, 0.0001)) + 0.5 * math.log(max(cost, 0.0001)))
 
 
 def _live_domain_ratio(
@@ -4725,10 +4490,9 @@ def _live_evidence_confidence(
     observed_data: dict[str, Any],
     cohort_context: dict[str, Any],
 ) -> dict[str, Any]:
-    has_claims = (
-        (_as_float(observed_data.get("total_services")) or 0.0) > 0
-        or (_as_float(observed_data.get("total_beneficiaries")) or 0.0) > 0
-    )
+    has_claims = (_as_float(observed_data.get("total_services")) or 0.0) > 0 or (
+        _as_float(observed_data.get("total_beneficiaries")) or 0.0
+    ) > 0
     has_qpp = (
         _as_float(observed_data.get("qpp_quality_score")) is not None
         or _as_float(observed_data.get("qpp_cost_score")) is not None
@@ -4751,7 +4515,13 @@ def _live_evidence_confidence(
             (35.0 if has_claims else 0.0)
             + (20.0 if has_qpp else 0.0)
             + (10.0 if has_rx else 0.0)
-            + (10.0 if selected_peer_count and selected_peer_count >= 100 else 5.0 if selected_peer_count and selected_peer_count >= 30 else 0.0)
+            + (
+                10.0
+                if selected_peer_count and selected_peer_count >= 100
+                else 5.0
+                if selected_peer_count and selected_peer_count >= 30
+                else 0.0
+            )
             + (5.0 if observed_data.get("zip5") else 0.0)
             + (5.0 if observed_data.get("state_key") else 0.0)
         ),
@@ -4948,7 +4718,8 @@ async def _precomputed_procedure_provider_count(
     year: int,
     procedure_code: int,
 ) -> int | None:
-    result = await session.execute(
+    result = await execute_network_read(
+        session,
         select(procedure_table.c.provider_count)
         .where(
             and_(
@@ -4956,7 +4727,7 @@ async def _precomputed_procedure_provider_count(
                 procedure_table.c.source_year == year,
             )
         )
-        .limit(1)
+        .limit(1),
     )
     value = result.scalar()
     return _as_int(value) if value is not None else None
@@ -4979,15 +4750,9 @@ def _single_procedure_provider_page_query(
             provider_table.c.state.label("state"),
             provider_table.c.zip5.label("zip5"),
             provider_procedure_table.c.total_services.label("total_services"),
-            provider_procedure_table.c.total_submitted_charges.label(
-                "total_submitted_charges"
-            ),
-            provider_procedure_table.c.total_allowed_amount.label(
-                "total_allowed_amount"
-            ),
-            provider_procedure_table.c.total_beneficiaries.label(
-                "total_beneficiaries"
-            ),
+            provider_procedure_table.c.total_submitted_charges.label("total_submitted_charges"),
+            provider_procedure_table.c.total_allowed_amount.label("total_allowed_amount"),
+            provider_procedure_table.c.total_beneficiaries.label("total_beneficiaries"),
             literal(1).label("matched_service_codes"),
         )
         .select_from(
@@ -5016,6 +4781,7 @@ def _single_procedure_provider_page_query(
 
 
 async def _query_crosswalk_edges(session, pairs: set[tuple[str, str]]) -> list[dict[str, Any]]:
+    code_crosswalk_table = claims_dictionary_tables(session)[1]
     if not pairs:
         return []
     clauses = []
@@ -5032,39 +4798,8 @@ async def _query_crosswalk_edges(session, pairs: set[tuple[str, str]]) -> list[d
                 func.upper(code_crosswalk_table.c.to_code) == code,
             )
         )
-    result = await session.execute(select(code_crosswalk_table).where(or_(*clauses)))
+    result = await execute_network_read(session, select(code_crosswalk_table).where(or_(*clauses)))
     return [_row_to_dict(row) for row in result]
-
-
-async def _query_catalog_neighbors(session, pairs: set[tuple[str, str]]) -> set[tuple[str, str]]:
-    if not pairs:
-        return set()
-
-    named_pairs = set()
-    for system, code in pairs:
-        lookup = await session.execute(
-            select(code_catalog_table.c.display_name)
-            .where(
-                and_(
-                    func.upper(code_catalog_table.c.code_system) == system,
-                    func.upper(code_catalog_table.c.code) == code,
-                )
-            )
-            .limit(1)
-        )
-        display_name = lookup.scalar()
-        if not display_name:
-            continue
-        named_pairs.add((system, code))
-        neighbors = await session.execute(
-            select(code_catalog_table.c.code_system, code_catalog_table.c.code).where(
-                func.lower(code_catalog_table.c.display_name) == str(display_name).strip().lower()
-            )
-        )
-        for row in neighbors:
-            pair = (str(row[0]).upper(), str(row[1]).upper())
-            named_pairs.add(pair)
-    return named_pairs
 
 
 async def _expand_code_crosswalk(
@@ -5265,10 +5000,7 @@ def _procedure_taxonomy_evidence_cache_key(
 def _procedure_taxonomy_evidence_cache_get(
     cache_key: tuple[int, tuple[int, ...], int],
 ) -> list[dict[str, Any]] | None:
-    if (
-        _PROCEDURE_TAXONOMY_EVIDENCE_CACHE_TTL_SECONDS <= 0
-        or _PROCEDURE_TAXONOMY_EVIDENCE_CACHE_MAX_KEYS <= 0
-    ):
+    if _PROCEDURE_TAXONOMY_EVIDENCE_CACHE_TTL_SECONDS <= 0 or _PROCEDURE_TAXONOMY_EVIDENCE_CACHE_MAX_KEYS <= 0:
         return None
     cache_entry = _PROCEDURE_TAXONOMY_EVIDENCE_CACHE.get(cache_key)
     if cache_entry is None:
@@ -5285,10 +5017,7 @@ def _procedure_taxonomy_evidence_cache_set(
     cache_key: tuple[int, tuple[int, ...], int],
     evidence_items: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    if (
-        _PROCEDURE_TAXONOMY_EVIDENCE_CACHE_TTL_SECONDS <= 0
-        or _PROCEDURE_TAXONOMY_EVIDENCE_CACHE_MAX_KEYS <= 0
-    ):
+    if _PROCEDURE_TAXONOMY_EVIDENCE_CACHE_TTL_SECONDS <= 0 or _PROCEDURE_TAXONOMY_EVIDENCE_CACHE_MAX_KEYS <= 0:
         return evidence_items
     _PROCEDURE_TAXONOMY_EVIDENCE_CACHE[cache_key] = (time.monotonic(), deepcopy(evidence_items))
     _PROCEDURE_TAXONOMY_EVIDENCE_CACHE.move_to_end(cache_key)
@@ -5301,10 +5030,7 @@ def _has_representative_procedure_taxonomy_evidence(evidence_items: list[dict[st
     if not evidence_items:
         return False
     distinct_npis = sum(item.get("distinct_npis") or 0 for item in evidence_items)
-    total_beneficiaries = sum(
-        _as_float(item.get("total_beneficiaries")) or 0.0
-        for item in evidence_items
-    )
+    total_beneficiaries = sum(_as_float(item.get("total_beneficiaries")) or 0.0 for item in evidence_items)
     return (
         distinct_npis >= PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_NPIS
         and total_beneficiaries >= PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_BENEFICIARIES
@@ -5317,17 +5043,12 @@ def _procedure_taxonomy_evidence_summary(
     is_known_young_skew: bool,
 ) -> dict[str, Any]:
     evidence_totals_by_metric = {
-        "distinct_npis": sum(
-            evidence_item.get("distinct_npis") or 0
-            for evidence_item in evidence_items
-        ),
+        "distinct_npis": sum(evidence_item.get("distinct_npis") or 0 for evidence_item in evidence_items),
         "total_services": sum(
-            _as_float(evidence_item.get("total_services")) or 0.0
-            for evidence_item in evidence_items
+            _as_float(evidence_item.get("total_services")) or 0.0 for evidence_item in evidence_items
         ),
         "total_beneficiaries": sum(
-            _as_float(evidence_item.get("total_beneficiaries")) or 0.0
-            for evidence_item in evidence_items
+            _as_float(evidence_item.get("total_beneficiaries")) or 0.0 for evidence_item in evidence_items
         ),
     }
     total_npis = max(float(evidence_totals_by_metric["distinct_npis"]), 1.0)
@@ -5343,15 +5064,10 @@ def _procedure_taxonomy_evidence_summary(
         )
 
     top_evidence_item = evidence_items[0] if evidence_items else None
-    top_npi_share = (
-        _as_float(top_evidence_item.get("distinct_npi_share"))
-        if top_evidence_item
-        else 0.0
-    )
+    top_npi_share = _as_float(top_evidence_item.get("distinct_npi_share")) if top_evidence_item else 0.0
     is_representative = (
         evidence_totals_by_metric["distinct_npis"] >= PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_NPIS
-        and evidence_totals_by_metric["total_beneficiaries"]
-        >= PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_BENEFICIARIES
+        and evidence_totals_by_metric["total_beneficiaries"] >= PROCEDURE_TAXONOMY_MIN_REPRESENTATIVE_BENEFICIARIES
         and not is_known_young_skew
     )
     if top_npi_share is not None and top_npi_share >= PROCEDURE_TAXONOMY_HIGH_NPI_SHARE and is_representative:
@@ -5377,9 +5093,7 @@ def _procedure_taxonomy_recommended_mode(
     safe_for_hard_filter: bool,
     allow_hard_filter: bool,
 ) -> tuple[str, str]:
-    hard_filter_allowed = (
-        allow_hard_filter or not PROCEDURE_TAXONOMY_HARD_FILTER_REQUIRES_ALLOW
-    )
+    hard_filter_allowed = allow_hard_filter or not PROCEDURE_TAXONOMY_HARD_FILTER_REQUIRES_ALLOW
     if needs_intent:
         return "ambiguous", "ambiguous"
     if not recommended_codes:
@@ -5414,16 +5128,10 @@ def _procedure_taxonomy_conflicts(
     conflict_reasons: list[str] = []
     if intent_codes and curated_codes and set(intent_codes).isdisjoint(set(curated_codes)):
         conflict_reasons.append("intent_conflicts_with_curated_code_range")
-    if (
-        recommended_codes
-        and top_evidence_item
-        and top_evidence_item.get("taxonomy_code") not in recommended_codes
-    ):
+    if recommended_codes and top_evidence_item and top_evidence_item.get("taxonomy_code") not in recommended_codes:
         top_share = _as_float(top_evidence_item.get("distinct_npi_share")) or 0.0
         if top_share >= PROCEDURE_TAXONOMY_MEDIUM_NPI_SHARE:
-            conflict_reasons.append(
-                "utilization_top_taxonomy_conflicts_with_selected_taxonomy"
-            )
+            conflict_reasons.append("utilization_top_taxonomy_conflicts_with_selected_taxonomy")
     return bool(conflict_reasons), conflict_reasons
 
 
@@ -5555,11 +5263,11 @@ _QUALITY_PROCEDURE_TAXONOMY_EVIDENCE_SQL = f"""
                         THEN NULL
                         ELSE NULLIF(BTRIM(COALESCE(qf.taxonomy_classification, '')), '')
                     END AS quality_classification
-                FROM {PRICING_SCHEMA}.{PricingProviderProcedure.__tablename__} pp
-                JOIN {PRICING_SCHEMA}.{PricingProvider.__tablename__} p
+                FROM {{procedure_relation}} pp
+                JOIN {{provider_relation}} p
                   ON p.npi = pp.npi
                  AND p.year = pp.year
-                JOIN {PRICING_SCHEMA}.{QUALITY_FEATURE_TABLE_NAME} qf
+                JOIN {{feature_relation}} qf
                   ON qf.npi = pp.npi
                  AND qf.year = pp.year
                 WHERE pp.year = :year
@@ -5604,16 +5312,15 @@ async def _load_procedure_taxonomy_evidence(
         return []
 
     cache_key = _procedure_taxonomy_evidence_cache_key(year, internal_codes, limit)
-    cached_evidence_items = _procedure_taxonomy_evidence_cache_get(cache_key)
+    has_guarded_read = has_network_read_inventory(session)
+    # Cached evidence is not bound to the independently proved current claims generation.
+    cached_evidence_items = None if has_guarded_read else _procedure_taxonomy_evidence_cache_get(cache_key)
     if cached_evidence_items is not None:
         return cached_evidence_items
 
-    if (
-        len(internal_codes) == 1
-        and await _is_table_available(
-            session,
-            procedure_taxonomy_signal_table.name,
-        )
+    if len(internal_codes) == 1 and await _is_table_available(
+        session,
+        procedure_taxonomy_signal_table.name,
     ):
         quality_evidence_items = await _load_precomputed_procedure_taxonomy_evidence(
             session,
@@ -5623,9 +5330,10 @@ async def _load_procedure_taxonomy_evidence(
             limit=limit,
         )
         if _has_representative_procedure_taxonomy_evidence(quality_evidence_items):
-            return _procedure_taxonomy_evidence_cache_set(
-                cache_key,
-                quality_evidence_items,
+            return (
+                quality_evidence_items
+                if has_guarded_read
+                else _procedure_taxonomy_evidence_cache_set(cache_key, quality_evidence_items)
             )
         fallback_evidence_items = await _load_precomputed_procedure_taxonomy_evidence(
             session,
@@ -5635,9 +5343,10 @@ async def _load_procedure_taxonomy_evidence(
             limit=limit,
         )
         if fallback_evidence_items:
-            return _procedure_taxonomy_evidence_cache_set(
-                cache_key,
-                fallback_evidence_items,
+            return (
+                fallback_evidence_items
+                if has_guarded_read
+                else _procedure_taxonomy_evidence_cache_set(cache_key, fallback_evidence_items)
             )
 
     quality_feature_exists = await _is_table_available(session, QUALITY_FEATURE_TABLE_NAME)
@@ -5649,11 +5358,23 @@ async def _load_procedure_taxonomy_evidence(
             limit=limit,
         )
         if _has_representative_procedure_taxonomy_evidence(quality_evidence_items):
-            return _procedure_taxonomy_evidence_cache_set(cache_key, quality_evidence_items)
+            return (
+                quality_evidence_items
+                if has_guarded_read
+                else _procedure_taxonomy_evidence_cache_set(cache_key, quality_evidence_items)
+            )
 
+    procedure_relation = f"{PRICING_SCHEMA}.{PricingProviderProcedure.__tablename__}"
+    provider_relation = f"{PRICING_SCHEMA}.{PricingProvider.__tablename__}"
+    feature_relation = f"{PRICING_SCHEMA}.{QUALITY_FEATURE_TABLE_NAME}"
+    if has_network_read_inventory(session):
+        procedure_relation = direct_heap_relation_sql(session, PRICING_SCHEMA, PricingProviderProcedure.__tablename__)
+        provider_relation = direct_heap_relation_sql(session, PRICING_SCHEMA, PricingProvider.__tablename__)
+        if quality_feature_exists:
+            feature_relation = direct_heap_relation_sql(session, PRICING_SCHEMA, QUALITY_FEATURE_TABLE_NAME)
     quality_join_sql = (
         f"""
-        LEFT JOIN {PRICING_SCHEMA}.{QUALITY_FEATURE_TABLE_NAME} qf
+        LEFT JOIN {feature_relation} qf
           ON qf.npi = pp.npi
          AND qf.year = pp.year
         """
@@ -5676,7 +5397,8 @@ async def _load_procedure_taxonomy_evidence(
         "internal_codes": list(internal_codes),
         "limit": limit,
     }
-    query_result = await session.execute(
+    query_result = await execute_network_read(
+        session,
         text(
             f"""
             WITH base AS (
@@ -5687,8 +5409,8 @@ async def _load_procedure_taxonomy_evidence(
                     p.provider_type,
                     {quality_select_sql}
                     nt.healthcare_provider_taxonomy_code AS nppes_taxonomy_code
-                FROM {PRICING_SCHEMA}.{PricingProviderProcedure.__tablename__} pp
-                JOIN {PRICING_SCHEMA}.{PricingProvider.__tablename__} p
+                FROM {procedure_relation} pp
+                JOIN {provider_relation} p
                   ON p.npi = pp.npi
                  AND p.year = pp.year
                 {quality_join_sql}
@@ -5759,11 +5481,8 @@ async def _load_procedure_taxonomy_evidence(
         ),
         query_params_by_name,
     )
-    evidence_items = [
-        _taxonomy_evidence_item(_row_to_dict(evidence_row))
-        for evidence_row in query_result
-    ]
-    return _procedure_taxonomy_evidence_cache_set(cache_key, evidence_items)
+    evidence_items = [_taxonomy_evidence_item(_row_to_dict(evidence_row)) for evidence_row in query_result]
+    return evidence_items if has_guarded_read else _procedure_taxonomy_evidence_cache_set(cache_key, evidence_items)
 
 
 async def _load_precomputed_procedure_taxonomy_evidence(
@@ -5776,7 +5495,8 @@ async def _load_precomputed_procedure_taxonomy_evidence(
 ) -> list[dict[str, Any]]:
     """Load one bounded evidence basis from the published signal table."""
 
-    query_result = await session.execute(
+    query_result = await execute_network_read(
+        session,
         select(
             procedure_taxonomy_signal_table.c.taxonomy_code,
             procedure_taxonomy_signal_table.c.classification,
@@ -5792,12 +5512,9 @@ async def _load_precomputed_procedure_taxonomy_evidence(
                 procedure_taxonomy_signal_table.c.year == year,
                 procedure_taxonomy_signal_table.c.procedure_code == internal_code,
                 procedure_taxonomy_signal_table.c.setting_key == "all",
-                procedure_taxonomy_signal_table.c.evidence_source
-                == evidence_source,
+                procedure_taxonomy_signal_table.c.evidence_source == evidence_source,
                 procedure_taxonomy_signal_table.c.source_relation_fingerprint
-                == literal_column(
-                    _PROCEDURE_TAXONOMY_SIGNAL_FINGERPRINT_SQL
-                ),
+                == literal_column(_PROCEDURE_TAXONOMY_SIGNAL_FINGERPRINT_SQL),
             )
         )
         .order_by(
@@ -5805,12 +5522,9 @@ async def _load_precomputed_procedure_taxonomy_evidence(
             procedure_taxonomy_signal_table.c.total_services.desc(),
             procedure_taxonomy_signal_table.c.taxonomy_code.asc(),
         )
-        .limit(limit)
+        .limit(limit),
     )
-    return [
-        _taxonomy_evidence_item(_row_to_dict(evidence_row))
-        for evidence_row in query_result
-    ]
+    return [_taxonomy_evidence_item(_row_to_dict(evidence_row)) for evidence_row in query_result]
 
 
 async def _load_quality_procedure_taxonomy_evidence(
@@ -5826,8 +5540,20 @@ async def _load_quality_procedure_taxonomy_evidence(
         "internal_codes": list(internal_codes),
         "limit": limit,
     }
-    query_result = await session.execute(
-        text(_QUALITY_PROCEDURE_TAXONOMY_EVIDENCE_SQL),
+    relation_names_by_slot = {
+        "procedure_relation": PricingProviderProcedure.__tablename__,
+        "provider_relation": PricingProvider.__tablename__,
+        "feature_relation": QUALITY_FEATURE_TABLE_NAME,
+    }
+    relations_by_slot = {
+        slot: direct_heap_relation_sql(session, PRICING_SCHEMA, name)
+        if has_network_read_inventory(session)
+        else f"{PRICING_SCHEMA}.{name}"
+        for slot, name in relation_names_by_slot.items()
+    }
+    query_result = await execute_network_read(
+        session,
+        text(_QUALITY_PROCEDURE_TAXONOMY_EVIDENCE_SQL.format(**relations_by_slot)),
         query_params_by_name,
     )
     return [_taxonomy_evidence_item(_row_to_dict(query_row)) for query_row in query_result]
@@ -5874,6 +5600,7 @@ async def _resolve_internal_rx_codes_for_request(
     default_system: str = INTERNAL_RX_CODE_SYSTEM,
 ) -> tuple[list[str], dict[str, Any]]:
     """Resolve an input prescription code to internal codes and crosswalk match metadata."""
+    code_crosswalk_table = claims_dictionary_tables(session)[1]
     code_system = _normalize_code_system(args.get("rx_code_system") or args.get("code_system") or default_system)
     code = _normalize_code(rx_code_value, "rx_code")
     expand_codes = _parse_bool(args.get("expand_codes"), "expand_codes", default=False)
@@ -5902,13 +5629,8 @@ async def _resolve_internal_rx_codes_for_request(
             )
         )
 
-    crosswalk_result = await session.execute(
-        select(code_crosswalk_table).where(or_(*clauses))
-    )
-    crosswalk_rows = [
-        _row_to_dict(crosswalk_row)
-        for crosswalk_row in crosswalk_result
-    ]
+    crosswalk_result = await execute_network_read(session, select(code_crosswalk_table).where(or_(*clauses)))
+    crosswalk_rows = [_row_to_dict(crosswalk_row) for crosswalk_row in crosswalk_result]
     resolved_codes, crosswalk_matches = _resolved_rx_crosswalk_matches(
         crosswalk_rows,
         expand_codes=expand_codes,
@@ -5921,8 +5643,7 @@ async def _resolve_internal_rx_codes_for_request(
     return unique_codes, {
         "input_code": {"code_system": code_system, "code": code},
         "resolved_codes": [
-            {"code_system": INTERNAL_RX_CODE_SYSTEM, "code": resolved_code}
-            for resolved_code in unique_codes
+            {"code_system": INTERNAL_RX_CODE_SYSTEM, "code": resolved_code} for resolved_code in unique_codes
         ],
         "matched_via": crosswalk_matches,
         "expanded": bool(expand_codes),
@@ -5933,6 +5654,8 @@ async def _resolve_external_rx_codes_for_internal(
     session,
     internal_codes: list[str],
 ) -> dict[str, dict[str, list[str]]]:
+    """Resolve internal prescription codes through the request's pinned dictionary."""
+    code_crosswalk_table = claims_dictionary_tables(session)[1]
     normalized_codes = sorted({str(code or "").strip().upper() for code in internal_codes if str(code or "").strip()})
     if not normalized_codes:
         return {}
@@ -5952,11 +5675,8 @@ async def _resolve_external_rx_codes_for_internal(
             ),
         )
     )
-    crosswalk_result = await session.execute(query)
-    crosswalk_rows = [
-        _row_to_dict(crosswalk_row)
-        for crosswalk_row in crosswalk_result
-    ]
+    crosswalk_result = await execute_network_read(session, query)
+    crosswalk_rows = [_row_to_dict(crosswalk_row) for crosswalk_row in crosswalk_result]
 
     external_codes_by_internal: dict[str, dict[str, list[str]]] = {}
     for crosswalk_row in crosswalk_rows:
@@ -6040,6 +5760,8 @@ def _apply_prescription_code_preferences(
 async def _current_source_snapshot_pairs_for_plan(session, plan_fields: dict[str, object]) -> list[tuple[str, str]]:
     try:
         snapshot_pairs = await current_network_snapshots_for_plan(session, plan_fields)
+    except sanic.exceptions.ServiceUnavailable:
+        raise
     except Exception:
         snapshot_pairs = []
     if snapshot_pairs:
@@ -6117,16 +5839,10 @@ _ALLOWED_AMOUNT_LOCATION_SELECT_SQL = """
     allowed_location.address_payload
 """
 ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK = "in_network"
-ALLOWED_AMOUNT_NETWORK_STATUS_NOT_CONFIRMED = (
-    "out_of_network_or_not_confirmed_in_network"
-)
+ALLOWED_AMOUNT_NETWORK_STATUS_NOT_CONFIRMED = "out_of_network_or_not_confirmed_in_network"
 ALLOWED_AMOUNT_NETWORK_STATUS_MIXED = "mixed_network_status"
-ALLOWED_AMOUNT_NETWORK_SEMANTICS_IN_NETWORK = (
-    "in_network_historical_allowed_amounts"
-)
-ALLOWED_AMOUNT_NETWORK_SEMANTICS_OUT_OF_NETWORK = (
-    "out_of_network_historical_allowed_amounts"
-)
+ALLOWED_AMOUNT_NETWORK_SEMANTICS_IN_NETWORK = "in_network_historical_allowed_amounts"
+ALLOWED_AMOUNT_NETWORK_SEMANTICS_OUT_OF_NETWORK = "out_of_network_historical_allowed_amounts"
 ALLOWED_AMOUNT_NETWORK_SEMANTICS_MIXED = "mixed_historical_allowed_amounts"
 _ALLOWED_AMOUNT_UNVERIFIED_LOCATION_FIELD_NAMES = frozenset(
     {
@@ -6187,26 +5903,17 @@ def _is_plan_pricing_projection_payload(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
     query_by_field = payload.get("query")
-    return (
-        isinstance(query_by_field, dict)
-        and query_by_field.get("source") == "plan_pricing_projection"
-    )
+    return isinstance(query_by_field, dict) and query_by_field.get("source") == "plan_pricing_projection"
 
 
 def _allowed_amount_scope_from_args(
     args: Mapping[str, Any],
 ) -> tuple[str, str, str, int | None] | None:
-    plan_id = str(
-        args.get("plan_id") or args.get("plan_external_id") or ""
-    ).strip()
+    plan_id = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
     code = str(args.get("code") or "").strip()
     if not plan_id or not code:
         return None
-    code_system = str(
-        args.get("code_system")
-        or _reported_procedure_code_system(code)
-        or ""
-    ).strip().upper()
+    code_system = str(args.get("code_system") or _reported_procedure_code_system(code) or "").strip().upper()
     npi_filter = _parse_int(args.get("npi") or None, "npi", minimum=1)
     return plan_id, code, code_system, npi_filter
 
@@ -6237,15 +5944,12 @@ async def _current_allowed_amount_snapshots_for_plan(
 
     query_parameter_map = {
         "allowed_contract": PTG2_ALLOWED_AMOUNT_CONTRACT,
-        "market_type": str(
-            args.get("plan_market_type") or args.get("market_type") or ""
-        ).strip().lower(),
+        "market_type": str(args.get("plan_market_type") or args.get("market_type") or "").strip().lower(),
         "plan_ids": list(ein_plan_id_variants(plan_id)),
-        "requested_source_key": str(
-            args.get("source_key") or ""
-        ).strip().lower(),
+        "requested_source_key": str(args.get("source_key") or "").strip().lower(),
     }
-    snapshot_result = await session.execute(
+    snapshot_result = await execute_network_read(
+        session,
         text(_ALLOWED_AMOUNT_CURRENT_SNAPSHOT_SQL),
         query_parameter_map,
     )
@@ -6274,12 +5978,13 @@ async def _allowed_amount_address_table(
     session,
     args: Mapping[str, Any],
 ) -> str | None:
+    from api.provider_allowed_amount_policy import allowed_address_relation, current_network_address_scope
+
+    if current_network_address_scope() is not None:
+        return allowed_address_relation(PTG2_SCHEMA)
     if not _has_allowed_amount_address_filter(args):
         return None
-    has_geo_filter = any(
-        args.get(parameter_name) not in (None, "", "null")
-        for parameter_name in ("lat", "long")
-    )
+    has_geo_filter = any(args.get(parameter_name) not in (None, "", "null") for parameter_name in ("lat", "long"))
     has_zip_filter = bool(_normalize_zip5(args.get("zip5") or args.get("zip")))
     has_spatial_filter = has_geo_filter or has_zip_filter
     address_table = await _ptg2_address_serving_table(
@@ -6288,17 +5993,13 @@ async def _allowed_amount_address_table(
         require_legacy_available=True,
     )
     if not _is_unified_address_table(address_table):
-        raise PTG2ManifestArtifactError(
-            "Allowed-amount location filtering requires unified source-backed addresses"
-        )
+        raise PTG2ManifestArtifactError("Allowed-amount location filtering requires unified source-backed addresses")
     if has_spatial_filter:
         if not await is_provider_address_geo_capability_available(
             session,
             schema_name=PTG2_SCHEMA,
         ):
-            raise PTG2ManifestArtifactError(
-                "Allowed-amount spatial filtering requires canonical ZIP geometry"
-            )
+            raise PTG2ManifestArtifactError("Allowed-amount spatial filtering requires canonical ZIP geometry")
     return address_table
 
 
@@ -6322,16 +6023,12 @@ def _allowed_amount_payment_filter_params(
     args: Mapping[str, Any],
 ) -> dict[str, Any]:
     service_codes = _normalize_filter_string_list(
-        args.get("pos")
-        or args.get("place_of_service")
-        or args.get("service_code"),
+        args.get("pos") or args.get("place_of_service") or args.get("service_code"),
         code_system="POS",
     )
     modifier_codes = sorted(
         _normalize_filter_string_list(
-            args.get("modifier")
-            or args.get("modifiers")
-            or args.get("billing_code_modifier"),
+            args.get("modifier") or args.get("modifiers") or args.get("billing_code_modifier"),
             upper=True,
         )
     )
@@ -6351,10 +6048,7 @@ def _allowed_amount_geo_sql(
 ) -> tuple[str, list[str]]:
     """Return distance projection and geo predicates for allowed evidence."""
 
-    has_geo_filter = all(
-        args.get(parameter_name) not in (None, "", "null")
-        for parameter_name in ("lat", "long")
-    )
+    has_geo_filter = all(args.get(parameter_name) not in (None, "", "null") for parameter_name in ("lat", "long"))
     if not has_geo_filter:
         return "NULL::double precision", []
     geo_latitude = _as_float(args.get("lat"))
@@ -6365,9 +6059,7 @@ def _allowed_amount_geo_sql(
     parameter_map.update(
         allowed_geo_lat=geo_latitude,
         allowed_geo_long=geo_longitude,
-        allowed_geo_radius_miles=(
-            geo_radius if geo_radius is not None else 10.0
-        ),
+        allowed_geo_radius_miles=(geo_radius if geo_radius is not None else 10.0),
     )
     distance_sql = _ptg2_geo_distance_miles_sql(
         "addr.lat::float8",
@@ -6383,10 +6075,7 @@ def _allowed_amount_geo_sql(
                 "addr.long",
             ).replace(":geo_", ":allowed_geo_"),
         ]
-    return distance_sql, [
-        f"{distance_sql} <= "
-        "CAST(:allowed_geo_radius_miles AS double precision)"
-    ]
+    return distance_sql, [f"{distance_sql} <= CAST(:allowed_geo_radius_miles AS double precision)"]
 
 
 def _allowed_amount_spatial_filter_sql(
@@ -6394,6 +6083,7 @@ def _allowed_amount_spatial_filter_sql(
     *,
     uses_unified_addresses: bool,
     parameter_map: dict[str, Any],
+    office_inputs=None,
 ) -> tuple[str, list[str]]:
     """Build spatial predicates shared by allowed-amount page and count SQL."""
 
@@ -6402,9 +6092,7 @@ def _allowed_amount_spatial_filter_sql(
         uses_unified_addresses=uses_unified_addresses,
         parameter_map=parameter_map,
     )
-    zip5 = _normalize_zip5(
-        request_arg_map.get("zip5") or request_arg_map.get("zip")
-    )
+    zip5 = _normalize_zip5(request_arg_map.get("zip5") or request_arg_map.get("zip"))
     zip_predicate = None
     if zip5:
         parameter_map["allowed_zip5"] = zip5
@@ -6414,6 +6102,11 @@ def _allowed_amount_spatial_filter_sql(
         )
         zip_predicate = f"{zip_sql} = :allowed_zip5"
     if uses_unified_addresses and (zip_predicate or geo_predicates):
+        if office_inputs is not None:
+            from api.provider_allowed_amount_policy import allowed_spatial_predicate
+
+            coherence_sql = allowed_spatial_predicate(office_inputs, PTG2_SCHEMA, zip_predicate, geo_predicates)
+            return distance_sql, [coherence_sql] if coherence_sql else []
         coherence_sql = provider_address_location_filter_sql(
             "addr",
             schema_name=PTG2_SCHEMA,
@@ -6423,9 +6116,7 @@ def _allowed_amount_spatial_filter_sql(
         return distance_sql, [coherence_sql] if coherence_sql else []
     if zip_predicate:
         legacy_spatial_sql = (
-            f"({zip_predicate} OR ({' AND '.join(geo_predicates)}))"
-            if geo_predicates
-            else zip_predicate
+            f"({zip_predicate} OR ({' AND '.join(geo_predicates)}))" if geo_predicates else zip_predicate
         )
         return distance_sql, [legacy_spatial_sql]
     return distance_sql, geo_predicates
@@ -6438,55 +6129,18 @@ def _allowed_amount_location_join_sql(
     address_predicates: list[str],
     address_rank_sql: str | None,
     distance_sql: str,
+    reference_join_sql: str = "",
 ) -> str:
-    """Render the indexed best-address lateral lookup."""
+    from api.provider_allowed_amount_policy import allowed_location_join_sql
 
-    zip5_sql = _ptg2_address_zip5_sql(
-        "addr",
-        unified=uses_unified_addresses,
+    return allowed_location_join_sql(
+        address_table=address_table,
+        zip5_sql=_ptg2_address_zip5_sql("addr", unified=uses_unified_addresses),
+        address_predicates=address_predicates,
+        address_rank_sql=address_rank_sql,
+        distance_sql=distance_sql,
+        reference_join_sql=reference_join_sql,
     )
-    address_rank_order_sql = (
-        f"{address_rank_sql},\n               " if address_rank_sql else ""
-    )
-    return f"""
-    LEFT JOIN LATERAL (
-        SELECT
-            addr.npi,
-            addr.state_name AS state,
-            addr.city_name AS city,
-            {zip5_sql} AS zip5,
-            {distance_sql} AS distance_miles,
-            jsonb_build_object(
-                'first_line', addr.first_line,
-                'second_line', addr.second_line,
-                'city', addr.city_name,
-                'state', addr.state_name,
-                'postal_code', addr.postal_code,
-                'country_code', addr.country_code,
-                'telephone_number', addr.telephone_number,
-                'fax_number', addr.fax_number,
-                'phone_number', addr.phone_number,
-                'phone_extension', addr.phone_extension,
-                'fax_number_digits', addr.fax_number_digits,
-                'fax_extension', addr.fax_extension,
-                'address_key', addr.address_key::text,
-                'lat', addr.lat,
-                'long', addr.long
-            )::text AS address_payload
-          FROM {address_table} addr
-         WHERE {' AND '.join(address_predicates)}
-         ORDER BY
-               {address_rank_order_sql}{distance_sql} ASC NULLS LAST,
-               CASE addr.type
-                   WHEN 'practice' THEN 0
-                   WHEN 'site' THEN 1
-                   WHEN 'primary' THEN 2
-                   ELSE 3
-               END,
-               addr.checksum
-         LIMIT 1
-    ) allowed_location ON TRUE
-    """
 
 
 def _allowed_amount_location_sql(
@@ -6494,23 +6148,27 @@ def _allowed_amount_location_sql(
     *,
     address_table: str | None,
     parameter_map: dict[str, Any],
+    office_inputs=None,
 ) -> tuple[str, str, str]:
     """Build one indexed per-NPI address lookup and its required-match clause."""
 
     if not address_table:
         return "", _ALLOWED_AMOUNT_EMPTY_LOCATION_SELECT_SQL, ""
-    uses_unified_addresses = _is_unified_address_table(address_table)
+    uses_unified_addresses = office_inputs is not None or _is_unified_address_table(address_table)
     parameter_map["allowed_address_types"] = (
-        ["practice", "primary", "secondary", "site"]
-        if uses_unified_addresses
-        else ["primary", "secondary"]
+        ["practice", "primary", "secondary", "site"] if uses_unified_addresses else ["primary", "secondary"]
     )
     address_predicates = [
         "addr.npi = provider_rollup.npi",
         "addr.type = ANY(CAST(:allowed_address_types AS varchar[]))",
     ]
     if uses_unified_addresses and _has_allowed_amount_address_filter(args):
-        address_predicates.append(_ptg2_geo_assured_address_sql("addr"))
+        if office_inputs is not None:
+            from api.provider_allowed_amount_policy import allowed_geo_evidence
+
+            address_predicates.append(allowed_geo_evidence(office_inputs, PTG2_SCHEMA))
+        else:
+            address_predicates.append(_ptg2_geo_assured_address_sql("addr"))
     _append_allowed_amount_text_location_filters(
         args,
         parameter_map,
@@ -6520,28 +6178,24 @@ def _allowed_amount_location_sql(
         args,
         uses_unified_addresses=uses_unified_addresses,
         parameter_map=parameter_map,
+        office_inputs=office_inputs,
     )
-    if (
-        uses_unified_addresses
-        and _has_allowed_amount_address_filter(args)
-        and not spatial_predicates
-    ):
+    if uses_unified_addresses and _has_allowed_amount_address_filter(args) and not spatial_predicates:
         address_predicates.append(f"NOT {postal_box_address_sql('addr')}")
     address_predicates.extend(spatial_predicates)
+    from api.provider_allowed_amount_policy import allowed_geo_joins
+
     join_sql = _allowed_amount_location_join_sql(
         address_table=address_table,
         uses_unified_addresses=uses_unified_addresses,
         address_predicates=address_predicates,
-        address_rank_sql=(
-            None
-            if _has_allowed_amount_address_filter(args)
-            else address_display_rank_sql("addr")
-        ),
+        address_rank_sql=(None if _has_allowed_amount_address_filter(args) else address_display_rank_sql("addr")),
         distance_sql=distance_sql,
+        reference_join_sql=("\n" + allowed_geo_joins(office_inputs, PTG2_SCHEMA) if office_inputs is not None else ""),
     )
     required_sql = (
         "AND allowed_location.npi IS NOT NULL"
-        if _has_allowed_amount_address_filter(args)
+        if office_inputs is not None or _has_allowed_amount_address_filter(args)
         else ""
     )
     return join_sql, _ALLOWED_AMOUNT_LOCATION_SELECT_SQL, required_sql
@@ -6556,14 +6210,10 @@ def _append_allowed_amount_text_location_filters(
     city_name = str(args.get("city") or "").strip().upper()
     if state_code:
         parameter_map["allowed_state"] = state_code
-        address_predicates.append(
-            "UPPER(COALESCE(addr.state_name, '')) = :allowed_state"
-        )
+        address_predicates.append("UPPER(COALESCE(addr.state_name, '')) = :allowed_state")
     if city_name:
         parameter_map["allowed_city"] = city_name
-        address_predicates.append(
-            "UPPER(COALESCE(addr.city_name, '')) = :allowed_city"
-        )
+        address_predicates.append("UPPER(COALESCE(addr.city_name, '')) = :allowed_city")
 
 
 def _allowed_amount_provider_sex_filter_sql(
@@ -6572,9 +6222,7 @@ def _allowed_amount_provider_sex_filter_sql(
 ) -> str:
     """Build the canonical provider-sex predicate for allowed evidence."""
 
-    provider_sex_code = normalize_provider_sex_code(
-        args.get("provider_sex_code")
-    )
+    provider_sex_code = normalize_provider_sex_code(args.get("provider_sex_code"))
     if provider_sex_code is None:
         return ""
     parameter_map["allowed_provider_sex_code"] = provider_sex_code
@@ -6623,33 +6271,26 @@ def _allowed_amount_provider_filter_sql(
         if str(field_value or "").strip()
     }
     if exact_taxonomy_by_field:
-        exact_predicates = [
-            "allowed_exact_taxonomy.npi = provider_rollup.npi"
-        ]
+        exact_predicates = ["allowed_exact_taxonomy.npi = provider_rollup.npi"]
         if _parse_bool(
             args.get("primary_only"),
             "primary_only",
             default=True,
         ):
             exact_predicates.append(
-                "UPPER(COALESCE("
-                "allowed_exact_taxonomy."
-                "healthcare_provider_primary_taxonomy_switch, '')) = 'Y'"
+                "UPPER(COALESCE(allowed_exact_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y'"
             )
         for field_name, field_value in exact_taxonomy_by_field.items():
             parameter_name = f"allowed_taxonomy_{field_name}"
             parameter_map[parameter_name] = field_value
-            exact_predicates.append(
-                f"LOWER(COALESCE(allowed_nucc.{field_name}, '')) "
-                f"= LOWER(:{parameter_name})"
-            )
+            exact_predicates.append(f"LOWER(COALESCE(allowed_nucc.{field_name}, '')) = LOWER(:{parameter_name})")
         predicates.append(
             f"""EXISTS (
                 SELECT 1
                   FROM {PTG2_SCHEMA}.npi_taxonomy allowed_exact_taxonomy
                   JOIN {PTG2_SCHEMA}.nucc_taxonomy allowed_nucc
                     ON allowed_nucc.code = allowed_exact_taxonomy.healthcare_provider_taxonomy_code
-                 WHERE {' AND '.join(exact_predicates)}
+                 WHERE {" AND ".join(exact_predicates)}
             )"""
         )
     return "".join(f"\n          AND {predicate}" for predicate in predicates)
@@ -6940,15 +6581,15 @@ def _allowed_amount_page_sql(
     *,
     address_table: str | None,
     parameter_map: dict[str, Any],
+    office_inputs=None,
 ) -> Any:
     """Build the exact provider page query after adding request parameters."""
 
-    location_join_sql, location_select_sql, location_required_sql = (
-        _allowed_amount_location_sql(
-            args,
-            address_table=address_table,
-            parameter_map=parameter_map,
-        )
+    location_join_sql, location_select_sql, location_required_sql = _allowed_amount_location_sql(
+        args,
+        address_table=address_table,
+        parameter_map=parameter_map,
+        office_inputs=office_inputs,
     )
     replacement_sql_by_marker = {
         "__PROVIDER_NAME_SQL__": _ptg2_provider_name_sql("npi_data"),
@@ -6969,35 +6610,19 @@ def _allowed_amount_page_sql(
     page_sql = _ALLOWED_AMOUNT_PAGE_SQL_TEMPLATE
     for marker, replacement_sql in replacement_sql_by_marker.items():
         page_sql = page_sql.replace(marker, replacement_sql)
+    if office_inputs is not None:
+        for role in ("npi_taxonomy", "nucc_taxonomy", "npi"):
+            for operation in ("FROM", "JOIN"):
+                page_sql = page_sql.replace(
+                    f"{operation} {PTG2_SCHEMA}.{role} ", f"{operation} ONLY {office_inputs.relation(role)} "
+                )
     return text(page_sql)
 
 
 def _allowed_amount_detail_sql() -> Any:
-    return text(
-        f"""
-        WITH {_ALLOWED_AMOUNT_SCOPE_CTES_SQL},
-        ranked_evidence AS (
-            SELECT
-                evidence.*,
-                ROW_NUMBER() OVER (
-                    PARTITION BY evidence.npi
-                    ORDER BY
-                          evidence.allowed_amount ASC NULLS LAST,
-                          evidence.billed_charge ASC NULLS LAST,
-                          evidence.source_key,
-                          evidence.snapshot_id,
-                          evidence.tin_type,
-                          evidence.tin_value
-                ) AS evidence_rank
-              FROM matching_evidence evidence
-             WHERE evidence.npi = ANY(CAST(:page_npis AS bigint[]))
-        )
-        SELECT *
-          FROM ranked_evidence
-         WHERE evidence_rank <= :detail_limit
-         ORDER BY npi, evidence_rank
-        """
-    )
+    from api.provider_allowed_amount_policy import allowed_detail_statement
+
+    return allowed_detail_statement(_ALLOWED_AMOUNT_SCOPE_CTES_SQL)
 
 
 def _allowed_amount_query_params(
@@ -7010,22 +6635,22 @@ def _allowed_amount_query_params(
     npi: int | None,
     current_snapshots: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    requested_market_type = str(
-        args.get("plan_market_type") or args.get("market_type") or ""
-    ).strip().lower()
+    requested_market_type = str(args.get("plan_market_type") or args.get("market_type") or "").strip().lower()
     physical_binding_tuples: list[tuple[str, str, str, str]] = []
     seen_binding_tuples: set[tuple[str, str, str, str]] = set()
     for snapshot_by_field in current_snapshots:
-        binding_plan_id = str(
-            snapshot_by_field.get("plan_id") or plan_id
-        ).strip()
-        binding_market_type = str(
-            snapshot_by_field.get(
-                "plan_market_type",
-                requested_market_type,
+        binding_plan_id = str(snapshot_by_field.get("plan_id") or plan_id).strip()
+        binding_market_type = (
+            str(
+                snapshot_by_field.get(
+                    "plan_market_type",
+                    requested_market_type,
+                )
+                or ""
             )
-            or ""
-        ).strip().lower()
+            .strip()
+            .lower()
+        )
         for plan_id_variant in ein_plan_id_variants(binding_plan_id):
             binding_tuple = (
                 str(snapshot_by_field["snapshot_id"]),
@@ -7042,12 +6667,8 @@ def _allowed_amount_query_params(
         "snapshot_ids": [binding_tuple[0] for binding_tuple in physical_binding_tuples],
         "source_keys": [binding_tuple[1] for binding_tuple in physical_binding_tuples],
         "plan_ids": [binding_tuple[2] for binding_tuple in physical_binding_tuples],
-        "plan_market_types": [
-            binding_tuple[3] for binding_tuple in physical_binding_tuples
-        ],
-        "allow_release_snapshot": bool(
-            str(args.get("plan_release_id") or "").strip()
-        ),
+        "plan_market_types": [binding_tuple[3] for binding_tuple in physical_binding_tuples],
+        "allow_release_snapshot": bool(str(args.get("plan_release_id") or "").strip()),
         "code": code,
         "code_system": code_system,
         "npi": npi,
@@ -7063,10 +6684,7 @@ async def _allowed_amount_detail_rows_for_page(
     query_parameter_map: Mapping[str, Any],
     provider_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    page_npis = [
-        int(provider_by_field["npi"])
-        for provider_by_field in provider_rows
-    ]
+    page_npis = [int(provider_by_field["npi"]) for provider_by_field in provider_rows]
     if not page_npis:
         return []
     detail_parameter_map = dict(query_parameter_map)
@@ -7076,14 +6694,12 @@ async def _allowed_amount_detail_rows_for_page(
             "detail_limit": _ALLOWED_AMOUNT_DETAIL_LIMIT,
         }
     )
-    detail_result = await session.execute(
+    detail_result = await execute_network_read(
+        session,
         _allowed_amount_detail_sql(),
         detail_parameter_map,
     )
-    return [
-        _row_to_dict(detail_by_field)
-        for detail_by_field in detail_result
-    ]
+    return [_row_to_dict(detail_by_field) for detail_by_field in detail_result]
 
 
 def _allowed_amount_network_context_from_summary(
@@ -7095,13 +6711,8 @@ def _allowed_amount_network_context_from_summary(
                 "network_status": network_status,
                 "network_semantics": network_semantics,
             }
-            for network_status in (
-                summary_by_field.get("result_network_statuses") or []
-            )
-            for network_semantics in (
-                summary_by_field.get("result_network_semantics_values")
-                or [None]
-            )
+            for network_status in (summary_by_field.get("result_network_statuses") or [])
+            for network_semantics in (summary_by_field.get("result_network_semantics_values") or [None])
         ]
     )
 
@@ -7153,11 +6764,7 @@ def _allowed_amount_search_response(
         "result_state": "allowed_amounts_found",
         "pricing_scope": "plan_scoped_allowed_amounts",
         "resolved": True,
-        "resolved_snapshot_id": (
-            resolved_snapshot_ids[0]
-            if len(resolved_snapshot_ids) == 1
-            else None
-        ),
+        "resolved_snapshot_id": (resolved_snapshot_ids[0] if len(resolved_snapshot_ids) == 1 else None),
         "resolved_snapshot_ids": resolved_snapshot_ids,
         "items": provider_items,
         "pagination": {
@@ -7193,6 +6800,8 @@ def _allowed_amount_no_match_response(
 ) -> dict[str, Any]:
     """Return a resolved empty result for an exact canonical release."""
 
+    from api.provider_allowed_amount_policy import allowed_contributors
+
     plan_id, code, code_system, _npi_filter = search_scope
     binding_sources = [
         {
@@ -7202,7 +6811,7 @@ def _allowed_amount_no_match_response(
             "plan_market_type": binding.plan_market_type,
             "role": binding.role,
         }
-        for binding in selection.allowed_amount_bindings
+        for binding in allowed_contributors(selection, args)
     ]
     network_context = _allowed_amount_network_context(())
     query_by_field = _allowed_amount_response_query(
@@ -7230,10 +6839,7 @@ def _allowed_amount_no_match_response(
         ),
         "warnings": [],
     }
-    return (
-        annotate_plan_release_response(response_by_field, selection)
-        or response_by_field
-    )
+    return annotate_plan_release_response(response_by_field, selection) or response_by_field
 
 
 def _empty_allowed_amount_pagination(pagination) -> dict[str, Any]:
@@ -7255,7 +6861,13 @@ async def _allowed_amount_page_rows(
     search_scope: tuple[str, str, str, int | None],
     current_snapshots: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    from api.provider_allowed_amount_policy import allowed_office_inputs, allowed_policy_parameters
+
     plan_id, code, code_system, npi_filter = search_scope
+    try:
+        office_inputs = await allowed_office_inputs(session)
+    except PlanPricingProjectionUnavailable as error:
+        raise sanic.exceptions.ServiceUnavailable("Managed allowed offices are unavailable.") from error
     address_table = await _allowed_amount_address_table(session, args)
     if _has_allowed_amount_address_filter(args) and not address_table:
         return None
@@ -7268,12 +6880,14 @@ async def _allowed_amount_page_rows(
         npi=npi_filter,
         current_snapshots=current_snapshots,
     )
+    query_parameter_map = allowed_policy_parameters(query_parameter_map)
     page_query = _allowed_amount_page_sql(
         args,
         address_table=address_table,
         parameter_map=query_parameter_map,
+        office_inputs=office_inputs,
     )
-    page_result = await session.execute(page_query, query_parameter_map)
+    page_result = await execute_network_read(session, page_query, query_parameter_map)
     return (
         [_row_to_dict(page_by_field) for page_by_field in page_result],
         query_parameter_map,
@@ -7297,9 +6911,7 @@ async def _allowed_amount_response_from_page(
     if total <= 0:
         return None
     provider_rows = [
-        provider_by_field
-        for provider_by_field in page_rows
-        if (_as_int(provider_by_field.get("npi")) or 0) > 0
+        provider_by_field for provider_by_field in page_rows if (_as_int(provider_by_field.get("npi")) or 0) > 0
     ]
     detail_rows = await _allowed_amount_detail_rows_for_page(
         session,
@@ -7312,12 +6924,8 @@ async def _allowed_amount_response_from_page(
         code=code,
         code_system=code_system,
     )
-    network_context = _allowed_amount_network_context_from_summary(
-        summary_by_field
-    )
-    evidence_sources = _allowed_amount_sources(
-        summary_by_field.get("source_rows_json")
-    )
+    network_context = _allowed_amount_network_context_from_summary(summary_by_field)
+    evidence_sources = _allowed_amount_sources(summary_by_field.get("source_rows_json"))
     return _allowed_amount_search_response(
         args,
         pagination,
@@ -7346,21 +6954,22 @@ async def _resolve_allowed_amount_route(
     session,
     args: Mapping[str, Any],
     *,
-    release_selection: PlanReleaseServingSelection | None | object = (
-        _RELEASE_SELECTION_UNSET
-    ),
+    release_selection: PlanReleaseServingSelection | None | object = (_RELEASE_SELECTION_UNSET),
 ) -> tuple[Mapping[str, Any], PlanReleaseServingSelection | None] | None:
+    from api import provider_allowed_amount_policy as allowed
+
+    is_managed = allowed.current_network_address_scope() is not None
     requested_release_id = str(args.get("plan_release_id") or "").strip()
-    is_release_selection_supplied = (
-        release_selection is not _RELEASE_SELECTION_UNSET
-    )
+    is_release_selection_supplied = release_selection is not _RELEASE_SELECTION_UNSET
     if is_release_selection_supplied and (
         not isinstance(release_selection, PlanReleaseServingSelection)
         or not requested_release_id
         or release_selection.plan_release_id != requested_release_id
     ):
-        return None
+        return allowed.unavailable_route()
     if not requested_release_id:
+        if is_managed:
+            raise sanic.exceptions.ServiceUnavailable("Managed allowed release is unavailable.")
         return args, None
     if has_conflicting_release_selectors(args):
         return None
@@ -7368,15 +6977,20 @@ async def _resolve_allowed_amount_route(
         release_selection = await resolve_plan_release_serving(
             session,
             requested_release_id,
+            **({"projection_only": True} if is_managed else {}),
         )
-    if release_selection is None:
+    if release_selection is None or not isinstance(release_selection, PlanReleaseServingSelection):
+        return allowed.unavailable_route()
+    original_bindings = release_selection.allowed_amount_bindings
+    try:
+        allowed_bindings = await allowed.admitted_allowed_amount_bindings(session, release_selection)
+    except PlanPricingProjectionUnavailable as error:
+        raise sanic.exceptions.ServiceUnavailable("Managed allowed sources are unavailable.") from error
+    if not original_bindings:
         return None
-    if not isinstance(release_selection, PlanReleaseServingSelection):
-        return None
-    allowed_bindings = release_selection.allowed_amount_bindings
-    if not allowed_bindings:
-        return None
-    resolved_args_by_name = binding_query_args(args, allowed_bindings[0])
+    resolved_args_by_name = binding_query_args(args, allowed_bindings[0] if allowed_bindings else original_bindings[0])
+    if is_managed:
+        resolved_args_by_name["_managed_allowed_bindings"] = allowed_bindings
     resolved_args_by_name["_plan_release_allowed_bindings"] = [
         {
             "source_key": binding.source_key,
@@ -7395,6 +7009,8 @@ async def _allowed_amount_snapshot_rows(
     plan_id: str,
     release_selection: PlanReleaseServingSelection | None,
 ) -> list[dict[str, Any]]:
+    from api.provider_allowed_amount_policy import allowed_contributors
+
     if release_selection is not None:
         return [
             {
@@ -7403,7 +7019,7 @@ async def _allowed_amount_snapshot_rows(
                 "plan_id": binding.plan_id,
                 "plan_market_type": binding.plan_market_type,
             }
-            for binding in release_selection.allowed_amount_bindings
+            for binding in allowed_contributors(release_selection, resolved_args)
         ]
     return await _current_allowed_amount_snapshots_for_plan(
         session,
@@ -7438,9 +7054,7 @@ async def _search_ptg_allowed_amount_evidence(
     args: Mapping[str, Any],
     pagination,
     *,
-    release_selection: PlanReleaseServingSelection | None | object = (
-        _RELEASE_SELECTION_UNSET
-    ),
+    release_selection: PlanReleaseServingSelection | None | object = (_RELEASE_SELECTION_UNSET),
 ) -> dict[str, Any] | None:
     """Search current or canonically pinned strict-V3 allowed evidence."""
 
@@ -7453,10 +7067,7 @@ async def _search_ptg_allowed_amount_evidence(
         return None
     resolved_args, release_selection = resolved_route
     search_scope = _allowed_amount_scope_from_args(resolved_args)
-    if (
-        search_scope is None
-        or not _supports_allowed_amount_fallback(resolved_args)
-    ):
+    if search_scope is None or not _supports_allowed_amount_fallback(resolved_args):
         return None
     plan_id = search_scope[0]
     current_snapshots = await _allowed_amount_snapshot_rows(
@@ -7466,6 +7077,10 @@ async def _search_ptg_allowed_amount_evidence(
         release_selection,
     )
     if not current_snapshots:
+        from api.provider_allowed_amount_policy import current_network_address_scope
+
+        if current_network_address_scope() is not None and release_selection is not None:
+            return _allowed_amount_release_response(None, resolved_args, pagination, release_selection, search_scope)
         return None
     page_search = await _allowed_amount_page_rows(
         session,
@@ -7502,9 +7117,7 @@ def _allowed_amount_rows_by_npi(
         provider_npi = _as_int(payment_by_field.get("npi"))
         if provider_npi is None or provider_npi <= 0:
             continue
-        payment_rows_by_npi.setdefault(provider_npi, []).append(
-            payment_by_field
-        )
+        payment_rows_by_npi.setdefault(provider_npi, []).append(payment_by_field)
     return payment_rows_by_npi
 
 
@@ -7512,15 +7125,11 @@ def _allowed_amount_sources(serialized_sources: Any) -> list[dict[str, Any]]:
     if isinstance(serialized_sources, str):
         try:
             serialized_sources = json.loads(serialized_sources)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             serialized_sources = []
     if not isinstance(serialized_sources, list):
         return []
-    sources = [
-        dict(source_by_field)
-        for source_by_field in serialized_sources
-        if isinstance(source_by_field, Mapping)
-    ]
+    sources = [dict(source_by_field) for source_by_field in serialized_sources if isinstance(source_by_field, Mapping)]
     sources.sort(
         key=lambda source_by_field: (
             str(source_by_field.get("source_key") or ""),
@@ -7536,31 +7145,19 @@ def _allowed_amount_response_filters(
     return {
         "specialty": args.get("specialty") or None,
         "provider_sex_code": args.get("provider_sex_code") or None,
-        "taxonomy_codes": (
-            args.get("taxonomy_codes") or args.get("taxonomy_code") or None
-        ),
+        "taxonomy_codes": (args.get("taxonomy_codes") or args.get("taxonomy_code") or None),
         "primary_only": args.get("primary_only") or None,
         "state": args.get("state") or None,
         "city": args.get("city") or None,
         "zip5": args.get("zip5") or None,
-        "zip_radius_miles": (
-            args.get("zip_radius_miles") if args.get("zip5") else None
-        ),
+        "zip_radius_miles": (args.get("zip_radius_miles") if args.get("zip5") else None),
         "lat": _request_value_or_none(args.get("lat")),
         "long": _request_value_or_none(args.get("long")),
         "radius_miles": _request_value_or_none(args.get("radius_miles")),
         "npi": args.get("npi") or None,
-        "service_code": (
-            args.get("service_code")
-            or args.get("pos")
-            or args.get("place_of_service")
-            or None
-        ),
+        "service_code": (args.get("service_code") or args.get("pos") or args.get("place_of_service") or None),
         "billing_code_modifier": (
-            args.get("billing_code_modifier")
-            or args.get("modifier")
-            or args.get("modifiers")
-            or None
+            args.get("billing_code_modifier") or args.get("modifier") or args.get("modifiers") or None
         ),
     }
 
@@ -7576,29 +7173,15 @@ def _allowed_amount_response_query(
 ) -> dict[str, Any]:
     """Build the response query contract for an allowed-evidence result."""
 
-    release_bindings, release_plan_ids, release_market_types = (
-        _allowed_release_query_scope(args)
-    )
-    source_keys, snapshot_ids = _allowed_evidence_coordinates(
-        evidence_sources
-    )
+    release_bindings, release_plan_ids, release_market_types = _allowed_release_query_scope(args)
+    source_keys, snapshot_ids = _allowed_evidence_coordinates(evidence_sources)
     query_by_field = {
-        "plan_id": (
-            release_plan_ids[0]
-            if len(release_plan_ids) == 1
-            else (None if release_bindings else plan_id)
-        ),
+        "plan_id": (release_plan_ids[0] if len(release_plan_ids) == 1 else (None if release_bindings else plan_id)),
         "plan_ids": release_plan_ids or None,
         "plan_market_type": (
             release_market_types[0]
             if len(release_market_types) == 1
-            else (
-                None
-                if release_bindings
-                else args.get("plan_market_type")
-                or args.get("market_type")
-                or None
-            )
+            else (None if release_bindings else args.get("plan_market_type") or args.get("market_type") or None)
         ),
         "plan_market_types": release_market_types or None,
         "bindings": release_bindings or None,
@@ -7621,9 +7204,7 @@ def _allowed_release_query_scope(
 ) -> tuple[list[dict[str, Any]], list[str], list[str]]:
     release_bindings = [
         dict(binding_by_field)
-        for binding_by_field in (
-            args.get("_plan_release_allowed_bindings") or []
-        )
+        for binding_by_field in (args.get("_plan_release_allowed_bindings") or [])
         if isinstance(binding_by_field, Mapping)
     ]
     release_plan_ids = sorted(
@@ -7635,13 +7216,9 @@ def _allowed_release_query_scope(
     )
     release_market_types = sorted(
         {
-            str(
-                binding_by_field.get("plan_market_type") or ""
-            ).strip().lower()
+            str(binding_by_field.get("plan_market_type") or "").strip().lower()
             for binding_by_field in release_bindings
-            if str(
-                binding_by_field.get("plan_market_type") or ""
-            ).strip()
+            if str(binding_by_field.get("plan_market_type") or "").strip()
         }
     )
     return release_bindings, release_plan_ids, release_market_types
@@ -7651,14 +7228,10 @@ def _allowed_evidence_coordinates(
     evidence_sources: Iterable[Mapping[str, Any]],
 ) -> tuple[list[Any], list[Any]]:
     source_keys = [
-        source_by_field.get("source_key")
-        for source_by_field in evidence_sources
-        if source_by_field.get("source_key")
+        source_by_field.get("source_key") for source_by_field in evidence_sources if source_by_field.get("source_key")
     ]
     snapshot_ids = [
-        source_by_field.get("snapshot_id")
-        for source_by_field in evidence_sources
-        if source_by_field.get("snapshot_id")
+        source_by_field.get("snapshot_id") for source_by_field in evidence_sources if source_by_field.get("snapshot_id")
     ]
     return source_keys, snapshot_ids
 
@@ -7671,9 +7244,7 @@ def _allowed_amount_response_sources(
         {
             **source_by_field,
             "source_system": "transparency_in_coverage_allowed_amounts",
-            "grain": (
-                "plan/code/tin/payment/provider_npi historical allowed amount"
-            ),
+            "grain": ("plan/code/tin/payment/provider_npi historical allowed amount"),
             "network_status": network_context["network_status"],
         }
         for source_by_field in evidence_sources
@@ -7681,13 +7252,7 @@ def _allowed_amount_response_sources(
 
 
 def _normalize_allowed_amount_network_status(value: Any) -> str:
-    normalized = (
-        str(value or "")
-        .strip()
-        .lower()
-        .replace("-", "_")
-        .replace(" ", "_")
-    )
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
     if normalized in {
         ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK,
         "innetwork",
@@ -7728,35 +7293,27 @@ def _allowed_amount_network_context(
 ) -> dict[str, str]:
     payment_rows = list(payment_rows)
     statuses = {
-        _normalize_allowed_amount_network_status(
-            payment_by_field.get("network_status")
-        )
+        _normalize_allowed_amount_network_status(payment_by_field.get("network_status"))
         for payment_by_field in payment_rows
     }
     if statuses == {ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK}:
         status = ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK
     elif (
-        ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK in statuses
-        and len(statuses) > 1
+        ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK in statuses and len(statuses) > 1
     ) or ALLOWED_AMOUNT_NETWORK_STATUS_MIXED in statuses:
         status = ALLOWED_AMOUNT_NETWORK_STATUS_MIXED
     else:
         status = ALLOWED_AMOUNT_NETWORK_STATUS_NOT_CONFIRMED
     semantics_values = {
         _allowed_amount_network_semantics(
-            _normalize_allowed_amount_network_status(
-                payment_by_field.get("network_status")
-            ),
+            _normalize_allowed_amount_network_status(payment_by_field.get("network_status")),
             payment_by_field.get("network_semantics"),
         )
         for payment_by_field in payment_rows
     }
     if semantics_values == {ALLOWED_AMOUNT_NETWORK_SEMANTICS_IN_NETWORK}:
         semantics = ALLOWED_AMOUNT_NETWORK_SEMANTICS_IN_NETWORK
-    elif (
-        len(semantics_values) > 1
-        or ALLOWED_AMOUNT_NETWORK_SEMANTICS_MIXED in semantics_values
-    ):
+    elif len(semantics_values) > 1 or ALLOWED_AMOUNT_NETWORK_SEMANTICS_MIXED in semantics_values:
         semantics = ALLOWED_AMOUNT_NETWORK_SEMANTICS_MIXED
     else:
         semantics = _allowed_amount_network_semantics(status)
@@ -7798,19 +7355,10 @@ def _allowed_amount_warning(
 
 def _allowed_amount_price_disclaimer(network_status: str) -> str:
     if network_status == ALLOWED_AMOUNT_NETWORK_STATUS_IN_NETWORK:
-        return (
-            "Historical in-network allowed amount; not a contracted "
-            "negotiated rate."
-        )
+        return "Historical in-network allowed amount; not a contracted negotiated rate."
     if network_status == ALLOWED_AMOUNT_NETWORK_STATUS_MIXED:
-        return (
-            "Historical allowed amount with mixed network status; not a "
-            "contracted negotiated rate."
-        )
-    return (
-        "Historical out-of-network or not-confirmed-in-network allowed "
-        "amount; not a negotiated rate."
-    )
+        return "Historical allowed amount with mixed network status; not a contracted negotiated rate."
+    return "Historical out-of-network or not-confirmed-in-network allowed amount; not a negotiated rate."
 
 
 def _allowed_amount_provider_item(
@@ -7821,12 +7369,8 @@ def _allowed_amount_provider_item(
     code: str,
     code_system: str,
 ) -> dict[str, Any]:
-    network_statuses = _normalize_string_sequence(
-        provider_by_field.get("network_statuses")
-    )
-    network_semantics_values = _normalize_string_sequence(
-        provider_by_field.get("network_semantics_values")
-    )
+    network_statuses = _normalize_string_sequence(provider_by_field.get("network_statuses"))
+    network_semantics_values = _normalize_string_sequence(provider_by_field.get("network_semantics_values"))
     network_context = _allowed_amount_network_context(
         [
             {
@@ -7841,8 +7385,7 @@ def _allowed_amount_provider_item(
     network_status = network_context["network_status"]
     network_semantics = network_context["network_semantics"]
     price_entries = [
-        _allowed_amount_price_payload(evidence_row)
-        for evidence_row in payment_rows[:_ALLOWED_AMOUNT_DETAIL_LIMIT]
+        _allowed_amount_price_payload(evidence_row) for evidence_row in payment_rows[:_ALLOWED_AMOUNT_DETAIL_LIMIT]
     ]
     provider_item_by_field = _allowed_amount_provider_identity(
         npi=npi,
@@ -7900,27 +7443,17 @@ def _allowed_amount_provider_identity(
     network_status: str,
     network_semantics: str,
 ) -> dict[str, Any]:
-    source_keys = _normalize_string_sequence(
-        provider_by_field.get("source_keys")
-    )
-    snapshot_ids = _normalize_string_sequence(
-        provider_by_field.get("snapshot_ids")
-    )
-    import_run_ids = _normalize_string_sequence(
-        provider_by_field.get("import_run_ids")
-    )
+    source_keys = _normalize_string_sequence(provider_by_field.get("source_keys"))
+    snapshot_ids = _normalize_string_sequence(provider_by_field.get("snapshot_ids"))
+    import_run_ids = _normalize_string_sequence(provider_by_field.get("import_run_ids"))
     source_file_import_ids = [
-        import_run_id.removeprefix("ptg2:")
-        for import_run_id in import_run_ids
-        if import_run_id.removeprefix("ptg2:")
+        import_run_id.removeprefix("ptg2:") for import_run_id in import_run_ids if import_run_id.removeprefix("ptg2:")
     ]
     distance_miles = _as_float(provider_by_field.get("distance_miles"))
     return {
         "npi": npi,
         "provider_ordinal": npi,
-        "provider_name": (
-            provider_by_field.get("provider_name") or "TiC provider"
-        ),
+        "provider_name": (provider_by_field.get("provider_name") or "TiC provider"),
         "provider_sex_code": provider_by_field.get("provider_sex_code"),
         "state": provider_by_field.get("state"),
         "city": provider_by_field.get("city"),
@@ -7936,11 +7469,7 @@ def _allowed_amount_provider_identity(
         "source_file_import_ids": source_file_import_ids,
         "source_key": source_keys[0] if len(source_keys) == 1 else None,
         "snapshot_id": snapshot_ids[0] if len(snapshot_ids) == 1 else None,
-        "source_file_import_id": (
-            source_file_import_ids[0]
-            if len(source_file_import_ids) == 1
-            else None
-        ),
+        "source_file_import_id": (source_file_import_ids[0] if len(source_file_import_ids) == 1 else None),
         "distance_miles": distance_miles,
         "distance_bucket": _distance_bucket(distance_miles),
         "network_status": network_status,
@@ -7978,7 +7507,7 @@ def _allowed_amount_provider_address(
     if isinstance(address_by_field, str):
         try:
             address_by_field = json.loads(address_by_field)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return {}
     return address_by_field if isinstance(address_by_field, dict) else {}
 
@@ -7988,21 +7517,11 @@ def _allowed_amount_summary_fields(
     provider_by_field: Mapping[str, Any],
     network_status: str,
 ) -> dict[str, Any]:
-    allowed_amount_min = _as_float(
-        provider_by_field.get("allowed_amount_min")
-    )
-    allowed_amount_max = _as_float(
-        provider_by_field.get("allowed_amount_max")
-    )
-    average_allowed_amount = _as_float(
-        provider_by_field.get("allowed_amount_avg")
-    )
-    billed_charge_min = _as_float(
-        provider_by_field.get("billed_charge_min")
-    )
-    billed_charge_max = _as_float(
-        provider_by_field.get("billed_charge_max")
-    )
+    allowed_amount_min = _as_float(provider_by_field.get("allowed_amount_min"))
+    allowed_amount_max = _as_float(provider_by_field.get("allowed_amount_max"))
+    average_allowed_amount = _as_float(provider_by_field.get("allowed_amount_avg"))
+    billed_charge_min = _as_float(provider_by_field.get("billed_charge_min"))
+    billed_charge_max = _as_float(provider_by_field.get("billed_charge_max"))
     evidence_count = _as_int(provider_by_field.get("evidence_count")) or 0
     return {
         "allowed_amount_min": allowed_amount_min,
@@ -8036,9 +7555,7 @@ def _allowed_amount_summary_fields(
 def _allowed_amount_price_payload(
     evidence_row: Mapping[str, Any],
 ) -> dict[str, Any]:
-    network_status = _normalize_allowed_amount_network_status(
-        evidence_row.get("network_status")
-    )
+    network_status = _normalize_allowed_amount_network_status(evidence_row.get("network_status"))
     return {
         "source": "allowed_amounts",
         "price_type": "historical_allowed_amount",
@@ -8051,14 +7568,10 @@ def _allowed_amount_price_payload(
         "billed_charge": _as_float(evidence_row.get("billed_charge")),
         "tin_type": evidence_row.get("tin_type"),
         "tin_value": evidence_row.get("tin_value"),
-        "service_code": _normalize_string_sequence(
-            evidence_row.get("service_code")
-        ),
+        "service_code": _normalize_string_sequence(evidence_row.get("service_code")),
         "billing_class": evidence_row.get("billing_class"),
         "setting": evidence_row.get("setting"),
-        "billing_code_modifier": _normalize_string_sequence(
-            evidence_row.get("billing_code_modifier")
-        ),
+        "billing_code_modifier": _normalize_string_sequence(evidence_row.get("billing_code_modifier")),
         "match_basis": "npi",
         "confidence": "medium",
         "disclaimer": _allowed_amount_price_disclaimer(network_status),
@@ -8074,11 +7587,7 @@ def _normalize_string_sequence(value: Any) -> list[str]:
         values = list(value)
     else:
         values = [value]
-    return [
-        str(item).strip()
-        for item in values
-        if str(item or "").strip()
-    ]
+    return [str(item).strip() for item in values if str(item or "").strip()]
 
 
 def _annotate_ptg2_result_state(
@@ -8095,20 +7604,11 @@ def _annotate_ptg2_result_state(
     result_items = ptg2_payload.get("items")
     has_items = isinstance(result_items, list) and bool(result_items)
     pagination = ptg2_payload.get("pagination")
-    total = (
-        _as_int(pagination.get("total"))
-        if isinstance(pagination, dict)
-        else None
-    )
+    total = _as_int(pagination.get("total")) if isinstance(pagination, dict) else None
     has_matches = has_items or (total is not None and total > 0)
-    status = str(
-        query_payload_map.get("status")
-        or ("matched" if has_matches else "no_match")
-    ).strip()
+    status = str(query_payload_map.get("status") or ("matched" if has_matches else "no_match")).strip()
     result_state = (
-        "matched"
-        if has_matches
-        else _ptg2_empty_result_state(status, has_location_filter=has_location_filter)
+        "matched" if has_matches else _ptg2_empty_result_state(status, has_location_filter=has_location_filter)
     )
     query_payload_map["status"] = "matched" if has_matches else "no_match"
     ptg2_payload["query"] = query_payload_map
@@ -8119,104 +7619,74 @@ def _annotate_ptg2_result_state(
 
 
 @blueprint.get("/group-plan-providers", name="pricing.group_plan_providers")
-async def group_plan_providers(request):
-    """Enumerate ALL distinct in-network provider NPIs for an imported MRF/PTG
-    group plan, keyed by EIN plan_id + market_type, keyset-paginated by NPI.
-
-    Resolves ALL of the plan's published serving snapshots (one per network
-    source) via ptg2_current_plan_source and unions their shared NPI scopes. The
-    zip5 filter widens to zip_radius_miles (default 10) around the ZIP. The
-    PTG2 serving search itself hard-requires a procedure code, so this is the only
-    path that can answer "all providers for this group plan" for any API client.
-    """
+async def group_plan_providers(request, *, native_args=None):
+    """Enumerate distinct plan providers across admitted sources, keyset-paginated by NPI."""
+    args = group_plan_arguments(request, native_args)
     session = _get_session(request)
-    # Keep the parameter visible to the route/OpenAPI parity scanner; the
-    # shared validator below also checks incompatible raw selectors.
-    request.args.get("plan_release_id")
-    plan_release_id = _validated_plan_release_id(request.args)
-    plan_id = (request.args.get("plan_id") or "").strip()
+    managed_addresses = group_plan_address_source(PRICING_SCHEMA)
+    # Keep the release parameter visible to the OpenAPI scanner.
+    args.get("plan_release_id")
+    plan_release_id = _validated_plan_release_id(args)
+    plan_id = (args.get("plan_id") or "").strip()
     if not plan_id and not plan_release_id:
         raise InvalidUsage("plan_id (EIN) or plan_release_id is required")
-    market_type = (request.args.get("market_type") or "group").strip().lower()
+    market_type = (args.get("market_type") or "group").strip().lower()
     try:
-        limit = int(request.args.get("limit") or 200)
-    except (TypeError, ValueError):
+        limit = int(args.get("limit") or 200)
+    except TypeError, ValueError:
         limit = 200
     limit = max(1, min(limit, 1000))
-    cursor_raw = (request.args.get("cursor") or "").strip()
+    cursor_raw = (args.get("cursor") or "").strip()
     try:
         cursor_npi = int(cursor_raw) if cursor_raw else 0
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         cursor_npi = 0
-    include_enrichment = (request.args.get("enrich") or "").strip().lower() in (
+    include_enrichment = (args.get("enrich") or "").strip().lower() in (
         "1",
         "true",
         "yes",
     )
-    city = (request.args.get("city") or "").strip().lower()
-    state = (request.args.get("state") or "").strip().upper()
-    zip5 = _normalize_zip5(request.args.get("zip5"))
-    # This route expands a ZIP into nearby ZIP codes before address filtering.
-    # zip_radius_miles=0 restores exact matching. It does not use the
-    # point-coherence contract of search-by-procedure.
+    city = (args.get("city") or "").strip().lower()
+    state = (args.get("state") or "").strip().upper()
+    zip5 = _normalize_zip5(args.get("zip5"))
+    # Expand nearby ZIPs; radius zero restores exact matching without point-distance semantics.
     zip_radius_miles = _parse_zip_radius_miles(
-        request.args.get("zip_radius_miles"),
+        args.get("zip_radius_miles"),
         param="zip_radius_miles",
         default=10.0 if zip5 else 0.0,
     )
     include_mail_addresses = _parse_bool(
-        request.args.get("include_mail_addresses"),
+        args.get("include_mail_addresses"),
         "include_mail_addresses",
         default=False,
     )
-    provider_sex_code = normalize_provider_sex_code(
-        request.args.get("provider_sex_code")
-    )
-    specialty_filter = await _resolve_ptg_specialty_or_raise(session, request.args)
+    provider_sex_code = normalize_provider_sex_code(args.get("provider_sex_code"))
+    specialty_filter = await _resolve_ptg_specialty_or_raise(session, args)
     specialty_warning = None
-
-    requested_source_key = (request.args.get("source_key") or "").strip().lower()
+    requested_source_key = (args.get("source_key") or "").strip().lower()
     release_selection = None
     resolved_plan_ids = [plan_id] if plan_id else []
-    resolved_market_types = (
-        [market_type] if market_type and not plan_release_id else []
-    )
+    resolved_market_types = [market_type] if market_type and not plan_release_id else []
     if plan_release_id:
         market_type = None
         release_selection = await resolve_plan_release_serving(
             session,
             plan_release_id,
         )
-        release_bindings = (
-            release_selection.in_network_bindings
-            if release_selection is not None
-            else ()
-        )
-        snapshot_pairs = [
-            (binding.source_key, binding.snapshot_id)
-            for binding in release_bindings
-        ]
+        release_bindings = release_selection.in_network_bindings if release_selection is not None else ()
+        contributing_bindings = await group_plan_release_bindings(session, release_selection)
+        try:
+            release_selection = await prepare_plan_release_bindings(session, release_selection, contributing_bindings)
+        except PlanPricingProjectionUnavailable:
+            raise sanic.exceptions.ServiceUnavailable("Managed group directory sources are unavailable.") from None
+        snapshot_pairs = [(binding.source_key, binding.snapshot_id) for binding in contributing_bindings]
         if release_bindings:
-            resolved_plan_ids = sorted(
-                {binding.plan_id for binding in release_bindings}
-            )
+            resolved_plan_ids = sorted({binding.plan_id for binding in release_bindings})
             resolved_market_types = sorted(
-                {
-                    binding.plan_market_type
-                    for binding in release_bindings
-                    if binding.plan_market_type
-                }
+                {binding.plan_market_type for binding in release_bindings if binding.plan_market_type}
             )
-            plan_id = (
-                resolved_plan_ids[0]
-                if len(resolved_plan_ids) == 1
-                else None
-            )
-            market_type = (
-                resolved_market_types[0]
-                if len(resolved_market_types) == 1
-                else None
-            )
+            plan_id = resolved_plan_ids[0] if len(resolved_plan_ids) == 1 else None
+            market_type = resolved_market_types[0] if len(resolved_market_types) == 1 else None
     else:
         snapshot_pairs = await _current_source_snapshot_pairs_for_plan(
             session,
@@ -8229,18 +7699,16 @@ async def group_plan_providers(request):
     if not snapshot_pairs:
         is_canonical_release_resolved = release_selection is not None
         no_route_by_field = {
-            "ok": True, "plan_id": plan_id, "market_type": market_type,
+            "ok": True,
+            "plan_id": plan_id,
+            "market_type": market_type,
             "plan_ids": resolved_plan_ids,
             "plan_market_types": resolved_market_types,
             "plan_release_id": plan_release_id or None,
             "snapshot_id": None,
             "snapshots": [],
             "resolved": is_canonical_release_resolved,
-            "result_state": (
-                "no_matching_providers"
-                if is_canonical_release_resolved
-                else "no_snapshot_for_plan"
-            ),
+            "result_state": ("no_matching_providers" if is_canonical_release_resolved else "no_snapshot_for_plan"),
             "reason": (
                 "published plan release has no in-network provider binding"
                 if is_canonical_release_resolved
@@ -8253,45 +7721,35 @@ async def group_plan_providers(request):
             "taxonomy_filter": specialty_filter.response_payload(),
             "specialty_warning": specialty_warning,
             "exhausted": True,
-            "query": {
-                "status": (
-                    "no_match" if is_canonical_release_resolved else "no_route"
-                )
-            },
+            "query": {"status": ("no_match" if is_canonical_release_resolved else "no_route")},
         }
+        if managed_addresses is not None and (args.get("count") or "").strip().lower() in ("1", "true", "yes"):
+            no_route_by_field["providers"].update(total_distinct=0, total=0)
         if release_selection is not None:
-            annotate_plan_release_response(no_route_by_field, release_selection)
+            annotate_plan_release_response(
+                no_route_by_field, release_selection, contributing_bindings=contributing_bindings
+            )
         return response.json(no_route_by_field)
     selected_source_key, snapshot_id = snapshot_pairs[0]
-
-    # A plan served by multiple networks (e.g. a medical network plus a
-    # pharmacy carve-out) has one snapshot per source. Enumerating only the
-    # first snapshot silently presented a single network as "the plan's
-    # entire directory", so union the NPI scopes of every published
-    # snapshot instead.
     snapshots = []
     shared_snapshot_keys: list[int] = []
     npi_scope_table_by_snapshot_key: dict[int, str] = {}
     release_binding_by_snapshot = {
         (binding.source_key, binding.snapshot_id): binding
-        for binding in (
-            release_selection.in_network_bindings
-            if release_selection is not None
-            else ()
-        )
+        for binding in (release_selection.in_network_bindings if release_selection is not None else ())
     }
     for pair_source_key, pair_snapshot_id in snapshot_pairs:
-        pair_tables = await snapshot_serving_tables(session, pair_snapshot_id)
+        pair_tables = (
+            release_selection.serving_tables_for_snapshot(pair_snapshot_id)
+            if managed_addresses is not None and release_selection is not None
+            else await snapshot_serving_tables(session, pair_snapshot_id)
+        )
         pair_plan_id = plan_id
         pair_market_type = market_type
         if release_selection is not None:
-            release_binding = release_binding_by_snapshot.get(
-                (pair_source_key, pair_snapshot_id)
-            )
+            release_binding = release_binding_by_snapshot.get((pair_source_key, pair_snapshot_id))
             if release_binding is None:
-                raise PTG2ManifestArtifactError(
-                    "canonical plan release is missing a frozen network binding"
-                )
+                raise PTG2ManifestArtifactError("canonical plan release is missing a frozen network binding")
             pair_plan_id = release_binding.plan_id
             pair_market_type = release_binding.plan_market_type
             if not is_release_binding_serving_scope_exact(
@@ -8304,43 +7762,35 @@ async def group_plan_providers(request):
                 )
         pair_snapshot_key = (
             int(pair_tables.shared_snapshot_key)
-            if pair_tables.uses_shared_blocks
-            and pair_tables.shared_snapshot_key is not None
+            if pair_tables.uses_shared_blocks and pair_tables.shared_snapshot_key is not None
             else None
         )
-        snapshots.append({
-            "source_key": pair_source_key,
-            "snapshot_id": pair_snapshot_id,
-            "plan_id": pair_plan_id,
-            "plan_market_type": pair_market_type,
-            "enumerated": pair_snapshot_key is not None,
-        })
+        snapshots.append(
+            {
+                "source_key": pair_source_key,
+                "snapshot_id": pair_snapshot_id,
+                "plan_id": pair_plan_id,
+                "plan_market_type": pair_market_type,
+                "enumerated": pair_snapshot_key is not None,
+            }
+        )
         if pair_snapshot_key is not None:
             shared_snapshot_keys.append(pair_snapshot_key)
-            npi_scope_table_by_snapshot_key[pair_snapshot_key] = (
-                _ptg2_npi_scope_table(
-                    pair_tables,
-                    schema_name=PRICING_SCHEMA,
-                )
+            npi_scope_table_by_snapshot_key[pair_snapshot_key] = _ptg2_npi_scope_table(
+                pair_tables,
+                schema_name=PRICING_SCHEMA,
             )
     if len(shared_snapshot_keys) != len(snapshot_pairs):
-        raise RuntimeError(
-            "published plan snapshot is not bound to strict shared-block V3 storage"
-        )
+        raise RuntimeError("published plan snapshot is not bound to strict shared-block V3 storage")
     npi_scope_tables = tuple(sorted(set(npi_scope_table_by_snapshot_key.values())))
-    group_member_table = "(" + " UNION ALL ".join(
-        f"SELECT npi FROM {table_name} "
-        "WHERE snapshot_key = ANY(:snapshot_keys)"
-        for table_name in npi_scope_tables
-    ) + ")"
-
-    # current_network_snapshots_for_plan resolves the plan's per-SOURCE serving
-    # snapshot, which for PTG group-plan imports is snapshot-scoped to a single
-    # plan (snapshot_scoped=true; the serving table carries only this plan_id). So
-    # the shared layout's NPI scope holds exactly the source's in-network provider
-    # NPIs. Enumerate them DISTINCT and keyset-paginate by NPI. The compact scope
-    # stays relational while high-cardinality membership remains compressed in
-    # PostgreSQL blocks.
+    group_member_table = (
+        "("
+        + " UNION ALL ".join(
+            f"SELECT npi FROM {table_name} WHERE snapshot_key = ANY(:snapshot_keys)" for table_name in npi_scope_tables
+        )
+        + ")"
+    )
+    # Each snapshot's compact NPI scope represents one complete source/plan binding.
     query_params_by_name = {
         "cursor_npi": max(cursor_npi, 0),
         "limit": limit,
@@ -8350,19 +7800,21 @@ async def group_plan_providers(request):
             {
                 plan_id_variant
                 for resolved_plan_id in resolved_plan_ids
-                for plan_id_variant in ein_plan_id_variants(
-                    resolved_plan_id
-                )
+                for plan_id_variant in ein_plan_id_variants(resolved_plan_id)
             }
         ),
         "snapshot_keys": sorted(set(shared_snapshot_keys)),
     }
-    taxonomy_predicate = provider_specialty_taxonomy_exists_sql(
-        "gm.npi",
-        query_params_by_name,
-        "group_provider_specialty",
-        specialty_filter,
-    ) if specialty_filter.is_active else ""
+    taxonomy_predicate = (
+        provider_specialty_taxonomy_exists_sql(
+            "gm.npi",
+            query_params_by_name,
+            "group_provider_specialty",
+            specialty_filter,
+        )
+        if specialty_filter.is_active
+        else ""
+    )
     taxonomy_where = f"\n               AND {taxonomy_predicate}" if taxonomy_predicate else ""
     provider_sex_predicate = provider_sex_exists_sql(
         "gm.npi",
@@ -8371,17 +7823,19 @@ async def group_plan_providers(request):
         provider_sex_code,
         schema=PRICING_SCHEMA,
     )
-    provider_sex_where = (
-        f"\n               AND {provider_sex_predicate}"
-        if provider_sex_predicate
-        else ""
-    )
+    provider_sex_where = f"\n               AND {provider_sex_predicate}" if provider_sex_predicate else ""
     has_location_filter = bool(city or state or zip5)
     address_table = f"{PRICING_SCHEMA}.npi_address"
     uses_unified_addresses = False
     supports_array_coverage = False
     supports_plan_bridge = False
-    if has_location_filter:
+    needs_address_scope = has_location_filter or managed_addresses is not None
+    if managed_addresses is not None:
+        (address_table, uses_unified_addresses, supports_array_coverage, supports_plan_bridge), policy_parameters = (
+            managed_addresses
+        )
+        query_params_by_name.update(policy_parameters)
+    elif has_location_filter:
         (
             address_table,
             uses_unified_addresses,
@@ -8409,12 +7863,7 @@ async def group_plan_providers(request):
                 state_hint=state or None,
             )
             location_zips = sorted(
-                {
-                    str(radius_record.get("zip5"))
-                    for radius_record in radius_rows
-                    if radius_record.get("zip5")
-                }
-                | {zip5}
+                {str(radius_record.get("zip5")) for radius_record in radius_rows if radius_record.get("zip5")} | {zip5}
             )
         else:
             location_zips = [zip5]
@@ -8431,7 +7880,7 @@ async def group_plan_providers(request):
         query_params_by_name["location_zips"] = location_zips
         location_clauses.append(f"{zip5_expr} = ANY(:location_zips)")
     location_predicate = ""
-    if has_location_filter:
+    if needs_address_scope:
         location_where = "\n                      AND ".join(location_clauses)
         location_predicate = f"""EXISTS (
                     SELECT 1
@@ -8439,12 +7888,7 @@ async def group_plan_providers(request):
                      WHERE {location_where}
                 )"""
     location_where = f"\n               AND {location_predicate}" if location_predicate else ""
-
-    # Sparse filters (specialty AND a ZIP set) make the NPI-scope walk
-    # pathological: it scans millions of member NPIs probing per-row EXISTS
-    # before it collects LIMIT matches. Compute the small local-specialty
-    # candidate set first (zip-index + taxonomy-index hash join) and drive
-    # the member lookup from it instead.
+    # Drive sparse specialty/ZIP searches from local candidates to avoid a full member walk.
     use_local_candidates = bool(specialty_filter.is_active and location_zips)
     candidate_cte = ""
     if use_local_candidates:
@@ -8456,11 +7900,7 @@ async def group_plan_providers(request):
         )
         candidate_clauses = [clause for clause in location_clauses if clause != "addr.npi = gm.npi"]
         if uses_unified_addresses and specialty_filter.taxonomy_codes:
-            # Cheap in-index pre-filter: taxonomy_array && the requested codes
-            # lets the planner BitmapAnd the serving zip and taxonomy GIN
-            # indexes, so only rows matching BOTH are read from the heap
-            # (~1k rows instead of ~100k+ for a dense-metro radius). The
-            # precise primary-taxonomy EXISTS below still decides membership.
+            # The indexed array prefilter narrows the heap; exact primary-taxonomy EXISTS decides membership.
             taxonomy_code_keys = []
             for idx, code in enumerate(specialty_filter.taxonomy_codes):
                 key = f"cand_array_taxonomy_code_{idx}"
@@ -8496,9 +7936,7 @@ async def group_plan_providers(request):
         page_join_sql = ""
         page_filter_sql = taxonomy_where + provider_sex_where + location_where
     bounded_member_streams = []
-    for stream_index, (stream_snapshot_key, stream_table) in enumerate(
-        sorted(npi_scope_table_by_snapshot_key.items())
-    ):
+    for stream_index, (stream_snapshot_key, stream_table) in enumerate(sorted(npi_scope_table_by_snapshot_key.items())):
         stream_key_parameter = f"page_snapshot_key_{stream_index}"
         query_params_by_name[stream_key_parameter] = stream_snapshot_key
         bounded_member_streams.append(
@@ -8515,23 +7953,16 @@ async def group_plan_providers(request):
         )
     provider_sql = f"""
         {candidate_cte}SELECT DISTINCT bounded_group_member.npi
-          FROM ({' UNION ALL '.join(bounded_member_streams)}) AS bounded_group_member
+          FROM ({" UNION ALL ".join(bounded_member_streams)}) AS bounded_group_member
          ORDER BY bounded_group_member.npi
          LIMIT :limit
         """
-    provider_rows = (
-        await session.execute(text(provider_sql), query_params_by_name)
-    ).fetchall()
-    provider_npis = [
-        int(provider_record.npi)
-        for provider_record in provider_rows
-        if provider_record.npi is not None
-    ]
-
+    provider_rows = (await execute_network_read(session, text(provider_sql), query_params_by_name)).fetchall()
+    provider_npis = [int(provider_record.npi) for provider_record in provider_rows if provider_record.npi is not None]
     total_distinct = None
-    is_count_requested = (request.args.get("count") or "").strip().lower() in ("1", "true", "yes")
+    is_count_requested = (args.get("count") or "").strip().lower() in ("1", "true", "yes")
     should_skip_exact_count = bool(
-        has_location_filter and uses_unified_addresses and not use_local_candidates
+        has_location_filter and uses_unified_addresses and not use_local_candidates and managed_addresses is None
     )
     if is_count_requested and not should_skip_exact_count:
         if use_local_candidates:
@@ -8547,20 +7978,16 @@ async def group_plan_providers(request):
                  FROM {group_member_table} gm
                  WHERE gm.npi BETWEEN :npi_min AND :npi_max{taxonomy_where}{provider_sex_where}{location_where}
                 """
-        total_distinct = int(
-            (
-                await session.execute(text(count_sql), query_params_by_name)
-            ).scalar()
-            or 0
-        )
-
+        total_distinct = int((await execute_network_read(session, text(count_sql), query_params_by_name)).scalar() or 0)
     provider_items: list[dict[str, Any]] = [{"npi": npi} for npi in provider_npis]
     addresses_by_npi: dict[int, list[dict[str, Any]]] = {}
-    if has_location_filter and provider_npis:
+    if needs_address_scope and provider_npis:
         address_parameters_by_name: dict[str, Any] = {
             "npis": provider_npis,
             "plan_ids": query_params_by_name["plan_ids"],
         }
+        if managed_addresses is not None:
+            address_parameters_by_name.update(policy_parameters)
         address_clauses = ["addr.npi = ANY(:npis)"]
         if not include_mail_addresses:
             address_clauses.append(f"addr.type IN ({_group_plan_provider_address_type_sql(address_types)})")
@@ -8604,9 +8031,12 @@ async def group_plan_providers(request):
             if uses_unified_addresses
             else "CASE addr.type WHEN 'primary' THEN 0 WHEN 'secondary' THEN 1 ELSE 2 END"
         )
-        address_rows = (await session.execute(
-            text(
-                f"""
+        address_rows = (
+            (
+                await execute_network_read(
+                    session,
+                    text(
+                        f"""
                 SELECT addr.npi,
                        addr.type,
                        addr.first_line,
@@ -8626,9 +8056,13 @@ async def group_plan_providers(request):
                           addr.postal_code,
                           addr.first_line
                 """
-            ),
-            address_parameters_by_name,
-        )).mappings().all()
+                    ),
+                    address_parameters_by_name,
+                )
+            )
+            .mappings()
+            .all()
+        )
         for address_row in address_rows:
             provider_address_by_field = {
                 "type": address_row.get("type"),
@@ -8643,25 +8077,23 @@ async def group_plan_providers(request):
             if uses_unified_addresses:
                 provider_address_by_field["address_precision"] = address_row.get("address_precision")
                 provider_address_by_field["plan_coverage_match"] = bool(address_row.get("plan_coverage_match"))
-            addresses_by_npi.setdefault(int(address_row["npi"]), []).append(
-                provider_address_by_field
-            )
+            addresses_by_npi.setdefault(int(address_row["npi"]), []).append(provider_address_by_field)
     if include_enrichment and provider_npis:
-        enrich_rows = (await session.execute(
-            select(
-                npi_data_table.c.npi,
-                npi_data_table.c.provider_first_name,
-                npi_data_table.c.provider_last_name,
-                npi_data_table.c.provider_organization_name,
-                npi_data_table.c.provider_credential_text,
-                npi_data_table.c.entity_type_code,
-                npi_data_table.c.provider_sex_code,
-            ).where(npi_data_table.c.npi.in_(provider_npis))
-        )).fetchall()
-        by_npi = {
-            int(enrichment_record.npi): enrichment_record
-            for enrichment_record in enrich_rows
-        }
+        enrich_rows = (
+            await execute_network_read(
+                session,
+                select(
+                    npi_data_table.c.npi,
+                    npi_data_table.c.provider_first_name,
+                    npi_data_table.c.provider_last_name,
+                    npi_data_table.c.provider_organization_name,
+                    npi_data_table.c.provider_credential_text,
+                    npi_data_table.c.entity_type_code,
+                    npi_data_table.c.provider_sex_code,
+                ).where(npi_data_table.c.npi.in_(provider_npis)),
+            )
+        ).fetchall()
+        by_npi = {int(enrichment_record.npi): enrichment_record for enrichment_record in enrich_rows}
         for provider_item in provider_items:
             npi_row = by_npi.get(provider_item["npi"])
             if npi_row is None:
@@ -8683,13 +8115,10 @@ async def group_plan_providers(request):
         if item_addresses:
             provider_item["addresses"] = item_addresses
             provider_item["address"] = item_addresses[0]
-
     next_cursor = str(provider_npis[-1]) if len(provider_npis) == limit else None
     response_by_field = {
         "ok": True,
-        "result_state": (
-            "matched" if provider_items else "no_matching_providers"
-        ),
+        "result_state": ("matched" if provider_items else "no_matching_providers"),
         "plan_id": plan_id,
         "plan_ids": resolved_plan_ids,
         "plan_release_id": plan_release_id or None,
@@ -8713,10 +8142,10 @@ async def group_plan_providers(request):
             "zip_radius_miles": zip_radius_miles if zip5 else None,
             "zips_considered": len(location_zips) if location_zips else None,
             "include_mail_addresses": include_mail_addresses,
-            "address_source": "unified" if has_location_filter and uses_unified_addresses else (
-                "npi" if has_location_filter else None
-            ),
-            "address_types": list(address_types) if has_location_filter and not include_mail_addresses else None,
+            "address_source": "unified"
+            if needs_address_scope and uses_unified_addresses
+            else ("npi" if needs_address_scope else None),
+            "address_types": list(address_types) if needs_address_scope and not include_mail_addresses else None,
             "count_requested": is_count_requested,
             "count_exact": is_count_requested and not should_skip_exact_count,
             "plan_ids_considered": resolved_plan_ids,
@@ -8732,7 +8161,9 @@ async def group_plan_providers(request):
         "exhausted": next_cursor is None,
     }
     if release_selection is not None:
-        annotate_plan_release_response(response_by_field, release_selection)
+        annotate_plan_release_response(
+            response_by_field, release_selection, contributing_bindings=contributing_bindings
+        )
     return response.json(response_by_field)
 
 
@@ -8740,7 +8171,6 @@ async def group_plan_providers(request):
 async def pricing_statistics(request):
     """Return aggregate provider and pricing statistics for the selected dataset."""
     session = _get_session(request)
-
     medicare_individuals_stmt = (
         select(func.count())
         .select_from(
@@ -8760,11 +8190,17 @@ async def pricing_statistics(request):
         func.length(func.trim(location_table.c.zip5)) > 0,
     )
 
-    medicare_individuals_result, providers_with_procedures_result, procedure_codes_result, procedure_zip_codes_result = await asyncio.gather(
-        session.execute(medicare_individuals_stmt),
-        session.execute(providers_with_procedures_stmt),
-        session.execute(procedure_codes_stmt),
-        session.execute(procedure_zip_codes_stmt),
+    (
+        medicare_individuals_result,
+        providers_with_procedures_result,
+        procedure_codes_result,
+        procedure_zip_codes_result,
+    ) = await gather_reader_calls(
+        db,
+        execute_network_read(session, medicare_individuals_stmt),
+        execute_network_read(session, providers_with_procedures_stmt),
+        execute_network_read(session, procedure_codes_stmt),
+        execute_network_read(session, procedure_zip_codes_stmt),
     )
 
     medicare_individuals = medicare_individuals_result.scalar()
@@ -8772,12 +8208,14 @@ async def pricing_statistics(request):
     procedure_codes = procedure_codes_result.scalar()
     procedure_zip_codes = procedure_zip_codes_result.scalar()
 
-    return response.json({
-        "medicare_individual_providers": int(medicare_individuals or 0),
-        "providers_with_procedure_history": int(providers_with_procedures or 0),
-        "procedure_codes_tracked": int(procedure_codes or 0),
-        "procedure_zip_codes": int(procedure_zip_codes or 0),
-    })
+    return response.json(
+        {
+            "medicare_individual_providers": int(medicare_individuals or 0),
+            "providers_with_procedure_history": int(providers_with_procedures or 0),
+            "procedure_codes_tracked": int(procedure_codes or 0),
+            "procedure_zip_codes": int(procedure_zip_codes or 0),
+        }
+    )
 
 
 async def _pricing_provider_list_where(session, args, year, list_values_by_name):
@@ -8787,11 +8225,7 @@ async def _pricing_provider_list_where(session, args, year, list_values_by_name)
     if list_values_by_name["state"]:
         filters.append(func.upper(provider_table.c.state) == list_values_by_name["state"])
     if list_values_by_name["city"]:
-        filters.append(
-            func.lower(provider_table.c.city).like(
-                f"%{list_values_by_name['city']}%"
-            )
-        )
+        filters.append(func.lower(provider_table.c.city).like(f"%{list_values_by_name['city']}%"))
     provider_type_clause, provider_type_resolution = await _provider_type_filter_clause(
         session,
         args,
@@ -8806,26 +8240,17 @@ async def _pricing_provider_list_where(session, args, year, list_values_by_name)
             or_(
                 func.lower(provider_table.c.provider_name).like(query_like),
                 func.lower(provider_table.c.provider_type).like(query_like),
-                cast(provider_table.c.npi, String).like(
-                    f"%{list_values_by_name['query_text']}%"
-                ),
+                cast(provider_table.c.npi, String).like(f"%{list_values_by_name['query_text']}%"),
             )
         )
     if list_values_by_name["min_claims"] is not None:
-        filters.append(
-            provider_table.c.total_services >= list_values_by_name["min_claims"]
-        )
+        filters.append(provider_table.c.total_services >= list_values_by_name["min_claims"])
     if list_values_by_name["min_total_cost"] is not None:
-        filters.append(
-            provider_table.c.total_allowed_amount
-            >= list_values_by_name["min_total_cost"]
-        )
+        filters.append(provider_table.c.total_allowed_amount >= list_values_by_name["min_total_cost"])
     return and_(*filters), provider_type_resolution
 
 
-async def _pricing_provider_list_query(
-    session, year, where_clause, benchmark_mode, order_by, order
-):
+async def _pricing_provider_list_query(session, year, where_clause, benchmark_mode, order_by, order):
     benchmark_mode_used = benchmark_mode
     benchmark_mode_source = "request" if benchmark_mode else None
     quality_order_available = order_by == "tier_relevance" and await _is_table_available(
@@ -8849,12 +8274,15 @@ async def _pricing_provider_list_query(
             (quality_score_table.c.tier == "low", 2),
             else_=3,
         )
-        query = select(provider_table).select_from(provider_with_scores).where(
-            where_clause
-        ).order_by(
-            tier_rank.asc(),
-            quality_score_table.c.score_0_100.desc(),
-            provider_table.c.total_allowed_amount.desc(),
+        query = (
+            select(provider_table)
+            .select_from(provider_with_scores)
+            .where(where_clause)
+            .order_by(
+                tier_rank.asc(),
+                quality_score_table.c.score_0_100.desc(),
+                provider_table.c.total_allowed_amount.desc(),
+            )
         )
     else:
         if order_by == "tier_relevance":
@@ -8880,18 +8308,14 @@ async def _pricing_provider_list_query(
 
 
 async def _pricing_provider_list_total(session, where_clause):
-    count_result = await session.execute(
-        select(func.count()).select_from(provider_table).where(where_clause)
+    count_result = await execute_network_read(
+        session, select(func.count()).select_from(provider_table).where(where_clause)
     )
     return int(count_result.scalar() or 0)
 
 
-async def _pricing_provider_list_page(
-    session, query, total, pagination, include_legacy_fields
-):
-    query_result = await session.execute(
-        query.limit(pagination.limit).offset(pagination.offset)
-    )
+async def _pricing_provider_list_page(session, query, total, pagination, include_legacy_fields):
+    query_result = await execute_network_read(session, query.limit(pagination.limit).offset(pagination.offset))
     return {
         "total": total,
         "items": [
@@ -8905,8 +8329,13 @@ async def _pricing_provider_list_page(
 
 
 def _pricing_provider_list_document(
-    page, pagination, year, year_source, list_values_by_name,
-    provider_type_resolution, query_details,
+    page,
+    pagination,
+    year,
+    year_source,
+    list_values_by_name,
+    provider_type_resolution,
+    query_details,
 ):
     _query, order_by, order, benchmark_mode_used, benchmark_mode_source = query_details
     return {
@@ -8948,15 +8377,9 @@ async def list_pricing_providers(request):
     list_values_by_name = {
         "npi": _parse_int(args.get("npi") or None, "npi", minimum=1),
         "min_claims": _parse_float(args.get("min_claims"), "min_claims", minimum=0),
-        "min_total_cost": _parse_float(
-            args.get("min_total_cost"), "min_total_cost", minimum=0
-        ),
-        "include_legacy_fields": _parse_bool(
-            args.get("include_legacy_fields"), "include_legacy_fields", default=False
-        ),
-        "benchmark_mode": _parse_benchmark_mode(
-            args.get("benchmark_mode"), "benchmark_mode"
-        ),
+        "min_total_cost": _parse_float(args.get("min_total_cost"), "min_total_cost", minimum=0),
+        "include_legacy_fields": _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False),
+        "benchmark_mode": _parse_benchmark_mode(args.get("benchmark_mode"), "benchmark_mode"),
         "query_text": str(args.get("q", "")).strip(),
         "state": str(args.get("state", "")).strip().upper(),
         "city": str(args.get("city", "")).strip().lower(),
@@ -8964,9 +8387,7 @@ async def list_pricing_providers(request):
     }
     order = _normalize_order(args.get("order"))
     order_by = str(args.get("order_by") or "total_allowed_amount")
-    year, year_source = await _resolve_year(
-        session, provider_table, _parse_int(args.get("year"), "year", minimum=2013)
-    )
+    year, year_source = await _resolve_year(session, provider_table, _parse_int(args.get("year"), "year", minimum=2013))
     where_clause, provider_type_resolution = await _pricing_provider_list_where(
         session, args, year, list_values_by_name
     )
@@ -9014,24 +8435,24 @@ async def get_pricing_provider(request, npi: str):
         raise InvalidUsage("Path parameter 'npi' must be provided")
 
     year, year_source = await _resolve_year(session, provider_table, year)
-    provider_result = await session.execute(
-        select(provider_table).where(
-            and_(provider_table.c.npi == provider_npi, provider_table.c.year == year)
-        )
+    provider_result = await execute_network_read(
+        session, select(provider_table).where(and_(provider_table.c.npi == provider_npi, provider_table.c.year == year))
     )
     provider_row = provider_result.first()
     if provider_row is None:
         raise sanic.exceptions.NotFound("Provider not found")
 
-    service_count_result = await session.execute(
-        select(func.count()).select_from(provider_procedure_table).where(
-            and_(provider_procedure_table.c.npi == provider_npi, provider_procedure_table.c.year == year)
-        )
+    service_count_result = await execute_network_read(
+        session,
+        select(func.count())
+        .select_from(provider_procedure_table)
+        .where(and_(provider_procedure_table.c.npi == provider_npi, provider_procedure_table.c.year == year)),
     )
-    location_count_result = await session.execute(
-        select(func.count(func.distinct(location_table.c.location_key))).select_from(location_table).where(
-            and_(location_table.c.npi == provider_npi, location_table.c.year == year)
-        )
+    location_count_result = await execute_network_read(
+        session,
+        select(func.count(func.distinct(location_table.c.location_key)))
+        .select_from(location_table)
+        .where(and_(location_table.c.npi == provider_npi, location_table.c.year == year)),
     )
     provider_payload = _normalize_provider_payload(
         _row_to_dict(provider_row),
@@ -9039,9 +8460,7 @@ async def get_pricing_provider(request, npi: str):
     )
     provider_payload["year_used"] = year
     provider_payload["year_source"] = year_source
-    add_provider_service_summary(
-        provider_payload, service_count_result.scalar(), location_count_result.scalar()
-    )
+    add_provider_service_summary(provider_payload, service_count_result.scalar(), location_count_result.scalar())
     return response.json(provider_payload)
 
 
@@ -9085,8 +8504,7 @@ async def get_pricing_provider_score(request, npi: str):
         profile = await _load_provider_quality_profile(session, npi=provider_npi, year=year_used)
         reasons = _provider_quality_unavailable_reasons(profile, benchmark_mode=benchmark_mode)
         scores_by_benchmark_mode: dict[str, dict[str, Any] | None] = {
-            mode: None
-            for mode in QUALITY_BENCHMARK_MODE_ORDER
+            mode: None for mode in QUALITY_BENCHMARK_MODE_ORDER
         }
         if not reasons and profile is not None:
             try:
@@ -9098,24 +8516,19 @@ async def get_pricing_provider_score(request, npi: str):
                     taxonomy_code_override=taxonomy_code,
                     specialty_key_override=specialty_key,
                 )
+            except sanic.exceptions.ServiceUnavailable:
+                raise
             except Exception:
-                scores_by_benchmark_mode = {
-                    mode: None
-                    for mode in QUALITY_BENCHMARK_MODE_ORDER
-                }
+                scores_by_benchmark_mode = {mode: None for mode in QUALITY_BENCHMARK_MODE_ORDER}
             available_modes = [
-                mode
-                for mode in QUALITY_BENCHMARK_MODE_ORDER
-                if scores_by_benchmark_mode.get(mode) is not None
+                mode for mode in QUALITY_BENCHMARK_MODE_ORDER if scores_by_benchmark_mode.get(mode) is not None
             ]
             if benchmark_mode is not None:
                 selected_payload = scores_by_benchmark_mode.get(benchmark_mode)
                 if selected_payload is not None:
                     return response.json(
                         _build_provider_quality_response_payload(
-                            identity=_ProviderQualityResponseIdentity(
-                                provider_npi, year_used, year_source_value
-                            ),
+                            identity=_ProviderQualityResponseIdentity(provider_npi, year_used, year_source_value),
                             selected_payload=selected_payload,
                             selected_mode=benchmark_mode,
                             scores_by_benchmark_mode=scores_by_benchmark_mode,
@@ -9130,9 +8543,7 @@ async def get_pricing_provider_score(request, npi: str):
                 assert selected_payload is not None
                 return response.json(
                     _build_provider_quality_response_payload(
-                        identity=_ProviderQualityResponseIdentity(
-                            provider_npi, year_used, year_source_value
-                        ),
+                        identity=_ProviderQualityResponseIdentity(provider_npi, year_used, year_source_value),
                         selected_payload=selected_payload,
                         selected_mode=selected_mode,
                         scores_by_benchmark_mode=scores_by_benchmark_mode,
@@ -9142,7 +8553,13 @@ async def get_pricing_provider_score(request, npi: str):
             else:
                 reasons.append("no_matching_peer_cohort")
 
-        selected_mode = benchmark_mode or ("zip" if profile and profile.get("zip5") else "state" if profile and profile.get("state_key") else "national")
+        selected_mode = benchmark_mode or (
+            "zip"
+            if profile and profile.get("zip5")
+            else "state"
+            if profile and profile.get("state_key")
+            else "national"
+        )
         selected_geography = None
         if profile is not None:
             if selected_mode == "zip" and profile.get("zip5"):
@@ -9200,9 +8617,7 @@ async def get_pricing_provider_score(request, npi: str):
         )
         return response.json(
             _build_provider_quality_response_payload(
-                identity=_ProviderQualityResponseIdentity(
-                    provider_npi, year_used, year_source_value
-                ),
+                identity=_ProviderQualityResponseIdentity(provider_npi, year_used, year_source_value),
                 selected_payload=selected_payload,
                 selected_mode=selected_mode,
                 scores_by_benchmark_mode=scores_by_benchmark_mode,
@@ -9232,12 +8647,10 @@ async def get_pricing_provider_score(request, npi: str):
             zip5=observed_data.get("zip5"),
         )
         scores_by_benchmark_mode: dict[str, dict[str, Any] | None] = {
-            mode: None
-            for mode in QUALITY_BENCHMARK_MODE_ORDER
+            mode: None for mode in QUALITY_BENCHMARK_MODE_ORDER
         }
         variants_by_benchmark_mode: dict[str, list[dict[str, Any]]] = {
-            mode: []
-            for mode in QUALITY_BENCHMARK_MODE_ORDER
+            mode: [] for mode in QUALITY_BENCHMARK_MODE_ORDER
         }
         for mode in modes_to_compute:
             mode_payload = _build_live_mode_payload(
@@ -9252,11 +8665,13 @@ async def get_pricing_provider_score(request, npi: str):
             if _is_live_mode_payload_available(mode_payload):
                 scores_by_benchmark_mode[mode] = mode_payload
             if variants_scope == SCORE_VARIANTS_SCOPE_PROVIDER:
-                provider_specialty_key, provider_taxonomy_code, provider_procedure_codes = _variant_scope_inputs_from_mode_payload(
-                    mode_payload,
-                    fallback_specialty_key=specialty_key,
-                    fallback_taxonomy_code=taxonomy_code,
-                    fallback_procedure_codes=requested_procedure_codes,
+                provider_specialty_key, provider_taxonomy_code, provider_procedure_codes = (
+                    _variant_scope_inputs_from_mode_payload(
+                        mode_payload,
+                        fallback_specialty_key=specialty_key,
+                        fallback_taxonomy_code=taxonomy_code,
+                        fallback_procedure_codes=requested_procedure_codes,
+                    )
                 )
                 mode_candidates = _collect_peer_target_candidates(
                     peer_target_rows,
@@ -9300,9 +8715,7 @@ async def get_pricing_provider_score(request, npi: str):
 
         return response.json(
             _build_provider_quality_response_payload(
-                identity=_ProviderQualityResponseIdentity(
-                    provider_npi, year, year_source
-                ),
+                identity=_ProviderQualityResponseIdentity(provider_npi, year, year_source),
                 selected_payload=selected_payload,
                 selected_mode=selected_mode,
                 scores_by_benchmark_mode=scores_by_benchmark_mode,
@@ -9327,7 +8740,7 @@ async def get_pricing_provider_score(request, npi: str):
         WHERE npi = :npi AND year = :year
         """
     )
-    score_result = await session.execute(score_query, {"npi": provider_npi, "year": year})
+    score_result = await execute_network_read(session, score_query, {"npi": provider_npi, "year": year})
     score_rows = [_row_to_dict(score_row) for score_row in score_result]
     if not score_rows:
         return await _fallback_response(year_used=year, year_source_value=year_source)
@@ -9370,8 +8783,7 @@ async def get_pricing_provider_score(request, npi: str):
     }
 
     domains_by_mode: dict[str, dict[str, Any]] = {
-        mode: _empty_domain_payloads_by_name()
-        for mode in QUALITY_BENCHMARK_MODE_ORDER
+        mode: _empty_domain_payloads_by_name() for mode in QUALITY_BENCHMARK_MODE_ORDER
     }
     domain_query = text(
         f"""
@@ -9389,7 +8801,7 @@ async def get_pricing_provider_score(request, npi: str):
         WHERE npi = :npi AND year = :year
         """
     )
-    domain_result = await session.execute(domain_query, {"npi": provider_npi, "year": year})
+    domain_result = await execute_network_read(session, domain_query, {"npi": provider_npi, "year": year})
     for domain_row in domain_result:
         row_data = _row_to_dict(domain_row)
         mode = str(row_data.get("benchmark_mode") or "").strip().lower()
@@ -9426,9 +8838,7 @@ async def get_pricing_provider_score(request, npi: str):
 
     return response.json(
         _build_provider_quality_response_payload(
-            identity=_ProviderQualityResponseIdentity(
-                provider_npi, year, year_source
-            ),
+            identity=_ProviderQualityResponseIdentity(provider_npi, year, year_source),
             selected_payload=selected_payload,
             selected_mode=selected_mode,
             scores_by_benchmark_mode=scores_by_benchmark_mode,
@@ -9476,29 +8886,29 @@ async def list_provider_procedures(request, npi: str):
             raise InvalidUsage(str(exc)) from exc
     if plan_id or plan_external_id or source_key or snapshot_id or plan_release_id:
         ptg_args_by_name = {
-                "plan_id": plan_id or None,
-                "plan_external_id": plan_external_id or None,
-                "plan_release_id": plan_release_id or None,
-                "plan_id_type": plan_id_type or None,
-                "plan_market_type": plan_market_type or None,
-                "source_key": source_key or None,
-                "snapshot_id": snapshot_id or None,
-                "mode": mode or None,
-                "code": code or reported_code or None,
-                "code_system": args.get("code_system") or None,
-                "q": query_text or service_name or None,
-                "pos": args.get("pos") or args.get("place_of_service") or None,
-                "service_code": args.get("service_code") or None,
-                "modifier": args.get("modifier") or args.get("modifiers") or None,
-                "billing_code_modifier": args.get("billing_code_modifier") or None,
-                "rate": args.get("rate") or None,
-                "negotiated_rate": args.get("negotiated_rate") or None,
-                "rate_tolerance": args.get("rate_tolerance") or None,
-                "negotiated_rate_tolerance": args.get("negotiated_rate_tolerance") or None,
-                "include_sources": args.get("include_sources") or None,
-                "include_details": args.get("include_details") or None,
-                "include_debug": args.get("include_debug") or None,
-            }
+            "plan_id": plan_id or None,
+            "plan_external_id": plan_external_id or None,
+            "plan_release_id": plan_release_id or None,
+            "plan_id_type": plan_id_type or None,
+            "plan_market_type": plan_market_type or None,
+            "source_key": source_key or None,
+            "snapshot_id": snapshot_id or None,
+            "mode": mode or None,
+            "code": code or reported_code or None,
+            "code_system": args.get("code_system") or None,
+            "q": query_text or service_name or None,
+            "pos": args.get("pos") or args.get("place_of_service") or None,
+            "service_code": args.get("service_code") or None,
+            "modifier": args.get("modifier") or args.get("modifiers") or None,
+            "billing_code_modifier": args.get("billing_code_modifier") or None,
+            "rate": args.get("rate") or None,
+            "negotiated_rate": args.get("negotiated_rate") or None,
+            "rate_tolerance": args.get("rate_tolerance") or None,
+            "negotiated_rate_tolerance": args.get("negotiated_rate_tolerance") or None,
+            "include_sources": args.get("include_sources") or None,
+            "include_details": args.get("include_details") or None,
+            "include_debug": args.get("include_debug") or None,
+        }
         ptg2_payload = await search_ptg2_provider_procedures(
             session,
             provider_npi,
@@ -9559,15 +8969,11 @@ async def list_provider_procedures(request, npi: str):
             ptg2_payload,
             plan_id_type=plan_id_type,
             year=year,
-            has_plan_scope=bool(
-                plan_id or plan_external_id or snapshot_id or plan_release_id
-            ),
+            has_plan_scope=bool(plan_id or plan_external_id or snapshot_id or plan_release_id),
         )
         _annotate_ptg2_result_state(
             ptg2_payload,
-            has_plan_scope=bool(
-                plan_id or plan_external_id or snapshot_id or plan_release_id
-            ),
+            has_plan_scope=bool(plan_id or plan_external_id or snapshot_id or plan_release_id),
             has_location_filter=_has_ptg2_location_filter(args),
         )
         return _json_response(ptg2_payload)
@@ -9601,7 +9007,9 @@ async def list_provider_procedures(request, npi: str):
         filters.append(provider_procedure_table.c.total_allowed_amount >= min_total_cost)
 
     where_clause = and_(*filters)
-    count_result = await session.execute(select(func.count()).select_from(provider_procedure_table).where(where_clause))
+    count_result = await execute_network_read(
+        session, select(func.count()).select_from(provider_procedure_table).where(where_clause)
+    )
     total = int(count_result.scalar() or 0)
 
     query = select(provider_procedure_table).where(where_clause)
@@ -9629,9 +9037,11 @@ async def list_provider_procedures(request, npi: str):
     )
     query = query.limit(pagination.limit).offset(pagination.offset)
 
-    query_result = await session.execute(query)
+    query_result = await execute_network_read(session, query)
     procedure_items = [
-        _normalize_service_payload({**_row_to_dict(procedure_record), "__include_legacy_fields__": include_legacy_fields})
+        _normalize_service_payload(
+            {**_row_to_dict(procedure_record), "__include_legacy_fields__": include_legacy_fields}
+        )
         for procedure_record in query_result
     ]
 
@@ -9729,8 +9139,8 @@ async def _provider_procedure_detail(
         args,
         default_system=default_code_system,
     )
-    procedure_query_result = await session.execute(
-        _provider_procedure_detail_query(provider_npi, internal_codes, year)
+    procedure_query_result = await execute_network_read(
+        session, _provider_procedure_detail_query(provider_npi, internal_codes, year)
     )
     procedure_row = procedure_query_result.first()
     if procedure_row is None:
@@ -9781,6 +9191,7 @@ async def _provider_procedure_cost_level(
 ):
     """Build the provider procedure estimated cost-level response from peer cost profiles."""
     session = _get_session(request)
+    code_catalog_table = claims_dictionary_tables(session)[0]
     args = request.args
 
     provider_npi = _parse_int(npi, "npi", minimum=1)
@@ -9833,7 +9244,8 @@ async def _provider_procedure_cost_level(
     if specialty_key:
         base_profile_filters.append(provider_procedure_cost_profile_table.c.specialty_key == specialty_key)
 
-    base_profile_result = await session.execute(
+    base_profile_result = await execute_network_read(
+        session,
         select(provider_procedure_cost_profile_table)
         .where(and_(*base_profile_filters))
         .order_by(
@@ -9841,7 +9253,7 @@ async def _provider_procedure_cost_level(
             provider_procedure_cost_profile_table.c.claim_count.desc().nullslast(),
             provider_procedure_cost_profile_table.c.avg_submitted_charge.desc().nullslast(),
         )
-        .limit(1)
+        .limit(1),
     )
     base_profile_row = base_profile_result.first()
     if base_profile_row is None and specialty_key:
@@ -9851,7 +9263,8 @@ async def _provider_procedure_cost_level(
             provider_procedure_cost_profile_table.c.procedure_code.in_(internal_codes),
             provider_procedure_cost_profile_table.c.setting_key == setting_key,
         ]
-        fallback_profile_result = await session.execute(
+        fallback_profile_result = await execute_network_read(
+            session,
             select(provider_procedure_cost_profile_table)
             .where(and_(*fallback_profile_filters))
             .order_by(
@@ -9859,7 +9272,7 @@ async def _provider_procedure_cost_level(
                 provider_procedure_cost_profile_table.c.claim_count.desc().nullslast(),
                 provider_procedure_cost_profile_table.c.avg_submitted_charge.desc().nullslast(),
             )
-            .limit(1)
+            .limit(1),
         )
         base_profile_row = fallback_profile_result.first()
 
@@ -9965,7 +9378,8 @@ async def _provider_procedure_cost_level(
                 )
             ]
 
-        peer_result = await session.execute(
+        peer_result = await execute_network_read(
+            session,
             select(procedure_peer_stats_table).where(
                 and_(
                     procedure_peer_stats_table.c.procedure_code == procedure_internal_code,
@@ -9974,11 +9388,9 @@ async def _provider_procedure_cost_level(
                     procedure_peer_stats_table.c.specialty_key.in_(specialty_candidates),
                     or_(*geography_clauses),
                 )
-            )
+            ),
         )
-        peer_rows = [
-            _row_to_dict(peer_result_row) for peer_result_row in peer_result
-        ]
+        peer_rows = [_row_to_dict(peer_result_row) for peer_result_row in peer_result]
         peer_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
         for peer_row in peer_rows:
             key = (
@@ -10005,7 +9417,9 @@ async def _provider_procedure_cost_level(
                 break
 
     if selected_peer is None:
-        raise sanic.exceptions.NotFound("Peer group is not available for this provider procedure in the requested region.")
+        raise sanic.exceptions.NotFound(
+            "Peer group is not available for this provider procedure in the requested region."
+        )
 
     provider_avg = _as_float(selected_profile.get("avg_submitted_charge"))
     provider_claim_count = _as_float(selected_profile.get("claim_count"))
@@ -10027,7 +9441,8 @@ async def _provider_procedure_cost_level(
     procedure_code_text = str(procedure_internal_code)
     procedure_name = None
     reported_code = None
-    procedure_detail_result = await session.execute(
+    procedure_detail_result = await execute_network_read(
+        session,
         select(
             provider_procedure_table.c.service_description,
             provider_procedure_table.c.reported_code,
@@ -10040,7 +9455,7 @@ async def _provider_procedure_cost_level(
             )
         )
         .order_by(provider_procedure_table.c.total_services.desc().nullslast())
-        .limit(1)
+        .limit(1),
     )
     procedure_detail_row = procedure_detail_result.first()
     if procedure_detail_row is not None:
@@ -10051,7 +9466,8 @@ async def _provider_procedure_cost_level(
             reported_code = str(reported_code_raw).strip().upper() or None
 
     if not procedure_name:
-        catalog_result = await session.execute(
+        catalog_result = await execute_network_read(
+            session,
             select(code_catalog_table.c.display_name, code_catalog_table.c.short_description)
             .where(
                 and_(
@@ -10059,7 +9475,7 @@ async def _provider_procedure_cost_level(
                     func.upper(code_catalog_table.c.code) == procedure_code_text,
                 )
             )
-            .limit(1)
+            .limit(1),
         )
         catalog_row = catalog_result.first()
         if catalog_row is not None:
@@ -10069,9 +9485,7 @@ async def _provider_procedure_cost_level(
     reported_code_system = _reported_procedure_code_system(reported_code)
 
     selected_zip_meta = (
-        zip_metadata_by_value.get(str(selected_value or "").strip())
-        if selected_scope == "zip5"
-        else None
+        zip_metadata_by_value.get(str(selected_value or "").strip()) if selected_scope == "zip5" else None
     )
 
     return response.json(
@@ -10219,7 +9633,9 @@ async def _query_provider_procedure_location_page(
 ) -> dict[str, Any]:
     where_clause = and_(*filters)
     total = int(
-        (await session.execute(select(func.count()).select_from(location_table).where(where_clause))).scalar()
+        (
+            await execute_network_read(session, select(func.count()).select_from(location_table).where(where_clause))
+        ).scalar()
         or 0
     )
 
@@ -10239,7 +9655,7 @@ async def _query_provider_procedure_location_page(
     )
     query = query.limit(pagination.limit).offset(pagination.offset)
 
-    location_query_result = await session.execute(query)
+    location_query_result = await execute_network_read(session, query)
     location_entries = [
         _normalize_service_payload(
             {
@@ -10302,9 +9718,7 @@ async def _provider_procedure_locations(
     internal_codes, code_context = await _resolve_internal_codes_for_request(
         session, code_value, args, default_system=default_code_system
     )
-    filters = _provider_procedure_location_filters(
-        provider_npi, internal_codes, year, state, city, zip5
-    )
+    filters = _provider_procedure_location_filters(provider_npi, internal_codes, year, state, city, zip5)
     page_by_field = await _query_provider_procedure_location_page(
         session,
         args,
@@ -10336,7 +9750,9 @@ async def _provider_procedure_locations(
     return response.json(response_document)
 
 
-@blueprint.get("/providers/<npi>/procedures/<procedure_code>/locations", name="pricing.providers.procedures.locations.list")
+@blueprint.get(
+    "/providers/<npi>/procedures/<procedure_code>/locations", name="pricing.providers.procedures.locations.list"
+)
 async def list_provider_procedure_locations(request, npi: str, procedure_code: str):
     """List locations where a provider reports the requested internal procedure."""
     return await _provider_procedure_locations(
@@ -10347,7 +9763,9 @@ async def list_provider_procedure_locations(request, npi: str, procedure_code: s
     )
 
 
-@blueprint.get("/physicians/<npi>/services/<code_system>/<code>/locations", name="pricing.physicians.services.locations.list")
+@blueprint.get(
+    "/physicians/<npi>/services/<code_system>/<code>/locations", name="pricing.physicians.services.locations.list"
+)
 async def list_physician_service_locations(request, npi: str, code_system: str, code: str):
     """List physician service locations after resolving the supplied code system."""
     return await _provider_procedure_locations(
@@ -10358,9 +9776,7 @@ async def list_physician_service_locations(request, npi: str, code_system: str, 
     )
 
 
-async def _procedure_provider_list_where(
-    session, args, year, internal_codes, list_values_by_name
-):
+async def _procedure_provider_list_where(session, args, year, internal_codes, list_values_by_name):
     filters = [
         provider_procedure_table.c.procedure_code.in_(internal_codes),
         provider_procedure_table.c.year == year,
@@ -10370,11 +9786,7 @@ async def _procedure_provider_list_where(
     if list_values_by_name["state"]:
         filters.append(func.upper(provider_table.c.state) == list_values_by_name["state"])
     if list_values_by_name["city"]:
-        filters.append(
-            func.lower(provider_table.c.city).like(
-                f"%{list_values_by_name['city']}%"
-            )
-        )
+        filters.append(func.lower(provider_table.c.city).like(f"%{list_values_by_name['city']}%"))
     provider_type_clause, provider_type_resolution = await _provider_type_filter_clause(
         session, args, provider_table.c.provider_type, list_values_by_name["specialty"]
     )
@@ -10390,15 +9802,9 @@ async def _procedure_provider_list_where(
             )
         )
     if list_values_by_name["min_claims"] is not None:
-        filters.append(
-            provider_procedure_table.c.total_services
-            >= list_values_by_name["min_claims"]
-        )
+        filters.append(provider_procedure_table.c.total_services >= list_values_by_name["min_claims"])
     if list_values_by_name["min_total_cost"] is not None:
-        filters.append(
-            provider_procedure_table.c.total_allowed_amount
-            >= list_values_by_name["min_total_cost"]
-        )
+        filters.append(provider_procedure_table.c.total_allowed_amount >= list_values_by_name["min_total_cost"])
     return and_(*filters), provider_type_resolution
 
 
@@ -10412,15 +9818,9 @@ def _procedure_provider_grouped_query(where_clause):
             provider_table.c.state.label("state"),
             provider_table.c.zip5.label("zip5"),
             func.sum(provider_procedure_table.c.total_services).label("total_services"),
-            func.sum(provider_procedure_table.c.total_submitted_charges).label(
-                "total_submitted_charges"
-            ),
-            func.sum(provider_procedure_table.c.total_allowed_amount).label(
-                "total_allowed_amount"
-            ),
-            func.sum(provider_procedure_table.c.total_beneficiaries).label(
-                "total_beneficiaries"
-            ),
+            func.sum(provider_procedure_table.c.total_submitted_charges).label("total_submitted_charges"),
+            func.sum(provider_procedure_table.c.total_allowed_amount).label("total_allowed_amount"),
+            func.sum(provider_procedure_table.c.total_beneficiaries).label("total_beneficiaries"),
             func.count().label("matched_rows"),
         )
         .select_from(
@@ -10441,32 +9841,32 @@ def _procedure_provider_grouped_query(where_clause):
     )
 
 
-async def _procedure_provider_list_page(
-    session, pagination, where_clause, include_legacy_fields, order_by, order
-):
+async def _procedure_provider_list_page(session, pagination, where_clause, include_legacy_fields, order_by, order):
     grouped_subquery = _procedure_provider_grouped_query(where_clause).subquery()
-    count_result = await session.execute(
-        select(func.count()).select_from(grouped_subquery)
+    count_result = await execute_network_read(session, select(func.count()).select_from(grouped_subquery))
+    query = (
+        _apply_ordering(
+            select(grouped_subquery),
+            order_by,
+            order,
+            {
+                "npi": grouped_subquery.c.npi,
+                "provider_name": grouped_subquery.c.provider_name,
+                "total_services": grouped_subquery.c.total_services,
+                "total_submitted_charges": grouped_subquery.c.total_submitted_charges,
+                "total_allowed_amount": grouped_subquery.c.total_allowed_amount,
+                "total_beneficiaries": grouped_subquery.c.total_beneficiaries,
+                "matched_rows": grouped_subquery.c.matched_rows,
+                "total_claims": grouped_subquery.c.total_services,
+                "total_day_supply": grouped_subquery.c.total_submitted_charges,
+                "total_drug_cost": grouped_subquery.c.total_allowed_amount,
+                "total_benes": grouped_subquery.c.total_beneficiaries,
+            },
+        )
+        .limit(pagination.limit)
+        .offset(pagination.offset)
     )
-    query = _apply_ordering(
-        select(grouped_subquery),
-        order_by,
-        order,
-        {
-            "npi": grouped_subquery.c.npi,
-            "provider_name": grouped_subquery.c.provider_name,
-            "total_services": grouped_subquery.c.total_services,
-            "total_submitted_charges": grouped_subquery.c.total_submitted_charges,
-            "total_allowed_amount": grouped_subquery.c.total_allowed_amount,
-            "total_beneficiaries": grouped_subquery.c.total_beneficiaries,
-            "matched_rows": grouped_subquery.c.matched_rows,
-            "total_claims": grouped_subquery.c.total_services,
-            "total_day_supply": grouped_subquery.c.total_submitted_charges,
-            "total_drug_cost": grouped_subquery.c.total_allowed_amount,
-            "total_benes": grouped_subquery.c.total_beneficiaries,
-        },
-    ).limit(pagination.limit).offset(pagination.offset)
-    query_result = await session.execute(query)
+    query_result = await execute_network_read(session, query)
     return {
         "total": int(count_result.scalar() or 0),
         "order": order,
@@ -10482,8 +9882,13 @@ async def _procedure_provider_list_page(
 
 
 def _procedure_provider_list_document(
-    page, pagination, year, year_source, list_values_by_name,
-    provider_type_resolution, code_context,
+    page,
+    pagination,
+    year,
+    year_source,
+    list_values_by_name,
+    provider_type_resolution,
+    code_context,
 ):
     return {
         "items": page["items"],
@@ -10522,16 +9927,12 @@ async def list_procedure_providers(request, code_system: str, code: str):
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
     list_values_by_name = {
         "min_claims": _parse_float(args.get("min_claims"), "min_claims", minimum=0),
-        "min_total_cost": _parse_float(
-            args.get("min_total_cost"), "min_total_cost", minimum=0
-        ),
+        "min_total_cost": _parse_float(args.get("min_total_cost"), "min_total_cost", minimum=0),
         "state": str(args.get("state", "")).strip().upper(),
         "city": str(args.get("city", "")).strip().lower(),
         "specialty": str(args.get("specialty", "")).strip().lower(),
         "query_text": str(args.get("q", "")).strip().lower(),
-        "include_legacy_fields": _parse_bool(
-            args.get("include_legacy_fields"), "include_legacy_fields", default=False
-        ),
+        "include_legacy_fields": _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False),
     }
     args.get("provider_type")
     args.get("classification")
@@ -10563,8 +9964,13 @@ async def list_procedure_providers(request, code_system: str, code: str):
     )
     return response.json(
         _procedure_provider_list_document(
-            page, pagination, year, year_source, list_values_by_name,
-            provider_type_resolution, code_context,
+            page,
+            pagination,
+            year,
+            year_source,
+            list_values_by_name,
+            provider_type_resolution,
+            code_context,
         )
     )
 
@@ -10581,10 +9987,12 @@ async def _procedure_benchmark_values(session, where_clause):
             func.min(provider_procedure_table.c.total_allowed_amount).label("min_total_allowed_amount"),
             func.max(provider_procedure_table.c.total_allowed_amount).label("max_total_allowed_amount"),
         )
-        .select_from(provider_procedure_table.join(provider_table, provider_table.c.npi == provider_procedure_table.c.npi))
+        .select_from(
+            provider_procedure_table.join(provider_table, provider_table.c.npi == provider_procedure_table.c.npi)
+        )
         .where(where_clause)
     )
-    aggregate_result = await session.execute(aggregate_query)
+    aggregate_result = await execute_network_read(session, aggregate_query)
     aggregate = _row_to_dict(aggregate_result.first() or {})
 
     provider_costs_subquery = (
@@ -10592,7 +10000,9 @@ async def _procedure_benchmark_values(session, where_clause):
             provider_procedure_table.c.npi.label("npi"),
             func.sum(provider_procedure_table.c.total_allowed_amount).label("provider_total_allowed_amount"),
         )
-        .select_from(provider_procedure_table.join(provider_table, provider_table.c.npi == provider_procedure_table.c.npi))
+        .select_from(
+            provider_procedure_table.join(provider_table, provider_table.c.npi == provider_procedure_table.c.npi)
+        )
         .where(where_clause)
         .group_by(provider_procedure_table.c.npi)
     ).subquery()
@@ -10603,7 +10013,7 @@ async def _procedure_benchmark_values(session, where_clause):
         func.percentile_cont(0.60).within_group(provider_costs_subquery.c.provider_total_allowed_amount).label("p60"),
         func.percentile_cont(0.80).within_group(provider_costs_subquery.c.provider_total_allowed_amount).label("p80"),
     )
-    threshold_result = await session.execute(threshold_query)
+    threshold_result = await execute_network_read(session, threshold_query)
     thresholds = _row_to_dict(threshold_result.first() or {})
     return aggregate, thresholds
 
@@ -10650,12 +10060,13 @@ async def get_procedure_benchmarks(request, code_system: str, code: str):
     year = _parse_int(args.get("year"), "year", minimum=2013)
     state = str(args.get("state", "")).strip().upper()
     city = str(args.get("city", "")).strip().lower()
-    include_legacy_fields = _parse_bool(
-        args.get("include_legacy_fields"), "include_legacy_fields", default=False
-    )
+    include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
     year, year_source = await _resolve_year(session, provider_procedure_table, year)
     internal_codes, code_context = await _resolve_internal_codes_for_request(
-        session, code, args, default_system=code_system,
+        session,
+        code,
+        args,
+        default_system=code_system,
     )
     filters = [
         provider_procedure_table.c.procedure_code.in_(internal_codes),
@@ -10667,12 +10078,8 @@ async def get_procedure_benchmarks(request, code_system: str, code: str):
         filters.append(func.upper(provider_table.c.state) == state)
     if city:
         filters.append(func.lower(provider_table.c.city).like(f"%{city}%"))
-    aggregate, thresholds = await _procedure_benchmark_values(
-        session, and_(*filters)
-    )
-    benchmark_payload_map = _procedure_benchmark_payload(
-        aggregate, thresholds, include_legacy_fields
-    )
+    aggregate, thresholds = await _procedure_benchmark_values(session, and_(*filters))
+    benchmark_payload_map = _procedure_benchmark_payload(aggregate, thresholds, include_legacy_fields)
     return response.json(
         {
             "query": {
@@ -10720,41 +10127,29 @@ async def _procedure_geo_scope_benchmark(
         procedure_geo_benchmark_table.c.geography_scope == scope,
     ]
     if geography_value is not None:
-        filters.append(
-            procedure_geo_benchmark_table.c.geography_value == geography_value
-        )
+        filters.append(procedure_geo_benchmark_table.c.geography_value == geography_value)
     total_services_expr = func.sum(procedure_geo_benchmark_table.c.total_services)
 
     def _weighted_average(column):
-        return (
-            func.sum(column * procedure_geo_benchmark_table.c.total_services)
-            / func.nullif(total_services_expr, 0)
-        )
+        return func.sum(column * procedure_geo_benchmark_table.c.total_services) / func.nullif(total_services_expr, 0)
+
     query = (
         select(
             func.count().label("rows"),
             total_services_expr.label("total_services"),
-            _weighted_average(
-                procedure_geo_benchmark_table.c.avg_submitted_charge
-            ).label("avg_submitted_charge"),
-            _weighted_average(
-                procedure_geo_benchmark_table.c.avg_payment_amount
-            ).label("avg_payment_amount"),
-            _weighted_average(
-                procedure_geo_benchmark_table.c.avg_standardized_amount
-            ).label("avg_standardized_amount"),
+            _weighted_average(procedure_geo_benchmark_table.c.avg_submitted_charge).label("avg_submitted_charge"),
+            _weighted_average(procedure_geo_benchmark_table.c.avg_payment_amount).label("avg_payment_amount"),
+            _weighted_average(procedure_geo_benchmark_table.c.avg_standardized_amount).label("avg_standardized_amount"),
         )
         .select_from(procedure_geo_benchmark_table)
         .where(and_(*filters))
     )
-    benchmark_query_result = await session.execute(query)
+    benchmark_query_result = await execute_network_read(session, query)
     benchmark_row = _row_to_dict(benchmark_query_result.first() or {})
     return _procedure_geo_benchmark_payload(benchmark_row, scope, geography_value)
 
 
-def _unavailable_procedure_geo_benchmarks(
-    year: int | None, state: str, code_system: str, code: str
-):
+def _unavailable_procedure_geo_benchmarks(year: int | None, state: str, code_system: str, code: str):
     return response.json(
         {
             "query": {
@@ -10805,7 +10200,8 @@ async def get_procedure_geo_benchmarks(request, code_system: str, code: str):
             geography_value=state,
             **benchmark_args_by_name,
         )
-        if state else None
+        if state
+        else None
     )
 
     return response.json(
@@ -10844,13 +10240,9 @@ async def autocomplete_provider_types(request):
         include_broad=True,
         limit=max((pagination.offset + pagination.limit) * 5, 100),
     )
-    ordered_provider_type_items = _provider_type_autocomplete_items(
-        provider_type_rows
-    )
+    ordered_provider_type_items = _provider_type_autocomplete_items(provider_type_rows)
     total = len(ordered_provider_type_items)
-    page_items = ordered_provider_type_items[
-        pagination.offset: pagination.offset + pagination.limit
-    ]
+    page_items = ordered_provider_type_items[pagination.offset : pagination.offset + pagination.limit]
 
     return response.json(
         {
@@ -10897,13 +10289,9 @@ def _provider_type_autocomplete_items(
             }
             provider_type_items_by_key[key] = current_provider_type_item_by_field
         if provider_type_row.get("term"):
-            current_provider_type_item_by_field["aliases"].add(
-                str(provider_type_row["term"])
-            )
+            current_provider_type_item_by_field["aliases"].add(str(provider_type_row["term"]))
         if provider_type_row.get("source"):
-            current_provider_type_item_by_field["sources"].add(
-                str(provider_type_row["source"])
-            )
+            current_provider_type_item_by_field["sources"].add(str(provider_type_row["source"]))
         if len(current_provider_type_item_by_field["matches"]) < 5:
             current_provider_type_item_by_field["matches"].append(provider_type_row)
 
@@ -10913,9 +10301,7 @@ def _provider_type_autocomplete_items(
             provider_type_item_by_field["aliases"],
             key=lambda value: value.lower(),
         )
-        provider_type_item_by_field["sources"] = sorted(
-            provider_type_item_by_field["sources"]
-        )
+        provider_type_item_by_field["sources"] = sorted(provider_type_item_by_field["sources"])
         ordered_provider_type_items.append(provider_type_item_by_field)
     ordered_provider_type_items.sort(
         key=lambda provider_type_item_by_field: (
@@ -10966,9 +10352,7 @@ async def resolve_procedure_term(request):
     return response.json(
         {
             "items": procedure_rows,
-            "internal_codes": [
-                str(internal_code) for internal_code in internal_codes
-            ],
+            "internal_codes": [str(internal_code) for internal_code in internal_codes],
             "resolved_codes": [
                 {
                     "code_system": procedure_row.get("target_system"),
@@ -11036,9 +10420,7 @@ async def autocomplete_procedures(request):
     year = _parse_int(args.get("year"), "year", minimum=2013)
     code_system_raw = str(args.get("code_system", "")).strip()
     dedupe_terms = _parse_bool(args.get("dedupe_terms"), "dedupe_terms", default=True)
-    include_matches = _parse_bool(
-        args.get("include_matches"), "include_matches", default=False
-    )
+    include_matches = _parse_bool(args.get("include_matches"), "include_matches", default=False)
     max_codes_per_term = _parse_int(args.get("max_codes_per_term"), "max_codes_per_term", minimum=1) or 5
     max_codes_per_term = min(max_codes_per_term, 25)
 
@@ -11051,9 +10433,7 @@ async def autocomplete_procedures(request):
         year_source = "none"
 
     fetch_limit = 3000
-    target_systems = (
-        (_normalize_code_system(code_system_raw),) if code_system_raw else None
-    )
+    target_systems = (_normalize_code_system(code_system_raw),) if code_system_raw else None
     code_catalog_rows = await _query_procedure_autocomplete_catalog(
         session,
         search_query=search_query,
@@ -11091,7 +10471,9 @@ async def autocomplete_procedures(request):
                     "matched_term": term_row.get("term"),
                     "code_systems": [code_system] if code_system else [],
                     "codes": [{"code_system": code_system, "code": code_value}] if code_system and code_value else [],
-                    "internal_codes": [code_value] if code_system == INTERNAL_CODE_SYSTEM and INT_PATTERN.fullmatch(code_value) else [],
+                    "internal_codes": [code_value]
+                    if code_system == INTERNAL_CODE_SYSTEM and INT_PATTERN.fullmatch(code_value)
+                    else [],
                     "sources": [term_row.get("source")] if term_row.get("source") else [],
                     **({"terminology_match": term_row} if include_matches else {}),
                 }
@@ -11111,16 +10493,20 @@ async def autocomplete_procedures(request):
                 "term": display_name,
                 "code_systems": [code_system] if code_system else [],
                 "codes": [{"code_system": code_system, "code": code_value}] if code_system and code_value else [],
-                "internal_codes": [code_value] if code_system == INTERNAL_CODE_SYSTEM and INT_PATTERN.fullmatch(code_value) else [],
+                "internal_codes": [code_value]
+                if code_system == INTERNAL_CODE_SYSTEM and INT_PATTERN.fullmatch(code_value)
+                else [],
                 "sources": [code_catalog_row.get("source")] if code_catalog_row.get("source") else [],
             }
             procedure_items.append(procedure_item_by_field)
         total = len(procedure_items)
-        page_items = procedure_items[pagination.offset: pagination.offset + pagination.limit]
+        page_items = procedure_items[pagination.offset : pagination.offset + pagination.limit]
     else:
         procedure_items_by_term: dict[str, dict[str, Any]] = {}
         for term_row in terminology_rows:
-            term = str(term_row.get("canonical_term") or term_row.get("target_display") or term_row.get("term") or "").strip()
+            term = str(
+                term_row.get("canonical_term") or term_row.get("target_display") or term_row.get("term") or ""
+            ).strip()
             if not term:
                 continue
             term_key = term.lower()
@@ -11151,9 +10537,7 @@ async def autocomplete_procedures(request):
                     and len(current_procedure_item_by_field["codes"]) < max_codes_per_term
                 ):
                     current_procedure_item_by_field["_seen_codes"].add(pair)
-                    current_procedure_item_by_field["codes"].append(
-                        {"code_system": code_system, "code": code_value}
-                    )
+                    current_procedure_item_by_field["codes"].append({"code_system": code_system, "code": code_value})
                 if code_system == INTERNAL_CODE_SYSTEM and INT_PATTERN.fullmatch(code_value):
                     current_procedure_item_by_field["internal_codes"].add(code_value)
         for code_catalog_row in code_catalog_rows:
@@ -11193,9 +10577,7 @@ async def autocomplete_procedures(request):
                     and len(current_procedure_item_by_field["codes"]) < max_codes_per_term
                 ):
                     current_procedure_item_by_field["_seen_codes"].add(pair)
-                    current_procedure_item_by_field["codes"].append(
-                        {"code_system": code_system, "code": code_value}
-                    )
+                    current_procedure_item_by_field["codes"].append({"code_system": code_system, "code": code_value})
                 if code_system == INTERNAL_CODE_SYSTEM and INT_PATTERN.fullmatch(code_value):
                     current_procedure_item_by_field["internal_codes"].add(code_value)
 
@@ -11218,16 +10600,12 @@ async def autocomplete_procedures(request):
                     "codes": codes,
                     "internal_codes": internal_codes,
                     "sources": source_names,
-                    **(
-                        {"matches": procedure_item_by_field.get("matches") or []}
-                        if include_matches
-                        else {}
-                    ),
+                    **({"matches": procedure_item_by_field.get("matches") or []} if include_matches else {}),
                 }
             )
 
         total = len(ordered_items)
-        page_items = ordered_items[pagination.offset: pagination.offset + pagination.limit]
+        page_items = ordered_items[pagination.offset : pagination.offset + pagination.limit]
 
     return response.json(
         {
@@ -11275,9 +10653,7 @@ async def _procedure_taxonomy_code_context(
             default_system=default_system,
         )
     except sanic.exceptions.NotFound:
-        code_system = _normalize_code_system(
-            resolver_arg_map.get("code_system") or default_system
-        )
+        code_system = _normalize_code_system(resolver_arg_map.get("code_system") or default_system)
         return [], {
             "input_code": {"code_system": code_system, "code": code},
             "resolved_codes": [],
@@ -11361,9 +10737,7 @@ async def resolve_procedure_taxonomy(request):
     return _procedure_taxonomy_response(
         query_payload_by_field={
             "code": code,
-            "code_system": code_context_map.get("input_code", {}).get(
-                "code_system"
-            ),
+            "code_system": code_context_map.get("input_code", {}).get("code_system"),
             "year": year,
             "year_source": year_source,
             "clinical_intent": clinical_intent or None,
@@ -11458,23 +10832,17 @@ async def _build_provider_specialty_scope(
     ]
     if request.state:
         filters.append(func.upper(provider_table.c.state) == request.state)
-    if request.city and not (
-        request.zip5 and request.zip_radius_miles > 0
-    ):
-        filters.append(
-            func.lower(provider_table.c.city).like(f"%{request.city}%")
-        )
+    if request.city and not (request.zip5 and request.zip_radius_miles > 0):
+        filters.append(func.lower(provider_table.c.city).like(f"%{request.city}%"))
     if zip_filter_values:
         filters.append(provider_table.c.zip5.in_(zip_filter_values))
     elif request.zip5:
         filters.append(provider_table.c.zip5 == request.zip5)
-    provider_type_clause, provider_type_resolution = (
-        await _provider_type_filter_clause(
-            session,
-            args,
-            provider_table.c.provider_type,
-            request.search_query,
-        )
+    provider_type_clause, provider_type_resolution = await _provider_type_filter_clause(
+        session,
+        args,
+        provider_table.c.provider_type,
+        request.search_query,
     )
     if provider_type_clause is not None:
         filters.append(provider_type_clause)
@@ -11513,9 +10881,7 @@ async def _provider_specialty_code_scope(
             total_services_expression=func.sum(provider_table.c.total_services),
             code_context_by_field=None,
         )
-    internal_codes, code_context_by_field = (
-        await _resolve_internal_codes_for_request(session, request.code, args)
-    )
+    internal_codes, code_context_by_field = await _resolve_internal_codes_for_request(session, request.code, args)
     from_clause = provider_procedure_table.join(
         provider_table,
         and_(
@@ -11530,9 +10896,7 @@ async def _provider_specialty_code_scope(
             provider_procedure_table.c.procedure_code.in_(internal_codes),
         ),
         from_clause=from_clause,
-        total_services_expression=func.sum(
-            provider_procedure_table.c.total_services
-        ),
+        total_services_expression=func.sum(provider_procedure_table.c.total_services),
         code_context_by_field=code_context_by_field,
     )
 
@@ -11547,12 +10911,8 @@ async def _load_provider_specialty_page(
     page_query = (
         select(
             provider_table.c.provider_type.label("specialty"),
-            func.lower(func.trim(provider_table.c.provider_type)).label(
-                "specialty_key"
-            ),
-            func.count(func.distinct(provider_table.c.npi)).label(
-                "provider_count"
-            ),
+            func.lower(func.trim(provider_table.c.provider_type)).label("specialty_key"),
+            func.count(func.distinct(provider_table.c.npi)).label("provider_count"),
             scope.total_services_expression.label("total_services"),
         )
         .select_from(scope.from_clause)
@@ -11565,10 +10925,7 @@ async def _load_provider_specialty_page(
         .limit(pagination.limit)
         .offset(pagination.offset)
     )
-    specialty_rows = [
-        _row_to_dict(specialty_row)
-        for specialty_row in await session.execute(page_query)
-    ]
+    specialty_rows = [_row_to_dict(specialty_row) for specialty_row in await execute_network_read(session, page_query)]
     count_query = select(func.count()).select_from(
         select(provider_table.c.provider_type)
         .select_from(scope.from_clause)
@@ -11576,7 +10933,7 @@ async def _load_provider_specialty_page(
         .group_by(provider_table.c.provider_type)
         .subquery()
     )
-    count_result = await session.execute(count_query)
+    count_result = await execute_network_read(session, count_query)
     return _ProviderSpecialtyPage(
         specialty_rows=specialty_rows,
         total=int(count_result.scalar() or 0),
@@ -11591,13 +10948,9 @@ def _provider_specialty_entries(
     return [
         {
             "specialty": str(specialty_row.get("specialty") or "").strip(),
-            "specialty_key": str(
-                specialty_row.get("specialty_key") or ""
-            ).strip().lower(),
+            "specialty_key": str(specialty_row.get("specialty_key") or "").strip().lower(),
             "provider_count": int(specialty_row.get("provider_count") or 0),
-            "total_services": _as_float(
-                specialty_row.get("total_services")
-            ),
+            "total_services": _as_float(specialty_row.get("total_services")),
         }
         for specialty_row in page.specialty_rows
     ]
@@ -11619,13 +10972,9 @@ def _provider_specialty_response(
         "state": request.state or None,
         "city": request.city or None,
         "zip5": request.zip5 or None,
-        "zip_radius_miles": (
-            request.zip_radius_miles if request.zip5 else None
-        ),
+        "zip_radius_miles": (request.zip_radius_miles if request.zip5 else None),
         "zip_candidate_count": (
-            len(scope.zip_filter_values)
-            if scope.zip_filter_values
-            else (1 if request.zip5 else None)
+            len(scope.zip_filter_values) if scope.zip_filter_values else (1 if request.zip5 else None)
         ),
         "provider_type_resolution": scope.provider_type_resolution,
     }
@@ -11684,9 +11033,7 @@ async def list_provider_specialties(request):
     args.get("taxonomy_section")
     args.get("page")
     args.get("limit")
-    year_table = (
-        provider_procedure_table if specialty_request.code else provider_table
-    )
+    year_table = provider_procedure_table if specialty_request.code else provider_table
     year, year_source = await _resolve_year(
         session,
         year_table,
@@ -11726,9 +11073,7 @@ def _prescription_autocomplete_grouped_subquery(
         func.lower(func.coalesce(source_table.c.rx_code, "")).like(q_like),
     ]
     if terminology_internal_codes:
-        text_or_code_filters.append(
-            source_table.c.rx_code.in_(terminology_internal_codes)
-        )
+        text_or_code_filters.append(source_table.c.rx_code.in_(terminology_internal_codes))
     filters = [
         source_table.c.year == year,
         source_table.c.rx_code_system == INTERNAL_RX_CODE_SYSTEM,
@@ -11736,8 +11081,7 @@ def _prescription_autocomplete_grouped_subquery(
     ]
     if "source_relation_fingerprint" in source_table.c:
         filters.append(
-            source_table.c.source_relation_fingerprint
-            == literal_column(_PRESCRIPTION_AUTOCOMPLETE_FINGERPRINT_SQL)
+            source_table.c.source_relation_fingerprint == literal_column(_PRESCRIPTION_AUTOCOMPLETE_FINGERPRINT_SQL)
         )
     return (
         select(
@@ -11766,27 +11110,19 @@ def _prescription_autocomplete_page_query(
 ):
     ranking = case(
         (
-            func.lower(func.coalesce(grouped_subquery.c.generic_name, "")).like(
-                q_prefix
-            ),
+            func.lower(func.coalesce(grouped_subquery.c.generic_name, "")).like(q_prefix),
             0,
         ),
         (
-            func.lower(func.coalesce(grouped_subquery.c.brand_name, "")).like(
-                q_prefix
-            ),
+            func.lower(func.coalesce(grouped_subquery.c.brand_name, "")).like(q_prefix),
             1,
         ),
         (
-            func.lower(func.coalesce(grouped_subquery.c.rx_name, "")).like(
-                q_prefix
-            ),
+            func.lower(func.coalesce(grouped_subquery.c.rx_name, "")).like(q_prefix),
             2,
         ),
         (
-            func.lower(func.coalesce(grouped_subquery.c.rx_code, "")).like(
-                q_prefix
-            ),
+            func.lower(func.coalesce(grouped_subquery.c.rx_code, "")).like(q_prefix),
             3,
         ),
         else_=4,
@@ -11809,10 +11145,14 @@ def _prescription_autocomplete_page_query(
             "total_benes": grouped_subquery.c.total_benes,
         },
     )
-    return ordered_query.order_by(
-        grouped_subquery.c.rx_code_system.asc(),
-        grouped_subquery.c.rx_code.asc(),
-    ).limit(pagination.limit).offset(pagination.offset)
+    return (
+        ordered_query.order_by(
+            grouped_subquery.c.rx_code_system.asc(),
+            grouped_subquery.c.rx_code.asc(),
+        )
+        .limit(pagination.limit)
+        .offset(pagination.offset)
+    )
 
 
 async def _load_prescription_autocomplete_page(
@@ -11833,39 +11173,35 @@ async def _load_prescription_autocomplete_page(
         q_like=q_like,
         terminology_internal_codes=terminology_internal_codes,
     )
-    query_result = await session.execute(
+    query_result = await execute_network_read(
+        session,
         _prescription_autocomplete_page_query(
             grouped_subquery,
             q_prefix=f"{search_query}%",
             order_by=order_by,
             order=order,
             pagination=pagination,
-        )
+        ),
     )
-    prescription_rows = [
-        _row_to_dict(prescription_row) for prescription_row in query_result
-    ]
+    prescription_rows = [_row_to_dict(prescription_row) for prescription_row in query_result]
     if prescription_rows:
-        return prescription_rows, int(
-            prescription_rows[0].get("_pagination_total") or 0
-        )
+        return prescription_rows, int(prescription_rows[0].get("_pagination_total") or 0)
     if pagination.offset:
-        count_result = await session.execute(
-            select(func.count()).select_from(grouped_subquery)
-        )
+        count_result = await execute_network_read(session, select(func.count()).select_from(grouped_subquery))
         return prescription_rows, int(count_result.scalar() or 0)
     return prescription_rows, 0
 
 
 async def _is_prescription_autocomplete_rollup_current(session) -> bool:
-    result = await session.execute(
+    result = await execute_network_read(
+        session,
         select(literal(1))
         .select_from(provider_prescription_autocomplete_table)
         .where(
             provider_prescription_autocomplete_table.c.source_relation_fingerprint
             == literal_column(_PRESCRIPTION_AUTOCOMPLETE_FINGERPRINT_SQL)
         )
-        .limit(1)
+        .limit(1),
     )
     return result.scalar() == 1
 
@@ -11917,11 +11253,7 @@ async def autocomplete_prescriptions(request):
         session,
         provider_prescription_autocomplete_table.name,
     )
-    source_table = (
-        provider_prescription_autocomplete_table
-        if rollup_available
-        else provider_prescription_table
-    )
+    source_table = provider_prescription_autocomplete_table if rollup_available else provider_prescription_table
     prescription_rows, total = await _load_prescription_autocomplete_page(
         session,
         source_table,
@@ -11966,29 +11298,17 @@ async def autocomplete_prescriptions(request):
         prescription_item_by_field["generic_name"] = generic_name or None
         prescription_item_by_field["brand_name"] = brand_name or None
         prescription_item_by_field["prescription_name"] = (
-            str(
-                prescription_item_by_field.get("rx_name")
-                or generic_name
-                or brand_name
-                or ""
-            ).strip()
-            or None
+            str(prescription_item_by_field.get("rx_name") or generic_name or brand_name or "").strip() or None
         )
         prescription_item_by_field["display_label"] = (
-            f"{generic_name} / {brand_name}" if generic_name and brand_name and generic_name != brand_name else (generic_name or brand_name or None)
+            f"{generic_name} / {brand_name}"
+            if generic_name and brand_name and generic_name != brand_name
+            else (generic_name or brand_name or None)
         )
-        prescription_item_by_field["prescription_code_system"] = (
-            prescription_item_by_field.get("rx_code_system")
-        )
-        prescription_item_by_field["prescription_code"] = prescription_item_by_field.get(
-            "rx_code"
-        )
-        prescription_item_by_field["total_prescriptions"] = (
-            prescription_item_by_field.get("total_claims")
-        )
-        prescription_item_by_field["total_allowed_amount"] = (
-            prescription_item_by_field.get("total_drug_cost")
-        )
+        prescription_item_by_field["prescription_code_system"] = prescription_item_by_field.get("rx_code_system")
+        prescription_item_by_field["prescription_code"] = prescription_item_by_field.get("rx_code")
+        prescription_item_by_field["total_prescriptions"] = prescription_item_by_field.get("total_claims")
+        prescription_item_by_field["total_allowed_amount"] = prescription_item_by_field.get("total_drug_cost")
         prescription_items.append(prescription_item_by_field)
 
     if prescription_items:
@@ -12000,6 +11320,8 @@ async def autocomplete_prescriptions(request):
                     for prescription_item_by_field in prescription_items
                 ],
             )
+        except sanic.exceptions.ServiceUnavailable:
+            raise
         except Exception:  # pragma: no cover - defensive fallback for missing/migrating crosswalk table
             external_codes_by_internal = {}
         _apply_prescription_code_preferences(
@@ -12027,7 +11349,9 @@ async def autocomplete_prescriptions(request):
                     "input": search_query,
                     "matches": terminology_matches,
                     "internal_codes": terminology_internal_codes,
-                } if terminology_matches else None,
+                }
+                if terminology_matches
+                else None,
             },
         }
     )
@@ -12066,13 +11390,9 @@ def _candidate_audit_batch_raw_limit() -> int:
             )
         )
     except ValueError as exc:
-        raise PTG2SharedBlockError(
-            "candidate audit batch raw-byte limit is invalid"
-        ) from exc
+        raise PTG2SharedBlockError("candidate audit batch raw-byte limit is invalid") from exc
     if configured_limit < 1:
-        raise PTG2SharedBlockError(
-            "candidate audit batch raw-byte limit must be positive"
-        )
+        raise PTG2SharedBlockError("candidate audit batch raw-byte limit must be positive")
     return min(configured_limit, 2 * 1024 * 1024 * 1024)
 
 
@@ -12087,9 +11407,7 @@ def _candidate_audit_process_limit() -> int:
         configured_limit = int(raw_limit)
         CandidateAuditProcessAdmission(configured_limit)
     except (TypeError, ValueError) as exc:
-        raise CandidateAuditProcessConfigurationError(
-            "candidate audit process-byte limit is invalid"
-        ) from exc
+        raise CandidateAuditProcessConfigurationError("candidate audit process-byte limit is invalid") from exc
     return configured_limit
 
 
@@ -12103,18 +11421,13 @@ def _candidate_audit_process_admission_for_limit(
 
 
 def _candidate_audit_process_admission() -> CandidateAuditProcessAdmission:
-    return _candidate_audit_process_admission_for_limit(
-        _candidate_audit_process_limit()
-    )
+    return _candidate_audit_process_admission_for_limit(_candidate_audit_process_limit())
 
 
 def _candidate_audit_partition_weight(raw_limit: int) -> int:
     """Reserve both independent raw and decoded request allowances."""
 
-    return (
-        raw_limit
-        + PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES
-    )
+    return raw_limit + PTG2_CANDIDATE_AUDIT_PARTITION_MAX_RETAINED_DECODED_BYTES
 
 
 def _read_once_block_io_map(read_once_scope) -> dict[str, int]:
@@ -12151,16 +11464,9 @@ def _validate_candidate_audit_batch_counts(batch_result, audit_request) -> None:
     """Require complete witness and persisted-coordinate validation counts."""
 
     if batch_result.matched_challenge_count != audit_request.challenge_count:
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate audit returned an incomplete match count"
-        )
-    if (
-        batch_result.validated_persisted_audit_occurrence_count
-        != batch_result.persisted_audit_occurrence_count
-    ):
-        raise PTG2ManifestArtifactError(
-            "PTG2 candidate audit returned an incomplete persisted occurrence count"
-        )
+        raise PTG2ManifestArtifactError("PTG2 candidate audit returned an incomplete match count")
+    if batch_result.validated_persisted_audit_occurrence_count != batch_result.persisted_audit_occurrence_count:
+        raise PTG2ManifestArtifactError("PTG2 candidate audit returned an incomplete persisted occurrence count")
 
 
 def _candidate_audit_batch_response_map(
@@ -12177,12 +11483,8 @@ def _candidate_audit_batch_response_map(
         "challenge_count": audit_request.challenge_count,
         "unique_challenge_count": batch_result.unique_challenge_count,
         "matched_challenge_count": batch_result.matched_challenge_count,
-        "persisted_audit_occurrence_count": (
-            batch_result.persisted_audit_occurrence_count
-        ),
-        "validated_persisted_audit_occurrence_count": (
-            batch_result.validated_persisted_audit_occurrence_count
-        ),
+        "persisted_audit_occurrence_count": (batch_result.persisted_audit_occurrence_count),
+        "validated_persisted_audit_occurrence_count": (batch_result.validated_persisted_audit_occurrence_count),
         "matched_challenge_digest": matched_audit_batch_digest(
             audit_request.request_digest,
             batch_result.matched_challenge_count,
@@ -12234,9 +11536,7 @@ async def _partitioned_candidate_audit_response(
     partition_result = build_partitioned_candidate_audit_result(
         request=audit_request,
         matched_source_occurrence_count=(batch_result.matched_challenge_count),
-        validated_persisted_occurrence_count=(
-            batch_result.validated_persisted_audit_occurrence_count
-        ),
+        validated_persisted_occurrence_count=(batch_result.validated_persisted_audit_occurrence_count),
         duration_ms=round((time.perf_counter() - started_at) * 1_000, 3),
         block_io=block_io_map,
         candidate_processing_io=batch_result.candidate_processing_io,
@@ -12252,14 +11552,13 @@ async def audit_ptg2_source_witness_batch(request):
     """Verify one legacy witness or one explicit bounded partition."""
 
     request_body_bytes = len(request.body or b"")
-    if request_body_bytes > 2 * 1024 * 1024:
+    if request_body_bytes > PTG2_PARTITIONED_CANDIDATE_AUDIT_MAX_REQUEST_BYTES:
         raise InvalidUsage("candidate audit batch request is too large")
     _require_candidate_audit_batch_auth(request)
     raw_request = request.json
     is_partitioned = (
         isinstance(raw_request, Mapping)
-        and raw_request.get("contract")
-        == PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT
+        and raw_request.get("contract") == PTG2_PARTITIONED_CANDIDATE_AUDIT_REQUEST_CONTRACT
     )
     if not is_partitioned and request_body_bytes > 64 * 1024:
         raise InvalidUsage("candidate audit batch request is too large")
@@ -12306,28 +11605,6 @@ async def audit_ptg2_source_witness_batch(request):
 # After the route was renamed to /by-procedure, that path fell through to
 # /providers/<npi> -> "Parameter 'npi' must be an integer", 500-ing every
 # plan-scoped pricing search. Keep the old path pointed at this handler.
-def _reject_resolver_only_procedure_search_params(args) -> None:
-    """Direct callers must resolve clinical intent before pricing search."""
-
-    resolver_only_param = next(
-        (
-            param_name
-            for param_name in ("clinical_intent", "intent")
-            if args.get(param_name) is not None
-        ),
-        None,
-    )
-    if resolver_only_param is None:
-        return
-    raise InvalidUsage(
-        f"Parameter '{resolver_only_param}' is resolver-only. Call "
-        "/pricing/procedure-taxonomy/resolve first. When "
-        "recommended_mode=hard_filter, copy provider_filter.taxonomy_codes, "
-        "provider_filter.primary_only, and "
-        "provider_filter.include_subspecialties into the pricing search."
-    )
-
-
 @blueprint.get("/providers/search-by-procedure", name="pricing.providers.search_by_procedure")
 @blueprint.get(
     "/providers/audit-search-by-procedure",
@@ -12336,24 +11613,30 @@ def _reject_resolver_only_procedure_search_params(args) -> None:
 @blueprint.get("/providers/by-procedure", name="pricing.providers.by_procedure")
 @blueprint.get("/providers/by-service", name="pricing.providers.by_service")
 @blueprint.get("/physicians/by-service", name="pricing.physicians.by_service")
-async def list_providers_by_procedure(request):
+@canonical_network_read
+async def list_providers_by_procedure(request, *, native_args=None, import_context=None):
     """List providers with pricing records matching a procedure or service code."""
-    if "billing_entity_ref" in request.args:
+    args = request.args
+    args = provider_service_native_args(args, native_args, import_context)
+    canonical_network_clause = _canonical_network_procedure_clause(
+        args,
+        import_context,
+        provider_procedure_table.c.npi,
+        query_string=getattr(request, "query_string", None),
+        managed_native=native_args is not None,
+    )
+    if "billing_entity_ref" in args:
+        if import_context is not None:
+            raise InvalidUsage("custom-import provider-service queries cannot use billing search")
         return await serve_billing_search_get(request, _get_session(request))
-    _reject_resolver_only_procedure_search_params(request.args)
+    _reject_resolver_only_procedure_search_params(args)
     begin_capacity_evidence(request)
     session = _get_session(request)
-    args = request.args
     is_state_scan = is_plan_pricing_state_scan(args)
-    if (
-        is_state_scan
-        and getattr(request, "path", BILLING_SEARCH_TRANSPORT_PATH)
-        != BILLING_SEARCH_TRANSPORT_PATH
-    ):
-        raise InvalidUsage(
-            "Release-bound state scans require the canonical "
-            "/api/v1/pricing/providers/search-by-procedure path"
-        )
+    if import_context is not None and is_state_scan:
+        raise InvalidUsage("custom-import provider-service queries require the claims lane")
+    if is_state_scan:
+        validate_state_scan_transport(request, native_args)
 
     # Keep pagination explicit so OpenAPI contract tests see both parameters.
     args.get("limit")
@@ -12395,6 +11678,12 @@ async def list_providers_by_procedure(request):
     code = str(args.get("code", "")).strip()
     order = _normalize_order(_request_value_or_none(args.get("order")))
     order_by = str(args.get("order_by") or "total_allowed_amount")
+    if (
+        import_context is not None
+        and import_context.prepared.normalized_order_terms
+        and any(_request_value_or_none(args.get(name)) is not None for name in ("order", "order_by"))
+    ):
+        raise InvalidUsage("custom-import ordering cannot be combined with native ordering")
     ptg_code_system = args.get("code_system") or (_reported_procedure_code_system(code) if code else None)
     include_legacy_fields = _parse_bool(args.get("include_legacy_fields"), "include_legacy_fields", default=False)
     include_sources = _parse_bool(args.get("include_sources"), "include_sources", default=False)
@@ -12423,32 +11712,39 @@ async def list_providers_by_procedure(request):
     snapshot_id = str(args.get("snapshot_id", "")).strip()
     args.get("plan_release_id")
     plan_release_id = _validated_plan_release_id(args)
+    if import_context is not None and (plan_id or plan_external_id or source_key or snapshot_id):
+        raise InvalidUsage("custom-import provider-service queries require the claims lane")
     if view == "card" and not plan_release_id:
         raise InvalidUsage("Parameter 'view=card' requires plan_release_id")
-    projected_result_type = (
-        projection_result_type(args) if plan_release_id else None
-    )
+    projected_result_type = projection_result_type(args) if plan_release_id else None
     if projected_result_type is not None:
-        if (
-            args.get("include_allowed_amounts") not in (None, "", "null")
-            and include_allowed_amounts
-        ):
-            raise InvalidUsage(
-                "Card and aggregate projections do not support "
-                "include_allowed_amounts=true"
-            )
+        if args.get("include_allowed_amounts") not in (None, "", "null") and include_allowed_amounts:
+            raise InvalidUsage("Card and aggregate projections do not support include_allowed_amounts=true")
         include_allowed_amounts = False
     mode = str(args.get("mode", "")).strip()
     npi = _parse_int(args.get("npi") or None, "npi", minimum=1)
-    provider_sex_code = normalize_provider_sex_code(
-        args.get("provider_sex_code")
-    )
+    provider_sex_code = normalize_provider_sex_code(args.get("provider_sex_code"))
     args.get("provider_type")
     args.get("classification")
     args.get("taxonomy_codes")
 
     if not query_text and not code:
         raise InvalidUsage("Provide at least one of 'q' or 'code'")
+    if (
+        plan_release_id
+        and native_args is None
+        and import_context is None
+        and not is_state_scan
+        and projected_result_type is None
+        and _parse_bool(args.get("include_providers"), "include_providers", default=True)
+        and getattr(request.ctx, "_sa_reader_scope", None) is not None
+        and is_owned_reader(session)
+    ):
+        # The HTTP Reader owns this transaction through response encoding.
+        await execute_network_read(
+            session,
+            text("SELECT set_config('jit', 'off', true), set_config('plan_cache_mode', 'force_custom_plan', true)"),
+        )
     ptg_specialty_filter = None
     if plan_id or plan_external_id or source_key or snapshot_id or plan_release_id:
         # Plan-scoped searches filter via taxonomy codes; an unresolvable
@@ -12499,15 +11795,9 @@ async def list_providers_by_procedure(request):
                 {
                     "status": 422,
                     "code": "ptg2_online_work_budget_exceeded",
-                    "message": (
-                        "This NPI page exceeds the fixed complete-rate-group "
-                        "budget."
-                    ),
+                    "message": ("This NPI page exceeds the fixed complete-rate-group budget."),
                     "fix_it": {
-                        "reason": (
-                            "No verified interactive retry shape is available "
-                            "for this page."
-                        ),
+                        "reason": ("No verified interactive retry shape is available for this page."),
                         "retry_options": [],
                     },
                 },
@@ -12516,72 +11806,71 @@ async def list_providers_by_procedure(request):
         except PlanPricingProjectionUnavailable as exc:
             if args.get("cursor") not in (None, "", "null"):
                 return _state_scan_generation_expired_response(request)
-            return _state_scan_projection_unavailable_response(
-                request, str(exc)
-            )
+            return _state_scan_projection_unavailable_response(request, str(exc))
         except (BillingSearchCursorKeyringError, PTG2ManifestArtifactError) as exc:
             logger.warning(
                 "plan pricing state scan could not serve an exact page",
-                extra={
-                    "plan_pricing_state_scan_failure_class": type(exc).__name__
-                },
+                extra={"plan_pricing_state_scan_failure_class": type(exc).__name__},
             )
             return _state_scan_projection_unavailable_response(
                 request,
                 "The selected release is not ready for exact state-scan serving.",
             )
         return _ptg_json_response(request, state_scan_payload)
-    if plan_release_id and _is_broad_office_visit_cpt(
-        ptg_code_system,
-        code,
-    ):
-        if (
-            _em_distance_request_code_index(args) is not None
-            and em_distance_retry_option(args, pagination) is not None
-        ):
+    if plan_release_id and npi is None and _is_broad_office_visit_cpt(ptg_code_system, code):
+        if _em_distance_request_code_index(args) is not None and em_distance_retry_option(args, pagination) is not None:
             release_selection = await resolve_plan_release_serving(
                 session,
                 plan_release_id,
                 projection_only=True,
             )
             guard_release_selection = release_selection
-            release_selection_args_by_name = _release_selection_args_by_name(
-                release_selection
+            release_selection_args_by_name = _release_selection_args_by_name(release_selection)
+        elif (
+            native_args is not None
+            or import_context is not None
+            or view != "full"
+            or projected_result_type is not None
+            or not _is_bounded_provider_expansion(
+                args,
+                zip5=zip5,
+                latitude=latitude,
+                longitude=longitude,
+                has_taxonomy_scope=bool(
+                    ptg_specialty_filter.is_active or args.get("taxonomy_code") or args.get("taxonomy_classification")
+                ),
             )
-        else:
+        ):
             guard_release_selection = await resolve_plan_release_guard_selection(
                 session,
                 plan_release_id,
             )
-        broad_expansion_market_type = _release_market_type_for_guard(
-            guard_release_selection
-        )
+        broad_expansion_market_type = _release_market_type_for_guard(guard_release_selection)
     office_visit_retry_by_field = (
-        em_distance_retry_option(args, pagination)
-        if guard_release_selection is not None
-        else None
+        em_distance_retry_option(args, pagination) if guard_release_selection is not None else None
     )
     _parse_bool(args.get("include_providers"), "include_providers", default=True)
     is_broad_office_visit_refused = False
     try:
-        _reject_broad_group_plan_provider_expansion(
-            args,
-            {
-                "code": code,
-                "code_system": ptg_code_system,
-                "plan_id": plan_id,
-                "plan_external_id": plan_external_id or plan_release_id,
-                "plan_market_type": broad_expansion_market_type,
-                "state": state,
-                "city": city,
-                "zip5": zip5,
-                "latitude": latitude,
-                "longitude": longitude,
-                "npi": npi,
-                "provider_sex_code": provider_sex_code,
-            },
-            specialty_filter=ptg_specialty_filter,
-        )
+        if import_context is None:
+            _reject_broad_group_plan_provider_expansion(
+                args,
+                {
+                    "code": code,
+                    "code_system": ptg_code_system,
+                    "plan_id": plan_id,
+                    "plan_external_id": plan_external_id or plan_release_id,
+                    "plan_market_type": broad_expansion_market_type,
+                    "state": state,
+                    "city": city,
+                    "zip5": zip5,
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "npi": npi,
+                    "provider_sex_code": provider_sex_code,
+                },
+                specialty_filter=ptg_specialty_filter,
+            )
     except InvalidUsage:
         if guard_release_selection is None or office_visit_retry_by_field is None:
             raise
@@ -12596,22 +11885,14 @@ async def list_providers_by_procedure(request):
             {
                 "status": 422,
                 "code": "ptg2_provider_scope_refused",
-                "message": (
-                    "This cost-ordered geographic procedure search exceeds "
-                    "the interactive scope limit."
-                ),
+                "message": ("This cost-ordered geographic procedure search exceeds the interactive scope limit."),
                 "fix_it": {
                     "reason": (
                         "Use the bounded ascending-distance provider lane."
                         if is_projection_ready
-                        else "No verified interactive retry shape is available "
-                        "for this release."
+                        else "No verified interactive retry shape is available for this release."
                     ),
-                    "retry_options": (
-                        [office_visit_retry_by_field]
-                        if is_projection_ready
-                        else []
-                    ),
+                    "retry_options": ([office_visit_retry_by_field] if is_projection_ready else []),
                 },
             },
             status=422,
@@ -12622,9 +11903,7 @@ async def list_providers_by_procedure(request):
             plan_release_id,
             projection_only=projected_result_type is not None,
         )
-        release_selection_args_by_name = _release_selection_args_by_name(
-            release_selection
-        )
+        release_selection_args_by_name = _release_selection_args_by_name(release_selection)
     if plan_id or plan_external_id or source_key or snapshot_id or plan_release_id:
         ptg_order_by = order_by
         if (
@@ -12632,9 +11911,7 @@ async def list_providers_by_procedure(request):
             and ptg_code_system == "HCPCS"
             and code[:1].isalpha()
             and (zip5 or (latitude is not None and longitude is not None))
-            and _parse_bool(
-                args.get("include_providers"), "include_providers", default=True
-            )
+            and _parse_bool(args.get("include_providers"), "include_providers", default=True)
         ):
             ptg_order_by = "distance"
         ptg_latitude = latitude
@@ -12653,64 +11930,63 @@ async def list_providers_by_procedure(request):
         if _request_value_or_none(args.get("order")) is None:
             ptg_order = "asc"
         ptg_args_by_name = {
-                "plan_id": plan_id or None,
-                "plan_external_id": plan_external_id or None,
-                "plan_release_id": plan_release_id or None,
-                "plan_id_type": plan_id_type or None,
-                "plan_market_type": plan_market_type or None,
-                "source_key": source_key or None,
-                "snapshot_id": snapshot_id or None,
-                "mode": mode or None,
-                "code": code or None,
-                "code_system": ptg_code_system or None,
-                "q": query_text or None,
-                "specialty": specialty or None,
-                "provider_type": args.get("provider_type") or None,
-                "classification": args.get("classification") or None,
-                "taxonomy_codes": (
-                    args.get("taxonomy_codes")
-                    or args.get("taxonomy_code")
-                    or specialty_probe.taxonomy_codes
-                    or None
-                ),
-                "provider_sex_code": provider_sex_code,
-                "include_subspecialties": args.get("include_subspecialties") or None,
-                "primary_only": args.get("primary_only") or None,
-                "taxonomy_code": args.get("taxonomy_code") or None,
-                "taxonomy_classification": args.get("taxonomy_classification") or None,
-                "taxonomy_specialization": args.get("taxonomy_specialization") or None,
-                "taxonomy_section": args.get("taxonomy_section") or None,
-                "order_by": ptg_order_by or None,
-                "order": ptg_order or None,
-                "state": state or None,
-                "city": city or None,
-                "zip5": zip5 or None,
-                "zip_radius_miles": zip_radius_miles if zip5 else None,
-                "lat": ptg_latitude,
-                "long": ptg_longitude,
-                "radius_miles": ptg_radius_miles,
-                "pos": args.get("pos") or args.get("place_of_service") or None,
-                "service_code": args.get("service_code") or None,
-                "modifier": args.get("modifier") or args.get("modifiers") or None,
-                "billing_code_modifier": args.get("billing_code_modifier") or None,
-                "rate": args.get("rate") or None,
-                "negotiated_rate": args.get("negotiated_rate") or None,
-                "rate_tolerance": args.get("rate_tolerance") or None,
-                "negotiated_rate_tolerance": args.get("negotiated_rate_tolerance") or None,
-                "include_providers": args.get("include_providers") or None,
-                "include_code_details": args.get("include_code_details") or None,
-                "include_sources": args.get("include_sources") or None,
-                "include_evidence": args.get("include_evidence") or None,
-                "include_unverified_addresses": args.get("include_unverified_addresses") or None,
-                "include_details": args.get("include_details") or None,
-                "include_debug": args.get("include_debug") or None,
-                "view": raw_view,
-                "npi": npi,
-            }
+            "plan_id": plan_id or None,
+            "plan_external_id": plan_external_id or None,
+            "plan_release_id": plan_release_id or None,
+            "plan_id_type": plan_id_type or None,
+            "plan_market_type": plan_market_type or None,
+            "source_key": source_key or None,
+            "snapshot_id": snapshot_id or None,
+            "mode": mode or None,
+            "code": code or None,
+            "code_system": ptg_code_system or None,
+            "q": query_text or None,
+            "specialty": specialty or None,
+            "provider_type": args.get("provider_type") or None,
+            "classification": args.get("classification") or None,
+            "taxonomy_codes": (
+                args.get("taxonomy_codes") or args.get("taxonomy_code") or specialty_probe.taxonomy_codes or None
+            ),
+            "provider_sex_code": provider_sex_code,
+            "include_subspecialties": args.get("include_subspecialties") or None,
+            "primary_only": args.get("primary_only") or None,
+            "taxonomy_code": args.get("taxonomy_code") or None,
+            "taxonomy_classification": args.get("taxonomy_classification") or None,
+            "taxonomy_specialization": args.get("taxonomy_specialization") or None,
+            "taxonomy_section": args.get("taxonomy_section") or None,
+            "order_by": ptg_order_by or None,
+            "order": ptg_order or None,
+            "state": state or None,
+            "city": city or None,
+            "zip5": zip5 or None,
+            "zip_radius_miles": zip_radius_miles if zip5 else None,
+            "lat": ptg_latitude,
+            "long": ptg_longitude,
+            "radius_miles": ptg_radius_miles,
+            "pos": args.get("pos") or args.get("place_of_service") or None,
+            "service_code": args.get("service_code") or None,
+            "modifier": args.get("modifier") or args.get("modifiers") or None,
+            "billing_code_modifier": args.get("billing_code_modifier") or None,
+            "rate": args.get("rate") or None,
+            "negotiated_rate": args.get("negotiated_rate") or None,
+            "rate_tolerance": args.get("rate_tolerance") or None,
+            "negotiated_rate_tolerance": args.get("negotiated_rate_tolerance") or None,
+            "include_providers": args.get("include_providers") or None,
+            "include_code_details": args.get("include_code_details") or None,
+            "include_sources": args.get("include_sources") or None,
+            "include_evidence": args.get("include_evidence") or None,
+            "include_unverified_addresses": args.get("include_unverified_addresses") or None,
+            "include_details": args.get("include_details") or None,
+            "include_debug": args.get("include_debug") or None,
+            "view": raw_view,
+            "npi": npi,
+        }
         route_name = str(getattr(getattr(request, "route", None), "name", ""))
         if route_name.endswith("pricing.providers.audit_search_by_procedure"):
             attach_candidate_audit_access(request, ptg_args_by_name)
         try:
+            if import_context is not None:
+                release_selection_args_by_name["import_context"] = import_context
             ptg2_payload = await search_current_ptg2_index(
                 session,
                 ptg_args_by_name,
@@ -12724,27 +12000,17 @@ async def list_providers_by_procedure(request):
                 status=400,
             )
         except PTG2ProviderFilterScopeError as exc:
-            allows_distance_retry = bool(
-                isinstance(exc, PTG2LocationScopeError)
-                and exc.allows_distance_retry
-            )
-            is_release_bound_office_visit = (
-                release_selection is not None
-                and _is_broad_office_visit_cpt(
-                    ptg_args_by_name.get("code_system"),
-                    str(ptg_args_by_name.get("code") or ""),
-                )
+            allows_distance_retry = bool(isinstance(exc, PTG2LocationScopeError) and exc.allows_distance_retry)
+            is_release_bound_office_visit = release_selection is not None and _is_broad_office_visit_cpt(
+                ptg_args_by_name.get("code_system"),
+                str(ptg_args_by_name.get("code") or ""),
             )
             if is_release_bound_office_visit:
                 assert release_selection is not None
-                retry_option_by_field = em_distance_retry_option(
-                    ptg_args_by_name, pagination
-                )
+                retry_option_by_field = em_distance_retry_option(ptg_args_by_name, pagination)
                 is_retry_ready = bool(
                     retry_option_by_field is not None
-                    and await is_em_distance_projection_ready(
-                        session, release_selection
-                    )
+                    and await is_em_distance_projection_ready(session, release_selection)
                 )
             else:
                 retry_option_by_field = None
@@ -12755,24 +12021,17 @@ async def list_providers_by_procedure(request):
                     "status": 422,
                     "code": exc.error_code,
                     "message": (
-                        "This cost-ordered geographic procedure search exceeds "
-                        "the interactive scope limit."
+                        "This cost-ordered geographic procedure search exceeds the interactive scope limit."
                         if isinstance(exc, PTG2LocationScopeError)
-                        else "This provider-filtered procedure search exceeds "
-                        "the supported interactive scope."
+                        else "This provider-filtered procedure search exceeds the supported interactive scope."
                     ),
                     "fix_it": {
                         "reason": (
                             "Use the bounded ascending-distance provider lane."
                             if allows_distance_retry and is_retry_ready
-                            else "No verified interactive retry shape is available "
-                            "for this request."
+                            else "No verified interactive retry shape is available for this request."
                         ),
-                        "retry_options": (
-                            [retry_option_by_field]
-                            if allows_distance_retry and is_retry_ready
-                            else []
-                        ),
+                        "retry_options": ([retry_option_by_field] if allows_distance_retry and is_retry_ready else []),
                     },
                 },
                 status=422,
@@ -12800,10 +12059,7 @@ async def list_providers_by_procedure(request):
                 {
                     "error": {
                         "code": exc.error_code,
-                        "message": (
-                            "The exact query exceeds this snapshot's sealed "
-                            "online work budget."
-                        ),
+                        "message": ("The exact query exceeds this snapshot's sealed online work budget."),
                         "dimension": exc.dimension,
                     }
                 },
@@ -12816,26 +12072,19 @@ async def list_providers_by_procedure(request):
         ):
             include_allowed_amounts = legacy_include_allowed_amounts
         if ptg2_payload is None:
-            if include_allowed_amounts:
-                allowed_amount_payload = (
-                    await _search_ptg_allowed_amount_evidence(
-                        session,
-                        ptg_args_by_name,
-                        pagination,
-                        **release_selection_args_by_name,
-                    )
+            if include_allowed_amounts and import_context is None:
+                allowed_amount_payload = await _search_ptg_allowed_amount_evidence(
+                    session,
+                    ptg_args_by_name,
+                    pagination,
+                    **release_selection_args_by_name,
                 )
                 if allowed_amount_payload is not None:
                     _annotate_ptg2_query_payload(
                         allowed_amount_payload,
                         plan_id_type=plan_id_type,
                         year=year,
-                        has_plan_scope=bool(
-                            plan_id
-                            or plan_external_id
-                            or snapshot_id
-                            or plan_release_id
-                        ),
+                        has_plan_scope=bool(plan_id or plan_external_id or snapshot_id or plan_release_id),
                     )
                     return _ptg_json_response(
                         request,
@@ -12901,10 +12150,7 @@ async def list_providers_by_procedure(request):
                     "query": query_by_field,
                 },
             )
-        if (
-            include_allowed_amounts
-            and _has_no_ptg2_priced_items(ptg2_payload)
-        ):
+        if include_allowed_amounts and import_context is None and _has_no_ptg2_priced_items(ptg2_payload):
             allowed_amount_payload = await _search_ptg_allowed_amount_evidence(
                 session,
                 ptg_args_by_name,
@@ -12916,12 +12162,7 @@ async def list_providers_by_procedure(request):
                     allowed_amount_payload,
                     plan_id_type=plan_id_type,
                     year=year,
-                    has_plan_scope=bool(
-                        plan_id
-                        or plan_external_id
-                        or snapshot_id
-                        or plan_release_id
-                    ),
+                    has_plan_scope=bool(plan_id or plan_external_id or snapshot_id or plan_release_id),
                 )
                 return _ptg_json_response(
                     request,
@@ -12931,15 +12172,11 @@ async def list_providers_by_procedure(request):
             ptg2_payload,
             plan_id_type=plan_id_type,
             year=year,
-            has_plan_scope=bool(
-                plan_id or plan_external_id or snapshot_id or plan_release_id
-            ),
+            has_plan_scope=bool(plan_id or plan_external_id or snapshot_id or plan_release_id),
         )
         _annotate_ptg2_result_state(
             ptg2_payload,
-            has_plan_scope=bool(
-                plan_id or plan_external_id or snapshot_id or plan_release_id
-            ),
+            has_plan_scope=bool(plan_id or plan_external_id or snapshot_id or plan_release_id),
             has_location_filter=_has_ptg2_location_filter(args),
         )
         return _ptg_json_response(request, ptg2_payload)
@@ -12948,12 +12185,25 @@ async def list_providers_by_procedure(request):
             raise InvalidUsage("Parameter 'order_by=cost_index' requires 'code'")
         if not (zip5 or (state and city)):
             raise InvalidUsage("Parameter 'order_by=cost_index' requires either 'zip5' or both 'state' and 'city'")
-
     year, year_source = await _resolve_year(session, provider_procedure_table, year)
     code_context = None
     zip_distance_map: dict[str, dict[str, Any]] = {}
     zip_filter_values: list[str] = []
-    if zip5 and zip_radius_miles > 0:
+    canonical_location_filter = None
+    if canonical_network_clause is not None:
+        anchor = await _canonical_procedure_zip_anchor(session, zip5) if zip5 and zip_radius_miles > 0 else None
+        canonical_location_filter = _canonical_procedure_location_filter(
+            state=state,
+            city=city,
+            zip5=zip5,
+            zip_radius=zip_radius_miles,
+            coordinates=(latitude, longitude, coordinate_radius_miles),
+            zip_anchor=anchor,
+        )
+        canonical_network_clause = _canonical_network_procedure_clause(
+            args, import_context, provider_procedure_table.c.npi, location_filter=canonical_location_filter
+        )
+    if canonical_network_clause is None and zip5 and zip_radius_miles > 0:
         zip_rows = await _zip_radius_rows(
             session,
             zip5=zip5,
@@ -12962,7 +12212,10 @@ async def list_providers_by_procedure(request):
         )
         for provider_record in sorted(
             zip_rows,
-            key=lambda provider_item_by_field: (_as_float(provider_item_by_field.get("distance_miles")) or 0.0, str(provider_item_by_field.get("zip5") or "")),
+            key=lambda provider_item_by_field: (
+                _as_float(provider_item_by_field.get("distance_miles")) or 0.0,
+                str(provider_item_by_field.get("zip5") or ""),
+            ),
         ):
             candidate_zip = _normalize_zip5(provider_record.get("zip5"))
             if candidate_zip is None:
@@ -12984,14 +12237,24 @@ async def list_providers_by_procedure(request):
         provider_table.c.year == year,
         provider_table.c.npi == provider_procedure_table.c.npi,
     ]
-    if state:
+    if canonical_network_clause is not None:
+        filters.append(canonical_network_clause)
+    if npi is not None:
+        filters.append(provider_procedure_table.c.npi == npi)
+    if canonical_network_clause is None and state:
         filters.append(func.upper(provider_table.c.state) == state)
-    if city and not (zip5 and zip_radius_miles > 0):
+    if canonical_network_clause is None and city and not (zip5 and zip_radius_miles > 0):
         filters.append(func.lower(provider_table.c.city).like(f"%{city}%"))
-    if zip_filter_values:
-        filters.append(provider_table.c.zip5.in_(zip_filter_values))
-    elif zip5:
-        filters.append(provider_table.c.zip5 == zip5)
+    zip_filter = provider_service_zip_filter(
+        provider_table.c.zip5,
+        geo_zip_table,
+        zip5,
+        zip_filter_values,
+        (latitude, longitude, coordinate_radius_miles),
+        _distance_miles_expression,
+    )
+    if canonical_network_clause is None and zip_filter is not None:
+        filters.append(zip_filter)
     provider_type_clause, provider_type_resolution = await _provider_type_filter_clause(
         session,
         args,
@@ -13036,10 +12299,11 @@ async def list_providers_by_procedure(request):
             args,
         )
         filters.append(provider_procedure_table.c.procedure_code.in_(internal_codes))
-    if min_claims is not None:
-        filters.append(provider_procedure_table.c.total_services >= min_claims)
-    if min_total_cost is not None:
-        filters.append(provider_procedure_table.c.total_allowed_amount >= min_total_cost)
+    if import_context is None:
+        if min_claims is not None:
+            filters.append(provider_procedure_table.c.total_services >= min_claims)
+        if min_total_cost is not None:
+            filters.append(provider_procedure_table.c.total_allowed_amount >= min_total_cost)
     provider_procedure_from = provider_procedure_table.join(
         provider_table,
         provider_table.c.npi == provider_procedure_table.c.npi,
@@ -13049,18 +12313,20 @@ async def list_providers_by_procedure(request):
             npi_data_table,
             npi_data_table.c.npi == provider_procedure_table.c.npi,
         )
-        filters.append(
-            npi_data_table.c.provider_sex_code == provider_sex_code
-        )
+        filters.append(npi_data_table.c.provider_sex_code == provider_sex_code)
     where_clause = and_(*filters)
 
     total = None
     if (
-        len(internal_codes) == 1
+        import_context is None
+        and canonical_network_clause is None
+        and len(internal_codes) == 1
         and not query_text
         and not state
         and not city
         and not zip5
+        and npi is None
+        and latitude is None
         and provider_type_clause is None
         and provider_sex_code is None
         and min_claims is None
@@ -13106,41 +12372,18 @@ async def list_providers_by_procedure(request):
                 provider_table.c.zip5,
             )
         )
-        grouped_subquery = grouped.subquery()
-        count_result = await session.execute(select(func.count()).select_from(grouped_subquery))
-        total = int(count_result.scalar() or 0)
-
-        cost_index_expr = case(
-            (
-                grouped_subquery.c.total_services > 0,
-                cast(grouped_subquery.c.total_allowed_amount, Float) / grouped_subquery.c.total_services,
-            ),
-            else_=None,
-        ).label("cost_index")
-
-        if order_by == "cost_index":
-            query = select(grouped_subquery, cost_index_expr)
-        else:
-            query = select(grouped_subquery)
-        query = _apply_ordering(
-            query,
-            order_by,
-            order,
-            {
-                "npi": grouped_subquery.c.npi,
-                "provider_name": grouped_subquery.c.provider_name,
-                "total_services": grouped_subquery.c.total_services,
-                "total_submitted_charges": grouped_subquery.c.total_submitted_charges,
-                "total_allowed_amount": grouped_subquery.c.total_allowed_amount,
-                "total_beneficiaries": grouped_subquery.c.total_beneficiaries,
-                "matched_service_codes": grouped_subquery.c.matched_service_codes,
-                "cost_index": cost_index_expr,
-            },
+        claims_statements = await build_provider_service_claims_statements(
+            grouped, import_context, min_claims, min_total_cost, order_by, order
         )
-        query = query.limit(pagination.limit).offset(pagination.offset)
-    query_result = await session.execute(query)
-    provider_items = [_normalize_provider_service_aggregate(_row_to_dict(provider_record), include_legacy=include_legacy_fields) for provider_record in query_result]
-    if zip5 and provider_items:
+        count_result = await execute_network_read(session, claims_statements.count_statement)
+        total = int(count_result.scalar() or 0)
+        query = claims_statements.page_statement.limit(pagination.limit).offset(pagination.offset)
+    query_result = await execute_network_read(session, query)
+    provider_items = [
+        _normalize_provider_service_aggregate(_row_to_dict(provider_record), include_legacy=include_legacy_fields)
+        for provider_record in query_result
+    ]
+    if canonical_network_clause is None and zip5 and provider_items:
         for provider_item_by_field in provider_items:
             item_zip = _normalize_zip5(provider_item_by_field.get("zip5"))
             if item_zip is None:
@@ -13159,10 +12402,13 @@ async def list_providers_by_procedure(request):
             provider_items,
             year=year,
             internal_codes=internal_codes,
-            fallback_state=state or None,
-            fallback_city=city or None,
-            fallback_zip5=zip5 or None,
+            fallback_state=(state or None) if canonical_network_clause is None else None,
+            fallback_city=(city or None) if canonical_network_clause is None else None,
+            fallback_zip5=(zip5 or None) if canonical_network_clause is None else None,
         )
+
+    if canonical_network_clause is not None:
+        await _canonical_procedure_locations(session, provider_items, canonical_location_filter)
 
     query_by_field: dict[str, Any] = {
         "q": query_text or None,
@@ -13207,44 +12453,14 @@ async def list_providers_by_procedure(request):
         },
         "query": query_by_field,
     }
-    if include_sources:
-        response_by_field["sources"] = [
-            {
-                "source_key": "cms_medicare_provider_services_claims",
-                "source_importer": "claims-pricing",
-                "source_system": "cms_medicare_part_b",
-                "dataset": "Medicare Physician & Other Practitioners by Provider and Service",
-                "serving_tables": ["pricing_provider", "pricing_provider_procedure"],
-                "grain": "provider_npi/year/procedure aggregate",
-                "derived": True,
-            }
-        ]
-    if include_evidence or include_debug:
-        response_by_field["evidence"] = {
-            "matched_provider_location_count": total,
-            "filters": {
-                "year": year,
-                "year_source": year_source,
-                "code": code or None,
-                "state": state or None,
-                "city": city or None,
-                "zip5": zip5 or None,
-                "specialty": specialty or None,
-                "provider_sex_code": provider_sex_code,
-                "q": query_text or None,
-                "min_claims": min_claims,
-                "min_total_cost": min_total_cost,
-                "provider_type_resolution": provider_type_resolution,
-                "procedure_term_resolution": procedure_resolution_by_field,
-            },
-            "zip_scope": {
-                "anchor_zip5": zip5,
-                "zip_radius_miles": zip_radius_miles if zip5 else None,
-                "candidate_count": len(zip_filter_values) if zip_filter_values else (1 if zip5 else None),
-            },
-            "code_resolution": code_context,
-        }
-    return response.json(response_by_field)
+    _provider_service_evidence(response_by_field, code_context, canonical=canonical_network_clause is not None)
+    reply = response.json(response_by_field)
+    if canonical_network_clause is not None:
+        from api.network_provider_read import MAX_RESPONSE_BYTES
+
+        if len(reply.body) > MAX_RESPONSE_BYTES:
+            raise sanic.exceptions.ServiceUnavailable("Complete selected-office evidence is unavailable.")
+    return reply
 
 
 @blueprint.get("/providers/by-prescription", name="pricing.providers.by_prescription")
@@ -13388,7 +12604,7 @@ async def list_providers_by_prescription(request):
         )
     )
     grouped_subquery = grouped.subquery()
-    count_result = await session.execute(select(func.count()).select_from(grouped_subquery))
+    count_result = await execute_network_read(session, select(func.count()).select_from(grouped_subquery))
     total = int(count_result.scalar() or 0)
 
     order = _normalize_order(args.get("order"))
@@ -13408,8 +12624,10 @@ async def list_providers_by_prescription(request):
         },
     )
     query = query.limit(pagination.limit).offset(pagination.offset)
-    query_result = await session.execute(query)
-    provider_items = [_normalize_prescription_provider_aggregate(_row_to_dict(provider_record)) for provider_record in query_result]
+    query_result = await execute_network_read(session, query)
+    provider_items = [
+        _normalize_prescription_provider_aggregate(_row_to_dict(provider_record)) for provider_record in query_result
+    ]
 
     query_by_field: dict[str, Any] = {
         "q": query_text or None,
@@ -13470,9 +12688,7 @@ def _provider_prescription_unavailable_document(provider_npi, year, pagination):
     }
 
 
-async def _provider_prescription_list_where(
-    session, args, provider_npi, year, list_values_by_name
-):
+async def _provider_prescription_list_where(session, args, provider_npi, year, list_values_by_name):
     filters = [
         provider_prescription_table.c.npi == provider_npi,
         provider_prescription_table.c.year == year,
@@ -13506,63 +12722,54 @@ async def _provider_prescription_list_where(
         )
         filters.extend(
             (
-                provider_prescription_table.c.rx_code_system
-                == INTERNAL_RX_CODE_SYSTEM,
+                provider_prescription_table.c.rx_code_system == INTERNAL_RX_CODE_SYSTEM,
                 provider_prescription_table.c.rx_code.in_(internal_rx_codes),
             )
         )
     if list_values_by_name["min_claims"] is not None:
-        filters.append(
-            provider_prescription_table.c.total_claims
-            >= list_values_by_name["min_claims"]
-        )
+        filters.append(provider_prescription_table.c.total_claims >= list_values_by_name["min_claims"])
     if list_values_by_name["min_total_cost"] is not None:
-        filters.append(
-            provider_prescription_table.c.total_drug_cost
-            >= list_values_by_name["min_total_cost"]
-        )
+        filters.append(provider_prescription_table.c.total_drug_cost >= list_values_by_name["min_total_cost"])
     return and_(*filters), code_context
 
 
-async def _provider_prescription_list_page(
-    session, pagination, where_clause, order_by, order
-):
-    count_result = await session.execute(
-        select(func.count()).select_from(provider_prescription_table).where(where_clause)
+async def _provider_prescription_list_page(session, pagination, where_clause, order_by, order):
+    count_result = await execute_network_read(
+        session, select(func.count()).select_from(provider_prescription_table).where(where_clause)
     )
-    query = _apply_ordering(
-        select(provider_prescription_table).where(where_clause),
-        order_by,
-        order,
-        {
-            "rx_code": provider_prescription_table.c.rx_code,
-            "rx_name": provider_prescription_table.c.rx_name,
-            "generic_name": provider_prescription_table.c.generic_name,
-            "brand_name": provider_prescription_table.c.brand_name,
-            "total_claims": provider_prescription_table.c.total_claims,
-            "total_drug_cost": provider_prescription_table.c.total_drug_cost,
-            "total_benes": provider_prescription_table.c.total_benes,
-        },
-    ).limit(pagination.limit).offset(pagination.offset)
-    query_result = await session.execute(query)
+    query = (
+        _apply_ordering(
+            select(provider_prescription_table).where(where_clause),
+            order_by,
+            order,
+            {
+                "rx_code": provider_prescription_table.c.rx_code,
+                "rx_name": provider_prescription_table.c.rx_name,
+                "generic_name": provider_prescription_table.c.generic_name,
+                "brand_name": provider_prescription_table.c.brand_name,
+                "total_claims": provider_prescription_table.c.total_claims,
+                "total_drug_cost": provider_prescription_table.c.total_drug_cost,
+                "total_benes": provider_prescription_table.c.total_benes,
+            },
+        )
+        .limit(pagination.limit)
+        .offset(pagination.offset)
+    )
+    query_result = await execute_network_read(session, query)
     prescription_items = [
-        _normalize_prescription_payload(_row_to_dict(prescription_record))
-        for prescription_record in query_result
+        _normalize_prescription_payload(_row_to_dict(prescription_record)) for prescription_record in query_result
     ]
     if prescription_items:
         try:
             external_codes_by_internal = await _resolve_external_rx_codes_for_internal(
                 session,
-                [
-                    str(prescription_item.get("rx_code") or "")
-                    for prescription_item in prescription_items
-                ],
+                [str(prescription_item.get("rx_code") or "") for prescription_item in prescription_items],
             )
+        except sanic.exceptions.ServiceUnavailable:
+            raise
         except Exception:  # pragma: no cover - defensive fallback for missing/migrating crosswalk table
             external_codes_by_internal = {}
-        _apply_prescription_code_preferences(
-            prescription_items, external_codes_by_internal
-        )
+        _apply_prescription_code_preferences(prescription_items, external_codes_by_internal)
     return {
         "total": int(count_result.scalar() or 0),
         "order": order,
@@ -13622,9 +12829,7 @@ async def list_provider_prescriptions(request, npi: str):
     year = _parse_int(args.get("year"), "year", minimum=2013)
     list_values_by_name = {
         "min_claims": _parse_float(args.get("min_claims"), "min_claims", minimum=0),
-        "min_total_cost": _parse_float(
-            args.get("min_total_cost"), "min_total_cost", minimum=0
-        ),
+        "min_total_cost": _parse_float(args.get("min_total_cost"), "min_total_cost", minimum=0),
         "query_text": str(args.get("q", "")).strip().lower(),
         "generic_name": str(args.get("generic_name", "")).strip().lower(),
         "brand_name": str(args.get("brand_name", "")).strip().lower(),
@@ -13635,16 +12840,12 @@ async def list_provider_prescriptions(request, npi: str):
     order = _normalize_order(args.get("order"))
     order_by = str(args.get("order_by") or "total_drug_cost")
     if not await _is_table_available(session, provider_prescription_table.name):
-        return response.json(
-            _provider_prescription_unavailable_document(provider_npi, year, pagination)
-        )
+        return response.json(_provider_prescription_unavailable_document(provider_npi, year, pagination))
     year, year_source = await _resolve_year(session, provider_prescription_table, year)
     where_clause, code_context = await _provider_prescription_list_where(
         session, args, provider_npi, year, list_values_by_name
     )
-    page = await _provider_prescription_list_page(
-        session, pagination, where_clause, order_by, order
-    )
+    page = await _provider_prescription_list_page(session, pagination, where_clause, order_by, order)
     return response.json(
         _provider_prescription_list_document(
             page,
@@ -13658,12 +12859,7 @@ async def list_provider_prescriptions(request, npi: str):
     )
 
 
-async def _provider_prescription_detail(
-    request,
-    npi: str,
-    rx_code_system: str,
-    rx_code: str,
-):
+async def _provider_prescription_detail(request, npi: str, rx_code_system: str, rx_code: str):
     """Build one provider prescription response for a resolved drug code."""
 
     session = _get_session(request)
@@ -13698,8 +12894,7 @@ async def _provider_prescription_detail(
         .limit(1)
     )
 
-    prescription_query_result = await session.execute(query)
-    prescription_row = prescription_query_result.first()
+    prescription_row = (await execute_network_read(session, query)).first()
     if prescription_row is None:
         raise sanic.exceptions.NotFound("Provider prescription not found")
 
@@ -13709,6 +12904,8 @@ async def _provider_prescription_detail(
             session,
             [str(prescription_payload.get("rx_code") or "")],
         )
+    except sanic.exceptions.ServiceUnavailable:
+        raise
     except Exception:  # pragma: no cover - defensive fallback for missing/migrating crosswalk table
         external_codes_by_internal = {}
     _apply_prescription_code_preferences([prescription_payload], external_codes_by_internal)
@@ -13805,28 +13002,16 @@ def _prescription_provider_where_clause(
     """Build the unchanged prescription-provider filters."""
 
     filters = [
-        provider_prescription_table.c.rx_code_system
-        == INTERNAL_RX_CODE_SYSTEM,
+        provider_prescription_table.c.rx_code_system == INTERNAL_RX_CODE_SYSTEM,
         provider_prescription_table.c.rx_code.in_(internal_rx_codes),
         provider_prescription_table.c.year == year,
     ]
     if request_filters.state:
-        filters.append(
-            func.upper(provider_prescription_table.c.state)
-            == request_filters.state
-        )
+        filters.append(func.upper(provider_prescription_table.c.state) == request_filters.state)
     if request_filters.city:
-        filters.append(
-            func.lower(provider_prescription_table.c.city).like(
-                f"%{request_filters.city}%"
-            )
-        )
+        filters.append(func.lower(provider_prescription_table.c.city).like(f"%{request_filters.city}%"))
     if request_filters.specialty:
-        filters.append(
-            func.lower(provider_prescription_table.c.provider_type).like(
-                f"%{request_filters.specialty}%"
-            )
-        )
+        filters.append(func.lower(provider_prescription_table.c.provider_type).like(f"%{request_filters.specialty}%"))
     if request_filters.search_query:
         q_like = f"%{request_filters.search_query}%"
         filters.append(
@@ -13837,15 +13022,9 @@ def _prescription_provider_where_clause(
             )
         )
     if request_filters.min_claims is not None:
-        filters.append(
-            provider_prescription_table.c.total_claims
-            >= request_filters.min_claims
-        )
+        filters.append(provider_prescription_table.c.total_claims >= request_filters.min_claims)
     if request_filters.min_total_cost is not None:
-        filters.append(
-            provider_prescription_table.c.total_drug_cost
-            >= request_filters.min_total_cost
-        )
+        filters.append(provider_prescription_table.c.total_drug_cost >= request_filters.min_total_cost)
     return and_(*filters)
 
 
@@ -13860,15 +13039,9 @@ def _prescription_provider_grouped_query(where_clause):
             provider_prescription_table.c.city.label("city"),
             provider_prescription_table.c.state.label("state"),
             provider_prescription_table.c.zip5.label("zip5"),
-            func.sum(provider_prescription_table.c.total_claims).label(
-                "total_claims"
-            ),
-            func.sum(provider_prescription_table.c.total_drug_cost).label(
-                "total_drug_cost"
-            ),
-            func.sum(provider_prescription_table.c.total_benes).label(
-                "total_benes"
-            ),
+            func.sum(provider_prescription_table.c.total_claims).label("total_claims"),
+            func.sum(provider_prescription_table.c.total_drug_cost).label("total_drug_cost"),
+            func.sum(provider_prescription_table.c.total_benes).label("total_benes"),
             func.count().label("matched_rows"),
         )
         .select_from(provider_prescription_table)
@@ -13889,7 +13062,7 @@ async def _prescription_provider_total(session, grouped_subquery) -> int:
     """Count grouped providers before validating page ordering."""
 
     count_query = select(func.count()).select_from(grouped_subquery)
-    count_result = await session.execute(count_query)
+    count_result = await execute_network_read(session, count_query)
     return int(count_result.scalar() or 0)
 
 
@@ -13902,24 +13075,25 @@ async def _load_prescription_provider_entries(
 ) -> list[dict[str, Any]]:
     """Load and normalize one ordered prescription-provider page."""
 
-    query = _apply_ordering(
-        select(grouped_subquery),
-        order_by,
-        order,
-        {
-            "npi": grouped_subquery.c.npi,
-            "provider_name": grouped_subquery.c.provider_name,
-            "total_claims": grouped_subquery.c.total_claims,
-            "total_drug_cost": grouped_subquery.c.total_drug_cost,
-            "total_benes": grouped_subquery.c.total_benes,
-            "matched_rows": grouped_subquery.c.matched_rows,
-        },
-    ).limit(pagination.limit).offset(pagination.offset)
-    query_result = await session.execute(query)
-    return [
-        _normalize_prescription_provider_aggregate(_row_to_dict(row))
-        for row in query_result
-    ]
+    query = (
+        _apply_ordering(
+            select(grouped_subquery),
+            order_by,
+            order,
+            {
+                "npi": grouped_subquery.c.npi,
+                "provider_name": grouped_subquery.c.provider_name,
+                "total_claims": grouped_subquery.c.total_claims,
+                "total_drug_cost": grouped_subquery.c.total_drug_cost,
+                "total_benes": grouped_subquery.c.total_benes,
+                "matched_rows": grouped_subquery.c.matched_rows,
+            },
+        )
+        .limit(pagination.limit)
+        .offset(pagination.offset)
+    )
+    query_result = await execute_network_read(session, query)
+    return [_normalize_prescription_provider_aggregate(_row_to_dict(row)) for row in query_result]
 
 
 def _prescription_provider_response(
@@ -13976,27 +13150,19 @@ async def list_prescription_providers(request, rx_code_system: str, rx_code: str
             specialty=str(args.get("specialty", "")).strip().lower(),
             search_query=str(args.get("q", "")).strip().lower(),
             min_claims=_parse_float(args.get("min_claims"), "min_claims", minimum=0),
-            min_total_cost=_parse_float(
-                args.get("min_total_cost"), "min_total_cost", minimum=0
-            ),
+            min_total_cost=_parse_float(args.get("min_total_cost"), "min_total_cost", minimum=0),
         ),
     )
     if not await _is_table_available(session, provider_prescription_table.name):
-        return _unavailable_prescription_provider_response(
-            provider_request, rx_code_system, rx_code
-        )
-    year, year_source = await _resolve_year(
-        session, provider_prescription_table, provider_request.requested_year
-    )
+        return _unavailable_prescription_provider_response(provider_request, rx_code_system, rx_code)
+    year, year_source = await _resolve_year(session, provider_prescription_table, provider_request.requested_year)
     internal_rx_codes, code_context = await _resolve_internal_rx_codes_for_request(
         session,
         rx_code,
         dict({"rx_code_system": rx_code_system}, **dict(args)),
         default_system=rx_code_system,
     )
-    where_clause = _prescription_provider_where_clause(
-        internal_rx_codes, year, provider_request.filters
-    )
+    where_clause = _prescription_provider_where_clause(internal_rx_codes, year, provider_request.filters)
     grouped_subquery = _prescription_provider_grouped_query(where_clause)
     total = await _prescription_provider_total(session, grouped_subquery)
     order = _normalize_order(args.get("order"))
@@ -14032,7 +13198,7 @@ async def _prescription_benchmark_values(session, where_clause):
         .select_from(provider_prescription_table)
         .where(where_clause)
     )
-    aggregate_result = await session.execute(aggregate_query)
+    aggregate_result = await execute_network_read(session, aggregate_query)
     aggregate = _row_to_dict(aggregate_result.first() or {})
 
     provider_costs_subquery = (
@@ -14051,14 +13217,12 @@ async def _prescription_benchmark_values(session, where_clause):
         func.percentile_cont(0.60).within_group(provider_costs_subquery.c.provider_total_drug_cost).label("p60"),
         func.percentile_cont(0.80).within_group(provider_costs_subquery.c.provider_total_drug_cost).label("p80"),
     )
-    threshold_result = await session.execute(threshold_query)
+    threshold_result = await execute_network_read(session, threshold_query)
     thresholds = _row_to_dict(threshold_result.first() or {})
     return aggregate, thresholds
 
 
-def _prescription_benchmark_payload(
-    aggregate: dict[str, Any], thresholds: dict[str, Any]
-) -> dict[str, Any]:
+def _prescription_benchmark_payload(aggregate: dict[str, Any], thresholds: dict[str, Any]) -> dict[str, Any]:
     return {
         "matched_rows": int(aggregate.get("matched_rows") or 0),
         "provider_count": int(aggregate.get("provider_count") or 0),
@@ -14077,9 +13241,7 @@ def _prescription_benchmark_payload(
     }
 
 
-def _unavailable_prescription_benchmarks(
-    year: int | None, state: str, city: str, rx_code_system: str, rx_code: str
-):
+def _unavailable_prescription_benchmarks(year: int | None, state: str, city: str, rx_code_system: str, rx_code: str):
     return response.json(
         {
             "query": {
@@ -14122,9 +13284,7 @@ async def get_prescription_benchmarks(request, rx_code_system: str, rx_code: str
     state = str(args.get("state", "")).strip().upper()
     city = str(args.get("city", "")).strip().lower()
     if not await _is_table_available(session, provider_prescription_table.name):
-        return _unavailable_prescription_benchmarks(
-            year, state, city, rx_code_system, rx_code
-        )
+        return _unavailable_prescription_benchmarks(year, state, city, rx_code_system, rx_code)
     year, year_source = await _resolve_year(session, provider_prescription_table, year)
     internal_rx_codes, code_context = await _resolve_internal_rx_codes_for_request(
         session,
@@ -14140,12 +13300,8 @@ async def get_prescription_benchmarks(request, rx_code_system: str, rx_code: str
     if state:
         filters.append(func.upper(provider_prescription_table.c.state) == state)
     if city:
-        filters.append(
-            func.lower(provider_prescription_table.c.city).like(f"%{city}%")
-        )
-    aggregate, thresholds = await _prescription_benchmark_values(
-        session, and_(*filters)
-    )
+        filters.append(func.lower(provider_prescription_table.c.city).like(f"%{city}%"))
+    aggregate, thresholds = await _prescription_benchmark_values(session, and_(*filters))
     return response.json(
         {
             "query": {

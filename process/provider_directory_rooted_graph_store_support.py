@@ -123,28 +123,13 @@ async def insert_work_spec(
     acquisition_id: str,
     spec: ProviderDirectoryRootedGraphWorkSpec,
 ) -> int:
-    """Insert one canonical work identity without duplicating acquisition."""
+    """Admit one control query through the same staged work-set boundary."""
 
-    return await database.status(
-        f"""
-        INSERT INTO {table_ref(WORK_TABLE)} (
-            acquisition_id, scope_id, query_id, query_identity_sha256,
-            query_identity_json_text, kind, resource_type, search_parameter,
-            reference_type, reference_id, closure_scope,
-            discovered_by_query_id, discovered_source_type,
-            discovered_source_id, discovered_edge_sha256,
-            status, attempt_count, pagination_terminal
-        ) VALUES (
-            :acquisition_id, :scope_id, :query_id, :query_identity_sha256,
-            :query_identity_json_text, :kind, :resource_type, :search_parameter,
-            :reference_type, :reference_id, :closure_scope,
-            :discovered_by_query_id, :discovered_source_type,
-            :discovered_source_id, :discovered_edge_sha256,
-            'pending', 0, false
-        ) ON CONFLICT (acquisition_id, query_id) DO NOTHING;
-        """,
-        acquisition_id=acquisition_id,
-        **work_fields(spec),
+    from process.provider_directory_rooted_graph_bulk import admit_work_specs
+
+    return await admit_work_specs(
+        database, acquisition_id, (spec,),
+        action="census" if spec.kind == "full_insurance_plan_census" else "derive",
     )
 
 

@@ -6,15 +6,17 @@ from __future__ import annotations
 
 import os
 
-from sqlalchemy import CheckConstraint
-from sqlalchemy import Column
-from sqlalchemy import ForeignKeyConstraint
-from sqlalchemy import Integer
-from sqlalchemy import PrimaryKeyConstraint
-from sqlalchemy import String
-from sqlalchemy import Text
-from sqlalchemy import TIMESTAMP
-from sqlalchemy import text
+from sqlalchemy import (
+    TIMESTAMP,
+    CheckConstraint,
+    Column,
+    ForeignKeyConstraint,
+    Integer,
+    PrimaryKeyConstraint,
+    String,
+    Text,
+    text,
+)
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
@@ -53,6 +55,7 @@ def _timestamp_column():
 class ProviderDirectoryRootedGraphResource(Base, JSONOutputMixin):
     """One immutable canonical payload for one exact query attempt."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = _RESOURCE
     __main_table__ = __tablename__
     __table_args__ = _table_args(
@@ -118,6 +121,7 @@ class ProviderDirectoryRootedGraphResource(Base, JSONOutputMixin):
 class ProviderDirectoryRootedGraphEdge(Base, JSONOutputMixin):
     """One immutable local-reference witness from a retained payload."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = _EDGE
     __main_table__ = __tablename__
     __table_args__ = _table_args(

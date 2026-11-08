@@ -12,15 +12,19 @@ from api.ptg2_candidate_audit import (
     candidate_audit_access_from_args,
 )
 from api.ptg2_serving_utils import ein_plan_id_variants
+from api.ptg2_tables import (
+    local_physical_binding_declared_sql,
+    snapshot_serving_tables,
+)
 from process.ptg_parts.domain import PTG2_CANDIDATE_ACTIVATION_CONTRACT
 from process.ptg_parts.ptg2_candidate_attestation import (
     PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS,
 )
+from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
 _PTG2_ATTESTATION_CONTRACT_SQL = ", ".join(
-    f"'{contract}'"
-    for contract in PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
+    f"'{contract}'" for contract in PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
 )
 
 
@@ -62,6 +66,7 @@ def _serving_relation_available_sql(
                AND shared_layout.generation IN ('shared_blocks_v3', 'shared_blocks_v4')
                AND (
                     shared_layout.generation <> 'shared_blocks_v4'
+                    OR {local_physical_binding_declared_sql(snapshot_alias, "shared_layout")}
                     OR EXISTS (
                         SELECT 1
                           FROM {PTG2_SCHEMA}.ptg2_v4_snapshot_map_root v4_root
@@ -74,13 +79,43 @@ def _serving_relation_available_sql(
     """
 
 
+def _local_binding_declared_sql(snapshot_alias: str) -> str:
+    return f"""EXISTS (
+        SELECT 1
+          FROM {PTG2_SCHEMA}.ptg2_v3_snapshot_binding local_binding
+          JOIN {PTG2_SCHEMA}.ptg2_v3_snapshot_layout local_layout
+            ON local_layout.snapshot_key = local_binding.snapshot_key
+         WHERE local_binding.snapshot_id = {snapshot_alias}.snapshot_id
+           AND {local_physical_binding_declared_sql(snapshot_alias, "local_layout")}
+    )"""
+
+
+async def _verified_snapshot_id(
+    session,
+    snapshot_record,
+    *,
+    candidate_audit_access: PTG2CandidateAuditAccess | None = None,
+) -> str | None:
+    """Keep shared-root selection cheap; authenticate every declared local family."""
+
+    if snapshot_record is None or not snapshot_record[0]:
+        return None
+    snapshot_id = str(snapshot_record[0])
+    if snapshot_record[1]:
+        serving_tables = await snapshot_serving_tables(
+            session,
+            snapshot_id,
+            candidate_audit_access=candidate_audit_access,
+        )
+        if serving_tables.snapshot_id != snapshot_id or serving_tables.physical_binding is None:
+            raise PTG2ManifestArtifactError("PTG snapshot-local physical binding is not available")
+    return snapshot_id
+
+
 def _logical_network_key_sql(pointer_alias: str, snapshot_alias: str) -> str:
     """Group dated source files that publish the same logical plan network."""
     network_names = f"{snapshot_alias}.manifest->'serving_index'->>'network_names'"
-    return (
-        f"COALESCE(NULLIF(NULLIF({network_names}, ''), '[]'), "
-        f"{pointer_alias}.source_key)"
-    )
+    return f"COALESCE(NULLIF(NULLIF({network_names}, ''), '[]'), {pointer_alias}.source_key)"
 
 
 def _source_effective_month_sql(pointer_alias: str, snapshot_alias: str) -> str:
@@ -224,7 +259,9 @@ async def _explicit_snapshot_id(
     snapshot_result = await session.execute(
         text(
             f"""
-            SELECT snapshot_id
+            SELECT snapshot_id,
+                   {_local_binding_declared_sql("ptg2_snapshot")}
+                       AS has_local_physical_binding
              FROM {PTG2_SCHEMA}.ptg2_snapshot
              WHERE snapshot_id = :snapshot_id
                AND {status_sql}
@@ -236,26 +273,30 @@ async def _explicit_snapshot_id(
         ),
         query_params_by_name,
     )
-    snapshot_value = snapshot_result.scalar()
-    return str(snapshot_value) if snapshot_value else None
+    return await _verified_snapshot_id(
+        session,
+        snapshot_result.one_or_none(),
+        candidate_audit_access=candidate_audit_access,
+    )
 
 
 async def _global_snapshot_id(session) -> str | None:
     snapshot_result = await session.execute(
         text(
             f"""
-            SELECT pointer.snapshot_id
+            SELECT pointer.snapshot_id,
+                   {_local_binding_declared_sql("published_snapshot")}
+                       AS has_local_physical_binding
               FROM {PTG2_SCHEMA}.ptg2_current_snapshot pointer
               JOIN {PTG2_SCHEMA}.ptg2_snapshot published_snapshot
                 ON published_snapshot.snapshot_id = pointer.snapshot_id
              WHERE pointer.slot = 'current'
                AND published_snapshot.status = 'published'
-               AND {_serving_relation_available_sql('published_snapshot')}
+               AND {_serving_relation_available_sql("published_snapshot")}
             """
         )
     )
-    snapshot_value = snapshot_result.scalar()
-    return str(snapshot_value) if snapshot_value else None
+    return await _verified_snapshot_id(session, snapshot_result.one_or_none())
 
 
 async def current_snapshot_id(
@@ -287,20 +328,21 @@ async def current_source_snapshot_id(session, source_key: str) -> str | None:
     result = await session.execute(
         text(
             f"""
-            SELECT pointer.snapshot_id
+            SELECT pointer.snapshot_id,
+                   {_local_binding_declared_sql("published_snapshot")}
+                       AS has_local_physical_binding
               FROM {PTG2_SCHEMA}.ptg2_current_source_snapshot pointer
               JOIN {PTG2_SCHEMA}.ptg2_snapshot published_snapshot
                 ON published_snapshot.snapshot_id = pointer.snapshot_id
              WHERE pointer.source_key = :source_key
                AND published_snapshot.status = 'published'
-               AND {_serving_relation_available_sql('published_snapshot')}
+               AND {_serving_relation_available_sql("published_snapshot")}
              LIMIT 1
             """
         ),
         {"source_key": normalized_source_key},
     )
-    value = result.scalar()
-    return str(value) if value else None
+    return await _verified_snapshot_id(session, result.one_or_none())
 
 
 async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) -> str | None:
@@ -328,14 +370,16 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
     snapshot_query = await session.execute(
         text(
             f"""
-             SELECT cps.snapshot_id
+             SELECT cps.snapshot_id,
+                    {_local_binding_declared_sql("s")}
+                        AS has_local_physical_binding
               FROM {PTG2_SCHEMA}.ptg2_current_plan_source cps
               JOIN {PTG2_SCHEMA}.ptg2_snapshot s ON s.snapshot_id = cps.snapshot_id
              WHERE cps.plan_id = ANY(CAST(:plan_ids AS text[]))
                {market_sql}
                {source_sql}
                AND s.status = 'published'
-               AND {_serving_relation_available_sql('s')}
+               AND {_serving_relation_available_sql("s")}
              ORDER BY {effective_month_sql} DESC NULLS LAST,
                       cps.import_month DESC NULLS LAST,
                       cps.updated_at DESC NULLS LAST
@@ -344,8 +388,7 @@ async def current_source_snapshot_id_for_plan(session, args: dict[str, object]) 
         ),
         query_parameters_by_name,
     )
-    snapshot_id_value = snapshot_query.scalar()
-    return str(snapshot_id_value) if snapshot_id_value else None
+    return await _verified_snapshot_id(session, snapshot_query.one_or_none())
 
 
 def _network_snapshot_filters(
@@ -370,9 +413,7 @@ def _network_snapshot_filters(
     return plan_variants, query_parameters_by_name, market_sql, source_sql
 
 
-async def current_network_snapshots_for_plan(
-    session, args: dict[str, object]
-) -> list[tuple[str, str]]:
+async def current_network_snapshots_for_plan(session, args: dict[str, object]) -> list[tuple[str, str]]:
     """Resolve the newest sealed shared V3 snapshot for each logical plan network.
 
     Manifest network names group dated source files; the source URL month selects
@@ -395,6 +436,8 @@ async def current_network_snapshots_for_plan(
              WITH candidate_snapshots AS (
                  SELECT cps.source_key,
                         cps.snapshot_id,
+                        {_local_binding_declared_sql("s")}
+                            AS has_local_physical_binding,
                         {logical_network_sql} AS logical_network_key,
                         {effective_month_sql} AS source_effective_month,
                         cps.import_month,
@@ -405,9 +448,10 @@ async def current_network_snapshots_for_plan(
                     {market_sql}
                     {source_sql}
                     AND s.status = 'published'
-                    AND {_serving_relation_available_sql('s')}
+                    AND {_serving_relation_available_sql("s")}
              )
-             SELECT DISTINCT ON (logical_network_key) source_key, snapshot_id
+             SELECT DISTINCT ON (logical_network_key)
+                    source_key, snapshot_id, has_local_physical_binding
                FROM candidate_snapshots
               ORDER BY logical_network_key,
                        source_effective_month DESC NULLS LAST,
@@ -417,31 +461,23 @@ async def current_network_snapshots_for_plan(
         ),
         query_parameters_by_name,
     )
-    source_snapshot_pairs = [
-        (str(snapshot_record[0] or ""), str(snapshot_record[1]))
-        for snapshot_record in source_snapshot_query
-        if snapshot_record[1]
-    ]
+    source_snapshot_pairs = []
+    for snapshot_record in source_snapshot_query:
+        snapshot_id = await _verified_snapshot_id(session, snapshot_record[1:])
+        if snapshot_id is not None:
+            source_snapshot_pairs.append((str(snapshot_record[0] or ""), snapshot_id))
     return source_snapshot_pairs
 
 
 async def resolve_current_ptg2_snapshot_id(session, args: dict[str, object]) -> str | None:
     """Resolve the published snapshot selected by explicit or scoped arguments."""
     if args.get("snapshot_id"):
-        requested_plan_id = str(
-            args.get("plan_id") or args.get("plan_external_id") or ""
-        ).strip()
-        requested_market_type = str(
-            args.get("plan_market_type") or ""
-        ).strip()
+        requested_plan_id = str(args.get("plan_id") or args.get("plan_external_id") or "").strip()
+        requested_market_type = str(args.get("plan_market_type") or "").strip()
         return await current_snapshot_id(
             session,
             requested_snapshot_id=str(args["snapshot_id"]),
-            requested_source_key=(
-                None
-                if args.get("source_key") is None
-                else str(args["source_key"])
-            ),
+            requested_source_key=(None if args.get("source_key") is None else str(args["source_key"])),
             requested_plan_id=requested_plan_id or None,
             requested_plan_market_type=requested_market_type or None,
             candidate_audit_access=candidate_audit_access_from_args(args),

@@ -50,13 +50,10 @@ async def _assert_dictionary_publications(lock_calls, batches) -> None:
     assert batches == [
         ("npi", (0,)),
         ("npi", (1,)),
-        ("npi", ()),
         ("component", (0,)),
         ("component", (1,)),
-        ("component", ()),
         ("pattern", (0,)),
         ("pattern", (1,)),
-        ("pattern", ()),
     ]
 
 
@@ -70,16 +67,6 @@ async def _assert_dictionary_row_rejections() -> None:
             entries=(),
             batch_rows=0,
         )
-    with pytest.raises(ValueError, match="contiguous"):
-        snapshot_maps._normalized_npi_row((1, 1_234_567_890), 0)
-    with pytest.raises(ValueError, match="invalid NPI"):
-        snapshot_maps._normalized_npi_row((0, 1), 0)
-    with pytest.raises(ValueError, match="16 bytes"):
-        snapshot_maps._normalized_component_row((0, b"x"), 0)
-    with pytest.raises(ValueError, match="digest"):
-        snapshot_maps._normalized_pattern_row((0, b"x", 1), 0)
-    with pytest.raises(ValueError, match="non-negative"):
-        snapshot_maps._normalized_pattern_row((0, b"x" * 32, -1), 0)
     with pytest.raises(ValueError, match="must contain"):
         snapshot_maps._validated_v4_name("", field_name="name", max_bytes=4)
 
@@ -107,9 +94,7 @@ async def _assert_relation_publications(monkeypatch, fake_lock) -> None:
     )
     assert relation_publication.row_count == 2
 
-    owner_rows = snapshot_maps._normalized_heavy_owner_rows(
-        (_owner_row("a", 1), _owner_row("b", 2))
-    )
+    owner_rows = (_owner_row("a", 1), _owner_row("b", 2))
     owner_session = _ScriptedSession(
         _Result(),
         _Result(rows=owner_rows),

@@ -1,11 +1,14 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-from contextlib import asynccontextmanager
 import importlib
 import types
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
+
+from process.provider_directory_generic_source_policy import source_transaction
+from tests.test_provider_directory_generic_source_policy import synthetic_source_factory
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -231,6 +234,15 @@ def _mock_validation_dependencies(
     )
 
 
+async def _validate_candidate_rows(monkeypatch, candidate, diagnostics):
+    """Check the validation body under real Source authority; attachment has separate coverage."""
+    async with synthetic_source_factory(monkeypatch, importer.db, schema=importer._schema()):
+        async with source_transaction(importer.db, isolation="repeatable read"):
+            async with importer.db.acquire() as connection:
+                state = await importer._persist_endpoint_dataset_validation(connection, candidate, diagnostics)
+    return importer._endpoint_dataset_validation_summary(candidate, *state)
+
+
 def test_network_plan_proof_sql_is_dataset_scoped_and_normalizes_refs():
     sql = importer._dataset_network_plan_proof_sql(
         should_verify_acquisition_root=True,
@@ -249,11 +261,8 @@ def test_network_plan_proof_sql_is_dataset_scoped_and_normalizes_refs():
 
 
 def test_affiliation_proof_sql_is_dataset_scoped_and_normalizes_org():
-    sql = (
-        importer
-        ._dataset_affiliation_organization_proof_sql(
-            should_verify_acquisition_root=True,
-        )
+    sql = importer._dataset_affiliation_organization_proof_sql(
+        should_verify_acquisition_root=True,
     )
 
     assert "resource.dataset_id" in sql
@@ -356,9 +365,7 @@ async def test_artifact_rebuilds_both_relations_once_per_dataset_alias_family(
         proof_recorder,
         fence_lock,
         relation_lock,
-    ) = (
-        _mock_artifact_relation_rebuild(monkeypatch)
-    )
+    ) = _mock_artifact_relation_rebuild(monkeypatch)
 
     aggregates = await importer._rebuild_current_dataset_serving_relations(
         fence,
@@ -381,9 +388,7 @@ async def test_artifact_rebuilds_both_relations_once_per_dataset_alias_family(
     )
     assert proof_recorder.await_count == 2
     fence_lock.assert_awaited_once_with(
-        importer.ProviderDirectoryArtifactDatasetFence(
-            (_artifact_dataset("source-a"), _artifact_dataset("source-b"))
-        ),
+        importer.ProviderDirectoryArtifactDatasetFence((_artifact_dataset("source-a"), _artifact_dataset("source-b"))),
         importer.db,
     )
     relation_lock.assert_awaited_once_with(importer.db, "dataset-1")
@@ -418,7 +423,8 @@ async def test_validation_builds_edges_before_storing_and_uses_root_identity(
         connection_executor,
     )
 
-    async def store_validated(*_args):
+    async def store_validated(*_args, status):
+        assert status == importer.ENDPOINT_DATASET_VALIDATED
         transaction_events.append("store-validated")
 
     validated_store = AsyncMock(side_effect=store_validated)
@@ -430,7 +436,8 @@ async def test_validation_builds_edges_before_storing_and_uses_root_identity(
         validated_store,
     )
 
-    validation_summary = await importer._validate_endpoint_dataset_candidate(
+    validation_summary = await _validate_candidate_rows(
+        monkeypatch,
         _candidate(),
         {"InsurancePlan": {"complete": True}},
     )
@@ -447,12 +454,8 @@ async def test_validation_builds_edges_before_storing_and_uses_root_identity(
     assert validation_summary["published"] is False
     connection_executor.scalar.assert_awaited_once()
     validation_metadata = validated_store.await_args.args[-1]
-    assert validation_metadata["dataset_network_plan"]["build_run_id"] == (
-        "retry-child-run"
-    )
-    assert validation_metadata["dataset_affiliation_organization"][
-        "acquisition_root_run_id"
-    ] == "root-run"
+    assert validation_metadata["dataset_network_plan"]["build_run_id"] == ("retry-child-run")
+    assert validation_metadata["dataset_affiliation_organization"]["acquisition_root_run_id"] == "root-run"
 
 
 @pytest.mark.parametrize("failing_relation", ["network", "affiliation"])
@@ -482,7 +485,8 @@ async def test_relation_build_failure_rolls_back_before_candidate_validation(
     )
 
     with pytest.raises(RuntimeError, match="edge build failed"):
-        await importer._validate_endpoint_dataset_candidate(
+        await _validate_candidate_rows(
+            monkeypatch,
             _candidate(),
             {"InsurancePlan": {"complete": True}},
         )

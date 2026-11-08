@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 import yaml
 
+from api import provider_detail_network_metadata as metadata
 from api.endpoint import npi as npi_module
 
 
@@ -119,9 +120,7 @@ async def test_mrf_sources_are_address_local_issuer_groups_with_exact_url_aliase
     first_address_key = "11111111-1111-1111-1111-111111111111"
     second_address_key = "22222222-2222-2222-2222-222222222222"
     addresses = _mrf_address_entries(first_address_key, second_address_key)
-    execute_stmt = AsyncMock(
-        return_value=_Rows(_mrf_evidence_entries(first_address_key, second_address_key))
-    )
+    execute_stmt = AsyncMock(return_value=_Rows(_mrf_evidence_entries(first_address_key, second_address_key)))
     table_available = AsyncMock(return_value=True)
     monkeypatch.setattr(npi_module, "_execute_stmt", execute_stmt)
     monkeypatch.setattr(npi_module, "_is_table_available", table_available)
@@ -225,14 +224,24 @@ def test_public_mrf_source_urls_reject_local_literal_hosts():
         "http://[::1]/providers.json",
     )
 
-    assert all(
-        npi_module._public_mrf_source_url(source_url) is None
-        for source_url in rejected_urls
+    assert all(npi_module._public_mrf_source_url(source_url) is None for source_url in rejected_urls)
+    assert npi_module._public_mrf_source_url("https://8.8.8.8/providers.json") == "https://8.8.8.8/providers.json"
+
+
+@pytest.mark.asyncio
+async def test_managed_source_attachment_does_not_read_mutable_associations(monkeypatch):
+    fhir_attachment = AsyncMock()
+    mrf_attachment = AsyncMock()
+    monkeypatch.setattr(metadata, "current_network_address_scope", lambda: object())
+    monkeypatch.setattr(npi_module, "_attach_provider_directory_source_details", fhir_attachment)
+    monkeypatch.setattr(npi_module, "_attach_mrf_source_details", mrf_attachment)
+
+    await npi_module._attach_selected_address_source_details(
+        [{"npi": 1000000001, "telephone_number": "555-0100"}], include_sources=True, include_role_evidence=True
     )
-    assert (
-        npi_module._public_mrf_source_url("https://8.8.8.8/providers.json")
-        == "https://8.8.8.8/providers.json"
-    )
+
+    fhir_attachment.assert_not_awaited()
+    mrf_attachment.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -314,9 +323,7 @@ def test_openapi_documents_address_local_mrf_source_shape():
     schemas = yaml.safe_load(openapi_path.read_text())["components"]["schemas"]
 
     address_properties = schemas["NpiAddress"]["properties"]
-    assert address_properties["mrf_sources"]["items"]["$ref"].endswith(
-        "/MrfAddressSource"
-    )
+    assert address_properties["mrf_sources"]["items"]["$ref"].endswith("/MrfAddressSource")
     assert address_properties["mrf_source_count"]["minimum"] == 1
     source_schema = schemas["MrfAddressSource"]
     assert source_schema["required"] == [

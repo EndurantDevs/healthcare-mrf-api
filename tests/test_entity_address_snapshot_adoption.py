@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import importlib
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -13,12 +14,23 @@ import pytest
 adoption = importlib.import_module("process.entity_address_snapshot_adoption")
 cutover_contract = importlib.import_module("process.entity_address_cutover_contract")
 native = importlib.import_module("process.entity_address_unified")
+generation = importlib.import_module("process.entity_address_result_generation")
+
+
+def _source_generation():
+    return generation.EntityAddressServingGeneration(
+        origin_lineage_id="c8f27af1-56ba-4cda-82d8-0fc67650918f",
+        origin_generation=12,
+        published_at=datetime.datetime(2026, 9, 14, 8, 30, tzinfo=datetime.UTC),
+    )
 
 
 @pytest.mark.asyncio
 async def test_prepare_uses_exact_main_and_support_stage_set_without_worker_shutdown(
     monkeypatch,
 ):
+    """Prepare every family member without invoking ordinary worker shutdown."""
+
     ensured_tables: list[str] = []
     stage_cls = SimpleNamespace(__tablename__="entity_address_unified_20260913")
     support_stage_class_map = {
@@ -52,12 +64,18 @@ async def test_prepare_uses_exact_main_and_support_stage_set_without_worker_shut
     prepared = await adoption.prepare_completed_entity_address_snapshot_adoption(
         db_schema=" mrf ",
         import_date=" 20260913 ",
+        source_serving_generation=_source_generation(),
     )
 
     assert len(native.SUPPORT_TABLE_MODELS) == 6
     assert ensured_tables == [swap.stage_cls.__tablename__ for swap in swaps]
     assert prepared.db_schema == "mrf"
-    assert prepared.context == {"address_alias_generation": 9, "stage_persistence": "p"}
+    assert prepared.context == {
+        "address_alias_generation": 9,
+        "stage_persistence": "p",
+        "result_generation_mode": "adoption",
+        "source_serving_generation": _source_generation().as_dict(),
+    }
     assert prepared.publish_validation == {"bridge_orphans": {}}
     run_phase.assert_awaited_once_with(
         "ANALYZE mrf.entity_address_unified_20260913;",
@@ -65,11 +83,94 @@ async def test_prepare_uses_exact_main_and_support_stage_set_without_worker_shut
         phase="entity-address snapshot analyzing restored main table",
     )
     validate.assert_awaited_once_with(
-        "mrf",
-        "entity_address_unified_20260913",
-        support_stage_class_map,
-        test_mode=False,
+        "mrf", "entity_address_unified_20260913", support_stage_class_map, test_mode=False
     )
+
+
+def _publisher_reimport_callbacks(session, stage, selected, events, failure):
+    """Observe the exact protected seal, projection and validation order."""
+
+    async def seal(actual, oid, owner):
+        assert actual is session and (oid, owner) == (42, 31)
+        events.append("seal")
+
+    async def state_lock(actual, schema, owner):
+        assert actual is session and (schema, owner) == ("mrf", 31)
+        events.append("state lock")
+
+    async def mutation(actual, oids, owner):
+        assert actual is session and (oids, owner) == ([99], 31)
+        events.append("ordinary denial")
+
+    async def project(schema, table, **options):
+        assert (schema, table) == ("mrf", stage.__tablename__)
+        assert options["force"] is True and options["dependency_bindings"] == selected
+        assert native.db._transaction_binding().session is session
+        events.append("projection")
+        if failure == "projection":
+            raise RuntimeError("projection failed")
+        options["context"]["geo_assurance_candidate_table_oid"] = 43 if failure == "oid" else 42
+        return 7
+
+    return seal, state_lock, mutation, project
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", (None, "owner", "projection", "oid"))
+async def test_publisher_reimport_seals_before_projection_and_receipt(monkeypatch, failure):
+    """Only the authenticated Publisher may receipt the exact sealed, selected stage."""
+    from process import entity_address_snapshot_preparation as protected
+    from tests.test_geo_assurance_dependency_bindings import _example_bindings
+
+    events, selected = [], _example_bindings()
+    stage = SimpleNamespace(__tablename__="entity_address_unified_synthetic")
+    swaps = [SimpleNamespace(stage_cls=stage)]
+    swaps.extend(SimpleNamespace(stage_cls=SimpleNamespace(__tablename__=f"support_{i}")) for i in range(6))
+
+    async def scalar(statement, parameters):
+        if "relowner=:owner" in str(statement):
+            assert parameters == {"relation": '"mrf"."entity_address_geo_assurance_state"', "owner": 31}
+            events.append("owner")
+            return None if failure == "owner" else 99
+        return 42
+
+    session = SimpleNamespace(execute=AsyncMock(), scalar=scalar)
+    monkeypatch.setattr(native.db, "_transaction_binding", lambda: SimpleNamespace(session=session))
+    monkeypatch.setattr(protected, "_publisher_authority", AsyncMock(return_value=31))
+    monkeypatch.setattr(protected, "_require_alias_authority", AsyncMock())
+    monkeypatch.setattr(adoption, "_prepared_full_result_stage", lambda **_: (stage, {}, swaps, [], [], []))
+    seal, state_lock, mutation, project = _publisher_reimport_callbacks(session, stage, selected, events, failure)
+    prepared = SimpleNamespace(context={})
+
+    async def validate(**options):
+        assert options == {"db_schema": "mrf", "import_date": "synthetic"}
+        events.append("validation")
+        return prepared
+
+    monkeypatch.setattr(protected, "_seal_published_relation", seal)
+    monkeypatch.setattr(protected, "_lock_publication_state", state_lock)
+    monkeypatch.setattr(protected, "_require_no_untrusted_mutation", mutation)
+    monkeypatch.setattr(native, "_materialize_geo_assurance", project)
+    monkeypatch.setattr(adoption, "prepare_completed_entity_address_snapshot_adoption", validate)
+    if failure:
+        with pytest.raises(
+            RuntimeError,
+            match={"owner": "geo state owner", "projection": "projection failed", "oid": "projection stage"}[failure],
+        ):
+            await adoption.prepare_entity_address_publisher_reimport(
+                session, db_schema="mrf", import_date="synthetic", dependency_bindings=selected
+            )
+        assert "validation" not in events
+        if failure == "owner":
+            assert "projection" not in events
+    else:
+        actual = await adoption.prepare_entity_address_publisher_reimport(
+            session, db_schema="mrf", import_date="synthetic", dependency_bindings=selected
+        )
+        assert actual is prepared
+        assert events == ["seal"] * 7 + ["state lock", "owner", "ordinary denial", "projection", "validation"]
+        assert actual.context["geo_assurance_projected_rows"] == 7
+        assert actual.context["geo_assurance_candidate_table_oid"] == 42
 
 
 @pytest.mark.asyncio
@@ -303,7 +404,18 @@ async def test_adopt_delegates_only_named_local_fence_and_receipt_callbacks(monk
 
     async def run_cutover(*args, **kwargs):
         cutover_events.append("cutover")
-        assert args[:6] == ("mrf", [], [], [], [], {"address_alias_generation": 4})
+        assert args[:6] == (
+            "mrf",
+            [],
+            [],
+            [],
+            [],
+            {
+                "address_alias_generation": 4,
+                "result_generation_mode": "adoption",
+                "source_serving_generation": _source_generation().as_dict(),
+            },
+        )
         assert kwargs["require_caller_owned_transaction"] is True
         callbacks = kwargs["callbacks"]
         await callbacks.before_cutover()
@@ -318,7 +430,11 @@ async def test_adopt_delegates_only_named_local_fence_and_receipt_callbacks(monk
         patch_statements=[],
         relation_names=[],
         required_names=[],
-        context={"address_alias_generation": 4},
+        context={
+            "address_alias_generation": 4,
+            "result_generation_mode": "adoption",
+            "source_serving_generation": _source_generation().as_dict(),
+        },
         publish_validation={"address_alias_generation": 4},
     )
 

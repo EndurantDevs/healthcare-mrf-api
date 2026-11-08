@@ -83,6 +83,37 @@ renaming anything and retries with short bounded backoff. The local
 `lock_timeout` is a final guard for DDL locks after the fail-fast relation-lock
 step; it is intentionally separate from the bulk-import lock timeout.
 
+### Protected archive activation and CMS history
+
+Protected archive activation recognizes the exact migrated
+`cms_serving_address_transition()` and `cms_serving_no_truncate()` guards.
+Their function ownership must exclude ordinary role membership; installations
+with ordinary-owned functions require explicit provisioning to the existing
+protected owner before activation. Activation changes no function ownership or
+privileges and never disables a guard.
+
+The CMS receipt relation is locked and must remain empty through commit. A
+populated `provider_directory_cms_serving_receipt` history refuses standalone
+archive activation because it requires coordinated composite publication.
+This path does not provide that populated-history integration. Unknown or
+altered guards, unsupported receipt catalogs, and concurrent receipt writers
+also refuse without publishing the candidate.
+
+### Captured TIGER source selection
+
+Native publication first selects an installed TIGER generation from protected
+local custody. To select a source-bound captured epoch instead, configure both
+`HLTHPRT_TIGER_SOURCE_BINDING_RELATION` and
+`HLTHPRT_TIGER_SOURCE_PACKAGE_RELATION`. There are no default relation names.
+Each value must be a distinct, unquoted, lowercase `schema.table` name with
+identifier components no longer than 63 characters. These are trusted process
+settings, not import-request parameters. The binding relation supplies
+`node_id`, `inventory`, `package_id`, `importer_id`, `dataset_key`, and `is_current`;
+the package relation supplies `package_id` and `manifest`. These rows only select
+an epoch: protected local custody and exact physical identities remain required.
+An inherited source without selected protected custody cannot publish a new
+Address generation. Ordinary non-inherited canonical inputs remain supported.
+
 ## Key Environment Variables
 
 - `HLTHPRT_ENTITY_ADDRESS_UNIFIED_BATCH_SIZE`

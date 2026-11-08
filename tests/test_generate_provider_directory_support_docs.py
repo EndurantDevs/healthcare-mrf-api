@@ -5,7 +5,9 @@ import re
 from pathlib import Path
 
 import pytest
+
 from scripts import generate_provider_directory_support_docs as generator
+from tests.provider_directory_endpoint_acquisition_test_support import synthetic_verification_snapshot
 
 
 def test_rendered_support_matrix_represents_each_manifest_entry_once():
@@ -13,53 +15,71 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
 
     rendered_document = generator.render_markdown(manifest)
-    configured_table = rendered_document.split(
-        "| Source | Configured support |", 1
-    )[1].split("## Known Not Importable", 1)[0]
-    configured_rows = [
-        line for line in configured_table.splitlines() if line.startswith("| ")
-    ][1:]
+    configured_table = rendered_document.split("| Source | Configured support |", 1)[1].split(
+        "## Known Not Importable", 1
+    )[0]
+    configured_rows = [line for line in configured_table.splitlines() if line.startswith("| ")][1:]
     entry_ids = [entry["entry_id"] for entry in manifest["entries"]]
 
     assert len(configured_rows) == len(entry_ids)
     assert all(
-        configured_row.count(f"`{entry_id}`") == 1
-        for configured_row, entry_id in zip(configured_rows, entry_ids)
+        configured_row.count(f"`{entry_id}`") == 1 for configured_row, entry_id in zip(configured_rows, entry_ids)
     )
     assert "OAuth2 client credentials | Bulk" in rendered_document
     assert "Cigna (`cigna`) | Acquisition-configured | None | REST" in rendered_document
-    assert "Michigan (`michigan`) | Acquisition-configured | None | REST | Location, Organization, OrganizationAffiliation, Practitioner, PractitionerRole" in rendered_document
-    assert "CareSource (`caresource`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint" in rendered_document
+    assert (
+        "Michigan (`michigan`) | Acquisition-configured | None | REST | Location, Organization, OrganizationAffiliation, Practitioner, PractitionerRole"
+        in rendered_document
+    )
+    assert (
+        "CareSource (`caresource`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint"
+        in rendered_document
+    )
     assert "processed and unique candidate resource IDs equal unchanged post-scan census" in rendered_document
     assert "No product membership is inferred from the catalog row" in rendered_document
-    assert "both _count=100 and _count=75 returned populated search sets" in rendered_document
-    assert "ALOHR (`alohr`) | Acquisition-configured | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole | https://" in rendered_document
-    assert "UnitedHealthcare Official Provider Files (`uhc-provider-files`) | Acquisition-configured | None | Official files | InsurancePlan, Location, Organization, OrganizationAffiliation, Practitioner, PractitionerRole" in rendered_document
-    assert "Horizon NJ (`horizon-nj`) | Probe-only | OAuth2 client credentials | Probe | None configured" in rendered_document
-    assert "AmeriHealth Caritas Carrier Directory (`amerihealth-caritas-carrier`) | Acquisition-configured | None | REST | InsurancePlan, Location, Organization, OrganizationAffiliation, Practitioner, PractitionerRole" in rendered_document
+    assert "supports configured _count=100 and _count=75 searches" in rendered_document
+    assert (
+        "ALOHR (`alohr`) | Acquisition-configured | Private connector | GraphQL | Practitioner, Organization, Location, PractitionerRole | https://"
+        in rendered_document
+    )
+    assert (
+        "UnitedHealthcare Official Provider Files (`uhc-provider-files`) | Acquisition-configured | None | Official files | InsurancePlan, Location, Organization, OrganizationAffiliation, Practitioner, PractitionerRole"
+        in rendered_document
+    )
+    assert (
+        "Horizon NJ (`horizon-nj`) | Probe-only | OAuth2 client credentials | Probe | None configured"
+        in rendered_document
+    )
+    assert (
+        "AmeriHealth Caritas Carrier Directory (`amerihealth-caritas-carrier`) | Acquisition-configured | None | REST | InsurancePlan, Location, Organization, OrganizationAffiliation, Practitioner, PractitionerRole"
+        in rendered_document
+    )
     assert "AmeriHealth Caritas DC (`amerihealth-dc`) | Probe-only" in rendered_document
     assert "clears plan_name and does not claim NH product membership" in rendered_document
     assert "Exhaustive equivalence with plan-code bases" in rendered_document
-    assert "## Inventory Summary" in rendered_document
-    assert "| Acquisition-configured | 26 |" in rendered_document
-    assert "| Externally supported | 0 |" in rendered_document
-    assert "| Probe-only | 13 |" in rendered_document
-    assert "| Known not importable | 3 |" in rendered_document
-    assert "| Total tracked | 42 |" in rendered_document
-    assert "### Credentialed Or Registered Access" in rendered_document
-    assert "Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Acquisition-configured | OAuth2 client credentials | Required" in rendered_document
-    assert "Horizon NJ (`horizon-nj`) | Probe-only | OAuth2 client credentials | Required" in rendered_document
-    assert "ALOHR (`alohr`) | Acquisition-configured | Private connector | Required" in rendered_document
-    assert "First Medical Health Plan, Inc. (`provider-directory-blocked-first-medical-pr`) | Not supported | User token | Required" in rendered_document
-    assert "| Registration | Reviewed at | Review valid through |" in rendered_document
-    assert "Aetna Commercial/Medicare (`aetna-commercial-medicare`)" in rendered_document
-    assert "Required | 2026-08-26 | 2026-10-10 | OAuth2 client credentials and Bulk" in rendered_document
-    assert "Cigna (`cigna`)" in rendered_document
-    assert "Not required | 2026-08-26 | 2026-10-10 | Sequential REST pagination" in rendered_document
+
+
+def test_rendered_support_matrix_separates_live_evidence_and_blockers():
+    """Configured access and observed publication remain distinct."""
+    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    rendered_document = generator.render_markdown(manifest)
+
+    assert (
+        "Historical source and probe notes retained in limitations are not new live verification" in rendered_document
+    )
     assert "## Observed Live Verification" in rendered_document
-    assert "| Terminal status | Resource completion | Derived artifacts | Unified/API readiness | Readiness observed at |" in rendered_document
-    assert "| ALOHR (`alohr`) | Not recorded | Not recorded | Not recorded | Not Promoted | Not Ready |" in rendered_document
-    assert "| Idaho (`idaho`) | Current | Succeeded | Complete | Promoted | Ready |" in rendered_document
+    assert (
+        "| Terminal status | Resource completion | Derived artifacts | Unified/API readiness | Readiness observed at |"
+        in rendered_document
+    )
+    assert (
+        "| ALOHR (`alohr`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |"
+        in rendered_document
+    )
+    assert (
+        "| Idaho (`idaho`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |"
+        in rendered_document
+    )
     assert "scripts/update_provider_directory_verification.py" in rendered_document
     assert "## Known Not Importable" in rendered_document
     assert "Chorus Community Health Plans" in rendered_document
@@ -67,6 +87,46 @@ def test_rendered_support_matrix_represents_each_manifest_entry_once():
     assert "Territory of Puerto Rico" in rendered_document
     assert "User token | Required" in rendered_document
     assert "[campaign report]" not in rendered_document
+
+
+def test_rendered_inventory_summary_and_access_requirements():
+    """Inventory totals and access requirements remain separate from live proof."""
+    manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
+    rendered_document = generator.render_markdown(manifest)
+
+    assert "## Inventory Summary" in rendered_document
+    assert "| Acquisition-configured | 34 |" in rendered_document
+    assert "| Externally supported | 0 |" in rendered_document
+    assert "| Probe-only | 13 |" in rendered_document
+    assert "| Known not importable | 3 |" in rendered_document
+    assert "| Total tracked | 50 |" in rendered_document
+    assert "### Credentialed Or Registered Access" in rendered_document
+    assert (
+        "Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Acquisition-configured | OAuth2 client credentials | Required"
+        in rendered_document
+    )
+    assert "Horizon NJ (`horizon-nj`) | Probe-only | OAuth2 client credentials | Required" in rendered_document
+    assert "ALOHR (`alohr`) | Acquisition-configured | Private connector | Required" in rendered_document
+    assert (
+        "First Medical Health Plan, Inc. (`provider-directory-blocked-first-medical-pr`) | Not supported | User token | Required"
+        in rendered_document
+    )
+    assert "| Registration | Reviewed at | Review valid through |" in rendered_document
+    aetna_row = next(
+        candidate_line
+        for candidate_line in rendered_document.splitlines()
+        if candidate_line.startswith("| Aetna Commercial/Medicare (`aetna-commercial-medicare`) |")
+        and "| Bulk |" in candidate_line
+    )
+    assert "| Required | 2026-10-11 | 2026-11-25 |" in aetna_row
+    assert "OAuth2 client credentials and Bulk" in aetna_row
+    cigna_row = next(
+        candidate_line
+        for candidate_line in rendered_document.splitlines()
+        if candidate_line.startswith("| Cigna (`cigna`) |")
+    )
+    assert "| Not required | 2026-10-11 | 2026-11-25 |" in cigna_row
+    assert "Sequential REST pagination" in cigna_row
 
 
 def test_caresource_manifest_entry_is_public_carrier_level_r8_rest_support():
@@ -77,8 +137,7 @@ def test_caresource_manifest_entry_is_public_carrier_level_r8_rest_support():
     assert entry["owner_id"] == "caresource-provider-directory"
     assert entry["source_ids"] == ["pdfhir_b627b38e07cae99151baa4b7"]
     assert entry["canonical_base"] == (
-        "https://orchestrateserver.caresource.careevolution.com/"
-        "api/fhir/provider-directory"
+        "https://orchestrateserver.caresource.careevolution.com/api/fhir/provider-directory"
     )
     assert entry["classification"] == "acquisition"
     assert entry["resource_profile"] == "R8"
@@ -101,14 +160,12 @@ def test_caresource_manifest_entry_is_public_carrier_level_r8_rest_support():
 def test_alohr_manifest_requires_fresh_four_resource_graphql_proof():
     manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
     alohr_entry = next(
-        manifest_entry
-        for manifest_entry in manifest["entries"]
-        if manifest_entry["entry_id"] == "alohr"
+        manifest_entry for manifest_entry in manifest["entries"] if manifest_entry["entry_id"] == "alohr"
     )
     alohr_support = manifest["support_documentation"]["entry_support"]["alohr"]
-    alohr_verification = generator.load_verification_snapshot(
-        generator.DEFAULT_VERIFICATION_SNAPSHOT
-    )["entries"]["alohr"]
+    alohr_verification = generator.load_verification_snapshot(generator.DEFAULT_VERIFICATION_SNAPSHOT)["entries"][
+        "alohr"
+    ]
 
     assert alohr_entry["classification"] == "acquisition"
     assert alohr_entry["launch_mode"] == "create"
@@ -126,14 +183,7 @@ def test_alohr_manifest_requires_fresh_four_resource_graphql_proof():
     assert alohr_verification["access_verification"] == "not_recorded"
     assert alohr_verification["proof_state"] == "not_recorded"
     assert alohr_verification["terminal_status"] is None
-    assert alohr_verification["publication_readiness"][
-        "derived_artifact_state"
-    ] == (
-        "not_promoted"
-    )
-    assert alohr_verification["publication_readiness"]["unified_api_state"] == (
-        "not_ready"
-    )
+    assert "publication_readiness" not in alohr_verification
     assert "current_observation" not in alohr_verification
     assert "terminal_evidence" not in alohr_verification
     assert "OrganizationAffiliation" not in json.dumps(alohr_verification)
@@ -142,13 +192,18 @@ def test_alohr_manifest_requires_fresh_four_resource_graphql_proof():
 
 def test_rendered_live_proof_summarizes_resource_rows():
     manifest = generator.load_manifest(generator.DEFAULT_MANIFEST)
-    rendered_document = generator.render_markdown(manifest)
+    rendered_document = generator.render_markdown(
+        manifest, verification_snapshot=synthetic_verification_snapshot(manifest)
+    )
 
     assert "| Rows by resource |" in rendered_document
     assert "| Idaho (`idaho`) | Current | Succeeded | Complete | Promoted | Ready |" in rendered_document
-    assert "| Cigna (`cigna`) | Current | Succeeded | Complete | Superseded (Promoted) | Superseded (Ready) |" in rendered_document
-    assert "HealthcareService: 1,108,600" in rendered_document
-    assert "Location: 280,847" in rendered_document
+    assert (
+        "| Cigna (`cigna`) | Current | Succeeded | Complete | Superseded (Promoted) | Superseded (Ready) |"
+        in rendered_document
+    )
+    assert "HealthcareService: 3" in rendered_document
+    assert "Location: 3" in rendered_document
 
 
 @pytest.mark.parametrize(
@@ -239,7 +294,7 @@ def test_validate_manifest_rejects_external_support_without_documented_resources
         {
             "classification": "external",
             "launch_mode": "external_completed",
-            "external_run_id": "run_17baae4934f54639bd748d50554a9cbd",
+            "external_run_id": "run_11111111111111111111111111111111",
             "resource_profile": "NONE",
             "resources": [],
         }
@@ -270,7 +325,7 @@ def test_validate_manifest_rejects_external_method_mismatch():
         {
             "classification": "external",
             "launch_mode": "external_completed",
-            "external_run_id": "run_17baae4934f54639bd748d50554a9cbd",
+            "external_run_id": "run_11111111111111111111111111111111",
             "resource_profile": "NONE",
             "resources": [],
         }
@@ -308,7 +363,12 @@ def test_blocker_registry_is_complete_and_shared_with_generated_docs():
     assert "Not importable | None confirmed | None confirmed" in rendered
     assert "Practitioner, PractitionerRole, Location | None confirmed" in rendered
     assert "| Live verification |" in rendered
-    assert "2026-08-25" in rendered
+    blocked_section = rendered.split("## Known Not Importable", 1)[1].split("## Observed Live Verification", 1)[0]
+    for entry in entries:
+        rows = [line for line in blocked_section.splitlines() if f"`{entry['id']}`" in line]
+        assert len(rows) == 1
+        assert rows[0].split("|")[10].strip() == entry["reviewed_at"]
+    assert "Reachable Unverified" in rendered
 
 
 def test_validate_blocker_registry_rejects_unknown_access_requirement():

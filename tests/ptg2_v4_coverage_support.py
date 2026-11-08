@@ -53,6 +53,7 @@ class _Result:
 
 class _ScriptedSession:
     def __init__(self, *responses: _Result) -> None:
+        self.info = {}
         self.responses = list(responses)
         self.calls: list[tuple[str, Any]] = []
 
@@ -363,43 +364,16 @@ def configure_publication_spies(monkeypatch):
     ):
         lock_calls.append((snapshot_key, build_token))
 
-    async def fake_npi_batch(_session, *, npi_rows, **_kwargs):
-        batches.append(("npi", tuple(row["npi_key"] for row in npi_rows)))
+    async def fake_publication(_session, *, table, snapshot_key, build_token, entries, columns, batch_rows, **_kwargs):
+        lock_calls.append((snapshot_key, build_token))
+        rows = tuple(entries)
+        label_by_table = {snapshot_maps.PTG2_V4_NPI_TABLE: "npi", snapshot_maps.PTG2_V4_COMPONENT_TABLE: "component", snapshot_maps.PTG2_V4_PATTERN_TABLE: "pattern"}
+        if table in label_by_table:
+            for offset in range(0, len(rows), batch_rows):
+                batches.append((label_by_table[table], tuple(row[columns[0]] if isinstance(row, dict) else row[0] for row in rows[offset:offset+batch_rows])))
+        return len(rows)
 
-    async def fake_component_batch(_session, *, component_rows, **_kwargs):
-        component_keys = tuple(
-            row["component_key"] for row in component_rows
-        )
-        batches.append(("component", component_keys))
-
-    async def fake_pattern_batch(_session, *, pattern_rows, **_kwargs):
-        pattern_keys = tuple(row["pattern_key"] for row in pattern_rows)
-        batches.append(("pattern", pattern_keys))
-
-    async def fake_dense(_session, *, expected_count: int, **_kwargs):
-        return expected_count
-
-    monkeypatch.setattr(
-        snapshot_maps,
-        "lock_v4_shared_layout_for_map_write",
-        fake_lock,
-    )
-    monkeypatch.setattr(
-        snapshot_maps,
-        "_publish_v4_npi_batch",
-        fake_npi_batch,
-    )
-    monkeypatch.setattr(
-        snapshot_maps,
-        "_publish_v4_component_batch",
-        fake_component_batch,
-    )
-    monkeypatch.setattr(
-        snapshot_maps,
-        "_publish_v4_pattern_batch",
-        fake_pattern_batch,
-    )
-    monkeypatch.setattr(snapshot_maps, "_verify_dense_table_keys", fake_dense)
+    monkeypatch.setattr(snapshot_maps, "publish_snapshot_records", fake_publication)
     return fake_lock, lock_calls, batches
 
 

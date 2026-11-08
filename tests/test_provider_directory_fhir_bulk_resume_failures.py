@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tests.provider_directory_checkpoint_unit_support import checkpoint_unit_scope as checkpoint_unit_scope
 from tests.test_provider_directory_fhir_bulk_resume import (
     _aetna_source,
     _checkpoint_identity,
@@ -16,6 +17,7 @@ from tests.test_provider_directory_fhir_bulk_resume import (
     _resume_stream_options,
     importer,
 )
+
 
 @pytest.mark.asyncio
 async def test_bulk_output_failure_cancels_and_drains_siblings(monkeypatch):

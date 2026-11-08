@@ -1,0 +1,335 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+"""Frozen additive DDL, current head and exact immutable assertion privileges."""
+
+import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
+from sqlalchemy import CheckConstraint
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.schema import CreateColumn
+
+from db.models.company_registry_assertions import CompanyRegistryGroupAssertion
+from process import registry_management_permissions as permissions
+
+ROOT = Path(__file__).parents[1]
+REVISION = "20261011010000_company_registry_group_assertions"
+PREDECESSOR = "20261010030000_registry_source_admission_receipt"
+
+
+def _migration(revision=REVISION):
+    path = ROOT / "alembic/versions" / (revision + ".py")
+    specification = importlib.util.spec_from_file_location(revision, path)
+    migration = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(migration)
+    return migration
+
+
+def _assert_source_inventory_migration_head(script):
+    """Require the inventory head and its refresh and catalog predecessors."""
+    assert script.get_heads() == ["20261107010000_custom_import_child_reference_aggregate"]
+    assert script.get_revision("20261029010000_registry_source_inventory").down_revision == (
+        "20261028020000_registry_membership_refresh"
+    )
+    assert script.get_revision("20261028020000_registry_membership_refresh").down_revision == (
+        "20261028010000_registry_fhir_catalog"
+    )
+
+
+def test_additive_group_assertion_migration_matches_frozen_model_and_index():
+    migration = _migration()
+    statements = migration._ddl("example_registry")
+    assert len(statements) == 3
+    normalized = "".join(statements[0].split())
+    table = CompanyRegistryGroupAssertion.__table__
+    for column in table.columns:
+        expected = str(CreateColumn(column).compile(dialect=postgresql.dialect()))
+        assert "".join(expected.split()) in normalized
+    for constraint in table.constraints:
+        if isinstance(constraint, CheckConstraint):
+            if constraint.name == "company_group_assertion_no_affiliation":
+                continue  # This constraint belongs to the later additive branch.
+            check = {
+                "company_group_assertion_relationship": "relationship_kind IN ('reported_affiliation','verified_ownership')",
+                "company_group_assertion_manual_group": "provenance_kind<>'manual_reference' OR group_id IS NOT NULL",
+            }.get(constraint.name, str(constraint.sqltext))
+            expected = f"CONSTRAINT{constraint.name}CHECK({check})"
+            assert "".join(expected.split()) in normalized
+    assert "PRIMARYKEY(assertion_id,company_id,company_revision)" in normalized
+    assert statements[1] == (
+        'CREATE INDEX company_group_assertion_revision_idx ON "example_registry".'
+        "company_registry_group_assertion (company_id, company_revision)"
+    )
+    assert statements[2] == 'REVOKE ALL ON "example_registry".company_registry_group_assertion FROM PUBLIC'
+    assert all(
+        word not in " ".join(statements).upper()
+        for word in (
+            "CREATE FUNCTION",
+            "CREATE TRIGGER",
+            "REFERENCES",
+            "ALTER TABLE",
+            "INSERT INTO",
+            "UPDATE ",
+            "GRANT ",
+        )
+    )
+    assert not table.foreign_keys
+    with pytest.raises(RuntimeError, match="retained-data migration"):
+        migration.downgrade()
+
+
+@pytest.mark.parametrize("schema", [None, 17, "", 'bad"name', "a.b", "a" * 64, "x\n"])
+def test_group_migration_rejects_invalid_schema_before_sql(schema):
+    with pytest.raises(ValueError):
+        _migration()._ddl(schema)
+
+
+def test_group_assertions_share_exact_insert_only_management_policy():
+    model = CompanyRegistryGroupAssertion
+    name = model.__tablename__
+    assert model in permissions._MODELS and model not in permissions._HEAD_MODELS
+    assert permissions._TABLES[name] == tuple(model.__table__.columns.keys())
+    assert permissions._INSERT_COLUMNS[name] == tuple(
+        column for column in model.__table__.columns.keys() if column != "created_at"
+    )
+    assert name not in permissions._UPDATE_COLUMNS
+
+
+def test_group_migration_extends_only_the_actual_current_receipt_head():
+    config = Config(str(ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    _assert_source_inventory_migration_head(script)
+    assert (
+        script.get_revision("20261019030000_provider_directory_role_schema").down_revision
+        == "20261019020000_registry_continuation_join"
+    )
+    assert script.get_revision("20261019020000_registry_continuation_join").down_revision == (
+        "20261019010000_registry_raw_object_join",
+        "20261019010000_custom_import_build_continuation",
+    )
+    assert script.get_revision("20261019010000_custom_import_build_continuation").down_revision == (
+        "20261017010000_custom_import_raw_objects"
+    )
+    assert script.get_revision("20261017020000_source_registry_snapshot_join").down_revision == (
+        "20261016060000_uhc_official_cohort_snapshots",
+        "20261017010000_registry_cms_source_notifications",
+    )
+    assert script.get_revision("20261017010000_registry_cms_source_notifications").down_revision == (
+        "20261016070000_registry_allowed_plan_scope"
+    )
+    assert script.get_revision("20261016070000_registry_allowed_plan_scope").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+    assert script.get_revision("20261016060000_uhc_official_cohort_snapshots").down_revision == (
+        "20261016050000_acquisition_validator_argument_types"
+    )
+    assert script.get_revision("20261015010000_plan_release_binding_cohorts").down_revision == (
+        "20261015020000_custom_import_query_projections"
+    )
+    assert script.get_revision("20261015020000_custom_import_query_projections").down_revision == (
+        "20261013010000_registry_custom_history_events"
+    )
+    assert script.get_revision(REVISION).down_revision == PREDECESSOR
+    assert script.get_revision(PREDECESSOR).down_revision == "20261010020000_registry_ptg_office_retention"
+    assert script._upgrade_revs("head", PREDECESSOR)[0].revision.revision == REVISION
+
+
+def test_snapshot_branch_join_preserves_both_parents_without_database_operations(monkeypatch):
+    migration = _migration("20261017020000_source_registry_snapshot_join")
+    statements = []
+    monkeypatch.setattr("alembic.op.execute", statements.append)
+    assert migration.revision == "20261017020000_source_registry_snapshot_join"
+    assert migration.down_revision == (
+        "20261016060000_uhc_official_cohort_snapshots",
+        "20261017010000_registry_cms_source_notifications",
+    )
+    assert migration.branch_labels is None and migration.depends_on is None
+    assert migration.upgrade() is None
+    assert migration.downgrade() is None
+    assert statements == []
+
+
+@pytest.mark.parametrize(
+    "installed_revision,remaining_revisions",
+    [
+        (
+            "20261016060000_uhc_official_cohort_snapshots",
+            [
+                "20261016070000_registry_allowed_plan_scope",
+                "20261017010000_registry_cms_source_notifications",
+                "20261017020000_source_registry_snapshot_join",
+            ],
+        ),
+        (
+            "20261017010000_registry_cms_source_notifications",
+            [
+                "20261015010000_plan_release_binding_cohorts",
+                "20261015015000_generic_source_candidates",
+                "20261016010000_cms_registry_source_pair_slot",
+                "20261016030000_cms_source_guard_argument_types",
+                "20261016040000_source_validator_argument_types",
+                "20261016050000_acquisition_validator_argument_types",
+                "20261016060000_uhc_official_cohort_snapshots",
+                "20261017020000_source_registry_snapshot_join",
+            ],
+        ),
+    ],
+)
+def test_snapshot_join_applies_only_the_missing_branch(installed_revision, remaining_revisions):
+    config = Config(str(ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert [
+        step.revision.revision
+        for step in script._upgrade_revs("20261017020000_source_registry_snapshot_join", installed_revision)
+    ] == (remaining_revisions)
+
+
+def test_raw_object_join_preserves_both_parents_without_database_operations(monkeypatch):
+    migration = _migration("20261019010000_registry_raw_object_join")
+    statements = []
+    monkeypatch.setattr("alembic.op.execute", statements.append)
+    assert migration.down_revision == (
+        "20261018040000_registry_aca_source_notifications",
+        "20261017010000_custom_import_raw_objects",
+    )
+    assert migration.branch_labels is None and migration.depends_on is None
+    assert migration.upgrade() is None
+    assert migration.downgrade() is None
+    assert statements == []
+
+
+@pytest.mark.parametrize(
+    "installed_revision",
+    (
+        "20261018040000_registry_aca_source_notifications",
+        "20261017010000_custom_import_raw_objects",
+    ),
+)
+def test_raw_object_join_upgrades_either_installed_branch_once(installed_revision):
+    config = Config(str(ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    revisions = [
+        step.revision.revision
+        for step in script._upgrade_revs("20261019010000_registry_raw_object_join", installed_revision)
+    ]
+    assert len(revisions) == len(set(revisions))
+    assert revisions[-1] == "20261019010000_registry_raw_object_join"
+    assert installed_revision not in revisions
+    assert "20261017210000_provider_directory_readiness_indexes" not in revisions
+    if installed_revision == "20261018040000_registry_aca_source_notifications":
+        assert revisions == [
+            "20261017010000_custom_import_raw_objects",
+            "20261019010000_registry_raw_object_join",
+        ]
+    else:
+        assert revisions[-2] == "20261018040000_registry_aca_source_notifications"
+        assert "20261017020000_source_registry_snapshot_join" in revisions
+
+
+def test_affiliation_branch_preserves_pending_directory_migrations_and_matches_constraints(monkeypatch):
+    from db.models.company_registry import CompanyRegistry
+    from db.models.company_registry_assertions import CompanyRegistryRoleAssertion
+
+    branch = "20261025010000_company_affiliation_states"
+    config = Config(str(ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    base = "20261023220000_merge_directory_pricing_controls"
+    assert [step.revision.revision for step in script._upgrade_revs(branch, base)] == [branch]
+    assert set(
+        step.revision.revision for step in script._upgrade_revs("20261025020000_company_affiliation_join", base)
+    ) == {
+        branch,
+        "20261024050000_provider_directory_first_retirement_owner_lineage",
+        "20261023100000_provider_directory_serving_recovery",
+        "20261025020000_company_affiliation_join",
+    }
+    migration = _migration(branch)
+    statements = migration._ddl("example_registry")
+    names = {
+        "registry_company_roles",
+        "company_role_assertion_role",
+        "company_group_assertion_relationship",
+        "company_group_assertion_manual_group",
+        "company_group_assertion_no_affiliation",
+    }
+    checks_by_name = {
+        constraint.name: str(constraint.sqltext)
+        for model in (CompanyRegistry, CompanyRegistryRoleAssertion, CompanyRegistryGroupAssertion)
+        for constraint in model.__table__.constraints
+        if constraint.name in names
+    }
+    assert len(statements) == 3 and len(checks_by_name) == 5
+    for model in (CompanyRegistry, CompanyRegistryRoleAssertion, CompanyRegistryGroupAssertion):
+        assert (
+            sum(f'ALTER TABLE "example_registry".{model.__tablename__} ' in statement for statement in statements) == 1
+        )
+    for name, check in checks_by_name.items():
+        assert sum(f"ADD CONSTRAINT {name} CHECK ({check})" in statement for statement in statements) == 1
+    assert not any(
+        token in " ".join(statements).upper()
+        for token in ("GRANT", "CREATE FUNCTION", "TRIGGER", "INSERT", "DELETE", "UPDATE ", "NOT VALID", "COMMIT")
+    )
+    executed_statements = []
+    monkeypatch.setattr("alembic.op.execute", executed_statements.append)
+    monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", "example_registry")
+    migration.upgrade()
+    assert executed_statements == ["SET LOCAL lock_timeout='1s'", "SET LOCAL statement_timeout='10s'", *statements]
+    with pytest.raises(RuntimeError, match="retained-data migration"):
+        migration.downgrade()
+    join = _migration("20261025020000_company_affiliation_join")
+    executed_statements.clear()
+    assert join.upgrade() is join.downgrade() is None and executed_statements == []
+
+
+@pytest.mark.parametrize("schema", [None, "", 'bad"name', "a.b", "a" * 64])
+def test_affiliation_migration_rejects_bad_namespace(schema):
+    with pytest.raises(ValueError):
+        _migration("20261025010000_company_affiliation_states")._ddl(schema)
+
+
+def test_affiliation_upgrade_retains_directory_head():
+    script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
+    installed = "20261024050000_provider_directory_first_retirement_owner_lineage"
+    branch = "20261025010000_company_affiliation_states"
+    steps = script._upgrade_revs(branch, installed)
+    assert [step.revision.revision for step in steps] == [branch]
+    assert steps[0].should_create_branch({installed})
+    assert not steps[0].should_merge_branches({installed})
+    assert steps[0].to_revisions == (branch,)
+
+
+def test_native_fixture_head_checks_preserve_history_without_database_work():
+    from tests.entity_address_migrated_preparation_support import _assert_address_migration_chain
+    from tests.test_provider_directory_profile_capacity_adoption_postgres import _assert_registry_migration_lineage
+
+    script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
+    assert _assert_registry_migration_lineage() == {"20261107010000_custom_import_child_reference_aggregate"}
+    assert _assert_address_migration_chain(script) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", [None, "before-affiliation"])
+async def test_assertion_fixture_keeps_named_affiliation_boundary(monkeypatch, tmp_path, phase):
+    from tests import test_company_registry_assertions_postgres as assertions
+
+    prepared = AsyncMock(return_value=object())
+    monkeypatch.setattr(assertions, "_guarded_url", lambda: None)
+    monkeypatch.setattr(assertions, "_registration", lambda path: (path / "receipt.json", {}))
+    monkeypatch.setattr(assertions, "_prepare_database", prepared)
+    monkeypatch.setattr(assertions, "_cleanup_database", AsyncMock())
+    fixture = assertions.assertion_db.__wrapped__(tmp_path, monkeypatch, SimpleNamespace(param=phase))
+    try:
+        assert await anext(fixture) is prepared.return_value
+        migrations = prepared.await_args.args[-1]
+        assert migrations[-1] == "20261028010000_registry_fhir_catalog.py"
+        assert (assertions._AFFILIATION_MIGRATION in migrations) == (phase is None)
+    finally:
+        await fixture.aclose()

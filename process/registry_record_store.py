@@ -1,0 +1,1569 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+"""Management draft heads and full history; this does not publish serving data."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import unicodedata
+from dataclasses import asdict, dataclass
+from datetime import date, datetime
+from uuid import UUID
+
+from sqlalchemy import (
+    BigInteger,
+    Integer,
+    MetaData,
+    String,
+    Text,
+    case,
+    cast,
+    column,
+    func,
+    insert,
+    literal,
+    or_,
+    select,
+    text,
+    tuple_,
+    update,
+)
+from sqlalchemy.dialects.postgresql import JSONB, aggregate_order_by
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
+
+from db.models import NPIData
+from db.models.company_group_registry import CompanyGroupRegistry
+from db.models.company_registry import CompanyRegistry
+from db.models.company_registry_assertions import (
+    CompanyRegistryGroupAssertion,
+    CompanyRegistryIdentifierAssertion,
+    CompanyRegistryRoleAssertion,
+)
+from db.models.company_registry_links import CompanyRegistryLinks
+from db.models.manual_directory_registry import (
+    ManualLocationRegistry,
+    ManualProviderLocationBinding,
+    ManualProviderRegistry,
+)
+from db.models.network_membership_draft import NetworkMembershipDraft
+from db.models.network_registry import NetworkRegistryIdentity, NetworkRegistryRecord
+from db.models.registry_evidence import RegistryIdentifierBinding, RegistrySourceObservation, RegistrySourceSnapshot
+from db.models.registry_network_binding import RegistryNetworkBinding
+from db.models.registry_revision import RegistryRecordHistory, RegistryRevisionControl
+from db.models.registry_site_binding import RegistrySiteBinding
+from process.company_registry_assertion_values import (
+    COMPANY_ROLES,
+    CONTRACT,
+    MAX_GROUP_ASSERTIONS,
+    MAX_IDENTIFIER_ASSERTIONS,
+    MAX_ROLE_ASSERTIONS,
+    validated_company_registry_assertions,
+)
+from process.ext.address_fast import _fast_module
+from process.network_membership_copy import MAX_INPUT_BYTES, MembershipCopyError, partition_network_membership_commands
+from process.network_registry_identity import allocate_network_ids
+from process.provider_directory_projection_fhir_values import is_valid_npi
+from process.registry_company_link_validation import (
+    _preflight_company_link_benefits,
+    _validate_company_link_snapshot,
+    _validate_company_link_targets,
+)
+from process.registry_issuer_resolution import MAX_EVIDENCE_ROWS, MAX_RESULT_BYTES
+from process.registry_manual_location_bindings import ManualLocationBindingConflict, retain_manual_location_bindings
+from process.registry_site_binding_store import resolve_site_binding_fields, validated_site_binding_fields
+from process.uhc_flex_practitioner_async_safety import drain_operation
+
+_RECORD_MODELS = {
+    "network_binding": (RegistryNetworkBinding, "binding_id", set()),
+    "group": (CompanyGroupRegistry, "group_id", {"group_kind", "display_name", "aliases"}),
+    "company": (CompanyRegistry, "company_id", {"display_name", "roles", "aliases"}),
+    "network": (NetworkRegistryRecord, "network_id", {"display_name", "aliases"}),
+    "company_links": (CompanyRegistryLinks, "company_id", {"network_ids", "group_id"}),
+    "provider": (ManualProviderRegistry, "provider_id", {"display_name", "provider_kind", "aliases", "npi"}),
+    "location": (ManualLocationRegistry, "location_id", {"display_name", "aliases", "address_json"}),
+    "membership": (NetworkMembershipDraft, "network_id", {"memberships_json"}),
+    "site_binding": (
+        RegistrySiteBinding,
+        "binding_id",
+        {"source_generation", "provider_system", "provider_id", "location_id", "location_key", "address_row_sha256"},
+    ),
+}
+_COMPANY_ROLES = frozenset(COMPANY_ROLES)
+
+
+class RegistryRecordConflict(ValueError):
+    """A stale revision or conflicting retry cannot mutate a draft."""
+
+
+class RegistryAddressUnavailable(RuntimeError):
+    """A management read or native encoding prerequisite is unavailable."""
+
+
+@dataclass(frozen=True)
+class RegistryActor:
+    """Server-derived actor; the caller verifies explicit action grants."""
+
+    kind: str
+    user_id: UUID
+    client_id: str
+    impersonator_id: UUID | None = None
+
+
+@dataclass(frozen=True)
+class RegistryRecordCommand:
+    record_kind: str
+    record_id: UUID | int | None
+    operation: str
+    expected_revision: int
+    fields: dict
+    reason: str
+    idempotency_key: str
+    allocation_key: UUID | None = None
+    _undo_provenance_required: bool = False
+
+
+@dataclass(frozen=True)
+class PreparedRegistryLocationCommand:
+    location_id: UUID
+    status: str
+    fields_json: str
+    matching_location_ids: tuple[UUID, ...]
+
+
+_LOCATION_CANONICAL_FIELDS = {
+    "address_key",
+    "identity_key",
+    "premise_key",
+    "premise_identity_key",
+    "line1_norm",
+    "unit_norm",
+    "city_norm",
+    "state_code",
+    "zip5",
+    "zip4",
+    "country_code",
+}
+_LOCATION_FIELDS = {"display_name", "aliases", "address_json"}
+
+
+def _bounded_text(value, maximum, field):
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum or "\0" in value:
+        raise ValueError(f"registry_{field}_invalid")
+    return value.strip()
+
+
+def _bounded_name(value, maximum, field):
+    normalized = _bounded_text(value, maximum, field)
+    if any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value):
+        raise ValueError(f"registry_{field}_invalid")
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        raise ValueError(f"registry_{field}_invalid") from None
+    return normalized
+
+
+def _uuid(value):
+    if not isinstance(value, UUID) or not value.int:
+        raise ValueError("registry_uuid_invalid")
+    return value
+
+
+def _record_identity(kind, value):
+    if kind in {"network", "membership"}:
+        if type(value) is not int or not 0 < value <= 2147483647:
+            raise ValueError("registry_network_id_invalid")
+        return value
+    return _uuid(value)
+
+
+def _validated_actor(actor):
+    if (
+        not isinstance(actor, RegistryActor)
+        or not isinstance(actor.kind, str)
+        or actor.kind not in {"platform_admin", "client_owner"}
+    ):
+        raise ValueError("registry_actor_invalid")
+    _uuid(actor.user_id)
+    if actor.impersonator_id is not None:
+        _uuid(actor.impersonator_id)
+    if _bounded_text(actor.client_id, 64, "client_id") != actor.client_id or any(
+        ord(character) < 32 or ord(character) == 127 for character in actor.client_id
+    ):
+        raise ValueError("registry_client_id_invalid")
+    return {key: str(value) if isinstance(value, UUID) else value for key, value in asdict(actor).items()}
+
+
+def _validated_fields(kind, fields):
+    if kind == "company_links":
+        if type(fields) is not dict or set(fields) not in (
+            _RECORD_MODELS[kind][2],
+            _RECORD_MODELS[kind][2] | {"network_assertions"},
+        ):
+            raise ValueError("registry_editable_fields_invalid")
+        return _validated_company_links(fields)
+    allowed = _RECORD_MODELS[kind][2]
+    if not isinstance(fields, dict) or set(fields) not in (
+        allowed,
+        allowed | {"assertions"}
+        if kind == "company"
+        else allowed | {"catalog_evidence_json"}
+        if kind == "network"
+        else allowed,
+    ):
+        raise ValueError("registry_editable_fields_invalid")
+    if kind == "site_binding":
+        return validated_site_binding_fields(fields)
+    if kind == "membership":
+        if type(fields["memberships_json"]) is not list:
+            raise ValueError("registry_membership_rows_invalid")
+        return {"memberships_json": fields["memberships_json"]}
+    maximum = 256 if kind in {"provider", "location"} else 512
+    fields_by_name = {"display_name": _bounded_name(fields["display_name"], maximum, "display_name")}
+    aliases = fields["aliases"]
+    if not isinstance(aliases, list) or len(aliases) > 100:
+        raise ValueError("registry_aliases_invalid")
+    fields_by_name["aliases"] = sorted({_bounded_name(alias, 512, "alias") for alias in aliases})
+    if kind == "location":
+        fields_by_name["address_json"] = _validated_location_address(fields["address_json"])
+    if kind == "provider":
+        provider_kind = fields["provider_kind"]
+        if type(provider_kind) is not str or provider_kind not in {"individual", "organization"}:
+            raise ValueError("registry_provider_kind_invalid")
+        npi = fields["npi"]
+        if npi is not None and (type(npi) is not str or len(npi) != 10 or not is_valid_npi(npi)):
+            raise ValueError("registry_provider_npi_invalid")
+        fields_by_name.update(provider_kind=provider_kind, npi=npi)
+    if kind == "group":
+        if not isinstance(fields["group_kind"], str) or fields["group_kind"] not in {"corporate_parent", "naic_group"}:
+            raise ValueError("registry_group_kind_invalid")
+        fields_by_name["group_kind"] = fields["group_kind"]
+    if kind == "company":
+        roles = fields["roles"]
+        if (
+            not isinstance(roles, list)
+            or not roles
+            or any(not isinstance(role, str) or role not in _COMPANY_ROLES for role in roles)
+        ):
+            raise ValueError("registry_company_roles_invalid")
+        fields_by_name["roles"] = sorted(set(roles))
+        if "assertions" in fields:
+            fields_by_name["assertions"] = validated_company_registry_assertions(fields["assertions"]).as_dict()
+    if kind == "network" and "catalog_evidence_json" in fields:
+        fields_by_name["catalog_evidence_json"] = _validated_catalog_evidence(fields["catalog_evidence_json"])
+    return fields_by_name
+
+
+def _validated_catalog_evidence(evidence):
+    """Require the native closed syntax, not physical pricing or benefit proof.
+
+    The 16 KiB bound applies to compact sorted UTF-8 parser input. PostgreSQL
+    JSONB text has a separate 32 KiB storage bound for added whitespace.
+    """
+    if evidence is None:
+        return None
+    if type(evidence) is not dict:
+        raise ValueError("registry_network_evidence_invalid")
+    try:
+        encoded = json.dumps(
+            evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        ).encode()
+    except TypeError, ValueError, UnicodeError, RecursionError:
+        raise ValueError("registry_network_evidence_invalid") from None
+    if len(encoded) > 16384:
+        raise ValueError("registry_network_evidence_invalid")
+    native = _fast_module()
+    parser = getattr(native, "parse_registry_network_evidence", None)
+    if not callable(parser):
+        raise RegistryAddressUnavailable("registry_network_evidence_native_unavailable")
+    output = parser(encoded)
+    if type(output) is not bytes or len(output) > 16384:
+        raise ValueError("registry_network_evidence_invalid")
+    document = json.loads(output)
+    if type(document) is not dict or set(document) != {
+        "network_id",
+        "expected_record_revision",
+        "pricing_refs",
+        "benefit_refs",
+    }:
+        raise ValueError("registry_network_evidence_invalid")
+    return document
+
+
+def _validated_location_address(address):
+    """Retain six bounded native input fields, with an optional second line."""
+    limits_by_field = {"first_line": 512, "second_line": 256, "city": 128, "state": 64, "zip": 32, "country": 64}
+    if type(address) is not dict or set(address) != set(limits_by_field):
+        raise ValueError("registry_location_address_fields_invalid")
+    return {
+        key: None
+        if key == "second_line" and address[key] is None
+        else _bounded_text(address[key], limit, "location_address")
+        for key, limit in limits_by_field.items()
+    }
+
+
+def _location_canonical_fields(canonical):
+    if (
+        type(canonical) is not dict
+        or set(canonical) != _LOCATION_CANONICAL_FIELDS
+        or any(value is not None and (type(value) is not str or len(value) > 4096) for value in canonical.values())
+        or not all(canonical[key] for key in ("address_key", "identity_key", "premise_key", "line1_norm", "city_norm"))
+    ):
+        raise ValueError("registry_location_address_invalid")
+    return dict(canonical)
+
+
+def _location_known_records(known_locations):
+    known_by_id = {}
+    expected = _LOCATION_FIELDS | {"location_id", "canonical_address_json", "archived", "revision", "created_at"}
+    for identity, snapshot in known_locations.items():
+        _uuid(identity)
+        if (
+            type(snapshot) is not dict
+            or set(snapshot) != expected
+            or snapshot["location_id"] != str(identity)
+            or type(snapshot["archived"]) is not bool
+            or type(snapshot["revision"]) is not int
+            or not 1 <= snapshot["revision"] <= 9223372036854775807
+            or type(snapshot["created_at"]) is not str
+            or not 1 <= len(snapshot["created_at"]) <= 64
+        ):
+            raise ValueError("registry_location_ledger_invalid")
+        fields = _validated_fields("location", {key: snapshot[key] for key in _LOCATION_FIELDS})
+        fields["canonical_address_json"] = _location_canonical_fields(snapshot["canonical_address_json"])
+        known_by_id[identity] = (fields, snapshot["revision"])
+    return known_by_id
+
+
+def _location_binding_rows(rows, *, owned):
+    bindings_by_pair = {}
+    expected = {"provider_system", "provider_id", "location_id"} | ({"owner", "identity_key"} if owned else set())
+    for row in rows:
+        if type(row) is not dict or set(row) != expected:
+            raise ValueError("registry_location_binding_invalid")
+        system, identity, location = row["provider_system"], row["provider_id"], _uuid(row["location_id"])
+        if type(system) is not str or system not in {"manual", "npi", "provider_directory"}:
+            raise ValueError("registry_location_binding_invalid")
+        if type(identity) is not str or _bounded_text(identity, 1024, "provider_id") != identity:
+            raise ValueError("registry_location_binding_invalid")
+        if system == "manual":
+            if str(_uuid(UUID(identity))) != identity:
+                raise ValueError("registry_location_binding_invalid")
+        if system == "npi" and (len(identity) != 10 or not identity.isascii() or not is_valid_npi(identity)):
+            raise ValueError("registry_location_binding_invalid")
+        pair = (system, identity, location)
+        if pair in bindings_by_pair:
+            raise ValueError("registry_location_binding_duplicate")
+        if owned:
+            if type(row["owner"]) is not str or row["owner"] not in {"manual", "source"}:
+                raise ValueError("registry_location_binding_invalid")
+            bindings_by_pair[pair] = (row["owner"], _bounded_text(row["identity_key"], 4096, "location_identity"))
+        else:
+            bindings_by_pair[pair] = None
+    return bindings_by_pair
+
+
+def _location_native_batch(addresses):
+    native = _fast_module()
+    if native is None:
+        raise RegistryAddressUnavailable("registry_location_address_native_unavailable")
+    try:
+        canonical = native.canonicalize_batch(
+            [
+                tuple(address[key] for key in ("first_line", "second_line", "city", "state", "zip", "country"))
+                for address in addresses
+            ]
+        )
+    except AttributeError, RuntimeError, TypeError, ValueError:
+        raise RegistryAddressUnavailable("registry_location_address_native_unavailable") from None
+    if type(canonical) is not list or len(canonical) != len(addresses):
+        raise ValueError("registry_location_address_invalid")
+    return [_location_canonical_fields(row) for row in canonical]
+
+
+def prepare_registry_location_commands(commands, *, known_locations=None, bindings=None, requested_bindings=None):
+    """Freeze one native batch and classify explicit identities without database work or automatic matches."""
+    known_locations = {} if known_locations is None else known_locations
+    bindings = [] if bindings is None else bindings
+    requested_bindings = [] if requested_bindings is None else requested_bindings
+    if (
+        type(commands) is not list
+        or not commands
+        or type(known_locations) is not dict
+        or type(bindings) is not list
+        or type(requested_bindings) is not list
+        or len(commands) + len(known_locations) + len(bindings) + len(requested_bindings) > 5000
+    ):
+        raise ValueError("registry_location_batch_bounds_invalid")
+    prepared_by_id = {}
+    for command in commands:
+        if (
+            type(command) is not RegistryRecordCommand
+            or command.record_kind != "location"
+            or command.operation not in {"create", "correct"}
+        ):
+            raise ValueError("registry_location_batch_command_invalid")
+        fields = _validated_command(command)
+        if command.record_id in prepared_by_id:
+            raise ValueError("registry_location_batch_duplicate")
+        prepared_by_id[command.record_id] = (fields, command.operation, command.expected_revision)
+    known_by_id = _location_known_records(known_locations)
+    owned = _location_binding_rows(bindings, owned=True)
+    requested = _location_binding_rows(requested_bindings, owned=False)
+    if any(pair[2] not in prepared_by_id for pair in requested):
+        raise ValueError("registry_location_binding_target_invalid")
+    documents = [
+        [_snapshot(asdict(command)) for command in commands],
+        [[str(identity), snapshot] for identity, snapshot in known_locations.items()],
+        [[*pair[:2], str(pair[2]), binding_metadata] for pair, binding_metadata in owned.items()],
+        [[*pair[:2], str(pair[2])] for pair in requested],
+    ]
+    input_bytes = 0
+    for chunk in json.JSONEncoder(ensure_ascii=False, allow_nan=False).iterencode(documents):
+        input_bytes += len(chunk.encode())
+        if input_bytes > 8388608:
+            raise ValueError("registry_location_batch_input_limit")
+    canonical = iter(
+        _location_native_batch(
+            [fields["address_json"] for fields, _, _ in prepared_by_id.values()]
+            + [fields["address_json"] for fields, _ in known_by_id.values()]
+        )
+    )
+    for fields, _, _ in prepared_by_id.values():
+        fields["canonical_address_json"] = next(canonical)
+    for fields, _ in known_by_id.values():
+        if fields["canonical_address_json"] != next(canonical):
+            raise ValueError("registry_location_ledger_canonical_conflict")
+    return _location_command_outcomes(prepared_by_id, known_by_id, owned, requested)
+
+
+def _location_command_outcomes(prepared_by_id, known_by_id, owned, requested):
+    by_address = {}
+    for identity, (fields, *_) in {**known_by_id, **prepared_by_id}.items():
+        by_address.setdefault(fields["canonical_address_json"]["identity_key"], set()).add(identity)
+    conflicts = set()
+    for pair in requested:
+        previous = owned.get(pair)
+        identity_key = prepared_by_id[pair[2]][0]["canonical_address_json"]["identity_key"]
+        if previous is not None and (previous[0] == "source" or previous[1] != identity_key):
+            conflicts.add(pair[2])
+    outcomes, output_bytes = [], 0
+    for identity, (fields, operation, revision) in prepared_by_id.items():
+        matches = tuple(sorted(by_address[fields["canonical_address_json"]["identity_key"]] - {identity}))
+        existing = known_by_id.get(identity)
+        if identity in conflicts:
+            status = "conflicting_binding"
+        elif existing is not None:
+            selected = revision == existing[1] if operation == "correct" else fields == existing[0]
+            status = "known_uuid" if selected else "conflicting_identity"
+        elif operation == "correct":
+            status = "conflicting_identity"
+        else:
+            status = "ambiguous_address" if matches else "create"
+        encoded = json.dumps(fields, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        output_bytes += len(encoded.encode()) + 128 + 40 * len(matches)
+        if output_bytes > 8388608:
+            raise ValueError("registry_location_batch_output_limit")
+        outcomes.append(PreparedRegistryLocationCommand(identity, status, encoded, matches))
+    return tuple(outcomes)
+
+
+def _canonical_location_address(command):
+    prepared = prepare_registry_location_commands([command])[0]
+    return json.loads(prepared.fields_json)["canonical_address_json"]
+
+
+def _validated_company_links(fields):
+    network_ids = fields["network_ids"]
+    if (
+        type(network_ids) is not list
+        or len(network_ids) > 5000
+        or any(type(network_id) is not int or not 1 <= network_id <= 2147483647 for network_id in network_ids)
+        or len(set(network_ids)) != len(network_ids)
+    ):
+        raise ValueError("registry_company_links_networks_invalid")
+    group_id = fields["group_id"]
+    if group_id is not None:
+        if type(group_id) is not str:
+            raise ValueError("registry_company_links_group_invalid")
+        parsed = _uuid(UUID(group_id))
+        if str(parsed) != group_id:
+            raise ValueError("registry_company_links_group_invalid")
+        group_id = parsed
+    validated_by_field = {"network_ids": sorted(network_ids), "group_id": group_id}
+    if "network_assertions" in fields:
+        assertions = fields["network_assertions"]
+        if type(assertions) is not list or len(assertions) > 5000:
+            raise ValueError("registry_company_assertions_invalid")
+        if (
+            len(json.dumps(assertions, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode())
+            > MAX_INPUT_BYTES
+        ):
+            raise ValueError("registry_company_assertions_invalid")
+        validated_by_field["network_assertions"] = json.loads(
+            json.dumps(assertions, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+        )
+    return validated_by_field
+
+
+def _validated_network_assertions(assertions):
+    """Require bounded native relationship validation with explicit conflict review."""
+    native = _fast_module()
+    if native is None or not callable(getattr(native, "validate_company_network_assertions", None)):
+        raise RegistryAddressUnavailable("registry_company_assertions_native_unavailable")
+    encoded = json.dumps(assertions, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+    if len(encoded) > MAX_INPUT_BYTES:
+        raise ValueError("registry_company_assertions_invalid")
+    validated = json.loads(native.validate_company_network_assertions(encoded))
+    if validated["conflicts"]:
+        raise ValueError("registry_company_assertions_review_required")
+    return validated["assertions"]
+
+
+def _validated_command(command):
+    if (
+        not isinstance(command, RegistryRecordCommand)
+        or not isinstance(command.record_kind, str)
+        or command.record_kind not in _RECORD_MODELS
+        or command.record_kind == "network_binding"
+    ):
+        raise ValueError("registry_record_kind_invalid")
+    if not isinstance(command.operation, str) or command.operation not in {"create", "correct", "archive", "restore"}:
+        raise ValueError("registry_operation_invalid")
+    if type(command._undo_provenance_required) is not bool or (
+        command._undo_provenance_required and command.operation != "correct"
+    ):
+        raise ValueError("registry_manual_undo_marker_invalid")
+    if type(command.expected_revision) is not int or not 0 <= command.expected_revision < 9223372036854775807:
+        raise ValueError("registry_expected_revision_invalid")
+    if command.operation == "create" and command.expected_revision != 0:
+        raise ValueError("registry_creation_revision_invalid")
+    if command.record_kind == "network" and command.operation == "create":
+        if command.record_id is not None:
+            raise ValueError("registry_network_create_requires_allocation_key")
+        _uuid(command.allocation_key)
+        if isinstance(command.fields, dict) and "catalog_evidence_json" in command.fields:
+            raise ValueError("registry_network_create_evidence_forbidden")
+    else:
+        _record_identity(command.record_kind, command.record_id)
+        if command.allocation_key is not None:
+            raise ValueError("registry_allocation_key_not_supported")
+    _bounded_text(command.reason, 1000, "reason")
+    if _bounded_text(command.idempotency_key, 128, "idempotency_key") != command.idempotency_key:
+        raise ValueError("registry_idempotency_key_invalid")
+    if command.operation in {"create", "correct"}:
+        fields = _validated_fields(command.record_kind, command.fields)
+        if command.record_kind == "network" and fields.get("catalog_evidence_json") is not None:
+            evidence = fields["catalog_evidence_json"]
+            if (evidence["network_id"], evidence["expected_record_revision"]) != (
+                command.record_id,
+                command.expected_revision,
+            ):
+                raise ValueError("registry_network_evidence_context_invalid")
+        return fields
+    if not isinstance(command.fields, dict) or command.fields:
+        raise ValueError("registry_archive_fields_must_be_empty")
+    return {}
+
+
+def _table(model, schema):
+    table = model.__table__
+    return table if schema is None else table.to_metadata(MetaData(), schema=schema)
+
+
+def _record_table(kind, schema):
+    if not isinstance(kind, str) or kind not in _RECORD_MODELS:
+        raise ValueError("registry_record_kind_invalid")
+    model, identity_column, _ = _RECORD_MODELS[kind]
+    return _table(model, schema), identity_column
+
+
+def _snapshot(row):
+    snapshot_by_field = {
+        key: str(value) if isinstance(value, UUID) else value.isoformat() if isinstance(value, datetime) else value
+        for key, value in row.items()
+    }
+    if "catalog_evidence_json" in snapshot_by_field:
+        _validate_network_evidence_snapshot(snapshot_by_field)
+    return snapshot_by_field
+
+
+def _validate_network_evidence_snapshot(snapshot):
+    """Keep retained authoring context unchanged while refusing substitution."""
+    evidence = snapshot.get("catalog_evidence_json")
+    if evidence is None:
+        return
+    if (
+        type(evidence) is not dict
+        or type(evidence.get("network_id")) is not int
+        or evidence["network_id"] != snapshot.get("network_id")
+        or type(evidence.get("expected_record_revision")) is not int
+        or type(snapshot.get("revision")) is not int
+        or not 0 < evidence["expected_record_revision"] < snapshot["revision"]
+    ):
+        raise ValueError("registry_network_evidence_context_invalid")
+
+
+def _history_result(history):
+    record_by_field = history["record_json"]
+    if history["record_kind"] == "company" and "correction_predecessors" in record_by_field:
+        record_by_field = {key: value for key, value in record_by_field.items() if key != "correction_predecessors"}
+    if history["record_kind"] == "network":
+        _validate_network_evidence_snapshot(record_by_field)
+    return {
+        "record_kind": history["record_kind"],
+        "record_id": record_by_field[_RECORD_MODELS[history["record_kind"]][1]],
+        "revision": history["revision"],
+        "custom_revision": history["custom_revision"],
+        "record": record_by_field,
+    }
+
+
+async def _write_record_head(session, command, table, identity_column, record_id, fields):
+    if command.operation == "create":
+        values_by_column = dict(fields)
+        if command.record_kind == "company":
+            values_by_column["display_name_origin"] = "manual"
+        statement = (
+            pg_insert(table)
+            .values(**{identity_column: record_id}, **values_by_column, archived=False, revision=1)
+            .on_conflict_do_nothing(index_elements=[table.c[identity_column]])
+        )
+    else:
+        values_by_column = {**fields, "revision": command.expected_revision + 1}
+        if command.record_kind == "company" and command.operation == "correct":
+            values_by_column["display_name_origin"] = case(
+                (table.c.display_name.is_distinct_from(fields["display_name"]), "manual"),
+                else_=table.c.display_name_origin,
+            )
+        if command.operation in {"archive", "restore"}:
+            values_by_column["archived"] = command.operation == "archive"
+        statement = (
+            update(table)
+            .where(table.c[identity_column] == record_id, table.c.revision == command.expected_revision)
+            .values(**values_by_column)
+        )
+    try:
+        record_by_column = (await session.execute(statement.returning(*table.c))).mappings().one_or_none()
+    except IntegrityError as error:
+        native_error = error.orig.__cause__
+        if (
+            command.record_kind == "provider"
+            and getattr(native_error, "constraint_name", None) == "manual_provider_npi_unique"
+        ):
+            raise RegistryRecordConflict("registry_provider_npi_claimed") from error
+        raise
+    if record_by_column is None:
+        raise RegistryRecordConflict("registry_record_revision_conflict")
+    return _snapshot(record_by_column)
+
+
+async def _append_record_history(
+    session,
+    command,
+    actor_document,
+    record_by_field,
+    control,
+    history_table,
+    request_metadata,
+    record_history=(None, None),
+):
+    predecessors, materialized_snapshot = record_history
+    custom_revision = await session.scalar(
+        update(control)
+        .where(control.c.id == 1)
+        .values(draft_revision=control.c.draft_revision + 1)
+        .returning(control.c.draft_revision)
+    )
+    identity_column = _RECORD_MODELS[command.record_kind][1]
+    history_by_column = {
+        "record_kind": command.record_kind,
+        "record_key": str(record_by_field[identity_column]),
+        "revision": record_by_field["revision"],
+        "custom_revision": custom_revision,
+        "record_json": record_by_field
+        if predecessors is None
+        else record_by_field | {"correction_predecessors": predecessors},
+        "actor_json": actor_document,
+        "reason": command.reason.strip(),
+        "idempotency_key": command.idempotency_key,
+        "request_sha256": request_metadata["request_sha256"],
+        "event_json": {
+            "operation": command.operation,
+            "before_revision": command.expected_revision,
+            "operation_context": request_metadata["operation_context"],
+        },
+    }
+    if materialized_snapshot is not None:
+        await session.execute(
+            insert(history_table).values(**_materialized_record_history(history_by_column, materialized_snapshot))
+        )
+    await session.execute(insert(history_table).values(**history_by_column))
+    return _history_result(history_by_column)
+
+
+def _materialized_record_history(correction, snapshot):
+    """Attribute baseline preservation to the correcting actor, not the source author."""
+    record_kind = correction.get("record_kind", "company")
+    snapshot_json = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    digest = hashlib.sha256(
+        (f"materialized-{record_kind}-predecessor:" + correction["request_sha256"] + ":" + snapshot_json).encode()
+    ).hexdigest()
+    return correction | {
+        "revision": snapshot["revision"],
+        "record_json": snapshot,
+        "reason": f"Preserved materialized {record_kind} before manual correction",
+        "idempotency_key": "materialized:" + digest,
+        "request_sha256": digest,
+        "event_json": {
+            "operation": "preserve_materialized",
+            "before_revision": None,
+            "operation_context": {"correction_request_sha256": correction["request_sha256"]},
+        },
+    }
+
+
+def _replay_benefit_context(context):
+    """The stored request and undo provenance stay exact; a server read pin may age."""
+    return (
+        {key: field for key, field in context.items() if key != "benefit_plan_metadata"}
+        if type(context) is dict
+        else context
+    )
+
+
+async def _read_record_replay(session, history_table, command, record_id, request_metadata):
+    statement = select(history_table).where(
+        history_table.c.record_kind == command.record_kind,
+        history_table.c.record_key == str(record_id),
+        history_table.c.idempotency_key == command.idempotency_key,
+    )
+    replay = (await session.execute(statement)).mappings().one_or_none()
+    recorded_context = (
+        replay["event_json"]["operation_context"] if replay is not None and replay["event_json"] is not None else None
+    )
+    expected_context = request_metadata["operation_context"]
+    if command.record_kind == "company_links":
+        recorded_context = _replay_benefit_context(recorded_context)
+        expected_context = _replay_benefit_context(expected_context)
+    if replay is not None and (
+        replay["request_sha256"] != request_metadata["request_sha256"]
+        or (replay["event_json"] is not None and recorded_context != expected_context)
+    ):
+        raise RegistryRecordConflict("registry_idempotency_conflict")
+    return replay
+
+
+async def _resolve_creation_identity(session, command, schema):
+    if command.record_kind != "network" or command.operation != "create":
+        return command.record_id
+    identity_table = _table(NetworkRegistryIdentity, schema)
+    existing_id = await session.scalar(
+        select(identity_table.c.network_id).where(identity_table.c.allocation_key == command.allocation_key)
+    )
+    if existing_id is not None:
+        return existing_id
+    return (await allocate_network_ids(session, [command.allocation_key], schema=schema))[command.allocation_key]
+
+
+def _history_command_metadata(command, actor_document, undo_provenance):
+    """Seal the existing command digest and trusted optional undo context once."""
+    if command._undo_provenance_required and undo_provenance is None:
+        raise ValueError("registry_manual_undo_provenance_required")
+    context_by_field = {}
+    if undo_provenance is not None:
+        from process.registry_manual_undo import validated_undo_event_context
+
+        context_by_field = validated_undo_event_context(command, undo_provenance)
+    return {
+        "request_sha256": hashlib.sha256(_command_request(command, actor_document).encode()).hexdigest(),
+        "operation_context": context_by_field,
+    }
+
+
+def _validate_company_assertion_context(command, fields):
+    if command.record_kind == "company" and "assertions" in fields:
+        if (fields["assertions"]["company_id"], fields["assertions"]["expected_revision"]) != (
+            str(command.record_id),
+            command.expected_revision,
+        ):
+            raise ValueError("registry_company_assertion_context_invalid")
+
+
+async def apply_registry_record_command(
+    session, command, actor, *, schema=None, source_schema=None, undo_provenance=None, plan_metadata_client=None
+):
+    """Atomically retain one draft in the caller transaction and a savepoint.
+
+    Retries must retain the caller's UUID or network allocation_key. Replay is
+    record-scoped and returns its original snapshot even after later changes.
+    """
+    fields = _validated_command(command)
+    actor_document = _validated_actor(actor)
+    _validate_company_assertion_context(command, fields)
+    if not session.in_transaction() or session.new or session.dirty or session.deleted:
+        raise ValueError("registry_requires_clean_caller_transaction")
+    request_metadata = _history_command_metadata(command, actor_document, undo_provenance)
+    table, identity_column = _record_table(command.record_kind, schema)
+    control = _table(RegistryRevisionControl, schema)
+    history_table = _table(RegistryRecordHistory, schema)
+    async with session.begin_nested():
+        if command.record_kind == "company_links":
+            replay = await _preflight_company_link_benefits(
+                session, command, fields, history_table, request_metadata, schema, plan_metadata_client, actor
+            )
+            if replay is not None:
+                return _history_result(replay)
+        # shortcut: one control lock for low-volume edits; partition only if measured contention requires it.
+        control_row = await session.scalar(select(control.c.id).where(control.c.id == 1).with_for_update())
+        if control_row != 1:
+            raise RegistryRecordConflict("registry_control_unavailable")
+        record_id = await _resolve_creation_identity(session, command, schema)
+        replay = await _read_record_replay(session, history_table, command, record_id, request_metadata)
+        if replay is not None:
+            return _history_result(replay)
+        if command.record_kind == "company_links":
+            await _validate_company_link_targets(session, command, fields, schema)
+        if command.record_kind == "membership" and command.operation != "archive":
+            await _validate_membership_targets(session, command, fields, schema, source_schema)
+        if command.record_kind == "provider":
+            await _validate_provider_npi_claim(session, command, fields, schema, source_schema)
+        if command.record_kind == "location" and command.operation in {"create", "correct"}:
+            fields["canonical_address_json"] = _canonical_location_address(command)
+        if command.record_kind == "site_binding" and command.operation != "archive":
+            fields = await _resolve_site_binding(session, command, fields, schema)
+        assertions, record_history = None, (None, None)
+        if command.record_kind == "company":
+            assertions, record_history = await _company_revision_assertions(
+                session, command, fields, history_table, schema
+            )
+            if command.operation != "archive":
+                await _validate_company_assertions(session, command, assertions, schema)
+        if command.record_kind == "group":
+            record_history = await _materialized_group_history(session, command, history_table, schema)
+        record_snapshot = await _write_record_head(session, command, table, identity_column, record_id, fields)
+        if command.record_kind == "company_links":
+            _validate_company_link_snapshot(record_snapshot, command.reason)
+        if assertions is not None:
+            await _retain_company_assertions(session, record_snapshot, assertions, schema)
+            record_snapshot.update(assertions)
+        return await _append_record_history(
+            session, command, actor_document, record_snapshot, control, history_table, request_metadata, record_history
+        )
+
+
+async def _resolve_site_binding(session, command, fields_by_name, schema):
+    retained_receipt = None
+    if command.operation == "restore":
+        table = _table(RegistrySiteBinding, schema)
+        retained = (
+            (
+                await session.execute(
+                    select(table).where(
+                        table.c.binding_id == command.record_id, table.c.revision == command.expected_revision
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if retained is None:
+            raise RegistryRecordConflict("registry_record_revision_conflict")
+        retained_receipt = retained["source_receipt_json"]
+        fields_by_name = {
+            key: str(retained[key]) if isinstance(retained[key], UUID) else retained[key]
+            for key in _RECORD_MODELS["site_binding"][2]
+        }
+    connection = await session.connection()
+    driver = (await connection.get_raw_connection()).driver_connection
+    resolved = await resolve_site_binding_fields(driver, fields_by_name, control_schema=schema)
+    if retained_receipt is not None and retained_receipt != resolved["source_receipt_json"]:
+        raise RegistryRecordConflict("registry_site_binding_source_conflict")
+    return resolved
+
+
+def _command_request(command, actor_document):
+    """Preserve exact JSON membership content while encoding command UUIDs."""
+    command_document = asdict(command)
+    # Internal preparation state is not part of the retained request identity.
+    command_document.pop("_undo_provenance_required")
+    command_document = _snapshot(command_document)
+    try:
+        return json.dumps({"command": command_document, "actor": actor_document}, sort_keys=True, allow_nan=False)
+    except TypeError, ValueError:
+        raise ValueError("registry_command_json_invalid") from None
+
+
+async def _validate_membership_targets(session, command, fields, schema, source_schema):
+    """Validate every native command target and retain only added manual-office pairs."""
+    if command.operation == "restore":
+        memberships = _table(NetworkMembershipDraft, schema)
+        membership_rows = await session.scalar(
+            select(memberships.c.memberships_json).where(
+                memberships.c.network_id == command.record_id, memberships.c.revision == command.expected_revision
+            )
+        )
+        if membership_rows is None:
+            raise RegistryRecordConflict("registry_record_revision_conflict")
+    else:
+        membership_rows = fields["memberships_json"]
+    input_bytes = json.dumps(membership_rows, separators=(",", ":"), ensure_ascii=False).encode()
+    if len(input_bytes) > MAX_INPUT_BYTES:
+        raise ValueError("registry_membership_rows_invalid")
+    try:
+        partition = await drain_operation(
+            asyncio.to_thread(partition_network_membership_commands, input_bytes), preserve_cancellation=True
+        )
+    except MembershipCopyError as error:
+        if str(error) == "Native membership command partitioner is unavailable":
+            raise RegistryAddressUnavailable("registry_membership_native_unavailable") from None
+        raise ValueError("registry_membership_rows_invalid") from None
+    except TypeError, ValueError:
+        raise ValueError("registry_membership_rows_invalid") from None
+    preparer = session.bind.dialect.identifier_preparer
+    relations_by_name = {
+        name: preparer.format_table(_table(model, namespace))
+        for name, model, namespace in (
+            ("networks", NetworkRegistryRecord, schema),
+            ("identities", NetworkRegistryIdentity, schema),
+            ("providers", ManualProviderRegistry, schema),
+            ("locations", ManualLocationRegistry, schema),
+            ("bindings", ManualProviderLocationBinding, schema),
+            ("source_bindings", RegistrySiteBinding, schema),
+            ("npis", NPIData, source_schema),
+        )
+    }
+    valid = await session.scalar(
+        text(_MEMBERSHIP_TARGETS_SQL.format(**relations_by_name)),
+        {"network_id": command.record_id, "memberships_json": input_bytes.decode()},
+    )
+    if valid is not True:
+        raise ValueError("registry_membership_target_invalid")
+    connection = await session.connection()
+    driver = (await connection.get_raw_connection()).driver_connection
+    try:
+        await retain_manual_location_bindings(
+            driver, partition.additions_copy_bytes, partition.additions_count, relations_by_name
+        )
+    except ManualLocationBindingConflict as error:
+        raise RegistryRecordConflict(str(error)) from None
+
+
+_MEMBERSHIP_TARGETS_SQL = """WITH members AS MATERIALIZED (
+  SELECT * FROM jsonb_to_recordset(CAST(:memberships_json AS jsonb)) AS member(
+    network_id integer,provider_system text,provider_id text,location_id uuid,evidence_id text)
+), checked AS (
+  SELECT member.*,
+    EXISTS (SELECT 1 FROM {bindings} binding WHERE NOT binding.archived
+      AND binding.provider_system=member.provider_system AND binding.provider_id=member.provider_id
+      AND binding.location_id=member.location_id) AS has_binding,
+    EXISTS (SELECT 1 FROM {source_bindings} binding WHERE NOT binding.archived
+      AND binding.provider_system=member.provider_system AND binding.provider_id=member.provider_id
+      AND binding.location_id=member.location_id) AS has_source_binding
+  FROM members member
+)
+SELECT EXISTS (SELECT 1 FROM {networks} network JOIN {identities} identity USING(network_id)
+  WHERE network.network_id=:network_id AND NOT network.archived)
+AND NOT EXISTS (SELECT 1 FROM members WHERE network_id<>:network_id)
+AND NOT EXISTS (SELECT 1 FROM checked member WHERE
+  NOT (CASE member.provider_system
+    WHEN 'manual' THEN EXISTS (SELECT 1 FROM {providers} provider WHERE NOT provider.archived
+      AND provider.provider_id=CASE WHEN member.provider_id ~ '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'
+        THEN member.provider_id::uuid END)
+    WHEN 'npi' THEN member.has_source_binding OR EXISTS (SELECT 1 FROM {npis} npi WHERE npi.npi=member.provider_id::bigint)
+    WHEN 'provider_directory' THEN member.has_binding OR member.has_source_binding
+    ELSE false END)
+  OR NOT (member.has_source_binding OR EXISTS (SELECT 1 FROM {locations} location
+    WHERE location.location_id=member.location_id AND NOT location.archived)
+    OR (member.has_binding AND NOT EXISTS (SELECT 1 FROM {locations} location
+      WHERE location.location_id=member.location_id))))
+"""
+
+
+async def _validate_provider_npi_claim(session, command, fields, schema, source_schema):
+    """Require explicit source reuse and one durable manual claim under the draft lock."""
+    if command.operation == "archive" or (command.operation in {"create", "correct"} and fields["npi"] is None):
+        return
+    providers = _table(ManualProviderRegistry, schema)
+    source = _table(NPIData, source_schema)
+    npi = (
+        select(providers.c.npi).where(providers.c.provider_id == command.record_id).scalar_subquery()
+        if command.operation == "restore"
+        else literal(fields["npi"], type_=String(10))
+    )
+    source_exists = select(source.c.npi).where(source.c.npi == cast(npi, BigInteger)).exists()
+    manual_exists = (
+        select(providers.c.provider_id)
+        .where(providers.c.npi == npi, providers.c.provider_id != command.record_id)
+        .exists()
+    )
+    source_claimed, manual_claimed = (await session.execute(select(source_exists, manual_exists))).one()
+    if source_claimed:
+        raise RegistryRecordConflict("registry_provider_npi_reuse_required")
+    if manual_claimed:
+        raise RegistryRecordConflict("registry_provider_npi_claimed")
+
+
+async def _membership_revision_statement(session, custom_revision, schema):
+    """Pin membership history to a known global draft revision, including gaps."""
+    if type(custom_revision) is not int or not 0 <= custom_revision <= 9223372036854775807:
+        raise ValueError("registry_custom_revision_invalid")
+    control = _table(RegistryRevisionControl, schema)
+    draft_revision = await session.scalar(select(control.c.draft_revision).where(control.c.id == 1))
+    if draft_revision is None or custom_revision > draft_revision:
+        raise ValueError("registry_custom_revision_invalid")
+    history = _table(RegistryRecordHistory, schema)
+    return (
+        select(history.c.record_key, history.c.record_json)
+        .where(history.c.record_kind == "membership", history.c.custom_revision <= custom_revision)
+        .distinct(history.c.record_key)
+        .order_by(history.c.record_key, history.c.custom_revision.desc(), history.c.revision.desc())
+    )
+
+
+async def get_registry_record(session, record_kind, record_id, *, custom_revision=None, schema=None):
+    """Read a draft head or membership snapshot as of a global custom revision."""
+    table, identity_column = _record_table(record_kind, schema)
+    record_id = _record_identity(record_kind, record_id)
+    if custom_revision is not None:
+        if record_kind != "membership":
+            raise ValueError("registry_custom_revision_invalid")
+        statement = await _membership_revision_statement(session, custom_revision, schema)
+        row = (
+            (await session.execute(statement.where(statement.selected_columns.record_key == str(record_id))))
+            .mappings()
+            .one_or_none()
+        )
+        return None if row is None else row["record_json"]
+    row = (await session.execute(select(table).where(table.c[identity_column] == record_id))).mappings().one_or_none()
+    records = [] if row is None else [_snapshot(row)]
+    if record_kind == "company":
+        await _attach_company_assertions(session, records, schema)
+    if record_kind == "group":
+        await _attach_group_evidence(session, records, schema)
+    return records[0] if records else None
+
+
+async def list_registry_records(
+    session, record_kind, *, limit=50, offset=0, record_ids=None, custom_revision=None, schema=None
+):
+    """Bounded management-only heads, ordered by durable identity."""
+    if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or not 0 <= offset <= 1000000:
+        raise ValueError("registry_page_invalid")
+    table, identity_column = _record_table(record_kind, schema)
+    statement = select(table)
+    if record_ids is not None:
+        if type(record_ids) not in {list, tuple} or len(record_ids) > 100:
+            raise ValueError("registry_selector_invalid")
+        identities = tuple(_record_identity(record_kind, identity) for identity in record_ids)
+        if len(set(identities)) != len(identities):
+            raise ValueError("registry_selector_duplicate")
+        statement = statement.where(table.c[identity_column].in_(identities))
+    if custom_revision is not None:
+        if record_kind != "membership":
+            raise ValueError("registry_custom_revision_invalid")
+        historical = await _membership_revision_statement(session, custom_revision, schema)
+        if record_ids is not None:
+            historical = historical.where(historical.selected_columns.record_key.in_(tuple(map(str, identities))))
+        latest = historical.subquery("membership_revision")
+        statement = (
+            select(latest.c.record_json).order_by(cast(latest.c.record_key, Integer)).limit(limit).offset(offset)
+        )
+        return list((await session.scalars(statement)).all())
+    record_rows = (
+        await session.execute(statement.order_by(table.c[identity_column]).limit(limit).offset(offset))
+    ).mappings()
+    record_documents = [_snapshot(record_fields) for record_fields in record_rows]
+    if record_kind == "company":
+        await _attach_company_assertions(session, record_documents, schema)
+    if record_kind == "group":
+        await _attach_group_evidence(session, record_documents, schema)
+    return record_documents
+
+
+def _company_search_ids(record_ids):
+    if record_ids is None:
+        return None
+    if type(record_ids) is not list or len(record_ids) > 5000:
+        raise ValueError("registry_selector_invalid")
+    identities = []
+    for value in record_ids:
+        if type(value) is not str:
+            raise ValueError("registry_selector_invalid")
+        identity = UUID(value)
+        if not identity.int or str(identity) != value:
+            raise ValueError("registry_selector_invalid")
+        identities.append(identity)
+    if len(set(identities)) != len(identities):
+        raise ValueError("registry_selector_duplicate")
+    return identities
+
+
+def _registry_search_statement(record_kind, query, limit, offset, record_ids, schema):
+    """Scope literal name/alias matches before durable ordering and pagination."""
+    if type(query) is not str or any(unicodedata.category(character) == "Cc" for character in query):
+        raise ValueError("registry_company_search_invalid")
+    query = query.strip()
+    if not query or len(query.encode("utf-8")) > 128:
+        raise ValueError("registry_company_search_invalid")
+    if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or not 0 <= offset <= 1000000:
+        raise ValueError("registry_page_invalid")
+    identities = _company_search_ids(record_ids)
+    table, identity_column = _record_table(record_kind, schema)
+    pattern = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    aliases = (
+        func.jsonb_array_elements_text(table.c.aliases)
+        .table_valued(column("alias", String))
+        .render_derived(name="registry_aliases")
+    )
+    alias_match = (
+        select(literal(1))
+        .select_from(aliases)
+        .where(aliases.c.alias.ilike(pattern, escape="\\"))
+        .correlate(table)
+        .exists()
+    )
+    predicate = or_(table.c.display_name.ilike(pattern, escape="\\"), alias_match)
+    try:
+        exact_id = UUID(query)
+    except ValueError:
+        exact_id = None
+    if exact_id is not None and exact_id.int and str(exact_id) == query:
+        predicate = or_(predicate, table.c[identity_column] == exact_id)
+    statement = select(table).where(predicate)
+    if identities is not None:
+        statement = statement.where(table.c[identity_column].in_(identities))
+    return statement.order_by(table.c[identity_column]).limit(limit).offset(offset)
+
+
+def _company_search_statement(query, limit, offset, record_ids, schema):
+    return _registry_search_statement("company", query, limit, offset, record_ids, schema)
+
+
+async def search_registry_groups(session, q, *, limit=50, offset=0, record_ids, schema=None):
+    """Search the complete authorized group set before bounded pagination."""
+    statement = _registry_search_statement("group", q, limit, offset, record_ids, schema)
+    rows = (await session.execute(statement)).mappings()
+    records = [_snapshot(row) for row in rows]
+    await _attach_group_evidence(session, records, schema)
+    return records
+
+
+async def search_registry_companies(session, q, *, limit=50, offset=0, record_ids, schema=None):
+    """Read companies for an explicit trusted admin or complete authorized selector."""
+    statement = _company_search_statement(q, limit, offset, record_ids, schema)
+    rows = (await session.execute(statement)).mappings()
+    records = [_snapshot(row) for row in rows]
+    await _attach_company_assertions(session, records, schema)
+    return records
+
+
+def _company_predecessors(command, retained_by_field):
+    """Reference the complete prior snapshot, without inferring fact-to-fact matches."""
+    if type(retained_by_field) is not dict or retained_by_field.get("company_id") != str(command.record_id):
+        raise RegistryRecordConflict("registry_company_predecessor_invalid")
+    if type(retained_by_field.get("revision")) is not int or retained_by_field["revision"] != command.expected_revision:
+        raise RegistryRecordConflict("registry_record_revision_conflict")
+    predecessor_by_field = {"company_revision": command.expected_revision}
+    for family, maximum in (
+        ("role_assertions", MAX_ROLE_ASSERTIONS),
+        ("identifier_assertions", MAX_IDENTIFIER_ASSERTIONS),
+        ("group_assertions", MAX_GROUP_ASSERTIONS),
+    ):
+        entries = retained_by_field.get(family, [])
+        if type(entries) is not list or len(entries) > maximum:
+            if family == "group_assertions":
+                raise RegistryRecordConflict("registry_company_group_assertions_invalid")
+            raise RegistryRecordConflict("registry_company_predecessor_invalid")
+        identifiers = []
+        for entry in entries:
+            identifier = entry.get("assertion_id") if type(entry) is dict else None
+            try:
+                if type(identifier) is not str:
+                    raise ValueError
+                parsed = UUID(identifier)
+                if not parsed.int or str(parsed) != identifier:
+                    raise ValueError
+            except ValueError, AttributeError:
+                raise RegistryRecordConflict("registry_company_predecessor_invalid") from None
+            identifiers.append(identifier)
+        if len(identifiers) != len(set(identifiers)):
+            raise RegistryRecordConflict("registry_company_predecessor_invalid")
+        predecessor_by_field[family] = sorted(identifiers)
+    return predecessor_by_field
+
+
+async def _materialized_group_history(session, command, history, schema):
+    """Retain a source-materialized first group head before its first correction."""
+    if command.operation != "correct" or command.expected_revision != 1:
+        return None, None
+    retained = await session.scalar(
+        select(history.c.record_json).where(
+            history.c.record_kind == "group",
+            history.c.record_key == str(command.record_id),
+            history.c.revision == 1,
+        )
+    )
+    if retained is not None:
+        return None, None
+    table = _table(CompanyGroupRegistry, schema)
+    row = (await session.execute(select(table).where(table.c.group_id == command.record_id))).mappings().one_or_none()
+    snapshot = None if row is None else _snapshot(row)
+    if snapshot is None or type(snapshot.get("revision")) is not int or snapshot["revision"] != 1:
+        raise RegistryRecordConflict("registry_record_revision_conflict")
+    if snapshot.get("group_id") != str(command.record_id):
+        raise RegistryRecordConflict("registry_group_predecessor_invalid")
+    return None, snapshot
+
+
+async def _company_revision_assertions(session, command, fields, history, schema):
+    document = fields.pop("assertions", None)
+    retained_by_field = {}
+    materialized_snapshot = None
+    if command.operation != "create":
+        retained_by_field = await session.scalar(
+            select(history.c.record_json).where(
+                history.c.record_kind == "company",
+                history.c.record_key == str(command.record_id),
+                history.c.revision == command.expected_revision,
+            )
+        )
+        if retained_by_field is None and command.expected_revision == 1:
+            retained_by_field = await get_registry_record(session, "company", command.record_id, schema=schema)
+            if retained_by_field is not None and retained_by_field["revision"] != command.expected_revision:
+                retained_by_field = None
+            if command.operation == "correct":
+                materialized_snapshot = retained_by_field
+        if retained_by_field is None:
+            raise RegistryRecordConflict("registry_record_revision_conflict")
+    predecessors = _company_predecessors(command, retained_by_field) if command.operation == "correct" else None
+    assertions_by_family = {
+        key: (document if document is not None else retained_by_field).get(key, [])
+        for key in ("role_assertions", "identifier_assertions")
+    }
+    assertions_by_family["group_assertions"] = (document or {}).get(
+        "group_assertions", retained_by_field.get("group_assertions", [])
+    )
+    if (
+        type(assertions_by_family["group_assertions"]) is not list
+        or len(assertions_by_family["group_assertions"]) > MAX_GROUP_ASSERTIONS
+    ):
+        raise RegistryRecordConflict("registry_company_group_assertions_invalid")
+    if assertions_by_family["group_assertions"] and (document is None or "group_assertions" not in document):
+        assertions_by_family = validated_company_registry_assertions(
+            {"contract": CONTRACT, "company_id": str(command.record_id), "expected_revision": command.expected_revision}
+            | assertions_by_family
+        ).as_dict()
+        assertions_by_family = {
+            key: assertions_by_family[key] for key in ("role_assertions", "identifier_assertions", "group_assertions")
+        }
+    assertion_ids = [entry["assertion_id"] for family in assertions_by_family.values() for entry in family]
+    if len(assertion_ids) != len(set(assertion_ids)):
+        raise RegistryRecordConflict("registry_company_assertion_id_conflict")
+    return assertions_by_family, (predecessors, materialized_snapshot)
+
+
+_COMPANY_ASSERTION_TARGETS_SQL = """WITH proposed AS MATERIALIZED (
+  SELECT value AS assertion FROM jsonb_array_elements(CAST(:roles AS jsonb))
+  UNION ALL SELECT value FROM jsonb_array_elements(CAST(:identifiers AS jsonb))
+  UNION ALL SELECT value FROM jsonb_array_elements(CAST(:groups AS jsonb))
+), proposed_groups AS MATERIALIZED (
+  SELECT value AS assertion FROM jsonb_array_elements(CAST(:groups AS jsonb))
+), identifiers AS MATERIALIZED (
+  SELECT value AS assertion FROM jsonb_array_elements(CAST(:identifiers AS jsonb))
+), current_claims AS MATERIALIZED (
+  SELECT retained.* FROM {namespace}.company_registry_identifier_assertion retained
+  JOIN {namespace}.company_registry company
+    ON (company.company_id,company.revision)=(retained.company_id,retained.company_revision)
+  WHERE NOT company.archived
+  UNION
+  SELECT retained.* FROM {namespace}.company_registry_identifier_assertion retained
+  JOIN {namespace}.registry_approved_record approved
+    ON approved.record_kind='company' AND approved.record_key=retained.company_id::text
+      AND approved.record_revision=retained.company_revision
+  JOIN {namespace}.registry_revision_control control
+    ON control.id=1 AND control.approved_revision=approved.approved_revision
+  WHERE approved.record_json->'archived'='false'::jsonb
+)
+SELECT NOT EXISTS (
+  SELECT 1 FROM proposed p WHERE p.assertion->'provenance'->>'kind'='source_reference' AND NOT EXISTS (
+    SELECT 1 FROM {namespace}.registry_source_snapshot snapshot
+    JOIN {namespace}.registry_source_observation observation USING(snapshot_id)
+    WHERE snapshot.snapshot_id=(p.assertion->'provenance'->>'snapshot_id')::uuid
+      AND observation.source_record_key=p.assertion->'provenance'->>'source_record_key'
+      AND observation.status IN ('accepted','unresolved'))
+) AND NOT EXISTS (
+  SELECT 1 FROM identifiers p WHERE EXISTS (
+    SELECT 1 FROM current_claims retained
+    WHERE retained.company_id<>CAST(:company_id AS uuid)
+      AND (retained.identifier_system,retained.identifier_scope,retained.identifier_value)=
+        (p.assertion->>'identifier_system',p.assertion->>'identifier_scope',p.assertion->>'identifier_value')
+      AND retained.valid_from<=COALESCE((p.assertion->>'valid_to')::date,'infinity'::date)
+      AND COALESCE(retained.valid_to,'infinity'::date)>=(p.assertion->>'valid_from')::date)
+    OR EXISTS (
+      SELECT 1 FROM {namespace}.registry_identifier_binding binding
+      WHERE binding.entity_kind='company' AND binding.entity_id<>CAST(:company_id AS uuid)
+        AND (binding.identifier_system,binding.identifier_value)=
+          (p.assertion->>'identifier_system',p.assertion->>'identifier_value'))
+    OR (p.assertion->'provenance'->>'kind'='source_reference'
+      AND p.assertion->>'identifier_system' IN ('ein','naic_company') AND NOT EXISTS (
+        SELECT 1 FROM {namespace}.registry_identifier_observation observation
+        WHERE observation.snapshot_id=(p.assertion->'provenance'->>'snapshot_id')::uuid
+          AND observation.source_record_key=p.assertion->'provenance'->>'source_record_key'
+          AND observation.entity_kind='company'
+          AND (observation.identifier_system,observation.identifier_value)=
+            (p.assertion->>'identifier_system',p.assertion->>'identifier_value')
+          AND observation.resolution_status<>'conflicting'
+          AND (observation.entity_id IS NULL OR observation.entity_id=CAST(:company_id AS uuid))))
+) AND NOT EXISTS (
+  SELECT 1 FROM proposed_groups p WHERE
+    (p.assertion->>'company_id')::uuid<>CAST(:company_id AS uuid)
+    OR (p.assertion->>'group_id' IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM {namespace}.company_group_registry target
+      WHERE target.group_id=(p.assertion->>'group_id')::uuid
+        AND NOT target.archived AND target.group_kind=p.assertion->>'group_kind'))
+    OR (p.assertion->'provenance'->>'kind'='source_reference' AND NOT EXISTS (
+      SELECT 1 FROM {namespace}.registry_source_snapshot snapshot
+      JOIN {namespace}.registry_source_observation observation USING(snapshot_id)
+      JOIN {namespace}.registry_company_group_assertion edge
+        ON (edge.snapshot_id,edge.source_record_key)=(observation.snapshot_id,observation.source_record_key)
+      WHERE snapshot.snapshot_id=(p.assertion->'provenance'->>'snapshot_id')::uuid
+        AND observation.source_record_key=p.assertion->'provenance'->>'source_record_key'
+        AND observation.status IN ('accepted','unresolved')
+        AND edge.resolution_status IN ('resolved','unresolved')
+        AND edge.company_id=CAST(:company_id AS uuid)
+        AND edge.group_id IS NOT DISTINCT FROM (p.assertion->>'group_id')::uuid
+        AND edge.relationship_kind=p.assertion->>'relationship_kind'
+        AND edge.valid_from IS NOT DISTINCT FROM (p.assertion->>'valid_from')::date
+        AND edge.valid_to IS NOT DISTINCT FROM (p.assertion->>'valid_to')::date
+        AND (observation.observation_json->>'group_kind' IS NULL
+          OR observation.observation_json->>'group_kind'=p.assertion->>'group_kind')))
+)"""
+
+
+async def _validate_company_assertions(session, command, assertions, schema):
+    if not any(assertions.values()):
+        return
+    from process.registry_source_observation_store import _namespace
+
+    valid = await session.scalar(
+        text(_COMPANY_ASSERTION_TARGETS_SQL.format(namespace=_namespace(schema))),
+        {
+            "company_id": command.record_id,
+            "roles": json.dumps(assertions["role_assertions"]),
+            "identifiers": json.dumps(assertions["identifier_assertions"]),
+            "groups": json.dumps(assertions["group_assertions"]),
+        },
+    )
+    if valid is not True:
+        raise RegistryRecordConflict("registry_company_assertion_target_conflict")
+
+
+def _company_assertion_row(assertion, company_id, revision):
+    provenance = assertion["provenance"]
+    row = {key: value for key, value in assertion.items() if key not in {"provenance", "valid_from", "valid_to"}} | {
+        "assertion_id": UUID(assertion["assertion_id"]),
+        "company_id": UUID(company_id),
+        "company_revision": revision,
+        "valid_from": None
+        if "group_kind" in assertion and assertion["valid_from"] is None
+        else date.fromisoformat(assertion["valid_from"]),
+        "valid_to": None if assertion["valid_to"] is None else date.fromisoformat(assertion["valid_to"]),
+        "provenance_kind": provenance["kind"],
+        "evidence_ref": provenance["evidence_ref"],
+        "source_snapshot_id": None if provenance["snapshot_id"] is None else UUID(provenance["snapshot_id"]),
+        "source_record_key": provenance["source_record_key"],
+    }
+    if "group_id" in assertion:
+        row["group_id"] = None if assertion["group_id"] is None else UUID(assertion["group_id"])
+    return row
+
+
+async def _retain_company_assertions(session, record, assertions, schema):
+    for model, key in (
+        (CompanyRegistryRoleAssertion, "role_assertions"),
+        (CompanyRegistryIdentifierAssertion, "identifier_assertions"),
+        (CompanyRegistryGroupAssertion, "group_assertions"),
+    ):
+        rows = [_company_assertion_row(item, record["company_id"], record["revision"]) for item in assertions[key]]
+        if rows:
+            await session.execute(insert(_table(model, schema)), rows)
+
+
+def _company_assertion_document(row):
+    excluded_columns = {
+        "company_id",
+        "company_revision",
+        "created_at",
+        "provenance_kind",
+        "evidence_ref",
+        "source_snapshot_id",
+        "source_record_key",
+    }
+    if "group_kind" in row:
+        excluded_columns.remove("company_id")
+    return {
+        key: value.isoformat() if isinstance(value, date) else str(value) if isinstance(value, UUID) else value
+        for key, value in row.items()
+        if key not in excluded_columns
+    } | {
+        "provenance": {
+            "kind": row["provenance_kind"],
+            "evidence_ref": row["evidence_ref"],
+            "snapshot_id": None if row["source_snapshot_id"] is None else str(row["source_snapshot_id"]),
+            "source_record_key": row["source_record_key"],
+        }
+    }
+
+
+def _group_evidence_documents(schema, group_ids):
+    """Select only exact group bindings and bounded native source references."""
+    binding = _table(RegistryIdentifierBinding, schema)
+    snapshot = _table(RegistrySourceSnapshot, schema)
+    observation = _table(RegistrySourceObservation, schema)
+    reference = func.jsonb_build_object(
+        "identifier_system",
+        binding.c.identifier_system,
+        "identifier_value",
+        binding.c.identifier_value,
+        "snapshot_id",
+        binding.c.snapshot_id,
+        "evidence_key",
+        binding.c.evidence_key,
+        "source_system",
+        snapshot.c.source_system,
+        "source_id",
+        snapshot.c.source_id,
+        "edition_id",
+        snapshot.c.edition_id,
+        "snapshot_present",
+        snapshot.c.snapshot_id.is_not(None),
+        "observation_present",
+        observation.c.snapshot_id.is_not(None),
+        "observation_status",
+        observation.c.status,
+    )
+    return (
+        select(
+            binding.c.entity_id,
+            binding.c.identifier_system,
+            binding.c.identifier_value,
+            func.jsonb_build_object("group_id", binding.c.entity_id, "reference", reference).label("document"),
+        )
+        .select_from(
+            binding.outerjoin(snapshot, snapshot.c.snapshot_id == binding.c.snapshot_id).outerjoin(
+                observation,
+                (observation.c.snapshot_id == binding.c.snapshot_id)
+                & (observation.c.source_record_key == binding.c.evidence_key),
+            )
+        )
+        .where(binding.c.entity_kind == "group", binding.c.entity_id.in_(group_ids))
+        .order_by(binding.c.entity_id, binding.c.identifier_system, binding.c.identifier_value)
+        .limit(MAX_EVIDENCE_ROWS + 1)
+        .cte("group_evidence_documents")
+    )
+
+
+async def _attach_group_evidence(session, group_documents, schema):
+    """Attach exact source references to one already-authorized bounded draft page.
+
+    This is read metadata, never part of the editable head, history or approved
+    projection. Missing source rows remain explicit references, not inferred facts.
+    """
+    if not group_documents:
+        return
+    by_identity = {UUID(group_document["group_id"]): group_document for group_document in group_documents}
+    documents = _group_evidence_documents(schema, tuple(by_identity))
+    bounds = (
+        select(
+            func.count().label("rows"),
+            (
+                func.coalesce(func.sum(func.octet_length(cast(documents.c.document, Text))), 0) + func.count() * 2 + 2
+            ).label("bytes"),
+        )
+        .select_from(documents)
+        .cte("group_evidence_bounds")
+    )
+    bounded_evidence = (
+        select(
+            func.coalesce(
+                func.jsonb_agg(
+                    aggregate_order_by(
+                        documents.c.document,
+                        documents.c.entity_id,
+                        documents.c.identifier_system,
+                        documents.c.identifier_value,
+                    )
+                ),
+                cast(literal("[]"), JSONB),
+            )
+        )
+        .select_from(documents, bounds)
+        .where(bounds.c.rows <= MAX_EVIDENCE_ROWS, bounds.c.bytes <= MAX_RESULT_BYTES)
+        .scalar_subquery()
+    )
+    receipt = (
+        (await session.execute(select(bounds.c.rows, bounds.c.bytes, bounded_evidence.label("documents"))))
+        .mappings()
+        .one()
+    )
+    if receipt["rows"] > MAX_EVIDENCE_ROWS or receipt["bytes"] > MAX_RESULT_BYTES:
+        raise RegistryAddressUnavailable("registry_group_evidence_unavailable")
+    for group_document in group_documents:
+        group_document["source_evidence"] = []
+    for document in receipt["documents"]:
+        by_identity[UUID(document["group_id"])]["source_evidence"].append(document["reference"])
+
+
+async def _attach_company_assertions(session, records, schema):
+    if not records:
+        return
+    by_identity = {(UUID(row["company_id"]), row["revision"]): row for row in records}
+    for model, key in (
+        (CompanyRegistryRoleAssertion, "role_assertions"),
+        (CompanyRegistryIdentifierAssertion, "identifier_assertions"),
+        (CompanyRegistryGroupAssertion, "group_assertions"),
+    ):
+        for record in records:
+            record[key] = []
+        table = _table(model, schema)
+        statement = (
+            select(table)
+            .where(tuple_(table.c.company_id, table.c.company_revision).in_(tuple(by_identity)))
+            .order_by(table.c.assertion_id)
+        )
+        if key == "group_assertions":
+            statement = statement.limit(len(by_identity) * MAX_GROUP_ASSERTIONS + 1)
+        rows = (await session.execute(statement)).mappings()
+        for row in rows:
+            family = by_identity[(row["company_id"], row["company_revision"])][key]
+            if key == "group_assertions" and len(family) >= MAX_GROUP_ASSERTIONS:
+                raise RegistryAddressUnavailable("registry_company_assertions_unavailable")
+            family.append(_company_assertion_document(row))
+
+
+def _company_record_json_sql(namespace):
+    """Compose the exact current revision without laundering legacy history rows."""
+    parts = []
+    for table, key in (
+        ("company_registry_role_assertion", "role_assertions"),
+        ("company_registry_identifier_assertion", "identifier_assertions"),
+        ("company_registry_group_assertion", "group_assertions"),
+    ):
+        company_column = "" if key == "group_assertions" else "'company_id',"
+        document = f"""to_jsonb(assertion)-ARRAY[{company_column}'company_revision','created_at','provenance_kind',
+          'evidence_ref','source_snapshot_id','source_record_key']||jsonb_build_object('provenance',jsonb_build_object(
+          'kind',assertion.provenance_kind,'evidence_ref',assertion.evidence_ref,
+          'snapshot_id',assertion.source_snapshot_id,'source_record_key',assertion.source_record_key))"""
+        relation = f"{namespace}.{table} assertion"
+        predicate = "WHERE assertion.company_id=head.company_id AND assertion.company_revision=head.revision"
+        aggregate = f"COALESCE(jsonb_agg({document} ORDER BY assertion.assertion_id),'[]'::jsonb)"
+        if key == "group_assertions":
+            relation = f"(SELECT * FROM {relation} {predicate} LIMIT {MAX_GROUP_ASSERTIONS + 1}) assertion"
+            predicate = ""
+            aggregate = f"CASE WHEN count(*)<={MAX_GROUP_ASSERTIONS} THEN {aggregate} ELSE NULL END"
+        parts.append(f"'{key}',(SELECT {aggregate} FROM {relation} {predicate})")
+    return "to_jsonb(head)||jsonb_build_object(" + ",".join(parts) + ")"

@@ -7,6 +7,7 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -28,6 +29,43 @@ from tests.ptg2_shared_gc_schema_support import (
     _insert_gc_build_pins,
     _insert_gc_finalizer_fixture,
 )
+
+
+async def _create_snapshot_history_gc(connection, schema: str, snapshot_keys: tuple[int, int]) -> None:
+    """Install real bounded cleanup over two retained multi-snapshot heaps."""
+    for column in ("heartbeat_at timestamptz DEFAULT now()", "lease_until timestamptz", "build_token text"):
+        await connection.status(f"ALTER TABLE {schema}.ptg2_v3_snapshot_layout ADD COLUMN IF NOT EXISTS {column}")
+    await connection.status(
+        f"ALTER TABLE {schema}.ptg2_layout_build_candidate ADD COLUMN IF NOT EXISTS cleanup_pending_at timestamptz"
+    )
+    await connection.status(f"CREATE TABLE {schema}.ptg2_snapshot_lifecycle_writer(role_name name PRIMARY KEY)")
+    await connection.status(f"INSERT INTO {schema}.ptg2_snapshot_lifecycle_writer VALUES(current_user)")
+    await connection.status(
+        f"CREATE TABLE {schema}.ptg2_snapshot_partition_preparation"
+        "(table_name text PRIMARY KEY,ordinal int,plan jsonb,parent_oid oid)"
+    )
+    for ordinal, table in enumerate(("ptg2_v4_npi_scope", "ptg2_v4_provider_component")):
+        await connection.status(
+            f"CREATE TABLE {schema}.{table}(snapshot_key bigint, row_key int, PRIMARY KEY(snapshot_key,row_key)) "
+            "PARTITION BY LIST(snapshot_key)"
+        )
+        await connection.status(f"CREATE TABLE {schema}.{table}_history(LIKE {schema}.{table} INCLUDING INDEXES)")
+        await connection.status(
+            f"ALTER TABLE {schema}.{table} ATTACH PARTITION {schema}.{table}_history "
+            f"FOR VALUES IN ({snapshot_keys[0]},{snapshot_keys[1]})"
+        )
+        await connection.status(
+            f"INSERT INTO {schema}.{table} SELECT snapshot_key,row_key "
+            "FROM unnest(CAST(:keys AS bigint[])) AS snapshot_key CROSS JOIN generate_series(1,5) AS row_key",
+            keys=list(snapshot_keys),
+        )
+        await connection.status(
+            f"INSERT INTO {schema}.ptg2_snapshot_partition_preparation VALUES(:table,:ordinal,"
+            "jsonb_build_object('oid',to_regclass(:history)::oid),to_regclass(:parent)::oid)",
+            table=table, ordinal=ordinal, history=f"{schema}.{table}_history", parent=f"{schema}.{table}",
+        )
+    sql = (Path(__file__).parents[1] / "db/sql/ptg_snapshot_gc.sql").read_text()
+    await connection.status(sql.replace("__S__", schema).replace("__Q__", schema))
 
 
 async def _insert_gc_layout_fixture(connection, schema: str) -> None:
@@ -476,3 +514,34 @@ async def _drop_test_schema_and_disconnect(
             await connection.status(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
     finally:
         await database.disconnect()
+
+
+async def _assert_v4_history_cleanup_defers(schema_name: str, build_token: str) -> None:
+    """Prove partial legacy batches commit before exact-owner cleanup resumes."""
+    for _ in range(2):
+        with pytest.raises(shared_gc.PTG2SharedLayoutAbandonmentDeferred, match="history cleanup committed"):
+            await shared_gc.abandon_owned_v4_layout(
+                schema_name=schema_name, snapshot_key=77, build_token=build_token,
+                grace_seconds=60, options=shared_gc.PTG2V4AbandonmentOptions(batch_rows=2),
+            )
+
+
+@asynccontextmanager
+async def _snapshot_history_gc_scope():
+    """Yield two populated retained snapshots with the production cleanup SQL."""
+    if os.getenv("HLTHPRT_PTG2_SHARED_GC_POSTGRES_TEST") != "1":
+        pytest.skip("requires disposable PostgreSQL GC tests")
+    database = Database()
+    schema_name = f"ptg_history_gc_{uuid.uuid4().hex}"
+    schema = f'"{schema_name}"'
+    await database.connect()
+    try:
+        async with database.acquire() as connection:
+            await connection.status(f"CREATE SCHEMA {schema}")
+            await _create_gc_layout_schema(connection, schema)
+            await _create_gc_block_schema(connection, schema)
+            await _insert_gc_layout_fixture(connection, schema)
+            await _create_snapshot_history_gc(connection, schema, (10, 20))
+        yield database, schema_name, schema
+    finally:
+        await _drop_test_schema_and_disconnect(database, schema)

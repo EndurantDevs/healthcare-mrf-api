@@ -6,9 +6,11 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
 
 from api.code_systems import canonical_catalog_code
+from api.network_read_execution import direct_heap_relation_sql, execute_network_read, has_network_read_inventory
 from api.ptg2_code_filters import (
     INTERNAL_PROCEDURE_CODE_SYSTEM,
     PROCEDURE_CODE_SYSTEMS,
@@ -48,17 +50,23 @@ async def _query_ptg2_code_crosswalk_edges(session, pairs: set[tuple[str, str]])
             )
             """
         )
+    relation = f"{PTG2_SCHEMA}.code_crosswalk"
+    if has_network_read_inventory(session):
+        relation = direct_heap_relation_sql(session, PTG2_SCHEMA, "code_crosswalk")
     try:
-        query_result = await session.execute(
+        query_result = await execute_network_read(
+            session,
             text(
                 f"""
                 SELECT from_system, from_code, to_system, to_code, match_type, confidence, source
-                  FROM {PTG2_SCHEMA}.code_crosswalk
+                  FROM {relation}
                  WHERE {" OR ".join(clauses)}
                 """
             ),
             query_params_by_name,
         )
+    except ServiceUnavailable:
+        raise
     except Exception:
         return []
     return [_row_mapping(edge_row) for edge_row in query_result]

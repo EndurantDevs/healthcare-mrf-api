@@ -35,6 +35,7 @@ from process.custom_import._source_text import (
     validate_snapshot_token,
     validate_source_label,
 )
+from process.custom_import.capture_limits import CaptureLimits
 from process.custom_import.definition import CONTRACT_VERSION, SourceStream
 from process.custom_import.parquet_pages import (
     ParquetPageError,
@@ -42,7 +43,6 @@ from process.custom_import.parquet_pages import (
     validate_page_layout,
 )
 
-_DEFAULT_READ_CHUNK_BYTES = 64 * 1024
 _MAX_PARQUET_FOOTER_BYTES = 1024 * 1024
 _MAX_PARQUET_ROW_GROUPS = 4_096
 _MAX_PARQUET_THRIFT_CONTAINER_ITEMS = 64 * 1024
@@ -64,40 +64,6 @@ Scalar = str | int | Decimal | bool | None
 
 class CaptureError(ValueError):
     """A source payload is malformed, exceeds limits, or fails replay checks."""
-
-
-@dataclass(frozen=True)
-class CaptureLimits:
-    """Resource limits applied before custom-import source data is admitted.
-
-    The per-record byte limit applies to raw delimited and JSON record bytes
-    (including escapes) and to the cumulative scalar content of XML records.
-    XML parser safety also applies fixed internal ceilings to unfinished markup
-    and the document-wide expanded-name vocabulary.
-    """
-
-    maximum_compressed_bytes: int = 64 * 1024 * 1024
-    maximum_decoded_bytes: int = 256 * 1024 * 1024
-    maximum_record_bytes: int = 1024 * 1024
-    maximum_records: int = 1_000_000
-    maximum_fields_per_record: int = 1_024
-    read_chunk_bytes: int = _DEFAULT_READ_CHUNK_BYTES
-
-    def __post_init__(self) -> None:
-        """Reject nonsensical or internally inconsistent resource limits."""
-
-        for name, value in (
-            ("maximum_compressed_bytes", self.maximum_compressed_bytes),
-            ("maximum_decoded_bytes", self.maximum_decoded_bytes),
-            ("maximum_record_bytes", self.maximum_record_bytes),
-            ("maximum_records", self.maximum_records),
-            ("maximum_fields_per_record", self.maximum_fields_per_record),
-            ("read_chunk_bytes", self.read_chunk_bytes),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
-        if self.maximum_decoded_bytes < self.maximum_record_bytes:
-            raise ValueError("maximum_decoded_bytes must cover one complete record")
 
 
 _DEFAULT_CAPTURE_LIMITS = CaptureLimits()
@@ -232,11 +198,13 @@ def iter_records(
     stream: SourceStream,
     *,
     limits: CaptureLimits = _DEFAULT_CAPTURE_LIMITS,
+    _cleanup_failures: list[BaseException] | None = None,
 ) -> Iterator[DecodedRecord]:
     """Yield validated source-label records from a verified sealed capture."""
 
     verify_capture(capture, stream, limits=limits)
-    yield from _iter_verified_records(capture, stream, limits=limits)
+    cleanup_options_by_name = {} if _cleanup_failures is None else {"_cleanup_failures": _cleanup_failures}
+    yield from _iter_verified_records(capture, stream, limits=limits, **cleanup_options_by_name)
 
 
 def _iter_verified_records(
@@ -244,6 +212,7 @@ def _iter_verified_records(
     stream: SourceStream,
     *,
     limits: CaptureLimits,
+    _cleanup_failures: list[BaseException] | None = None,
 ) -> Iterator[DecodedRecord]:
     """Decode one capture only after an internal caller has verified its sealed bytes."""
 
@@ -260,12 +229,14 @@ def _iter_verified_records(
         yield from _iter_xml_records(capture.payload, stream, limits)
         return
     if stream.format == "parquet":
+        cleanup_options_by_name = {} if _cleanup_failures is None else {"_cleanup_failures": _cleanup_failures}
         yield from _iter_parquet_records(
             capture.payload,
             stream,
             limits,
             expected_decoded_bytes=capture.manifest.decoded_bytes,
             expected_decoded_sha256=capture.manifest.decoded_sha256,
+            **cleanup_options_by_name,
         )
         return
     raise CaptureError("capture manifest declares an unsupported source format")
@@ -787,9 +758,32 @@ def _iter_parquet_records(
     *,
     expected_decoded_bytes: int,
     expected_decoded_sha256: str,
+    _cleanup_failures: list[BaseException] | None = None,
 ) -> Iterator[DecodedRecord]:
     """Decode bounded, flat Parquet rows without permitting external file references."""
 
+    with _validated_parquet_reader(
+        captured_bytes,
+        stream,
+        limits,
+        expected_decoded_bytes=expected_decoded_bytes,
+        expected_decoded_sha256=expected_decoded_sha256,
+        _cleanup_failures=_cleanup_failures,
+    ) as (parquet_reader, source_labels, expected_record_count):
+        yield from _iter_parquet_batch_records(parquet_reader, source_labels, expected_record_count, limits)
+
+
+@contextmanager
+def _validated_parquet_reader(
+    captured_bytes,
+    stream,
+    limits,
+    *,
+    expected_decoded_bytes,
+    expected_decoded_sha256,
+    _cleanup_failures=None,
+):
+    """Share the sealed payload, schema and raw-page guards between SOURCE readers."""
     decoded_payload = _bounded_parquet_payload(
         captured_bytes,
         stream.compression,
@@ -798,7 +792,8 @@ def _iter_parquet_records(
         expected_decoded_sha256=expected_decoded_sha256,
     )
     _validate_parquet_envelope(decoded_payload)
-    with _open_parquet_reader(decoded_payload, limits) as parquet_reader:
+    cleanup_options_by_name = {} if _cleanup_failures is None else {"_cleanup_failures": _cleanup_failures}
+    with _open_parquet_reader(decoded_payload, limits, **cleanup_options_by_name) as parquet_reader:
         schema = parquet_reader.schema_arrow
         source_labels = _validated_parquet_schema(schema, limits)
         expected_record_count = _validated_parquet_metadata(
@@ -812,18 +807,44 @@ def _iter_parquet_records(
             schema,
             maximum_decoded_bytes=limits.maximum_decoded_bytes,
         )
-        yield from _iter_parquet_batch_records(
-            parquet_reader,
-            source_labels,
-            expected_record_count,
-            limits,
-        )
+        yield parquet_reader, source_labels, expected_record_count
+
+
+def iter_parquet_source_batches(capture, stream, *, limits, _cleanup_failures=None):
+    """Expose guarded bounded Arrow windows before Python scalar conversion."""
+    verify_capture(capture, stream, limits=limits)
+    if stream.format != "parquet":
+        raise CaptureError("SOURCE column replay requires Parquet")
+    with _validated_parquet_reader(
+        capture.payload,
+        stream,
+        limits,
+        expected_decoded_bytes=capture.manifest.decoded_bytes,
+        expected_decoded_sha256=capture.manifest.decoded_sha256,
+        _cleanup_failures=_cleanup_failures,
+    ) as (reader, labels, expected_rows):
+        emitted = logical_bytes = 0
+        for batch in reader.iter_batches(batch_size=64, use_threads=False, use_pandas_metadata=False):
+            _validate_parquet_batch_schema(batch, labels)
+            logical_bytes += _nonnegative_parquet_integer(batch.nbytes)
+            if logical_bytes > limits.maximum_decoded_bytes:
+                raise CaptureError("Parquet source payload exceeds the decoded-byte limit")
+            if not batch.num_rows:
+                continue
+            if batch.num_rows > 64 or emitted + batch.num_rows > expected_rows:
+                raise CaptureError("Parquet source payload has inconsistent row metadata")
+            emitted += batch.num_rows
+            yield batch
+        if emitted != expected_rows:
+            raise CaptureError("Parquet source payload has inconsistent row metadata")
 
 
 @contextmanager
 def _open_parquet_reader(
     decoded_payload: bytes | memoryview,
     limits: CaptureLimits,
+    *,
+    _cleanup_failures: list[BaseException] | None = None,
 ) -> Iterator[pq.ParquetFile]:
     """Open one in-memory Parquet reader with bounded native parser metadata."""
 
@@ -844,13 +865,20 @@ def _open_parquet_reader(
         yield parquet_reader
     except CaptureError:
         raise
+    except MemoryError:
+        raise
     except (pa.ArrowException, EOFError, OSError, OverflowError, ValueError) as exc:
         raise CaptureError("Parquet source payload is invalid") from exc
     finally:
-        if parquet_reader is not None:
-            parquet_reader.close()
-        if native_buffer is not None:
-            native_buffer.close()
+        try:
+            if parquet_reader is not None:
+                parquet_reader.close()
+            if native_buffer is not None:
+                native_buffer.close()
+        except BaseException as error:
+            if _cleanup_failures is not None:
+                _cleanup_failures.append(error)
+            raise
 
 
 def _iter_parquet_batch_records(

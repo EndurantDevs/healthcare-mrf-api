@@ -57,6 +57,24 @@ ALLOWLISTED_REJECTION_REASONS = (
     ),
 )
 
+ALLOWLISTED_REJECTION_REASONS += tuple(
+    (message, message)
+    for message in (
+        "partitioned_audit_request_fields_invalid",
+        "partitioned_audit_request_contract_invalid",
+        "partitioned_audit_request_items_invalid",
+        "partitioned_audit_request_item_count_invalid",
+        "partitioned_audit_request_binding_invalid",
+        "partitioned_audit_request_duplicate_ordinal",
+        "partitioned_audit_source_fields_invalid",
+        "partitioned_audit_persisted_fields_invalid",
+        "partitioned_audit_network_digests_invalid",
+        "partitioned_audit_occurrence_id_invalid",
+        "partitioned_audit_npi_invalid",
+        "partitioned_audit_request_too_large",
+    )
+)
+
 
 class _ResponseContent:
     def __init__(self, response_body: bytes):
@@ -222,6 +240,13 @@ def test_allowlisted_endpoint_message_adds_stable_rejection_detail(
             b'byte limit while retaining the batched V4 pattern graph projection: '
             b'private"}'
         ),
+        b'{"message":"partitioned_audit_request_binding_invalid: private"}',
+        b'{"message":"private: partitioned_audit_network_digests_invalid"}',
+        b'{"message":"partitioned_audit_request_binding_invalid "}',
+        b'{"message":"partitioned_audit_unknown_invalid"}',
+        b'{"error":{"message":"partitioned_audit_request_binding_invalid"}}',
+        b'{"message":null}',
+        b'\xff',
     ),
 )
 def test_unknown_or_malformed_rejection_body_is_not_classified(response_body):
@@ -229,3 +254,24 @@ def test_unknown_or_malformed_rejection_body_is_not_classified(response_body):
         batch_audit._batch_rejection_reason(400, response_body)
         == "batch_endpoint_rejected_400"
     )
+
+
+@pytest.mark.asyncio
+async def test_oversized_known_rejection_uses_existing_response_budget(monkeypatch):
+    response_body = json.dumps(
+        {
+            "message": "partitioned_audit_request_binding_invalid",
+            "padding": "x" * batch_audit.PTG2_BATCH_AUDIT_MAX_RESPONSE_BYTES,
+            "detail": "private endpoint detail",
+        }
+    ).encode()
+    observed_posts = _install_http_response(monkeypatch, 400, response_body)
+    with pytest.raises(batch_audit.BatchCandidateAuditContractError) as exc_info:
+        await batch_audit._post_batch_request(
+            request_payload_by_field={},
+            http_config=_http_config("https://audit.example"),
+            deadline_seconds=55.0,
+        )
+    assert len(observed_posts) == 1
+    assert exc_info.value.reason == "batch_response_too_large"
+    assert "private endpoint detail" not in str(exc_info.value)

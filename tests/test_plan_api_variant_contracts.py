@@ -1,21 +1,15 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 import asyncio
-
 import datetime
-
 import json
-
 import types
 
 import pytest
-
 import sanic.exceptions
-
 from sqlalchemy.exc import ProgrammingError
 
 import api.endpoint.plan as plan_module
-
 from api.endpoint.plan import (
     _fetch_network_entry,
     _get_session,
@@ -26,14 +20,13 @@ from api.endpoint.plan import (
     all_plans_variants,
     find_a_plan,
     get_autocomplete_list,
-    get_network_by_checksum,
     get_network_batch_by_checksums,
+    get_network_by_checksum,
     get_plan,
     get_price_plan,
     get_price_plans_bulk,
     index_status,
 )
-
 from tests.test_plan_api import (
     FakeResult,
     FakeSession,
@@ -44,6 +37,7 @@ from tests.test_plan_api import (
     make_facet_results,
     make_request,
 )
+
 
 @pytest.mark.asyncio
 async def test_get_plan_with_variant(monkeypatch):
@@ -84,6 +78,7 @@ async def test_get_plan_with_variant(monkeypatch):
     assert response_payload["formulary_has_drug_data"] is True
     assert response_payload["formulary_uri"] == "P1/2024"
 
+
 @pytest.mark.asyncio
 async def test_get_plan_normalizes_variant_identifiers():
     """Verify get plan normalizes variant identifiers."""
@@ -98,6 +93,7 @@ async def test_get_plan_normalizes_variant_identifiers():
     assert response_payload["formulary_has_drug_data"] is False
     assert response_payload["formulary_uri"] == "P1/2024"
 
+
 @pytest.mark.asyncio
 async def test_get_plan_uses_fallback_variants_when_missing():
     request = make_request(
@@ -108,11 +104,7 @@ async def test_get_plan_uses_fallback_variants_when_missing():
             FakeResult(rows=[]),
             FakeResult(rows=[], scalar=0),
             FakeResult(rows=[]),
-            FakeResult(
-                rows=[
-                    {"full_plan_id": None, "attr_name": "FormularyId", "attr_value": "PlanLevelValue"}
-                ]
-            ),
+            FakeResult(rows=[{"full_plan_id": None, "attr_name": "FormularyId", "attr_value": "PlanLevelValue"}]),
             FakeResult(
                 rows=[
                     {
@@ -143,6 +135,7 @@ async def test_get_plan_uses_fallback_variants_when_missing():
     assert response_payload["formulary_has_drug_data"] is False
     assert response_payload["formulary_uri"] == "P2/2024"
 
+
 @pytest.mark.asyncio
 async def test_get_plan_variant_not_found():
     request = make_request(
@@ -157,6 +150,7 @@ async def test_get_plan_variant_not_found():
     )
     with pytest.raises(sanic.exceptions.NotFound):
         await get_plan(request, "P1", year="2024", variant="P1-99")
+
 
 @pytest.mark.asyncio
 async def test_plan_variants_unique_and_clean():
@@ -214,6 +208,7 @@ async def test_plan_variants_unique_and_clean():
     assert response_payload["formulary_has_drug_data"] is False
     assert response_payload["formulary_uri"] == "P1/2024"
 
+
 def test_result_rows_handles_typeerror():
     class BadAll:
         def all(self):
@@ -224,20 +219,23 @@ def test_result_rows_handles_typeerror():
 
     assert _result_rows(BadAll()) == [1, 2]
 
+
 def test_result_scalar_empty():
     assert _result_scalar(FakeResult(rows=[])) is None
 
+
 @pytest.mark.asyncio
 async def test_get_network_batch_by_checksums_skips_invalid(monkeypatch):
-    async def fake_fetch(_session, checksum):
-        return {"checksum": checksum, "plans": []}
+    async def fake_fetch(_session, checksums):
+        return {checksum: {"checksum": checksum, "plans": []} for checksum in checksums}
 
-    monkeypatch.setattr("api.endpoint.plan._fetch_network_entry", fake_fetch)
+    monkeypatch.setattr("api.endpoint.plan._fetch_networks_by_checksum", fake_fetch)
     session = FakeSession([])
-    request = types.SimpleNamespace(ctx=types.SimpleNamespace(sa_session=session))
+    request = types.SimpleNamespace(args={}, ctx=types.SimpleNamespace(sa_session=session))
     response = await get_network_batch_by_checksums(request, "bad,1")
     response_payload = json.loads(response.body)
     assert [entry["checksum"] for entry in response_payload] == [1]
+
 
 @pytest.mark.asyncio
 async def test_find_a_plan_skips_missing_plan_id():
@@ -254,11 +252,13 @@ async def test_find_a_plan_skips_missing_plan_id():
     assert response_payload["results"] == []
     assert response_payload["issuers"] == []
 
+
 @pytest.mark.asyncio
 async def test_plan_get_price_plan_bad_year_value():
     request = make_request([], args={})
     with pytest.raises(sanic.exceptions.BadRequest):
         await get_price_plan(request, "123", year="bad")
+
 
 def test_result_scalar_tuple():
     class TupleResult:
@@ -270,6 +270,7 @@ def test_result_scalar_tuple():
 
     assert _result_scalar(TupleResult()) == 1
 
+
 @pytest.mark.asyncio
 async def test_get_network_by_checksum_not_found(monkeypatch):
     async def fake_fetch(_session, _checksum):
@@ -280,11 +281,13 @@ async def test_get_network_by_checksum_not_found(monkeypatch):
     with pytest.raises(sanic.exceptions.NotFound):
         await get_network_by_checksum(request, "123")
 
+
 @pytest.mark.asyncio
 async def test_plan_get_autocomplete_no_query():
     request = make_request([], args={})
     response = await get_autocomplete_list(request)
     assert json.loads(response.body) == {"plans": []}
+
 
 @pytest.mark.asyncio
 async def test_find_a_plan_invalid_limit_page():
@@ -297,6 +300,7 @@ async def test_find_a_plan_invalid_limit_page():
     )
     with pytest.raises(sanic.exceptions.BadRequest):
         await find_a_plan(request)
+
 
 @pytest.mark.asyncio
 async def test_find_a_plan_boolean_filter_without_metadata():
@@ -314,6 +318,7 @@ async def test_find_a_plan_boolean_filter_without_metadata():
     assert response_payload["applied_filters"]["has_adult_dental"] is True
     assert "facets" in response_payload
 
+
 @pytest.mark.asyncio
 async def test_find_a_plan_include_facets_false_hides_facets_payload():
     request = make_request(
@@ -327,6 +332,7 @@ async def test_find_a_plan_include_facets_false_hides_facets_payload():
     response_payload = json.loads(response.body)
     assert response_payload["facets"] == {}
     assert response_payload["applied_filters"]["include_facets"] is False
+
 
 @pytest.mark.asyncio
 async def test_find_a_plan_include_aggregations_alias_controls_facets():
@@ -342,11 +348,13 @@ async def test_find_a_plan_include_aggregations_alias_controls_facets():
     assert response_payload["facets"] == {}
     assert response_payload["applied_filters"]["include_facets"] is False
 
+
 @pytest.mark.asyncio
 async def test_find_a_plan_rejects_conflicting_facet_aliases():
     request = make_request([], args={"include_facets": "true", "include_aggregations": "false"})
     with pytest.raises(sanic.exceptions.BadRequest):
         await find_a_plan(request)
+
 
 @pytest.mark.asyncio
 async def test_find_a_plan_returns_pagination_metadata():
@@ -363,17 +371,21 @@ async def test_find_a_plan_returns_pagination_metadata():
     assert response_payload["limit"] == 20
     assert response_payload["offset"] == 40
 
+
 def test_result_scalar_empty_iterable():
     assert _result_scalar([]) is None
 
+
 def test_result_scalar_simple_value():
-    assert _result_scalar(['alpha']) == 'alpha'
+    assert _result_scalar(["alpha"]) == "alpha"
+
 
 @pytest.mark.asyncio
 async def test_find_a_plan_invalid_age():
-    request = make_request([], args={'age': 'not-a-number'})
+    request = make_request([], args={"age": "not-a-number"})
     with pytest.raises(sanic.exceptions.BadRequest):
         await find_a_plan(request)
+
 
 def test_normalize_attribute_map_converts_scalars():
     raw_by_key = {"PlanMarketingName": "Bronze ABC"}

@@ -7,41 +7,70 @@ from copy import deepcopy
 
 import pytest
 
+from process.ptg_parts import ptg2_v4_taxonomy_candidates as candidates
 from process.ptg_parts.ptg2_candidate_layout_identity import (
     PTG2_CANDIDATE_V3_GENERATION,
     PTG2_CANDIDATE_V4_GENERATION,
     normalize_candidate_storage_generation,
     validate_candidate_layout_identity,
 )
-from process.ptg_parts import ptg2_v4_taxonomy_candidates as candidates
-
+from tests.test_ptg2_physical_binding import _binding
 
 MAP_DIGEST = b"m" * 32
+
+
+@pytest.mark.parametrize("drift", [None, "metadata-key", "payload-key", "snapshot", "map", "legacy", "untyped"])
+def test_explicit_local_identity_keeps_metadata_and_payload_keys_separate(drift):
+    binding = _binding()
+    row_by_field, serving_by_field, layout_serving_by_field = _v4_identity_parts()
+    row_by_field.update(snapshot_key=binding.destination_layout_key, snapshot_id=binding.snapshot_id)
+    serving_by_field["shared_snapshot_key"] = layout_serving_by_field["shared_snapshot_key"] = (
+        binding.payload_snapshot_key
+    )
+    match drift:
+        case "metadata-key":
+            row_by_field["snapshot_key"] += 1
+        case "payload-key":
+            serving_by_field["shared_snapshot_key"] = binding.destination_layout_key
+        case "snapshot":
+            row_by_field["snapshot_id"] = "another-snapshot"
+        case "map":
+            row_by_field["v4_root_map_digest"] = b"x" * 32
+        case "legacy":
+            binding = None
+        case "untyped":
+            binding = object()
+    if drift:
+        with pytest.raises(ValueError):
+            validate_candidate_layout_identity(
+                row_by_field, serving_by_field, layout_serving_by_field, physical_binding=binding
+            )
+    else:
+        assert (
+            validate_candidate_layout_identity(
+                row_by_field, serving_by_field, layout_serving_by_field, physical_binding=binding
+            )
+            == PTG2_CANDIDATE_V4_GENERATION
+        )
 
 
 def _projection_manifest() -> dict[str, object]:
     rule_digest = b"r" * 32
     member_keys = candidates.pack_inferred_taxonomy_npi_keys((0, 2))
-    pattern_member_digest = (
-        candidates.inferred_taxonomy_pattern_member_digest(
-            rule_digest,
-            representation="direct_v1",
-            pattern_count=0,
-            pattern_member_count=0,
-            packed_pattern_payload=b"",
-        )
+    pattern_member_digest = candidates.inferred_taxonomy_pattern_member_digest(
+        rule_digest,
+        representation="direct_v1",
+        pattern_count=0,
+        pattern_member_count=0,
+        packed_pattern_payload=b"",
     )
     return candidates.shape_v4_inferred_taxonomy_projection_manifest(
         (
             {
                 "rule_digest": rule_digest,
-                "catalog_contract": (
-                    candidates.PTG2_V4_INFERRED_TAXONOMY_CATALOG_CONTRACT
-                ),
+                "catalog_contract": (candidates.PTG2_V4_INFERRED_TAXONOMY_CATALOG_CONTRACT),
                 "catalog_digest": b"c" * 32,
-                "vector_format": (
-                    candidates.PTG2_V4_INFERRED_TAXONOMY_VECTOR_FORMAT
-                ),
+                "vector_format": (candidates.PTG2_V4_INFERRED_TAXONOMY_VECTOR_FORMAT),
                 "member_count": 2,
                 "member_digest": candidates.inferred_taxonomy_member_digest(
                     rule_digest,
@@ -66,14 +95,8 @@ def _install_projection(
     serving_index: dict[str, object],
     projection: dict[str, object],
 ) -> None:
-    serving_index["provider_graph"] = {
-        "inferred_taxonomy_candidates": deepcopy(projection)
-    }
-    serving_index["serving_binary"] = {
-        "provider_graph_v4": {
-            "inferred_taxonomy_candidates": deepcopy(projection)
-        }
-    }
+    serving_index["provider_graph"] = {"inferred_taxonomy_candidates": deepcopy(projection)}
+    serving_index["serving_binary"] = {"provider_graph_v4": {"inferred_taxonomy_candidates": deepcopy(projection)}}
 
 
 def _v4_identity_parts_with_projection():
@@ -90,15 +113,9 @@ def _projection_copies(
 ) -> tuple[dict[str, object], ...]:
     return (
         serving_index["provider_graph"]["inferred_taxonomy_candidates"],
-        serving_index["serving_binary"]["provider_graph_v4"][
-            "inferred_taxonomy_candidates"
-        ],
-        layout_serving_index["provider_graph"][
-            "inferred_taxonomy_candidates"
-        ],
-        layout_serving_index["serving_binary"]["provider_graph_v4"][
-            "inferred_taxonomy_candidates"
-        ],
+        serving_index["serving_binary"]["provider_graph_v4"]["inferred_taxonomy_candidates"],
+        layout_serving_index["provider_graph"]["inferred_taxonomy_candidates"],
+        layout_serving_index["serving_binary"]["provider_graph_v4"]["inferred_taxonomy_candidates"],
     )
 
 
@@ -148,29 +165,14 @@ def _v4_identity_parts():
 
 
 def test_candidate_layout_identity_accepts_exact_v3_and_v4():
-    assert (
-        validate_candidate_layout_identity(*_v3_identity_parts())
-        == PTG2_CANDIDATE_V3_GENERATION
-    )
-    assert (
-        validate_candidate_layout_identity(*_v4_identity_parts())
-        == PTG2_CANDIDATE_V4_GENERATION
-    )
-    assert (
-        validate_candidate_layout_identity(
-            *_v4_identity_parts_with_projection()
-        )
-        == PTG2_CANDIDATE_V4_GENERATION
-    )
+    assert validate_candidate_layout_identity(*_v3_identity_parts()) == PTG2_CANDIDATE_V3_GENERATION
+    assert validate_candidate_layout_identity(*_v4_identity_parts()) == PTG2_CANDIDATE_V4_GENERATION
+    assert validate_candidate_layout_identity(*_v4_identity_parts_with_projection()) == PTG2_CANDIDATE_V4_GENERATION
 
 
 def test_candidate_v4_projection_must_be_present_in_every_sealed_copy():
-    row, serving_index, layout_serving_index = (
-        _v4_identity_parts_with_projection()
-    )
-    del layout_serving_index["serving_binary"]["provider_graph_v4"][
-        "inferred_taxonomy_candidates"
-    ]
+    row, serving_index, layout_serving_index = _v4_identity_parts_with_projection()
+    del layout_serving_index["serving_binary"]["provider_graph_v4"]["inferred_taxonomy_candidates"]
 
     with pytest.raises(ValueError, match="projection is missing"):
         validate_candidate_layout_identity(
@@ -181,12 +183,8 @@ def test_candidate_v4_projection_must_be_present_in_every_sealed_copy():
 
 
 def test_candidate_v4_projection_must_equal_sealed_layout():
-    row, serving_index, layout_serving_index = (
-        _v4_identity_parts_with_projection()
-    )
-    serving_index["serving_binary"]["provider_graph_v4"][
-        "inferred_taxonomy_candidates"
-    ]["projection_digest"] = "0" * 64
+    row, serving_index, layout_serving_index = _v4_identity_parts_with_projection()
+    serving_index["serving_binary"]["provider_graph_v4"]["inferred_taxonomy_candidates"]["projection_digest"] = "0" * 64
 
     with pytest.raises(ValueError, match="changed after layout sealing"):
         validate_candidate_layout_identity(
@@ -204,9 +202,7 @@ def test_candidate_v4_projection_must_equal_sealed_layout():
             "projection is invalid",
         ),
         (
-            lambda projection: projection.update(
-                projection_digest="0" * 64
-            ),
+            lambda projection: projection.update(projection_digest="0" * 64),
             "projection is invalid",
         ),
         (
@@ -219,9 +215,7 @@ def test_candidate_v4_projection_requires_canonical_contract_digest_and_counts(
     mutator,
     message,
 ):
-    row, serving_index, layout_serving_index = (
-        _v4_identity_parts_with_projection()
-    )
+    row, serving_index, layout_serving_index = _v4_identity_parts_with_projection()
     for projection in _projection_copies(
         serving_index,
         layout_serving_index,
@@ -244,15 +238,11 @@ def test_candidate_v4_projection_requires_canonical_contract_digest_and_counts(
             "root is incomplete",
         ),
         (
-            lambda row, index, layout: row.update(
-                v4_root_map_digest=b"x" * 32
-            ),
+            lambda row, index, layout: row.update(v4_root_map_digest=b"x" * 32),
             "root is incomplete",
         ),
         (
-            lambda row, index, layout: layout["snapshot_map"].update(
-                map_digest=(b"x" * 32).hex()
-            ),
+            lambda row, index, layout: layout["snapshot_map"].update(map_digest=(b"x" * 32).hex()),
             "manifest changed",
         ),
         (
@@ -264,15 +254,11 @@ def test_candidate_v4_projection_requires_canonical_contract_digest_and_counts(
             "exact strict",
         ),
         (
-            lambda row, index, layout: layout.update(
-                shared_snapshot_key=18
-            ),
+            lambda row, index, layout: layout.update(shared_snapshot_key=18),
             "shared layout binding",
         ),
         (
-            lambda row, index, layout: index.update(
-                provider_scope_strategy="postgres_shared_graph"
-            ),
+            lambda row, index, layout: index.update(provider_scope_strategy="postgres_shared_graph"),
             "markers are inconsistent",
         ),
     ),
@@ -286,9 +272,7 @@ def test_candidate_v4_layout_identity_fails_closed(mutator, message):
 
 
 def test_candidate_v4_layout_identity_accepts_canonical_string_keys():
-    row_by_field, serving_index_by_field, layout_index_by_field = (
-        _v4_identity_parts()
-    )
+    row_by_field, serving_index_by_field, layout_index_by_field = _v4_identity_parts()
     row_by_field["snapshot_key"] = "17"
     serving_index_by_field["shared_snapshot_key"] = "17"
     layout_index_by_field["shared_snapshot_key"] = "17"
@@ -307,9 +291,7 @@ def test_candidate_v4_layout_identity_accepts_canonical_string_keys():
 def test_candidate_v4_layout_identity_rejects_noncanonical_snapshot_keys(
     invalid_snapshot_key,
 ):
-    row_by_field, serving_index_by_field, layout_index_by_field = (
-        _v4_identity_parts()
-    )
+    row_by_field, serving_index_by_field, layout_index_by_field = _v4_identity_parts()
     row_by_field["snapshot_key"] = invalid_snapshot_key
 
     with pytest.raises(ValueError, match="snapshot key is invalid"):
@@ -324,9 +306,7 @@ def test_candidate_v4_layout_identity_rejects_noncanonical_snapshot_keys(
 def test_candidate_v4_layout_identity_rejects_invalid_map_digests(
     invalid_digest,
 ):
-    row_by_field, serving_index_by_field, layout_index_by_field = (
-        _v4_identity_parts()
-    )
+    row_by_field, serving_index_by_field, layout_index_by_field = _v4_identity_parts()
     row_by_field["layout_mapping_digest"] = invalid_digest
 
     with pytest.raises(ValueError, match="layout mapping digest is invalid"):
@@ -338,10 +318,7 @@ def test_candidate_v4_layout_identity_rejects_invalid_map_digests(
 
 
 def test_candidate_storage_generation_is_exact():
-    assert (
-        normalize_candidate_storage_generation(" shared_blocks_v4 ")
-        == PTG2_CANDIDATE_V4_GENERATION
-    )
+    assert normalize_candidate_storage_generation(" shared_blocks_v4 ") == PTG2_CANDIDATE_V4_GENERATION
     for unsupported_generation in ("shared_blocks_v5", "SHARED_BLOCKS_V4"):
         with pytest.raises(ValueError, match="unsupported"):
             normalize_candidate_storage_generation(unsupported_generation)

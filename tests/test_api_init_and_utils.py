@@ -1,19 +1,20 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import importlib
 import types
 
 import pytest
-import importlib
 from shapely.geometry import Polygon
 
 from api import init_api
+from api.endpoint.network_catalog import private_catalog_response
 from api.utils import square_poly
-
 
 EXPECTED_PUBLIC_BLUEPRINT_NAMES = {
     "coverage",
     "clinical",
     "codes",
+    "custom_import",
     "healthcheck",
     "hospital_prices",
     "plan",
@@ -21,12 +22,18 @@ EXPECTED_PUBLIC_BLUEPRINT_NAMES = {
     "formulary_fhir",
     "import",
     "issuer",
+    "network_catalog",
+    "network_providers",
+    "network_serving",
     "npi",
     "nucc",
     "geo",
     "pricing",
     "partd_formulary",
     "pharmacy_license",
+    "provider_directory_entities",
+    "registry_management",
+    "registry_publication",
     "reports",
     "site_intelligence",
 }
@@ -40,10 +47,13 @@ def test_init_api_registers_group(monkeypatch):
     api_module = importlib.import_module("api.__init__")
     monkeypatch.setattr(api_module, "db", fake_db)
     monkeypatch.setitem(init_api.__globals__, "db", fake_db)
+
     class FakeApp:
         def __init__(self):
             self.config = {}
+            self.ctx = types.SimpleNamespace()
             self.registered = None
+            self.registered_blueprints = []
             self.registered_middleware = []
             self.listeners = {}
 
@@ -51,6 +61,7 @@ def test_init_api_registers_group(monkeypatch):
             def decorator(func):
                 self.listeners[event] = func
                 return func
+
             return decorator
 
         signal = listener
@@ -58,13 +69,15 @@ def test_init_api_registers_group(monkeypatch):
         def middleware(self, _phase):
             def decorator(func):
                 return func
+
             return decorator
 
         def register_middleware(self, middleware, phase):
             self.registered_middleware.append((middleware, phase))
 
-        def blueprint(self, group):
+        def blueprint(self, group, **_options):
             self.registered = group
+            self.registered_blueprints.append(group)
 
     app = FakeApp()
     init_api(app)
@@ -74,12 +87,17 @@ def test_init_api_registers_group(monkeypatch):
     assert app.registered is not None
     assert app.registered_middleware == [
         (init_api.__globals__["_capacity_process_request_guard"], "request"),
+        (init_api.__globals__["require_internal_plan_release_read"], "request"),
         (init_api.__globals__["add_runtime_identity_headers"], "response"),
+        (private_catalog_response, "response"),
     ]
     assert hasattr(app.registered, "blueprints")
-    assert {bp.name for bp in app.registered.blueprints} == (
-        EXPECTED_PUBLIC_BLUEPRINT_NAMES
-    )
+    assert {bp.name for bp in app.registered.blueprints} == (EXPECTED_PUBLIC_BLUEPRINT_NAMES)
+    assert init_api.__globals__["admission_batch_blueprint"] in app.registered_blueprints
+    assert "custom_import_admission" not in EXPECTED_PUBLIC_BLUEPRINT_NAMES
+    assert init_api.__globals__["source_batch_blueprint"] in app.registered_blueprints
+    assert "custom_import_source" not in EXPECTED_PUBLIC_BLUEPRINT_NAMES
+    assert app.registered_blueprints.count(init_api.__globals__["rejection_evidence_blueprint"]) == 1
 
 
 @pytest.mark.parametrize("distance", [0.1, 1, 5])

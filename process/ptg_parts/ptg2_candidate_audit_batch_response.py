@@ -7,6 +7,11 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Mapping
 
+from process.ptg_parts.ptg2_fragment_witness_audit_ledger import (
+    FRAGMENT_WITNESS_IO_FIELDS,
+    validate_fragment_witness_io,
+)
+
 if TYPE_CHECKING:
     from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
         AuditBatchRequest,
@@ -231,9 +236,14 @@ def validate_audit_batch_once_ledgers(
     block_io: Any,
     witness_io: Any,
     candidate_processing_io: Any,
+    expected_source_witness: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
-    """Return strict ledgers only when every physical/logical repeat is zero."""
+    """Require once-only payloads and the sealed version's evidence accounting."""
 
+    is_fragment_witness = (
+        expected_source_witness is not None
+        and expected_source_witness.get("format_version") == 6
+    )
     validated_block_io_by_name = _counter_ledger_by_name(
         block_io,
         field_name="audit_batch_block_io",
@@ -242,7 +252,11 @@ def validate_audit_batch_once_ledgers(
     validated_witness_io_by_name = _counter_ledger_by_name(
         witness_io,
         field_name="audit_batch_witness_io",
-        expected_fields=_WITNESS_IO_FIELDS,
+        expected_fields=(
+            _WITNESS_IO_FIELDS | FRAGMENT_WITNESS_IO_FIELDS
+            if is_fragment_witness
+            else _WITNESS_IO_FIELDS
+        ),
     )
     validated_candidate_io_by_name = _counter_ledger_by_name(
         candidate_processing_io,
@@ -250,7 +264,10 @@ def validate_audit_batch_once_ledgers(
         expected_fields=_CANDIDATE_PROCESSING_IO_FIELDS,
     )
     _validate_block_io_once(validated_block_io_by_name)
-    _validate_witness_io_once(validated_witness_io_by_name)
+    if is_fragment_witness:
+        validate_fragment_witness_io(validated_witness_io_by_name, expected_source_witness)
+    else:
+        _validate_witness_io_once(validated_witness_io_by_name)
     _validate_candidate_processing_once(validated_candidate_io_by_name)
     return (
         validated_block_io_by_name,
@@ -325,6 +342,13 @@ def _validate_response_binding(
         or witness_io_by_name["record_decodes"] != expected_record_count
         or witness_io_by_name["unique_evidence_entries"]
         != expected_evidence_count
+        or (
+            expected_source_witness.get("format_version") == 6
+            and (
+                expected_source_witness.get("sample_digest") != request.source_witness_sample_digest
+                or expected_source_witness.get("payload_sha256") != request.source_witness_payload_sha256
+            )
+        )
     ):
         raise ValueError("audit_batch_response_candidate_mismatch")
 
@@ -360,6 +384,7 @@ def parse_audit_batch_response(
             block_io=raw_response.get("block_io"),
             witness_io=raw_response.get("witness_io"),
             candidate_processing_io=raw_response.get("candidate_processing_io"),
+            expected_source_witness=expected_source_witness,
         )
     )
     _validate_response_binding(

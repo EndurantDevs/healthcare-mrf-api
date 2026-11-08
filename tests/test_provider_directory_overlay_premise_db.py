@@ -4,24 +4,24 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, contextmanager
 import importlib
 import importlib.util
 import os
-from pathlib import Path
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, contextmanager
+from pathlib import Path
 
 import pytest
+from sqlalchemy import text
 
 from db.connection import Database
+
 directory = importlib.import_module("process.provider_directory_fhir")
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION_PATH = (
-    ROOT / "alembic/versions/20260811140000_address_premise_grouping.py"
-)
+MIGRATION_PATH = ROOT / "alembic/versions/20260811140000_address_premise_grouping.py"
 MATCHED_ADDRESS_KEY = "00000000-0000-0000-0000-000000000001"
 NULL_PREMISE_ADDRESS_KEY = "00000000-0000-0000-0000-000000000002"
 MERGED_ADDRESS_KEY = "00000000-0000-0000-0000-000000000003"
@@ -212,7 +212,7 @@ async def _assert_downgrade(database: Database, schema: str) -> None:
     )
     index_relation = await database.scalar(
         "SELECT to_regclass(:index_name);",
-        index_name=f'{schema}.provider_directory_address_overlay_npi_premise_key_idx',
+        index_name=f"{schema}.provider_directory_address_overlay_npi_premise_key_idx",
     )
     assert column_count == 0
     assert index_relation is None
@@ -261,16 +261,11 @@ async def _assert_stage_premise_index(database: Database, schema: str) -> None:
     directory.db = database
     try:
         await directory._create_address_overlay_stage_indexes(schema, stage_table)
-        await database.status(
-            f'ALTER TABLE "{schema}"."{stage_table}" '
-            'RENAME TO "provider_directory_address_overlay";'
-        )
+        await database.status(f'ALTER TABLE "{schema}"."{stage_table}" RENAME TO "provider_directory_address_overlay";')
         await directory._rename_address_overlay_stage_indexes(schema, stage_table)
     finally:
         directory.db = original_db
-    index_name = directory._address_overlay_index_name(
-        "provider_directory_address_overlay", "npi_premise_key_idx"
-    )
+    index_name = directory._address_overlay_index_name("provider_directory_address_overlay", "npi_premise_key_idx")
     index_row = await database.first(
         """
         SELECT pg_get_indexdef(index_record.oid) AS index_definition,
@@ -397,3 +392,37 @@ async def test_premise_index_is_deferred_to_and_promoted_with_overlay_stage():
 
     async with _premise_schema() as (database, schema):
         await _assert_stage_premise_index(database, schema)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", [(), ("lat",), ("formatted_address_source",), ("premise_key",)])
+async def test_overlay_ensure_repairs_legacy_shape_and_keeps_pinned_reader(monkeypatch, missing):
+    """Compatibility repair completes before a separate readonly session pins the live table."""
+    async with _premise_schema() as (database, schema):
+        monkeypatch.setattr(directory, "db", database)
+        await directory._ensure_provider_directory_address_overlay_table(schema)
+        relation = f'"{schema}".provider_directory_address_overlay'
+        for column in missing:
+            await database.status(f'ALTER TABLE {relation} DROP COLUMN "{column}"')
+        await directory._ensure_provider_directory_address_overlay_table(schema)
+        columns = await database.all(
+            "SELECT attname FROM pg_attribute WHERE attrelid=to_regclass(:relation) AND attnum>0 AND NOT attisdropped",
+            relation=relation,
+        )
+        assert set(directory._provider_directory_address_overlay_columns()) <= {column_row[0] for column_row in columns}
+        before = await database.first(
+            "SELECT oid,relfilenode FROM pg_class WHERE oid=to_regclass(:relation)", relation=relation
+        )
+        async with database.engine.begin() as reader:
+            await reader.execute(text("SET TRANSACTION READ ONLY"))
+            assert await reader.scalar(text(f"SELECT count(*) FROM {relation}")) == 0
+            async with database.transaction():
+                await database.status("SET LOCAL lock_timeout='200ms'")
+                await directory._ensure_provider_directory_address_overlay_table(schema)
+                assert (
+                    await database.first(
+                        "SELECT oid,relfilenode FROM pg_class WHERE oid=to_regclass(:relation)", relation=relation
+                    )
+                    == before
+                )
+            assert await reader.scalar(text(f"SELECT count(*) FROM {relation}")) == 0

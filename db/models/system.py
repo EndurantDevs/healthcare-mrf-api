@@ -15,6 +15,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     Integer,
     LargeBinary,
     PrimaryKeyConstraint,
@@ -24,6 +25,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
@@ -32,6 +34,7 @@ __all__ = (
     "ImportHistory",
     "ImportLog",
     "ImportRun",
+    "EntityAddressResultGeneration",
     "PTGImportWave",
     "PTGImportWaveAdmissionRollback",
     "PTGImportWaveClaim",
@@ -85,27 +88,72 @@ __all__ = (
 )
 
 
-class ImportHistory(Base, JSONOutputMixin):
-    __tablename__ = 'history'
+class EntityAddressResultGeneration(Base, JSONOutputMixin):
+    """Singleton authority for local builds and the currently served origin."""
+
+    __runtime_schema_sync__ = False
+    __tablename__ = "entity_address_result_generation"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('import_id'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("singleton"),
+        CheckConstraint(
+            "singleton IS TRUE AND local_generation >= 0 AND ("
+            "(origin_lineage_id IS NULL AND origin_generation IS NULL "
+            "AND published_at IS NULL AND relation_oids IS NULL) OR ("
+            "origin_lineage_id IS NOT NULL AND origin_generation IS NOT NULL "
+            "AND origin_generation > 0 "
+            "AND published_at IS NOT NULL AND relation_oids IS NOT NULL "
+            "AND array_ndims(relation_oids) = 1 "
+            "AND array_lower(relation_oids, 1) = 1 "
+            "AND cardinality(relation_oids) = 7 "
+            "AND array_position(relation_oids, NULL) IS NULL "
+            "AND 0 < ALL(relation_oids) "
+            "AND 4294967295 >= ALL(relation_oids) "
+            "AND relation_oids[1] <> ALL(relation_oids[2:7]) "
+            "AND relation_oids[2] <> ALL(relation_oids[3:7]) "
+            "AND relation_oids[3] <> ALL(relation_oids[4:7]) "
+            "AND relation_oids[4] <> ALL(relation_oids[5:7]) "
+            "AND relation_oids[5] <> ALL(relation_oids[6:7]) "
+            "AND relation_oids[6] <> relation_oids[7]))",
+            name="entity_address_result_generation_shape_check",
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+        },
     )
-    __my_index_elements__ = ['import_id']
+    __my_index_elements__ = ["singleton"]
+
+    singleton = Column(Boolean, nullable=False)
+    local_lineage_id = Column(PG_UUID(as_uuid=True), nullable=False)
+    local_generation = Column(BigInteger, nullable=False)
+    origin_lineage_id = Column(PG_UUID(as_uuid=True))
+    origin_generation = Column(BigInteger)
+    published_at = Column(TIMESTAMP(timezone=True))
+    relation_oids = Column(ARRAY(BigInteger))
+
+
+class ImportHistory(Base, JSONOutputMixin):
+    __tablename__ = "history"
+    __main_table__ = __tablename__
+    __table_args__ = (
+        PrimaryKeyConstraint("import_id"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+    )
+    __my_index_elements__ = ["import_id"]
     import_id = Column(String)
     json_status = Column(JSON)
     when = Column(DateTime)
 
 
 class ImportLog(Base, JSONOutputMixin):
-    __tablename__ = 'log'
+    __tablename__ = "log"
     __main_table__ = __tablename__
     __table_args__ = (
-        PrimaryKeyConstraint('issuer_id', 'checksum'),
-        {'schema': os.getenv('HLTHPRT_DB_SCHEMA') or 'mrf', 'extend_existing': True},
+        PrimaryKeyConstraint("issuer_id", "checksum"),
+        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
     )
-    __my_index_elements__ = ['issuer_id', 'checksum']
+    __my_index_elements__ = ["issuer_id", "checksum"]
     issuer_id = Column(Integer)
     checksum = Column(Integer)
     type = Column(String(4))
@@ -124,6 +172,18 @@ class ImportRun(Base, JSONOutputMixin):
     )
     __my_index_elements__ = ["run_id"]
     __my_additional_indexes__ = [
+        {
+            "index_elements": ("importer", "idempotency_key"),
+            "name": "import_run_code_pricing_idempotency_idx",
+            "unique": True,
+            "where": "importer = 'plan-pricing-code-projection' AND idempotency_key IS NOT NULL",
+        },
+        {
+            "index_elements": ("importer", "idempotency_key"),
+            "name": "import_run_ptg_membership_idempotency_idx",
+            "unique": True,
+            "where": "importer = 'ptg-provider-membership-projection' AND idempotency_key IS NOT NULL",
+        },
         {"index_elements": ("status", "heartbeat_at"), "name": "import_run_status_heartbeat_idx"},
         {"index_elements": ("importer", "created_at"), "name": "import_run_importer_created_idx"},
         {
@@ -138,13 +198,24 @@ class ImportRun(Base, JSONOutputMixin):
             "unique": True,
             "where": (
                 "importer IN ('plan-pricing-projection', "
-                "'plan-pricing-prewarm', 'plan-pricing-em-distance') "
+                "'plan-pricing-prewarm', 'plan-pricing-em-distance', 'plan-pricing-em-attribution') "
                 "AND idempotency_key IS NOT NULL"
             ),
+        },
+        {
+            "index_elements": ("importer", "idempotency_key"),
+            "name": "import_run_registry_source_check_idempotency_idx",
+            "unique": True,
+            "where": "importer = 'registry-source-check' AND idempotency_key IS NOT NULL",
         },
         {"index_elements": ("schedule_id",), "name": "import_run_schedule_idx"},
         {"index_elements": ("subscription_id",), "name": "import_run_subscription_idx"},
         {"index_elements": ("source_file_import_id",), "name": "import_run_source_file_import_idx"},
+        {
+            "index_elements": ("retry_of_run_id", "run_id"),
+            "name": "import_run_plan_pricing_retry_census_idx",
+            "where": "importer = 'plan-pricing-projection' AND retry_of_run_id IS NOT NULL",
+        },
         {
             "index_elements": ("retry_of_run_id",),
             "name": "import_run_provider_directory_retry_child_idx",
@@ -290,25 +361,25 @@ class PTGImportWave(Base, JSONOutputMixin):
         CheckConstraint(
             "((cohort_attestation ->> 'schema_version' = "
             "'healthporta.ptg-import-wave-attestation.v6' "
-                "AND receipt_key_id IS NOT NULL "
-                "AND receipt_key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "
-                "AND cohort_attestation ->> 'receipt_key_id' = receipt_key_id "
-                "AND receipt_public_modulus_hex IS NOT NULL "
-                "AND length(receipt_public_modulus_hex) = 512 "
-                "AND receipt_public_modulus_hex ~ '^[0-9a-f]+$' "
-                "AND left(receipt_public_modulus_hex, 1) ~ '^[89a-f]$' "
-                "AND right(receipt_public_modulus_hex, 1) ~ '^[13579bdf]$' "
-                "AND receipt_public_exponent IS NOT NULL "
-                "AND receipt_public_exponent = 65537 "
-                "AND cohort_attestation ->> 'receipt_public_modulus_hex' "
-                "= receipt_public_modulus_hex "
-                "AND (cohort_attestation ->> 'receipt_public_exponent')::integer "
-                "= receipt_public_exponent) "
-                "OR (cohort_attestation ->> 'schema_version' <> "
-                "'healthporta.ptg-import-wave-attestation.v6' "
-                "AND receipt_key_id IS NULL "
-                "AND receipt_public_modulus_hex IS NULL "
-                "AND receipt_public_exponent IS NULL))",
+            "AND receipt_key_id IS NOT NULL "
+            "AND receipt_key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "
+            "AND cohort_attestation ->> 'receipt_key_id' = receipt_key_id "
+            "AND receipt_public_modulus_hex IS NOT NULL "
+            "AND length(receipt_public_modulus_hex) = 512 "
+            "AND receipt_public_modulus_hex ~ '^[0-9a-f]+$' "
+            "AND left(receipt_public_modulus_hex, 1) ~ '^[89a-f]$' "
+            "AND right(receipt_public_modulus_hex, 1) ~ '^[13579bdf]$' "
+            "AND receipt_public_exponent IS NOT NULL "
+            "AND receipt_public_exponent = 65537 "
+            "AND cohort_attestation ->> 'receipt_public_modulus_hex' "
+            "= receipt_public_modulus_hex "
+            "AND (cohort_attestation ->> 'receipt_public_exponent')::integer "
+            "= receipt_public_exponent) "
+            "OR (cohort_attestation ->> 'schema_version' <> "
+            "'healthporta.ptg-import-wave-attestation.v6' "
+            "AND receipt_key_id IS NULL "
+            "AND receipt_public_modulus_hex IS NULL "
+            "AND receipt_public_exponent IS NULL))",
             name="ptg_import_wave_receipt_key_epoch_check",
         ),
         CheckConstraint(
@@ -425,7 +496,8 @@ class PTGImportWaveQuarantine(Base, JSONOutputMixin):
     __table_args__ = (
         PrimaryKeyConstraint("predecessor_wave_id"),
         ForeignKeyConstraint(
-            ("predecessor_wave_id",), (PTGImportWave.wave_id,),
+            ("predecessor_wave_id",),
+            (PTGImportWave.wave_id,),
             name="ptg_import_wave_quarantine_predecessor_wave_fkey",
             ondelete="RESTRICT",
         ),
@@ -568,12 +640,14 @@ class PTGImportWaveSupersession(Base, JSONOutputMixin):
     __table_args__ = (
         PrimaryKeyConstraint("predecessor_wave_id"),
         ForeignKeyConstraint(
-            ("predecessor_wave_id",), (PTGImportWave.wave_id,),
+            ("predecessor_wave_id",),
+            (PTGImportWave.wave_id,),
             name="ptg_import_wave_supersession_predecessor_wave_fkey",
             ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
-            ("successor_wave_id",), (PTGImportWave.wave_id,),
+            ("successor_wave_id",),
+            (PTGImportWave.wave_id,),
             name="ptg_import_wave_supersession_successor_wave_fkey",
             ondelete="RESTRICT",
             deferrable=True,
@@ -588,8 +662,7 @@ class PTGImportWaveSupersession(Base, JSONOutputMixin):
             name="ptg_import_wave_supersession_distinct_check",
         ),
         CheckConstraint(
-            "recovery_basis IN ('logical_preclaim_failure', "
-            "'materialized_preclaim_failure')",
+            "recovery_basis IN ('logical_preclaim_failure', 'materialized_preclaim_failure')",
             name="ptg_import_wave_supersession_basis_check",
         ),
         CheckConstraint(
@@ -697,17 +770,23 @@ class PTGImportWaveIntent(Base, JSONOutputMixin):
     __table_args__ = (
         PrimaryKeyConstraint("wave_id", "ordinal"),
         ForeignKeyConstraint(
-            ("wave_id",), (PTGImportWave.wave_id,),
-            name="ptg_import_wave_intent_wave_fkey", ondelete="CASCADE",
+            ("wave_id",),
+            (PTGImportWave.wave_id,),
+            name="ptg_import_wave_intent_wave_fkey",
+            ondelete="CASCADE",
         ),
         UniqueConstraint("run_id", name="ptg_import_wave_intent_run_id_key"),
         UniqueConstraint("job_id", name="ptg_import_wave_intent_job_id_key"),
         UniqueConstraint(
-            "wave_id", "ordinal", "run_id", "job_id",
+            "wave_id",
+            "ordinal",
+            "run_id",
+            "job_id",
             name="ptg_import_wave_intent_claim_identity_key",
         ),
         UniqueConstraint(
-            "wave_id", "source_file_import_id",
+            "wave_id",
+            "source_file_import_id",
             name="ptg_import_wave_intent_source_per_wave_key",
         ),
         CheckConstraint(
@@ -809,10 +888,13 @@ class PTGImportWaveClaim(Base, JSONOutputMixin):
         ForeignKeyConstraint(
             ("wave_id", "ordinal", "run_id", "job_id"),
             (
-                PTGImportWaveIntent.wave_id, PTGImportWaveIntent.ordinal,
-                PTGImportWaveIntent.run_id, PTGImportWaveIntent.job_id,
+                PTGImportWaveIntent.wave_id,
+                PTGImportWaveIntent.ordinal,
+                PTGImportWaveIntent.run_id,
+                PTGImportWaveIntent.job_id,
             ),
-            name="ptg_import_wave_claim_intent_fkey", ondelete="CASCADE",
+            name="ptg_import_wave_claim_intent_fkey",
+            ondelete="CASCADE",
         ),
         UniqueConstraint("run_id", name="ptg_import_wave_claim_run_id_key"),
         UniqueConstraint("job_id", name="ptg_import_wave_claim_job_id_key"),
@@ -862,10 +944,13 @@ class PTGImportWaveOutcome(Base, JSONOutputMixin):
         ForeignKeyConstraint(
             ("wave_id", "ordinal", "run_id", "job_id"),
             (
-                PTGImportWaveIntent.wave_id, PTGImportWaveIntent.ordinal,
-                PTGImportWaveIntent.run_id, PTGImportWaveIntent.job_id,
+                PTGImportWaveIntent.wave_id,
+                PTGImportWaveIntent.ordinal,
+                PTGImportWaveIntent.run_id,
+                PTGImportWaveIntent.job_id,
             ),
-            name="ptg_import_wave_outcome_intent_fkey", ondelete="CASCADE",
+            name="ptg_import_wave_outcome_intent_fkey",
+            ondelete="CASCADE",
         ),
         UniqueConstraint("run_id", name="ptg_import_wave_outcome_run_id_key"),
         CheckConstraint(
@@ -1204,6 +1289,7 @@ class MRFUrlObservation(Base, JSONOutputMixin):
 
 
 class ProviderDirectoryAPIEndpoint(Base, JSONOutputMixin):
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_api_endpoint"
     __main_table__ = __tablename__
     __table_args__ = (
@@ -1232,11 +1318,16 @@ class ProviderDirectoryAPIEndpoint(Base, JSONOutputMixin):
 
 
 class ProviderDirectoryEndpointDataset(Base, JSONOutputMixin):
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_endpoint_dataset"
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("dataset_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["dataset_id"]
     __my_additional_indexes__ = [
@@ -1291,14 +1382,26 @@ class ProviderDirectoryEndpointDataset(Base, JSONOutputMixin):
     completion_proof_required_version = Column(Integer)
     completion_proof_json = Column(JSONB)
     completion_proof_sha256 = Column(String(64))
+    candidate_storage_json = Column(JSONB)
 
 
 class ProviderDirectoryDatasetResource(Base, JSONOutputMixin):
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_dataset_resource"
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("dataset_id", "resource_type", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        Index(
+            "provider_directory_dataset_resource_content_cursor_c_idx",
+            "dataset_id",
+            text('resource_type COLLATE "C"'),
+            text('resource_id COLLATE "C"'),
+        ),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["dataset_id", "resource_type", "resource_id"]
     __my_additional_indexes__ = [
@@ -1316,10 +1419,6 @@ class ProviderDirectoryDatasetResource(Base, JSONOutputMixin):
 
     dataset_id = Column(
         String(96),
-        ForeignKey(
-            ProviderDirectoryEndpointDataset.dataset_id,
-            name="provider_directory_dataset_resource_dataset_id_fkey",
-        ),
         nullable=False,
     )
     resource_type = Column(String(64), nullable=False)
@@ -1330,11 +1429,16 @@ class ProviderDirectoryDatasetResource(Base, JSONOutputMixin):
 
 
 class ProviderDirectoryDatasetInsurancePlan(Base, JSONOutputMixin):
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_dataset_insurance_plan"
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("dataset_id", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["dataset_id", "resource_id"]
     __my_additional_indexes__ = [
@@ -1351,11 +1455,6 @@ class ProviderDirectoryDatasetInsurancePlan(Base, JSONOutputMixin):
 
     dataset_id = Column(
         String(96),
-        ForeignKey(
-            ProviderDirectoryEndpointDataset.dataset_id,
-            name="provider_directory_dataset_insurance_plan_dataset_id_fkey",
-            ondelete="CASCADE",
-        ),
         nullable=False,
     )
     resource_id = Column(String(256), nullable=False)
@@ -1364,8 +1463,7 @@ class ProviderDirectoryDatasetInsurancePlan(Base, JSONOutputMixin):
     plan_active = Column(
         Boolean,
         Computed(
-            "COALESCE(NULLIF(lower(btrim(payload_json ->> 'status')), ''), "
-            "'active') = 'active'",
+            "COALESCE(NULLIF(lower(btrim(payload_json ->> 'status')), ''), 'active') = 'active'",
             persisted=True,
         ),
     )
@@ -1379,6 +1477,7 @@ class ProviderDirectoryDatasetInsurancePlan(Base, JSONOutputMixin):
 
 
 class ProviderDirectoryDatasetNetworkPlan(Base, JSONOutputMixin):
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_dataset_network_plan"
     __main_table__ = __tablename__
     __table_args__ = (
@@ -1387,7 +1486,11 @@ class ProviderDirectoryDatasetNetworkPlan(Base, JSONOutputMixin):
             "network_resource_id",
             "insurance_plan_resource_id",
         ),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = [
         "dataset_id",
@@ -1403,11 +1506,6 @@ class ProviderDirectoryDatasetNetworkPlan(Base, JSONOutputMixin):
     ]
     dataset_id = Column(
         String(96),
-        ForeignKey(
-            ProviderDirectoryEndpointDataset.dataset_id,
-            name="provider_directory_dataset_network_plan_dataset_id_fkey",
-            ondelete="CASCADE",
-        ),
         nullable=False,
     )
     network_resource_id = Column(String(256), nullable=False)
@@ -1415,6 +1513,7 @@ class ProviderDirectoryDatasetNetworkPlan(Base, JSONOutputMixin):
 
 
 class ProviderDirectoryDatasetAffiliationOrganization(Base, JSONOutputMixin):
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_dataset_affiliation_organization"
     __main_table__ = __tablename__
     __table_args__ = (
@@ -1423,7 +1522,11 @@ class ProviderDirectoryDatasetAffiliationOrganization(Base, JSONOutputMixin):
             "participating_organization_resource_id",
             "affiliation_resource_id",
         ),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = [
         "dataset_id",
@@ -1432,11 +1535,6 @@ class ProviderDirectoryDatasetAffiliationOrganization(Base, JSONOutputMixin):
     ]
     dataset_id = Column(
         String(96),
-        ForeignKey(
-            ProviderDirectoryEndpointDataset.dataset_id,
-            name="pd_dataset_affiliation_org_dataset_id_fkey",
-            ondelete="CASCADE",
-        ),
         nullable=False,
     )
     participating_organization_resource_id = Column(
@@ -1447,6 +1545,7 @@ class ProviderDirectoryDatasetAffiliationOrganization(Base, JSONOutputMixin):
 
 
 class ProviderDirectorySource(Base, JSONOutputMixin):
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_source"
     __main_table__ = __tablename__
     __table_args__ = (
@@ -1559,9 +1658,14 @@ class ProviderDirectoryCapability(Base, JSONOutputMixin):
 class ProviderDirectoryInsurancePlan(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_insurance_plan"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "resource_id"]
     __my_additional_indexes__ = [
@@ -1599,9 +1703,14 @@ class ProviderDirectoryInsurancePlan(Base, JSONOutputMixin):
 class ProviderDirectoryPractitioner(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_practitioner"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "resource_id"]
     __my_additional_indexes__ = [
@@ -1645,9 +1754,14 @@ class ProviderDirectoryPractitioner(Base, JSONOutputMixin):
 class ProviderDirectoryOrganization(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_organization"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "resource_id"]
     __my_additional_indexes__ = [
@@ -1690,9 +1804,14 @@ class ProviderDirectoryOrganization(Base, JSONOutputMixin):
 class ProviderDirectoryLocation(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_location"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "resource_id"]
     __my_additional_indexes__ = [
@@ -1753,19 +1872,34 @@ class ProviderDirectoryLocation(Base, JSONOutputMixin):
 class ProviderDirectoryPractitionerRole(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_practitioner_role"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "resource_id"]
     __my_additional_indexes__ = [
         {"index_elements": ("practitioner_ref",), "name": "provider_directory_role_practitioner_idx"},
-        {"index_elements": ("source_id", "practitioner_ref"), "name": "provider_directory_role_source_practitioner_idx"},
+        {
+            "index_elements": ("source_id", "practitioner_ref"),
+            "name": "provider_directory_role_source_practitioner_idx",
+        },
         {"index_elements": ("organization_ref",), "name": "provider_directory_role_organization_idx"},
-        {"index_elements": ("source_id", "organization_ref"), "name": "provider_directory_role_source_organization_idx"},
+        {
+            "index_elements": ("source_id", "organization_ref"),
+            "name": "provider_directory_role_source_organization_idx",
+        },
         {"index_elements": ("last_seen_run_id", "source_id"), "name": "provider_directory_role_run_source_idx"},
         {"index_elements": ("location_refs",), "using": "gin", "name": "provider_directory_role_location_refs_gin_idx"},
-        {"index_elements": ("specialty_codes",), "using": "gin", "name": "provider_directory_role_specialty_codes_gin_idx"},
+        {
+            "index_elements": ("specialty_codes",),
+            "using": "gin",
+            "name": "provider_directory_role_specialty_codes_gin_idx",
+        },
         {"index_elements": ("code_codes",), "using": "gin", "name": "provider_directory_role_code_codes_gin_idx"},
         {"index_elements": ("network_refs",), "using": "gin", "name": "provider_directory_role_network_refs_gin_idx"},
     ]
@@ -1810,9 +1944,14 @@ class ProviderDirectoryPractitionerRole(Base, JSONOutputMixin):
 class ProviderDirectoryHealthcareService(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_healthcare_service"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "resource_id"]
 
@@ -1857,9 +1996,14 @@ class ProviderDirectoryHealthcareService(Base, JSONOutputMixin):
 class ProviderDirectoryOrganizationAffiliation(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_organization_affiliation"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "resource_id"]
     __my_additional_indexes__ = [
@@ -1912,9 +2056,14 @@ class ProviderDirectoryOrganizationAffiliation(Base, JSONOutputMixin):
 class ProviderDirectoryEndpoint(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_endpoint"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "resource_id"]
     __my_additional_indexes__ = [
@@ -1957,9 +2106,14 @@ class ProviderDirectoryEndpoint(Base, JSONOutputMixin):
 class ProviderDirectoryCanonicalResource(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_canonical_resource"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("canonical_api_base", "resource_type", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["canonical_api_base", "resource_type", "resource_id"]
     __my_additional_indexes__ = [
@@ -1990,9 +2144,14 @@ class ProviderDirectoryCanonicalResource(Base, JSONOutputMixin):
 class ProviderDirectorySourceResource(Base, JSONOutputMixin):
     __tablename__ = "provider_directory_source_resource"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("source_id", "resource_type", "resource_id"),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["source_id", "resource_type", "resource_id"]
     __my_additional_indexes__ = [
@@ -2017,15 +2176,16 @@ class ProviderDirectoryDatasetRehydrationCheckpoint(Base, JSONOutputMixin):
 
     __tablename__ = "provider_directory_dataset_rehydration_checkpoint"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
-        PrimaryKeyConstraint(
-            "source_id", "dataset_id", "acquisition_root_run_id", "resource_type"
-        ),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        PrimaryKeyConstraint("source_id", "dataset_id", "acquisition_root_run_id", "resource_type"),
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
-    __my_index_elements__ = [
-        "source_id", "dataset_id", "acquisition_root_run_id", "resource_type"
-    ]
+    __my_index_elements__ = ["source_id", "dataset_id", "acquisition_root_run_id", "resource_type"]
     __my_additional_indexes__ = [
         {"index_elements": ("owner_run_id",), "name": "pd_dataset_rehydrate_checkpoint_owner_idx"},
         {"index_elements": ("state", "updated_at"), "name": "pd_dataset_rehydrate_checkpoint_state_idx"},
@@ -2058,6 +2218,7 @@ class ProviderDirectoryBulkAcquisitionCheckpoint(Base, JSONOutputMixin):
 
     __tablename__ = "provider_directory_bulk_acquisition_checkpoint"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("checkpoint_id"),
         UniqueConstraint(
@@ -2069,7 +2230,11 @@ class ProviderDirectoryBulkAcquisitionCheckpoint(Base, JSONOutputMixin):
             "dataset_id",
             name="provider_directory_bulk_acquisition_identity_key",
         ),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["checkpoint_id"]
     __my_additional_indexes__ = [
@@ -2140,6 +2305,7 @@ class ProviderDirectoryBulkOutputCheckpoint(Base, JSONOutputMixin):
 
     __tablename__ = "provider_directory_bulk_output_checkpoint"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint("checkpoint_id", "output_id"),
         UniqueConstraint(
@@ -2147,7 +2313,11 @@ class ProviderDirectoryBulkOutputCheckpoint(Base, JSONOutputMixin):
             "output_index",
             name="provider_directory_bulk_output_index_key",
         ),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = ["checkpoint_id", "output_id"]
     __my_additional_indexes__ = [
@@ -2199,6 +2369,7 @@ class ProviderDirectoryPaginationCheckpoint(Base, JSONOutputMixin):
 
     __tablename__ = "provider_directory_pagination_checkpoint"
     __main_table__ = __tablename__
+    __runtime_schema_sync__ = False
     __table_args__ = (
         PrimaryKeyConstraint(
             "canonical_api_base",
@@ -2206,7 +2377,11 @@ class ProviderDirectoryPaginationCheckpoint(Base, JSONOutputMixin):
             "source_scope_hash",
             "acquisition_root_run_id",
         ),
-        {"schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf", "extend_existing": True},
+        {
+            "schema": os.getenv("HLTHPRT_DB_SCHEMA") or "mrf",
+            "extend_existing": True,
+            "info": {"managed_immutable_storage": True},
+        },
     )
     __my_index_elements__ = [
         "canonical_api_base",
@@ -2262,6 +2437,7 @@ class ProviderDirectoryPaginationCheckpoint(Base, JSONOutputMixin):
 class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
     """Durable, lineage-fenced progress for one staged Profile build."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_profile_build_checkpoint"
     __main_table__ = __tablename__
     __table_args__ = (
@@ -2292,8 +2468,7 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
             name="pd_profile_build_checkpoint_stage_storage_check",
         ),
         CheckConstraint(
-            "state IN ('building_evidence', 'evidence_complete', "
-            "'building_profile', 'ready', 'failed')",
+            "state IN ('building_evidence', 'evidence_complete', 'building_profile', 'ready', 'failed')",
             name="pd_profile_build_checkpoint_state_check",
         ),
         CheckConstraint(
@@ -2304,13 +2479,11 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
             name="pd_profile_build_checkpoint_batch_bounds_check",
         ),
         CheckConstraint(
-            "profile_next_batch = 0 "
-            "OR evidence_next_batch = evidence_total_batches",
+            "profile_next_batch = 0 OR evidence_next_batch = evidence_total_batches",
             name="pd_profile_build_checkpoint_phase_order_check",
         ),
         CheckConstraint(
-            "executable_plan_hash IS NULL "
-            "OR executable_plan_hash ~ '^[0-9a-f]{64}$'",
+            "executable_plan_hash IS NULL OR executable_plan_hash ~ '^[0-9a-f]{64}$'",
             name="pd_profile_build_checkpoint_plan_hash_check",
         ),
         CheckConstraint(
@@ -2453,6 +2626,7 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
 class ProviderDirectoryProfileServingGeneration(Base, JSONOutputMixin):
     """One exact global generation over incrementally materialized profiles."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_profile_serving_generation"
     __main_table__ = __tablename__
     __table_args__ = (
@@ -2524,6 +2698,7 @@ class ProviderDirectoryProfileServingGeneration(Base, JSONOutputMixin):
 class ProviderDirectoryProfileDeltaReceipt(Base, JSONOutputMixin):
     """Replay-safe receipt for one committed source-vector delta."""
 
+    __runtime_schema_sync__ = False
     __tablename__ = "provider_directory_profile_delta_receipt"
     __main_table__ = __tablename__
     __table_args__ = (
@@ -2656,7 +2831,12 @@ class ProviderDirectoryProfileCapacityLeaseConsumption(
         ),
         UniqueConstraint(
             "run_id",
-            name="pd_profile_capacity_consumption_run_key",
+            "admission_purpose",
+            name="pd_profile_capacity_consumption_run_purpose_key",
+        ),
+        CheckConstraint(
+            "admission_purpose IN ('profile','cms_nonprofile')",
+            name="pd_profile_capacity_consumption_purpose_check",
         ),
         CheckConstraint(
             "attestation_id ~ '^[0-9a-f]{64}$' "
@@ -2725,6 +2905,7 @@ class ProviderDirectoryProfileCapacityLeaseConsumption(
     source_vector_hash = Column(String(64), nullable=False)
     source_context_vector_hash = Column(String(64), nullable=False)
     run_id = Column(String(64), nullable=False)
+    admission_purpose = Column(String(32), nullable=False, server_default="profile")
     build_id = Column(String(64), nullable=False)
     profile_as_of = Column(String(10), nullable=False)
     contract_id = Column(String(64), nullable=False)
@@ -2752,9 +2933,7 @@ class ProviderDirectoryProfileCapacityLeaseConsumption(
     )
 
 
-_PROFILE_CAPACITY_CONTROL_PLANE_RECEIPT_COLUMN = (
-    "control_plane_receipt_sha256"
-)
+_PROFILE_CAPACITY_CONTROL_PLANE_RECEIPT_COLUMN = "control_plane_receipt_sha256"
 
 
 class ProviderDirectoryProfileCapacityPreflightReceipt(
@@ -2892,8 +3071,7 @@ class ProviderDirectoryProfileSelectionProof(Base, JSONOutputMixin):
             name="provider_directory_profile_selection_proof_id_key",
         ),
         CheckConstraint(
-            "input_identity_digest ~ '^[0-9a-f]{64}$' "
-            "AND proof_id ~ '^[0-9a-f]{64}$'",
+            "input_identity_digest ~ '^[0-9a-f]{64}$' AND proof_id ~ '^[0-9a-f]{64}$'",
             name="pd_profile_selection_proof_identity_check",
         ),
         {

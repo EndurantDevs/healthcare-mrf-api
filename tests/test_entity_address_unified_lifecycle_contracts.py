@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-
 entity_address = importlib.import_module("process.entity_address_unified")
 
 
@@ -17,6 +16,7 @@ class _StageClass:
 
 def _configure_database_harness(monkeypatch, sql_events):
     """Route database effects into a deterministic SQL event log."""
+
     async def record_status(statement, **_params):
         sql_events.append(str(statement))
 
@@ -26,12 +26,8 @@ def _configure_database_harness(monkeypatch, sql_events):
     async def scalar(statement, **_params):
         statement_text = str(statement)
         sql_events.append(statement_text)
-        if (
-            "base_address_version IS DISTINCT FROM" in statement_text
-            or (
-                "address_alias_v1" in statement_text
-                and "WHERE revoked_at IS NULL" in statement_text
-            )
+        if "base_address_version IS DISTINCT FROM" in statement_text or (
+            "address_alias_v1" in statement_text and "WHERE revoked_at IS NULL" in statement_text
         ):
             return 0
         return 1
@@ -57,6 +53,8 @@ def _configure_database_harness(monkeypatch, sql_events):
     monkeypatch.setattr(entity_address.db, "create_table", record_create_table)
     monkeypatch.setattr(entity_address.db, "scalar", scalar)
     monkeypatch.setattr(entity_address, "_run_sql_phase", run_sql_phase)
+    # Lifecycle effects stay in the SQL log; native COPY has separate connected coverage.
+    monkeypatch.setattr(entity_address.prepared_rows.rows, "native_preparation_module", lambda: None)
 
 
 def _configure_source_harness(monkeypatch, environment_flag_by_name, runtime_option_by_name):
@@ -211,9 +209,7 @@ async def test_materialization_lifecycle_keeps_publish_separate_and_records_revi
 async def test_materialization_rejects_dependent_views_before_stage_mutation(
     monkeypatch,
 ):
-    sql_events, _progress_events, _environment_flags, _runtime_options = (
-        _configure_materialization_harness(monkeypatch)
-    )
+    sql_events, _progress_events, _environment_flags, _runtime_options = _configure_materialization_harness(monkeypatch)
     dependency_preflight = AsyncMock(
         side_effect=RuntimeError(
             "entity-address-unified cutover has dependent views: "
@@ -285,10 +281,7 @@ async def test_reused_stage_reconciles_current_model_columns(monkeypatch):
         _StageClass.__tablename__,
     )
     assert import_context_by_key["context"]["stage_reused"] is True
-    assert not any(
-        f"DROP TABLE IF EXISTS mrf.{_StageClass.__tablename__};" == statement
-        for statement in sql_events
-    )
+    assert not any(f"DROP TABLE IF EXISTS mrf.{_StageClass.__tablename__};" == statement for statement in sql_events)
     assert "CREATE_STAGE" not in sql_events
 
 
@@ -326,9 +319,7 @@ async def test_materialization_preflights_geo_projection_dependencies(
 
 @pytest.mark.asyncio
 async def test_partial_refresh_builds_an_atomic_replacement_stage_without_patching_live_rows(monkeypatch):
-    sql_events, _progress_events, _environment_flags, _runtime_options = _configure_materialization_harness(
-        monkeypatch
-    )
+    sql_events, _progress_events, _environment_flags, _runtime_options = _configure_materialization_harness(monkeypatch)
     monkeypatch.setattr(
         entity_address,
         "_provider_directory_partial_replacement_source_selects",
@@ -373,8 +364,7 @@ async def test_partial_refresh_builds_an_atomic_replacement_stage_without_patchi
     assert any("affected" in statement.lower() for statement in sql_events)
     assert any("replacement" in statement.lower() for statement in sql_events)
     assert not any(
-        "UPDATE mrf.entity_address_unified" in statement
-        and "entity_address_unified_20260724" not in statement
+        "UPDATE mrf.entity_address_unified" in statement and "entity_address_unified_20260724" not in statement
         for statement in sql_events
     )
 
@@ -395,9 +385,7 @@ async def test_partial_refresh_checks_exact_dataset_before_materialization(monke
     monkeypatch.setattr(
         entity_address,
         "_index_partial_affected_groups_sql",
-        lambda *_args, **_kwargs: (
-            "CREATE INDEX affected_groups_idx ON affected_groups ((1))"
-        ),
+        lambda *_args, **_kwargs: "CREATE INDEX affected_groups_idx ON affected_groups ((1))",
     )
     dataset_assertion = AsyncMock()
     monkeypatch.setattr(
@@ -412,9 +400,7 @@ async def test_partial_refresh_checks_exact_dataset_before_materialization(monke
             "context": {"control_run_id": "synthetic-control-run"},
         },
         {
-            "refresh_mode": (
-                entity_address.ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL
-            ),
+            "refresh_mode": (entity_address.ENTITY_ADDRESS_REFRESH_MODE_PROVIDER_DIRECTORY_PARTIAL),
             "provider_directory_partial_scope": "latest-run",
             "provider_directory_source_ids": ["synthetic-source"],
             "provider_directory_run_id": "synthetic-root-run",

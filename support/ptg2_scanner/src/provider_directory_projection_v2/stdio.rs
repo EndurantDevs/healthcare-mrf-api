@@ -1,7 +1,8 @@
 // Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
 use super::contracts::{
-    invalid_input, is_sha256, ProjectionCopyContext, ProviderDirectoryInputFraming,
+    invalid_input, is_sha256, NpiIdentityPolicy, ProjectionCopyContext,
+    ProviderDirectoryInputFraming, EXPLICIT_NPI_ONLY_POLICY,
 };
 use super::encode::project_provider_directory_copy;
 use super::input::read_bounded_input;
@@ -9,7 +10,7 @@ use std::io::{self, BufWriter, Write};
 use std::time::Instant;
 
 const USAGE: &str = "usage: ptg2_scanner --provider-directory-materialize-stdio-v2 \
-<recipe_id> <partition_id> <partition_ordinal> <ndjson|bundle>";
+<recipe_id> <partition_id> <partition_ordinal> <ndjson|bundle> [explicit-only-v1]";
 
 pub fn run_provider_directory_materialization_stdio_v2_cli(arguments: &[String]) -> io::Result<()> {
     let (context, framing) = parse_arguments(arguments)?;
@@ -27,9 +28,14 @@ pub fn run_provider_directory_materialization_stdio_v2_cli(arguments: &[String])
 fn parse_arguments(
     arguments: &[String],
 ) -> io::Result<(ProjectionCopyContext, ProviderDirectoryInputFraming)> {
-    if arguments.len() != 4 || !is_sha256(&arguments[0]) || !is_sha256(&arguments[1]) {
+    if !matches!(arguments.len(), 4 | 5) || !is_sha256(&arguments[0]) || !is_sha256(&arguments[1]) {
         return Err(invalid_input(USAGE));
     }
+    let npi_identity_policy = match arguments.get(4).map(String::as_str) {
+        None => NpiIdentityPolicy::Legacy,
+        Some(EXPLICIT_NPI_ONLY_POLICY) => NpiIdentityPolicy::ExplicitOnly,
+        _ => return Err(invalid_input(USAGE)),
+    };
     let partition_ordinal = arguments[2]
         .parse::<u32>()
         .ok()
@@ -42,6 +48,7 @@ fn parse_arguments(
             recipe_id: arguments[0].clone(),
             partition_id: arguments[1].clone(),
             partition_ordinal,
+            npi_identity_policy,
         },
         framing,
     ))

@@ -285,7 +285,7 @@ def test_receipt_open_guard():
 def test_receipt_serving_guard():
     """Reject a receipt that no longer matches serving generation state."""
     receipt = _receipt()
-    identity = types.SimpleNamespace(serving_state=_serving_state())
+    identity = types.SimpleNamespace(serving_state=_serving_state(), initial_targets=None)
     importer._assert_profile_capacity_receipt_serving(receipt, identity)
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,

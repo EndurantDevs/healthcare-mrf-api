@@ -15,6 +15,7 @@ from typing import Any
 from db.connection import init_db
 from db.models import TerminologySynonym, db
 from process.ext.utils import ensure_database, make_class, push_objects
+from process.reference_family_result_generation import publish_local_reference_family_generation
 from process.terminology_synonym_sources import (
     MEDICATION_CODE_SYSTEMS,
     PROCEDURE_CODE_SYSTEMS,
@@ -375,6 +376,9 @@ async def _rollback_terminology_snapshot(
             (expected_old_oid, expected_live_oid),
             "terminology rollback verification failed",
         )
+        await publish_local_reference_family_generation(
+            db, importer_id="terminology-synonyms", schema_name=schema
+        )
 
     return {
         "live_oid": expected_old_oid,
@@ -397,6 +401,9 @@ async def _publish_stage(schema: str, stage_cls, expected_row_count: int) -> Non
             raise RuntimeError(
                 f"promoted row count {promoted_row_count} does not match staged row count {expected_row_count}"
             )
+        await publish_local_reference_family_generation(
+            db, importer_id="terminology-synonyms", schema_name=schema
+        )
 
 
 async def import_terminology_synonyms(

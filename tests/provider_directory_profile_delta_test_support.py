@@ -24,7 +24,6 @@ from tests.test_provider_directory_profile_control_capacity import (
     _control_wal_plan_input,
 )
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
@@ -49,9 +48,7 @@ def _bound_control_geometry(
     )
     geometry_payload.update(
         {
-            "control_wal_plan_input_hash": (
-                capacity.profile_control_wal_plan_input_hash(plan_input)
-            ),
+            "control_wal_plan_input_hash": (capacity.profile_control_wal_plan_input_hash(plan_input)),
             "control_wal_upper_bound_bytes": 1,
             "control_metadata_data_upper_bound_bytes": 1,
         }
@@ -64,12 +61,8 @@ def _bound_control_geometry(
     geometry = capacity.revalidate_capacity_geometry(
         replace(
             seed_geometry,
-            control_wal_upper_bound_bytes=(
-                seed_projection.total_control_wal_bytes
-            ),
-            control_metadata_data_upper_bound_bytes=(
-                seed_projection.total_control_metadata_data_bytes
-            ),
+            control_wal_upper_bound_bytes=(seed_projection.total_control_wal_bytes),
+            control_metadata_data_upper_bound_bytes=(seed_projection.total_control_metadata_data_bytes),
         )
     )
     projection = capacity.revalidate_profile_control_wal_projection(
@@ -89,32 +82,18 @@ def _prepared_delta_lineage_by_field(
 ) -> dict[str, object]:
     """Return source, context, and geometry identity defaults."""
     return {
-        "from_source_vector_hash": (
-            importer._provider_directory_profile_source_vector_hash(
-                source_vector
-            )
-        ),
-        "to_source_vector_hash": (
-            importer._provider_directory_profile_source_vector_hash(
-                source_vector
-            )
-        ),
+        "from_source_vector_hash": (importer._provider_directory_profile_source_vector_hash(source_vector)),
+        "to_source_vector_hash": (importer._provider_directory_profile_source_vector_hash(source_vector)),
         "to_source_vector": source_vector,
         "from_source_context_vector_hash": (
-            importer._provider_directory_profile_source_context_vector_hash(
-                context_vector
-            )
+            importer._provider_directory_profile_source_context_vector_hash(context_vector)
         ),
         "to_source_context_vector_hash": (
-            importer._provider_directory_profile_source_context_vector_hash(
-                context_vector
-            )
+            importer._provider_directory_profile_source_context_vector_hash(context_vector)
         ),
         "to_source_context_vector": context_vector,
         "capacity_geometry_hash": capacity.capacity_geometry_hash(geometry),
-        "capacity_geometry_json": (
-            capacity.canonical_capacity_geometry_json(geometry)
-        ),
+        "capacity_geometry_json": (capacity.canonical_capacity_geometry_json(geometry)),
     }
 
 
@@ -145,9 +124,7 @@ def _prepared_delta(
         "control_generation": 7,
         "authority_revision": 7,
         "profile_schema_version": 1,
-        "profile_strategy_version": (
-            profile.PROFILE_BUILD_STRATEGY_VERSION
-        ),
+        "profile_strategy_version": (profile.PROFILE_BUILD_STRATEGY_VERSION),
         "executable_plan_hash": "6" * 64,
         **_prepared_delta_lineage_by_field(
             source_vector,
@@ -170,24 +147,20 @@ def _prepared_delta(
 
 async def _require_disposable_database(database: Database) -> None:
     try:
-        database_name = str(
-            await database.scalar("SELECT current_database();") or ""
-        )
-    except (OSError, OperationalError):
+        database_name = str(await database.scalar("SELECT current_database();") or "")
+    except OSError, OperationalError:
         pytest.skip("Profile delta tests need disposable PostgreSQL")
     is_disposable_database_opted_in = os.getenv(
         "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_ALLOW_SCHEMA_TESTS",
         "",
     ).strip().lower() in {"1", "true", "yes", "on"}
-    if (
-        "test" not in database_name.lower()
-        and not is_disposable_database_opted_in
-    ):
+    if "test" not in database_name.lower() and not is_disposable_database_opted_in:
         pytest.skip("Profile delta tests need a test database")
 
 
 @asynccontextmanager
 async def _delta_database(monkeypatch):
+    """Yield one owned schema and release table locks between cleanup steps."""
     schema = f"provider_directory_delta_{uuid.uuid4().hex[:12]}"
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
     database = Database()
@@ -195,18 +168,24 @@ async def _delta_database(monkeypatch):
     try:
         await database.connect()
         await _require_disposable_database(database)
-        await database.status(
-            f"CREATE SCHEMA {profile.quote_identifier(schema)};"
-        )
+        await database.status(f"CREATE SCHEMA {profile.quote_identifier(schema)};")
         is_database_created = True
         yield database, schema
     finally:
-        if is_database_created:
-            await database.status(
-                f"DROP SCHEMA IF EXISTS "
-                f"{profile.quote_identifier(schema)} CASCADE;"
-            )
-        await database.disconnect()
+        try:
+            if is_database_created:
+                tables = await database.all(
+                    "SELECT c.relname FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = :schema AND c.relkind IN ('r', 'p') "
+                    "ORDER BY c.relkind DESC, c.oid;",
+                    schema=schema,
+                )
+                for table in tables:
+                    await database.status(f"DROP TABLE IF EXISTS {profile.qualified_table(schema, table[0])} CASCADE;")
+                await database.status(f"DROP SCHEMA IF EXISTS {profile.quote_identifier(schema)} CASCADE;")
+        finally:
+            await database.disconnect()
 
 
 async def _insert_evidence(

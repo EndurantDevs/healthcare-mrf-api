@@ -19,12 +19,12 @@ from process.provider_directory_profile_capacity_trust import (
     CAPACITY_TRUST_MAX_DOCUMENT_BYTES,
     CAPACITY_TRUST_MAX_KEYS,
 )
+from tests.provider_directory_profile_capacity_signing_guard_test_support import (
+    synthetic_profile_task,
+)
 from tests.provider_directory_profile_capacity_trust_fixtures import (
     PUBLIC_KEY_HEX,
     capacity_trust,
-)
-from tests.provider_directory_profile_capacity_signing_guard_test_support import (
-    synthetic_profile_task,
 )
 from tests.test_provider_directory_profile_capacity_attestation import (
     VALIDATION_TIME,
@@ -34,8 +34,8 @@ from tests.test_provider_directory_profile_capacity_attestation import (
 
 UTC = datetime.timezone.utc
 EXECUTION_V2_FIXTURE = Path(__file__).resolve().parent / "fixtures/provider_directory_profile_execution_v2_golden.json"
-EXECUTION_V2_CANONICAL_SHA256 = "2aea70d19d3a4927eb5ca9e0fb45e9d5c356a677a8123ec1d8b16ccbb1c07935"
-EXECUTION_V2_FILE_SHA256 = "e8518483370e00ee74e3ce4b2b1e4adcfff0e76f1019f1c8f424c990df17a758"
+EXECUTION_V2_CANONICAL_SHA256 = "0b33ba66c33ca5541eda58a86d5ab0126d19d301b428324ee172285510745acc"
+EXECUTION_V2_FILE_SHA256 = "05b69014effcb688085f3fa29e7cbab5a92cb5d7aa982c618d447851de616a04"
 
 
 def _active_key(
@@ -145,7 +145,7 @@ def test_execution_v2_golden_freezes_neutral_cross_repository_envelope(
         + "\n"
     ).encode("ascii")
     assert fixture_bytes == regenerated_bytes
-    assert len(fixture_bytes) == 27_811
+    assert len(fixture_bytes) == 27_808
     assert fixture_bytes.endswith(b"\n")
     assert not fixture_bytes.endswith(b"\n\n")
     assert hashlib.sha256(fixture_bytes).hexdigest() == (EXECUTION_V2_FILE_SHA256)

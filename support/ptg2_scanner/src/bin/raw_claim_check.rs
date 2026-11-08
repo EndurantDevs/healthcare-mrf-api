@@ -330,11 +330,11 @@ fn scan_matching_rate<R: Read>(
         item.service_codes_seen
             .extend(service_codes.iter().cloned());
         item.rates_seen.extend(rates.iter().cloned());
-        if let Some(pos) = &key.pos {
-            if service_codes.contains(pos) {
-                item.raw_npi_code_pos_present = true;
-                item.pos_rate_rows += 1;
-            }
+        if let Some(pos) = &key.pos
+            && service_codes.contains(pos)
+        {
+            item.raw_npi_code_pos_present = true;
+            item.pos_rate_rows += 1;
         }
     }
     Ok(())
@@ -371,12 +371,11 @@ fn scan_in_network<R: Read>(
                         normalize_code_system(&value_string(&value).unwrap_or_default());
                 }
                 "negotiated_rates" => {
-                    if matched_targets.is_empty() {
-                        if let Some(targets) = target_keys_by_code
+                    if matched_targets.is_empty()
+                        && let Some(targets) = target_keys_by_code
                             .get(&(billing_code.clone(), billing_code_type.clone()))
-                        {
-                            matched_targets = targets.clone();
-                        }
+                    {
+                        matched_targets = targets.clone();
                     }
                     json_reader.begin_array().map_err(to_io_error)?;
                     if matched_targets.is_empty() {

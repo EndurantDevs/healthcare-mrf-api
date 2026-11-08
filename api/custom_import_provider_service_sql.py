@@ -1,0 +1,292 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
+"""Compose one prepared imported-NPI relation with provider-service claims."""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field, replace
+
+from sanic.exceptions import InvalidUsage
+from sqlalchemy import Float, String, and_, case, cast, exists, func, or_, select
+from sqlalchemy.sql import Select
+
+from process.custom_import.read_contracts import CustomImportReadUnavailableError
+from process.custom_import.read_core import PreparedNpiEntityRelation, ReadOrderTerm
+
+
+def _is_sha256(value: object) -> bool:
+    return type(value) is str and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
+def _require_unpaged(statement: Select, *, relation: str) -> None:
+    if (
+        statement._limit_clause is not None
+        or statement._offset_clause is not None
+        or statement._fetch_clause is not None
+        or statement._order_by_clauses
+    ):
+        raise CustomImportReadUnavailableError(f"{relation} is not unpaged")
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderServiceImportQuery:
+    """Trusted imported membership and ordering for one claims-provider query."""
+
+    prepared: PreparedNpiEntityRelation
+    require_match: bool
+    native_scope_preparer: Callable[[Select], Awaitable[PreparedNpiEntityRelation]] | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        if type(self.prepared) is not PreparedNpiEntityRelation or type(self.require_match) is not bool:
+            raise CustomImportReadUnavailableError("provider-service import query is invalid")
+        if self.native_scope_preparer is not None and not callable(self.native_scope_preparer):
+            raise CustomImportReadUnavailableError("provider-service native scope preparer is invalid")
+        if self.prepared.effective_require_match is not None:
+            object.__setattr__(self, "require_match", self.prepared.effective_require_match)
+        if not isinstance(self.prepared.statement, Select):
+            raise CustomImportReadUnavailableError("provider-service import relation is invalid")
+        _require_unpaged(self.prepared.statement, relation="provider-service import relation")
+        if not _is_sha256(self.prepared.query_fingerprint) or not _is_sha256(self.prepared.authorization_scope_sha256):
+            raise CustomImportReadUnavailableError("provider-service import query is invalid")
+        if type(self.prepared.normalized_order_terms) is not tuple or any(
+            type(term) is not ReadOrderTerm for term in self.prepared.normalized_order_terms
+        ):
+            raise CustomImportReadUnavailableError("provider-service import order is invalid")
+        expected_columns = ("entity_value",) + tuple(
+            f"sort_{ordinal}" for ordinal in range(len(self.prepared.normalized_order_terms))
+        )
+        if tuple(self.prepared.statement.selected_columns.keys()) != expected_columns:
+            raise CustomImportReadUnavailableError("provider-service import relation is invalid")
+
+    async def scope_native(self, native_entity_scope: Select) -> ProviderServiceImportQuery:
+        """Prepare imported predicates against this request's complete native eligibility."""
+
+        if self.native_scope_preparer is None:
+            return self
+        return replace(self, prepared=await self.native_scope_preparer(native_entity_scope))
+
+
+def provider_service_native_args(request_args, native_args, import_context):
+    """Accept explicit native options only with imported or trusted managed scope."""
+
+    if native_args is not None and import_context is None:
+        from api.network_address_scope import current_network_address_scope
+
+        scope = current_network_address_scope()
+        if scope is not None and _is_sha256(scope.access_scope_sha256):
+            return native_args
+    if (native_args is None) != (import_context is None):
+        raise InvalidUsage("custom-import provider-service arguments are invalid")
+    if import_context is not None and type(import_context) is not ProviderServiceImportQuery:
+        raise InvalidUsage("custom-import provider-service context is invalid")
+    return request_args if native_args is None else native_args
+
+
+def provider_service_zip_filter(
+    provider_zip, geo_zip_table, zip5, nearby_zip_values, coordinate_scope, distance_expression
+):
+    """Keep claims ZIP eligibility and apply coordinates on its native centroid model."""
+
+    latitude, longitude, radius = coordinate_scope
+    if latitude is not None:
+        coordinate_filter = and_(
+            geo_zip_table.c.latitude.is_not(None),
+            geo_zip_table.c.longitude.is_not(None),
+            distance_expression(latitude, longitude) <= radius,
+        )
+        if zip5:
+            coordinate_filter = or_(geo_zip_table.c.zip_code == zip5, coordinate_filter)
+        return provider_zip.in_(select(geo_zip_table.c.zip_code).where(coordinate_filter))
+    if nearby_zip_values:
+        return provider_zip.in_(nearby_zip_values)
+    return provider_zip == zip5 if zip5 else None
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderServiceClaimsRelation:
+    """Unpaged native claims relation with optional imported ordering."""
+
+    statement: Select
+    native_relation: object
+    import_order_terms: tuple[object, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderServiceClaimsStatements:
+    """Exact count and unpaged page statements for one claims-provider query."""
+
+    count_statement: Select
+    page_statement: Select
+
+
+async def _prepare_provider_service_native_scope(grouped, import_context, min_claims, min_total_cost):
+    """Apply aggregate admission once before scores, count and pagination."""
+
+    if import_context is None:
+        return grouped, import_context
+    if type(import_context) is not ProviderServiceImportQuery:
+        raise CustomImportReadUnavailableError("provider-service import query is invalid")
+    if import_context.native_scope_preparer is None:
+        return grouped, import_context
+    if not isinstance(grouped, Select):
+        raise CustomImportReadUnavailableError("provider-service claims relation is invalid")
+    _require_unpaged(grouped, relation="provider-service claims relation")
+    aggregate = grouped.subquery("native_service_aggregates")
+    eligible = select(aggregate)
+    if min_claims is not None:
+        eligible = eligible.where(aggregate.c.total_services >= min_claims)
+    if min_total_cost is not None:
+        eligible = eligible.where(aggregate.c.total_allowed_amount >= min_total_cost)
+    native = eligible.cte("native_score_claims").prefix_with("MATERIALIZED")
+    scoped = await import_context.scope_native(select(native.c.npi).distinct())
+    return select(native), scoped
+
+
+def compose_provider_service_claims_relation(
+    native_grouped_statement: Select,
+    import_context: ProviderServiceImportQuery,
+) -> ProviderServiceClaimsRelation:
+    """Compose winners before a caller applies aggregate metrics, count, and page."""
+
+    if type(import_context) is not ProviderServiceImportQuery:
+        raise CustomImportReadUnavailableError("provider-service import query is invalid")
+    if not isinstance(native_grouped_statement, Select):
+        raise CustomImportReadUnavailableError("provider-service claims relation is invalid")
+    _require_unpaged(native_grouped_statement, relation="provider-service claims relation")
+    native_relation = native_grouped_statement.subquery("native_provider_service")
+    if "npi" not in native_relation.c:
+        raise CustomImportReadUnavailableError("provider-service claims relation is invalid")
+
+    imported_relation = import_context.prepared.statement.subquery("custom_import_provider_service")
+    is_matching_npi = imported_relation.c.entity_value == cast(native_relation.c.npi, String)
+    order_terms = import_context.prepared.normalized_order_terms
+    if not order_terms:
+        statement = select(native_relation)
+        if import_context.require_match:
+            statement = statement.where(exists(select(1).select_from(imported_relation).where(is_matching_npi)))
+        return ProviderServiceClaimsRelation(statement, native_relation, ())
+
+    statement = select(native_relation).select_from(native_relation.outerjoin(imported_relation, is_matching_npi))
+    if import_context.require_match:
+        statement = statement.where(imported_relation.c.entity_value.is_not(None))
+    import_order_terms: list[object] = [imported_relation.c.entity_value.is_(None).asc()]
+    for ordinal, term in enumerate(order_terms):
+        expression = imported_relation.c[f"sort_{ordinal}"]
+        directed_expression = expression.asc() if term.direction == "asc" else expression.desc()
+        import_order_terms.append(
+            directed_expression.nullsfirst() if term.nulls == "first" else directed_expression.nullslast()
+        )
+    import_order_terms.append(native_relation.c.npi.asc())
+    return ProviderServiceClaimsRelation(statement, native_relation, tuple(import_order_terms))
+
+
+async def build_provider_service_claims_statements(
+    native_grouped_statement: Select,
+    import_context: ProviderServiceImportQuery | None,
+    min_claims: float | None,
+    min_total_cost: float | None,
+    order_by: str,
+    order: str,
+) -> ProviderServiceClaimsStatements:
+    """Return count and page statements before the caller applies pagination."""
+
+    if import_context is None:
+        return _native_claims_statements(native_grouped_statement, order_by, order)
+    native_grouped_statement, import_context = await _prepare_provider_service_native_scope(
+        native_grouped_statement, import_context, min_claims, min_total_cost
+    )
+    return _imported_claims_statements(
+        native_grouped_statement,
+        import_context,
+        min_claims,
+        min_total_cost,
+        order_by,
+        order,
+    )
+
+
+def _native_claims_statements(
+    native_grouped_statement: Select,
+    order_by: str,
+    order: str,
+) -> ProviderServiceClaimsStatements:
+    native_relation = native_grouped_statement.subquery()
+    count_statement = select(func.count()).select_from(native_relation)
+    page_statement = _ordered_provider_service_statement(select(native_relation), native_relation, order_by, order)
+    return ProviderServiceClaimsStatements(count_statement, page_statement)
+
+
+def _imported_claims_statements(
+    native_grouped_statement: Select,
+    import_context: ProviderServiceImportQuery,
+    min_claims: float | None,
+    min_total_cost: float | None,
+    order_by: str,
+    order: str,
+) -> ProviderServiceClaimsStatements:
+    claims_relation = compose_provider_service_claims_relation(native_grouped_statement, import_context)
+    page_statement = claims_relation.statement
+    if min_claims is not None:
+        page_statement = page_statement.where(claims_relation.native_relation.c.total_services >= min_claims)
+    if min_total_cost is not None:
+        page_statement = page_statement.where(claims_relation.native_relation.c.total_allowed_amount >= min_total_cost)
+    count_statement = select(func.count()).select_from(page_statement.order_by(None).subquery())
+    if claims_relation.import_order_terms:
+        page_statement = page_statement.order_by(*claims_relation.import_order_terms)
+    else:
+        page_statement = _ordered_provider_service_statement(
+            page_statement,
+            claims_relation.native_relation,
+            order_by,
+            order,
+        )
+    return ProviderServiceClaimsStatements(count_statement, page_statement)
+
+
+def _ordered_provider_service_statement(
+    statement: Select,
+    native_relation: object,
+    order_by: str,
+    order: str,
+) -> Select:
+    cost_index_expr = case(
+        (
+            native_relation.c.total_services > 0,
+            cast(native_relation.c.total_allowed_amount, Float) / native_relation.c.total_services,
+        ),
+        else_=None,
+    ).label("cost_index")
+    if order_by == "cost_index":
+        statement = statement.add_columns(cost_index_expr)
+    order_fields = _provider_service_order_fields(native_relation, cost_index_expr)
+    order_column = order_fields.get(order_by)
+    if order_column is None:
+        allowed = ", ".join(sorted(order_fields))
+        raise InvalidUsage(f"Unsupported order_by '{order_by}'. Allowed: {allowed}")
+    ordered_statement = statement.order_by(order_column.asc() if order == "asc" else order_column.desc())
+    return ordered_statement.order_by(native_relation.c.npi.asc())
+
+
+def _provider_service_order_fields(native_relation: object, cost_index_expr: object) -> dict[str, object]:
+    return {
+        "npi": native_relation.c.npi,
+        "provider_name": native_relation.c.provider_name,
+        "total_services": native_relation.c.total_services,
+        "total_submitted_charges": native_relation.c.total_submitted_charges,
+        "total_allowed_amount": native_relation.c.total_allowed_amount,
+        "total_beneficiaries": native_relation.c.total_beneficiaries,
+        "matched_service_codes": native_relation.c.matched_service_codes,
+        "cost_index": cost_index_expr,
+    }
+
+
+__all__ = (
+    "ProviderServiceClaimsRelation",
+    "ProviderServiceClaimsStatements",
+    "ProviderServiceImportQuery",
+    "build_provider_service_claims_statements",
+    "compose_provider_service_claims_relation",
+)

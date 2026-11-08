@@ -1,0 +1,410 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
+"""Claims provider-service composition stays unpaged until the final page."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from sqlalchemy import Column, Float, MetaData, String, Table, literal, select
+from sqlalchemy.dialects import postgresql
+
+from api import custom_import_provider_service_sql as service_sql
+from api.endpoint import pricing
+from process.custom_import.read_contracts import CustomImportReadUnavailableError
+from process.custom_import.read_core import PreparedNpiEntityRelation, ReadOrderTerm
+
+
+class _Result:
+    def __init__(self, *, scalar=None, rows=()):
+        self._scalar = scalar
+        self._rows = list(rows)
+
+    def scalar(self):
+        return self._scalar
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
+class _Session:
+    def __init__(self, results):
+        self._results = list(results)
+        self.statements = []
+
+    async def execute(self, statement, parameters=None):
+        assert parameters in (None, {})
+        self.statements.append(statement)
+        return self._results.pop(0)
+
+
+def _prepared(direction: str = "desc") -> PreparedNpiEntityRelation:
+    return PreparedNpiEntityRelation(
+        select(
+            literal("1000000001").label("entity_value"),
+            literal(7).label("sort_0"),
+        ),
+        (ReadOrderTerm("metric", direction, "last"),),
+        "a" * 64,
+        "b" * 64,
+    )
+
+
+def _request(session):
+    return SimpleNamespace(args={}, ctx=SimpleNamespace(sa_session=session))
+
+
+def _compiled(statement) -> str:
+    return str(statement.compile(dialect=postgresql.dialect()))
+
+
+def _assert_imported_response(response, session, no_precomputed_count) -> None:
+    response_document = json.loads(response.body)
+    assert set(response_document) == {"items", "pagination", "query"}
+    assert response_document["pagination"] == {"total": 2, "limit": 1, "offset": 0, "page": 1}
+    assert response_document["items"][0]["npi"] == 1000000001
+    assert len(session.statements) == 2
+    no_precomputed_count.assert_not_awaited()
+
+
+def _assert_imported_claims_sql(statements, direction: str) -> None:
+    count_sql, page_sql = map(_compiled, statements)
+    assert "custom_import_provider_service" in count_sql
+    assert "ORDER BY" not in count_sql and "LIMIT" not in count_sql
+    assert "GROUP BY" in page_sql
+    assert page_sql.index("GROUP BY") < page_sql.index(") AS native_provider_service")
+    assert page_sql.index(") AS native_provider_service") < page_sql.index("LEFT OUTER JOIN")
+    assert page_sql.index("LEFT OUTER JOIN") < page_sql.rindex("WHERE native_provider_service.total_services")
+    assert "pricing_provider_procedure.total_services >=" not in page_sql
+    assert "pricing_provider_procedure.npi =" in count_sql and "pricing_provider_procedure.npi =" in page_sql
+    assert "custom_import_provider_service.entity_value IS NULL ASC" in page_sql
+    assert f"custom_import_provider_service.sort_0 {direction.upper()} NULLS LAST" in page_sql
+    assert "native_provider_service.npi ASC" in page_sql
+    assert "LIMIT" in page_sql
+
+
+@pytest.mark.parametrize("direction", ("asc", "desc"))
+@pytest.mark.asyncio
+async def test_by_service_import_order_groups_then_joins_counts_and_pages(monkeypatch, direction):
+    session = _Session(
+        (
+            _Result(scalar=2),
+            _Result(
+                rows=(
+                    {
+                        "npi": 1000000001,
+                        "provider_name": "Synthetic Provider",
+                        "provider_type": "Synthetic Type",
+                        "city": "Example",
+                        "state": "EX",
+                        "zip5": "12345",
+                        "total_services": 12.0,
+                        "total_submitted_charges": 24.0,
+                        "total_allowed_amount": 36.0,
+                        "total_beneficiaries": 4.0,
+                        "matched_service_codes": 1,
+                    },
+                )
+            ),
+        )
+    )
+    resolve_year = AsyncMock(return_value=(2024, "request"))
+    resolve_codes = AsyncMock(
+        return_value=(
+            [99213],
+            {
+                "input_code": {"code_system": "CPT", "code": "99213"},
+                "resolved_codes": [],
+                "matched_via": [],
+            },
+        )
+    )
+    no_precomputed_count = AsyncMock()
+    monkeypatch.setattr(pricing, "_resolve_year", resolve_year)
+    monkeypatch.setattr(pricing, "_resolve_internal_codes_for_request", resolve_codes)
+    monkeypatch.setattr(pricing, "_precomputed_procedure_provider_count", no_precomputed_count)
+    monkeypatch.setattr(pricing, "_enrich_provider_service_cost_indices", AsyncMock())
+
+    response = await pricing.list_providers_by_procedure(
+        _request(session),
+        native_args={
+            "code": "99213",
+            "code_system": "CPT",
+            "min_claims": "10",
+            "min_total_cost": "20",
+            "npi": "1000000001",
+            "limit": "1",
+            "offset": "0",
+        },
+        import_context=service_sql.ProviderServiceImportQuery(_prepared(direction), require_match=False),
+    )
+
+    _assert_imported_response(response, session, no_precomputed_count)
+    _assert_imported_claims_sql(session.statements, direction)
+
+
+@pytest.mark.parametrize("require_match", (False, True))
+def test_membership_only_relation_uses_exists_without_duplicate_native_rows(require_match):
+    duplicate_npis = (
+        select(literal("1000000001").label("entity_value"))
+        .union_all(select(literal("1000000001").label("entity_value")))
+        .subquery()
+    )
+    prepared = PreparedNpiEntityRelation(
+        select(duplicate_npis.c.entity_value),
+        (),
+        "a" * 64,
+        "b" * 64,
+    )
+    relation = service_sql.compose_provider_service_claims_relation(
+        select(literal(1000000001).label("npi")),
+        service_sql.ProviderServiceImportQuery(prepared, require_match=require_match),
+    )
+
+    compiled = _compiled(relation.statement)
+
+    assert ("EXISTS" in compiled) is require_match
+    assert "JOIN" not in compiled
+    assert ("custom_import_provider_service" in compiled) is require_match
+    assert relation.import_order_terms == ()
+
+
+@pytest.mark.parametrize("require_match", (False, True))
+def test_prepared_membership_overrides_caller_before_ordered_composition(require_match):
+    prepared = replace(_prepared(), effective_require_match=require_match)
+    context = service_sql.ProviderServiceImportQuery(prepared, require_match=not require_match)
+    relation = service_sql.compose_provider_service_claims_relation(select(literal(1000000001).label("npi")), context)
+
+    compiled = _compiled(relation.statement.order_by(*relation.import_order_terms))
+
+    assert context.require_match is require_match
+    assert "LEFT OUTER JOIN" in compiled
+    assert ("WHERE custom_import_provider_service.entity_value IS NOT NULL" in compiled) is require_match
+    assert "custom_import_provider_service.sort_0 DESC NULLS LAST" in compiled
+    assert compiled.endswith("native_provider_service.npi ASC")
+    assert "LIMIT" not in compiled and "OFFSET" not in compiled
+
+
+@pytest.mark.parametrize("prepared,require_match", ((None, True), (_prepared(), 1)))
+def test_import_context_rejects_untyped_query_inputs(prepared, require_match):
+    with pytest.raises(CustomImportReadUnavailableError, match="^provider-service import query is invalid$"):
+        service_sql.ProviderServiceImportQuery(prepared, require_match=require_match)
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    (
+        ("statement", None, "relation"),
+        ("query_fingerprint", "a" * 63, "query"),
+        ("authorization_scope_sha256", "B" * 64, "query"),
+        ("authorization_scope_sha256", None, "query"),
+        ("normalized_order_terms", [ReadOrderTerm("metric", "desc", "last")], "order"),
+        ("normalized_order_terms", (None,), "order"),
+    ),
+)
+def test_import_context_rejects_malformed_prepared_authority(field, value, message):
+    prepared = replace(_prepared(), **{field: value})
+
+    with pytest.raises(CustomImportReadUnavailableError, match=f"^provider-service import {message} is invalid$"):
+        service_sql.ProviderServiceImportQuery(prepared, require_match=True)
+
+
+def test_import_context_rejects_malformed_prepared_relation():
+    malformed = PreparedNpiEntityRelation(
+        select(literal("1000000001").label("not_an_npi")),
+        (),
+        "a" * 64,
+        "b" * 64,
+    )
+
+    with pytest.raises(CustomImportReadUnavailableError, match="provider-service import relation"):
+        service_sql.ProviderServiceImportQuery(malformed, require_match=True)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        select(literal("1000000001").label("entity_value")).limit(1),
+        select(literal("1000000001").label("entity_value")).offset(1),
+        select(literal("1000000001").label("entity_value")).order_by(literal(1)),
+    ),
+)
+def test_import_context_rejects_paged_or_ordered_prepared_relation(statement):
+    prepared = PreparedNpiEntityRelation(statement, (), "a" * 64, "b" * 64)
+
+    with pytest.raises(CustomImportReadUnavailableError, match="not unpaged"):
+        service_sql.ProviderServiceImportQuery(prepared, require_match=True)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        select(literal(1000000001).label("npi")).limit(1),
+        select(literal(1000000001).label("npi")).offset(1),
+        select(literal(1000000001).label("npi")).order_by(literal(1)),
+    ),
+)
+def test_claims_composition_rejects_paged_or_ordered_native_relation(statement):
+    with pytest.raises(CustomImportReadUnavailableError, match="claims relation is not unpaged"):
+        service_sql.compose_provider_service_claims_relation(
+            statement,
+            service_sql.ProviderServiceImportQuery(_prepared(), require_match=True),
+        )
+
+
+@pytest.mark.parametrize("statement", (None, select(literal(1000000001).label("not_an_npi"))))
+def test_claims_composition_rejects_malformed_native_relation(statement):
+    with pytest.raises(CustomImportReadUnavailableError, match="^provider-service claims relation is invalid$"):
+        service_sql.compose_provider_service_claims_relation(
+            statement, service_sql.ProviderServiceImportQuery(_prepared(), require_match=True)
+        )
+
+
+def test_claims_composition_rejects_substituted_import_context():
+    with pytest.raises(CustomImportReadUnavailableError, match="^provider-service import query is invalid$"):
+        service_sql.compose_provider_service_claims_relation(select(literal(1000000001).label("npi")), None)
+
+
+def test_claims_coordinate_eligibility_is_unpaged_and_preserves_exact_zip_union():
+    metadata = MetaData()
+    providers = Table("synthetic_providers", metadata, Column("zip5", String))
+    zips = Table(
+        "synthetic_zips", metadata, Column("zip_code", String), Column("latitude", Float), Column("longitude", Float)
+    )
+    clause = service_sql.provider_service_zip_filter(
+        providers.c.zip5,
+        zips,
+        "12345",
+        [],
+        (10, 20, 5),
+        lambda latitude, longitude: (zips.c.latitude - latitude) + (zips.c.longitude - longitude),
+    )
+    sql = _compiled(select(providers).where(clause))
+    assert "synthetic_zips.latitude IS NOT NULL" in sql
+    assert "synthetic_zips.longitude IS NOT NULL" in sql
+    assert "synthetic_zips.zip_code =" in sql and " OR " in sql
+    assert "LIMIT" not in sql and "OFFSET" not in sql
+
+
+@pytest.mark.asyncio
+async def test_by_service_import_context_requires_native_args_pair():
+    with pytest.raises(pricing.InvalidUsage, match="arguments are invalid"):
+        await pricing.list_providers_by_procedure(_request(_Session(())), native_args={})
+
+
+@pytest.mark.asyncio
+async def test_service_rejects_substituted_import_context():
+    session = _Session(())
+    with pytest.raises(pricing.InvalidUsage, match="context is invalid"):
+        await pricing.list_providers_by_procedure(
+            _request(session), native_args={"code": "99213", "code_system": "CPT"}, import_context=object()
+        )
+    assert session.statements == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coordinate_args", [{"radius": "2"}, {"lat": "10"}])
+async def test_imported_service_rejects_incomplete_geography(coordinate_args):
+    session = _Session(())
+    with pytest.raises(pricing.InvalidUsage, match="requires|provided together"):
+        await pricing.list_providers_by_procedure(
+            _request(session),
+            native_args={"code": "99213", "code_system": "CPT", **coordinate_args},
+            import_context=service_sql.ProviderServiceImportQuery(_prepared(), require_match=True),
+        )
+    assert session.statements == []
+
+
+@pytest.mark.asyncio
+async def test_imported_service_rejects_mixed_evidence_card():
+    session = _Session(())
+    with pytest.raises(pricing.InvalidUsage, match="do not support include_allowed_amounts"):
+        await pricing.list_providers_by_procedure(
+            _request(session),
+            native_args={
+                "code": "27447",
+                "code_system": "CPT",
+                "plan_release_id": "hprelease_" + "1" * 26,
+                "view": "card",
+                "include_allowed_amounts": "true",
+            },
+            import_context=service_sql.ProviderServiceImportQuery(_prepared(), require_match=True),
+        )
+    assert session.statements == []
+
+
+@pytest.mark.parametrize("branch_args", ({"cursor": "opaque"}, {"plan_id": "TESTPLAN001"}))
+@pytest.mark.asyncio
+async def test_by_service_import_context_rejects_nonclaims_branches(branch_args):
+    with pytest.raises(pricing.InvalidUsage, match="require the claims lane"):
+        await pricing.list_providers_by_procedure(
+            _request(_Session(())),
+            native_args={"code": "99213", "code_system": "CPT", **branch_args},
+            import_context=service_sql.ProviderServiceImportQuery(_prepared(), require_match=True),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("min_claims,min_cost", ((None, None), (10, None), (None, 20), (10, 20)))
+async def test_native_service_scope_filters_aggregates_before_scoring(min_claims, min_cost):
+    claims = Table(
+        "synthetic_claims",
+        MetaData(),
+        Column("npi", String),
+        Column("total_services", Float),
+        Column("total_allowed_amount", Float),
+    )
+    prepared = _prepared()
+    scope_preparer = AsyncMock(return_value=prepared)
+    context = service_sql.ProviderServiceImportQuery(prepared, True, scope_preparer)
+    grouped, scoped = await service_sql._prepare_provider_service_native_scope(
+        select(claims), context, min_claims, min_cost
+    )
+    scope = scope_preparer.await_args.args[0]
+    sql = _compiled(scope)
+    assert "native_score_claims AS MATERIALIZED" in sql
+    assert "SELECT DISTINCT native_score_claims.npi" in sql
+    assert ("total_services >=" in sql) is (min_claims is not None)
+    assert ("total_allowed_amount >=" in sql) is (min_cost is not None)
+    assert "LIMIT" not in sql and "OFFSET" not in sql
+    assert "SELECT native_score_claims.npi" in _compiled(grouped)
+    assert scoped.prepared is prepared and scoped.require_match is True
+
+
+def test_native_scope_preparer_rejects_noncallable():
+    with pytest.raises(CustomImportReadUnavailableError, match="native scope preparer"):
+        service_sql.ProviderServiceImportQuery(_prepared(), True, object())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("window", ("limit", "offset", "fetch", "order_by"))
+async def test_scoped_service_rejects_paging_before_wrapping(window):
+    grouped = select(literal("1000000001").label("npi"))
+    grouped = getattr(grouped, window)(1 if window != "order_by" else grouped.selected_columns.npi)
+    scope_preparer = AsyncMock(return_value=_prepared())
+    context = service_sql.ProviderServiceImportQuery(_prepared(), True, scope_preparer)
+    with pytest.raises(CustomImportReadUnavailableError, match="not unpaged"):
+        await service_sql._prepare_provider_service_native_scope(grouped, context, None, None)
+    scope_preparer.assert_not_awaited()
+
+
+def test_provider_service_order_refuses_unknown_fields():
+    from sanic.exceptions import InvalidUsage
+
+    fields = (
+        "npi",
+        "total_services",
+        "total_allowed_amount",
+        "total_submitted_charges",
+        "total_beneficiaries",
+        "matched_service_codes",
+    )
+    relation = select(
+        *(literal(1).label(name) for name in fields), literal("Synthetic").label("provider_name")
+    ).subquery()
+    with pytest.raises(InvalidUsage, match="Unsupported order_by"):
+        service_sql._ordered_provider_service_statement(select(relation), relation, "unknown", "asc")

@@ -1,4 +1,4 @@
-FROM ghcr.io/astral-sh/uv:0.12.12@sha256:73d2665b478d8fa2de1cf105c6841f8e9cb6b09e568fc7700440c09f8fcd7ac4 AS uv-bin
+FROM ghcr.io/astral-sh/uv:0.12.17@sha256:10787c682e4184e4f290de1171fd4703dc63de99221f10fe1c99002ce7fa9acc AS uv-bin
 
 FROM docker.io/library/rust:1.98.1-slim-trixie@sha256:ce84a5edd80c5f91e05c5533b1e53eb1da54028f33734dc06aa6b49fa190462d AS ptg2-scanner-builder
 
@@ -12,6 +12,7 @@ COPY requirements.txt requirements-runtime.in requirements-runtime.lock requirem
 COPY scripts/python_locks.py /build/scripts/python_locks.py
 COPY support/ptg2_scanner/ /build/support/ptg2_scanner/
 COPY process/ext/address_pub28.py /build/process/ext/address_pub28.py
+COPY specs/uhc_provider_file_census_v1.json /build/specs/uhc_provider_file_census_v1.json
 RUN uv venv --python 3.14.7 /build/venv \
     && /build/venv/bin/python /build/scripts/python_locks.py check --root /build \
     && uv pip install \
@@ -70,6 +71,16 @@ ARG HLTHPRT_LOG_CFG=./logging.yaml
 ARG HLTHPRT_RELEASE="dev"
 ARG HLTHPRT_ENVIRONMENT=test
 ARG HLTHPRT_SOURCE_COMMIT
+ARG DRUG_SOURCE_COMMIT
+ARG DRUG_SOURCE_TREE
+ARG DRUG_SOURCE_BASE
+
+COPY config/drug_snapshot_runtime.json /opt/healthporta/build-identity/drug-runtime-source.json
+COPY scripts/drug_runtime_dependency.py /opt/scripts/drug_runtime_dependency.py
+RUN PYTHONDONTWRITEBYTECODE=1 /opt/venv/bin/python -I /opt/scripts/drug_runtime_dependency.py compose \
+        "${DRUG_SOURCE_COMMIT}" "${DRUG_SOURCE_TREE}" "${DRUG_SOURCE_BASE}" \
+    && PYTHONDONTWRITEBYTECODE=1 /opt/venv/bin/python -I /opt/scripts/drug_runtime_dependency.py verify-baked \
+        "${DRUG_SOURCE_COMMIT}" "${DRUG_SOURCE_TREE}" "${DRUG_SOURCE_BASE}"
 
 ARG HLTHPRT_DB_POOL_MIN_SIZE=1
 ARG HLTHPRT_DB_POOL_MAX_SIZE=10
@@ -107,6 +118,7 @@ ENV HLTHPRT_DB_SCHEMA=${HLTHPRT_DB_SCHEMA}
 
 ENV HLTHPRT_REDIS_ADDRESS=${HLTHPRT_REDIS_ADDRESS}
 ENV HLTHPRT_SAVE_PER_PACK=${HLTHPRT_SAVE_PER_PACK}
+ENV PATH=/opt/venv/bin:${PATH}
 ENV HLTHPRT_PTG2_RUST_SCANNER_BIN=/opt/support/ptg2_scanner/target/release/ptg2_scanner
 ENV HLTHPRT_PTG2_PROVIDER_GRAPH_V4_BIN=/opt/support/ptg2_scanner/target/release/ptg2_provider_graph_v4
 ENV HLTHPRT_UHC_SEMANTIC_BIN=/opt/support/ptg2_scanner/target/release/uhc_semantic_facts
@@ -156,9 +168,13 @@ COPY --from=ptg2-scanner-builder /build/wheels/ /tmp/ptg2-address-canon-wheels/
 RUN uv pip install --python /opt/venv/bin/python --no-cache --no-build --no-deps /tmp/ptg2-address-canon-wheels/*.whl \
     && uv pip check --python /opt/venv/bin/python \
     && rm -rf /tmp/ptg2-address-canon-wheels
+COPY custom_import_cli.py /opt/custom_import_cli.py
+COPY custom_import_snowflake_operator.py /opt/custom_import_snowflake_operator.py
 COPY logging.yaml main.py alembic.ini /opt/
 
 USER nobody:nogroup
+
+RUN /opt/venv/bin/python -B -c "import inspect; import ptg2_address_canon as native; from process.custom_import import scalar_digest; encoder = getattr(native, 'custom_import_scalar_frames_v1', None); assert inspect.isbuiltin(encoder); assert scalar_digest.native_encoder() is encoder"
 
 EXPOSE 8080
 CMD ["/usr/local/bin/start_api.sh"]

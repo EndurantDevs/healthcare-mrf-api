@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import struct
 import uuid
 import zlib
+from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -19,31 +21,34 @@ from api.ptg2_candidate_audit_capacity import (
     CandidateAuditDecodedRetentionError,
 )
 from api.ptg2_shared_blocks import (
-    PTG2SharedBlockError,
     PTG2_V3_GRAPH_CHUNK_BYTES,
     PTG2_V3_GRAPH_NPI_TO_GROUP,
+    PTG2SharedBlockError,
     decode_shared_block_payload,
     fetch_shared_blocks,
     fetch_shared_graph_members,
-    fetch_snapshot_source_set_metadata,
     fetch_snapshot_source_set_identity,
+    fetch_snapshot_source_set_metadata,
     shared_block_read_once_scope,
 )
 from db.connection import db
+from process.ptg_parts import ptg2_serving_binary_v3
 from process.ptg_parts import ptg2_shared_audit as shared_audit
 from process.ptg_parts import ptg2_shared_blocks as shared_blocks_module
-from process.ptg_parts import ptg2_serving_binary_v3
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+from process.ptg_parts.ptg2_serving_binary_v3_types import (
+    PTG2V3PriceAtomRecord,
+)
 from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_DENSE_LAYOUT_TABLES,
+    SharedBlock,
     SharedBlockReference,
     SharedMappingDigestSummary,
     _SharedMappingBinaryCopyDigest,
-    is_shared_layout_build_abandoned,
-    lock_shared_layout_for_dense_write,
-    SharedBlock,
     bind_snapshot_to_shared_layout,
     delete_shared_layout_dense_rows,
+    is_shared_layout_build_abandoned,
+    lock_shared_layout_for_dense_write,
     reserve_shared_layout,
     seal_shared_layout,
     shared_block_hash,
@@ -53,10 +58,6 @@ from process.ptg_parts.ptg2_shared_blocks import (
     summarize_shared_snapshot_mappings,
     touch_shared_layout_build,
 )
-from process.ptg_parts.ptg2_serving_binary_v3_types import (
-    PTG2V3PriceAtomRecord,
-)
-
 
 _PG_BINARY_COPY_HEADER = b"PGCOPY\n\xff\r\n\0" + struct.pack(">II", 0, 0)
 
@@ -119,18 +120,17 @@ class _ReadOnceSession:
             return _Rows(({"root_present": False, "finalizer_manifest": None},))
         if "ptg2_v3_snapshot_block" in sql:
             requested_keys = set(params_by_name["block_keys"])
-            return _Rows(
-                row
-                for row in self.mapping_rows
-                if int(row["block_key"]) in requested_keys
-            )
+            if "ptg2_v3_block" in sql:
+                physical_by_hash = {row["block_hash"]: row for row in self.physical_rows}
+                return _Rows(
+                    dict(physical_by_hash[row["block_hash"]], **row)
+                    for row in self.mapping_rows
+                    if int(row["block_key"]) in requested_keys
+                )
+            return _Rows(row for row in self.mapping_rows if int(row["block_key"]) in requested_keys)
         if "ptg2_v3_block" in sql:
             requested_hashes = set(params_by_name["block_hashes"])
-            return _Rows(
-                row
-                for row in self.physical_rows
-                if bytes(row["block_hash"]) in requested_hashes
-            )
+            return _Rows(row for row in self.physical_rows if bytes(row["block_hash"]) in requested_hashes)
         raise AssertionError(f"unexpected SQL: {sql}")
 
 
@@ -149,6 +149,13 @@ class _LazyAsyncRows:
             raise StopAsyncIteration
         self.consumed_count += 1
         return row
+
+
+class _CancellingGraphRows(_LazyAsyncRows):
+    async def __anext__(self):
+        if self.consumed_count == 1:
+            raise asyncio.CancelledError("graph stream cancelled")
+        return await super().__anext__()
 
 
 class _LazyMappingSession:
@@ -265,11 +272,7 @@ def _mapping_streams_by_kind(
     object_kinds = sorted({reference.object_kind for reference in references})
     for object_kind in object_kinds:
         kind_references = sorted(
-            (
-                reference
-                for reference in references
-                if reference.object_kind == object_kind
-            ),
+            (reference for reference in references if reference.object_kind == object_kind),
             key=lambda reference: (reference.block_key, reference.fragment_no),
         )
         streams_by_kind[object_kind] = _binary_copy_stream(
@@ -287,9 +290,7 @@ def _mapping_summary(
         unique_block_count=len({reference.block_hash for reference in references}),
         entry_count=sum(reference.entry_count for reference in references),
         logical_byte_count=sum(reference.raw_byte_count for reference in references),
-        canonical_byte_count=sum(
-            len(_mapping_record(reference)) for reference in references
-        ),
+        canonical_byte_count=sum(len(_mapping_record(reference)) for reference in references),
         object_kinds=tuple(sorted({reference.object_kind for reference in references})),
     )
 
@@ -362,9 +363,7 @@ def _read_once_rows(
 
 
 def _provider_code_payload(code_key):
-    encoded_codes, _stats = ptg2_serving_binary_v3.encode_provider_code_set(
-        (code_key,)
-    )
+    encoded_codes, _stats = ptg2_serving_binary_v3.encode_provider_code_set((code_key,))
     payload = bytearray()
     ptg2_serving_binary_v3.append_uvarint(payload, 1)
     ptg2_serving_binary_v3.append_uvarint(payload, 0)
@@ -378,13 +377,9 @@ def _provider_code_block_payload(provider_code_rows):
     payload = bytearray()
     ptg2_serving_binary_v3.append_uvarint(payload, len(rows))
     for provider_offset, code_keys in rows:
-        encoded_codes, _stats = (
-            ptg2_serving_binary_v3.encode_provider_code_set(code_keys)
-        )
+        encoded_codes, _stats = ptg2_serving_binary_v3.encode_provider_code_set(code_keys)
         ptg2_serving_binary_v3.append_uvarint(payload, provider_offset)
-        ptg2_serving_binary_v3.append_uvarint(
-            payload, len(encoded_codes)
-        )
+        ptg2_serving_binary_v3.append_uvarint(payload, len(encoded_codes))
         payload.extend(encoded_codes)
     return bytes(payload)
 
@@ -394,9 +389,7 @@ def _partially_aliased_provider_rows():
     first_payload = _provider_code_payload(1)
     second_payload = _provider_code_payload(2)
     shared_prefix_size = next(
-        index
-        for index, pair in enumerate(zip(first_payload, second_payload))
-        if pair[0] != pair[1]
+        index for index, pair in enumerate(zip(first_payload, second_payload)) if pair[0] != pair[1]
     )
     raw_parts = (
         first_payload[:shared_prefix_size],
@@ -440,15 +433,9 @@ def _partially_aliased_provider_rows():
 
 
 def test_semantic_fingerprint_is_order_stable_and_context_sensitive():
-    first = shared_semantic_fingerprint(
-        {"files": [{"sha256": "a"}], "plan": "one", "arch": "shared_blocks_v3"}
-    )
-    reordered = shared_semantic_fingerprint(
-        {"arch": "shared_blocks_v3", "plan": "one", "files": [{"sha256": "a"}]}
-    )
-    other_plan = shared_semantic_fingerprint(
-        {"files": [{"sha256": "a"}], "plan": "two", "arch": "shared_blocks_v3"}
-    )
+    first = shared_semantic_fingerprint({"files": [{"sha256": "a"}], "plan": "one", "arch": "shared_blocks_v3"})
+    reordered = shared_semantic_fingerprint({"arch": "shared_blocks_v3", "plan": "one", "files": [{"sha256": "a"}]})
+    other_plan = shared_semantic_fingerprint({"files": [{"sha256": "a"}], "plan": "two", "arch": "shared_blocks_v3"})
 
     assert first == reordered
     assert first != other_plan
@@ -498,18 +485,14 @@ def test_binary_copy_mapping_digest_is_exact_for_unicode_and_arbitrary_chunks():
             accumulator.feed(stream[offset : offset + chunk_size])
             offset += chunk_size
             chunk_index += 1
-        assert accumulator.finish_copy() == sum(
-            reference.object_kind == object_kind for reference in references
-        )
+        assert accumulator.finish_copy() == sum(reference.object_kind == object_kind for reference in references)
 
     parsed = accumulator.finish()
 
     assert parsed.mapping_digest == shared_mapping_digest(references)
     assert parsed.mapping_count == len(references)
     assert parsed.entry_count == sum(reference.entry_count for reference in references)
-    assert parsed.canonical_byte_count == sum(
-        len(_mapping_record(reference)) for reference in references
-    )
+    assert parsed.canonical_byte_count == sum(len(_mapping_record(reference)) for reference in references)
 
 
 @pytest.mark.parametrize(
@@ -532,9 +515,7 @@ def test_binary_copy_mapping_digest_is_exact_for_unicode_and_arbitrary_chunks():
             "exactly one field",
         ),
         (
-            _PG_BINARY_COPY_HEADER
-            + struct.pack(">hi", 1, -1)
-            + struct.pack(">h", -1),
+            _PG_BINARY_COPY_HEADER + struct.pack(">hi", 1, -1) + struct.pack(">h", -1),
             "must not be NULL",
         ),
         (
@@ -542,31 +523,18 @@ def test_binary_copy_mapping_digest_is_exact_for_unicode_and_arbitrary_chunks():
             "invalid length",
         ),
         (
-            _binary_copy_stream(
-                [
-                    _mapping_record(
-                        SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1)
-                    )
-                    + b"x"
-                ]
-            ),
+            _binary_copy_stream([_mapping_record(SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1)) + b"x"]),
             "does not match object_kind",
         ),
         (
-            _binary_copy_stream(
-                [_mapping_record(SharedBlockReference("a", -1, 0, 1, b"a" * 32, 1))]
-            ),
+            _binary_copy_stream([_mapping_record(SharedBlockReference("a", -1, 0, 1, b"a" * 32, 1))]),
             "negative mapping value",
         ),
         (
             _binary_copy_stream(
                 [
-                    _mapping_record(
-                        SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1)
-                    ),
-                    _mapping_record(
-                        SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1)
-                    ),
+                    _mapping_record(SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1)),
+                    _mapping_record(SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1)),
                 ]
             ),
             "duplicate mapping key",
@@ -574,21 +542,14 @@ def test_binary_copy_mapping_digest_is_exact_for_unicode_and_arbitrary_chunks():
         (
             _binary_copy_stream(
                 [
-                    _mapping_record(
-                        SharedBlockReference("a", 2, 0, 1, b"b" * 32, 1)
-                    ),
-                    _mapping_record(
-                        SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1)
-                    ),
+                    _mapping_record(SharedBlockReference("a", 2, 0, 1, b"b" * 32, 1)),
+                    _mapping_record(SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1)),
                 ]
             ),
             "out-of-order mapping key",
         ),
         (
-            _binary_copy_stream(
-                [_mapping_record(SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1))]
-            )
-            + b"x",
+            _binary_copy_stream([_mapping_record(SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1))]) + b"x",
             "after its trailer",
         ),
     ],
@@ -603,9 +564,7 @@ def test_binary_copy_mapping_digest_rejects_malformed_streams(stream, error):
 
 @pytest.mark.parametrize("removed_bytes", [1, 2, 3, 20])
 def test_binary_copy_mapping_digest_rejects_truncated_streams(removed_bytes):
-    stream = _binary_copy_stream(
-        [_mapping_record(SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1))]
-    )
+    stream = _binary_copy_stream([_mapping_record(SharedBlockReference("a", 1, 0, 1, b"a" * 32, 1))])
     accumulator = _SharedMappingBinaryCopyDigest()
     accumulator.begin_copy("a")
     accumulator.feed(stream[:-removed_bytes])
@@ -619,25 +578,15 @@ def _aggregate_mapping_rows(
 ) -> list[dict[str, object]]:
     aggregate_rows = []
     for object_kind in {reference.object_kind for reference in references}:
-        kind_references = [
-            reference
-            for reference in references
-            if reference.object_kind == object_kind
-        ]
+        kind_references = [reference for reference in references if reference.object_kind == object_kind]
         aggregate_rows.append(
             {
                 "object_kind": object_kind,
                 "mapping_count": len(kind_references),
-                "unique_block_count": len(
-                    {reference.block_hash for reference in kind_references}
-                ),
+                "unique_block_count": len({reference.block_hash for reference in kind_references}),
                 "resolved_mapping_count": len(kind_references),
-                "entry_count": sum(
-                    reference.entry_count for reference in kind_references
-                ),
-                "logical_byte_count": sum(
-                    reference.raw_byte_count for reference in kind_references
-                ),
+                "entry_count": sum(reference.entry_count for reference in kind_references),
+                "logical_byte_count": sum(reference.raw_byte_count for reference in kind_references),
             }
         )
     return aggregate_rows
@@ -665,24 +614,16 @@ async def test_mapping_summary_uses_supplied_session_and_matches_python_digest()
 
     assert summary.mapping_digest == shared_mapping_digest(references)
     assert summary.mapping_count == len(references)
-    assert summary.unique_block_count == len(
-        {reference.block_hash for reference in references}
-    )
+    assert summary.unique_block_count == len({reference.block_hash for reference in references})
     assert summary.entry_count == sum(reference.entry_count for reference in references)
-    assert summary.logical_byte_count == sum(
-        reference.raw_byte_count for reference in references
-    )
-    assert summary.canonical_byte_count == sum(
-        len(_mapping_record(reference)) for reference in references
-    )
-    assert summary.object_kinds == tuple(
-        sorted({reference.object_kind for reference in references})
-    )
+    assert summary.logical_byte_count == sum(reference.raw_byte_count for reference in references)
+    assert summary.canonical_byte_count == sum(len(_mapping_record(reference)) for reference in references)
+    assert summary.object_kinds == tuple(sorted({reference.object_kind for reference in references}))
     assert summary.object_kind_count == 3
     assert session.connection_calls == 1
     assert session.connection_object.raw_connection_calls == 1
     assert session.calls[0][1] == {"snapshot_key": 41}
-    assert "LEFT JOIN \"mrf\".ptg2_v3_block" in session.calls[0][0]
+    assert 'LEFT JOIN "mrf".ptg2_v3_block' in session.calls[0][0]
     assert [call[1][1] for call in driver.calls] == list(summary.object_kinds)
     assert all(call[1][0] == 41 and call[2] == "binary" for call in driver.calls)
 
@@ -816,21 +757,17 @@ async def test_snapshot_source_identity_preserves_dense_ordinal_order():
         ]
     )
 
-    first_set, first_ordered, first_raw_hashes = (
-        await fetch_snapshot_source_set_identity(
-            first_session,
-            schema_name="mrf",
-            logical_snapshot_id="snapshot-1",
-            expected_source_count=2,
-        )
+    first_set, first_ordered, first_raw_hashes = await fetch_snapshot_source_set_identity(
+        first_session,
+        schema_name="mrf",
+        logical_snapshot_id="snapshot-1",
+        expected_source_count=2,
     )
-    reversed_set, reversed_ordered, reversed_raw_hashes = (
-        await fetch_snapshot_source_set_identity(
-            reversed_session,
-            schema_name="mrf",
-            logical_snapshot_id="snapshot-1",
-            expected_source_count=2,
-        )
+    reversed_set, reversed_ordered, reversed_raw_hashes = await fetch_snapshot_source_set_identity(
+        reversed_session,
+        schema_name="mrf",
+        logical_snapshot_id="snapshot-1",
+        expected_source_count=2,
     )
 
     assert first_set == reversed_set
@@ -842,12 +779,9 @@ async def test_snapshot_source_identity_preserves_dense_ordinal_order():
 @pytest.mark.asyncio
 async def test_snapshot_source_identity_streams_and_fails_before_buffering():
     session = _LazySourceIdentitySession(
-        {"source_key": source_key, "raw_container_sha256": "1" * 64}
-        for source_key in range(100)
+        {"source_key": source_key, "raw_container_sha256": "1" * 64} for source_key in range(100)
     )
-    budget = CandidateAuditDecodedRetentionBudget(
-        maximum_bytes=shared_readers._SOURCE_IDENTITY_RECORD_RETAINED_BYTES
-    )
+    budget = CandidateAuditDecodedRetentionBudget(maximum_bytes=shared_readers._SOURCE_IDENTITY_RECORD_RETAINED_BYTES)
 
     with pytest.raises(
         CandidateAuditDecodedRetentionError,
@@ -870,9 +804,7 @@ async def test_snapshot_source_identity_streams_and_fails_before_buffering():
 
 @pytest.mark.asyncio
 async def test_snapshot_source_set_rejects_omitted_or_extra_rows():
-    session = _Session(
-        [{"source_key": 0, "raw_container_sha256": "1" * 64}]
-    )
+    session = _Session([{"source_key": 0, "raw_container_sha256": "1" * 64}])
 
     with pytest.raises(PTG2SharedBlockError, match="complete and dense"):
         await fetch_snapshot_source_set_metadata(
@@ -938,9 +870,7 @@ async def test_failed_build_abandonment_never_touches_another_attempt_or_binding
     )
     assert len(not_owned.calls) == 1
 
-    bound = _ScriptedSession(
-        [_Result(scalar_value=42), _Result(scalar_value=1)]
-    )
+    bound = _ScriptedSession([_Result(scalar_value=42), _Result(scalar_value=1)])
     with pytest.raises(RuntimeError, match="bound shared PTG layout"):
         await is_shared_layout_build_abandoned(
             bound,
@@ -981,9 +911,7 @@ async def test_dense_write_lock_requires_current_build_token():
 @pytest.mark.asyncio
 async def test_seal_locks_ownership_then_rechecks_authoritative_summary(monkeypatch):
     """Prove sealing rechecks authoritative ownership under its short lock."""
-    expected = SharedBlock(
-        "page_v4", 7, 0, 3, "none", 9, b"123456789"
-    ).reference()
+    expected = SharedBlock("page_v4", 7, 0, 3, "none", 9, b"123456789").reference()
     expected_summary = _mapping_summary([expected])
     summarize = _patch_shared_seal_dependencies(monkeypatch, expected_summary)
     session = _ScriptedSession(
@@ -1137,11 +1065,13 @@ async def test_seal_exact_reuse_does_not_queue_still_referenced_blocks_for_gc(
 def _patch_shared_reuse_seal_dependencies(monkeypatch, expected_summary):
     """Install exact-winner reuse dependencies and return cleanup marker."""
     monkeypatch.setattr(
-        shared_blocks_module, "summarize_shared_snapshot_mappings",
+        shared_blocks_module,
+        "summarize_shared_snapshot_mappings",
         AsyncMock(return_value=expected_summary),
     )
     monkeypatch.setattr(
-        shared_blocks_module, "acquire_ptg2_source_lifecycle_lock",
+        shared_blocks_module,
+        "acquire_ptg2_source_lifecycle_lock",
         AsyncMock(return_value="layout_attempt_41"),
     )
     monkeypatch.setattr(
@@ -1354,9 +1284,7 @@ def test_read_once_scope_rejects_invalid_state_transitions():
         with pytest.raises(PTG2SharedBlockError, match="unprepared fragment"):
             scope.claim_logical_payload_processing("mrf", (unread_hash,))
         with pytest.raises(PTG2SharedBlockError, match="cannot be nested"):
-            with shared_block_read_once_scope(
-                max_retained_raw_bytes=1024
-            ) as nested_scope:
+            with shared_block_read_once_scope(max_retained_raw_bytes=1024) as nested_scope:
                 assert nested_scope is not scope
 
 
@@ -1380,27 +1308,39 @@ async def _read_once_fetch(
 
 
 @pytest.mark.asyncio
-async def test_shared_fetch_rejects_bad_coordinates_and_incomplete_mappings():
+async def test_shared_fetch_rejects_bad_coordinates_and_accepts_empty_results():
     empty_session = _ReadOnceSession(mapping_rows=(), physical_rows=())
     with pytest.raises(ValueError, match="non-negative"):
         await _read_once_fetch(empty_session, fragment_nos=(-1,))
 
-    assert await _read_once_fetch(
-        _ReadOnceSession(mapping_rows=(), physical_rows=()),
-        block_keys=(),
-    ) == {}
-    assert await fetch_shared_blocks(
-        _Session([]),
-        schema_name="mrf",
-        snapshot_key=12,
-        object_kind="page_v4",
-        block_keys=(),
-    ) == {}
-    assert await _read_once_fetch(
-        _ReadOnceSession(mapping_rows=(), physical_rows=()),
-        require_all=False,
-    ) == {}
+    assert (
+        await _read_once_fetch(
+            _ReadOnceSession(mapping_rows=(), physical_rows=()),
+            block_keys=(),
+        )
+        == {}
+    )
+    assert (
+        await fetch_shared_blocks(
+            _Session([]),
+            schema_name="mrf",
+            snapshot_key=12,
+            object_kind="page_v4",
+            block_keys=(),
+        )
+        == {}
+    )
+    assert (
+        await _read_once_fetch(
+            _ReadOnceSession(mapping_rows=(), physical_rows=()),
+            require_all=False,
+        )
+        == {}
+    )
 
+
+@pytest.mark.asyncio
+async def test_shared_fetch_rejects_incomplete_mappings():
     mapping_rows, physical_rows = _read_once_rows(
         object_kind="page_v4",
         raw_payload=b"payload",
@@ -1416,9 +1356,7 @@ async def test_shared_fetch_rejects_bad_coordinates_and_incomplete_mappings():
         )
 
     with pytest.raises(PTG2SharedBlockError, match="missing block keys"):
-        await _read_once_fetch(
-            _ReadOnceSession(mapping_rows=(), physical_rows=())
-        )
+        await _read_once_fetch(_ReadOnceSession(mapping_rows=(), physical_rows=()))
 
     mapping_rows, physical_rows = _read_once_rows(
         object_kind="page_v4",
@@ -1555,9 +1493,7 @@ async def test_source_identity_rejects_unbounded_source_count_before_query():
             object(),
             schema_name="mrf",
             logical_snapshot_id="snapshot",
-            expected_source_count=(
-                shared_readers.PTG2_V3_MAX_AUDIT_SOURCE_FILES + 1
-            ),
+            expected_source_count=(shared_readers.PTG2_V3_MAX_AUDIT_SOURCE_FILES + 1),
         )
     with pytest.raises(PTG2SharedBlockError, match="snapshot id is missing"):
         await fetch_snapshot_source_set_identity(
@@ -1604,8 +1540,7 @@ async def test_fetch_shared_blocks_uses_one_stable_query_without_process_cache()
     assert len(session.calls) == 2
     assert all("ptg2_v3_snapshot_block" in sql and "ptg2_v3_block" in sql for sql, _ in session.calls)
     assert all(
-        params["shared_projection_generations"]
-        == ("shared_blocks_v3", "shared_blocks_v4")
+        params["shared_projection_generations"] == ("shared_blocks_v3", "shared_blocks_v4")
         for _sql, params in session.calls
     )
 
@@ -1698,9 +1633,7 @@ async def test_read_once_mapping_stream_stops_and_unwinds_on_budget_excess():
     )
     session = _LazyMappingSession(mapping_rows)
     retained_row_bytes = shared_readers._SHARED_MAPPING_RECORD_RETAINED_BYTES
-    budget = CandidateAuditDecodedRetentionBudget(
-        maximum_bytes=2 * retained_row_bytes - 1
-    )
+    budget = CandidateAuditDecodedRetentionBudget(maximum_bytes=2 * retained_row_bytes - 1)
 
     with shared_block_read_once_scope(max_retained_raw_bytes=1024):
         shared_readers.bind_shared_block_decoded_retention_budget(budget)
@@ -1739,17 +1672,15 @@ async def test_forward_alias_is_read_decoded_and_parsed_once_then_fanned_out():
     )
 
     with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
-        price_keys_by_occurrence = await (
-            ptg2_db_sidecars.lookup_forward_price_index_from_db(
-                session,
-                (7, 8),
-                provider_set_keys_by_code={7: (5,), 8: (5,)},
-                source_keys_by_code={7: (0,), 8: (0,)},
-                shared_snapshot_key=12,
-                source_count=1,
-                price_dictionary_item_count=128,
-                price_dictionary_block_bytes=2048,
-            )
+        price_keys_by_occurrence = await ptg2_db_sidecars.lookup_forward_price_index_from_db(
+            session,
+            (7, 8),
+            provider_set_keys_by_code={7: (5,), 8: (5,)},
+            source_keys_by_code={7: (0,), 8: (0,)},
+            shared_snapshot_key=12,
+            source_count=1,
+            price_dictionary_item_count=128,
+            price_dictionary_block_bytes=2048,
         )
         scope.assert_processed_once()
         ledger = scope.ledger
@@ -1853,13 +1784,11 @@ async def test_partially_aliased_fragments_prepare_once_and_parse_each_logical_p
         decoder_spy,
     )
     with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
-        code_keys_by_provider = await (
-            ptg2_db_sidecars.lookup_provider_code_keys_from_db(
-                session,
-                12,
-                provider_set_keys=(0, 1024),
-                schema_name="mrf",
-            )
+        code_keys_by_provider = await ptg2_db_sidecars.lookup_provider_code_keys_from_db(
+            session,
+            12,
+            provider_set_keys=(0, 1024),
+            schema_name="mrf",
         )
         scope.assert_processed_once()
         ledger = scope.ledger
@@ -1911,16 +1840,14 @@ async def test_provider_code_intersections_keep_alias_reads_and_processing_once(
     )
 
     with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
-        code_keys_by_provider = await (
-            ptg2_db_sidecars.lookup_provider_code_intersections_from_db(
-                session,
-                12,
-                provider_set_keys=(0, 1024),
-                requested_code_keys=(2,),
-                max_retained_memberships=1,
-                schema_name="mrf",
-                inputs_are_normalized=True,
-            )
+        code_keys_by_provider = await ptg2_db_sidecars.lookup_provider_code_intersections_from_db(
+            session,
+            12,
+            provider_set_keys=(0, 1024),
+            requested_code_keys=(2,),
+            max_retained_memberships=1,
+            schema_name="mrf",
+            inputs_are_normalized=True,
         )
         scope.assert_processed_once()
         ledger = scope.ledger
@@ -1928,13 +1855,8 @@ async def test_provider_code_intersections_keep_alias_reads_and_processing_once(
     assert code_keys_by_provider == {0: (), 1024: (2,)}
     assert decoder_spy.call_count == 2
     partition_spy.assert_called_once()
-    requested_selection = decoder_spy.call_args_list[0].kwargs[
-        "requested_code_selection"
-    ]
-    assert all(
-        call.kwargs["requested_code_selection"] is requested_selection
-        for call in decoder_spy.call_args_list
-    )
+    requested_selection = decoder_spy.call_args_list[0].kwargs["requested_code_selection"]
+    assert all(call.kwargs["requested_code_selection"] is requested_selection for call in decoder_spy.call_args_list)
     assert requested_selection.requested_keys == (2,)
     assert ledger["physical_block_reads"] == 3
     assert ledger["physical_block_decodes"] == 3
@@ -1956,17 +1878,15 @@ async def test_provider_code_dimension_intersection_matches_exact_request():
     )
     decoded_budget = CandidateAuditDecodedRetentionBudget(maximum_bytes=64 * 1024)
     with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
-        dimension_code_keys_by_provider = await (
-            ptg2_db_sidecars.lookup_provider_code_intersections_from_db(
-                dimension_session,
-                12,
-                provider_set_keys=(0, 1024),
-                requested_code_keys=(2,),
-                max_retained_memberships=1,
-                schema_name="mrf",
-                decoded_retention_budget=decoded_budget,
-                inputs_are_normalized=True,
-            )
+        dimension_code_keys_by_provider = await ptg2_db_sidecars.lookup_provider_code_intersections_from_db(
+            dimension_session,
+            12,
+            provider_set_keys=(0, 1024),
+            requested_code_keys=(2,),
+            max_retained_memberships=1,
+            schema_name="mrf",
+            decoded_retention_budget=decoded_budget,
+            inputs_are_normalized=True,
         )
         scope.assert_processed_once()
 
@@ -1980,22 +1900,18 @@ async def test_provider_code_dimension_intersection_matches_exact_request():
         membership_count=2,
     )
     with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
-        exact_code_keys_by_provider = await (
-            ptg2_db_sidecars._lookup_prepared_code_map_from_db(
-                exact_session,
-                12,
-                exact_requests,
-                max_retained_memberships=2,
-                schema_name="mrf",
-            )
+        exact_code_keys_by_provider = await ptg2_db_sidecars._lookup_prepared_code_map_from_db(
+            exact_session,
+            12,
+            exact_requests,
+            max_retained_memberships=2,
+            schema_name="mrf",
         )
         scope.assert_processed_once()
 
     assert exact_code_keys_by_provider == dimension_code_keys_by_provider
     assert decoded_budget.retained_bytes == (
-        provider_code_sets.decoded_provider_code_bytes(
-            dimension_code_keys_by_provider
-        )
+        provider_code_sets.decoded_provider_code_bytes(dimension_code_keys_by_provider)
     )
     assert decoded_budget.peak_retained_bytes > decoded_budget.retained_bytes
 
@@ -2004,9 +1920,7 @@ async def test_provider_code_dimension_intersection_matches_exact_request():
 async def test_provider_specific_intersections_avoid_global_cross_product(
     monkeypatch,
 ):
-    provider_payload = _provider_code_block_payload(
-        ((0, (1, 2)), (1, (1, 2)))
-    )
+    provider_payload = _provider_code_block_payload(((0, (1, 2)), (1, (1, 2))))
     mapping_rows, physical_rows = _read_once_rows(
         object_kind="provider_set_codes_v3",
         raw_payload=provider_payload,
@@ -2025,14 +1939,12 @@ async def test_provider_specific_intersections_avoid_global_cross_product(
     )
 
     with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
-        code_keys_by_provider = await (
-            ptg2_db_sidecars.lookup_provider_code_map_from_db(
-                session,
-                12,
-                {0: (1,), 1: (2,)},
-                max_retained_memberships=2,
-                schema_name="mrf",
-            )
+        code_keys_by_provider = await ptg2_db_sidecars.lookup_provider_code_map_from_db(
+            session,
+            12,
+            {0: (1,), 1: (2,)},
+            max_retained_memberships=2,
+            schema_name="mrf",
         )
         scope.assert_processed_once()
         ledger = scope.ledger
@@ -2043,9 +1955,7 @@ async def test_provider_specific_intersections_avoid_global_cross_product(
     assert decoder_kwargs["requested_code_selection"] is None
     assert {
         provider_set_key: code_selection.requested_keys
-        for provider_set_key, code_selection in decoder_kwargs[
-            "requested_code_selections_by_provider_set"
-        ].items()
+        for provider_set_key, code_selection in decoder_kwargs["requested_code_selections_by_provider_set"].items()
     } == {0: (1,), 1: (2,)}
     assert decoder_kwargs["claim_retained_code_keys"] is None
     assert ledger["physical_block_reads"] == 1
@@ -2057,9 +1967,7 @@ async def test_provider_specific_intersections_avoid_global_cross_product(
 
 @pytest.mark.asyncio
 async def test_provider_specific_requests_normalize_and_bound_before_io():
-    provider_payload = _provider_code_block_payload(
-        ((0, (1, 2)), (1, (1, 2)))
-    )
+    provider_payload = _provider_code_block_payload(((0, (1, 2)), (1, (1, 2))))
     mapping_rows, physical_rows = _read_once_rows(
         object_kind="provider_set_codes_v3",
         raw_payload=provider_payload,
@@ -2193,13 +2101,16 @@ async def test_provider_specific_requests_drop_empty_coordinates_before_io():
         scope.assert_processed_once()
 
     empty_session = _ReadOnceSession(mapping_rows=(), physical_rows=())
-    assert await ptg2_db_sidecars.lookup_provider_code_map_from_db(
-        empty_session,
-        12,
-        {provider_set_key: () for provider_set_key in range(10_000)},
-        max_retained_memberships=1,
-        schema_name="mrf",
-    ) == {}
+    assert (
+        await ptg2_db_sidecars.lookup_provider_code_map_from_db(
+            empty_session,
+            12,
+            {provider_set_key: () for provider_set_key in range(10_000)},
+            max_retained_memberships=1,
+            schema_name="mrf",
+        )
+        == {}
+    )
     assert empty_session.calls == []
 
 
@@ -2262,9 +2173,7 @@ async def test_provider_specific_intersections_filter_physical_aliases_once(
         "_decode_provider_code_block",
         decoder_spy,
     )
-    intersection_spy = Mock(
-        wraps=ptg2_db_sidecars._ordered_code_intersection
-    )
+    intersection_spy = Mock(wraps=ptg2_db_sidecars._ordered_code_intersection)
     monkeypatch.setattr(
         ptg2_db_sidecars,
         "_ordered_code_intersection",
@@ -2272,23 +2181,19 @@ async def test_provider_specific_intersections_filter_physical_aliases_once(
     )
 
     with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
-        code_keys_by_provider = await (
-            ptg2_db_sidecars.lookup_provider_code_map_from_db(
-                session,
-                12,
-                {0: (1,), 1024: (2,)},
-                max_retained_memberships=2,
-                schema_name="mrf",
-            )
+        code_keys_by_provider = await ptg2_db_sidecars.lookup_provider_code_map_from_db(
+            session,
+            12,
+            {0: (1,), 1024: (2,)},
+            max_retained_memberships=2,
+            schema_name="mrf",
         )
         scope.assert_processed_once()
         ledger = scope.ledger
 
     assert code_keys_by_provider == {0: (1,), 1024: (2,)}
     assert decoder_spy.call_count == 1
-    assert [
-        call.args for call in intersection_spy.call_args_list
-    ] == [((1, 2), (1,)), ((1, 2), (2,))]
+    assert [call.args for call in intersection_spy.call_args_list] == [((1, 2), (1,)), ((1, 2), (2,))]
     assert ledger["physical_block_reads"] == 1
     assert ledger["physical_block_decodes"] == 1
     assert ledger["logical_payload_processes"] == 1
@@ -2312,9 +2217,7 @@ async def test_provider_specific_partial_aliases_read_and_filter_once(
         "_decode_provider_code_block",
         decoder_spy,
     )
-    intersection_spy = Mock(
-        wraps=ptg2_db_sidecars._ordered_code_intersection
-    )
+    intersection_spy = Mock(wraps=ptg2_db_sidecars._ordered_code_intersection)
     monkeypatch.setattr(
         ptg2_db_sidecars,
         "_ordered_code_intersection",
@@ -2322,23 +2225,19 @@ async def test_provider_specific_partial_aliases_read_and_filter_once(
     )
 
     with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
-        code_keys_by_provider = await (
-            ptg2_db_sidecars.lookup_provider_code_map_from_db(
-                session,
-                12,
-                {0: (1,), 1024: (2,)},
-                max_retained_memberships=2,
-                schema_name="mrf",
-            )
+        code_keys_by_provider = await ptg2_db_sidecars.lookup_provider_code_map_from_db(
+            session,
+            12,
+            {0: (1,), 1024: (2,)},
+            max_retained_memberships=2,
+            schema_name="mrf",
         )
         scope.assert_processed_once()
         ledger = scope.ledger
 
     assert code_keys_by_provider == {0: (1,), 1024: (2,)}
     assert decoder_spy.call_count == 2
-    assert [
-        call.args for call in intersection_spy.call_args_list
-    ] == [((1,), (1,)), ((2,), (2,))]
+    assert [call.args for call in intersection_spy.call_args_list] == [((1,), (1,)), ((2,), (2,))]
     assert ledger["physical_block_reads"] == 3
     assert ledger["physical_block_decodes"] == 3
     assert ledger["logical_payload_processes"] == 2
@@ -2350,9 +2249,7 @@ async def test_provider_specific_partial_aliases_read_and_filter_once(
 
 @pytest.mark.asyncio
 async def test_provider_specific_aliases_union_only_the_same_offset(monkeypatch):
-    provider_payload = _provider_code_block_payload(
-        ((0, (1, 2)), (1, (1, 2)))
-    )
+    provider_payload = _provider_code_block_payload(((0, (1, 2)), (1, (1, 2))))
     mapping_rows, physical_rows = _read_once_rows(
         object_kind="provider_set_codes_v3",
         raw_payload=provider_payload,
@@ -2406,13 +2303,11 @@ async def test_provider_specific_intersections_preserve_empty_and_missing():
     )
 
     with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
-        code_keys_by_provider = await (
-            ptg2_db_sidecars.lookup_provider_code_map_from_db(
-                session,
-                12,
-                {0: (99,), 1: (1,)},
-                schema_name="mrf",
-            )
+        code_keys_by_provider = await ptg2_db_sidecars.lookup_provider_code_map_from_db(
+            session,
+            12,
+            {0: (99,), 1: (1,)},
+            schema_name="mrf",
         )
         scope.assert_processed_once()
 
@@ -2426,9 +2321,7 @@ def test_ordered_provider_code_intersections_advance_both_inputs():
 def test_provider_specific_fanout_filters_and_budgets_each_alias_once(
     monkeypatch,
 ):
-    intersection_spy = Mock(
-        wraps=ptg2_db_sidecars._ordered_code_intersection
-    )
+    intersection_spy = Mock(wraps=ptg2_db_sidecars._ordered_code_intersection)
     monkeypatch.setattr(
         ptg2_db_sidecars,
         "_ordered_code_intersection",
@@ -2453,9 +2346,7 @@ def test_provider_specific_fanout_filters_and_budgets_each_alias_once(
 
     assert code_keys_by_provider == {0: (1,), 1025: (2,), 2050: (1,)}
     assert budget.retained_memberships == 3
-    assert [
-        call.args for call in intersection_spy.call_args_list
-    ] == [((1, 2), (1,)), ((1, 2), (2,)), ((1, 2), (1,))]
+    assert [call.args for call in intersection_spy.call_args_list] == [((1, 2), (1,)), ((1, 2), (2,)), ((1, 2), (1,))]
 
 
 @pytest.mark.asyncio
@@ -2517,15 +2408,13 @@ async def test_provider_code_budget_counts_fully_aliased_logical_deliveries(
         physical_rows=physical_rows,
     )
     with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
-        code_keys_by_provider = await (
-            ptg2_db_sidecars.lookup_provider_code_intersections_from_db(
-                accepted_session,
-                12,
-                provider_set_keys=(0, 1024),
-                requested_code_keys=(2,),
-                max_retained_memberships=2,
-                schema_name="mrf",
-            )
+        code_keys_by_provider = await ptg2_db_sidecars.lookup_provider_code_intersections_from_db(
+            accepted_session,
+            12,
+            provider_set_keys=(0, 1024),
+            requested_code_keys=(2,),
+            max_retained_memberships=2,
+            schema_name="mrf",
         )
         scope.assert_processed_once()
 
@@ -2837,9 +2726,9 @@ async def test_fetch_shared_blocks_filters_exact_fragments():
 
 
 @pytest.mark.asyncio
-async def test_graph_members_are_resolved_in_one_query_and_integer_space():
+async def test_graph_members_use_unique_chunks_and_integer_space():
     members = (3, 9, 17)
-    encoded = b"xx" + b"".join(member.to_bytes(4, "little") for member in members)
+    encoded = b"\x00" * 4 + b"".join(member.to_bytes(4, "little") for member in members)
     stored_row = _stored_row(
         object_kind="graph_npi_groups_v1",
         block_key=4,
@@ -2849,8 +2738,9 @@ async def test_graph_members_are_resolved_in_one_query_and_integer_space():
         extra={
             "owner_key": 1234567890,
             "first_chunk": 4,
-            "member_offset": 2,
+            "member_offset": 4,
             "member_count": len(members),
+            "mapping_entry_count": len(members) + 1,
         },
     )
     session = _Session([stored_row])
@@ -2864,18 +2754,23 @@ async def test_graph_members_are_resolved_in_one_query_and_integer_space():
     )
 
     assert member_map == {1234567890: members, 9999999999: ()}
-    assert len(session.calls) == 1
+    assert len(session.calls) == 2
     sql, params = session.calls[0]
     assert "ptg2_v3_graph_owner" in sql
-    assert "generate_series" in sql
+    assert "block.payload" not in sql
     assert params["member_width"] == 4
+    assert session.calls[1][1]["block_keys"] == (4,)
 
 
+@pytest.mark.parametrize("direction", tuple(shared_readers._GRAPH_KIND_AND_WIDTH))
+@pytest.mark.parametrize("read_once", (False, True))
 @pytest.mark.asyncio
-async def test_graph_read_once_scope_loads_one_chunk_shared_by_multiple_owners():
-    encoded = (3).to_bytes(4, "little") + (9).to_bytes(4, "little")
+async def test_graph_reads_load_one_chunk_shared_by_multiple_owners(direction, read_once):
+    object_kind, member_width = shared_readers._GRAPH_KIND_AND_WIDTH[direction]
+    members = (3, 2**32 + 9) if member_width == 8 else (3, 9)
+    encoded = b"".join(member.to_bytes(member_width, "little") for member in members)
     mapping_rows, physical_rows = _read_once_rows(
-        object_kind="graph_npi_groups_v1",
+        object_kind=object_kind,
         raw_payload=encoded,
         coordinates=((4, 0),),
         codec="zlib",
@@ -2884,44 +2779,221 @@ async def test_graph_read_once_scope_loads_one_chunk_shared_by_multiple_owners()
     session = _ReadOnceSession(
         mapping_rows=mapping_rows,
         physical_rows=physical_rows,
-        owner_rows=(
-            {
-                "owner_key": 1111111111,
-                "first_chunk": 4,
-                "member_offset": 0,
-                "member_count": 1,
-                "selected_member_count": 1,
-            },
-            {
-                "owner_key": 2222222222,
-                "first_chunk": 4,
-                "member_offset": 4,
-                "member_count": 1,
-                "selected_member_count": 1,
-            },
+        owner_rows=tuple(
+            dict(
+                owner_key=owner_key,
+                first_chunk=4,
+                member_offset=index * member_width,
+                member_count=count,
+                selected_member_count=count,
+            )
+            for index, (owner_key, count) in enumerate(((1111111111, 1), (2222222222, 1), (3333333333, 0)))
         ),
     )
 
-    with shared_block_read_once_scope(max_retained_raw_bytes=1024) as scope:
+    context = shared_block_read_once_scope(max_retained_raw_bytes=1024) if read_once else nullcontext()
+    with context as scope:
         member_map = await fetch_shared_graph_members(
             session,
             schema_name="mrf",
             snapshot_key=12,
-            direction=PTG2_V3_GRAPH_NPI_TO_GROUP,
-            owner_keys=(1111111111, 2222222222),
+            direction=direction,
+            owner_keys=(4444444444, 3333333333, 2222222222, 1111111111, 1111111111),
         )
-        scope.assert_read_once()
-        ledger = scope.ledger
+        if scope is not None:
+            scope.assert_read_once()
+            assert scope.ledger["physical_block_reads"] == 1
+            assert scope.ledger["physical_block_decodes"] == 1
 
-    assert member_map == {1111111111: (3,), 2222222222: (9,)}
-    assert ledger["unique_physical_blocks"] == 1
-    assert ledger["physical_block_reads"] == 1
-    assert ledger["physical_block_decodes"] == 1
-    assert len(session.calls) == 3
+    assert member_map == {1111111111: members[:1], 2222222222: members[1:], 3333333333: (), 4444444444: ()}
+    assert list(member_map) == sorted(member_map)
+    assert len(session.calls) == (3 if read_once else 2)
+    assert session.calls[1][1]["block_keys"] == (4,)
+
+
+@pytest.mark.parametrize("direction", tuple(shared_readers._GRAPH_KIND_AND_WIDTH))
+@pytest.mark.parametrize("max_members", (None, 0, 2))
+@pytest.mark.asyncio
+async def test_graph_members_cross_chunks_and_keep_selected_prefix(direction, max_members):
+    object_kind, member_width = shared_readers._GRAPH_KIND_AND_WIDTH[direction]
+    chunk_member_count = PTG2_V3_GRAPH_CHUNK_BYTES // member_width
+    first_member = 2**32 if member_width == 8 else 0
+    members = tuple(range(first_member, first_member + chunk_member_count + 3))
+    encoded = b"".join(member.to_bytes(member_width, "little") for member in members)
+    chunks = [
+        _stored_row(
+            object_kind=object_kind,
+            block_key=block_key,
+            fragment_no=0,
+            raw_payload=encoded[offset : offset + PTG2_V3_GRAPH_CHUNK_BYTES],
+            extra={"mapping_entry_count": min(chunk_member_count, len(members) - block_key * chunk_member_count)},
+        )
+        for block_key, offset in enumerate(range(0, len(encoded), PTG2_V3_GRAPH_CHUNK_BYTES))
+    ]
+    selected_count = 4 if max_members is None else max_members
+    owner_by_field = dict(
+        owner_key=1,
+        first_chunk=0,
+        member_offset=PTG2_V3_GRAPH_CHUNK_BYTES - member_width,
+        member_count=4,
+        selected_member_count=selected_count,
+    )
+    session = _ScriptedSession([_Rows([owner_by_field])] + ([_Rows(chunks)] if selected_count else []))
+
+    members_by_owner = await fetch_shared_graph_members(
+        session,
+        schema_name="mrf",
+        snapshot_key=12,
+        direction=direction,
+        owner_keys=(1,),
+        max_members=max_members,
+    )
+
+    assert members_by_owner == {1: members[chunk_member_count - 1 : chunk_member_count - 1 + selected_count]}
+    assert len(session.calls) == (2 if selected_count else 1)
+    if selected_count:
+        assert session.calls[1][1]["block_keys"] == (0, 1)
 
 
 @pytest.mark.asyncio
-async def test_graph_read_once_scope_rejects_overlapping_owner_ranges():
+async def test_graph_members_preserve_aliased_chunk_coordinates():
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="graph_npi_groups_v1",
+        raw_payload=b"\x03\0\0\0" * (PTG2_V3_GRAPH_CHUNK_BYTES // 4),
+        coordinates=((0, 0), (1, 0)),
+        entry_count=PTG2_V3_GRAPH_CHUNK_BYTES // 4,
+    )
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+        owner_rows=tuple(
+            dict(
+                owner_key=owner_key, first_chunk=owner_key - 1, member_offset=0, member_count=1, selected_member_count=1
+            )
+            for owner_key in (1, 2)
+        ),
+    )
+
+    result = await fetch_shared_graph_members(
+        session,
+        schema_name="mrf",
+        snapshot_key=12,
+        direction=PTG2_V3_GRAPH_NPI_TO_GROUP,
+        owner_keys=(1, 2),
+    )
+
+    assert result == {1: (3,), 2: (3,)}
+    assert len(session.calls) == 2
+    assert session.calls[1][1]["block_keys"] == (0, 1)
+
+
+@pytest.mark.parametrize("corruption", ("payload", "entry_count", "fragment", "missing"))
+@pytest.mark.asyncio
+async def test_graph_members_reject_corrupt_or_missing_chunks(corruption):
+    mapping_rows, physical_rows = _read_once_rows(
+        object_kind="graph_npi_groups_v1",
+        raw_payload=b"\x03\0\0\0",
+        coordinates=((0, 0),),
+        entry_count=1,
+    )
+    if corruption == "payload":
+        physical_rows[0]["payload"] = b"\x04\0\0\0"
+    elif corruption == "entry_count":
+        mapping_rows[0]["mapping_entry_count"] = 2
+    elif corruption == "fragment":
+        mapping_rows[0]["fragment_no"] = 1
+    else:
+        mapping_rows.clear()
+    session = _ReadOnceSession(
+        mapping_rows=mapping_rows,
+        physical_rows=physical_rows,
+        owner_rows=(dict(owner_key=1, first_chunk=0, member_offset=0, member_count=1),),
+    )
+
+    with pytest.raises(PTG2SharedBlockError):
+        await fetch_shared_graph_members(
+            session,
+            schema_name="mrf",
+            snapshot_key=12,
+            direction=PTG2_V3_GRAPH_NPI_TO_GROUP,
+            owner_keys=(1,),
+        )
+
+
+@pytest.mark.parametrize("is_cancelled", (False, True))
+@pytest.mark.parametrize("has_close_failure", (False, True))
+@pytest.mark.asyncio
+async def test_graph_stream_failure_closes_unread_payloads(is_cancelled, has_close_failure):
+    members_per_chunk = PTG2_V3_GRAPH_CHUNK_BYTES // 4
+    stored_rows = [
+        _stored_row(
+            object_kind="graph_npi_groups_v1",
+            block_key=block_key,
+            fragment_no=0,
+            raw_payload=b"\x03\0\0\0" * count,
+            extra={"mapping_entry_count": count},
+        )
+        for block_key, count in enumerate((members_per_chunk, 1))
+    ]
+    if not is_cancelled:
+        stored_rows[0]["payload"] = b"corrupt"
+    streamed_rows = _CancellingGraphRows(stored_rows) if is_cancelled else _LazyAsyncRows(stored_rows)
+    streamed_rows.close = AsyncMock(side_effect=RuntimeError("close failed") if has_close_failure else None)
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            return_value=_Rows((dict(owner_key=1, first_chunk=0, member_offset=0, member_count=members_per_chunk + 1),))
+        ),
+        stream=AsyncMock(return_value=streamed_rows),
+    )
+    expected_error = asyncio.CancelledError if is_cancelled else PTG2SharedBlockError
+    expected_message = "graph stream cancelled" if is_cancelled else "identity validation failed"
+
+    with pytest.raises(expected_error, match=expected_message):
+        await fetch_shared_graph_members(
+            session,
+            schema_name="mrf",
+            snapshot_key=12,
+            direction=PTG2_V3_GRAPH_NPI_TO_GROUP,
+            owner_keys=(1,),
+        )
+
+    assert streamed_rows.consumed_count == 1
+    streamed_rows.close.assert_awaited_once()
+    session.execute.assert_awaited_once()
+    session.stream.assert_awaited_once()
+
+
+@pytest.mark.parametrize("has_close_failure", (False, True))
+@pytest.mark.asyncio
+async def test_graph_buffered_result_closes_and_propagates_cleanup_failure(has_close_failure):
+    stored_row = _stored_row(
+        object_kind="graph_npi_groups_v1",
+        block_key=0,
+        fragment_no=0,
+        raw_payload=b"\x03\0\0\0",
+    )
+    buffered_rows = _Rows((stored_row,))
+    buffered_rows.close = Mock(side_effect=RuntimeError("close failed") if has_close_failure else None)
+    owner_rows = _Rows((dict(owner_key=1, first_chunk=0, member_offset=0, member_count=1),))
+    session = _ScriptedSession((owner_rows, buffered_rows))
+
+    context = pytest.raises(RuntimeError, match="close failed") if has_close_failure else nullcontext()
+    with context:
+        assert await fetch_shared_graph_members(
+            session,
+            schema_name="mrf",
+            snapshot_key=12,
+            direction=PTG2_V3_GRAPH_NPI_TO_GROUP,
+            owner_keys=(1,),
+        ) == {1: (3,)}
+
+    buffered_rows.close.assert_called_once_with()
+    assert len(session.calls) == 2
+
+
+@pytest.mark.parametrize("read_once", (False, True))
+@pytest.mark.asyncio
+async def test_graph_reads_reject_overlapping_owner_ranges(read_once):
     session = _ReadOnceSession(
         mapping_rows=(),
         physical_rows=(),
@@ -2943,7 +3015,8 @@ async def test_graph_read_once_scope_rejects_overlapping_owner_ranges():
         ),
     )
 
-    with shared_block_read_once_scope(max_retained_raw_bytes=1024):
+    context = shared_block_read_once_scope(max_retained_raw_bytes=1024) if read_once else nullcontext()
+    with context:
         with pytest.raises(PTG2SharedBlockError, match="ranges overlap"):
             await fetch_shared_graph_members(
                 session,
@@ -2954,8 +3027,9 @@ async def test_graph_read_once_scope_rejects_overlapping_owner_ranges():
             )
 
 
+@pytest.mark.parametrize("read_once", (False, True))
 @pytest.mark.asyncio
-async def test_graph_read_once_scope_rejects_a_short_nonfinal_chunk():
+async def test_graph_reads_reject_a_short_nonfinal_chunk(read_once):
     raw_chunks_by_key = {
         0: b"a\x00\x00\x00" * ((PTG2_V3_GRAPH_CHUNK_BYTES - 4) // 4),
         1: b"b\x00\x00\x00",
@@ -2963,33 +3037,14 @@ async def test_graph_read_once_scope_rejects_a_short_nonfinal_chunk():
     mapping_rows = []
     physical_rows = []
     for block_key, raw_chunk in raw_chunks_by_key.items():
-        stored_row = _stored_row(
+        chunk_mapping_rows, chunk_physical_rows = _read_once_rows(
             object_kind="graph_npi_groups_v1",
-            block_key=block_key,
-            fragment_no=0,
             raw_payload=raw_chunk,
+            coordinates=((block_key, 0),),
+            entry_count=len(raw_chunk) // 4,
         )
-        entry_count = len(raw_chunk) // 4
-        mapping_rows.append(
-            {
-                "object_kind": "graph_npi_groups_v1",
-                "block_key": block_key,
-                "fragment_no": 0,
-                "mapping_entry_count": entry_count,
-                "block_hash": stored_row["block_hash"],
-            }
-        )
-        physical_rows.append(
-            {
-                "block_hash": stored_row["block_hash"],
-                "object_kind": "graph_npi_groups_v1",
-                "format_version": stored_row["format_version"],
-                "codec": stored_row["codec"],
-                "block_entry_count": entry_count,
-                "raw_byte_count": len(raw_chunk),
-                "payload": stored_row["payload"],
-            }
-        )
+        mapping_rows.extend(chunk_mapping_rows)
+        physical_rows.extend(chunk_physical_rows)
     session = _ReadOnceSession(
         mapping_rows=mapping_rows,
         physical_rows=physical_rows,
@@ -3004,7 +3059,8 @@ async def test_graph_read_once_scope_rejects_a_short_nonfinal_chunk():
         ),
     )
 
-    with shared_block_read_once_scope(max_retained_raw_bytes=128 * 1024):
+    context = shared_block_read_once_scope(max_retained_raw_bytes=128 * 1024) if read_once else nullcontext()
+    with context:
         with pytest.raises(PTG2SharedBlockError, match="member framing"):
             await fetch_shared_graph_members(
                 session,
@@ -3100,14 +3156,9 @@ async def test_reservation_resumes_same_token_and_isolates_other_build(
     assert reservation.snapshot_key == 23
     assert reservation.reused is False
     assert not any("ptg2_v3_gc_candidate" in sql for sql, _params in matching.calls)
+    assert not any('DELETE FROM "mrf".ptg2_v3_snapshot_block' in sql for sql, _params in matching.calls)
     assert not any(
-        "DELETE FROM \"mrf\".ptg2_v3_snapshot_block" in sql
-        for sql, _params in matching.calls
-    )
-    assert not any(
-        f'\"mrf\".\"{table_name}\"' in sql
-        for sql, _params in matching.calls
-        for table_name in PTG2_V3_DENSE_LAYOUT_TABLES
+        f'"mrf"."{table_name}"' in sql for sql, _params in matching.calls for table_name in PTG2_V3_DENSE_LAYOUT_TABLES
     )
 
     conflicting = _building_layout_session(
@@ -3123,10 +3174,7 @@ async def test_reservation_resumes_same_token_and_isolates_other_build(
         build_token="other-run",
     )
     assert (isolated.snapshot_key, isolated.reused) == (24, False)
-    assert any(
-        "ptg2_layout_build_candidate" in sql
-        for sql, _params in conflicting.calls
-    )
+    assert any("ptg2_layout_build_candidate" in sql for sql, _params in conflicting.calls)
 
 
 @pytest.mark.asyncio
@@ -3155,9 +3203,7 @@ async def test_snapshot_binding_retry_is_idempotent_only_for_same_layout():
 async def test_snapshot_binding_accepts_only_complete_v4_map_root():
     session = _ScriptedSession(
         [
-            _Result(
-                rows=[{"import_run_id": "run-v4", "manifest": {}}]
-            ),
+            _Result(rows=[{"import_run_id": "run-v4", "manifest": {}}]),
             _Result(scalar_value=None),
             _Result(scalar_value=None),
             _Result(scalar_value=b"m" * 32),
@@ -3262,8 +3308,7 @@ async def _insert_mapping_summary_rows(
         [
             {"block_hash": block_hash, "raw_byte_count": raw_byte_count}
             for block_hash, raw_byte_count in {
-                reference.block_hash: reference.raw_byte_count
-                for reference in references
+                reference.block_hash: reference.raw_byte_count for reference in references
             }.items()
         ],
     )
@@ -3295,18 +3340,10 @@ async def _insert_mapping_summary_rows(
 def _assert_mapping_summary(summary, references: list[SharedBlockReference]) -> None:
     assert summary.mapping_digest == shared_mapping_digest(references)
     assert summary.mapping_count == len(references)
-    assert summary.unique_block_count == len(
-        {reference.block_hash for reference in references}
-    )
-    assert summary.entry_count == sum(
-        reference.entry_count for reference in references
-    )
-    assert summary.logical_byte_count == sum(
-        reference.raw_byte_count for reference in references
-    )
-    assert summary.object_kinds == tuple(
-        sorted({reference.object_kind for reference in references})
-    )
+    assert summary.unique_block_count == len({reference.block_hash for reference in references})
+    assert summary.entry_count == sum(reference.entry_count for reference in references)
+    assert summary.logical_byte_count == sum(reference.raw_byte_count for reference in references)
+    assert summary.object_kinds == tuple(sorted({reference.object_kind for reference in references}))
 
 
 @pytest.mark.asyncio
@@ -3314,9 +3351,7 @@ async def test_mapping_summary_real_postgres_uses_same_uncommitted_transaction()
     """Read uncommitted mappings through the caller's PostgreSQL transaction."""
 
     if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
-        pytest.skip(
-            "set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1 for the isolated PostgreSQL test"
-        )
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1 for the isolated PostgreSQL test")
 
     schema_name = f"ptg2_mapping_digest_{uuid.uuid4().hex[:16]}"
     quoted_schema = f'"{schema_name}"'

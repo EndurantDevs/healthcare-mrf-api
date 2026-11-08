@@ -38,6 +38,15 @@ destination = importlib.import_module("process.entity_address_snapshot_destinati
 models = importlib.import_module("db.models")
 receipt = importlib.import_module("process.entity_address_snapshot_receipt")
 restore = importlib.import_module("process.entity_address_snapshot_restore")
+result_generation = importlib.import_module("process.entity_address_result_generation")
+
+
+def _source_serving_generation() -> dict[str, object]:
+    return {
+        "origin_lineage_id": "c8f27af1-56ba-4cda-82d8-0fc67650918f",
+        "origin_generation": 27,
+        "published_at": "2026-09-14T08:30:00Z",
+    }
 
 
 async def _create_alias_relations(database: Database, schema: str, generation: int) -> None:
@@ -235,7 +244,7 @@ async def _seed_support_rows(session, schema: str, *, location_key: str, entity_
         )
 
 
-async def _prepare_fixture(database: Database, schema: str):
+async def _prepare_fixture(database: Database, schema: str, *, hold_dependencies=False):
     """Create incumbent state and return a fully prepared destination receipt."""
 
     assert database.engine is not None and database.session_factory is not None
@@ -251,27 +260,11 @@ async def _prepare_fixture(database: Database, schema: str):
         )
     async with database.engine.begin() as connection:
         await _seed_support_rows(connection, schema, location_key="live-sentinel", entity_id="incumbent")
-    incumbent_oid_by_table = {
-        relation_record._mapping["table_name"]: relation_record._mapping["relation_oid"]
-        for relation_record in await database.all(
-            "SELECT relation.relname AS table_name, relation.oid::bigint AS relation_oid "
-            "FROM pg_catalog.pg_class AS relation "
-            "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace "
-            "WHERE namespace.nspname=:schema_name AND relation.relkind='r' "
-            "AND relation.relname = ANY(:table_names)",
-            schema_name=schema,
-            table_names=[
-                model.__tablename__
-                for model in (
-                    destination.entity_address_unified.EntityAddressUnified,
-                    *destination.entity_address_unified.SUPPORT_TABLE_MODELS,
-                )
-            ],
-        )
-    }
+    incumbent_oid_by_table = await _incumbent_family_oids(database, schema)
     await _create_alias_relations(database, schema, generation=91)
     await _create_geo_dependencies(database, schema)
     await _seed_geo_dependencies(database, schema)
+    dependency_bindings = await _held_geo_dependencies(database, schema) if hold_dependencies else None
     async with session_factory() as session, session.begin():
         owner = await restore.precreate_entity_address_archive_restore(
             session,
@@ -291,8 +284,53 @@ async def _prepare_fixture(database: Database, schema: str):
             source_alias_receipt=source_alias,
             db_schema=schema,
             import_date="20260913",
+            source_serving_generation=_source_serving_generation(),
+            dependency_bindings=dependency_bindings,
         )
     return prepared, incumbent_oid_by_table
+
+
+async def _incumbent_family_oids(database, schema):
+    """Observe the exact published family before a candidate is prepared."""
+    return {
+        relation_record._mapping["table_name"]: relation_record._mapping["relation_oid"]
+        for relation_record in await database.all(
+            "SELECT relation.relname AS table_name, relation.oid::bigint AS relation_oid "
+            "FROM pg_catalog.pg_class AS relation "
+            "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace "
+            "WHERE namespace.nspname=:schema_name AND relation.relkind='r' "
+            "AND relation.relname = ANY(:table_names)",
+            schema_name=schema,
+            table_names=[
+                model.__tablename__
+                for model in (
+                    destination.entity_address_unified.EntityAddressUnified,
+                    *destination.entity_address_unified.SUPPORT_TABLE_MODELS,
+                )
+            ],
+        )
+    }
+
+
+async def _held_geo_dependencies(database, schema):
+    """Copy real input rows and bind every independent heap by its observed identity."""
+    held_schema = "held_geo_" + uuid4().hex
+    await database.status(f'CREATE SCHEMA "{held_schema}"')
+    bindings_by_name = {}
+    for namespace, table in geo_projection._PROJECTION_DEPENDENCIES:
+        canonical = f"{namespace or schema}.{table}"
+        await database.status(f'CREATE TABLE "{held_schema}"."{table}" AS TABLE "{namespace or schema}"."{table}"')
+        identity = await database.first(
+            "SELECT oid::bigint,pg_relation_filenode(oid)::bigint FROM pg_class WHERE oid=to_regclass(:name)",
+            name=f"{held_schema}.{table}",
+        )
+        bindings_by_name[canonical] = {
+            "schema_name": held_schema,
+            "table_name": table,
+            "relation_oid": identity[0],
+            "relfilenode": identity[1],
+        }
+    return bindings_by_name
 
 
 def _runtime_evidence_sql(schema: str) -> str:
@@ -424,6 +462,41 @@ async def _assert_family_identity_and_rows(
         assert await database.scalar(f'SELECT count(*) FROM "{schema}"."{actual_table_name}"') == 1
 
 
+async def _generation_authority(database: Database, schema: str):
+    row = await database.first(
+        f"SELECT singleton, local_lineage_id, local_generation, origin_lineage_id, "
+        f"origin_generation, published_at, relation_oids FROM {schema}."
+        "entity_address_result_generation WHERE singleton IS TRUE"
+    )
+    return result_generation.validate_entity_address_result_generation_authority(row)
+
+
+async def _assert_adopted_generation(database: Database, schema: str) -> None:
+    """Require the preserved origin to reference all destination-local relations."""
+
+    authority = await _generation_authority(database, schema)
+    assert authority.local_generation == 0
+    assert authority.serving_generation.as_dict() == _source_serving_generation()
+    relation_oids_list = []
+    for table_name in result_generation.RELATION_NAMES:
+        relation_oids_list.append(
+            await database.scalar(
+                "SELECT to_regclass(:relation_name)::oid::bigint",
+                relation_name=f"{schema}.{table_name}",
+            )
+        )
+    assert authority.relation_oids == tuple(relation_oids_list)
+
+
+async def _install_destination_extensions(database: Database) -> None:
+    """Install only the extensions required by native destination activation."""
+
+    await database.status("CREATE EXTENSION IF NOT EXISTS postgis")
+    await database.status("CREATE EXTENSION IF NOT EXISTS intarray")
+    await database.status("CREATE EXTENSION IF NOT EXISTS btree_gin")
+    await database.status('CREATE SCHEMA "tiger"')
+
+
 async def _spliced_main_stage(database: Database, prepared) -> dict:
     """Substitute a non-derived main value and recompute the actual stage receipt."""
 
@@ -462,6 +535,16 @@ async def _activate(database: Database, prepared_or_stored, *, fail_after_publis
 
     async def verify_local_state() -> None:
         assert destination.db._transaction_binding() is not None
+        bindings = stored["restored"]["context"].get("dependency_bindings")
+        if bindings is not None:
+            assert (
+                await destination.db.scalar(
+                    "SELECT count(DISTINCT relation) FROM pg_locks WHERE pid=pg_backend_pid() "
+                    "AND granted AND mode='AccessShareLock' AND relation=ANY(:oids)",
+                    oids=[binding["relation_oid"] for binding in bindings.values()],
+                )
+                == 6
+            )
 
     async def record_adoption() -> None:
         await destination.db.status(f"INSERT INTO {db_schema}.adoption_receipt VALUES ('recorded')")
@@ -487,10 +570,7 @@ async def test_native_destination_adoption_is_query_ready_and_failure_preserves_
 
     async_dsn, _environment = _native_test_connection()
     async with _owned_native_database(async_dsn, monkeypatch) as database:
-        await database.status("CREATE EXTENSION IF NOT EXISTS postgis")
-        await database.status("CREATE EXTENSION IF NOT EXISTS intarray")
-        await database.status("CREATE EXTENSION IF NOT EXISTS btree_gin")
-        await database.status('CREATE SCHEMA "tiger"')
+        await _install_destination_extensions(database)
         successful_schema = "address_destination_success_" + uuid4().hex
         rollback_schema = "address_destination_rollback_" + uuid4().hex
         successful, successful_incumbent_oid_by_table = await _prepare_fixture(database, successful_schema)
@@ -518,6 +598,7 @@ async def test_native_destination_adoption_is_query_ready_and_failure_preserves_
             suffix="_old",
         )
         assert await database.scalar(f"SELECT count(*) FROM {successful_schema}.adoption_receipt") == 1
+        await _assert_adopted_generation(database, successful_schema)
 
         rolled_back, rollback_incumbent_oid_by_table = await _prepare_fixture(database, rollback_schema)
         await database.status(f"CREATE TABLE {rollback_schema}.adoption_receipt (marker text NOT NULL)")
@@ -538,6 +619,61 @@ async def test_native_destination_adoption_is_query_ready_and_failure_preserves_
             suffix="",
         )
         assert await database.scalar(f"SELECT count(*) FROM {rollback_schema}.adoption_receipt") == 0
+        rolled_back_generation = await _generation_authority(database, rollback_schema)
+        assert rolled_back_generation.local_generation == 0
+        assert rolled_back_generation.serving_generation is None
+        assert rolled_back_generation.relation_oids is None
+
+
+@pytest.mark.asyncio
+async def test_native_destination_preserves_six_held_bindings_through_activation(monkeypatch):
+    """Persist exact held inputs, refuse substituted identity, and preserve rollback/readback."""
+    async_dsn, _environment = _native_test_connection()
+    async with _owned_native_database(async_dsn, monkeypatch) as database:
+        await _install_destination_extensions(database)
+        schema = "address_held_" + uuid4().hex
+        prepared, incumbent = await _prepare_fixture(database, schema, hold_dependencies=True)
+        stored = prepared.as_dict()
+        bindings = stored["restored"]["context"]["dependency_bindings"]
+        assert len(bindings) == 6
+        assert (
+            await database.scalar(
+                f'SELECT candidate_dependency_bindings FROM "{schema}".entity_address_geo_assurance_state'
+            )
+            == bindings
+        )
+        await database.status(f'CREATE TABLE "{schema}".adoption_receipt (marker text NOT NULL)')
+        await database.status("TRUNCATE " + ",".join(bindings))
+        missing = copy.deepcopy(stored)
+        missing["restored"]["context"].pop("dependency_bindings")
+        with pytest.raises(destination.EntityAddressSnapshotDestinationError, match="candidate is stale"):
+            await _activate(database, missing, fail_after_publish=False)
+        for canonical in bindings:
+            changed = copy.deepcopy(stored)
+            changed["restored"]["context"]["dependency_bindings"][canonical]["relation_oid"] += 100000
+            with pytest.raises(destination.EntityAddressSnapshotDestinationError, match="candidate is stale"):
+                await _activate(database, changed, fail_after_publish=False)
+        held_tiger = bindings["tiger.zcta5"]
+        relation = f'"{held_tiger["schema_name"]}"."{held_tiger["table_name"]}"'
+        await database.status(f"ALTER TABLE {relation} ENABLE ROW LEVEL SECURITY")
+        try:
+            with pytest.raises(destination.EntityAddressSnapshotDestinationError, match="candidate is stale"):
+                await _activate(database, stored, fail_after_publish=False)
+        finally:
+            await database.status(f"ALTER TABLE {relation} DISABLE ROW LEVEL SECURITY")
+        with pytest.raises(RuntimeError, match="synthetic receipt failure"):
+            await _activate(database, stored, fail_after_publish=True)
+        await _assert_family_identity_and_rows(database, schema, incumbent, suffix="")
+        assert await database.scalar(f'SELECT count(*) FROM "{schema}".adoption_receipt') == 0
+        await _activate(database, stored, fail_after_publish=False)
+        assert (
+            await database.scalar(
+                f'SELECT active_dependency_bindings FROM "{schema}".entity_address_geo_assurance_state'
+            )
+            == bindings
+        )
+        await _assert_query_ready(database, schema)
+        await _assert_adopted_generation(database, schema)
 
 
 @pytest.mark.asyncio

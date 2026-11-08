@@ -1,6 +1,120 @@
 use super::*;
 
 #[test]
+fn source_witness_population_overflow_never_wraps_the_failed_counter() {
+    for counter in ["rows", "unqueryable", "occurrences"] {
+        let mut delta = SourceWitnessPopulationDelta::default();
+        match counter {
+            "rows" => delta.rate_rows = u64::MAX,
+            "unqueryable" => delta.unqueryable_rate_rows = u64::MAX,
+            _ => delta.occurrence_count = u64::MAX,
+        }
+        let error = delta
+            .record_rate(u64::from(counter != "unqueryable"))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("population overflow"));
+        let failed_counter = match counter {
+            "rows" => delta.rate_rows,
+            "unqueryable" => delta.unqueryable_rate_rows,
+            _ => delta.occurrence_count,
+        };
+        assert_eq!(failed_counter, u64::MAX);
+    }
+    let mut delta = SourceWitnessPopulationDelta::default();
+    delta.record_rate(0).unwrap();
+    delta.record_rate(2).unwrap();
+    assert_eq!(
+        (
+            delta.rate_rows,
+            delta.unqueryable_rate_rows,
+            delta.occurrence_count
+        ),
+        (2, 1, 2)
+    );
+}
+
+#[test]
+fn source_witness_linked_provider_revalidates_raw_evidence_against_cached_identity() {
+    for corruption in [
+        "none",
+        "reference",
+        "id",
+        "wrong_id",
+        "groups",
+        "group_type",
+        "npi",
+        "locator",
+    ] {
+        let context = test_compact_context();
+        context.source_witness.configure_provider_spools(1).unwrap();
+        let mut provider = valid_provider_reference();
+        let (key, mut entry) = provider_ref_definition(&provider).unwrap();
+        let selected_npi = entry.npi[0];
+        match corruption {
+            "id" => {
+                provider
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("provider_group_id");
+            }
+            "wrong_id" => provider["provider_group_id"] = json!(8),
+            "groups" => {
+                provider.as_object_mut().unwrap().remove("provider_groups");
+            }
+            "group_type" => provider["provider_groups"] = json!({}),
+            "npi" => provider["provider_groups"][0]["npi"] = json!([2222222222_i64]),
+            _ => {}
+        }
+        let raw = format!(" \n{provider}\t").into_bytes();
+        let locator = context
+            .source_witness
+            .store_provider_source(0, &raw)
+            .unwrap();
+        context.source_witness.seal_provider_sources().unwrap();
+        if corruption != "locator" {
+            entry.source_locators.push(locator);
+        }
+        let provider_map = if corruption == "reference" {
+            HashMap::new()
+        } else {
+            HashMap::from([(key.clone(), entry)])
+        };
+        let rate = RateLite {
+            provider_refs: vec![key],
+            provider_groups: Vec::new(),
+            provider_groups_raw: None,
+            network_names: Vec::new(),
+            prices: Vec::new(),
+            prepared_price_set: None,
+        };
+        let result =
+            linked_provider_source_evidence(&rate, &[], &provider_map, &context, selected_npi);
+        if corruption == "none" {
+            let (evidence, retained_locator, digest) = result.unwrap();
+            assert_eq!(evidence["source_kind"], "provider_reference");
+            assert_eq!(evidence["provider_group_ordinal"], 0);
+            assert_eq!(evidence["npi_ordinal"], 0);
+            assert_eq!(retained_locator, Some(locator));
+            assert_eq!(digest, Some(<[u8; 32]>::from(Sha256::digest(&raw))));
+        } else {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{corruption}"
+            );
+        }
+        assert_eq!(
+            context
+                .source_witness
+                .read_provider_source(locator)
+                .unwrap(),
+            raw
+        );
+    }
+}
+
+#[test]
 fn skipped_inline_provider_quarantine_covers_raw_and_parsed_rates() {
     let parsed_rate = RateLite {
         provider_refs: Vec::new(),
@@ -126,7 +240,6 @@ fn strict_provider_definition_rejects_malformed_tin_and_network_metadata() {
     }
 
     for invalid_network_name in [
-        Value::Null,
         json!(true),
         json!(7),
         json!({}),
@@ -137,6 +250,13 @@ fn strict_provider_definition_rejects_malformed_tin_and_network_metadata() {
         provider_ref["network_name"] = invalid_network_name;
         assert!(provider_ref_definition(&provider_ref).is_err());
     }
+
+    let mut provider_ref = valid_provider_reference();
+    let omitted = provider_ref_definition(&provider_ref).unwrap();
+    provider_ref["network_name"] = Value::Null;
+    let explicit_null = provider_ref_definition(&provider_ref).unwrap();
+    assert!(explicit_null.1.network_names.is_empty());
+    assert_eq!(explicit_null, omitted);
 
     let mut scalar_provider_ref = valid_provider_reference();
     scalar_provider_ref["network_name"] = json!(" network one ");
@@ -4329,6 +4449,63 @@ fn v3_finalizer_requires_one_existing_price_key_map_input() {
     assert!(missing_count
         .to_string()
         .contains("requires --price-key-map-row-count"));
+
+    for option in [
+        "--workers",
+        "--total-sort-memory-bytes",
+        "--identity-map-max-bytes",
+        "--price-key-map-input",
+        "--price-key-map-row-count",
+        "--price-membership-input",
+        "--price-atom-input",
+    ] {
+        let error = parse_v3_finalizer_options(&[output.clone(), option.to_owned()]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), v3_finalizer_usage(), "{option}");
+    }
+
+    for option in [
+        "--workers",
+        "--total-sort-memory-bytes",
+        "--identity-map-max-bytes",
+        "--price-key-map-row-count",
+    ] {
+        let error = parse_v3_finalizer_options(&[
+            output.clone(),
+            option.to_owned(),
+            "not-a-number".to_owned(),
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("invalid {option} value:")),
+            "{option}: {error}",
+        );
+    }
+
+    for (required_arguments, expected) in [
+        (vec![], "requires --workers"),
+        (vec!["--workers", "2"], "requires --identity-map-max-bytes"),
+        (
+            vec!["--workers", "2", "--identity-map-max-bytes", "1"],
+            "requires --total-sort-memory-bytes",
+        ),
+    ] {
+        let mut arguments = vec![
+            output.clone(),
+            "--price-key-map-input".to_owned(),
+            map_path.display().to_string(),
+            "--price-key-map-row-count".to_owned(),
+            "1".to_owned(),
+        ];
+        arguments.extend(required_arguments.into_iter().map(str::to_owned));
+        arguments.push(manifest.clone());
+        let error = parse_v3_finalizer_options(&arguments).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(expected), "{error}");
+    }
 
     for invalid_count in ["0", "4294967297"] {
         let invalid = parse_v3_finalizer_options(&[

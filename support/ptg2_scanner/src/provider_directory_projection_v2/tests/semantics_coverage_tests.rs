@@ -18,11 +18,112 @@ fn expanded(addresses: Vec<Value>, references: Vec<Value>) -> Value {
 }
 
 #[test]
+fn explicit_npi_policy_rejects_resource_id_fallback_and_invalid_identifiers() {
+    let without_identifier = object(json!({}));
+    assert_eq!(
+        summary_npi(
+            &without_identifier,
+            "Organization",
+            "1003000126",
+            NpiIdentityPolicy::Legacy
+        )
+        .unwrap(),
+        Some(1_003_000_126),
+    );
+    assert_eq!(
+        summary_npi(
+            &without_identifier,
+            "Organization",
+            "1003000126",
+            NpiIdentityPolicy::ExplicitOnly
+        )
+        .unwrap(),
+        None,
+    );
+    let identifiers = object(json!({"identifier": [
+        {"system": "http://hl7.org/fhir/sid/us-npi", "value": "1234567890"},
+        {"system": "http://hl7.org/fhir/sid/us-npi", "value": "1234567893"}
+    ]}));
+    assert_eq!(
+        summary_npi(
+            &identifiers,
+            "Organization",
+            "1003000126",
+            NpiIdentityPolicy::ExplicitOnly
+        )
+        .unwrap(),
+        Some(1_234_567_893),
+    );
+    let type_text = object(json!({"identifier": [{
+        "type": {"text": "National Provider Identifier"},
+        "value": "1234567893"
+    }]}));
+    assert_eq!(
+        summary_npi(
+            &type_text,
+            "Organization",
+            "1003000126",
+            NpiIdentityPolicy::ExplicitOnly
+        )
+        .unwrap(),
+        Some(1_234_567_893),
+    );
+    let legacy_suffix = object(json!({"identifier": [{
+        "system": "http://hl7.org/fhir/sid/us-npi",
+        "value": "1234567893\u{2163}"
+    }]}));
+    assert_eq!(
+        summary_npi(
+            &legacy_suffix,
+            "Organization",
+            "1003000126",
+            NpiIdentityPolicy::Legacy
+        )
+        .unwrap(),
+        Some(1_234_567_893),
+    );
+}
+
+#[test]
+fn explicit_npi_policy_rejects_unicode_numeric_suffix_for_all_npi_resources() {
+    for resource_type in [
+        "HealthcareService",
+        "Organization",
+        "Practitioner",
+        "PractitionerRole",
+    ] {
+        for (value, expected_npi) in [
+            ("123-456-7893", Some(1_234_567_893)),
+            ("1234567893\u{0661}", None),
+            ("1234567893\u{00b2}", None),
+            ("1234567893\u{2163}", None),
+        ] {
+            let resource = object(json!({"identifier": [{
+                "system": "http://hl7.org/fhir/sid/us-npi",
+                "value": value
+            }]}));
+            assert_eq!(
+                summary_npi(
+                    &resource,
+                    resource_type,
+                    "1003000126",
+                    NpiIdentityPolicy::ExplicitOnly
+                )
+                .unwrap(),
+                expected_npi,
+                "{resource_type} with {value:?}",
+            );
+        }
+    }
+}
+
+#[test]
 fn internal_semantic_validation_boundaries_fail_closed() {
     let context = ProjectionCopyContext {
         recipe_id: "a".repeat(64),
         partition_id: "b".repeat(64),
         partition_ordinal: 1,
+        npi_identity_policy: NpiIdentityPolicy::Legacy,
     };
     assert!(project_resource(
         0,
@@ -130,7 +231,8 @@ fn internal_semantic_validation_boundaries_fail_closed() {
         summary_npi(
             &object(json!({"identifier": [{"system": "npi"}]})),
             "Practitioner",
-            "not-an-npi"
+            "not-an-npi",
+            NpiIdentityPolicy::Legacy,
         )
         .unwrap(),
         None
@@ -138,7 +240,8 @@ fn internal_semantic_validation_boundaries_fail_closed() {
     assert!(summary_npi(
         &object(json!({"identifier": [false]})),
         "Practitioner",
-        "not-an-npi"
+        "not-an-npi",
+        NpiIdentityPolicy::Legacy,
     )
     .is_err());
     assert_eq!(

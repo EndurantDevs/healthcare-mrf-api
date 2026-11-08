@@ -21,7 +21,10 @@ from process.ptg_parts.ptg2_shared_blocks import (
     PTG2_V3_SHARED_GENERATION,
     shared_block_hash,
 )
-from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
+from process.ptg_parts.ptg2_lifecycle_lock import (
+    acquire_ptg2_lifecycle_lock,
+    acquire_ptg2_source_lifecycle_lock,
+)
 from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
     PTG2_V4_MAP_BLOCK_KIND,
@@ -1598,6 +1601,46 @@ def _release_layouts_sql(
     )
 
 
+async def _empty_snapshot_history_keys(
+    executor: Any,
+    *,
+    schema_name: str,
+    snapshot_keys: Sequence[int],
+    batch_rows: int,
+    building_max_age_seconds: int,
+    abandonment_token: str | None = None,
+) -> list[int]:
+    """Delete one bounded legacy batch, retaining layouts with remaining rows."""
+
+    catalog_rows = await executor.all(
+        "SELECT to_regclass(:relation) IS NOT NULL AS installed",
+        relation=f"{_quote_ident(schema_name)}.ptg2_snapshot_lifecycle_writer",
+    )
+    if not _row_mapping(catalog_rows[0])["installed"]:
+        return list(snapshot_keys)
+    selected_keys = list(snapshot_keys[:batch_rows])
+    if not selected_keys:
+        return []
+    history_results = await executor.all(
+        f"""
+        SELECT snapshot_key,
+               {_quote_ident(schema_name)}.delete_ptg_snapshot_history(
+                   snapshot_key, :batch_rows, :building_max_age_seconds,
+                   :abandonment_token
+               ) AS empty
+          FROM unnest(CAST(:snapshot_keys AS bigint[])) AS selected(snapshot_key)
+        """,
+        snapshot_keys=selected_keys, batch_rows=max(1, batch_rows // len(selected_keys)),
+        building_max_age_seconds=building_max_age_seconds,
+        abandonment_token=abandonment_token,
+    )
+    return [
+        int(_row_mapping(history_result)["snapshot_key"])
+        for history_result in history_results
+        if _row_mapping(history_result)["empty"]
+    ]
+
+
 def _v4_abandonment_chunks(
     values: Sequence[bytes],
     batch_rows: int,
@@ -1716,7 +1759,7 @@ async def _owned_v4_stored_bytes(
     context: _OwnedV4AbandonmentContext,
     block_hashes: Sequence[bytes],
 ) -> int:
-    """Lock every referenced CAS row and return its exact stored bytes."""
+    """Resolve referenced CAS bytes under the aggregate lifecycle fence."""
 
     schema = _quote_ident(context.schema_name)
     stored_bytes = 0
@@ -1734,7 +1777,6 @@ async def _owned_v4_stored_bytes(
               FROM {schema}.ptg2_v3_block
              WHERE block_hash = ANY(CAST(:block_hashes AS bytea[]))
              ORDER BY block_hash
-             FOR KEY SHARE
             """,
             block_hashes=list(hash_batch),
         )
@@ -1833,7 +1875,7 @@ async def _queue_owned_v4_candidate_batch(
     context: _OwnedV4AbandonmentContext,
     block_hashes: Sequence[bytes],
 ) -> int:
-    """Queue one locked hash batch for ordinary grace-bound CAS sweeping."""
+    """Queue one checked hash batch under the aggregate lifecycle fence."""
 
     await _set_v4_abandonment_statement_timeout(
         executor,
@@ -1857,7 +1899,6 @@ async def _queue_owned_v4_candidate_batch(
           FROM {schema}.ptg2_v3_block
          WHERE block_hash = ANY(CAST(:block_hashes AS bytea[]))
          ORDER BY block_hash
-         FOR KEY SHARE
         """,
         block_hashes=list(block_hashes),
     )
@@ -1951,7 +1992,6 @@ def _delete_v4_pin_batch_sql(schema: str) -> str:
                     SELECT DISTINCT selected.block_hash FROM selected
              )
              ORDER BY block.block_hash
-             FOR KEY SHARE
         ),
         queued AS (
             INSERT INTO {schema}.ptg2_v3_gc_candidate AS candidate
@@ -2065,7 +2105,7 @@ async def _assert_owned_v4_candidates_complete(
     context: _OwnedV4AbandonmentContext,
     block_hashes: Sequence[bytes],
 ) -> None:
-    """Require every inventory hash to remain locked and queued."""
+    """Require every inventory hash to remain present and queued."""
 
     schema = _quote_ident(context.schema_name)
     for hash_batch in _v4_abandonment_chunks(
@@ -2081,7 +2121,6 @@ async def _assert_owned_v4_candidates_complete(
              WHERE candidate.block_hash = ANY(CAST(:block_hashes AS bytea[]))
              ORDER BY candidate.block_hash
              FOR UPDATE OF candidate
-             FOR KEY SHARE OF block
             """,
             block_hashes=list(hash_batch),
         )
@@ -2194,6 +2233,14 @@ async def _finalize_owned_v4_abandonment(
         executor,
         context=context,
     )
+    empty_keys = await _empty_snapshot_history_keys(
+        executor, schema_name=context.schema_name,
+        snapshot_keys=(context.snapshot_key,), batch_rows=context.batch_rows,
+        building_max_age_seconds=PTG2_V3_BUILDING_MAX_AGE_SECONDS_DEFAULT,
+        abandonment_token=inventory.abandonment_token,
+    )
+    if not empty_keys:
+        return PTG2SharedLayoutGCStats()
     await _delete_owned_v4_layout(
         executor,
         context=context,
@@ -2287,11 +2334,24 @@ async def _run_owned_v4_step(
         context.deadline,
         context.monotonic,
     )
-    if executor is not None:
+    async def fenced_step(connection: Any) -> Any:
+        """Keep CAS stable until the exact-owner cleanup step commits."""
+        timeout = min(
+            _v4_abandonment_remaining_seconds(context.deadline, context.monotonic),
+            context.statement_timeout_seconds,
+        )
+        await acquire_ptg2_source_lifecycle_lock(
+            connection,
+            source_key=f"layout_{context.build_token}",
+            statement_timeout=f"{max(1, int(timeout * 1000))}ms",
+        )
         if step_guard is not None:
-            await step_guard(executor)
-        return await operation(executor)
-    return await _run_owned_v4_abandonment_step(operation, step_guard)
+            await step_guard(connection)
+        return await operation(connection)
+
+    if executor is not None:
+        return await fenced_step(executor)
+    return await _run_owned_v4_abandonment_step(fenced_step)
 
 
 async def _queue_owned_v4_candidates(
@@ -2396,7 +2456,7 @@ async def _finalize_owned_v4_step(
         context=context,
         inventory=inventory,
     )
-    if finalize_callback is not None:
+    if finalize_callback is not None and stats.logical_layout_count:
         await finalize_callback(connection, stats)
     return stats
 
@@ -2453,6 +2513,10 @@ async def _execute_owned_v4_abandonment(
         executor=executor,
         step_guard=callbacks.step_guard,
     )
+    if not stats.logical_layout_count:
+        raise PTG2SharedLayoutAbandonmentDeferred(
+            "bounded PTG V4 history cleanup committed; resume the remaining rows"
+        )
     if progress_callback is not None:
         progress_callback("layouts", stats.logical_layout_count)
     return stats
@@ -2493,6 +2557,31 @@ async def abandon_owned_v4_layout(
         raise
 
 
+async def _lock_cleanup_layout_keys(
+    executor: Any,
+    *,
+    schema_name: str,
+    building_max_age_seconds: int,
+    max_layouts: int,
+    layout_keys: Sequence[int] | None,
+) -> list[int]:
+    """Lock one bounded eligible layout set before removing snapshot payloads."""
+
+    locked_rows = await executor.all(
+        _lock_layouts_sql(schema_name),
+        cleanup_generations=list(PTG2_V3_CLEANUP_GENERATIONS),
+        building_max_age_seconds=building_max_age_seconds,
+        layout_limit=max_layouts,
+        restrict_layout_keys=layout_keys is not None,
+        layout_keys=list(layout_keys or ()),
+    )
+    return [
+        int(_row_mapping(locked_layout_row).get("snapshot_key"))
+        for locked_layout_row in locked_rows
+        if _row_mapping(locked_layout_row).get("snapshot_key") is not None
+    ]
+
+
 async def _release_layouts_ready(
     executor: Any,
     *,
@@ -2503,19 +2592,13 @@ async def _release_layouts_ready(
     layout_keys: Sequence[int] | None,
     dense_batch_rows: int | None = None,
 ) -> PTG2SharedLayoutGCStats:
-    locked_rows = await executor.all(
-        _lock_layouts_sql(schema_name),
-        cleanup_generations=list(PTG2_V3_CLEANUP_GENERATIONS),
+    """Queue reachable CAS and release only layouts whose payload batches are empty."""
+
+    layout_keys = await _lock_cleanup_layout_keys(
+        executor, schema_name=schema_name,
         building_max_age_seconds=building_max_age_seconds,
-        layout_limit=max_layouts,
-        restrict_layout_keys=layout_keys is not None,
-        layout_keys=list(layout_keys or ()),
+        max_layouts=max_layouts, layout_keys=layout_keys,
     )
-    layout_keys = [
-        int(_row_mapping(locked_layout_row).get("snapshot_key"))
-        for locked_layout_row in locked_rows
-        if _row_mapping(locked_layout_row).get("snapshot_key") is not None
-    ]
     if not layout_keys:
         return PTG2SharedLayoutGCStats()
     v4_tables_available = await _has_v4_map_tables(executor, schema_name)
@@ -2532,6 +2615,11 @@ async def _release_layouts_ready(
         )
         if v4_tables_available
         else set()
+    )
+    layout_keys = await _empty_snapshot_history_keys(
+        executor, schema_name=schema_name, snapshot_keys=layout_keys,
+        batch_rows=_v4_abandonment_batch_rows(dense_batch_rows),
+        building_max_age_seconds=building_max_age_seconds,
     )
     aggregate_records = await executor.all(
         _release_layouts_sql(

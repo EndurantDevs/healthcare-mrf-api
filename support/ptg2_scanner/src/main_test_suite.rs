@@ -6,35 +6,50 @@ mod cases {
 
     struct TestEnvVar {
         name: &'static str,
-        previous: Option<String>,
+        previous: Option<Option<std::ffi::OsString>>,
     }
 
     impl TestEnvVar {
         fn set(name: &'static str, value: &str) -> Self {
-            let previous = std::env::var(name).ok();
-            std::env::set_var(name, value);
+            let previous = env::replace_test_var(name, Some(value.into()));
             Self { name, previous }
         }
 
         fn remove(name: &'static str) -> Self {
-            let previous = std::env::var(name).ok();
-            std::env::remove_var(name);
+            let previous = env::replace_test_var(name, None);
             Self { name, previous }
         }
     }
 
     impl Drop for TestEnvVar {
         fn drop(&mut self) {
-            match self.previous.as_deref() {
-                Some(value) => std::env::set_var(self.name, value),
-                None => std::env::remove_var(self.name),
-            }
+            env::restore_test_var(self.name, self.previous.take());
         }
     }
 
     fn scanner_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn test_env_overrides_restore_and_reach_worker_threads() {
+        const NAME: &str = "PTG2_SCANNER_TEST_ENV_OVERRIDE";
+        let _lock = scanner_env_lock().lock().unwrap();
+        let inherited = env::var_os(NAME);
+        let outer = TestEnvVar::set(NAME, "outer");
+        assert_eq!(env::var(NAME).as_deref(), Ok("outer"));
+        assert_eq!(
+            thread::spawn(|| env::var(NAME)).join().unwrap().as_deref(),
+            Ok("outer")
+        );
+        {
+            let _removed = TestEnvVar::remove(NAME);
+            assert!(matches!(env::var(NAME), Err(env::VarError::NotPresent)));
+        }
+        assert_eq!(env::var(NAME).as_deref(), Ok("outer"));
+        drop(outer);
+        assert_eq!(env::var_os(NAME), inherited);
     }
 
     #[derive(Clone)]
@@ -366,7 +381,7 @@ mod cases {
     }
 
     fn source_witness_record_metadata(bundle: &[u8]) -> Vec<Value> {
-        assert_eq!(&bundle[..8], b"PTG2SW03");
+        assert_eq!(&bundle[..8], b"PTG2SW04");
         let header_length = u32::from_be_bytes(bundle[8..12].try_into().unwrap()) as usize;
         let mut offset = 12 + header_length;
         let evidence_count =
@@ -380,6 +395,15 @@ mod cases {
             let compressed_length =
                 u32::from_be_bytes(bundle[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4 + compressed_length;
+        }
+        let recipe_count =
+            u32::from_be_bytes(bundle[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        for _ in 0..recipe_count {
+            offset += 36;
+            let reference_count =
+                u32::from_be_bytes(bundle[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4 + reference_count * 32;
         }
         let record_count =
             u32::from_be_bytes(bundle[offset..offset + 4].try_into().unwrap()) as usize;
@@ -404,9 +428,19 @@ mod cases {
     }
 
     fn source_witness_header(bundle: &[u8]) -> Value {
-        assert_eq!(&bundle[..8], b"PTG2SW03");
+        assert_eq!(&bundle[..8], b"PTG2SW04");
         let header_length = u32::from_be_bytes(bundle[8..12].try_into().unwrap()) as usize;
-        serde_json::from_slice(&bundle[12..12 + header_length]).unwrap()
+        let header: Value = serde_json::from_slice(&bundle[12..12 + header_length]).unwrap();
+        assert_eq!(header["format_version"], 4);
+        assert_eq!(header["evidence_encoding"], "fixed_byte_fragments_v1");
+        assert_eq!(header["fragment_byte_count"], 4096);
+        let fragment_count = u32::from_be_bytes(
+            bundle[12 + header_length..16 + header_length]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(header["fragment_count"], fragment_count);
+        header
     }
 
     fn strict_scan_env(serving_run_directory: &Path) -> [TestEnvVar; 5] {
@@ -2035,4 +2069,21 @@ mod cases {
     mod finalizer_and_provider;
     mod scanner_and_v3_finalizer;
     mod serving_and_runtime;
+}
+#[test]
+fn fragment_witness_capacity_failures_are_typed_without_masking_corruption() {
+    for detail in [
+        "fragment count exceeds its bound",
+        "recipe count exceeds its bound",
+        "recipe reference work exceeds its bound",
+        "reconstructed byte work exceeds its bound",
+    ] {
+        let failure = std::io::Error::other(format!("source witness {detail}"));
+        assert_eq!(
+            super::scanner_failure_code(&failure),
+            "witness_payload_limit"
+        );
+    }
+    let corruption = std::io::Error::other("source witness fragment digest is inconsistent");
+    assert_eq!(super::scanner_failure_code(&corruption), "scanner_failure");
 }

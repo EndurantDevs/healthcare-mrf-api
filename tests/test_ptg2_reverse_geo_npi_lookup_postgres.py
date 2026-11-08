@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import pytest
 
+from api import ptg2_geo_projection as geo_projection
 from api import ptg2_serving as serving
 from tests.ptg2_serving_address_evidence_postgres_geo import (
     _insert_cms_identity_locations,
@@ -159,7 +161,13 @@ def test_npi_only_sql_keeps_the_unique_scope_probe_correlated():
     assert "addr.location_key" in statement
     assert "ORDER BY distance_miles ASC NULLS LAST, npi" in statement
     assert statement.index("ORDER BY distance_miles") < statement.index("LIMIT :limit")
-    assert "jsonb_build_" not in statement
+    metadata_predicate = geo_projection.projection_state_available_sql("mrf")
+    sql_without_metadata = statement
+    for predicate in (metadata_predicate, _schema_sql(metadata_predicate, "mrf")):
+        assert predicate in statement
+        assert re.search(r"\baddr\b", predicate, re.IGNORECASE) is None
+        sql_without_metadata = sql_without_metadata.replace(predicate, "")
+    assert "jsonb_build_" not in sql_without_metadata
     assert "address_payload" not in statement
 
 

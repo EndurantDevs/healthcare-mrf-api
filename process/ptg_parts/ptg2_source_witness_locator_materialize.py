@@ -147,6 +147,13 @@ def _materialized_evidence_map(
 ) -> dict[str, bytes]:
     evidence_by_sha256: dict[str, bytes] = {}
     for evidence_sha256, evidence_locator in evidence_locator_by_sha256.items():
+        if evidence_locator.fragments_by_sha256 is not None:
+            from process.ptg_parts.ptg2_source_witness_fragment_bundle import read_fragment_locator_token
+
+            evidence_by_sha256[evidence_sha256] = read_fragment_locator_token(
+                bundle_file, bundle_identity, evidence_locator,
+            )
+            continue
         compressed_evidence = _read_locator_payload(
             bundle_file,
             bundle_identity,

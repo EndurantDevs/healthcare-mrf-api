@@ -22,6 +22,12 @@ from process.ptg_parts.frozen_rate_binding import (
 from process.ptg_parts.frozen_rate_candidate import (
     validate_frozen_candidate_evidence,
 )
+from process.ptg_parts.ptg2_batch_candidate_audit_report import (
+    PTG2_BATCH_AUDIT_ATTESTATION_CONTRACT,
+    PTG2_BATCH_AUDIT_REPORT_SCHEMA_VERSION,
+    PTG2_BATCH_AUDIT_TOOL,
+    validate_batch_candidate_release_audit_report,
+)
 from process.ptg_parts.ptg2_candidate_audit_contract import (
     PTG2_FAST_AUDIT_CONTRACT,
     PTG2_FAST_AUDIT_DEADLINE_SECONDS,
@@ -36,11 +42,17 @@ from process.ptg_parts.ptg2_candidate_layout_identity import (
     normalize_candidate_storage_generation,
     validate_candidate_layout_identity,
 )
-from process.ptg_parts.ptg2_batch_candidate_audit_report import (
-    PTG2_BATCH_AUDIT_ATTESTATION_CONTRACT,
-    PTG2_BATCH_AUDIT_REPORT_SCHEMA_VERSION,
-    PTG2_BATCH_AUDIT_TOOL,
-    validate_batch_candidate_release_audit_report,
+from process.ptg_parts.ptg2_invalid_price_exclusion import (
+    validate_candidate_invalid_price_exclusion_evidence,
+    validated_candidate_invalid_price_exclusion_policy,
+)
+from process.ptg_parts.ptg2_lifecycle_lock import (
+    acquire_ptg2_source_lifecycle_lock,
+)
+from process.ptg_parts.ptg2_provider_quarantine import (
+    provider_identifier_quarantine_evidence,
+    validate_provider_identifier_quarantine,
+    validate_provider_identifier_quarantine_evidence,
 )
 from process.ptg_parts.ptg2_shared_reuse import (
     PTG2_V3_SOURCE_SET_CONTRACT,
@@ -49,52 +61,29 @@ from process.ptg_parts.ptg2_shared_reuse import (
 from process.ptg_parts.ptg2_shared_source_set import (
     ordered_source_ordinal_digest,
 )
-from process.ptg_parts.ptg2_lifecycle_lock import (
-    acquire_ptg2_source_lifecycle_lock,
-)
-from process.ptg_parts.ptg2_invalid_price_exclusion import (
-    validate_candidate_invalid_price_exclusion_evidence,
-    validated_candidate_invalid_price_exclusion_policy,
-)
-from process.ptg_parts.ptg2_provider_quarantine import (
-    provider_identifier_quarantine_evidence,
-    validate_provider_identifier_quarantine,
-    validate_provider_identifier_quarantine_evidence,
-)
 from process.ptg_parts.ptg2_source_witness_contract import (
     PTG2_V3_SOURCE_WITNESS_SELECTION,
     source_witness_manifest_projection,
     validate_source_witness_manifest,
 )
 
-
-PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3 = (
-    "ptg2_v3_release_audit_attestation_v3"
-)
-PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4 = (
-    PTG2_BATCH_AUDIT_ATTESTATION_CONTRACT
-)
-PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT = (
-    PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
-)
+PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3 = "ptg2_v3_release_audit_attestation_v3"
+PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4 = PTG2_BATCH_AUDIT_ATTESTATION_CONTRACT
+PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT = PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4
 PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS = (
     PTG2_CANDIDATE_ATTESTATION_CONTRACT_V4,
     PTG2_CANDIDATE_ATTESTATION_CONTRACT_V3,
 )
 # Compatibility alias for callers that record the current writer contract.
 # Readers continue accepting every explicitly SUPPORTED rolling contract.
-PTG2_CANDIDATE_ATTESTATION_CONTRACT = (
-    PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT
-)
+PTG2_CANDIDATE_ATTESTATION_CONTRACT = PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT
 PTG2_CANDIDATE_AUDIT_TOOL = PTG2_FAST_AUDIT_TOOL
 PTG2_CANDIDATE_AUDIT_TOOL_VERSION = PTG2_FAST_AUDIT_TOOL_VERSION
 PTG2_VERIFIED_HTTPS_TRANSPORT = "verified_https_v1"
 PTG2_TRUSTED_CLUSTER_HTTP_TRANSPORT = "authenticated_cluster_service_v1"
 PTG2_CANDIDATE_API_PATH = "/api/v1/pricing/providers/audit-search-by-procedure"
 PTG2_CANDIDATE_OCCURRENCE_API_PATH = "/api/v1/pricing/providers/audit-occurrences"
-PTG2_CANDIDATE_ATTESTATION_TTL_HOURS_ENV = (
-    "HLTHPRT_PTG2_CANDIDATE_ATTESTATION_TTL_HOURS"
-)
+PTG2_CANDIDATE_ATTESTATION_TTL_HOURS_ENV = "HLTHPRT_PTG2_CANDIDATE_ATTESTATION_TTL_HOURS"
 PTG2_CANDIDATE_ATTESTATION_TTL_HOURS_DEFAULT = 24
 PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE = "audit_and_activate"
 PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY = "audit_only"
@@ -104,12 +93,8 @@ PTG2_CANDIDATE_ACTIVATION_INTENTS = frozenset(
         PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY,
     }
 )
-_PTG2_CANDIDATE_ATTESTATION_DIGEST_DOMAIN = (
-    b"PTG2CANDIDATEAUDITINTENT\x01"
-)
-PTG2_CANDIDATE_AUDIT_REPORT_MAX_AGE_MINUTES_ENV = (
-    "HLTHPRT_PTG2_CANDIDATE_AUDIT_REPORT_MAX_AGE_MINUTES"
-)
+_PTG2_CANDIDATE_ATTESTATION_DIGEST_DOMAIN = b"PTG2CANDIDATEAUDITINTENT\x01"
+PTG2_CANDIDATE_AUDIT_REPORT_MAX_AGE_MINUTES_ENV = "HLTHPRT_PTG2_CANDIDATE_AUDIT_REPORT_MAX_AGE_MINUTES"
 
 
 class CandidateAttestationWriterContractError(ValueError):
@@ -181,9 +166,7 @@ def candidate_attestation_digest(
     normalized_report_digest = bytes(report_digest)
     if len(normalized_report_digest) != 32:
         raise ValueError("candidate audit report digest is invalid")
-    normalized_intent = normalize_candidate_activation_intent(
-        activation_intent
-    )
+    normalized_intent = normalize_candidate_activation_intent(activation_intent)
     intent_bytes = normalized_intent.encode("ascii")
     return hashlib.sha256(
         _PTG2_CANDIDATE_ATTESTATION_DIGEST_DOMAIN
@@ -201,19 +184,13 @@ def parse_candidate_attestation_digest(value: Any) -> bytes:
     else:
         digest_text = str(value or "").strip()
         if len(digest_text) != 64:
-            raise ValueError(
-                "expected_audit_only_attestation_digest must be 64 hex characters"
-            )
+            raise ValueError("expected_audit_only_attestation_digest must be 64 hex characters")
         try:
             digest = bytes.fromhex(digest_text)
         except ValueError as exc:
-            raise ValueError(
-                "expected_audit_only_attestation_digest must be 64 hex characters"
-            ) from exc
+            raise ValueError("expected_audit_only_attestation_digest must be 64 hex characters") from exc
     if len(digest) != 32:
-        raise ValueError(
-            "expected_audit_only_attestation_digest must be 64 hex characters"
-        )
+        raise ValueError("expected_audit_only_attestation_digest must be 64 hex characters")
     return digest
 
 
@@ -357,9 +334,7 @@ def _v3_report_sections(report: Mapping[str, Any]) -> _V3ReportSections:
         unsupported_fields = sorted(report_keys - _REQUIRED_REPORT_TOP_LEVEL_KEYS)
         detail = "missing=" + ",".join(missing_fields) if missing_fields else ""
         if unsupported_fields:
-            detail += ("; " if detail else "") + "unsupported=" + ",".join(
-                unsupported_fields
-            )
+            detail += ("; " if detail else "") + "unsupported=" + ",".join(unsupported_fields)
         raise ValueError(f"audit report fields are invalid ({detail})")
     failures_by_field = _required_report_mapping(report_by_field, "failures")
     return _V3ReportSections(
@@ -413,16 +388,10 @@ def _validated_v3_report_time(
         or float(duration_seconds) < 0
         or float(duration_seconds) > PTG2_FAST_AUDIT_DEADLINE_SECONDS
         or started_at > completed_at
-        or abs(
-            (completed_at - started_at).total_seconds()
-            - float(duration_seconds)
-        )
-        > 1.0
+        or abs((completed_at - started_at).total_seconds() - float(duration_seconds)) > 1.0
     ):
         raise ValueError("audit report timing is invalid")
-    if completed_at > evaluation_time + datetime.timedelta(
-        seconds=PTG2_CANDIDATE_AUDIT_REPORT_FUTURE_SKEW_SECONDS
-    ):
+    if completed_at > evaluation_time + datetime.timedelta(seconds=PTG2_CANDIDATE_AUDIT_REPORT_FUTURE_SKEW_SECONDS):
         raise ValueError("audit report completion time is in the future")
     if completed_at <= evaluation_time - _audit_report_max_age():
         raise ValueError("audit report is too old for candidate activation")
@@ -459,9 +428,7 @@ def _validated_v3_tool_version(sections: _V3ReportSections) -> str:
     ):
         raise ValueError("audit report did not pass the release gate")
     request_p95_ms = sections.latency_by_field.get("request_p95_ms")
-    request_p95_ceiling_ms = sections.latency_by_field.get(
-        "request_p95_ceiling_ms"
-    )
+    request_p95_ceiling_ms = sections.latency_by_field.get("request_p95_ceiling_ms")
     if (
         isinstance(request_p95_ms, bool)
         or not isinstance(request_p95_ms, (int, float))
@@ -500,20 +467,12 @@ def _validate_v3_target(
     }
     for field_name, expected_value in expected_target_by_field.items():
         if target_by_field.get(field_name) != expected_value:
-            raise ValueError(
-                f"audit report target {field_name} does not match the candidate"
-            )
+            raise ValueError(f"audit report target {field_name} does not match the candidate")
     transport_contract = target_by_field.get("transport_contract")
     is_tls_verified = target_by_field.get("tls_verified")
     if not (
-        (
-            transport_contract == PTG2_VERIFIED_HTTPS_TRANSPORT
-            and is_tls_verified is True
-        )
-        or (
-            transport_contract == PTG2_TRUSTED_CLUSTER_HTTP_TRANSPORT
-            and is_tls_verified is False
-        )
+        (transport_contract == PTG2_VERIFIED_HTTPS_TRANSPORT and is_tls_verified is True)
+        or (transport_contract == PTG2_TRUSTED_CLUSTER_HTTP_TRANSPORT and is_tls_verified is False)
     ):
         raise ValueError("audit report transport contract is invalid")
 
@@ -522,8 +481,7 @@ def _validate_v3_redaction(redaction_by_field: Mapping[str, Any]) -> None:
     if (
         redaction_by_field.get("policy") != "sensitive_identifiers_excluded"
         or not isinstance(redaction_by_field.get("excluded"), list)
-        or tuple(redaction_by_field["excluded"])
-        != _REQUIRED_REDACTION_EXCLUSIONS
+        or tuple(redaction_by_field["excluded"]) != _REQUIRED_REDACTION_EXCLUSIONS
     ):
         raise ValueError("audit report redaction contract is invalid")
 
@@ -569,9 +527,7 @@ def _validated_v3_witness(
         sections.source_by_field.get("source_set_digest"),
         field="source.source_set_digest",
     )
-    if witness_by_field["source_set_digest"] != sections.source_by_field.get(
-        "source_set_digest"
-    ):
+    if witness_by_field["source_set_digest"] != sections.source_by_field.get("source_set_digest"):
         raise ValueError("audit report source-witness source set is invalid")
     source_witness_digest = _sha256_digest(
         witness_by_field.get("payload_sha256"),
@@ -583,9 +539,7 @@ def _validated_v3_witness(
     )
     return _V3WitnessEvidence(
         witness_by_field=witness_by_field,
-        expected_challenge_count=int(
-            witness_by_field["occurrence_witness_count"]
-        ),
+        expected_challenge_count=int(witness_by_field["occurrence_witness_count"]),
         provider_witness_count=int(witness_by_field["provider_witness_count"]),
         checks_by_name=_validated_v3_checks(
             sections.checks_by_name,
@@ -611,29 +565,19 @@ def _validated_v3_http_requests(
         expected_challenge_count + 1,
     )
     if (
-        sections.coverage_by_field.get("selection_method")
-        != PTG2_V3_SOURCE_WITNESS_SELECTION
-        or sections.coverage_by_field.get(
-            "queryable_occurrence_population_count"
-        )
+        sections.coverage_by_field.get("selection_method") != PTG2_V3_SOURCE_WITNESS_SELECTION
+        or sections.coverage_by_field.get("queryable_occurrence_population_count")
         != witness_by_field["queryable_occurrence_population_count"]
-        or sections.coverage_by_field.get("emitted_rate_row_count")
-        != witness_by_field["emitted_rate_row_count"]
+        or sections.coverage_by_field.get("emitted_rate_row_count") != witness_by_field["emitted_rate_row_count"]
         or sections.coverage_by_field.get("unqueryable_rate_row_count")
         != witness_by_field["unqueryable_rate_row_count"]
-        or sections.coverage_by_field.get("unqueryable_rate_policy")
-        != witness_by_field["unqueryable_rate_policy"]
-        or sections.coverage_by_field.get("occurrence_sample_count")
-        != expected_challenge_count
-        or sections.coverage_by_field.get("provider_sample_count")
-        != witness_evidence.provider_witness_count
-        or sections.random_requests_by_field.get("requested")
-        != expected_challenge_count
-        or sections.random_requests_by_field.get("executed")
-        != expected_challenge_count
+        or sections.coverage_by_field.get("unqueryable_rate_policy") != witness_by_field["unqueryable_rate_policy"]
+        or sections.coverage_by_field.get("occurrence_sample_count") != expected_challenge_count
+        or sections.coverage_by_field.get("provider_sample_count") != witness_evidence.provider_witness_count
+        or sections.random_requests_by_field.get("requested") != expected_challenge_count
+        or sections.random_requests_by_field.get("executed") != expected_challenge_count
         or sections.http_by_field.get("max_concurrency") != 32
-        or _required_count(sections.http_by_field, "retry_count", 0)
-        > standard_http_requests
+        or _required_count(sections.http_by_field, "retry_count", 0) > standard_http_requests
         or standard_http_requests > expected_challenge_count * 16 + 2
         or sections.audit_sample_by_field.get("sample_digest_validated") is not True
         or sections.audit_sample_by_field.get("source_set_validated") is not True
@@ -706,9 +650,7 @@ def validate_candidate_release_audit_report(
 ) -> dict[str, Any]:
     """Dispatch strict V3 and V4 release reports without rewriting history."""
 
-    normalized_generation = normalize_candidate_storage_generation(
-        storage_generation
-    )
+    normalized_generation = normalize_candidate_storage_generation(storage_generation)
     if report.get("schema_version") == PTG2_BATCH_AUDIT_REPORT_SCHEMA_VERSION:
         return validate_batch_candidate_release_audit_report(
             report,
@@ -720,9 +662,7 @@ def validate_candidate_release_audit_report(
             evaluated_at=evaluated_at,
         )
     if normalized_generation != PTG2_CANDIDATE_V3_GENERATION:
-        raise ValueError(
-            "legacy candidate audit reports require shared_blocks_v3"
-        )
+        raise ValueError("legacy candidate audit reports require shared_blocks_v3")
     return _validate_v3_release_report(
         report,
         snapshot_id=snapshot_id,
@@ -740,9 +680,7 @@ def _require_current_candidate_attestation_writer(
 
     report_contract = str(evidence.get("contract") or "").strip()
     if report_contract != PTG2_CANDIDATE_ATTESTATION_CURRENT_CONTRACT:
-        raise CandidateAttestationWriterContractError(
-            "candidate audit report contract is not enabled for writes"
-        )
+        raise CandidateAttestationWriterContractError("candidate audit report contract is not enabled for writes")
 
 
 def _attestation_ttl_hours() -> int:
@@ -774,15 +712,9 @@ def _validated_candidate_physical_identity(
         _sha256_hex(raw_digest, field="candidate raw container digest")
         for raw_digest in list(database_row.get("raw_container_sha256_values") or [])
     )
-    observed_source_set_by_field = shared_source_set_metadata(
-        raw_container_hashes
-    )
-    source_set_digest_hex = str(
-        source_set_by_field.get("raw_container_sha256_digest") or ""
-    ).strip().lower()
-    coverage_scope_hex = str(
-        serving_index_by_field.get("coverage_scope_id") or ""
-    ).strip().lower()
+    observed_source_set_by_field = shared_source_set_metadata(raw_container_hashes)
+    source_set_digest_hex = str(source_set_by_field.get("raw_container_sha256_digest") or "").strip().lower()
+    coverage_scope_hex = str(serving_index_by_field.get("coverage_scope_id") or "").strip().lower()
     if len(source_set_digest_hex) != 64 or len(coverage_scope_hex) != 64:
         raise ValueError("candidate manifest is missing immutable audit identity")
     try:
@@ -794,21 +726,13 @@ def _validated_candidate_physical_identity(
     if (
         source_set_by_field.get("contract") != PTG2_V3_SOURCE_SET_CONTRACT
         or int(source_set_by_field.get("source_count") or -1) != source_count
-        or source_set_digest
-        != bytes.fromhex(
-            observed_source_set_by_field["raw_container_sha256_digest"]
-        )
-        or coverage_scope_id
-        != bytes(database_row.get("coverage_scope_id") or b"")
+        or source_set_digest != bytes.fromhex(observed_source_set_by_field["raw_container_sha256_digest"])
+        or coverage_scope_id != bytes(database_row.get("coverage_scope_id") or b"")
     ):
         raise ValueError("candidate manifest disagrees with its PostgreSQL bindings")
     if (
-        str(layout_serving_index_by_field.get("coverage_scope_id") or "")
-        .strip()
-        .lower()
-        != coverage_scope_hex
-        or int(layout_serving_index_by_field.get("source_count") or -1)
-        != source_count
+        str(layout_serving_index_by_field.get("coverage_scope_id") or "").strip().lower() != coverage_scope_hex
+        or int(layout_serving_index_by_field.get("source_count") or -1) != source_count
     ):
         raise ValueError("sealed layout disagrees with the candidate physical scope")
     return _CandidatePhysicalIdentity(
@@ -825,11 +749,9 @@ def _validated_candidate_audit_sample(
     source_count: int,
 ) -> tuple[dict[str, Any], bytes]:
     try:
-        snapshot_public_sample_by_field = (
-            validated_public_audit_sample_projection(
-                snapshot_sample_by_field,
-                expected_source_count=source_count,
-            )
+        snapshot_public_sample_by_field = validated_public_audit_sample_projection(
+            snapshot_sample_by_field,
+            expected_source_count=source_count,
         )
         layout_public_sample_by_field = validated_public_audit_sample_projection(
             layout_sample_by_field,
@@ -895,9 +817,7 @@ def _validated_candidate_quarantine(
         layout_serving_index_by_field.get("provider_identifier_quarantine")
     )
     if snapshot_quarantine_by_field != layout_quarantine_by_field:
-        raise ValueError(
-            "candidate provider identifier quarantine changed after layout sealing"
-        )
+        raise ValueError("candidate provider identifier quarantine changed after layout sealing")
     return layout_quarantine_by_field
 
 
@@ -945,20 +865,16 @@ def _validated_candidate_public_evidence(
         serving_index_by_field,
         layout_serving_index_by_field,
     )
-    audit_sample_by_field, audit_sample_digest = (
-        _validated_candidate_audit_sample(
-            _mapping(serving_index_by_field.get("audit_sample")),
-            _mapping(layout_serving_index_by_field.get("audit_sample")),
-            physical_identity.source_count,
-        )
+    audit_sample_by_field, audit_sample_digest = _validated_candidate_audit_sample(
+        _mapping(serving_index_by_field.get("audit_sample")),
+        _mapping(layout_serving_index_by_field.get("audit_sample")),
+        physical_identity.source_count,
     )
-    source_witness_by_field, source_witness_digest = (
-        _validated_candidate_source_witness(
-            _mapping(serving_index_by_field.get("source_witness")),
-            _mapping(layout_serving_index_by_field.get("source_witness")),
-            source_count=physical_identity.source_count,
-            source_set_digest_hex=physical_identity.source_set_digest.hex(),
-        )
+    source_witness_by_field, source_witness_digest = _validated_candidate_source_witness(
+        _mapping(serving_index_by_field.get("source_witness")),
+        _mapping(layout_serving_index_by_field.get("source_witness")),
+        source_count=physical_identity.source_count,
+        source_set_digest_hex=physical_identity.source_set_digest.hex(),
     )
     return (
         quarantine_by_field,
@@ -1011,26 +927,20 @@ def _candidate_evidence_identity(
         "storage_generation": storage_generation,
         "source_key": str(activation_by_field.get("source_key") or "").strip().lower(),
         "plan_id": str(database_row.get("plan_id") or "").strip(),
-        "plan_market_type": str(
-            database_row.get("plan_market_type") or ""
-        ).strip().lower(),
+        "plan_market_type": str(database_row.get("plan_market_type") or "").strip().lower(),
         "coverage_scope_id": physical_identity.coverage_scope_id,
         "source_set_digest": physical_identity.source_set_digest,
-        "ordered_source_ordinal_digest": ordered_source_ordinal_digest(
-            physical_identity.raw_container_hashes
-        ),
+        "ordered_source_ordinal_digest": ordered_source_ordinal_digest(physical_identity.raw_container_hashes),
         "source_witness_manifest": source_witness_by_field,
         "audit_sample_public": audit_sample_by_field,
         "source_witness_digest": source_witness_digest,
         "audit_sample_digest": audit_sample_digest,
         "provider_identifier_quarantine": quarantine_by_field,
-        "provider_identifier_quarantine_evidence": (
-            provider_identifier_quarantine_evidence(quarantine_by_field)
-        ),
+        "provider_identifier_quarantine_evidence": (provider_identifier_quarantine_evidence(quarantine_by_field)),
     }
 
 
-def _candidate_identity(database_row: Mapping[str, Any]) -> dict[str, Any]:
+def _candidate_identity(database_row: Mapping[str, Any], *, physical_binding=None) -> dict[str, Any]:
     """Validate candidate bindings and return their immutable audit identity."""
 
     snapshot_by_field = _mapping(database_row.get("manifest"))
@@ -1039,18 +949,16 @@ def _candidate_identity(database_row: Mapping[str, Any]) -> dict[str, Any]:
     serving_index_by_field = _mapping(snapshot_by_field.get("serving_index"))
     if (
         str(database_row.get("status") or "") != "validated"
-        or activation_by_field.get("contract")
-        != PTG2_CANDIDATE_ACTIVATION_CONTRACT
+        or activation_by_field.get("contract") != PTG2_CANDIDATE_ACTIVATION_CONTRACT
         or activation_by_field.get("state") != "validated"
     ):
         raise ValueError("snapshot is not a strict validated candidate")
-    layout_serving_index_by_field = _mapping(
-        layout_manifest_by_field.get("serving_index")
-    )
+    layout_serving_index_by_field = _mapping(layout_manifest_by_field.get("serving_index"))
     storage_generation = validate_candidate_layout_identity(
         database_row,
         serving_index_by_field,
         layout_serving_index_by_field,
+        **({"physical_binding": physical_binding} if physical_binding is not None else {}),
     )
     return _candidate_evidence_identity(
         database_row,
@@ -1155,6 +1063,16 @@ async def _locked_candidate_identity(
 ) -> dict[str, Any]:
     """Load and lock one candidate with its corroborating private sources."""
 
+    from process.ptg_parts.ptg2_physical_binding import local_candidate_audit_state
+
+    local_state = await local_candidate_audit_state(session, snapshot_id=snapshot_id, schema_name=schema_name)
+    if local_state is not None:
+        candidate_by_field = dict(local_state["candidate"])
+        candidate_by_field["frozen_source_records"] = local_state["source_records"]
+        candidate_by_field["raw_container_sha256_values"] = [
+            source_record["raw_container_sha256"] for source_record in local_state["source_records"]
+        ]
+        return _candidate_identity(candidate_by_field, physical_binding=local_state["physical_binding"])
     quoted_schema = _quote_ident(schema_name)
     query_result = await session.execute(
         db.text(_LOCKED_CANDIDATE_SQL.format(schema=quoted_schema)),
@@ -1216,12 +1134,8 @@ def _candidate_attestation_target(
         source_key=str(source_key or "").strip().lower(),
         plan_id=str(plan_id or "").strip(),
         plan_market_type=str(plan_market_type or "").strip().lower(),
-        storage_generation=normalize_candidate_storage_generation(
-            storage_generation
-        ),
-        activation_intent=normalize_candidate_activation_intent(
-            activation_intent
-        ),
+        storage_generation=normalize_candidate_storage_generation(storage_generation),
+        activation_intent=normalize_candidate_activation_intent(activation_intent),
     )
     if not all(
         (
@@ -1267,10 +1181,8 @@ def _validate_attestation_identity_binding(
         identity["source_key"] != attestation_target.source_key
         or identity["plan_id"] != attestation_target.plan_id
         or identity["plan_market_type"] != attestation_target.plan_market_type
-        or identity["storage_generation"]
-        != attestation_target.storage_generation
-        or evidence["storage_generation"]
-        != attestation_target.storage_generation
+        or identity["storage_generation"] != attestation_target.storage_generation
+        or evidence["storage_generation"] != attestation_target.storage_generation
     ):
         raise ValueError("audit target does not match the candidate bindings")
     for evidence_name, identity_name, message in (
@@ -1299,14 +1211,9 @@ def _validate_attestation_identity_binding(
             == identity["provider_identifier_quarantine_evidence"]
         )
     else:
-        is_quarantine_match = (
-            evidence["provider_identifier_quarantine"]
-            == identity["provider_identifier_quarantine"]
-        )
+        is_quarantine_match = evidence["provider_identifier_quarantine"] == identity["provider_identifier_quarantine"]
     if not is_quarantine_match:
-        raise ValueError(
-            "audit report provider identifier quarantine does not match the sealed candidate"
-        )
+        raise ValueError("audit report provider identifier quarantine does not match the sealed candidate")
 
 
 def _validate_v4_writer_identity_binding(
@@ -1315,22 +1222,13 @@ def _validate_v4_writer_identity_binding(
 ) -> None:
     """Cross-check V4 ordinals and public audit metadata before persistence."""
 
+    if evidence.get("ordered_source_ordinal_digest") != identity["ordered_source_ordinal_digest"]:
+        raise ValueError("audit report does not match the sealed candidate source ordinals")
     if (
-        evidence.get("ordered_source_ordinal_digest")
-        != identity["ordered_source_ordinal_digest"]
+        evidence.get("source_witness_manifest") != identity["source_witness_manifest"]
+        or evidence.get("audit_sample_public") != identity["audit_sample_public"]
     ):
-        raise ValueError(
-            "audit report does not match the sealed candidate source ordinals"
-        )
-    if (
-        evidence.get("source_witness_manifest")
-        != identity["source_witness_manifest"]
-        or evidence.get("audit_sample_public")
-        != identity["audit_sample_public"]
-    ):
-        raise ValueError(
-            "audit report metadata does not match the sealed candidate"
-        )
+        raise ValueError("audit report metadata does not match the sealed candidate")
 
 
 _CANDIDATE_ATTESTATION_UPSERT_SQL = """
@@ -1400,11 +1298,7 @@ async def _persist_candidate_attestation_row(
         attestation_target.activation_intent,
     )
     insert_result = await session.execute(
-        db.text(
-            _CANDIDATE_ATTESTATION_UPSERT_SQL.format(
-                schema=_quote_ident(schema_name)
-            )
-        ),
+        db.text(_CANDIDATE_ATTESTATION_UPSERT_SQL.format(schema=_quote_ident(schema_name))),
         {
             "snapshot_id": attestation_target.snapshot_id,
             **identity,
@@ -1426,9 +1320,7 @@ async def _persist_candidate_attestation_row(
         },
     )
     if insert_result.first() is None:
-        raise ValueError(
-            "candidate audit attestation conflicts with existing evidence"
-        )
+        raise ValueError("candidate audit attestation conflicts with existing evidence")
     return attestation_digest
 
 
@@ -1457,9 +1349,7 @@ def _candidate_attestation_result(
         "batch_api_actual_http_requests",
     ):
         if request_metric_name in evidence:
-            result_by_field[request_metric_name] = evidence[
-                request_metric_name
-            ]
+            result_by_field[request_metric_name] = evidence[request_metric_name]
     return result_by_field
 
 
@@ -1518,9 +1408,7 @@ async def record_candidate_audit_attestation(
     plan_market_type: str,
     report: Mapping[str, Any],
     storage_generation: str = PTG2_CANDIDATE_V3_GENERATION,
-    activation_intent: str = (
-        PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE
-    ),
+    activation_intent: str = (PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE),
 ) -> dict[str, Any]:
     """Persist a passing release report against the candidate's immutable identity."""
 
@@ -1540,13 +1428,11 @@ async def record_candidate_audit_attestation(
     )
     schema_name = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
     async with db.transaction() as session:
-        evidence, attestation_digest, expires_at = (
-            await _record_candidate_attestation_in_transaction(
-                session,
-                schema_name=schema_name,
-                attestation_target=attestation_target,
-                report=report,
-            )
+        evidence, attestation_digest, expires_at = await _record_candidate_attestation_in_transaction(
+            session,
+            schema_name=schema_name,
+            attestation_target=attestation_target,
+            report=report,
         )
     return _candidate_attestation_result(
         attestation_target=attestation_target,
@@ -1591,16 +1477,12 @@ async def _candidate_attestation_row(
             "snapshot_key": int(identity["snapshot_key"]),
             "source_key": str(identity["source_key"]).strip().lower(),
             "plan_id": str(identity["plan_id"]).strip(),
-            "plan_market_type": str(
-                identity["plan_market_type"]
-            ).strip().lower(),
+            "plan_market_type": str(identity["plan_market_type"]).strip().lower(),
             "coverage_scope_id": bytes(identity["coverage_scope_id"]),
             "source_set_digest": identity["source_set_digest"],
             "audit_sample_digest": identity["audit_sample_digest"],
             "source_witness_digest": identity["source_witness_digest"],
-            "supported_contracts": list(
-                PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS
-            ),
+            "supported_contracts": list(PTG2_CANDIDATE_ATTESTATION_SUPPORTED_CONTRACTS),
         },
     )
     return attestation_query.first()
@@ -1614,26 +1496,17 @@ def _validated_attestation_binding(
 ) -> tuple[bytes, dict[str, Any], str, bytes] | None:
     """Validate the report-to-intent binding and current lifecycle state."""
 
-    normalized_activation_intent = normalize_candidate_activation_intent(
-        activation_intent
-    )
+    normalized_activation_intent = normalize_candidate_activation_intent(activation_intent)
     if attestation_row is None:
         return None
     report_digest = bytes(attestation_row[0])
     if len(report_digest) != 32:
         raise ValueError("candidate audit attestation digest is invalid")
     stored_report = _mapping(attestation_row[1])
-    stored_activation_intent = normalize_candidate_activation_intent(
-        attestation_row[2]
-    )
+    stored_activation_intent = normalize_candidate_activation_intent(attestation_row[2])
     if stored_activation_intent != normalized_activation_intent:
-        if (
-            stored_activation_intent
-            == PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY
-        ):
-            raise ValueError(
-                "candidate audit attestation is held for audit-only review"
-            )
+        if stored_activation_intent == PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY:
+            raise ValueError("candidate audit attestation is held for audit-only review")
         raise ValueError("candidate audit attestation activation intent conflicts")
     stored_attestation_digest = bytes(attestation_row[3])
     expected_attestation_digest = candidate_attestation_digest(
@@ -1646,15 +1519,11 @@ def _validated_attestation_binding(
     ):
         raise ValueError("candidate audit attestation intent digest is invalid")
     if attestation_row[6] is not None:
-        raise CandidateAttestationApprovalConflict(
-            "candidate audit attestation was already consumed"
-        )
+        raise CandidateAttestationApprovalConflict("candidate audit attestation was already consumed")
     if not bool(attestation_row[7]):
         if allow_expired:
             return None
-        raise ValueError(
-            "candidate has no current passing release audit attestation"
-        )
+        raise ValueError("candidate has no current passing release audit attestation")
     return (
         report_digest,
         stored_report,
@@ -1671,25 +1540,16 @@ def _validate_v4_attestation_metadata(
     """Validate V4 ordinal, witness, and public sample evidence."""
 
     report_batch = _required_report_mapping(stored_report, "batch")
-    if report_batch.get("ordered_source_ordinal_digest") != identity.get(
-        "ordered_source_ordinal_digest"
-    ):
-        raise ValueError(
-            "candidate source ordinals changed after its release audit"
-        )
+    if report_batch.get("ordered_source_ordinal_digest") != identity.get("ordered_source_ordinal_digest"):
+        raise ValueError("candidate source ordinals changed after its release audit")
     report_audit_sample = validated_public_audit_sample_projection(
         _required_report_mapping(stored_report, "api_audit_sample"),
-        expected_source_count=int(
-            identity["source_witness_manifest"]["source_count"]
-        ),
+        expected_source_count=int(identity["source_witness_manifest"]["source_count"]),
     )
-    if (
-        report_witness != identity.get("source_witness_manifest")
-        or report_audit_sample != identity.get("audit_sample_public")
+    if report_witness != identity.get("source_witness_manifest") or report_audit_sample != identity.get(
+        "audit_sample_public"
     ):
-        raise ValueError(
-            "candidate audit metadata changed after its release audit"
-        )
+        raise ValueError("candidate audit metadata changed after its release audit")
 
 
 def _validate_attestation_report_identity(
@@ -1699,42 +1559,32 @@ def _validate_attestation_report_identity(
 ) -> None:
     """Recompute report evidence against the locked candidate identity."""
 
-    observed_report_digest = hashlib.sha256(
-        _canonical_report_bytes(stored_report)
-    ).digest()
+    observed_report_digest = hashlib.sha256(_canonical_report_bytes(stored_report)).digest()
     if not hmac.compare_digest(observed_report_digest, report_digest):
         raise ValueError("candidate audit attestation report changed after validation")
     report_source = _required_report_mapping(stored_report, "source")
-    is_v4_report = (
-        stored_report.get("schema_version")
-        == PTG2_BATCH_AUDIT_REPORT_SCHEMA_VERSION
-    )
+    is_v4_report = stored_report.get("schema_version") == PTG2_BATCH_AUDIT_REPORT_SCHEMA_VERSION
     if is_v4_report:
         is_report_quarantine_match = (
-            validate_provider_identifier_quarantine_evidence(
-                report_source.get("provider_identifier_quarantine")
-            )
+            validate_provider_identifier_quarantine_evidence(report_source.get("provider_identifier_quarantine"))
             == identity["provider_identifier_quarantine_evidence"]
         )
     else:
         is_report_quarantine_match = (
-            validate_provider_identifier_quarantine(
-                report_source.get("provider_identifier_quarantine")
-            )
+            validate_provider_identifier_quarantine(report_source.get("provider_identifier_quarantine"))
             == identity["provider_identifier_quarantine"]
         )
     if not is_report_quarantine_match:
-        raise ValueError(
-            "candidate provider identifier quarantine changed after its release audit"
-        )
+        raise ValueError("candidate provider identifier quarantine changed after its release audit")
     report_witness = _required_report_mapping(report_source, "witness")
-    if _sha256_digest(
-        report_witness.get("payload_sha256"),
-        field="source.witness.payload_sha256",
-    ) != identity["source_witness_digest"]:
-        raise ValueError(
-            "candidate source witness changed after its release audit"
+    if (
+        _sha256_digest(
+            report_witness.get("payload_sha256"),
+            field="source.witness.payload_sha256",
         )
+        != identity["source_witness_digest"]
+    ):
+        raise ValueError("candidate source witness changed after its release audit")
     if is_v4_report:
         _validate_v4_attestation_metadata(
             stored_report,
@@ -1806,10 +1656,7 @@ async def _verify_candidate_attestation_in_transaction(
         schema_name=schema_name,
         snapshot_id=snapshot_id,
     )
-    if any(
-        identity[key] != expected_value
-        for key, expected_value in expected_identity_by_field.items()
-    ):
+    if any(identity[key] != expected_value for key, expected_value in expected_identity_by_field.items()):
         raise ValueError("candidate identity changed after its release audit")
     attestation = await _load_candidate_audit_attestation_in_transaction(
         session,
@@ -1819,13 +1666,9 @@ async def _verify_candidate_attestation_in_transaction(
         activation_intent=activation_intent,
     )
     if attestation is None:
-        raise ValueError(
-            "candidate has no current passing release audit attestation"
-        )
+        raise ValueError("candidate has no current passing release audit attestation")
     if expected_attestation_digest is not None:
-        expected_digest = parse_candidate_attestation_digest(
-            expected_attestation_digest
-        )
+        expected_digest = parse_candidate_attestation_digest(expected_attestation_digest)
         if not hmac.compare_digest(
             expected_digest,
             bytes(attestation["attestation_digest"]),
@@ -1880,9 +1723,7 @@ async def verify_candidate_audit_attestation_in_transaction(
         schema_name=schema_name,
         snapshot_id=snapshot_id,
         expected_identity_by_field=expected_identity_by_field,
-        activation_intent=(
-            PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE
-        ),
+        activation_intent=(PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE),
     )
 
 
@@ -1928,9 +1769,7 @@ def _held_attestation_target(
         "source_key": str(source_key or "").strip().lower(),
         "plan_id": str(plan_id or "").strip(),
         "plan_market_type": str(plan_market_type or "").strip().lower(),
-        "storage_generation": normalize_candidate_storage_generation(
-            storage_generation
-        ),
+        "storage_generation": normalize_candidate_storage_generation(storage_generation),
     }
     if not all(
         target_by_field[name]
@@ -1982,13 +1821,8 @@ async def load_held_candidate_audit_attestation(
                 "storage_generation",
             )
         }
-        if any(
-            identity[key] != expected_value
-            for key, expected_value in expected_identity_by_field.items()
-        ):
-            raise ValueError(
-                "candidate identity changed after its release audit"
-            )
+        if any(identity[key] != expected_value for key, expected_value in expected_identity_by_field.items()):
+            raise ValueError("candidate identity changed after its release audit")
         attestation = await _load_candidate_audit_attestation_in_transaction(
             session,
             schema_name=schema_name,
@@ -2010,9 +1844,7 @@ def _held_attestation_response(
     return {
         **attestation,
         "report_digest": bytes(attestation["report_digest"]).hex(),
-        "attestation_digest": bytes(
-            attestation["attestation_digest"]
-        ).hex(),
+        "attestation_digest": bytes(attestation["attestation_digest"]).hex(),
         "attested_at": attestation["attested_at"].isoformat(),
         "expires_at": attestation["expires_at"].isoformat(),
     }
@@ -2026,29 +1858,18 @@ def _consumed_attestation_binding(
 ) -> tuple[str, bytes]:
     """Return the exact intent and digest admitted by the consume statement."""
 
-    normalized_activation_intent = normalize_candidate_activation_intent(
-        activation_intent
-    )
+    normalized_activation_intent = normalize_candidate_activation_intent(activation_intent)
     attestation_digest = candidate_attestation_digest(
         bytes(report_digest),
         normalized_activation_intent,
     )
     if expected_attestation_digest is not None:
-        expected_digest = parse_candidate_attestation_digest(
-            expected_attestation_digest
-        )
+        expected_digest = parse_candidate_attestation_digest(expected_attestation_digest)
         if not hmac.compare_digest(expected_digest, attestation_digest):
-            raise CandidateAttestationApprovalConflict(
-                "candidate audit-only approval digest changed during activation"
-            )
+            raise CandidateAttestationApprovalConflict("candidate audit-only approval digest changed during activation")
         return normalized_activation_intent, expected_digest
-    if (
-        normalized_activation_intent
-        == PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY
-    ):
-        raise ValueError(
-            "audit-only attestation activation requires its exact approval digest"
-        )
+    if normalized_activation_intent == PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_ONLY:
+        raise ValueError("audit-only attestation activation requires its exact approval digest")
     return normalized_activation_intent, attestation_digest
 
 
@@ -2059,21 +1880,17 @@ async def consume_candidate_audit_attestation_in_transaction(
     snapshot_id: str,
     report_digest: bytes,
     activated_at: datetime.datetime,
-    activation_intent: str = (
-        PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE
-    ),
+    activation_intent: str = (PTG2_CANDIDATE_ACTIVATION_INTENT_AUDIT_AND_ACTIVATE),
     expected_attestation_digest: bytes | None = None,
 ) -> None:
     """Mark the exact locked attestation consumed by the successful activation."""
 
     if activated_at.tzinfo is None:
         activated_at = activated_at.replace(tzinfo=datetime.timezone.utc)
-    normalized_activation_intent, attestation_digest = (
-        _consumed_attestation_binding(
-            report_digest=report_digest,
-            activation_intent=activation_intent,
-            expected_attestation_digest=expected_attestation_digest,
-        )
+    normalized_activation_intent, attestation_digest = _consumed_attestation_binding(
+        report_digest=report_digest,
+        activation_intent=activation_intent,
+        expected_attestation_digest=expected_attestation_digest,
     )
 
     update_result = await session.execute(
@@ -2099,6 +1916,4 @@ async def consume_candidate_audit_attestation_in_transaction(
         },
     )
     if update_result.first() is None:
-        raise CandidateAttestationApprovalConflict(
-            "candidate audit attestation changed during activation"
-        )
+        raise CandidateAttestationApprovalConflict("candidate audit attestation changed during activation")

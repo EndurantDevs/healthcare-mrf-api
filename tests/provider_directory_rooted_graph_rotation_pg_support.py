@@ -7,13 +7,14 @@ from __future__ import annotations
 import json
 from typing import Any, Awaitable, Callable
 
+import asyncpg
 import pytest
 
 from db.connection import Database
 from process.provider_directory_dataset_scoped_publication import (
+    ProviderDirectoryDatasetScopedPublicationError,
     exact_uhc_dataset_pair,
     lock_exact_current_dataset,
-    ProviderDirectoryDatasetScopedPublicationError,
 )
 from process.provider_directory_profile_selection_dataset import (
     _dataset_selection_by_group,
@@ -33,13 +34,16 @@ from process.uhc_flex_practitioner_registration import (
 from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
 from tests.provider_directory_uhc_flex_npi_cohort_pg_support import (
     DATASET_ID as OFFICIAL_DATASET_ID,
+)
+from tests.provider_directory_uhc_flex_npi_cohort_pg_support import (
     ENDPOINT_ID as OFFICIAL_ENDPOINT_ID,
+)
+from tests.provider_directory_uhc_flex_npi_cohort_pg_support import (
     MEMBER_NPIS,
 )
 from tests.test_provider_directory_uhc_flex_practitioner_publication_postgres import (
     _sealed_pair as _sealed_legacy_pair,
 )
-
 
 _ROTATED_OFFICIAL_DATASET_ID = "dataset-2026-rotated"
 _ROTATED_OFFICIAL_ROOT_RUN_ID = "s" * 64
@@ -118,16 +122,10 @@ def _rotated_official_metadata_json() -> str:
 
 async def _replace_official_parent(context) -> None:
     await context.connection.execute(
-        f"UPDATE {context.schema}.provider_directory_endpoint_dataset "
-        "SET status = 'superseded', is_current = false, "
-        "superseded_at = transaction_timestamp() WHERE dataset_id = $1",
-        OFFICIAL_DATASET_ID,
-    )
-    await context.connection.execute(
         f"INSERT INTO {context.schema}.provider_directory_endpoint_dataset "
         "(dataset_id, endpoint_id, acquisition_root_run_id, dataset_hash, "
         "status, is_current, resource_count, publication_metadata_json) "
-        "VALUES ($1, $2, $3, $4, 'published', true, 4, $5::jsonb)",
+        "VALUES ($1, $2, $3, $4, 'building', false, 4, $5::jsonb)",
         _ROTATED_OFFICIAL_DATASET_ID,
         OFFICIAL_ENDPOINT_ID,
         _ROTATED_OFFICIAL_ROOT_RUN_ID,
@@ -144,12 +142,48 @@ async def _replace_official_parent(context) -> None:
         _ROTATED_OFFICIAL_DATASET_ID,
         OFFICIAL_DATASET_ID,
     )
+    await context.connection.execute(
+        f"UPDATE {context.schema}.provider_directory_endpoint_dataset "
+        "SET status = 'superseded', is_current = false, "
+        "superseded_at = transaction_timestamp() WHERE dataset_id = $1",
+        OFFICIAL_DATASET_ID,
+    )
+    await context.connection.execute(
+        f"UPDATE {context.schema}.provider_directory_endpoint_dataset "
+        "SET status = 'published', is_current = true WHERE dataset_id = $1",
+        _ROTATED_OFFICIAL_DATASET_ID,
+    )
+
+
+async def _assert_official_snapshots_immutable(context) -> None:
+    if hasattr(context, "component"):
+        from tests.formulary_fhir_twin_admission_pg_support import connect
+
+        connection = await connect(context.url.set(username=context.component.builder))
+        try:
+            for dataset_id in (OFFICIAL_DATASET_ID, _ROTATED_OFFICIAL_DATASET_ID):
+                with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                    await connection.execute(
+                        f"UPDATE {context.schema}.provider_directory_dataset_resource "
+                        "SET payload_hash = payload_hash WHERE dataset_id = $1",
+                        dataset_id,
+                    )
+        finally:
+            await connection.close()
+        return
+    for dataset_id in (OFFICIAL_DATASET_ID, _ROTATED_OFFICIAL_DATASET_ID):
+        with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match="candidate_immutable"):
+            async with context.connection.transaction():
+                await context.connection.execute(
+                    f"UPDATE {context.schema}.provider_directory_dataset_resource "
+                    "SET payload_hash = payload_hash WHERE dataset_id = $1",
+                    dataset_id,
+                )
 
 
 async def _insert_rotated_cohort(context, cohort) -> None:
     await context.connection.executemany(
-        f"INSERT INTO {context.schema}.provider_directory_uhc_flex_npi_member "
-        "(cohort_id, npi) VALUES ($1, $2)",
+        f"INSERT INTO {context.schema}.provider_directory_uhc_flex_npi_member (cohort_id, npi) VALUES ($1, $2)",
         tuple((cohort.cohort_id, npi) for npi in MEMBER_NPIS),
     )
     await context.connection.execute(
@@ -183,10 +217,22 @@ async def _insert_rotated_cohort(context, cohort) -> None:
 async def rotate_official_dataset(context):
     """Publish a second official dataset and return its exact cohort."""
 
+    if hasattr(context, "component"):
+        from tests.provider_directory_specialized_source_postgres_support import publish_official_source
+
+        cohort = await publish_official_source(
+            context.database,
+            dataset_id=_ROTATED_OFFICIAL_DATASET_ID,
+            root_run_id=_ROTATED_OFFICIAL_ROOT_RUN_ID,
+            previous_dataset_id=OFFICIAL_DATASET_ID,
+        )
+        await _assert_official_snapshots_immutable(context)
+        return cohort
     cohort = _rotated_official_cohort()
     async with context.connection.transaction():
         await _replace_official_parent(context)
         await _insert_rotated_cohort(context, cohort)
+    await _assert_official_snapshots_immutable(context)
     return cohort
 
 
@@ -196,9 +242,7 @@ async def profile_exact_selection(context):
     pair = exact_uhc_dataset_pair()
     rows = await load_profile_selection_dataset_rows(
         database=context.database,
-        endpoint_dataset_ref=(
-            f'{context.schema}."provider_directory_endpoint_dataset"'
-        ),
+        endpoint_dataset_ref=(f'{context.schema}."provider_directory_endpoint_dataset"'),
         schema_ref=context.schema,
         row_mapping=lambda row: dict(row._mapping),
     )
@@ -212,9 +256,7 @@ async def profile_exact_selection(context):
         ((pair.legacy_source_id, pair.rooted_source_id),),
     )
     exact_rows = tuple(
-        row
-        for row in rows
-        if row.get("endpoint_id") in {pair.legacy_endpoint_id, pair.rooted_endpoint_id}
+        row for row in rows if row.get("endpoint_id") in {pair.legacy_endpoint_id, pair.rooted_endpoint_id}
     )
     assert len(exact_rows) == 1
     return exact_rows[0], selected
@@ -360,9 +402,7 @@ async def prove_recursive_rooted_rotation(
     )
     legacy_row, legacy_selection = await profile_exact_selection(context)
     assert legacy_row["dataset_id"] == replacement_legacy.dataset_id
-    assert legacy_selection == {
-        (exact_uhc_dataset_pair().legacy_source_id,): legacy_row
-    }
+    assert legacy_selection == {(exact_uhc_dataset_pair().legacy_source_id,): legacy_row}
     recovered = await _publish_recovered_generations(
         context,
         replacement_legacy,

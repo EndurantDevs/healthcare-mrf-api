@@ -12,8 +12,31 @@ from scripts.research import (
     provider_directory_endpoint_acquisition_support as acquisition_support,
 )
 from tests.provider_directory_endpoint_acquisition_test_support import (
-    successful_operator_input,
+    successful_operator_input, synthetic_catalog_confirmation,
 )
+
+
+@pytest.fixture(autouse=True)
+def reviewed_test_catalog(monkeypatch):
+    load_manifest = acquisition_cli.harness.load_manifest
+
+    def load_reviewed_manifest(*args, **kwargs):
+        manifest = load_manifest(*args, **kwargs)
+        manifest["catalog_confirmation"] = synthetic_catalog_confirmation()
+        return manifest
+
+    monkeypatch.setattr(acquisition_cli.harness, "load_manifest", load_reviewed_manifest)
+
+
+def test_operator_input_requires_private_reviewed_catalog_confirmation():
+    manifest = acquisition_cli.harness.load_manifest()
+    entry = next(item for item in manifest["entries"] if item["resources"])
+    manifest["catalog_confirmation"] = None
+    operator_input = successful_operator_input({**manifest, "catalog_confirmation": synthetic_catalog_confirmation()}, entry)
+    plan = acquisition_cli.harness.build_operator_plan(manifest, frozenset({entry["entry_id"]}))
+    operator_input["manifest_sha256"] = plan["manifest_sha256"]
+    with pytest.raises(acquisition_cli.harness.ManifestError, match="requires a reviewed catalog confirmation"):
+        acquisition_cli._validated_observation_time(manifest, operator_input, frozenset({entry["entry_id"]}))
 
 
 def test_acquisition_cli_defaults_to_local_inputs():

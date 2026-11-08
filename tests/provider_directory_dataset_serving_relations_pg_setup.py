@@ -34,6 +34,11 @@ async def _create_dataset_tables(database: Database, schema: str) -> None:
         "completion_proof_required_version integer, completion_proof_json jsonb, "
         "completion_proof_sha256 varchar(64));"
     )
+    await database.status(
+        f"CREATE TABLE {schema}.provider_directory_cms_npd_stale_candidate ("
+        "dataset_id varchar(96) PRIMARY KEY REFERENCES "
+        f"{schema}.provider_directory_endpoint_dataset(dataset_id));"
+    )
     await subset_setup.install_subset_canonical_functions(database, schema)
     await database.status(
         f"""

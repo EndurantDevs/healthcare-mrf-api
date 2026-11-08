@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts.research import provider_directory_api_evidence_db as evidence_db
 from scripts.research import provider_directory_api_evidence_matrix as matrix
 from scripts.research import provider_directory_api_evidence_support as support
-
 
 SOURCE_ID = "pdfhir_0123456789abcdef01234567"
 ADDRESS_KEY = "00000000-0000-0000-0000-000000000001"
@@ -43,9 +44,7 @@ def _build_provenance_entry(**field_overrides) -> dict:
     return provenance_entry_dict
 
 
-def _build_detail_response(
-    *, endpoint_id: str = "endpoint-1", detail_geo_present: bool = True
-) -> dict:
+def _build_detail_response(*, endpoint_id: str = "endpoint-1", detail_geo_present: bool = True) -> dict:
     source_provenance_dict = _build_provenance_entry(endpoint_id=endpoint_id)
     fact_evidence_dict = {
         **source_provenance_dict,
@@ -66,11 +65,7 @@ def _build_detail_response(
                 "provider_directory_profile": {"sources": [source_provenance_dict]},
                 "provider_directory_profile_evidence": {
                     "sources": [source_provenance_dict],
-                    "facts": {
-                        "accepting_patients": {
-                            "items": [{"evidence": [fact_evidence_dict]}]
-                        }
-                    },
+                    "facts": {"accepting_patients": {"items": [{"evidence": [fact_evidence_dict]}]}},
                 },
             }
         }
@@ -199,9 +194,7 @@ def test_matrix_accepts_detail_geo_without_candidate():
 
     checks = result["verification_matrix"][0]
     assert result["status"] == "pass"
-    assert {checks[code]["state"] for code in ("A", "P", "F", "V")} == {
-        "pass"
-    }
+    assert {checks[code]["state"] for code in ("A", "P", "F", "V")} == {"pass"}
     assert checks["G"] == {
         "state": "pass",
         "geo_match_candidates": {"status_code": 200, "latency_ms": 1.0},
@@ -260,18 +253,32 @@ def test_matrix_fails_all_http_checks_when_latency_exceeds_slo():
     assert {checks[code]["state"] for code in ("A", "P", "G", "F", "V")} == {"fail"}
 
 
-def test_profile_source_matrix_selects_all_25_and_expresses_special_contracts():
+def test_profile_source_matrix_selects_all_reviewed_sources_and_special_contracts():
     root = Path(__file__).resolve().parents[1]
-    manifest = json.loads(
-        (root / "specs/provider_directory_endpoint_acquisition_manifest.json").read_text()
-    )
+    manifest = json.loads((root / "specs/provider_directory_endpoint_acquisition_manifest.json").read_text())
     profile_spec = matrix.load_matrix_source_spec()
     selections = matrix.resolve_matrix_source_selection(manifest, profile_spec)
 
-    assert len(selections) == 25
-    michigan = next(
-        selection for selection in selections if selection.entry_id == "michigan"
-    )
+    assert len(profile_spec["source_ids"]) == 35
+    assert len(selections) == 33
+    source_id_by_entry = {
+        selection.entry_id: selection.source_id
+        for selection in selections
+        if selection.entry_id.startswith("capital-blue-cross")
+    }
+    assert source_id_by_entry == {
+        "capital-blue-cross-medicare": "pdfhir_a756316e811afc3e5c1b9330",
+        "capital-blue-cross-chip": "pdfhir_5c4da9c19d969edfdebc9ce1",
+    }
+    assert selections[0].source_id == "cms-npd"
+    molina = next(selection for selection in selections if selection.entry_id == "molina")
+    assert molina.resource_profile == "R8"
+    assert molina.resources == tuple(profile_spec["verification_matrix"]["resource_profiles"]["R8"]["resources"])
+    pacificsource = next(selection for selection in selections if selection.entry_id == "pacificsource")
+    assert pacificsource.source_id == "pdfhir_19526dc970938f7a212516fa"
+    assert pacificsource.resource_profile == "R8"
+    assert pacificsource.resources == molina.resources
+    michigan = next(selection for selection in selections if selection.entry_id == "michigan")
     assert michigan.resource_profile == "M5"
     assert michigan.resources == (
         "Location",
@@ -289,11 +296,7 @@ def test_profile_source_matrix_selects_all_25_and_expresses_special_contracts():
         "PractitionerRole",
     )
     assert "OrganizationAffiliation" not in alohr.resources
-    uhc = next(
-        selection
-        for selection in selections
-        if selection.entry_id == "uhc-provider-files"
-    )
+    uhc = next(selection for selection in selections if selection.entry_id == "uhc-provider-files")
     assert uhc.resource_profile == "A6"
     assert uhc.resources == (
         "InsurancePlan",
@@ -304,6 +307,63 @@ def test_profile_source_matrix_selects_all_25_and_expresses_special_contracts():
         "PractitionerRole",
     )
     assert all(selection.matrix_checks == ("A", "P", "G", "F", "V") for selection in selections)
+
+
+def test_profile_source_matrix_includes_cms_in_declared_order():
+    profile_spec = matrix.load_matrix_source_spec()
+    sources = profile_spec["verification_matrix"]["sources"]
+
+    assert [source["source_id"] for source in sources] == profile_spec["source_ids"]
+    assert sources[0] == {
+        "entry_id": "cms-npd",
+        "source_id": "cms-npd",
+        "resource_profile": "CMS_NPD_R4",
+    }
+    assert profile_spec["verification_matrix"]["resource_profiles"]["CMS_NPD_R4"] == {
+        "transport": "cms_npd_bulk_files",
+        "resources": [
+            "InsurancePlan",
+            "PractitionerRole",
+            "Practitioner",
+            "Organization",
+            "Location",
+            "HealthcareService",
+            "OrganizationAffiliation",
+            "Endpoint",
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "source_ids",
+    [
+        ["source-b", "source-a"],
+        ["source-a", "source-c"],
+        ["source-a", "source-a"],
+    ],
+)
+def test_profile_source_matrix_rejects_order_membership_and_duplicate_drift(source_ids, tmp_path):
+    spec_path = tmp_path / "sources.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source_ids": source_ids,
+                "entry_ids": ["entry-a", "entry-b"],
+                "verification_matrix": {
+                    "check_codes": ["A", "P", "G", "F", "V"],
+                    "resource_profiles": {"R4": {"resources": ["Practitioner"]}},
+                    "sources": [
+                        {"entry_id": "entry-a", "source_id": "source-a", "resource_profile": "R4"},
+                        {"entry_id": "entry-b", "source_id": "source-b", "resource_profile": "R4"},
+                    ],
+                },
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="provider_directory_profile_source_matrix_invalid"):
+        matrix.load_matrix_source_spec(spec_path)
 
 
 def test_current_provenance_query_fences_one_published_dataset_per_source():

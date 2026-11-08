@@ -1,0 +1,1087 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+"""Select one fixed FHIR source bootstrap from an observed native queue job."""
+
+import json
+import os
+import re
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from importlib import import_module
+
+from yarl import URL
+
+from api.reference_source_worker import _IMAGE
+from api.reference_source_worker import IMAGE_ENV as REFERENCE_IMAGE_ENV
+
+PURPOSE = "provider-directory-source"
+COMMAND = ["/usr/local/bin/fhir-source-worker"]
+IMAGE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_SOURCE_WORKER_IMAGE"
+ROUTES_ENV = "HLTHPRT_PROVIDER_DIRECTORY_SOURCE_WORKER_ROUTES_JSON"
+PROXY_POOL_SECRET_ENV = "HLTHPRT_HTTP_PROXY_POOL_SECRET_NAME"
+PROXY_POOL_REVISION_ENV = "HLTHPRT_HTTP_PROXY_POOL_REVISION"
+PROXY_POLICY_ENV = "HLTHPRT_SOURCE_HTTP_PROXY_POLICY_JSON"
+PROXY_POOL_ENV = "HLTHPRT_HTTP_PROXY_POOL_JSON"
+PROXY_BINDING_ENV = "HLTHPRT_SOURCE_HTTP_PROXY_BINDING_JSON"
+PROXY_COOLDOWNS_ENV = "HLTHPRT_SOURCE_HTTP_PROXY_COOLDOWNS_JSON"
+PROFILE_IMAGE_ENV = "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_WORKER_IMAGE"
+_WORKER_CLASS = "process.ProviderDirectoryFHIR"
+_IMPORTER = "provider-directory-fhir"
+_QUEUE = "arq:ProviderDirectoryFHIR"
+_FUNCTION = "control_single_job_start"
+
+
+@dataclass(frozen=True)
+class FHIRSourceWorkerLaunch:
+    """Keep the owner image and observed native job outside serialized input."""
+
+    run_id: str
+    job_id: str
+    image: str
+    root_run_id: str = ""
+    secret_name: str = ""
+    source_id: str = ""
+    endpoint_scope: str = ""
+    retry_of_run_id: str = ""
+    policy_revision: str = ""
+    pool_revision: str = ""
+    pool_secret_name: str = ""
+    proxy_cooldowns_json: str = ""
+
+
+@dataclass(frozen=True)
+class FHIRSourcePublicationLaunch(FHIRSourceWorkerLaunch):
+    """Bind a publication executor to the retained native attempt and handoff."""
+
+    attempt_id: str = ""
+    handoff_sha256: str = ""
+
+
+def _configured_routes(*, setting=ROUTES_ENV):
+    """Validate the complete server-owned route inventory before selection."""
+    raw = os.getenv(setting, "").strip()
+    if not raw:
+        return []
+    try:
+        routes = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError("fhir_source_worker_route_invalid") from error
+    if type(routes) is not list or len(routes) > 32:
+        raise ValueError("fhir_source_worker_route_invalid")
+    identities = set()
+    for route in routes:
+        if (
+            type(route) is not dict
+            or set(route) != {"root_run_id", "source_id", "endpoint_scope", "image", "secret_name"}
+            or not (
+                (
+                    route["root_run_id"] is None
+                    or type(route["root_run_id"]) is str
+                    and re.fullmatch(r"run_[0-9a-f]{32}", route["root_run_id"])
+                )
+                and type(route["source_id"]) is str
+                and re.fullmatch(r"[A-Za-z0-9_-]{1,96}", route["source_id"])
+                and type(route["endpoint_scope"]) is str
+                and route["endpoint_scope"] == route["endpoint_scope"].strip()
+                and route["endpoint_scope"]
+                and type(route["image"]) is str
+                and _IMAGE.fullmatch(route["image"])
+                and type(route["secret_name"]) is str
+                and re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", route["secret_name"])
+            )
+        ):
+            raise ValueError("fhir_source_worker_route_invalid")
+        route_identity_fields = tuple(route[key] for key in ("root_run_id", "source_id", "endpoint_scope"))
+        if route_identity_fields in identities:
+            raise ValueError("fhir_source_worker_route_invalid")
+        identities.add(route_identity_fields)
+    return routes
+
+
+def _source_route(admitted_run, *, routes=None):
+    """Preserve an exact original route before selecting fresh or retry execution."""
+    params = admitted_run.get("params")
+    params = params if type(params) is dict else {}
+    routes = _configured_routes() if routes is None else routes
+    root = admitted_run.get("run_id")
+    root_routes = [route for route in routes if route["root_run_id"] == root]
+    if not root_routes:
+        root = params.get("provider_directory_pagination_root_run_id")
+        if root is None:
+            return _fresh_source_route(admitted_run, params, routes)
+        root_routes = [route for route in routes if route["root_run_id"] == root]
+    if not root_routes:
+        return None
+    if root == admitted_run.get("run_id"):
+        has_route_lineage = (
+            admitted_run.get("retry_of_run_id") is None
+            and params.get("retry_of_run_id") is None
+            and params.get("provider_directory_pagination_root_run_id") in (None, root)
+        )
+    else:
+        has_route_lineage = (
+            type(params.get("retry_of_run_id")) is str
+            and re.fullmatch(r"run_[0-9a-f]{32}", params["retry_of_run_id"]) is not None
+        )
+    matches = [
+        route
+        for route in root_routes
+        if params.get("source_ids") == [route["source_id"]]
+        and params.get("provider_directory_endpoint_scope") == route["endpoint_scope"]
+        and has_route_lineage
+    ]
+    if len(matches) != 1:
+        raise ValueError("fhir_source_worker_route_changed")
+    return matches[0]
+
+
+def _fresh_source_route(admitted_run, params, routes):
+    """A source-scoped credential requires an observed fresh single-source root."""
+    source_ids = params.get("source_ids")
+    candidates = [
+        route
+        for route in routes
+        if route["root_run_id"] is None and type(source_ids) is list and route["source_id"] in source_ids
+    ]
+    if not candidates:
+        return None
+    if not _uses_source_http(params):
+        return None
+    matches = [
+        route
+        for route in candidates
+        if source_ids == [route["source_id"]]
+        and params.get("provider_directory_endpoint_scope") == route["endpoint_scope"]
+    ]
+    if (
+        len(matches) != 1
+        or "retry_of_run_id" not in admitted_run
+        or admitted_run["retry_of_run_id"] is not None
+        or {"retry_of_run_id", "provider_directory_pagination_root_run_id"}.intersection(params)
+        or admitted_run.get("status") not in {"queued", "starting", "running", "finalizing"}
+    ):
+        raise ValueError("fhir_source_worker_route_changed")
+    return matches[0]
+
+
+def _is_launch_secret_selected(selection, launch, *, allow_shared=False):
+    """Keep routed credentials isolated while allowing explicitly shared env."""
+    secret_name = str(selection.get("secretName") or selection.get("secret_name") or "").strip()
+    from api.provider_directory_source_publication import ROUTES_ENV as PUBLICATION_ROUTES_ENV
+
+    route_secret_names = {
+        route["secret_name"] for route in [*_configured_routes(), *_configured_routes(setting=PUBLICATION_ROUTES_ENV)]
+    }
+    shared_for_routes = selection.get("sharedForRoutes", False)
+    if type(shared_for_routes) is not bool or (shared_for_routes and not allow_shared):
+        raise ValueError("worker purpose shared secret selector is invalid")
+    pool_marker = selection.get("sourceProxyPool", False)
+    if type(pool_marker) is not bool:
+        raise ValueError("worker purpose proxy pool selector is invalid")
+    pool_secret = os.getenv(PROXY_POOL_SECRET_ENV, "").strip()
+    environment_name = str(selection.get("name") or "").strip()
+    secret_key = str(selection.get("key") or "").strip()
+    reserved = (
+        environment_name in {PROXY_POOL_ENV, PROXY_POLICY_ENV, PROXY_BINDING_ENV, PROXY_COOLDOWNS_ENV}
+        or secret_key == PROXY_POOL_ENV
+        or bool(pool_secret and secret_name == pool_secret)
+    )
+    if pool_marker or reserved:
+        if (
+            not allow_shared
+            or not pool_marker
+            or shared_for_routes
+            or selection.get("name") != PROXY_POOL_ENV
+            or selection.get("key") != PROXY_POOL_ENV
+            or selection.get("optional", False) is not False
+        ):
+            raise ValueError("worker purpose proxy pool selector is invalid")
+        return bool(launch.pool_secret_name and secret_name == launch.pool_secret_name)
+    if shared_for_routes:
+        if secret_name in route_secret_names:
+            raise ValueError("worker purpose shared secret selector is invalid")
+        return True
+    if launch.secret_name:
+        return secret_name == launch.secret_name
+    return secret_name not in route_secret_names
+
+
+def requires_source_proxy_admission(selection):
+    """Reserve the pool's key and configured Secret for exact Source admission."""
+    secret = str(selection.get("secretName") or selection.get("secret_name") or "").strip()
+    configured_secret = os.getenv(PROXY_POOL_SECRET_ENV, "").strip()
+    environment_name = str(selection.get("name") or "").strip()
+    secret_key = str(selection.get("key") or "").strip()
+    return (
+        "sourceProxyPool" in selection
+        or environment_name in {PROXY_POOL_ENV, PROXY_POLICY_ENV, PROXY_BINDING_ENV, PROXY_COOLDOWNS_ENV}
+        or secret_key == PROXY_POOL_ENV
+        or bool(configured_secret and secret == configured_secret)
+    )
+
+
+def _proxy_fields(source_ids, endpoint_scope, route, *, policy=None):
+    """Read only trusted policy and nonsecret pool references in the API."""
+    from process.ext.source_http_proxy import SourceProxyConfig
+
+    policy = SourceProxyConfig.from_environment() if policy is None else policy
+    source_ids = source_ids if type(source_ids) is list else []
+    enabled_source_ids = [source_id for source_id in source_ids if policy.use_proxy(source_id, endpoint_scope)]
+    if not enabled_source_ids:
+        return {}
+    if route is None or source_ids != [route["source_id"]] or endpoint_scope != route["endpoint_scope"]:
+        raise ValueError("fhir_source_worker_proxy_route_required")
+    secret = os.getenv(PROXY_POOL_SECRET_ENV, "")
+    revision = os.getenv(PROXY_POOL_REVISION_ENV, "")
+    if (
+        not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", secret)
+        or len(secret) > 253
+        or secret in {entry["secret_name"] for entry in _configured_routes()}
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", revision)
+    ):
+        raise ValueError("fhir_source_worker_proxy_configuration_invalid")
+    return {
+        "policy_revision": policy.policy_revision,
+        "pool_revision": revision,
+        "pool_secret_name": secret,
+        "proxy_cooldowns_json": _cooldowns_json(endpoint_scope, revision, []) if route["root_run_id"] is None else "",
+    }
+
+
+def _uses_source_http(params):
+    """Keep recovery and local-only modes outside acquisition transport routing."""
+    from process import provider_directory_serving_recovery as recovery
+    from process.provider_directory_refresh_preset import apply_provider_directory_refresh_preset
+
+    params = params if type(params) is dict else {}
+    effective_by_name = apply_provider_directory_refresh_preset(params)
+    if recovery.is_recovery_request(_IMPORTER, effective_by_name) or any(
+        bool(effective_by_name.get(name))
+        for name in (
+            "publish_artifacts_only",
+            "dataset_rehydrate_only",
+            "dataset_followup_only",
+            "canonical_backfill_only",
+            "contact_backfill_only",
+        )
+    ):
+        return False
+    return not bool(effective_by_name.get("seed_only", False)) and (
+        bool(effective_by_name.get("probe", True)) or bool(effective_by_name.get("import_resources", False))
+    )
+
+
+def _require_source_proxy_scope(policy, params):
+    """Refuse Source HTTP selectors that would omit an enabled worker policy."""
+    if not policy.has_enabled_sources or not _uses_source_http(params):
+        return
+    params = params if type(params) is dict else {}
+    source_ids = params.get("source_ids")
+    if (
+        type(source_ids) is not list
+        or not source_ids
+        or any(
+            type(source_id) is not str or not source_id.strip() or source_id != source_id.strip()
+            for source_id in source_ids
+        )
+    ):
+        raise ValueError("fhir_source_worker_proxy_source_scope_required")
+
+
+def admit_ordinary_profile_job(admitted_run, launch_request):
+    """Authenticate a stored non-CMS Profile without consuming its worker lease."""
+    if admitted_run.get("importer") != _IMPORTER:
+        return None
+    params = admitted_run.get("params")
+    if not isinstance(params, dict) or not params.get("provider_directory_profile_contract_id"):
+        return None
+    from api.control_workers import _BY_WORKER_CLASS, _AdmittedWorkerRequest
+    from process.provider_directory_profile_capacity_preflight_contract import (
+        canonical_preflight_json,
+        validated_capacity_preflight_request,
+    )
+    from process.provider_directory_profile_selection_contract import validated_profile_execution
+
+    if type(launch_request) is not _AdmittedWorkerRequest or type(admitted_run.get("metrics")) is not dict:
+        raise ValueError("fhir_profile_worker_admission_unavailable")
+    _require_fhir_job_identity(
+        _BY_WORKER_CLASS[_WORKER_CLASS],
+        launch_request,
+        admitted_run.get("run_id"),
+        admitted_run["metrics"].get("job_id"),
+    )
+    execution = validated_profile_execution(params)
+    if (
+        execution.attestation.desired_cms_dataset is not None
+        or execution.cms_nonprofile_capacity_attestation is not None
+    ):
+        return None
+    lease = _verified_profile_capacity_lease(execution.capacity_attestation, require_fresh_observation=False)
+    request = validated_capacity_preflight_request(lease.signing_preflight_guard["healthcare_request"])
+    observed_execution_by_field = {**params, "provider_directory_profile_capacity_attestation": {}}
+    if request.cms_nonprofile_admission is not None or canonical_preflight_json(
+        observed_execution_by_field
+    ) != canonical_preflight_json(request.execution_payload):
+        raise ValueError("fhir_profile_worker_admission_unavailable")
+    launch_request.ordinary_fhir_profile_lease = lease
+    return launch_request.admitted_job
+
+
+def _verified_profile_capacity_lease(envelope, *, require_fresh_observation):
+    """Use the shared verifier with current trust and build-deadline checks."""
+    from process.provider_directory_profile_capacity_attestation import verify_database_capacity_lease
+    from process.provider_directory_profile_capacity_trust_config import configured_capacity_lease_trust
+
+    trust = configured_capacity_lease_trust()
+    body = envelope.get("lease")
+    return verify_database_capacity_lease(
+        envelope,
+        trust=trust,
+        now=datetime.now(UTC),
+        require_fresh_observation=require_fresh_observation,
+        expected_capacity_geometry_hash=body.get("capacity_geometry_hash") if isinstance(body, dict) else None,
+        expected_database_system_identifier=trust.database_system_identifier,
+        expected_database_oid=trust.database_oid,
+        expected_database_name=trust.database_name,
+    )
+
+
+def require_fresh_ordinary_profile_launch(spec, launch_request):
+    """Permit stale observation reuse, never creation of a replacement Job."""
+    from api.control_workers import _AdmittedWorkerRequest
+    from process.provider_directory_profile_capacity_attestation import VerifiedDatabaseCapacityLease
+
+    if type(launch_request) is not _AdmittedWorkerRequest or launch_request.ordinary_fhir_profile_job is None:
+        return
+    admitted_ordinary_fhir_job(spec, launch_request)
+    lease = launch_request.ordinary_fhir_profile_lease
+    if not isinstance(lease, VerifiedDatabaseCapacityLease):
+        raise ValueError("fhir_profile_worker_admission_unavailable")
+    _verified_profile_capacity_lease(
+        {"lease": json.loads(lease.canonical_lease_json), "signature": lease.signature},
+        require_fresh_observation=True,
+    )
+
+
+def admit_fhir_source_worker_launch(admitted_run):
+    """Require the configured immutable source image and original queued identity."""
+    if admitted_run.get("importer") != _IMPORTER:
+        return None
+    metrics = admitted_run.get("metrics")
+    image = os.getenv(IMAGE_ENV, os.getenv(REFERENCE_IMAGE_ENV, ""))
+    if (
+        not isinstance(metrics, dict)
+        or metrics.get("queue") != _QUEUE
+        or metrics.get("function") != _FUNCTION
+        or any(
+            type(identity) is not str or not identity or identity != identity.strip()
+            for identity in (admitted_run.get("run_id"), metrics.get("job_id"))
+        )
+    ):
+        raise ValueError("fhir_source_worker_admission_unavailable")
+    params_by_name = admitted_run.get("params")
+    if (
+        isinstance(params_by_name, dict)
+        and params_by_name.get("provider_directory_dataset_followup_stage") == "address_overlay"
+    ):
+        from process.provider_directory_generic_source_artifacts import ordinary_overlay_followup
+
+        directory = import_module("process.provider_directory_fhir")
+        if ordinary_overlay_followup(directory, params_by_name) is not None:
+            if {"test_mode", "run_id"}.intersection(params_by_name):
+                raise ValueError("fhir_source_worker_admission_unavailable")
+            return None
+    from process.ext.source_http_proxy import SourceProxyConfig
+
+    policy = SourceProxyConfig.from_environment()
+    _require_source_proxy_scope(policy, params_by_name)
+    route = _source_route(admitted_run)
+    if route is not None:
+        image = route["image"]
+    if _IMAGE.fullmatch(image) is None:
+        raise ValueError("fhir_source_worker_admission_unavailable")
+    return FHIRSourceWorkerLaunch(
+        admitted_run["run_id"],
+        metrics["job_id"],
+        image,
+        (route["root_run_id"] or "") if route else "",
+        route["secret_name"] if route else "",
+        route["source_id"] if route else "",
+        route["endpoint_scope"] if route else "",
+        (params_by_name.get("retry_of_run_id") or "") if route and route["root_run_id"] else "",
+        **(
+            _proxy_fields(
+                params_by_name.get("source_ids") if type(params_by_name) is dict else None,
+                params_by_name.get("provider_directory_endpoint_scope") if type(params_by_name) is dict else None,
+                route,
+                policy=policy,
+            )
+            if policy.has_enabled_sources and _uses_source_http(params_by_name)
+            else {}
+        ),
+    )
+
+
+def _lineage_by_id(lineage_rows):
+    """Normalize the bounded native rows before checking the retry chain."""
+    return {
+        lineage_record["run_id"]: lineage_record
+        for lineage_record in (
+            dict(raw_record._mapping) if hasattr(raw_record, "_mapping") else dict(raw_record)
+            for raw_record in lineage_rows
+        )
+    }
+
+
+def _is_admissible_route_root(lineage_record, launch):
+    """Keep active originals distinct from failed ancestors of native retries."""
+    if lineage_record["retry_of_run_id"] is not None:
+        return False
+    if launch.run_id != launch.root_run_id:
+        return lineage_record["status"] == "failed"
+    params = lineage_record["params"]
+    return (
+        lineage_record["status"]
+        in (
+            {"succeeded"}
+            if type(launch) is FHIRSourcePublicationLaunch
+            else {"queued", "starting", "running", "finalizing"}
+        )
+        and not launch.retry_of_run_id
+        and params.get("retry_of_run_id") is None
+        and params.get("provider_directory_pagination_root_run_id") in (None, launch.root_run_id)
+    )
+
+
+def _is_unstarted_canceled_route_parent(lineage_record, current_params):
+    """Retain a removed queued attempt only when the successor cannot reset data."""
+    from api.control_workers import _kubernetes_namespace
+
+    signal = lineage_record.get("cancel_signal")
+    if type(signal) is not dict:
+        return False
+    kubernetes = signal.get("kubernetes")
+    return (
+        type(current_params) is dict
+        and current_params.get("allow_retained_pagination_reset") is False
+        and {"started_at", "finished_at", "phase_detail"}.issubset(lineage_record)
+        and lineage_record["status"] == "canceled"
+        and lineage_record.get("started_at") is None
+        and lineage_record.get("finished_at") is not None
+        and lineage_record.get("phase_detail") == "canceled before start"
+        and lineage_record.get("source_http_proxy_binding") is None
+        and lineage_record.get("source_http_proxy_cooldowns") is None
+        and signal.get("redis") is True
+        and signal.get("removed") is True
+        and signal.get("deleted_job_key") is True
+        and type(signal.get("deleted_keys")) is int
+        and signal["deleted_keys"] == 1
+        and signal.get("queue") == _QUEUE
+        and signal.get("job_id") == "provider_directory_start_" + lineage_record["run_id"]
+        and type(kubernetes) is dict
+        and kubernetes.get("enabled") is True
+        and type(kubernetes.get("deleted")) is int
+        and kubernetes == {"enabled": True, "namespace": _kubernetes_namespace(), "deleted": 0, "items": []}
+        and not {"error", "errors", "identity_mismatch", "identity_unavailable"}.intersection(signal)
+    )
+
+
+async def _source_route_lineage(connection, root_run_id):
+    """Read only native ancestry and its bounded nonsecret transport audit fields."""
+    from sqlalchemy import text
+
+    from api.control_imports import ImportRun
+    from db.plan_release_storage import storage_relation
+
+    run_relation = storage_relation(str(ImportRun.__table__.schema), "import_run")
+    return await connection.all(
+        text(
+            "SELECT run_id,importer,status,retry_of_run_id,params,started_at,finished_at,phase_detail,"
+            "metrics->'cancel_signal' AS cancel_signal,"
+            "metrics->'audit'->'source_http_proxy'->'binding' AS source_http_proxy_binding,"
+            "metrics->'audit'->'source_http_proxy'->'cooldowns' AS source_http_proxy_cooldowns FROM "
+            + run_relation
+            + " WHERE importer='provider-directory-fhir' AND "
+            "(run_id=:root OR params::jsonb->>'provider_directory_pagination_root_run_id'=:root) LIMIT 65"
+        ),
+        root=root_run_id,
+    )
+
+
+async def require_fhir_source_route_ancestry(connection, launch):
+    """Return the immutable launch only after native ancestry and cooldown capture."""
+    if type(launch) not in (FHIRSourceWorkerLaunch, FHIRSourcePublicationLaunch) or not launch.root_run_id:
+        return launch
+    lineage_rows = await _source_route_lineage(connection, launch.root_run_id)
+    runs_by_id = _lineage_by_id(lineage_rows)
+    if len(lineage_rows) > 64 or len(runs_by_id) != len(lineage_rows):
+        raise ValueError("fhir_source_worker_route_changed")
+    current_id = launch.run_id
+    current_params = runs_by_id.get(current_id, {}).get("params")
+    seen_run_ids = set()
+    ancestors = []
+    while current_id not in seen_run_ids and len(seen_run_ids) <= 64:
+        seen_run_ids.add(current_id)
+        lineage_record = runs_by_id.get(current_id)
+        if lineage_record is None:
+            break
+        if current_id != launch.run_id and lineage_record["status"] != "canceled":
+            ancestors.append(lineage_record)
+        params = lineage_record["params"]
+        if not (
+            type(params) is dict
+            and params.get("source_ids") == [launch.source_id]
+            and params.get("provider_directory_endpoint_scope") == launch.endpoint_scope
+            and (
+                current_id == launch.root_run_id
+                or params.get("provider_directory_pagination_root_run_id") == launch.root_run_id
+            )
+        ):
+            break
+        if current_id == launch.root_run_id:
+            if _is_admissible_route_root(lineage_record, launch):
+                return (
+                    launch
+                    if type(launch) is FHIRSourcePublicationLaunch
+                    else _proxy_lineage_launch(launch, ancestors or [lineage_record])
+                )
+            break
+        parent_id = lineage_record["retry_of_run_id"]
+        if not (
+            type(parent_id) is str
+            and params.get("retry_of_run_id") == parent_id
+            and (
+                lineage_record["status"]
+                in (
+                    {"succeeded"}
+                    if type(launch) is FHIRSourcePublicationLaunch
+                    else {"queued", "starting", "running", "finalizing"}
+                )
+                if current_id == launch.run_id
+                else lineage_record["status"] == "failed"
+                or _is_unstarted_canceled_route_parent(lineage_record, current_params)
+            )
+            and (current_id != launch.run_id or parent_id == launch.retry_of_run_id)
+        ):
+            break
+        current_id = parent_id
+    raise ValueError("fhir_source_worker_route_changed")
+
+
+def authorized_fhir_source_worker_launch(spec, launch_request):
+    """Accept only the exact server-held capability and closed engine adapter."""
+    from api.control_workers import _AdmittedWorkerRequest
+
+    if type(launch_request) is not _AdmittedWorkerRequest:
+        return None
+    if getattr(launch_request, "cms_registry_launch", None) is not None:
+        return None
+    launch = getattr(launch_request, "fhir_source_launch", None)
+    if launch is None:
+        return None
+    if type(launch) not in (FHIRSourceWorkerLaunch, FHIRSourcePublicationLaunch):
+        raise ValueError("fhir_source_worker_admission_unavailable")
+    is_publication = type(launch) is FHIRSourcePublicationLaunch
+    _require_fhir_job_identity(spec, launch_request, launch.run_id, launch.job_id, publication=is_publication)
+    if is_publication and (
+        not re.fullmatch(re.escape(launch.run_id) + r":[0-9a-f]{32}", launch.attempt_id)
+        or not re.fullmatch(r"[0-9a-f]{64}", launch.handoff_sha256)
+        or any((launch.policy_revision, launch.pool_revision, launch.pool_secret_name, launch.proxy_cooldowns_json))
+    ):
+        raise ValueError("fhir_source_worker_admission_unavailable")
+    if not is_publication:
+        _require_proxy_launch(launch)
+    return launch
+
+
+def _require_proxy_launch(launch):
+    """A changed capability or server policy cannot silently replace its binding."""
+    fields = (launch.policy_revision, launch.pool_revision, launch.pool_secret_name)
+    if not launch.source_id and not any(fields):
+        if launch.proxy_cooldowns_json:
+            raise ValueError("fhir_source_worker_admission_unavailable")
+        return
+    route = next(
+        (
+            entry
+            for entry in _configured_routes()
+            if (
+                entry["root_run_id"] or "",
+                entry["source_id"],
+                entry["endpoint_scope"],
+                entry["image"],
+                entry["secret_name"],
+            )
+            == (launch.root_run_id, launch.source_id, launch.endpoint_scope, launch.image, launch.secret_name)
+        ),
+        None,
+    )
+    expected = _proxy_fields([launch.source_id], launch.endpoint_scope, route)
+    if fields != tuple(expected.get(name, "") for name in ("policy_revision", "pool_revision", "pool_secret_name")):
+        raise ValueError("fhir_source_worker_admission_unavailable")
+    if launch.pool_secret_name:
+        _require_proxy_cooldowns(launch)
+        if not launch.root_run_id and launch.proxy_cooldowns_json != expected["proxy_cooldowns_json"]:
+            raise ValueError("fhir_source_worker_admission_unavailable")
+    elif launch.proxy_cooldowns_json:
+        raise ValueError("fhir_source_worker_admission_unavailable")
+
+
+def _proxy_binding(launch):
+    return {
+        "source_id": launch.source_id,
+        "endpoint_scope": launch.endpoint_scope,
+        "policy_revision": launch.policy_revision,
+        "pool_revision": launch.pool_revision,
+    }
+
+
+def _cooldowns_json(endpoint_scope, pool_revision, cooldowns):
+    return json.dumps(
+        {
+            "version": 1,
+            "pool_revision": pool_revision,
+            "origin": str(URL(endpoint_scope).origin()),
+            "cooldowns": cooldowns,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _validated_cooldowns(snapshot, launch):
+    """Copy a closed nonsecret audit envelope without inspecting any pool credential."""
+    error = "fhir_source_worker_proxy_cooldowns_invalid"
+    if (
+        type(snapshot) is not dict
+        or set(snapshot) != {"version", "pool_revision", "origin", "cooldowns"}
+        or type(snapshot["version"]) is not int
+        or snapshot["version"] != 1
+        or snapshot["pool_revision"] != launch.pool_revision
+        or snapshot["origin"] != str(URL(launch.endpoint_scope).origin())
+        or type(snapshot["cooldowns"]) is not list
+        or len(snapshot["cooldowns"]) > 64
+    ):
+        raise ValueError(error)
+    boundaries_by_id = {}
+    for entry in snapshot["cooldowns"]:
+        if (
+            type(entry) is not dict
+            or set(entry) != {"proxy_id", "retry_not_before"}
+            or type(entry["proxy_id"]) is not str
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}", entry["proxy_id"])
+            or entry["proxy_id"] in boundaries_by_id
+        ):
+            raise ValueError(error)
+        boundary = entry["retry_not_before"]
+        if boundary is not None:
+            try:
+                if type(boundary) is not str or len(boundary) > 64:
+                    raise ValueError
+                deadline = datetime.fromisoformat(boundary)
+                if deadline.tzinfo is None or deadline.utcoffset() is None:
+                    raise ValueError
+                boundary = deadline.astimezone(UTC).isoformat().replace("+00:00", "Z")
+            except ValueError, OverflowError:
+                raise ValueError(error) from None
+        boundaries_by_id[entry["proxy_id"]] = boundary
+    return [
+        {"proxy_id": proxy_id, "retry_not_before": boundary} for proxy_id, boundary in sorted(boundaries_by_id.items())
+    ]
+
+
+def _require_proxy_cooldowns(launch):
+    try:
+        if type(launch.proxy_cooldowns_json) is not str or len(launch.proxy_cooldowns_json) > 65536:
+            raise ValueError
+        snapshot = json.loads(launch.proxy_cooldowns_json)
+    except ValueError, TypeError:
+        raise ValueError("fhir_source_worker_proxy_cooldowns_invalid") from None
+    cooldowns = _validated_cooldowns(snapshot, launch)
+    if launch.proxy_cooldowns_json != _cooldowns_json(launch.endpoint_scope, launch.pool_revision, cooldowns):
+        raise ValueError("fhir_source_worker_proxy_cooldowns_invalid")
+
+
+def _proxy_lineage_launch(launch, ancestors):
+    if not launch.pool_secret_name:
+        if any(
+            ancestor.get("source_http_proxy_binding") is not None
+            or ancestor.get("source_http_proxy_cooldowns") is not None
+            for ancestor in ancestors
+        ):
+            raise ValueError("fhir_source_worker_route_changed")
+        return launch
+    if not ancestors:
+        raise ValueError("fhir_source_worker_proxy_cooldowns_invalid")
+    boundaries_by_id = {}
+    for ancestor in ancestors:
+        if ancestor.get("source_http_proxy_binding") != _proxy_binding(launch):
+            raise ValueError("fhir_source_worker_route_changed")
+        for entry in _validated_cooldowns(ancestor.get("source_http_proxy_cooldowns"), launch):
+            proxy_id, boundary = entry["proxy_id"], entry["retry_not_before"]
+            if proxy_id not in boundaries_by_id:
+                boundaries_by_id[proxy_id] = boundary
+            elif boundaries_by_id[proxy_id] is not None:
+                boundaries_by_id[proxy_id] = (
+                    max(boundaries_by_id[proxy_id], boundary, key=datetime.fromisoformat)
+                    if boundary is not None
+                    else None
+                )
+            if len(boundaries_by_id) > 64:
+                raise ValueError("fhir_source_worker_proxy_cooldowns_invalid")
+    cooldowns = [
+        {"proxy_id": proxy_id, "retry_not_before": boundary} for proxy_id, boundary in sorted(boundaries_by_id.items())
+    ]
+    updated = replace(
+        launch, proxy_cooldowns_json=_cooldowns_json(launch.endpoint_scope, launch.pool_revision, cooldowns)
+    )
+    _require_proxy_cooldowns(updated)
+    return updated
+
+
+def _proxy_literal_environment(launch):
+    if not launch.pool_secret_name:
+        return []
+    policy_by_field = {
+        "version": 1,
+        "revision": launch.policy_revision,
+        "sources": [{"source_id": launch.source_id, "endpoint_scope": launch.endpoint_scope, "use_proxy": True}],
+    }
+    return [
+        {"name": name, "value": json.dumps(value, sort_keys=True, separators=(",", ":"))}
+        for name, value in ((PROXY_POLICY_ENV, policy_by_field), (PROXY_BINDING_ENV, _proxy_binding(launch)))
+    ] + [{"name": PROXY_COOLDOWNS_ENV, "value": launch.proxy_cooldowns_json}]
+
+
+def source_proxy_environment(spec, launch_request, environment):
+    """Emit captured source policy or publication proof with exact keyrefs."""
+    from api.provider_directory_source_publication import environment as publication_environment
+
+    launch = authorized_fhir_source_worker_launch(spec, launch_request)
+    if launch is None or not launch.pool_secret_name:
+        return publication_environment(launch)
+    expected_by_field = {
+        "name": PROXY_POOL_ENV,
+        "valueFrom": {"secretKeyRef": {"name": launch.pool_secret_name, "key": PROXY_POOL_ENV}},
+    }
+    if [entry for entry in environment if entry["name"] == PROXY_POOL_ENV] != [expected_by_field]:
+        raise ValueError("fhir_source_worker_proxy_configuration_invalid")
+    return _proxy_literal_environment(launch)
+
+
+def source_proxy_annotations(spec, launch_request):
+    """Bind proxy-enabled Job admission to its captured policy and pool revisions."""
+    launch = authorized_fhir_source_worker_launch(spec, launch_request)
+    if launch is None or not launch.pool_secret_name:
+        return {}
+    return {
+        "healthporta.com/source-proxy-policy-revision": launch.policy_revision,
+        "healthporta.com/source-proxy-pool-revision": launch.pool_revision,
+    }
+
+
+def _is_proxy_job_matching(job, launch):
+    annotations_by_key = job["metadata"]["annotations"]
+    if any(
+        annotations_by_key.get(name, "") != value
+        for name, value in (
+            ("healthporta.com/source-proxy-policy-revision", launch.policy_revision),
+            ("healthporta.com/source-proxy-pool-revision", launch.pool_revision),
+        )
+    ):
+        return False
+    expected_entries = _proxy_literal_environment(launch)
+    if launch.pool_secret_name:
+        expected_entries.append(
+            {
+                "name": PROXY_POOL_ENV,
+                "valueFrom": {"secretKeyRef": {"name": launch.pool_secret_name, "key": PROXY_POOL_ENV}},
+            }
+        )
+    observed_entries = [
+        entry
+        for entry in job["spec"]["template"]["spec"]["containers"][0]["env"]
+        if entry["name"] in {PROXY_POOL_ENV, PROXY_POLICY_ENV, PROXY_BINDING_ENV, PROXY_COOLDOWNS_ENV}
+    ]
+    return sorted(observed_entries, key=lambda entry: entry["name"]) == sorted(
+        expected_entries, key=lambda entry: entry["name"]
+    )
+
+
+def fresh_route_annotations(spec, launch_request):
+    """Expose exact fresh-route coordinates only from the admitted capability."""
+    launch = authorized_fhir_source_worker_launch(spec, launch_request)
+    if launch is None or launch.root_run_id or not launch.secret_name:
+        return {}
+    if launch.retry_of_run_id or not any(
+        route["root_run_id"] is None
+        and (route["source_id"], route["endpoint_scope"], route["image"], route["secret_name"])
+        == (launch.source_id, launch.endpoint_scope, launch.image, launch.secret_name)
+        for route in _configured_routes()
+    ):
+        raise ValueError("fhir_source_worker_admission_unavailable")
+    return {
+        "healthporta.com/source-id": launch.source_id,
+        "healthporta.com/source-endpoint-scope": launch.endpoint_scope,
+    }
+
+
+def admitted_ordinary_fhir_job(spec, launch_request):
+    """Keep authenticated ordinary operations bound to their original native job."""
+    from api.control_workers import _AdmittedWorkerRequest
+
+    if type(launch_request) is not _AdmittedWorkerRequest:
+        return None
+    overlay = launch_request.ordinary_fhir_overlay_job
+    profile = launch_request.ordinary_fhir_profile_job
+    identity = overlay if overlay is not None else profile
+    if identity is None:
+        return None
+    if (
+        type(identity) is not tuple
+        or (overlay is not None and profile is not None)
+        or len(identity) != 5
+        or identity != launch_request.admitted_job
+        or launch_request.cms_registry_launch is not None
+        or launch_request.fhir_source_launch is not None
+    ):
+        raise ValueError("fhir_source_worker_admission_unavailable")
+    _require_fhir_job_identity(spec, launch_request, identity[0], identity[4])
+    return identity[4]
+
+
+def _require_fhir_job_identity(spec, launch_request, run_id, job_id, *, publication=False):
+    """Keep both runtimes on the same exact native adapter and queue identity."""
+    from api.control_imports import _SINGLE_JOB_ADAPTERS
+    from api.provider_directory_source_publication import ROLE
+
+    adapter = _SINGLE_JOB_ADAPTERS.get(_IMPORTER, {})
+    role = ROLE if publication else "start"
+    if (
+        (spec.worker_class, spec.queue, spec.importers, spec.role) != (_WORKER_CLASS, _QUEUE, (_IMPORTER,), role)
+        or (publication and launch_request.get("role") != ROLE)
+        or launch_request.admitted_job != (run_id, _IMPORTER, _QUEUE, _FUNCTION, job_id)
+        or launch_request.get("run_id") != run_id
+        or launch_request.get("importer", _IMPORTER) != _IMPORTER
+        or launch_request.get("job_id") not in (None, "", job_id)
+        or tuple(
+            adapter.get(name)
+            for name in ("queue", "function", "payload", "target_module", "target_function", "job_prefix")
+        )
+        != (
+            _QUEUE,
+            _FUNCTION,
+            "control_wrapped",
+            "process.provider_directory_fhir",
+            "process_data",
+            "provider_directory_start",
+        )
+        or adapter.get("run_shutdown") is not True
+        or job_id != "provider_directory_start_" + run_id
+    ):
+        raise ValueError("fhir_source_worker_admission_unavailable")
+
+
+def apply_fhir_source_worker_spec(spec, launch_request, labels, pod_spec):
+    """Use the fixed non-root source runtime only after native purpose admission."""
+    if authorized_fhir_source_worker_launch(spec, launch_request) is not None:
+        labels["healthporta.com/worker-purpose"] = PURPOSE
+        security = pod_spec["securityContext"]
+        # Preserve the shared volume group to avoid rewriting existing file ownership.
+        security.update(runAsUser=10001, runAsGroup=10001)
+
+
+def _is_fhir_secret_scope(selection, worker_class):
+    """Keep environment and mount selectors on the same exact Source purpose."""
+    classes = selection.get("workerClasses", selection.get("worker_classes"))
+    if (
+        selection.get("purposes") != [PURPOSE]
+        or selection.get("importers") != [_IMPORTER]
+        or classes != [_WORKER_CLASS]
+        or ("workerClasses" in selection and "worker_classes" in selection)
+    ):
+        raise ValueError("worker purpose secret selector is invalid")
+    return worker_class == _WORKER_CLASS
+
+
+def is_fhir_source_secret_selected(selection, worker_class, launch_request):
+    """Select source credentials only for the exact admitted FHIR queue purpose."""
+    if not _is_fhir_secret_scope(selection, worker_class):
+        return False
+    from api.control_workers import _BY_WORKER_CLASS
+    from api.provider_directory_source_publication import selected_spec
+
+    spec = _BY_WORKER_CLASS.get(_WORKER_CLASS)
+    spec = selected_spec(spec, launch_request) if spec is not None and launch_request is not None else spec
+    launch = authorized_fhir_source_worker_launch(spec, launch_request) if spec is not None else None
+    return launch is not None and _is_launch_secret_selected(selection, launch, allow_shared=True)
+
+
+def is_fhir_source_volume_selected(selection, worker_class, launch):
+    """Use the existing Source capability for explicitly purpose-scoped mounts."""
+    return (
+        _is_fhir_secret_scope(selection, worker_class)
+        and type(launch) in (FHIRSourceWorkerLaunch, FHIRSourcePublicationLaunch)
+        and _is_launch_secret_selected(selection, launch)
+    )
+
+
+def is_fhir_source_job_matching(job, launch, launch_request=None):
+    """Refuse changed bootstrap code, native target or process isolation on reuse."""
+    from api.control_workers import (
+        _BY_WORKER_CLASS,
+        _has_broad_proxy_pool_reference,
+        _worker_job_container_security_context,
+        _worker_job_manifest,
+        _worker_job_pod_security_context,
+        _worker_job_pvc_volumes,
+        _worker_job_secret_volumes,
+    )
+    from api.provider_directory_source_publication import ROLE
+
+    if type(launch) not in (FHIRSourceWorkerLaunch, FHIRSourcePublicationLaunch) or _has_broad_proxy_pool_reference(
+        job
+    ):
+        return False
+    spec = _BY_WORKER_CLASS[_WORKER_CLASS]
+    spec = replace(spec, role=ROLE) if type(launch) is FHIRSourcePublicationLaunch else spec
+    try:
+        template = job["spec"]["template"]
+        pod = template["spec"]
+        containers = pod["containers"]
+        security = pod["securityContext"]
+        volumes = [*_worker_job_pvc_volumes(), *_worker_job_secret_volumes(spec, launch)]
+        expected_security = _worker_job_pod_security_context(has_group_read_volume="fsGroup" in security)
+        expected_security.update(runAsUser=10001, runAsGroup=10001)
+        expected_env = None
+        if launch_request is not None:
+            expected_job = _worker_job_manifest(spec, launch_request, launch.image)
+            expected_env = expected_job["spec"]["template"]["spec"]["containers"][0]["env"]
+        return (
+            security == expected_security
+            and pod["automountServiceAccountToken"] is False
+            and all(not pod.get(key, False) for key in ("hostPID", "hostIPC", "hostNetwork"))
+            and not any(pod.get(name) for name in ("initContainers", "ephemeralContainers"))
+            and len(containers) == 1
+            and containers[0]["securityContext"] == _worker_job_container_security_context()
+            and containers[0]["image"] == launch.image
+            and (expected_env is None or containers[0]["env"] == expected_env)
+            and _is_proxy_job_matching(job, launch)
+            and _fhir_source_identity_matches(job, launch)
+            and containers[0].get("volumeMounts", []) == [volume["volumeMount"] for volume in volumes]
+            and _secret_volume_defaults(pod.get("volumes", []))
+            == _secret_volume_defaults([volume["volume"] for volume in volumes])
+        )
+    except KeyError, TypeError, IndexError:
+        return False
+
+
+def _fhir_source_identity_matches(job, launch):
+    """Match only the fixed acquisition or publication bootstrap and native target."""
+    from api.provider_directory_source_publication import ROLE, environment
+
+    template = job["spec"]["template"]
+    container = template["spec"]["containers"][0]
+    is_publication = type(launch) is FHIRSourcePublicationLaunch
+    return (
+        job["metadata"]["labels"]["healthporta.com/worker-purpose"] == PURPOSE
+        and template["metadata"]["labels"]["healthporta.com/worker-purpose"] == PURPOSE
+        and job["metadata"]["annotations"].get("healthporta.com/source-root-run-id", "")
+        == (launch.root_run_id if launch.retry_of_run_id else "")
+        and job["metadata"]["annotations"].get("healthporta.com/source-id", "")
+        == (launch.source_id if launch.secret_name and not launch.root_run_id else "")
+        and job["metadata"]["annotations"].get("healthporta.com/source-endpoint-scope", "")
+        == (launch.endpoint_scope if launch.secret_name and not launch.root_run_id else "")
+        and container["command"] == COMMAND
+        and container["workingDir"] == "/app"
+        and (container.get("args") == ["publish"] if is_publication else not container.get("args"))
+        and not any(container.get(name) for name in ("lifecycle", "volumeDevices"))
+        and (
+            not is_publication
+            or (
+                job["metadata"]["labels"]["healthporta.com/role"] == ROLE
+                and template["metadata"]["labels"]["healthporta.com/role"] == ROLE
+                and all(
+                    [entry for entry in container["env"] if entry.get("name") == expected["name"]] == [expected]
+                    for expected in environment(launch)
+                )
+            )
+        )
+        and all(
+            [entry.get("value") for entry in container["env"] if entry.get("name") == name] == [expected]
+            for name, expected in (
+                ("HLTHPRT_CONTROL_RUN_ID", launch.run_id),
+                ("HLTHPRT_WORKER_ONCE_TARGET_JOB_ID", launch.job_id),
+            )
+        )
+    )
+
+
+def _secret_volume_defaults(volumes):
+    """Retain every binding field while allowing the API's Secret default 0644."""
+    return [
+        {**volume, "secret": {"defaultMode": 0o644, **volume["secret"]}} if "secret" in volume else volume
+        for volume in volumes
+    ]
+
+
+def is_overlay_job_matching(job, expected_job):
+    """Refuse reuse of a different runtime or native target for an ordinary overlay."""
+    try:
+        template_by_field = job["spec"]["template"]
+        pod_by_field = template_by_field["spec"]
+        expected_pod_by_field = expected_job["spec"]["template"]["spec"]
+        containers = pod_by_field["containers"]
+        expected_container_by_field = expected_pod_by_field["containers"][0]
+        return (
+            len(containers) == 1
+            and all(
+                containers[0].get(name) == expected_container_by_field.get(name)
+                for name in (
+                    "image",
+                    "imagePullPolicy",
+                    "workingDir",
+                    "command",
+                    "env",
+                    "envFrom",
+                    "securityContext",
+                    "volumeMounts",
+                )
+            )
+            and not any(containers[0].get(name) for name in ("args", "lifecycle", "volumeDevices"))
+            and not any(
+                pod_by_field.get(name)
+                for name in (
+                    "initContainers",
+                    "ephemeralContainers",
+                    "hostPID",
+                    "hostIPC",
+                    "hostNetwork",
+                )
+            )
+            and pod_by_field["automountServiceAccountToken"] is False
+            and pod_by_field.get("serviceAccountName", "default")
+            == expected_pod_by_field.get("serviceAccountName", "default")
+            and pod_by_field["securityContext"] == expected_pod_by_field["securityContext"]
+            and _secret_volume_defaults(pod_by_field.get("volumes", []))
+            == _secret_volume_defaults(expected_pod_by_field.get("volumes", []))
+            and all(
+                "healthporta.com/worker-purpose" not in metadata.get("labels", {})
+                for metadata in (job["metadata"], template_by_field["metadata"])
+            )
+            and job["metadata"]["annotations"] == expected_job["metadata"]["annotations"]
+        )
+    except KeyError, TypeError, IndexError:
+        return False
+
+
+def is_fhir_job_set_matching(spec, launch_request, jobs):
+    """Check existing FHIR Jobs against the runtime selected by native admission."""
+    launch = authorized_fhir_source_worker_launch(spec, launch_request)
+    if launch is not None:
+        return all(is_fhir_source_job_matching(job, launch, launch_request) for job in jobs)
+    if admitted_ordinary_fhir_job(spec, launch_request) is None:
+        return True
+    from api.control_workers import _configured_worker_job_image, _worker_job_manifest
+
+    expected_job = _worker_job_manifest(spec, launch_request, _configured_worker_job_image(spec, launch_request))
+    return all(is_overlay_job_matching(job, expected_job) for job in jobs)

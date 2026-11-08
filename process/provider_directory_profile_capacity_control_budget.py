@@ -16,6 +16,7 @@ from process.provider_directory_profile_capacity_target import (
     _checked_add,
 )
 from process.provider_directory_profile_capacity_types import (
+    _MAX_SIGNED_BIGINT,
     ARTIFACT_SCOPE_RECOVERY_CONTRACT_ID,
     CONTROL_WAL_ARTIFACT_SCOPE_NAMES,
     CONTROL_WAL_ARTIFACT_SCOPE_TABLE_COUNT,
@@ -34,15 +35,11 @@ from process.provider_directory_profile_capacity_types import (
     ProviderDirectoryProfileCapacityGeometry,
     ProviderDirectoryProfileControlWalOperation,
     ProviderDirectoryProfileMetadataMutationInput,
-    _MAX_SIGNED_BIGINT,
 )
 
+
 def _control_wal_nonnegative_integer(value: Any, field_name: str) -> int:
-    if (
-        not isinstance(value, int)
-        or isinstance(value, bool)
-        or not 0 <= value <= _MAX_SIGNED_BIGINT
-    ):
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= _MAX_SIGNED_BIGINT:
         raise _error("control_wal_projection_input_invalid:" + field_name)
     return value
 
@@ -73,9 +70,7 @@ def _validate_control_wal_metadata_input(
         or mutation.operation != operation
         or not isinstance(mutation.payload_upper_bytes, int)
         or isinstance(mutation.payload_upper_bytes, bool)
-        or not 0
-        <= mutation.payload_upper_bytes
-        <= METADATA_PAYLOAD_UPPER_BOUND_BYTES
+        or not 0 <= mutation.payload_upper_bytes <= METADATA_PAYLOAD_UPPER_BOUND_BYTES
         or not isinstance(mutation.deleted_toast_chunks, int)
         or isinstance(mutation.deleted_toast_chunks, bool)
         or mutation.deleted_toast_chunks < 0
@@ -83,19 +78,11 @@ def _validate_control_wal_metadata_input(
         or not mutation.main_index_pages
         or not isinstance(mutation.toast_index_pages, tuple)
         or any(
-            not isinstance(page_count, int)
-            or isinstance(page_count, bool)
-            or page_count < 1
-            for page_count in (
-                mutation.main_index_pages
-                + mutation.toast_index_pages
-            )
+            not isinstance(page_count, int) or isinstance(page_count, bool) or page_count < 1
+            for page_count in (mutation.main_index_pages + mutation.toast_index_pages)
         )
     ):
-        raise _error(
-            "control_wal_projection_metadata_input_invalid:"
-            + relation_name
-        )
+        raise _error("control_wal_projection_metadata_input_invalid:" + relation_name)
 
 
 def _validate_control_artifact_batches(
@@ -112,20 +99,15 @@ def _validate_control_artifact_batches(
             )
         )
         != CONTROL_WAL_ARTIFACT_SCOPE_NAMES
-        or len(artifact_batches)
-        != CONTROL_WAL_ARTIFACT_SCOPE_TABLE_COUNT
+        or len(artifact_batches) != CONTROL_WAL_ARTIFACT_SCOPE_TABLE_COUNT
     ):
-        raise _error(
-            "control_wal_projection_input_invalid:artifact_batch_order"
-        )
+        raise _error("control_wal_projection_input_invalid:artifact_batch_order")
     for artifact_batch in artifact_batches:
         if not isinstance(
             artifact_batch,
             ProfileControlArtifactBatchCount,
         ):
-            raise _error(
-                "control_wal_projection_input_invalid:artifact_batch"
-            )
+            raise _error("control_wal_projection_input_invalid:artifact_batch")
         _control_wal_nonnegative_integer(
             artifact_batch.batch_count,
             "artifact_batch_count",
@@ -140,17 +122,9 @@ def _validate_control_wal_plan_input(
         ProfileControlWalPlanInput,
     ):
         raise _error("control_wal_projection_input_invalid:plan")
-    _validate_control_artifact_batches(
-        plan_input.artifact_batch_counts
-    )
-    if (
-        plan_input.artifact_scope_recovery_contract_id
-        != ARTIFACT_SCOPE_RECOVERY_CONTRACT_ID
-    ):
-        raise _error(
-            "control_wal_projection_input_invalid:"
-            "artifact_scope_recovery_contract"
-        )
+    _validate_control_artifact_batches(plan_input.artifact_batch_counts)
+    if plan_input.artifact_scope_recovery_contract_id != ARTIFACT_SCOPE_RECOVERY_CONTRACT_ID:
+        raise _error("control_wal_projection_input_invalid:artifact_scope_recovery_contract")
     for field_name in (
         "evidence_batch_count",
         "compact_batch_count",
@@ -211,9 +185,7 @@ def _control_metadata_projection_per_operation(
     if sequence_operation_count < 1:
         return 0, 0
     inserted_toast_chunks = (
-        mutation.payload_upper_bytes
-        + geometry.postgres_toast_max_chunk_size_bytes
-        - 1
+        mutation.payload_upper_bytes + geometry.postgres_toast_max_chunk_size_bytes - 1
     ) // geometry.postgres_toast_max_chunk_size_bytes
     conservative_mutation = dataclasses.replace(
         mutation,
@@ -265,11 +237,7 @@ def _control_operation_totals(
     fixed_wal_per_operation: int,
     commits_per_operation: int,
 ) -> tuple[int, int, int, int, int, int, int, int, int, int]:
-    metadata_mutation_count = (
-        operation_count
-        if metadata_data_per_operation or metadata_wal_per_operation
-        else 0
-    )
+    metadata_mutation_count = operation_count if metadata_data_per_operation or metadata_wal_per_operation else 0
     fixed_statement_count = _control_wal_product(
         operation_count,
         fixed_statements_per_operation,
@@ -420,6 +388,22 @@ def _commit_control_operation(
     )
 
 
+def _checkpoint_payload_control_operation(
+    geometry: ProviderDirectoryProfileCapacityGeometry,
+    operation_name: str,
+    operation_count: int,
+) -> ProviderDirectoryProfileControlWalOperation:
+    """Reserve the checkpoint row lock and commit for each payload worker."""
+    return _control_wal_operation(
+        geometry,
+        ("pre_cutover", operation_name),
+        operation_count=operation_count,
+        fixed_statements_per_operation=1,
+        fixed_wal_bytes_per_operation=(CONTROL_WAL_ROW_LOCK_UPPER_BOUND_BYTES_PER_TUPLE),
+        commits_per_operation=1,
+    )
+
+
 def _row_lock_control_operation(
     geometry: ProviderDirectoryProfileCapacityGeometry,
     operation_name: str,
@@ -430,9 +414,7 @@ def _row_lock_control_operation(
         ("pre_cutover", operation_name),
         operation_count=operation_count,
         fixed_statements_per_operation=1,
-        fixed_wal_bytes_per_operation=(
-            CONTROL_WAL_ROW_LOCK_UPPER_BOUND_BYTES_PER_TUPLE
-        ),
+        fixed_wal_bytes_per_operation=(CONTROL_WAL_ROW_LOCK_UPPER_BOUND_BYTES_PER_TUPLE),
         commits_per_operation=0,
     )
 

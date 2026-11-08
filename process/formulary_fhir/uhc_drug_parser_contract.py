@@ -8,14 +8,11 @@ import datetime as dt
 import hashlib
 import re
 from dataclasses import dataclass, field
+from typing import cast
 
 from process.formulary_fhir.continuation import validated_alias
-from process.formulary_fhir.repository_shared import strict_hash
-from process.formulary_fhir.repository_shared import strict_text
-from process.formulary_fhir.repository_shared import utc_timestamp
-from process.formulary_fhir.types import CoveragePlanRecord
-from process.formulary_fhir.types import MedicationRecord
-
+from process.formulary_fhir.repository_shared import strict_hash, strict_text, utc_timestamp
+from process.formulary_fhir.types import CoveragePlanRecord, MedicationRecord
 
 PLAN_TYPE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 PLAN_ALIAS_DOMAIN = "uhc-official-drug-plan-alias-v1"
@@ -47,14 +44,12 @@ def uhc_drug_plan_alias(
     if not PLAN_TYPE_PATTERN.fullmatch(normalized_type):
         raise ValueError("UHC drug plan id type is invalid")
     normalized_id = _source_plan_text(plan_id, "plan id", 256)
-    if plan_year is not None and (
-        type(plan_year) is not int or not 2000 <= plan_year <= 2100
-    ):
+    if plan_year is not None and (type(plan_year) is not int or not 2000 <= plan_year <= 2100):
         raise ValueError("UHC drug plan year is invalid")
     identity = "\x1f".join(
         (
             PLAN_ALIAS_DOMAIN,
-            family,
+            cast(str, family),
             normalized_type,
             normalized_id,
             str(plan_year) if plan_year is not None else "",
@@ -78,15 +73,9 @@ class UHCDrugPlanKey:
         if self.family not in {"cs", "ifp"}:
             raise ValueError("UHC drug plan family is invalid")
         _source_plan_text(self.plan_id, "plan id", 256)
-        if (
-            type(self.plan_id_type) is not str
-            or not PLAN_TYPE_PATTERN.fullmatch(self.plan_id_type)
-        ):
+        if type(self.plan_id_type) is not str or not PLAN_TYPE_PATTERN.fullmatch(self.plan_id_type):
             raise ValueError("UHC drug plan id type is invalid")
-        if self.plan_year is not None and (
-            type(self.plan_year) is not int
-            or not 2000 <= self.plan_year <= 2100
-        ):
+        if self.plan_year is not None and (type(self.plan_year) is not int or not 2000 <= self.plan_year <= 2100):
             raise ValueError("UHC drug plan year is invalid")
         validated_alias(self.source_plan_identifier)
         expected_identifier = uhc_drug_plan_alias(
@@ -142,8 +131,7 @@ class UHCDrugSpoolEvidence:
         if (
             self.expected_file_count != 48
             or not 1 <= self.file_count <= self.expected_file_count
-            or self.file_count + self.excluded_file_count
-            != self.expected_file_count
+            or self.file_count + self.excluded_file_count != self.expected_file_count
             or self.plan_count <= 0
         ):
             raise ValueError("UHC drug spool census is incomplete")
@@ -154,8 +142,7 @@ class UHCDrugSpoolEvidence:
             )
             if (
                 self.max_last_updated_at.utcoffset() != dt.timedelta(0)
-                or self.max_last_updated_at.isoformat()
-                != normalized_timestamp.isoformat()
+                or self.max_last_updated_at.isoformat() != normalized_timestamp.isoformat()
             ):
                 raise ValueError("UHC drug maximum update timestamp is invalid")
 
@@ -196,12 +183,10 @@ class UHCDrugPlanMaterialization:
             or type(self.coverage_plan) is not CoveragePlanRecord
             or type(self.medications) is not tuple
             or not self.medications
-            or self.coverage_plan.source_plan_identifiers
-            != (self.key.source_plan_identifier,)
+            or self.coverage_plan.source_plan_identifiers != (self.key.source_plan_identifier,)
             or any(
                 type(medication) is not MedicationRecord
-                or medication.source_plan_identifiers
-                != (self.key.source_plan_identifier,)
+                or medication.source_plan_identifiers != (self.key.source_plan_identifier,)
                 for medication in self.medications
             )
         ):

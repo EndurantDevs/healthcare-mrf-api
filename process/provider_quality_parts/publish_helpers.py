@@ -22,10 +22,11 @@ from process.provider_quality_parts.lifecycle import _archived_identifier
 from process.provider_quality_parts.model_helpers import _cohort_model_classes
 from process.provider_quality_parts.state import _safe_int
 from process.provider_quality_parts.table_helpers import _index_name_for_table, _is_table_available
+from process.reference_family_result_generation import publish_local_reference_family_generation
 
 
-async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> None:
-    final_classes = (
+def _published_models() -> tuple[type, ...]:
+    return (
         PricingQppProvider,
         PricingSviZcta,
         PricingProviderQualityMeasure,
@@ -33,6 +34,12 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
         PricingProviderQualityScore,
         *_cohort_model_classes(),
     )
+
+
+async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> None:
+    """Atomically replace all quality serving tables and bind their generation."""
+
+    final_classes = _published_models()
 
     async def archive_index(index_name: str) -> str:
         """Move a live index name aside before publishing its replacement."""
@@ -83,6 +90,7 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
                 await db.status(
                     f"ALTER INDEX IF EXISTS {schema}.{staged_index_name} RENAME TO {base_name};"
                 )
+        await publish_local_reference_family_generation(db, importer_id="provider-quality", schema_name=schema)
 
 
 async def _insert_run_metadata(

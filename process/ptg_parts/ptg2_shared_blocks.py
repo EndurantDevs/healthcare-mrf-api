@@ -685,17 +685,26 @@ async def _mapping_aggregates_by_kind(
     aggregate_result = await session.execute(
         text(
             f"""
-            SELECT mapping.object_kind,
-                   COUNT(*) AS mapping_count,
-                   COUNT(DISTINCT mapping.block_hash) AS unique_block_count,
-                   COUNT(block.block_hash) AS resolved_mapping_count,
-                   COALESCE(SUM(mapping.entry_count), 0) AS entry_count,
-                   COALESCE(SUM(block.raw_byte_count), 0) AS logical_byte_count
-              FROM {schema}.ptg2_v3_snapshot_block AS mapping
+            SELECT grouped.object_kind,
+                   SUM(grouped.mapping_count)::bigint AS mapping_count,
+                   COUNT(grouped.block_hash) AS unique_block_count,
+                   COALESCE(SUM(grouped.mapping_count)
+                     FILTER (WHERE block.block_hash IS NOT NULL), 0)::bigint
+                     AS resolved_mapping_count,
+                   COALESCE(SUM(grouped.entry_count), 0) AS entry_count,
+                   COALESCE(SUM(grouped.mapping_count * block.raw_byte_count::numeric), 0)
+                     AS logical_byte_count
+              FROM (
+                SELECT mapping.object_kind, mapping.block_hash,
+                       COUNT(*) AS mapping_count,
+                       SUM(mapping.entry_count) AS entry_count
+                  FROM {schema}.ptg2_v3_snapshot_block AS mapping
+                 WHERE mapping.snapshot_key = :snapshot_key
+                 GROUP BY mapping.object_kind, mapping.block_hash
+              ) AS grouped
               LEFT JOIN {schema}.ptg2_v3_block AS block
-                ON block.block_hash = mapping.block_hash
-             WHERE mapping.snapshot_key = :snapshot_key
-             GROUP BY mapping.object_kind
+                ON block.block_hash = grouped.block_hash
+             GROUP BY grouped.object_kind
             """
         ),
         {"snapshot_key": int(snapshot_key)},

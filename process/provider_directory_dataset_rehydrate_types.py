@@ -11,9 +11,6 @@ import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 
-from sqlalchemy import types as sa_types
-
-
 DEFAULT_BATCH_SIZE = 5_000
 MAX_BATCH_SIZE = 25_000
 CHECKPOINT_TABLE = "provider_directory_dataset_rehydration_checkpoint"
@@ -62,6 +59,7 @@ class RehydrationRequest:
     owner_run_id: str
     resource_types: tuple[str, ...] = ()
     batch_size: int = DEFAULT_BATCH_SIZE
+    retry_of_run_id: str | None = None
 
 
 UpsertBatch = Callable[[type, list[dict[str, Any]], DatasetScope], Awaitable[int]]
@@ -79,6 +77,7 @@ class RehydrationRuntime:
     upsert_batch: UpsertBatch
     cancel_check: CancelCheck | None = None
     progress_callback: ProgressCallback | None = None
+    directory: Any | None = None
 
 
 @dataclass(frozen=True)

@@ -113,6 +113,12 @@ Useful environment knobs for full crawls:
 - `HLTHPRT_MRF_DISCOVERY_MAX_TOC_BYTES`: generic TOC/metadata fetch limit; defaults to 25 MB.
   Resolver-specific caps in `specs/mrf_source_discovery_sources.json` can raise this for known
   larger index files without changing the global default.
+- `HLTHPRT_MRF_DISCOVERY_SPOOL_BYTES`: positive per-target scratch-space limit; defaults to 1 GiB.
+  TOCs use the existing worker-state/chunk directory and retain complete input before writing rows.
+  The limit includes transport, decoded and repaired files, SQLite pages and journal overhead.
+  Ordering uses checked indexes rather than temporary sort files. Exhaustion fails the source
+  checkpoint with a diagnostic; raising this trusted worker setting requires enough disk capacity
+  for every concurrently admitted target.
 
 ASR Health Benefits does not expose an all-groups catalog. Keep monthly imports constrained to the
 `asr_health_benefits_groups` seed list, and refresh the CSV only through an intentional maintenance

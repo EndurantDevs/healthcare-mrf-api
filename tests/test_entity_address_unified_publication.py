@@ -1,13 +1,51 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-from contextlib import asynccontextmanager
 import importlib
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
-
 entity_address_unified = importlib.import_module("process.entity_address_unified")
+
+
+class _GenerationAuthority:
+    def as_dict(self):
+        return {
+            "local_lineage_id": "c8f27af1-56ba-4cda-82d8-0fc67650918f",
+            "local_generation": 1,
+            "serving_generation": {
+                "origin_lineage_id": "c8f27af1-56ba-4cda-82d8-0fc67650918f",
+                "origin_generation": 1,
+                "published_at": "2026-09-14T08:30:00Z",
+            },
+            "relation_oids": list(range(10, 17)),
+        }
+
+
+@pytest.fixture(autouse=True)
+def _stub_generation_publication(monkeypatch):
+    from process import provider_directory_artifact_read_access as read_access
+
+    # These SQL recorders have no native actor; separate tests verify ACL custody.
+    monkeypatch.setattr(
+        read_access,
+        "prepare_ordinary_read_access",
+        AsyncMock(side_effect=lambda _database, _schema, swaps: (object(),) * len(swaps)),
+    )
+    monkeypatch.setattr(read_access, "recheck_ordinary_read_access", AsyncMock())
+
+    async def publish(database, *, schema_name):
+        assert schema_name == "mrf"
+        database.events.append("result generation published")
+        return _GenerationAuthority()
+
+    monkeypatch.setattr(
+        entity_address_unified.result_generation,
+        "publish_local_entity_address_generation",
+        AsyncMock(side_effect=publish),
+    )
 
 
 class _LiveTable:
@@ -54,7 +92,13 @@ class _RecordingDB:
 
     async def scalar(self, statement, **_params):
         self.events.append(statement)
-        if "relpersistence" in statement:
+        if "SELECT c.relowner FROM pg_class" in statement and "hp_snapshot_retention" in statement:
+            return None
+        if "SELECT EXISTS(SELECT 1 FROM pg_class" in statement and "hp_snapshot_retention" in statement:
+            return False
+        if "to_regclass(:relation) IS NOT NULL" in statement:
+            return False
+        if "SELECT c.relpersistence::text" in statement:
             return self.persistence_values.pop(0)
         if "address_numeric_grid_alias_v1" in statement:
             return 1
@@ -69,10 +113,7 @@ class _RecordingDB:
         if "pg_depend AS dependency" in statement:
             return self.dependent_views
         assert "ORDER BY c.relname" in statement
-        return [
-            (name,)
-            for name in sorted(set(params["relation_names"]) & self.existing_names)
-        ]
+        return [(name,) for name in sorted(set(params["relation_names"]) & self.existing_names)]
 
     async def first(self, statement, **_params):
         if "address_alias_state_v1" in statement:
@@ -120,8 +161,7 @@ async def test_entity_address_cutover_uses_one_fail_fast_transaction(monkeypatch
     assert recording_db.statements[0] == "ANALYZE mrf.entity_address_unified_stage;"
     assert recording_db.statements[1] == "SET LOCAL lock_timeout = '50ms';"
     assert recording_db.statements[2] == (
-        "LOCK TABLE mrf.entity_address_unified, mrf.entity_address_unified_stage "
-        "IN ACCESS EXCLUSIVE MODE NOWAIT;"
+        "LOCK TABLE mrf.entity_address_unified, mrf.entity_address_unified_stage IN ACCESS EXCLUSIVE MODE NOWAIT;"
     )
     assert recording_db.statements[3:6] == [
         "DROP TABLE IF EXISTS mrf.entity_address_unified_old;",
@@ -131,6 +171,12 @@ async def test_entity_address_cutover_uses_one_fail_fast_transaction(monkeypatch
     assert cutover_context_map["cutover_attempts"] == 1
     assert cutover_context_map["stage_persistence"] == "p"
     assert cutover_context_map["geo_assurance_active_table_oid"] == 123
+    assert cutover_context_map["result_generation_mode"] == "ordinary"
+    assert cutover_context_map["result_generation"]["local_generation"] == 1
+    entity_address_unified.result_generation.publish_local_entity_address_generation.assert_awaited_once_with(
+        recording_db,
+        schema_name="mrf",
+    )
     stage_rename_at = recording_db.events.index(
         "ALTER TABLE mrf.entity_address_unified_stage RENAME TO entity_address_unified;"
     )
@@ -139,19 +185,15 @@ async def test_entity_address_cutover_uses_one_fail_fast_transaction(monkeypatch
         for index, statement in enumerate(recording_db.events)
         if "entity_address_geo_assurance_state" in statement
     )
-    assert stage_rename_at < activation_at
+    generation_at = recording_db.events.index("result generation published")
+    assert stage_rename_at < activation_at < generation_at
     dependency_check_at = next(
-        index
-        for index, statement in enumerate(recording_db.events)
-        if "pg_depend AS dependency" in statement
+        index for index, statement in enumerate(recording_db.events) if "pg_depend AS dependency" in statement
     )
     lock_at = recording_db.events.index(
-        "LOCK TABLE mrf.entity_address_unified, mrf.entity_address_unified_stage "
-        "IN ACCESS EXCLUSIVE MODE NOWAIT;"
+        "LOCK TABLE mrf.entity_address_unified, mrf.entity_address_unified_stage IN ACCESS EXCLUSIVE MODE NOWAIT;"
     )
-    drop_at = recording_db.events.index(
-        "DROP TABLE IF EXISTS mrf.entity_address_unified_old;"
-    )
+    drop_at = recording_db.events.index("DROP TABLE IF EXISTS mrf.entity_address_unified_old;")
     assert lock_at < dependency_check_at < drop_at
 
 
@@ -189,9 +231,7 @@ async def test_partial_evidence_patch_is_bound_to_main_generation_swap(monkeypat
         "ALTER TABLE mrf.entity_address_unified_stage RENAME TO entity_address_unified;"
     )
     delete_at = recording_db.events.index("DELETE FROM mrf.entity_address_evidence;")
-    insert_at = recording_db.events.index(
-        "INSERT INTO mrf.entity_address_evidence SELECT 1;"
-    )
+    insert_at = recording_db.events.index("INSERT INTO mrf.entity_address_evidence SELECT 1;")
     activation_at = next(
         index
         for index, statement in enumerate(recording_db.events)

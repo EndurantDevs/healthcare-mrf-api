@@ -18,6 +18,7 @@ from process.provider_directory_fhir_census_contract import (
     CURRENT_VERSION_CENSUS_CONTRACT_FIELD,
     CURRENT_VERSION_CENSUS_SMILE_CONTINUATION_STRATEGY,
 )
+from tests.provider_directory_checkpoint_unit_support import checkpoint_unit_scope as checkpoint_unit_scope
 
 importer = importlib.import_module("process.provider_directory_fhir")
 BASE = "https://directory.example.test/fhir"
@@ -107,10 +108,9 @@ def test_census_direct_retry_restarts_an_expired_cursor():
     )
 
 
-@pytest.mark.asyncio
-async def test_direct_retry_restarts_only_terminal_drifted_census_checkpoint(
-    monkeypatch,
-):
+@pytest.fixture
+def terminal_census_retry(monkeypatch):
+    """Provide one original drifted checkpoint and observe its guarded reset."""
     context = importer.PaginationCheckpointContext(
         canonical_api_base=BASE,
         source_scope_hash="a" * 64,
@@ -141,6 +141,14 @@ async def test_direct_retry_restarts_only_terminal_drifted_census_checkpoint(
     )
     monkeypatch.setattr(importer, "_reset_pagination_checkpoint", reset)
 
+    return context, checkpoint_by_field, start_url, reset
+
+
+@pytest.mark.asyncio
+async def test_direct_retry_restarts_only_terminal_drifted_census_checkpoint(terminal_census_retry):
+    """The existing direct retry resets only its admitted terminal drift."""
+    context, checkpoint_by_field, start_url, reset = terminal_census_retry
+
     resume = await importer._load_or_initialize_pagination_checkpoint(
         context,
         "Organization",
@@ -159,6 +167,22 @@ async def test_direct_retry_restarts_only_terminal_drifted_census_checkpoint(
         checkpoint_by_field,
         replace(context, lineage_verified=False),
     )
+
+
+@pytest.mark.asyncio
+async def test_direct_retry_preserves_terminal_drift_when_retained_reset_is_disabled(terminal_census_retry):
+    """Refuse a rewind without changing the persisted resource counters."""
+    context, checkpoint_by_field, start_url, reset = terminal_census_retry
+    with pytest.raises(RuntimeError, match="checkpoint_lineage_conflict"):
+        await importer._load_or_initialize_pagination_checkpoint(
+            replace(context, allow_retained_pagination_reset=False),
+            "Organization",
+            start_url,
+            allow_terminal_census_restart=True,
+        )
+    reset.assert_not_awaited()
+    assert checkpoint_by_field["rows_processed"] == 500
+    assert checkpoint_by_field["pages_processed"] == 2
 
 
 @pytest.mark.asyncio
@@ -252,9 +276,7 @@ async def test_retryable_http_exhaustion_is_fixed_and_redacted(
     assert fetch_result == (status_code, response_by_field, None, 21)
     assert retry_count == 2
     assert attempt.await_count == 3
-    assert all(
-        attempt_call.args[1] == request_url for attempt_call in attempt.await_args_list
-    )
+    assert all(attempt_call.args[1] == request_url for attempt_call in attempt.await_args_list)
     assert sleep.await_args_list == [call(1.0), call(1.0)]
     generic_attempts.assert_not_called()
     recorder.assert_called_once()
@@ -323,10 +345,7 @@ async def test_transport_error_exhaustion_records_aggregate_diagnostic(monkeypat
     assert retry_count == 2
     assert attempt.await_count == 3
     assert sleep.await_args_list == [call(1.0), call(1.0)]
-    assert (
-        source_record[importer.SOURCE_FETCH_DIAGNOSTIC_FIELD]["response_class"]
-        == "transient_transport_error"
-    )
+    assert source_record[importer.SOURCE_FETCH_DIAGNOSTIC_FIELD]["response_class"] == "transient_transport_error"
 
 
 @pytest.mark.asyncio

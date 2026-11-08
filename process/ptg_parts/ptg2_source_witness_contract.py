@@ -43,8 +43,30 @@ PTG2_V3_SOURCE_WITNESS_MAX_DECODED_RECORD_BYTES = 64 * 1024 * 1024
 PTG2_V3_SOURCE_WITNESS_MAX_DECODED_TOTAL_BYTES = 512 * 1024 * 1024
 SOURCE_BUNDLE_MAGIC = b"PTG2SW02"
 SOURCE_DICTIONARY_BUNDLE_MAGIC = b"PTG2SW03"
+SOURCE_FRAGMENT_BUNDLE_MAGIC = b"PTG2SW04"
 SOURCE_RECORD_MAGIC = b"PTG2SWR2"
 PERSISTED_PAYLOAD_MAGIC = b"PTG2SWP5"
+FRAGMENT_PERSISTED_PAYLOAD_MAGIC = b"PTG2SWP6"
+PTG2_V3_SOURCE_WITNESS_FRAGMENT_PAYLOAD_CONTRACT = "ptg2_v3_source_witness_payload_v6"
+PTG2_V3_SOURCE_WITNESS_FRAGMENT_COMPRESSION = "per_record_zlib_shared_byte_fragments_v1"
+PTG2_V3_SOURCE_WITNESS_FRAGMENT_BYTES = 4096
+PTG2_V3_SOURCE_WITNESS_MAX_RECIPES = PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET * 2
+# Every token contributes at most one partial fragment; full fragments consume
+# the existing aggregate byte budget. This independently bounds tiny tails.
+PTG2_V3_SOURCE_WITNESS_MAX_FRAGMENTS = (
+    PTG2_V3_SOURCE_WITNESS_MAX_DECODED_TOTAL_BYTES
+    // PTG2_V3_SOURCE_WITNESS_FRAGMENT_BYTES
+    + PTG2_V3_SOURCE_WITNESS_MAX_RECIPES
+)
+# Each reference occupies 32 stored bytes. These limits follow from the
+# existing stored-byte ceiling, and also bound reconstruction work explicitly.
+PTG2_V3_SOURCE_WITNESS_MAX_FRAGMENT_REFERENCES = (
+    PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES // 32
+)
+PTG2_V3_SOURCE_WITNESS_MAX_RECONSTRUCTED_BYTES = (
+    PTG2_V3_SOURCE_WITNESS_MAX_FRAGMENT_REFERENCES
+    * PTG2_V3_SOURCE_WITNESS_FRAGMENT_BYTES
+)
 PTG2_SOURCE_WITNESS_MANIFEST_FIELDS = (
     "contract",
     "format_version",
@@ -70,6 +92,12 @@ PTG2_SOURCE_WITNESS_MANIFEST_FIELDS = (
     "payload_sha256",
     "payload_bytes",
     "compression",
+)
+PTG2_SOURCE_WITNESS_FRAGMENT_MANIFEST_FIELDS = (
+    "fragment_count",
+    "fragment_byte_count",
+    "evidence_reconstructed_bytes",
+    "recipe_reference_count",
 )
 
 
@@ -168,6 +196,7 @@ class SourceWitnessEvidenceLocator:
     raw_byte_count: int
     offset: int
     length: int
+    fragments_by_sha256: Mapping[str, SourceWitnessEvidenceLocator] | None = None
 
 
 @dataclass(frozen=True)
@@ -246,22 +275,39 @@ def _strict_manifest_digest(manifest: Mapping[str, Any], field_name: str) -> str
 
 
 def _validate_manifest_contract(manifest_by_field: Mapping[str, Any]) -> None:
+    is_fragment_format = manifest_by_field.get("format_version") == 6
     expected_value_by_field = {
-        "contract": PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
-        "format_version": 5,
+        "contract": PTG2_V3_SOURCE_WITNESS_FRAGMENT_PAYLOAD_CONTRACT if is_fragment_format else PTG2_V3_SOURCE_WITNESS_PAYLOAD_CONTRACT,
+        "format_version": 6 if is_fragment_format else 5,
         "selection_method": PTG2_V3_SOURCE_WITNESS_SELECTION,
         "population_semantics": "queryable_emitted_price_provider_occurrence_v1",
         "unqueryable_rate_policy": PTG2_V3_SOURCE_WITNESS_UNQUERYABLE_POLICY,
         "occurrence_target": PTG2_V3_SOURCE_WITNESS_OCCURRENCE_TARGET,
         "total_target": PTG2_V3_SOURCE_WITNESS_TOTAL_TARGET,
         "provider_quota": PTG2_V3_SOURCE_WITNESS_PROVIDER_QUOTA,
-        "compression": PTG2_V3_SOURCE_WITNESS_PAYLOAD_COMPRESSION,
+        "compression": PTG2_V3_SOURCE_WITNESS_FRAGMENT_COMPRESSION if is_fragment_format else PTG2_V3_SOURCE_WITNESS_PAYLOAD_COMPRESSION,
     }
     if any(
         manifest_by_field.get(field_name) != expected_value
         for field_name, expected_value in expected_value_by_field.items()
     ):
         raise ValueError("incompatible source witness contract")
+    if is_fragment_format:
+        _validate_fragment_manifest(manifest_by_field)
+
+
+def _validate_fragment_manifest(manifest: Mapping[str, Any]) -> None:
+    limit_by_field = {
+        "fragment_count": PTG2_V3_SOURCE_WITNESS_MAX_FRAGMENTS,
+        "recipe_reference_count": PTG2_V3_SOURCE_WITNESS_MAX_FRAGMENT_REFERENCES,
+        "evidence_reconstructed_bytes": PTG2_V3_SOURCE_WITNESS_MAX_RECONSTRUCTED_BYTES,
+        "evidence_dictionary_raw_bytes": PTG2_V3_SOURCE_WITNESS_MAX_DECODED_TOTAL_BYTES,
+        "evidence_dictionary_stored_bytes": PTG2_V3_SOURCE_WITNESS_MAX_PAYLOAD_BYTES,
+    }
+    if manifest.get("fragment_byte_count") != PTG2_V3_SOURCE_WITNESS_FRAGMENT_BYTES or any(
+        _strict_manifest_int(manifest, field) > limit for field, limit in limit_by_field.items()
+    ):
+        raise ValueError("source witness fragment manifest exceeds its bound")
 
 
 def _manifest_populations(
@@ -384,7 +430,10 @@ def source_witness_manifest_projection(
     )
     return {
         field_name: validated_manifest[field_name]
-        for field_name in PTG2_SOURCE_WITNESS_MANIFEST_FIELDS
+        for field_name in (
+            *PTG2_SOURCE_WITNESS_MANIFEST_FIELDS,
+            *(PTG2_SOURCE_WITNESS_FRAGMENT_MANIFEST_FIELDS if validated_manifest["format_version"] == 6 else ()),
+        )
     }
 
 

@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
+import hmac
 from collections.abc import Mapping
 from dataclasses import dataclass
-import hmac
 from typing import Any
 
 from sqlalchemy import text
 
+from api.network_read_execution import execute_network_read
 from api.ptg2_billing_associations import _normalized_provider_group_refs
 from api.ptg2_billing_entity_group_resolution import (
     _resolve_billing_entity_ref_tin_key,
@@ -57,9 +58,7 @@ class ResolvedBillingEntitySourceScope:
     def provider_group_refs(self) -> tuple[str, ...]:
         """Return stable distinct group identifiers in deterministic order."""
 
-        return tuple(
-            dict.fromkeys(witness.provider_group_ref for witness in self.witnesses)
-        )
+        return tuple(dict.fromkeys(witness.provider_group_ref for witness in self.witnesses))
 
     @property
     def source_keys(self) -> tuple[int, ...]:
@@ -91,8 +90,7 @@ def _source_tables(schema_name: str) -> tuple[str, str, str, str]:
 def _source_geometry_query(schema_name: str):
     source_manifest, aggregate_manifest, binding, _ = _source_tables(schema_name)
     binding_columns = ",\n".join(
-        f"                   binding.{field_name} AS binding_{field_name}"
-        for field_name in SOURCE_BINDING_FIELDS
+        f"                   binding.{field_name} AS binding_{field_name}" for field_name in SOURCE_BINDING_FIELDS
     )
     return text(f"""
         WITH source_geometry AS MATERIALIZED (
@@ -184,25 +182,15 @@ def _canonical_source_publication(
     """Require the canonical strict representation of one sealed publication."""
 
     if type(expected) is not TaxIdentitySourcePublication:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing source scope is unavailable"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing source scope is unavailable")
     try:
-        canonical_expected = tax_identity_source_publication_from_metadata(
-            expected.as_dict()
-        )
+        canonical_expected = tax_identity_source_publication_from_metadata(expected.as_dict())
     except Exception:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing source scope is unavailable"
-        ) from None
+        raise PTG2BillingAssociationDataError("sealed billing source scope is unavailable") from None
     if canonical_expected != expected:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing source scope is unavailable"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing source scope is unavailable")
     if canonical_expected.source_count > _MAX_SOURCE_BINDINGS:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing source scope exceeds its source limit"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing source scope exceeds its source limit")
     return canonical_expected
 
 
@@ -256,10 +244,7 @@ def _source_binding_records(
 ) -> tuple[dict[str, Any], ...]:
     records: list[dict[str, Any]] = []
     for source_row in source_rows:
-        values = tuple(
-            source_row.get(f"binding_{field_name}")
-            for field_name in SOURCE_BINDING_FIELDS
-        )
+        values = tuple(source_row.get(f"binding_{field_name}") for field_name in SOURCE_BINDING_FIELDS)
         if all(value is None for value in values):
             continue
         records.append(dict(zip(SOURCE_BINDING_FIELDS, values, strict=True)))
@@ -274,22 +259,15 @@ def _validate_source_bindings(
     binding_records = _source_binding_records(source_rows)
     try:
         binding_digest = tax_identity_source_binding_vector_digest(binding_records)
-        artifact_byte_count = sum(
-            int(binding_record["artifact_byte_count"])
-            for binding_record in binding_records
-        )
+        artifact_byte_count = sum(int(binding_record["artifact_byte_count"]) for binding_record in binding_records)
     except Exception:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing source scope is unavailable"
-        ) from None
+        raise PTG2BillingAssociationDataError("sealed billing source scope is unavailable") from None
     if (
         len(binding_records) != expected.source_count
         or artifact_byte_count != expected.artifact_byte_count
         or not hmac.compare_digest(binding_digest, expected.binding_vector_digest)
     ):
-        raise PTG2BillingAssociationDataError(
-            "sealed billing source scope is unavailable"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing source scope is unavailable")
 
 
 def _validated_source_geometry(
@@ -300,18 +278,12 @@ def _validated_source_geometry(
     """Bind durable source tables to the exact trusted sealed geometry."""
 
     if not source_rows:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing source scope returned no state"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing source scope returned no state")
     geometry = _persisted_geometry(source_rows[0])
     if any(_persisted_geometry(source_row) != geometry for source_row in source_rows):
-        raise PTG2BillingAssociationDataError(
-            "sealed billing source scope is inconsistent"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing source scope is inconsistent")
     if geometry != _expected_geometry(expected):
-        raise PTG2BillingAssociationDataError(
-            "sealed billing source scope is unavailable"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing source scope is unavailable")
     _validate_source_bindings(source_rows, expected=expected)
     return expected
 
@@ -339,9 +311,7 @@ def _source_witness_from_row(
     source_key = source_state_row.get("source_key")
     source_record_ordinal = source_state_row.get("source_record_ordinal")
     source_provider_group_count = source_state_row.get("source_provider_group_count")
-    normalized_group_refs = _normalized_provider_group_refs(
-        (source_state_row.get("provider_group_ref"),)
-    )
+    normalized_group_refs = _normalized_provider_group_refs((source_state_row.get("provider_group_ref"),))
     if (
         type(source_key) is not int
         or not 0 <= source_key < source_count
@@ -350,9 +320,7 @@ def _source_witness_from_row(
         or not 0 <= source_record_ordinal < source_provider_group_count
         or len(normalized_group_refs) != 1
     ):
-        raise PTG2BillingAssociationDataError(
-            "sealed billing source scope contains an invalid witness"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing source scope contains an invalid witness")
     return BillingEntitySourceWitness(
         source_key=source_key,
         source_record_ordinal=source_record_ordinal,
@@ -368,17 +336,12 @@ def _normalized_source_witnesses(
     """Require bounded, unique, canonically ordered source witnesses."""
 
     witnesses = [
-        _source_witness_from_row(source_state_row, source_count=source_count)
-        for source_state_row in source_state_rows
+        _source_witness_from_row(source_state_row, source_count=source_count) for source_state_row in source_state_rows
     ]
     if not witnesses:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing source scope contains no witnesses"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing source scope contains no witnesses")
     if len(witnesses) > _MAX_SOURCE_WITNESSES:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing source scope exceeds its witness limit"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing source scope exceeds its witness limit")
     ordered_witnesses = tuple(
         sorted(
             witnesses,
@@ -389,20 +352,14 @@ def _normalized_source_witnesses(
             ),
         )
     )
-    source_record_coordinates = {
-        (witness.source_key, witness.source_record_ordinal) for witness in witnesses
-    }
-    source_group_coordinates = {
-        (witness.source_key, witness.provider_group_ref) for witness in witnesses
-    }
+    source_record_coordinates = {(witness.source_key, witness.source_record_ordinal) for witness in witnesses}
+    source_group_coordinates = {(witness.source_key, witness.provider_group_ref) for witness in witnesses}
     if (
         tuple(witnesses) != ordered_witnesses
         or len(source_record_coordinates) != len(witnesses)
         or len(source_group_coordinates) != len(witnesses)
     ):
-        raise PTG2BillingAssociationDataError(
-            "sealed billing source scope contains inconsistent witnesses"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing source scope contains inconsistent witnesses")
     return ordered_witnesses
 
 
@@ -423,23 +380,23 @@ async def resolve_billing_entity_ref_source_scope(
         snapshot_key=snapshot_key,
         billing_entity_ref=billing_entity_ref,
     )
-    geometry_result = await session.execute(
+    geometry_result = await execute_network_read(
+        session,
         _source_geometry_query(schema_name),
         {
             "snapshot_key": snapshot_key,
             "binding_limit": publication.source_count + 1,
         },
     )
-    geometry_rows = tuple(
-        dict(geometry_row) for geometry_row in geometry_result.mappings()
-    )
+    geometry_rows = tuple(dict(geometry_row) for geometry_row in geometry_result.mappings())
     publication = _validated_source_geometry(
         geometry_rows,
         expected=publication,
     )
     if tin_key is None:
         return None
-    witness_result = await session.execute(
+    witness_result = await execute_network_read(
+        session,
         _source_witness_query(schema_name),
         {
             "snapshot_key": snapshot_key,

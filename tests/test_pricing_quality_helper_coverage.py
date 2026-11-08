@@ -1,8 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import json
+from unittest.mock import AsyncMock
+
 import pytest
 
 from api.endpoint import pricing
+from tests.test_pricing_api import FakeResult, make_request, pricing_module
 
 
 @pytest.mark.parametrize(
@@ -48,9 +52,7 @@ def test_cost_level_threshold_boundaries(value, thresholds, expected):
         (0.88, None, 0.70, 55, "acceptable"),
     ],
 )
-def test_quality_tier_requires_confident_interval_support(
-    risk_ratio, ci75_high, ci90_low, confidence, expected
-):
+def test_quality_tier_requires_confident_interval_support(risk_ratio, ci75_high, ci90_low, confidence, expected):
     assert (
         pricing._tier_from_quality_summary(
             risk_ratio_point=risk_ratio,
@@ -118,9 +120,7 @@ def test_estimated_data_coverage_scores_available_evidence_and_caps():
         ),
     ],
 )
-def test_estimated_confidence_uses_geography_and_peer_thresholds(
-    profile, peer_count, expected
-):
+def test_estimated_confidence_uses_geography_and_peer_thresholds(profile, peer_count, expected):
     assert pricing._estimated_confidence_score(profile, peer_count) == expected
 
 
@@ -137,15 +137,8 @@ def test_estimated_confidence_uses_geography_and_peer_thresholds(
         ({}, None, ["national"]),
     ],
 )
-def test_estimated_benchmark_modes_follow_available_geography(
-    profile, requested_mode, expected
-):
-    assert (
-        pricing._estimated_benchmark_modes_for_profile(
-            profile, benchmark_mode=requested_mode
-        )
-        == expected
-    )
+def test_estimated_benchmark_modes_follow_available_geography(profile, requested_mode, expected):
+    assert pricing._estimated_benchmark_modes_for_profile(profile, benchmark_mode=requested_mode) == expected
 
 
 @pytest.mark.parametrize(
@@ -203,9 +196,7 @@ def test_parse_token_list_normalizes_supported_input_shapes(raw_tokens, expected
         ({"scope": "state", "state": "IL"}, ("state", "IL", "state:IL")),
     ],
 )
-def test_extract_peer_target_geography_normalizes_explicit_and_inferred_shapes(
-    payload, expected
-):
+def test_extract_peer_target_geography_normalizes_explicit_and_inferred_shapes(payload, expected):
     assert pricing._extract_peer_target_geography(payload) == expected
 
 
@@ -232,12 +223,7 @@ def test_extract_peer_target_geography_normalizes_explicit_and_inferred_shapes(
     ],
 )
 def test_quality_unavailable_reasons_are_specific(profile, benchmark_mode, expected):
-    assert (
-        pricing._provider_quality_unavailable_reasons(
-            profile, benchmark_mode=benchmark_mode
-        )
-        == expected
-    )
+    assert pricing._provider_quality_unavailable_reasons(profile, benchmark_mode=benchmark_mode) == expected
 
 
 @pytest.mark.parametrize(
@@ -291,14 +277,289 @@ def test_code_list_parser_handles_multivalue_and_scalar_inputs():
 
 
 def test_geography_candidates_preserve_specific_to_national_order():
-    assert pricing._geography_candidates(
-        state_raw=" il ", city_raw=" Chicago ", zip5_raw="60601-1234"
-    ) == [
+    assert pricing._geography_candidates(state_raw=" il ", city_raw=" Chicago ", zip5_raw="60601-1234") == [
         ("zip5", "60601"),
         ("state_city", "IL|chicago"),
         ("state", "IL"),
         ("national", "US"),
     ]
-    assert pricing._geography_candidates(
-        state_raw=None, city_raw=None, zip5_raw=None
-    ) == [("national", "US")]
+    assert pricing._geography_candidates(state_raw=None, city_raw=None, zip5_raw=None) == [("national", "US")]
+
+
+def _quality_profile(**overrides):
+    profile_by_field = {
+        "specialty_key": "family_medicine",
+        "taxonomy_code": "207Q00000X",
+        "zip5": "60601",
+        "state_key": "IL",
+        "provider_class": "clinician",
+        "location_source": "npi_address",
+        "has_enrollment": True,
+    }
+    profile_by_field.update(overrides)
+    if profile_by_field["zip5"] is None and profile_by_field["state_key"] is None:
+        profile_by_field["location_source"] = "unknown"
+    return profile_by_field
+
+
+def _patch_quality_tables(monkeypatch):
+    async def is_table_available(_session, table_name):
+        return table_name in {
+            pricing_module.QUALITY_SCORE_TABLE_NAME,
+            pricing_module.QUALITY_DOMAIN_TABLE_NAME,
+            pricing_module.NPIDataTaxonomy.__tablename__,
+            pricing_module.ProviderEnrichmentSummary.__tablename__,
+            pricing_module.NPIAddress.__tablename__,
+        }
+
+    monkeypatch.setattr(pricing_module, "_is_table_available", is_table_available)
+
+
+def _empty_quality_cohort():
+    return FakeResult(
+        rows=[
+            {
+                "peer_count": 0,
+                "risk_ratio_point": None,
+                "ci75_low": None,
+                "ci75_high": None,
+                "ci90_low": None,
+                "ci90_high": None,
+                "score_0_100": None,
+            }
+        ]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("benchmark_mode", ["zip", "state", "national"])
+@pytest.mark.parametrize("override", [False, True])
+async def test_score_estimates_requested_cohort(monkeypatch, benchmark_mode, override):
+    _patch_quality_tables(monkeypatch)
+    request_args_by_name = {"year": "2024", "benchmark_mode": benchmark_mode}
+    if override:
+        request_args_by_name["taxonomy_code"] = " 207r00000x "
+    request = make_request(
+        [
+            FakeResult(rows=[]),
+            FakeResult(rows=[_quality_profile()]),
+            FakeResult(rows=[{"peer_count": 40, "risk_ratio_point": 0.8, "score_0_100": 82}]),
+            FakeResult(rows=[{"domain": "cost", "risk_ratio": 0.75, "peer_count": 35}]),
+        ],
+        args=request_args_by_name,
+    )
+
+    document = json.loads((await pricing_module.get_pricing_provider_score(request, "1000000001")).body)
+
+    assert document["score_method"] == "estimated"
+    assert document["benchmark_mode"] == benchmark_mode
+    assert document["available_benchmark_modes"] == [benchmark_mode]
+    assert document["score_0_100"] == 82.0
+    assert document["domains"]["cost"]["evidence_n"] == 35.0
+    assert document["evidence_profile"]["has_enrollment"] is True
+    assert document["scores_by_benchmark_mode"][benchmark_mode]["score_0_100"] == 82.0
+    assert (
+        document["cohort_context"]["selected_geography"]
+        == {"zip": "zip:60601", "state": "state:IL", "national": "national"}[benchmark_mode]
+    )
+    estimate_sql, parameters = request.ctx.sa_session.executions[-2][0]
+    assert "s.score_method" in str(estimate_sql)
+    assert parameters["year"] == 2024
+    assert parameters["benchmark_mode"] == benchmark_mode
+    assert parameters["taxonomy_code"] == ("207R00000X" if override else "207Q00000X")
+    assert parameters.get("zip5") == ("60601" if benchmark_mode == "zip" else None)
+    assert parameters.get("state_key") == ("IL" if benchmark_mode == "state" else None)
+
+
+@pytest.mark.asyncio
+async def test_score_fallback_selects_next_available_cohort(monkeypatch):
+    _patch_quality_tables(monkeypatch)
+    request = make_request(
+        [
+            FakeResult(rows=[]),
+            FakeResult(rows=[_quality_profile()]),
+            _empty_quality_cohort(),
+            FakeResult(rows=[{"peer_count": 30, "score_0_100": 70}]),
+            FakeResult(rows=[]),
+            _empty_quality_cohort(),
+        ],
+        args={"year": "2024"},
+    )
+
+    document = json.loads((await pricing_module.get_pricing_provider_score(request, "1000000001")).body)
+
+    assert document["score_method"] == "estimated"
+    assert document["benchmark_mode"] == "state"
+    assert document["available_benchmark_modes"] == ["state"]
+    assert document["scores_by_benchmark_mode"]["zip"] is None
+    assert document["scores_by_benchmark_mode"]["national"] is None
+    assert document["cohort_context"]["selected_geography"] == "state:IL"
+    assert [execution[0][1]["benchmark_mode"] for execution in request.ctx.sa_session.executions[2:]] == [
+        "zip",
+        "state",
+        "state",
+        "national",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("profile", "benchmark_mode", "selected_mode", "geography", "reason", "empty_modes"),
+    [
+        (None, None, "national", None, "provider_profile_not_found", ()),
+        (_quality_profile(), "zip", "zip", "zip:60601", "benchmark_mode_zip_estimate_unavailable", ("zip",)),
+        (_quality_profile(zip5=None), None, "state", "state:IL", "no_matching_peer_cohort", ("state", "national")),
+        (_quality_profile(zip5=None, state_key=None), None, "national", None, "missing_geography", ()),
+        (_quality_profile(state_key=None), "state", "state", "zip:60601", "missing_state_for_state_benchmark", ()),
+    ],
+)
+async def test_score_fallback_explains_unavailability(
+    monkeypatch, profile, benchmark_mode, selected_mode, geography, reason, empty_modes
+):
+    _patch_quality_tables(monkeypatch)
+    request_args_by_name = {"year": "2024"}
+    if benchmark_mode:
+        request_args_by_name["benchmark_mode"] = benchmark_mode
+    request = make_request(
+        [
+            FakeResult(rows=[]),
+            FakeResult(rows=[] if profile is None else [profile]),
+            *[_empty_quality_cohort() for _ in empty_modes],
+        ],
+        args=request_args_by_name,
+    )
+
+    document = json.loads((await pricing_module.get_pricing_provider_score(request, "1000000001")).body)
+
+    assert document["score_method"] == "unavailable"
+    assert document["benchmark_mode"] == selected_mode
+    assert document["score_0_100"] is None
+    assert document["available_benchmark_modes"] == []
+    assert reason in document["unavailable_reasons"]
+    assert all(score is None for score in document["scores_by_benchmark_mode"].values())
+    assert document.get("cohort_context", {}).get("selected_geography") == geography
+    assert request.ctx.sa_session.executions[1][0][1] == {"npi": 1000000001, "year": 2024}
+    assert (
+        tuple(execution[0][1]["benchmark_mode"] for execution in request.ctx.sa_session.executions[2:]) == empty_modes
+    )
+
+
+@pytest.mark.asyncio
+async def test_score_fallback_handles_estimate_query_failure(monkeypatch):
+    _patch_quality_tables(monkeypatch)
+    request = make_request([], args={"year": "2024", "benchmark_mode": "state"})
+    request.ctx.sa_session.execute = AsyncMock(
+        side_effect=[
+            FakeResult(rows=[]),
+            FakeResult(rows=[_quality_profile()]),
+            RuntimeError("Synthetic peer lookup unavailable"),
+        ]
+    )
+
+    document = json.loads((await pricing_module.get_pricing_provider_score(request, "1000000001")).body)
+
+    assert document["score_method"] == "unavailable"
+    assert document["unavailable_reasons"] == ["benchmark_mode_state_estimate_unavailable"]
+    assert document["cohort_context"]["selected_geography"] == "state:IL"
+    assert request.ctx.sa_session.execute.await_count == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("benchmark_mode", [None, "zip"])
+async def test_live_score_without_peer_evidence_falls_back(monkeypatch, benchmark_mode):
+    _patch_quality_tables(monkeypatch)
+    request_args_by_name = {"year": "2024", "taxonomy_code": "207Q00000X"}
+    if benchmark_mode:
+        request_args_by_name["benchmark_mode"] = benchmark_mode
+    request = make_request(
+        [
+            FakeResult(
+                rows=[
+                    {
+                        "npi": 1000000001,
+                        "total_services": 10,
+                        "total_beneficiaries": 5,
+                        "total_allowed_amount": 500,
+                        "state": "IL",
+                        "zip5": "60601",
+                    }
+                ]
+            ),
+            FakeResult(rows=[]),
+            FakeResult(rows=[{"total_rx_claims": 0.0, "total_rx_beneficiaries": 0.0}]),
+            FakeResult(scalar=0.5),
+            FakeResult(rows=[]),
+            FakeResult(rows=[]),
+            FakeResult(rows=[]),
+            FakeResult(rows=[_quality_profile()]),
+            *[_empty_quality_cohort() for _ in range(1 if benchmark_mode else 3)],
+        ],
+        args=request_args_by_name,
+    )
+
+    document = json.loads((await pricing_module.get_pricing_provider_score(request, "1000000001")).body)
+
+    assert document["score_method"] == "unavailable"
+    assert document["benchmark_mode"] == "zip"
+    assert document["available_benchmark_modes"] == []
+    assert document["unavailable_reasons"] == [
+        "benchmark_mode_zip_estimate_unavailable" if benchmark_mode else "no_matching_peer_cohort"
+    ]
+    target_parameters = request.ctx.sa_session.executions[4][0][1]
+    assert target_parameters["zip5"] == "60601"
+    assert target_parameters["state_key"] == "IL"
+    assert target_parameters["mode_0"] == "zip"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("score_rows", "selected_mode", "selected_score", "available_modes"),
+    [
+        ([{"benchmark_mode": "historic", "score_0_100": 55}], "historic", 55.0, []),
+        (
+            [
+                {"benchmark_mode": "zip", "score_0_100": 82},
+                {"benchmark_mode": "national", "score_0_100": 70},
+            ],
+            "zip",
+            82.0,
+            ["zip", "national"],
+        ),
+    ],
+)
+async def test_stored_score_selects_available_modes_and_ignores_unknown_domains(
+    monkeypatch, score_rows, selected_mode, selected_score, available_modes
+):
+    _patch_quality_tables(monkeypatch)
+    request = make_request(
+        [
+            FakeResult(rows=score_rows),
+            FakeResult(
+                rows=[
+                    {"benchmark_mode": "historic", "domain": "cost", "score_0_100": 1},
+                    {"benchmark_mode": "zip", "domain": "obsolete", "score_0_100": 1},
+                ]
+            ),
+        ],
+        args={"year": "2024", "procedure_codes": " , , ", "benchmark_mode": "   "},
+    )
+
+    document = json.loads((await pricing_module.get_pricing_provider_score(request, "1000000001")).body)
+
+    assert document["benchmark_mode"] == selected_mode
+    assert document["score_0_100"] == selected_score
+    assert document["available_benchmark_modes"] == available_modes
+    assert document["domains"]["cost"]["score_0_100"] is None
+    assert "obsolete" not in document["domains"]
+    assert len(request.ctx.sa_session.executions) == 2
+    assert all(execution[0][1] == {"npi": 1000000001, "year": 2024} for execution in request.ctx.sa_session.executions)
+
+
+@pytest.mark.asyncio
+async def test_score_rejects_unknown_benchmark():
+    request = make_request([], args={"benchmark_mode": "county"})
+
+    with pytest.raises(pricing_module.InvalidUsage, match="benchmark_mode.*zip, state, national"):
+        await pricing_module.get_pricing_provider_score(request, "1000000001")
+
+    assert request.ctx.sa_session.executions == []

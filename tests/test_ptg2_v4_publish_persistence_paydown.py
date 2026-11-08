@@ -54,42 +54,18 @@ async def test_provider_map_and_key_persistence_guards(
 
 @pytest.mark.asyncio
 async def test_tax_sidecar_persistence_guards(monkeypatch) -> None:
-    """Reject incomplete published sidecar counts and batches."""
-
-    monkeypatch.setattr(
-        publication,
-        "_count_v4_target_keys",
-        AsyncMock(return_value=1),
-    )
-    with pytest.raises(RuntimeError, match="provider-group tax identity changed"):
-        await publication._reject_tax_group_count(
-            object(),
-            schema='"mrf"',
-            snapshot_key=1,
-            expected_count=2,
-            published_count=2,
-            estimated_row_bytes=1,
-            heartbeat_callback=None,
+    """Require candidate authority and propagate a COPY census failure."""
+    with pytest.raises(RuntimeError, match="build token"):
+        await publication._publish_v4_tax_group_ranges(
+            object(), schema='"mrf"', snapshot_key=1, stage_table="stage",
+            expected_count=2, progress_callback=None, build_token="",
         )
-    monkeypatch.setattr(
-        publication,
-        "_v4_tax_group_batch_boundary",
-        AsyncMock(return_value=(1, b"g" * 16, 0.01)),
-    )
-    monkeypatch.setattr(
-        publication,
-        "_publish_v4_tax_group_batch",
-        AsyncMock(return_value=(0, 0.01)),
-    )
-    with pytest.raises(RuntimeError, match="provider-group tax identity changed"):
-        await publication._publish_tax_group_ranges(
-            object(),
-            schema='"mrf"',
-            snapshot_key=1,
-            stage='"stage"',
-            sizer=publication._V4DictionaryBatchSizer(estimated_row_bytes=1),
-            progress_callback=None,
-            heartbeat_callback=None,
+    monkeypatch.setattr(publication, "copy_snapshot_candidate",
+        AsyncMock(side_effect=RuntimeError("PTG snapshot candidate COPY census differs")))
+    with pytest.raises(RuntimeError, match="COPY census"):
+        await publication._publish_v4_tax_group_ranges(
+            object(), schema='"mrf"', snapshot_key=1, stage_table="stage",
+            expected_count=2, progress_callback=None, build_token="owned",
         )
 
 
@@ -142,28 +118,19 @@ async def test_tax_digest_and_sealed_index_guards(monkeypatch) -> None:
     """Reject a drifted tax digest and return an authenticated serving index."""
 
     contract = _tax_stage_contract()
-    monkeypatch.setattr(
-        publication,
-        "_validate_v4_tax_token_rows",
-        AsyncMock(),
-    )
-    monkeypatch.setattr(
-        publication,
-        "_validate_v4_tax_group_rows",
-        AsyncMock(
-            return_value={
-                "provider_group_count": contract.provider_group_count,
-                "matched_ein": contract.matched_ein_count,
-                "missing": contract.missing_count,
-                "malformed": contract.malformed_count,
-                "unsupported_type": contract.unsupported_type_count,
-                "referenced_tax_identity_count": contract.tax_identity_count,
-            }
-        ),
+    async def empty_rows():
+        if False:
+            yield None
+
+    token_result = SimpleNamespace(one=lambda: (1, 1, 0, 0, True))
+    group_result = SimpleNamespace(one=lambda: (4, 4, 1, 1, 1, 1, 1, True))
+    tax_session = SimpleNamespace(
+        execute=AsyncMock(side_effect=[None, token_result, group_result]),
+        stream=AsyncMock(side_effect=lambda *_args: empty_rows()),
     )
     with pytest.raises(RuntimeError, match="content digest changed"):
         await publication._validate_v4_tax_identity_stages(
-            object(),
+            tax_session,
             schema='"mrf"',
             group_dictionary_stage="groups",
             tax_identity_stage="tax",

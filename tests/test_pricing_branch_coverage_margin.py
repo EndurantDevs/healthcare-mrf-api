@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -11,6 +12,8 @@ from sanic.exceptions import InvalidUsage, NotFound
 from tests.test_pricing_api import (
     FakeResult,
     FakeSession,
+    _canonical_release_selection,
+    _patch_group_plan_snapshot_tables,
     make_request,
     pricing_module,
 )
@@ -70,10 +73,7 @@ async def test_estimated_quality_modes_skip_empty_and_unknown_cohorts():
     assert scores_by_mode["state"] is None
     assert scores_by_mode["national"]["score_method"] == "estimated"
     assert scores_by_mode["national"]["domains"]["cost"]["score_0_100"] == 85.0
-    parameter_maps = [
-        execution_args[1]
-        for execution_args, _execution_kwargs in session.executions
-    ]
+    parameter_maps = [execution_args[1] for execution_args, _execution_kwargs in session.executions]
     assert [parameters["benchmark_mode"] for parameters in parameter_maps] == [
         "zip",
         "state",
@@ -137,12 +137,8 @@ async def test_estimated_quality_modes_use_specialty_or_skip_missing_identity():
 async def test_cost_index_enrichment_stops_at_missing_inputs_or_tables(monkeypatch):
     availability = AsyncMock(return_value=True)
     monkeypatch.setattr(pricing_module, "_is_table_available", availability)
-    await pricing_module._enrich_provider_service_cost_indices(
-        FakeSession(), [], year=2024, internal_codes=[123]
-    )
-    await pricing_module._enrich_provider_service_cost_indices(
-        FakeSession(), [{}], year=2024, internal_codes=[]
-    )
+    await pricing_module._enrich_provider_service_cost_indices(FakeSession(), [], year=2024, internal_codes=[123])
+    await pricing_module._enrich_provider_service_cost_indices(FakeSession(), [{}], year=2024, internal_codes=[])
     assert availability.await_count == 0
 
     monkeypatch.setattr(
@@ -177,9 +173,7 @@ async def test_cost_index_enrichment_filters_rows_and_uses_all_specialty_peer(mo
     provider_service_rows = _provider_service_cost_rows()
     profile_rows = _provider_cost_profile_rows()
     peer_rows = _provider_cost_peer_rows()
-    session = FakeSession(
-        [FakeResult(rows=profile_rows), FakeResult(rows=peer_rows)]
-    )
+    session = FakeSession([FakeResult(rows=profile_rows), FakeResult(rows=peer_rows)])
 
     await pricing_module._enrich_provider_service_cost_indices(
         session,
@@ -324,9 +318,7 @@ async def test_provider_procedure_list_applies_every_legacy_filter(monkeypatch):
         },
     )
 
-    response_payload = json.loads(
-        (await pricing_module.list_provider_procedures(request, "123")).body
-    )
+    response_payload = json.loads((await pricing_module.list_provider_procedures(request, "123")).body)
 
     assert response_payload["pagination"]["total"] == 1
     assert response_payload["query"]["input_code"] == code_context_by_field["input_code"]
@@ -366,9 +358,7 @@ async def test_provider_procedure_detail_rejects_empty_npi_and_returns_match(mon
         args={"year": "2024"},
     )
 
-    response_payload = json.loads(
-        (await pricing_module.get_provider_procedure(request, "123", "123")).body
-    )
+    response_payload = json.loads((await pricing_module.get_provider_procedure(request, "123", "123")).body)
     assert response_payload["service_code"] == "123"
     assert response_payload["year_used"] == 2024
     assert response_payload["matched_via"] == "internal"
@@ -417,3 +407,195 @@ async def test_provider_score_rejects_unavailable_requested_mode(monkeypatch):
 
     with pytest.raises(NotFound, match="benchmark_mode='zip'"):
         await pricing_module.get_pricing_provider_score(request, "123")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("limit", "cursor", "bound_limit", "bound_cursor"),
+    [("invalid", "invalid", 200, 0), ("0", "-1", 1, 0), ("1001", "1000000000", 1000, 1000000000)],
+)
+async def test_group_provider_bounds_are_normalized(monkeypatch, limit, cursor, bound_limit, bound_cursor):
+    _patch_group_plan_snapshot_tables(monkeypatch)
+    request = make_request(
+        [FakeResult(rows=[SimpleNamespace(npi=1000000001)])],
+        args={"plan_id": "SYNTHETIC-PLAN", "limit": limit, "cursor": cursor},
+    )
+
+    document = json.loads((await pricing_module.group_plan_providers(request)).body)
+
+    parameters = request.ctx.sa_session.executions[0][0][1]
+    assert parameters["limit"] == bound_limit
+    assert parameters["cursor_npi"] == bound_cursor
+    assert document["providers"]["items"] == [{"npi": 1000000001}]
+    assert document["providers"]["next_cursor"] == ("1000000001" if bound_limit == 1 else None)
+    assert document["exhausted"] is (bound_limit != 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unified", [False, True])
+async def test_group_provider_mail_address_enrichment(monkeypatch, unified):
+    _patch_group_plan_snapshot_tables(monkeypatch)
+    monkeypatch.setattr(
+        pricing_module,
+        "_group_plan_provider_address_source",
+        AsyncMock(return_value=("mrf.entity_address_unified" if unified else "mrf.npi_address", unified, False, False)),
+    )
+    address_by_field = {
+        "npi": 1000000001,
+        "type": "mail",
+        "first_line": "1 Example Street",
+        "city_name": "EXAMPLE",
+        "state_name": "IL",
+        "postal_code": "60601-1234",
+        "plan_coverage_match": False,
+        "address_precision": "street",
+    }
+    enrichment_rows = [
+        SimpleNamespace(
+            npi=1000000001,
+            provider_first_name=None,
+            provider_last_name=None,
+            provider_organization_name="Synthetic Clinic",
+            provider_credential_text=None,
+            entity_type_code=2,
+            provider_sex_code=None,
+        ),
+        SimpleNamespace(
+            npi=1000000002,
+            provider_first_name="Example",
+            provider_last_name="Person",
+            provider_organization_name=None,
+            provider_credential_text="MD",
+            entity_type_code=1,
+            provider_sex_code="F",
+        ),
+    ]
+    request = make_request(
+        [
+            FakeResult(rows=[SimpleNamespace(npi=npi) for npi in (1000000001, 1000000002, 1000000003)]),
+            *([] if unified else [FakeResult(scalar=3)]),
+            FakeResult(rows=[address_by_field]),
+            FakeResult(rows=enrichment_rows),
+        ],
+        args={
+            "plan_id": "SYNTHETIC-PLAN",
+            "city": " Example ",
+            "state": " il ",
+            "enrich": "yes",
+            "include_mail_addresses": "true",
+            "count": "true",
+        },
+    )
+
+    document = json.loads((await pricing_module.group_plan_providers(request)).body)
+
+    _assert_mail_enrichment(request, document, unified)
+
+
+def _assert_mail_enrichment(request, document, unified):
+    providers = document["providers"]["items"]
+    assert providers[0]["name"] == "Synthetic Clinic"
+    assert providers[1]["name"] == "Example Person"
+    assert providers[1]["credential"] == "MD"
+    assert providers[1]["provider_sex_code"] == "F"
+    assert providers[2] == {"npi": 1000000003}
+    assert providers[0]["address"] == providers[0]["addresses"][0]
+    assert providers[0]["address"]["zip5"] == "60601"
+    assert ("plan_coverage_match" in providers[0]["address"]) is unified
+    if unified:
+        assert providers[0]["address"]["plan_coverage_match"] is False
+    assert document["location_filter"]["address_types"] is None
+    assert document["location_filter"]["count_exact"] is (not unified)
+    assert document["providers"]["total"] == (None if unified else 3)
+    page_sql, parameters = request.ctx.sa_session.executions[0][0]
+    assert "addr.type IN" not in str(page_sql)
+    assert parameters["location_city"] == "example"
+    assert parameters["location_state"] == "IL"
+    address_sql, address_parameters = request.ctx.sa_session.executions[-2][0]
+    assert "addr.type IN" not in str(address_sql)
+    assert address_parameters["npis"] == [1000000001, 1000000002, 1000000003]
+
+
+@pytest.mark.asyncio
+async def test_group_provider_requires_plan_scope():
+    request = make_request([])
+
+    with pytest.raises(InvalidUsage, match="plan_id .* or plan_release_id is required"):
+        await pricing_module.group_plan_providers(request)
+
+    assert request.ctx.sa_session.executions == []
+
+
+@pytest.mark.asyncio
+async def test_group_provider_rejects_unbound_storage(monkeypatch):
+    _patch_group_plan_snapshot_tables(monkeypatch)
+    monkeypatch.setattr(
+        pricing_module,
+        "snapshot_serving_tables",
+        AsyncMock(return_value=SimpleNamespace(uses_shared_blocks=False)),
+    )
+    request = make_request([], args={"plan_id": "SYNTHETIC-PLAN"})
+
+    with pytest.raises(RuntimeError, match="not bound to strict shared-block V3 storage"):
+        await pricing_module.group_plan_providers(request)
+
+    assert request.ctx.sa_session.executions == []
+
+
+@pytest.mark.asyncio
+async def test_group_release_without_network_stays_resolved(monkeypatch):
+    selection = _canonical_release_selection([])
+    monkeypatch.setattr(pricing_module, "resolve_plan_release_serving", AsyncMock(return_value=selection))
+    request = make_request([], args={"plan_release_id": selection.plan_release_id})
+
+    document = json.loads((await pricing_module.group_plan_providers(request)).body)
+
+    assert document["resolved"] is True
+    assert document["query"]["status"] == "no_match"
+    assert document["result_state"] == "no_matching_providers"
+    assert document["reason"] == "published plan release has no in-network provider binding"
+    assert document["providers"] == {"count": 0, "items": [], "next_cursor": None}
+    assert document["healthporta_plan_id"] == selection.healthporta_plan_id
+    assert document["query"]["plan_release_id"] == selection.plan_release_id
+    assert request.ctx.sa_session.executions == []
+
+
+@pytest.mark.asyncio
+async def test_local_group_candidates_keep_taxonomy_and_sex(monkeypatch):
+    _patch_group_plan_snapshot_tables(monkeypatch)
+    monkeypatch.setattr(
+        pricing_module,
+        "_group_plan_provider_address_source",
+        AsyncMock(return_value=("mrf.entity_address_unified", True, True, True)),
+    )
+    request = make_request(
+        [FakeResult(rows=[SimpleNamespace(npi=1000000001)]), FakeResult(scalar=2), FakeResult(rows=[])],
+        args={
+            "plan_id": "SYNTHETIC-PLAN",
+            "taxonomy_codes": "207Q00000X",
+            "provider_sex_code": "f",
+            "zip5": "60601",
+            "zip_radius_miles": "0",
+            "count": "true",
+            "limit": "1",
+        },
+    )
+
+    document = json.loads((await pricing_module.group_plan_providers(request)).body)
+
+    assert document["providers"]["total"] == 2
+    assert document["providers"]["next_cursor"] == "1000000001"
+    assert document["location_filter"]["count_exact"] is True
+    assert document["provider_sex_code"] == "F"
+    assert document["taxonomy_filter"]["taxonomy_code_set"] == ["207Q00000X"]
+    page_sql, parameters = request.ctx.sa_session.executions[0][0]
+    count_sql = request.ctx.sa_session.executions[1][0][0]
+    assert "addr.taxonomy_array &&" in str(page_sql)
+    assert "cand_provider_specialty_nt.healthcare_provider_taxonomy_code IN" in str(page_sql)
+    assert "group_candidate_sex_npi.provider_sex_code" in str(page_sql)
+    assert parameters["group_candidate_sex_provider_sex_code"] == "F"
+    assert "local_specialty_npis" in str(count_sql)
+    assert "COUNT(DISTINCT gm.npi)" in str(count_sql)
+    assert "cursor_npi" not in str(count_sql)
+    assert parameters["cand_array_taxonomy_code_0"] == "207Q00000X"
+    assert parameters["location_zips"] == ["60601"]

@@ -43,9 +43,7 @@ def _prior_names(run_id):
 
 def _plan(run_id=None):
     """Return deterministic current-run artifact-scope coordinates."""
-    return importer._artifact_scope_materialization_plan(
-        run_id or "run_" + "a" * 32
-    )
+    return importer._artifact_scope_materialization_plan(run_id or "run_" + "a" * 32)
 
 
 def test_current_owner_refuses_consumption_and_status_drift(monkeypatch):
@@ -121,9 +119,7 @@ async def test_consumption_owner_set_rejects_ambiguity_or_missing_row(
     "relation_name",
     (
         "unknown_artifact_scope_" + "a" * 32,
-        importer._provider_directory_artifact_scope_table_prefix(
-            importer.ProviderDirectorySource.__tablename__
-        )
+        importer._provider_directory_artifact_scope_table_prefix(importer.ProviderDirectorySource.__tablename__)
         + "_not-a-run",
     ),
 )
@@ -154,18 +150,13 @@ def test_prior_coordinates_require_complete_collision_free_family():
         importer.ProviderDirectoryArtifactBuildStale,
         match="stale_scope_present",
     ):
-        importer._artifact_scope_prior_coordinates(
-            [name_by_base[importer.ProviderDirectorySource.__tablename__]]
-        )
+        importer._artifact_scope_prior_coordinates([name_by_base[importer.ProviderDirectorySource.__tablename__]])
 
 
 def test_prior_owner_refuses_current_ambiguous_or_wrong_family():
     """Prior ownership must be one terminal run with the exact relation set."""
     admission = _wal_tracker_admission()
-    current_by_base = {
-        name: (relation, admission.run_id)
-        for name, relation in _prior_names(admission.run_id).items()
-    }
+    current_by_base = {name: (relation, admission.run_id) for name, relation in _prior_names(admission.run_id).items()}
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
         match="current_owner_present",
@@ -193,10 +184,7 @@ def test_prior_owner_refuses_current_ambiguous_or_wrong_family():
         )
 
     prior_run = "run_" + "e" * 32
-    wrong_family_by_base = {
-        name: (relation, prior_run)
-        for name, relation in _prior_names(prior_run).items()
-    }
+    wrong_family_by_base = {name: (relation, prior_run) for name, relation in _prior_names(prior_run).items()}
     wrong_family_by_base[first_key] = ("wrong-relation", prior_run)
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
@@ -218,11 +206,14 @@ async def test_recovery_coordinates_and_identity_empty_paths(monkeypatch):
         AsyncMock(return_value=[]),
     )
     admission = _wal_tracker_admission()
-    assert await importer._artifact_scope_recovery_coordinates(
-        "mrf",
-        _plan(),
-        admission,
-    ) == ()
+    assert (
+        await importer._artifact_scope_recovery_coordinates(
+            "mrf",
+            _plan(),
+            admission,
+        )
+        == ()
+    )
 
     query = AsyncMock()
     monkeypatch.setattr(importer.db, "all", query)
@@ -281,9 +272,8 @@ def test_recovery_identity_requires_exact_unlogged_heap(observed):
 
 
 @pytest.mark.asyncio
-async def test_recovery_layout_refuses_structure_or_tablespace_drift(
-    monkeypatch,
-):
+@pytest.mark.parametrize("drift", ["structure", "tablespace", "indexes"])
+async def test_recovery_layout_refuses_structure_or_tablespace_drift(monkeypatch, drift):
     """Takeover requires structural identity in the admitted tablespace."""
     admission = _wal_tracker_admission()
     coordinate = importer._ArtifactScopeRecoveryCoordinate(
@@ -296,23 +286,22 @@ async def test_recovery_layout_refuses_structure_or_tablespace_drift(
         "_artifact_scope_relation_identities",
         AsyncMock(return_value={"current": (22, "r", "u")}),
     )
+    expected_tablespace = admission.geometry.tablespace_oid
     fingerprint = AsyncMock(
         side_effect=(
-            SimpleNamespace(
-                structural_fingerprint="prior",
-                effective_tablespace_oids=(admission.geometry.tablespace_oid,),
-            ),
-            SimpleNamespace(
-                structural_fingerprint="current",
-                effective_tablespace_oids=(admission.geometry.tablespace_oid,),
+            (SimpleNamespace(effective_tablespace_oids=(expected_tablespace,)), "prior"),
+            (
+                SimpleNamespace(
+                    main_index_oids=(31,) if drift == "indexes" else (),
+                    effective_tablespace_oids=(
+                        expected_tablespace + 1 if drift == "tablespace" else expected_tablespace,
+                    ),
+                ),
+                "current" if drift == "structure" else "prior",
             ),
         )
     )
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_profile_relation_storage_fingerprint",
-        fingerprint,
-    )
+    monkeypatch.setattr(importer, "_artifact_scope_recovery_heap_fingerprint", fingerprint)
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
         match="recovery_layout_changed",
@@ -340,10 +329,7 @@ async def test_recovery_noop_and_postimage_drift_paths(monkeypatch):
         "_artifact_scope_recovery_coordinates",
         coordinates,
     )
-    assert await importer._recover_provider_directory_artifact_scope(
-        "mrf",
-        _plan(admission.run_id),
-    ) == ()
+    assert await importer._recover_provider_directory_artifact_scope("mrf", _plan(admission.run_id)) == ()
 
     coordinate = importer._ArtifactScopeRecoveryCoordinate(
         base_table_name="provider_directory_source",
@@ -381,10 +367,7 @@ async def test_recovery_noop_and_postimage_drift_paths(monkeypatch):
         importer.ProviderDirectoryArtifactBuildStale,
         match="recovery_postimage_changed",
     ):
-        await importer._recover_provider_directory_artifact_scope(
-            "mrf",
-            _plan(admission.run_id),
-        )
+        await importer._recover_provider_directory_artifact_scope("mrf", _plan(admission.run_id))
 
 
 @pytest.mark.asyncio

@@ -8,15 +8,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as dt
-from dataclasses import dataclass, field
 import math
 import os
-from pathlib import Path
 import re
 import signal
 import sys
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Sequence
-
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -85,7 +85,7 @@ def _candidate_acquisition_id(raw_value: str) -> str:
 def _projection_date(raw_value: str) -> str:
     try:
         parsed_date = dt.date.fromisoformat(raw_value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise argparse.ArgumentTypeError("invalid") from None
     if parsed_date.isoformat() != raw_value:
         raise argparse.ArgumentTypeError("invalid")
@@ -95,7 +95,7 @@ def _projection_date(raw_value: str) -> str:
 def _bounded_integer(raw_value: str, minimum: int, maximum: int) -> int:
     try:
         parsed_value = int(raw_value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise argparse.ArgumentTypeError("invalid") from None
     if str(parsed_value) != raw_value or not minimum <= parsed_value <= maximum:
         raise argparse.ArgumentTypeError("invalid")
@@ -121,13 +121,9 @@ def _batch_size(raw_value: str) -> int:
 def _retry_seconds(raw_value: str) -> float:
     try:
         parsed_value = float(raw_value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise argparse.ArgumentTypeError("invalid") from None
-    if (
-        not math.isfinite(parsed_value)
-        or not 0.0 < parsed_value <= 60.0
-        or raw_value != raw_value.strip()
-    ):
+    if not math.isfinite(parsed_value) or not 0.0 < parsed_value <= 60.0 or raw_value != raw_value.strip():
         raise argparse.ArgumentTypeError("invalid")
     return parsed_value
 
@@ -227,7 +223,7 @@ def _install_signal_handlers(
                 signal_number,
             )
             registration.previous_handler_by_signal[signal_number] = previous_handler
-    except (NotImplementedError, RuntimeError, ValueError):
+    except NotImplementedError, RuntimeError, ValueError:
         registration.restore()
         raise RuntimeError("Flex Practitioner operator signal setup failed") from None
     return registration
@@ -262,9 +258,7 @@ async def _drain_disconnect(
         raise cancellation_error
 
 
-async def _execute_operation(
-    parsed_arguments: argparse.Namespace, database: Any
-) -> str:
+async def _execute_operation(parsed_arguments: argparse.Namespace, database: Any) -> str:
     if parsed_arguments.command == "sync-cohort":
         from process.uhc_flex_practitioner_operator import (
             sync_uhc_flex_practitioner_cohort_operation,
@@ -372,7 +366,11 @@ def _print_error(code: str) -> None:
     print(_error_json(code), file=sys.stderr)
 
 
-def run_command(arguments: Sequence[str] | None = None) -> int:
+def run_command(
+    arguments: Sequence[str] | None = None,
+    *,
+    operation_runner: Callable[[argparse.Namespace], Awaitable[str]] | None = None,
+) -> int:
     """Run one gated phase with deterministic JSON-only output."""
 
     parsed_arguments = _parser().parse_args(arguments)
@@ -380,7 +378,8 @@ def run_command(arguments: Sequence[str] | None = None) -> int:
         _print_error("disabled")
         return 1
     try:
-        rendered_result = asyncio.run(_run_operation(parsed_arguments))
+        runner = _run_operation if operation_runner is None else operation_runner
+        rendered_result = asyncio.run(runner(parsed_arguments))
     except asyncio.CancelledError as error:
         _print_error("canceled")
         return _cancellation_exit_code(error)

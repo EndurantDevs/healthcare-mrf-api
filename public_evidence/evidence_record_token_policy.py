@@ -7,7 +7,7 @@ import hashlib
 import hmac
 import re
 from types import MappingProxyType
-from typing import Mapping, NamedTuple
+from typing import Mapping, NamedTuple, cast
 
 from public_evidence.evidence_record_primitives import (
     PUBLIC_EVIDENCE_TAX_IDENTITY_REF_PREFIX,
@@ -109,15 +109,15 @@ def build_opaque_tax_identity(
     )
     identity_fields = _exact_dict(raw, fields)
     contract_id = identity_fields["token_policy_contract_id"]
+    if type(contract_id) is not str:
+        raise _fail()
     profile = _profile(contract_id)
     policy_id = _policy_id(profile, identity_fields["token_policy_id"])
     tin_type = identity_fields["tin_type"]
     if type(tin_type) is not str or tin_type not in profile.normalization_by_type:
         raise _fail()
     expected_descriptor = token_policy_descriptor_sha256(contract_id, policy_id)
-    supplied_descriptor = _strict_sha256(
-        identity_fields["token_policy_descriptor_sha256"]
-    )
+    supplied_descriptor = _strict_sha256(identity_fields["token_policy_descriptor_sha256"])
     if not hmac.compare_digest(supplied_descriptor, expected_descriptor):
         raise _fail()
     locator = identity_fields["locator_128"]
@@ -136,7 +136,13 @@ def build_opaque_tax_identity(
         "normalization_contract_id": profile.normalization_by_type[tin_type],
     }
     return OpaqueTaxIdentityReference(
-        **identity_payload_by_field,
+        tin_type=tin_type,
+        token_policy_contract_id=contract_id,
+        token_policy_id=policy_id,
+        token_policy_descriptor_sha256=supplied_descriptor,
+        locator_128=locator,
+        full_hmac_sha256=full_hmac,
+        normalization_contract_id=profile.normalization_by_type[tin_type],
         tax_identity_ref=_derived_ref(
             PUBLIC_EVIDENCE_TAX_IDENTITY_REF_PREFIX,
             "tax_identity",

@@ -9,6 +9,7 @@ from typing import Any
 
 from sqlalchemy import text
 
+from api.network_read_execution import execute_network_read
 from api.ptg2_billing_associations import (
     _normalized_provider_group_refs,
     _sidecar_state,
@@ -127,23 +128,14 @@ def _sealed_sidecar_state(
     """Validate the repeated sidecar contract and completed V4 root."""
 
     if not candidate_records:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing reference lookup returned no state"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing reference lookup returned no state")
     states: set[str] = set()
     for candidate_record in candidate_records:
         states.add(_sidecar_state(candidate_record))
-        if (
-            candidate_record.get("layout_count") != 1
-            or candidate_record.get("root_count") != 1
-        ):
-            raise PTG2BillingAssociationDataError(
-                "sealed billing reference snapshot is not complete"
-            )
+        if candidate_record.get("layout_count") != 1 or candidate_record.get("root_count") != 1:
+            raise PTG2BillingAssociationDataError("sealed billing reference snapshot is not complete")
     if len(states) != 1:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing reference sidecar state is inconsistent"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing reference sidecar state is inconsistent")
     return states.pop()
 
 
@@ -162,32 +154,17 @@ def _verified_tin_key(
         full_hmac = candidate_record.get("tin_hmac_sha256")
         if tin_key is None and full_hmac is None:
             continue
-        if (
-            type(tin_key) is not int
-            or tin_key < 0
-            or type(full_hmac) is not bytes
-            or len(full_hmac) != 32
-        ):
-            raise PTG2BillingAssociationDataError(
-                "sealed billing reference candidate is invalid"
-            )
+        if type(tin_key) is not int or tin_key < 0 or type(full_hmac) is not bytes or len(full_hmac) != 32:
+            raise PTG2BillingAssociationDataError("sealed billing reference candidate is invalid")
         token_candidates.append((tin_key, full_hmac))
     if state == "legacy":
         if token_candidates:
-            raise PTG2BillingAssociationDataError(
-                "legacy billing reference sidecar contains token candidates"
-            )
-        raise PTG2BillingAssociationProjectionUnavailable(
-            "sealed billing reference projection is unavailable"
-        )
+            raise PTG2BillingAssociationDataError("legacy billing reference sidecar contains token candidates")
+        raise PTG2BillingAssociationProjectionUnavailable("sealed billing reference projection is unavailable")
     if len(token_candidates) > _MAX_BILLING_REF_CANDIDATES:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing reference locator exceeds its collision limit"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing reference locator exceeds its collision limit")
     if len({tin_key for tin_key, _ in token_candidates}) != len(token_candidates):
-        raise PTG2BillingAssociationDataError(
-            "sealed billing reference candidates are inconsistent"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing reference candidates are inconsistent")
     verified_tin_keys = [
         tin_key
         for tin_key, full_hmac in token_candidates
@@ -198,9 +175,7 @@ def _verified_tin_key(
         )
     ]
     if len(verified_tin_keys) > 1:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing reference resolved ambiguously"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing reference resolved ambiguously")
     return verified_tin_keys[0] if verified_tin_keys else None
 
 
@@ -214,18 +189,12 @@ def _resolved_group_refs(
 ) -> tuple[str, ...]:
     """Validate one exact identity's bounded, stable provider-group refs."""
 
-    raw_refs = tuple(
-        _returned_provider_group_ref(group_record) for group_record in group_records
-    )
+    raw_refs = tuple(_returned_provider_group_ref(group_record) for group_record in group_records)
     if len(raw_refs) > _MAX_PROVIDER_GROUPS:
-        raise PTG2BillingAssociationDataError(
-            "sealed billing reference scope exceeds its provider-group limit"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing reference scope exceeds its provider-group limit")
     normalized_refs = _normalized_provider_group_refs(raw_refs)
     if not normalized_refs or len(normalized_refs) != len(raw_refs):
-        raise PTG2BillingAssociationDataError(
-            "sealed billing reference returned invalid provider-group rows"
-        )
+        raise PTG2BillingAssociationDataError("sealed billing reference returned invalid provider-group rows")
     return normalized_refs
 
 
@@ -255,7 +224,8 @@ async def resolve_billing_entity_ref_group_scope(
         return None
     if tin_key is None:
         return None
-    group_result = await session.execute(
+    group_result = await execute_network_read(
+        session,
         _billing_ref_groups_query(schema_name),
         {
             "snapshot_key": snapshot_key,
@@ -263,9 +233,7 @@ async def resolve_billing_entity_ref_group_scope(
             "provider_group_limit": _MAX_PROVIDER_GROUPS + 1,
         },
     )
-    provider_group_refs = _resolved_group_refs(
-        dict(group_record) for group_record in group_result.mappings()
-    )
+    provider_group_refs = _resolved_group_refs(dict(group_record) for group_record in group_result.mappings())
     return ResolvedBillingEntityGroupScope(
         snapshot_key=snapshot_key,
         provider_group_refs=provider_group_refs,
@@ -282,11 +250,10 @@ async def _resolve_billing_entity_ref_tin_key(
     """Verify one opaque reference and return only its internal token key."""
 
     if type(snapshot_key) is not int or not 1 <= snapshot_key < 2**63:
-        raise PTG2BillingAssociationDataError(
-            "billing association snapshot key is invalid"
-        )
+        raise PTG2BillingAssociationDataError("billing association snapshot key is invalid")
     decoded_reference = decode_billing_entity_ref(billing_entity_ref)
-    candidate_result = await session.execute(
+    candidate_result = await execute_network_read(
+        session,
         _billing_ref_candidates_query(schema_name),
         {
             "snapshot_key": snapshot_key,
@@ -294,9 +261,7 @@ async def _resolve_billing_entity_ref_tin_key(
             "candidate_limit": _MAX_BILLING_REF_CANDIDATES + 1,
         },
     )
-    candidate_records = tuple(
-        dict(candidate_record) for candidate_record in candidate_result.mappings()
-    )
+    candidate_records = tuple(dict(candidate_record) for candidate_record in candidate_result.mappings())
     return _verified_tin_key(
         candidate_records,
         decoded_reference=decoded_reference,

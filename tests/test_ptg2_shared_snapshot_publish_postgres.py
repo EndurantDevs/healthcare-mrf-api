@@ -27,7 +27,7 @@ from api.ptg2_db_sidecars import (
 )
 from api.ptg2_shared_blocks import fetch_shared_blocks, fetch_shared_graph_members
 from db.connection import Database, db
-from process.ptg_parts import ptg2_shared_publish
+from process.ptg_parts import ptg2_shared_blocks, ptg2_shared_publish
 from process.ptg_parts import ptg2_shared_gc
 from process.ptg_parts import ptg2_shared_snapshot_publish
 from process.ptg_parts import ptg2_v4_snapshot_maps
@@ -51,6 +51,7 @@ from process.ptg_parts.ptg2_shared_blocks import (
     reserve_shared_layout,
     seal_shared_layout,
     shared_block_hash,
+    shared_mapping_digest,
     shared_semantic_fingerprint,
     summarize_shared_snapshot_mappings,
 )
@@ -82,6 +83,7 @@ from process.ptg_parts.ptg2_shared_snapshot_publish import (
     publish_shared_v3_snapshot_sources,
     publish_strict_shared_v3_layout,
 )
+from process.ptg_parts.ptg2_snapshot_candidates import attach_snapshot_candidates
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -530,6 +532,84 @@ async def _selective_block_database(monkeypatch):
     finally:
         await db.status(f"DROP SCHEMA IF EXISTS {quoted_schema} CASCADE")
         await db.disconnect()
+
+
+async def _insert_summary_test_mappings(session, schema, references):
+    """Insert uncommitted mappings and an unrelated snapshot for isolation checks."""
+    await session.execute(
+        db.text(f"INSERT INTO {schema}.ptg2_v3_snapshot_block VALUES (41, :kind, :key, 0, :entries, :hash)"),
+        [
+            {
+                "kind": reference.object_kind,
+                "key": reference.block_key,
+                "entries": reference.entry_count,
+                "hash": reference.block_hash,
+            }
+            for reference in references
+        ],
+    )
+    await session.execute(
+        db.text(
+            f"INSERT INTO {schema}.ptg2_v3_snapshot_block "
+            "SELECT 42, object_kind, block_key, fragment_no, entry_count, block_hash "
+            f"FROM {schema}.ptg2_v3_snapshot_block WHERE snapshot_key=41 LIMIT 1"
+        )
+    )
+
+
+@pytest.mark.parametrize("case", ("empty", "distinct", "reused", "overflow", "missing"))
+@pytest.mark.asyncio
+async def test_mapping_summary_preserves_grouped_multiplicity(monkeypatch, case):
+    """Keep exact summaries, snapshot isolation and unresolved-block rejection."""
+    if os.getenv("HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST") != "1":
+        pytest.skip("set HLTHPRT_PTG2_SHARED_PUBLISH_POSTGRES_TEST=1")
+    async with _selective_block_database(monkeypatch) as (schema_name, schema):
+        payloads = (b"aaa", b"bbb", b"ccc", b"ddd", b"eee", b"fff")
+        hashes = [
+            await _insert_selective_durable_block(schema_name, block_payload)
+            for block_payload in payloads[: 6 if case == "distinct" else 2]
+        ]
+        raw_bytes = 2**63 - 1 if case == "overflow" else 3
+        if case == "overflow":
+            await db.status(f"UPDATE {schema}.ptg2_v3_block SET raw_byte_count=:size", size=raw_bytes)
+        if case == "missing":
+            await db.execute_ddl(
+                f"ALTER TABLE {schema}.ptg2_v3_snapshot_block DROP CONSTRAINT ptg2_v3_snapshot_block_block_hash_fkey"
+            )
+        references = [
+            SharedBlockReference(
+                ("a_kind", "b_kind")[index // 3],
+                index,
+                0,
+                0 if index % 2 else 2**63 - 1,
+                b"x" * 32 if case == "missing" else hashes[index % len(hashes)],
+                raw_bytes,
+            )
+            for index in range(0 if case == "empty" else 6)
+        ]
+        async with db.transaction() as session:
+            if references:
+                await _insert_summary_test_mappings(session, schema, references)
+            if case == "missing":
+                with pytest.raises(RuntimeError, match="could not resolve every block_hash"):
+                    await ptg2_shared_blocks._mapping_aggregates_by_kind(
+                        session,
+                        schema=schema,
+                        snapshot_key=41,
+                    )
+                return
+            summary = await summarize_shared_snapshot_mappings(
+                session,
+                schema_name=schema_name,
+                snapshot_key=41,
+            )
+            assert summary.mapping_digest == shared_mapping_digest(references)
+            assert summary.mapping_count == len(references)
+            assert summary.unique_block_count == len(
+                {(reference.object_kind, reference.block_hash) for reference in references}
+            )
+            assert summary.entry_count == sum(reference.entry_count for reference in references)
+            assert summary.logical_byte_count == sum(reference.raw_byte_count for reference in references)
 
 
 def _owned_cas_preparers(prepare_v4_cas, prepare_shared_cas):
@@ -1656,6 +1736,7 @@ async def _install_selective_v4_map_schema(
         )
         """
     )
+    await _install_selective_map_candidates(schema_name)
     await db.status(
         f"""
         INSERT INTO {schema}.ptg2_v3_snapshot_layout
@@ -1665,6 +1746,17 @@ async def _install_selective_v4_map_schema(
         snapshot_key=int(snapshot_key),
         build_token=build_token,
     )
+
+
+async def _install_selective_map_candidates(schema_name):
+    """Convert the synthetic map relation through the actual candidate migration."""
+    from tests.ptg_snapshot_candidate_support import apply_candidate_migration
+
+    schema = '"' + schema_name + '"'
+    await db.execute_ddl(f"CREATE FUNCTION {schema}.guard_ptg2_v4_snapshot_map_pack() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN COALESCE(NEW,OLD); END $$")
+    await db.execute_ddl(f"CREATE TRIGGER ptg2_v4_snapshot_map_pack_guard BEFORE INSERT OR UPDATE OR DELETE ON {schema}.ptg2_v4_snapshot_map_pack FOR EACH ROW EXECUTE FUNCTION {schema}.guard_ptg2_v4_snapshot_map_pack()")
+    async with db.transaction() as session:
+        await apply_candidate_migration(await session.connection(),schema_name,("ptg2_v4_snapshot_map_pack",))
 
 
 async def _stage_selective_v4_reuse(
@@ -1869,6 +1961,7 @@ async def _publish_v4_fixture_in_session(session, request: _V4FixtureRequest):
         pin_token="block_stage",
     )
     assert deleted_pin_count == cas_publication.unique_block_count
+    await attach_snapshot_candidates(session, request.schema_name, request.snapshot_key, request.build_token)
     return cas_publication, map_summary
 
 
@@ -1933,15 +2026,15 @@ def _observe_v4_map_pack_publication(monkeypatch) -> list[bytes]:
     """Record map blocks written before a later transactional failure."""
 
     published_map_blocks: list[bytes] = []
-    original_publish = ptg2_v4_snapshot_maps._publish_v4_map_pack
+    original_publish = ptg2_v4_snapshot_maps._copy_v4_map_batch
 
     async def publish_and_record(session, **kwargs):
         await original_publish(session, **kwargs)
-        published_map_blocks.append(bytes(kwargs["pack"].map_block.block_hash))
+        published_map_blocks.extend(bytes(pack.map_block.block_hash) for pack in kwargs["packs"])
 
     monkeypatch.setattr(
         ptg2_v4_snapshot_maps,
-        "_publish_v4_map_pack",
+        "_copy_v4_map_batch",
         publish_and_record,
     )
     return published_map_blocks
@@ -1954,7 +2047,7 @@ def _observe_candidate_cancellation_before_map_validation(
     """Prove map validation runs after CAS candidate cancellation."""
 
     cancellation_observed = asyncio.Event()
-    original_verify = ptg2_v4_snapshot_maps._verify_target_blocks
+    original_verify = ptg2_v4_snapshot_maps._copy_v4_map_batch
 
     async def verify_after_cancellation(session, **kwargs):
         candidate_count = await session.scalar(
@@ -1969,7 +2062,7 @@ def _observe_candidate_cancellation_before_map_validation(
 
     monkeypatch.setattr(
         ptg2_v4_snapshot_maps,
-        "_verify_target_blocks",
+        "_copy_v4_map_batch",
         verify_after_cancellation,
     )
     return cancellation_observed
@@ -2651,10 +2744,7 @@ async def test_real_postgres_v4_manifest_auth_failure_rolls_back_atomic_publish(
                 manifest_proof=manifest_proof,
             )
 
-        expected_published_packs = (
-            1 if manifest_case == "same_row_count_drift" else 0
-        )
-        assert len(published_map_blocks) == expected_published_packs
+        assert published_map_blocks == []
         await _assert_v4_failed_map_pins(
             quoted_schema,
             new_block_hash=new_hash,

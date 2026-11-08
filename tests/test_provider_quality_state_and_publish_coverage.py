@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -100,10 +101,15 @@ class _HangingRenewRedis(_MemoryRedis):
 
 
 class _Transaction:
+    def __init__(self, database):
+        self.database = database
+
     async def __aenter__(self):
+        self.database.in_transaction = True
         return self
 
     async def __aexit__(self, *_exception_info):
+        self.database.in_transaction = False
         return False
 
 
@@ -111,9 +117,10 @@ class _PublishDatabase:
     def __init__(self, scalar_values=()) -> None:
         self.statements = []
         self.scalar_values = list(scalar_values)
+        self.in_transaction = False
 
     def transaction(self):
-        return _Transaction()
+        return _Transaction(self)
 
     async def status(self, statement, **_parameters):
         self.statements.append(statement)
@@ -430,6 +437,17 @@ async def test_publish_renames_all_tables_and_indexes(monkeypatch) -> None:
         "_archived_identifier",
         lambda identifier: f"archived_{identifier}",
     )
+    published_generations = []
+
+    async def publish_generation(database, *, importer_id, schema_name):
+        assert database.in_transaction
+        published_generations.append((importer_id, schema_name))
+
+    monkeypatch.setattr(
+        publish_helpers,
+        "publish_local_reference_family_generation",
+        publish_generation,
+    )
     await publish_helpers._publish_by_table_rename(stage_classes_by_name, "mrf")
     statements = "\n".join(database.statements)
     assert "ALTER TABLE IF EXISTS mrf.live_0 RENAME TO live_0_old" in statements
@@ -444,6 +462,8 @@ async def test_publish_renames_all_tables_and_indexes(monkeypatch) -> None:
         f"ALTER INDEX IF EXISTS mrf.{staged_signal_index} "
         "RENAME TO procedure_taxonomy_signal_lookup_idx"
     ) in statements
+    assert published_generations == [("provider-quality", "mrf")]
+    assert database.in_transaction is False
 
 
 async def _async(value):
@@ -456,8 +476,15 @@ async def test_publish_refuses_a_missing_stage(monkeypatch) -> None:
     _patch_publish_models(monkeypatch, live_classes)
     monkeypatch.setattr(publish_helpers, "db", _PublishDatabase())
     monkeypatch.setattr(publish_helpers, "_is_table_available", lambda *_args: _async(False))
+    publish_generation = AsyncMock()
+    monkeypatch.setattr(
+        publish_helpers,
+        "publish_local_reference_family_generation",
+        publish_generation,
+    )
     with pytest.raises(RuntimeError, match="Staging table missing"):
         await publish_helpers._publish_by_table_rename(stage_classes_by_name, "mrf")
+    publish_generation.assert_not_awaited()
 
 
 @pytest.mark.asyncio
