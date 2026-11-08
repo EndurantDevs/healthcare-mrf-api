@@ -71,7 +71,14 @@ def _configured_routes(*, setting=ROUTES_ENV):
     for route in routes:
         if (
             type(route) is not dict
-            or set(route) != {"root_run_id", "source_id", "endpoint_scope", "image", "secret_name"}
+            or set(route) - {"allow_retained_retries"}
+            != {"root_run_id", "source_id", "endpoint_scope", "image", "secret_name"}
+            or "allow_retained_retries" in route
+            and (
+                setting != ROUTES_ENV
+                or route["root_run_id"] is not None
+                or type(route["allow_retained_retries"]) is not bool
+            )
             or not (
                 (
                     route["root_run_id"] is None
@@ -110,7 +117,9 @@ def _source_route(admitted_run, *, routes=None):
             return _fresh_source_route(admitted_run, params, routes)
         root_routes = [route for route in routes if route["root_run_id"] == root]
     if not root_routes:
-        return None
+        return _fresh_source_route(
+            admitted_run, params, [route for route in routes if route.get("allow_retained_retries") is True], root=root
+        )
     if root == admitted_run.get("run_id"):
         has_route_lineage = (
             admitted_run.get("retry_of_run_id") is None
@@ -134,8 +143,8 @@ def _source_route(admitted_run, *, routes=None):
     return matches[0]
 
 
-def _fresh_source_route(admitted_run, params, routes):
-    """A source-scoped credential requires an observed fresh single-source root."""
+def _fresh_source_route(admitted_run, params, routes, *, root=None):
+    """Select a fresh source or explicitly enabled native retry of that source."""
     source_ids = params.get("source_ids")
     candidates = [
         route
@@ -152,14 +161,53 @@ def _fresh_source_route(admitted_run, params, routes):
         if source_ids == [route["source_id"]]
         and params.get("provider_directory_endpoint_scope") == route["endpoint_scope"]
     ]
+    parent = admitted_run.get("retry_of_run_id")
+    valid_lineage = (
+        type(root) is str
+        and re.fullmatch(r"run_[0-9a-f]{32}", root) is not None
+        and root != admitted_run.get("run_id")
+        and type(parent) is str
+        and re.fullmatch(r"run_[0-9a-f]{32}", parent) is not None
+        and params.get("retry_of_run_id") == parent
+        if root is not None
+        else "retry_of_run_id" in admitted_run
+        and parent is None
+        and not {"retry_of_run_id", "provider_directory_pagination_root_run_id"}.intersection(params)
+    )
     if (
         len(matches) != 1
-        or "retry_of_run_id" not in admitted_run
-        or admitted_run["retry_of_run_id"] is not None
-        or {"retry_of_run_id", "provider_directory_pagination_root_run_id"}.intersection(params)
+        or not valid_lineage
         or admitted_run.get("status") not in {"queued", "starting", "running", "finalizing"}
     ):
         raise ValueError("fhir_source_worker_route_changed")
+    return matches[0]
+
+
+def _configured_launch_route(launch):
+    """Revalidate the exact current executor, preserving explicit-root precedence."""
+    routes = _configured_routes()
+    candidates = [route for route in routes if route["root_run_id"] == launch.root_run_id]
+    if not candidates:
+        candidates = [
+            route
+            for route in routes
+            if route["root_run_id"] is None
+            and (
+                not launch.root_run_id
+                and not launch.retry_of_run_id
+                or launch.root_run_id
+                and launch.retry_of_run_id
+                and route.get("allow_retained_retries") is True
+            )
+        ]
+    matches = [
+        route
+        for route in candidates
+        if (route["source_id"], route["endpoint_scope"], route["image"], route["secret_name"])
+        == (launch.source_id, launch.endpoint_scope, launch.image, launch.secret_name)
+    ]
+    if len(matches) != 1:
+        raise ValueError("fhir_source_worker_admission_unavailable")
     return matches[0]
 
 
@@ -399,15 +447,16 @@ def admit_fhir_source_worker_launch(admitted_run):
         image = route["image"]
     if _IMAGE.fullmatch(image) is None:
         raise ValueError("fhir_source_worker_admission_unavailable")
-    return FHIRSourceWorkerLaunch(
+    root = (route["root_run_id"] or params_by_name.get("provider_directory_pagination_root_run_id")) if route else ""
+    launch = FHIRSourceWorkerLaunch(
         admitted_run["run_id"],
         metrics["job_id"],
         image,
-        (route["root_run_id"] or "") if route else "",
+        root or "",
         route["secret_name"] if route else "",
         route["source_id"] if route else "",
         route["endpoint_scope"] if route else "",
-        (params_by_name.get("retry_of_run_id") or "") if route and route["root_run_id"] else "",
+        (params_by_name.get("retry_of_run_id") or "") if root else "",
         **(
             _proxy_fields(
                 params_by_name.get("source_ids") if type(params_by_name) is dict else None,
@@ -419,6 +468,7 @@ def admit_fhir_source_worker_launch(admitted_run):
             else {}
         ),
     )
+    return replace(launch, proxy_cooldowns_json="") if root else launch
 
 
 def _lineage_by_id(lineage_rows):
@@ -600,21 +650,7 @@ def _require_proxy_launch(launch):
         if launch.proxy_cooldowns_json:
             raise ValueError("fhir_source_worker_admission_unavailable")
         return
-    route = next(
-        (
-            entry
-            for entry in _configured_routes()
-            if (
-                entry["root_run_id"] or "",
-                entry["source_id"],
-                entry["endpoint_scope"],
-                entry["image"],
-                entry["secret_name"],
-            )
-            == (launch.root_run_id, launch.source_id, launch.endpoint_scope, launch.image, launch.secret_name)
-        ),
-        None,
-    )
+    route = _configured_launch_route(launch)
     expected = _proxy_fields([launch.source_id], launch.endpoint_scope, route)
     if fields != tuple(expected.get(name, "") for name in ("policy_revision", "pool_revision", "pool_secret_name")):
         raise ValueError("fhir_source_worker_admission_unavailable")
@@ -808,17 +844,16 @@ def _is_proxy_job_matching(job, launch):
 
 
 def fresh_route_annotations(spec, launch_request):
-    """Expose exact fresh-route coordinates only from the admitted capability."""
+    """Expose source-wide route coordinates only from the admitted capability."""
     launch = authorized_fhir_source_worker_launch(spec, launch_request)
-    if launch is None or launch.root_run_id or not launch.secret_name:
+    return _source_route_annotations(launch)
+
+
+def _source_route_annotations(launch):
+    if type(launch) is not FHIRSourceWorkerLaunch or not launch.secret_name:
         return {}
-    if launch.retry_of_run_id or not any(
-        route["root_run_id"] is None
-        and (route["source_id"], route["endpoint_scope"], route["image"], route["secret_name"])
-        == (launch.source_id, launch.endpoint_scope, launch.image, launch.secret_name)
-        for route in _configured_routes()
-    ):
-        raise ValueError("fhir_source_worker_admission_unavailable")
+    if _configured_launch_route(launch)["root_run_id"] is not None:
+        return {}
     return {
         "healthporta.com/source-id": launch.source_id,
         "healthporta.com/source-endpoint-scope": launch.endpoint_scope,
@@ -971,7 +1006,7 @@ def is_fhir_source_job_matching(job, launch, launch_request=None):
             and _secret_volume_defaults(pod.get("volumes", []))
             == _secret_volume_defaults([volume["volume"] for volume in volumes])
         )
-    except KeyError, TypeError, IndexError:
+    except KeyError, TypeError, IndexError, ValueError:
         return False
 
 
@@ -982,15 +1017,16 @@ def _fhir_source_identity_matches(job, launch):
     template = job["spec"]["template"]
     container = template["spec"]["containers"][0]
     is_publication = type(launch) is FHIRSourcePublicationLaunch
+    route_annotations = _source_route_annotations(launch)
     return (
         job["metadata"]["labels"]["healthporta.com/worker-purpose"] == PURPOSE
         and template["metadata"]["labels"]["healthporta.com/worker-purpose"] == PURPOSE
         and job["metadata"]["annotations"].get("healthporta.com/source-root-run-id", "")
         == (launch.root_run_id if launch.retry_of_run_id else "")
         and job["metadata"]["annotations"].get("healthporta.com/source-id", "")
-        == (launch.source_id if launch.secret_name and not launch.root_run_id else "")
+        == route_annotations.get("healthporta.com/source-id", "")
         and job["metadata"]["annotations"].get("healthporta.com/source-endpoint-scope", "")
-        == (launch.endpoint_scope if launch.secret_name and not launch.root_run_id else "")
+        == route_annotations.get("healthporta.com/source-endpoint-scope", "")
         and container["command"] == COMMAND
         and container["workingDir"] == "/app"
         and (container.get("args") == ["publish"] if is_publication else not container.get("args"))

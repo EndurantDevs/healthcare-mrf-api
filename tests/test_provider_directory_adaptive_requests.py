@@ -238,7 +238,7 @@ async def test_already_reserved_requests_recheck_reduced_allowance_after_pacing(
     network.results[0] = (429, {}, None, 0)
     paced, release_pacing = asyncio.Queue(), asyncio.Event()
 
-    async def pace(source_record):
+    async def pace(source_record, *, allow_census_defer=False):
         if source_record.get("_queued_index") is not None:
             paced.put_nowait(source_record["_queued_index"])
             await release_pacing.wait()

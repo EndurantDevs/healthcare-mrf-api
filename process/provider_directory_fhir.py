@@ -90,6 +90,7 @@ from process import provider_directory_capped_partition as capped_partition
 from process import provider_directory_christus as christus
 from process import provider_directory_cms_desired_fence as cms_desired_fence
 from process import provider_directory_fhir_response as fhir_response
+from process import provider_directory_leaf_census as leaf_census
 from process import provider_directory_molina as molina
 from process import provider_directory_mvp as mvp
 from process import provider_directory_owned_wal_transaction as profile_owned_wal
@@ -1790,6 +1791,7 @@ class LastUpdatedPartitionConfig:
     volatile_metadata_paths: tuple[str, ...]
     maximum_pages_per_window: int | None = None
     versioned_search_limit: int | None = None
+    census_mode: str | None = None
 
     def identity(self) -> dict[str, Any]:
         """Return stable metadata identity without a moving resolved cutoff."""
@@ -1807,6 +1809,8 @@ class LastUpdatedPartitionConfig:
             identity_by_field["maximum_pages_per_window"] = self.maximum_pages_per_window
         if self.versioned_search_limit is not None:
             identity_by_field["versioned_search_limit"] = self.versioned_search_limit
+        if self.census_mode is not None:
+            identity_by_field["census_mode"] = self.census_mode
         return identity_by_field
 
     def root_end(self) -> datetime.datetime:
@@ -1847,6 +1851,7 @@ class LastUpdatedCompletenessCensus:
     unfiltered_post: int | None = None
     failure: str | None = None
     capped: dict[str, Any] | None = None
+    leaf_sum: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -3605,6 +3610,7 @@ def _build_partition_config(
         volatile_metadata_paths=volatile_paths,
         maximum_pages_per_window=maximum_pages,
         versioned_search_limit=capped_partition.search_limit(resource_settings, ceiling),
+        census_mode=leaf_census.mode(resource_settings),
     )
     validation_end = partition_end or (partition_start + minimum_width)
     PartitionPlan.create(
@@ -17356,8 +17362,9 @@ def _source_contract_metadata_keys(
     """Preserve legacy tuples while binding explicit traversal controls."""
 
     base_keys = ARTIFACT_SOURCE_CONTRACT_METADATA_KEYS if artifact else TWIN_ROOT_ACQUISITION_METADATA_KEYS
-    if "provider_directory_pagination_same_collection" in metadata:
-        base_keys += ("provider_directory_pagination_same_collection",)
+    for key in ("provider_directory_pagination_same_collection", "provider_directory_opaque_cursor_census"):
+        if key in metadata:
+            base_keys += (key,)
     is_subset_shape = bool(
         metadata.get(CURRENT_VERSION_CENSUS_CONTRACT_VERSION_FIELD) == SERVER_ISSUED_SUBSET_REQUIRED_VERSION
         and metadata.get(CURRENT_VERSION_CENSUS_METADATA_STRATEGY_FIELD) == SERVER_ISSUED_SUBSET_SEMANTICS
@@ -41113,41 +41120,9 @@ def _resource_search_payload_error(
     fhir_payload: dict[str, Any] | None,
 ) -> str | None:
     """Reject errored or ambiguous successful collection responses."""
-    aetna_error = _aetna_resource_search_payload_error(
-        source_record,
-        request_url,
-        status_code,
-        fhir_payload,
+    return fhir_response.resource_search_payload_error(
+        sys.modules[__name__], source_record, request_url, status_code, fhir_payload
     )
-    if aetna_error:
-        return aetna_error
-    resource_type = _fhir_collection_search_resource_type(
-        source_record,
-        request_url,
-    )
-    if status_code != 200 or not resource_type or not isinstance(fhir_payload, dict):
-        return None
-    if fhir_payload.get("resourceType") == "OperationOutcome":
-        return RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR
-    if not _is_bundle_payload(fhir_payload):
-        return None
-    if (
-        _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
-        == CIGNA_PROVIDER_DIRECTORY_BASE
-        and _has_fhir_continuation_query(request_url)
-        and _is_empty_fhir_search_set(status_code, fhir_payload, None)
-        and type(fhir_payload.get("total")) is int
-        and fhir_payload["total"] == 0
-    ):
-        return CIGNA_AMBIGUOUS_EMPTY_CONTINUATION_ERROR
-    entry_resources = [entry["resource"] for entry in _bundle_entries(fhir_payload)]
-    outcome_resources = [resource for resource in entry_resources if resource.get("resourceType") == "OperationOutcome"]
-    if outcome_resources and (
-        not any(resource.get("resourceType") == resource_type for resource in entry_resources)
-        or any(_has_operation_outcome_error(outcome) for outcome in outcome_resources)
-    ):
-        return RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR
-    return None
 
 
 def _source_fetch_retry_delay_seconds(attempt_index: int) -> float:
@@ -41235,7 +41210,7 @@ def _source_request_interval_seconds(source_record: dict[str, Any]) -> float:
     return max(0.0, interval_seconds)
 
 
-async def _pace_source_request(source_record: dict[str, Any]) -> None:
+async def _pace_source_request(source_record: dict[str, Any], *, allow_census_defer: bool = False) -> None:
     interval_seconds = _source_request_interval_seconds(source_record)
     pacing_state = source_record.get("_provider_directory_request_pacing_state", source_record)
     if interval_seconds <= 0 and not pacing_state.get("retry_after_monotonic"):
@@ -41247,6 +41222,8 @@ async def _pace_source_request(source_record: dict[str, Any]) -> None:
     async with pacing_lock:
         last_started_at = float(pacing_state.get("_provider_directory_last_request_monotonic") or 0.0)
         while True:
+            if allow_census_defer and source_selection.has_census_cooldown(sys.modules[__name__], source_record):
+                raise source_selection.CensusRequestDeferred
             next_request_at = max(last_started_at + interval_seconds, pacing_state.get("retry_after_monotonic", 0.0))
             wait_seconds = next_request_at - time.monotonic()
             if wait_seconds <= 0:
@@ -41760,6 +41737,8 @@ async def _retry_rest_pagination_after_cooldown(
     while retries < REST_PAGINATION_COOLDOWN_RETRY_CAP:
         status_code, fhir_payload, fetch_error, _elapsed_ms = fetch_result
         if not _is_rest_pagination_cooldown_failure(status_code, fetch_error, source_record=source_record):
+            break
+        if source_selection.should_defer_census_retry(sys.modules[__name__], source_record, fhir_payload):
             break
         delay_seconds = _rest_pagination_cooldown_delay_seconds(
             status_code,
@@ -49193,7 +49172,13 @@ def _partition_checkpoint_control(
 def _partition_census_from_control(
     control_dict: dict[str, Any],
     versioned_search_limit: int | None = None,
+    census_mode: str | None = None,
+    plan: PartitionPlan | None = None,
 ) -> LastUpdatedCompletenessCensus:
+    if census_mode == leaf_census.CONTRACT:
+        return leaf_census.restore(sys.modules[__name__], control_dict.get("census"), plan)
+    if plan is not None and any(window.split_reason == "planned" for window in plan.windows.values()):
+        raise ValueError("checkpoint planned split requires leaf census contract")
     return capped_partition.restore_census(sys.modules[__name__], control_dict, versioned_search_limit)
 
 
@@ -49289,7 +49274,9 @@ def _last_updated_partition_resume_from_checkpoint(
                 restored_plan,
                 completed_passes_by_window,
             ),
-            census=_partition_census_from_control(control_dict, config.versioned_search_limit),
+            census=_partition_census_from_control(
+                control_dict, config.versioned_search_limit, config.census_mode, restored_plan
+            ),
         )
     except (json.JSONDecodeError, TypeError, ValueError, PartitionPlanError) as exc:
         raise RuntimeError("provider_directory_last_updated_partition_checkpoint_invalid") from exc
@@ -49298,6 +49285,8 @@ def _last_updated_partition_resume_from_checkpoint(
 def _is_last_updated_partition_census_complete(
     census: LastUpdatedCompletenessCensus,
 ) -> bool:
+    if census.leaf_sum is not None:
+        return leaf_census.validate(census)
     if census.capped is not None:
         return census.failure is None and capped_partition.complete(census.capped)
     return (
@@ -49639,7 +49628,7 @@ def _last_updated_partition_retry_not_before(
         )
         or {}
     )
-    return _molina_quota_retry_not_before(
+    retry_at = _molina_quota_retry_not_before(
         source_record,
         status_code,
         response_payload,
@@ -49651,6 +49640,7 @@ def _last_updated_partition_retry_not_before(
         max_delay_seconds=max_delay_seconds,
         fallback_seconds=fallback_seconds,
     )
+    return fhir_response.retained_census_retry_boundary(sys.modules[__name__], source_record, retry_at)
 
 
 async def _fetch_last_updated_partition_count(
@@ -49658,53 +49648,11 @@ async def _fetch_last_updated_partition_count(
     request_url: str,
     *,
     timeout: int,
+    deadline_at: float | None = None,
 ) -> LastUpdatedCountFetch:
-    """Fetch one exact, non-paginated partition count observation."""
-    retry_delays = LAST_UPDATED_PARTITION_COUNT_ENVELOPE_RETRY_DELAYS_SECONDS
-    attempt_index = 0
-    while True:
-        status_code, response_payload, error, _elapsed = await _fetch_source_json(
-            source_record,
-            request_url,
-            timeout=timeout,
-        )
-        split_observation = capped_partition.split_observation(
-            sys.modules[__name__], source_record, request_url, status_code, response_payload, error
-        )
-        if split_observation is not None:
-            return LastUpdatedCountFetch(split_observation, pages_fetched=attempt_index + 1)
-        pages_fetched = attempt_index + 1
-        if status_code != 200 or error:
-            failure_error = error or f"http_{status_code}"
-            is_transient = _is_transient_source_fetch_failure(status_code, error)
-            return LastUpdatedCountFetch(
-                observation=(None if is_transient else CountObservation.error(failure_error)),
-                pages_fetched=pages_fetched,
-                error=failure_error,
-                transient=is_transient,
-                retry_not_before=(
-                    _last_updated_partition_retry_not_before(
-                        source_record,
-                        request_url,
-                        status_code,
-                        response_payload,
-                        error,
-                    )
-                    if is_transient
-                    else None
-                ),
-            )
-        count_fetch = _validate_last_updated_partition_count_payload(response_payload)
-        if count_fetch.error != "non_searchset_count_bundle":
-            return replace(count_fetch, pages_fetched=pages_fetched)
-        if attempt_index == len(retry_delays):
-            return replace(
-                count_fetch,
-                pages_fetched=pages_fetched,
-                error="non_searchset_count_bundle_retry_exhausted",
-            )
-        await asyncio.sleep(retry_delays[attempt_index])
-        attempt_index += 1
+    return await fhir_response.fetch_last_updated_partition_count(
+        sys.modules[__name__], source_record, request_url, timeout=timeout, deadline_at=deadline_at
+    )
 
 
 def _validate_last_updated_partition_count_payload(
@@ -49788,6 +49736,7 @@ def _last_updated_window_page_failure(
                 status_code,
                 response_payload,
                 fetch_error,
+                max_delay_seconds=source_selection.retry_after_limit(sys.modules[__name__], source_record),
             )
             if is_transient
             else None
@@ -49822,12 +49771,16 @@ async def _fetch_last_updated_window_page(
     window: TimeWindow,
     *,
     timeout: int,
+    deadline_at: float | None = None,
 ) -> LastUpdatedWindowPage:
-    status_code, response_payload, fetch_error, _elapsed = await _fetch_source_json(
+    fetch_result, _deadline_blocked = await _fetch_cooldown_checkpoint_page(
         source_record,
         request_url,
+        (None, None, "TimeoutError: resource deadline reached before partition page", 0),
         timeout=timeout,
+        deadline_at=deadline_at,
     )
+    status_code, response_payload, fetch_error, _elapsed = fetch_result
     if status_code != 200 or fetch_error:
         return _last_updated_window_page_failure(
             source_record,
@@ -50002,8 +49955,9 @@ async def _fetch_last_updated_partition_window(
             current_url,
             window,
             timeout=timeout,
+            deadline_at=deadline_at,
         )
-        pages_fetched += 1
+        pages_fetched += int(page.error != source_selection.CENSUS_REQUEST_DEFERRED_ERROR)
         page_failure = _last_updated_window_page_failure_result(
             collected_resources,
             pages_fetched,
@@ -51392,6 +51346,7 @@ def _last_updated_partition_completeness_diagnostic(
         "verified": verified,
         "failure": state.census.failure,
         **({"capped_search": dict(state.census.capped)} if state.census.capped is not None else {}),
+        **({"leaf_sum_census": dict(state.census.leaf_sum)} if state.census.leaf_sum is not None else {}),
     }
 
 
@@ -51579,6 +51534,7 @@ async def _observe_partition_census_value(
         source_record,
         census_request.request_url,
         timeout=fetch_options.timeout,
+        deadline_at=state.deadline_at,
     )
     return await _record_partition_census_fetch(
         resource_type,
@@ -51683,8 +51639,8 @@ async def _observe_partition_pre_census(
     fetch_options: LastUpdatedPartitionFetchOptions,
 ) -> ResourceFetchResult | None:
     """Establish immutable unfiltered and ranged counts before acquisition."""
-    if config.versioned_search_limit is not None:
-        return await capped_partition.pre_census(
+    if census_handler := leaf_census.handler(config):
+        return await census_handler.pre_census(
             sys.modules[__name__], source_record, resource_type, model, config, state, fetch_options
         )
     root_window = state.plan.windows["root"]
@@ -51735,8 +51691,8 @@ async def _reconcile_partition_leaf_counts(
     config: LastUpdatedPartitionConfig,
     state: LastUpdatedPartitionState,
 ) -> ResourceFetchResult | None:
-    if config.versioned_search_limit is not None:
-        return await capped_partition.reconcile(sys.modules[__name__], resource_type, model, config, state)
+    if census_handler := leaf_census.handler(config):
+        return await census_handler.reconcile(sys.modules[__name__], resource_type, model, config, state)
     leaf_count_sum = sum(window.count or 0 for window in state.plan.leaf_windows())
     if leaf_count_sum == state.census.ranged_root_pre:
         return None
@@ -51762,8 +51718,10 @@ async def _observe_next_partition_count(
         source_record,
         _last_updated_partition_count_url(state, config, window),
         timeout=fetch_options.timeout,
+        deadline_at=state.deadline_at,
     )
     if count_fetch.transient:
+        leaf_census.record_deferred_count(sys.modules[__name__], config, state, window, count_fetch)
         return await _saved_partition_retry_result(
             model,
             resource_type,
@@ -52109,8 +52067,8 @@ async def _observe_partition_post_census(
     state: LastUpdatedPartitionState,
     fetch_options: LastUpdatedPartitionFetchOptions,
 ) -> ResourceFetchResult | None:
-    if config.versioned_search_limit is not None:
-        return await capped_partition.post_census(
+    if census_handler := leaf_census.handler(config):
+        return await census_handler.post_census(
             sys.modules[__name__], source_record, resource_type, model, config, state, fetch_options
         )
     expected_count = state.census.ranged_root_pre
@@ -52344,7 +52302,10 @@ def _is_caresource_opaque_cursor_census(
         checkpoint_context is not None
         and checkpoint_context.dataset_id
         and current_version_census_contract(source_record) is None
-        and api_base == CARESOURCE_PROVIDER_DIRECTORY_BASE
+        and (
+            api_base == CARESOURCE_PROVIDER_DIRECTORY_BASE
+            or _source_metadata(source_record).get("provider_directory_opaque_cursor_census") is True
+        )
     )
 
 
@@ -52382,13 +52343,17 @@ async def _fetch_caresource_census_count(
     start_url: str,
     *,
     timeout: int,
+    deadline_at: float | None = None,
 ) -> CareSourceCensusFetch:
     census_url = _caresource_census_url(start_url)
-    status_code, response_payload, fetch_error, _elapsed = await _fetch_source_json(
+    fetch_result, _deadline_blocked = await _fetch_cooldown_checkpoint_page(
         source_record,
         census_url,
+        (None, None, "TimeoutError: census deadline reached", 0),
         timeout=timeout,
+        deadline_at=deadline_at,
     )
+    status_code, response_payload, fetch_error, _elapsed = fetch_result
     if status_code != 200 or fetch_error:
         failure_detail = fetch_error or f"http_{status_code}"
         is_transient = _is_transient_source_fetch_failure(status_code, fetch_error)
@@ -52403,6 +52368,7 @@ async def _fetch_caresource_census_count(
                     status_code,
                     response_payload,
                     fetch_error,
+                    max_delay_seconds=source_selection.retry_after_limit(sys.modules[__name__], source_record),
                 )
                 if is_transient
                 else None
@@ -52469,8 +52435,12 @@ async def _prepare_caresource_pre_census(
     start_url: str,
     *,
     timeout: int,
+    deadline_at: float | None = None,
 ) -> dict[str, Any] | ResourceFetchResult:
     persisted_pre_count, persisted_error = _caresource_persisted_pre_count(resume_state.completeness)
+    persisted_error = persisted_error or await fhir_response.opaque_terminal_resume_error(
+        sys.modules[__name__], checkpoint_context, resource_type, resume_state
+    )
     if persisted_error:
         return _caresource_proof_error_result(
             model,
@@ -52486,6 +52456,7 @@ async def _prepare_caresource_pre_census(
         source_record,
         start_url,
         timeout=timeout,
+        deadline_at=deadline_at,
     )
     if census_fetch.count is None:
         proof_by_field = {
@@ -52551,12 +52522,14 @@ async def _finish_caresource_opaque_cursor_census(
     proof_by_field: dict[str, Any],
     *,
     timeout: int,
+    deadline_at: float | None = None,
     rows_processed: int,
 ) -> CareSourceOpaqueCursorOutcome:
     post_census = await _fetch_caresource_census_count(
         source_record,
         start_url,
         timeout=timeout,
+        deadline_at=deadline_at,
     )
     if post_census.count is None:
         failed_proof_by_field = {
@@ -53402,6 +53375,7 @@ async def _fetch_resource_rows(
         cancel_ctx,
         cancel_task,
     )
+    deadline_at = time.monotonic() + deadline_seconds if is_caresource_census_enabled and deadline_seconds > 0 else None
     caresource_proof_by_field: dict[str, Any] | None = None
     current_version_proof_by_field: dict[str, Any] | None = None
     if is_caresource_census_enabled:
@@ -53416,6 +53390,7 @@ async def _fetch_resource_rows(
             resume_state,
             checkpoint_start_url,
             timeout=resource_timeout,
+            deadline_at=deadline_at,
         )
         if isinstance(prepared_census, ResourceFetchResult):
             return prepared_census
@@ -53578,7 +53553,8 @@ async def _fetch_resource_rows(
     is_pagination_cooldown_recovered = False
     is_pagination_cooldown_exhausted = False
     is_pagination_cooldown_deadline_blocked = False
-    deadline_at = time.monotonic() + deadline_seconds if deadline_seconds > 0 else None
+    if not is_caresource_census_enabled:
+        deadline_at = time.monotonic() + deadline_seconds if deadline_seconds > 0 else None
     is_deadline_reached = False
     source_api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
     (
@@ -53592,6 +53568,8 @@ async def _fetch_resource_rows(
         else _env_int("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", DEFAULT_FULL_REFRESH_MAX_PAGES)
     )
     pending_start_urls = [resume_state.next_url] if resume_state and resume_state.next_url else list(start_urls)
+    if is_caresource_census_enabled and caresource_proof_by_field.get("terminal_page") is not None:
+        pending_start_urls = []
     is_partitioned_fetch = len(pending_start_urls) > 1
     if is_partitioned_fetch and per_resource_limit <= 0 and page_limit <= 0:
         partition_fetch_options = PartitionFetchOptions(
@@ -53616,7 +53594,7 @@ async def _fetch_resource_rows(
     partition_error_count = 0
     url: str | None = None
     page_prefetch_state = RestPagePrefetchState()
-    is_page_prefetch_eligible = _is_rest_page_prefetch_eligible(
+    is_page_prefetch_eligible = bool(pending_start_urls) and _is_rest_page_prefetch_eligible(
         source_record,
         pending_start_urls[0],
         RestPagePrefetchEligibility(
@@ -53927,6 +53905,7 @@ async def _fetch_resource_rows(
                             resume_state,
                             checkpoint_start_url,
                             timeout=resource_timeout,
+                            deadline_at=deadline_at,
                         )
                         if isinstance(prepared_census, ResourceFetchResult):
                             return prepared_census
@@ -53983,6 +53962,9 @@ async def _fetch_resource_rows(
                         ),
                     )
                     or checkpoint_non_bundle_retry_at
+                )
+                retry_not_before = fhir_response.retained_census_retry_boundary(
+                    sys.modules[__name__], source_record, retry_not_before
                 )
                 current_error = error or f"http_{status_code}"
                 if is_partitioned_fetch:
@@ -54271,11 +54253,11 @@ async def _fetch_resource_rows(
                     name="provider-directory-rest-page-prefetch",
                 )
             try:
-                if (
-                    checkpoint_context
-                    and not defer_caresource_terminal_checkpoint
-                    and not defer_exact_census_terminal_checkpoint
-                ):
+                if checkpoint_context and not defer_exact_census_terminal_checkpoint:
+                    if defer_caresource_terminal_checkpoint:
+                        caresource_proof_by_field = fhir_response.opaque_terminal_proof(
+                            sys.modules[__name__], caresource_proof_by_field, url, pages, rows_fetched
+                        )
                     recent_url_hashes.append(request_url_hash)
                     recent_url_hashes = recent_url_hashes[-PAGINATION_CHECKPOINT_RECENT_URL_LIMIT:]
                     checkpoint_started_at = time.monotonic()
@@ -54285,12 +54267,14 @@ async def _fetch_resource_rows(
                             await _save_pagination_checkpoint(
                                 checkpoint_context,
                                 resource_type,
-                                next_url=resolved_next_url,
+                                next_url=url if defer_caresource_terminal_checkpoint else resolved_next_url,
                                 pages_processed=pages,
                                 rows_processed=rows_fetched,
                                 recent_url_hashes=recent_url_hashes,
                                 completeness=(
-                                    current_version_proof_by_field
+                                    caresource_proof_by_field
+                                    if defer_caresource_terminal_checkpoint
+                                    else current_version_proof_by_field
                                     if is_current_version_census_enabled
                                     else {anthem.SORTED_LAST_ID_KEY: previous_anthem_id}
                                     if is_anthem_source
@@ -54365,6 +54349,7 @@ async def _fetch_resource_rows(
             checkpoint_start_url,
             caresource_proof_by_field,
             timeout=resource_timeout,
+            deadline_at=deadline_at,
             rows_processed=rows_fetched,
         )
         caresource_proof_by_field = caresource_outcome.proof
@@ -58473,9 +58458,11 @@ def _validate_current_version_census_lineage(
 def _pagination_checkpoint_strategy_version(
     canonical_api_base: str | None,
     last_updated_partition_config: dict[str, Any],
+    *,
+    is_opaque_cursor_census: bool = False,
 ) -> str:
     """Select the checkpoint compatibility contract for one endpoint."""
-    if canonical_api_base == CARESOURCE_PROVIDER_DIRECTORY_BASE:
+    if canonical_api_base == CARESOURCE_PROVIDER_DIRECTORY_BASE or is_opaque_cursor_census:
         return CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION
     if last_updated_partition_config:
         return LAST_UPDATED_PARTITION_STRATEGY_VERSION
@@ -58496,11 +58483,13 @@ def _pagination_checkpoint_scope_identity(
     canonical_api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
     last_updated_partition_config = _last_updated_partition_resource_configs(source_record)
     census_contract = current_version_census_contract(source_record)
+    is_opaque_cursor_census = _source_metadata(source_record).get("provider_directory_opaque_cursor_census") is True
     supports_checkpoint = (
         canonical_api_base in PAGINATION_CHECKPOINT_API_BASES
         or _is_amerihealth_caritas_provider_api_base(canonical_api_base)
         or bool(last_updated_partition_config)
         or census_contract is not None
+        or is_opaque_cursor_census
     )
     if not source_ids or not supports_checkpoint or not canonical_api_base:
         return None
@@ -58510,6 +58499,7 @@ def _pagination_checkpoint_scope_identity(
         else _pagination_checkpoint_strategy_version(
             canonical_api_base,
             last_updated_partition_config,
+            is_opaque_cursor_census=is_opaque_cursor_census,
         )
     )
     scope_payload_dict = {

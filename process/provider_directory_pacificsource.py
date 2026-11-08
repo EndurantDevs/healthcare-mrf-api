@@ -14,6 +14,32 @@ RESOURCES = (
 )
 
 
+def _partition_acquisition() -> dict:
+    """Keep cursor chains bounded under the existing exhaustive verifier."""
+    return {
+        "enabled": True,
+        "resources": {
+            resource: {
+                "start": "1900-01-01T00:00:00Z",
+                "end": "resolved_now",
+                "ceiling": 25 if resource == "PractitionerRole" else 1000,
+                "minimum_width_seconds": 1,
+                "boundary_precision_seconds": 1,
+                "page_count": 1 if resource == "PractitionerRole" else 200,
+                "census_mode": "unfiltered-leaf-sum-v1",
+                "volatile_metadata_paths": [],
+            }
+            for resource in (
+                "Practitioner",
+                "Location",
+                "Organization",
+                "HealthcareService",
+                "PractitionerRole",
+            )
+        },
+    }
+
+
 def seed_rows() -> list[dict]:
     """Keep the public directory distinct from historical product aliases."""
     return [
@@ -45,10 +71,13 @@ def seed_rows() -> list[dict]:
                 ],
                 "provider_directory_resource_page_count_caps": {
                     **{resource: 100 for resource in RESOURCES},
-                    "PractitionerRole": 10,
+                    **{resource: 200 for resource in ("Practitioner", "Location", "Organization", "HealthcareService")},
+                    "PractitionerRole": 1,
                     "OrganizationAffiliation": 50,
                 },
                 "provider_directory_resource_scan_concurrency": 8,
+                "provider_directory_opaque_cursor_census": True,
+                "provider_directory_last_updated_partition_acquisition": _partition_acquisition(),
                 "provider_directory_probe_resource": "Practitioner",
                 "provider_directory_resource_count_estimates": {
                     "Practitioner": 3931561,

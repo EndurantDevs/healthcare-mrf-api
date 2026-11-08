@@ -7,7 +7,6 @@ import importlib
 
 import pytest
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
@@ -49,13 +48,13 @@ class _PageSequence:
         _window,
         *,
         timeout,
+        deadline_at=None,
     ):
+        assert deadline_at is None
         self.requested_urls.append((request_url, timeout))
         page_number = len(self.requested_urls)
         if page_number <= 3:
-            page_resources = tuple(
-                {"id": f"role-{page_number}-{row_number}"} for row_number in range(1000)
-            )
+            page_resources = tuple({"id": f"role-{page_number}-{row_number}"} for row_number in range(1000))
             next_url = f"page:{page_number + 1}"
         elif self.fourth_page_mode == "unexpected_row":
             page_resources = ({"id": "unexpected-role"},)

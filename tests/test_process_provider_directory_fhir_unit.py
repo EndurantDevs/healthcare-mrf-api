@@ -8455,6 +8455,103 @@ async def test_search_bundle_rejects_error_outcome_alongside_resource(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_kind", "severity"),
+    [("plain", "error"), ("outcome_only", "warning"), ("mixed", "error"), ("mixed", "fatal")],
+)
+async def test_root_cursor_outcomes_preserve_checkpoint(monkeypatch, response_kind, severity):
+    """Reject error payloads without losing or advancing the retained cursor."""
+    source_by_field = {"source_id": "source-a", "api_base": "https://directory.example.test/fhir"}
+    cursor = source_by_field["api_base"] + "?_getpages=opaque%2f+value&_getpagesoffset=300&_count=100"
+    outcome_by_field = {
+        "resourceType": "OperationOutcome",
+        "issue": [{"severity": severity, "code": "processing"}],
+    }
+    payload_by_field = outcome_by_field
+    if response_kind != "plain":
+        entries = [{"resource": outcome_by_field}]
+        if response_kind == "mixed":
+            entries.append({"resource": {"resourceType": "Practitioner", "id": "practitioner-4"}})
+        payload_by_field = {"resourceType": "Bundle", "type": "searchset", "entry": entries}
+    state = importer.PaginationResumeState(
+        next_url=cursor, pages_processed=3, rows_processed=300, recent_url_hashes=("prior-page",), resumed=True
+    )
+    context = _checkpoint_context(
+        owner_run_id="run_retry",
+        retry_of_run_id="run_original",
+        acquisition_root_run_id="run_original",
+        endpoint_id=None,
+        allow_retained_pagination_reset=False,
+    )
+    fetch_once = AsyncMock(return_value=(200, payload_by_field, None, 5))
+    persist = AsyncMock(return_value=0)
+    save = AsyncMock()
+    reset = AsyncMock()
+    sleep = AsyncMock()
+    checkpoint_transaction = Mock(side_effect=AssertionError("outcome must not alter the checkpoint"))
+    monkeypatch.setattr(importer, "_load_or_initialize_pagination_checkpoint", AsyncMock(return_value=state))
+    monkeypatch.setattr(importer, "_fetch_source_json_once", fetch_once)
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", save)
+    monkeypatch.setattr(importer, "_reset_pagination_checkpoint", reset)
+    monkeypatch.setattr(importer, "source_checkpoint_transaction", checkpoint_transaction)
+    monkeypatch.setattr(importer.asyncio, "sleep", sleep)
+
+    fetch_result = await importer._fetch_resource_rows(
+        source_by_field,
+        "Practitioner",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_retry",
+        row_batch_handler=persist,
+        retain_rows=False,
+        pagination_checkpoint=context,
+    )
+
+    assert fetch_result.error == importer.RESOURCE_SEARCH_OPERATION_OUTCOME_ERROR
+    assert fetch_result.complete is False and fetch_result.next_url_remaining is True
+    assert (fetch_result.pages_fetched, fetch_result.rows_fetched, fetch_result.rows_written) == (3, 300, 0)
+    assert state.next_url == cursor and state.recent_url_hashes == ("prior-page",)
+    fetch_once.assert_awaited_once_with(source_by_field, cursor, timeout=3)
+    persist.assert_not_awaited()
+    save.assert_not_awaited()
+    reset.assert_not_awaited()
+    sleep.assert_not_awaited()
+    checkpoint_transaction.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_kind", ["empty_terminal", "empty_next", "mixed_warning"])
+async def test_root_cursor_preserves_valid_search_responses(monkeypatch, response_kind):
+    source_by_field = {"source_id": "source-a", "api_base": "https://directory.example.test/fhir"}
+    cursor = source_by_field["api_base"] + "?_getpages=opaque%2f+value&_getpagesoffset=300"
+    payload_by_field = {"resourceType": "Bundle", "type": "searchset", "entry": []}
+    if response_kind == "empty_next":
+        payload_by_field["link"] = [{"relation": "next", "url": cursor + "&_count=100"}]
+    elif response_kind == "mixed_warning":
+        payload_by_field["entry"] = [
+            {"resource": {"resourceType": "OperationOutcome", "issue": [{"severity": "warning"}]}},
+            {"resource": {"resourceType": "Practitioner", "id": "practitioner-4"}},
+        ]
+    fetch_once = AsyncMock(return_value=(200, payload_by_field, None, 5))
+    monkeypatch.setattr(importer, "_fetch_source_json_once", fetch_once)
+
+    fetch_result = await importer._fetch_source_json(source_by_field, cursor, timeout=3)
+
+    assert fetch_result[:3] == (200, payload_by_field, None)
+    fetch_once.assert_awaited_once_with(source_by_field, cursor, timeout=3)
+
+
+@pytest.mark.parametrize("path", ["", "/metadata?_getpages=opaque", "/Practitioner/id?_getpages=opaque"])
+def test_root_cursor_outcome_validation_excludes_non_search_paths(path):
+    base = "https://directory.example.test/fhir"
+    outcome_by_field = {"resourceType": "OperationOutcome", "issue": [{"severity": "error"}]}
+    for url in (base + path, "https://other.example.test/fhir?_getpages=opaque"):
+        assert importer._resource_search_payload_error({"api_base": base}, url, 200, outcome_by_field) is None
+
+
+@pytest.mark.asyncio
 async def test_aetna_http_200_operation_outcome_is_resource_error(monkeypatch):
     fetch_json = AsyncMock(
         return_value=(
@@ -23512,6 +23609,10 @@ def _install_caresource_scan_callbacks(
     monkeypatch,
     start_url: str,
     next_url: str,
+    *,
+    post_count: int = 2,
+    terminal_resource_id: str | None = "role-2",
+    unique_count: int = 2,
 ):
     requested_urls: list[str] = []
     saved_checkpoints: list[dict[str, Any]] = []
@@ -23526,11 +23627,17 @@ def _install_caresource_scan_callbacks(
         assert timeout == 3
         requested_urls.append(request_url)
         if "_summary=count" in request_url:
-            return 200, _caresource_count_bundle(2), None, 1
+            count = 2 if len(requested_urls) == 1 else post_count
+            return 200, _caresource_count_bundle(count), None, 1
         if request_url == start_url:
             return 200, _caresource_role_bundle("role-1", next_url), None, 1
         assert request_url == next_url
-        return 200, _caresource_role_bundle("role-2"), None, 1
+        terminal_bundle_by_field = (
+            _caresource_role_bundle(terminal_resource_id)
+            if terminal_resource_id is not None
+            else {"resourceType": "Bundle", "type": "searchset", "entry": []}
+        )
+        return 200, terminal_bundle_by_field, None, 1
 
     async def save_checkpoint(_context, _resource_type, **checkpoint):
         saved_checkpoints.append(checkpoint)
@@ -23542,11 +23649,7 @@ def _install_caresource_scan_callbacks(
         return len(rows)
 
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", "1")
-    monkeypatch.setattr(
-        importer,
-        "_load_or_initialize_pagination_checkpoint",
-        load_checkpoint,
-    )
+    monkeypatch.setattr(importer, "_load_or_initialize_pagination_checkpoint", load_checkpoint)
     monkeypatch.setattr(importer, "_fetch_source_json", fetch_source_json)
     monkeypatch.setattr(importer, "_save_pagination_checkpoint", save_checkpoint)
     monkeypatch.setattr(
@@ -23557,7 +23660,7 @@ def _install_caresource_scan_callbacks(
     monkeypatch.setattr(
         importer,
         "_caresource_unique_candidate_count",
-        AsyncMock(return_value=2),
+        AsyncMock(return_value=unique_count),
     )
     return requested_urls, saved_checkpoints, saved_proofs, row_batch_handler
 
@@ -23578,7 +23681,7 @@ def _assert_caresource_completion_metrics(fetch_result):
     assert role_stats_by_name["caresource_opaque_cursor_post_count"] == 2
 
 
-def _assert_caresource_checkpoint_proofs(saved_proofs):
+def _assert_caresource_checkpoint_proofs(saved_proofs, terminal_url):
     assert saved_proofs == [
         {
             "strategy_version": importer.CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION,
@@ -23589,6 +23692,12 @@ def _assert_caresource_checkpoint_proofs(saved_proofs):
             "strategy_version": importer.CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION,
             "verified": True,
             "pre_count": 2,
+            "terminal_page": {
+                "request_sha256": hashlib.sha256(terminal_url.encode()).hexdigest(),
+                "pages_processed": 2,
+                "rows_processed": 2,
+                "has_next": False,
+            },
             "post_count": 2,
             "processed_rows": 2,
             "unique_candidate_rows": 2,
@@ -23642,8 +23751,125 @@ async def test_caresource_opaque_cursor_scan_reconciles_and_checkpoints_terminal
     ]
     assert saved_checkpoints[-1]["next_url"] is None
     assert saved_checkpoints[-1]["rows_processed"] == 2
-    _assert_caresource_checkpoint_proofs(saved_proofs)
+    _assert_caresource_checkpoint_proofs(saved_proofs, next_url)
     _assert_caresource_completion_metrics(fetch_result)
+
+
+@pytest.mark.parametrize("opt_in", [None, False, "true", 1, True])
+def test_opaque_cursor_census_requires_explicit_boolean_and_bound_candidate(monkeypatch, opt_in):
+    source_by_field = {
+        "api_base": "https://directory.example.test/fhir",
+        "metadata_json": {"provider_directory_opaque_cursor_census": opt_in},
+    }
+    context = _caresource_checkpoint_context()
+    assert importer._is_caresource_opaque_cursor_census(source_by_field, context) is (opt_in is True)
+    assert not importer._is_caresource_opaque_cursor_census(source_by_field, None)
+    assert not importer._is_caresource_opaque_cursor_census(
+        source_by_field, dataclasses.replace(context, dataset_id=None)
+    )
+    scope = importer._pagination_checkpoint_scope_identity(source_by_field, ["synthetic-source"])
+    assert (scope is not None) is (opt_in is True)
+    monkeypatch.setattr(importer, "current_version_census_contract", lambda _source: object())
+    assert not importer._is_caresource_opaque_cursor_census(source_by_field, context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("post_count", "terminal_id", "unique_count", "expected_error"),
+    [
+        (2, "role-2", 2, None),
+        (2, None, 1, "cursor_loss"),
+        (2, "role-1", 1, "duplicate_resource_ids"),
+        (3, "role-2", 2, "census_drift"),
+    ],
+)
+async def test_opted_in_opaque_cursor_scan_requires_exact_stable_census(
+    monkeypatch, unit_source_factory, unit_checkpoint_catalog, post_count, terminal_id, unique_count, expected_error
+):
+    base = "https://directory.example.test/fhir"
+    source_by_field = {
+        "source_id": "synthetic-source",
+        "api_base": base,
+        "metadata_json": {"provider_directory_opaque_cursor_census": True},
+    }
+    start_url = f"{base}/PractitionerRole?_format=json&_count=100"
+    next_url = f"{base}?_getpages=opaque%2f+value&_getpagesoffset=1&_count=100"
+    source_by_field["endpoint_practitioner_role"] = start_url
+    requests, checkpoints, proofs, handler = _install_caresource_scan_callbacks(
+        monkeypatch,
+        start_url,
+        next_url,
+        post_count=post_count,
+        terminal_resource_id=terminal_id,
+        unique_count=unique_count,
+    )
+    context = dataclasses.replace(_caresource_checkpoint_context(), canonical_api_base=base)
+    fetch_result = await importer._fetch_resource_rows(
+        source_by_field,
+        "PractitionerRole",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_retry",
+        row_batch_handler=handler,
+        row_batch_size=1000,
+        retain_rows=False,
+        pagination_checkpoint=context,
+    )
+    assert fetch_result is not None
+    assert fetch_result.complete is (expected_error is None)
+    assert fetch_result.fetch_mode == importer.CARESOURCE_OPAQUE_CURSOR_FETCH_MODE
+    assert requests == [
+        importer._caresource_census_url(start_url),
+        start_url,
+        next_url,
+        importer._caresource_census_url(start_url),
+    ]
+    assert proofs[-1]["verified"] is (expected_error is None)
+    if expected_error is None:
+        assert fetch_result.error is None
+        assert checkpoints[-1]["next_url"] is None
+        _assert_caresource_completion_metrics(fetch_result)
+    else:
+        assert fetch_result.error == f"{importer.CARESOURCE_OPAQUE_CURSOR_BLOCKED_ERROR}:{expected_error}"
+        assert all(checkpoint["next_url"] is not None for checkpoint in checkpoints)
+        assert proofs[-1]["failure"] == expected_error
+
+
+@pytest.mark.asyncio
+async def test_opted_in_completed_checkpoint_without_proof_refuses_completion(monkeypatch):
+    source_by_field = {
+        "api_base": "https://directory.example.test/fhir",
+        "metadata_json": {"provider_directory_opaque_cursor_census": True},
+    }
+    checkpoint = importer.PaginationResumeState(None, 10, 10, (), resumed=True, complete=True)
+    monkeypatch.setattr(importer, "_load_or_initialize_pagination_checkpoint", AsyncMock(return_value=checkpoint))
+    monkeypatch.setattr(
+        importer, "_fetch_caresource_census_count", AsyncMock(return_value=importer.CareSourceCensusFetch(count=10))
+    )
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint_completeness", AsyncMock())
+    fetch = AsyncMock(side_effect=AssertionError("completed checkpoint must not be replayed"))
+    save = AsyncMock()
+    monkeypatch.setattr(importer, "_fetch_source_json", fetch)
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", save)
+    fetch_result = await importer._fetch_resource_rows(
+        source_by_field,
+        "PractitionerRole",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=100,
+        timeout=3,
+        run_id="run_retry",
+        row_batch_handler=AsyncMock(),
+        pagination_checkpoint=_caresource_checkpoint_context(),
+    )
+    assert fetch_result is not None and not fetch_result.complete
+    assert fetch_result.error == (
+        f"{importer.CARESOURCE_OPAQUE_CURSOR_BLOCKED_ERROR}:checkpoint_completion_proof_missing"
+    )
+    fetch.assert_not_awaited()
+    save.assert_not_awaited()
 
 
 def _caresource_expired_census_proofs():
@@ -23714,7 +23940,7 @@ def _patch_caresource_expired_cursor_callbacks(monkeypatch, start_url, resume_ur
 
 
 @pytest.mark.asyncio
-async def test_caresource_expired_cursor_restarts_with_fresh_census(monkeypatch):
+async def test_caresource_expired_cursor_restarts_with_fresh_census(monkeypatch, unit_checkpoint_catalog):
     """Restart an expired CareSource cursor against a new census proof."""
     start_url = f"{importer.CARESOURCE_PROVIDER_DIRECTORY_BASE}/PractitionerRole?_count=1000"
     resume_url = f"{start_url}&_searchId=expired&_page=2"
@@ -23763,7 +23989,9 @@ async def test_caresource_expired_cursor_restarts_with_fresh_census(monkeypatch)
     assert fresh_resume_state.rows_processed == 0
     assert fresh_resume_state.completeness == {}
     finish_census.assert_awaited_once()
-    assert finish_census.await_args.args[4] == fresh_proof_by_field
+    assert finish_census.await_args.args[4] == importer.fhir_response.opaque_terminal_proof(
+        importer, fresh_proof_by_field, start_url, 1, 0
+    )
 
 
 @pytest.mark.asyncio
@@ -35209,6 +35437,7 @@ async def test_remaining_partition_and_checkpoint_opposite_paths(monkeypatch):
         census=Mock(),
         rows_fetched=0,
         start_url="https://example.test/fhir/Organization",
+        deadline_at=None,
     )
     monkeypatch.setattr(
         importer,
