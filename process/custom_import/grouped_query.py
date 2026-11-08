@@ -48,7 +48,7 @@ def selected_identities(context, plan, entity_values=None, *, entity_binding_ids
         family.root_revision_id,
         *((winner.entity_binding_id,) if include_binding else ()),
         entity.canonical_value.label("entity_value"),
-        *statement.selected_columns[-2:],
+        *(description["expr"] for description in statement.column_descriptions[-2:]),
         maintain_column_froms=True,
     )
     if entity_binding_ids is not None:
@@ -71,7 +71,7 @@ def _root_values(context, selected, fields):
             values_by_field[field.field_id] = selected_dimensions_by_id[field.field_id]
             states_by_field[field.field_id] = literal("value")
             continue
-        scalar = inspect(context.model(core.CustomImportRootScalar)).selectable.alias(f"score_root_{field.field_slot}")
+        scalar = inspect(core._field_scalar_model(context, field)).selectable.alias(f"score_root_{field.field_slot}")
         statement = statement.outerjoin(
             scalar,
             and_(
@@ -93,7 +93,7 @@ def _keyed_children(context, selectors, *, name="complete_score_child_keys"):
     if not selectors:
         return None
     predicate = selectors[0]
-    scalar = inspect(context.model(CustomImportChildScalar)).selectable.alias("complete_child_key")
+    scalar = inspect(core._field_scalar_model(context, predicate.field)).selectable.alias("complete_child_key")
     typed_value = getattr(scalar.c, core._SCALAR_COLUMNS[predicate.field.value_type])
     return (
         select(
@@ -262,7 +262,7 @@ def _child_values(
             values_by_field[field.field_id], states_by_field[field.field_id] = typed_value, state
             statement = statement.add_columns(typed_value.label(f"value_{index}"), state.label(f"state_{index}"))
             continue
-        scalar = inspect(context.model(CustomImportChildScalar)).selectable.alias(f"score_child_{field.field_slot}")
+        scalar = inspect(core._field_scalar_model(context, field)).selectable.alias(f"score_child_{field.field_slot}")
         statement = statement.outerjoin(
             scalar,
             and_(

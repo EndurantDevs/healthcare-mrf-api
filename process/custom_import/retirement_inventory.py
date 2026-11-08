@@ -86,8 +86,8 @@ async def _frozen_families(session):
     ).all()
 
 
-def _reference_tables(family):
-    tables_by_name = dict(snapshot_tables(family.family_id))
+def _reference_tables(family, storage=None):
+    tables_by_name = dict(snapshot_tables(family.family_id) if storage is None else storage.tables_by_name)
     if family.origin_table_oid is not None:
         tables_by_name["legacy_copy_origin"] = Table(
             "legacy_copy_origin",
@@ -104,9 +104,11 @@ def _reference_tables(family):
 
 async def _pin_family(session, quoted, family):
     """Validate the native registry on both sides of read-compatible leaf pins."""
+    from process.custom_import.retirement_storage import resolve_storage
+
     resolve = text(f"SELECT * FROM {quoted}.resolve_custom_import_snapshot_relations(:family)")
-    await session.execute(resolve, {"family": family.family_id})
-    names = list(_reference_tables(family))
+    storage = await resolve_storage(session, quoted, family)
+    names = list(_reference_tables(family, storage))
     if family.landing_table_oid is not None:
         names.append("source_bulk_landing")
     namespace = snapshot_schema(family.family_id)
@@ -114,7 +116,7 @@ async def _pin_family(session, quoted, family):
     await session.execute(text(f"LOCK TABLE {relation_sql} IN ACCESS SHARE MODE NOWAIT"))
     from process.custom_import.retirement import _close_frozen_reference_heaps
 
-    await _close_frozen_reference_heaps(session, family)
+    await _close_frozen_reference_heaps(session, family, quoted)
     await session.execute(resolve, {"family": family.family_id})
     physical = (
         await session.execute(
@@ -131,9 +133,11 @@ async def _pin_family(session, quoted, family):
         _refuse("physical relations are incomplete")
     registry = (
         await session.execute(
-            select(*CustomImportSnapshotRelation.__table__.columns)
-            .where(CustomImportSnapshotRelation.family_id == family.family_id)
-            .order_by(CustomImportSnapshotRelation.relation_slot)
+            select(*storage.registry_model.__table__.columns)
+            .where(storage.registry_model.family_id == family.family_id)
+            .order_by(
+                storage.registry_model.role_slot if storage.is_block else CustomImportSnapshotRelation.relation_slot
+            )
         )
     ).all()
     family_values = tuple(getattr(family, column.name) for column in CustomImportSnapshotFamily.__table__.columns)
@@ -281,6 +285,7 @@ async def prepare_frozen_reference_inventory(session):
         _indexed_reference_columns,
         _owner_schema,
     )
+    from process.custom_import.retirement_storage import resolve_storage
 
     schema, quoted = await _owner_schema(session)
     connection = await session.connection()
@@ -290,8 +295,11 @@ async def prepare_frozen_reference_inventory(session):
     for family in await _frozen_families(session):
         binding = await _pin_family(session, quoted, family)
         families[family.family_id] = binding
+        storage = await resolve_storage(session, quoted, family)
+        if storage.is_block:
+            continue  # The exact membership decoder is checked directly under these same write-excluding pins.
         oid_by_name = {entry[0]: entry[1] for entry in binding[2]}
-        for name, table in sorted(_reference_tables(family).items()):
+        for name, table in sorted(_reference_tables(family, storage).items()):
             if name not in _REFERENCES:
                 continue
             indexed = await _indexed_reference_columns(session, table)
@@ -365,7 +373,8 @@ async def can_prove_frozen_reference_inventory(session, family, retained):
 
 async def _check_frozen_reference_coverage(session, quoted, family, frozen_families, inventory):
     """Check every retained source and its complete actual revision references."""
-    from process.custom_import.retirement import _REFERENCES, _indexed_revision_references
+    from process.custom_import.retirement import _REFERENCES, _indexed_revision_references, _revision_references
+    from process.custom_import.retirement_storage import resolve_storage
 
     expected_ids = {entry.family_id for entry in frozen_families}
     removed = set(inventory.families) - expected_ids - {family.family_id}
@@ -381,7 +390,11 @@ async def _check_frozen_reference_coverage(session, quoted, family, frozen_famil
     for kept_family in frozen_families:
         if await _pin_family(session, quoted, kept_family) != inventory.families.get(kept_family.family_id):
             _refuse("frozen family binding changed or is missing")
-        for name, table in sorted(_reference_tables(kept_family).items()):
+        storage = await resolve_storage(session, quoted, kept_family)
+        if storage.is_block:
+            await _revision_references(session, family, [kept_family], include_canonical=False)
+            continue
+        for name, table in sorted(_reference_tables(kept_family, storage).items()):
             if name not in _REFERENCES:
                 continue
             remaining = await _indexed_revision_references(session, table, family.family_id, _REFERENCES[name])

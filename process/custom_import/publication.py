@@ -624,6 +624,7 @@ async def _renew_finality_lease(
     fence: int,
     token_sha256: bytes,
     conflict_message: str,
+    continuation_id: int | None = None,
 ) -> dt.datetime:
     """Extend the exact live lease before a bounded finality graph scan.
 
@@ -640,6 +641,7 @@ async def _renew_finality_lease(
         fence=fence,
         token_sha256=token_sha256,
         now=now,
+        continuation_id=continuation_id,
     ):
         raise PublicationConflict(conflict_message)
     expires_at = now + dt.timedelta(seconds=_SEAL_LEASE_WINDOW_SECONDS)
@@ -649,6 +651,7 @@ async def _renew_finality_lease(
             CustomImportLease.execution_id == execution.execution_id,
             CustomImportLease.fence == fence,
             CustomImportLease.token_sha256 == token_sha256,
+            CustomImportLease.continuation_id == continuation_id,
             CustomImportLease.expires_at > now,
         )
         .values(heartbeat_at=now, expires_at=expires_at, updated_at=now)
@@ -1020,13 +1023,23 @@ async def _finality_materialization_models(session: AsyncSession, generation: Cu
     arguments = ", ".join(f"CAST(:{name} AS {'bytea' if name == 'token' else 'bigint'})" for name in parameters)
     await _prepare_bounded_materialization_statement(session, reserve_for_authority=True)
     family_id = (await session.execute(text(f"SELECT {quoted}.{resolver}({arguments})"), parameters)).scalar_one()
-    return None if family_id is None else snapshot_models(_positive_integer(family_id, "finality snapshot family id"))
+    if family_id is None:
+        return None
+    family_id = _positive_integer(family_id, "finality snapshot family id")
+    from process.custom_import.family_block_materialization import resolve_models
+
+    block_models = await resolve_models(session, generation, family_id)
+    return snapshot_models(family_id) if block_models is None else block_models
 
 
 async def _materialization(session: AsyncSession, generation: CustomImportGeneration) -> _Materialization:
     """Recompute a canonical digest from precisely the rows serving a generation."""
 
     models = await _finality_materialization_models(session, generation)
+    if getattr(models, "family_block_binding", None) is not None:
+        from process.custom_import.family_block_materialization import materialization
+
+        return await materialization(session, generation, models)
     source_bundle_sha256 = await _validated_source_bundle_digest(session, generation)
     digest = _new_digest(_MATERIALIZATION_DOMAIN)
     await _add_generation_identity_material(session, digest, generation)
@@ -1091,6 +1104,10 @@ async def _effective_output_materialization(
         raise PublicationConflict("generation definition or schema identity is missing")
     if models is None:
         models = await _finality_materialization_models(session, generation)
+    if getattr(models, "family_block_binding", None) is not None:
+        from process.custom_import.family_block_materialization import materialization
+
+        return (await materialization(session, generation, models)).effective_output_sha256
     digest = _new_digest(_EFFECTIVE_OUTPUT_DOMAIN)
     _add_digest_record(digest, "definition", _materialization_document(definition))
     _add_digest_record(digest, "schema", _materialization_document(schema_revision))
@@ -2336,7 +2353,12 @@ async def _validate_sealed_projection(session, generation, seal):
 
     try:
         await verify_generation_storage(session, generation)
-        await validate_sealed_projection(session, generation, seal)
+        bound = await _finality_materialization_models(session, generation)
+        binding = getattr(bound, "family_block_binding", None)
+        if binding is None:
+            await validate_sealed_projection(session, generation, seal)
+        else:
+            await validate_sealed_projection(session, generation, seal, family_block_binding=binding)
     except (CustomImportReadUnavailableError, QueryProjectionUnavailable) as exc:
         raise PublicationConflict(str(exc)) from exc
 

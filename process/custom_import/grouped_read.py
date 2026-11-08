@@ -167,7 +167,7 @@ def _query_field(context, field_id):
 
 def _join_root_scalar(statement, context, field, *, prefix="root"):
     family = context.model(core.CustomImportFamilyRevision)
-    scalar = inspect(context.model(CustomImportRootScalar)).selectable.alias(f"{prefix}_slot_{field.field_slot}")
+    scalar = inspect(core._field_scalar_model(context, field)).selectable.alias(f"{prefix}_slot_{field.field_slot}")
     statement = statement.outerjoin(
         scalar,
         and_(

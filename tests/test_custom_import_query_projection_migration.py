@@ -104,6 +104,8 @@ def _assert_projection_upgrade_order(script, module):
         "20261102040000_custom_import_post_seal_audit",
         "20261104010000_custom_import_unlogged_landing",
         "20261107010000_custom_import_child_reference_aggregate",
+        "20261104020000_custom_import_family_blocks",
+        "20261107010000_custom_import_retained_copy",
     ]
 
 
@@ -115,7 +117,7 @@ def test_projection_migration_extends_the_single_installed_head():
     script = ScriptDirectory.from_config(config)
     module = migration()
     assert module.down_revision == "20261013010000_registry_custom_history_events"
-    assert script.get_heads() == ["20261107010000_custom_import_child_reference_aggregate"]
+    assert script.get_heads() == ["20261107010000_custom_import_retained_copy"]
     assert script.get_revision("20261029010000_registry_source_inventory").down_revision == (
         "20261028020000_registry_membership_refresh"
     )
