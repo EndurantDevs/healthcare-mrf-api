@@ -53,19 +53,34 @@ def install_current_verification(connection, schema):
         WHERE attrelid=to_regclass(:relation) AND attname='manual_acceptance' AND NOT attisdropped)"""),
         {"relation": f'"{schema}".custom_import_build_verification'},
     )
-    if present:
-        return
     for name in (
-        "20261020150000_custom_import_staged_verification",
-        "20261020180000_custom_import_verification_arms",
-        "20261020190000_custom_import_verification_root_ranges",
-        "20261020200000_custom_import_manual_acceptance",
+        ()
+        if present
+        else (
+            "20261020150000_custom_import_staged_verification",
+            "20261020180000_custom_import_verification_arms",
+            "20261020190000_custom_import_verification_root_ranges",
+            "20261020200000_custom_import_manual_acceptance",
+        )
     ):
         path = Path(__file__).resolve().parents[1] / "alembic/versions" / (name + ".py")
         migration = _migration(path, "scratch_" + name)
         migration._schema = lambda: schema
         migration.op = Operations(MigrationContext.configure(connection))
         migration.upgrade()
+    from tests.custom_import_post_seal_audit_postgres import (
+        _family_reference_migration,
+        _refresh_aggregate,
+        _refresh_family_reference,
+    )
+
+    identity = f'"{schema}".verify_custom_import_build_structure(bigint)'
+    installed = connection.scalar(
+        text("SELECT prosrc FROM pg_proc WHERE oid=to_regprocedure(:identity)"), {"identity": identity}
+    )
+    if installed != _family_reference_migration()._bodies(schema)[1]:
+        _refresh_aggregate(connection, schema)
+    _refresh_family_reference(connection, schema)
 
 
 async def _family(case, request):

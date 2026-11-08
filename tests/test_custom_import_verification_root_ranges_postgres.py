@@ -401,3 +401,43 @@ async def test_child_reference_changed_sql_refuses_eighteen_checkpoint_prefix(
     )
 
     await verify(monkeypatch)
+
+
+async def test_family_reference_aggregate_preserves_null_and_duplicate_witnesses():
+    from tests.custom_import_post_seal_audit_postgres import (
+        test_family_reference_aggregate_preserves_null_and_duplicate_witnesses as verify,
+    )
+
+    await verify()
+
+
+async def test_family_reference_planner_restores_native_transaction_setting(monkeypatch):
+    from tests.custom_import_post_seal_audit_postgres import (
+        test_family_reference_planner_restores_native_transaction_setting as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+async def test_family_reference_refresh_preserves_exact_metadata_and_rollback():
+    from tests.custom_import_post_seal_audit_postgres import (
+        test_family_reference_refresh_preserves_exact_metadata_and_rollback as verify,
+    )
+
+    await verify()
+
+
+async def test_family_reference_changed_sql_requires_fresh_twenty_checkpoint_audit(monkeypatch):
+    from tests.custom_import_post_seal_audit_postgres import (
+        test_family_reference_changed_sql_requires_fresh_twenty_checkpoint_audit as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+async def test_family_reference_native_verifier_restores_scoped_planner(monkeypatch):
+    from tests.custom_import_post_seal_audit_postgres import (
+        test_family_reference_native_verifier_restores_scoped_planner as verify,
+    )
+
+    await verify(monkeypatch)

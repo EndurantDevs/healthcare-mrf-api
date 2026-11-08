@@ -517,6 +517,20 @@ async def _complete_counts(session, context, values_by_name, resource):
     return values_by_name | {"state": "complete", "outcome": "counts", "counts": counts}
 
 
+async def _membership_violation(session, context, arm, parameters):
+    # A failed statement rolls back SET LOCAL with the savepoint. On success,
+    # restore the caller's exact effective setting before later binding SQL.
+    async with session.begin_nested():
+        previous_nestloop = await session.scalar(text("SELECT current_setting('enable_nestloop')"))
+        await session.execute(text("SELECT set_config('enable_nestloop','off',true)"))
+        violation = (await session.execute(_compiled(arm["sql"], context), parameters)).first()
+        await session.execute(
+            text("SELECT set_config('enable_nestloop',:previous_nestloop,true)"),
+            {"previous_nestloop": previous_nestloop},
+        )
+    return violation
+
+
 async def _run_arm(session, context, previous):
     """Advance exactly one bounded invariant or root page from its retained checkpoint."""
     ordinal = previous.next_ordinal
@@ -559,7 +573,10 @@ async def _run_arm(session, context, previous):
             page_root_count=len(roots),
             range_sha256=range_digest,
         )
-    violation = (await session.execute(_compiled(arm["sql"], context), parameters)).first()
+    if ordinal == 21:
+        violation = await _membership_violation(session, context, arm, parameters)
+    else:
+        violation = (await session.execute(_compiled(arm["sql"], context), parameters)).first()
     if violation is not None:
         return values_by_name | {
             "state": "failed",
