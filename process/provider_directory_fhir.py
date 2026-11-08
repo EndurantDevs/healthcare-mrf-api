@@ -45373,6 +45373,12 @@ async def _probe_and_persist_bulk_output_validator(
 ) -> str | None:
     try:
         stored_validator = _stored_bulk_output_validator(output_checkpoint)
+        if (
+            stored_validator is not None
+            and stored_validator.output_expires_at is not None
+            and stored_validator.output_expires_at <= _bulk_export_now_utc()
+        ):
+            return "bulk_export_output_url_expired"
         status_code, headers_by_name, request_error = await _bulk_http_probe_output(
             session,
             source_record,
@@ -45389,19 +45395,9 @@ async def _probe_and_persist_bulk_output_validator(
                 if status_code == 200
                 else f"bulk_export_output_http_{status_code}"
             )
-        observed_validator = _bulk_output_validator_from_probe(
-            manifest_output.url,
-            headers_by_name,
-        )
-        _assert_bulk_output_validator_unchanged(
-            stored_validator,
-            observed_validator,
-        )
-        await _persist_bulk_output_validator(
-            identity,
-            output_checkpoint,
-            observed_validator,
-        )
+        observed_validator = _bulk_output_validator_from_probe(manifest_output.url, headers_by_name)
+        _assert_bulk_output_validator_unchanged(stored_validator, observed_validator)
+        await _persist_bulk_output_validator(identity, output_checkpoint, observed_validator)
     except (RuntimeError, ValueError) as exc:
         return str(exc)
     return None

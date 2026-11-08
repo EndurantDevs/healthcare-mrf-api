@@ -355,6 +355,53 @@ async def test_prepare_bulk_validators_records_probe_failure(monkeypatch):
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seconds_until_expiry", [-1, 0, 1, None])
+async def test_recorded_expiry_precedes_remote_bad_request(monkeypatch, seconds_until_expiry):
+    observed_at = datetime.datetime(2026, 7, 20, 12, tzinfo=datetime.UTC)
+    monkeypatch.setattr(importer, "_bulk_export_now_utc", lambda: observed_at)
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_KEY", "bulk-protocol-test-key")
+    manifest = _manifest()
+    etag = '"output-v1"'
+    output_checkpoint_by_field = {
+        **_output_checkpoint(manifest),
+        "state": importer.BULK_EXPORT_OUTPUT_STREAMING,
+        "rows_written": 7,
+        "committed_bytes": 50,
+        "content_length_bytes": 100,
+        "etag_ciphertext": importer._encrypt_bulk_capability(etag),
+        "etag_hash": hashlib.sha256(etag.encode()).hexdigest(),
+        "validator_checked_at": observed_at,
+        "output_expires_at": (
+            observed_at + datetime.timedelta(seconds=seconds_until_expiry) if seconds_until_expiry is not None else None
+        ),
+    }
+    probe = AsyncMock(return_value=(400, {}, None))
+    record_error, ownership_probe = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(importer, "_bulk_http_probe_output", probe)
+    monkeypatch.setattr(importer, "_record_bulk_export_output_error", record_error)
+
+    checkpoints, error = await importer._prepare_bulk_output_validators(
+        object(),
+        _aetna_source(),
+        _identity(),
+        manifest,
+        [output_checkpoint_by_field],
+        timeout=3,
+        ownership_probe=ownership_probe,
+    )
+
+    is_expired = seconds_until_expiry is not None and seconds_until_expiry <= 0
+    expected_error = "bulk_export_output_url_expired" if is_expired else "bulk_export_output_http_400"
+    assert checkpoints == [output_checkpoint_by_field]
+    assert error == expected_error
+    assert probe.await_count == (0 if is_expired else 1)
+    ownership_probe.assert_awaited_once()
+    record_error.assert_awaited_once_with(_identity(), output_checkpoint_by_field["output_id"], 7, 50, expected_error)
+    assert importer._is_bulk_export_capability_refresh_error(error) is is_expired
+    assert importer._is_bulk_export_error_terminal(error) is not is_expired
+
+
 def test_stored_bulk_validator_rejects_partial_checkpoint():
     with pytest.raises(
         ValueError,

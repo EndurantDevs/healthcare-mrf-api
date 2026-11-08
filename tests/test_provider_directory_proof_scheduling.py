@@ -105,7 +105,7 @@ async def test_async_spool_completion_preserves_unions_and_metrics(monkeypatch, 
 
 @pytest.mark.asyncio
 async def test_merge_allows_io_progress_before_finishing_records(monkeypatch, tmp_path):
-    """A short sequence of I/O waits must progress during the default merge."""
+    """A sequence of callback-backed I/O waits must finish before the resource merge."""
     lines = [
         proof._stable_json(
             proof._proof_record(
@@ -113,7 +113,7 @@ async def test_merge_allows_io_progress_before_finishing_records(monkeypatch, tm
                 LEGACY_RESOURCE_HASH_CONTRACT,
             )
         ).encode()
-        for index in range(512)
+        for index in range(4096)
     ]
     sync_directory, async_directory = tmp_path / "sync", tmp_path / "async"
     sync_directory.mkdir()
@@ -126,8 +126,10 @@ async def test_merge_allows_io_progress_before_finishing_records(monkeypatch, tm
         return original_decode(line)
 
     async def io_work():
-        for _ in range(4):
-            await asyncio.sleep(0)
+        for _ in range(32):
+            pending = asyncio.get_running_loop().create_future()
+            asyncio.get_running_loop().call_soon(pending.set_result, None)
+            await pending
         return len(consumed)
 
     monkeypatch.setattr(proof, "_decoded_record", decode)
