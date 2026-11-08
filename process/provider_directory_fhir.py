@@ -114,6 +114,7 @@ from process import provider_directory_profile_initial_contract as profile_initi
 from process import provider_directory_profile_payload_custody as profile_payload_custody
 from process import provider_directory_profile_scope_copy as profile_scope_copy
 from process import provider_directory_profile_target_wal_witness as profile_statement_wal
+from process import provider_directory_resource_retry as rest_retry
 from process import provider_directory_serving_recovery as serving_recovery
 from process import provider_directory_source_proxy as source_proxy
 from process import provider_directory_source_selection as source_selection
@@ -57885,6 +57886,7 @@ async def _mark_provider_directory_progress(
         # writes. Outer publishing progress remains in memory and the control
         # wrapper records the terminal state after admitted execution.
         return
+    rest_retry.update_metrics(sys.modules[__name__], metrics)
     total = max(total, 1)
     done = max(0, min(done, total))
     progress_by_name, progress_details_by_name = _profile_progress_payload(
@@ -67244,6 +67246,7 @@ class ResourceGroupScanRunner:
         source_record_by_field: dict[str, Any],
         *,
         report_start: bool,
+        deadline_seconds: float | None = None,
     ) -> ResourceFetchResult | None:
         """Fetch and persist one isolated resource cursor."""
         await _raise_if_resource_import_cancelled(
@@ -67271,12 +67274,15 @@ class ResourceGroupScanRunner:
                 self.options.seen_stage_table,
             )
         async with fhir_response.bulk_export_wait_scope(partial(self.report_bulk_wait, resource_type)):
-            return await self._fetch_rows(resource_type, source_record_by_field)
+            options = {"deadline_seconds": deadline_seconds} if deadline_seconds is not None else {}
+            return await self._fetch_rows(resource_type, source_record_by_field, **options)
 
     async def _fetch_rows(
         self,
         resource_type: str,
         source_record_by_field: dict[str, Any],
+        *,
+        deadline_seconds: float | None = None,
     ) -> ResourceFetchResult | None:
         """Invoke the generic FHIR reader with one task-local source record."""
         return await _fetch_resource_rows(
@@ -67294,7 +67300,7 @@ class ResourceGroupScanRunner:
             cancel_task=self.options.cancel_task,
             bulk_export=self.options.bulk_export,
             bulk_export_max_pending_seconds=(self.options.bulk_export_max_pending_seconds),
-            deadline_seconds=self.options.resource_deadline_seconds,
+            deadline_seconds=(self.options.resource_deadline_seconds if deadline_seconds is None else deadline_seconds),
             pagination_checkpoint=source_record_by_field.get("_pagination_checkpoint_context"),
             deferred_materialization=self.options.deferred_materialization,
             timing_progress_callback=partial(
@@ -67339,6 +67345,9 @@ class ResourceGroupScanRunner:
         resource_diagnostic["resource_scan_concurrency_requested"] = self.options.requested_resource_concurrency
         resource_diagnostic["resource_scan_concurrency_effective"] = self.effective_concurrency
         self.diagnostic_by_resource[resource_type] = resource_diagnostic
+        resource_diagnostic["resource_scan"] = await rest_retry.settled(
+            sys.modules[__name__], self, resource_type, fetch_result
+        )
         is_zero_role = bool(
             resource_type == "PractitionerRole"
             and fetch_result.complete
@@ -67395,19 +67404,10 @@ class ResourceGroupScanRunner:
         resource_type: str,
         *,
         report_start: bool,
+        resource_semaphore: asyncio.Semaphore | None = None,
     ) -> ResourceFetchResult | None:
         """Fetch one task-local source view and merge its settled outcome."""
-        source_record_by_field = dict(self.source_record)
-        fetch_result = await self.fetch(
-            resource_type,
-            source_record_by_field,
-            report_start=report_start,
-        )
-        return await self.record(
-            resource_type,
-            source_record_by_field,
-            fetch_result,
-        )
+        return await rest_retry.import_one(sys.modules[__name__], self, resource_type, report_start, resource_semaphore)
 
     def _is_reviewed_serial_stop_required(self, resource_type: str) -> bool:
         """Return whether reviewed traversal must finalize before another cursor."""
@@ -67458,9 +67458,8 @@ class ResourceGroupScanRunner:
         resource_type: str,
         resource_semaphore: asyncio.Semaphore,
     ) -> ResourceFetchResult | None:
-        """Run one resource only while holding a bounded wave slot."""
-        async with resource_semaphore:
-            return await self.import_one(resource_type, report_start=False)
+        """Release the resource slot while its retained cursor waits to retry."""
+        return await self.import_one(resource_type, report_start=False, resource_semaphore=resource_semaphore)
 
     async def wave(
         self,
@@ -67650,7 +67649,7 @@ async def _import_resources(
     total_groups = len(source_groups)
     completed_groups = 0
     report_every = max(1, total_groups // 20)
-    progress_lock = asyncio.Lock()
+    progress_lock, progress_write_lock = asyncio.Lock(), asyncio.Lock()
     active_partial_count_by_group: dict[int, dict[str, int]] = {}
     active_group_by_key: dict[int, dict[str, Any]] = {}
     progress_high_water_by_resource: dict[str, int] = {}
@@ -67716,27 +67715,28 @@ async def _import_resources(
         """Publish current provider-directory import progress."""
         if not progress_callback:
             return
-        progress_count_by_resource: dict[str, int] | None = None
-        progress_detail_by_field: dict[str, Any] | None = None
         async with progress_lock:
-            now = time.monotonic()
-            if force or now >= progress_timer_by_name["next_partial_progress_at"]:
-                if not force:
-                    progress_timer_by_name["next_partial_progress_at"] = now + 15.0
-                progress_count_by_resource = progress_counts_snapshot()
-                progress_detail_by_field = {"active_source_groups": active_group_snapshot()}
-        if progress_count_by_resource is not None:
-            try:
-                await progress_callback(
-                    completed_groups,
-                    total_groups,
-                    progress_count_by_resource,
-                    progress_detail_by_field,
-                )
-            except asyncio.CancelledError, ImportCancelledError:
-                raise
-            except Exception as failure:
-                raise ResourceImportProgressFailure("provider_directory_progress_callback_failed") from failure
+            if not force and time.monotonic() < progress_timer_by_name["next_partial_progress_at"]:
+                return
+        async with progress_write_lock:
+            progress_count_by_resource: dict[str, int] | None = None
+            progress_detail_by_field: dict[str, Any] | None = None
+            async with progress_lock:
+                now = time.monotonic()
+                if force or now >= progress_timer_by_name["next_partial_progress_at"]:
+                    if not force:
+                        progress_timer_by_name["next_partial_progress_at"] = now + 15.0
+                    progress_count_by_resource = progress_counts_snapshot()
+                    progress_detail_by_field = {"active_source_groups": active_group_snapshot()}
+            if progress_count_by_resource is not None:
+                try:
+                    await progress_callback(
+                        completed_groups, total_groups, progress_count_by_resource, progress_detail_by_field
+                    )
+                except asyncio.CancelledError, ImportCancelledError:
+                    raise
+                except Exception as failure:
+                    raise ResourceImportProgressFailure("provider_directory_progress_callback_failed") from failure
 
     async def maybe_report_partial_progress(
         group_key: int,
