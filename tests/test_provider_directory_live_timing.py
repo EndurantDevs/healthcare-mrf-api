@@ -399,8 +399,10 @@ async def test_many_timing_updates_reuse_existing_progress_throttle(monkeypatch)
             )
         return _result(resource_type, 50)
 
-    async def report(done, _total, counts, _details):
-        progress.append((done, counts["Location"]))
+    async def report(done, _total, counts, details):
+        groups = details["active_source_groups"]
+        state = groups[0].get("resource_scans", {}).get("Location", {}).get("state") if groups else None
+        progress.append((done, counts["Location"], state))
 
     monkeypatch.setattr(importer, "_fetch_resource_rows", fetch)
     monkeypatch.setattr(
@@ -421,5 +423,8 @@ async def test_many_timing_updates_reuse_existing_progress_throttle(monkeypatch)
     )
 
     assert counts == {"Location": 50}
-    assert [count for done, count in progress if done == 0 and count > 0] == [1]
-    assert progress[-1] == (1, 50)
+    assert [(count, state) for done, count, state in progress if done == 0 and count > 0] == [
+        (1, "fetching"),
+        (50, "complete"),
+    ]
+    assert progress[-1] == (1, 50, None)
