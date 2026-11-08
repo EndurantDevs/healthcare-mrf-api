@@ -5,7 +5,7 @@ import importlib
 import json
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -121,6 +121,51 @@ def test_vsp_catalog_is_runnable_only_on_explicit_selection():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [("import_resources", False, "import_required"), ("publish_after_acquisition", True, "incompatible_mode")],
+)
+async def test_deferred_directory_rejects_incompatible_work_before_acquisition(monkeypatch, field, value, error):
+    manifest = harness.load_manifest()
+    (selected,) = harness._selected_entries(manifest, frozenset({adapter.ENTRY_ID}))
+    params = harness.entry_params(manifest, selected)
+    params[field] = value
+    storage, capture = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(directory, "ensure_database", storage)
+    monkeypatch.setattr(capture_api, "capture_vsp_directory", capture)
+    with pytest.raises(ValueError, match=f"^provider_directory_deferred_typed_materialization_{error}$"):
+        await directory.process_provider_directory_fhir_data({"context": {}}, params)
+    storage.assert_not_awaited()
+    capture.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_explicit_import_seeds_only_the_directory_and_refuses_test_capture(monkeypatch):
+    for name in (
+        "ensure_database",
+        "_prepare_provider_directory_job_tables",
+        "_raise_if_resource_import_cancelled",
+        "_clear_resource_rows_seen",
+        "_mark_provider_directory_progress",
+    ):
+        monkeypatch.setattr(directory, name, AsyncMock())
+    for name in ("_resolve_seed_db", "_resolve_retest_results", "_seed_rows_from_supplemental_catalogs"):
+        monkeypatch.setattr(directory, name, Mock(side_effect=AssertionError("unrelated catalog selection")))
+    monkeypatch.delenv(transport.POLICY_ENV, raising=False)
+    monkeypatch.delenv(directory.source_proxy.BINDING_ENV, raising=False)
+    store = AsyncMock(side_effect=OSError("synthetic storage unavailable"))
+    monkeypatch.setattr(directory, "_upsert_provider_directory_source_rows", store)
+    task_by_field = {"source_ids": [SOURCE_ID], "seed_only": True, "run_id": "example"}
+    with pytest.raises(VSPDirectoryError, match="^vsp_test_capture_forbidden$"):
+        await directory.process_provider_directory_fhir_data({"context": {}}, {**task_by_field, "test": True})
+    store.assert_not_awaited()
+    with pytest.raises(OSError, match="^synthetic storage unavailable$"):
+        await directory.process_provider_directory_fhir_data({"context": {}}, task_by_field)
+    (selected,) = store.await_args.args[0]
+    assert adapter.is_source(selected) and selected["metadata_json"]["provider_directory_fhir_endpoint"] is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("proxy", [True, False, None], indirect=True, ids=["proxied", "direct", "default"])
 async def test_probe_reuses_capture_root_without_claiming_completeness(monkeypatch, source_record, proxy):
     proof_by_field = {"network": "Signature", "total_count": 3, "capture_sha256": "b" * 64, "complete": False}
@@ -181,6 +226,48 @@ async def _stage(record, **overrides):
     )
     params_by_name.update(overrides)
     return await directory._import_resources([record], **params_by_name)
+
+
+@pytest.mark.asyncio
+async def test_short_candidate_write_closes_the_stream_and_reports_capture_progress(
+    monkeypatch, source_record, proxy, completed_capture
+):
+    write, finalize, fail = _mock_candidate_storage(monkeypatch, source_record)
+    write.side_effect = lambda model, rows, **scope: len(rows) - 1
+    counts = completed_capture.resource_counts
+    counts["Location"] = 513
+    completed_capture.proof["resource_counts"] = counts.copy()
+    read, closed = [], []
+
+    def stream():
+        try:
+            for index in range(counts["Location"]):
+                read.append(index)
+                yield {"resourceType": "Location", "id": f"office-{index:04d}"}
+            yield from completed_capture.rows[1:]
+        finally:
+            closed.append(True)
+
+    completed_capture.iter_resources = stream
+    progress_by_field = {"phase": "discovery", "office_count": 7}
+
+    async def capture(**kwargs):
+        await kwargs["progress_callback"](progress_by_field)
+        return completed_capture
+
+    monkeypatch.setattr(capture_api, "capture_vsp_directory", capture)
+    progress = AsyncMock()
+    with pytest.raises(VSPDirectoryError, match="^vsp_candidate_write_incomplete$"):
+        await _stage(source_record, progress_callback=progress)
+    assert any(
+        group.get("directory_capture") == progress_by_field
+        for call in progress.await_args_list
+        for group in (call.args[3] or {}).get("active_source_groups", [])
+    )
+    write.assert_awaited_once()
+    assert len(read) == len(write.await_args.args[1]) == 512 and closed == [True]
+    finalize.assert_not_awaited()
+    fail.assert_awaited_once()
 
 
 @pytest.mark.asyncio

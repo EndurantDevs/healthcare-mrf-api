@@ -56,6 +56,7 @@ def test_parsed_memberships_use_declared_networks_without_a_product():
     capture = office(
         {"pid": 2, "npi": "1234567893", "first": "Alex", "last": "Example"}, {"pid": 1, "npi": "1999999992"}
     )
+    capture["addr"]["countyName"] = "Example County"
     profiles = [profile(2, "4000", "1000", "9999"), profile(1, "2000")]
     resources = normalize_vsp_office(capture, profiles=profiles)
     assert resources.other_network_ids == ("9999",)
@@ -69,6 +70,7 @@ def test_parsed_memberships_use_declared_networks_without_a_product():
         "PractitionerRole",
     ]
     site, _, first_role, doctor, last_role = resources
+    assert site["address"]["district"] == "Example County"
     site_row = parse_fhir_resource("example", site)[1]
     assert (site_row["first_line"], site_row["second_line"], site_row["state_code"], site_row["zip5"]) == (
         "12 Example Road",
@@ -130,6 +132,7 @@ def test_outside_profiles_keep_unknown_codes_without_membership():
         ([{"pid": 2}], [profile(2, "2000"), profile(2, "4000")], "duplicate_doctor_id"),
         ([{"pid": 2}], [{"doctorPublicId": 2, "networkIds": [2000]}], "invalid_network_ids"),
         ([{"pid": 2}], [{"doctorPublicId": 2}], "invalid_network_ids"),
+        ([{"pid": 2}], [{**profile(2, "2000"), "providerNetworks": ["2000"]}], "invalid_network_ids"),
         (
             [{"pid": 2}],
             [{**profile(2, "2000"), "providerNetworks": [{"networkId": "1000"}]}],
@@ -149,3 +152,18 @@ def test_invalid_position_is_not_published(coordinate):
     capture["addr"]["latitude"] = coordinate
     with pytest.raises(VSPDirectoryNormalizationError, match="^vsp_directory_invalid_position$"):
         normalize_vsp_office(capture, profiles=[profile(2, "2000")])
+
+
+@pytest.mark.parametrize(
+    "replacement,reason",
+    [
+        ({"providerSummaries": None}, "invalid_doctor_list"),
+        ({"addr": None}, "invalid_address"),
+        ({"addr": {"city": "Example City"}}, "invalid_address"),
+        ({"phone": 1234}, "invalid_text"),
+    ],
+)
+def test_malformed_office_cannot_publish_a_role(replacement, reason):
+    office_by_field = {**office({"pid": 2, "npi": "1234567893"}), **replacement}
+    with pytest.raises(VSPDirectoryNormalizationError, match=f"^vsp_directory_{reason}$"):
+        normalize_vsp_office(office_by_field, profiles=[profile(2, "2000")])

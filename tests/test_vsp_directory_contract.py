@@ -5,7 +5,14 @@ import math
 
 import pytest
 
-from process.vsp_directory_contract import API_BASE, SEARCH_URL, VSPDirectoryError, search_result, validated_url
+from process.vsp_directory_contract import (
+    API_BASE,
+    SEARCH_URL,
+    VSPDirectoryError,
+    office_position,
+    search_result,
+    validated_url,
+)
 from process.vsp_directory_geometry import GeoTile, census_request, distance_miles, world_tiles
 
 
@@ -22,6 +29,7 @@ def test_source_error_inside_success_response_is_never_empty_completion():
     "url",
     [
         "https://other.example/provider-web/publicdoctorprofile?officepublicid=1&asofdate=2035-01-01",
+        API_BASE + "unrelated",
         API_BASE + "provider-web/%2e%2e/private",
         API_BASE + "provider-web/publicdoctorprofile?officepublicid=1&asofdate=2035-01-01&extra=1",
         API_BASE + "provider-web/publicdoctorprofile?officepublicid=1&asofdate=invalid",
@@ -52,7 +60,16 @@ def test_world_tiles_cover_boundaries_and_spherical_query_circles():
     assert float(census_request("Choice")["radius"]) > math.pi * 3958.7613
 
 
-@pytest.mark.parametrize("tile,children", [(GeoTile(30, 30.1, -110, -100), 2), (GeoTile(30, 31, -101, -100), 4)])
+def test_invalid_publisher_coordinates_cannot_become_discovery_points():
+    for bad in ("not-a-coordinate", "NaN", "181"):
+        with pytest.raises(VSPDirectoryError, match="^vsp_office_position_invalid$"):
+            office_position({"addr": {"latitude": 0, "longitude": bad}})
+
+
+@pytest.mark.parametrize(
+    "tile,children",
+    [(GeoTile(30, 30.1, -110, -100), 2), (GeoTile(30, 40, -100, -99.9), 2), (GeoTile(30, 31, -101, -100), 4)],
+)
 def test_adaptive_splits_preserve_every_part_of_parent(tile, children):
     descendants = tile.split()
     assert len(descendants) == children
