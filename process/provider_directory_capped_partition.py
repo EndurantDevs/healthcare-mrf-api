@@ -59,6 +59,8 @@ def complete(census_by_field):
 
 def expected_count(census):
     """Keep capped leaf totals distinct from exact unfiltered census totals."""
+    if census.leaf_sum is not None:
+        return census.leaf_sum["count_pre"]
     return census.capped["count_pre"] if census.capped is not None else census.ranged_root_pre
 
 
@@ -179,7 +181,7 @@ async def _tails(directory, source_record, resource, model, config, state, optio
                 model, resource, config, state, "deadline_reached", deadline_reached=True
             )
         count = await directory._fetch_last_updated_partition_count(
-            source_record, _tail_url(directory, state, before), timeout=options.timeout
+            source_record, _tail_url(directory, state, before), timeout=options.timeout, deadline_at=state.deadline_at
         )
         state.pages_fetched += count.pages_fetched
         observation = count.observation
@@ -295,8 +297,9 @@ async def reconcile(directory, resource, model, config, state):
     return None
 
 
-async def post_census(directory, source_record, resource, model, config, state, options):
-    """Recount every disjoint leaf and both tails before accepting the candidate."""
+async def recount_leaves(directory, source_record, resource, model, config, state, options):
+    """Recount each disjoint leaf and compare its frozen authoritative count."""
+    prefix = "leaf" if state.census.leaf_sum is not None else "capped_leaf"
     total = 0
     for window in state.plan.leaf_windows():
         await _check_cancel(directory, options)
@@ -305,7 +308,9 @@ async def post_census(directory, source_record, resource, model, config, state, 
                 model, resource, config, state, "deadline_reached", deadline_reached=True
             )
         url = directory._last_updated_partition_count_url(state, config, window)
-        count = await directory._fetch_last_updated_partition_count(source_record, url, timeout=options.timeout)
+        count = await directory._fetch_last_updated_partition_count(
+            source_record, url, timeout=options.timeout, deadline_at=state.deadline_at
+        )
         state.pages_fetched += count.pages_fetched
         observation = count.observation
         if (
@@ -313,17 +318,25 @@ async def post_census(directory, source_record, resource, model, config, state, 
             or observation.kind is not directory.CountKind.EXACT
             or observation.count != window.count
         ):
-            return await _failure(directory, resource, model, config, state, "capped_leaf_post_census_mismatch", count)
+            return await _failure(directory, resource, model, config, state, f"{prefix}_post_census_mismatch", count)
         total += observation.count
-    if total != state.census.capped["count_pre"]:
-        return await _failure(directory, resource, model, config, state, "capped_leaf_post_sum_mismatch")
+    if total != expected_count(state.census):
+        return await _failure(directory, resource, model, config, state, f"{prefix}_post_sum_mismatch")
+    return None
+
+
+async def post_census(directory, source_record, resource, model, config, state, options):
+    """Recount every disjoint leaf and both tails before accepting the candidate."""
+    failure = await recount_leaves(directory, source_record, resource, model, config, state, options)
+    if failure is not None:
+        return failure
     failure = await _versioned_contract(directory, source_record, resource, model, config, state, options)
     if failure is not None:
         return failure
     failure = await _tails(directory, source_record, resource, model, config, state, options, "post")
     if failure is not None:
         return failure
-    state.census.capped["count_post"] = total
+    state.census.capped["count_post"] = state.census.capped["count_pre"]
     await _save(directory, resource, config, state)
     return None
 
@@ -335,7 +348,7 @@ def restore_census(
 ):
     """Restore immutable exact or capped census with matching source contract."""
     census_dict = control_dict.get("census")
-    if not isinstance(census_dict, dict):
+    if not isinstance(census_dict, dict) or "leaf_sum" in census_dict:
         raise ValueError("checkpoint census missing")
     count_names = (
         "unfiltered_pre",
@@ -389,6 +402,8 @@ def record_stats(
     capped = completeness_proof.get("capped_search") if isinstance(completeness_proof, dict) else None
     if capped is not None:
         resource_stats["last_updated_capped_sources"] = resource_stats.get("last_updated_capped_sources", 0) + 1
+    if not directory.leaf_census.has_recorded_stats(directory, resource_stats, completeness_proof):
+        return
     if not isinstance(completeness_proof, dict) or completeness_proof.get("verified") is not True:
         return
     if capped is not None:
@@ -447,6 +462,7 @@ def checkpoint_payload(
                     "unfiltered_post": census.unfiltered_post,
                     "failure": census.failure,
                     **({"capped": census.capped} if census.capped is not None else {}),
+                    **({"leaf_sum": census.leaf_sum} if census.leaf_sum is not None else {}),
                 },
             },
         },

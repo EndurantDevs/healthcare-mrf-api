@@ -69,11 +69,25 @@ An explicit `root_run_id: null` selects a fresh-root route for only the exact
 singleton source and endpoint. It requires a stored run with no retry parent
 and no retry or pagination-root parameters. Other sources retain their default
 route; a changed or multiple-source identity containing the configured source
-is refused. Fresh routes do not select retained retries, which still require
-an exact string-root route and the existing failed-parent ancestry checks.
+is refused. Fresh routes do not select retained retries by default. An optional
+`allow_retained_retries: true` on an acquisition route with `root_run_id: null`
+also admits the exact source and endpoint through the existing failed-parent
+ancestry checks. The stored retry must carry its native parent and pagination
+root; every ancestor must retain the same source and endpoint. Explicit
+string-root routes take precedence.
+
+This opt-in selects the current configured immutable executor and Secret for
+eligible retained chains; it does not preserve an original launch binding.
+Keep an explicit string-root route when a retained chain requires a different
+executor. Omission or `false` preserves fresh-only routing. The option is not
+accepted on string-root or publication routes. Retained proxy retries keep the
+existing policy-binding checks and ancestor cooldowns.
 Fresh routed Jobs expose the admitted coordinates in
 `healthporta.com/source-id` and `healthporta.com/source-endpoint-scope`
-annotations, while keeping `healthporta.com/source-root-run-id` absent. Request
+annotations, while keeping `healthporta.com/source-root-run-id` absent. Opted-in
+retained retries carry those coordinates plus their actual pagination root in
+`healthporta.com/source-root-run-id`; admission policy must allow that exact
+source, endpoint, immutable image and Secret combination. Request
 fields cannot supply these annotations; admission policy can bind them to the
 specific immutable fresh-route image and its runtime Secret.
 Publisher secret selectors must name only that exact purpose,
@@ -864,6 +878,28 @@ included in checkpoint-capable source policy. An incomplete UHC partition scan
 emits the same required-resume signal as an incomplete paginated scan, even
 though its partition state lives in
 `provider_directory_reverse_lookup_checkpoint`.
+
+Ordinary checkpointed sources may opt into the existing stable census verifier
+with `provider_directory_opaque_cursor_census: true`. Completion requires equal
+unfiltered counts before and after acquisition, processed rows, and distinct
+candidate resources. Partial terminal pages, duplicate identities, count drift,
+or a completed checkpoint without its proof fail closed. A deferred terminal
+count resumes from the committed terminal receipt after checking its exact
+request, counters and native candidate count. It does not replay the terminal
+page. The opt-in changes the checkpoint contract; it cannot certify older
+ordinary checkpoints. Explicit census REST requests retain shared server
+cooldowns as durable retry boundaries, including requests queued without a
+resource deadline.
+
+Partition configurations may select `census_mode: "unfiltered-leaf-sum-v1"`
+when an exact unfiltered count is available but a broad ranged count is not.
+This mode retains planned splits separately from failed count requests and
+requires every final leaf count to remain unchanged after both existing
+resource passes. The leaf sums, unfiltered pre/post counts and raw proof counts
+must agree; native candidate validation still applies. Direct ranged-root
+counts remain unobserved in this mode. Retry boundaries, changed checkpoint
+contracts and unsplittable windows still fail closed. These observations do not
+establish an atomic snapshot of a changing upstream directory.
 
 REST pagination checkpoints are keyed by canonical API base, resource type,
 source scope, and acquisition root. A direct retry may adopt only its immediate

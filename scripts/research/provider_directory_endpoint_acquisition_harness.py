@@ -202,6 +202,30 @@ def _validate_manifest_header(manifest: dict[str, Any]) -> None:
             raise ManifestError(f"parameter_profiles.{classification} must be an object")
 
 
+def _validate_partition_resource_declarations(entry_by_field: dict[str, Any]) -> None:
+    """Require disjoint census modes over explicitly selected REST resources."""
+    selected_resources: set[str] = set()
+    for field_name in ("capped_last_updated_resources", "leaf_sum_last_updated_resources"):
+        if field_name not in entry_by_field:
+            continue
+        resources = entry_by_field[field_name]
+        entry_id = entry_by_field["entry_id"]
+        if (
+            entry_by_field["classification"] != "acquisition"
+            or not isinstance(resources, list)
+            or not resources
+            or not all(isinstance(resource, str) for resource in resources)
+            or len(resources) != len(set(resources))
+            or not set(resources).issubset(entry_by_field["resources"])
+        ):
+            raise ManifestError(f"{entry_id}: {field_name} must select distinct acquisition resources")
+        if selected_resources.intersection(resources):
+            raise ManifestError(
+                f"{entry_id}: capped_last_updated_resources and leaf_sum_last_updated_resources overlap"
+            )
+        selected_resources.update(resources)
+
+
 def _validate_manifest_entry(entry: dict[str, Any], seen_by_kind: dict[str, set[str]]) -> None:
     entry_id = str(entry.get("entry_id") or "")
     owner_id = str(entry.get("owner_id") or "")
@@ -226,17 +250,7 @@ def _validate_manifest_entry(entry: dict[str, Any], seen_by_kind: dict[str, set[
         raise ManifestError(f"{entry_id}: resources do not exactly match resource_profile")
     if classification not in RESOURCE_CLASSIFICATIONS and entry.get("resources"):
         raise ManifestError(f"{entry_id}: only acquisition or manual entries may list resources")
-    if "capped_last_updated_resources" in entry:
-        capped_resources = entry["capped_last_updated_resources"]
-        if (
-            classification != "acquisition"
-            or not isinstance(capped_resources, list)
-            or not capped_resources
-            or not all(isinstance(resource, str) for resource in capped_resources)
-            or len(capped_resources) != len(set(capped_resources))
-            or not set(capped_resources).issubset(entry["resources"])
-        ):
-            raise ManifestError(f"{entry_id}: capped_last_updated_resources must select distinct acquisition resources")
+    _validate_partition_resource_declarations(entry)
     unique_values_by_kind = {
         "entry": [entry_id],
         "owner": [owner_id],

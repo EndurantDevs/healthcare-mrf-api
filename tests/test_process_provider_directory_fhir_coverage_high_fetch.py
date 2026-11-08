@@ -12,6 +12,7 @@ from tests.provider_directory_fhir_coverage_high_support import (
     pagination_checkpoint_context,
     resource_fetch_result,
 )
+from tests.test_process_provider_directory_fhir_unit import unit_checkpoint_catalog, unit_source_factory
 
 
 def _patch_paged_fetch_defaults(monkeypatch, start_urls):
@@ -215,7 +216,10 @@ async def test_fetch_resource_rows_marks_limit_with_remaining_next_page(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_fetch_resource_rows_surfaces_caresource_proof_retry(monkeypatch):
+async def test_fetch_resource_rows_surfaces_caresource_proof_retry(
+    monkeypatch, unit_source_factory, unit_checkpoint_catalog
+):
+    """Keep the committed terminal cursor when its final census retries."""
     _patch_paged_fetch_defaults(monkeypatch, ["https://example.test/root"])
     checkpoint_context = pagination_checkpoint_context()
     resume_state = importer.PaginationResumeState(
@@ -224,17 +228,11 @@ async def test_fetch_resource_rows_surfaces_caresource_proof_retry(monkeypatch):
         rows_processed=0,
         recent_url_hashes=(),
     )
-    monkeypatch.setattr(
-        importer,
-        "_load_or_initialize_pagination_checkpoint",
-        AsyncMock(return_value=resume_state),
-    )
+    monkeypatch.setattr(importer, "_load_or_initialize_pagination_checkpoint", AsyncMock(return_value=resume_state))
     monkeypatch.setattr(importer, "_is_caresource_opaque_cursor_census", Mock(return_value=True))
-    monkeypatch.setattr(
-        importer,
-        "_prepare_caresource_pre_census",
-        AsyncMock(return_value={"pre_count": 0}),
-    )
+    save_checkpoint = AsyncMock()
+    monkeypatch.setattr(importer, "_save_pagination_checkpoint", save_checkpoint)
+    monkeypatch.setattr(importer, "_prepare_caresource_pre_census", AsyncMock(return_value={"pre_count": 0}))
     monkeypatch.setattr(
         importer,
         "_fetch_source_json",
@@ -266,8 +264,9 @@ async def test_fetch_resource_rows_surfaces_caresource_proof_retry(monkeypatch):
         retain_rows=False,
     )
 
-    assert fetch_outcome.error == (
-        f"{importer.CARESOURCE_OPAQUE_CURSOR_RETRYABLE_ERROR}:post_census_busy"
-    )
+    assert fetch_outcome.error == (f"{importer.CARESOURCE_OPAQUE_CURSOR_RETRYABLE_ERROR}:post_census_busy")
     assert fetch_outcome.next_url_remaining is True
     assert fetch_outcome.retry_not_before == "later"
+    save_checkpoint.assert_awaited_once()
+    assert save_checkpoint.await_args.kwargs["next_url"] == "https://example.test/root"
+    assert save_checkpoint.await_args.kwargs["completeness"]["terminal_page"]["has_next"] is False

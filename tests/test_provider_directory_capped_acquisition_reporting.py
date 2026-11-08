@@ -179,40 +179,112 @@ def test_ordinary_report_shape_and_uncapped_verification_are_unchanged():
     assert support.acquisition_metric_errors(entry, metrics) == []
 
 
+@pytest.mark.parametrize("field_name", ["capped_last_updated_resources", "leaf_sum_last_updated_resources"])
 @pytest.mark.parametrize("selected", [["Practitioner"], list(harness.RESOURCE_PROFILES["G4"])])
-def test_manifest_capped_selection_may_cover_some_or_all_selected_resources(tmp_path, selected):
+def test_manifest_census_selection_may_cover_some_or_all_selected_resources(tmp_path, selected, field_name):
     entry = acquisition_entry()
-    entry["capped_last_updated_resources"] = selected
+    entry.pop("capped_last_updated_resources")
+    entry[field_name] = selected
     path = tmp_path / "manifest.json"
     path.write_text(json.dumps(manifest(entry)))
-    assert harness.load_manifest(path)["entries"][0]["capped_last_updated_resources"] == selected
+    assert harness.load_manifest(path)["entries"][0][field_name] == selected
 
 
+@pytest.mark.parametrize("field_name", ["capped_last_updated_resources", "leaf_sum_last_updated_resources"])
 @pytest.mark.parametrize("selected", [None, "Practitioner", [], ["Practitioner", "Practitioner"], ["Unknown"], [1], {}])
-def test_manifest_rejects_invalid_capped_resource_selection(tmp_path, selected):
+def test_manifest_rejects_invalid_census_resource_selection(tmp_path, selected, field_name):
     entry = acquisition_entry()
-    entry["capped_last_updated_resources"] = selected
+    entry.pop("capped_last_updated_resources")
+    entry[field_name] = selected
     path = tmp_path / "manifest.json"
     path.write_text(json.dumps(manifest(entry)))
-    with pytest.raises(harness.ManifestError, match="capped_last_updated_resources"):
+    with pytest.raises(harness.ManifestError, match=field_name):
         harness.load_manifest(path)
 
 
+@pytest.mark.parametrize("field_name", ["capped_last_updated_resources", "leaf_sum_last_updated_resources"])
 @pytest.mark.parametrize("classification", ["bulk_acquisition", "manual_acquisition", "probe_only", "external"])
-def test_manifest_capped_resources_require_rest_acquisition(tmp_path, classification):
+def test_manifest_census_resources_require_rest_acquisition(tmp_path, classification, field_name):
     entry = acquisition_entry()
+    entry[field_name] = entry.pop("capped_last_updated_resources")
     entry["classification"] = classification
     if classification in {"probe_only", "external"}:
         entry.update(resource_profile="NONE", resources=[])
     path = tmp_path / "manifest.json"
     path.write_text(json.dumps(manifest(entry)))
-    with pytest.raises(harness.ManifestError, match="capped_last_updated_resources"):
+    with pytest.raises(harness.ManifestError, match=field_name):
         harness.load_manifest(path)
 
 
-def test_manifest_defaults_do_not_gain_a_capped_selection(tmp_path):
+def test_manifest_defaults_do_not_gain_a_census_selection(tmp_path):
     entry = acquisition_entry()
     entry.pop("capped_last_updated_resources")
     path = tmp_path / "manifest.json"
     path.write_text(json.dumps(manifest(entry)))
     assert harness.load_manifest(path) == manifest(entry)
+
+
+@pytest.mark.parametrize("leaf_resource", ["Practitioner", "Location"])
+def test_manifest_partition_census_declarations_must_be_disjoint(tmp_path, leaf_resource):
+    entry_by_field = acquisition_entry()
+    entry_by_field["leaf_sum_last_updated_resources"] = [leaf_resource]
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest(entry_by_field)))
+    if leaf_resource == "Practitioner":
+        with pytest.raises(harness.ManifestError, match="overlap"):
+            harness.load_manifest(path)
+    else:
+        assert harness.load_manifest(path)["entries"][0] == entry_by_field
+
+
+def _empty_opaque_census_metrics():
+    entry_by_field = acquisition_entry()
+    entry_by_field.pop("capped_last_updated_resources")
+    entry_by_field["resources"] = ["Endpoint"]
+    metrics_by_name = acquisition_metrics(entry_by_field)
+    metrics_by_name["resource_fetch_stats"]["Endpoint"].update(
+        caresource_opaque_cursor_sources=1,
+        caresource_opaque_cursor_verified_sources=1,
+        **{name: 0 for name in support.CARESOURCE_PROOF_METRIC_NAMES},
+    )
+    return entry_by_field, metrics_by_name
+
+
+def test_empty_opaque_census_proof_survives_safe_reporting_and_validation():
+    entry_by_field, metrics_by_name = _empty_opaque_census_metrics()
+    outcomes_by_resource = reporting.run_summary({"status": "succeeded", "metrics": metrics_by_name})[
+        "resource_outcomes"
+    ]
+    assert all(outcomes_by_resource["Endpoint"][name] == 0 for name in support.CARESOURCE_PROOF_METRIC_NAMES)
+    metrics_by_name["resource_fetch_stats"] = outcomes_by_resource
+    assert support.acquisition_metric_errors(entry_by_field, metrics_by_name) == []
+
+
+@pytest.mark.parametrize("raw_value", [None, False, "0", -1])
+def test_opaque_census_sanitizer_does_not_synthesize_missing_or_invalid_zero_proof(raw_value):
+    entry_by_field, metrics_by_name = _empty_opaque_census_metrics()
+    proof_field = support.CARESOURCE_PROOF_METRIC_NAMES[0]
+    stats_by_name = metrics_by_name["resource_fetch_stats"]["Endpoint"]
+    if raw_value is None:
+        stats_by_name.pop(proof_field)
+    else:
+        stats_by_name[proof_field] = raw_value
+    outcomes_by_resource = reporting.run_summary({"status": "succeeded", "metrics": metrics_by_name})[
+        "resource_outcomes"
+    ]
+    assert proof_field not in outcomes_by_resource["Endpoint"]
+    metrics_by_name["resource_fetch_stats"] = outcomes_by_resource
+    assert any(
+        "census counts do not reconcile" in error
+        for error in support.acquisition_metric_errors(entry_by_field, metrics_by_name)
+    )
+
+
+@pytest.mark.parametrize("source_count", [None, 0, False, -1, "1"])
+def test_unproven_opaque_census_zero_report_shape_is_unchanged(source_count):
+    _entry_by_field, metrics_by_name = _empty_opaque_census_metrics()
+    metrics_by_name["resource_fetch_stats"]["Endpoint"]["caresource_opaque_cursor_sources"] = source_count
+    outcomes_by_resource = reporting.run_summary({"status": "succeeded", "metrics": metrics_by_name})[
+        "resource_outcomes"
+    ]
+    assert not set(support.CARESOURCE_PROOF_METRIC_NAMES).intersection(outcomes_by_resource["Endpoint"])

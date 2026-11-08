@@ -44,6 +44,18 @@ CAPPED_LAST_UPDATED_SOURCE_METRIC_NAMES = (
     "last_updated_capped_verified_sources",
     "last_updated_capped_versioned_sources",
 )
+LEAF_SUM_LAST_UPDATED_COUNT_METRIC_NAMES = (
+    "last_updated_leaf_sum_count_pre",
+    "last_updated_leaf_sum_count_post",
+    *(name for name in LAST_UPDATED_PROOF_METRIC_NAMES if "ranged_root" not in name),
+)
+LEAF_SUM_LAST_UPDATED_SOURCE_METRIC_NAMES = (
+    "last_updated_partition_sources",
+    "last_updated_completeness_verified_sources",
+    "last_updated_leaf_sum_sources",
+    "last_updated_leaf_sum_verified_sources",
+)
+LEAF_SUM_LAST_UPDATED_ZERO_METRIC_NAMES = ("last_updated_ranged_root_pre", "last_updated_ranged_root_post")
 CARESOURCE_PROOF_METRIC_NAMES = (
     "caresource_opaque_cursor_pre_count",
     "caresource_opaque_cursor_processed_rows",
@@ -78,6 +90,10 @@ def _last_updated_completeness_errors(
 ) -> list[str]:
     """Validate exact partition reconciliation for sources that expose it."""
 
+    if resource_type in entry.get("leaf_sum_last_updated_resources", []) or resource_stats.get(
+        "last_updated_leaf_sum_sources"
+    ) not in (None, 0):
+        return _leaf_sum_completeness_errors(entry, resource_type, resource_stats)
     if resource_type in entry.get("capped_last_updated_resources", []) or resource_stats.get(
         "last_updated_capped_sources"
     ) not in (None, 0):
@@ -123,6 +139,32 @@ def _capped_last_updated_completeness_errors(
         for name in CAPPED_LAST_UPDATED_ZERO_METRIC_NAMES
     ):
         errors.append(f"{resource_type} capped last-updated tails or legacy census fields are not exact zero")
+    return errors
+
+
+def _leaf_sum_completeness_errors(entry, resource_type, resource_stats):
+    """Require explicit leaf-sum provenance, including empty collections."""
+    errors = []
+    if any(
+        type(resource_stats.get(name)) is not int or resource_stats[name] != len(entry["source_ids"])
+        for name in LEAF_SUM_LAST_UPDATED_SOURCE_METRIC_NAMES
+    ):
+        errors.append(f"{resource_type} lacks exact verified leaf-sum source metrics")
+    counts = [
+        resource_stats.get(name)
+        for name in LEAF_SUM_LAST_UPDATED_COUNT_METRIC_NAMES
+        if resource_type != "Organization" or name != "last_updated_staged_candidate_count"
+    ]
+    candidate_count = resource_stats.get("last_updated_staged_candidate_count")
+    if type(candidate_count) is not int or candidate_count < 0:
+        errors.append(f"{resource_type} lacks its separately verified native candidate count")
+    if any(type(count) is not int or count < 0 for count in counts) or len(set(counts)) != 1:
+        errors.append(f"{resource_type} leaf-sum completeness counts do not reconcile")
+    if resource_stats.get("last_updated_capped_sources") not in (None, 0) or any(
+        type(resource_stats.get(name)) is not int or resource_stats[name] != 0
+        for name in LEAF_SUM_LAST_UPDATED_ZERO_METRIC_NAMES
+    ):
+        errors.append(f"{resource_type} leaf-sum census contains foreign root or capped evidence")
     return errors
 
 
