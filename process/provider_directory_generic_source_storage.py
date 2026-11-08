@@ -1345,13 +1345,23 @@ async def append_generic_source_batch(database, directory, candidate, resources,
 async def reset_generic_source_family(database, directory, candidate, resource_type=None):
     """Retire old observations by a low-volume cutoff; never delete payload rows."""
     identity = candidate_identity(directory, candidate)
-    _require(resource_type is None or resource_type in candidate.selected_resources, "reset_scope_changed")
+    _require(
+        resource_type is None
+        or resource_type in candidate.selected_resources
+        or any(
+            resource_type == directory._last_updated_partition_checkpoint_resource_type(selected)
+            or resource_type
+            in tuple(directory._last_updated_partition_fingerprint_resource_type(selected, number) for number in (1, 2))
+            for selected in candidate.selected_resources
+        ),
+        "reset_scope_changed",
+    )
     async with source_owner_transaction(database) as publisher:
         connection, policy = publisher.connection, publisher.policy
         _require_candidate_storage(publisher, directory, identity)
         if resource_type is not None:
             await _locked(connection, policy, identity, lock="KEY SHARE")
-            await _lock_resource_family(connection, policy, candidate.dataset_id, resource_type)
+            await _lock_resource_family(connection, policy, candidate.dataset_id, _resource_family(resource_type))
         previous = await _locked(
             connection, policy, identity, lock="UPDATE" if resource_type is None else "NO KEY UPDATE"
         )
