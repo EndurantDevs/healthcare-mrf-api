@@ -630,12 +630,20 @@ async def test_ownership_postimage_is_left_to_the_outer_validator(reverse_case):
         await recheck()
 
 
-async def test_timeout_has_no_cleanup_sql_and_preserves_caller_transaction(reverse_case):
+async def test_timeout_has_no_cleanup_sql_and_preserves_caller_transaction(reverse_case, monkeypatch):
     case = reverse_case
+    scopes, timeout_at = [], asyncio.timeout_at
+
+    def capture(when):
+        scopes.append(timeout_at(when))
+        return scopes[-1]
+
+    monkeypatch.setattr(reverse.asyncio, "timeout_at", capture)
     with pytest.raises(TimeoutError):
-        # Leave room for setup on a loaded runner; the deadline still expires inside the body.
-        async with _context(case, deadline=asyncio.get_running_loop().time() + 1.0):
+        async with _context(case):
             before = (case.connection.fetchrow.await_count, case.connection.fetchval.await_count)
+            # Expire the live custody scope from the body, so setup time on a loaded runner cannot matter.
+            scopes[-1].reschedule(asyncio.get_running_loop().time())
             await asyncio.Event().wait()
     assert (case.connection.fetchrow.await_count, case.connection.fetchval.await_count) == before
     assert case.connection.is_in_transaction()
