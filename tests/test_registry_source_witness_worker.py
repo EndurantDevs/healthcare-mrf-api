@@ -63,8 +63,11 @@ def _config(runtime, *, session=False):
     )
 
 
+_PHYSICAL_OWNER = "registry_snapshot_owner"
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("omitted", _ACTORS)
+@pytest.mark.parametrize("omitted", tuple(role for role in _ACTORS if role != _PHYSICAL_OWNER))
 async def test_incomplete_source_actor_census_refuses_before_custodian_pool(monkeypatch, omitted):
     runtime = _runtime(tuple(role for role in _ACTORS if role != omitted))
     config = _config(runtime)
@@ -78,6 +81,51 @@ async def test_incomplete_source_actor_census_refuses_before_custodian_pool(monk
     finalizer.assert_not_awaited()
     verifier.assert_not_awaited()
     runtime.source_export.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proven", [False, True])
+async def test_physical_owner_outside_census_requires_database_proof_before_pool(monkeypatch, proven):
+    from process import registry_source_recipe_composition as composition
+
+    runtime = _runtime(tuple(role for role in _ACTORS if role != _PHYSICAL_OWNER))
+    config = _config(runtime)
+    refusal = composition.RegistrySourceCompositionError("registry_source_witness_runtime_census_differs")
+    proof = AsyncMock(return_value=None) if proven else AsyncMock(side_effect=refusal)
+    monkeypatch.setattr(composition, "require_source_witness_census_outsiders", proof)
+    configured = worker._configured_source_witness_runtime(
+        config, config.consumer, {"custody_owner_role": "protected_control_owner"}
+    )
+    assert configured.census_outsiders == (_PHYSICAL_OWNER,) and configured.runtime_roles == runtime.runtime_roles
+    case, create, finalizer, verifier, _ = _runtime_custody_case(monkeypatch, config, "complete", False)
+    async with AsyncExitStack() as stack:
+        if proven:
+            await worker._custody_runtime(config, stack, config.consumer, case.execution)
+        else:
+            with pytest.raises(ValueError, match="registry_source_witness_runtime_census_differs"):
+                await worker._custody_runtime(config, stack, config.consumer, case.execution)
+            assert not stack._exit_callbacks
+    proof.assert_awaited_once()
+    proven_connection, proven_runtime, proven_outsiders = proof.await_args.args
+    assert proven_connection is case.execution and proven_outsiders == (_PHYSICAL_OWNER,)
+    assert proven_runtime.census_outsiders == (_PHYSICAL_OWNER,)
+    assert proven_runtime.source_export is runtime.source_export
+    if not proven:
+        create.assert_not_awaited()
+        finalizer.assert_not_awaited()
+        verifier.assert_not_awaited()
+    runtime.source_export.assert_not_called()
+
+
+def test_only_physical_owners_may_be_absent_from_the_capture_census():
+    identity_by_name = {"custody_owner_role": "protected_control_owner"}
+    runtime = _runtime(tuple(role for role in _ACTORS if role not in (_PHYSICAL_OWNER, "worker_lifecycle")))
+    config = _config(runtime)
+    with pytest.raises(ValueError, match="registry_source_witness_runtime_census_differs"):
+        worker._configured_source_witness_runtime(config, config.consumer, identity_by_name)
+    complete = _runtime()
+    assert worker._configured_source_witness_runtime(_config(complete), config.consumer, identity_by_name) is complete
+    assert complete.census_outsiders == ()
 
 
 @pytest.mark.asyncio

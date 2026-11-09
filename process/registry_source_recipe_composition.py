@@ -116,11 +116,20 @@ class SourceWitnessRuntime:
     runtime_roles: tuple[str, ...]
     semantic_validation: object = None
     semantic_policy: object = None
+    census_outsiders: tuple[str, ...] = ()
 
     def __post_init__(self):
         if not callable(self.source_export):
             raise RegistrySourceCompositionError("registry_source_witness_runtime_invalid")
         validate_source_witness_configuration(self.source_profiles, self.capture_owner_role, self.runtime_roles)
+        if (
+            type(self.census_outsiders) is not tuple
+            or tuple(sorted(set(self.census_outsiders))) != self.census_outsiders
+            or set(self.census_outsiders) & {self.capture_owner_role, *self.runtime_roles}
+        ):
+            raise RegistrySourceCompositionError("registry_source_witness_runtime_invalid")
+        for role in self.census_outsiders:
+            _identifier(role)
         if self.semantic_policy is not None:
             from process.network_fhir_sampled_validation import SemanticSamplingPolicy
 
@@ -155,6 +164,51 @@ def validate_source_witness_configuration(source_profiles, capture_owner_role, r
         profile.__post_init__()
     for role in (capture_owner_role, *runtime_roles):
         _identifier(role)
+
+
+_CENSUS_OUTSIDERS_SQL = """SELECT pg_catalog.count(*)=pg_catalog.cardinality($1::pg_catalog.text[])
+ AND coalesce(pg_catalog.bool_and(
+ NOT (r.rolcanlogin OR r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls)
+ AND NOT EXISTS(SELECT FROM pg_catalog.pg_roles protected WHERE protected.rolname=ANY($2::pg_catalog.text[]) AND (
+  pg_catalog.pg_has_role(r.oid,protected.oid,'MEMBER') OR pg_catalog.pg_has_role(r.oid,protected.oid,'USAGE')
+  OR pg_catalog.pg_has_role(r.oid,protected.oid,'SET')))
+ AND NOT EXISTS(SELECT FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles o ON o.oid=n.nspowner
+  WHERE o.rolname=$3::pg_catalog.text AND (pg_catalog.has_schema_privilege(r.oid,n.oid,'CREATE')
+  OR pg_catalog.has_schema_privilege(r.oid,n.oid,'USAGE')))
+ AND NOT EXISTS(SELECT FROM pg_catalog.pg_class c JOIN pg_catalog.pg_roles o ON o.oid=c.relowner
+  WHERE o.rolname=$3::pg_catalog.text AND c.relkind IN ('r','p','v','m','f','S')
+  AND (pg_catalog.has_table_privilege(r.oid,c.oid,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
+   OR pg_catalog.has_any_column_privilege(r.oid,c.oid,'SELECT,INSERT,UPDATE,REFERENCES')))),false)
+ FROM pg_catalog.unnest($1::pg_catalog.text[]) outsider(name) JOIN pg_catalog.pg_roles r ON r.rolname=outsider.name"""
+
+
+async def require_source_witness_census_outsiders(connection, runtime, outsiders):
+    """Admit only declared census outsiders, and only when each is wholly outside every capture."""
+    if type(runtime) is not SourceWitnessRuntime or type(outsiders) is not tuple:
+        raise RegistrySourceCompositionError("registry_source_witness_runtime_invalid")
+    if not outsiders:
+        return
+    if (
+        tuple(sorted(set(outsiders))) != outsiders
+        or set(outsiders) & {runtime.capture_owner_role, *runtime.runtime_roles}
+        or not set(outsiders) <= set(runtime.census_outsiders)
+    ):
+        raise RegistrySourceCompositionError("registry_source_witness_runtime_census_differs")
+    for role in outsiders:
+        _identifier(role)
+    # Census roles are protected too: SET-only membership would reach their capture reads via SET ROLE.
+    protected = sorted(
+        {
+            runtime.capture_owner_role,
+            *runtime.runtime_roles,
+            *(profile.owner_role for profile in runtime.source_profiles),
+        }
+    )
+    if (
+        await connection.fetchval(_CENSUS_OUTSIDERS_SQL, list(outsiders), protected, runtime.capture_owner_role)
+        is not True
+    ):
+        raise RegistrySourceCompositionError("registry_source_witness_runtime_census_differs")
 
 
 async def _approved_source_witness_capture(connection, recipe, approved, control_schema, *, retained_approval=False):
