@@ -210,7 +210,7 @@ async def _admitted_reader(fixture):
     assert not any("binding_matches AS MATERIALIZED" in query.query for query in queries)
     candidate_queries = [query for query in queries if "to_jsonb(candidate)::text AS candidate_json" in query.query]
     assert len(candidate_queries) == 1
-    assert candidate_queries[0].args == (admission.manifest.generation_id, False)
+    assert candidate_queries[0].args == (admission.manifest.generation_id, False, [])
     assert candidate_queries[0].exception is None
     assert not any("validation_json::text AS validation_json" in query.query for query in queries)
     seals = [query for query in queries if "SELECT seal_sha256,receipt_json::text AS receipt_json" in query.query]

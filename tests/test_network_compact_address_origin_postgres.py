@@ -597,3 +597,112 @@ async def test_complete_indexed_content_proof_is_bounded_across_many_ranges(inde
         )
         == fixture.previous.generation_id
     )
+
+
+async def _direct_executor(fixture):
+    """Mirror DEV: the executor reaches neither retained source through the shared reader role."""
+    from process.network_bootstrap_read_access import install_bootstrap_read_access
+
+    connection, executor, reader = fixture.connection, fixture.executor_role, fixture.roles["reader"]
+    if await connection.fetchval("SELECT pg_has_role($1::name,$2::name,'MEMBER')", executor, reader):
+        await connection.execute(f'REVOKE "{reader}" FROM "{executor}"')
+    assert not await connection.fetchval("SELECT pg_has_role($1::name,$2::name,'USAGE')", executor, reader)
+    async with connection.transaction(isolation="repeatable_read"):
+        await install_bootstrap_read_access(connection, fixture.bootstrap, reader_role=executor)
+
+
+async def _legacy_grant(fixture, role, *, revoke=False):
+    connection, schema = fixture.connection, fixture.legacy.schema_name
+    action, direction = ("REVOKE", "FROM") if revoke else ("GRANT", "TO")
+    await connection.execute(f'SET ROLE "{fixture.roles["owner"]}"')
+    try:
+        await connection.execute(f'{action} USAGE ON SCHEMA "{schema}" {direction} "{role}"')
+        await connection.execute(f'{action} SELECT ON ALL TABLES IN SCHEMA "{schema}" {direction} "{role}"')
+    finally:
+        await connection.execute("RESET ROLE")
+
+
+async def _retained_resolves(fixture):
+    from process.network_serving_read import resolve_retained_network_address_source
+
+    async with fixture.connection.transaction(isolation="repeatable_read"):
+        return await resolve_retained_network_address_source(
+            fixture.connection, fixture.indexed_source, control_schema=fixture.control_schema
+        )
+
+
+async def _retained_access(fixture, *, revoke=False):
+    from process import network_retained_read_access as retained
+
+    operation = retained.revoke_retained_read_access if revoke else retained.install_retained_read_access
+    async with fixture.connection.transaction(isolation="repeatable_read"):
+        return await operation(
+            fixture.connection,
+            fixture.indexed_source,
+            reader_role=fixture.executor_role,
+            control_schema=fixture.control_schema,
+        )
+
+
+async def _executor_reads_legacy(fixture):
+    return await fixture.connection.fetchval(
+        "SELECT has_schema_privilege($1::name,$2::name,'USAGE') AND has_table_privilege($1::name,"
+        "to_regclass(quote_ident($2)||'.entity_address_unified'),'SELECT')",
+        fixture.executor_role,
+        fixture.legacy.schema_name,
+    )
+
+
+async def test_bare_executor_grant_on_the_unsealed_base_is_refused(indexed_db):
+    from process.network_serving_read import NetworkServingReadUnavailable
+
+    fixture = indexed_db
+    await _direct_executor(fixture)
+    await _legacy_grant(fixture, fixture.executor_role)
+    with pytest.raises(NetworkServingReadUnavailable, match="runtime privileges are not protected"):
+        await _adopt(fixture)
+
+
+async def test_retained_successor_admits_direct_executor_adoption(indexed_db):
+    fixture = indexed_db
+    await _direct_executor(fixture)
+    proof = await _retained_access(fixture)
+    assert proof["reader"] == fixture.executor_role and proof["after"] != proof["before"]
+    assert await _executor_reads_legacy(fixture)
+    copy_target = await _adopt(fixture)
+    await _seal(fixture, copy_target)
+    await _publish(fixture, copy_target)
+    current, address_rows = await _read(fixture)
+    assert address_rows == fixture.previous_rows
+    assert current.compact_layout.base.schema_name == fixture.legacy.schema_name
+    assert (await _retained_resolves(fixture)).schema_name == fixture.legacy.schema_name
+
+
+async def test_retained_successor_refuses_drift_and_re_arms(indexed_db):
+    from process.network_serving_read import NetworkServingReadUnavailable
+
+    fixture = indexed_db
+    await _direct_executor(fixture)
+    await _retained_access(fixture)
+    await _retained_resolves(fixture)
+    stranger = "retained_stranger_" + uuid4().hex[:12]
+    await fixture.connection.execute(f'CREATE ROLE "{stranger}" NOLOGIN')
+    try:
+        await _legacy_grant(fixture, stranger)
+        with pytest.raises(NetworkServingReadUnavailable):
+            await _retained_resolves(fixture)
+        await _legacy_grant(fixture, stranger, revoke=True)
+        await _retained_resolves(fixture)
+        # A changed reader role component invalidates the proof until it is re-armed.
+        await fixture.connection.execute(f'GRANT "{stranger}" TO "{fixture.executor_role}"')
+        with pytest.raises(NetworkServingReadUnavailable):
+            await _retained_resolves(fixture)
+        await _retained_access(fixture, revoke=True)
+        assert not await _executor_reads_legacy(fixture)
+        await _retained_resolves(fixture)
+        re_armed = await _retained_access(fixture)
+        assert re_armed["reader"] == fixture.executor_role
+        await _retained_resolves(fixture)
+    finally:
+        await fixture.connection.execute(f'REVOKE "{stranger}" FROM "{fixture.executor_role}"')
+        await fixture.connection.execute(f'DROP ROLE "{stranger}"')
