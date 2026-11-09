@@ -929,6 +929,24 @@ async def _seal_ready_candidate(
     )
 
 
+async def _require_source_witness_census(connection, source_witness_runtime, runtime_roles, actor):
+    """Keep the sealing actor in the capture census and prove any other outsider is outside every capture."""
+    from process.registry_source_recipe_composition import (
+        RegistrySourceCompositionError,
+        SourceWitnessRuntime,
+        require_source_witness_census_outsiders,
+    )
+
+    _require(type(source_witness_runtime) is SourceWitnessRuntime)
+    source_witness_runtime.__post_init__()
+    _require(actor["current"] in source_witness_runtime.runtime_roles)
+    outsiders = tuple(sorted(set(runtime_roles) - set(source_witness_runtime.runtime_roles)))
+    try:
+        await require_source_witness_census_outsiders(connection, source_witness_runtime, outsiders)
+    except RegistrySourceCompositionError:
+        _require(False)
+
+
 async def _prove_ready_candidate(
     connection,
     copy_target,
@@ -948,11 +966,7 @@ async def _prove_ready_candidate(
     office_authority = proof_options.get("office_authority")
     source_witness_runtime = proof_options.get("source_witness_runtime")
     if source_witness_runtime is not None:
-        from process.registry_source_recipe_composition import SourceWitnessRuntime
-
-        _require(type(source_witness_runtime) is SourceWitnessRuntime)
-        source_witness_runtime.__post_init__()
-        _require(set(runtime_roles) | {actor["current"]} <= set(source_witness_runtime.runtime_roles))
+        await _require_source_witness_census(connection, source_witness_runtime, runtime_roles, actor)
         if source_witness_runtime.semantic_validation is not None:
             _require(source_witness_runtime.semantic_validation.candidate_id == copy_target.candidate_id)
             await source_witness_runtime.semantic_validation._bind(connection)

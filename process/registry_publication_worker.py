@@ -795,9 +795,22 @@ def _configured_source_witness_runtime(config, consumer, identity):
             required.add(current.owner_role)
         else:
             raise ValueError("registry_source_witness_worker_unsupported")
-    if not required <= set(runtime.runtime_roles):
+    # A new physical output owner may postdate the captures; startup and sealing prove it is outside them.
+    outsiders = required - set(runtime.runtime_roles)
+    physical_owners = {getattr(current, "physical_owner_role", None) for current in (config.consumer, consumer)}
+    if not outsiders <= physical_owners - {None}:
         raise ValueError("registry_source_witness_runtime_census_differs")
-    return runtime
+    return replace(runtime, census_outsiders=tuple(sorted(outsiders))) if outsiders else runtime
+
+
+async def _proven_source_witness_runtime(config, consumer, identity, connection):
+    """Resolve the configured capture census and prove any physical owner it omits stays outside it."""
+    source_runtime = _configured_source_witness_runtime(config, consumer, identity)
+    if source_runtime is not None:
+        from process.registry_source_recipe_composition import require_source_witness_census_outsiders
+
+        await require_source_witness_census_outsiders(connection, source_runtime, source_runtime.census_outsiders)
+    return source_runtime
 
 
 async def _custody_runtime(config, stack, consumer, execution_connection, *, backend_verifier=None):
@@ -813,7 +826,7 @@ async def _custody_runtime(config, stack, consumer, execution_connection, *, bac
     _verify_custody_config(config, consumer)
     schema = consumer.control_schema
     identity = await _custody_identity(execution_connection, schema, consumer.execution_role)
-    source_runtime = _configured_source_witness_runtime(config, consumer, identity)
+    source_runtime = await _proven_source_witness_runtime(config, consumer, identity, execution_connection)
     await _q_reach_closed(
         execution_connection,
         identity,
