@@ -36,6 +36,7 @@ _READONLY_WRITER_JOIN_SQL = f"""
                 UNION SELECT jsonb_array_elements_text(
                 CASE WHEN jsonb_typeof(candidate.validation_json->'writer_closure'->'reader_roles')='array'
                   THEN candidate.validation_json->'writer_closure'->'reader_roles' ELSE '[]'::jsonb END)
+                UNION SELECT unnest($3::text[])
                 LIMIT 65) AS role_names,NULL::text[] AS relation_names)
           {_NATIVE_WRITER_PRIVILEGES_SQL}
         ) privileges ON true
@@ -93,6 +94,23 @@ def parse_canonical_network_ids(value: str) -> tuple[int, ...]:
 
 
 async def _read_manifest(connection, namespace, generation_id, *, include_ineligible=False):
+    entry = await _read_manifest_with(connection, namespace, generation_id, include_ineligible, ())
+    if (
+        entry is not None
+        and entry["retained_proof"] is True
+        and json.loads(entry["catalog_json"])["privileges_closed"] is not True
+    ):
+        from process.network_retained_read_access import retained_extra_readers
+
+        # Only an owner-proven direct reader of a retained candidate may join its recorded closure.
+        readers = await retained_extra_readers(connection, entry)
+        if readers:
+            generation = json.loads(entry["manifest_json"])["generation_id"]
+            entry = await _read_manifest_with(connection, namespace, generation, include_ineligible, readers)
+    return entry
+
+
+async def _read_manifest_with(connection, namespace, generation_id, include_ineligible, extra_readers):
     return await connection.fetchrow(
         f"""SELECT to_jsonb(candidate)::text AS candidate_json,to_jsonb(manifest)::text AS manifest_json,
           jsonb_build_object('schema_oid',physical_schema.oid::bigint,
@@ -105,7 +123,8 @@ async def _read_manifest(connection, namespace, generation_id, *, include_inelig
             'index_table_oids',inventory.index_table_oids,'owners_match',inventory.owners_match,
             'unsupported_relations',inventory.unsupported_relations,'relation_count',inventory.relation_count,
             'has_routines',EXISTS(SELECT 1 FROM pg_proc WHERE pronamespace=physical_schema.oid),
-            'address_table_oid',inventory.address_table_oid,'privileges_closed',privileges.closed)::text AS catalog_json
+            'address_table_oid',inventory.address_table_oid,'privileges_closed',privileges.closed)::text AS catalog_json,
+          to_regnamespace('network_retained_access_'||substr(candidate.schema_name,19)) IS NOT NULL AS retained_proof
         FROM {namespace}.network_serving_manifest manifest
         JOIN {namespace}.network_membership_candidate candidate ON candidate.candidate_id=manifest.candidate_id
         LEFT JOIN pg_namespace physical_schema ON physical_schema.nspname=candidate.schema_name
@@ -132,6 +151,7 @@ async def _read_manifest(connection, namespace, generation_id, *, include_inelig
           AND octet_length(candidate.validation_json::text)<=1048576""",
         generation_id,
         include_ineligible,
+        list(extra_readers),
     )
 
 
