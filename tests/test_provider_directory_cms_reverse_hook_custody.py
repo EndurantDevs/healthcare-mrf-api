@@ -633,7 +633,8 @@ async def test_ownership_postimage_is_left_to_the_outer_validator(reverse_case):
 async def test_timeout_has_no_cleanup_sql_and_preserves_caller_transaction(reverse_case):
     case = reverse_case
     with pytest.raises(TimeoutError):
-        async with _context(case, deadline=asyncio.get_running_loop().time() + 0.1):
+        # Leave room for setup on a loaded runner; the deadline still expires inside the body.
+        async with _context(case, deadline=asyncio.get_running_loop().time() + 1.0):
             before = (case.connection.fetchrow.await_count, case.connection.fetchval.await_count)
             await asyncio.Event().wait()
     assert (case.connection.fetchrow.await_count, case.connection.fetchval.await_count) == before
