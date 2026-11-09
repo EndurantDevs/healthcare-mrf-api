@@ -43,7 +43,7 @@ def _config(connection=None):
 
 def test_directory_pricing_join_preserves_exact_parents_without_database_work():
     scripts = ScriptDirectory.from_config(_config())
-    assert scripts.get_heads() == ["20261108010000_custom_import_family_child_reference_aggregate"]
+    assert scripts.get_heads() == ["20261110010000_drop_unused_provider_directory_indexes"]
     assert scripts.get_revision("20261029010000_registry_source_inventory").down_revision == (
         "20261028020000_registry_membership_refresh"
     )

@@ -1883,24 +1883,15 @@ class ProviderDirectoryPractitionerRole(Base, JSONOutputMixin):
     )
     __my_index_elements__ = ["source_id", "resource_id"]
     __my_additional_indexes__ = [
-        {"index_elements": ("practitioner_ref",), "name": "provider_directory_role_practitioner_idx"},
         {
             "index_elements": ("source_id", "practitioner_ref"),
             "name": "provider_directory_role_source_practitioner_idx",
         },
-        {"index_elements": ("organization_ref",), "name": "provider_directory_role_organization_idx"},
         {
             "index_elements": ("source_id", "organization_ref"),
             "name": "provider_directory_role_source_organization_idx",
         },
         {"index_elements": ("last_seen_run_id", "source_id"), "name": "provider_directory_role_run_source_idx"},
-        {"index_elements": ("location_refs",), "using": "gin", "name": "provider_directory_role_location_refs_gin_idx"},
-        {
-            "index_elements": ("specialty_codes",),
-            "using": "gin",
-            "name": "provider_directory_role_specialty_codes_gin_idx",
-        },
-        {"index_elements": ("code_codes",), "using": "gin", "name": "provider_directory_role_code_codes_gin_idx"},
         {"index_elements": ("network_refs",), "using": "gin", "name": "provider_directory_role_network_refs_gin_idx"},
     ]
 
@@ -2121,7 +2112,6 @@ class ProviderDirectoryCanonicalResource(Base, JSONOutputMixin):
             "index_elements": ("resource_type", "resource_id"),
             "name": "provider_directory_canonical_resource_type_id_idx",
         },
-        {"index_elements": ("payload_hash",), "name": "provider_directory_canonical_resource_hash_idx"},
         {"index_elements": ("last_seen_run_id",), "name": "provider_directory_canonical_resource_run_idx"},
     ]
 
@@ -2155,10 +2145,6 @@ class ProviderDirectorySourceResource(Base, JSONOutputMixin):
     )
     __my_index_elements__ = ["source_id", "resource_type", "resource_id"]
     __my_additional_indexes__ = [
-        {
-            "index_elements": ("canonical_api_base", "resource_type", "resource_id"),
-            "name": "provider_directory_source_resource_canonical_idx",
-        },
         {"index_elements": ("last_seen_run_id",), "name": "provider_directory_source_resource_run_idx"},
     ]
 
