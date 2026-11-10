@@ -564,6 +564,11 @@ def verify_shard_artifacts(
             base_sha,
             head_sha,
         )
+        if "common_test_execution" in provenance:
+            # The controller authenticates this reference; here it only has to be well formed.
+            if not isinstance(provenance["common_test_execution"], dict):
+                raise CoverageForecastError(f"{kind}/{shard}: common test execution must be an object")
+            expected["common_test_execution"] = provenance["common_test_execution"]
         if provenance != expected:
             raise CoverageForecastError(f"{kind}/{shard}: coverage provenance differs from the exact CI input")
         coverage_paths.append(coverage_path)
