@@ -303,9 +303,11 @@ async def test_native_copy_repairs_npi_without_mutating_incumbent(monkeypatch):
                 plan=dict(decision_at=decision.isoformat()),
                 metrics=dict(resource_id_npis_backfilled=dict(Practitioner=0)),
             )
+            # This component copies an incumbent projection through the fixed-input branch.
+            admission = SimpleNamespace(factory=object(), prepared=enrichment_by_field)
             assert (
                 await artifacts._copy(
-                    directory, session, model, name, inputs, params_by_name, enrichment=enrichment_by_field, kind="npi"
+                    directory, session, model, name, inputs, params_by_name, admission=admission, kind="npi"
                 )
                 == 1
             )
@@ -364,7 +366,7 @@ async def _wait_for_lock(database, relation_oid):
             await asyncio.sleep(0.01)
 
 
-async def _copy_again(case, name):
+async def _copy_again(case, name, admission):
     async with case.database.transaction() as session:
         return await artifacts._copy(
             case.directory,
@@ -375,6 +377,7 @@ async def _copy_again(case, name):
                 case.directory.ProviderDirectorySource, case.schema
             ),
             {"source_ids": [case.pin["source_id"]]},
+            admission=admission,
         )
 
 
@@ -395,7 +398,7 @@ async def test_native_cancellation_drains_owned_copy_and_cleanup(monkeypatch, op
                 pending = (
                     artifacts._drain_cleanup(directory, created_by_relation)
                     if operation_kind == "cleanup"
-                    else _copy_again(case, name)
+                    else _copy_again(case, name, admission)
                 )
                 operation = asyncio.create_task(pending)
                 await _wait_for_lock(database, created_by_relation[name][0])

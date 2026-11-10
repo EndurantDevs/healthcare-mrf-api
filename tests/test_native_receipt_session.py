@@ -58,11 +58,34 @@ async def test_native_receipt_decode_yields_before_finishing_a_large_page(monkey
             await task
         assert len(decoded_values) == 256
     else:
-        for expected_count in (512, 768):
-            await asyncio.sleep(0)
-            assert len(decoded_values) == expected_count
         rows = await task
         assert rows == [{"payload": number} for number in range(1000)]
+
+
+@pytest.mark.asyncio
+async def test_native_receipt_decode_allows_pending_io_before_finishing(monkeypatch):
+    decoded, original_loads = [], json.loads
+
+    def loads(value):
+        decoded.append(value)
+        return original_loads(value)
+
+    async def io_work():
+        for _ in range(32):
+            pending = asyncio.get_running_loop().create_future()
+            asyncio.get_running_loop().call_soon(pending.set_result, None)
+            await pending
+        return len(decoded)
+
+    monkeypatch.setattr(capture.json, "loads", loads)
+    session, _prepared = _native_session([{"payload": str(number)} for number in range(4096)])
+    observer = asyncio.create_task(io_work())
+    try:
+        rows = await session.execute(text("SELECT payload"))
+    finally:
+        progressed_at = await observer
+    assert rows == [{"payload": number} for number in range(4096)]
+    assert 0 < progressed_at < len(rows)
 
 
 @pytest.mark.asyncio

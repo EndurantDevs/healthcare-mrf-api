@@ -204,13 +204,22 @@ async def test_cleanup_refuses_a_replaced_native_relation(case, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_typed_copy_retains_native_scalar_encoders_and_fixed_reader(case, monkeypatch):
+@pytest.mark.parametrize("pinned", [False, True])
+async def test_typed_copy_retains_native_scalar_encoders_and_fixed_reader(case, monkeypatch, pinned):
     copied_records = []
     model = SimpleNamespace(__table__=SimpleNamespace(columns=[SimpleNamespace(name=name) for name in ("time", "n")]))
     values_by_column = dict(time=datetime(2026, 1, 1), n=Decimal("1.25"))
 
-    async def pages(database, statement, params, actual_model):
-        assert database is case.directory.db and actual_model is model
+    async def pages(directory, actual_model, dataset, enrichment):
+        assert pinned is False
+        assert directory is case.directory and actual_model is model
+        assert dataset is None and enrichment is None
+        yield [values_by_column]
+
+    async def pinned_pages(database, statement, params, actual_model):
+        assert pinned is True
+        assert database is case.directory.db and statement == "SELECT" and params == {}
+        assert actual_model is model
         yield [values_by_column]
 
     async def copy(_name, **options):
@@ -221,10 +230,20 @@ async def test_typed_copy_retains_native_scalar_encoders_and_fixed_reader(case, 
     case.directory._schema = lambda: "sample"
     case.directory._json_columns = lambda _table: set()
     case.directory._copy_record = lambda row, columns, _json: tuple(row[column] for column in columns)
-    monkeypatch.setattr(artifacts, "projected_pages", pages)
+    monkeypatch.setattr(artifacts, "_resource_pages", pages)
+    monkeypatch.setattr(artifacts, "projected_pages", pinned_pages)
+    admission = SimpleNamespace(
+        factory=object() if pinned else None, fence=SimpleNamespace(datasets=(None,)), prepared=None
+    )
     assert (
         await artifacts._copy(
-            case.directory, SimpleNamespace(copy_records_to_table=copy), model, "private_stage", "SELECT", {}
+            case.directory,
+            SimpleNamespace(copy_records_to_table=copy),
+            model,
+            "private_stage",
+            "SELECT",
+            {},
+            admission=admission,
         )
         == 1
     )
@@ -280,7 +299,9 @@ async def test_ordinary_preparation_reuses_repair_copy_and_full_tuple_parity(mon
     directory = importlib.import_module("process.provider_directory_fhir")
     dataset = SimpleNamespace(source_id="source_a", dataset_id="dataset_a", evidence_run_id="root_a")
     admission = SimpleNamespace(
-        factory=None, fence=SimpleNamespace(datasets=(dataset,)), resource_types={"Practitioner"},
+        factory=None,
+        fence=SimpleNamespace(datasets=(dataset,)),
+        resource_types={"Practitioner"},
         prepared=dict(plan=dict(publish_targets=["address_overlay"], decision_at="2026-01-01T00:00:00")),
     )
     session = object()
@@ -299,11 +320,13 @@ async def test_ordinary_preparation_reuses_repair_copy_and_full_tuple_parity(mon
     monkeypatch.setattr(artifacts, "_copy", copy)
     monkeypatch.setattr(artifacts, "_verify_set_parity", parity)
     created_by_relation = {}
-    await artifacts._prepare_model(directory, admission, directory.ProviderDirectoryPractitioner, "private_stage", created_by_relation)
+    await artifacts._prepare_model(
+        directory, admission, directory.ProviderDirectoryPractitioner, "private_stage", created_by_relation
+    )
     assert created_by_relation == {"private_stage": (1, 2, "r", "u")}
     statement, params = copy.await_args.args[-2:]
     assert "provider_directory_dataset_resource" in statement and "repair_eligible" in statement
-    assert copy.await_args.kwargs == dict(enrichment=admission.prepared, kind="npi")
+    assert copy.await_args.kwargs == dict(admission=admission, kind="npi")
     assert params["source_ids"] == ["source_a"] and params["dataset_ids"] == ["dataset_a"]
     assert params["evidence_run_ids"] == ["root_a"] and params["resource_type"] == "Practitioner"
     assert parity.await_args.args[0] is session and parity.await_args.args[-1] == params

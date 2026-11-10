@@ -78,6 +78,16 @@ async def _observe(ticks, stop):
         await asyncio.sleep(0)
 
 
+def _content_pages(resource_rows):
+    def page(_query, **parameters):
+        after = parameters.get("after_resource_type"), parameters.get("after_resource_id")
+        return [row for row in resource_rows if after[0] is None or (row["resource_type"], row["resource_id"]) > after][
+            : parameters["batch_size"]
+        ]
+
+    return SimpleNamespace(all=AsyncMock(side_effect=page))
+
+
 @pytest.mark.asyncio
 async def test_async_spool_completion_preserves_unions_and_metrics(monkeypatch, tmp_path):
     monkeypatch.setattr(proof, "_SPOOL_ROWS", 1)
@@ -222,9 +232,8 @@ async def test_direct_content_proof_yields_without_skipping_payload_verification
             connection, DATASET_ID, verify_payload_hashes=True, resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT
         )
     )
-    for expected_count in (256, 512):
-        await asyncio.sleep(0)
-        assert verify_payload_hash.call_count == expected_count
+    await asyncio.sleep(0)
+    assert verify_payload_hash.call_count == 256
     if corrupt:
         with pytest.raises(RuntimeError, match="payload_hash"):
             await task
@@ -235,6 +244,105 @@ async def test_direct_content_proof_yields_without_skipping_payload_verification
     assert verify_payload_hash.call_count == len(resource_rows)
     assert resource_rows == before
     assert connection.all.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_content_proof_allows_pending_io_before_finishing(monkeypatch):
+    resource_rows = [_dataset_resource("Practitioner", f"person-{index:06d}", {"npi": "123"}) for index in range(4096)]
+    connection = _content_pages(resource_rows)
+    verify_payload_hash = Mock(wraps=fhir._assert_endpoint_dataset_resource_payload_hash)
+    monkeypatch.setattr(fhir, "_assert_endpoint_dataset_resource_payload_hash", verify_payload_hash)
+
+    async def io_work():
+        for _ in range(32):
+            pending = asyncio.get_running_loop().create_future()
+            asyncio.get_running_loop().call_soon(pending.set_result, None)
+            await pending
+        return verify_payload_hash.call_count
+
+    observer = asyncio.create_task(io_work())
+    try:
+        completed = await fhir._endpoint_dataset_content_proof(
+            connection, DATASET_ID, verify_payload_hashes=True, resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT
+        )
+    finally:
+        progressed_at = await observer
+    assert completed.resource_count == verify_payload_hash.call_count == len(resource_rows)
+    assert 0 < progressed_at < len(resource_rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "verify_payloads,configured,expected", ((True, 10_000, 1000), (True, 127, 127), (False, 10_000, 10_000))
+)
+async def test_content_proof_bounds_payload_pages_without_changing_hashes(
+    monkeypatch, verify_payloads, configured, expected
+):
+    resource_rows = [
+        _dataset_resource(resource_type, f"item-{index:06d}", {"npi": "123"})
+        for resource_type in ("Location", "Practitioner")
+        for index in range(1000)
+    ]
+    connection = _content_pages(resource_rows)
+    monkeypatch.setattr(fhir, "ENDPOINT_DATASET_HASH_BATCH_SIZE", configured)
+    checked = Mock(wraps=fhir._assert_endpoint_dataset_resource_payload_hash)
+    monkeypatch.setattr(fhir, "_assert_endpoint_dataset_resource_payload_hash", checked)
+    completed = await fhir._endpoint_dataset_content_proof(
+        connection,
+        DATASET_ID,
+        verify_payload_hashes=verify_payloads,
+        resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT,
+    )
+    expected_hash = hashlib.sha256(
+        b"\n".join(
+            proof._stable_json((row["resource_type"], row["resource_id"], row["payload_hash"])).encode()
+            for row in resource_rows
+        )
+    ).hexdigest()
+    assert completed.dataset_hash == expected_hash and completed.resource_count == len(resource_rows)
+    assert completed.resource_counts == {"Location": 1000, "Practitioner": 1000}
+    assert checked.call_count == (len(resource_rows) if verify_payloads else 0)
+    assert connection.all.await_count == len(resource_rows) // expected + 1
+    assert all(call.kwargs["batch_size"] == expected for call in connection.all.await_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ("corrupt", "cancel"))
+async def test_payload_proof_refuses_corruption_and_cancels_across_pages(monkeypatch, failure):
+    resource_rows = [_dataset_resource("Practitioner", f"person-{index:06d}", {"npi": "123"}) for index in range(1001)]
+    connection = _content_pages(resource_rows)
+    checked = Mock(wraps=fhir._assert_endpoint_dataset_resource_payload_hash)
+    monkeypatch.setattr(fhir, "_assert_endpoint_dataset_resource_payload_hash", checked)
+    entered_second_page = asyncio.Event()
+    page = connection.all.side_effect
+
+    async def interrupted_page(query, **parameters):
+        if parameters.get("after_resource_id") is not None:
+            entered_second_page.set()
+            await asyncio.Event().wait()
+        return page(query, **parameters)
+
+    if failure == "corrupt":
+        resource_rows[-1]["payload_hash"] = "0" * 64
+    else:
+        connection.all.side_effect = interrupted_page
+    task = asyncio.create_task(
+        fhir._endpoint_dataset_content_proof(
+            connection, DATASET_ID, verify_payload_hashes=True, resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT
+        )
+    )
+    if failure == "corrupt":
+        with pytest.raises(RuntimeError, match="payload_hash_mismatch"):
+            await task
+        assert checked.call_count == len(resource_rows)
+    else:
+        await asyncio.wait_for(entered_second_page.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert checked.call_count == 1000
+    assert connection.all.await_count == 2
+    assert connection.all.await_args_list[1].kwargs["after_resource_id"] == resource_rows[999]["resource_id"]
 
 
 @pytest.mark.asyncio

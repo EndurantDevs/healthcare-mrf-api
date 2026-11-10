@@ -107,9 +107,9 @@ class NativeReceiptSession:
                     for name, value in record.items()
                 }
             )
-            # Large proof pages must not starve concurrent lease renewals.
+            # A timed yield lets pending renewal I/O drain between payload batches.
             if row_number % 256 == 0:
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.001)
         return rows
 
     async def scalar(self, statement, parameters=None):

@@ -44729,7 +44729,7 @@ def _is_bulk_export_error_terminal(error: str | None) -> bool:
         return status_text.isdigit() and 300 <= int(status_text) < 500
     if error.startswith("bulk_export_output_http_"):
         status_text = error.rsplit("_", 1)[-1]
-        return status_text.isdigit() and 300 <= int(status_text) < 500
+        return status_text.isdigit() and 300 <= int(status_text) < 500 and int(status_text) != 429
     return False
 
 
@@ -47414,7 +47414,8 @@ def _completed_bulk_output_error(
             task_error = _bulk_transport_error(exc)
         except Exception as exc:
             task_error = _bulk_transport_error(exc)
-        output_error = output_error or task_error
+        if task_error and (not output_error or bulk_parallel.is_transient_output_error(output_error)):
+            output_error = task_error
     return output_error
 
 
@@ -47459,36 +47460,9 @@ async def _run_pending_bulk_output_tasks(
         Awaitable[str | None],
     ],
 ) -> tuple[BulkExportStreamState, str | None]:
-    active_item_by_task: dict[
-        asyncio.Task[str | None],
-        tuple[BulkExportManifestOutput, dict[str, Any]],
-    ] = {}
-    pending_iter = iter(pending_outputs)
-    try:
-        _fill_active_bulk_tasks(active_item_by_task, pending_iter, options.output_concurrency, stream_output)
-        while active_item_by_task:
-            completed_tasks, _pending_tasks = await asyncio.wait(
-                active_item_by_task,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            output_error = _completed_bulk_output_error(
-                completed_tasks,
-                active_item_by_task,
-            )
-            if output_error:
-                await _cancel_bulk_output_tasks(active_item_by_task)
-                await options.ownership_probe()
-                await _record_bulk_export_checkpoint_error(
-                    identity,
-                    output_error,
-                    terminal=_is_bulk_export_error_terminal(output_error),
-                )
-                return stream_state, output_error
-            _fill_active_bulk_tasks(active_item_by_task, pending_iter, options.output_concurrency, stream_output)
-        return stream_state, None
-    finally:
-        if active_item_by_task:
-            await _cancel_bulk_output_tasks(active_item_by_task)
+    return await bulk_parallel.run_outputs(
+        sys.modules[__name__], identity, options, stream_state, pending_outputs, stream_output
+    )
 
 
 async def _resume_checkpointed_bulk_outputs(
@@ -47499,7 +47473,7 @@ async def _resume_checkpointed_bulk_outputs(
     options: BulkExportStreamOptions,
     output_checkpoints: list[dict[str, Any]],
 ) -> tuple[BulkExportStreamState, str | None]:
-    """Run incomplete outputs with bounded fail-fast concurrency."""
+    """Run incomplete outputs with bounded concurrency and isolated transport retries."""
     stream_state = BulkExportStreamState()
     pending_outputs, pending_error = _pending_bulk_outputs(
         identity,
@@ -47519,14 +47493,13 @@ async def _resume_checkpointed_bulk_outputs(
         item: tuple[BulkExportManifestOutput, dict[str, Any]],
     ) -> str | None:
         """Stream one scheduled manifest output."""
-        manifest_output, output_checkpoint = item
-        return await _stream_one_checkpointed_bulk_output(
+        return await bulk_parallel.stream_output(
+            sys.modules[__name__],
             session,
             source_record,
             identity,
             manifest,
-            manifest_output,
-            output_checkpoint,
+            item,
             options,
             stream_state,
         )
@@ -64050,6 +64023,9 @@ async def _endpoint_dataset_content_proof(
     after_resource_type: str | None = None
     after_resource_id: str | None = None
     batch_size = max(1, ENDPOINT_DATASET_HASH_BATCH_SIZE)
+    if verify_payload_hashes:
+        # Bound raw JSON fetch/decode bursts as well as cooperative hash processing.
+        batch_size = min(batch_size, 1000)
     while True:
         resource_rows = await _endpoint_dataset_content_page(
             connection,
@@ -64081,7 +64057,7 @@ async def _endpoint_dataset_content_proof(
             resource_hasher.update(identity_bytes)
             resource_count_by_type[resource_type] = resource_count_by_type.get(resource_type, 0) + 1
             if resource_count % 256 == 0:
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.001)
         after_resource_type, after_resource_id, _payload_hash = _endpoint_dataset_hash_identity(resource_rows[-1])
         if len(resource_rows) < batch_size:
             break
