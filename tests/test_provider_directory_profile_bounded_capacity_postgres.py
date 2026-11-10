@@ -266,6 +266,12 @@ async def test_bounded_artifact_windows_settle_below_the_whole_future_wal_foreca
             control_metadata_data_upper_bound_bytes=projection.total_control_metadata_data_bytes,
         )
         admission = _admission(bounded, start)
+        # The fixture completed all scope layout statements before the WAL baseline.
+        admission.wal_tracker.accounted_control_operation_counts["artifact_scope_layout"] = next(
+            operation.operation_count
+            for operation in projection.operations
+            if operation.operation_name == "artifact_scope_layout"
+        )
         token = fhir._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(admission)
         try:
             await fhir._preflight_provider_directory_artifact_scope_capacity(
