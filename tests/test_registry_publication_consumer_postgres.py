@@ -378,6 +378,20 @@ async def _assert_request_rows_preserved(fixture, queued, other, immutable, unto
     )
 
 
+def _assert_worker_error(output, code):
+    """Only constant codes leave the worker; a transient authority failure names both wrapped codes."""
+    reported = json.loads(output.err)
+    causes = reported.pop("causes", None)
+    assert output.out == "" and reported == {"state": "error", "code": code}
+    if code == "worker_failed":
+        assert [cause.get("code") for cause in causes[:2]] == [
+            "registry_publication_consumer_unavailable",
+            "registry_publication_authority_unavailable",
+        ]
+    else:
+        assert causes is None
+
+
 async def test_expired_lease_restarts_exact_request_after_transient_authority_failure(
     bounded_worker_permissions, monkeypatch, capsys
 ):
@@ -413,8 +427,7 @@ async def test_expired_lease_restarts_exact_request_after_transient_authority_fa
         for failure, exit_code, code in (("authority", 1, "worker_failed"), ("cancel", 130, "canceled")):
             before_calls = len(calls)
             assert await asyncio.to_thread(worker.run_command) == exit_code
-            output = capsys.readouterr()
-            assert output.out == "" and json.loads(output.err) == {"state": "error", "code": code}
+            _assert_worker_error(capsys.readouterr(), code)
             assert len(calls) > before_calls and (await _status(fixture, queued))["state"] == "running"
             assert await _head(fixture) is None
             await _assert_request_rows_preserved(fixture, queued, other, immutable, untouched)

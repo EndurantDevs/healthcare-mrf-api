@@ -726,10 +726,49 @@ def test_command_errors_never_echo_configuration_or_exception(monkeypatch, capsy
     monkeypatch.setattr(worker, "run_registry_publication_worker", run)
     assert worker.run_command() == status
     captured = capsys.readouterr()
-    assert (
-        captured.out == ""
-        and captured.err == json.dumps({"state": "error", "code": code}, separators=(",", ":")) + "\n"
-    )
+    reported = json.loads(captured.err)
+    causes = reported.pop("causes", None)
+    assert captured.out == "" and _PRIVATE not in captured.err
+    assert reported == {"state": "error", "code": code}
+    if failure == "runtime":
+        assert causes[0].pop("where").startswith("test_registry_publication_worker.py:")
+        assert causes == [{"class": "RuntimeError"}]
+    else:
+        assert causes is None
+
+
+def test_command_failure_names_constant_codes_through_the_suppressed_chain(monkeypatch, capsys):
+    import asyncpg
+
+    monkeypatch.setenv(worker.CONFIG_ENV, json.dumps(configuration()))
+    secret = "a" * 64
+
+    async def run(_config):
+        try:
+            try:
+                try:
+                    raise asyncpg.exceptions.QueryCanceledError(_PRIVATE)
+                except asyncpg.PostgresError:
+                    raise KeyError("registry_lookup_key") from None
+            except KeyError:
+                raise TimeoutError(secret) from None
+        except TimeoutError:
+            raise RuntimeError("registry_publication_consumer_unavailable") from None
+
+    monkeypatch.setattr(worker, "run_registry_publication_worker", run)
+    assert worker.run_command() == 1
+    captured = capsys.readouterr()
+    assert captured.out == "" and _PRIVATE not in captured.err and secret not in captured.err
+    reported = json.loads(captured.err)
+    assert reported["code"] == "worker_failed"
+    locations = [cause.pop("where") for cause in reported["causes"]]
+    assert reported["causes"] == [
+        {"class": "RuntimeError", "code": "registry_publication_consumer_unavailable"},
+        {"class": "TimeoutError"},
+        {"class": "KeyError"},
+        {"class": "QueryCanceledError", "sqlstate": "57014"},
+    ]
+    assert all(location.startswith("test_registry_publication_worker.py:") for location in locations)
 
 
 def test_actual_process_group_registration_and_argument_redaction(monkeypatch):
