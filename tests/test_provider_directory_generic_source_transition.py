@@ -299,7 +299,7 @@ def _retain_original_root(case, status):
         (None, None),
         ("checkpoint", "transition_checkpoint_changed"),
         ("input", "transition_input_changed"),
-        ("different-failure", "transition_candidate_changed"),
+        ("different-failure", "transition_checkpoint_changed"),
     ],
 )
 async def test_vsp_pre_capture_failure_transitions_only_an_empty_original_candidate(case, retained, error):

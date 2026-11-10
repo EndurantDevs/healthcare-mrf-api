@@ -738,7 +738,10 @@ def _validated_transition_identity(identity_by_field, expected_resource_counts):
         and type(expected_resource_counts) is dict
         and 1 <= len(expected_resource_counts) <= 32
         and all(
-            type(name) is str and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", name) and type(count) is int and count >= 0
+            type(name) is str
+            and re.fullmatch(r"(?:[A-Za-z][A-Za-z0-9]{0,63}|LU:[A-Za-z][A-Za-z0-9]{0,63}:pass:[12])", name)
+            and type(count) is int
+            and count >= 0
             for name, count in expected_resource_counts.items()
         ),
         "transition_identity_invalid",
@@ -844,6 +847,15 @@ async def _locked_transition_candidate(
     is_empty_vsp_failure = _is_empty_vsp_checkpoint_failure(
         header, candidate_by_field, identity_by_field, expected_counts, new_storage
     )
+    metadata = _json(header["publication_metadata_json"])
+    has_identity_metadata = metadata == stored_identity["metadata"] or (
+        header["status"] == "failed"
+        and type(metadata) is dict
+        and all(
+            field_name in metadata and metadata[field_name] == expected_value
+            for field_name, expected_value in stored_identity["metadata"].items()
+        )
+    )
     _require(
         candidate_by_field["contract"] == ISOLATED_CONTRACT
         and candidate_by_field["admission"] is None
@@ -852,15 +864,11 @@ async def _locked_transition_candidate(
             stored_identity[field] == identity_by_field[field]
             for field in ("dataset_id", "endpoint_id", "acquisition_root_run_id")
         )
-        and (
-            is_empty_vsp_failure
-            or (
-                header["status"] == "acquiring"
-                and _json(header["publication_metadata_json"]) == stored_identity["metadata"]
-            )
-        )
-        and set(stored_identity["metadata"].get("selected_resources", ())) == set(expected_counts)
-        and set(stored_identity["metadata"].get("expected_resources", ())) == set(expected_counts)
+        and (is_empty_vsp_failure or has_identity_metadata)
+        and set(stored_identity["metadata"].get("selected_resources", ()))
+        == set(stored_identity["metadata"].get("expected_resources", ()))
+        == {name for name in expected_counts if not name.startswith("LU:")}
+        == {_resource_family(name) for name in expected_counts}
         and candidate_by_field["storage"] in (old_storage, new_storage),
         "transition_candidate_changed",
     )
@@ -1110,14 +1118,22 @@ async def _verify_bulk_transition_checkpoints(
 
 
 async def _verify_transition_checkpoints(
-    connection, policy, identity_by_field, expected_counts, run_status, lineage_run_ids, *, is_empty_vsp_failure=False
+    connection,
+    policy,
+    identity_by_field,
+    expected_counts,
+    run_status,
+    lineage_run_ids,
+    source_ids,
+    *,
+    is_empty_vsp_failure=False,
 ):
     """Reject mixed checkpoint families before comparing their retained input census."""
     root_run_id = identity_by_field["acquisition_root_run_id"]
     dataset_id = identity_by_field["dataset_id"]
     checkpoint_rows = await connection.fetch(
         "SELECT resource_type,state,owner_run_id,dataset_id,rows_processed,pages_processed,completed_at,"
-        "canonical_api_base,start_url_hash,next_url,acquisition_root_run_id FROM "
+        "canonical_api_base,start_url_hash,next_url,acquisition_root_run_id,source_ids,source_scope_hash FROM "
         + storage_relation(policy.schema, "provider_directory_pagination_checkpoint")
         + " WHERE acquisition_root_run_id=$1 OR dataset_id=$2 FOR SHARE NOWAIT",
         root_run_id,
@@ -1137,11 +1153,16 @@ async def _verify_transition_checkpoints(
         return
     _require(not (checkpoint_rows and bulk_checkpoints), "transition_checkpoint_changed")
     if bulk_checkpoints:
+        _require(not any(name.startswith("LU:") for name in expected_counts), "transition_checkpoint_changed")
         await _verify_bulk_transition_checkpoints(
             connection, policy, bulk_checkpoints, identity_by_field, expected_counts, lineage_run_ids
         )
         return
     _require(run_status == "failed", "transition_run_changed")
+    from process.provider_directory_partition_successor import has_verified_partition_checkpoints
+
+    if has_verified_partition_checkpoints(checkpoint_rows, identity_by_field, expected_counts, source_ids):
+        return
     _require(
         len(checkpoint_rows) == len(expected_counts)
         and {checkpoint_record["resource_type"] for checkpoint_record in checkpoint_rows} == set(expected_counts)
@@ -1177,6 +1198,7 @@ async def _verify_transition_inputs(
         expected_counts,
         run_status,
         lineage_run_ids,
+        candidate_by_field["identity"]["metadata"]["source_ids"],
         is_empty_vsp_failure=is_empty_vsp_failure,
     )
     dataset_id = identity_by_field["dataset_id"]
@@ -1273,13 +1295,7 @@ async def _require_transition_administrator(connection, policy):
 
 
 async def transition_isolated_loading_candidate_storage(
-    connection,
-    *,
-    policy,
-    identity_by_field,
-    old_storage,
-    new_storage,
-    expected_resource_counts,
+    connection, *, policy, identity_by_field, old_storage, new_storage, expected_resource_counts
 ):
     """Move one verified stopped private intake to an admin-issued successor producer."""
     from process.provider_directory_generic_source_policy import GenericSourcePolicy
@@ -1327,13 +1343,19 @@ async def transition_isolated_loading_candidate_storage(
     if candidate_by_field["storage"] == new_storage:
         return {**receipt_by_field, "already_applied": True}
     await _store_transition_successor(
-        connection, policy, identity_by_field, successor_by_field, candidate_by_field, previous_status
+        connection,
+        policy,
+        identity_by_field,
+        successor_by_field,
+        candidate_by_field,
+        previous_status,
+        is_empty_vsp_failure,
     )
     return {**receipt_by_field, "already_applied": False}
 
 
 async def _store_transition_successor(
-    connection, policy, identity_by_field, successor_by_field, candidate_by_field, previous_status
+    connection, policy, identity_by_field, successor_by_field, candidate_by_field, previous_status, is_empty_vsp_failure
 ):
     """Commit only the unchanged unpublished header preimage."""
     updated = await connection.execute(
@@ -1345,7 +1367,7 @@ async def _store_transition_successor(
         identity_by_field["dataset_id"],
         _encoded(successor_by_field),
         _encoded(candidate_by_field),
-        "acquiring",
+        "acquiring" if is_empty_vsp_failure else previous_status,
         previous_status,
     )
     _require(updated == "UPDATE 1", "transition_header_compare_failed")

@@ -50864,10 +50864,6 @@ async def _v4_partition_candidate_proof_counts(
 ) -> LastUpdatedPartitionProofCounts:
     """Load raw occurrence proofs and unique retained Organizations."""
 
-    table_ref = _qt(
-        _schema(),
-        ProviderDirectoryDatasetResource.__tablename__,
-    )
     pass1_resource_type = _last_updated_partition_fingerprint_resource_type(
         resource_type,
         1,
@@ -50883,6 +50879,7 @@ async def _v4_partition_candidate_proof_counts(
 
         retained_rows = await source_partition_rows(sys.modules[__name__], context.dataset_id, resource_type)
     else:
+        table_ref = _qt(_schema(), ProviderDirectoryDatasetResource.__tablename__)
         retained_rows = await db.all(
             f"SELECT resource_type, resource_id, payload_hash, payload_json, "
             f"acquired_resource_sha256 "

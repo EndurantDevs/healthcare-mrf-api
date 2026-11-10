@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import copy
 import importlib
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
-
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -33,9 +35,7 @@ def _source() -> dict[str, object]:
 
     return {
         "source_id": "source-organization-partition",
-        "_resource_hash_contract": (
-            importer.SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
-        ),
+        "_resource_hash_contract": (importer.SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT),
         "_semantic_projection_as_of": "2026-08-10",
     }
 
@@ -57,9 +57,7 @@ def _organization(
             "lastUpdated": last_updated,
         },
         "active": True,
-        "identifier": [
-            {"system": "urn:example", "value": "organization-a"}
-        ],
+        "identifier": [{"system": "urn:example", "value": "organization-a"}],
         "name": name,
         "alias": aliases or [],
     }
@@ -81,22 +79,14 @@ def _proof_rows(
             ),
             "payload_json": {
                 "window_id": window_id,
-                "fingerprint": importer._identity_hash(
-                    {"occurrence_id": occurrence_id}
-                ),
-                "source_fingerprint": (
-                    stage.occurrence_source_fingerprints_by_id[occurrence_id]
-                ),
+                "fingerprint": importer._identity_hash({"occurrence_id": occurrence_id}),
+                "source_fingerprint": (stage.occurrence_source_fingerprints_by_id[occurrence_id]),
                 "candidate_resource_id": proof_record[1],
-                "candidate_payload_hash": stage.candidate_hashes_by_id[
-                    occurrence_id
-                ],
+                "candidate_payload_hash": stage.candidate_hashes_by_id[occurrence_id],
                 "candidate_proof_record": proof_record,
             },
         }
-        for occurrence_id, proof_record in sorted(
-            stage.candidate_proof_records_by_id.items()
-        )
+        for occurrence_id, proof_record in sorted(stage.candidate_proof_records_by_id.items())
     ]
 
 
@@ -158,9 +148,7 @@ async def _stage(
         staged_resources,
         importer.LastUpdatedPartitionStageOptions(
             run_id="run-organization-partition",
-            fetch_url=(
-                "https://directory.example.test/fhir/Organization"
-            ),
+            fetch_url=("https://directory.example.test/fhir/Organization"),
             occurrence_ids=occurrence_ids,
             source_fingerprints_by_id=source_fingerprints_by_id,
         ),
@@ -183,9 +171,7 @@ def test_v4_occurrence_ids_are_order_stable() -> None:
 
     assert forward[1:] == reverse[1:]
     assert len(forward[2]) == len(set(forward[2])) == 3
-    assert _bindings((first,), "window-a")[2] != _bindings(
-        (first,), "window-b"
-    )[2]
+    assert _bindings((first,), "window-a")[2] != _bindings((first,), "window-b")[2]
 
 
 @pytest.mark.asyncio
@@ -227,9 +213,7 @@ async def test_v4_partition_stage_emits_occurrence_proofs() -> None:
         staged_candidate_count=1,
         invalid_candidate_count=0,
         orphan_proof_count=0,
-        candidate_hashes_by_id={
-            stage.rows[0]["resource_id"]: stage.rows[0]["payload_hash"]
-        },
+        candidate_hashes_by_id={stage.rows[0]["resource_id"]: stage.rows[0]["payload_hash"]},
     )
 
 
@@ -362,12 +346,10 @@ async def test_v4_partition_binds_planner_window() -> None:
     for pass_number, pass_rows in ((1, pass1_rows), (2, proof_rows)):
         pass_rows[0]["resource_id"] = rewritten_id
         pass_rows[0]["payload_json"]["window_id"] = "window-rewritten"
-        pass_rows[0]["payload_hash"] = (
-            importer._last_updated_partition_window_proof_hash(
-                "Organization",
-                "window-rewritten",
-                pass_number,
-            )
+        pass_rows[0]["payload_hash"] = importer._last_updated_partition_window_proof_hash(
+            "Organization",
+            "window-rewritten",
+            pass_number,
         )
 
     counts = importer._v4_partition_proof_counts(
@@ -489,3 +471,47 @@ def test_v4_partition_accepts_empty_leaf() -> None:
     assert counts.invalid_candidate_count == 0
     assert counts.staged_candidate_count == 0
     assert counts.pass1_unique == counts.pass2_unique == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_isolated", [False, True])
+async def test_v4_partition_proof_selects_existing_reader(monkeypatch, is_isolated) -> None:
+    """Keep both proof readers while isolated reconciliation opens its native transaction."""
+    from process import provider_directory_generic_source_adapters as adapters
+    from process import provider_directory_generic_source_policy as policy
+    from process.provider_directory_generic_candidate import GenericCandidateError
+
+    stage = await _stage(
+        (_organization("Community Health Center", last_updated="2024-01-01T01:00:00Z"),),
+        "window-a",
+    )
+    proofs = _proof_rows(stage, "window-a")
+    retained_rows = [
+        *stage.rows,
+        *({**proof_row, "resource_type": "LU:Organization:pass:1"} for proof_row in _pass1_rows(proofs)),
+        *({**proof_row, "resource_type": "LU:Organization:pass:2"} for proof_row in proofs),
+    ]
+    native_read = AsyncMock(return_value=retained_rows)
+    monkeypatch.setattr(adapters, "source_partition_rows", native_read)
+    legacy_read = AsyncMock(return_value=retained_rows)
+    monkeypatch.setattr(importer.db, "all", legacy_read)
+    factory = SimpleNamespace(transaction=AsyncMock(), storage_binding=object())
+    scope = policy.bind_generic_source_transaction_factory(factory) if is_isolated else nullcontext()
+    async with scope:
+        if is_isolated:
+            with pytest.raises(GenericCandidateError, match="isolated_transaction_required"):
+                importer._qt(importer._schema(), importer.ProviderDirectoryDatasetResource.__tablename__)
+        counts = await importer._v4_partition_candidate_proof_counts(_context(), "Organization", {"window-a": 1})
+    if is_isolated:
+        native_read.assert_awaited_once_with(importer, _context().dataset_id, "Organization")
+        legacy_read.assert_not_awaited()
+    else:
+        native_read.assert_not_awaited()
+        legacy_read.assert_awaited_once()
+        assert legacy_read.await_args.kwargs == dict(
+            dataset_id=_context().dataset_id,
+            resource_types=["Organization", "LU:Organization:pass:1", "LU:Organization:pass:2"],
+        )
+    assert counts == importer._v4_partition_proof_counts(stage.rows, _pass1_rows(proofs), proofs, {"window-a": 1})
+    assert counts.staged_candidate_count == counts.pass1_unique == counts.pass2_unique == 1
+    assert counts.invalid_candidate_count == counts.orphan_proof_count == 0
