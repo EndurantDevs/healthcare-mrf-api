@@ -31,7 +31,6 @@ from db.models.custom_import import (
 from process.custom_import import source_finalize_sql as finalizer
 from process.custom_import.bulk_page_codec import encode_landing_batch
 from process.custom_import.family import _is_valid_npi
-from tests.custom_import_postgres_support import transaction_session
 from tests.test_custom_import_build_output_postgres import _records, _request_for
 from tests.test_custom_import_build_source_postgres import (
     _candidate_models,
@@ -40,6 +39,7 @@ from tests.test_custom_import_build_source_postgres import (
     _root,
     _source_case,
 )
+from tests.test_custom_import_grouped_helper_cardinality_postgres import _connection
 
 
 def _synthetic_npi(index):
@@ -514,7 +514,7 @@ async def _dictionary_collision(session, parameter_by_name):
     ],
 )
 async def test_dictionary_reads_reject_missing_foreign_and_byte_different_records(case):
-    async with transaction_session() as session:
+    async with _connection() as session:
         await _dictionary_tables(session)
         parameter_by_name = dict(p_batch=UUID(int=17), b_dataset_id=11, key_contract=b"k" * 32)
         expected_key = '["caf\u00e9"]' if case == "unicode_mismatch" else '["synthetic-key"]'
@@ -569,7 +569,7 @@ async def test_dictionary_reads_reject_missing_foreign_and_byte_different_record
 
 
 async def test_full_dictionary_key_remains_unique():
-    async with transaction_session() as session:
+    async with _connection() as session:
         await _dictionary_tables(session)
         await session.execute(
             text("""
@@ -588,7 +588,7 @@ async def test_full_dictionary_key_remains_unique():
 
 @pytest.mark.parametrize("has_missing_reference", [False, True])
 async def test_corrupt_nonunique_dictionary_preserves_missing_and_reference_count_denials(has_missing_reference):
-    async with transaction_session() as session:
+    async with _connection() as session:
         await _dictionary_tables(session)
         await session.execute(text("DROP TABLE pg_temp.custom_import_root_record"))
         await session.execute(
