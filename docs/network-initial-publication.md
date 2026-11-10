@@ -73,5 +73,13 @@ valid after the head advances. A different initial publication cannot replace an
 existing head. Use retained-generation operations only when their ordinary
 preconditions hold; clearing serving configuration is not a rollback.
 
+A worker that exits with status 1 after a transient failure leaves the request
+running without a result; once its lease expires, an explicit later worker run
+resumes it. A refused request is marked rejected and is not resumed. The
+`worker_failed` line lists bounded `causes` for the exception chain (see the
+[worker guide](../doc/registry-publication-worker.md)); read the innermost
+entry's class, constant code, SQLSTATE and location before deciding whether to
+resume the request or fix the cause first.
+
 Directory inventory alone does not establish pricing availability or nationwide
 network coverage.
