@@ -452,8 +452,10 @@ def test_audit_sql_matches_current_verifier():
             .replace("__BASE__", "__BASE_LEAF__")
             .replace("__ORIGIN_QUERY__", "")
         )
-        assert resource["arms"][index]["sql"] == normalized
-        assert hashlib.sha256(normalized.encode()).hexdigest() == resource["arms"][index]["sha256"]
+        # Scalar references use a separately exercised equivalent join to avoid field expansion.
+        if index != 55:
+            assert resource["arms"][index]["sql"] == normalized
+        assert hashlib.sha256(resource["arms"][index]["sql"].encode()).hexdigest() == resource["arms"][index]["sha256"]
     assert resource["root_page_sql"] == ranges._ROOTS.replace("__CANDIDATE__", "__LEAF__")
     assert resource["counts_sql"].count(" AS NOT MATERIALIZED (") == 3
     assert resource["counts_sql"].replace(" AS NOT MATERIALIZED (", " AS (") == (
@@ -464,6 +466,54 @@ def test_audit_sql_matches_current_verifier():
         for spec in json.loads(staged._finality()._INDEX_SPECIFICATIONS)
     ]
     assert resource["indexes"] == expected_indexes
+
+
+async def test_child_scalar_reference_preserves_complete_failure_set():
+    from tests.test_custom_import_grouped_helper_cardinality_postgres import _connection
+    from tests.test_custom_import_source_homes_postgres import _SCALAR_INPUTS, _plan_nodes
+
+    ranges = _aggregate_migration()._ranges()
+    arms = ranges._arms()
+    original = arms._queries(arms._staged())[55].replace("__CANDIDATE__", "__LEAF__")
+    updated = audit._sql_resource()[0]["arms"][55]["sql"]
+    context = SimpleNamespace(quoted="pg_temp", family=SimpleNamespace(family_id=1), base_family=None)
+    branches = []
+    for query in (original, updated):
+        query = query.split("WITH violations(failure_code,row_identity) AS MATERIALIZED (", 1)[1]
+        query = query.removesuffix(") SELECT * FROM violations LIMIT 1;\n")
+        query = query.replace("__LEAF__.", "").replace("__CONTROL__.", "")
+        branches.append(query)
+    parameters_by_name = {"p_2": 2, "p_3": 3, "p_4": 4}
+    async with _connection() as connection, connection.begin():
+        expected_failures = {("child_scalar_reference", scalar_id) for scalar_id in (*range(2, 16), 17)}
+        scenarios = [(_SCALAR_INPUTS, parameters_by_name, expected_failures)]
+        scenarios.append(
+            (
+                _SCALAR_INPUTS.replace("'number'", "NULL::text"),
+                parameters_by_name,
+                expected_failures - {("child_scalar_reference", 12)},
+            )
+        )
+        for name in parameters_by_name:
+            scenarios.append(
+                (
+                    _SCALAR_INPUTS,
+                    parameters_by_name | {name: None},
+                    {("child_scalar_reference", scalar_id) for scalar_id in range(1, 18)},
+                )
+            )
+        for inputs, bindings, failures in scenarios:
+            for branch in branches:
+                query = audit._compiled(inputs + branch, context)
+                assert set((await connection.execute(query, bindings)).all()) == failures
+        query = audit._compiled(_SCALAR_INPUTS + branches[1], context)
+        await connection.execute(text("SET LOCAL enable_nestloop='off'"))
+        plan = await connection.scalar(text("EXPLAIN (ANALYZE, FORMAT JSON) " + str(query)), parameters_by_name)
+        if isinstance(plan, str):
+            plan = json.loads(plan)
+        nodes = _plan_nodes(plan[0]["Plan"])
+        assert sum(node.get("Join Type") in {"Anti", "Right Anti"} for node in nodes) == 2
+        assert all(node.get("Parent Relationship") != "SubPlan" or node["Actual Loops"] <= 1 for node in nodes)
 
 
 async def _ready(case, monkeypatch):

@@ -335,6 +335,14 @@ async def test_inline_counts_preserve_membership_multiplicity_and_scope():
     await verify()
 
 
+async def test_child_scalar_reference_preserves_complete_failure_set():
+    from tests.custom_import_post_seal_audit_postgres import (
+        test_child_scalar_reference_preserves_complete_failure_set as verify,
+    )
+
+    await verify()
+
+
 async def test_audit_stales_on_same_oid_heap_and_authority_changes(monkeypatch):
     from tests.custom_import_post_seal_audit_postgres import (
         test_audit_stales_on_same_oid_heap_and_authority_changes as verify,
