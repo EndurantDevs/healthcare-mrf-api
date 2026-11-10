@@ -21,7 +21,7 @@ from process.provider_directory_artifact_scratch_inputs import (
     typed_input_projection,
 )
 from process.provider_directory_cms_preparation import desired_fence_hash
-from process.provider_directory_dataset_rehydrate_pages import projected_pages
+from process.provider_directory_dataset_rehydrate_pages import READ_MAX_ROWS, projected_pages
 from process.provider_directory_output_snapshot_catalog import require_output
 from process.provider_directory_output_snapshot_stage import _record_batches
 from process.provider_directory_projection_stage import _copy_driver
@@ -546,7 +546,46 @@ async def _catalog(directory, name):
     )
 
 
-async def _copy(directory, session, model, name, statement, params_by_name, *, enrichment=None, kind=None):
+async def _resource_pages(directory, model, dataset, enrichment):
+    """Seek native resource keys before expanding one bounded typed page."""
+    columns = ",".join(directory._q(str(column.name)) for column in model.__table__.columns)
+    projection = directory._artifact_resource_batch_select_sql(model, directory._schema())
+    statement = f"WITH projected({columns}) AS ({projection}) SELECT * FROM projected"
+    params_by_name = dict(
+        source_id=dataset.source_id,
+        dataset_id=dataset.dataset_id,
+        evidence_run_id=dataset.evidence_run_id,
+        resource_type=directory.RESOURCE_TYPES_BY_MODEL[model],
+        after_resource_id=None,
+        scope_batch_size=READ_MAX_ROWS,
+    )
+    while True:
+        keys = await directory.db.all(
+            f"SELECT p.resource_id FROM ({statement}) p ORDER BY p.resource_id", **params_by_name
+        )
+        if not keys:
+            return
+        frontier = keys[-1]._mapping["resource_id"]
+        page, _expected, page_params, _kind, _counts = _loading_projection(
+            directory, model.__tablename__, statement, params_by_name, enrichment
+        )
+        async for rows in projected_pages(directory.db, page, page_params, model):
+            yield rows
+        # Advance by native keys even if the typed projection rejects the whole page.
+        params_by_name["after_resource_id"] = frontier
+
+
+async def _copy(
+    directory,
+    session,
+    model,
+    name,
+    statement,
+    params_by_name,
+    *,
+    admission,
+    kind=None,
+):
     """Bound both read transport and native COPY on the ordinary stage owner."""
     from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner
 
@@ -554,11 +593,13 @@ async def _copy(directory, session, model, name, statement, params_by_name, *, e
     columns = tuple(str(column.name) for column in model.__table__.columns)
     json_columns = directory._json_columns(model.__table__)
     total = 0
-    pages = (
-        _source_pages(directory, statement, params_by_name["source_ids"])
-        if model is directory.ProviderDirectorySource
-        else projected_pages(directory.db, statement, params_by_name, model)
-    )
+    enrichment = admission.prepared
+    if model is directory.ProviderDirectorySource:
+        pages = _source_pages(directory, statement, params_by_name["source_ids"])
+    elif admission.factory is not None:
+        pages = projected_pages(directory.db, statement, params_by_name, model)
+    else:
+        pages = _resource_pages(directory, model, admission.fence.datasets[0], enrichment)
     try:
         async for resource_rows in pages:
             if kind is not None:
@@ -624,7 +665,7 @@ async def _prepare_model(directory, admission, model, name, created_by_relation)
                 name,
                 statement,
                 params_by_name,
-                enrichment=admission.prepared,
+                admission=admission,
                 kind=kind,
             )
         await directory._build_artifact_scope_pk(model, schema, name, status_executor=directory.db.status)

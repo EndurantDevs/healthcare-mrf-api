@@ -2,17 +2,21 @@
 """Metadata-only reads use genuine published captures and native readonly callers."""
 
 import asyncio
+import importlib
 import json
 import os
 from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import asyncpg
 import pytest
+from sqlalchemy import text
 
 from api import provider_directory_retained_fhir_metadata as metadata
 from api.provider_directory_retained_fhir_metadata import verify_retained_fhir_metadata
+from process import provider_directory_source_checkpoint_control as control
 from process.network_fhir_retained_capture_contract import TABLES, RetainedFHIRCaptureError, capture_digest
 from process.network_fhir_source_epoch import _catalog_relations
 from tests.generic_fhir_capture_postgres_support import _capture, legacy_capture_db
@@ -366,3 +370,51 @@ async def test_unpinned_native_definer_escape_is_refused(legacy_capture_db):
         with pytest.raises(RetainedFHIRCaptureError):
             await verify_retained_fhir_metadata(reader, pin(capture))
         await _no_capture_locks(reader, capture)
+
+
+@pytest.mark.asyncio
+async def test_native_transient_file_failure_preserves_original_guard_query(legacy_capture_db, monkeypatch):
+    """A sibling transport error must not cancel the shared session's active query."""
+    directory = importlib.import_module("process.provider_directory_fhir")
+    engine = legacy_capture_db.session_factory("publisher").kw["bind"]
+    identity = SimpleNamespace(checkpoint_id="bulk-file-guard")
+    async with engine.connect() as original:
+        connection = await original.execution_options(isolation_level="AUTOCOMMIT")
+        pid = await connection.scalar(text("SELECT pg_backend_pid()"))
+        lock_arguments_by_name = {"id": identity.checkpoint_id}
+        assert await connection.scalar(
+            text("SELECT pg_try_advisory_lock(hashtextextended(:id,0))"), lock_arguments_by_name
+        )
+
+        async def owner():
+            await control.assert_bulk_checkpoint_guard_live(directory, connection, identity)
+
+        async def stream(output):
+            if output == 0:
+                async with asyncio.timeout(2):
+                    while (
+                        await legacy_capture_db.admin.fetchval(
+                            "SELECT wait_event FROM pg_stat_activity WHERE pid=$1", pid
+                        )
+                        != "PgSleep"
+                    ):
+                        await asyncio.sleep(0.001)
+                return "bulk_export_transport_clientpayloaderror"
+            await connection.scalar(text("SELECT pg_sleep(0.3)"))
+            await owner()
+            return None
+
+        record_error = AsyncMock()
+        monkeypatch.setattr(directory, "_record_bulk_export_checkpoint_error", record_error)
+        options = SimpleNamespace(output_concurrency=2, ownership_probe=owner, range_resume_enabled=True)
+        _, error = await directory._run_pending_bulk_output_tasks(identity, options, object(), [0, 1], stream)
+        assert error == "bulk_export_transport_clientpayloaderror"
+        record_error.assert_awaited_once_with(identity, error, terminal=False)
+        assert not connection.invalidated
+        assert await connection.scalar(text("SELECT pg_backend_pid()")) == pid
+        await owner()
+        assert await connection.scalar(
+            text("SELECT pg_advisory_unlock(hashtextextended(:id,0))"), lock_arguments_by_name
+        )
+        with pytest.raises(RuntimeError, match="bulk_export_checkpoint_worker_guard_lost"):
+            await owner()

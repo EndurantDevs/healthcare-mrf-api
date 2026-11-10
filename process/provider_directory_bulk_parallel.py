@@ -6,6 +6,101 @@ from contextlib import asynccontextmanager, nullcontext
 
 from process.provider_directory_fhir_response import AdaptiveRequestSlots
 
+_TRANSIENT_STREAM_ERRORS = frozenset(
+    "bulk_export_transport_" + name
+    for name in (
+        "clientpayloaderror",
+        "clientconnectionerror",
+        "clientconnectionreseterror",
+        "clientconnectorerror",
+        "clientoserror",
+        "serverconnectionerror",
+        "serverdisconnectederror",
+        "servertimeouterror",
+        "connectiontimeouterror",
+        "sockettimeouterror",
+        "timeouterror",
+        "connectionreseterror",
+        "connectionabortederror",
+    )
+)
+
+
+def is_transient_output_error(error):
+    """Keep only recognized transport failures local to one output."""
+    return error in _TRANSIENT_STREAM_ERRORS or error in {
+        "bulk_export_output_http_429",
+        "bulk_export_output_http_500",
+        "bulk_export_output_http_502",
+        "bulk_export_output_http_503",
+        "bulk_export_output_http_504",
+    }
+
+
+async def stream_output(directory, session, source_record, identity, manifest, output_pair, options, stream_state):
+    """Retry a broken stream from its committed boundary under the original guard."""
+    output, checkpoint = output_pair
+    attempts = directory._source_fetch_retry_attempts()
+    for attempt in range(attempts):
+        error = await directory._stream_one_checkpointed_bulk_output(
+            session, source_record, identity, manifest, output, checkpoint, options, stream_state
+        )
+        if not options.range_resume_enabled or error not in _TRANSIENT_STREAM_ERRORS or attempt + 1 >= attempts:
+            return error
+        validator = directory._stored_bulk_output_validator(checkpoint)
+        if validator is None:
+            return error
+        await options.ownership_probe()
+        await asyncio.sleep(directory._source_fetch_retry_delay_seconds(attempt))
+        await options.ownership_probe()
+        checkpoints, checkpoint_error = await directory._validated_bulk_output_checkpoints(
+            identity, manifest, options.ownership_probe
+        )
+        if checkpoint_error:
+            return checkpoint_error
+        resumed = directory._bulk_output_checkpoint_for_manifest_output(identity.checkpoint_id, output, checkpoints)
+        if directory._stored_bulk_output_validator(resumed) != validator:
+            return "bulk_export_output_validator_mismatch"
+        if resumed["committed_bytes"] < checkpoint["committed_bytes"]:
+            return "bulk_export_output_validator_checkpoint_corrupt"
+        checkpoint = resumed
+        directory._bulk_export_log(
+            "output_retry",
+            resource=identity.resource_type,
+            output_index=output.output_index,
+            attempt=attempt + 2,
+            committed_bytes=checkpoint["committed_bytes"],
+            error=error,
+        )
+
+
+async def run_outputs(directory, identity, options, stream_state, pending_outputs, stream_output):
+    """Let healthy files finish after a transient failure; retain fatal cancellation."""
+    active_by_task = {}
+    pending = iter(pending_outputs)
+    output_error = None
+    try:
+        directory._fill_active_bulk_tasks(active_by_task, pending, options.output_concurrency, stream_output)
+        while active_by_task:
+            completed, _ = await asyncio.wait(active_by_task, return_when=asyncio.FIRST_COMPLETED)
+            error = directory._completed_bulk_output_error(completed, active_by_task)
+            if error:
+                if not options.range_resume_enabled or not is_transient_output_error(error):
+                    output_error = error
+                    await directory._cancel_bulk_output_tasks(active_by_task)
+                    break
+                output_error = output_error or error
+            directory._fill_active_bulk_tasks(active_by_task, pending, options.output_concurrency, stream_output)
+        if output_error:
+            await options.ownership_probe()
+            await directory._record_bulk_export_checkpoint_error(
+                identity, output_error, terminal=directory._is_bulk_export_error_terminal(output_error)
+            )
+        return stream_state, output_error
+    finally:
+        if active_by_task:
+            await directory._cancel_bulk_output_tasks(active_by_task)
+
 
 def output_concurrency(directory, source_record):
     """Return only the existing validator-bound output concurrency setting."""

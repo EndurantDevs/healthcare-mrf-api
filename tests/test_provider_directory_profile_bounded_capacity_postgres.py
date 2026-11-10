@@ -186,7 +186,6 @@ async def test_bounded_target_windows_are_atomic_and_replay_exactly(monkeypatch,
     async with _delta_database(monkeypatch) as (database, schema):
         monkeypatch.setattr(fhir, "db", database)
         scenario = await _wide_delta(database, schema)
-        delta, admission = await _prepare(database, scenario)
         retained = await database.scalar(
             f"SELECT row_to_json(target)::text FROM {scenario.evidence_target_ref} "
             "AS target WHERE source_id = 'source-b';"
@@ -218,6 +217,8 @@ async def test_bounded_target_windows_are_atomic_and_replay_exactly(monkeypatch,
 
         monkeypatch.setattr(database, "status", status)
         try:
+            # Exclude fixture preflight reads and observer setup from publication WAL.
+            delta, admission = await _prepare(database, scenario)
             if failure:
                 await _assert_target_window_rollback(delta, admission, observer, scenario, original_rows)
                 return
