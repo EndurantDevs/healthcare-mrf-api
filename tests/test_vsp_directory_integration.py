@@ -3,6 +3,7 @@
 
 import importlib
 import json
+from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -10,6 +11,9 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from api.provider_directory_sources import provider_directory_source_catalog
+from process import provider_directory_generic_source_adapters as source_adapters
+from process import provider_directory_generic_source_policy as source_policy
+from process import provider_directory_generic_source_storage as source_storage
 from process import vsp_directory_capture as capture_api
 from process import vsp_directory_integration as adapter
 from process.ext import source_http_proxy as transport
@@ -38,7 +42,7 @@ def source_record():
         source_scope_hash="example-scope",
         source_ids=(SOURCE_ID,),
         owner_run_id="run-example",
-        retry_of_run_id=None,
+        retry_of_run_id="root-example",
         acquisition_root_run_id="root-example",
         endpoint_id="endpoint-example",
         dataset_id="dataset-example",
@@ -120,6 +124,90 @@ def test_vsp_catalog_is_runnable_only_on_explicit_selection():
         adapter.explicit_selection(["other", SOURCE_ID], None)
 
 
+def test_vsp_checkpoint_keeps_the_acquisition_root_on_retry():
+    record = adapter.source_row(datetime(2026, 1, 1))
+    fresh = directory._resource_group_pagination_checkpoint_context(
+        [record],
+        run_id="run-example",
+        retry_of_run_id=None,
+        pagination_root_run_id=None,
+        is_checkpointing_enabled=True,
+    )
+    resumed = directory._resource_group_pagination_checkpoint_context(
+        [record],
+        run_id="retry-example",
+        retry_of_run_id="run-example",
+        pagination_root_run_id="run-example",
+        is_checkpointing_enabled=True,
+    )
+    assert fresh is not None and resumed is not None
+    assert fresh.canonical_api_base == resumed.canonical_api_base == ENDPOINT_SCOPE
+    assert fresh.source_ids == resumed.source_ids == (SOURCE_ID,)
+    assert fresh.source_scope_hash == resumed.source_scope_hash
+    assert fresh.acquisition_root_run_id == resumed.acquisition_root_run_id == "run-example"
+    assert resumed.owner_run_id == "retry-example"
+
+
+@pytest.mark.asyncio
+async def test_failed_vsp_retry_reopens_the_exact_parent_without_reset(monkeypatch, source_record):
+    context = source_record["_pagination_checkpoint_context"]
+    header_by_field = {
+        "endpoint_id": context.endpoint_id,
+        "dataset_id": context.dataset_id,
+        "acquisition_root_run_id": context.acquisition_root_run_id,
+        "import_run_id": context.retry_of_run_id,
+        "resource_count": 0,
+        "is_current": False,
+        "status": directory.ENDPOINT_DATASET_FAILED,
+    }
+    monkeypatch.setattr(directory, "_checkpoint_candidate_dataset_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(directory, "_previous_endpoint_dataset_id", AsyncMock(return_value=None))
+    profile = directory.EndpointDatasetVerificationProfile(is_twin_root_required=False)
+    selection = await directory._select_resumable_endpoint_dataset_candidate(
+        header_by_field,
+        context.dataset_id,
+        context.endpoint_id,
+        RESOURCE_TYPES,
+        context.acquisition_root_run_id,
+        context.retry_of_run_id,
+        context,
+        profile,
+    )
+    candidate = directory._build_endpoint_dataset_candidate(
+        [source_record],
+        context.endpoint_id,
+        RESOURCE_TYPES,
+        RESOURCE_TYPES,
+        selection,
+        context.owner_run_id,
+        context,
+        profile,
+    )
+    assert candidate.checkpoint_context.require_retained_vsp_capture
+    header_by_field["publication_metadata_json"] = directory._endpoint_dataset_candidate_metadata(candidate)
+    connection = SimpleNamespace(first=AsyncMock(return_value=header_by_field))
+    monkeypatch.setattr(source_policy, "source_transaction", lambda _db: nullcontext())
+    monkeypatch.setattr(source_adapters, "require_source_transaction", Mock())
+    monkeypatch.setattr(source_adapters, "require_generic_source_layout", AsyncMock())
+    monkeypatch.setattr(directory.db, "acquire", lambda: nullcontext(connection))
+    monkeypatch.setattr(directory, "_assert_no_conflicting_endpoint_candidate", AsyncMock(return_value=candidate))
+    prepare, verify, upsert, reset = AsyncMock(), AsyncMock(), AsyncMock(), AsyncMock()
+    monkeypatch.setattr(source_storage, "prepare_generic_source_candidate", prepare)
+    monkeypatch.setattr(source_storage, "verify_empty_vsp_capture_retry", verify)
+    monkeypatch.setattr(directory, "_upsert_endpoint_dataset_candidate", upsert)
+    monkeypatch.setattr(directory, "_reset_new_endpoint_candidate", reset)
+
+    await directory._ensure_endpoint_dataset_candidate(candidate)
+    verify.assert_awaited_once()
+    upsert.assert_awaited_once()
+    prepare.assert_not_awaited()
+    reset.assert_not_awaited()
+    header_by_field["import_run_id"] = "other-run"
+    with pytest.raises(RuntimeError, match="^provider_directory_endpoint_dataset_candidate_stale$"):
+        await directory._ensure_endpoint_dataset_candidate(candidate)
+    upsert.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("field", "value", "error"),
@@ -182,8 +270,16 @@ async def test_probe_reuses_capture_root_without_claiming_completeness(monkeypat
     fetch.assert_not_awaited()
 
 
-def _mock_candidate_storage(monkeypatch, record):
-    context = record["_pagination_checkpoint_context"]
+def _mock_candidate_storage(monkeypatch, source_record):
+    context = source_record["_pagination_checkpoint_context"]
+
+    @asynccontextmanager
+    async def checkpoint_guard(checkpoint):
+        assert checkpoint is not None and checkpoint.source_ids == (SOURCE_ID,)
+        assert checkpoint.acquisition_root_run_id == context.acquisition_root_run_id
+        yield
+
+    monkeypatch.setattr(directory, "_pagination_checkpoint_worker_guard", checkpoint_guard)
     candidate = directory.EndpointDatasetCandidate(
         endpoint_id=context.endpoint_id,
         dataset_id=context.dataset_id,
@@ -198,8 +294,8 @@ def _mock_candidate_storage(monkeypatch, record):
     finalize = AsyncMock(return_value={"status": directory.ENDPOINT_DATASET_VALIDATED})
     fail = AsyncMock()
     write = AsyncMock(side_effect=lambda model, rows, **scope: len(rows))
-    for name, value in {
-        "_prepare_resource_import_source_group": AsyncMock(return_value=([record], candidate)),
+    for attribute, replacement in {
+        "_prepare_resource_import_source_group": AsyncMock(return_value=([source_record], candidate)),
         "_upsert_deferred_resource_rows": write,
         "_finalize_endpoint_dataset_candidate": finalize,
         "_clear_finalized_dataset_checkpoints": AsyncMock(),
@@ -207,18 +303,21 @@ def _mock_candidate_storage(monkeypatch, record):
         "_mark_endpoint_dataset_candidate": fail,
         "_fetch_resource_rows": AsyncMock(side_effect=AssertionError("unexpected REST request")),
     }.items():
-        monkeypatch.setattr(directory, name, value)
+        monkeypatch.setattr(directory, attribute, replacement)
     return write, finalize, fail
 
 
 async def _stage(record, **overrides):
+    context = record["_pagination_checkpoint_context"]
     params_by_name = dict(
         resources=list(RESOURCE_TYPES),
         per_resource_limit=0,
         page_limit=0,
         page_count=10,
         timeout=3,
-        run_id="run-example",
+        run_id=context.owner_run_id,
+        retry_of_run_id=context.retry_of_run_id,
+        pagination_root_run_id=context.acquisition_root_run_id,
         stream_batch_size=10,
         is_pagination_checkpointing_enabled=True,
         defer_typed_materialization=True,

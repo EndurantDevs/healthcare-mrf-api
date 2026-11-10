@@ -7,6 +7,55 @@ from db.plan_release_storage import storage_relation
 from process import provider_directory_generic_source_storage as storage
 from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
 from process.provider_directory_source_storage_binding import require_storage_schema
+from process.vsp_directory_integration import is_failed_capture_retry
+
+
+def is_retained_vsp_capture_retry(candidate):
+    """Identify a candidate admitted for a retained capture rather than a reset."""
+    context = candidate.checkpoint_context
+    return bool(candidate.repair_empty_orphan and context and context.require_retained_vsp_capture)
+
+
+async def orphan_candidate_status(directory, existing_by_field, candidate):
+    """Revalidate the failed parent and prove its detached inputs empty under the header lock."""
+    if not is_retained_vsp_capture_retry(candidate):
+        return directory.ENDPOINT_DATASET_ACQUIRING
+    if not is_failed_capture_retry(existing_by_field, candidate.checkpoint_context):
+        raise RuntimeError("provider_directory_endpoint_dataset_candidate_stale")
+    await storage.verify_empty_vsp_capture_retry(directory, candidate, existing_by_field)
+    return directory.ENDPOINT_DATASET_FAILED
+
+
+def assert_empty_orphan_candidate_identity(directory, existing_by_field, candidate, expected_status):
+    """Require an empty orphan row to retain its exact acquisition identity."""
+    expected_metadata_by_field = directory._empty_orphan_expected_metadata(candidate)
+    existing_metadata = existing_by_field.get("publication_metadata_json")
+    has_exact_metadata = isinstance(existing_metadata, dict) and all(
+        existing_metadata.get(key) == expected_field_value
+        for key, expected_field_value in expected_metadata_by_field.items()
+    )
+    if (
+        candidate.reviewed_root_policy is not None
+        and not candidate.reviewed_root_policy.is_twin_root_required
+        and isinstance(existing_metadata, dict)
+        and any(
+            field_name in existing_metadata
+            for field_name in (
+                directory.TWIN_ROOT_VERIFICATION_ROLE_KEY,
+                directory.TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY,
+                directory.TWIN_ROOT_VERIFICATION_METADATA_KEY,
+            )
+        )
+    ):
+        has_exact_metadata = False
+    if (
+        not existing_by_field
+        or directory._clean_text(existing_by_field.get("endpoint_id")) != candidate.endpoint_id
+        or directory._clean_text(existing_by_field.get("status")) != expected_status
+        or not has_exact_metadata
+        or directory._dataset_resource_hash_contract(existing_by_field) != candidate.resource_hash_contract
+    ):
+        raise RuntimeError("provider_directory_endpoint_dataset_orphan_identity_mismatch")
 
 
 async def mark_source_candidate(directory, candidate, status, metadata):

@@ -112,6 +112,7 @@ class PaginationCheckpointContext:
     lineage_verified: bool = False
     restart_expired_current_census_slice: bool = True
     allow_retained_pagination_reset: bool = True
+    require_retained_vsp_capture: bool = False
 
     def __post_init__(self) -> None:
         if type(self.allow_retained_pagination_reset) is not bool:
