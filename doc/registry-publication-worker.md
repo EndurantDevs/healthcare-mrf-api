@@ -137,6 +137,20 @@ Output is only `{"state":"no_work"}` or a canonical `request_id` and
 exception messages are omitted. Exit status 2 reports constant invalid-input
 errors, status 1 reports a constant worker failure, and status 130 reports
 cancellation. Unsupported arguments are also redacted; `--help` is available.
+
+A worker failure line also carries `causes`, which describes at most five links
+of the exception chain, including suppressed contexts. Each entry names the
+exception class, adds the SQLSTATE of database errors, and gives the file name
+and line of the innermost frame. It adds `code` only when the exception has a
+single string argument made of lowercase letters, digits and underscores with
+at least one underscore; that argument is emitted verbatim, so worker code must
+raise only constant codes in this form and never put sensitive values in it.
+Any other message text, lookup-error keys and values without an underscore are
+omitted:
+
+```json
+{"state":"error","code":"worker_failed","causes":[{"class":"RuntimeError","code":"registry_publication_consumer_unavailable","where":"registry_publication_consumer.py:577"},{"class":"QueryCanceledError","sqlstate":"57014","where":"connection.py:2049"}]}
+```
 Source qualification, trusted role bootstrap, deployed command registration and
 runtime acceptance remain separate from this command's local checks.
 
