@@ -277,9 +277,10 @@ def _saved_binding(store, proxy_binding):
     return prior, binding_by_field
 
 
-def _bound_http(store, session, proxy_binding, cancel_check):
+def _bound_http(store, session, proxy_binding, cancel_check, *, require_retained=False):
     """Restore counted attempts and proxy cooldowns before another origin request."""
     prior, binding_by_field = _saved_binding(store, proxy_binding)
+    require(not require_retained or prior is not None, "vsp_retained_capture_required")
 
     async def pause_and_account(boundary, cooldowns):
         """Persist each counted attempt and cooldown before sending."""
@@ -296,13 +297,15 @@ def _bound_http(store, session, proxy_binding, cancel_check):
     return http
 
 
-async def _with_capture(source_record, root_run_id, proxy_binding, progress_callback, cancel_check, *, probe):
+async def _with_capture(
+    source_record, root_run_id, proxy_binding, progress_callback, cancel_check, *, probe, require_retained=False
+):
     """Hold one source lock across acquisition and its closing verification."""
     require(
         source_record.get("source_id") == SOURCE_ID and source_record.get("canonical_api_base") == ENDPOINT_SCOPE,
         "vsp_source_identity_invalid",
     )
-    store = VSPCaptureStore(configured_root(), root_run_id)
+    store = VSPCaptureStore(configured_root(), root_run_id, require_retained=require_retained)
     store.acquire()
     try:
         complete = store.load_checkpoint("complete")
@@ -319,7 +322,7 @@ async def _with_capture(source_record, root_run_id, proxy_binding, progress_call
         async with aiohttp.ClientSession(
             auto_decompress=False, trust_env=False, cookie_jar=aiohttp.DummyCookieJar()
         ) as session:
-            http = _bound_http(store, session, proxy_binding, cancel_check)
+            http = _bound_http(store, session, proxy_binding, cancel_check, require_retained=require_retained)
             pause = store.pause_state()
             if pause is not None:
                 boundary = datetime.fromisoformat(pause["not_before"])
@@ -342,9 +345,19 @@ async def _with_capture(source_record, root_run_id, proxy_binding, progress_call
         store.release()
 
 
-async def capture_vsp_directory(*, source_record, root_run_id, proxy_binding, progress_callback, cancel_check):
+async def capture_vsp_directory(
+    *, source_record, root_run_id, proxy_binding, progress_callback, cancel_check, require_retained=False
+):
     """Acquire all three network scopes using the source worker's configured transport."""
-    return await _with_capture(source_record, root_run_id, proxy_binding, progress_callback, cancel_check, probe=False)
+    return await _with_capture(
+        source_record,
+        root_run_id,
+        proxy_binding,
+        progress_callback,
+        cancel_check,
+        probe=False,
+        require_retained=require_retained,
+    )
 
 
 async def probe_vsp_directory(*, source_record, root_run_id, proxy_binding):

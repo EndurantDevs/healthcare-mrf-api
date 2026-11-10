@@ -3,6 +3,7 @@
 
 import hashlib
 import re
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict
 from types import SimpleNamespace
@@ -10,10 +11,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from process import provider_directory_generic_source_policy as policy_module
 from process import provider_directory_generic_source_storage as storage
 from process import provider_directory_source_storage_binding as binding
 from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
+from process.vsp_directory_contract import RESOURCE_TYPES, SOURCE_ID
 from tests.test_provider_directory_generic_source_storage import _case
 
 ROOT = "run_" + "a" * 32
@@ -102,6 +105,13 @@ def _completed_input_evidence():
     return run_rows, checkpoint_rows, input_rows
 
 
+def _update_test_transition_header(header, args):
+    if storage._json(args[2]) != header["candidate_storage_json"] or args[4] != header["status"]:
+        return "UPDATE 0"
+    header.update(candidate_storage_json=storage._json(args[1]), status=args[3])
+    return "UPDATE 1"
+
+
 @pytest.fixture
 def case(monkeypatch):
     """Expose a transaction-shaped fake and native proof seams."""
@@ -131,10 +141,7 @@ def case(monkeypatch):
 
     async def execute(sql, *args):
         writes.append((sql, args))
-        if storage._json(args[2]) != header["candidate_storage_json"]:
-            return "UPDATE 0"
-        header["candidate_storage_json"] = storage._json(args[1])
-        return "UPDATE 1"
+        return _update_test_transition_header(header, args)
 
     connection = SimpleNamespace(
         is_in_transaction=lambda: True,
@@ -233,6 +240,49 @@ async def test_exact_detached_candidate_changes_only_its_storage_binding(case):
     assert len(case.writes) == 1
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("retained", "error"),
+    [
+        (None, None),
+        ("input", "transition_input_changed"),
+        ("witness_or_proof", "transition_witness_changed"),
+        ("producer", "storage_binding_changed"),
+    ],
+)
+async def test_vsp_capture_retry_proves_empty_storage_under_the_current_producer(case, monkeypatch, retained, error):
+    binding_document = case.header["candidate_storage_json"]
+    metadata = binding_document["identity"]["metadata"]
+    metadata.update(
+        source_ids=[SOURCE_ID], selected_resources=list(RESOURCE_TYPES), expected_resources=list(RESOURCE_TYPES)
+    )
+    case.header["publication_metadata_json"] = deepcopy(metadata)
+    case.header["status"] = "failed"
+    binding_document.update(ordinal=0, resets={"*": 0})
+    case.checkpoints.clear()
+    if retained != "input":
+        case.input_rows.clear()
+    if retained == "witness_or_proof":
+        case.connection.fetchval.return_value = False
+        case.connection.fetchval.side_effect = None
+    publisher = SimpleNamespace(connection=case.connection, policy=case.policy)
+    monkeypatch.setattr(storage, "source_owner_transaction", lambda _database: nullcontext(publisher))
+    monkeypatch.setattr(storage, "_require_candidate_storage", lambda *_args: True)
+    monkeypatch.setattr(policy_module, "bound_publisher", lambda: publisher)
+    monkeypatch.setattr(
+        storage, "storage_document", lambda _publisher: case.new if retained == "producer" else case.old
+    )
+    directory = SimpleNamespace(db=object(), _endpoint_dataset_candidate_metadata=lambda _candidate: metadata)
+    candidate = SimpleNamespace(dataset_id=DATASET, endpoint_id=ENDPOINT, acquisition_root_run_id=ROOT)
+    if error:
+        with pytest.raises(GenericCandidateError, match=f"^provider_directory_generic_source_{error}$"):
+            await storage.verify_empty_vsp_capture_retry(directory, candidate, case.header)
+    else:
+        await storage.verify_empty_vsp_capture_retry(directory, candidate, case.header)
+        case.tables.assert_awaited_once()
+    assert not case.writes
+
+
 def _retain_original_root(case, status):
     """An original run has no retry parent or explicit reference to itself."""
     case.runs[:] = [case.runs[-1]]
@@ -240,6 +290,50 @@ def _retain_original_root(case, status):
     case.header["import_run_id"] = ROOT
     for checkpoint in (*case.checkpoints, *case.bulk_checkpoints):
         checkpoint["owner_run_id"] = ROOT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("retained", "error"),
+    [
+        (None, None),
+        ("checkpoint", "transition_checkpoint_changed"),
+        ("input", "transition_input_changed"),
+        ("different-failure", "transition_candidate_changed"),
+    ],
+)
+async def test_vsp_pre_capture_failure_transitions_only_an_empty_original_candidate(case, retained, error):
+    _retain_original_root(case, "failed")
+    case.runs[0]["source_ids"] = [SOURCE_ID]
+    candidate = case.header["candidate_storage_json"]
+    candidate.update(ordinal=0, resets={"*": 0})
+    metadata = candidate["identity"]["metadata"]
+    metadata.update(
+        source_ids=[SOURCE_ID], selected_resources=list(RESOURCE_TYPES), expected_resources=list(RESOURCE_TYPES)
+    )
+    case.header.update(
+        status="failed",
+        resource_count=0,
+        publication_metadata_json={**metadata, "error": "vsp_prepared_candidate_required"},
+    )
+    if retained != "checkpoint":
+        case.checkpoints.clear()
+    if retained != "input":
+        case.input_rows.clear()
+    if retained == "different-failure":
+        case.header["publication_metadata_json"]["error"] = "unrelated failure"
+    expected_counts = dict.fromkeys(RESOURCE_TYPES, 0)
+    if error:
+        with pytest.raises(GenericCandidateError, match=f"^provider_directory_generic_source_{error}$"):
+            await _transition(case, expected_counts, stopped_run_id=ROOT)
+        assert not case.writes
+        return
+    receipt = await _transition(case, expected_counts, stopped_run_id=ROOT)
+    assert receipt["rows"] == 0 and receipt["lineage_run_ids"] == [ROOT]
+    assert case.header["status"] == "acquiring"
+    assert case.header["candidate_storage_json"] == {**candidate, "storage": case.new}
+    assert (await _transition(case, expected_counts, stopped_run_id=ROOT))["already_applied"] is True
+    assert len(case.writes) == 1
 
 
 @pytest.mark.asyncio

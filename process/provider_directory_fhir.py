@@ -2144,6 +2144,7 @@ class EndpointDatasetCandidateSelection:
     resource_hash_contract: str = DEFAULT_RESOURCE_HASH_CONTRACT
     semantic_projection_as_of: str | None = None
     proof_resource_scope: tuple[str, ...] | None = None
+    require_retained_vsp_capture: bool = False
 
 
 @dataclass(frozen=True)
@@ -58448,7 +58449,7 @@ def _pagination_checkpoint_scope_identity(
         or census_contract is not None
         or is_opaque_cursor_census
     )
-    if not source_ids or not supports_checkpoint or not canonical_api_base:
+    if not (source_ids and (vsp_directory.is_source(source_record) or supports_checkpoint) and canonical_api_base):
         return None
     strategy_version = (
         census_contract.strategy_version
@@ -58895,7 +58896,9 @@ async def _assert_locked_endpoint_candidate(
         f"""
         SELECT dataset_id, endpoint_id, acquisition_root_run_id, status,
                is_current, publication_metadata_json,
-               completion_proof_required_version
+               completion_proof_required_version, import_run_id, resource_count,
+               published_at, validated_at, dataset_hash, completion_proof_json,
+               completion_proof_sha256, candidate_storage_json
           FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
          WHERE dataset_id = :dataset_id
          FOR UPDATE;
@@ -58926,46 +58929,25 @@ async def _assert_locked_endpoint_candidate(
     ):
         raise RuntimeError("provider_directory_endpoint_dataset_candidate_stale")
     if candidate.repair_empty_orphan:
+        from process.provider_directory_source_failure_control import orphan_candidate_status
+
         _assert_empty_orphan_candidate_identity(
             existing_candidate_map,
             candidate,
+            expected_status=await orphan_candidate_status(sys.modules[__name__], existing_candidate_map, candidate),
         )
 
 
 def _assert_empty_orphan_candidate_identity(
     existing_candidate_map: dict[str, Any],
     candidate: EndpointDatasetCandidate,
+    *,
+    expected_status: str = ENDPOINT_DATASET_ACQUIRING,
 ) -> None:
     """Require an empty orphan row to retain its exact acquisition identity."""
+    from process.provider_directory_source_failure_control import assert_empty_orphan_candidate_identity
 
-    expected_metadata_by_field = _empty_orphan_expected_metadata(candidate)
-    existing_metadata = existing_candidate_map.get("publication_metadata_json")
-    has_exact_metadata = isinstance(existing_metadata, dict) and all(
-        existing_metadata.get(key) == expected_field_value
-        for key, expected_field_value in expected_metadata_by_field.items()
-    )
-    if (
-        candidate.reviewed_root_policy is not None
-        and not candidate.reviewed_root_policy.is_twin_root_required
-        and isinstance(existing_metadata, dict)
-        and any(
-            field_name in existing_metadata
-            for field_name in (
-                TWIN_ROOT_VERIFICATION_ROLE_KEY,
-                TWIN_ROOT_VERIFICATION_BASELINE_DATASET_KEY,
-                TWIN_ROOT_VERIFICATION_METADATA_KEY,
-            )
-        )
-    ):
-        has_exact_metadata = False
-    if (
-        not existing_candidate_map
-        or _clean_text(existing_candidate_map.get("endpoint_id")) != candidate.endpoint_id
-        or _clean_text(existing_candidate_map.get("status")) != ENDPOINT_DATASET_ACQUIRING
-        or not has_exact_metadata
-        or _dataset_resource_hash_contract(existing_candidate_map) != candidate.resource_hash_contract
-    ):
-        raise RuntimeError("provider_directory_endpoint_dataset_orphan_identity_mismatch")
+    assert_empty_orphan_candidate_identity(sys.modules[__name__], existing_candidate_map, candidate, expected_status)
 
 
 def _empty_orphan_expected_metadata(
@@ -60400,6 +60382,7 @@ async def _ensure_endpoint_dataset_candidate(
     async with source_transaction(db):
         from process.provider_directory_generic_source_adapters import require_source_transaction
         from process.provider_directory_generic_source_storage import prepare_generic_source_candidate
+        from process.provider_directory_source_failure_control import is_retained_vsp_capture_retry
 
         require_source_transaction()
         from process.provider_directory_generic_source_adapters import require_generic_source_layout
@@ -60412,7 +60395,7 @@ async def _ensure_endpoint_dataset_candidate(
             candidate = await _assert_no_conflicting_endpoint_candidate(connection, candidate)
             metadata = _endpoint_dataset_candidate_metadata(candidate)
             await _upsert_endpoint_dataset_candidate(connection, candidate, metadata)
-            if not _is_finalized_endpoint_dataset_candidate(candidate):
+            if not _is_finalized_endpoint_dataset_candidate(candidate) and not is_retained_vsp_capture_retry(candidate):
                 await prepare_generic_source_candidate(db, sys.modules[__name__], candidate)
                 await _reset_new_endpoint_candidate(connection, candidate, partition_initializations)
         return candidate
@@ -60597,7 +60580,9 @@ def _should_repair_empty_endpoint_dataset_orphan(
     if existing_dataset_map.get("is_current") is True or existing_status in IMMUTABLE_ENDPOINT_DATASET_STATUSES:
         raise RuntimeError("provider_directory_endpoint_dataset_root_already_finalized")
     if existing_dataset_map and checkpoint_dataset_id is None:
-        if existing_status != ENDPOINT_DATASET_ACQUIRING:
+        if existing_status != ENDPOINT_DATASET_ACQUIRING and not vsp_directory.is_failed_capture_retry(
+            existing_dataset_map, checkpoint_context
+        ):
             raise RuntimeError("provider_directory_endpoint_dataset_uncheckpointed_candidate_exists")
         return True
     if retry_of_run_id and checkpoint_context is not None and not existing_dataset_map:
@@ -61026,6 +61011,8 @@ async def _select_resumable_endpoint_dataset_candidate(
         previous_dataset_id=previous_dataset_id,
         reused_from_checkpoint=checkpoint_dataset_id is not None,
         repair_empty_orphan=should_repair_empty_orphan,
+        require_retained_vsp_capture=should_repair_empty_orphan
+        and vsp_directory.is_failed_capture_retry(existing_dataset_map, checkpoint_context),
         resource_hash_contract=_dataset_resource_hash_contract(existing_dataset_map),
         **verification_fields_by_name,
     )
@@ -61307,6 +61294,7 @@ def _candidate_bound_checkpoint_context(
         endpoint_id=endpoint_id,
         dataset_id=selection.dataset_id,
         lineage_verified=True,
+        require_retained_vsp_capture=selection.require_retained_vsp_capture,
     )
 
 

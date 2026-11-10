@@ -101,6 +101,32 @@ def endpoint_contract():
     }
 
 
+def is_failed_capture_retry(existing_by_field, checkpoint):
+    """Identify a failed VSP parent; the locked storage proof decides whether it can reopen."""
+    return bool(
+        checkpoint is not None
+        and checkpoint.source_ids == (SOURCE_ID,)
+        and checkpoint.canonical_api_base == ENDPOINT_SCOPE
+        and checkpoint.retry_of_run_id
+        and checkpoint.owner_run_id not in (checkpoint.retry_of_run_id, checkpoint.acquisition_root_run_id)
+        and existing_by_field.get("acquisition_root_run_id") == checkpoint.acquisition_root_run_id
+        and existing_by_field.get("import_run_id") == checkpoint.retry_of_run_id
+        and existing_by_field.get("status") == "failed"
+        and existing_by_field.get("is_current") is False
+        and existing_by_field.get("resource_count") == 0
+        and all(
+            existing_by_field.get(field) is None
+            for field in (
+                "published_at",
+                "validated_at",
+                "dataset_hash",
+                "completion_proof_json",
+                "completion_proof_sha256",
+            )
+        )
+    )
+
+
 def _proxy(directory, record):
     """Use direct transport only when this run's frozen source policy allows it."""
     require(is_source(record), "vsp_source_identity_changed")
@@ -251,6 +277,7 @@ async def import_group(directory, source_record, *, run_id, persist, progress_ca
         proxy_binding=_proxy(directory, source_record),
         progress_callback=progress_callback,
         cancel_check=cancel_check,
+        require_retained=context.require_retained_vsp_capture,
     )
     counts = await _persist_capture(directory, capture, source_record, run_id, persist, cancel_check)
     await cancel_check()

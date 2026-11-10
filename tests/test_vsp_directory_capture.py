@@ -275,12 +275,43 @@ async def test_probe_and_capture_share_retained_response_and_respect_origin_paus
     assert store.load_checkpoint("complete") is None
     await store.pause((datetime.now(UTC) + timedelta(minutes=20)).isoformat(), None)
     wait.reset_mock()
-    completed = await acquisition.capture_vsp_directory(**arguments_by_name, progress_callback=noop, cancel_check=noop)
+    retry_arguments_by_name = {
+        **arguments_by_name,
+        "progress_callback": noop,
+        "cancel_check": noop,
+        "require_retained": True,
+    }
+    completed = await acquisition.capture_vsp_directory(**retry_arguments_by_name)
     assert 1190 < wait.await_args_list[0].args[0] <= 1200
     assert len(sessions) == 2
     assert len(list(completed.iter_resources())) == 10
     assert completed.proof["http_attempts"] == offline_http.requests == 10
     assert offline_http.source.observations == dict.fromkeys(NETWORKS.values(), 2)
+    reopened = await acquisition.capture_vsp_directory(**retry_arguments_by_name)
+    assert reopened.proof == completed.proof
+    assert len(sessions) == 2 and offline_http.requests == 10
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_identity", [False, True])
+async def test_retained_capture_requires_identity_and_binding_before_requests(monkeypatch, tmp_path, has_identity):
+    monkeypatch.setattr(acquisition, "configured_root", lambda: tmp_path)
+    exchange = AsyncMock(side_effect=AssertionError("must not request missing retained capture"))
+    monkeypatch.setattr(acquisition.VSPHTTP, "_exchange", exchange)
+    root = "synthetic-retry"
+    if has_identity:
+        VSPCaptureStore(tmp_path, root)
+    with pytest.raises(VSPDirectoryError, match="^vsp_retained_capture_required$"):
+        await acquisition.capture_vsp_directory(
+            source_record={"source_id": SOURCE_ID, "canonical_api_base": ENDPOINT_SCOPE},
+            root_run_id=root,
+            proxy_binding=None,
+            progress_callback=noop,
+            cancel_check=noop,
+            require_retained=True,
+        )
+    exchange.assert_not_awaited()
+    assert len(list(tmp_path.glob("*/identity.json"))) == int(has_identity)
 
 
 @pytest.mark.asyncio

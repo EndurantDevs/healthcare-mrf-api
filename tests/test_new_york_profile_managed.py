@@ -454,21 +454,24 @@ async def test_cancel_between_sources_preserves_captured_files(managed_case, mon
 
 async def test_deadline_interrupts_waiting_source(managed_case, monkeypatch):
     state = managed_case(_cases())
-    original = worker._parameters
+    scopes = []
 
-    def parameters(task):
-        root, api_key, budget = original(task)
-        budget["deadline"] = worker.time.monotonic() + 0.15
-        return root, api_key, budget
+    def capture_timeout(when):
+        scopes.append(asyncio.timeout_at(when))
+        return scopes[-1]
 
     async def blocked(*args, **kwargs):
+        assert state.claimed and len(scopes) == 1
+        # Expire the real timeout after source acquisition starts, independent of setup speed.
+        scopes[0].reschedule(asyncio.get_running_loop().time())
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(worker, "_parameters", parameters)
+    monkeypatch.setattr(worker, "asyncio", SimpleNamespace(timeout_at=capture_timeout))
     monkeypatch.setattr(worker.acquisition, "acquire_license", blocked)
     with pytest.raises(TimeoutError):
         await worker.import_profiles({}, TASK)
-    assert state.failed and not state.published
+    assert state.failed == [(state.run["run_id"], "TimeoutError")]
+    assert not state.published and not state.writes
 
 
 @pytest.mark.parametrize("failure", ["transport", "support_transport", "database", "bundle_write"])

@@ -63,11 +63,11 @@ def configured_root():
 class VSPCaptureStore:
     """A source-wide acquisition lock, immutable responses and small atomic checkpoints."""
 
-    def __init__(self, root, root_run_id):
+    def __init__(self, root, root_run_id, *, require_retained=False):
         require(type(root_run_id) is str and 0 < len(root_run_id) <= 256, "vsp_capture_identity_invalid")
         self.root = _directory(Path(root))
         self.capture_id = hashlib.sha256(canonical_json([SOURCE_ID, ADAPTER_ID, root_run_id]).encode()).hexdigest()
-        self.path = _directory(self.root / self.capture_id)
+        self.path = self.root / self.capture_id
         self._lock = PTG2ArtifactStore(self.root).named_lock("vsp-directory", "source-acquisition")
         identity_by_field = {
             "adapter_id": ADAPTER_ID,
@@ -75,7 +75,12 @@ class VSPCaptureStore:
             "root_run_id": root_run_id,
             "capture_id": self.capture_id,
         }
-        _atomic(self.path / "identity.json", canonical_json(identity_by_field).encode(), immutable=True)
+        identity = self.path / "identity.json"
+        expected = canonical_json(identity_by_field).encode()
+        if require_retained:
+            require(identity.is_file() and identity.read_bytes() == expected, "vsp_retained_capture_required")
+        else:
+            _atomic(identity, expected, immutable=True)
 
     def acquire(self):
         """Refuse duplicate source workers instead of multiplying origin request load."""
