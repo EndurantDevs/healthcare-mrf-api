@@ -32,6 +32,12 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
 
 from api import provider_directory_cms_registry_stop as cms_registry_stop
+from api.cigna_collection_worker import (
+    _locked_ptg_source_replay,
+    recheck_collection_attempt,
+    recheck_collection_replay,
+    require_collection_request_match,
+)
 from api.control_plan_pricing_em_attribution import (
     ADAPTER as EM_ATTRIBUTION_ADAPTER,
 )
@@ -111,6 +117,8 @@ from process.ptg_allowed_amount_blank import (
     allowed_amount_blank_metrics,
 )
 from process.ptg_frozen_control import normalize_protected_rate_params
+from process.ptg_parts.cigna_toc_collection import COLLECTION_PROOF_PARAM
+from process.ptg_parts.cigna_toc_dispatch import restore_collection_retry_proof, validated_collection_dispatch
 from process.ptg_parts.frozen_rate_binding import (
     FROZEN_RATE_FILE_PROTECTED_FIELDS,
     protected_frozen_tuple_presence,
@@ -1414,16 +1422,10 @@ def normalize_run(import_run: Any) -> dict[str, Any]:
     )
 
 
-def _params_for_import_run_storage(
-    importer: str,
-    params_by_name: dict[str, Any],
-) -> dict[str, Any]:
+def _params_for_import_run_storage(importer: str, params_by_name: dict[str, Any]) -> dict[str, Any]:
     """Remove importer-specific ephemeral values from persisted API state."""
 
-    ephemeral_param_names = _EPHEMERAL_PARAM_NAMES_BY_IMPORTER.get(
-        importer,
-        frozenset(),
-    )
+    ephemeral_param_names = _EPHEMERAL_PARAM_NAMES_BY_IMPORTER.get(importer, frozenset())
     return {name: param_value for name, param_value in params_by_name.items() if name not in ephemeral_param_names}
 
 
@@ -1433,10 +1435,8 @@ def _params_for_import_run_response(
 ) -> dict[str, Any]:
     """Project private multipart coordinates to an opaque public run marker."""
 
-    stored_params_by_name = _params_for_import_run_storage(
-        importer,
-        params_by_name,
-    )
+    stored_params_by_name = _params_for_import_run_storage(importer, params_by_name)
+    stored_params_by_name.pop(COLLECTION_PROOF_PARAM, None)
     if importer != "ptg":
         return stored_params_by_name
     stored_params_by_name.pop(INVALID_PRICE_EXCLUSION_POLICY_FIELD, None)
@@ -1478,11 +1478,11 @@ def _import_param_views(
 ) -> _ImportParamViews:
     """Build separate persisted and one-shot enqueue parameter mappings."""
 
+    collection_proof = validated_collection_dispatch(importer, params_by_name)
+    if collection_proof is not None:
+        params_by_name = {**params_by_name, COLLECTION_PROOF_PARAM: collection_proof}
     if importer != "ptg":
-        return _ImportParamViews(
-            persisted_by_name=dict(params_by_name),
-            enqueue_by_name=dict(params_by_name),
-        )
+        return _ImportParamViews(persisted_by_name=dict(params_by_name), enqueue_by_name=dict(params_by_name))
     if _PTG_FULL_REBUILD_SCOPE_PARAM in params_by_name:
         raise ValueError("PTG full rebuild scope is internal and cannot be supplied")
     if _PTG_FULL_REBUILD_MARKER_PARAM in params_by_name:
@@ -2641,7 +2641,10 @@ async def _idempotent_import_run(
         existing = await find_importer_run_by_idempotency_key(importer, idempotency_key)
         _validate_registry_cms_source_params(importer, params, existing)
         return existing
-    return await find_active_run_by_idempotency_key(importer, idempotency_key)
+    existing = await find_active_run_by_idempotency_key(importer, idempotency_key)
+    if existing:
+        await recheck_collection_replay(params or {}, existing)
+    return existing
 
 
 def _validate_registry_cms_source_params(importer, params, existing=None):
@@ -3342,40 +3345,6 @@ async def _admit_hospital_price_run(
     return None
 
 
-async def _locked_ptg_source_replay(
-    connection: Any,
-    import_row: dict[str, Any],
-    *,
-    source_file_import_id: str,
-) -> dict[str, Any] | None:
-    idempotency_key = import_row.get("idempotency_key")
-    if idempotency_key:
-        active_run = await _active_idempotency_run(
-            connection,
-            "ptg",
-            str(idempotency_key),
-        )
-        if active_run and not await is_ptg_wave_owned_run(
-            connection,
-            str(active_run.get("run_id") or ""),
-        ):
-            await recheck_frozen_binding_on_connection(
-                connection,
-                import_row["params"],
-            )
-            return active_run
-    source_replay = await _active_ptg_source_file_replay(
-        connection,
-        source_file_import_id,
-    )
-    if source_replay:
-        await recheck_frozen_binding_on_connection(
-            connection,
-            import_row["params"],
-        )
-    return source_replay
-
-
 async def _admit_ptg_source_file_run(
     import_row: dict[str, Any],
 ) -> dict[str, Any] | None:
@@ -3406,6 +3375,7 @@ async def _admit_ptg_source_file_run(
         # must clear the exact-wave capacity fence before it can insert a
         # frozen binding.
         await require_no_capacity_owning_wave(connection)
+        await recheck_collection_attempt(connection, import_row["params"], source_file_import_id)
         await insert_or_compare_frozen_binding(
             connection,
             import_row["params"],
@@ -3417,6 +3387,7 @@ async def _admit_ptg_source_file_run(
         ):
             active_runs = await _active_importer_runs(connection, "ptg")
             if active_runs:
+                await recheck_collection_replay(import_row["params"], active_runs[0], connection=connection)
                 return active_runs[0]
         await connection.status(insert(ImportRun).values(**import_row))
         await record_source_attempt_event(
@@ -3447,6 +3418,7 @@ async def _admit_wave_fenced_import_run(
                 str(idempotency_key),
             )
             if existing:
+                await recheck_collection_replay(import_row.get("params") or {}, existing, connection=connection)
                 return existing
             active_run = await _active_idempotency_run(
                 connection,
@@ -3454,16 +3426,22 @@ async def _admit_wave_fenced_import_run(
                 str(idempotency_key),
             )
             if active_run:
+                await recheck_collection_replay(import_row.get("params") or {}, active_run, connection=connection)
                 return active_run
         existing_importer = await find_earliest_active_run_by_importer(str(import_row["importer"]))
         if existing_importer:
+            await recheck_collection_replay(import_row.get("params") or {}, existing_importer, connection=connection)
             return existing_importer
         active_runs = await _active_importer_runs(
             connection,
             str(import_row["importer"]),
         )
         if active_runs:
+            await recheck_collection_replay(import_row.get("params") or {}, active_runs[0], connection=connection)
             return active_runs[0]
+        if import_row["importer"] == "ptg":
+            request_params = import_row.get("params") or {}
+            await recheck_collection_attempt(connection, request_params, request_params.get("import_id"))
         await connection.status(insert(ImportRun).values(**import_row))
     return None
 
@@ -3633,6 +3611,7 @@ async def create_import_run(
         if importer == "ptg"
         else dict(effective_params_by_name)
     )
+    validated_collection_dispatch(importer, normalized_params_by_name)
     if importer == "ptg" and (
         protected_frozen_tuple_presence(normalized_params_by_name)
         or protected_singleton_direct_presence(normalized_params_by_name)
@@ -3700,6 +3679,7 @@ async def create_import_run(
     ):
         active_importer = await find_earliest_active_run_by_importer(importer)
         if active_importer:
+            await recheck_collection_replay(normalized_params_by_name, active_importer)
             _validate_massachusetts_request(importer, normalized_params_by_name, active_importer)
             _validate_registry_cms_source_params(importer, normalized_params_by_name, active_importer)
             return normalize_run(active_importer), False
@@ -4955,6 +4935,10 @@ def _retry_child_params(
     retry_params_by_name: dict[str, Any],
 ) -> dict[str, Any]:
     current_params_by_name = current_run_map.get("params") if isinstance(current_run_map.get("params"), dict) else {}
+    if COLLECTION_PROOF_PARAM in retry_params_by_name and retry_params_by_name[
+        COLLECTION_PROOF_PARAM
+    ] != current_params_by_name.get(COLLECTION_PROOF_PARAM):
+        raise ValueError("Cigna collection retry cannot replace expected archive proof")
     from process.provider_directory_serving_recovery import OPERATION_PARAM, is_recovery_request
 
     if OPERATION_PARAM in current_params_by_name:
@@ -4977,6 +4961,8 @@ def _retry_child_params(
         **current_params_by_name,
         **retry_params_by_name,
     }
+    if COLLECTION_PROOF_PARAM in current_params_by_name:
+        require_collection_request_match(current_params_by_name, child_params_by_name)
     if current_run_map.get("importer") == "mrf-source-discovery":
         root_run_id = str(
             current_params_by_name.get("mrf_discovery_root_run_id")
@@ -5011,6 +4997,7 @@ async def retry_import_run(run_id: str, payload: dict[str, Any]) -> tuple[dict[s
     current = await get_import_run(run_id)
     if not current:
         return None
+    current = await restore_collection_retry_proof(current, lambda: npi_execution.read_control_run(db, run_id))
     if str(current.get("importer") or "") == "ptg":
         await require_not_wave_owned_run(db, run_id)
     retry_params = payload.get("retry_params") if isinstance(payload.get("retry_params"), dict) else {}

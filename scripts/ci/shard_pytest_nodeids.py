@@ -194,7 +194,7 @@ def _registry_shard_index(nodeid: str, shard_count: int) -> int:
         "tests/test_verified_witness_custom_publication_postgres.py"
         "::test_source_v2_manual_commands_preserve_custody_and_replay"
     ):
-        return 6
+        return 10
     if shard_count == 48 and nodeid == (
         "tests/test_registry_fhir_catalog_metadata_reader_postgres.py::test_api_reader_successor_preserves_incumbent"
     ):

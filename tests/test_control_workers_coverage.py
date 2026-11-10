@@ -66,7 +66,7 @@ def test_terminal_job_cleanup_skips_ineligible_jobs(monkeypatch):
         {"metadata": {}, "status": {"succeeded": 1}},
         {"metadata": {"name": "active"}, "status": {"active": 1}},
         {"metadata": {"name": "pending"}, "status": {}},
-        {"metadata": {"name": "gone"}, "status": {"succeeded": 1}},
+        {"metadata": {"name": "gone", "uid": "gone-uid"}, "status": {"succeeded": 1}},
     ]
     monkeypatch.setattr(
         control_workers,
@@ -74,7 +74,8 @@ def test_terminal_job_cleanup_skips_ineligible_jobs(monkeypatch):
         lambda *_args, **_kwargs: {"items": job_records},
     )
 
-    def delete_job(_namespace, job_name):
+    def delete_job(_namespace, job_name, *, uid):
+        assert uid == f"{job_name}-uid"
         if job_name == "gone":
             raise control_workers._KubernetesApiError(404, "gone")
         if job_name == "fatal":
@@ -88,7 +89,7 @@ def test_terminal_job_cleanup_skips_ineligible_jobs(monkeypatch):
     )
 
     job_records[:] = [
-        {"metadata": {"name": "fatal"}, "status": {"failed": 1}},
+        {"metadata": {"name": "fatal", "uid": "fatal-uid"}, "status": {"failed": 1}},
     ]
     with pytest.raises(control_workers._KubernetesApiError, match="unavailable"):
         control_workers._delete_terminal_kubernetes_worker_jobs(
@@ -96,6 +97,44 @@ def test_terminal_job_cleanup_skips_ineligible_jobs(monkeypatch):
             spec,
             {},
         )
+
+
+@pytest.mark.parametrize("has_replacement", [False, True])
+def test_terminal_cleanup_delete_is_bound_to_the_listed_uid(monkeypatch, has_replacement):
+    calls = []
+    job_by_field = {"metadata": {"name": "terminal-worker", "uid": "listed-uid"}, "status": {"succeeded": 1}}
+
+    def query(method, path, body=None):
+        calls.append((method, path, body))
+        if method == "GET":
+            return {"items": [job_by_field]}
+        assert method == "DELETE"
+        assert body["preconditions"] == {"uid": "listed-uid"}
+        assert body["propagationPolicy"] == "Background"
+        if has_replacement:
+            raise control_workers._KubernetesApiError(409, "UID changed")
+        return {}
+
+    monkeypatch.setattr(control_workers, "_kubernetes_request", query)
+    if has_replacement:
+        with pytest.raises(control_workers._KubernetesApiError, match="UID changed"):
+            control_workers._delete_terminal_kubernetes_worker_jobs("synthetic-workers", _spec(), {})
+    else:
+        control_workers._delete_terminal_kubernetes_worker_jobs("synthetic-workers", _spec(), {})
+    assert [method for method, _, _ in calls] == ["GET", "DELETE"]
+
+
+def test_terminal_cleanup_refuses_a_job_without_its_uid(monkeypatch):
+    methods = []
+
+    def query(method, _path, _body=None):
+        methods.append(method)
+        return {"items": [{"metadata": {"name": "terminal-worker"}, "status": {"failed": 1}}]}
+
+    monkeypatch.setattr(control_workers, "_kubernetes_request", query)
+    with pytest.raises(control_workers._KubernetesApiError, match="UID is missing"):
+        control_workers._delete_terminal_kubernetes_worker_jobs("synthetic-workers", _spec(), {})
+    assert methods == ["GET"]
 
 
 def test_delete_worker_jobs_reports_disabled_and_error_states(monkeypatch):
@@ -143,12 +182,10 @@ def test_delete_jobs_for_spec_preserves_query_and_record_errors(monkeypatch):
         raise control_workers._KubernetesApiError(503, "query failed")
 
     monkeypatch.setattr(control_workers, "_kubernetes_request", fail_query)
-    deletion_record_list, deletion_error_list = (
-        control_workers._delete_kubernetes_worker_jobs_for_spec(
-            "namespace-test",
-            spec,
-            {},
-        )
+    deletion_record_list, deletion_error_list = control_workers._delete_kubernetes_worker_jobs_for_spec(
+        "namespace-test",
+        spec,
+        {},
     )
     assert deletion_record_list == []
     assert deletion_error_list[0]["status"] == 503
@@ -163,12 +200,10 @@ def test_delete_jobs_for_spec_preserves_query_and_record_errors(monkeypatch):
         "_delete_kubernetes_worker_job_record",
         lambda *_args: (None, {"job_name": "failed", "error": "delete failed"}),
     )
-    deletion_record_list, deletion_error_list = (
-        control_workers._delete_kubernetes_worker_jobs_for_spec(
-            "namespace-test",
-            spec,
-            {},
-        )
+    deletion_record_list, deletion_error_list = control_workers._delete_kubernetes_worker_jobs_for_spec(
+        "namespace-test",
+        spec,
+        {},
     )
     assert deletion_record_list == []
     assert deletion_error_list == [
@@ -179,9 +214,7 @@ def test_delete_jobs_for_spec_preserves_query_and_record_errors(monkeypatch):
 def test_kubernetes_worker_state_handles_configuration_edges(monkeypatch):
     spec = _spec()
     monkeypatch.setattr(control_workers, "_is_kubernetes_configured", lambda: False)
-    assert control_workers._kubernetes_worker_state(spec)["job_status"] == (
-        "unconfigured"
-    )
+    assert control_workers._kubernetes_worker_state(spec)["job_status"] == ("unconfigured")
 
     monkeypatch.setattr(control_workers, "_is_kubernetes_configured", lambda: True)
     monkeypatch.setattr(

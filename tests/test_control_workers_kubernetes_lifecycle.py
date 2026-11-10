@@ -34,10 +34,7 @@ def test_kubernetes_worker_job_uses_resource_profile(monkeypatch):
         "limits": {"cpu": "4", "memory": "8Gi"},
     }
     assert container["command"][-2:] == ["worker-once", "process.PTGSmall"]
-    env_by_name = {
-        environment_entry["name"]: environment_entry["value"]
-        for environment_entry in container["env"]
-    }
+    env_by_name = {environment_entry["name"]: environment_entry["value"] for environment_entry in container["env"]}
     assert env_by_name["HLTHPRT_ACTIVE_WORKER_QUEUE"] == "arq:PTGSmall"
     assert env_by_name["HLTHPRT_ACTIVE_WORKER_CLASS"] == "process.PTGSmall"
     assert env_by_name["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] == "ptg_start_run_ptg"
@@ -58,15 +55,11 @@ def test_kubernetes_hospital_worker_targets_exact_job(monkeypatch):
         "healthcare-mrf-api:test",
     )
     container = job["spec"]["template"]["spec"]["containers"][0]
-    assert job["spec"]["template"]["spec"]["priorityClassName"] == (
-        "ci-nonpreempting"
-    )
+    assert job["spec"]["template"]["spec"]["priorityClassName"] == ("ci-nonpreempting")
     env_by_name = {entry["name"]: entry["value"] for entry in container["env"]}
 
     assert container["command"][-2:] == ["worker-once", "process.HospitalPrices"]
-    assert env_by_name["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] == (
-        "hospital_prices_start_run_hospital"
-    )
+    assert env_by_name["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"] == ("hospital_prices_start_run_hospital")
     assert env_by_name["HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS"] == (
         "cdn.hs.uab.edu,d2cg6hcwj0g0z0.cloudfront.net,"
         "shelteringarmsinstitute.com,bilh.org,ajh.org,bidmilton.org,"
@@ -80,9 +73,7 @@ def test_kubernetes_hospital_worker_targets_exact_job(monkeypatch):
         {"run_id": "run_npi"},
         "healthcare-mrf-api:test",
     )["spec"]["template"]["spec"]["containers"][0]
-    assert "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS" not in {
-        entry["name"] for entry in other_container["env"]
-    }
+    assert "HLTHPRT_HOSPITAL_PRICE_US_EGRESS_HOSTS" not in {entry["name"] for entry in other_container["env"]}
 
 
 def test_kubernetes_worker_job_sets_finalizer_identity_capacity_only_for_ptg_huge():
@@ -103,9 +94,7 @@ def test_kubernetes_worker_job_sets_finalizer_identity_capacity_only_for_ptg_hug
         )
         container = job["spec"]["template"]["spec"]["containers"][0]
         capacity_env_by_worker[spec.worker_class] = [
-            entry
-            for entry in container["env"]
-            if entry["name"] == "HLTHPRT_PTG2_V3_FINALIZER_IDENTITY_MAP_MAX_BYTES"
+            entry for entry in container["env"] if entry["name"] == "HLTHPRT_PTG2_V3_FINALIZER_IDENTITY_MAP_MAX_BYTES"
         ]
 
     assert capacity_env_by_worker == {
@@ -146,9 +135,7 @@ def test_kubernetes_start_worker_replicas_use_parallel_job(monkeypatch):
     monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
     monkeypatch.setattr(control_workers, "_kubernetes_request", fake_request)
 
-    worker_response = control_workers.ensure_worker(
-        {"importer": "mrf", "run_id": "run_mrf"}
-    )
+    worker_response = control_workers.ensure_worker({"importer": "mrf", "run_id": "run_mrf"})
 
     assert worker_response["status"] == "started"
     post = next(call for call in calls if call[0] == "POST")
@@ -183,9 +170,7 @@ def test_kubernetes_start_worker_replicas_do_not_apply_to_finish(monkeypatch):
     monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
     monkeypatch.setattr(control_workers, "_kubernetes_request", fake_request)
 
-    worker_response = control_workers.ensure_worker(
-        {"importer": "mrf", "run_id": "run_mrf", "status": "finalizing"}
-    )
+    worker_response = control_workers.ensure_worker({"importer": "mrf", "run_id": "run_mrf", "status": "finalizing"})
 
     assert worker_response["status"] == "started"
     post = next(call for call in calls if call[0] == "POST")
@@ -231,9 +216,7 @@ def test_kubernetes_completed_start_job_promotes_running_import_to_finish(monkey
     monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "healthporta-dev")
     monkeypatch.setattr(control_workers, "_kubernetes_request", fake_request)
 
-    worker_response = control_workers.ensure_worker(
-        {"importer": "mrf", "run_id": "run_mrf", "status": "running"}
-    )
+    worker_response = control_workers.ensure_worker({"importer": "mrf", "run_id": "run_mrf", "status": "running"})
 
     assert worker_response["status"] == "started"
     post = next(call for call in calls if call[0] == "POST")
@@ -252,7 +235,7 @@ def test_kubernetes_completed_worker_job_is_recreated(monkeypatch):
         if method == "GET":
             if any(item[0] == "POST" for item in calls):
                 return {"items": [{"metadata": {"name": "worker-job"}, "status": {"active": 1}}]}
-            return {"items": [{"metadata": {"name": "worker-job"}, "status": {"succeeded": 1}}]}
+            return {"items": [{"metadata": {"name": "worker-job", "uid": "old-uid"}, "status": {"succeeded": 1}}]}
         return {}
 
     monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
@@ -280,8 +263,8 @@ def test_kubernetes_completed_worker_jobs_are_all_removed_before_recreate(monkey
                 return {"items": [{"metadata": {"name": "worker-job-new"}, "status": {"active": 1}}]}
             return {
                 "items": [
-                    {"metadata": {"name": "worker-job-old-a"}, "status": {"succeeded": 1}},
-                    {"metadata": {"name": "worker-job-old-b"}, "status": {"succeeded": 1}},
+                    {"metadata": {"name": "worker-job-old-a", "uid": "old-a-uid"}, "status": {"succeeded": 1}},
+                    {"metadata": {"name": "worker-job-old-b", "uid": "old-b-uid"}, "status": {"succeeded": 1}},
                 ]
             }
         return {}

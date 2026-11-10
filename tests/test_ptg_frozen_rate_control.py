@@ -9,8 +9,7 @@ from contextlib import asynccontextmanager
 
 import pytest
 
-from api import control
-from api import control_imports
+from api import control, control_imports
 from process.ptg_parts import frozen_rate_binding_store
 from process.ptg_parts.frozen_rate_binding import (
     FROZEN_RATE_FILE_BINDING_OPTION,
@@ -30,29 +29,21 @@ from process.ptg_parts.frozen_rate_files import (
 from process.ptg_parts.ptg_wave_admission_fence import PTGWaveCapacityConflict
 from tests.ptg_frozen_test_support import (
     frozen_rate_file_set as _frozen_set,
+)
+from tests.ptg_frozen_test_support import (
     protected_control_payload as _protected_payload,
 )
 
+
 def test_control_api_normalizes_internal_engine_envelope_before_persistence():
     request = _protected_payload()
-    request["params"]["frozen_rate_files"] = list(
-        reversed(request["params"]["frozen_rate_files"])
-    )
+    request["params"]["frozen_rate_files"] = list(reversed(request["params"]["frozen_rate_files"]))
     request_payload = control._validated_control_import_payload(request)
 
-    assert [
-        descriptor["ordinal"]
-        for descriptor in request_payload["params"]["frozen_rate_files"]
-    ] == [1, 2]
-    assert (
-        request_payload["params"]["frozen_rate_file_set_sha256"]
-        == request["params"]["frozen_rate_file_set_sha256"]
-    )
+    assert [descriptor["ordinal"] for descriptor in request_payload["params"]["frozen_rate_files"]] == [1, 2]
+    assert request_payload["params"]["frozen_rate_file_set_sha256"] == request["params"]["frozen_rate_file_set_sha256"]
     assert request_payload["params"]["frozen_rate_file_count"] == 2
-    assert (
-        request_payload["params"]["frozen_rate_file_set_contract"]
-        == FROZEN_RATE_FILE_SET_CONTRACT
-    )
+    assert request_payload["params"]["frozen_rate_file_set_contract"] == FROZEN_RATE_FILE_SET_CONTRACT
 
 
 @pytest.mark.parametrize(
@@ -108,18 +99,14 @@ def test_frozen_binding_is_exact_replay_only_and_keeps_internal_run_id():
         "contract": "ptg_frozen_source_file_binding_v1",
         "source_file_import_id": "source-file-import-001",
         "frozen_rate_file_set_contract": FROZEN_RATE_FILE_SET_CONTRACT,
-        "frozen_rate_file_set_sha256": request["params"][
-            "frozen_rate_file_set_sha256"
-        ],
+        "frozen_rate_file_set_sha256": request["params"]["frozen_rate_file_set_sha256"],
         "frozen_rate_file_count": 2,
         "source_key": "source_a",
         "import_month": "2026-07-01",
         "plan_ids": ["plan-a", "plan-b"],
         "plan_market_types": ["group"],
     }
-    assert frozen_internal_run_id("source-file-import-001") == (
-        "ptg2:source-file-import-001"
-    )
+    assert frozen_internal_run_id("source-file-import-001") == ("ptg2:source-file-import-001")
     assert_existing_frozen_binding(
         {FROZEN_RATE_FILE_BINDING_OPTION: binding},
         binding,
@@ -178,17 +165,13 @@ class _BindingConnection:
 @pytest.mark.asyncio
 async def test_frozen_binding_database_cas_allows_exact_replay():
     connection = _BindingConnection()
-    params = control._validated_control_import_payload(
-        _protected_payload()
-    )["params"]
+    params = control._validated_control_import_payload(_protected_payload())["params"]
 
     first = await insert_or_compare_frozen_binding(connection, params)
     replay = await insert_or_compare_frozen_binding(connection, params)
 
     assert replay == first
-    assert connection.row["internal_run_id"] == (
-        "ptg2:source-file-import-001"
-    )
+    assert connection.row["internal_run_id"] == ("ptg2:source-file-import-001")
     assert connection.last_status_params["import_month"] == dt.date(
         2026,
         7,
@@ -199,16 +182,17 @@ async def test_frozen_binding_database_cas_allows_exact_replay():
 @pytest.mark.asyncio
 async def test_frozen_binding_recheck_on_connection_is_read_only():
     connection = _BindingConnection()
-    params = control._validated_control_import_payload(
-        _protected_payload()
-    )["params"]
+    params = control._validated_control_import_payload(_protected_payload())["params"]
     expected = await insert_or_compare_frozen_binding(connection, params)
     connection.last_status_params = None
 
-    assert await recheck_frozen_binding_on_connection(
-        connection,
-        params,
-    ) == expected
+    assert (
+        await recheck_frozen_binding_on_connection(
+            connection,
+            params,
+        )
+        == expected
+    )
     assert connection.last_status_params is None
 
 
@@ -231,9 +215,7 @@ async def test_frozen_binding_recheck_without_source_id_avoids_database(
 @pytest.mark.asyncio
 async def test_frozen_binding_database_cas_rejects_retry_drift():
     connection = _BindingConnection()
-    params = control._validated_control_import_payload(
-        _protected_payload()
-    )["params"]
+    params = control._validated_control_import_payload(_protected_payload())["params"]
     await insert_or_compare_frozen_binding(connection, params)
 
     with pytest.raises(
@@ -249,9 +231,7 @@ async def test_frozen_binding_database_cas_rejects_retry_drift():
 @pytest.mark.asyncio
 async def test_frozen_binding_database_cas_rejects_legacy_retry():
     connection = _BindingConnection()
-    params = control._validated_control_import_payload(
-        _protected_payload()
-    )["params"]
+    params = control._validated_control_import_payload(_protected_payload())["params"]
     await insert_or_compare_frozen_binding(connection, params)
 
     with pytest.raises(
@@ -280,6 +260,11 @@ class _AdmissionOrderConnection:
     async def status(self, *_args, **_kwargs):
         self.event_list.append("control_row_insert")
         return 1
+
+    async def all(self, statement):
+        assert "source_file_import_id" in str(statement)
+        self.event_list.append("retained_collection_check")
+        return []
 
 
 @asynccontextmanager
@@ -327,9 +312,7 @@ async def test_control_admission_fences_before_binding_insert(
         "_active_importer_runs",
         _async_test_hook(events, None, []),
     )
-    request = control._validated_control_import_payload(
-        _protected_payload()
-    )
+    request = control._validated_control_import_payload(_protected_payload())
     import_row_by_name = {
         "run_id": "run-001",
         "importer": "ptg",
@@ -338,9 +321,7 @@ async def test_control_admission_fences_before_binding_insert(
         "idempotency_key": None,
     }
 
-    blocking = await control_imports._admit_ptg_source_file_run(
-        import_row_by_name
-    )
+    blocking = await control_imports._admit_ptg_source_file_run(import_row_by_name)
 
     assert blocking is None
     assert events == [
@@ -349,6 +330,7 @@ async def test_control_admission_fences_before_binding_insert(
         "admission_lock",
         "source_replay_check",
         "capacity_fence",
+        "retained_collection_check",
         "binding_cas",
         "control_row_insert",
         "source_attempt_event",
@@ -374,9 +356,7 @@ async def test_control_admission_rechecks_existing_replay_before_capacity(
         "_active_ptg_source_file_replay": "source_replay_check",
         "recheck_frozen_binding_on_connection": "binding_recheck",
     }.items():
-        hook_result = (
-            existing_run_map if function_name == "_active_ptg_source_file_replay" else None
-        )
+        hook_result = existing_run_map if function_name == "_active_ptg_source_file_replay" else None
         monkeypatch.setattr(
             control_imports,
             function_name,
@@ -384,9 +364,7 @@ async def test_control_admission_rechecks_existing_replay_before_capacity(
         )
 
     async def unexpected(*_args, **_kwargs):  # pragma: no cover - safety assertion
-        raise AssertionError(
-            "a binding-verified replay must not consume capacity or write"
-        )
+        raise AssertionError("a binding-verified replay must not consume capacity or write")
 
     monkeypatch.setattr(
         control_imports,
@@ -400,15 +378,18 @@ async def test_control_admission_rechecks_existing_replay_before_capacity(
     )
     request = control._validated_control_import_payload(_protected_payload())
 
-    assert await control_imports._admit_ptg_source_file_run(
-        {
-            "run_id": "run-new",
-            "importer": "ptg",
-            "params": request["params"],
-            "source_file_import_id": request["source_file_import_id"],
-            "idempotency_key": None,
-        }
-    ) == existing_run_map
+    assert (
+        await control_imports._admit_ptg_source_file_run(
+            {
+                "run_id": "run-new",
+                "importer": "ptg",
+                "params": request["params"],
+                "source_file_import_id": request["source_file_import_id"],
+                "idempotency_key": None,
+            }
+        )
+        == existing_run_map
+    )
     assert events == [
         "capability_check",
         "source_attempt_guard",
@@ -494,7 +475,10 @@ async def test_source_replay_excludes_a_wave_owned_run(monkeypatch):
         return True
 
     monkeypatch.setattr(control_imports, "is_ptg_wave_owned_run", is_wave_owned)
-    assert await control_imports._active_ptg_source_file_replay(
-        _Connection(),
-        "source-file-import-001",
-    ) is None
+    assert (
+        await control_imports._active_ptg_source_file_replay(
+            _Connection(),
+            "source-file-import-001",
+        )
+        is None
+    )

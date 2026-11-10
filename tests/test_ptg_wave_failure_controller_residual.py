@@ -1,98 +1,36 @@
-
-
 """Residual fail-closed branch coverage for exact-wave controller contracts."""
-
 
 from __future__ import annotations
 
-
 import asyncio
-
-
 import runpy
-
-
 import types
-
-
 from unittest.mock import AsyncMock, Mock
 
-
 import pytest
-
-
 from sanic.exceptions import BadRequest, NotFound, SanicException
 
-
 from api import control as control_api
-
-
 from api import control_import_wave_attestation as attestation
-
-
-from api import control_imports
-
-
+from api import control_imports, control_workers, provider_specialty_filters
 from api import control_wave_linkage_route as linkage_routes
-
-
 from api import control_wave_routes as routes
-
-
-from api import control_workers
-
-
 from api import mrf_discovery_catalog_manifest as catalog_manifest
-
-
-from api import provider_specialty_filters
-
-
 from api import ptg2_candidate_audit_reverse as reverse_scope
-
-
 from api import ptg2_candidate_audit_v4 as v4_scope
-
-
 from api.mrf_discovery_catalog_paging import bounded_file_windows
-
-
 from api.provider_profile_display import display_value
-
-
 from process import ptg_control
-
-
 from process import ptg_wave_barrier as barrier
-
-
 from process import ptg_wave_controller_isolation as isolation
-
-
 from process import ptg_wave_controller_receipts as receipts
-
-
 from process import ptg_wave_outcome_contract as outcome_contract
-
-
 from process import ptg_wave_outcome_terminal_validation as terminal_validation
-
-
 from process import ptg_wave_receipt_projection as receipt_projection
-
-
 from process import ptg_wave_worker as wave_worker
-
-
 from process.ptg_parts import frozen_rate_binding_store as bindings
-
-
 from process.ptg_parts import ptg_wave_admission_fence as fence
-
-
 from process.ptg_wave_terminal_state import derive_terminal_state
-
-
 from tests.test_ptg_wave_failure_controller_edges import (
     _CONFIG_DIGEST,
     _IMAGE,
@@ -102,10 +40,10 @@ from tests.test_ptg_wave_failure_controller_edges import (
     _MANIFEST_IDENTITY,
     _RUNTIME_IDENTITY,
     _WAVE_DIGEST,
-    _Request,
     _claim,
     _intent,
     _outcome,
+    _Request,
     _wave,
 )
 
@@ -152,9 +90,7 @@ def _terminal_kubernetes_receipt(wave, ready_slots):
     expected = terminal_validation._expected_kubernetes_receipt(wave, ready_slots)
     return {
         **expected,
-        "attestation_digest": terminal_validation.sha256_digest(
-            terminal_validation.canonical_json(expected)
-        ),
+        "attestation_digest": terminal_validation.sha256_digest(terminal_validation.canonical_json(expected)),
     }
 
 
@@ -180,9 +116,7 @@ def _terminal_redis_receipt(wave):
     }
     return {
         **unsigned_by_field,
-        "attestation_digest": terminal_validation.sha256_digest(
-            terminal_validation.canonical_json(unsigned_by_field)
-        ),
+        "attestation_digest": terminal_validation.sha256_digest(terminal_validation.canonical_json(unsigned_by_field)),
     }
 
 
@@ -245,15 +179,11 @@ def _isolation_controller(rows, generic_jobs):
 
 
 def _synthetic_catalog_metadata() -> dict[str, object]:
-    accumulator = catalog_manifest._SourceManifestAccumulator.create(
-        "synthetic-source"
-    )
+    accumulator = catalog_manifest._SourceManifestAccumulator.create("synthetic-source")
     accumulator.add_file("synthetic-file", 0)
     return {
         "discovery_run_id": "synthetic-run",
-        catalog_manifest.CATALOG_PAGING_MANIFEST_METADATA_KEY: accumulator.manifest(
-            "synthetic-run"
-        ),
+        catalog_manifest.CATALOG_PAGING_MANIFEST_METADATA_KEY: accumulator.manifest("synthetic-run"),
     }
 
 
@@ -271,6 +201,7 @@ def test_worker_identity_environment_rejects_noncanonical_numbers(environment, m
     with pytest.raises(barrier.PTGWaveContractError, match=message):
         barrier.PTGWaveWorkerIdentity.from_environment(values)
 
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
@@ -286,6 +217,7 @@ def test_worker_identity_environment_rejects_noncanonical_numbers(environment, m
 def test_worker_identity_validate_rejects_each_fail_closed_edge(overrides, message):
     with pytest.raises(barrier.PTGWaveContractError, match=message):
         _identity(**overrides).validate()
+
 
 @pytest.mark.asyncio
 async def test_barrier_awaits_async_start_and_rejects_unreleased_receipts():
@@ -316,9 +248,11 @@ async def test_barrier_awaits_async_start_and_rejects_unreleased_receipts():
     with pytest.raises(barrier.PTGWaveContractError, match="not released"):
         await barrier.run_after_wave_release(identity, gate, start)
 
+
 def test_barrier_required_rejects_missing_values():
     with pytest.raises(barrier.PTGWaveContractError, match="missing or invalid"):
         barrier._required({}, "HLTHPRT_PTG_WAVE_DIGEST")
+
 
 def test_outcome_primitives_and_claim_guards(monkeypatch):
     intent = _intent(0)
@@ -369,13 +303,9 @@ def test_linkage_ack_shape_and_binding_guards():
         "mapping_digest": outcome_contract.linkage_mapping_digest([outcome]),
         "outcomes_digest": wave.outcomes_digest,
     }
-    unsigned_by_field["signature"] = outcome_contract.sign_linkage_ack(
-        unsigned_by_field, key=_LINKAGE_KEY
-    )
+    unsigned_by_field["signature"] = outcome_contract.sign_linkage_ack(unsigned_by_field, key=_LINKAGE_KEY)
     with pytest.raises(outcome_contract.PTGWaveOutcomeConflict, match="fields are not exact"):
-        outcome_contract._validate_linkage_ack(
-            wave, [outcome], unsigned_by_field, _LINKAGE_KEY
-        )
+        outcome_contract._validate_linkage_ack(wave, [outcome], unsigned_by_field, _LINKAGE_KEY)
 
     unsigned_by_field["schema_version"] = "healthporta.ptg-wave-linkage-ack.v1"
     unsigned_by_field["wave_id"] = "other-wave"
@@ -384,17 +314,13 @@ def test_linkage_ack_shape_and_binding_guards():
         key=_LINKAGE_KEY,
     )
     with pytest.raises(outcome_contract.PTGWaveOutcomeConflict, match="does not bind"):
-        outcome_contract._validate_linkage_ack(
-            wave, [outcome], unsigned_by_field, _LINKAGE_KEY
-        )
+        outcome_contract._validate_linkage_ack(wave, [outcome], unsigned_by_field, _LINKAGE_KEY)
 
 
 def test_terminal_ready_slots_and_row_binding():
     wave = _wave()
     with pytest.raises(terminal_validation.PTGWaveOutcomeConflict, match="12-slot"):
-        terminal_validation._ready_slots_by_number(
-            _wave(kubernetes_ready_attestation={"slots": []})
-        )
+        terminal_validation._ready_slots_by_number(_wave(kubernetes_ready_attestation={"slots": []}))
     duplicate = _wave()
     duplicate.kubernetes_ready_attestation["slots"][1]["slot"] = 0
     with pytest.raises(terminal_validation.PTGWaveOutcomeConflict, match="12-slot"):
@@ -433,25 +359,15 @@ def test_terminal_outcome_and_linkage_digest_guards(monkeypatch):
     outcome = _outcome(_intent(0))
     monkeypatch.setattr(terminal_validation, "_collection_digest", Mock(return_value="bad"))
     with pytest.raises(terminal_validation.PTGWaveOutcomeConflict, match="outcomes digest"):
-        terminal_validation._validate_outcome_and_linkage_digests(
-            wave, [outcome], key=_LINKAGE_KEY
-        )
-    monkeypatch.setattr(
-        terminal_validation, "_collection_digest", Mock(return_value=wave.outcomes_digest)
-    )
+        terminal_validation._validate_outcome_and_linkage_digests(wave, [outcome], key=_LINKAGE_KEY)
+    monkeypatch.setattr(terminal_validation, "_collection_digest", Mock(return_value=wave.outcomes_digest))
     with pytest.raises(terminal_validation.PTGWaveOutcomeConflict, match="linkage acknowledgement"):
-        terminal_validation._validate_outcome_and_linkage_digests(
-            wave, [outcome], key=_LINKAGE_KEY
-        )
+        terminal_validation._validate_outcome_and_linkage_digests(wave, [outcome], key=_LINKAGE_KEY)
     wave.linkage_ack = {}
     wave.linkage_ack_digest = "a" * 64
-    monkeypatch.setattr(
-        terminal_validation, "_validate_linkage_ack", Mock(return_value=({}, "b" * 64))
-    )
+    monkeypatch.setattr(terminal_validation, "_validate_linkage_ack", Mock(return_value=({}, "b" * 64)))
     with pytest.raises(terminal_validation.PTGWaveOutcomeConflict, match="acknowledgement digest"):
-        terminal_validation._validate_outcome_and_linkage_digests(
-            wave, [outcome], key=_LINKAGE_KEY
-        )
+        terminal_validation._validate_outcome_and_linkage_digests(wave, [outcome], key=_LINKAGE_KEY)
 
 
 def test_terminal_kubernetes_receipt_guards():
@@ -544,9 +460,7 @@ def test_import_attestation_snapshot_guards():
             "catalog_generation",
         )
     }
-    valid_snapshot_by_field["authorization_basis"] = (
-        attestation.AUTHORIZATION_BASIS
-    )
+    valid_snapshot_by_field["authorization_basis"] = attestation.AUTHORIZATION_BASIS
     valid_snapshot_by_field["authorization_digest"] = "b" * 64
     valid_snapshot_by_field["entitlement_coverage_count"] = True
     with pytest.raises(ValueError, match="invalid"):
@@ -573,6 +487,7 @@ def test_import_attestation_partition_guards():
     with pytest.raises(ValueError, match="imported \\+ reused"):
         attestation._validate_partition(partition_by_field)
 
+
 @pytest.mark.asyncio
 async def test_control_wave_route_error_translation_and_outcomes(monkeypatch):
     monkeypatch.setattr(routes, "require_control_auth", Mock())
@@ -584,35 +499,26 @@ async def test_control_wave_route_error_translation_and_outcomes(monkeypatch):
     )
     with pytest.raises(SanicException, match="conflict"):
         await routes.control_admit_import_wave(_Request(json={}))
-    monkeypatch.setattr(
-        routes, "admit_import_wave", AsyncMock(side_effect=ValueError("invalid"))
-    )
+    monkeypatch.setattr(routes, "admit_import_wave", AsyncMock(side_effect=ValueError("invalid")))
     with pytest.raises(BadRequest, match="invalid"):
         await routes.control_admit_import_wave(_Request(json={}))
-    monkeypatch.setattr(
-        routes, "get_import_wave", AsyncMock(side_effect=ValueError("invalid"))
-    )
+    monkeypatch.setattr(routes, "get_import_wave", AsyncMock(side_effect=ValueError("invalid")))
     with pytest.raises(BadRequest, match="invalid"):
         await routes.control_get_import_wave(_Request(), "wave")
-    monkeypatch.setattr(
-        routes, "get_wave_outcomes_page", AsyncMock(side_effect=ValueError("bad"))
-    )
+    monkeypatch.setattr(routes, "get_wave_outcomes_page", AsyncMock(side_effect=ValueError("bad")))
     with pytest.raises(BadRequest, match="bad"):
-        await routes.control_get_import_wave_outcomes(
-            _Request(args={"after_ordinal": "bad"}), "wave"
-        )
+        await routes.control_get_import_wave_outcomes(_Request(args={"after_ordinal": "bad"}), "wave")
     monkeypatch.setattr(
         linkage_routes,
         "record_linkage_ack",
         AsyncMock(side_effect=routes.PTGWaveOutcomeConflict("conflict")),
     )
     with pytest.raises(SanicException, match="conflict"):
-        await linkage_routes.control_record_import_wave_linkage(
-            _Request(json={"linkage_ack": {}}), "wave"
-        )
+        await linkage_routes.control_record_import_wave_linkage(_Request(json={"linkage_ack": {}}), "wave")
     monkeypatch.setattr(routes, "get_wave_receipts", AsyncMock(return_value=None))
     with pytest.raises(NotFound):
         await routes.control_get_import_wave_proof(_Request(), "wave")
+
 
 def test_exact_wave_internal_params_are_rejected_at_both_import_boundaries():
     internal_by_field = {"_wave_id": "wave-synthetic"}
@@ -620,6 +526,7 @@ def test_exact_wave_internal_params_are_rejected_at_both_import_boundaries():
         control_imports._import_param_views("ptg", internal_by_field, run_id="run")
     with pytest.raises(ValueError, match="exact-wave identity"):
         control_imports._assert_ptg_rebuild_request_params("ptg", internal_by_field)
+
 
 def _install_admission_replay_mocks(monkeypatch):
     connection = object()
@@ -630,6 +537,7 @@ def _install_admission_replay_mocks(monkeypatch):
         "acquire_ptg_admission_lock",
         "require_no_capacity_owning_wave",
         "insert_or_compare_frozen_binding",
+        "recheck_collection_attempt",
     ):
         monkeypatch.setattr(control_imports, name, AsyncMock())
     monkeypatch.setattr(
@@ -658,9 +566,9 @@ async def test_ptg_source_admission_replay_does_not_insert(monkeypatch):
         "_active_importer_runs",
         AsyncMock(return_value=[existing_by_field]),
     )
-    assert await control_imports._admit_ptg_source_file_run(
-        {"params": {}, "idempotency_key": None}
-    ) == existing_by_field
+    assert (
+        await control_imports._admit_ptg_source_file_run({"params": {}, "idempotency_key": None}) == existing_by_field
+    )
 
 
 @pytest.mark.asyncio
@@ -672,9 +580,10 @@ async def test_ptg_fenced_admission_replays_do_not_insert(monkeypatch):
         "find_active_run_by_idempotency_key",
         AsyncMock(return_value=existing_by_field),
     )
-    assert await control_imports._admit_wave_fenced_import_run(
-        {"importer": "ptg", "idempotency_key": "key"}
-    ) == existing_by_field
+    assert (
+        await control_imports._admit_wave_fenced_import_run({"importer": "ptg", "idempotency_key": "key"})
+        == existing_by_field
+    )
     monkeypatch.setattr(
         control_imports,
         "find_active_run_by_idempotency_key",
@@ -685,9 +594,10 @@ async def test_ptg_fenced_admission_replays_do_not_insert(monkeypatch):
         "_active_idempotency_run",
         AsyncMock(return_value=existing_by_field),
     )
-    assert await control_imports._admit_wave_fenced_import_run(
-        {"importer": "ptg", "idempotency_key": "key"}
-    ) == existing_by_field
+    assert (
+        await control_imports._admit_wave_fenced_import_run({"importer": "ptg", "idempotency_key": "key"})
+        == existing_by_field
+    )
     monkeypatch.setattr(
         control_imports,
         "_active_idempotency_run",
@@ -698,9 +608,10 @@ async def test_ptg_fenced_admission_replays_do_not_insert(monkeypatch):
         "find_earliest_active_run_by_importer",
         AsyncMock(return_value=existing_by_field),
     )
-    assert await control_imports._admit_wave_fenced_import_run(
-        {"importer": "ptg", "idempotency_key": "key"}
-    ) == existing_by_field
+    assert (
+        await control_imports._admit_wave_fenced_import_run({"importer": "ptg", "idempotency_key": "key"})
+        == existing_by_field
+    )
     monkeypatch.setattr(
         control_imports,
         "find_earliest_active_run_by_importer",
@@ -711,9 +622,11 @@ async def test_ptg_fenced_admission_replays_do_not_insert(monkeypatch):
         "_active_importer_runs",
         AsyncMock(return_value=[existing_by_field]),
     )
-    assert await control_imports._admit_wave_fenced_import_run(
-        {"importer": "ptg", "idempotency_key": None}
-    ) == existing_by_field
+    assert (
+        await control_imports._admit_wave_fenced_import_run({"importer": "ptg", "idempotency_key": None})
+        == existing_by_field
+    )
+
 
 @pytest.mark.asyncio
 async def test_claim_exception_never_guesses_after_ambiguous_reconciliation(monkeypatch):
@@ -722,9 +635,10 @@ async def test_claim_exception_never_guesses_after_ambiguous_reconciliation(monk
         "_exact_wave_claim_values",
         Mock(side_effect=RuntimeError()),
     )
-    assert await ptg_control._reconcile_exact_wave_claim_exception(
-        object(), {}, run_id="run", claim_attempt_token="token"
-    ) is None
+    assert (
+        await ptg_control._reconcile_exact_wave_claim_exception(object(), {}, run_id="run", claim_attempt_token="token")
+        is None
+    )
     fields_by_field = {"run_id": "run"}
     monkeypatch.setattr(
         ptg_control,
@@ -736,9 +650,10 @@ async def test_claim_exception_never_guesses_after_ambiguous_reconciliation(monk
         "reconcile_wave_claim_exception",
         AsyncMock(side_effect=RuntimeError()),
     )
-    assert await ptg_control._reconcile_exact_wave_claim_exception(
-        object(), {}, run_id="run", claim_attempt_token="token"
-    ) is None
+    assert (
+        await ptg_control._reconcile_exact_wave_claim_exception(object(), {}, run_id="run", claim_attempt_token="token")
+        is None
+    )
     flushed = AsyncMock()
     monkeypatch.setattr(
         ptg_control,
@@ -746,16 +661,15 @@ async def test_claim_exception_never_guesses_after_ambiguous_reconciliation(monk
         AsyncMock(return_value=types.SimpleNamespace(status="rejected")),
     )
     monkeypatch.setattr(ptg_control, "_flush_terminal_status_events", flushed)
-    assert (await ptg_control._reconcile_exact_wave_claim_exception(
-        object(), {}, run_id="run", claim_attempt_token="token"
-    )).status == "rejected"
+    assert (
+        await ptg_control._reconcile_exact_wave_claim_exception(object(), {}, run_id="run", claim_attempt_token="token")
+    ).status == "rejected"
     flushed.assert_awaited_once()
     marked = AsyncMock()
     monkeypatch.setattr(ptg_control, "mark_control_run", marked)
-    await ptg_control._mark_exact_wave_preexecution_failure(
-        "run", reason="reason", error=RuntimeError("detail")
-    )
+    await ptg_control._mark_exact_wave_preexecution_failure("run", reason="reason", error=RuntimeError("detail"))
     marked.assert_awaited_once()
+
 
 def test_terminal_state_rejects_non_dead_letter_failure_receipt():
     with pytest.raises(Exception, match="all dead letter"):
@@ -763,6 +677,7 @@ def test_terminal_state_rejects_non_dead_letter_failure_receipt():
             _wave(failure_receipt_digest="a" * 64, intent_count=1),
             [types.SimpleNamespace(ordinal=0, status="failed")],
         )
+
 
 @pytest.mark.asyncio
 async def test_fence_fallbacks_and_conflicts_are_fail_closed(monkeypatch):
@@ -810,6 +725,7 @@ async def test_fence_fallbacks_and_conflicts_are_fail_closed(monkeypatch):
         original_is_ptg_wave_owned_run,
     )
     assert await fence.is_ptg_wave_owned_run(object(), "run") is False
+
 
 def test_kubernetes_receipt_and_membership_projection(monkeypatch):
     attested = types.SimpleNamespace(
@@ -882,9 +798,8 @@ def test_redis_and_terminal_receipt_projection(monkeypatch):
         wave,
         types.SimpleNamespace(as_mapping=lambda: {"ok": True}),
     ) == {"ok": True}
-    assert receipts.redis_terminal_receipt(
-        types.SimpleNamespace(as_mapping=lambda: {"ok": True})
-    ) == {"ok": True}
+    assert receipts.redis_terminal_receipt(types.SimpleNamespace(as_mapping=lambda: {"ok": True})) == {"ok": True}
+
 
 @pytest.mark.asyncio
 async def test_worker_admission_and_binding_replay_short_circuit(monkeypatch):
@@ -905,9 +820,10 @@ async def test_worker_admission_and_binding_replay_short_circuit(monkeypatch):
         "_admit_worker_ensure",
         AsyncMock(return_value=failed_by_field),
     )
-    assert await control_workers._guarded_ptg_family_ensure(
-        {}, run_id="run", importer="ptg", selected_specs=[]
-    ) is failed_by_field
+    assert (
+        await control_workers._guarded_ptg_family_ensure({}, run_id="run", importer="ptg", selected_specs=[])
+        is failed_by_field
+    )
     action_lock.assert_awaited_once_with(connection, "run")
     expected_by_field = {"digest": "a" * 64}
     monkeypatch.setattr(
@@ -926,6 +842,7 @@ async def test_worker_admission_and_binding_replay_short_circuit(monkeypatch):
         Mock(return_value=None),
     )
     assert await bindings.recheck_frozen_binding_on_connection(connection, {}) == expected_by_field
+
 
 @pytest.mark.asyncio
 async def test_control_api_translation_edges(monkeypatch):
@@ -962,6 +879,7 @@ async def test_control_api_translation_edges(monkeypatch):
             _Request(json={"source_key": "source", "snapshot_id": "snapshot"})
         )
 
+
 def test_worker_module_main_entrypoint_calls_asyncio_run(monkeypatch):
     seen_values = []
 
@@ -973,6 +891,7 @@ def test_worker_module_main_entrypoint_calls_asyncio_run(monkeypatch):
     with pytest.warns(RuntimeWarning, match="found in sys.modules"):
         runpy.run_module("process.ptg_wave_worker", run_name="__main__")
     assert len(seen_values) == 1
+
 
 @pytest.mark.asyncio
 async def test_worker_barrier_factory_resolution_covers_async_and_failure_edges(
@@ -1016,6 +935,7 @@ async def test_worker_barrier_factory_resolution_covers_async_and_failure_edges(
     with pytest.raises(barrier.PTGWaveContractError, match="process.PTGSmall"):
         await wave_worker._drain_wave_queue(identity)
 
+
 @pytest.mark.asyncio
 async def test_controller_isolation_preflight_and_terminal_run_edges(monkeypatch):
     monkeypatch.setattr(isolation, "_require_generic_redis_idle", AsyncMock())
@@ -1052,18 +972,28 @@ async def test_controller_isolation_preflight_and_terminal_run_edges(monkeypatch
         object(),
     )
 
-    assert await isolation.has_only_terminal_wave_runs(
-        _isolation_controller([("succeeded",)], []),
-        bundle,
-    ) is True
-    assert await isolation.has_only_terminal_wave_runs(
-        _isolation_controller([], []),
-        bundle,
-    ) is False
-    assert await isolation.has_only_terminal_wave_runs(
-        _isolation_controller([("running",)], []),
-        bundle,
-    ) is False
+    assert (
+        await isolation.has_only_terminal_wave_runs(
+            _isolation_controller([("succeeded",)], []),
+            bundle,
+        )
+        is True
+    )
+    assert (
+        await isolation.has_only_terminal_wave_runs(
+            _isolation_controller([], []),
+            bundle,
+        )
+        is False
+    )
+    assert (
+        await isolation.has_only_terminal_wave_runs(
+            _isolation_controller([("running",)], []),
+            bundle,
+        )
+        is False
+    )
+
 
 @pytest.mark.asyncio
 async def test_claim_reconciliation_none_and_nonrejected_paths(monkeypatch):
@@ -1072,12 +1002,15 @@ async def test_claim_reconciliation_none_and_nonrejected_paths(monkeypatch):
         "_exact_wave_claim_values",
         Mock(return_value=None),
     )
-    assert await ptg_control._reconcile_exact_wave_claim_exception(
-        object(),
-        {},
-        run_id="run",
-        claim_attempt_token="token",
-    ) is None
+    assert (
+        await ptg_control._reconcile_exact_wave_claim_exception(
+            object(),
+            {},
+            run_id="run",
+            claim_attempt_token="token",
+        )
+        is None
+    )
 
     monkeypatch.setattr(
         ptg_control,
@@ -1092,12 +1025,15 @@ async def test_claim_reconciliation_none_and_nonrejected_paths(monkeypatch):
     )
     flushed = AsyncMock()
     monkeypatch.setattr(ptg_control, "_flush_terminal_status_events", flushed)
-    assert await ptg_control._reconcile_exact_wave_claim_exception(
-        object(),
-        {},
-        run_id="run",
-        claim_attempt_token="token",
-    ) is resolution
+    assert (
+        await ptg_control._reconcile_exact_wave_claim_exception(
+            object(),
+            {},
+            run_id="run",
+            claim_attempt_token="token",
+        )
+        is resolution
+    )
     flushed.assert_not_awaited()
 
     marked = AsyncMock()
@@ -1108,6 +1044,7 @@ async def test_claim_reconciliation_none_and_nonrejected_paths(monkeypatch):
         error=None,
     )
     assert marked.await_args.kwargs["error"]["message"] == "worker start failed"
+
 
 @pytest.mark.asyncio
 async def test_incomplete_claim_payload_is_never_reconciled(monkeypatch):
@@ -1124,10 +1061,9 @@ async def test_incomplete_claim_payload_is_never_reconciled(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match="claim"):
-        await ptg_control.ptg_control_start(
-            {}, {"run_id": "run", "params": {"_wave_id": "wave"}}
-        )
+        await ptg_control.ptg_control_start({}, {"run_id": "run", "params": {"_wave_id": "wave"}})
     reconcile.assert_not_awaited()
+
 
 @pytest.mark.asyncio
 async def test_control_without_run_id_never_installs_live_context(monkeypatch):
@@ -1150,19 +1086,21 @@ async def test_control_without_run_id_never_installs_live_context(monkeypatch):
     assert result == {"status": "succeeded", "run_id": ""}
     reset.assert_not_called()
 
+
 @pytest.mark.asyncio
 async def test_fence_scalar_keyword_fallback_and_idle_admission(monkeypatch):
     class KeywordOnlyScalar:
         async def scalar(self, _statement, **parameters):
             return parameters["relation"]
 
-    assert await fence._scalar(
-        KeywordOnlyScalar(), object(), {"relation": "mrf.ptg_import_wave"}
-    ) == "mrf.ptg_import_wave"
+    assert (
+        await fence._scalar(KeywordOnlyScalar(), object(), {"relation": "mrf.ptg_import_wave"}) == "mrf.ptg_import_wave"
+    )
 
     monkeypatch.setattr(fence, "_capacity_owning_waves", AsyncMock(return_value=[]))
     monkeypatch.setattr(fence, "_all", AsyncMock(return_value=[]))
     await fence.require_wave_admission_capacity(object())
+
 
 @pytest.mark.asyncio
 async def test_successful_wave_and_discovery_get_routes(monkeypatch):
@@ -1189,10 +1127,9 @@ async def test_successful_wave_and_discovery_get_routes(monkeypatch):
     assert response.status == 200
     source_files.assert_awaited_once_with("source", cursor="cursor", limit=2)
 
+
 def test_matching_slot_membership_and_receipt_projection():
-    attested = types.SimpleNamespace(
-        pod_uid_by_slot={slot: f"pod-{slot}" for slot in range(12)}
-    )
+    attested = types.SimpleNamespace(pod_uid_by_slot={slot: f"pod-{slot}" for slot in range(12)})
     receipts.assert_slot_membership(
         attested,
         [types.SimpleNamespace(slot=slot, pod_uid=f"pod-{slot}") for slot in range(12)],
@@ -1222,6 +1159,7 @@ def test_matching_slot_membership_and_receipt_projection():
     )
     assert receipt_projection.wave_receipt_mapping(wave)["capacity_owning"] is True
 
+
 def test_coverage_margin_pager_stops_before_a_second_plan_dense_row():
     windows, cursor = bounded_file_windows(
         [
@@ -1239,10 +1177,9 @@ def test_coverage_margin_pager_stops_before_a_second_plan_dense_row():
         plan_reference_limit=1,
     )
 
-    assert [window.file_data["mrf_file_id"] for window in windows] == [
-        "synthetic-file-one"
-    ]
+    assert [window.file_data["mrf_file_id"] for window in windows] == ["synthetic-file-one"]
     assert cursor == "synthetic-file-one"
+
 
 def test_coverage_margin_manifest_rejects_an_unsupported_requested_page_size():
     assert (
@@ -1252,6 +1189,7 @@ def test_coverage_margin_manifest_rejects_an_unsupported_requested_page_size():
         )
         is None
     )
+
 
 @pytest.mark.parametrize(
     "page_totals",
@@ -1277,6 +1215,7 @@ def test_coverage_margin_manifest_rejects_malformed_cached_totals(
         is None
     )
 
+
 @pytest.mark.parametrize("counts", ((True, 0), (0, -1)))
 def test_v4_bound_rejects_invalid_counts(
     counts: tuple[object, object],
@@ -1284,8 +1223,10 @@ def test_v4_bound_rejects_invalid_counts(
     with pytest.raises(ValueError, match="V4 candidate proof counts"):
         v4_scope.v4_candidate_proof_memory_bound(*counts)
 
+
 def test_v4_bound_skips_zero_candidate_graph():
     assert v4_scope.v4_candidate_proof_memory_bound(2, 0) == 992
+
 
 @pytest.mark.parametrize(
     ("counts", "message"),
@@ -1301,17 +1242,21 @@ def test_coverage_margin_source_projection_rejects_non_integer_counts(
     with pytest.raises(ValueError, match=message):
         reverse_scope.source_key_projection_retention_upper_bound(*counts)
 
+
 def test_coverage_margin_provider_projection_rejects_boolean_count():
     with pytest.raises(ValueError, match="candidate provider projection counts"):
-        reverse_scope.provider_candidate_projection_retention_upper_bound(
-            0, 0, False, 0
-        )
+        reverse_scope.provider_candidate_projection_retention_upper_bound(0, 0, False, 0)
+
 
 def test_coverage_margin_display_omits_duplicate_casefolded_code():
-    assert display_value(
-        "synthetic_detail",
-        {"display": "Synthetic label", "code": "synthetic label"},
-    ) == "Synthetic label"
+    assert (
+        display_value(
+            "synthetic_detail",
+            {"display": "Synthetic label", "code": "synthetic label"},
+        )
+        == "Synthetic label"
+    )
+
 
 def test_coverage_margin_specialty_exists_sql_excludes_subspecialties():
     params_by_field: dict[str, object] = {}
