@@ -58857,10 +58857,10 @@ async def _current_endpoint_dataset_id(
     return _clean_text(predecessor.get("dataset_id"))
 
 
-async def _assert_locked_endpoint_candidate(
+async def _has_empty_locked_candidate(
     connection: Any,
     candidate: EndpointDatasetCandidate,
-) -> None:
+) -> bool:
     """Lock a candidate and reject stale or unproven orphan reuse."""
     existing_candidate = await connection.first(
         f"""
@@ -58898,14 +58898,9 @@ async def _assert_locked_endpoint_candidate(
         != _candidate_proof_resource_scope(candidate)
     ):
         raise RuntimeError("provider_directory_endpoint_dataset_candidate_stale")
-    if candidate.repair_empty_orphan:
-        from process.provider_directory_source_failure_control import orphan_candidate_status
+    from process.provider_directory_source_failure_control import has_verified_empty_orphan
 
-        _assert_empty_orphan_candidate_identity(
-            existing_candidate_map,
-            candidate,
-            expected_status=await orphan_candidate_status(sys.modules[__name__], existing_candidate_map, candidate),
-        )
+    return await has_verified_empty_orphan(sys.modules[__name__], existing_candidate_map, candidate)
 
 
 def _assert_empty_orphan_candidate_identity(
@@ -60352,7 +60347,7 @@ async def _ensure_endpoint_dataset_candidate(
     async with source_transaction(db):
         from process.provider_directory_generic_source_adapters import require_source_transaction
         from process.provider_directory_generic_source_storage import prepare_generic_source_candidate
-        from process.provider_directory_source_failure_control import is_retained_vsp_capture_retry
+        from process.provider_directory_source_failure_control import should_prepare_candidate
 
         require_source_transaction()
         from process.provider_directory_generic_source_adapters import require_generic_source_layout
@@ -60360,12 +60355,13 @@ async def _ensure_endpoint_dataset_candidate(
         await require_generic_source_layout(sys.modules[__name__])
         async with db.acquire() as connection:
             await _lock_endpoint_dataset_candidate_admission(connection, candidate.endpoint_id)
-            await _assert_locked_endpoint_candidate(connection, candidate)
-            await _assert_empty_endpoint_dataset_orphan(connection, candidate)
+            has_empty_isolated_storage = await _has_empty_locked_candidate(connection, candidate)
+            if not has_empty_isolated_storage:
+                await _assert_empty_endpoint_dataset_orphan(connection, candidate)
             candidate = await _assert_no_conflicting_endpoint_candidate(connection, candidate)
             metadata = _endpoint_dataset_candidate_metadata(candidate)
             await _upsert_endpoint_dataset_candidate(connection, candidate, metadata)
-            if not _is_finalized_endpoint_dataset_candidate(candidate) and not is_retained_vsp_capture_retry(candidate):
+            if should_prepare_candidate(sys.modules[__name__], candidate, has_empty_isolated_storage):
                 await prepare_generic_source_candidate(db, sys.modules[__name__], candidate)
                 await _reset_new_endpoint_candidate(connection, candidate, partition_initializations)
         return candidate

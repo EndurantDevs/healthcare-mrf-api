@@ -363,8 +363,8 @@ async def test_candidate_initial_clear_rejects_sealed_parent_before_delete(
     )
     monkeypatch.setattr(
         importer,
-        "_assert_locked_endpoint_candidate",
-        AsyncMock(),
+        "_has_empty_locked_candidate",
+        AsyncMock(return_value=False),
     )
     monkeypatch.setattr(
         importer,
