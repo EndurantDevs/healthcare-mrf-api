@@ -3,17 +3,16 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import PurePosixPath
-import re
 from urllib.parse import urljoin, urlsplit
 
 from process.nppes_public_evidence_archive_contract import (
     NppesArchiveCandidate,
     archive_error,
 )
-
 
 NPPES_LISTING_URL = "https://download.cms.gov/nppes/NPI_Files.html"
 _MONTHLY_RE = re.compile(
@@ -99,10 +98,7 @@ def validate_nppes_archive_candidate(candidate: object) -> NppesArchiveCandidate
             or type(candidate.archive_name) is not str
             or type(candidate.archive_kind) is not str
             or type(candidate.period_start) is not date
-            or (
-                candidate.period_end is not None
-                and type(candidate.period_end) is not date
-            )
+            or (candidate.period_end is not None and type(candidate.period_end) is not date)
         ):
             raise archive_error()
         rebuilt_candidate = _candidate_from_url(candidate.source_url)
@@ -144,9 +140,7 @@ def parse_official_nppes_listing(
             candidates_by_url[resolved_url] = candidate
         if not candidates_by_url:
             raise archive_error()
-        parsed_candidates = tuple(
-            sorted(candidates_by_url.values(), key=_candidate_order)
-        )
+        parsed_candidates = tuple(sorted(candidates_by_url.values(), key=_candidate_order))
     except Exception:
         normalized_error = archive_error()
     else:
@@ -163,15 +157,8 @@ def select_nppes_release_chain(
     try:
         if type(candidates) is not tuple or type(monthly_snapshot_date) is not date:
             raise archive_error()
-        fixed_candidates = tuple(
-            validate_nppes_archive_candidate(candidate)
-            for candidate in candidates
-        )
-        monthly_candidates = [
-            candidate
-            for candidate in fixed_candidates
-            if candidate.archive_kind == "monthly"
-        ]
+        fixed_candidates = tuple(validate_nppes_archive_candidate(candidate) for candidate in candidates)
+        monthly_candidates = [candidate for candidate in fixed_candidates if candidate.archive_kind == "monthly"]
         if not monthly_candidates:
             raise archive_error()
         monthly = max(monthly_candidates, key=lambda candidate: candidate.period_start)
@@ -193,9 +180,11 @@ def select_nppes_release_chain(
         )
         previous_end = monthly_snapshot_date
         selected_candidates: list[NppesArchiveCandidate] = [monthly]
-        for weekly in weekly_candidates:
+        for index, weekly in enumerate(weekly_candidates):
             allowed_start = previous_end + timedelta(days=1)
-            if weekly.period_start != allowed_start:
+            # CMS measures the first weekly delta from when the monthly file was generated.
+            is_monthly_boundary = index == 0 and weekly.period_start == monthly_snapshot_date
+            if weekly.period_start != allowed_start and not is_monthly_boundary:
                 raise archive_error()
             selected_candidates.append(weekly)
             previous_end = weekly.period_end

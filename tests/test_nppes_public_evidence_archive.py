@@ -3,12 +3,12 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-from datetime import date
 import hashlib
 import os
-from pathlib import Path
 import zipfile
+from dataclasses import replace
+from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -28,7 +28,6 @@ from process.nppes_public_evidence_members import (
     materialize_nppes_legacy_members,
     open_verified_nppes_legacy_text,
 )
-
 
 MONTHLY = "NPPES_Data_Dissemination_July_2026_V2.zip"
 WEEKLY_NAMES = (
@@ -78,14 +77,31 @@ def _write_zip(path: Path, primary: str, body: str, *extra_names: str) -> None:
 
 
 def test_listing_order_is_deterministic_and_selects_post_monthly_chain() -> None:
-    candidates = parse_official_nppes_listing(
-        _listing(WEEKLY_NAMES[3], WEEKLY_NAMES[0], MONTHLY, *WEEKLY_NAMES[1:3])
-    )
+    candidates = parse_official_nppes_listing(_listing(WEEKLY_NAMES[3], WEEKLY_NAMES[0], MONTHLY, *WEEKLY_NAMES[1:3]))
     selected = select_nppes_release_chain(candidates, date(2026, 7, 12))
     assert [item.archive_name for item in selected] == [MONTHLY, *WEEKLY_NAMES[1:]]
     assert selected[0].archive_kind == "monthly"
     assert all(item.archive_kind == "weekly" for item in selected[1:])
     assert "NPPES" not in repr(selected[0])
+
+
+def test_release_chain_allows_first_weekly_on_the_monthly_generation_date() -> None:
+    candidates = parse_official_nppes_listing(_listing(MONTHLY, *WEEKLY_NAMES))
+    selected = select_nppes_release_chain(candidates, date(2026, 7, 13))
+    assert [item.archive_name for item in selected] == [MONTHLY, *WEEKLY_NAMES[1:]]
+
+
+@pytest.mark.parametrize(
+    "weekly_names",
+    (
+        ("NPPES_Data_Dissemination_071226_071826_Weekly_V2.zip",),
+        (WEEKLY_NAMES[1], "NPPES_Data_Dissemination_071926_072526_Weekly_V2.zip"),
+    ),
+)
+def test_release_chain_rejects_other_overlaps(weekly_names) -> None:
+    candidates = parse_official_nppes_listing(_listing(MONTHLY, *weekly_names))
+    with pytest.raises(NppesPublicEvidenceArchiveError):
+        select_nppes_release_chain(candidates, date(2026, 7, 13))
 
 
 def test_listing_deduplicates_exact_links_and_ignores_unrelated_links() -> None:
@@ -175,9 +191,7 @@ def test_valid_zip_inventory_and_complete_csv_stream(tmp_path: Path) -> None:
     assert len(layout.members) == 2
     with NppesPrimaryCsvRows(prepared) as rows:
         assert rows.header == HEADER
-        assert list(rows) == [
-            ("1003000100", "1", "05/23/2005", "07/01/2026", "", "")
-        ]
+        assert list(rows) == [("1003000100", "1", "05/23/2005", "07/01/2026", "", "")]
 
 
 def test_monthly_archive_rejects_a_primary_snapshot_from_another_month(
@@ -368,9 +382,7 @@ def test_csv_stream_rejects_an_exact_type_with_a_forged_seal(tmp_path: Path) -> 
         ),
     ),
 )
-def test_zip_rejects_unsafe_or_ambiguous_primary_members(
-    tmp_path: Path, member_names: tuple[str, ...]
-) -> None:
+def test_zip_rejects_unsafe_or_ambiguous_primary_members(tmp_path: Path, member_names: tuple[str, ...]) -> None:
     path = tmp_path / MONTHLY
     with zipfile.ZipFile(path, "w") as archive:
         for name in member_names:

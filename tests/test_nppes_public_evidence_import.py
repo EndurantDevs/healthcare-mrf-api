@@ -17,7 +17,6 @@ from process.nppes_public_evidence_import import (
     NppesEvidenceRuntimeConfig,
     NppesPublicEvidenceArchiveReceipt,
     NppesPublicEvidenceChainReceipt,
-    _archive_receipt as build_archive_receipt,
     _expected_source_counts,
     _finished_chain_receipt,
     build_prepared_nppes_release_chain,
@@ -25,9 +24,12 @@ from process.nppes_public_evidence_import import (
     materialize_prepared_nppes_archive,
     prepare_nppes_release_chain,
     resolve_nppes_evidence_runtime_config,
-    validate_prepared_nppes_release_chain,
-    validate_nppes_public_evidence_chain_receipt,
     validate_nppes_evidence_runtime_config,
+    validate_nppes_public_evidence_chain_receipt,
+    validate_prepared_nppes_release_chain,
+)
+from process.nppes_public_evidence_import import (
+    _archive_receipt as build_archive_receipt,
 )
 from process.nppes_public_evidence_replay import prepare_nppes_registry_replay
 from process.nppes_public_evidence_writer import NppesRegistryAdmissionReceipt
@@ -37,7 +39,6 @@ from tests.nppes_public_evidence_process_support import (
 )
 from tests.public_evidence_nppes_registry_support import active_type_1_row
 from tests.test_nppes_public_evidence_replay import _config
-
 
 MONTHLY = "NPPES_Data_Dissemination_July_2026_V2.zip"
 WEEKLY_1 = "NPPES_Data_Dissemination_071326_071926_Weekly_V2.zip"
@@ -267,20 +268,20 @@ def _writer_receipt(replay) -> NppesRegistryAdmissionReceipt:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("monthly_date", ("20260712", "20260713"))
 async def test_prepare_release_chain_acquires_monthly_then_weekly(
+    monthly_date: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source_chain = prepared_release_chain(
         tmp_path,
         (
-            (MONTHLY, "20260712", (active_type_1_row(),)),
+            (MONTHLY, monthly_date, (active_type_1_row(),)),
             (WEEKLY_1, "20260719", (active_type_1_row(),)),
         ),
     )
-    retained_by_name = {
-        archive.archive_name: archive.retained for archive in source_chain.archives
-    }
+    retained_by_name = {archive.archive_name: archive.retained for archive in source_chain.archives}
 
     async def acquire_archive(_store, candidate, _listing_sha256, **_kwargs):
         return retained_by_name[candidate.archive_name]
