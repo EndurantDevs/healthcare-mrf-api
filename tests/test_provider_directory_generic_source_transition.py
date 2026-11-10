@@ -240,6 +240,24 @@ async def test_exact_detached_candidate_changes_only_its_storage_binding(case):
     assert len(case.writes) == 1
 
 
+@pytest.fixture
+def vsp_retry_candidate(case, monkeypatch):
+    binding_document = case.header["candidate_storage_json"]
+    metadata = binding_document["identity"]["metadata"]
+    metadata.update(
+        source_ids=[SOURCE_ID], selected_resources=list(RESOURCE_TYPES), expected_resources=list(RESOURCE_TYPES)
+    )
+    case.header["publication_metadata_json"] = deepcopy(metadata)
+    binding_document.update(ordinal=0, resets={"*": 0})
+    case.checkpoints.clear()
+    publisher = SimpleNamespace(connection=case.connection, policy=case.policy)
+    monkeypatch.setattr(storage, "source_owner_transaction", lambda _database: nullcontext(publisher))
+    monkeypatch.setattr(policy_module, "bound_publisher", lambda: publisher)
+    directory = SimpleNamespace(db=object(), _endpoint_dataset_candidate_metadata=lambda _candidate: metadata)
+    candidate = SimpleNamespace(dataset_id=DATASET, endpoint_id=ENDPOINT, acquisition_root_run_id=ROOT)
+    return directory, candidate
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("retained", "error"),
@@ -250,36 +268,41 @@ async def test_exact_detached_candidate_changes_only_its_storage_binding(case):
         ("producer", "storage_binding_changed"),
     ],
 )
-async def test_vsp_capture_retry_proves_empty_storage_under_the_current_producer(case, monkeypatch, retained, error):
-    binding_document = case.header["candidate_storage_json"]
-    metadata = binding_document["identity"]["metadata"]
-    metadata.update(
-        source_ids=[SOURCE_ID], selected_resources=list(RESOURCE_TYPES), expected_resources=list(RESOURCE_TYPES)
-    )
-    case.header["publication_metadata_json"] = deepcopy(metadata)
+async def test_vsp_capture_retry_proves_empty_storage_under_the_current_producer(
+    case, monkeypatch, vsp_retry_candidate, retained, error
+):
+    directory, candidate = vsp_retry_candidate
     case.header["status"] = "failed"
-    binding_document.update(ordinal=0, resets={"*": 0})
-    case.checkpoints.clear()
     if retained != "input":
         case.input_rows.clear()
     if retained == "witness_or_proof":
         case.connection.fetchval.return_value = False
         case.connection.fetchval.side_effect = None
-    publisher = SimpleNamespace(connection=case.connection, policy=case.policy)
-    monkeypatch.setattr(storage, "source_owner_transaction", lambda _database: nullcontext(publisher))
     monkeypatch.setattr(storage, "_require_candidate_storage", lambda *_args: True)
-    monkeypatch.setattr(policy_module, "bound_publisher", lambda: publisher)
     monkeypatch.setattr(
         storage, "storage_document", lambda _publisher: case.new if retained == "producer" else case.old
     )
-    directory = SimpleNamespace(db=object(), _endpoint_dataset_candidate_metadata=lambda _candidate: metadata)
-    candidate = SimpleNamespace(dataset_id=DATASET, endpoint_id=ENDPOINT, acquisition_root_run_id=ROOT)
     if error:
         with pytest.raises(GenericCandidateError, match=f"^provider_directory_generic_source_{error}$"):
-            await storage.verify_empty_vsp_capture_retry(directory, candidate, case.header)
+            await storage.has_empty_isolated_vsp_storage(directory, candidate, case.header)
     else:
-        await storage.verify_empty_vsp_capture_retry(directory, candidate, case.header)
+        assert await storage.has_empty_isolated_vsp_storage(directory, candidate, case.header) is True
         case.tables.assert_awaited_once()
+    assert not case.writes
+
+
+@pytest.mark.asyncio
+async def test_vsp_capture_retry_rejects_acquiring_legacy_storage(case, monkeypatch, vsp_retry_candidate):
+    directory, candidate = vsp_retry_candidate
+    case.header["status"] = "acquiring"
+    binding_document = case.header["candidate_storage_json"]
+    binding_document["contract"] = storage.CONTRACT
+    del binding_document["storage"], binding_document["admission"]
+    case.input_rows.clear()
+    monkeypatch.setattr(storage, "_require_candidate_storage", lambda *_args: None)
+    with pytest.raises(GenericCandidateError, match="^provider_directory_generic_source_vsp_retry_candidate_changed$"):
+        await storage.has_empty_isolated_vsp_storage(directory, candidate, case.header)
+    case.tables.assert_not_awaited()
     assert not case.writes
 
 
@@ -300,10 +323,11 @@ def _retain_original_root(case, status):
         ("checkpoint", "transition_checkpoint_changed"),
         ("input", "transition_input_changed"),
         ("different-failure", "transition_checkpoint_changed"),
+        ("canceled", "transition_checkpoint_changed"),
     ],
 )
 async def test_vsp_pre_capture_failure_transitions_only_an_empty_original_candidate(case, retained, error):
-    _retain_original_root(case, "failed")
+    _retain_original_root(case, "canceled" if retained == "canceled" else "failed")
     case.runs[0]["source_ids"] = [SOURCE_ID]
     candidate = case.header["candidate_storage_json"]
     candidate.update(ordinal=0, resets={"*": 0})
@@ -333,6 +357,56 @@ async def test_vsp_pre_capture_failure_transitions_only_an_empty_original_candid
     assert case.header["status"] == "acquiring"
     assert case.header["candidate_storage_json"] == {**candidate, "storage": case.new}
     assert (await _transition(case, expected_counts, stopped_run_id=ROOT))["already_applied"] is True
+    assert len(case.writes) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("drift", "error"),
+    [
+        (None, None),
+        ("wrong_error", "transition_run_changed"),
+        ("active_child", "transition_run_changed"),
+        ("retained_input", "transition_input_changed"),
+    ],
+)
+async def test_rearmed_vsp_root_transitions_after_exact_pre_capture_child_failure(case, drift, error):
+    case.runs[0]["error_message"] = (
+        "unrelated error"
+        if drift == "wrong_error"
+        else "provider_directory_generic_source_isolated_relation_override_changed"
+    )
+    case.runs[1]["root_run_id"] = None
+    for run in case.runs:
+        run["source_ids"] = [SOURCE_ID]
+    if drift == "active_child":
+        case.runs[0]["status"] = "running"
+    candidate = case.header["candidate_storage_json"]
+    candidate.update(ordinal=0, resets={"*": 0})
+    metadata = candidate["identity"]["metadata"]
+    metadata.update(
+        source_ids=[SOURCE_ID], selected_resources=list(RESOURCE_TYPES), expected_resources=list(RESOURCE_TYPES)
+    )
+    case.header.update(
+        import_run_id=ROOT,
+        status="acquiring",
+        resource_count=0,
+        publication_metadata_json={**metadata, "error": "vsp_prepared_candidate_required"},
+    )
+    case.checkpoints.clear()
+    if drift != "retained_input":
+        case.input_rows.clear()
+    counts_by_resource = dict.fromkeys(RESOURCE_TYPES, 0)
+    if error:
+        with pytest.raises(GenericCandidateError, match=f"^provider_directory_generic_source_{error}$"):
+            await _transition(case, counts_by_resource)
+        assert case.writes == []
+        return
+    receipt = await _transition(case, counts_by_resource)
+    assert receipt["rows"] == 0 and receipt["lineage_run_ids"] == [ROOT, FAILED]
+    assert case.header["status"] == "acquiring" and case.header["import_run_id"] == ROOT
+    assert case.header["candidate_storage_json"] == {**candidate, "storage": case.new}
+    assert (await _transition(case, counts_by_resource))["already_applied"] is True
     assert len(case.writes) == 1
 
 
@@ -474,6 +548,7 @@ async def test_mixed_transition_preserves_complete_checkpoint_and_full_input_req
         ("checkpoint", "transition_checkpoint_changed"),
         ("row_count", "transition_input_changed"),
         ("metadata", "transition_candidate_changed"),
+        ("header_owner", "transition_candidate_changed"),
         ("producer", "transition_storage_changed"),
         ("identity", "transition_candidate_changed"),
     ],
@@ -492,11 +567,25 @@ async def test_drift_refuses_without_candidate_write(case, drift, reason):
             case.input_rows[0]["total"] = 2
         case "metadata":
             case.header["publication_metadata_json"] = {}
+        case "header_owner":
+            case.header["import_run_id"] = ROOT
         case "producer":
             case.new["catalog_schema"] = "other_schema"
         case "identity":
             case.header["endpoint_id"] = "other-endpoint"
     with pytest.raises(GenericCandidateError, match=reason):
+        await _transition(case)
+    assert case.writes == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_empty_candidate_refuses_without_candidate_write(case):
+    case.header.update(status="acquiring", resource_count=0)
+    candidate = case.header["candidate_storage_json"]
+    candidate["contract"] = storage.CONTRACT
+    del candidate["storage"], candidate["admission"]
+
+    with pytest.raises(GenericCandidateError, match="^provider_directory_generic_source_transition_candidate_changed$"):
         await _transition(case)
     assert case.writes == []
 

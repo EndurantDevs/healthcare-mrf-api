@@ -779,13 +779,20 @@ def _validated_transition_storage(policy, old_storage, new_storage):
 
 
 def _is_empty_vsp_checkpoint_failure(header, candidate_by_field, identity_by_field, expected_counts, new_storage):
-    """Recognize only the original VSP attempt that stopped before capture."""
+    """Recognize an empty original VSP header, including a rearmed root."""
     failure_metadata = _json(header["publication_metadata_json"])
     identity_metadata = candidate_by_field["identity"]["metadata"]
+    root_run_id = identity_by_field["acquisition_root_run_id"]
     return (
         header.get("resource_count") == 0
-        and (header["status"] == "failed" or candidate_by_field["storage"] == new_storage)
-        and identity_by_field["failed_run_id"] == identity_by_field["acquisition_root_run_id"]
+        and header["import_run_id"] == root_run_id
+        and (
+            (
+                identity_by_field["failed_run_id"] == root_run_id
+                and (header["status"] == "failed" or candidate_by_field.get("storage") == new_storage)
+            )
+            or (identity_by_field["failed_run_id"] != root_run_id and header["status"] == "acquiring")
+        )
         and identity_metadata.get("source_ids") == [VSP_SOURCE_ID]
         and type(failure_metadata) is dict
         and failure_metadata.get("error") == "vsp_prepared_candidate_required"
@@ -824,7 +831,6 @@ async def _locked_transition_header(connection, policy, identity_by_field):
                 ("dataset_id", "dataset_id"),
                 ("endpoint_id", "endpoint_id"),
                 ("acquisition_root_run_id", "acquisition_root_run_id"),
-                ("import_run_id", "failed_run_id"),
             )
         )
         and header["status"] in {"acquiring", "failed"}
@@ -856,8 +862,10 @@ async def _locked_transition_candidate(
             for field_name, expected_value in stored_identity["metadata"].items()
         )
     )
+    has_changed_header_owner = header["import_run_id"] != identity_by_field["failed_run_id"]
     _require(
         candidate_by_field["contract"] == ISOLATED_CONTRACT
+        and (not has_changed_header_owner or is_empty_vsp_failure)
         and candidate_by_field["admission"] is None
         and candidate_by_field["auxiliary"] is None
         and all(
@@ -873,16 +881,21 @@ async def _locked_transition_candidate(
         "transition_candidate_changed",
     )
     await _verify_tables(connection, policy, candidate_by_field)
-    return candidate_by_field, header["status"], is_empty_vsp_failure
+    return candidate_by_field, header["status"], is_empty_vsp_failure, has_changed_header_owner
 
 
-async def _verify_transition_run(connection, catalog_schema, identity_by_field, source_ids):
+async def _verify_transition_run(
+    connection, catalog_schema, identity_by_field, source_ids, *, has_changed_header_owner
+):
     """Require the exact latest stopped run and no active same-root run."""
     root_run_id = identity_by_field["acquisition_root_run_id"]
+    failure_field = ",error::jsonb->>'message' AS error_message" if has_changed_header_owner else ""
     run_rows = await connection.fetch(
         "SELECT run_id,status,finished_at,retry_of_run_id,created_at,"
         "params::jsonb->>'provider_directory_pagination_root_run_id' AS root_run_id,"
-        "params::jsonb->'source_ids' AS source_ids FROM "
+        "params::jsonb->'source_ids' AS source_ids"
+        + failure_field
+        + " FROM "
         + storage_relation(catalog_schema, "import_run")
         + " WHERE importer='provider-directory-fhir' AND "
         "(run_id=$1 OR params::jsonb->>'provider_directory_pagination_root_run_id'=$1) "
@@ -890,10 +903,22 @@ async def _verify_transition_run(connection, catalog_schema, identity_by_field, 
         root_run_id,
     )
     run_ids = {run_record["run_id"] for run_record in run_rows}
-    parents_by_id = {run_record["run_id"]: run_record["retry_of_run_id"] for run_record in run_rows}
+    failed_run_id = identity_by_field["failed_run_id"]
+    _verify_transition_run_rows(run_rows, run_ids, root_run_id, failed_run_id, source_ids)
+    if has_changed_header_owner:
+        _verify_rearmed_vsp_child(run_rows, root_run_id)
+    return {
+        "lineage_run_ids": sorted(run_ids),
+        "ancestor_run_ids": _transition_run_ancestors(run_rows, root_run_id, failed_run_id),
+        "status": run_rows[0]["status"],
+    }
+
+
+def _verify_transition_run_rows(run_rows, run_ids, root_run_id, failed_run_id, source_ids):
+    """Check the latest stop and reject active or out-of-scope runs."""
     _require(
         1 <= len(run_rows) <= 64
-        and run_rows[0]["run_id"] == identity_by_field["failed_run_id"]
+        and run_rows[0]["run_id"] == failed_run_id
         and run_rows[0]["status"] in {"failed", "canceled"}
         and run_rows[0]["finished_at"] is not None
         and (
@@ -918,17 +943,31 @@ async def _verify_transition_run(connection, catalog_schema, identity_by_field, 
         ),
         "transition_run_changed",
     )
-    lineage_cursor = identity_by_field["failed_run_id"]
+
+
+def _verify_rearmed_vsp_child(run_rows, root_run_id):
+    """Accept only the stopped direct child that never attached to the candidate."""
+    _require(
+        len(run_rows) == 2
+        and run_rows[0]["retry_of_run_id"] == root_run_id
+        and run_rows[0]["status"] == "failed"
+        and run_rows[1]["status"] == "failed"
+        and run_rows[1]["finished_at"] is not None
+        and run_rows[0].get("error_message") == "provider_directory_generic_source_isolated_relation_override_changed",
+        "transition_run_changed",
+    )
+
+
+def _transition_run_ancestors(run_rows, root_run_id, failed_run_id):
+    """Follow the exact failed lineage to its root without cycles."""
+    parents_by_id = {run_record["run_id"]: run_record["retry_of_run_id"] for run_record in run_rows}
+    lineage_cursor = failed_run_id
     seen_run_ids = set()
     while lineage_cursor != root_run_id:
-        _require(lineage_cursor in run_ids and lineage_cursor not in seen_run_ids, "transition_run_changed")
+        _require(lineage_cursor in parents_by_id and lineage_cursor not in seen_run_ids, "transition_run_changed")
         seen_run_ids.add(lineage_cursor)
         lineage_cursor = parents_by_id[lineage_cursor]
-    return {
-        "lineage_run_ids": sorted(run_ids),
-        "ancestor_run_ids": sorted(seen_run_ids | {root_run_id}),
-        "status": run_rows[0]["status"],
-    }
+    return sorted(seen_run_ids | {root_run_id})
 
 
 def _is_resumable_transition_checkpoint(checkpoint):
@@ -1149,7 +1188,7 @@ async def _verify_transition_checkpoints(
         dataset_id,
     )
     if is_empty_vsp_failure:
-        _require(run_status == "failed" and not (checkpoint_rows or bulk_checkpoints), "transition_checkpoint_changed")
+        _require(not (checkpoint_rows or bulk_checkpoints), "transition_checkpoint_changed")
         return
     _require(not (checkpoint_rows and bulk_checkpoints), "transition_checkpoint_changed")
     if bulk_checkpoints:
@@ -1229,7 +1268,7 @@ async def _verify_transition_inputs(
     await _verify_transition_witness(connection, policy, candidate_by_field, dataset_id, is_empty_vsp_failure)
 
 
-async def verify_empty_vsp_capture_retry(directory, candidate, header):
+async def has_empty_isolated_vsp_storage(directory, candidate, header):
     """Prove the locked VSP candidate has never committed normalized input."""
     identity = candidate_identity(directory, candidate)
     metadata = identity["metadata"]
@@ -1248,6 +1287,7 @@ async def verify_empty_vsp_capture_retry(directory, candidate, header):
         _validate_binding(binding, identity, phases=("loading",))
         _require(
             (isolated is not None) == (binding["contract"] in ISOLATED_CONTRACTS)
+            and (header["status"] == "failed" or (header["status"] == "acquiring" and isolated is not None))
             and binding["ordinal"] == 0
             and binding["resets"] in ({}, {"*": 0})
             and binding["relationship_sha256"] is None
@@ -1265,6 +1305,7 @@ async def verify_empty_vsp_capture_retry(directory, candidate, header):
             (),
             is_empty_vsp_failure=True,
         )
+        return isolated is not None
 
 
 async def _verify_transition_witness(connection, policy, candidate_by_field, dataset_id, is_empty_vsp_failure):
@@ -1307,7 +1348,7 @@ async def transition_isolated_loading_candidate_storage(
     _validated_transition_identity(identity_by_field, expected_resource_counts)
     old_binding = _validated_transition_storage(policy, old_storage, new_storage)
     await verify_isolated_source_storage_coordinates(connection, policy, old_binding)
-    candidate_by_field, previous_status, is_empty_vsp_failure = await _locked_transition_candidate(
+    locked_candidate = await _locked_transition_candidate(
         connection,
         policy,
         identity_by_field,
@@ -1315,12 +1356,15 @@ async def transition_isolated_loading_candidate_storage(
         new_storage,
         expected_resource_counts,
     )
+    candidate_by_field, previous_status, is_empty_vsp_failure, has_changed_header_owner = locked_candidate
     run_evidence_by_field = await _verify_transition_run(
         connection,
         old_binding.catalog_schema,
         identity_by_field,
         candidate_by_field["identity"]["metadata"]["source_ids"],
+        has_changed_header_owner=has_changed_header_owner,
     )
+    _require(not is_empty_vsp_failure or run_evidence_by_field["status"] == "failed", "transition_checkpoint_changed")
     await _verify_transition_inputs(
         connection,
         policy,
@@ -1331,15 +1375,10 @@ async def transition_isolated_loading_candidate_storage(
         run_evidence_by_field["ancestor_run_ids"],
         is_empty_vsp_failure=is_empty_vsp_failure,
     )
-    old_document_by_field = {**candidate_by_field, "storage": old_storage}
     successor_by_field = {**candidate_by_field, "storage": new_storage}
-    receipt_by_field = {
-        "dataset_id": identity_by_field["dataset_id"],
-        "rows": sum(expected_resource_counts.values()),
-        "lineage_run_ids": run_evidence_by_field["lineage_run_ids"],
-        "old_binding_sha256": hashlib.sha256(_encoded(old_document_by_field).encode()).hexdigest(),
-        "new_binding_sha256": hashlib.sha256(_encoded(successor_by_field).encode()).hexdigest(),
-    }
+    receipt_by_field = _transition_receipt(
+        candidate_by_field, old_storage, successor_by_field, expected_resource_counts, run_evidence_by_field
+    )
     if candidate_by_field["storage"] == new_storage:
         return {**receipt_by_field, "already_applied": True}
     await _store_transition_successor(
@@ -1352,6 +1391,18 @@ async def transition_isolated_loading_candidate_storage(
         is_empty_vsp_failure,
     )
     return {**receipt_by_field, "already_applied": False}
+
+
+def _transition_receipt(candidate, old_storage, successor, expected_counts, run_evidence):
+    """Bind the verified input counts and both exact storage states."""
+    old_candidate_by_field = {**candidate, "storage": old_storage}
+    return {
+        "dataset_id": candidate["identity"]["dataset_id"],
+        "rows": sum(expected_counts.values()),
+        "lineage_run_ids": run_evidence["lineage_run_ids"],
+        "old_binding_sha256": hashlib.sha256(_encoded(old_candidate_by_field).encode()).hexdigest(),
+        "new_binding_sha256": hashlib.sha256(_encoded(successor).encode()).hexdigest(),
+    }
 
 
 async def _store_transition_successor(

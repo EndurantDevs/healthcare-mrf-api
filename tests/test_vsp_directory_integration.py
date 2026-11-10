@@ -148,18 +148,8 @@ def test_vsp_checkpoint_keeps_the_acquisition_root_on_retry():
     assert resumed.owner_run_id == "retry-example"
 
 
-@pytest.mark.asyncio
-async def test_failed_vsp_retry_reopens_the_exact_parent_without_reset(monkeypatch, source_record):
-    context = source_record["_pagination_checkpoint_context"]
-    header_by_field = {
-        "endpoint_id": context.endpoint_id,
-        "dataset_id": context.dataset_id,
-        "acquisition_root_run_id": context.acquisition_root_run_id,
-        "import_run_id": context.retry_of_run_id,
-        "resource_count": 0,
-        "is_current": False,
-        "status": directory.ENDPOINT_DATASET_FAILED,
-    }
+async def _vsp_retry_candidate(monkeypatch, source_record, context, header_by_field):
+    """Select and build the same candidate used for a retained VSP retry."""
     monkeypatch.setattr(directory, "_checkpoint_candidate_dataset_id", AsyncMock(return_value=None))
     monkeypatch.setattr(directory, "_previous_endpoint_dataset_id", AsyncMock(return_value=None))
     profile = directory.EndpointDatasetVerificationProfile(is_twin_root_required=False)
@@ -173,7 +163,7 @@ async def test_failed_vsp_retry_reopens_the_exact_parent_without_reset(monkeypat
         context,
         profile,
     )
-    candidate = directory._build_endpoint_dataset_candidate(
+    return directory._build_endpoint_dataset_candidate(
         [source_record],
         context.endpoint_id,
         RESOURCE_TYPES,
@@ -183,22 +173,43 @@ async def test_failed_vsp_retry_reopens_the_exact_parent_without_reset(monkeypat
         context,
         profile,
     )
-    assert candidate.checkpoint_context.require_retained_vsp_capture
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rearmed", [False, True])
+async def test_vsp_retry_reopens_verified_detached_inputs_without_reset(monkeypatch, source_record, rearmed):
+    context = source_record["_pagination_checkpoint_context"]
+    header_by_field = {
+        "endpoint_id": context.endpoint_id,
+        "dataset_id": context.dataset_id,
+        "acquisition_root_run_id": context.acquisition_root_run_id,
+        "import_run_id": context.acquisition_root_run_id if rearmed else context.retry_of_run_id,
+        "resource_count": 0,
+        "is_current": False,
+        "status": directory.ENDPOINT_DATASET_ACQUIRING if rearmed else directory.ENDPOINT_DATASET_FAILED,
+    }
+    candidate = await _vsp_retry_candidate(monkeypatch, source_record, context, header_by_field)
+    assert candidate.checkpoint_context.require_retained_vsp_capture is not rearmed
     header_by_field["publication_metadata_json"] = directory._endpoint_dataset_candidate_metadata(candidate)
+    if rearmed:
+        header_by_field["publication_metadata_json"]["error"] = "vsp_prepared_candidate_required"
     connection = SimpleNamespace(first=AsyncMock(return_value=header_by_field))
     monkeypatch.setattr(source_policy, "source_transaction", lambda _db: nullcontext())
     monkeypatch.setattr(source_adapters, "require_source_transaction", Mock())
     monkeypatch.setattr(source_adapters, "require_generic_source_layout", AsyncMock())
     monkeypatch.setattr(directory.db, "acquire", lambda: nullcontext(connection))
     monkeypatch.setattr(directory, "_assert_no_conflicting_endpoint_candidate", AsyncMock(return_value=candidate))
-    prepare, verify, upsert, reset = AsyncMock(), AsyncMock(), AsyncMock(), AsyncMock()
+    prepare, verify, upsert, reset = AsyncMock(), AsyncMock(return_value=True), AsyncMock(), AsyncMock()
     monkeypatch.setattr(source_storage, "prepare_generic_source_candidate", prepare)
-    monkeypatch.setattr(source_storage, "verify_empty_vsp_capture_retry", verify)
+    monkeypatch.setattr(source_storage, "has_empty_isolated_vsp_storage", verify)
     monkeypatch.setattr(directory, "_upsert_endpoint_dataset_candidate", upsert)
     monkeypatch.setattr(directory, "_reset_new_endpoint_candidate", reset)
+    legacy_empty = AsyncMock(side_effect=AssertionError("detached inputs cannot use the canonical resource count"))
+    monkeypatch.setattr(directory, "_assert_empty_endpoint_dataset_orphan", legacy_empty)
 
     await directory._ensure_endpoint_dataset_candidate(candidate)
     verify.assert_awaited_once()
+    legacy_empty.assert_not_awaited()
     upsert.assert_awaited_once()
     prepare.assert_not_awaited()
     reset.assert_not_awaited()

@@ -33640,7 +33640,7 @@ async def test_locked_endpoint_candidate_rejects_conflicts_and_validates_repairs
 ):
     connection = SimpleNamespace(first=AsyncMock(return_value={"dataset_id": "dataset-a"}))
     with pytest.raises(RuntimeError, match="active_conflict"):
-        await importer._assert_locked_endpoint_candidate(connection, _endpoint_candidate())
+        await importer._has_empty_locked_candidate(connection, _endpoint_candidate())
 
     connection.first.return_value = {
         "dataset_id": "dataset-a",
@@ -33650,7 +33650,7 @@ async def test_locked_endpoint_candidate_rejects_conflicts_and_validates_repairs
         "is_current": False,
     }
     with pytest.raises(RuntimeError, match="candidate_stale"):
-        await importer._assert_locked_endpoint_candidate(connection, _endpoint_candidate(reused_from_checkpoint=True))
+        await importer._has_empty_locked_candidate(connection, _endpoint_candidate(reused_from_checkpoint=True))
 
     identity_check = Mock()
     monkeypatch.setattr(importer, "_assert_empty_orphan_candidate_identity", identity_check)
@@ -33664,7 +33664,7 @@ async def test_locked_endpoint_candidate_rejects_conflicts_and_validates_repairs
         repair_empty_orphan=True,
         resource_hash_contract=LEGACY_RESOURCE_HASH_CONTRACT,
     )
-    await importer._assert_locked_endpoint_candidate(connection, candidate)
+    await importer._has_empty_locked_candidate(connection, candidate)
     identity_check.assert_called_once()
 
 

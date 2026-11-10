@@ -103,6 +103,24 @@ def endpoint_contract():
 
 def is_failed_capture_retry(existing_by_field, checkpoint):
     """Identify a failed VSP parent; the locked storage proof decides whether it can reopen."""
+    return _empty_capture_retry_matches(
+        existing_by_field, checkpoint, getattr(checkpoint, "retry_of_run_id", None), "failed"
+    )
+
+
+def is_rearmed_capture_retry(existing_by_field, checkpoint):
+    """Recognize the root header rearmed after the original pre-capture failure."""
+    metadata = existing_by_field.get("publication_metadata_json")
+    return (
+        isinstance(metadata, dict)
+        and metadata.get("error") == "vsp_prepared_candidate_required"
+        and _empty_capture_retry_matches(
+            existing_by_field, checkpoint, getattr(checkpoint, "acquisition_root_run_id", None), "acquiring"
+        )
+    )
+
+
+def _empty_capture_retry_matches(existing_by_field, checkpoint, previous_run_id, status):
     return bool(
         checkpoint is not None
         and checkpoint.source_ids == (SOURCE_ID,)
@@ -110,8 +128,8 @@ def is_failed_capture_retry(existing_by_field, checkpoint):
         and checkpoint.retry_of_run_id
         and checkpoint.owner_run_id not in (checkpoint.retry_of_run_id, checkpoint.acquisition_root_run_id)
         and existing_by_field.get("acquisition_root_run_id") == checkpoint.acquisition_root_run_id
-        and existing_by_field.get("import_run_id") == checkpoint.retry_of_run_id
-        and existing_by_field.get("status") == "failed"
+        and existing_by_field.get("import_run_id") == previous_run_id
+        and existing_by_field.get("status") == status
         and existing_by_field.get("is_current") is False
         and existing_by_field.get("resource_count") == 0
         and all(
