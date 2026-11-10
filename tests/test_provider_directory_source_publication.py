@@ -199,9 +199,12 @@ def runtime(monkeypatch, configured_publication):
             return {"items": jobs}
         if method == "POST":
             jobs.append({**deepcopy(body), "status": {"active": 1}})
+            jobs[-1]["metadata"]["uid"] = f"publication-job-{len(calls)}"
         elif method == "DELETE":
             assert path.rsplit("/", 1)[-1] != original["metadata"]["name"]
-            jobs[:] = [job for job in jobs if not path.endswith("/" + job["metadata"]["name"])]
+            job = next(job for job in jobs if path.endswith("/" + job["metadata"]["name"]))
+            assert body["preconditions"] == {"uid": job["metadata"]["uid"]}
+            jobs.remove(job)
         return {}
 
     monkeypatch.setattr(workers.db, "acquire", connection)
@@ -332,10 +335,12 @@ async def test_publication_replaces_only_its_own_terminal_job(runtime):
     original = deepcopy(runtime.original)
     assert (await workers.guarded_ensure_worker(_request()))["status"] == "started"
     name = runtime.jobs[0]["metadata"]["name"]
+    uid = runtime.jobs[0]["metadata"]["uid"]
     runtime.jobs[0]["status"] = {"failed": 1, "conditions": [{"type": "Failed", "status": "True"}]}
     assert (await workers.guarded_ensure_worker(_request()))["status"] == "started"
     deleted_names = [path.rsplit("/", 1)[-1] for method, path, _ in runtime.calls if method == "DELETE"]
     assert deleted_names == [name] and runtime.original == original
+    assert len(runtime.jobs) == 1 and runtime.jobs[0]["metadata"]["uid"] != uid
 
 
 def test_publication_requires_an_in_process_native_capability(runtime):

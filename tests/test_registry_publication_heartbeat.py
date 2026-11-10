@@ -184,8 +184,8 @@ async def test_unfinished_publication_remains_cancelled_and_fenced(monkeypatch, 
     monkeypatch.setattr(consumer, "_ordinary_publication", publish)
     pending = asyncio.create_task(_run_case(case))
     try:
+        await asyncio.wait_for(case.events.work_started.wait(), timeout=10)
         async with asyncio.timeout(2):
-            await case.events.work_started.wait()
             if failure == "cancellation":
                 pending.cancel()
             with pytest.raises(asyncio.CancelledError if failure == "cancellation" else RegistryApprovalConflict):

@@ -372,7 +372,7 @@ def test_native_proofs_use_measured_shards_without_redistributing_other_cases(sh
         f"{catalog}::test_public_view_rights_refuse_without_schema_usage[public]": (47, 2),
         "tests/test_verified_witness_custom_publication_postgres.py::test_source_v2_manual_commands_preserve_custody_and_replay": (
             47,
-            6,
+            10,
         ),
         "tests/test_registry_fhir_catalog_metadata_reader_postgres.py::test_api_reader_successor_preserves_incumbent": (
             1,

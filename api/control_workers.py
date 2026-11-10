@@ -20,7 +20,9 @@ from pathlib import Path
 from typing import Any
 
 from api import (
+    cigna_collection_worker,
     npi_source_worker,
+    plan_pricing_worker_policy,
     provider_directory_cms_registry_stop,
     provider_directory_source_publication,
     provider_directory_source_worker,
@@ -61,6 +63,7 @@ class _AdmittedWorkerRequest(dict[str, Any]):
     """Carry an observed queue identity outside the serialized launch request."""
 
     admitted_job: tuple[str, str, str, str, str] | None = None
+    cigna_collection_job: object | None = None
     cms_registry_launch: object | None = None
     reference_source_launch: object | None = None
     aca_source_launch: object | None = None
@@ -349,6 +352,7 @@ async def _admit_source_worker_launches(worker_payload, admitted_run):
             worker_payload.aca_source_launch = registry_aca_source_worker.admit_aca_source_worker_launch(admitted_run)
         except ValueError, RuntimeError:
             return _failed_worker_admission(worker_payload, "ACA source worker admission is unavailable")
+        return cigna_collection_worker.admit_collection_worker(admitted_run, worker_payload)
     return None
 
 
@@ -770,7 +774,7 @@ def _start_process(spec: WorkerSpec, payload: dict[str, Any]) -> int:
     env = os.environ.copy()
     env["HLTHPRT_ACTIVE_WORKER_CLASS"] = spec.worker_class
     env["HLTHPRT_ACTIVE_WORKER_QUEUE"] = spec.queue
-    import_id = str(payload.get("import_id") or "").strip()
+    import_id = _worker_import_id(spec, payload)
     if import_id:
         env["HLTHPRT_IMPORT_ID_OVERRIDE"] = import_id
     run_id = str(payload.get("run_id") or "").strip()
@@ -842,6 +846,11 @@ def _configured_worker_job_image(spec: WorkerSpec, launch_request: dict[str, Any
         if provider_directory_source_worker._IMAGE.fullmatch(image) is None:
             raise ValueError("fhir_profile_worker_image_unavailable")
         return image
+    collection_image = cigna_collection_worker.configured_collection_worker_image(spec, launch_request)
+    if collection_image is not None:
+        return collection_image
+    if release_image := plan_pricing_worker_policy.configured_release_worker_image(spec, launch_request):
+        return release_image
     if (spec.worker_class, spec.importers) == ("process.RegistryFHIRCatalogSync", ("registry-fhir-catalog-sync",)):
         return os.getenv("HLTHPRT_REGISTRY_FHIR_CATALOG_WORKER_IMAGE", "").strip() or generic_image
     if spec.importers == ("mrf-source-discovery",):
@@ -882,23 +891,29 @@ def _ensure_kubernetes_job(
             if exc.status != 404:
                 return {**state, "status": "failed", "message": str(exc)}
 
+    status = "started"
     try:
         _kubernetes_request("POST", f"/apis/batch/v1/namespaces/{namespace}/jobs", job)
     except _KubernetesApiError as exc:
-        if exc.status == 409:
-            refreshed = _worker_state(spec, launch_request)
-            if refreshed.get("job_status") == "purpose_mismatch":
-                return {**refreshed, "status": "failed", "message": "Existing worker purpose does not match admission"}
-            return {**refreshed, "status": "already_running" if refreshed.get("running") else "exists"}
-        return {**state, "status": "failed", "message": str(exc)}
-    return {**_worker_state(spec, launch_request), "status": "started"}
+        if exc.status != 409:
+            return {**state, "status": "failed", "message": str(exc)}
+        status = "exists"
+    refreshed = _worker_state(spec, launch_request)
+    if refreshed.get("job_status") == "purpose_mismatch":
+        return {**refreshed, "status": "failed", "message": "Existing worker purpose does not match admission"}
+    if status == "exists" and refreshed.get("running"):
+        status = "already_running"
+    return {**refreshed, "status": status}
 
 
 def _delete_terminal_kubernetes_worker_jobs(namespace: str, spec: WorkerSpec, payload: dict[str, Any]) -> None:
     selector = _kubernetes_label_selector(spec, payload)
     path = f"/apis/batch/v1/namespaces/{namespace}/jobs?{urllib.parse.urlencode({'labelSelector': selector})}"
     body = _kubernetes_request("GET", path)
-    for job_record in _kubernetes_job_records(body):
+    jobs = _kubernetes_job_records(body)
+    if not _is_scoped_job_set_matching(spec, payload, jobs):
+        raise _KubernetesApiError(409, "Existing worker purpose does not match admission")
+    for job_record in jobs:
         metadata = job_record.get("metadata") if isinstance(job_record.get("metadata"), dict) else {}
         job_name = str(metadata.get("name") or "").strip()
         if not job_name:
@@ -909,20 +924,25 @@ def _delete_terminal_kubernetes_worker_jobs(namespace: str, spec: WorkerSpec, pa
         failed_count = int(status.get("failed") or 0)
         if active_count or not (succeeded_count or failed_count):
             continue
+        uid = metadata.get("uid")
+        if not isinstance(uid, str) or not uid:
+            raise _KubernetesApiError(409, "Existing worker UID is missing")
         try:
-            _delete_kubernetes_job(namespace, job_name)
+            _delete_kubernetes_job(namespace, job_name, uid=uid)
         except _KubernetesApiError as exc:
             if exc.status != 404:
                 raise
 
 
-def _delete_kubernetes_job(namespace: str, job_name: str) -> None:
+def _delete_kubernetes_job(namespace: str, job_name: str, *, uid: str | None = None) -> None:
     encoded = urllib.parse.quote(job_name, safe="")
     delete_options_dict = {
         "apiVersion": "v1",
         "kind": "DeleteOptions",
         "propagationPolicy": "Background",
     }
+    if uid is not None:
+        delete_options_dict["preconditions"] = {"uid": uid}
     _kubernetes_request(
         "DELETE",
         f"/apis/batch/v1/namespaces/{namespace}/jobs/{encoded}",
@@ -1058,6 +1078,42 @@ def _kubernetes_worker_base(spec: WorkerSpec) -> dict[str, Any]:
     }
 
 
+def _is_scoped_job_set_matching(spec, request, jobs):
+    """Recheck admitted execution before reusing or deleting listed Jobs."""
+    from api.provider_directory_cms_registry_worker import (
+        authorized_cms_registry_worker_launch,
+        is_cms_registry_job_matching,
+    )
+
+    if any(_has_broad_proxy_pool_reference(job) for job in jobs):
+        return False
+    launch = authorized_cms_registry_worker_launch(spec, request)
+    if launch is not None and any(not is_cms_registry_job_matching(job, launch) for job in jobs):
+        return False
+    reference_launch = reference_source_worker.authorized_reference_source_worker_launch(spec, request)
+    if reference_launch is not None and any(
+        not reference_source_worker.is_reference_source_job_matching(job, reference_launch) for job in jobs
+    ):
+        return False
+    aca_launch = registry_aca_source_worker.authorized_aca_source_worker_launch(spec, request)
+    if aca_launch is not None and any(
+        not registry_aca_source_worker.is_aca_source_job_matching(job, aca_launch) for job in jobs
+    ):
+        return False
+    if not (
+        provider_directory_source_worker.is_fhir_job_set_matching(spec, request, jobs)
+        and cigna_collection_worker.collection_job_set_matches(spec, request, jobs)
+        and plan_pricing_worker_policy.release_worker_job_set_matches(spec, request, jobs)
+    ):
+        return False
+    npi_launch = npi_source_worker.authorized_npi_source_worker_launch(spec, request)
+    if npi_launch is not None and any(
+        not npi_source_worker.is_npi_source_job_matching(job, npi_launch) for job in jobs
+    ):
+        return False
+    return True
+
+
 def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | None = None) -> dict[str, Any]:
     """Summarize Kubernetes jobs matching a worker spec and optional run."""
     state_base_dict = _kubernetes_worker_base(spec)
@@ -1083,32 +1139,7 @@ def _kubernetes_worker_state(spec: WorkerSpec, launch_request: dict[str, Any] | 
 
     raw_job_records = body.get("items") if isinstance(body, dict) else []
     jobs = [job_record for job_record in raw_job_records if isinstance(job_record, dict)]
-    if any(_has_broad_proxy_pool_reference(job) for job in jobs):
-        return {**state_base_dict, "job_status": "purpose_mismatch"}
-    from api.provider_directory_cms_registry_worker import (
-        authorized_cms_registry_worker_launch,
-        is_cms_registry_job_matching,
-    )
-
-    launch = authorized_cms_registry_worker_launch(spec, launch_request)
-    if launch is not None and any(not is_cms_registry_job_matching(job, launch) for job in jobs):
-        return {**state_base_dict, "job_status": "purpose_mismatch"}
-    reference_launch = reference_source_worker.authorized_reference_source_worker_launch(spec, launch_request)
-    if reference_launch is not None and any(
-        not reference_source_worker.is_reference_source_job_matching(job, reference_launch) for job in jobs
-    ):
-        return {**state_base_dict, "job_status": "purpose_mismatch"}
-    aca_launch = registry_aca_source_worker.authorized_aca_source_worker_launch(spec, launch_request)
-    if aca_launch is not None and any(
-        not registry_aca_source_worker.is_aca_source_job_matching(job, aca_launch) for job in jobs
-    ):
-        return {**state_base_dict, "job_status": "purpose_mismatch"}
-    if not provider_directory_source_worker.is_fhir_job_set_matching(spec, launch_request, jobs):
-        return {**state_base_dict, "job_status": "purpose_mismatch"}
-    npi_launch = npi_source_worker.authorized_npi_source_worker_launch(spec, launch_request)
-    if npi_launch is not None and any(
-        not npi_source_worker.is_npi_source_job_matching(job, npi_launch) for job in jobs
-    ):
+    if not _is_scoped_job_set_matching(spec, launch_request, jobs):
         return {**state_base_dict, "job_status": "purpose_mismatch"}
     state_map = _kubernetes_job_state(state_base_dict, jobs, spec, launch_request or {})
     if state_map["job_status"] == "failed":
@@ -1255,6 +1286,14 @@ def _discovery_acquisition_environment(spec: WorkerSpec) -> list[dict[str, str]]
     return [] if value is None else [{"name": setting, "value": value}]
 
 
+def _worker_import_id(spec: WorkerSpec, payload: dict[str, Any]) -> str:
+    """Keep equivalent admitted collection requests on the same source."""
+    collection_job = cigna_collection_worker.authorized_collection_worker_job(spec, payload)
+    if collection_job is not None:
+        return collection_job.source_file_import_id
+    return str(payload.get("import_id") or "").strip()
+
+
 def _worker_job_environment(
     spec: WorkerSpec,
     launch_request: dict[str, Any],
@@ -1268,7 +1307,7 @@ def _worker_job_environment(
         {"name": "HLTHPRT_ACTIVE_WORKER_QUEUE", "value": spec.queue},
     ]
     env_list.extend(_discovery_acquisition_environment(spec))
-    import_id = str(launch_request.get("import_id") or "").strip()
+    import_id = _worker_import_id(spec, launch_request)
     if import_id:
         env_list.append({"name": "HLTHPRT_IMPORT_ID_OVERRIDE", "value": import_id})
     run_id = str(launch_request.get("run_id") or "").strip()
@@ -1906,7 +1945,8 @@ def _admitted_source_job_target(spec, payload):
     fhir_launch = provider_directory_source_worker.authorized_fhir_source_worker_launch(spec, payload)
     if fhir_launch is not None:
         return fhir_launch.job_id
-    return None
+    collection_job = cigna_collection_worker.authorized_collection_worker_job(spec, payload)
+    return collection_job.identity[4] if collection_job is not None else None
 
 
 def _single_job_worker_target(
@@ -1918,6 +1958,8 @@ def _single_job_worker_target(
     ) or provider_directory_source_worker.admitted_ordinary_fhir_job(spec, launch_payload)
     if source_job_id is not None:
         return source_job_id
+    if plan_pricing_worker_policy.configured_release_worker_image(spec, launch_payload) is not None:
+        return launch_payload.admitted_job[4]
     if not _uses_single_job_worker(spec):
         return None
     queued_job_id = str(launch_payload.get("job_id") or "").strip()

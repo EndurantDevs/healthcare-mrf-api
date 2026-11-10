@@ -22,8 +22,10 @@ from api.plan_release_source_bindings import (
     CUSTOM_SOURCE_BINDING_STORAGE,
     SOURCE_BINDING_STORAGE,
     SourceBindingAdmission,
+    required_registry_schema,
     storage_admissions,
 )
+from api.plan_release_supporting_metadata import SupportingMetadataResourceLimit, require_supporting_metadata_fetch
 from process.network_approved_catalog_evidence import (
     MAX_NETWORKS,
     ApprovedNetworkCatalogEvidenceResourceLimit,
@@ -87,14 +89,27 @@ async def _fetch_release_binding_rows(connection, release_ids, max_report_bytes)
     )
 
 
+async def _require_admitted_source_metadata(connection, admissions, max_report_bytes):
+    """Recheck custody and complete supporting commitments in the same transaction."""
+    for admission in admissions:
+        await require_source_binding_custody_fetch(connection.fetch, PTG2_SCHEMA, admission)
+    if admissions:
+        await require_supporting_metadata_fetch(
+            connection.fetch, PTG2_SCHEMA, required_registry_schema(), admissions, max_bytes=max_report_bytes
+        )
+
+
 async def _fetch_admitted_binding_rows(
     connection, release_ids, max_report_bytes, admissions, *, retained, has_projection
 ):
     source_ids = [identity for identity in admissions if isinstance(admissions[identity], SourceBindingAdmission)]
     legacy_ids = [identity for identity in release_ids if admissions.get(identity) is None]
     try:
-        for identity in source_ids:
-            await require_source_binding_custody_fetch(connection.fetch, PTG2_SCHEMA, admissions[identity])
+        await _require_admitted_source_metadata(
+            connection, [admissions[identity] for identity in source_ids], max_report_bytes
+        )
+    except SupportingMetadataResourceLimit:
+        return None
     except _OPTIONAL_STORAGE_ERRORS as error:
         raise ValueError("plan_release_source_binding_storage_missing") from error
     binding_rows = []
