@@ -327,6 +327,14 @@ async def test_manual_audit_resumes_and_authorizes_only_complete_cleanup(monkeyp
     await verify(monkeypatch)
 
 
+async def test_inline_counts_preserve_membership_multiplicity_and_scope():
+    from tests.custom_import_post_seal_audit_postgres import (
+        test_inline_counts_preserve_membership_multiplicity_and_scope as verify,
+    )
+
+    await verify()
+
+
 async def test_audit_stales_on_same_oid_heap_and_authority_changes(monkeypatch):
     from tests.custom_import_post_seal_audit_postgres import (
         test_audit_stales_on_same_oid_heap_and_authority_changes as verify,
