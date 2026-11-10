@@ -28,6 +28,75 @@ from tests.custom_import_postgres_support import _migration
 from tests.test_custom_import_build_source_postgres import _source_case
 
 
+def _count_mirrors():
+    # Duplicate memberships and unselected rows retain the original bag counts.
+    columns_by_table = {
+        "custom_import_generation_family": "generation_id bigint,root_record_id bigint,family_revision_id bigint",
+        "custom_import_family_revision": "family_revision_id bigint,root_revision_id bigint",
+        "custom_import_family_child": "family_revision_id bigint,child_revision_id bigint",
+        "custom_import_winner": "generation_id bigint",
+        "custom_import_selection_profile": "definition_revision_id bigint",
+        "custom_import_root_scalar": "root_revision_id bigint",
+        "custom_import_child_scalar": "child_revision_id bigint",
+    }
+    rows_by_table = {
+        "custom_import_generation_family": [(1, 10, 100), (1, 11, 100), (1, 12, 101), (2, 13, 102)],
+        "custom_import_family_revision": [(100, 200), (101, 201), (102, 202), (103, 203)],
+        "custom_import_family_child": [(100, 300), (100, 301), (101, 301), (101, 302), (102, 303), (103, 304)],
+        "custom_import_winner": [(1,), (1,), (2,)],
+        "custom_import_selection_profile": [(4,), (4,), (5,)],
+        "custom_import_root_scalar": [(200,), (200,), (201,), (202,), (999,)],
+        "custom_import_child_scalar": [(300,), (300,), (301,), (301,), (301,), (302,), (303,), (303,), (304,), (999,)],
+    }
+    expected_counts_by_name = {
+        "root_count": 3,
+        "family_count": 3,
+        "generation_family_count": 3,
+        "family_child_count": 6,
+        "winner_count": 2,
+        "profile_count": 2,
+        "root_scalar_count": 5,
+        "child_scalar_count": 14,
+    }
+    other_generation_counts_by_name = dict.fromkeys(expected_counts_by_name, 1) | {
+        "profile_count": 2,
+        "child_scalar_count": 2,
+    }
+    empty_counts_by_name = dict.fromkeys(expected_counts_by_name, 0)
+    cases = (
+        (1, 4, expected_counts_by_name),
+        (1, 5, expected_counts_by_name | {"profile_count": 1}),
+        (2, 4, other_generation_counts_by_name),
+        (999, 4, empty_counts_by_name | {"profile_count": 2}),
+        (None, None, empty_counts_by_name),
+    )
+    return columns_by_table, rows_by_table, cases
+
+
+async def test_inline_counts_preserve_membership_multiplicity_and_scope():
+    columns_by_table, rows_by_table, cases = _count_mirrors()
+    current = audit._sql_resource()[0]["counts_sql"]
+    previous = _aggregate_migration()._ranges()._arms()._staged()._finality()._COUNTS_QUERY
+    previous = previous.replace("__CANDIDATE__", "__LEAF__")
+    context = SimpleNamespace(quoted="pg_temp", family=SimpleNamespace(family_id=1), base_family=None)
+    queries = [
+        audit._compiled(sql.replace("__LEAF__", "pg_temp").replace("__CONTROL__", "pg_temp"), context)
+        for sql in (previous, current)
+    ]
+    async with _source_case() as case, case.engine.begin() as connection:
+        for table, definition in columns_by_table.items():
+            await connection.execute(text(f"CREATE TEMP TABLE {table} ({definition}) ON COMMIT DROP"))
+            placeholders = ",".join(f":value_{i}" for i in range(len(rows_by_table[table][0])))
+            await connection.execute(
+                text(f"INSERT INTO pg_temp.{table} VALUES ({placeholders})"),
+                [{f"value_{i}": value for i, value in enumerate(row)} for row in rows_by_table[table]],
+            )
+        for generation, definition, expected_counts_by_name in cases:
+            for query in queries:
+                actual = await connection.scalar(query, {"p_1": generation, "p_2": definition})
+                assert actual == expected_counts_by_name
+
+
 def _aggregate_migration():
     path = (
         Path(__file__).resolve().parents[1]
@@ -386,7 +455,10 @@ def test_audit_sql_matches_current_verifier():
         assert resource["arms"][index]["sql"] == normalized
         assert hashlib.sha256(normalized.encode()).hexdigest() == resource["arms"][index]["sha256"]
     assert resource["root_page_sql"] == ranges._ROOTS.replace("__CANDIDATE__", "__LEAF__")
-    assert resource["counts_sql"] == staged._finality()._COUNTS_QUERY.replace("__CANDIDATE__", "__LEAF__")
+    assert resource["counts_sql"].count(" AS NOT MATERIALIZED (") == 3
+    assert resource["counts_sql"].replace(" AS NOT MATERIALIZED (", " AS (") == (
+        staged._finality()._COUNTS_QUERY.replace("__CANDIDATE__", "__LEAF__")
+    )
     expected_indexes = [
         {key: index_attribute for key, index_attribute in spec.items() if key != "ddl"}
         for spec in json.loads(staged._finality()._INDEX_SPECIFICATIONS)
