@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import traceback
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -1139,15 +1140,45 @@ async def run_registry_publication_worker(config, *, membership_refresh_request_
     return _summary(result_by_name)
 
 
-def _error(code):
+# Constant codes always contain an underscore, so hex or base64 secrets never qualify.
+_FAILURE_CODE = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)+")
+_FAILURE_CLASS = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,79}")
+
+
+def _failure_causes(error):
+    """Describe the exception chain by class, constant code, SQLSTATE and innermost frame only.
+
+    Suppressed contexts (``raise ... from None``) are followed on purpose: they hold the cause that the
+    consumer's constant wrapper code hides from the operator.
+    """
+    causes, seen_ids = [], set()
+    while error is not None and id(error) not in seen_ids and len(causes) < 5:
+        seen_ids.add(id(error))
+        cause_by_name = {"class": type(error).__name__ if _FAILURE_CLASS.fullmatch(type(error).__name__) else "unnamed"}
+        # Lookup errors carry data keys rather than codes.
+        message = error.args[0] if len(error.args) == 1 and not isinstance(error, LookupError) else None
+        if type(message) is str and len(message) <= 128 and _FAILURE_CODE.fullmatch(message):
+            cause_by_name["code"] = message
+        sqlstate = getattr(error, "sqlstate", None)
+        if type(sqlstate) is str and re.fullmatch(r"[0-9A-Z]{5}", sqlstate):
+            cause_by_name["sqlstate"] = sqlstate
+        frames = traceback.extract_tb(error.__traceback__)
+        if frames:
+            cause_by_name["where"] = f"{os.path.basename(frames[-1].filename)}:{frames[-1].lineno}"
+        causes.append(cause_by_name)
+        error = error.__cause__ or error.__context__
+    return causes
+
+
+def _error(code, **fields):
     print(
-        json.dumps({"state": "error", "code": code}, separators=(",", ":")),
+        json.dumps({"state": "error", "code": code, **fields}, separators=(",", ":")),
         file=sys.stderr,
     )
 
 
 def run_command():
-    """Emit only bounded metadata or constant errors, never environment or exception text."""
+    """Emit only bounded metadata, constant codes and code locations, never environment or exception text."""
     try:
         config = parse_registry_publication_worker_config(os.environ.get(CONFIG_ENV))
     except ValueError:
@@ -1158,8 +1189,8 @@ def run_command():
     except KeyboardInterrupt, asyncio.CancelledError:
         _error("canceled")
         return 130
-    except Exception:
-        _error("worker_failed")
+    except Exception as error:
+        _error("worker_failed", causes=_failure_causes(error))
         return 1
     print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
     return 0
