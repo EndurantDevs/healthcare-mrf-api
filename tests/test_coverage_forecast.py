@@ -382,6 +382,36 @@ def test_python_artifact_inventory_rejects_an_extra_producer_file(tmp_path: Path
         artifacts.verify_shard_artifacts(tmp_path, artifact_directory, "main", BASE_SHA, HEAD_SHA)
 
 
+@pytest.mark.parametrize("kind", ["main", "capacity"])
+def test_shard_provenance_may_carry_a_common_test_execution_reference(tmp_path: Path, kind: str) -> None:
+    """A recorded or reused shard names its execution; the controller authenticates that reference."""
+
+    baseline_path = tmp_path / artifacts.BASELINE_NAME
+    baseline_path.write_text(json.dumps(_artifact_baseline()), encoding="utf-8")
+    artifact_directory = tmp_path / kind
+    artifact_directory.mkdir()
+    shards = artifacts.SHARD_SPEC_BY_KIND[kind]["shards"]
+    for shard in shards:
+        coverage_name, provenance_name = artifacts.shard_file_names(kind, shard)
+        coverage_path = artifact_directory / coverage_name
+        coverage_path.write_bytes(b"coverage")
+        provenance = artifacts._expected_shard_provenance(tmp_path, kind, shard, coverage_path, BASE_SHA, HEAD_SHA)
+        provenance["common_test_execution"] = {"executed": False, "fingerprint": "f" * 64}
+        (artifact_directory / provenance_name).write_text(json.dumps(provenance), encoding="utf-8")
+    assert len(artifacts.verify_shard_artifacts(tmp_path, artifact_directory, kind, BASE_SHA, HEAD_SHA)) == len(shards)
+
+    provenance_path = artifact_directory / artifacts.shard_file_names(kind, shards[0])[1]
+    accepted = json.loads(provenance_path.read_text(encoding="utf-8"))
+    for changed in (
+        {**accepted, "common_test_execution": ["not", "an", "object"]},
+        {**accepted, "coverage_sha256": "0" * 64},
+        {**accepted, "unreviewed": True},
+    ):
+        provenance_path.write_text(json.dumps(changed), encoding="utf-8")
+        with pytest.raises(artifacts.CoverageForecastError, match="exact CI input|must be an object"):
+            artifacts.verify_shard_artifacts(tmp_path, artifact_directory, kind, BASE_SHA, HEAD_SHA)
+
+
 def test_rust_artifact_inventory_rejects_a_mixed_report_set(tmp_path: Path) -> None:
     """Rust diagnostics cannot consume an unrelated downloaded artifact."""
 
