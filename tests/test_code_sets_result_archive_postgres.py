@@ -3,19 +3,22 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import re
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import delete, text, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.schema import MetaData
 
-from db.models import CodeCatalog
+from db.models import CodeCatalog, ImportRun
 from process import code_sets_result_archive as archive
 from process import reference_family_archive as native
 from process.scoped_catalog_retention import cleanup_retained_catalog
@@ -446,3 +449,205 @@ async def test_precreated_two_relation_stage_validates_after_restore():
                 await cleanup_retained_catalog(session, activation.retained_family)
     finally:
         await engine.dispose()
+
+
+@asynccontextmanager
+async def _code_sets_cancel_fixture(monkeypatch, *, legacy=True):
+    from api import control_imports
+    from tests import test_code_sets_publication_postgres as publication
+
+    engine = create_async_engine(_dsn())
+    try:
+        async with publication._mutable_catalog(engine) as actors:
+            database = publication._mutable_dependencies(monkeypatch, actors)
+            publication._mutable_api_dependencies(monkeypatch, database)
+            context = await publication._mutable_context(actors, status="queued")
+            run_id = context["context"]["control_run_id"]
+            job_id = uuid4().hex if legacy else f"code_sets_start_{run_id}"
+            metrics_by_name = {
+                "enqueue_adapter": "arq_single_job",
+                "queue": "arq:CodeSets",
+                "function": "control_single_job_start",
+                "job_id": job_id,
+            }
+            async with actors.builder.begin() as session:
+                await session.execute(
+                    update(ImportRun).where(ImportRun.run_id == run_id).values(progress={}, metrics=metrics_by_name)
+                )
+            redis, pipeline = publication._code_sets_cancel_redis(monkeypatch)
+            yield SimpleNamespace(
+                actors=actors,
+                database=database,
+                run_id=run_id,
+                job_id=job_id,
+                metrics=metrics_by_name,
+                pipeline=pipeline,
+                publication=publication,
+                redis=redis,
+            )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_interrupted_codesets_payload_cleanup_recovers_from_its_committed_reservation(monkeypatch, legacy):
+    from api import control_imports, control_workers
+    from tests.test_control_imports_api import _serialized_arq_job
+
+    async with _code_sets_cancel_fixture(monkeypatch, legacy=legacy) as scenario:
+        pipeline = scenario.pipeline
+        pipeline.get.return_value = _serialized_arq_job(
+            "control_single_job_start", {"run_id": scenario.run_id, "importer": "code-sets"}
+        )
+        pipeline.execute.return_value = [1, 4]
+        persist = control_imports._persist_cancel_request
+        monkeypatch.setattr(control_imports, "_persist_cancel_request", AsyncMock(side_effect=asyncio.CancelledError))
+        before = await scenario.publication._mutable_state(scenario.actors)
+        with pytest.raises(asyncio.CancelledError):
+            await control_imports.request_cancel(scenario.run_id)
+        reserved = await control_imports.get_import_run(scenario.run_id)
+        assert reserved["status"] == "canceling" and "cancel_signal" not in reserved["metrics"]
+        pipeline.delete.assert_called_once_with(
+            *(f"arq:{key}:{scenario.job_id}" for key in ("job", "retry", "in-progress", "result"))
+        )
+        pipeline.get.return_value = None
+        pipeline.execute.return_value = [True]
+        monkeypatch.setattr(control_imports, "_persist_cancel_request", persist)
+        monkeypatch.setattr(control_imports, "exact_worker_presence", control_workers.exact_worker_presence)
+        requests = Mock(
+            side_effect=[
+                {"items": [{"status": {"active": 1, "conditions": []}}]},
+                {"items": [{"status": {"phase": "Running"}}]},
+                {"items": []},
+                {"items": []},
+            ]
+        )
+        monkeypatch.setattr(control_workers, "_launcher_mode", lambda: "kubernetes")
+        monkeypatch.setattr(control_workers, "_is_kubernetes_configured", lambda: True)
+        monkeypatch.setattr(control_workers, "_kubernetes_namespace", lambda: "test-workers")
+        monkeypatch.setattr(control_workers, "_kubernetes_request", requests)
+        waiting = await control_imports.request_cancel(scenario.run_id)
+        assert waiting["status"] == "canceling" and waiting["finished_at"] is None
+        assert waiting["metrics"]["cancel_signal"]["worker_stopped"] is False
+        canceled = await control_imports.request_cancel(scenario.run_id)
+        assert canceled["status"] == "canceled" and canceled["finished_at"] is not None
+        assert canceled["metrics"]["job_id"] == canceled["metrics"]["cancel_signal"]["job_id"] == scenario.job_id
+        assert canceled["metrics"]["cancel_signal"]["payload_absent"] is True
+        assert canceled["metrics"]["cancel_signal"]["worker_stopped"] is True
+        assert len(requests.call_args_list) == 4
+        assert await scenario.publication._mutable_state(scenario.actors) == before
+
+
+async def _change_code_sets_cancel(scenario, changed):
+    from api import control_imports
+
+    metric_keys_by_name = {
+        "job": "job_id",
+        "numeric_job": "job_id",
+        "queue": "queue",
+        "function": "function",
+        "handoff": "scoped_catalog_handoff",
+        "publication": "code_sets_mutable_publication",
+    }
+    changes_by_name = {
+        "status": {"status": "queued"},
+        "phase": {"phase_detail": "other"},
+        "heartbeat": {"heartbeat_at": None},
+        "finished": {"finished_at": control_imports.utc_now()},
+        "engine": {"engine": "other"},
+        "node": {"node_id": "other"},
+        "attempt": {"progress": {"message": "cancel requested", "attempt_id": "claimed"}},
+        "partial_attempt": {"progress": {"message": "cancel requested", "attempt_started_at": "claimed"}},
+        "progress": {"progress": []},
+        "message": {"progress": {"message": "other"}},
+    }
+    if changed == "missing":
+        statement = delete(ImportRun)
+    else:
+        statement = update(ImportRun)
+        if changed in metric_keys_by_name:
+            values_by_name = {
+                "metrics": {
+                    **scenario.metrics,
+                    metric_keys_by_name[changed]: 7 if changed == "numeric_job" else "other",
+                }
+            }
+        else:
+            values_by_name = changes_by_name[changed]
+        statement = statement.values(**values_by_name)
+    async with scenario.actors.builder.begin() as session:
+        await session.execute(statement.where(ImportRun.run_id == scenario.run_id))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "missing",
+        "status",
+        "phase",
+        "heartbeat",
+        "finished",
+        "job",
+        "numeric_job",
+        "queue",
+        "function",
+        "engine",
+        "node",
+        "attempt",
+        "partial_attempt",
+        "progress",
+        "message",
+        "handoff",
+        "publication",
+        "foreign_payload",
+    ],
+)
+async def test_codesets_residue_refuses_a_missing_or_changed_committed_reservation(monkeypatch, changed):
+    from api import control_imports
+    from process.control_cancel import is_queued_code_sets_cancel_reserved
+    from tests.test_control_imports_api import _serialized_arq_job
+
+    async with _code_sets_cancel_fixture(monkeypatch) as scenario:
+        queued = await control_imports.get_import_run(scenario.run_id)
+        assert await is_queued_code_sets_cancel_reserved(scenario.database, queued, control_imports.utc_now())
+        reserved = await control_imports.get_import_run(scenario.run_id)
+        if changed == "foreign_payload":
+            scenario.pipeline.get.return_value = _serialized_arq_job(
+                "control_single_job_start", {"run_id": "other", "importer": "code-sets"}
+            )
+        else:
+            await _change_code_sets_cancel(scenario, changed)
+        result = await control_imports._remove_queued_job(reserved)
+        assert result["identity_mismatch" if changed == "foreign_payload" else "identity_unavailable"] is True
+        assert result["removed"] is False
+        scenario.pipeline.multi.assert_not_called()
+        scenario.pipeline.zrem.assert_not_called()
+        scenario.pipeline.delete.assert_not_called()
+        scenario.pipeline.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codesets_residue_cannot_use_an_uncommitted_cancellation(monkeypatch):
+    from api import control_imports
+
+    async with _code_sets_cancel_fixture(monkeypatch) as scenario:
+        queued = await control_imports.get_import_run(scenario.run_id)
+        with pytest.raises(RuntimeError, match="rollback fixture"):
+            async with scenario.database.transaction():
+                await scenario.database.execute(
+                    update(ImportRun)
+                    .where(ImportRun.run_id == scenario.run_id)
+                    .values(
+                        status="canceling",
+                        phase_detail="cancel requested",
+                        heartbeat_at=control_imports.utc_now(),
+                        progress={"message": "cancel requested"},
+                    )
+                )
+                result = await control_imports._remove_queued_job(queued)
+                assert result["identity_unavailable"] is True
+                scenario.pipeline.execute.assert_not_awaited()
+                raise RuntimeError("rollback fixture")
+        assert (await control_imports.get_import_run(scenario.run_id))["status"] == "queued"

@@ -101,6 +101,7 @@ def _committed_target_result(
     if (
         target_module
         not in {
+            "process.code_sets",
             "process.nucc",
             "process.npi",
             "process.entity_address_unified",
@@ -645,6 +646,10 @@ def _where_no_profile_handoff(stmt):
         or_(
             ImportRun.importer.not_in(("code-sets", "ms-drg")),
             ImportRun.metrics["scoped_catalog_handoff"].as_string().is_(None),
+        ),
+        or_(
+            ImportRun.importer != "code-sets",
+            ImportRun.metrics["code_sets_mutable_publication"].as_string().is_(None),
         ),
     )
 

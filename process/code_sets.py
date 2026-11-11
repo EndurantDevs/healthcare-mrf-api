@@ -260,10 +260,47 @@ def _select_test_rows(
     return preferred_rows or code_rows[:10]
 
 
-async def import_code_sets(test_mode: bool = False, *, _control_context=None) -> dict[str, Any]:
-    """Fetch and prepare source-owned catalog contributions for native publication."""
-    await ensure_database(test_mode)
+async def _publish_code_sets(mode, ctx, schema, payloads, metrics, test_mode, expected=None):
+    if mode == "legacy-mutable":
+        from process.code_sets_mutable_publication import publish_mutable_code_sets
+
+        return await publish_mutable_code_sets(
+            db, ctx, schema=schema, payloads=payloads, metrics=metrics, expected=expected, test_mode=test_mode
+        )
+    return await prepare_catalog_handoff(
+        db,
+        ctx,
+        importer="code-sets",
+        schema=schema,
+        payloads={"code_catalog": payloads},
+        options={"include_relationships": False, "test_mode": test_mode},
+        metrics=metrics,
+    )
+
+
+def _publication_request(ctx, test_mode):
+    mode = os.getenv("HLTHPRT_CODE_SETS_PUBLICATION_MODE", "native")
+    if mode not in {"native", "legacy-mutable"}:
+        raise RuntimeError("unsupported code-set publication mode")
     schema = os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+    if mode == "legacy-mutable":
+        from process.code_sets_mutable_publication import validate_mutable_attempt
+
+        validate_mutable_attempt(db, ctx, schema, test_mode)
+    return mode, schema
+
+
+async def import_code_sets(test_mode: bool = False, *, _control_context=None) -> dict[str, Any]:
+    """Fetch fixed-source code sets and use the selected publication mode."""
+    mode, schema = _publication_request(_control_context, test_mode)
+    await ensure_database(test_mode)
+    expected = None
+    if mode == "legacy-mutable":
+        from process.code_sets_mutable_publication import capture_mutable_code_sets
+
+        expected, completed = await capture_mutable_code_sets(db, _control_context, schema=schema, test_mode=test_mode)
+        if completed is not None:
+            return completed
 
     pos_url = os.getenv("HLTHPRT_CODE_SETS_POS_URL", DEFAULT_POS_URL)
     rc_url = os.getenv("HLTHPRT_CODE_SETS_RC_URL", DEFAULT_RC_URL)
@@ -282,7 +319,8 @@ async def import_code_sets(test_mode: bool = False, *, _control_context=None) ->
         raise RuntimeError(f"CMS Blue Button revenue-code source produced no code rows: {rc_url}")
 
     modifier_rows = modifier_code_rows()
-    await _ensure_code_catalog(schema)
+    if mode == "native":
+        await _ensure_code_catalog(schema)
     pos_payloads, rc_payloads, modifier_payloads = map(_code_payloads, (pos_rows, rc_rows, modifier_rows))
     pos_count, rc_count, modifier_count = map(len, (pos_payloads, rc_payloads, modifier_payloads))
     summary_map = {
@@ -292,14 +330,8 @@ async def import_code_sets(test_mode: bool = False, *, _control_context=None) ->
         "pos_url": pos_url,
         "rc_url": rc_url,
     }
-    outcome = await prepare_catalog_handoff(
-        db,
-        _control_context,
-        importer="code-sets",
-        schema=schema,
-        payloads={"code_catalog": pos_payloads + rc_payloads + modifier_payloads},
-        options={"include_relationships": False, "test_mode": test_mode},
-        metrics=summary_map,
+    outcome = await _publish_code_sets(
+        mode, _control_context, schema, pos_payloads + rc_payloads + modifier_payloads, summary_map, test_mode, expected
     )
     print(
         f"Code set import {outcome['status']}: "
@@ -311,6 +343,7 @@ async def import_code_sets(test_mode: bool = False, *, _control_context=None) ->
 
 async def main(test_mode: bool = False, *, _control_context=None) -> dict[str, Any]:
     """Run code-set import with standalone database lifecycle handling."""
+    _publication_request(_control_context, test_mode)
     await init_db(db)
     try:
         return await import_code_sets(test_mode=test_mode, _control_context=_control_context)

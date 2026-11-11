@@ -50,6 +50,10 @@ Most importers resolve current files/distributions at runtime (from catalog APIs
 
 Other states use discovery-driven machine-readable extraction via FDA BeSafeRx links where a direct adapter is not hardcoded.
 
+## Code-set Publication
+
+`code-sets` uses native catalog handoff by default. Setting `HLTHPRT_CODE_SETS_PUBLICATION_MODE=legacy-mutable` explicitly selects publication into an existing ordinary-owned mutable catalog and requires a complete managed import attempt. This mode preserves the existing catalog heap and rows omitted from the current source feeds, and commits the source updates, result generation, and managed completion together. Storage or attempt validation failures stop publication.
+
 ## Notes
 
 - External websites are import-time dependencies; the API serves local PostgreSQL tables at request time.

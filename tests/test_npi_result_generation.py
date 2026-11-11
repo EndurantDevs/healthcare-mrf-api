@@ -11,6 +11,7 @@ from alembic.script import ScriptDirectory
 
 from process import npi_result_archive as archive
 from process import npi_result_generation as generation
+from tests.test_company_registry_group_assertion_migration import _assert_source_inventory_migration_head
 
 _HOSPITAL_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",
@@ -155,6 +156,7 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20261104010000_custom_import_unlogged_landing",
     "20261107010000_custom_import_child_reference_aggregate",
     "20261108010000_custom_import_family_child_reference_aggregate",
+    "20261111010000_code_sets_publication_idempotency",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",
@@ -213,15 +215,7 @@ def _assert_legacy_capture_lineage(script):
 
 def _assert_current_registry_head(script: ScriptDirectory) -> None:
     """Require one registry head after the unchanged published custom-import chain."""
-    assert script.get_heads() == ["20261108010000_custom_import_family_child_reference_aggregate"]
-    assert (
-        script.get_revision("20261029010000_registry_source_inventory").down_revision
-        == "20261028020000_registry_membership_refresh"
-    )
-    assert (
-        script.get_revision("20261028020000_registry_membership_refresh").down_revision
-        == "20261028010000_registry_fhir_catalog"
-    )
+    _assert_source_inventory_migration_head(script)
     _assert_custom_import_manual_acceptance_lineage(script)
     assert (
         script.get_revision("20261019030000_provider_directory_role_schema").down_revision

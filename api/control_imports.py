@@ -50,6 +50,15 @@ from api.control_workers import (
 from db.models import ImportRun, PTG2ImportRun, PTG2Snapshot, db
 from process import mrf_discovery_acquisition_guard as mrf_acquisition
 from process import npi_isolated_execution as npi_execution
+from process.control_cancel import (
+    _cancel_attempt_pair,
+    _cancel_progress_by_name,
+    _cancel_state_by_name,
+    cancel_attempt_statement,
+    has_committed_code_sets_cancel_reservation,
+    is_queued_code_sets_cancel,
+    is_queued_code_sets_cancel_reserved,
+)
 from process.control_lifecycle import (
     _SOURCE_PROFILE_IMPORTERS_BY_MODULE,
     _where_no_places_handoff,
@@ -335,6 +344,7 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "run_shutdown": True,
     },
     "code-sets": {
+        "job_prefix": "code_sets_start",
         "queue": "arq:CodeSets",
         "function": "control_single_job_start",
         "payload": "control_wrapped_kwargs",
@@ -2606,6 +2616,21 @@ async def _idempotent_import_run(
     *,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
+    if importer == "code-sets":
+        published = await db.execute(
+            select(ImportRun)
+            .where(
+                ImportRun.importer == importer,
+                ImportRun.idempotency_key == idempotency_key,
+                or_(
+                    ImportRun.status.in_(ACTIVE_STATUSES),
+                    ImportRun.metrics["code_sets_mutable_publication"].as_string().is_not(None),
+                ),
+            )
+            .limit(1)
+        )
+        existing = published.scalar_one_or_none()
+        return normalize_run(existing) if existing is not None else None
     if importer == "massachusetts-borim-profile":
         existing = await find_importer_run_by_idempotency_key(importer, idempotency_key)
         if (params or {}).get("reprocess_from") is not None or ((existing or {}).get("params") or {}).get(
@@ -3717,7 +3742,7 @@ async def create_import_run(
         "import_id": import_id,
         "retry_of_run_id": retry_of_run_id,
     }
-    if importer in {"places-zcta", "nucc"} or importer in PRICING_IMPORTERS:
+    if importer in {"places-zcta", "nucc", "code-sets"} or importer in PRICING_IMPORTERS:
         adapter = _SINGLE_JOB_ADAPTERS[importer]
         import_run_values_by_name["metrics"] = {
             "enqueue_adapter": "arq_single_job",
@@ -3727,6 +3752,12 @@ async def create_import_run(
         }
         if importer in PRICING_IMPORTERS:
             import_run_values_by_name["metrics"][DELIVERY_FIELD] = initial_delivery(run_id)
+    if (
+        importer == "code-sets"
+        and os.getenv("HLTHPRT_CODE_SETS_PUBLICATION_MODE", "native") == "legacy-mutable"
+        and (db._transaction_binding() is not None or db._reader_binding() is not None)
+    ):
+        raise RuntimeError("CodeSets admission requires its own commit boundary")
     try:
         blocking_run = await _admit_import_row(
             importer,
@@ -3806,7 +3837,7 @@ async def _write_enqueue_result(run_id, importer, run_values_by_name):
             raise RuntimeError("pricing enqueue delivery identity changed")
         return normalize_run(acknowledged_run)
     statement = update(ImportRun).where(ImportRun.run_id == run_id)
-    if importer in {"places-zcta", "nucc"}:
+    if importer in {"places-zcta", "nucc", "code-sets"}:
         statement = _where_no_places_handoff(
             statement.where(
                 ImportRun.importer == importer,
@@ -3835,11 +3866,11 @@ async def _write_enqueue_result(run_id, importer, run_values_by_name):
             error=run_values_by_name["error"],
         )
     )
-    if importer in {"places-zcta", "nucc"} and updated.rowcount != 1:
+    if importer in {"places-zcta", "nucc", "code-sets"} and updated.rowcount != 1:
         latest = (await db.execute(select(ImportRun).where(ImportRun.run_id == run_id).limit(1))).scalar_one_or_none()
         if latest is None:
             raise RuntimeError(
-                f"{'PLACES' if importer == 'places-zcta' else 'NUCC'} run disappeared after enqueue acknowledgement"
+                f"{'PLACES' if importer == 'places-zcta' else importer.upper()} run disappeared after enqueue acknowledgement"
             )
         return normalize_run(latest)
     return normalize_run(_serialize_run_timestamps(run_values_by_name))
@@ -4085,9 +4116,9 @@ def _safe_enqueued_job_id(
     if any(name in params_by_name for name in ephemeral_param_names):
         return str(requested_job_id or "")
     explicit_job_id = getattr(job, "job_id", None)
-    if importer == "nucc" and requested_job_id:
+    if importer in {"nucc", "code-sets"} and requested_job_id:
         if job is not None and explicit_job_id != requested_job_id:
-            raise RuntimeError("NUCC enqueue acknowledgement identity changed")
+            raise RuntimeError(f"{importer.upper()} enqueue acknowledgement identity changed")
         return str(requested_job_id)
     if explicit_job_id:
         return str(explicit_job_id)
@@ -4337,18 +4368,28 @@ async def _request_worker_cancel(current: dict[str, Any], *, cancel_signal=None,
         await require_not_wave_owned_run(db, run_id)
     if current.get("status") in TERMINAL_STATUSES:
         return current
-    current_metrics = current.get("metrics") if isinstance(current.get("metrics"), dict) else {}
-    run_metrics_by_name = dict(current_metrics)
-    is_queued_arq = _is_queued_arq_cancel(current, run_metrics_by_name)
+    run_metrics_by_name = dict(current["metrics"]) if isinstance(current.get("metrics"), dict) else {}
+    current_progress = current.get("progress") if isinstance(current.get("progress"), dict) else {}
+    is_queued_code_sets = is_queued_code_sets_cancel(current)
+    is_queued_arq = _is_queued_arq_cancel(current, run_metrics_by_name) or (
+        is_queued_code_sets and run_metrics_by_name.get("enqueue_adapter") == "arq_single_job"
+    )
     if (
         current.get("status") != "queued"
         and not is_queued_arq
+        and not is_queued_code_sets
         and not _supports_active_cancel(str(current.get("importer") or ""))
     ):
         raise ValueError(f"importer does not support canceling active runs: {current.get('importer')}")
     now = utc_now()
-    current_progress = current.get("progress") if isinstance(current.get("progress"), dict) else {}
-    is_pending_adapter = current.get("status") == "queued" and run_metrics_by_name.get("enqueue_adapter") == "pending"
+    persisted_run_by_name = current
+    if is_queued_code_sets:
+        if not await is_queued_code_sets_cancel_reserved(db, current, now):
+            return await get_import_run(run_id)
+        persisted_run_by_name = {**current, "status": "canceling"}
+    is_pending_adapter = (current.get("status") == "queued" or is_queued_code_sets) and (
+        run_metrics_by_name.get("enqueue_adapter") == "pending"
+    )
     worker_cancel_signal_map = (
         cancel_signal
         if cancel_signal is not None
@@ -4373,7 +4414,7 @@ async def _request_worker_cancel(current: dict[str, Any], *, cancel_signal=None,
     )
     return await _persist_cancel_request(
         run_id,
-        current_run=current,
+        current_run=persisted_run_by_name,
         requested_at=now,
         cancel_state_by_name=cancel_state_by_name,
         run_metrics_by_name=run_metrics_by_name,
@@ -4532,31 +4573,6 @@ async def _record_places_cancel_signal(run_id, attempt, signal, canceled_before_
                 raise RuntimeError("PLACES cancellation changed after worker signal")
 
 
-def _cancel_state_by_name(
-    *,
-    canceled_before_start: bool,
-    has_terminalized_active_worker: bool,
-    current_progress: dict[str, Any],
-) -> dict[str, Any]:
-    """Build persisted status and progress for a cancellation request."""
-
-    canceled_now = canceled_before_start or has_terminalized_active_worker
-    phase_detail = "cancel requested"
-    if has_terminalized_active_worker:
-        phase_detail = "canceled active worker"
-    elif canceled_before_start:
-        phase_detail = "canceled before start"
-    return {
-        "canceled_now": canceled_now,
-        "status": "canceled" if canceled_now else "canceling",
-        "phase_detail": phase_detail,
-        "progress": _cancel_progress_by_name(
-            canceled_now=canceled_now,
-            current_progress=current_progress,
-        ),
-    }
-
-
 async def _persist_cancel_request(
     run_id: str,
     *,
@@ -4582,13 +4598,7 @@ async def _persist_cancel_request(
             metrics=preserve_delivery(ImportRun, run_metrics_by_name),
         )
     )
-    attempt_pair = _cancel_attempt_pair(cancel_progress_by_name)
-    if attempt_pair is not None:
-        attempt_id, attempt_started_at = attempt_pair
-        cancel_update = cancel_update.where(
-            ImportRun.progress["attempt_id"].as_string() == attempt_id,
-            ImportRun.progress["attempt_started_at"].as_string() == attempt_started_at,
-        )
+    cancel_update = cancel_attempt_statement(cancel_update, current_run, cancel_progress_by_name)
     update_result = await db.execute(cancel_update)
     updated = await get_import_run(run_id)
     if getattr(update_result, "rowcount", 1) == 0:
@@ -4646,51 +4656,15 @@ async def _cancel_signal_for_run(
 async def _is_canceled_worker_stopped(run: dict[str, Any]) -> bool:
     """Require fresh Job and Pod stop proof after asynchronous worker deletion."""
     try:
-        presence = await asyncio.to_thread(exact_worker_presence, _reconciliation_worker_payload(run))
+        payload = (
+            _active_worker_cancel_payload(run)
+            if run.get("importer") == "code-sets"
+            else _reconciliation_worker_payload(run)
+        )
+        presence = await asyncio.to_thread(exact_worker_presence, payload)
     except Exception:
         return False
     return presence.get("enabled") is True and presence.get("stopped") is True
-
-
-def _cancel_progress_by_name(
-    *,
-    canceled_now: bool,
-    current_progress: dict[str, Any],
-) -> dict[str, Any]:
-    """Return terminal or in-progress cancellation progress."""
-
-    cancel_progress_by_name = {
-        "unit": "run",
-        "total": 1,
-        "done": 1 if canceled_now else 0,
-        "pct": 100 if canceled_now else current_progress.get("pct", 0),
-        "message": "canceled" if canceled_now else "cancel requested",
-    }
-    attempt_pair = _cancel_attempt_pair(current_progress)
-    if attempt_pair is not None:
-        attempt_id, attempt_started_at = attempt_pair
-        cancel_progress_by_name["attempt_id"] = attempt_id
-        cancel_progress_by_name["attempt_started_at"] = attempt_started_at
-    return cancel_progress_by_name
-
-
-def _cancel_attempt_pair(
-    progress_by_name: dict[str, Any],
-) -> tuple[str, str] | None:
-    """Return a complete exact-attempt fence or no attempt fence."""
-
-    attempt_id = progress_by_name.get("attempt_id")
-    attempt_started_at = progress_by_name.get("attempt_started_at")
-    if (
-        type(attempt_id) is str
-        and bool(attempt_id)
-        and attempt_id == attempt_id.strip()
-        and type(attempt_started_at) is str
-        and bool(attempt_started_at)
-        and attempt_started_at == attempt_started_at.strip()
-    ):
-        return attempt_id, attempt_started_at
-    return None
 
 
 def _has_terminalized_active_worker_cancel_signal(cancel_signal: dict[str, Any]) -> bool:
@@ -4950,13 +4924,19 @@ async def _reconcile_cancel_queue_residue(
     """Remove inert queue residue only when the durable run proves its identity."""
     metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
     refusal = _arq_cleanup_refusal(queue, job_id, "identity_unavailable", "ARQ job payload is unavailable")
-    if not _is_queued_arq_cancel(run, metrics):
-        return refusal
     try:
-        _run_id, _importer, expected_queue, expected_job_id = _reconciliation_arq_identity(run)
-        persisted_queue = str(metrics.get("queue") or "").strip()
-        if (queue, job_id) != (expected_queue, expected_job_id) or (persisted_queue and persisted_queue != queue):
-            return refusal
+        if run.get("importer") == "code-sets":
+            if not await has_committed_code_sets_cancel_reservation(
+                db, run, queue, job_id, _SINGLE_JOB_ADAPTERS["code-sets"]
+            ):
+                return refusal
+        else:
+            if not _is_queued_arq_cancel(run, metrics):
+                return refusal
+            _run_id, _importer, expected_queue, expected_job_id = _reconciliation_arq_identity(run)
+            persisted_queue = str(metrics.get("queue") or "").strip()
+            if (queue, job_id) != (expected_queue, expected_job_id) or (persisted_queue and persisted_queue != queue):
+                return refusal
         receipt = await _reconcile_terminal_queue_member(pipe, run, queue, job_id, _arq_evidence_keys(job_id))
     except Exception:
         return {**refusal, "redis": False}

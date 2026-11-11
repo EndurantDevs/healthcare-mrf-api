@@ -15,6 +15,7 @@ from db.models.system import ProviderDirectoryProfileCapacityPreflightReceipt
 from tests.provider_directory_profile_capacity_v2_migration_support import (
     load_capacity_v2_migration,
 )
+from tests.test_company_registry_group_assertion_migration import _assert_source_inventory_migration_head
 from tests.test_provider_directory_profile_capacity_attestation_schema import (
     _OperationsRecorder,
 )
@@ -59,12 +60,7 @@ def _assert_receipt_columns_match_model(elements) -> None:
 def test_capacity_v2_migration_precedes_the_unique_repository_head():
     """Preserve capacity and joined registry ancestry beneath the actual unique head."""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert script.get_heads() == ["20261108010000_custom_import_family_child_reference_aggregate"]
-    inventory_migration = script.get_revision("20261029010000_registry_source_inventory")
-    assert inventory_migration.down_revision == "20261028020000_registry_membership_refresh"
-    assert script.get_revision("20261028020000_registry_membership_refresh").down_revision == (
-        "20261028010000_registry_fhir_catalog"
-    )
+    _assert_source_inventory_migration_head(script)
     assert (
         script.get_revision("20261019030000_provider_directory_role_schema").down_revision
         == "20261019020000_registry_continuation_join"
