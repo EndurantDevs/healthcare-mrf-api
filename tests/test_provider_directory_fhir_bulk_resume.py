@@ -127,18 +127,29 @@ class _Session:
         return self.response
 
 
-def test_aetna_alone_enables_eight_way_range_resume(monkeypatch):
-    source = _aetna_source()
+def test_seed_enables_bounded_range_resume_without_changing_generic_default(monkeypatch):
+    source_record = _aetna_source()
     generic_source_map = {
         "metadata_json": {
             "provider_directory_bulk_export_output_concurrency": 8,
         }
     }
 
-    assert importer._is_bulk_range_resume_enabled(source) is True
-    assert importer._bulk_output_concurrency(source) == 8
+    assert importer._is_bulk_range_resume_enabled(source_record) is True
+    assert importer._bulk_output_concurrency(source_record) == 32
     assert importer._is_bulk_range_resume_enabled(generic_source_map) is False
     assert importer._bulk_output_concurrency(generic_source_map) == 1
+
+    saved_seed = importer._aetna_provider_directory_data_seed_rows()[0]
+    saved_seed["metadata_json"]["provider_directory_bulk_export_output_concurrency"] = 8
+    saved_source = importer._source_row_from_seed(saved_seed)
+    assert importer._bulk_output_concurrency(saved_source) == 8
+    assert importer._dedupe_source_rows([saved_source, source_record]) == [saved_source]
+    source_ids = [source_record["source_id"]]
+    assert importer._pagination_checkpoint_scope_identity(source_record, source_ids) is not None
+    assert importer._pagination_checkpoint_scope_identity(saved_source, source_ids) == (
+        importer._pagination_checkpoint_scope_identity(source_record, source_ids)
+    )
 
     monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", "8")
     with pytest.raises(
@@ -150,8 +161,32 @@ def test_aetna_alone_enables_eight_way_range_resume(monkeypatch):
     importer._assert_bulk_output_pool_capacity(8)
 
 
+def test_primary_seed_does_not_shadow_supplemental_concurrency():
+    supplemental_source = _aetna_source()
+    primary_source = importer._source_row_from_seed(
+        {
+            "id": "primary-aetna-row",
+            "org_name": "Aetna",
+            "api_base": importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE,
+            "source": "primary-catalog",
+            "metadata_json": {
+                "provider_directory_bulk_export_range_resume": True,
+                "provider_directory_bulk_export_output_concurrency": 8,
+            },
+        }
+    )
+    assert primary_source["source_id"] != supplemental_source["source_id"]
+    assert importer._bulk_output_concurrency(primary_source) == 8
+    sources_by_id = {
+        source_record["source_id"]: source_record
+        for source_record in importer._dedupe_source_rows([primary_source, supplemental_source])
+    }
+    assert importer._bulk_output_concurrency(sources_by_id[supplemental_source["source_id"]]) == 32
+    assert importer._bulk_output_concurrency(sources_by_id[primary_source["source_id"]]) == 8
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("configured_concurrency", range(1, 9))
+@pytest.mark.parametrize("configured_concurrency", [*range(1, 9), 31, 32])
 async def test_source_bulk_output_concurrency_preserves_legacy_configuration(monkeypatch, configured_concurrency):
     source_map = {
         "metadata_json": {

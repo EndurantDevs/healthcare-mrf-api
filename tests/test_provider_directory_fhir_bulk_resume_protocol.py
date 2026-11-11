@@ -105,7 +105,7 @@ class _ProbeSession:
 
 @pytest.mark.parametrize(
     "configured_concurrency",
-    [True, "not-a-number", 0, 9],
+    [True, "not-a-number", 0, 33],
 )
 @pytest.mark.parametrize("source_storage", [False, True])
 def test_bulk_output_concurrency_rejects_invalid_configuration(

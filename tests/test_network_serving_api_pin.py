@@ -393,3 +393,40 @@ def test_catalog_deparser_and_trigger_types_are_qualified_before_statement_parsi
     for type_name in ("trigger", "event_trigger"):
         assert f"'pg_catalog.{type_name}'::pg_catalog.regtype" in statement
         assert f"'{type_name}'::regtype" not in statement
+
+
+@pytest.mark.parametrize("optional", [False, True])
+async def test_catalog_fallback_keeps_optional_ledger_error_boundary(pin_reader, monkeypatch, optional):
+    failure = _missing_table(_SCHEMA, "network_candidate_custody" if optional else "another_table")
+    monkeypatch.setattr(pins, "read_published_api_pin", AsyncMock(side_effect=failure))
+    session = pin_reader.session
+    object.__setattr__(
+        pin_reader.result[0],
+        "_api_control_relations",
+        (CompactAddressRelation(_SCHEMA, "network_serving_manifest", 81), pin_reader.result[2]),
+    )
+    original = session.transaction
+    with _bound_reader(session):
+        if optional:
+            await _read_catalog_body(pin_reader, "success", None)
+        else:
+            with pytest.raises(asyncpg.UndefinedTableError) as caught:
+                await _read_catalog_body(pin_reader, "success", None)
+            assert caught.value is failure
+    assert session.events[:2] == ["savepoint", "rollback-savepoint"]
+    assert session.transaction is original and session.nested is None
+    assert pin_reader.legacy.await_count == pin_reader.approved_pin.await_count == int(optional)
+
+
+@pytest.mark.parametrize("report", [None, {"serving_readiness": None}])
+def test_malformed_legacy_report_never_selects_fallback(report):
+    with pytest.raises(NetworkServingReadUnavailable):
+        pins._uses_legacy_contract({"candidate_json": json.dumps({"validation_json": report})})
+    assert pins._is_missing_custody(RuntimeError("synthetic"), _SCHEMA) is False
+
+
+def test_catalog_reader_entry_refuses_an_inactive_unbound_session():
+    session = _PinSession()
+    session.transaction = None
+    with pytest.raises(NetworkServingReadUnavailable):
+        pins._reader_entry(session)

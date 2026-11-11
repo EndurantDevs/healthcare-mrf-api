@@ -1693,6 +1693,21 @@ and the output is marked complete only after the final batch succeeds. Endpoint
 dataset promotion remains blocked until every output for every selected
 resource is complete and every resource diagnostic is unbounded and error-free.
 
+Exports opting into immutable range resume can configure
+`provider_directory_bulk_export_output_concurrency` from 1 through 32; the
+generic default remains one. Transfers share the source's adaptive allowance,
+which decreases on throttling or timeouts. Each file retains its own validator
+and committed byte offset, so another file's delay does not reset its progress.
+These exports resume from the committed boundary only after validating the
+original ETag and full content length.
+
+Unbounded, checkpointed exports into isolated Source storage also reuse up to
+four persistent processes for parsing, canonical rows and proof preparation.
+Downloads fill bounded raw batches before reserving preparation capacity;
+oversized batches use the existing inline path. One publisher still commits
+payload, proof and byte checkpoint atomically. Cancellation drains preparation
+workers before the scan returns. The existing 5,000-row batch size is unchanged.
+
 Bulk start and status requests must be HTTPS and remain on the payer origin.
 Payer credentials are resolved only for the payer request URL. Manifest outputs
 must be absolute HTTPS URLs without userinfo or fragments; IP-literal hosts are

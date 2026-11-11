@@ -25,17 +25,51 @@ from tests.test_provider_directory_fhir_bulk_atomicity import _identity
 directory = importlib.import_module("process.provider_directory_fhir")
 
 
-def _source():
+def _source(concurrency=8):
     source_by_field = _parallel_resource_source()
     source_by_field["metadata_json"] = {
         "provider_directory_bulk_export_eligible": True,
         "provider_directory_bulk_export_auto_enabled": True,
         "provider_directory_bulk_export_range_resume": True,
-        "provider_directory_bulk_export_output_concurrency": 8,
+        "provider_directory_bulk_export_output_concurrency": concurrency,
         "provider_directory_request_interval_seconds": 0,
     }
     source_by_field["_provider_directory_request_pacing_state"] = {}
     return source_by_field
+
+
+@pytest.mark.parametrize("configured", [1, 8, 31, 32])
+def test_output_concurrency_preserves_configured_limits(configured):
+    source = _source()
+    source["metadata_json"]["provider_directory_bulk_export_output_concurrency"] = configured
+    assert parallel.output_concurrency(directory, source) == configured
+
+
+@pytest.mark.parametrize("configured", [0, 33, True, "invalid"])
+def test_output_concurrency_rejects_values_outside_shared_limit(configured):
+    source = _source()
+    source["metadata_json"]["provider_directory_bulk_export_output_concurrency"] = configured
+    with pytest.raises(ValueError, match="bulk_export_output_concurrency_invalid"):
+        parallel.output_concurrency(directory, source)
+
+
+@pytest.mark.asyncio
+async def test_output_scheduler_starts_all_thirty_one_files_at_supported_limit():
+    from tests.test_provider_directory_fhir_bulk_atomicity import _stream_options
+
+    started, release = set(), asyncio.Event()
+
+    async def stream(item):
+        started.add(item)
+        if len(started) == 31:
+            release.set()
+        await release.wait()
+
+    state = object()
+    result = await asyncio.wait_for(
+        parallel.run_outputs(directory, _identity(), _stream_options(32), state, list(range(31)), stream), 2
+    )
+    assert started == set(range(31)) and result == (state, None)
 
 
 @pytest.mark.parametrize(("pool_capacity", "expected"), [(2, 1), (3, 2), (5, 4), (9, 8), (16, 8)])
@@ -61,8 +95,10 @@ def test_export_wave_keeps_one_ordinary_connection_reserved(monkeypatch, pool_ca
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancel", [False, True])
-async def test_resources_and_files_share_eight_real_http_streams(cancel):
-    source_by_field = _source()
+@pytest.mark.parametrize(("concurrency", "file_count"), [(8, 15), (32, 31)])
+async def test_resources_and_files_share_bounded_real_http_streams(cancel, concurrency, file_count):
+    source_by_field = _source(concurrency)
+    active_limit = min(concurrency, file_count)
     parallel.prepare_scan(directory, source_by_field, 4)
     reached_limit, release = asyncio.Event(), asyncio.Event()
     counts_by_state = {"active": 0, "maximum": 0, "requests": 0}
@@ -71,7 +107,7 @@ async def test_resources_and_files_share_eight_real_http_streams(cancel):
         counts_by_state["active"] += 1
         counts_by_state["requests"] += 1
         counts_by_state["maximum"] = max(counts_by_state["maximum"], counts_by_state["active"])
-        if counts_by_state["active"] == 8:
+        if counts_by_state["active"] == active_limit:
             reached_limit.set()
         try:
             await release.wait()
@@ -89,33 +125,34 @@ async def test_resources_and_files_share_eight_real_http_streams(cancel):
             ) as response:
                 return await response.text()
 
-        tasks = [asyncio.create_task(read(resource, output)) for resource in range(3) for output in range(5)]
+        tasks = [asyncio.create_task(read(output // 5, output)) for output in range(file_count)]
         try:
             await asyncio.wait_for(reached_limit.wait(), 3)
             await asyncio.sleep(0.02)
-            assert counts_by_state["requests"] == 8
+            assert counts_by_state["requests"] == active_limit
             if cancel:
                 for task in tasks:
                     task.cancel()
             release.set()
             responses = await asyncio.gather(*tasks, return_exceptions=cancel)
-            assert len(responses) == 15
+            assert len(responses) == file_count
             if cancel:
                 assert all(isinstance(response, asyncio.CancelledError) for response in responses)
             else:
-                assert len(set(responses)) == 15
+                assert len(set(responses)) == file_count
         finally:
             release.set()
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-    assert counts_by_state["maximum"] == 8
+    assert counts_by_state["maximum"] == active_limit
     assert parallel.state(directory, source_by_field)["requests"].active == 0
 
 
 @pytest.mark.asyncio
-async def test_provider_limit_reduces_shared_budget_and_honors_retry_after():
-    source_by_field = _source()
+@pytest.mark.parametrize("concurrency", [8, 32])
+async def test_provider_limit_reduces_shared_budget_and_honors_retry_after(concurrency):
+    source_by_field = _source(concurrency)
     parallel.prepare_scan(directory, source_by_field, 4)
     calls = []
 
@@ -130,7 +167,7 @@ async def test_provider_limit_reduces_shared_budget_and_honors_retry_after():
             assert response.status == 200
     assert len(calls) == 2 and calls[1] - calls[0] >= 0.035
     shared = parallel.state(directory, source_by_field)
-    assert shared["requests"].limit == 4 and shared["resources"].limit == 2
+    assert shared["requests"].limit == concurrency // 2 and shared["resources"].limit == 2
     assert shared is parallel.state(directory, dict(source_by_field))
     assert parallel.state(directory, _source())["requests"].limit == 8
 
@@ -246,8 +283,9 @@ async def test_limited_export_never_falls_back_to_an_uncheckpointed_rest_scan(mo
 
 
 @pytest.mark.asyncio
-async def test_timeout_preserves_primary_error_and_releases_transfer_slot():
-    source_by_field = _source()
+@pytest.mark.parametrize("concurrency", [8, 32])
+async def test_timeout_preserves_primary_error_and_releases_transfer_slot(concurrency):
+    source_by_field = _source(concurrency)
 
     class Session:
         def get(self, *_args, **_options):
@@ -257,4 +295,4 @@ async def test_timeout_preserves_primary_error_and_releases_transfer_slot():
         async with parallel.request(directory, source_by_field, Session(), "https://files.example.org/output"):
             pytest.fail("timed out transport returned a response")
     assert parallel.state(directory, source_by_field)["requests"].active == 0
-    assert parallel.state(directory, source_by_field)["requests"].limit == 4
+    assert parallel.state(directory, source_by_field)["requests"].limit == concurrency // 2
