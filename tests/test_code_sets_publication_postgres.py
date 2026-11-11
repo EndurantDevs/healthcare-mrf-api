@@ -8,9 +8,10 @@ import importlib
 import json
 import os
 import re
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
@@ -29,8 +30,11 @@ from db.models import CodeCatalog, ImportRun
 from process import code_sets_mutable_publication as mutable
 from process import code_sets_result_archive as archive
 from process import control_lifecycle
+from process import provider_directory_cms_npd_recovery as recovery
 from process import reference_family_archive as native
 from process import scoped_catalog_handoff as handoff
+from process.provider_directory_source_control_privileges import ADMISSION_GRANTS
+from process.provider_directory_source_storage_binding import _ADMISSION_RIGHTS, _ADMISSION_RIGHTS_SQL
 from process.scoped_catalog_retention import cleanup_retained_catalog
 from tests.scoped_catalog_native_fixture import catalog_actors, seal_catalog
 
@@ -334,6 +338,246 @@ async def _mutable_context(actors, *, status="running"):
             },
         )
     return {"context": context_by_field}
+
+
+async def _remove_protected_control_lock(engine, schema, roles):
+    async with engine.begin() as connection:
+        await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        for role in reversed(roles):
+            if await connection.scalar(text("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=:role)"), {"role": role}):
+                await connection.execute(text(f'DROP OWNED BY "{role}"'))
+                await connection.execute(text(f'DROP ROLE "{role}"'))
+        assert not await connection.scalar(
+            text("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=ANY(CAST(:roles AS text[])))"),
+            {"roles": list(roles)},
+        )
+
+
+async def _prepare_protected_control_namespace(connection, schema, owner):
+    await connection.execute(
+        text(f'CREATE ROLE "{owner}" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS')
+    )
+    await connection.execute(text(f'CREATE SCHEMA "{schema}" AUTHORIZATION "{owner}"'))
+    assert await connection.scalar(
+        text(
+            "SELECT nspowner<>datdba FROM pg_namespace,pg_database WHERE nspname=:schema AND datname=current_database()"
+        ),
+        {"schema": schema},
+    )
+
+
+@asynccontextmanager
+async def _protected_control_lock(actors, *, protected_namespace=False):
+    """Issue native lock permissions without inventing Source enrollment."""
+    suffix = uuid4().hex
+    schema = "control_lock_" + suffix
+    owner = "control_owner_" + suffix
+    publisher = "control_publisher_" + suffix
+    namespace_owner = "control_namespace_" + suffix
+    roles = (owner, publisher, namespace_owner) if protected_namespace else (owner, publisher)
+    async with AsyncExitStack() as cleanup:
+        async with actors.engine.begin() as connection:
+            assert await connection.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": schema}) is None
+            assert not await connection.scalar(
+                text("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=ANY(CAST(:roles AS text[])))"),
+                {"roles": list(roles)},
+            )
+            cleanup.push_async_callback(_remove_protected_control_lock, actors.engine, schema, roles)
+            await connection.execute(
+                text(f'CREATE ROLE "{owner}" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS')
+            )
+            await connection.execute(
+                text(
+                    f'CREATE ROLE "{publisher}" LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS'
+                )
+            )
+            password = uuid4().hex
+            driver = (await connection.get_raw_connection()).driver_connection
+            try:
+                await driver.execute(f"ALTER ROLE \"{publisher}\" PASSWORD '{password}'")
+            except Exception:
+                raise RuntimeError("control fixture login bootstrap failed") from None
+            await connection.execute(text(f'GRANT "{owner}" TO "{publisher}" WITH INHERIT FALSE'))
+            if protected_namespace:
+                await _prepare_protected_control_namespace(connection, schema, namespace_owner)
+            assert (
+                await connection.scalar(
+                    text(
+                        "SELECT count(*) FROM pg_class WHERE relowner=(SELECT oid FROM pg_roles WHERE rolname=:owner)"
+                    ),
+                    {"owner": owner},
+                )
+                == 0
+            )
+            await connection.execute(text(f'GRANT USAGE ON SCHEMA mrf TO "{owner}"'))
+            await connection.execute(
+                text(f'GRANT {dict(ADMISSION_GRANTS)["import_run"]} ON mrf.import_run TO "{owner}"')
+            )
+        publisher_engine = create_async_engine(
+            actors.engine.url.set(username=publisher, password=password), hide_parameters=True
+        )
+        cleanup.push_async_callback(publisher_engine.dispose)
+        yield SimpleNamespace(schema=schema, owner=owner, publisher=publisher, engine=publisher_engine)
+
+
+async def _require_native_source_lock(actors, lock_profile, run_id, status):
+    query = _ADMISSION_RIGHTS_SQL.replace("$3::oid", "CAST(:owner AS oid)").replace(
+        "$4::oid", "CAST(:publisher AS oid)"
+    )
+    query = query.replace("$2::name", "CAST(:schema AS name)").replace("$8::jsonb", "CAST(:rights AS jsonb)")
+    key, selected = _ADMISSION_RIGHTS["import_run"]
+    async with actors.engine.begin() as connection:
+        owner_oid = await connection.scalar(
+            text("SELECT oid FROM pg_roles WHERE rolname=:role"), {"role": lock_profile.owner}
+        )
+        publisher_oid = await connection.scalar(
+            text("SELECT oid FROM pg_roles WHERE rolname=:role"), {"role": lock_profile.publisher}
+        )
+        actual = (
+            await connection.execute(
+                text(
+                    "WITH catalog AS (SELECT 'admission' AS scope,c.oid,c.relowner,c.relname FROM pg_class c "
+                    "WHERE c.oid='mrf.import_run'::regclass) " + query
+                ),
+                {
+                    "owner": owner_oid,
+                    "publisher": publisher_oid,
+                    "schema": "mrf",
+                    "rights": json.dumps([{"root": "import_run", "key": key, "selected": selected}]),
+                },
+            )
+        ).one()
+        assert actual.closed is True
+    async with lock_profile.engine.begin() as connection:
+        assert await connection.scalar(text("SELECT session_user")) == lock_profile.publisher
+        await connection.execute(text(f'SET LOCAL ROLE "{lock_profile.owner}"'))
+
+        async def all_rows(query, **parameters):
+            return (await connection.execute(text(query), parameters)).mappings().all()
+
+        fhir = SimpleNamespace(
+            db=SimpleNamespace(all=all_rows),
+            _schema=lambda: "mrf",
+            _qt=lambda schema, name: f'"{schema}"."{name}"',
+            _pagination_checkpoint_row_mapping=dict,
+        )
+        control_rows = await recovery._run_records(fhir, run_id=run_id)
+        assert len(control_rows) == 1 and control_rows[0]["run_id"] == run_id and control_rows[0]["status"] == status
+        assert control_rows[0]["importer"] == "provider-directory-fhir"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protected_namespace", [False, True])
+async def test_mutable_code_sets_coexist_with_owner_issued_native_control_lock(monkeypatch, protected_namespace):
+    engine = create_async_engine(_dsn())
+    try:
+        async with (
+            _mutable_catalog(engine) as actors,
+            _protected_control_lock(actors, protected_namespace=protected_namespace) as lock_profile,
+        ):
+            database = _mutable_dependencies(monkeypatch, actors)
+            run_context = await _claim_mutable_context(monkeypatch, actors, database)
+            run_id = uuid4().hex
+            async with actors.builder.begin() as session:
+                await session.execute(
+                    text(
+                        "INSERT INTO mrf.import_run (run_id,engine,importer,node_id,status,params) "
+                        "VALUES (:run_id,'healthcare-mrf-api','provider-directory-fhir','synthetic-node','failed','{}')"
+                    ),
+                    {"run_id": run_id},
+                )
+            await _require_native_source_lock(actors, lock_profile, run_id, "failed")
+            before = await _mutable_state(actors)
+            publication_by_field = await code_sets.import_code_sets(_control_context=run_context)
+            after = await _mutable_state(actors)
+            assert after[2:] == before[2:]
+            assert len(after[0]) == 5 and after[1][2] == 1
+            assert publication_by_field["contract"] == mutable.CONTRACT
+            assert publication_by_field["generation"]["row_count"] == 4
+            assert run_context["context"]["control_run_terminal_committed"] is True
+            await _require_native_source_lock(actors, lock_profile, run_id, "failed")
+    finally:
+        await engine.dispose()
+
+
+async def _delegate_foreign_control_key(connection, lock_profile):
+    await connection.execute(text(f'GRANT USAGE ON SCHEMA mrf TO "{lock_profile.publisher}"'))
+    await connection.execute(
+        text(f'GRANT UPDATE(run_id) ON mrf.import_run TO "{lock_profile.publisher}" WITH GRANT OPTION')
+    )
+    await connection.execute(text(f'SET LOCAL ROLE "{lock_profile.publisher}"'))
+    await connection.execute(text(f'GRANT UPDATE(run_id) ON mrf.import_run TO "{lock_profile.owner}"'))
+    assert await connection.scalar(
+        text(
+            "SELECT EXISTS(SELECT FROM pg_attribute col,LATERAL aclexplode(col.attacl) acl "
+            "JOIN pg_roles grantor ON grantor.oid=acl.grantor JOIN pg_roles recipient ON recipient.oid=acl.grantee "
+            "WHERE col.attrelid='mrf.import_run'::regclass AND col.attname='run_id' "
+            "AND grantor.rolname=:grantor AND recipient.rolname=:recipient "
+            "AND acl.privilege_type='UPDATE' AND NOT acl.is_grantable)"
+        ),
+        {"grantor": lock_profile.publisher, "recipient": lock_profile.owner},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "foreign-grantee",
+        "public-grantee",
+        "missing-read",
+        "foreign-grantor",
+        "column",
+        "grant-option",
+        "table",
+        "catalog",
+        "generation",
+        "extra-read",
+        "login",
+        "elevated",
+        "inherited-elevation",
+        "mutable-namespace-writer",
+        "owner-membership",
+        "writer-membership",
+        "read-grant-option",
+        "insert",
+    ],
+)
+async def test_mutable_control_lock_exception_refuses_foreign_authority(failure):
+    engine = create_async_engine(_dsn())
+    try:
+        async with _mutable_catalog(engine) as actors, _protected_control_lock(actors) as lock_profile:
+            statements_by_failure = {
+                "foreign-grantee": f'GRANT UPDATE(run_id) ON mrf.import_run TO "{actors.roles["owner"]}"',
+                "public-grantee": "GRANT UPDATE(run_id) ON mrf.import_run TO PUBLIC",
+                "missing-read": f'REVOKE SELECT(params) ON mrf.import_run FROM "{lock_profile.owner}"',
+                "column": f'GRANT UPDATE(status) ON mrf.import_run TO "{lock_profile.owner}"',
+                "grant-option": f'GRANT UPDATE(run_id) ON mrf.import_run TO "{lock_profile.owner}" WITH GRANT OPTION',
+                "table": f'GRANT UPDATE ON mrf.import_run TO "{lock_profile.owner}"',
+                "catalog": f'GRANT UPDATE(code) ON mrf.code_catalog TO "{lock_profile.owner}"',
+                "generation": f'GRANT UPDATE(local_generation) ON mrf.code_sets_result_generation TO "{lock_profile.owner}"',
+                "extra-read": f'GRANT SELECT(progress) ON mrf.import_run TO "{lock_profile.owner}"',
+                "login": f'ALTER ROLE "{lock_profile.owner}" LOGIN',
+                "elevated": f'ALTER ROLE "{lock_profile.owner}" CREATEDB',
+                "inherited-elevation": f'GRANT postgres TO "{lock_profile.owner}"',
+                "mutable-namespace-writer": f'GRANT CREATE ON SCHEMA mrf TO "{lock_profile.owner}"',
+                "owner-membership": f'GRANT "{actors.roles["builder"]}" TO "{lock_profile.owner}"',
+                "writer-membership": f'GRANT "{lock_profile.owner}" TO "{actors.roles["builder"]}"',
+                "read-grant-option": f'GRANT SELECT(run_id) ON mrf.import_run TO "{lock_profile.owner}" WITH GRANT OPTION',
+                "insert": f'GRANT INSERT(run_id) ON mrf.import_run TO "{lock_profile.owner}"',
+            }
+            prior_state = await _mutable_state(actors)
+            async with engine.begin() as session:
+                if failure == "foreign-grantor":
+                    await _delegate_foreign_control_key(session, lock_profile)
+                else:
+                    await session.execute(text(statements_by_failure[failure]))
+            async with actors.builder.begin() as session:
+                with pytest.raises(RuntimeError, match="ownership, access or execution hooks differ"):
+                    await mutable._mutable_storage(session, "mrf")
+            assert await _mutable_state(actors) == prior_state
+    finally:
+        await engine.dispose()
 
 
 async def _mutable_state(actors):

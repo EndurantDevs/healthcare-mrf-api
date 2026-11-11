@@ -23,6 +23,46 @@ METRIC = "code_sets_mutable_publication"
 MAX_ROWS = 20_000
 MAX_BYTES = 16 * 1024**2
 
+_MUTABLE_STORAGE_SQL = (
+    "WITH lock_owners AS (SELECT DISTINCT r.oid FROM pg_catalog.pg_attribute col "
+    "CROSS JOIN LATERAL pg_catalog.aclexplode(col.attacl) a "
+    "JOIN pg_catalog.pg_roles r ON r.oid=a.grantee "
+    "WHERE col.attrelid=:control AND col.attname=:lock_key AND a.privilege_type='UPDATE' "
+    "AND NOT a.is_grantable AND NOT r.rolcanlogin AND NOT r.rolsuper "
+    "AND NOT r.rolcreaterole AND NOT r.rolcreatedb AND NOT r.rolreplication AND NOT r.rolbypassrls "
+    "AND NOT pg_catalog.pg_has_role(r.oid,CAST(:owner AS oid),'MEMBER') "
+    "AND NOT pg_catalog.pg_has_role(CAST(:owner AS oid),r.oid,'MEMBER') "
+    "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_roles elevated "
+    "WHERE pg_catalog.pg_has_role(r.oid,elevated.oid,'MEMBER') "
+    "AND (elevated.rolsuper OR elevated.rolcreaterole OR elevated.rolcreatedb "
+    "OR elevated.rolreplication OR elevated.rolbypassrls)) "
+    "AND pg_catalog.has_schema_privilege(r.oid,CAST(:schema AS oid),'USAGE') "
+    "AND NOT pg_catalog.has_schema_privilege(r.oid,CAST(:schema AS oid),'CREATE') "
+    "AND NOT pg_catalog.has_table_privilege(r.oid,:control,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN') "
+    "AND NOT pg_catalog.has_any_column_privilege(r.oid,:control,'INSERT,REFERENCES') "
+    "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_attribute item WHERE item.attrelid=:control "
+    "AND item.attnum>0 AND NOT item.attisdropped AND ("
+    "pg_catalog.has_column_privilege(r.oid,:control,item.attnum,'UPDATE')<>(item.attname=:lock_key) "
+    "OR pg_catalog.has_column_privilege(r.oid,:control,item.attnum,'SELECT') "
+    "<>(item.attname=ANY(CAST(:lock_reads AS text[]))) "
+    "OR pg_catalog.has_column_privilege(r.oid,:control,item.attnum,'SELECT WITH GRANT OPTION,UPDATE WITH GRANT OPTION')))) "
+    "SELECT count(*)=3 AND bool_and(c.relowner=:owner AND c.relnamespace=:schema "
+    "AND c.relkind='r' AND c.relpersistence='p' AND NOT c.relispartition "
+    "AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity "
+    "AND NOT EXISTS(SELECT 1 FROM pg_catalog.aclexplode(COALESCE(c.relacl,"
+    "pg_catalog.acldefault('r',c.relowner))) a WHERE a.grantee<>c.relowner "
+    "AND (a.is_grantable OR a.privilege_type<>'SELECT')) "
+    "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_attribute col,LATERAL pg_catalog.aclexplode(col.attacl) a "
+    "WHERE col.attrelid=c.oid AND a.grantee<>c.relowner AND (a.is_grantable OR (a.privilege_type<>'SELECT' "
+    "AND NOT (c.oid=:control AND col.attname=:lock_key AND a.privilege_type='UPDATE' "
+    "AND a.grantor=c.relowner AND a.grantee IN (SELECT oid FROM lock_owners))))) "
+    "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite WHERE ev_class=c.oid) "
+    "AND (c.oid=:control OR NOT EXISTS(SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal)) "
+    "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_constraint WHERE conrelid=c.oid AND contype='f') "
+    "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)) "
+    "FROM pg_catalog.pg_class c WHERE c.oid=ANY(CAST(:oids AS oid[]))"
+)
+
 
 async def _mutable_authority(session, schema):
     authority = (
@@ -63,28 +103,26 @@ async def _mutable_authority(session, schema):
 
 
 async def _mutable_storage(session, schema):
+    """Keep data heaps closed while admitting owner-issued protected control locks."""
+    from process.provider_directory_source_storage_binding import _ADMISSION_RIGHTS
+
     authority = await _mutable_authority(session, schema)
     names = ("code_catalog", codes.TABLE, "import_run")
     oids = tuple([await native._relation_oid(session, schema, name) for name in names])
     if any(type(oid) is not int or oid <= 0 for oid in oids):
         raise RuntimeError("mutable code-set relation inventory is incomplete")
+    # The owner-issued key privilege permits native row locks, not completion writes.
+    lock_key, lock_reads = _ADMISSION_RIGHTS["import_run"]
     safe = await session.scalar(
-        text(
-            "SELECT count(*)=3 AND bool_and(c.relowner=:owner AND c.relnamespace=:schema "
-            "AND c.relkind='r' AND c.relpersistence='p' AND NOT c.relispartition "
-            "AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity "
-            "AND NOT EXISTS(SELECT 1 FROM pg_catalog.aclexplode(COALESCE(c.relacl,"
-            "pg_catalog.acldefault('r',c.relowner))) a WHERE a.grantee<>c.relowner "
-            "AND (a.is_grantable OR a.privilege_type<>'SELECT')) "
-            "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_attribute col,LATERAL pg_catalog.aclexplode(col.attacl) a "
-            "WHERE col.attrelid=c.oid AND a.grantee<>c.relowner AND (a.is_grantable OR a.privilege_type<>'SELECT')) "
-            "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_rewrite WHERE ev_class=c.oid) "
-            "AND (c.oid=:control OR NOT EXISTS(SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal)) "
-            "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_constraint WHERE conrelid=c.oid AND contype='f') "
-            "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)) "
-            "FROM pg_catalog.pg_class c WHERE c.oid=ANY(CAST(:oids AS oid[]))"
-        ),
-        {"owner": authority["owner_oid"], "schema": authority["schema_oid"], "oids": list(oids), "control": oids[2]},
+        text(_MUTABLE_STORAGE_SQL),
+        {
+            "owner": authority["owner_oid"],
+            "schema": authority["schema_oid"],
+            "oids": list(oids),
+            "control": oids[2],
+            "lock_key": lock_key,
+            "lock_reads": lock_reads,
+        },
     )
     if safe is not True:
         raise RuntimeError("mutable code-set relation ownership, access or execution hooks differ")
