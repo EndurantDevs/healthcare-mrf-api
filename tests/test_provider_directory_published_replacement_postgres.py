@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from db.connection import Database
 from process import provider_directory_generic_source_artifacts as artifacts
@@ -506,3 +506,65 @@ async def test_late_reader_failure_rolls_back_completed_copy_pages(monkeypatch):
                     kind=kind,
                 )
         assert (await case.connection.execute(text("SELECT count(*) FROM mrf.new_stage"))).scalar_one() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_hashagg", ["on", "off"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        None,
+        "DELETE FROM mrf.parity_actual WHERE ctid IN (SELECT ctid FROM mrf.parity_actual LIMIT 1)",
+        "INSERT INTO mrf.parity_actual SELECT * FROM mrf.parity_actual LIMIT 1",
+        "UPDATE mrf.parity_actual SET body=jsonb_build_object('changed',true) WHERE id=2",
+    ],
+    ids=["equal", "missing_duplicate", "extra_duplicate", "changed_json"],
+)
+async def test_native_parity_sorts_and_restores(monkeypatch, initial_hashagg, mutation):
+    """Keep exhaustive multiset checks on spillable sorts without leaking planner settings."""
+    parity_queries = []
+
+    def capture_parity(connection, _cursor, statement, _parameters, _context, _executemany):
+        if statement.startswith("WITH expected AS MATERIALIZED"):
+            assert connection.exec_driver_sql("SHOW enable_hashagg").scalar_one() == "off"
+            parity_queries.append(statement)
+
+    async with page_copy.native_case(monkeypatch, rows=0) as case, case.connection.begin():
+        for statement in (
+            "CREATE TABLE mrf.parity_expected AS SELECT id,jsonb_build_object('nested',"
+            "jsonb_build_array(id,NULL,repeat('x',128))) AS body FROM (VALUES(1),(1),(2)) fixture(id)",
+            "CREATE TABLE mrf.parity_actual AS TABLE mrf.parity_expected",
+        ):
+            await case.connection.execute(text(statement))
+        if mutation:
+            await case.connection.execute(text(mutation))
+        await case.connection.execute(text("SET LOCAL enable_hashagg=" + initial_hashagg))
+        event.listen(case.connection.sync_connection, "before_cursor_execute", capture_parity)
+        try:
+            if mutation:
+                with pytest.raises(RuntimeError, match="scratch_tuple_parity_failed"):
+                    await artifacts._verify_set_parity(
+                        case.connection, "SELECT * FROM mrf.parity_expected", "mrf.parity_actual", {}
+                    )
+            else:
+                await artifacts._verify_set_parity(
+                    case.connection, "SELECT * FROM mrf.parity_expected", "mrf.parity_actual", {}
+                )
+        finally:
+            event.remove(case.connection.sync_connection, "before_cursor_execute", capture_parity)
+        assert (await case.connection.execute(text("SHOW enable_hashagg"))).scalar_one() == initial_hashagg
+        assert len(parity_queries) == 1
+        await case.connection.execute(text("SET LOCAL enable_hashagg=off"))
+        plan = (await case.connection.execute(text("EXPLAIN(VERBOSE,FORMAT JSON) " + parity_queries[0]))).scalar_one()
+        nodes = [plan[0]["Plan"]]
+        for node in nodes:
+            nodes.extend(node.get("Plans", ()))
+        operations = [node for node in nodes if node["Node Type"] == "Aggregate"]
+        assert len(operations) == 1 and operations[0]["Strategy"] == "Sorted"
+        assert len(operations[0]["Group Key"]) == 1
+        assert "sum" in operations[0]["Filter"]
+        assert all(node.get("Strategy") != "Hashed" for node in nodes)
+        sorts = [node for node in nodes if node["Node Type"] == "Sort"]
+        assert len(sorts) == 1 and len(sorts[0]["Output"]) == 2
+        assert "AS row_value, 1 AS delta" in parity_queries[0]
+        assert "AS row_value, -1 AS delta" in parity_queries[0]

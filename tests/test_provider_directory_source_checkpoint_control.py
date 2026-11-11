@@ -371,21 +371,29 @@ async def test_private_checkpoint_read_entrypoints_borrow_short_source_scope(
         assert events == ["enter", "exit"]
 
 
-def test_all_bulk_writer_scopes_and_connection_children_pass_full_identity():
-    source = Path(control.__file__).with_name("provider_directory_fhir.py")
+@pytest.mark.parametrize(
+    ("source_name", "expected_count_by_helper"),
+    [
+        ("provider_directory_fhir.py", {"source_checkpoint_transaction": 20, "require_checkpoint_executor": 3}),
+        ("provider_directory_bulk_parallel.py", {"source_checkpoint_transaction": 2, "require_checkpoint_executor": 1}),
+    ],
+)
+def test_all_bulk_writer_scopes_and_connection_children_pass_full_identity(source_name, expected_count_by_helper):
+    source = Path(control.__file__).with_name(source_name)
     tree = ast.parse(source.read_text())
-    count_by_helper = {"source_checkpoint_transaction": 0, "require_checkpoint_executor": 0}
+    count_by_helper = {name: 0 for name in expected_count_by_helper}
     for function in ast.walk(tree):
-        if not isinstance(function, ast.AsyncFunctionDef) or "bulk" not in function.name:
+        if not isinstance(function, ast.AsyncFunctionDef):
+            continue
+        if source_name == "provider_directory_fhir.py" and "bulk" not in function.name:
             continue
         if not any(argument.arg == "identity" for argument in function.args.args):
             continue
         for call in ast.walk(function):
-            if (
-                not isinstance(call, ast.Call)
-                or not isinstance(call.func, ast.Name)
-                or call.func.id not in count_by_helper
-            ):
+            if not isinstance(call, ast.Call):
+                continue
+            helper_name = getattr(call.func, "id", None) or getattr(call.func, "attr", None)
+            if helper_name not in count_by_helper:
                 continue
             keyword_by_name = {keyword.arg: keyword.value for keyword in call.keywords}
             assert (
@@ -393,5 +401,25 @@ def test_all_bulk_writer_scopes_and_connection_children_pass_full_identity():
                 and keyword_by_name["bulk_identity"].id == "identity"
             )
             assert not {"dataset_ids", "root_run_ids", "checkpoint_ids"}.intersection(keyword_by_name)
-            count_by_helper[call.func.id] += 1
-    assert count_by_helper == {"source_checkpoint_transaction": 21, "require_checkpoint_executor": 3}
+            count_by_helper[helper_name] += 1
+    assert count_by_helper == expected_count_by_helper
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reject", [False, True])
+async def test_shared_refresh_child_requires_original_executor_before_write(monkeypatch, reject):
+    directory = importlib.import_module("process.provider_directory_fhir")
+    identity = SimpleNamespace(**_IDENTITY)
+    connection = SimpleNamespace(status=AsyncMock(return_value=1))
+    require = AsyncMock(side_effect=GenericCandidateError("synthetic_executor_refused") if reject else None)
+    monkeypatch.setattr(directory, "require_checkpoint_executor", require)
+    operation = directory.bulk_parallel.reserve_refresh_attempts(directory, connection, identity, 1, 1)
+    if reject:
+        with pytest.raises(GenericCandidateError, match="synthetic_executor_refused"):
+            await operation
+        connection.status.assert_not_awaited()
+    else:
+        await operation
+        connection.status.assert_awaited_once()
+        assert connection.status.await_args.kwargs["checkpoint_id"] == identity.checkpoint_id
+    require.assert_awaited_once_with(connection, bulk_identity=identity)

@@ -18,7 +18,17 @@ from process import provider_directory_output_snapshot_custody as custody
 from process import provider_directory_output_snapshot_journal as journal
 from process import provider_directory_output_snapshot_stage as stages
 from process.plan_release_storage_custody import storage_roles
+from process.provider_directory_admission_seal import (
+    ADMISSION_KIND_GENERIC,
+    ADMISSION_KIND_UHC_CANONICAL,
+    ADMISSION_METADATA_SUMMARY_MAX_BYTES,
+    ADMISSION_SEAL_VERSION,
+    _bounded_metadata_summary,
+    _digest_envelope,
+    _normalized_resource_types,
+)
 from process.provider_directory_dataset_rehydrate_pages import projected_pages
+from process.provider_directory_fhir_subset_canonical import canonical_payload_sha256
 from process.provider_directory_generic_source_policy import bound_publisher, source_copy_session, source_transaction
 from process.provider_directory_output_snapshot_catalog import (
     OUTPUT_CATALOG_SQL,
@@ -42,6 +52,28 @@ _SOURCE_CATALOG_SQL = OUTPUT_CATALOG_SQL.replace(
 _ACTIVE = ContextVar("provider_directory_artifact_scratch_inputs", default=None)
 _VERIFIED = ContextVar("provider_directory_artifact_scratch_native_transaction", default=None)
 _ISSUED = WeakKeyDictionary()
+_HEADER_PROJECTION = "admitted-source-header-v1"
+_HEADER_SEAL_FIELDS = (
+    "publication_metadata_summary_json",
+    "publication_metadata_sha256",
+    "content_proof_admission_version",
+    "content_proof_admission_kind",
+    "content_proof_admission_sha256",
+    "content_proof_resource_types",
+)
+_HEADER_FACT_FIELDS = (
+    "dataset_id",
+    "endpoint_id",
+    "acquisition_root_run_id",
+    "dataset_hash",
+    "status",
+    "is_current",
+    "created_at",
+    "validated_at",
+    "published_at",
+    "candidate_storage_json",
+    *_HEADER_SEAL_FIELDS,
+)
 
 
 @dataclass(frozen=True, eq=False)
@@ -173,15 +205,109 @@ def _admitted_identity(directory, admission, fence, resource_types, projection):
     )
 
 
+def _source_header_identity_sql():
+    """Decode raw JSON once, retaining the last value of only bounded binding keys."""
+    return f"""(WITH expected AS MATERIALIZED (
+        SELECT key,value FROM jsonb_each(h.candidate_storage_json->'identity'->'metadata')
+    ), actual AS MATERIALIZED (
+        SELECT DISTINCT ON (raw.key) raw.key,
+            octet_length(raw.value::text)<={ADMISSION_METADATA_SUMMARY_MAX_BYTES} AS bounded,
+            CASE WHEN octet_length(raw.value::text)<={ADMISSION_METADATA_SUMMARY_MAX_BYTES}
+                 THEN raw.value::text END AS value
+        FROM json_each(h.publication_metadata_json::json) WITH ORDINALITY raw(key,value,ordinal)
+        JOIN expected USING (key)
+        ORDER BY raw.key,raw.ordinal DESC
+    ) SELECT coalesce(bool_and(CASE WHEN actual.key IS NULL OR actual.bounded
+        THEN coalesce(actual.value::jsonb,'null'::jsonb)=expected.value ELSE false END),true)
+        FROM expected LEFT JOIN actual USING (key))"""
+
+
+def _source_header_sql(root, *, size):
+    """Keep large retained JSON native while hashing every original header field."""
+    absent = "num_nonnulls(" + ",".join("h." + name for name in _HEADER_SEAL_FIELDS) + ")=0"
+    projection = ",".join("h." + name for name in _HEADER_FACT_FIELDS)
+    if size:
+        value = (
+            f"CASE WHEN {absent} THEN octet_length(row_to_json(h)::text) "
+            "ELSE octet_length(row_to_json(p)::text) END +1024 AS bytes"
+        )
+    else:
+        # Finish the native per-row hash allocations before decoding raw identity fields.
+        header_digest = (
+            "(SELECT max(encode(sha256(convert_to(row_to_json(original)::text,'UTF8')),'hex')) "
+            f"FROM {root} original WHERE original.dataset_id=h.dataset_id)"
+        )
+        value = (
+            f"(CASE WHEN {absent} THEN to_jsonb(h) ELSE to_jsonb(p) || jsonb_build_object("
+            f"'_source_header_projection','{_HEADER_PROJECTION}',"
+            f"'_source_header_sha256',{header_digest},"
+            f"'_source_header_identity_matches',{_source_header_identity_sql()}) END)::text AS facts"
+        )
+    return (
+        f"SELECT h.dataset_id,{value} FROM {root} h CROSS JOIN LATERAL (SELECT {projection}) p "
+        "WHERE h.dataset_id=ANY($1::varchar[]) ORDER BY h.dataset_id"
+    )
+
+
+def _source_header_metadata(header):
+    """Use only a complete existing admission seal for a compact native header."""
+    if "_source_header_projection" not in header:
+        return decoded(header["publication_metadata_json"])
+    summary = decoded(header.get("publication_metadata_summary_json"))
+    resource_types = header.get("content_proof_resource_types")
+    proof_sha256 = header.get("content_proof_admission_sha256")
+    require_output(
+        header.get("_source_header_projection") == _HEADER_PROJECTION
+        and header.get("_source_header_identity_matches") is True
+        and type(summary) is dict
+        and type(resource_types) is list
+        and all(type(resource_type) is str for resource_type in resource_types)
+        and type(header.get("content_proof_admission_version")) is int
+        and header["content_proof_admission_version"] == ADMISSION_SEAL_VERSION
+        and header.get("content_proof_admission_kind") in {ADMISSION_KIND_GENERIC, ADMISSION_KIND_UHC_CANONICAL}
+        and type(proof_sha256) is str
+        and len(proof_sha256) == 64
+        and set(proof_sha256) <= set("0123456789abcdef"),
+        "scratch_header_seal_invalid",
+    )
+    require_output(
+        _bounded_metadata_summary(summary) == summary
+        and list(_normalized_resource_types(dict.fromkeys(resource_types, 0))) == resource_types
+        and canonical_payload_sha256(
+            _digest_envelope(
+                summary,
+                admission_version=header["content_proof_admission_version"],
+                admission_kind=header["content_proof_admission_kind"],
+                proof_sha256=proof_sha256,
+                resource_types=tuple(resource_types),
+            )
+        )
+        == header.get("publication_metadata_sha256"),
+        "scratch_header_seal_invalid",
+    )
+    return summary
+
+
+def _source_header_digest(header):
+    """Retain the whole native row digest, including untransported metadata and completion JSON."""
+    if "_source_header_projection" not in header:
+        return custody._digest(header)
+    digest = header.get("_source_header_sha256")
+    require_output(
+        type(digest) is str and len(digest) == 64 and set(digest) <= set("0123456789abcdef"),
+        "scratch_header_digest_invalid",
+    )
+    return digest
+
+
 async def _source_headers(publisher, dataset_ids):
-    """Admit small indexed header weights before transporting complete native facts."""
+    """Admit bounded facts before transport; preserve every original field in the native digest."""
     root = storage_relation(publisher.policy.schema, source_storage.HEADER)
     for offset in range(0, len(dataset_ids), 512):
         remaining_ids = dataset_ids[offset : offset + 512]
         while remaining_ids:
             headers = await publisher.connection.fetch(
-                f"SELECT h.dataset_id,octet_length(convert_to(row_to_json(h)::text,'UTF8'))+1024 AS bytes "
-                f"FROM {root} h WHERE dataset_id=ANY($1::varchar[]) ORDER BY h.dataset_id",
+                _source_header_sql(root, size=True),
                 remaining_ids,
             )
             selected, size = [], 21
@@ -194,8 +320,7 @@ async def _source_headers(publisher, dataset_ids):
                 size += header["bytes"]
             require_output(bool(selected), "scratch_source_missing")
             header_rows = await publisher.connection.fetch(
-                f"SELECT h.dataset_id,to_jsonb(h)::text AS facts FROM {root} h "
-                "WHERE dataset_id=ANY($1::varchar[]) ORDER BY dataset_id",
+                _source_header_sql(root, size=False),
                 selected,
             )
             require_output(
@@ -209,6 +334,10 @@ async def _source_headers(publisher, dataset_ids):
                 ),
                 "scratch_source_changed",
             )
+            for fact in facts:
+                if "_source_header_projection" in fact:
+                    _source_header_metadata(fact)
+                    _source_header_digest(fact)
             yield facts
             remaining_ids = [dataset_id for dataset_id in remaining_ids if dataset_id not in set(selected)]
 
@@ -263,7 +392,7 @@ async def _capture_mixed_sources(directory, publisher, fence):
             == (dataset.dataset_id, dataset.endpoint_id, dataset.evidence_run_id),
             "scratch_source_changed",
         )
-        metadata = decoded(header["publication_metadata_json"])
+        metadata = _source_header_metadata(header)
         require_output(
             type(metadata) is dict
             and all(metadata.get(key) == expected_fact for key, expected_fact in identity["metadata"].items()),
@@ -279,7 +408,7 @@ async def _capture_mixed_sources(directory, publisher, fence):
         bindings_by_source[dataset.source_id] = binding
         facts_by_source[dataset.source_id] = dict(
             binding=binding,
-            header_sha256=custody._digest(header),
+            header_sha256=_source_header_digest(header),
             projection_time={field: header[field] for field in ("published_at", "validated_at", "created_at")},
         )
         pins.append(_source_pin(dataset, header, binding))
@@ -584,9 +713,23 @@ async def _prepare_source_copy(directory, admission, session, publisher, fence):
 
 
 async def _verify_set_parity(session, projection, relation, params, *, actual_filter=""):
-    actual = f"SELECT to_jsonb(a) FROM {relation} a{actual_filter}"
-    statement = f"WITH expected AS MATERIALIZED ({projection}), difference AS ((SELECT to_jsonb(e) FROM expected e EXCEPT ALL {actual}) UNION ALL ({actual} EXCEPT ALL SELECT to_jsonb(e) FROM expected e)) SELECT NOT EXISTS(SELECT FROM difference)"
-    require_output((await session.execute(text(statement), params)).scalar_one(), "scratch_tuple_parity_failed")
+    actual = f"SELECT to_jsonb(a) AS row_value, -1 AS delta FROM {relation} a{actual_filter}"
+    statement = f"""WITH expected AS MATERIALIZED ({projection}),
+        signed_rows AS (
+            SELECT to_jsonb(e) AS row_value, 1 AS delta FROM expected e
+            UNION ALL
+            {actual}
+        ), difference AS (
+            SELECT row_value FROM signed_rows
+            GROUP BY row_value HAVING sum(delta) <> 0
+        )
+        SELECT NOT EXISTS(SELECT FROM difference)"""
+    previous = (await session.execute(text("SHOW enable_hashagg"))).scalar_one()
+    async with session.begin_nested():
+        # Sorted heap tuples spill; PostgreSQL 18.2 datum sorts miss wide-value memory.
+        await session.execute(text("SET LOCAL enable_hashagg=off"))
+        require_output((await session.execute(text(statement), params)).scalar_one(), "scratch_tuple_parity_failed")
+        await session.execute(text("SELECT set_config('enable_hashagg', :previous, true)"), {"previous": previous})
 
 
 async def _loading_enrichment(directory, admission, fence, session, projection):

@@ -16,7 +16,12 @@ from db.plan_release_storage import storage_relation
 from process import provider_directory_generic_source_policy as source
 from process import provider_directory_generic_source_storage as storage
 from process import provider_directory_owned_wal_transaction as owned
-from process.provider_directory_artifact_scratch_inputs import _source_headers, _source_pin
+from process.provider_directory_artifact_scratch_inputs import (
+    _source_header_digest,
+    _source_header_metadata,
+    _source_headers,
+    _source_pin,
+)
 from process.provider_directory_generic_source_provision import verify_generic_source_family
 from process.provider_directory_output_snapshot_catalog import decoded, encoded, require_output
 from process.provider_directory_projection_stage import _copy_driver
@@ -160,7 +165,7 @@ async def _capture(scope, coordinates):
         require_output(type(captured) is dict, "profile_input_binding_required")
         storage._validate_binding(captured, captured.get("identity"), phases=("published",))
         _source_pin(dataset, header, captured)
-        metadata = decoded(header["publication_metadata_json"])
+        metadata = _source_header_metadata(header)
         require_output(
             header["status"] == dataset.status
             and (
@@ -192,7 +197,7 @@ async def _capture(scope, coordinates):
         )
     for captured in bindings_by_key.values():
         await storage._verify_tables(scope.connection, scope.policy, captured)
-    return bindings_by_key
+    return bindings_by_key, {key: _source_header_digest(headers_by_id[key[1]]) for key in coordinates}
 
 
 async def _drain(state_by_field):
@@ -234,13 +239,14 @@ async def profile_source_input_scope(directory, full_fence, resource_fence):
             "profile_input_probe_busy",
         )
         await verify_generic_source_family(driver, scope.policy)
-        captured = await _capture(scope, full_by_key)
+        captured, header_digests = await _capture(scope, full_by_key)
         state_by_field = dict(
             active=True,
             full=full_fence,
             resource=resource_fence,
             coordinates=coordinates,
             bindings=captured,
+            header_digests=header_digests,
             full_coordinates=full_by_key,
             tasks={},
         )
@@ -319,7 +325,10 @@ async def read_transaction(directory):
         )
         require_output(
             await _capture(observed, state_by_field["coordinates"])
-            == {key: state_by_field["bindings"][key] for key in state_by_field["coordinates"]},
+            == (
+                {key: state_by_field["bindings"][key] for key in state_by_field["coordinates"]},
+                {key: state_by_field["header_digests"][key] for key in state_by_field["coordinates"]},
+            ),
             "profile_input_binding_changed",
         )
         yield

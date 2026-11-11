@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Native private bootstrap and rollback; never enrollment or activation proof."""
 
+import json
 from contextlib import AsyncExitStack
 from types import SimpleNamespace
 from uuid import uuid4
@@ -17,11 +18,16 @@ from sqlalchemy.schema import CreateTable
 from db.models.system import ProviderDirectoryEndpointDataset
 from db.plan_release_storage import storage_identifier as quote
 from db.plan_release_storage import storage_relation
+from process import provider_directory_artifact_scratch_inputs as scratch
 from process import provider_directory_generic_source_provision as provision
+from process import provider_directory_profile_source_inputs as profile
+from process.provider_directory_admission_seal import admission_seal_from_validated_metadata
 from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 from tests.cms_npd_admission_postgres_support import _database_url, _owned_database
+from tests.provider_directory_fhir_subset_completion_support import build_proof_pair, build_subset_contract
 from tests.provider_directory_source_postgres_support import source_component_database, verify_native_source_profile
+from tests.test_provider_directory_dataset_selection_bounded_db import _large_metadata_by_field
 from tests.test_provider_directory_subset_completion_migration import _load_migration
 
 
@@ -720,3 +726,126 @@ async def test_original_superuser_and_outer_transaction_are_mandatory(native_boo
                 await _provision(case)
     finally:
         await outsider.close()
+
+
+async def _seed_wide_header(connection):
+    """Reuse valid semantic proof metadata in the existing native header model."""
+    header = storage_relation("catalog", provision.HEADER)
+    await connection.execute(
+        f"ALTER TABLE {header} ALTER COLUMN publication_metadata_json TYPE json USING publication_metadata_json::json"
+    )
+    metadata_by_field = _large_metadata_by_field(25000)
+    seal = admission_seal_from_validated_metadata(metadata_by_field)
+    assert seal is not None
+    raw_json = json.dumps(metadata_by_field, separators=(",", ":"))
+    assert len(raw_json.encode()) > 16 * 1024**2
+    identity_metadata_by_field = {
+        field: expected_fact
+        for field, expected_fact in metadata_by_field.items()
+        if field != "provider_directory_content_proof_v1"
+    }
+    identity_metadata_by_field["optional_null"] = None
+    await connection.execute(
+        f"INSERT INTO {header}(dataset_id,endpoint_id,status,is_current,resource_count,publication_metadata_json,"
+        "publication_metadata_summary_json,publication_metadata_sha256,content_proof_admission_version,"
+        "content_proof_admission_kind,content_proof_admission_sha256,content_proof_resource_types,candidate_storage_json) "
+        "VALUES('dataset_shared','endpoint_shared','published',true,25000,$1::json,$2::jsonb,$3,$4,$5,$6,$7,$8::jsonb)",
+        raw_json,
+        json.dumps(seal.metadata_summary),
+        seal.metadata_sha256,
+        seal.admission_version,
+        seal.admission_kind,
+        seal.proof_sha256,
+        list(seal.resource_types),
+        json.dumps({"identity": {"metadata": identity_metadata_by_field}}),
+    )
+    completion, digest, _ = build_proof_pair()
+    await connection.execute(
+        f"UPDATE {header} SET completion_proof_json=$1::jsonb,completion_proof_sha256=$2,"
+        "completion_proof_required_version=3,dataset_hash=$3,resource_count=$4",
+        json.dumps(completion),
+        digest,
+        completion["dataset"]["hash"],
+        completion["dataset"]["count"],
+    )
+    return header
+
+
+async def _native_header_facts(connection):
+    """Exercise the shared SQL reader without asserting any catalog authority."""
+    publisher = SimpleNamespace(connection=connection, policy=SimpleNamespace(schema="catalog"))
+    pages = [page async for page in scratch._source_headers(publisher, ["dataset_shared"])]
+    assert len(pages) == len(pages[0]) == 1
+    assert scratch._source_header_digest(pages[0][0]) == await connection.fetchval(
+        "SELECT encode(sha256(convert_to(row_to_json(h)::text,'UTF8')),'hex') "
+        f"FROM {storage_relation('catalog', provision.HEADER)} h WHERE dataset_id='dataset_shared'"
+    )
+    return pages[0][0]
+
+
+async def _assert_header_mutation(connection, original, statement, *arguments, refused):
+    """Keep each fault inside a native rollback and compare the entire original digest."""
+    coordinates_sql = (
+        "SELECT dataset_hash,resource_count,completion_proof_required_version "
+        f"FROM {storage_relation('catalog', provision.HEADER)} WHERE dataset_id='dataset_shared'"
+    )
+    coordinates = await connection.fetchrow(coordinates_sql)
+    transaction = connection.transaction()
+    await transaction.start()
+    try:
+        await connection.execute(statement, *arguments)
+        assert await connection.fetchrow(coordinates_sql) == coordinates
+        if refused:
+            with pytest.raises(RuntimeError, match="scratch_header_seal_invalid"):
+                await _native_header_facts(connection)
+            scope = SimpleNamespace(connection=connection, policy=SimpleNamespace(schema="catalog"))
+            with pytest.raises(RuntimeError, match="scratch_header_seal_invalid"):
+                await profile._capture(scope, {("source_primary", "dataset_shared", "root-shared"): None})
+        else:
+            changed = await _native_header_facts(connection)
+            assert scratch._source_header_digest(changed) != scratch._source_header_digest(original)
+            assert len(scratch.encoded(changed).encode()) < 16 * 1024**2
+    finally:
+        await transaction.rollback()
+    assert await _native_header_facts(connection) == original
+    assert await connection.fetchrow(coordinates_sql) == coordinates
+
+
+async def test_native_wide_header_identity_digest_and_rollback(native_bootstrap):
+    """Keep full-byte freshness, last-key identity, absent/null parity and bounded transport."""
+    connection = native_bootstrap.connection
+    header = await _seed_wide_header(connection)
+    original = await _native_header_facts(connection)
+    assert "publication_metadata_json" not in original and "completion_proof_json" not in original
+    assert len(scratch.encoded(original).encode()) < 16 * 1024
+    changes = (
+        ("publication_metadata_json=replace(publication_metadata_json::text,'source_primary','foreign')::json", True),
+        ("content_proof_admission_kind=NULL", True),
+        ("publication_metadata_summary_json='{}'::jsonb", True),
+        (
+            "publication_metadata_json=replace(publication_metadata_json::text,"
+            "'\"artifact_byte_count\":1','\"artifact_byte_count\":2')::json",
+            False,
+        ),
+        (
+            'publication_metadata_json=(\'{"source_ids":["ignored-first"],"optional_null":null,\''
+            "||substring(publication_metadata_json::text FROM 2))::json",
+            False,
+        ),
+        (
+            "publication_metadata_json=(substring(publication_metadata_json::text "
+            'FROM 1 FOR length(publication_metadata_json::text)-1)||\',"source_ids":["wrong-last"]}\')::json',
+            True,
+        ),
+    )
+    for assignment, refused in changes:
+        await _assert_header_mutation(connection, original, f"UPDATE {header} SET {assignment}", refused=refused)
+    completion, digest, _ = build_proof_pair(contract=build_subset_contract(campaign_id="x" * (17 * 1024**2)))
+    await _assert_header_mutation(
+        connection,
+        original,
+        f"UPDATE {header} SET completion_proof_json=$1::jsonb,completion_proof_sha256=$2",
+        json.dumps(completion),
+        digest,
+        refused=False,
+    )

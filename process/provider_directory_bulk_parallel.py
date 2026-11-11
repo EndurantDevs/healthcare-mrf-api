@@ -3,6 +3,8 @@
 
 import asyncio
 from contextlib import asynccontextmanager, nullcontext
+from dataclasses import replace
+from functools import partial
 
 from process.provider_directory_fhir_response import AdaptiveRequestSlots
 
@@ -26,15 +28,35 @@ _TRANSIENT_STREAM_ERRORS = frozenset(
 )
 
 
-def is_transient_output_error(error):
-    """Keep only recognized transport failures local to one output."""
-    return error in _TRANSIENT_STREAM_ERRORS or error in {
-        "bulk_export_output_http_429",
-        "bulk_export_output_http_500",
-        "bulk_export_output_http_502",
-        "bulk_export_output_http_503",
-        "bulk_export_output_http_504",
-    }
+def is_transient_output_error(directory, error):
+    """Let healthy transfers finish after retryable output failures."""
+    return (
+        error in _TRANSIENT_STREAM_ERRORS
+        or directory._is_bulk_export_capability_refresh_error(error)
+        or error
+        in {
+            "bulk_export_output_http_429",
+            "bulk_export_output_http_500",
+            "bulk_export_output_http_502",
+            "bulk_export_output_http_503",
+            "bulk_export_output_http_504",
+        }
+    )
+
+
+def preferred_output_error(directory, current_error, candidate_error):
+    """Keep fatal failures first, then capability renewal, then ordinary retries."""
+    if not candidate_error:
+        return current_error
+    if not current_error:
+        return candidate_error
+    if not is_transient_output_error(directory, current_error):
+        return current_error
+    if directory._is_bulk_export_capability_refresh_error(candidate_error) or not is_transient_output_error(
+        directory, candidate_error
+    ):
+        return candidate_error
+    return current_error
 
 
 async def stream_output(directory, session, source_record, identity, manifest, output_pair, options, stream_state):
@@ -85,11 +107,10 @@ async def run_outputs(directory, identity, options, stream_state, pending_output
             completed, _ = await asyncio.wait(active_by_task, return_when=asyncio.FIRST_COMPLETED)
             error = directory._completed_bulk_output_error(completed, active_by_task)
             if error:
-                if not options.range_resume_enabled or not is_transient_output_error(error):
-                    output_error = error
+                output_error = preferred_output_error(directory, output_error, error)
+                if not options.range_resume_enabled or not is_transient_output_error(directory, error):
                     await directory._cancel_bulk_output_tasks(active_by_task)
                     break
-                output_error = output_error or error
             directory._fill_active_bulk_tasks(active_by_task, pending, options.output_concurrency, stream_output)
         if output_error:
             await options.ownership_probe()
@@ -276,3 +297,321 @@ def effective_resource_concurrency(directory, source_record, options):
     except RuntimeError:
         return 1
     return min(requested, len(resources))
+
+
+async def refresh_capabilities(directory, session, source_record, identity, checkpoint, fetch_options, runtime_probe):
+    """Read the saved export, or request capabilities when no status was retained."""
+    try:
+        status_url = directory._bulk_checkpoint_status_url(checkpoint) if checkpoint is not None else None
+    except (RuntimeError, ValueError) as exc:
+        return None, str(exc), 0
+    if status_url is not None:
+        status_payload, refresh_error, polls = await directory._poll_bulk_capability_refresh_request(
+            session,
+            source_record,
+            identity,
+            status_url,
+            timeout=fetch_options.timeout,
+            max_pending_seconds=fetch_options.bulk_export_max_pending_seconds,
+            runtime_probe=runtime_probe,
+            checkpoint=pending_refresh_checkpoint(directory, checkpoint),
+        )
+        if refresh_error is None:
+            manifest, manifest_error = directory._validated_bulk_capability_refresh_manifest(
+                source_record, identity, status_payload
+            )
+            return replace(manifest, status_url=status_url) if manifest is not None else None, manifest_error, polls
+        return None, refresh_error, polls
+    return await directory._request_bulk_capability_refresh_manifest(
+        session,
+        source_record,
+        identity,
+        timeout=fetch_options.timeout,
+        max_pending_seconds=fetch_options.bulk_export_max_pending_seconds,
+        runtime_probe=runtime_probe,
+    )
+
+
+async def renew_capabilities(
+    directory, session, source_record, identity, checkpoint, output_checkpoints, fetch_options, runtime_probe
+):
+    """Allow one fresh export after retained status or output capabilities expire."""
+    polls = 0
+    for saved_checkpoint in (checkpoint, None):
+        try:
+            if saved_checkpoint is None or directory._bulk_checkpoint_status_url(saved_checkpoint) is None:
+                await directory._begin_bulk_capability_refresh(identity, checkpoint, output_checkpoints)
+        except directory.ImportCancelledError, directory.ResourceImportControlPlaneFailure:
+            raise
+        except (RuntimeError, ValueError) as exc:
+            if str(exc) in directory.BULK_EXPORT_FENCING_ERRORS:
+                raise
+            return await directory._record_bulk_capability_refresh_error(identity, str(exc), polls, terminal=True)
+        manifest, refresh_error, request_polls = await directory._request_bulk_capability_refresh_for_options(
+            session, source_record, identity, fetch_options, runtime_probe, checkpoint=saved_checkpoint
+        )
+        polls += request_polls
+        if refresh_error is None and manifest is not None:
+            try:
+                refresh_error = await directory._validate_and_persist_bulk_capabilities(
+                    session,
+                    source_record,
+                    identity,
+                    checkpoint,
+                    manifest,
+                    output_checkpoints,
+                    fetch_options,
+                    runtime_probe,
+                )
+            except directory.ImportCancelledError, directory.ResourceImportControlPlaneFailure:
+                raise
+            except (RuntimeError, ValueError) as exc:
+                if str(exc) in directory.BULK_EXPORT_FENCING_ERRORS:
+                    raise
+                return await directory._record_bulk_capability_refresh_error(identity, str(exc), polls, terminal=True)
+        elif refresh_error is None:
+            refresh_error = "bulk_export_manifest_unavailable"
+        if (
+            saved_checkpoint is not None
+            and directory._clean_text(saved_checkpoint.get("status_url_ciphertext"))
+            and refresh_error
+            in {
+                "bulk_export_manifest_transaction_time_stale",
+                "bulk_export_status_http_404",
+                "bulk_export_status_http_410",
+                "bulk_export_output_http_404",
+                "bulk_export_output_http_410",
+                "bulk_export_output_url_expired",
+            }
+        ):
+            continue
+        if refresh_error is not None:
+            return await directory._record_bulk_capability_refresh_error(identity, refresh_error, polls)
+        return manifest, None, polls
+
+
+async def begin_capability_refresh(
+    directory,
+    identity,
+    checkpoint,
+    output_checkpoints,
+    *,
+    fresh_export=True,
+):
+    """Fence retained polling and reserve attempts only for a new remote export."""
+
+    async with directory.source_checkpoint_transaction(
+        directory.db,
+        schema=directory._schema(),
+        bulk_identity=identity,
+    ):
+        refresh_error = directory._clean_text(checkpoint.get("error"))
+        if not directory._is_bulk_export_capability_refresh_error(refresh_error):
+            raise ValueError("bulk_export_output_capability_refresh_not_required")
+        incomplete_outputs = [
+            output for output in output_checkpoints if output.get("state") != directory.BULK_EXPORT_OUTPUT_COMPLETE
+        ]
+        attempt_limit = directory._bulk_capability_refresh_attempt_limit()
+        if not incomplete_outputs or (
+            fresh_export
+            and any(int(output.get("attempt_count") or 0) >= attempt_limit for output in incomplete_outputs)
+        ):
+            raise ValueError("bulk_export_output_capability_refresh_exhausted")
+        async with directory.db.acquire() as connection:
+            parent_count = await connection.status(
+                f"""
+                UPDATE {directory._bulk_acquisition_checkpoint_table_ref()}
+                   SET lease_expires_at =
+                           now() + make_interval(secs => :lease_seconds),
+                       updated_at = now()
+                 WHERE checkpoint_id = :checkpoint_id
+                   AND owner_run_id = :owner_run_id
+                   AND state = :retryable_state
+                   AND error = :refresh_error;
+                """,
+                checkpoint_id=identity.checkpoint_id,
+                owner_run_id=identity.owner_run_id,
+                retryable_state=directory.BULK_EXPORT_CHECKPOINT_RETRYABLE,
+                refresh_error=refresh_error,
+                lease_seconds=directory._bulk_checkpoint_lease_seconds(),
+            )
+            if directory._coerce_rowcount(parent_count) != 1:
+                raise RuntimeError("bulk_export_checkpoint_ownership_lost")
+            if not fresh_export:
+                return
+            await reserve_refresh_attempts(directory, connection, identity, attempt_limit, len(incomplete_outputs))
+
+
+async def reserve_refresh_attempts(directory, connection, identity, attempt_limit, incomplete_count):
+    """Reserve the existing incomplete-output counters within the fenced transaction."""
+    await directory.require_checkpoint_executor(connection, bulk_identity=identity)
+    output_count = await connection.status(
+        f"""
+        UPDATE {directory._bulk_output_checkpoint_table_ref()}
+           SET attempt_count = attempt_count + 1,
+               updated_at = now()
+         WHERE checkpoint_id = :checkpoint_id
+           AND state <> :complete_state
+           AND attempt_count < :attempt_limit;
+        """,
+        checkpoint_id=identity.checkpoint_id,
+        complete_state=directory.BULK_EXPORT_OUTPUT_COMPLETE,
+        attempt_limit=attempt_limit,
+    )
+    if directory._coerce_rowcount(output_count) != incomplete_count:
+        raise RuntimeError("bulk_export_output_capability_refresh_exhausted")
+
+
+async def persist_refresh_status(directory, identity, status_url):
+    """Retain an accepted replacement before polling, under its checkpoint lease."""
+    async with directory.source_checkpoint_transaction(
+        directory.db, schema=directory._schema(), bulk_identity=identity
+    ):
+        checkpoint_row = await directory.db.first(
+            f"""
+            UPDATE {directory._bulk_acquisition_checkpoint_table_ref()}
+               SET status_url_ciphertext = :status_url_ciphertext,
+                   status_url_hash = :status_url_hash,
+                   accepted_at = now(), next_poll_at = NULL,
+                   lease_expires_at = now() + make_interval(secs => :lease_seconds),
+                   updated_at = now()
+             WHERE checkpoint_id = :checkpoint_id
+               AND owner_run_id = :owner_run_id
+               AND state = :retryable_state
+               AND error = ANY(:refresh_errors)
+         RETURNING accepted_at, manifest_received_at, next_poll_at;
+            """,
+            checkpoint_id=identity.checkpoint_id,
+            owner_run_id=identity.owner_run_id,
+            retryable_state=directory.BULK_EXPORT_CHECKPOINT_RETRYABLE,
+            refresh_errors=list(directory.BULK_EXPORT_CAPABILITY_REFRESH_ERRORS),
+            status_url_ciphertext=directory._encrypt_bulk_capability(status_url),
+            status_url_hash=directory.hashlib.sha256(status_url.encode()).hexdigest(),
+            lease_seconds=directory._bulk_checkpoint_lease_seconds(),
+        )
+        checkpoint = directory._pagination_checkpoint_row_mapping(checkpoint_row)
+        if not checkpoint:
+            raise RuntimeError("bulk_export_checkpoint_ownership_lost")
+        return checkpoint
+
+
+def pending_refresh_checkpoint(directory, checkpoint):
+    """Reuse the acceptance epoch only while a replacement manifest is pending."""
+    accepted_at = checkpoint.get("accepted_at")
+    received_at = checkpoint.get("manifest_received_at")
+    if accepted_at is None or received_at is None:
+        return None
+    accepted_at = directory._bulk_export_utc_datetime(accepted_at, error="bulk_export_checkpoint_accepted_at_invalid")
+    received_at = directory._bulk_export_utc_datetime(
+        received_at, error="bulk_export_checkpoint_manifest_received_at_invalid"
+    )
+    return checkpoint if accepted_at > received_at else None
+
+
+async def poll_capability_refresh(directory, session, source_record, identity, status_location, poll_options, timeout):
+    """Poll with the retained replacement deadline and durable pacing boundary."""
+    try:
+        status_url = directory._resolved_bulk_export_status_url(source_record, identity.start_url, status_location)
+    except ValueError as exc:
+        return None, str(exc), 0
+    options = replace(
+        poll_options,
+        lease_handler=partial(directory._refresh_bulk_export_rows_written, identity),
+        accepted_at=poll_options.accepted_at or directory._bulk_export_now_utc(),
+        next_poll_handler=partial(directory._persist_bulk_export_next_poll_at, identity)
+        if poll_options.accepted_at is not None
+        else None,
+    )
+    return await directory._bulk_export_poll_manifest(
+        session, source_record, status_url, resource_type=identity.resource_type, timeout=timeout, poll_options=options
+    )
+
+
+async def persist_rate_limit(directory, context, status_code, headers, request_error):
+    """Keep the final rate-limit delay across retries without extending acceptance."""
+    callback = context.options.next_poll_handler
+    if status_code == 429 and request_error is None and callback is not None:
+        await callback(
+            directory._next_bulk_export_poll_at(
+                headers.get("retry-after"),
+                context.poll_seconds,
+                directory._bulk_export_now_utc(),
+                context.pending_deadline,
+            )
+        )
+
+
+async def poll_response(directory, session, context, timeout):
+    """Bound pacing, transport retries and body reads by the accepted deadline."""
+    remaining = (
+        (context.pending_deadline - directory._bulk_export_now_utc()).total_seconds()
+        if context.pending_deadline is not None
+        else None
+    )
+    if remaining is not None and remaining <= 0:
+        return None, {}, None, directory.BULK_EXPORT_STATUS_DEADLINE_EXCEEDED
+    pending_timeout = asyncio.timeout(remaining)
+    try:
+        async with pending_timeout:
+            result = await directory._bulk_http_get_json(
+                session,
+                context.source_record,
+                context.status_url,
+                timeout=min(timeout, remaining) if remaining is not None else timeout,
+            )
+    except TimeoutError:
+        if not pending_timeout.expired():
+            raise
+        return None, {}, None, directory.BULK_EXPORT_STATUS_DEADLINE_EXCEEDED
+    if context.pending_deadline is not None and directory._bulk_export_now_utc() >= context.pending_deadline:
+        return None, {}, None, directory.BULK_EXPORT_STATUS_DEADLINE_EXCEEDED
+    return result
+
+
+async def request_capability_refresh(
+    directory, session, source_record, identity, timeout, max_pending_seconds, runtime_probe
+):
+    """Retain accepted replacement locations and validate completed manifests."""
+    await runtime_probe()
+    (
+        status_code,
+        status_payload,
+        status_location,
+        request_error,
+    ) = await directory._start_bulk_capability_refresh_request(session, source_record, identity, timeout=timeout)
+    if request_error is not None:
+        return None, request_error, 0
+    if status_code is None:
+        return None, "bulk_export_acceptance_outcome_unknown", 0
+    if status_code not in {200, 202}:
+        return None, f"bulk_export_status_http_{status_code}", 0
+    status_url = None
+    if status_location is not None or status_code == 202:
+        try:
+            status_url = directory._resolved_bulk_export_status_url(source_record, identity.start_url, status_location)
+        except ValueError as exc:
+            return None, str(exc), 0
+    polls = 0
+    if status_code == 202:
+        checkpoint = await persist_refresh_status(directory, identity, status_url)
+        status_payload, poll_error, polls = await directory._poll_bulk_capability_refresh_request(
+            session,
+            source_record,
+            identity,
+            status_url,
+            timeout=timeout,
+            max_pending_seconds=max_pending_seconds,
+            runtime_probe=runtime_probe,
+            checkpoint=checkpoint,
+        )
+        if poll_error is not None:
+            return None, poll_error, polls
+    if not directory._is_bulk_export_status_payload(status_payload):
+        return None, "bulk_export_status_non_bulk_payload", polls
+    payload_error = directory._bulk_export_payload_error(status_payload)
+    if payload_error is not None:
+        return None, payload_error, polls
+    manifest, manifest_error = directory._validated_bulk_capability_refresh_manifest(
+        source_record, identity, status_payload
+    )
+    return replace(manifest, status_url=status_url) if manifest is not None else None, manifest_error, polls

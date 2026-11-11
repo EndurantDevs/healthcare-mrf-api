@@ -21178,14 +21178,9 @@ class _BulkCheckpointMemory:
         )
         return dict(stored)
 
-    async def begin_capability_refresh(
-        self,
-        identity,
-        checkpoint,
-        output_checkpoints,
-    ):
+    async def begin_capability_refresh(self, identity, checkpoint, output_checkpoints, *, fresh_export=True):
         assert checkpoint["error"] in importer.BULK_EXPORT_CAPABILITY_REFRESH_ERRORS
-        for output_checkpoint in output_checkpoints:
+        for output_checkpoint in output_checkpoints if fresh_export else ():
             if output_checkpoint["state"] != importer.BULK_EXPORT_OUTPUT_COMPLETE:
                 self.output_by_id[output_checkpoint["output_id"]]["attempt_count"] += 1
         self.event_log.append(("begin_capability_refresh", identity.checkpoint_id))
@@ -21381,7 +21376,7 @@ async def test_bulk_poll_honors_durable_next_poll_boundary(monkeypatch):
     sleep_mock = AsyncMock()
     status_payload = _bulk_status_payload()
     http_get = AsyncMock(return_value=(200, {}, status_payload, None))
-    monkeypatch.setattr(importer, "_bulk_export_now_utc", lambda: next(observed_times))
+    monkeypatch.setattr(importer, "_bulk_export_now_utc", lambda: next(observed_times, next_poll_at))
     monkeypatch.setattr(importer.asyncio, "sleep", sleep_mock)
     monkeypatch.setattr(importer, "_bulk_http_get_json", http_get)
 
@@ -21993,7 +21988,7 @@ class _BulkCapabilityRefreshFakes:
         )
         monkeypatch.setattr(
             importer,
-            "_request_bulk_capability_refresh_manifest",
+            "_request_bulk_capability_refresh_for_options",
             self.refresh_manifest,
         )
         monkeypatch.setattr(
