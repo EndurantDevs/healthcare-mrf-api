@@ -21,7 +21,7 @@ class Driver:
 
     async def fetch(self, statement, identifiers):
         headers = [item for item in self.headers if item["dataset_id"] in identifiers]
-        if "octet_length" in statement:
+        if " AS bytes FROM " in statement:
             return [dict(dataset_id=item["dataset_id"], bytes=4096) for item in headers]
         return [dict(dataset_id=item["dataset_id"], facts=json.dumps(item)) for item in headers]
 
@@ -187,6 +187,16 @@ async def test_native_catalog_refusal_propagates(case, monkeypatch):
             pytest.fail("native refusal ignored")
     assert caught.value is failure
     assert case.events[-1][0] == "exit"
+
+
+@pytest.mark.parametrize("field", ["publication_metadata_json", "completion_proof_json", "other_header_field"])
+async def test_fresh_reader_refuses_complete_header_drift(case, field):
+    async with inputs.profile_source_input_scope(case.directory, case.full, case.resource):
+        case.reader.headers = copy.deepcopy(case.headers)
+        case.reader.headers[0][field] = {"changed": True}
+        with pytest.raises(RuntimeError, match="profile_input_(header|binding)_changed"):
+            async with inputs.read_transaction(case.directory):
+                pytest.fail("changed header exposed through a fresh reader")
 
 
 async def test_unregistered_child_refuses_and_scope_cleans(case):

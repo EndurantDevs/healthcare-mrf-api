@@ -7,6 +7,7 @@ import dataclasses
 import datetime
 import hashlib
 import json
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from urllib.parse import urlsplit
@@ -231,10 +232,109 @@ async def test_real_truncated_response_resumes_only_its_committed_file(files, da
 
 @pytest.mark.parametrize(
     "error",
-    ["bulk_export_output_http_401", "bulk_export_output_http_403", "bulk_export_output_validator_mismatch"],
+    ["bulk_export_output_http_401", "bulk_export_output_validator_mismatch"],
 )
 def test_file_isolation_keeps_authentication_and_validator_failures_fatal(error):
-    assert not parallel.is_transient_output_error(error)
+    assert not parallel.is_transient_output_error(directory, error)
+
+
+@pytest.mark.asyncio
+async def test_bulk_budget_reduction_rechecks_transfers_waiting_for_pacing(monkeypatch):
+    source_record = _source()
+    shared = parallel.state(directory, source_record)
+    all_entered, release = asyncio.Event(), asyncio.Event()
+    active_counts = []
+
+    async def pace(_source):
+        if pace_probe.await_count == 3:
+            all_entered.set()
+        await release.wait()
+
+    @asynccontextmanager
+    async def response(_url, **_options):
+        active_counts.append(shared["requests"].active)
+        yield SimpleNamespace(status=200, headers={})
+
+    async def transfer():
+        async with parallel.request(
+            directory, source_record, SimpleNamespace(get=response), "https://files.example.org/part"
+        ) as received:
+            assert received.status == 200
+
+    pace_probe = AsyncMock(side_effect=pace)
+    monkeypatch.setattr(directory, "_pace_source_request", pace_probe)
+    tasks = []
+    try:
+        tasks = [asyncio.create_task(transfer()) for _ in range(3)]
+        await asyncio.wait_for(all_entered.wait(), 3)
+        shared["requests"].reduce()
+        shared["requests"].reduce()
+        assert shared["requests"].limit == 2
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*tasks), 3)
+    finally:
+        release.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    assert pace_probe.await_count > 3
+    assert len(active_counts) == 3 and max(active_counts) <= 2
+    assert shared["requests"].active == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "expiry_error",
+    [
+        "bulk_export_output_url_expired",
+        "bulk_export_output_http_403",
+        "bulk_export_output_http_404",
+        "bulk_export_output_http_410",
+    ],
+)
+@pytest.mark.parametrize("transient_order", [None, "before", "after"])
+async def test_known_url_expiry_preserves_healthy_open_responses(files, monkeypatch, expiry_error, transient_order):
+    """An expired capability waits for existing transfers without retrying it."""
+    errors = (expiry_error,)
+    if transient_order:
+        errors = ("bulk_export_output_http_503", expiry_error)
+        if transient_order == "after":
+            errors = tuple(reversed(errors))
+    collection_events = [asyncio.Event() for _ in errors]
+    observed_errors = []
+    completed_output_ids = []
+    collect = directory._completed_bulk_output_error
+
+    def observed_error(completed, active):
+        error = collect(completed, active)
+        if error:
+            observed_errors.append(error)
+            collection_events[len(observed_errors) - 1].set()
+        return error
+
+    async def stream(_session, _source, _identity, _manifest, output, *_args):
+        if output.output_index < len(errors):
+            if output.output_index:
+                await collection_events[output.output_index - 1].wait()
+            return errors[output.output_index]
+        await collection_events[-1].wait()
+        completed_output_ids.append(output.output_index)
+        return None
+
+    monkeypatch.setattr(directory, "_completed_bulk_output_error", observed_error)
+    monkeypatch.setattr(directory, "_stream_one_checkpointed_bulk_output", stream)
+    _state, error = await directory._resume_checkpointed_bulk_outputs(
+        object(),
+        files.source_record,
+        files.identity,
+        files.manifest,
+        files.options,
+        copy.deepcopy(list(files.checkpoint_by_index.values())),
+    )
+    assert error == expiry_error
+    assert observed_errors == list(errors)
+    assert sorted(completed_output_ids) == list(range(len(errors), 4))
+    files.record_error.assert_awaited_once_with(files.identity, error, terminal=False)
 
 
 @pytest.mark.asyncio
@@ -268,17 +368,37 @@ async def test_retry_refuses_lost_owner_or_cancellation_before_another_request(f
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "errors",
+    "errors,expected",
     [
-        ("bulk_export_transport_clientpayloaderror", "invalid_ndjson"),
-        ("invalid_ndjson", "bulk_export_transport_clientpayloaderror"),
+        ((None, ""), None),
+        (("bulk_export_output_url_expired", None), "bulk_export_output_url_expired"),
+        (("bulk_export_transport_clientpayloaderror", "invalid_ndjson"), "invalid_ndjson"),
+        (("bulk_export_output_http_503", "bulk_export_output_url_expired"), "bulk_export_output_url_expired"),
+        (("bulk_export_output_url_expired", "bulk_export_output_http_401"), "bulk_export_output_http_401"),
+        (("bulk_export_output_http_404", "invalid_ndjson"), "invalid_ndjson"),
+        (("bulk_export_output_http_410", "invalid_ndjson"), "invalid_ndjson"),
+        (("bulk_export_output_http_404", "bulk_export_output_http_401"), "bulk_export_output_http_401"),
+        (("bulk_export_output_http_410", "bulk_export_output_http_401"), "bulk_export_output_http_401"),
+        (("bulk_export_output_http_403", "invalid_ndjson"), "invalid_ndjson"),
+        (("bulk_export_output_http_403", "bulk_export_output_http_401"), "bulk_export_output_http_401"),
+        (
+            ("bulk_export_output_http_403", "bulk_export_output_validator_mismatch"),
+            "bulk_export_output_validator_mismatch",
+        ),
+        (
+            ("bulk_export_output_url_expired", "bulk_export_output_validator_mismatch"),
+            "bulk_export_output_validator_mismatch",
+        ),
     ],
 )
-async def test_simultaneous_transient_error_cannot_hide_terminal_output_error(errors):
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_simultaneous_output_errors_preserve_recovery_priority(errors, expected, reverse):
+    if reverse:
+        errors = tuple(reversed(errors))
     tasks = [asyncio.create_task(asyncio.sleep(0, result=error)) for error in errors]
     await asyncio.gather(*tasks)
     active = dict.fromkeys(tasks)
-    assert directory._completed_bulk_output_error(tasks, active) == "invalid_ndjson"
+    assert directory._completed_bulk_output_error(tasks, active) == expected
     assert not active
 
 

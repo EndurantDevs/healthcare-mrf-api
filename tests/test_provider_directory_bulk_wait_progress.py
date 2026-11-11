@@ -4,16 +4,123 @@
 import asyncio
 import datetime
 import importlib
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from process import live_progress
+from tests.provider_directory_fhir_bulk_test_support import _Response
 from tests.test_provider_directory_fhir_reviewed_serial_stop import _runner
 
 importer = importlib.import_module("process.provider_directory_fhir")
 NOW = datetime.datetime(2026, 8, 1, 12, tzinfo=datetime.UTC)
 SOURCE = {"source_id": "directory-alpha", "api_base": "https://directory.example.test/fhir"}
+
+
+@pytest.fixture
+def deadline_transport(monkeypatch):
+    clock_values = [NOW]
+    monotonic_start, real_sleep = importer.time.monotonic(), asyncio.sleep
+
+    async def advance(seconds):
+        while seconds > 0:
+            step = min(seconds, 10)
+            clock_values[0] += datetime.timedelta(seconds=step)
+            seconds -= step
+            await real_sleep(0)
+            await real_sleep(0)
+
+    monkeypatch.setattr(importer, "_bulk_export_now_utc", lambda: clock_values[0])
+    monkeypatch.setattr(importer.time, "monotonic", lambda: monotonic_start + (clock_values[0] - NOW).total_seconds())
+    monkeypatch.setattr(asyncio, "sleep", advance)
+    monkeypatch.setattr(importer, "_refresh_bulk_export_rows_written", AsyncMock())
+    monkeypatch.setattr(importer, "_persist_bulk_export_next_poll_at", AsyncMock())
+    return SimpleNamespace(
+        clock_values=clock_values,
+        advance=advance,
+        source=dict(SOURCE),
+        session=SimpleNamespace(get=Mock()),
+        identity=SimpleNamespace(start_url=SOURCE["api_base"] + "/$export", resource_type="PractitionerRole"),
+        checkpoint={"accepted_at": NOW - datetime.timedelta(seconds=40)},
+        probe=AsyncMock(),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase,delay", [("retry", 30), ("pacing", 30), ("read", 30), ("late", 30), ("retry", 7), ("read", 7)]
+)
+async def test_pending_deadline_bounds_real_status_transport(deadline_transport, phase, delay):
+    case = deadline_transport
+    ready = _Response(body=b'{"output":[]}')
+
+    async def read():
+        if phase == "read":
+            await case.advance(delay)
+        elif phase == "late":
+            case.clock_values[0] += datetime.timedelta(seconds=delay)
+        return ready.body
+
+    ready.read = AsyncMock(side_effect=read)
+    responses = [_Response(status=429, headers={"Retry-After": str(delay)}), ready] if phase == "retry" else [ready]
+    case.session.get.side_effect = responses
+    if phase == "pacing":
+        case.source["_provider_directory_request_pacing_state"] = {
+            "retry_after_monotonic": importer.time.monotonic() + delay
+        }
+    poll_result = await importer._poll_bulk_capability_refresh_request(
+        case.session,
+        case.source,
+        case.identity,
+        "/status/accepted",
+        timeout=180,
+        max_pending_seconds=60,
+        runtime_probe=case.probe,
+        checkpoint=case.checkpoint,
+    )
+    if delay > 20:
+        assert poll_result == (None, importer.BULK_EXPORT_STATUS_DEADLINE_EXCEEDED, 1)
+        assert case.session.get.call_count == (0 if phase == "pacing" else 1)
+        if phase != "late":
+            assert case.clock_values[0] == NOW + datetime.timedelta(seconds=20)
+    else:
+        assert poll_result == ({"output": []}, None, 1)
+        assert case.session.get.call_count == (2 if phase == "retry" else 1)
+    assert all(call.kwargs["timeout"].total <= 20 for call in case.session.get.call_args_list)
+    assert case.checkpoint["accepted_at"] == NOW - datetime.timedelta(seconds=40)
+    assert importer.bulk_parallel.state(importer, case.source)["requests"].active == 0
+    importer._refresh_bulk_export_rows_written.assert_awaited_once_with(case.identity)
+    importer._persist_bulk_export_next_poll_at.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_kind", ["task_cancel", "cancel", "control", "timeout", *sorted(importer.BULK_EXPORT_FENCING_ERRORS)]
+)
+async def test_pending_deadline_preserves_control_errors(monkeypatch, deadline_transport, failure_kind):
+    case = deadline_transport
+    failure = {
+        "task_cancel": asyncio.CancelledError(),
+        "cancel": importer.ImportCancelledError("cancelled"),
+        "control": importer.ResourceImportControlPlaneFailure("control-failed"),
+        "timeout": TimeoutError("upstream timeout"),
+    }.get(failure_kind, RuntimeError(failure_kind))
+    monkeypatch.setattr(importer, "_bulk_http_get_json", AsyncMock(side_effect=failure))
+    with pytest.raises(type(failure)) as raised:
+        await importer._poll_bulk_capability_refresh_request(
+            case.session,
+            case.source,
+            case.identity,
+            "/status/accepted",
+            timeout=180,
+            max_pending_seconds=60,
+            runtime_probe=case.probe,
+            checkpoint=case.checkpoint,
+        )
+    assert raised.value is failure
+    importer._refresh_bulk_export_rows_written.assert_not_awaited()
+    importer._persist_bulk_export_next_poll_at.assert_not_awaited()
 
 
 @pytest.mark.asyncio

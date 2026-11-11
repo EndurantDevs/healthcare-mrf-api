@@ -1972,6 +1972,7 @@ class BulkExportManifest:
     payload: dict[str, Any]
     requires_access_token: bool
     outputs: tuple[BulkExportManifestOutput, ...]
+    status_url: str | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -44240,11 +44241,8 @@ async def _bulk_export_poll_manifest(
             return None, wait_error, poll - 1
         if options.cancel_probe is not None:
             await options.cancel_probe()
-        status_code, headers, status_payload, request_error = await _bulk_http_get_json(
-            session,
-            source_record,
-            status_url,
-            timeout=timeout,
+        status_code, headers, status_payload, request_error = await bulk_parallel.poll_response(
+            sys.modules[__name__], session, context, timeout
         )
         if options.lease_handler:
             await options.lease_handler()
@@ -44258,6 +44256,7 @@ async def _bulk_export_poll_manifest(
                 await fhir_response.clear_bulk_export_wait(has_primary_error=True)
                 return None, wait_error, poll
             continue
+        await bulk_parallel.persist_rate_limit(sys.modules[__name__], context, status_code, headers, request_error)
         poll_result = _bulk_export_finished_poll_result(context, poll, status_code, status_payload, request_error)
         await fhir_response.clear_bulk_export_wait(has_primary_error=bool(poll_result[1]))
         return poll_result
@@ -44726,7 +44725,7 @@ def _is_bulk_export_error_terminal(error: str | None) -> bool:
         return True
     if error.startswith("bulk_export_status_http_"):
         status_text = error.rsplit("_", 1)[-1]
-        return status_text.isdigit() and 300 <= int(status_text) < 500
+        return status_text.isdigit() and 300 <= int(status_text) < 500 and int(status_text) != 429
     if error.startswith("bulk_export_output_http_"):
         status_text = error.rsplit("_", 1)[-1]
         return status_text.isdigit() and 300 <= int(status_text) < 500 and int(status_text) != 429
@@ -45442,60 +45441,12 @@ async def _begin_bulk_capability_refresh(
     identity: BulkExportCheckpointIdentity,
     checkpoint: Mapping[str, Any],
     output_checkpoints: list[dict[str, Any]],
+    *,
+    fresh_export: bool = True,
 ) -> None:
-    """Persist one bounded refresh attempt before creating a remote job."""
-
-    async with source_checkpoint_transaction(
-        db,
-        schema=_schema(),
-        bulk_identity=identity,
-    ):
-        refresh_error = _clean_text(checkpoint.get("error"))
-        if not _is_bulk_export_capability_refresh_error(refresh_error):
-            raise ValueError("bulk_export_output_capability_refresh_not_required")
-        incomplete_outputs = [
-            output for output in output_checkpoints if output.get("state") != BULK_EXPORT_OUTPUT_COMPLETE
-        ]
-        attempt_limit = _bulk_capability_refresh_attempt_limit()
-        if not incomplete_outputs or any(
-            int(output.get("attempt_count") or 0) >= attempt_limit for output in incomplete_outputs
-        ):
-            raise ValueError("bulk_export_output_capability_refresh_exhausted")
-        async with db.acquire() as connection:
-            parent_count = await connection.status(
-                f"""
-                UPDATE {_bulk_acquisition_checkpoint_table_ref()}
-                   SET lease_expires_at =
-                           now() + make_interval(secs => :lease_seconds),
-                       updated_at = now()
-                 WHERE checkpoint_id = :checkpoint_id
-                   AND owner_run_id = :owner_run_id
-                   AND state = :retryable_state
-                   AND error = :refresh_error;
-                """,
-                checkpoint_id=identity.checkpoint_id,
-                owner_run_id=identity.owner_run_id,
-                retryable_state=BULK_EXPORT_CHECKPOINT_RETRYABLE,
-                refresh_error=refresh_error,
-                lease_seconds=_bulk_checkpoint_lease_seconds(),
-            )
-            if _coerce_rowcount(parent_count) != 1:
-                raise RuntimeError("bulk_export_checkpoint_ownership_lost")
-            output_count = await connection.status(
-                f"""
-                UPDATE {_bulk_output_checkpoint_table_ref()}
-                   SET attempt_count = attempt_count + 1,
-                       updated_at = now()
-                 WHERE checkpoint_id = :checkpoint_id
-                   AND state <> :complete_state
-                   AND attempt_count < :attempt_limit;
-                """,
-                checkpoint_id=identity.checkpoint_id,
-                complete_state=BULK_EXPORT_OUTPUT_COMPLETE,
-                attempt_limit=attempt_limit,
-            )
-            if _coerce_rowcount(output_count) != len(incomplete_outputs):
-                raise RuntimeError("bulk_export_output_capability_refresh_exhausted")
+    await bulk_parallel.begin_capability_refresh(
+        sys.modules[__name__], identity, checkpoint, output_checkpoints, fresh_export=fresh_export
+    )
 
 
 async def _start_bulk_capability_refresh_request(
@@ -45534,30 +45485,21 @@ async def _poll_bulk_capability_refresh_request(
     timeout: int,
     max_pending_seconds: int,
     runtime_probe: Callable[[], Awaitable[None]],
+    checkpoint: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, str | None, int]:
-    try:
-        status_url = _resolved_bulk_export_status_url(
-            source_record,
-            identity.start_url,
-            raw_status_location,
-        )
-    except ValueError as exc:
-        return None, str(exc), 0
-    return await _bulk_export_poll_manifest(
+    return await bulk_parallel.poll_capability_refresh(
+        sys.modules[__name__],
         session,
         source_record,
-        status_url,
-        resource_type=identity.resource_type,
-        timeout=timeout,
-        poll_options=BulkExportPollOptions(
-            lease_handler=partial(
-                _refresh_bulk_export_rows_written,
-                identity,
-            ),
-            accepted_at=_bulk_export_now_utc(),
+        identity,
+        raw_status_location,
+        BulkExportPollOptions(
+            accepted_at=(checkpoint or {}).get("accepted_at"),
+            next_poll_at=(checkpoint or {}).get("next_poll_at"),
             max_pending_seconds=max_pending_seconds,
             cancel_probe=runtime_probe,
         ),
+        timeout,
     )
 
 
@@ -45593,45 +45535,9 @@ async def _request_bulk_capability_refresh_manifest(
     max_pending_seconds: int,
     runtime_probe: Callable[[], Awaitable[None]],
 ) -> tuple[BulkExportManifest | None, str | None, int]:
-    """Request a fresh URL capability without changing dataset identity."""
-
-    await runtime_probe()
-    status_code, status_payload, status_location, request_error = await _start_bulk_capability_refresh_request(
-        session,
-        source_record,
-        identity,
-        timeout=timeout,
+    return await bulk_parallel.request_capability_refresh(
+        sys.modules[__name__], session, source_record, identity, timeout, max_pending_seconds, runtime_probe
     )
-    if request_error is not None:
-        return None, request_error, 0
-    if status_code is None:
-        return None, "bulk_export_acceptance_outcome_unknown", 0
-    if status_code not in {200, 202}:
-        return None, f"bulk_export_status_http_{status_code}", 0
-    polls = 0
-    if status_code == 202:
-        status_payload, poll_error, polls = await _poll_bulk_capability_refresh_request(
-            session,
-            source_record,
-            identity,
-            status_location,
-            timeout=timeout,
-            max_pending_seconds=max_pending_seconds,
-            runtime_probe=runtime_probe,
-        )
-        if poll_error is not None:
-            return None, poll_error, polls
-    if not _is_bulk_export_status_payload(status_payload):
-        return None, "bulk_export_status_non_bulk_payload", polls
-    payload_error = _bulk_export_payload_error(status_payload)
-    if payload_error is not None:
-        return None, payload_error, polls
-    manifest, manifest_error = _validated_bulk_capability_refresh_manifest(
-        source_record,
-        identity,
-        status_payload,
-    )
-    return manifest, manifest_error, polls
 
 
 async def _probe_bulk_capability_refresh_validators(
@@ -45751,10 +45657,10 @@ def _bulk_capability_output_update_sql() -> str:
 def _bulk_capability_parent_update_sql() -> str:
     return f"""
         UPDATE {_bulk_acquisition_checkpoint_table_ref()}
-           SET status_url_ciphertext = NULL,
-               status_url_hash = NULL,
-               manifest_hash = :manifest_hash,
+           SET manifest_hash = :manifest_hash,
                manifest_ciphertext = :manifest_ciphertext,
+               status_url_ciphertext = :status_url_ciphertext,
+               status_url_hash = :status_url_hash,
                manifest_json = CAST(:manifest_audit_json AS jsonb),
                state = :manifest_ready_state,
                error = NULL,
@@ -45827,6 +45733,8 @@ async def _persist_refreshed_bulk_manifest(
         manifest_hash=manifest.identity_hash,
         manifest_ciphertext=_encrypt_bulk_capability(json.dumps(manifest.payload, sort_keys=True)),
         manifest_audit_json=manifest_audit_json,
+        status_url_ciphertext=_encrypt_bulk_capability(manifest.status_url) if manifest.status_url else None,
+        status_url_hash=hashlib.sha256(manifest.status_url.encode()).hexdigest() if manifest.status_url else None,
         manifest_ready_state=BULK_EXPORT_CHECKPOINT_MANIFEST_READY,
         lease_seconds=_bulk_checkpoint_lease_seconds(),
     )
@@ -45884,11 +45792,10 @@ async def _record_bulk_capability_refresh_error(
     *,
     terminal: bool | None = None,
 ) -> tuple[None, str, int]:
-    await _record_bulk_export_checkpoint_error(
-        identity,
-        refresh_error,
-        terminal=(_is_bulk_export_error_terminal(refresh_error) if terminal is None else terminal),
-    )
+    # Retryable failures retain the renewal trigger; the caller receives the latest error.
+    is_terminal = _is_bulk_export_error_terminal(refresh_error) if terminal is None else terminal
+    if is_terminal:
+        await _record_bulk_export_checkpoint_error(identity, refresh_error, terminal=True)
     return None, refresh_error, polls
 
 
@@ -45905,6 +45812,7 @@ async def _prepare_bulk_capability_refresh(
         identity,
         checkpoint,
         output_checkpoints,
+        fresh_export=False,
     )
     return output_checkpoints
 
@@ -45915,14 +45823,11 @@ async def _request_bulk_capability_refresh_for_options(
     identity: BulkExportCheckpointIdentity,
     fetch_options: BulkExportFetchOptions,
     runtime_probe: Callable[[], Awaitable[None]],
+    *,
+    checkpoint: dict[str, Any] | None = None,
 ) -> tuple[BulkExportManifest | None, str | None, int]:
-    return await _request_bulk_capability_refresh_manifest(
-        session,
-        source_record,
-        identity,
-        timeout=fetch_options.timeout,
-        max_pending_seconds=fetch_options.bulk_export_max_pending_seconds,
-        runtime_probe=runtime_probe,
+    return await bulk_parallel.refresh_capabilities(
+        sys.modules[__name__], session, source_record, identity, checkpoint, fetch_options, runtime_probe
     )
 
 
@@ -45981,44 +45886,16 @@ async def _refresh_checkpointed_bulk_export_capabilities(
             str(exc),
             0,
         )
-    manifest, refresh_error, polls = await _request_bulk_capability_refresh_for_options(
+    return await bulk_parallel.renew_capabilities(
+        sys.modules[__name__],
         session,
         source_record,
         identity,
+        checkpoint,
+        output_checkpoints,
         fetch_options,
         runtime_probe,
     )
-    if refresh_error is not None or manifest is None:
-        return await _record_bulk_capability_refresh_error(
-            identity,
-            refresh_error or "bulk_export_manifest_unavailable",
-            polls,
-        )
-    try:
-        refresh_error = await _validate_and_persist_bulk_capabilities(
-            session,
-            source_record,
-            identity,
-            checkpoint,
-            manifest,
-            output_checkpoints,
-            fetch_options,
-            runtime_probe,
-        )
-    except (RuntimeError, ValueError) as exc:
-        return await _record_bulk_capability_refresh_error(
-            identity,
-            str(exc),
-            polls,
-            terminal=True,
-        )
-    if refresh_error is not None:
-        return await _record_bulk_capability_refresh_error(
-            identity,
-            refresh_error,
-            polls,
-        )
-    return manifest, None, polls
 
 
 async def _refresh_bulk_export_rows_written(
@@ -47414,8 +47291,7 @@ def _completed_bulk_output_error(
             task_error = _bulk_transport_error(exc)
         except Exception as exc:
             task_error = _bulk_transport_error(exc)
-        if task_error and (not output_error or bulk_parallel.is_transient_output_error(output_error)):
-            output_error = task_error
+        output_error = bulk_parallel.preferred_output_error(sys.modules[__name__], output_error, task_error)
     return output_error
 
 

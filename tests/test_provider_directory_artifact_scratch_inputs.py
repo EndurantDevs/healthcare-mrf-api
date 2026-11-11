@@ -14,6 +14,7 @@ import pytest
 
 from process import provider_directory_artifact_scratch_inputs as scratch
 from process import provider_directory_cms_preparation as preparation
+from process.provider_directory_admission_seal import parse_source_admission_receipt
 from process.provider_directory_output_address_key_backfill import _digest_rows
 from process.provider_directory_output_snapshot_catalog import output_models
 from tests.test_entity_address_source_preparation import source_case as source_case
@@ -126,6 +127,92 @@ async def test_oversized_header_refuses_before_payload_transport(size, reason):
         pages = [rows async for rows in scratch._source_headers(publisher, ["a"])]
         assert not pages
     assert fetch.await_count == 1
+
+
+def _sealed_header_facts():
+    """Construct a genuine bounded seal without inventing raw header authority."""
+    metadata = dict(source_ids=["synthetic-source"], selected_resources=["Location"])
+    seal = parse_source_admission_receipt(
+        metadata, admission_kind="generic", proof_sha256="d" * 64, resource_counts={"Location": 1}
+    )
+    return dict(
+        dataset_id="synthetic-dataset",
+        publication_metadata_summary_json=seal.metadata_summary,
+        publication_metadata_sha256=seal.metadata_sha256,
+        content_proof_admission_version=seal.admission_version,
+        content_proof_admission_kind=seal.admission_kind,
+        content_proof_admission_sha256=seal.proof_sha256,
+        content_proof_resource_types=list(seal.resource_types),
+        _source_header_projection=scratch._HEADER_PROJECTION,
+        _source_header_sha256="e" * 64,
+        _source_header_identity_matches=True,
+    )
+
+
+def test_header_projection_hashes_whole_row_and_bounds_raw_identity_values():
+    sql = scratch._source_header_sql('"synthetic"."provider_directory_endpoint_dataset"', size=False)
+    projected = sql.split("CROSS JOIN LATERAL (SELECT ", 1)[1].split(") p ", 1)[0]
+    assert "publication_metadata_json" not in projected and "completion_proof_json" not in projected
+    assert "publication_metadata_summary_json" in projected and "candidate_storage_json" in projected
+    assert "max(encode(sha256(convert_to(row_to_json(original)::text,'UTF8')),'hex'))" in sql
+    assert "original.dataset_id=h.dataset_id" in sql
+    assert "h.publication_metadata_json::jsonb" not in sql
+    assert "jsonb_each(h.candidate_storage_json->'identity'->'metadata')" in sql
+    assert "octet_length(raw.value::text)<=1048576" in sql
+    assert "coalesce(actual.value::jsonb,'null'::jsonb)" in sql
+    assert "json_each(h.publication_metadata_json::json) WITH ORDINALITY" in sql
+    assert "SELECT DISTINCT ON (raw.key)" in sql and "ORDER BY raw.key,raw.ordinal DESC" in sql
+
+
+@pytest.mark.parametrize(
+    "field,changed",
+    [
+        ("_source_header_projection", "changed"),
+        ("_source_header_identity_matches", False),
+        ("_source_header_identity_matches", None),
+        ("publication_metadata_summary_json", None),
+        ("publication_metadata_summary_json", {"source_ids": ["changed"]}),
+        ("publication_metadata_sha256", "f" * 64),
+        ("content_proof_admission_version", True),
+        ("content_proof_admission_kind", "unknown"),
+        ("content_proof_admission_sha256", "invalid"),
+        ("content_proof_resource_types", None),
+        ("content_proof_resource_types", ["Location", "Location"]),
+    ],
+)
+def test_compact_header_refuses_partial_or_changed_seal(field, changed):
+    header = _sealed_header_facts()
+    header[field] = changed
+    with pytest.raises(RuntimeError, match="scratch_header_seal_invalid"):
+        scratch._source_header_metadata(header)
+
+
+def test_compact_summary_and_native_digest_leave_legacy_facts_intact():
+    header = _sealed_header_facts()
+    assert scratch._source_header_metadata(header) == header["publication_metadata_summary_json"]
+    assert scratch._source_header_digest(header) == "e" * 64
+    legacy_by_field = dict(dataset_id="legacy", publication_metadata_json={"retained": True})
+    assert scratch._source_header_metadata(legacy_by_field) == {"retained": True}
+    assert scratch._source_header_digest(legacy_by_field) == scratch.custody._digest(legacy_by_field)
+    header["_source_header_sha256"] = "invalid"
+    with pytest.raises(RuntimeError, match="scratch_header_digest_invalid"):
+        scratch._source_header_digest(header)
+
+
+@pytest.mark.asyncio
+async def test_compact_header_is_validated_before_exposure():
+    header = _sealed_header_facts()
+    header["_source_header_identity_matches"] = False
+    fetch = AsyncMock(
+        side_effect=[
+            [dict(dataset_id=header["dataset_id"], bytes=4096)],
+            [dict(dataset_id=header["dataset_id"], facts=scratch.encoded(header))],
+        ]
+    )
+    publisher = SimpleNamespace(policy=SimpleNamespace(schema="synthetic"), connection=SimpleNamespace(fetch=fetch))
+    with pytest.raises(RuntimeError, match="scratch_header_seal_invalid"):
+        pages = [page async for page in scratch._source_headers(publisher, [header["dataset_id"]])]
+        assert not pages
 
 
 def test_control_catalog_preserves_native_hooks_fks_owner_and_acl():
