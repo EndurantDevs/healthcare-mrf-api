@@ -18,6 +18,7 @@ from process.vsp_directory_contract import (
     canonical_json,
     require,
 )
+from process.vsp_directory_store import is_artifact_root_failure
 
 ENTRY_ID = "vsp-provider-directory"
 _EMITTED_TYPES = frozenset({"Location", "Organization", "Practitioner", "PractitionerRole"})
@@ -116,7 +117,7 @@ def is_rearmed_capture_retry(existing_by_field, checkpoint):
     error = metadata.get("error")
     if error == "vsp_prepared_candidate_required":
         previous_run_id = checkpoint.acquisition_root_run_id
-    elif error == "vsp_artifact_root_invalid" and checkpoint.retry_of_run_id != checkpoint.acquisition_root_run_id:
+    elif is_artifact_root_failure(error) and checkpoint.retry_of_run_id != checkpoint.acquisition_root_run_id:
         previous_run_id = checkpoint.retry_of_run_id
     else:
         return False

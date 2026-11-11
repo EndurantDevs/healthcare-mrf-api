@@ -8,6 +8,7 @@ from process import provider_directory_generic_source_storage as storage
 from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
 from process.provider_directory_source_storage_binding import require_storage_schema
 from process.vsp_directory_integration import is_failed_capture_retry, is_rearmed_capture_retry
+from process.vsp_directory_store import is_artifact_root_failure
 
 
 def is_retained_vsp_capture_retry(candidate):
@@ -26,10 +27,9 @@ async def orphan_candidate_status(directory, existing_by_field, candidate):
             directory, candidate, existing_by_field
         )
     metadata = existing_by_field.get("publication_metadata_json")
-    if isinstance(metadata, dict) and metadata.get("error") in {
-        "vsp_prepared_candidate_required",
-        "vsp_artifact_root_invalid",
-    }:
+    if isinstance(metadata, dict) and (
+        metadata.get("error") == "vsp_prepared_candidate_required" or is_artifact_root_failure(metadata.get("error"))
+    ):
         if not is_rearmed_capture_retry(existing_by_field, checkpoint):
             raise RuntimeError("provider_directory_endpoint_dataset_candidate_stale")
         return directory.ENDPOINT_DATASET_ACQUIRING, await storage.has_empty_isolated_vsp_storage(

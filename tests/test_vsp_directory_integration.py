@@ -15,6 +15,7 @@ from api.provider_directory_sources import provider_directory_source_catalog
 from process import provider_directory_generic_source_adapters as source_adapters
 from process import provider_directory_generic_source_policy as source_policy
 from process import provider_directory_generic_source_storage as source_storage
+from process import provider_directory_source_failure_control as failure_control
 from process import vsp_directory_capture as capture_api
 from process import vsp_directory_integration as adapter
 from process.ext import source_http_proxy as transport
@@ -177,12 +178,18 @@ async def _vsp_retry_candidate(monkeypatch, source_record, context, header_by_fi
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("rearmed", [None, "vsp_prepared_candidate_required", "vsp_artifact_root_invalid"])
+@pytest.mark.parametrize(
+    "rearmed", [None, "vsp_prepared_candidate_required", "vsp_artifact_root_invalid", "permission"]
+)
 async def test_vsp_retry_reopens_verified_detached_inputs_without_reset(
     monkeypatch, source_record, rearmed, tmp_path, completed_capture
 ):
     context = source_record["_pagination_checkpoint_context"]
-    if rearmed == "vsp_artifact_root_invalid":
+    if rearmed == "permission":
+        artifact_root = tmp_path / "artifacts"
+        monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT", str(artifact_root))
+        rearmed = str(PermissionError(13, "Permission denied", str(artifact_root / "vsp-directory" / "tmp")))
+    if rearmed and rearmed != "vsp_prepared_candidate_required":
         context = replace(context, retry_of_run_id="failed-child-example")
         source_record["_pagination_checkpoint_context"] = context
     header_by_field = {
@@ -267,6 +274,20 @@ async def test_failed_vsp_retry_requires_retained_capture_until_rearmed(monkeypa
     }
     candidate = await _vsp_retry_candidate(monkeypatch, source_record, context, header_by_field)
     assert candidate.checkpoint_context.require_retained_vsp_capture is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", [None, {"error": "vsp_http_status"}])
+async def test_other_failures_do_not_receive_empty_storage_recovery(monkeypatch, source_record, metadata):
+    checkpoint = source_record["_pagination_checkpoint_context"]
+    candidate = SimpleNamespace(repair_empty_orphan=True, checkpoint_context=checkpoint)
+    verify = AsyncMock(side_effect=AssertionError("unrecognized failure must not receive empty-storage proof"))
+    monkeypatch.setattr(source_storage, "has_empty_isolated_vsp_storage", verify)
+    status, verified = await failure_control.orphan_candidate_status(
+        directory, {"publication_metadata_json": metadata}, candidate
+    )
+    assert status == directory.ENDPOINT_DATASET_ACQUIRING and verified is False
+    verify.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

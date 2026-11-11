@@ -1,7 +1,9 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """A successor producer may adopt only one verified, detached stopped intake."""
 
+import errno
 import hashlib
+import os
 import re
 from contextlib import nullcontext
 from copy import deepcopy
@@ -436,9 +438,34 @@ def _empty_vsp_artifact_failure(case):
     return case.runs[0]["run_id"]
 
 
+def _empty_vsp_permission_failure(case, monkeypatch, tmp_path):
+    previous_run_id = _empty_vsp_artifact_failure(case)
+    root = tmp_path / "artifacts"
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT", str(root))
+    error = str(PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(root / "vsp-directory" / "tmp")))
+    failed_run_id = "run_" + "d" * 32
+    case.runs.insert(
+        0,
+        {
+            **case.runs[0],
+            "run_id": failed_run_id,
+            "retry_of_run_id": previous_run_id,
+            "error_message": error,
+        },
+    )
+    case.header["import_run_id"] = failed_run_id
+    case.header["publication_metadata_json"]["error"] = error
+    return failed_run_id
+
+
 @pytest.mark.asyncio
-async def test_vsp_artifact_failure_rearms_only_the_latest_attached_child_and_replays(case):
-    failed_run_id = _empty_vsp_artifact_failure(case)
+@pytest.mark.parametrize("historical", [False, True])
+async def test_vsp_artifact_failure_rearms_only_the_latest_attached_child_and_replays(
+    case, monkeypatch, tmp_path, historical
+):
+    failed_run_id = (
+        _empty_vsp_permission_failure(case, monkeypatch, tmp_path) if historical else _empty_vsp_artifact_failure(case)
+    )
     before = deepcopy(case.header)
     runs = deepcopy(case.runs)
     counts = dict.fromkeys(RESOURCE_TYPES, 0)
@@ -452,6 +479,28 @@ async def test_vsp_artifact_failure_rearms_only_the_latest_attached_child_and_re
     assert (await _transition(case, counts, stopped_run_id=failed_run_id))["already_applied"] is True
     assert len(case.writes) == 1 and case.runs == runs
     assert not case.checkpoints and not case.bulk_checkpoints and not case.input_rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["header_error", "run_error", "capture_ancestor", "sibling", "wrong_path"])
+async def test_vsp_permission_failure_keeps_exact_error_and_pre_capture_lineage(case, monkeypatch, tmp_path, drift):
+    failed_run_id = _empty_vsp_permission_failure(case, monkeypatch, tmp_path)
+    match drift:
+        case "header_error":
+            case.header["publication_metadata_json"]["error"] = "vsp_artifact_root_invalid"
+        case "run_error":
+            case.runs[0]["error_message"] = "vsp_artifact_root_invalid"
+        case "capture_ancestor":
+            case.runs[1]["error_message"] = "vsp_http_status"
+        case "sibling":
+            case.runs.insert(1, {**case.runs[0], "run_id": "run_" + "e" * 32})
+        case "wrong_path":
+            monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT", str(tmp_path / "different"))
+    before = deepcopy((case.header, case.runs, case.input_rows, case.checkpoints))
+    with pytest.raises(GenericCandidateError):
+        await _transition(case, dict.fromkeys(RESOURCE_TYPES, 0), stopped_run_id=failed_run_id)
+    assert not case.writes
+    assert (case.header, case.runs, case.input_rows, case.checkpoints) == before
 
 
 @pytest.mark.asyncio

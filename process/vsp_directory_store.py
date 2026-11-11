@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -11,7 +12,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from process.ptg_parts.artifacts import PTG2ArtifactStore
-from process.vsp_directory_contract import ADAPTER_ID, SOURCE_ID, canonical_json, request_key, require
+from process.vsp_directory_contract import (
+    ADAPTER_ID,
+    SOURCE_ID,
+    VSPDirectoryError,
+    canonical_json,
+    request_key,
+    require,
+)
 from process.vsp_directory_http import strict_json
 
 
@@ -52,12 +60,30 @@ def configured_root():
     """Reuse the directory artifact volume; temporary storage cannot hold an import."""
     configured = os.environ.get("HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT", "")
     require(bool(configured), "vsp_artifact_root_required")
+    try:
+        root = Path(configured).resolve()
+        require(
+            root.is_absolute() and root != Path("/") and not root.is_relative_to(Path(tempfile.gettempdir()).resolve()),
+            "vsp_artifact_root_invalid",
+        )
+        return _directory(root / "vsp-directory")
+    except PermissionError as error:
+        raise VSPDirectoryError("vsp_artifact_root_invalid") from error
+
+
+def is_artifact_root_failure(error):
+    """Recognize root validation or the legacy failure before capture identity creation."""
+    if error == "vsp_artifact_root_invalid":
+        return True
+    if type(error) is not str or not error.startswith(f"[Errno {errno.EACCES}] {os.strerror(errno.EACCES)}: "):
+        return False
+    configured = os.environ.get("HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT", "")
+    if not configured or not Path(configured).is_absolute():
+        return False
     root = Path(configured).resolve()
-    require(
-        root.is_absolute() and root != Path("/") and not root.is_relative_to(Path(tempfile.gettempdir()).resolve()),
-        "vsp_artifact_root_invalid",
+    return root != Path("/") and error == str(
+        PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(root / "vsp-directory" / "tmp"))
     )
-    return _directory(root / "vsp-directory")
 
 
 class VSPCaptureStore:
@@ -65,10 +91,13 @@ class VSPCaptureStore:
 
     def __init__(self, root, root_run_id, *, require_retained=False):
         require(type(root_run_id) is str and 0 < len(root_run_id) <= 256, "vsp_capture_identity_invalid")
-        self.root = _directory(Path(root))
+        try:
+            self.root = _directory(Path(root))
+            self._lock = PTG2ArtifactStore(self.root).named_lock("vsp-directory", "source-acquisition")
+        except PermissionError as error:
+            raise VSPDirectoryError("vsp_artifact_root_invalid") from error
         self.capture_id = hashlib.sha256(canonical_json([SOURCE_ID, ADAPTER_ID, root_run_id]).encode()).hexdigest()
         self.path = self.root / self.capture_id
-        self._lock = PTG2ArtifactStore(self.root).named_lock("vsp-directory", "source-acquisition")
         identity_by_field = {
             "adapter_id": ADAPTER_ID,
             "source_id": SOURCE_ID,
