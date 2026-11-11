@@ -73,18 +73,23 @@ from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 _AUTHORIZATION_SCOPE_SHA256 = hashlib.sha256(b"HEALTHPORTA_PLAN_PRICING_STATE_SCAN_PUBLIC_V1").hexdigest()
 
 
-def validate_state_scan_transport(request, native_args):
-    """Keep public scans canonical and admit only the installed protected default scope."""
+def is_plan_pricing_scan_transport(request, native_args) -> bool:
+    """Admit canonical public scans and the authenticated default collection."""
     if getattr(request, "path", BILLING_SEARCH_TRANSPORT_PATH) == BILLING_SEARCH_TRANSPORT_PATH:
-        return
+        return True
     scope = current_network_address_scope()
-    if (
+    return (
         getattr(request, "path", None) == "/api/v1/registry/serving/providers/collection"
         and getattr(request, "method", None) == "POST"
         and native_args is not None
         and scope is not None
         and scope.network_ids is None
-    ):
+    )
+
+
+def validate_state_scan_transport(request, native_args):
+    """Keep public scans canonical and admit only the installed protected default scope."""
+    if is_plan_pricing_scan_transport(request, native_args):
         return
     raise InvalidUsage(
         "Release-bound state scans require the canonical /api/v1/pricing/providers/search-by-procedure path"

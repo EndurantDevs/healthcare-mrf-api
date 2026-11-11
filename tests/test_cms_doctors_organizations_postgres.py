@@ -24,7 +24,7 @@ from process.entity_address_cutover_contract import postgres_sqlstate
 from process.ext.utils import make_class
 from process.provider_directory_generic_source_policy import bound_publisher
 from tests.cms_doctors_component_postgres_support import doctors_component_template as doctors_component_template
-from tests.cms_doctors_preparation_postgres_support import doctors_database
+from tests.cms_doctors_preparation_postgres_support import authority, doctors_database
 
 cms_doctors = importlib.import_module("process.cms_doctors")
 pytestmark = pytest.mark.usefixtures("doctors_component_template")
@@ -415,17 +415,80 @@ async def test_prepared_groups_publish_with_complete_family_and_stable_replay(st
     assert await _bindings(replay, "group") == groups and await _bindings(replay, "site") == sites_map
 
 
+async def _publish_contending_candidates(staged, competitor, monkeypatch):
+    """Hold genuine publication locks through every bounded competing attempt."""
+    winner_locked, release_winner = asyncio.Event(), asyncio.Event()
+    lock_publication = cms_doctors._lock_cms_doctors_publication
+    lock_attempts = []
+
+    async def synchronized_lock(session, stage_cls, schema, import_date):
+        lock_attempts.append(import_date)
+        if import_date == competitor.import_date:
+            # PostgreSQL must refuse before the existing 100ms reader-drain deadline.
+            await session.execute(text("SET LOCAL lock_timeout='10ms'"))
+        await lock_publication(session, stage_cls, schema, import_date)
+        if import_date == staged.import_date:
+            winner_locked.set()
+            await asyncio.wait_for(release_winner.wait(), 10)
+
+    async def publish_competitor():
+        try:
+            await asyncio.wait_for(winner_locked.wait(), 10)
+            return await _publish(competitor)
+        finally:
+            release_winner.set()
+
+    with monkeypatch.context() as changed:
+        changed.setattr(cms_doctors, "_lock_cms_doctors_publication", synchronized_lock)
+        publication_results = await asyncio.wait_for(
+            asyncio.gather(_publish(staged), publish_competitor(), return_exceptions=True), 30
+        )
+    assert lock_attempts.count(competitor.import_date) == 4
+    return publication_results
+
+
 @pytest.mark.asyncio
-async def test_concurrent_publishers_keep_one_stable_winner_and_require_whole_reprepare(staged_groups):
+async def test_concurrent_publishers_keep_one_stable_winner_and_require_whole_reprepare(staged_groups, monkeypatch):
+    """Preserve the winning UUID maps until the loser fully prepares them again."""
     staged = staged_groups
     competitor = await _replay(staged)
-    await _prepare_groups(staged)
-    await _prepare_sites(staged)
-    await _prepare_groups(competitor)
-    await _prepare_sites(competitor)
-    results = await asyncio.gather(_publish(staged), _publish(competitor), return_exceptions=True)
-    assert sum(not isinstance(value, BaseException) for value in results) == 1
-    loser = next(value for value in results if isinstance(value, BaseException))
-    assert isinstance(loser, identities.CMSIdentityReprepareRequired)
-    assert len(await _bindings(staged, "group", published=True)) == 207
-    assert len(await _bindings(staged, "site", published=True)) == 206
+    candidates = (staged, competitor)
+    prepared_bindings = []
+    for candidate in candidates:
+        await _prepare_groups(candidate)
+        await _prepare_sites(candidate)
+        prepared_bindings.append((await _bindings(candidate, "group"), await _bindings(candidate, "site")))
+    prior = await authority(staged.fixture)
+    publication_results = await _publish_contending_candidates(staged, competitor, monkeypatch)
+    assert sum(not isinstance(publication_result, BaseException) for publication_result in publication_results) == 1
+    loser_index = next(
+        index
+        for index, publication_result in enumerate(publication_results)
+        if isinstance(publication_result, BaseException)
+    )
+    assert loser_index == 1
+    loser, losing_candidate = publication_results[loser_index], candidates[loser_index]
+    assert isinstance(loser, (DBAPIError, asyncpg.LockNotAvailableError))
+    assert postgres_sqlstate(loser) == "55P03"
+    winner_bindings = prepared_bindings[1 - loser_index]
+    assert tuple(map(len, winner_bindings)) == (207, 206)
+    for kind, expected in zip(("group", "site"), winner_bindings, strict=True):
+        assert await _bindings(staged, kind, published=True) == expected
+    accepted = await authority(staged.fixture)
+    assert accepted.local_generation == prior.local_generation + 1
+
+    with pytest.raises(identities.CMSIdentityReprepareRequired, match="whole_candidate_reprepare"):
+        await _publish(losing_candidate)
+    assert await authority(staged.fixture) == accepted
+    for kind, expected in zip(("group", "site"), winner_bindings, strict=True):
+        assert await _bindings(staged, kind, published=True) == expected
+
+    await identities.discard_doctors_identities(staged.fixture.database, losing_candidate.ctx)
+    assert await _prepare_groups(losing_candidate) == 207
+    assert await _prepare_sites(losing_candidate) == 206
+    for kind, expected in zip(("group", "site"), winner_bindings, strict=True):
+        assert await _bindings(losing_candidate, kind) == expected
+    await _publish(losing_candidate)
+    assert (await authority(staged.fixture)).local_generation == accepted.local_generation + 1
+    for kind, expected in zip(("group", "site"), winner_bindings, strict=True):
+        assert await _bindings(staged, kind, published=True) == expected

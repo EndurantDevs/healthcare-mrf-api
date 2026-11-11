@@ -40,6 +40,12 @@ from api.code_systems import (
 from api.endpoint.pagination import PaginationParams
 from api.network_address_scope import current_network_address_scope
 from api.network_read_execution import direct_heap_relation_sql, execute_network_read, has_network_read_inventory
+from api.plan_pricing_distance_page import (
+    DISTANCE_CONTINUATION_FIELD,
+    RankedSnapshotBatch,
+    is_distance_order,
+    search_ranked_distance_release,
+)
 from api.plan_pricing_em_distance import search_plan_pricing_em_distance
 from api.plan_pricing_projection import (
     PlanPricingProjectionUnavailable,
@@ -90,6 +96,14 @@ from api.provider_specialty_filters import (
     provider_specialty_taxonomy_exists_sql,
     provider_specialty_taxonomy_semijoin_sql,
     resolve_provider_specialty_filter,
+)
+from api.ptg2_address_assurance_sql import MEMBERSHIP_EXACT_NPI_SCOPE_LIMIT as _MEMBERSHIP_EXACT_NPI_SCOPE_LIMIT
+from api.ptg2_address_assurance_sql import MEMBERSHIP_KNN_SPARSE_SCOPE_LIMIT as _MEMBERSHIP_KNN_SPARSE_SCOPE_LIMIT
+from api.ptg2_address_assurance_sql import MEMBERSHIP_LOCATION_KNN_SQL as _MEMBERSHIP_LOCATION_KNN_SQL
+from api.ptg2_address_assurance_sql import MEMBERSHIP_LOCATION_SQL as _MEMBERSHIP_LOCATION_SQL
+from api.ptg2_address_assurance_sql import MEMBERSHIP_NPI_SQL as _MEMBERSHIP_NPI_SQL
+from api.ptg2_address_assurance_sql import (
+    MEMBERSHIP_UNIFIED_ASSURED_LOCATION_SQL as _MEMBERSHIP_UNIFIED_ASSURED_LOCATION_SQL,
 )
 from api.ptg2_address_assurance_sql import UNIFIED_ASSURED_LOCATION_CTES_SQL as _UNIFIED_ASSURED_LOCATION_CTES_SQL
 from api.ptg2_address_policy import (
@@ -177,6 +191,8 @@ from api.ptg2_response import (
     _coerce_numeric_rate,
     _include_ptg2_sources,
     _is_request_flag_enabled,
+    _manifest_response_row_order,
+    _manifest_response_row_order_for_direction,
     _normalize_filter_string_list,
     _normalize_price_payload,
     _normalize_string_list,
@@ -184,6 +200,7 @@ from api.ptg2_response import (
     _optional_float,
     _price_response_fields,
     _price_row_key,
+    _request_value_or_none,
     _shape_ptg2_response,
 )
 from api.ptg2_serving_utils import (
@@ -255,6 +272,7 @@ from api.ptg2_v4_graph import (
 )
 from api.ptg2_v4_intersection import intersect_sorted_u32
 from api.ptg_membership_distance import (
+    _execute_ranked_membership_sql,
     _has_exact_network_totals,
     _LocalDistanceGraphState,
     _new_local_taxonomy_locations,
@@ -627,12 +645,6 @@ def _non_nullish_contact_value(value: Any) -> Any:
     }:
         return None
     return value
-
-
-def _request_value_or_none(value: Any) -> Any:
-    """Preserve explicit numeric zero while normalizing request null sentinels."""
-
-    return None if value in (None, "", "null") else value
 
 
 def _first_contact_value(*values: Any) -> Any:
@@ -1972,6 +1984,7 @@ def _shape_ptg2_manifest_response(
     *,
     database_evidence: Mapping[str, Any] | None = None,
     storage_generation: str = PTG2_V3_SHARED_GENERATION,
+    shape_public: bool = True,
 ) -> dict[str, Any]:
     manifest_response_by_field = dict(response_by_field)
     manifest_response_by_field["query"] = {
@@ -2001,7 +2014,7 @@ def _shape_ptg2_manifest_response(
         shaped_item_by_field.pop("service_code_system", None)
         shaped_item_by_field.pop("tic_prices", None)
         manifest_response_by_field["items"].append(shaped_item_by_field)
-    return _shape_ptg2_response(manifest_response_by_field, args)
+    return _shape_ptg2_response(manifest_response_by_field, args) if shape_public else manifest_response_by_field
 
 
 def _ptg2_manifest_id(value: Any) -> str:
@@ -2942,31 +2955,6 @@ async def _shared_code_prefix_rows(
         )
         for selected_row in selected_rows
     ]
-
-
-def _manifest_response_row_order(row: Mapping[str, Any]) -> tuple[Any, ...]:
-    return (
-        int(row.get("price_key") if row.get("price_key") is not None else 2**32),
-        int(row.get("_ptg_provider_set_key") if row.get("_ptg_provider_set_key") is not None else 2**31),
-        int(row.get("source_key") or 0),
-        int(row.get("provider_count") or 0),
-        int(row.get("code_key") or 0),
-        str(row.get("reported_code") or ""),
-        str(row.get("serving_content_hash_128") or ""),
-        str(row.get("plan_id") or ""),
-        str(row.get("plan_market_type") or ""),
-    )
-
-
-def _manifest_response_row_order_for_direction(
-    row: Mapping[str, Any],
-    *,
-    descending: bool,
-) -> tuple[Any, ...]:
-    order = _manifest_response_row_order(row)
-    if not descending:
-        return order
-    return (-int(order[0]), *order[1:])
 
 
 @dataclass(frozen=True)
@@ -8629,7 +8617,6 @@ def _sort_ptg2_manifest_provider_items(
     order_by = requested_order or ("distance" if location_filter_requested else "")
     order = str(args.get("order") or "").strip().lower()
     is_descending = order == "desc"
-    distance_order_fields = {"distance", "distance_miles"}
     if order_by in _PTG2_COST_ORDER_FIELDS:
         return sorted(
             provider_items,
@@ -8638,7 +8625,7 @@ def _sort_ptg2_manifest_provider_items(
                 is_descending=is_descending,
             ),
         )
-    if order_by in distance_order_fields:
+    if order_by in {"distance", "distance_miles"}:
         return sorted(
             provider_items,
             key=lambda provider_item: _ptg2_distance_sort_key(
@@ -9204,402 +9191,6 @@ class _MembershipLocationQuery:
     knn_prefilter_sql: str = "TRUE"
 
 
-_MEMBERSHIP_NPI_SQL = """
-WITH matched AS MATERIALIZED (
-    SELECT
-        addr.npi,
-        {distance_sql} AS distance_miles,
-        ROW_NUMBER() OVER (
-            PARTITION BY addr.npi
-            ORDER BY {distance_sql} ASC NULLS LAST,
-                     CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
-                     addr.checksum,
-                     addr.location_key
-        ) AS address_rank
-    FROM {address_table} addr
-    WHERE {address_filter_sql}
-      AND {address_assurance_sql}
-      AND EXISTS (
-          SELECT 1
-          FROM {npi_scope_table} npi_scope
-          WHERE npi_scope.snapshot_key = :shared_snapshot_key
-            AND npi_scope.npi = addr.npi
-          OFFSET 0
-      )
-)
-SELECT npi, distance_miles, address_rank
-FROM matched
-WHERE address_rank = 1
-ORDER BY distance_miles ASC NULLS LAST, npi
-LIMIT :limit OFFSET :offset
-"""
-
-
-_MEMBERSHIP_LOCATION_SQL = """
-WITH matched AS MATERIALIZED (
-    SELECT
-        addr.npi,
-        {location_hash_sql} AS location_hash,
-        addr.state_name AS state,
-        addr.city_name AS city,
-        LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5,
-        {distance_sql} AS distance_miles,
-        addr.type,
-        addr.checksum,
-        {telephone_sql} AS telephone_number,
-        {fax_sql} AS fax_number,
-        addr.phone_number,
-        addr.phone_extension,
-        addr.fax_number_digits,
-        addr.fax_extension,
-        jsonb_build_object(
-            'first_line', addr.first_line,
-            'second_line', addr.second_line,
-            'city', addr.city_name,
-            'state', addr.state_name,
-            'postal_code', addr.postal_code,
-            'country_code', addr.country_code,
-            'telephone_number', {telephone_sql},
-            'fax_number', {fax_sql},
-            'phone_number', addr.phone_number,
-            'phone_extension', addr.phone_extension,
-            'fax_number_digits', addr.fax_number_digits,
-            'fax_extension', addr.fax_extension,
-            'address_key', addr.address_key::text,
-            {address_site_key_json_pair_sql}
-            'location_key', {location_key_sql},
-            'address_sources', {address_sources_sql},
-            'source_record_ids', {source_record_ids_sql},
-            'source_count', {source_count_sql},
-            'multi_source_confirmed', {multi_source_sql},
-            'source_mask', {source_mask_sql},
-            'address_source_mask', {address_source_mask_sql},
-            'location_confidence_id', {location_confidence_sql},
-            'lat', addr.lat,
-            'long', addr.long
-        )::text AS address_payload,
-        ROW_NUMBER() OVER (
-            PARTITION BY addr.npi
-            ORDER BY {postal_box_rank_sql},
-                     {distance_sql} ASC NULLS LAST,
-                     CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
-                     addr.checksum,
-                     {location_tiebreak_sql}
-        ) AS address_rank
-    FROM {address_table} addr
-    JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
-    WHERE {filter_sql}
-      AND {address_assurance_sql}
-)
-SELECT *
-FROM matched
-WHERE address_rank = 1
-ORDER BY distance_miles ASC NULLS LAST, npi
-LIMIT :limit OFFSET :offset
-"""
-
-
-_MEMBERSHIP_UNIFIED_ASSURED_LOCATION_SQL = (
-    _UNIFIED_ASSURED_LOCATION_CTES_SQL
-    + """, ranked AS MATERIALIZED (
-    SELECT
-        classified.location_key,
-        classified.npi,
-        classified.distance_miles,
-        classified.geo_evidence_level,
-        ROW_NUMBER() OVER (
-            PARTITION BY classified.npi
-            ORDER BY classified.distance_miles ASC NULLS LAST,
-                     CASE classified.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
-                     classified.checksum,
-                     classified.location_key
-        ) AS address_rank
-    FROM classified_locations AS classified
-    WHERE classified.geo_evidence_level IS NOT NULL
-), selected AS MATERIALIZED (
-    SELECT *
-    FROM ranked
-    WHERE address_rank = 1
-    ORDER BY distance_miles ASC NULLS LAST, npi
-    LIMIT :limit OFFSET :offset
-)
-SELECT
-    addr.npi,
-    {location_hash_sql} AS location_hash,
-    addr.state_name AS state,
-    addr.city_name AS city,
-    LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5,
-    selected.distance_miles,
-    addr.type,
-    addr.checksum,
-    {telephone_sql} AS telephone_number,
-    {fax_sql} AS fax_number,
-    addr.phone_number,
-    addr.phone_extension,
-    addr.fax_number_digits,
-    addr.fax_extension,
-    selected.geo_evidence_level AS _geo_evidence_level,
-    {selected_geo_evidence_source_id_sql} AS _geo_evidence_source_id,
-    jsonb_build_object(
-        'first_line', addr.first_line,
-        'second_line', addr.second_line,
-        'city', addr.city_name,
-        'state', addr.state_name,
-        'postal_code', addr.postal_code,
-        'country_code', addr.country_code,
-        'telephone_number', {telephone_sql},
-        'fax_number', {fax_sql},
-        'phone_number', addr.phone_number,
-        'phone_extension', addr.phone_extension,
-        'fax_number_digits', addr.fax_number_digits,
-        'fax_extension', addr.fax_extension,
-        'address_key', addr.address_key::text,
-        {address_site_key_json_pair_sql}
-        'location_key', {location_key_sql},
-        'address_sources', {address_sources_sql},
-        'source_record_ids', {source_record_ids_sql},
-        'source_count', {source_count_sql},
-        'multi_source_confirmed', {multi_source_sql},
-        'source_mask', {source_mask_sql},
-        'address_source_mask', {address_source_mask_sql},
-        'location_confidence_id', {location_confidence_sql},
-        'lat', addr.lat,
-        'long', addr.long
-    )::text AS address_payload,
-    selected.address_rank
-FROM selected
-JOIN {address_table} addr ON addr.location_key = selected.location_key
-ORDER BY selected.distance_miles ASC NULLS LAST, addr.npi
-"""
-)
-
-
-_MEMBERSHIP_KNN_SPARSE_SCOPE_LIMIT = 4096
-_MEMBERSHIP_EXACT_NPI_SCOPE_LIMIT = 16384
-
-
-_MEMBERSHIP_LOCATION_KNN_SQL = """
-WITH scope_probe AS MATERIALIZED (
-    SELECT COUNT(*)::bigint AS npi_count
-    FROM (
-        SELECT 1
-        FROM {npi_scope_table}
-        WHERE snapshot_key = :shared_snapshot_key
-        LIMIT {scope_probe_limit}
-    ) scoped_npis
-), sparse_geocoded_candidates AS MATERIALIZED (
-    SELECT
-        addr.location_key,
-        {distance_sql} AS candidate_distance_miles
-    FROM {address_table} addr
-    JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
-    WHERE (SELECT npi_count < {scope_probe_limit} FROM scope_probe)
-      AND npi_scope.snapshot_key = :shared_snapshot_key
-      AND addr.npi IS NOT NULL
-      AND CASE
-              WHEN (SELECT npi_count < {scope_probe_limit} FROM scope_probe)
-              THEN ({knn_prefilter_sql})
-              ELSE FALSE
-          END
-      AND addr.type IN ('primary', 'secondary', 'practice', 'site')
-      AND COALESCE(addr.address_precision, '') <> 'city_zip'
-      AND addr.lat IS NOT NULL
-      AND addr.long IS NOT NULL
-      -- A scalar fence keeps sparse scopes on their NPI-first plan.
-      AND (SELECT {raw_geo_radius_sql} OFFSET 0)
-    ORDER BY {knn_order_sql},
-             addr.npi,
-             CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
-             addr.checksum,
-             addr.location_key
-    LIMIT :raw_probe_limit
-), broad_geocoded_candidates AS MATERIALIZED (
-    SELECT
-        addr.location_key,
-        {distance_sql} AS candidate_distance_miles
-    FROM {address_table} addr
-    JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
-    WHERE (SELECT npi_count >= {scope_probe_limit} FROM scope_probe)
-      AND npi_scope.snapshot_key = :shared_snapshot_key
-      AND addr.npi IS NOT NULL
-      AND CASE
-              WHEN (SELECT npi_count >= {scope_probe_limit} FROM scope_probe)
-              THEN ({knn_prefilter_sql})
-              ELSE FALSE
-          END
-      AND addr.type IN ('primary', 'secondary', 'practice', 'site')
-      AND COALESCE(addr.address_precision, '') <> 'city_zip'
-      AND addr.lat IS NOT NULL
-      AND addr.long IS NOT NULL
-      -- Keep the radius planner-visible so underfilled broad scans can stop.
-      AND {raw_geo_radius_sql}
-    ORDER BY {knn_order_sql},
-             addr.npi,
-             CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
-             addr.checksum,
-             addr.location_key
-    LIMIT :raw_probe_limit
-), geocoded_candidates AS MATERIALIZED (
-    SELECT * FROM sparse_geocoded_candidates
-    UNION ALL
-    SELECT * FROM broad_geocoded_candidates
-), geocoded_probe_stats AS MATERIALIZED (
-    SELECT COUNT(*)::bigint AS raw_probe_count
-    FROM geocoded_candidates
-), exact_zip_candidates AS MATERIALIZED (
-    SELECT
-        exact_zip.location_key,
-        NULL::double precision AS candidate_distance_miles
-    FROM geocoded_probe_stats
-    CROSS JOIN LATERAL (
-        SELECT addr.location_key
-        FROM {address_table} addr
-        JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
-        WHERE geocoded_probe_stats.raw_probe_count < :raw_probe_limit
-          AND npi_scope.snapshot_key = :shared_snapshot_key
-          AND addr.npi IS NOT NULL
-          AND CASE
-                  WHEN geocoded_probe_stats.raw_probe_count < :raw_probe_limit
-                  THEN ({knn_prefilter_sql})
-                  ELSE FALSE
-              END
-          AND addr.type IN ('primary', 'secondary', 'practice', 'site')
-          AND {exact_zip_candidate_filter_sql}
-        ORDER BY addr.npi,
-                 CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
-                 addr.checksum,
-                 addr.location_key
-        LIMIT GREATEST(
-            :raw_probe_limit - geocoded_probe_stats.raw_probe_count,
-            0
-        )
-    ) exact_zip
-), exact_zip_probe_stats AS MATERIALIZED (
-    SELECT COUNT(*)::bigint AS raw_probe_count
-    FROM exact_zip_candidates
-), candidate_keys AS MATERIALIZED (
-    SELECT * FROM geocoded_candidates
-    UNION ALL
-    SELECT * FROM exact_zip_candidates
-), nearest_addresses AS MATERIALIZED (
-    SELECT
-        addr.npi,
-        addr.state_name,
-        addr.city_name,
-        addr.postal_code,
-        addr.lat,
-        addr.long,
-        addr.type,
-        addr.checksum,
-        addr.telephone_number,
-        addr.fax_number,
-        addr.phone_number,
-        addr.phone_extension,
-        addr.fax_number_digits,
-        addr.fax_extension,
-        addr.first_line,
-        addr.second_line,
-        addr.country_code,
-        addr.address_key,
-        addr.premise_key,
-        {location_key_sql} AS location_key,
-        {address_sources_sql} AS address_sources,
-        {source_record_ids_sql} AS source_record_ids,
-        {source_count_sql} AS source_count,
-        {multi_source_sql} AS multi_source_confirmed,
-        {source_mask_sql} AS source_mask,
-        {address_source_mask_sql} AS address_source_mask,
-        {location_confidence_sql} AS location_confidence_id,
-        {geo_evidence_level_sql} AS geo_evidence_level,
-        candidate.candidate_distance_miles
-    FROM candidate_keys candidate
-    CROSS JOIN LATERAL (
-        SELECT candidate_address.*
-        FROM {address_table} candidate_address
-        WHERE candidate_address.location_key = candidate.location_key
-        -- Fence the bounded candidates onto the location-key PK lookup.
-        OFFSET 0
-    ) addr
-    JOIN {npi_scope_table} npi_scope ON npi_scope.npi = addr.npi
-    WHERE {filter_sql}
-), probe_stats AS MATERIALIZED (
-    SELECT
-        geocoded.raw_probe_count AS geocoded_probe_count,
-        exact_zip.raw_probe_count AS exact_zip_probe_count
-    FROM geocoded_probe_stats geocoded
-    CROSS JOIN exact_zip_probe_stats exact_zip
-), matched AS MATERIALIZED (
-    SELECT
-        addr.npi,
-        {location_hash_sql} AS location_hash,
-        addr.state_name AS state,
-        addr.city_name AS city,
-        LEFT(COALESCE(addr.postal_code, ''), 5) AS zip5,
-        addr.candidate_distance_miles AS distance_miles,
-        addr.type,
-        addr.checksum,
-        {telephone_sql} AS telephone_number,
-        {fax_sql} AS fax_number,
-        addr.phone_number,
-        addr.phone_extension,
-        addr.fax_number_digits,
-        addr.fax_extension,
-        addr.geo_evidence_level AS _geo_evidence_level,
-        {knn_geo_evidence_source_id_sql} AS _geo_evidence_source_id,
-        jsonb_build_object(
-            'first_line', addr.first_line,
-            'second_line', addr.second_line,
-            'city', addr.city_name,
-            'state', addr.state_name,
-            'postal_code', addr.postal_code,
-            'country_code', addr.country_code,
-            'telephone_number', {telephone_sql},
-            'fax_number', {fax_sql},
-            'phone_number', addr.phone_number,
-            'phone_extension', addr.phone_extension,
-            'fax_number_digits', addr.fax_number_digits,
-            'fax_extension', addr.fax_extension,
-            'address_key', addr.address_key::text,
-            {address_site_key_json_pair_sql}
-            'location_key', addr.location_key,
-            'address_sources', addr.address_sources,
-            'source_record_ids', addr.source_record_ids,
-            'source_count', addr.source_count,
-            'multi_source_confirmed', addr.multi_source_confirmed,
-            'source_mask', addr.source_mask,
-            'address_source_mask', addr.address_source_mask,
-            'location_confidence_id', addr.location_confidence_id,
-            'lat', addr.lat,
-            'long', addr.long
-        )::text AS address_payload,
-        ROW_NUMBER() OVER (
-            PARTITION BY addr.npi
-            ORDER BY addr.candidate_distance_miles ASC NULLS LAST,
-                     CASE addr.type WHEN 'practice' THEN 0 WHEN 'primary' THEN 1 ELSE 2 END,
-                     addr.checksum,
-                     addr.location_key
-        ) AS address_rank
-    FROM nearest_addresses addr
-    WHERE addr.geo_evidence_level IS NOT NULL
-)
-SELECT selected.*,
-       (
-           probe_stats.geocoded_probe_count + probe_stats.exact_zip_probe_count < :raw_probe_limit
-           AND NOT EXISTS (SELECT 1 FROM matched WHERE address_rank = 1 OFFSET :limit)
-       ) AS _ptg_source_exhausted,
-       (selected.npi IS NULL) AS _ptg_probe_empty
-FROM probe_stats
-LEFT JOIN LATERAL (
-    SELECT matched.*
-    FROM matched
-    WHERE address_rank = 1
-    ORDER BY distance_miles ASC NULLS LAST, npi
-    LIMIT :limit
-) selected ON TRUE
-ORDER BY selected.distance_miles ASC NULLS LAST, selected.npi
-"""
-
-
 def _membership_geo_sql(
     args: dict[str, Any],
     *,
@@ -10007,6 +9598,7 @@ async def _membership_location_query(
     coarse_taxonomy_knn: bool = False,
     limit: int,
     offset: int = 0,
+    allow_knn: bool = True,
 ) -> _MembershipLocationQuery | None:
     """Build one bounded address lookup against immutable snapshot membership."""
     _require_strict_shared_v3(serving_tables)
@@ -10017,12 +9609,14 @@ async def _membership_location_query(
     parameter_map = _membership_location_parameters(
         uses_unified_addresses=uses_unified_addresses, limit=limit, offset=offset
     )
-    knn_order_sql = _membership_knn_order_sql(
-        args,
-        candidate_npis=candidate_npis,
-        uses_unified_addresses=uses_unified_addresses,
-        offset=offset,
-    )
+    knn_order_sql = None
+    if allow_knn:
+        knn_order_sql = _membership_knn_order_sql(
+            args,
+            candidate_npis=candidate_npis,
+            uses_unified_addresses=uses_unified_addresses,
+            offset=offset,
+        )
     filter_sql_parts, knn_prefilter_sql, taxonomy_index_sql = _membership_location_filter_plan(
         args,
         parameter_map,
@@ -11139,6 +10733,87 @@ async def _membership_location_rows(
     )
 
 
+@dataclass(frozen=True)
+class _MembershipDistancePage:
+    rows: list[dict[str, Any]]
+    scanned_count: int
+    next_position: tuple[float | None, int] | None
+
+
+def _ranked_membership_sql(
+    query_context: _MembershipLocationQuery,
+    limit: int,
+    after: tuple[float | None, int] | None,
+    include_anchor: bool,
+) -> str:
+    """Apply the seek after nearest-office selection and before hydration."""
+    # Seeking before address ranking can promote a farther office for an already-seen NPI.
+    predicate = ""
+    if after is not None:
+        distance, npi = after
+        query_context.parameter_map["seek_npi"] = npi
+        comparator = ">=" if include_anchor else ">"
+        if distance is None:
+            predicate = f"distance_miles IS NULL AND npi {comparator} :seek_npi"
+        else:
+            predicate = f"distance_miles IS NULL OR (distance_miles, npi) {comparator} (:seek_distance, :seek_npi)"
+            query_context.parameter_map["seek_distance"] = distance
+    location_sql = _membership_location_sql(query_context, limit=limit, offset=0)
+    if predicate:
+        nearest_filter = "WHERE address_rank = 1"
+        if location_sql.count(nearest_filter) != 1:
+            raise PTG2ManifestArtifactError("PTG2 location relation has an invalid nearest-address filter")
+        location_sql = location_sql.replace(nearest_filter, f"{nearest_filter} AND ({predicate})")
+    return location_sql
+
+
+async def _membership_distance_page(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: dict[str, Any],
+    *,
+    candidate_npis: tuple[int, ...] | None,
+    limit: int,
+    after: tuple[float | None, int] | None = None,
+    include_anchor: bool = False,
+) -> _MembershipDistancePage | None:
+    """Seek through the exact nearest eligible address for each snapshot NPI."""
+
+    if not 1 <= limit <= _graph_location_scan_limit(1):
+        raise PTG2ManifestArtifactError("PTG2 location page exceeds its configured exactness bound")
+    if candidate_npis == ():
+        return _MembershipDistancePage([], 0, None)
+    query_context = await _membership_location_query(
+        session,
+        serving_tables,
+        args,
+        candidate_npis=candidate_npis,
+        limit=limit,
+        allow_knn=False,
+    )
+    if query_context is None:
+        return None
+
+    location_sql = _ranked_membership_sql(query_context, limit, after, include_anchor)
+    raw_rows = await _execute_ranked_membership_sql(session, query_context, location_sql)
+    scanned_count = len(raw_rows)
+    next_position = None
+    if scanned_count == limit:
+        last_row = raw_rows[-1]
+        next_position = (last_row["distance_miles"], int(last_row["npi"]))
+    address_rows = await _finalize_location_rows(
+        session,
+        query_context,
+        args,
+        raw_rows,
+        candidate_npis=candidate_npis,
+        limit=limit,
+    )
+    if address_rows is None:
+        return None
+    return _MembershipDistancePage(address_rows, scanned_count, next_position)
+
+
 async def _membership_npi_rows(
     session,
     serving_tables: PTG2ServingTables,
@@ -11507,6 +11182,11 @@ def _is_graph_location_source_exhausted(
     return len(candidate_location_rows) < probe_limit
 
 
+def _graph_location_scan_limit(batch_size: int) -> int:
+    """Keep exact seek and offset scans within the established raw allowance."""
+    return max(_ptg2_manifest_location_match_limit() * 20, batch_size)
+
+
 def _graph_location_probe_setup(
     candidate_limit: int,
     batch_size: int,
@@ -11515,7 +11195,7 @@ def _graph_location_probe_setup(
     """Return the cap, rejection policy, and request-scoped probe state."""
     configured_match_limit = _ptg2_manifest_location_match_limit()
     return (
-        max(configured_match_limit * 20, batch_size),
+        _graph_location_scan_limit(batch_size),
         candidate_limit > configured_match_limit and not require_provider_set_coverage,
         _GraphLocationProbeState(provider_set_coverage_required=require_provider_set_coverage),
     )
@@ -12163,6 +11843,25 @@ def _append_local_code_matches(
             return
 
 
+async def _append_local_distance_batch(
+    session,
+    serving_tables: PTG2ServingTables,
+    locations: Sequence[dict[str, Any]],
+    request: _LocalDistanceGraphRequest,
+    state: _LocalDistanceGraphState,
+) -> None:
+    new_npis = tuple(
+        dict.fromkeys(int(location["npi"]) for location in locations if int(location["npi"]) not in state.seen_npis)
+    )
+    memberships = await _local_v4_memberships(session, serving_tables, new_npis, request, state)
+    await _classify_local_code_sets(session, serving_tables, memberships, request, state)
+    state.seen_npis.update(new_npis)
+    for location in locations:
+        npi = int(location["npi"])
+        memberships.setdefault(npi, tuple(state.matching_sets_by_npi.get(npi, ())))
+    _append_local_code_matches(locations, memberships, request.candidate_limit, state)
+
+
 async def _scan_local_distance_graph(
     session,
     serving_tables: PTG2ServingTables,
@@ -12191,18 +11890,7 @@ async def _scan_local_distance_graph(
         if locations is None:
             return None
         new_locations = _new_local_taxonomy_locations(locations, state)
-        new_npis = tuple(
-            dict.fromkeys(
-                int(location["npi"]) for location in new_locations if int(location["npi"]) not in state.seen_npis
-            )
-        )
-        memberships = await _local_v4_memberships(session, serving_tables, new_npis, request, state)
-        await _classify_local_code_sets(session, serving_tables, memberships, request, state)
-        state.seen_npis.update(new_npis)
-        for location in new_locations:
-            npi = int(location["npi"])
-            memberships.setdefault(npi, tuple(state.matching_sets_by_npi.get(npi, ())))
-        _append_local_code_matches(new_locations, memberships, request.candidate_limit, state)
+        await _append_local_distance_batch(session, serving_tables, new_locations, request, state)
         if len(state.matched_locations) >= request.candidate_limit:
             return state.candidates()
         if not locations or _is_graph_location_source_exhausted(locations, probe_limit):
@@ -12217,6 +11905,66 @@ async def _scan_local_distance_graph(
             required_matches=request.candidate_limit,
         )
     return state.candidates()
+
+
+@dataclass(frozen=True)
+class _RankedDistanceCandidates:
+    candidates: _GraphLocationCandidates
+    scanned_count: int
+    next_position: tuple[float | None, int] | None
+
+
+async def _seek_local_distance_graph(
+    session,
+    serving_tables: PTG2ServingTables,
+    args: dict[str, Any],
+    request: _LocalDistanceGraphRequest,
+    batch_size: int,
+    max_candidates: int,
+    *,
+    after: tuple[float | None, int] | None = None,
+    include_anchor: bool = False,
+) -> _RankedDistanceCandidates | None:
+    """Classify a bounded rank window and grow raw batches across sparse matches."""
+
+    state = _LocalDistanceGraphState()
+    scanned_count = 0
+    has_provider_filter = _is_ptg2_provider_filter_requested(args)
+    max_candidates = min(max_candidates, _graph_location_scan_limit(batch_size))
+    probe_limit = min(batch_size, request.candidate_limit)
+    while len(state.matched_locations) < request.candidate_limit:
+        limit = min(probe_limit - scanned_count, max_candidates - scanned_count)
+        if limit < 1:
+            raise PTG2ManifestArtifactError("PTG2 location traversal reached its configured exactness bound")
+        page = await _membership_distance_page(
+            session, serving_tables, args, candidate_npis=None, limit=limit, after=after, include_anchor=include_anchor
+        )
+        include_anchor = False
+        if page is None:
+            return None
+        scanned_count += page.scanned_count
+        locations = [location for location in page.rows if location.get("npi") not in (None, "")]
+        if has_provider_filter and locations:
+            npis = tuple(int(location["npi"]) for location in locations)
+            matched_npis = set(await _filter_npis_by_taxonomy(session, args, npis, limit=len(npis)))
+            locations = [location for location in locations if int(location["npi"]) in matched_npis]
+        await _append_local_distance_batch(session, serving_tables, locations, request, state)
+        if len(state.matched_locations) == request.candidate_limit:
+            last_match = state.matched_locations[-1]
+            # The raw probe can contain unreturned matches after this rank.
+            after = (last_match["distance_miles"], int(last_match["npi"]))
+            break
+        after = page.next_position
+        if after is None:
+            break
+        probe_limit = _next_graph_location_probe_limit(
+            probe_limit,
+            batch_size=batch_size,
+            max_candidates=max_candidates,
+            observed_matches=len(state.matched_locations),
+            required_matches=request.candidate_limit,
+        )
+    return _RankedDistanceCandidates(state.candidates(), scanned_count, after)
 
 
 async def _bounded_exact_distance_npis(
@@ -12276,7 +12024,7 @@ async def _local_inferred_distance_graph_candidates(
     forward_limits = _v4_geo_rate_forward_limits(serving_tables)
     request = _LocalDistanceGraphRequest(candidate_limit, code_rows, forward_limits, requested_system, requested_code)
     batch_size = _graph_location_probe_batch_size(candidate_limit, taxonomy_filter_requested=False)
-    max_candidates = max(_ptg2_manifest_location_match_limit() * 20, batch_size)
+    max_candidates = _graph_location_scan_limit(batch_size)
     candidate_npis, coarse_taxonomy_knn = await _bounded_exact_distance_npis(
         session, serving_tables, args, max_candidates, candidate_limit
     )
@@ -17873,6 +17621,99 @@ async def _procedure_details_for_rows(
     }
 
 
+@dataclass(frozen=True)
+class _RankedDistanceHydration:
+    """A complete set of addresses within one bounded, admitted snapshot batch."""
+
+    candidates: _GraphLocationCandidates
+    limits: _V4GeoRateForwardLimits
+
+
+async def _read_complete_ranked_code_groups(
+    session,
+    serving_tables: PTG2ServingTables,
+    logical_rows_by_code_key: Mapping[int, Sequence[Mapping[str, Any]]],
+    declared_count_by_key: Mapping[int, int],
+    read_scope: _ManifestCodeReadScope,
+    row_allowance: int,
+) -> list[dict[str, Any]] | None:
+    """Prove every provider-scoped code exhausted within one shared allowance."""
+
+    combined_rows: list[dict[str, Any]] = []
+    for code_key, logical_code_rows in logical_rows_by_code_key.items():
+        alias_count = len(logical_code_rows)
+        per_code_limit = (row_allowance - len(combined_rows) + alias_count - 1) // alias_count
+        variant_rows = await _shared_rows_for_scope(
+            session,
+            serving_tables,
+            logical_code_rows[0],
+            read_scope,
+            limit=per_code_limit,
+            offset=0,
+        )
+        if variant_rows is None:
+            return None
+        if len(variant_rows) > min(per_code_limit, declared_count_by_key[code_key]):
+            raise PTG2ManifestArtifactError("PTG2 code variant exceeds its admitted or declared rate count")
+        if len(combined_rows) + len(variant_rows) * alias_count >= row_allowance:
+            raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
+        for logical_code_row in logical_code_rows:
+            combined_rows.extend(
+                {
+                    **variant_row,
+                    "plan_id": logical_code_row.get("plan_id"),
+                    "plan_market_type": logical_code_row.get("plan_market_type"),
+                }
+                for variant_row in variant_rows
+            )
+        variant_rows = []
+    return _manifest_code_merge_window(combined_rows, start=0, limit=None, descending=False)
+
+
+async def _complete_ranked_manifest_code_rows(
+    session,
+    serving_tables: PTG2ServingTables,
+    *,
+    code_rows: list[Mapping[str, Any]],
+    provider_set_keys: Iterable[int] | None,
+    network_names: list[str],
+    limits: _V4GeoRateForwardLimits,
+) -> list[dict[str, Any]] | None:
+    """Admit complete multi-code hydration against the remaining batch capacity."""
+
+    logical_rows_by_code_key = _manifest_code_rows_by_key(code_rows)
+    declared_count_by_key = {
+        code_key: _manifest_code_group_rate_count(logical_rows)
+        for code_key, logical_rows in logical_rows_by_code_key.items()
+    }
+    read_scope = await _version_three_provider_filter_scope(
+        session,
+        serving_tables,
+        provider_set_keys,
+        None,
+        network_names,
+        descending=False,
+        scan_budget=limits.scan_budget,
+    )
+    budget = limits.scan_budget
+    remaining = limits.maximum_code_occurrences - max(
+        budget.active_read_row_capacity, budget.active_result_row_capacity
+    )
+    if remaining < 0:
+        raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
+    row_allowance = remaining + 1
+    try:
+        budget.reserve_row_capacity(read_rows=row_allowance, result_rows=row_allowance)
+    except ForwardReadBudgetExceeded as exc:
+        raise PTG2OnlineWorkBudgetExceeded("forward_scan") from exc
+    try:
+        return await _read_complete_ranked_code_groups(
+            session, serving_tables, logical_rows_by_code_key, declared_count_by_key, read_scope, row_allowance
+        )
+    finally:
+        budget.release_row_capacity(read_rows=row_allowance, result_rows=row_allowance)
+
+
 async def _search_manifest_serving_table(
     session,
     snapshot_id: str,
@@ -17880,6 +17721,8 @@ async def _search_manifest_serving_table(
     pagination,
     serving_tables: PTG2ServingTables,
     mode_value: str,
+    *,
+    ranked_distance: _RankedDistanceHydration | None = None,
 ) -> dict[str, Any] | None:
     """Serve one strict shared V3 snapshot through sparse PostgreSQL reads."""
 
@@ -17969,6 +17812,15 @@ async def _search_manifest_serving_table(
             _ptg2_manifest_location_match_limit() + 1,
         )
     )
+    if ranked_distance is not None and (
+        not has_geographic_filter
+        or not include_providers
+        or requested_npi is not None
+        or price_filter_requested
+        or location_requires_exhaustive
+        or int(pagination.offset) != 0
+    ):
+        raise PTG2ManifestArtifactError("PTG2 ranked distance hydration requires a complete geographic batch")
     deferred_location_selection = bool(
         location_filter_requested and price_filter_requested and not uses_local_exhaustive_rate_scope
     )
@@ -18116,19 +17968,31 @@ async def _search_manifest_serving_table(
         and not use_geo_rate_prefix_selection
         and not strict_cost_provider_expansion
     ):
-        location_matches = await _ptg2_manifest_location_provider_matches(
-            session,
-            serving_tables,
-            args,
-            candidate_limit=rate_candidate_limit,
-            plan_id=requested_plan,
-            snapshot_id=snapshot_id,
-            source_key=serving_tables.source_key or args.get("source_key"),
-            provider_set_keys=provider_set_keys,
-            explicit_npi_scope=explicit_npi_scope,
-            require_exhaustive=location_requires_exhaustive,
-            require_provider_set_coverage=(location_requires_exhaustive and not include_providers),
-        )
+        if ranked_distance is not None:
+            if not ranked_distance.candidates.location_rows:
+                return no_match_response()
+            location_matches = await _project_graph_candidates(
+                session,
+                serving_tables,
+                ranked_distance.candidates,
+                plan_id=requested_plan,
+                snapshot_id=snapshot_id,
+                source_key=serving_tables.source_key or args.get("source_key"),
+            )
+        else:
+            location_matches = await _ptg2_manifest_location_provider_matches(
+                session,
+                serving_tables,
+                args,
+                candidate_limit=rate_candidate_limit,
+                plan_id=requested_plan,
+                snapshot_id=snapshot_id,
+                source_key=serving_tables.source_key or args.get("source_key"),
+                provider_set_keys=provider_set_keys,
+                explicit_npi_scope=explicit_npi_scope,
+                require_exhaustive=location_requires_exhaustive,
+                require_provider_set_coverage=(location_requires_exhaustive and not include_providers),
+            )
         if location_matches is None:
             return None
         provider_set_ids, location_providers_by_set = location_matches
@@ -18141,7 +18005,9 @@ async def _search_manifest_serving_table(
             }
         )
         is_location_selection_exhausted = (
-            location_requires_exhaustive or location_candidate_count < rate_candidate_limit
+            ranked_distance is not None
+            or location_requires_exhaustive
+            or location_candidate_count < rate_candidate_limit
         )
         if not provider_set_ids:
             return no_match_response()
@@ -18222,6 +18088,15 @@ async def _search_manifest_serving_table(
         serving_rows = list(exact_provider_materialization.row_data)
         if location_filter_requested:
             is_location_selection_exhausted = exact_provider_selection.exhausted
+    elif ranked_distance is not None:
+        serving_rows = await _complete_ranked_manifest_code_rows(
+            session,
+            serving_tables,
+            code_rows=code_rows,
+            provider_set_keys=provider_set_keys,
+            network_names=network_names,
+            limits=ranked_distance.limits,
+        )
     else:
         serving_rows = await _merge_manifest_code_variant_rows(
             session,
@@ -18246,7 +18121,9 @@ async def _search_manifest_serving_table(
     if serving_rows is None:
         return None
     is_serving_row_selection_exhausted = (
-        geo_rate_selection.exhausted
+        True
+        if ranked_distance is not None
+        else geo_rate_selection.exhausted
         if geo_rate_selection is not None
         else exact_provider_selection.exhausted
         if exact_provider_selection is not None
@@ -18414,6 +18291,8 @@ async def _search_manifest_serving_table(
         session,
         serving_rows,
     )
+    should_preserve_distance_order = is_distance_order(args) and _include_unverified_addresses(args)
+    defer_response_shaping = bool(args.get("_ptg2_defer_response_shaping"))
     for serving_row in serving_rows:
         if (
             not include_providers
@@ -18487,7 +18366,8 @@ async def _search_manifest_serving_table(
         if source_provenance is not None:
             base_response_by_field.update(_item_source_provenance(source_provenance))
         base_response_by_field["address_verification"] = _address_verification_payload(base_response_by_field, {}, {})
-        _apply_address_display_policy(base_response_by_field, args)
+        if ranked_distance is None:
+            _apply_address_display_policy(base_response_by_field, args)
         if not include_providers:
             response_items.append(base_response_by_field)
             continue
@@ -18499,6 +18379,14 @@ async def _search_manifest_serving_table(
                 [],
             )
         )
+        if ranked_distance is not None:
+            budget = ranked_distance.limits.scan_budget
+            retained_rows = max(budget.active_read_row_capacity, budget.active_result_row_capacity)
+            if (
+                len(response_items) + len(provider_rows) + retained_rows
+                > ranked_distance.limits.maximum_code_occurrences
+            ):
+                raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
         if not provider_rows and not location_filter_requested and not _is_ptg2_provider_filter_requested(args):
             response_item_by_field = dict(base_response_by_field)
             response_item_by_field["npi"] = None
@@ -18552,7 +18440,8 @@ async def _search_manifest_serving_table(
                 provider,
                 address_payload,
             )
-            _apply_address_display_policy(response_item_by_field, args)
+            if ranked_distance is None and not should_preserve_distance_order:
+                _apply_address_display_policy(response_item_by_field, args)
             response_items.append(response_item_by_field)
     if not response_items:
         return None
@@ -18591,6 +18480,8 @@ async def _search_manifest_serving_table(
         int(pagination.limit),
         0,
     )
+    if ranked_distance is not None and total_items > requested_page_end:
+        raise PTG2OnlineWorkBudgetExceeded("code_occurrences")
     membership_filter_requested = bool(location_filter_requested or direct_npi_filter_requested)
     membership_selection_exhausted = bool(direct_npi_filter_requested or is_location_selection_exhausted)
     if (
@@ -18607,9 +18498,14 @@ async def _search_manifest_serving_table(
         has_more_page_rows = end < total_items
     elif total is not None:
         has_more_page_rows = (int(pagination.offset) + len(response_items)) < int(total)
-    _hide_source_artifact_key_unless_requested(response_items, args)
+    if ranked_distance is None and not defer_response_shaping:
+        if should_preserve_distance_order:
+            for response_item_by_field in response_items:
+                _apply_address_display_policy(response_item_by_field, args)
+        _hide_source_artifact_key_unless_requested(response_items, args)
     for response_item_by_field in response_items:
-        response_item_by_field.pop("_ptg_price_key", None)
+        if not defer_response_shaping:
+            response_item_by_field.pop("_ptg_price_key", None)
         response_item_by_field.pop("_ptg_provider_rank", None)
     return _shape_ptg2_manifest_response(
         {
@@ -18675,6 +18571,7 @@ async def _search_manifest_serving_table(
         args,
         database_evidence=serving_tables.database_evidence,
         storage_generation=str(serving_tables.storage_generation or ""),
+        shape_public=ranked_distance is None and not defer_response_shaping,
     )
 
 
@@ -19936,8 +19833,102 @@ async def _search_one_ptg2_snapshot(
     )
     if db_payload is not None:
         db_payload = await _enrich_ptg2_code_details(session, db_payload, args)
-        return _shape_ptg2_response(db_payload, args)
+        return db_payload if args.get("_ptg2_defer_response_shaping") else _shape_ptg2_response(db_payload, args)
     return None
+
+
+async def _hydrate_ranked_snapshot_rates(
+    session,
+    binding: PlanReleaseSnapshotBinding,
+    tables: PTG2ServingTables,
+    args: dict[str, Any],
+    graph_request: _LocalDistanceGraphRequest,
+    after: tuple[float | None, int] | None,
+) -> tuple[RankedSnapshotBatch, dict[str, Any]]:
+    """Share one authenticated graph budget between discovery and hydration."""
+    limits = graph_request.forward_limits
+    with v4_graph_request_scope():
+        graph_root = await load_v4_graph_root(
+            session, _required_shared_snapshot_key(tables), schema_name=_payload_schema(tables)
+        )
+        multiplier = _v4_direct_io_multiplier(tables) if graph_root.representation == "direct_v1" else 1
+        with v4_graph_taxonomy_projection_scope(
+            maximum_members=limits.maximum_projection_members,
+            maximum_pages=limits.scan_budget.maximum_fragments * multiplier,
+            maximum_bytes=limits.scan_budget.maximum_raw_payload_bytes * multiplier,
+            maximum_batches=limits.maximum_graph_batches,
+        ):
+            batch_size = _graph_location_probe_batch_size(graph_request.candidate_limit, taxonomy_filter_requested=True)
+            ranked = await _seek_local_distance_graph(
+                session,
+                tables,
+                args,
+                graph_request,
+                batch_size,
+                _graph_location_scan_limit(batch_size),
+                after=after,
+                include_anchor=after is not None,
+            )
+            if ranked is None:
+                raise PlanPricingProjectionUnavailable("the ranked address relation is unavailable")
+            locations = ranked.candidates.location_rows
+            if not locations:
+                return RankedSnapshotBatch(binding.source_key, binding.snapshot_id, [], True), {}
+            snapshot_response = await _search_manifest_serving_table(
+                session,
+                binding.snapshot_id,
+                args,
+                PaginationParams(page=1, limit=limits.maximum_code_occurrences, offset=0, source="offset"),
+                tables,
+                normalize_ptg2_mode(args.get("mode")),
+                ranked_distance=_RankedDistanceHydration(ranked.candidates, limits),
+            )
+    if snapshot_response is None:
+        raise PTG2ManifestArtifactError("PTG2 ranked rate hydration is unavailable")
+    rate_groups = snapshot_response["items"]
+    if {(int(provider_row["npi"]), provider_row["distance_miles"]) for provider_row in rate_groups} != {
+        (int(provider_row["npi"]), provider_row["distance_miles"]) for provider_row in locations
+    }:
+        raise PTG2ManifestArtifactError("PTG2 ranked rate hydration changed the selected provider ranks")
+    return (
+        RankedSnapshotBatch(binding.source_key, binding.snapshot_id, rate_groups, ranked.next_position is None),
+        {key: snapshot_response[key] for key in ("query", "provenance")},
+    )
+
+
+async def _read_ranked_distance_snapshot(
+    session,
+    binding: PlanReleaseSnapshotBinding,
+    serving_tables: PTG2ServingTables,
+    args: dict[str, Any],
+    candidate_target: int,
+    after: tuple[float | None, int] | None,
+) -> tuple[RankedSnapshotBatch, dict[str, Any]]:
+    """Read complete rate groups for one admitted snapshot's next ranked candidates."""
+
+    args = binding_query_args(args, binding)
+    tables = await read_serving_tables(session, binding.snapshot_id, serving_tables=serving_tables)
+    _require_strict_shared_v3(tables)
+    if not _uses_local_distance_rate_scope(tables, args, {}, None, None, candidate_target):
+        raise PlanPricingProjectionUnavailable("the selected snapshot does not support ranked distance continuation")
+    requested = _ptg2_manifest_plan_code_values(args)
+    if requested is None:
+        raise PlanPricingProjectionUnsupported("distance continuation requires a procedure code")
+    plan_id, system, code = requested
+    code_rows = await _shared_rate_code_scope_rows(
+        session,
+        tables,
+        plan_id=plan_id,
+        plan_market_type=binding.plan_market_type,
+        reported_code=code,
+        code_system=system,
+    )
+    if not code_rows:
+        return RankedSnapshotBatch(binding.source_key, binding.snapshot_id, [], True), {}
+
+    limits = _v4_geo_rate_forward_limits(tables)
+    graph_request = _LocalDistanceGraphRequest(candidate_target, code_rows, limits, system, code)
+    return await _hydrate_ranked_snapshot_rates(session, binding, tables, args, graph_request, after)
 
 
 async def _search_candidate_ptg2_snapshot(
@@ -20673,9 +20664,7 @@ async def _search_multi_ptg2_snapshots(
     contributing_bindings: tuple[PlanReleaseSnapshotBinding, ...] | None = None,
 ) -> dict[str, Any] | None:
     """Union attributable network rows into one globally ordered plan page."""
-    # Pull enough from each network to fill the requested page after the merge:
-    # the global window [offset, offset+limit) could be satisfied entirely by a
-    # single network, so fetch (offset+limit) rows from each, merge, then slice.
+    # Read each network through the global page boundary before merging.
     fetch_count = max(1, int(pagination.offset) + int(pagination.limit))
     sub_pagination = PaginationParams(
         page=1,
@@ -20694,16 +20683,11 @@ async def _search_multi_ptg2_snapshots(
     )
     if network_responses is None:
         return None
-    (
-        combined_provider_items,
-        total,
-        base_query_by_field,
-        matched_networks,
-    ) = _combine_ptg2_network_results(network_responses)
+    combined_provider_items, total, base_query_by_field, matched_networks = _combine_ptg2_network_results(
+        network_responses
+    )
 
     if base_query_by_field is None:
-        # No network produced a payload, so behave like
-        # the single-snapshot path returning no match.
         return None
 
     response_by_field = _multi_snapshot_response(
@@ -20744,6 +20728,13 @@ def _multi_snapshot_response(
     start = max(int(pagination.offset), 0)
     end = start + max(int(pagination.limit), 0)
     page_items = ordered_items[start:end]
+    if is_distance_order(args):
+        for page_item in page_items:
+            if _include_unverified_addresses(args):
+                _apply_address_display_policy(page_item, args)
+            page_item.pop("_ptg_price_key", None)
+        shaped = _shape_ptg2_response({"items": page_items, "query": base_query_by_field}, args)
+        page_items, base_query_by_field = shaped["items"], shaped["query"]
     query_by_field = {
         **base_query_by_field,
         "source_key": None,
@@ -20830,16 +20821,18 @@ async def _read_multi_ptg2_snapshots(
             return None
     network_responses = []
     for source_key, snapshot_id in network_snapshots:
-        network_args = args
+        network_query_by_field = args
         if release_selection is not None:
             binding = binding_by_network.get((source_key, snapshot_id))
             if binding is None:
                 return None
-            network_args = binding_query_args(args, binding)
+            network_query_by_field = binding_query_args(args, binding)
+        if is_distance_order(args):
+            network_query_by_field = {**network_query_by_field, "_ptg2_defer_response_shaping": True}
         network_response = await _search_one_ptg2_snapshot(
             session,
             snapshot_id,
-            network_args,
+            network_query_by_field,
             sub_pagination,
             serving_tables=serving_tables_by_snapshot_id[snapshot_id],
         )
@@ -20859,6 +20852,12 @@ async def _search_established_plan_release_index(
     serving_tables_by_snapshot_id = release_selection.network_tables_by_snapshot(contributing_bindings=release_bindings)
     if serving_tables_by_snapshot_id is None:
         return None
+    if DISTANCE_CONTINUATION_FIELD in args:
+        ranked_page = await search_ranked_distance_release(
+            session, release_selection, release_bindings, serving_tables_by_snapshot_id, args, pagination
+        )
+        if ranked_page is not None:
+            return ranked_page
     if not release_bindings:
         return _plan_release_no_match_response(
             release_selection, args, pagination, contributing_bindings=release_bindings

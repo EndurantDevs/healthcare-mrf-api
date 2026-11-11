@@ -78,6 +78,15 @@ async def test_leaf_relation_does_not_apply_catalog_no_inheritance_rule():
 
 
 @pytest.mark.asyncio
+async def test_pinned_reader_checks_same_leaf_custody_without_requesting_another_lock():
+    relation_by_field = {**_inventory()["relations"][0], "protected": True}
+    session = _session(relation_by_field)
+    assert await held.read_protected_tiger_relation(session, '"held"."zip_state"') == _inventory()["relations"][0]
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert len(statements) == 1 and "LOCK TABLE" not in statements[0]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("locked", (False, None))
 async def test_selection_refuses_busy_or_unavailable_advisory_fence(locked):
     session = _session(scalars=(locked,))

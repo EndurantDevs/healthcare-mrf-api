@@ -68,6 +68,32 @@ cannot prove completion.
 
 ## Response lanes
 
+### Full-view distance continuation
+
+Canonical release searches with ascending distance order, a procedure code,
+provider expansion, enabled `include_unverified_addresses` (the default), and
+explicit `include_allowed_amounts=false` can return
+`pagination.next_cursor` from the full-view reader. The selected snapshots must
+support the sealed V4 distance and rate budgets, and the existing billing-search
+cursor keyring must be configured. First pages use `offset=0`. Continue with the
+returned `cursor` and the same query fields and page size, omitting any nonzero
+`offset`.
+
+Requests with `include_unverified_addresses=false` use the established numeric
+offset reader on every page, preserving its ordering after address suppression.
+
+Each page retains complete provider rate groups, source identities, address
+evidence and the existing optional code details. A boundary within one
+distance/NPI tie resumes the remaining groups across all admitted snapshots.
+The cursor binds the query, current authorization, serving revision, exact
+source bindings and native provider/address generations. Geographic references
+and protected inherited leaves remain pinned through each page. A changed or
+expired generation returns a conflict and requires a new traversal.
+
+`pagination.total` and `total_lower_bound` describe the observed lower bound
+until `total_is_exact=true`. Finish at `has_more=false`. Work that exceeds a
+sealed read or complete-group budget fails before a page is returned.
+
 Provider cards contain NPI, provider name, credential, primary taxonomy and
 specialty, classification, city/state/ZIP, minimum and maximum negotiated
 rate, and rate count. The v3 reader combines release-frozen membership and
