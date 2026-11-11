@@ -8,7 +8,9 @@ import asyncpg
 from sanic.exceptions import NotFound, SanicException
 from sqlalchemy.exc import DBAPIError
 
-from api.network_address_scope import current_network_address_scope, network_address_read_scope
+from api.network_address_scope import _bound_address_read_session_scope, current_network_address_scope
+from api.network_read_execution import _original_read_driver
+from api.network_serving_api_read import api_catalog_read_snapshot
 from api.provider_detail_network_contract import ProviderDetailNetworkQuery, parse_managed_detail_query
 from api.provider_profile_snapshot import provider_profile_read_snapshot
 from db.registry_schema import registry_schema
@@ -19,8 +21,10 @@ from process.registry_network_catalog_read import (
     RegistryNetworkCatalogLegacyBatchSelector,
     _closed_json,
     _exclusions,
-    _pin,
     resolve_registry_network_catalog_legacy,
+)
+from process.registry_network_catalog_read import (
+    _pin as _pin,
 )
 from process.registry_provider_plan_read import RegistryProviderPlansQuery, read_registry_provider_plans
 
@@ -187,15 +191,13 @@ async def managed_provider_network_read_scope(
     session, *, selector, network_generation, excluded_network_ids, access_scope_sha256, organization_policy=None
 ):
     """Pin and authorize one collection or detail in the existing Reader snapshot."""
-    from process.registry_network_catalog_read import registry_catalog_read_snapshot
-
     exclusions = _exclusions(excluded_network_ids)
     if organization_policy is not None and type(organization_policy) is not RegistryOrganizationVisibility:
         raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
     control_schema = registry_schema()
-    connection = await session.connection()
-    driver = (await connection.get_raw_connection()).driver_connection
-    async with registry_catalog_read_snapshot(driver, network_generation, control_schema) as manifest:
+    transaction = session.get_transaction()
+    driver, backend_pid = await _original_read_driver(session)
+    async with api_catalog_read_snapshot(session, network_generation, control_schema) as (manifest, approved_relation):
         if network_generation is not None and manifest.generation_id != network_generation:
             raise RegistryNetworkCatalogError("registry_network_catalog_source_changed")
         network_ids = await _selected_networks(
@@ -203,9 +205,14 @@ async def managed_provider_network_read_scope(
         )
         scope_options = {"excluded_network_ids": exclusions} if network_ids is None else {}
         if type(selector) is RegistryNetworkCatalogLegacyBatchSelector and selector.namespace == "checksum_network":
-            scope_options["legacy_checksums"] = tuple(sorted(int(value) for value in selector.values))
-        with network_address_read_scope(
+            scope_options["legacy_checksums"] = tuple(sorted(int(checksum) for checksum in selector.values))
+        async with _bound_address_read_session_scope(
+            session,
+            transaction,
+            driver,
+            backend_pid,
             manifest,
+            approved_relation,
             network_ids,
             access_scope_sha256=access_scope_sha256,
             organization_policy=organization_policy,

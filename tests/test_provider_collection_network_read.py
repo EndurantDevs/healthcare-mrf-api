@@ -11,8 +11,7 @@ from unittest.mock import AsyncMock
 
 import asyncpg
 import pytest
-from sanic import Request, response
-from sanic.compat import Header
+from sanic import response
 from sanic.exceptions import SanicException
 
 from api import provider_batch
@@ -25,6 +24,7 @@ from process import registry_network_catalog_read as catalog
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 from process.registry_network_catalog_read import RegistryNetworkCatalogError
+from tests.provider_network_read_support import approved_record_relation, provider_reader_double, provider_test_request
 
 NPI = "0000000049"
 DIGEST = "a" * 64
@@ -32,13 +32,14 @@ DIGEST = "a" * 64
 
 @pytest.fixture
 def boundary(monkeypatch):
+    """Isolate route orchestration; native pin authority is tested independently."""
     candidate = "11111111-1111-4111-8111-111111111111"
     manifest = PinnedNetworkServingManifest(
         9, candidate, "network_candidate_" + candidate.replace("-", ""), 1, {}, 4, "b" * 64, 123
     )
-    driver = SimpleNamespace(fetchval=AsyncMock(return_value=1))
-    connection = SimpleNamespace(get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=driver)))
-    session = SimpleNamespace(connection=AsyncMock(return_value=connection))
+    driver, session = provider_reader_double(
+        lambda: detail.resolve_registry_network_catalog_legacy.return_value["items"]
+    )
     state = SimpleNamespace(
         active=False, catalog_active=False, snapshots=[], seen=[], document={"rows": [], "total_source": "omitted"}
     )
@@ -54,10 +55,10 @@ def boundary(monkeypatch):
             state.active = False
 
     @asynccontextmanager
-    async def catalog_snapshot(driver, generation, schema):
+    async def catalog_snapshot(actual_session, generation, schema):
         state.catalog_active = True
         try:
-            yield await detail._pin(driver, generation, schema)
+            yield await detail._pin(driver, generation, schema), approved_record_relation(schema)
         finally:
             state.catalog_active = False
 
@@ -78,7 +79,7 @@ def boundary(monkeypatch):
     monkeypatch.setattr(collection, "provider_geo_read_snapshot", snapshot)
     monkeypatch.setattr(detail, "registry_schema", lambda: "sample_registry")
     monkeypatch.setattr(detail, "_pin", AsyncMock(return_value=manifest))
-    monkeypatch.setattr(catalog, "registry_catalog_read_snapshot", catalog_snapshot, raising=False)
+    monkeypatch.setattr(detail, "api_catalog_read_snapshot", catalog_snapshot)
     monkeypatch.setattr(
         detail,
         "resolve_registry_network_catalog_legacy",
@@ -88,7 +89,7 @@ def boundary(monkeypatch):
     monkeypatch.setattr(provider, "get_near_npi", AsyncMock(side_effect=native_read))
     monkeypatch.setattr(provider_batch, "read_native_batch", AsyncMock(side_effect=batch_read))
     path = b"/api/v1/registry/serving/providers/collection?plan_network=99"
-    request = Request(path, Header({}), "1.1", "POST", None, SimpleNamespace(config={}))
+    request = provider_test_request(path)
     return SimpleNamespace(request=request, driver=driver, session=session, manifest=manifest, state=state)
 
 

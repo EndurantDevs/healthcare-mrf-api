@@ -56,6 +56,7 @@ async def collection_transport(profile_transport, monkeypatch):
         return manifest
 
     monkeypatch.setattr(catalog, "_pin", observe_pin)
+    monkeypatch.setattr(catalog, "catalog_pin", observe_pin)
     monkeypatch.setattr(catalog, "resolve_network_serving_manifest", observe_custody)
     sentinel = object()
 
@@ -99,7 +100,7 @@ def _reader_evidence(case):
     assert len(case.pins) == len(case.custody) == 1
     arguments, options_by_name, manifest = case.custody[0]
     assert len(arguments) == 1 and arguments[0] is case.pins[0][0]
-    assert options_by_name == {"generation_id": case.pins[0][1], "control_schema": case.pins[0][2]}
+    assert options_by_name == {"generation_id": case.pins[0][1], "control_schema": case.pins[0][2], "api_read": True}
     assert manifest == context.manifest
     seal = getattr(manifest, "_custody_seal_sha256", None)
     assert type(seal) is str and len(seal) == 64 and set(seal) <= set("0123456789abcdef")

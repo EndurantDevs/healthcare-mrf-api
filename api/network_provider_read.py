@@ -45,7 +45,36 @@ class NetworkProviderNotFound(LookupError):
     """This identity has no selected office in the pinned network."""
 
 
-_PROVIDERS_SQL = """WITH selected_addresses AS NOT MATERIALIZED (
+_PROVIDER_RESULT_SQL = """locations AS MATERIALIZED (
+  SELECT selected.provider_system,selected.provider_id,selected.location_id,
+    jsonb_build_object('location_id',selected.location_id::text,'location_key',selected.location_key,
+      'first_line',first_line,'second_line',second_line,'city_name',city_name,'state_name',state_name,
+      'postal_code',postal_code,'country_code',country_code,'lat',lat,'long',long) AS document
+  FROM offices selected JOIN page USING(provider_system,provider_id) WHERE page.consistent AND page.location_count<=$6
+), bounds AS (
+  SELECT coalesce(bool_and(consistent AND location_count<=$6),true) AS valid,
+    coalesce(sum(octet_length(provider_id)+octet_length(coalesce(display_name,''))+256),0)
+      +coalesce((SELECT sum(octet_length(document::text)+2) FROM locations),0)<=$7-1024 AS bounded
+  FROM page
+), providers AS (
+  SELECT page.provider_system,page.provider_id,jsonb_build_object(
+    'provider_system',page.provider_system,'provider_id',page.provider_id,'display_name',page.display_name,
+    'npi',page.npi,'locations',coalesce((SELECT jsonb_agg(document ORDER BY location_id)
+      FROM locations WHERE locations.provider_system=page.provider_system
+        AND locations.provider_id=page.provider_id),'[]'::jsonb)) AS document
+  FROM page,bounds WHERE bounds.valid AND bounds.bounded
+), result AS (
+  SELECT jsonb_build_object('generation_id',$8::bigint,'total_count',(SELECT count(*) FROM identities),
+    'limit',$4::integer,'offset',$5::integer,'has_more',(SELECT count(*) FROM identities)>$5+$4,
+    'providers',coalesce((SELECT jsonb_agg(document ORDER BY provider_system COLLATE "C",provider_id COLLATE "C")
+      FROM providers),'[]'::jsonb))::text AS document
+)
+SELECT integrity.valid AND bounds.valid AS valid,bounds.bounded AND octet_length(result.document)<=$7 AS bounded,
+  CASE WHEN integrity.valid AND bounds.valid AND bounds.bounded AND octet_length(result.document)<=$7
+    THEN result.document END AS result FROM integrity,bounds,result"""
+
+_PROVIDERS_SQL = (
+    """WITH selected_addresses AS NOT MATERIALIZED (
   SELECT location_key,entity_type,entity_id,entity_name,npi,first_line,second_line,city_name,state_name,
     postal_code,country_code,lat,long FROM {addresses}
   WHERE {address_membership}
@@ -98,33 +127,47 @@ _PROVIDERS_SQL = """WITH selected_addresses AS NOT MATERIALIZED (
   FROM offices GROUP BY provider_system,provider_id
 ), page AS MATERIALIZED (
   SELECT * FROM identities ORDER BY provider_system COLLATE "C",provider_id COLLATE "C" LIMIT $4 OFFSET $5
-), locations AS MATERIALIZED (
-  SELECT selected.provider_system,selected.provider_id,selected.location_id,
-    jsonb_build_object('location_id',selected.location_id::text,'location_key',selected.location_key,
-      'first_line',first_line,'second_line',second_line,'city_name',city_name,'state_name',state_name,
-      'postal_code',postal_code,'country_code',country_code,'lat',lat,'long',long) AS document
-  FROM offices selected JOIN page USING(provider_system,provider_id) WHERE page.consistent AND page.location_count<=$6
-), bounds AS (
-  SELECT coalesce(bool_and(consistent AND location_count<=$6),true) AS valid,
-    coalesce(sum(octet_length(provider_id)+octet_length(coalesce(display_name,''))+256),0)
-      +coalesce((SELECT sum(octet_length(document::text)+2) FROM locations),0)<=$7-1024 AS bounded
-  FROM page
-), providers AS (
-  SELECT page.provider_system,page.provider_id,jsonb_build_object(
-    'provider_system',page.provider_system,'provider_id',page.provider_id,'display_name',page.display_name,
-    'npi',page.npi,'locations',coalesce((SELECT jsonb_agg(document ORDER BY location_id)
-      FROM locations WHERE locations.provider_system=page.provider_system
-        AND locations.provider_id=page.provider_id),'[]'::jsonb)) AS document
-  FROM page,bounds WHERE bounds.valid AND bounds.bounded
-), result AS (
-  SELECT jsonb_build_object('generation_id',$8::bigint,'total_count',(SELECT count(*) FROM identities),
-    'limit',$4::integer,'offset',$5::integer,'has_more',(SELECT count(*) FROM identities)>$5+$4,
-    'providers',coalesce((SELECT jsonb_agg(document ORDER BY provider_system COLLATE "C",provider_id COLLATE "C")
-      FROM providers),'[]'::jsonb))::text AS document
+), """
+    + _PROVIDER_RESULT_SQL
 )
-SELECT integrity.valid AND bounds.valid AS valid,bounds.bounded AND octet_length(result.document)<=$7 AS bounded,
-  CASE WHEN integrity.valid AND bounds.valid AND bounds.bounded AND octet_length(result.document)<=$7
-    THEN result.document END AS result FROM integrity,bounds,result"""
+
+_MEMBERSHIP_PROVIDERS_SQL = (
+    """WITH identities AS MATERIALIZED (
+  SELECT DISTINCT provider_system,provider_id FROM ONLY {namespace}.network_membership
+  WHERE network_id=ANY($1::text::integer[])
+), page_identities AS MATERIALIZED (
+  SELECT * FROM identities ORDER BY provider_system COLLATE "C",provider_id COLLATE "C" LIMIT $4 OFFSET $5
+), selected_memberships AS MATERIALIZED (
+  SELECT DISTINCT member.provider_system,member.provider_id,member.location_id
+  FROM page_identities page JOIN ONLY {namespace}.network_membership member USING(provider_system,provider_id)
+  WHERE member.network_id=ANY($1::text::integer[])
+), selected AS MATERIALIZED (
+  SELECT member.*,binding.location_key,address.location_key AS matched_key,address.entity_name,address.npi,
+    address.first_line,address.second_line,address.city_name,address.state_name,address.postal_code,
+    address.country_code,address.lat,address.long
+  FROM selected_memberships member LEFT JOIN ONLY {namespace}.provider_location_binding binding
+    ON (binding.provider_system,binding.provider_id,binding.location_id)
+      =(member.provider_system,member.provider_id,member.location_id)
+  LEFT JOIN LATERAL (SELECT * FROM {addresses} address
+    WHERE (address.location_key,address.entity_type,address.entity_id)
+      =(binding.location_key,binding.entity_type,binding.entity_id) OFFSET 0) address ON true
+), integrity AS (
+  SELECT count(*)=count(DISTINCT (provider_system,provider_id,location_id))
+    AND coalesce(bool_and(matched_key IS NOT NULL AND provider_system IN ('npi','manual','provider_directory')
+      AND location_id<>'00000000-0000-0000-0000-000000000000'::uuid
+      AND location_key ~ '^[0-9a-f]{{64}}$'),true)
+    AND ($2::text,$3::text,$9::uuid,$10::double precision,$11::double precision,$12::double precision) IS NULL
+    AS valid FROM selected
+), offices AS MATERIALIZED (
+  SELECT DISTINCT ON(provider_system,provider_id,location_key) * FROM selected
+  ORDER BY provider_system,provider_id,location_key,location_id
+), page AS MATERIALIZED (
+  SELECT provider_system,provider_id,min(entity_name) AS display_name,min(npi) AS npi,
+    count(*) AS location_count,count(DISTINCT entity_name)<=1 AND count(DISTINCT npi)<=1 AS consistent
+  FROM offices GROUP BY provider_system,provider_id
+), """
+    + _PROVIDER_RESULT_SQL
+)
 
 
 def _selector(provider_system, provider_id):
@@ -263,14 +306,19 @@ async def _read(connection, scope, selector, limit, offset, control_schema, offi
         )
         if current != scope.manifest:
             raise NetworkProviderReadUnavailable("Canonical provider generation differs from the pinned scope")
-        addresses, address_arguments = _provider_addresses(current, scope.network_ids)
-        relations = _provider_read_relations(current)
+        membership_page = (
+            current.supports_membership_pages
+            and selector == (None, None)
+            and all(filter_value is None for filter_value in office_filters)
+        )
+        addresses, address_arguments = _provider_addresses(current, scope.network_ids, membership_page=membership_page)
+        relations = _provider_read_relations(current, membership_page=membership_page)
         backend_pid = connection.get_server_pid()
         receipt = await connection.fetchrow(
-            _PROVIDERS_SQL.format(
+            (_MEMBERSHIP_PROVIDERS_SQL if membership_page else _PROVIDERS_SQL).format(
                 namespace=_identifier(current.schema_name),
                 addresses=addresses,
-                # Compact addresses already select the same networks through pinned edges.
+                # The full compact address query already applies its pinned edges.
                 address_membership="TRUE"
                 if current.compact_layout is not None
                 else "canonical_network_ids && $1::text::integer[]",
@@ -314,7 +362,7 @@ def _candidate_relations(manifest, names):
     return tuple(selected_pins)
 
 
-def _provider_read_relations(manifest):
+def _provider_read_relations(manifest, *, membership_page=False):
     relations = _candidate_relations(manifest, ("network_membership", "provider_location_binding"))
     if manifest.compact_layout is None:
         return relations + (
@@ -325,12 +373,14 @@ def _provider_read_relations(manifest):
     return relations + compact_address_read_relations(manifest.compact_layout)
 
 
-def _provider_addresses(manifest, network_ids):
+def _provider_addresses(manifest, network_ids, *, membership_page=False):
     if manifest.compact_layout is None:
         return "ONLY " + _identifier(manifest.schema_name) + ".entity_address_unified", ()
     from api.network_compact_address import compact_address_native_sql
 
-    return compact_address_native_sql(manifest.compact_layout, first_parameter=13, network_ids=network_ids)
+    return compact_address_native_sql(
+        manifest.compact_layout, first_parameter=13, network_ids=network_ids, location_lookup=membership_page
+    )
 
 
 async def read_network_provider_page(

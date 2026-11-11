@@ -11,9 +11,9 @@ from process.registry_catalog_policy import RegistryOrganizationVisibility
 from process.registry_network_catalog_read import (
     MAX_RESPONSE_BYTES,
     RegistryNetworkCatalogError,
+    _catalog_manifest,
     _closed_json,
     _integer,
-    _pin,
     _text,
     _uuid,
 )
@@ -155,7 +155,9 @@ def _read_scope(query, organization_policy):
     return query.record_ids, organization_policy.excluded_group_ids, organization_policy.exclusions(query.record_kind)
 
 
-async def read_registry_serving_organizations(connection, query, *, organization_policy=None, control_schema=None):
+async def read_registry_serving_organizations(
+    connection, query, *, organization_policy=None, control_schema=None, manifest=None
+):
     """Read selected metadata with independent visibility in one retained approval.
 
     Trusted v2 callers supply default-visible typed exceptions. The prepared
@@ -172,7 +174,7 @@ async def read_registry_serving_organizations(connection, query, *, organization
         if record_ids is not None:
             sql = sql.replace("AND $4::text[] IS NOT NULL", "AND $4::text[] IS NOT NULL AND record_key=ANY($8::text[])")
     try:
-        manifest = await _pin(connection, query.generation_id, control_schema)
+        manifest = await _catalog_manifest(connection, query.generation_id, control_schema, manifest)
         parameters = (
             manifest.approved_custom_revision,
             query.record_kind,

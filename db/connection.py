@@ -321,17 +321,26 @@ class Database:
         pool_size = max(pool_min, 1)
         max_overflow = max(pool_max - pool_size, 0)
 
+        reader_engine_by_option = {}
+        if self._reader_login:
+            reader_engine_by_option = {
+                "isolation_level": "REPEATABLE READ",
+                "execution_options": {"postgresql_readonly": True},
+            }
+            # Metadata and bounded API reads do not amortize query JIT compilation.
+            if driver == "postgresql+asyncpg":
+                reader_engine_by_option["connect_args"] = {"server_settings": {"jit": "off"}}
+            elif driver == "postgresql+psycopg":
+                server_options = f"{os.getenv('PGOPTIONS', '')} -c jit=off".strip()
+                reader_engine_by_option["connect_args"] = {"options": server_options}
+
         self.engine = create_async_engine(
             url,
             pool_size=pool_size,
             max_overflow=max_overflow,
             echo=_is_env_enabled(os.getenv("HLTHPRT_DB_ECHO")),
             hide_parameters=True,
-            **(
-                {"isolation_level": "REPEATABLE READ", "execution_options": {"postgresql_readonly": True}}
-                if self._reader_login
-                else {}
-            ),
+            **reader_engine_by_option,
         )
         self.session_factory = async_sessionmaker(
             self.engine,

@@ -11,9 +11,19 @@ from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
+from api.network_address_scope import (
+    network_address_read_session_scope,
+    scoped_address_parameters,
+    scoped_address_relation_sql,
+)
+from api.network_read_execution import execute_network_read
+from api.network_serving_api_read import api_catalog_read_snapshot, resolve_api_network_pin
+from api.reference_family_reads import pin_claims_reader
+from db.connection import Database, current_session
 from process import network_indexed_address_artifact as indexed
 from process.entity_address_unified import _location_key_expr
 from process.network_address_artifact import NetworkAddressArtifactError, verify_network_address_artifact
@@ -23,10 +33,13 @@ from process.network_membership_candidate_lifecycle import create_network_candid
 from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_pipeline import prepare_network_candidate
 from process.network_membership_publication import publish_network_candidate
+from process.network_serving_api_sql import api_serving_pin_statement
+from process.network_serving_read import NetworkServingReadUnavailable
 from process.registry_candidate_composition import (
     RegistryCompositionAddressSources,
     compose_registry_membership_candidate,
 )
+from process.registry_publication_consumer import _publication_address_sources
 from process.registry_retained_generation import RegistryRetainedGenerationError
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from tests.registry_candidate_custody_postgres_support import install_candidate_custody
@@ -764,3 +777,174 @@ async def test_retained_successor_refuses_drift_and_re_arms(indexed_db):
     finally:
         await fixture.connection.execute(f'REVOKE "{stranger}" FROM "{fixture.executor_role}"')
         await fixture.connection.execute(f'DROP ROLE "{stranger}"')
+
+
+async def _publish_api_candidate(fixture, previous, address_sources):
+    target, address_source = await compose_registry_membership_candidate(
+        fixture.execution_connection,
+        request_id=uuid4(),
+        approved_revision=0,
+        expected_head=previous.generation_id,
+        address_sources=address_sources,
+        writer_roles=fixture.writer_roles,
+        source_manifest=previous,
+        control_schema=fixture.control_schema,
+    )
+    assert address_source == fixture.source
+    await _prepare(fixture, target)
+    await _seal(fixture, target)
+    await _publish(fixture, target)
+    return await _read(fixture)
+
+
+@pytest.fixture
+async def indexed_api_db(indexed_db, monkeypatch):
+    fixture = indexed_db
+    previous, address_sources = await _publication_address_sources(
+        fixture.execution_connection,
+        fixture.previous.generation_id,
+        SimpleNamespace(control_schema=fixture.control_schema),
+        RegistryCompositionAddressSources(fixture.indexed_source, compact=True),
+    )
+    assert previous == fixture.previous and address_sources.base_source == fixture.indexed_source
+    fixture.source = address_sources.base_source
+    retained, address_rows = await _publish_api_candidate(fixture, previous, address_sources)
+    current, current_rows = await _publish_api_candidate(fixture, retained, address_sources)
+    assert current_rows == address_rows and len(address_rows) == 1
+    assert retained.supports_location_lookup and current.supports_location_lookup
+    assert current.compact_layout.base == retained.compact_layout.base
+    assert len(current.compact_layout.artifacts) == 1
+    assert current.compact_layout.artifacts == retained.compact_layout.artifacts
+    assert current.compact_layout.artifacts[0].candidate_id not in (retained.candidate_id, current.candidate_id)
+
+    role, password, url = fixture.roles["reader"], uuid4().hex, fixture.engine.url
+    await fixture.connection.execute(f"ALTER ROLE \"{role}\" LOGIN PASSWORD '{password}'")
+    settings_by_name = {
+        "DRIVER": "asyncpg",
+        "HOST": url.host,
+        "PORT": str(url.port),
+        "DATABASE": url.database,
+        "READER_USER": role,
+        "READER_PASSWORD": password,
+        "READER_POOL_MIN_SIZE": "1",
+        "READER_POOL_MAX_SIZE": "1",
+    }
+    for name, setting_value in settings_by_name.items():
+        monkeypatch.setenv("HLTHPRT_DB_" + name, setting_value)
+    monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", fixture.control_schema)
+    database = Database()
+    database._database_override = url.database
+    requests = []
+    native_fetchrow = asyncpg.Connection.fetchrow
+    metadata_sql = api_serving_pin_statement(fixture.control_schema)
+
+    async def observe_metadata(connection, statement, *parameters, **options):
+        address_entry = await native_fetchrow(connection, statement, *parameters, **options)
+        if statement == metadata_sql:
+            requests.append((connection, parameters, address_entry))
+        return address_entry
+
+    monkeypatch.setattr(asyncpg.Connection, "fetchrow", observe_metadata)
+    try:
+        yield SimpleNamespace(
+            fixture=fixture,
+            database=database,
+            current=current,
+            retained=retained,
+            address_rows=address_rows,
+            requests=requests,
+        )
+    finally:
+        await database.disconnect()
+
+
+async def _api_rows(held, generation_id):
+    async with held.database.reader_session() as session:
+        assert session.info["api_reader_verified"] is True and current_session() is session
+        identity_by_field = dict(session.info["api_reader_identity"])
+        transaction = session.get_transaction()
+        await pin_claims_reader(session, api_read=True)
+        before = len(held.requests)
+        async with api_catalog_read_snapshot(session, generation_id) as (manifest, approved_relation):
+            assert len(held.requests) == before + 1
+            driver, parameters, entry = held.requests[-1]
+            assert parameters == (held.fixture.control_schema, generation_id, 8388608)
+            assert entry["control_consumed"] is True and entry["edge_candidate_count"] == 1
+            assert entry["current_user"] == entry["session_user"] == held.fixture.roles["reader"]
+            assert {field: entry[field] for field in identity_by_field} == identity_by_field
+            controls = manifest._api_control_relations
+            expected = await held.fixture.connection.fetch(
+                "SELECT relname,oid::bigint AS oid FROM pg_class WHERE relnamespace=to_regnamespace($1) "
+                "AND relname=ANY($2::text[]) ORDER BY relname",
+                held.fixture.control_schema,
+                [pin.table_name for pin in controls],
+            )
+            assert len(controls) == 5
+            assert sorted((pin.table_name, pin.table_oid) for pin in controls) == [
+                tuple(address_entry) for address_entry in expected
+            ]
+            assert approved_relation in controls
+            families = json.loads(entry["families_json"])
+            assert len(families) == 2
+            assert sum(family["projected_edge"] is True for family in families) == 1
+            async with network_address_read_session_scope(session, manifest, (42,)):
+                relation = scoped_address_relation_sql("mrf.entity_address_unified")
+                address_result = await execute_network_read(
+                    session,
+                    text(f"SELECT location_key,canonical_network_ids FROM {relation} offices ORDER BY location_key"),
+                    scoped_address_parameters({}),
+                )
+                address_rows = [dict(address_entry) for address_entry in address_result.mappings()]
+            assert session.get_transaction() is transaction and session.get_nested_transaction() is None
+            assert driver.get_server_pid() == identity_by_field["backend_pid"]
+        return manifest, address_rows
+
+
+async def test_indexed_api_pin_one_query_full_validation_and_retained_reader_parity(indexed_api_db):
+    held = indexed_api_db
+    expected_rows = [
+        {field: address_entry[field] for field in ("location_key", "canonical_network_ids")}
+        for address_entry in held.address_rows
+    ]
+    for generation_id, expected_manifest in (
+        (None, held.current),
+        (held.current.generation_id, held.current),
+        (held.retained.generation_id, held.retained),
+    ):
+        manifest, address_rows = await _api_rows(held, generation_id)
+        assert manifest == expected_manifest and address_rows == expected_rows
+    assert len(held.requests) == 3 and not held.database.has_reader_session()
+
+
+@pytest.mark.parametrize("damage", ["actor", "relation", "publication"])
+async def test_indexed_api_pin_refuses_native_drift_before_rows(indexed_api_db, damage):
+    held = indexed_api_db
+    fixture, base = held.fixture, held.current.compact_layout.base
+    commands_by_damage = {
+        "actor": (
+            f'ALTER ROLE "{fixture.roles["reader"]}" CREATEROLE',
+            f'ALTER ROLE "{fixture.roles["reader"]}" NOCREATEROLE',
+        ),
+        "relation": (
+            f'ALTER TABLE "{base.schema_name}"."{base.table_name}" ENABLE ROW LEVEL SECURITY',
+            f'ALTER TABLE "{base.schema_name}"."{base.table_name}" DISABLE ROW LEVEL SECURITY',
+        ),
+        "publication": (
+            f'UPDATE "{fixture.control_schema}".network_serving_manifest SET eligible=false',
+            f'UPDATE "{fixture.control_schema}".network_serving_manifest SET eligible=true',
+        ),
+    }
+    change, restore = commands_by_damage[damage]
+    await fixture.connection.execute(change)
+    try:
+        for generation_id in (None, held.retained.generation_id):
+            async with held.database.reader_session() as session:
+                await pin_claims_reader(session, api_read=True)
+                before = len(held.requests)
+                with pytest.raises(NetworkServingReadUnavailable):
+                    await resolve_api_network_pin(session, generation_id=generation_id)
+                assert len(held.requests) == before + 1
+    finally:
+        await fixture.connection.execute(restore)
+    assert not held.database.has_reader_session()
+    assert (await _api_rows(held, None))[0] == held.current

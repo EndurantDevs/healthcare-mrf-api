@@ -10,8 +10,7 @@ from unittest.mock import AsyncMock
 
 import asyncpg
 import pytest
-from sanic import Request, response
-from sanic.compat import Header
+from sanic import response
 from sanic.exceptions import NotFound, SanicException, ServiceUnavailable
 
 from api import provider_detail_network_read as composer
@@ -22,6 +21,7 @@ from process import registry_network_catalog_read as catalog
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 from process.registry_network_catalog_read import RegistryNetworkCatalogError
+from tests.provider_network_read_support import approved_record_relation, provider_reader_double, provider_test_request
 
 NPI = "0000000049"
 DIGEST = "a" * 64
@@ -29,10 +29,11 @@ DIGEST = "a" * 64
 
 def _install_catalog_mocks(monkeypatch, manifest, native_read):
     @asynccontextmanager
-    async def catalog_snapshot(driver, generation, schema):
-        yield await composer._pin(driver, generation, schema)
+    async def catalog_snapshot(session, generation, schema):
+        driver = (await (await session.connection()).get_raw_connection()).driver_connection
+        yield await composer._pin(driver, generation, schema), approved_record_relation(schema)
 
-    monkeypatch.setattr(catalog, "registry_catalog_read_snapshot", catalog_snapshot, raising=False)
+    monkeypatch.setattr(composer, "api_catalog_read_snapshot", catalog_snapshot)
     monkeypatch.setattr(composer, "_pin", AsyncMock(return_value=manifest))
     monkeypatch.setattr(composer, "registry_schema", lambda: "sample_registry")
     monkeypatch.setattr(provider, "read_npi_detail", AsyncMock(side_effect=native_read))
@@ -63,9 +64,10 @@ def detail_boundary(monkeypatch):
     manifest = PinnedNetworkServingManifest(
         9, candidate, "network_candidate_" + candidate.replace("-", ""), 1, {}, 4, "b" * 64, 123
     )
-    driver = SimpleNamespace(fetchval=AsyncMock(return_value=1))
-    connection = SimpleNamespace(get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=driver)))
-    session = SimpleNamespace(connection=AsyncMock(return_value=connection))
+    driver, session = provider_reader_double(
+        lambda: composer.resolve_registry_network_catalog_legacy.return_value["items"]
+    )
+
     state = SimpleNamespace(
         active=False,
         snapshots=[],
@@ -102,13 +104,8 @@ def detail_boundary(monkeypatch):
     monkeypatch.setitem(sys.modules, metadata_module.__name__, metadata_module)
     monkeypatch.setattr(composer, "provider_profile_read_snapshot", snapshot)
     _install_catalog_mocks(monkeypatch, manifest, native_read)
-    request = Request(
-        b"/api/v1/registry/serving/providers/detail?force_address_update=true&address_limit=all",
-        Header({}),
-        "1.1",
-        "POST",
-        None,
-        SimpleNamespace(config={}),
+    request = provider_test_request(
+        b"/api/v1/registry/serving/providers/detail?force_address_update=true&address_limit=all"
     )
     return SimpleNamespace(
         driver=driver,

@@ -113,6 +113,44 @@ async def test_office_page_guards_only_rendered_relations(monkeypatch, compact, 
     connection.acquire.assert_not_called()
 
 
+@pytest.mark.parametrize("trusted", [False, True])
+async def test_membership_page_uses_fresh_capability_and_only_consumed_pins(monkeypatch, trusted):
+    manifest = _manifest(compact=True, artifacts=True)
+    object.__setattr__(manifest, "_supports_membership_pages", trusted)
+    connection, verifier, events = _office_spies(monkeypatch, manifest)
+    caller_manifest = replace(manifest)
+    object.__setattr__(caller_manifest, "_supports_membership_pages", True)
+    await readers.read_network_provider_page(connection, NetworkAddressReadScope(caller_manifest, (11,), None))
+    query = connection.fetchrow.await_args.args[0]
+    assert query.startswith("WITH identities AS MATERIALIZED") is trusted
+    assert {pin.table_oid for pin in verifier.await_args.args[1]} == (
+        {101, 102, 201, 202} if trusted else {101, 102, 103, 201, 202, 301}
+    )
+    assert events == ["resolve", "pid", "data", "guard", "decode"]
+
+
+@pytest.mark.parametrize("selection", ["detail", "location", "geo"])
+async def test_membership_capability_keeps_filtered_reads_on_full_verification(monkeypatch, selection):
+    manifest = _manifest(compact=True, artifacts=True)
+    object.__setattr__(manifest, "_supports_membership_pages", True)
+    connection, verifier, _ = _office_spies(monkeypatch, manifest)
+    scope = NetworkAddressReadScope(manifest, (11,), None)
+    if selection == "detail":
+        with pytest.raises(readers.NetworkProviderNotFound):
+            await readers.read_network_provider_detail(
+                connection, scope, provider_system="npi", provider_id="1000000491"
+            )
+    else:
+        filters = (
+            readers.NetworkOfficeSelection(location_id=str(UUID(int=9)))
+            if selection == "location"
+            else readers.NetworkOfficeSelection(lat=10, long=20, radius_miles=1)
+        )
+        await readers.read_network_provider_page(connection, scope, office_filters=filters)
+    assert connection.fetchrow.await_args.args[0].startswith("WITH selected_addresses")
+    assert {pin.table_oid for pin in verifier.await_args.args[1]} == {101, 102, 103, 201, 202, 301}
+
+
 @pytest.mark.parametrize("missing", ["network_membership", "provider_location_binding", "all"])
 async def test_missing_candidate_pins_refuse_before_data(monkeypatch, missing):
     manifest = _manifest()
@@ -128,8 +166,10 @@ async def test_missing_candidate_pins_refuse_before_data(monkeypatch, missing):
     verifier.assert_not_awaited()
 
 
-async def test_guard_refusal_precedes_empty_result_and_cache(monkeypatch):
-    manifest = _manifest()
+@pytest.mark.parametrize("fast", [False, True])
+async def test_guard_refusal_precedes_empty_result_and_cache(monkeypatch, fast):
+    manifest = _manifest(compact=fast, artifacts=fast)
+    object.__setattr__(manifest, "_supports_membership_pages", fast)
     connection, verifier, events = _office_spies(
         monkeypatch, manifest, guard_error=NetworkReadIdentityError("synthetic mismatch")
     )

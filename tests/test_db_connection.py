@@ -26,7 +26,16 @@ from db.connection import (
 
 
 @pytest.mark.asyncio
-async def test_database_connect_initializes_engine(monkeypatch):
+@pytest.mark.parametrize(
+    ("driver", "normalized_driver"),
+    [
+        ("asyncpg", "postgresql+asyncpg"),
+        ("postgresql+asyncpg", "postgresql+asyncpg"),
+        ("psycopg", "postgresql+psycopg"),
+        ("postgresql+psycopg", "postgresql+psycopg"),
+    ],
+)
+async def test_database_connect_initializes_engine(monkeypatch, driver, normalized_driver):
     created_by_field = {}
 
     def fake_create_engine(url, **kwargs):  # pragma: no cover - executed in test
@@ -38,7 +47,7 @@ async def test_database_connect_initializes_engine(monkeypatch):
         created_by_field["session_kwargs"] = kwargs
         return lambda: "session"
 
-    monkeypatch.setenv("HLTHPRT_DB_DRIVER", "psycopg")
+    monkeypatch.setenv("HLTHPRT_DB_DRIVER", driver)
     monkeypatch.setenv("HLTHPRT_DB_USER", "user")
     monkeypatch.setenv("HLTHPRT_DB_PASSWORD", "pass")
     monkeypatch.setenv("HLTHPRT_DB_HOST", "host")
@@ -53,10 +62,11 @@ async def test_database_connect_initializes_engine(monkeypatch):
     db = Database()
     await db.connect()
 
-    assert created_by_field["url"].drivername == "postgresql+psycopg"
+    assert created_by_field["url"].drivername == normalized_driver
     assert created_by_field["kwargs"]["pool_size"] == 2
     assert created_by_field["kwargs"]["max_overflow"] == 2
     assert created_by_field["kwargs"]["hide_parameters"] is True
+    assert "connect_args" not in created_by_field["kwargs"]
     assert db.engine is not None
     assert db.session_factory is not None
 

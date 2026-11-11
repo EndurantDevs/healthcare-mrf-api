@@ -166,8 +166,19 @@ def reader_database(monkeypatch, sessions):
     return writer
 
 
-async def test_reader_pool_uses_separate_login_and_read_only_transactions(monkeypatch):
+@pytest.mark.parametrize(
+    ("driver", "connection_options"),
+    [
+        ("asyncpg", {"server_settings": {"jit": "off"}}),
+        ("postgresql+asyncpg", {"server_settings": {"jit": "off"}}),
+        ("psycopg", {"options": "-c jit=off"}),
+        ("postgresql+psycopg", {"options": "-c jit=off"}),
+    ],
+)
+async def test_reader_pool_uses_separate_login_and_read_only_transactions(monkeypatch, driver, connection_options):
     engine_by_field = {}
+    monkeypatch.delenv("PGOPTIONS", raising=False)
+    monkeypatch.setenv("HLTHPRT_DB_DRIVER", driver)
     monkeypatch.setenv("HLTHPRT_DB_USER", "writer_test")
     monkeypatch.setenv("HLTHPRT_DB_PASSWORD", "writer_value")
     monkeypatch.setenv("HLTHPRT_DB_READER_USER", "reader_test")
@@ -188,11 +199,30 @@ async def test_reader_pool_uses_separate_login_and_read_only_transactions(monkey
     assert engine_by_field["url"].password == "reader_value"
     assert engine_by_field["options"]["isolation_level"] == "REPEATABLE READ"
     assert engine_by_field["options"]["execution_options"] == {"postgresql_readonly": True}
+    assert engine_by_field["options"]["connect_args"] == connection_options
     assert engine_by_field["options"]["pool_size"] == 2
     assert engine_by_field["options"]["max_overflow"] == 1
     await writer.disconnect()
     assert reader.engine is None
     assert writer._reader_database is None
+
+
+async def test_psycopg_reader_preserves_existing_server_options(monkeypatch):
+    engine_by_option = {}
+    monkeypatch.setenv("HLTHPRT_DB_DRIVER", "psycopg")
+    monkeypatch.setenv("PGOPTIONS", "-c statement_timeout=3000 -c timezone=UTC")
+
+    def engine(_url, **options):
+        engine_by_option.update(options)
+        return SimpleNamespace(dispose=AsyncMock())
+
+    monkeypatch.setattr("db.connection.create_async_engine", engine)
+    monkeypatch.setattr("db.connection.async_sessionmaker", lambda *_args, **_kwargs: object())
+    reader = Database()
+    reader._reader_login = ("reader_test", "")
+    await reader.connect()
+    assert engine_by_option["connect_args"] == {"options": "-c statement_timeout=3000 -c timezone=UTC -c jit=off"}
+    await reader.disconnect()
 
 
 @pytest.mark.parametrize("user", ["", "writer_test"])

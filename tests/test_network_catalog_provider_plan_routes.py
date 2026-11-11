@@ -8,6 +8,7 @@ from uuid import UUID
 import pytest
 
 from api.endpoint import network_catalog as endpoint
+from process import registry_network_catalog_read as catalog
 from process.registry_network_catalog_read import RegistryNetworkCatalogError
 from tests.test_network_catalog_routes import _OWNED_READ_EVENTS, envelope, send, v2_envelope
 from tests.test_network_catalog_routes import batch_boundary as batch_boundary
@@ -27,8 +28,9 @@ def plans_context(context, monkeypatch):
         "issuer_data": [],
     }
 
-    async def read(connection, query, *, excluded_network_ids):
+    async def read(connection, query, *, excluded_network_ids, manifest):
         assert connection is context.driver and connection.in_transaction
+        assert catalog._reuse_manifest(connection, manifest, query.generation_id, "sample_control") is context.manifest
         context.plan_calls.append((query, excluded_network_ids))
         return context.plan_page
 
@@ -55,7 +57,8 @@ async def test_provider_plans_full_policy_and_one_snapshot(plans_context, header
     assert result.headers["X-Network-Access-Scope"] == document["access_scope_sha256"]
     query, exclusions = context.plan_calls[0]
     assert (query.npi, query.year, query.generation_id, exclusions) == ("0000000001", 2000, 9, (84,))
-    assert len(context.plan_calls) == 1 and context.driver.calls == []
+    assert len(context.plan_calls) == 1 and context.api_pins == [9] and context.revisions == [4]
+    assert catalog._PINNED_READ.get() is None
     assert context.session.events == _OWNED_READ_EVENTS
     assert len(context.session.snapshot_queries) == 3
 
@@ -120,7 +123,7 @@ async def test_provider_plans_authentication_precedes_body(plans_context):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind,status", [("detail_denied", 404), ("source_unavailable", 503), ("response_bounds", 503)])
 async def test_provider_plans_reader_refusal_closes_snapshot_without_retry(plans_context, monkeypatch, kind, status):
-    async def refuse(connection, query, *, excluded_network_ids):
+    async def refuse(connection, query, *, excluded_network_ids, manifest):
         plans_context.plan_calls.append(query)
         raise RegistryNetworkCatalogError("registry_network_catalog_" + kind)
 
@@ -135,7 +138,7 @@ async def test_provider_plans_reader_refusal_closes_snapshot_without_retry(plans
 
 @pytest.mark.asyncio
 async def test_provider_plans_cancellation_propagates_and_releases_snapshot(plans_context, monkeypatch):
-    async def cancel(connection, query, *, excluded_network_ids):
+    async def cancel(connection, query, *, excluded_network_ids, manifest):
         raise asyncio.CancelledError
 
     monkeypatch.setattr(endpoint, "read_registry_provider_plans", cancel, raising=False)

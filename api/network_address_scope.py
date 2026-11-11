@@ -4,7 +4,7 @@
 import hashlib
 import json
 import re
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
@@ -691,8 +691,8 @@ def _network_scope_claim(request, args):
 @asynccontextmanager
 async def _pin_network_scope(request, args):
     from api.network_read_execution import _original_read_driver
+    from api.network_serving_api_read import api_catalog_read_snapshot
     from api.network_serving_read_context import bind_network_request_reader
-    from process.network_approved_membership_source import resolve_api_retained_approved_membership_source
 
     network_ids, access_scope_sha256, legacy_checksums, generation = _network_scope_claim(request, args)
     session = await bind_network_request_reader(request)
@@ -700,25 +700,31 @@ async def _pin_network_scope(request, args):
     transaction = session.get_transaction()
     try:
         driver, backend_pid = await _original_read_driver(session)
-        manifest, _approved, approved_relation = await resolve_api_retained_approved_membership_source(
-            driver, generation_id=generation
-        )
     except (ValueError, TypeError, KeyError) as error:
         raise ServiceUnavailable(
             "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
         ) from error
-    async with _bound_address_read_session_scope(
-        session,
-        transaction,
-        driver,
-        backend_pid,
-        manifest,
-        approved_relation,
-        network_ids,
-        access_scope_sha256=access_scope_sha256,
-        legacy_checksums=legacy_checksums,
-    ) as scope:
-        yield scope
+    async with AsyncExitStack() as stack:
+        try:
+            manifest, approved_relation = await stack.enter_async_context(
+                api_catalog_read_snapshot(session, generation)
+            )
+        except (ValueError, TypeError, KeyError) as error:
+            raise ServiceUnavailable(
+                "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
+            ) from error
+        async with _bound_address_read_session_scope(
+            session,
+            transaction,
+            driver,
+            backend_pid,
+            manifest,
+            approved_relation,
+            network_ids,
+            access_scope_sha256=access_scope_sha256,
+            legacy_checksums=legacy_checksums,
+        ) as scope:
+            yield scope
 
 
 def canonical_network_read(handler):

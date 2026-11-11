@@ -6,6 +6,7 @@ import json
 from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -19,7 +20,7 @@ from api import provider_detail_network_read as detail
 from api.endpoint import extension_reads
 from api.network_address_scope import current_network_address_scope
 from api.provider_geo_sql import native_geo_entity_scope
-from process.custom_import.read_contracts import MAX_CURSOR_TTL_SECONDS
+from process.custom_import.read_contracts import MAX_CURSOR_TTL_SECONDS, CustomImportReadUnavailableError
 from process.custom_import.read_core import ReadFieldValue
 from process.custom_import.read_cursor import _base64url_decode
 from tests import test_custom_import_provider_geo_http as fixtures
@@ -136,8 +137,9 @@ def _open(token, binding):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("include_filter", [False, True])
 @pytest.mark.parametrize("has_prior", [False, True])
-async def test_actual_signed_geo_has_one_reader_pin_and_exact_family(geo_boundary, include_filter, has_prior):
-    document = _document(include_filter=include_filter)
+@pytest.mark.parametrize("view", ["", "card"])
+async def test_actual_signed_geo_has_one_reader_pin_and_exact_family(geo_boundary, include_filter, has_prior, view):
+    document = _document(include_filter=include_filter, native_query=fixtures._native_query(view=view))
     document["managed_collection"] = v2_envelope(
         document["managed_collection"]["query"], excluded_network_ids=list(range(1, 5001))
     )
@@ -236,8 +238,9 @@ async def test_bad_signed_geo_never_opens_reader(geo_boundary, failure):
 
 
 @pytest.mark.asyncio
-async def test_geo_continuation_retains_generation_and_original_expiry(geo_boundary, monkeypatch):
-    first = await _post(_document())
+@pytest.mark.parametrize("view", ["", "card"])
+async def test_geo_continuation_retains_generation_and_original_expiry(geo_boundary, monkeypatch, view):
+    first = await _post(_document(native_query=fixtures._native_query(view=view)))
     assert first.status == 200
     first_state = _open(first.json["next_cursor"], geo_boundary.bindings[0])
     current_head = replace(geo_boundary.manifest, generation_id=18)
@@ -249,7 +252,9 @@ async def test_geo_continuation_retains_generation_and_original_expiry(geo_bound
     detail._pin.side_effect = pin
     later = transport._canonical_utc(permits._NOW)[1] + timedelta(seconds=15)
     monkeypatch.setattr(transport, "_trusted_now", lambda: later.strftime("%Y-%m-%dT%H:%M:%SZ"))
-    reply = await _post(_document(native_query=fixtures._native_query(cursor=first.json["next_cursor"]), generation=17))
+    reply = await _post(
+        _document(native_query=fixtures._native_query(view=view, cursor=first.json["next_cursor"]), generation=17)
+    )
     assert reply.status == 200, reply.json
     continued = _open(reply.json["next_cursor"], geo_boundary.bindings[-1])
     assert (continued.issued_at, continued.expires_at) == (first_state.issued_at, first_state.expires_at)
@@ -319,6 +324,23 @@ async def test_managed_geo_checks_entire_presented_response_bound(geo_boundary, 
     assert reply.status == 503 and set(reply.json) == {"error"}
     assert len(geo_boundary.observed["hydration"]) == 1
     assert not geo_boundary.state.active and not geo_boundary.state.catalog_active
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["hydrate", "finality"])
+async def test_managed_geo_import_failure_discards_page_and_releases_pin(geo_boundary, monkeypatch, failure):
+    refuse = AsyncMock(side_effect=CustomImportReadUnavailableError("private import diagnostic"))
+    if failure == "hydrate":
+        monkeypatch.setattr(geo.CustomImportReadService, "hydrate_npi_page", refuse)
+    else:
+        monkeypatch.setattr(geo, "verify_published_generation", refuse)
+    prior = object()
+    reply = await _post(_document(), prior=prior)
+    assert reply.status == 503 and set(reply.json) == {"error"}
+    assert b"private import diagnostic" not in reply.body
+    refuse.assert_awaited_once()
+    assert not geo_boundary.state.active and not geo_boundary.state.catalog_active
+    assert len(geo_boundary.state.snapshots) == 1
 
 
 @pytest.mark.asyncio
