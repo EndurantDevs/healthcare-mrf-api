@@ -10,6 +10,7 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 
 from api import plan_pricing_em_distance_build as projection_build
+from tests.test_company_registry_group_assertion_migration import _assert_source_inventory_migration_head
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_PATH = REPOSITORY_ROOT / ("alembic/versions/20260901103000_plan_pricing_em_distance.py")
@@ -52,13 +53,7 @@ def _assert_registry_migration_chain():
     alembic_config = Config(str(REPOSITORY_ROOT / "alembic.ini"))
     alembic_config.set_main_option("script_location", str(REPOSITORY_ROOT / "alembic"))
     script = ScriptDirectory.from_config(alembic_config)
-    assert script.get_heads() == ["20261108010000_custom_import_family_child_reference_aggregate"]
-    assert script.get_revision("20261029010000_registry_source_inventory").down_revision == (
-        "20261028020000_registry_membership_refresh"
-    )
-    assert script.get_revision("20261028020000_registry_membership_refresh").down_revision == (
-        "20261028010000_registry_fhir_catalog"
-    )
+    _assert_source_inventory_migration_head(script)
     assert (
         script.get_revision("20261019030000_provider_directory_role_schema").down_revision
         == "20261019020000_registry_continuation_join"

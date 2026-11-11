@@ -6,11 +6,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from process.control_cancel import ImportCancelledError, raise_if_cancelled, run_id_from_task
 from process import control_lifecycle
+from process.control_cancel import ImportCancelledError, raise_if_cancelled, run_id_from_task
 from process.control_lifecycle import control_single_job_start
 from process.live_progress import current_live_progress_context
-
 
 _SHUTDOWN_METRICS_BY_NAME = {
     "staged_rows": 123,
@@ -27,9 +26,7 @@ _SHUTDOWN_METRICS_BY_NAME = {
     ],
     "post_publish_skipped_indexes": [],
     "published_elapsed_seconds": 233.2,
-    "phase_timings": {
-        "entity-address-unified indexing stage": {"wall_seconds": 24.1}
-    },
+    "phase_timings": {"entity-address-unified indexing stage": {"wall_seconds": 24.1}},
     "stage_index_timings": [{"index": "primary_npi", "seconds": 1.2}],
     "preserve_control_run_finished_at": True,
 }
@@ -67,15 +64,11 @@ def _assert_shutdown_terminal_metrics(terminal):
     assert metrics_by_name["post_publish_index_timings"][1]["index"] == "geo_idx"
     assert metrics_by_name["post_publish_skipped_indexes"] == []
     assert metrics_by_name["published_elapsed_seconds"] == 233.2
-    assert metrics_by_name["phase_timings"]["entity-address-unified indexing stage"] == {
-        "wall_seconds": 24.1
-    }
+    assert metrics_by_name["phase_timings"]["entity-address-unified indexing stage"] == {"wall_seconds": 24.1}
     assert metrics_by_name["stage_index_timings"][0]["index"] == "primary_npi"
     assert terminal["progress"]["done"] == 123
     assert terminal["progress"]["phase"] == "provider-enrichment published"
-    assert terminal["metrics"]["address_resolve"] == _ADDRESS_SHUTDOWN_RESULT_BY_NAME[
-        "address_resolve"
-    ]
+    assert terminal["metrics"]["address_resolve"] == _ADDRESS_SHUTDOWN_RESULT_BY_NAME["address_resolve"]
     assert terminal["preserve_finished_at"] is True
 
 
@@ -160,9 +153,7 @@ async def test_control_single_job_start_marks_success(monkeypatch):
         }
     ]
     assert live_contexts[0]["attempt_id"].startswith("run_1:")
-    assert live_contexts[0]["attempt_id"] != (
-        f"run_1:{live_contexts[0]['started_at']}"
-    )
+    assert live_contexts[0]["attempt_id"] != (f"run_1:{live_contexts[0]['started_at']}")
     assert "source" not in live_contexts[0]
     assert "confidence" not in live_contexts[0]
 
@@ -231,7 +222,7 @@ async def test_live_progress_heartbeat_fails_closed_on_database_error(
     )
     monkeypatch.setattr(
         control_lifecycle,
-        "_persist_control_run_heartbeat",
+        "_is_control_run_heartbeat_persisted",
         fail_heartbeat_persistence,
     )
     monkeypatch.setattr(
@@ -339,12 +330,8 @@ async def test_control_single_job_start_can_run_module_shutdown(monkeypatch):
     assert shutdown_context["run"] == 1
     assert target_context["_control_attempt_id"].startswith("run_1:")
     assert len(target_context["_control_attempt_id"]) == len("run_1:") + 32
-    assert shutdown_context["_control_attempt_id"] == target_context[
-        "_control_attempt_id"
-    ]
-    assert shutdown_context["_control_attempt_started_at"] == target_context[
-        "_control_attempt_started_at"
-    ]
+    assert shutdown_context["_control_attempt_id"] == target_context["_control_attempt_id"]
+    assert shutdown_context["_control_attempt_started_at"] == target_context["_control_attempt_started_at"]
     assert run_response["run_id"] == "run_1"
     assert [mark_entry[1]["status"] for mark_entry in marks] == ["running", "succeeded"]
     _assert_shutdown_terminal_metrics(marks[-1][1])
@@ -414,11 +401,7 @@ async def test_control_wrapper_preserves_durable_npi_success_after_shutdown_erro
     monkeypatch.setattr(
         control_lifecycle,
         "import_module",
-        lambda name: (
-            _durable_npi_success_module(publication_ref, committed_at)
-            if name == "process.npi"
-            else None
-        ),
+        lambda name: _durable_npi_success_module(publication_ref, committed_at) if name == "process.npi" else None,
     )
 
     outcome = await control_single_job_start(

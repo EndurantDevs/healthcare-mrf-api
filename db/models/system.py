@@ -204,6 +204,16 @@ class ImportRun(Base, JSONOutputMixin):
         },
         {
             "index_elements": ("importer", "idempotency_key"),
+            "name": "import_run_code_sets_publication_idempotency_idx",
+            "unique": True,
+            "where": (
+                "importer = 'code-sets' AND idempotency_key IS NOT NULL AND "
+                "(status IN ('queued', 'starting', 'running', 'finalizing', 'canceling') "
+                "OR metrics->>'code_sets_mutable_publication' IS NOT NULL)"
+            ),
+        },
+        {
+            "index_elements": ("importer", "idempotency_key"),
             "name": "import_run_registry_source_check_idempotency_idx",
             "unique": True,
             "where": "importer = 'registry-source-check' AND idempotency_key IS NOT NULL",

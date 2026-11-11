@@ -1752,7 +1752,9 @@ async def test_remove_queued_job_refuses_unresolvable_identity(monkeypatch):
     create_pool = AsyncMock()
     monkeypatch.setattr(control_imports, "create_pool", create_pool)
 
-    outcome_by_field = await _remove_queued_job({"run_id": "run_exact", "importer": "code-sets", "metrics": {}})
+    outcome_by_field = await _remove_queued_job(
+        {"run_id": "run_exact", "importer": "clinical-reference", "metrics": {}}
+    )
 
     assert outcome_by_field["identity_unavailable"] is True
     assert outcome_by_field["removed"] is False
@@ -1812,7 +1814,8 @@ def test_import_run_migration_mirrors_model(monkeypatch):
     expected_model_indexes = {
         spec["name"]
         for spec in ImportRun.__my_additional_indexes__
-        if spec["name"]
+        if spec["name"] != "import_run_code_sets_publication_idempotency_idx"
+        and spec["name"]
         not in {
             "import_run_importer_active_idempotency_idx",
             "import_run_provider_directory_retry_child_idx",

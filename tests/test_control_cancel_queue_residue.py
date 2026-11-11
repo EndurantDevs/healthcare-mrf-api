@@ -1,5 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
@@ -330,4 +332,165 @@ def test_cancel_residue_requires_cancel_fence(cancel_flag):
             "cancel_flag": cancel_flag,
             "kubernetes": {"enabled": True, "deleted": 1},
         }
+    )
+
+
+def _code_sets_cancel_run():
+    return {
+        "run_id": RUN_ID,
+        "engine": "healthcare-mrf-api",
+        "node_id": "synthetic-node",
+        "importer": "code-sets",
+        "status": "canceling",
+        "progress": {"message": "cancel requested"},
+        "metrics": {
+            "enqueue_adapter": "arq_single_job",
+            "queue": "arq:CodeSets",
+            "function": "control_single_job_start",
+            "job_id": "retained-job",
+        },
+    }
+
+
+def _reservation_database(found):
+    @asynccontextmanager
+    async def transaction():
+        yield
+
+    return SimpleNamespace(
+        _transaction_binding=lambda: None,
+        _reader_binding=lambda: None,
+        transaction=transaction,
+        execute=AsyncMock(side_effect=[None, SimpleNamespace(scalar_one_or_none=lambda: found)]),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("found", [RUN_ID, None])
+@pytest.mark.parametrize("progress", [None, {"message": "cancel requested"}])
+async def test_codesets_residue_authenticates_the_committed_database_reservation(found, progress):
+    from process.control_cancel import has_committed_code_sets_cancel_reservation
+
+    database = _reservation_database(found)
+    run = _code_sets_cancel_run()
+    run["progress"] = progress
+    assert await has_committed_code_sets_cancel_reservation(
+        database, run, "arq:CodeSets", "retained-job", control_imports._SINGLE_JOB_ADAPTERS["code-sets"]
+    ) is (found is not None)
+    assert database.execute.await_count == 2
+    assert "pg_catalog,pg_temp" in str(database.execute.call_args_list[0].args[0])
+    statement = str(database.execute.call_args.args[0])
+    assert "FOR UPDATE" in statement and "heartbeat_at IS NOT NULL" in statement and "finished_at IS NULL" in statement
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "importer",
+        "engine",
+        "status",
+        "metrics",
+        "job",
+        "queue",
+        "function",
+        "progress",
+        "attempt",
+        "partial",
+        "transaction",
+        "reader",
+        "job_type",
+        "empty_job",
+        "spaced_job",
+        "configured_queue",
+    ],
+)
+async def test_codesets_reservation_refuses_other_inputs_before_database_access(changed):
+    from process.control_cancel import has_committed_code_sets_cancel_reservation
+
+    run = _code_sets_cancel_run()
+    database = _reservation_database(RUN_ID)
+    queue = "arq:CodeSets"
+    job_id = "retained-job"
+    changes_by_name = {
+        "importer": (run, "importer", "other"),
+        "engine": (run, "engine", "other"),
+        "status": (run, "status", "other"),
+        "metrics": (run, "metrics", []),
+        "job": (run["metrics"], "job_id", "other"),
+        "queue": (run["metrics"], "queue", "other"),
+        "function": (run["metrics"], "function", "other"),
+        "progress": (run, "progress", []),
+        "attempt": (run["progress"], "attempt_id", "claimed"),
+        "partial": (run["progress"], "attempt_started_at", "claimed"),
+    }
+    if changed in changes_by_name:
+        fields_by_name, field, expected_value = changes_by_name[changed]
+        fields_by_name[field] = expected_value
+    elif changed in {"job_type", "empty_job", "spaced_job"}:
+        job_id = {"job_type": 7, "empty_job": "", "spaced_job": " retained-job "}[changed]
+        run["metrics"]["job_id"] = job_id
+    elif changed == "configured_queue":
+        queue = "arq:Other"
+        run["metrics"]["queue"] = queue
+    else:
+        binding_field = {"transaction": "_transaction_binding", "reader": "_reader_binding"}[changed]
+        setattr(database, binding_field, lambda: object())
+    assert not await has_committed_code_sets_cancel_reservation(
+        database, run, queue, job_id, control_imports._SINGLE_JOB_ADAPTERS["code-sets"]
+    )
+    database.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("present_index", range(4))
+async def test_authenticated_codesets_residue_keeps_all_executable_state_refusals(monkeypatch, present_index):
+    run = _code_sets_cancel_run()
+    _, _, pipeline = _install_dependencies(
+        monkeypatch, run, key_presence=tuple(index == present_index for index in range(4))
+    )
+    pipeline.get = AsyncMock(return_value=None)
+    monkeypatch.setattr(control_imports, "has_committed_code_sets_cancel_reservation", AsyncMock(return_value=True))
+    signal = await control_imports._remove_queued_job(run)
+    assert signal["identity_unavailable"] is True
+    pipeline.multi.assert_not_called()
+    pipeline.zrem.assert_not_called()
+    pipeline.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_codesets_residue_never_falls_back_without_a_committed_reservation(monkeypatch, legacy):
+    run = _code_sets_cancel_run()
+    if not legacy:
+        run["metrics"]["job_id"] = f"code_sets_start_{RUN_ID}"
+    _, _, pipeline = _install_dependencies(monkeypatch, run)
+    pipeline.get = AsyncMock(return_value=None)
+    monkeypatch.setattr(control_imports, "has_committed_code_sets_cancel_reservation", AsyncMock(return_value=False))
+    canonical = Mock(side_effect=AssertionError("a failed CodeSets reservation cannot select a generic route"))
+    monkeypatch.setattr(control_imports, "_reconciliation_arq_identity", canonical)
+    result = await control_imports._remove_queued_job(run)
+    assert result["identity_unavailable"] is True
+    canonical.assert_not_called()
+    pipeline.execute.assert_not_awaited()
+
+
+def test_recorded_codesets_legacy_identity_does_not_relax_generic_reconciliation():
+    run = _code_sets_cancel_run()
+    assert control_imports._arq_cleanup_identity(run)[-1] == "retained-job"
+    with pytest.raises(control_imports.StaleWorkerReconciliationConflict, match="conflicts"):
+        control_imports._reconciliation_arq_identity(run)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_codesets_cancel_stop_probe_uses_exact_worker_identity_for_recorded_jobs(monkeypatch, legacy):
+    run = _code_sets_cancel_run()
+    if not legacy:
+        run["metrics"]["job_id"] = f"code_sets_start_{RUN_ID}"
+    presence = Mock(return_value={"enabled": True, "stopped": True})
+    monkeypatch.setattr(control_imports, "exact_worker_presence", presence)
+    assert await control_imports._is_canceled_worker_stopped(run)
+    presence.assert_called_once_with(
+        {"run_id": RUN_ID, "importer": "code-sets", "status": "canceling", "queue": "arq:CodeSets"}
     )

@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from db import connection as db_connection
+from process import code_sets_mutable_publication as mutable
 from process import control_lifecycle
 from process.control_cancel import ImportCancelledError
 from process.control_lifecycle import control_single_job_start
@@ -186,11 +187,15 @@ async def test_committed_native_handoff_is_not_overwritten_as_terminal(monkeypat
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [RuntimeError, ImportCancelledError, asyncio.CancelledError])
 @pytest.mark.parametrize(
-    "target_module", ["process.nucc", *sorted(control_lifecycle._SOURCE_PROFILE_IMPORTERS_BY_MODULE)]
+    "target_module",
+    ["process.nucc", "process.code_sets", *sorted(control_lifecycle._SOURCE_PROFILE_IMPORTERS_BY_MODULE)],
 )
 async def test_uncertain_native_commit_does_not_overwrite_persisted_custody(monkeypatch, failure, target_module):
     async def target(ctx, _task):
-        marker = "nucc_native_commit_unknown" if target_module == "process.nucc" else "source_profile_commit_unknown"
+        marker = {
+            "process.nucc": "nucc_native_commit_unknown",
+            "process.code_sets": "scoped_catalog_commit_unknown",
+        }.get(target_module, "source_profile_commit_unknown")
         ctx["context"][marker] = True
         raise failure("synthetic readback lost")
 
@@ -1480,9 +1485,84 @@ async def test_nucc_claim_recovers_closed_original_attempt_before_a_new_claim(mo
             assert case.scope.session.executed == []
 
 
+def _mutable_terminal_row():
+    completed = dt.datetime(2026, 1, 1, 0, 1)
+    lineage = "11111111-1111-4111-8111-111111111111"
+    receipt = mutable._publication_receipt(
+        {
+            "run_id": "synthetic_plain",
+            "attempt_id": "synthetic-attempt",
+            "attempt_started_at": "2026-01-01T00:00:00+00:00",
+        },
+        {"database_oid": 11, "schema_oid": 12, "owner_oid": 13, "relation_oids": (41, 42, 43)},
+        {
+            "local_lineage_id": lineage,
+            "local_generation": 1,
+            "origin_lineage_id": lineage,
+            "origin_generation": 1,
+            "published_at": completed.replace(tzinfo=dt.UTC),
+            "code_catalog_oid": 41,
+            "row_count": 3,
+            "row_sha256": "a" * 64,
+        },
+        {"pos_rows": 1, "rc_rows": 1, "modifier_rows": 1},
+        3,
+    )
+    return {
+        "metrics": {mutable.METRIC: receipt},
+        "heartbeat_at": completed,
+        "finished_at": completed + dt.timedelta(seconds=1),
+    }
+
+
+async def _assert_terminal_projection(
+    monkeypatch, committed_target, result_by_field, importer, module, heartbeat_at, finished_at
+):
+    async def parse_projection(_run_id, **transition):
+        times = control_lifecycle._control_transition_times(
+            status="succeeded",
+            is_terminal=True,
+            attempt_started_at=None,
+            preserve_finished_at=transition["preserve_finished_at"],
+            database_state_committed=True,
+            database_heartbeat_at=transition["database_heartbeat_at"],
+            database_finished_at=transition["database_finished_at"],
+        )
+        assert times.committed_heartbeat == dt.datetime.fromisoformat(heartbeat_at)
+        assert times.committed_finished == dt.datetime.fromisoformat(finished_at)
+
+    marks = AsyncMock(return_value=True)
+    projection = AsyncMock(side_effect=parse_projection if importer == "code-sets" else None)
+    monkeypatch.setenv("HLTHPRT_IMPORT_LIVE_PROGRESS_HEARTBEAT_SECONDS", "0")
+    monkeypatch.setattr(control_lifecycle, "mark_control_run", marks)
+    monkeypatch.setattr(control_lifecycle, "_mark_and_flush_terminal_control_run", projection)
+    monkeypatch.setattr(control_lifecycle, "_flush_terminal_status_events", AsyncMock())
+    monkeypatch.setattr(
+        control_lifecycle, "import_module", lambda _name: SimpleNamespace(process_data=committed_target)
+    )
+    actual = await control_single_job_start(
+        {},
+        {
+            "run_id": "synthetic_plain",
+            "importer": importer,
+            "target_module": module,
+            "target_function": "process_data",
+        },
+    )
+    assert actual == {"status": "succeeded", "run_id": "synthetic_plain", "result": result_by_field}
+    assert [call.kwargs["status"] for call in marks.await_args_list] == ["running"]
+    projected = projection.await_args.kwargs
+    assert projected["database_state_committed"] is True
+    assert projected["database_heartbeat_at"] == heartbeat_at
+    assert projected["database_finished_at"] == finished_at
+    assert projected["phase_detail"] == result_by_field["terminal_progress"]["phase"]
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("importer,module", [("nucc", "process.nucc"), ("code-sets", "process.code_sets")])
 @pytest.mark.parametrize("late_error", [None, RuntimeError, ImportCancelledError, asyncio.CancelledError])
-async def test_plain_nucc_terminal_commit_survives_late_worker_errors(monkeypatch, late_error):
+async def test_plain_terminal_commit_survives_late_worker_errors(monkeypatch, late_error, importer, module):
+    committed_row = _mutable_terminal_row() if importer == "code-sets" else None
     result_by_field = {
         "rows": 2,
         "terminal_progress": {
@@ -1494,37 +1574,25 @@ async def test_plain_nucc_terminal_commit_survives_late_worker_errors(monkeypatc
             "phase": "nucc published",
         },
     }
+    heartbeat_at, finished_at = "native-heartbeat", "native-finished"
+    if committed_row is not None:
+        result_by_field = committed_row["metrics"][mutable.METRIC]
+        heartbeat_at = committed_row["heartbeat_at"].replace(tzinfo=dt.UTC).isoformat(timespec="microseconds")
+        finished_at = committed_row["finished_at"].replace(tzinfo=dt.UTC).isoformat(timespec="microseconds")
 
     async def target(ctx, _task):
-        ctx["context"].update(
-            control_run_terminal_committed=True,
-            preserve_control_run_finished_at=True,
-            _control_committed_result=result_by_field,
-            _control_committed_heartbeat_at="native-heartbeat",
-            _control_committed_finished_at="native-finished",
-        )
+        if committed_row is not None:
+            assert mutable._committed(ctx, committed_row) == result_by_field
+        else:
+            ctx["context"].update(
+                control_run_terminal_committed=True,
+                preserve_control_run_finished_at=True,
+                _control_committed_result=result_by_field,
+                _control_committed_heartbeat_at=heartbeat_at,
+                _control_committed_finished_at=finished_at,
+            )
         if late_error:
             raise late_error("synthetic after commit")
         return {"incorrect_later_result": True}
 
-    marks, projection = AsyncMock(return_value=True), AsyncMock()
-    monkeypatch.setenv("HLTHPRT_IMPORT_LIVE_PROGRESS_HEARTBEAT_SECONDS", "0")
-    monkeypatch.setattr(control_lifecycle, "mark_control_run", marks)
-    monkeypatch.setattr(control_lifecycle, "_mark_and_flush_terminal_control_run", projection)
-    monkeypatch.setattr(control_lifecycle, "_flush_terminal_status_events", AsyncMock())
-    monkeypatch.setattr(control_lifecycle, "import_module", lambda _name: SimpleNamespace(process_data=target))
-    actual = await control_single_job_start(
-        {},
-        {
-            "run_id": "synthetic_plain",
-            "importer": "nucc",
-            "target_module": "process.nucc",
-            "target_function": "process_data",
-        },
-    )
-    assert actual == {"status": "succeeded", "run_id": "synthetic_plain", "result": result_by_field}
-    assert [call.kwargs["status"] for call in marks.await_args_list] == ["running"]
-    projected = projection.await_args.kwargs
-    assert projected["database_state_committed"] is True
-    assert projected["database_heartbeat_at"] == "native-heartbeat"
-    assert projected["database_finished_at"] == "native-finished" and projected["phase_detail"] == "nucc published"
+    await _assert_terminal_projection(monkeypatch, target, result_by_field, importer, module, heartbeat_at, finished_at)
