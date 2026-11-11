@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import re
 from contextlib import aclosing, asynccontextmanager
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -315,6 +316,28 @@ async def _read_scope(connection, manifest, network_id, control_schema):
     }
 
 
+def _requests_lock(statement):
+    executable = re.sub(r"'(?:''|[^'])*'", "''", statement)
+    return bool(re.search(r'\bLOCK\s+TABLE\b|\bpg_(?:try_)?advisory_\w+"?\s*\(', executable, re.IGNORECASE))
+
+
+@pytest.mark.parametrize(
+    "statement,expected",
+    [
+        ("SELECT proname FROM pg_proc WHERE proname IN ('pg_advisory_lock','pg_try_advisory_lock')", False),
+        ("SELECT 'quoted '' pg_advisory_lock(1)'", False),
+        ("SELECT 'LOCK TABLE example'", False),
+        ("LOCK TABLE example IN ACCESS SHARE MODE", True),
+        ("SELECT pg_advisory_lock(1)", True),
+        ("SELECT pg_catalog.pg_advisory_xact_lock_shared(1)", True),
+        ('SELECT pg_catalog."pg_try_advisory_lock"(1)', True),
+        ("SELECT 'pg_advisory_lock', pg_try_advisory_xact_lock(1)", True),
+    ],
+)
+async def test_read_query_lock_classification(statement, expected):
+    assert _requests_lock(statement) is expected
+
+
 async def _canonical_request(context, manifest, copy_target, monkeypatch):
     """Pin real compact custody through the public selector wrapper without an address clone."""
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-network-read-token")
@@ -342,10 +365,7 @@ async def _canonical_request(context, manifest, copy_target, monkeypatch):
             await _assert_canonical_locations(session, manifest, network_id)
             await asyncio.sleep(0)
         assert metadata["seal_sha256"] == manifest._custody_seal_sha256
-        assert not any(
-            query_event.query.lstrip().upper().startswith("LOCK TABLE") or "pg_advisory" in query_event.query.lower()
-            for query_event in statements
-        )
+        assert not any(_requests_lock(query_event.query) for query_event in statements)
         request = SimpleNamespace(
             query_string=f"network_ids={network_id}",
             headers={"Authorization": "Bearer synthetic-network-read-token"},
@@ -357,10 +377,7 @@ async def _canonical_request(context, manifest, copy_target, monkeypatch):
         with driver.query_logger(statements.append):
             http_response = await read_addresses(request)
             await asyncio.sleep(0)
-        assert not any(
-            query_event.query.lstrip().upper().startswith("LOCK TABLE") or "pg_advisory" in query_event.query.lower()
-            for query_event in statements
-        )
+        assert not any(_requests_lock(query_event.query) for query_event in statements)
         assert http_response.status == 200 and json.loads(http_response.body) == {"locations": ["a" * 64]}
         assert http_response.headers["X-Network-Generation"] == str(manifest.generation_id)
         assert http_response.headers["Cache-Control"] == "private, no-store"

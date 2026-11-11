@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Legacy membership stays independent from its authorized canonical identity."""
 
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -13,9 +14,9 @@ from sqlalchemy.dialects import postgresql
 
 from api import network_address_scope as scope
 from db.models import EntityAddressUnified
-from process import network_serving_read
 from process.network_serving_read import PinnedNetworkServingManifest
-from tests.network_read_execution_support import mock_approved_control_metadata, with_read_identity_receipts
+from tests.network_read_execution_support import with_read_identity_receipts
+from tests.provider_network_read_support import approved_record_relation
 
 MANIFEST = PinnedNetworkServingManifest(
     7,
@@ -37,18 +38,24 @@ def request(checksums=None, *, query="network_ids=42&network_generation=7", auth
         headers["X-Network-Legacy-Checksums"] = checksums
     driver = SimpleNamespace(fetchrow=AsyncMock(return_value={"complete": True, "network_ids": [42]}))
     session = with_read_identity_receipts(SimpleNamespace(execute=AsyncMock()), driver=driver)
-    driver.native = session.connection.return_value.get_raw_connection.return_value.driver_connection
     return SimpleNamespace(headers=headers, query_string=query, ctx=SimpleNamespace(sa_session=session)), driver
 
 
 @pytest.fixture(autouse=True)
 def approved_metadata(monkeypatch):
-    mock_approved_control_metadata(monkeypatch)
+    pin = AsyncMock(return_value=(MANIFEST, approved_record_relation("registry_control")))
+
+    @asynccontextmanager
+    async def snapshot(session, generation_id=None, control_schema=None):
+        assert session.in_transaction()
+        yield await pin(session, generation_id=generation_id, control_schema=control_schema)
 
     async def bind_reader(incoming):
         return incoming.ctx.sa_session
 
     monkeypatch.setattr("api.network_serving_read_context.bind_network_request_reader", bind_reader)
+    monkeypatch.setattr("api.network_serving_api_read.api_catalog_read_snapshot", snapshot)
+    return pin
 
 
 def test_legacy_predicate_keeps_authorization_but_does_not_require_canonical_office_coverage():
@@ -104,7 +111,6 @@ async def test_invalid_header_never_reaches_mapping_or_native(monkeypatch, raw):
 )
 async def test_missing_ambiguous_or_mismatched_mapping_refuses_before_handler(monkeypatch, mapping):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-legacy-token")
-    monkeypatch.setattr(network_serving_read, "resolve_network_serving_manifest", AsyncMock(return_value=MANIFEST))
     incoming, driver = request("42")
     driver.fetchrow.return_value = mapping
     handler = AsyncMock(return_value=response.json({"unexpected": True}))
@@ -116,10 +122,8 @@ async def test_missing_ambiguous_or_mismatched_mapping_refuses_before_handler(mo
 
 
 @pytest.mark.parametrize("checksums", [None, "-2147483648,0,42,2147483647"])
-async def test_verified_header_is_exact_pinned_scope_and_acknowledged(monkeypatch, checksums):
+async def test_verified_header_is_exact_pinned_scope_and_acknowledged(monkeypatch, approved_metadata, checksums):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-legacy-token")
-    pin = AsyncMock(return_value=MANIFEST)
-    monkeypatch.setattr(network_serving_read, "resolve_network_serving_manifest", pin)
     incoming, driver = request(checksums)
 
     async def native(_request):
@@ -132,14 +136,12 @@ async def test_verified_header_is_exact_pinned_scope_and_acknowledged(monkeypatc
     assert result.headers.get("X-Network-Legacy-Checksums") == checksums
     assert result.headers["X-Network-Generation"] == "7"
     assert scope.current_network_address_scope() is None
-    pin.assert_awaited_once_with(driver.native, generation_id=7, control_schema=None, api_read=True)
+    approved_metadata.assert_awaited_once_with(incoming.ctx.sa_session, generation_id=7, control_schema=None)
     assert driver.fetchrow.await_count == int(checksums is not None)
 
 
-async def test_nested_batch_read_reuses_the_outer_legacy_scope(monkeypatch):
+async def test_nested_batch_read_reuses_the_outer_legacy_scope(monkeypatch, approved_metadata):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-legacy-token")
-    pin = AsyncMock(return_value=MANIFEST)
-    monkeypatch.setattr(network_serving_read, "resolve_network_serving_manifest", pin)
     incoming, driver = request("42")
 
     @scope.canonical_network_read
@@ -157,7 +159,7 @@ async def test_nested_batch_read_reuses_the_outer_legacy_scope(monkeypatch):
     result = await batch(incoming)
     assert result.headers["X-Network-Generation"] == "7"
     assert result.headers["X-Network-Legacy-Checksums"] == "42"
-    pin.assert_awaited_once_with(driver.native, generation_id=7, control_schema=None, api_read=True)
+    approved_metadata.assert_awaited_once_with(incoming.ctx.sa_session, generation_id=7, control_schema=None)
     assert driver.fetchrow.await_count == 1
     assert scope.current_network_address_scope() is None
 
@@ -197,10 +199,8 @@ async def test_header_requires_one_value_and_both_trusted_pins(monkeypatch, miss
     driver.fetchrow.assert_not_awaited()
 
 
-async def test_http_pin_uses_bound_reader_instead_of_configuring_writer(monkeypatch):
+async def test_http_pin_uses_bound_reader_instead_of_configuring_writer(monkeypatch, approved_metadata):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-legacy-token")
-    pin = AsyncMock(return_value=MANIFEST)
-    monkeypatch.setattr(network_serving_read, "resolve_network_serving_manifest", pin)
     incoming, driver = request()
     ordinary = incoming.ctx.sa_session
     reader = with_read_identity_receipts(SimpleNamespace(execute=AsyncMock()), driver=driver)
@@ -211,5 +211,4 @@ async def test_http_pin_uses_bound_reader_instead_of_configuring_writer(monkeypa
     binder.assert_awaited_once_with(incoming)
     ordinary.execute.assert_not_awaited()
     assert [str(call.args[0]) for call in reader.execute.await_args_list] == ["SET LOCAL lock_timeout='1s'"]
-    reader_driver = reader.connection.return_value.get_raw_connection.return_value.driver_connection
-    pin.assert_awaited_once_with(reader_driver, generation_id=7, control_schema=None, api_read=True)
+    approved_metadata.assert_awaited_once_with(reader, generation_id=7, control_schema=None)

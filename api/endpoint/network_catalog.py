@@ -14,6 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from api.control_auth import require_registry_auth
 from api.network_catalog_fhir_query import FHIRCatalogSelection, parse_fhir_catalog_query
+from api.network_serving_api_read import api_catalog_read_snapshot
 from api.network_serving_read_context import bind_network_request_reader, network_serving_read_context
 from api.provider_collection_network_contract import parse_managed_collection_query
 from api.provider_collection_network_read import ProviderCollectionServiceRefusal, read_managed_provider_collection
@@ -354,23 +355,29 @@ def _parameters(request, kind):
     return policy_by_field, excluded_ids, selector, generation, scope
 
 
-async def _read_catalog_page(driver, kind, selector, generation, excluded, options):
+async def _read_catalog_page(driver, kind, selector, generation, excluded, options, *, manifest=None):
     if isinstance(selector, FHIRCatalogSelection):
         return await read_fhir_catalog(
             driver, selector.query, excluded_network_ids=excluded, network_id=selector.network_id, **options
         )
     if kind == "autocomplete":
-        return await read_registry_network_autocomplete(driver, selector, excluded_network_ids=excluded)
+        return await read_registry_network_autocomplete(
+            driver, selector, excluded_network_ids=excluded, manifest=manifest
+        )
     if kind == "provider-plans":
-        return await read_registry_provider_plans(driver, selector, excluded_network_ids=excluded)
+        return await read_registry_provider_plans(driver, selector, excluded_network_ids=excluded, manifest=manifest)
     if kind.startswith("organization"):
         return await read_registry_serving_organizations(
-            driver, RegistryOrganizationCatalogQuery(**selector, generation_id=generation), **options
+            driver, RegistryOrganizationCatalogQuery(**selector, generation_id=generation), manifest=manifest, **options
         )
     if kind == "list":
-        return await read_registry_network_catalog(driver, selector, excluded_network_ids=excluded, **options)
+        return await read_registry_network_catalog(
+            driver, selector, excluded_network_ids=excluded, manifest=manifest, **options
+        )
     reader = read_registry_network_catalog_detail if kind == "detail" else resolve_registry_network_catalog_legacy
-    return await reader(driver, selector, excluded_network_ids=excluded, generation_id=generation, **options)
+    return await reader(
+        driver, selector, excluded_network_ids=excluded, generation_id=generation, manifest=manifest, **options
+    )
 
 
 async def _read_managed_provider_page(request, kind, selector, excluded, scope, options):
@@ -403,7 +410,12 @@ async def _read_catalog_snapshot(request, kind, selector, generation, excluded, 
     """Read the selected catalog within one request-owned, read-only snapshot."""
     session = await bind_network_request_reader(request)
     async with network_serving_read_context(session) as driver:
-        return await _read_catalog_page(driver, kind, selector, generation, excluded, options)
+        if isinstance(selector, FHIRCatalogSelection):
+            return await _read_catalog_page(driver, kind, selector, generation, excluded, options)
+        if kind == "detail" and selector in excluded:
+            raise RegistryNetworkCatalogError("registry_network_catalog_detail_denied")
+        async with api_catalog_read_snapshot(session, generation) as (manifest, _approved_relation):
+            return await _read_catalog_page(driver, kind, selector, generation, excluded, options, manifest=manifest)
 
 
 def _catalog_response_headers(selector, page, scope):

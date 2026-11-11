@@ -45,6 +45,7 @@ async def test_opt_in_dispatches_authorized_reader_and_keeps_last_good_serving(c
     assert reply.headers["X-Network-Generation"] == "9"
     assert reader.call_args.args[1].plan_search == "Gold"
     assert reader.call_args.kwargs["organization_policy"].excluded_company_ids == ()
+    assert "manifest" not in reader.call_args.kwargs and context.api_pins == []
 
 
 @pytest.mark.asyncio
@@ -60,6 +61,7 @@ async def test_unattached_enriched_page_has_metadata_pins_and_no_directory_heade
     assert reply.json["items"][0]["directory_available"] is False
     assert "X-Network-Generation" not in reply.headers
     assert reply.headers["X-Network-Access-Scope"]
+    assert context.api_pins == []
 
 
 @pytest.mark.asyncio

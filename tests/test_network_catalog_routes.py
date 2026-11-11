@@ -4,6 +4,7 @@
 import asyncio
 import hashlib
 import json
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
@@ -108,6 +109,17 @@ def context(batch_boundary, monkeypatch):
     session = Session(driver)
     bind_reader = AsyncMock(return_value=session)
     monkeypatch.setattr(endpoint, "bind_network_request_reader", bind_reader)
+    api_pins = []
+
+    @asynccontextmanager
+    async def api_snapshot(reader_session, generation_id=None, control_schema=None):
+        assert reader_session is session and driver.in_transaction
+        assert control_schema is None
+        api_pins.append(generation_id)
+        async with catalog.registry_catalog_read_snapshot(driver, generation_id, "sample_control") as pinned:
+            yield pinned, None
+
+    monkeypatch.setattr(endpoint, "api_catalog_read_snapshot", api_snapshot)
     app = Sanic("catalog_routes_" + uuid4().hex)
     app.blueprint(Blueprint.group([endpoint.blueprint], version_prefix="/api/v"))
     endpoint.register_network_catalog_private_responses(app)
@@ -117,7 +129,13 @@ def context(batch_boundary, monkeypatch):
         request.ctx.sa_session = session
 
     return SimpleNamespace(
-        app=app, session=session, driver=driver, manifest=manifest, revisions=revisions, bind_reader=bind_reader
+        app=app,
+        session=session,
+        driver=driver,
+        manifest=manifest,
+        revisions=revisions,
+        bind_reader=bind_reader,
+        api_pins=api_pins,
     )
 
 
@@ -171,6 +189,7 @@ async def test_actual_reader_pins_retained_revision_and_policy_before_count_page
     )
     assert http_response.json["generation"] == http_response.headers["X-Network-Generation"] == "9"
     assert http_response.json["approved_custom_revision"] == "4" and context.revisions == [4]
+    assert context.api_pins == [9] and catalog._PINNED_READ.get() is None
     assert (
         http_response.json["items"][0]["priceable"] is None and http_response.json["items"][0]["benefit_codes"] is None
     )
@@ -211,6 +230,25 @@ async def test_exact_canonical_detail_preserves_reader_page(context):
     http_response = await send(context, envelope({"network_id": 7, "network_generation": "9"}), path=_PATH + "/detail")
     assert http_response.status == 200 and http_response.json["items"][0]["network_id"] == 7
     assert context.driver.calls[-1][1][5:] == ((7,), 0, 1, 1048576, None)
+
+
+@pytest.mark.asyncio
+async def test_catalog_pin_exit_refusal_does_not_expose_buffered_page_or_retry(context, monkeypatch):
+    snapshot = endpoint.api_catalog_read_snapshot
+
+    @asynccontextmanager
+    async def changed_pin(session, generation_id=None):
+        async with snapshot(session, generation_id) as pinned:
+            yield pinned
+            raise ValueError("synthetic consumed relation changed")
+
+    monkeypatch.setattr(endpoint, "api_catalog_read_snapshot", changed_pin)
+    result = await send(context)
+    assert result.status == 503 and result.json == {"error": {"code": "network_catalog_unavailable"}}
+    assert "X-Network-Generation" not in result.headers
+    assert context.api_pins == [None] and context.revisions == [4]
+    assert not context.driver.in_transaction and catalog._PINNED_READ.get() is None
+    assert context.session.events[-1] == ("exit", ValueError)
 
 
 @pytest.mark.asyncio
@@ -255,6 +293,7 @@ async def test_legacy_hidden_ambiguous_or_missing_refuses_without_selector_value
 async def test_excluded_detail_never_reads_candidate_or_approved_metadata(context):
     http_response = await send(context, envelope({"network_id": 7}, excluded_network_ids=[7]), path=_PATH + "/detail")
     assert http_response.status == 404 and context.driver.calls == []
+    assert context.api_pins == []
     assert context.session.events[-1] == ("exit", catalog.RegistryNetworkCatalogError)
 
 
@@ -690,8 +729,9 @@ def autocomplete_context(context, monkeypatch):
         ],
     }
 
-    async def read(connection, query, *, excluded_network_ids):
+    async def read(connection, query, *, excluded_network_ids, manifest):
         assert connection is context.driver and connection.in_transaction
+        assert catalog._reuse_manifest(connection, manifest, query.generation_id, "sample_control") is context.manifest
         context.autocomplete_calls.append((query, excluded_network_ids))
         return context.autocomplete_page
 
@@ -718,7 +758,8 @@ async def test_autocomplete_full_policy_pins_one_transaction_and_keeps_metadata_
     assert http_response.headers["X-Network-Access-Scope"] == document["access_scope_sha256"]
     query, exclusions = context.autocomplete_calls[0]
     assert (query.query, query.limit, query.zip_code, query.generation_id, exclusions) == ("É%_", 2, "01234", 9, (84,))
-    assert len(context.autocomplete_calls) == 1 and context.driver.calls == []
+    assert len(context.autocomplete_calls) == 1 and context.api_pins == [9] and context.revisions == [4]
+    assert catalog._PINNED_READ.get() is None
     assert context.session.events == _OWNED_READ_EVENTS
     assert len(context.session.snapshot_queries) == 3
 

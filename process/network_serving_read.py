@@ -69,6 +69,11 @@ class PinnedNetworkServingManifest:
         return getattr(self, "_supports_location_lookup", False) is True
 
     @property
+    def supports_membership_pages(self):
+        """Sealed typed membership and office parity permit paging before hydration."""
+        return getattr(self, "_supports_membership_pages", False) is True
+
+    @property
     def candidate_relation_pins(self):
         """Verified candidate data identities, outside the public manifest wire format."""
         return getattr(self, "_candidate_relation_pins", ())
@@ -233,6 +238,19 @@ def _pinned_manifest(entry, *, custody=None):
         address_table_oid=address_table_oid,
     )
     _attach_manifest_custody(pinned, custody, readiness, is_compact)
+    if is_compact and custody is not None:
+        from process.registry_initial_source_composition import verify_initial_source_office_receipt
+
+        contributions = verify_registry_source_contributions(candidate)
+        offices = verify_initial_source_office_receipt(candidate)
+        object.__setattr__(
+            pinned,
+            "_supports_membership_pages",
+            contributions is not None
+            and contributions["revision"] == 6
+            and offices is not None
+            and offices["revision"] == 6,
+        )
     return pinned
 
 

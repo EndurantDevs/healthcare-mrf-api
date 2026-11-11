@@ -16,6 +16,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from sanic import Blueprint, Sanic
 
 from api import provider_collection_network_read as collection
+from api import provider_detail_network_read as detail
 from api import provider_directory_cms_entities as cms
 from api import provider_directory_cms_network_scope as scoped
 from api import provider_directory_entities_contract as contract
@@ -29,6 +30,7 @@ from process.network_approved_source_bindings import RegistryNetworkSourceCoordi
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from tests.network_read_execution_support import with_read_identity_receipts
+from tests.provider_network_read_support import approved_record_relation
 from tests.test_network_catalog_routes import v2_envelope
 from tests.test_provider_collection_network_read import boundary as boundary
 from tests.test_provider_directory_entities import ENTITY_ID, KEY
@@ -78,7 +80,18 @@ def directory_boundary(boundary, monkeypatch):
     monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", "sample_registry")
     monkeypatch.setattr(managed, "provider_profile_read_snapshot", collection.provider_profile_read_snapshot)
     monkeypatch.setattr(catalog, "_pin", AsyncMock(return_value=held.manifest))
-    monkeypatch.setattr(catalog, "registry_catalog_read_snapshot", _CATALOG_SNAPSHOT)
+
+    @asynccontextmanager
+    async def catalog_snapshot(session, generation, schema):
+        assert session is held.session and held.state.active
+        held.state.catalog_active = True
+        try:
+            async with _CATALOG_SNAPSHOT(held.driver, generation, schema) as manifest:
+                yield manifest, approved_record_relation(schema)
+        finally:
+            held.state.catalog_active = False
+
+    monkeypatch.setattr(detail, "api_catalog_read_snapshot", catalog_snapshot)
 
     @asynccontextmanager
     async def bounded(session, *, timeout_ms):
@@ -87,6 +100,7 @@ def directory_boundary(boundary, monkeypatch):
 
     async def source_read(session, query, *, response_headers=None):
         assert session is held.session and held.requests[-1].ctx.sa_session is session
+        assert held.state.active and held.state.catalog_active
         assert query.network_ids is None and query.excluded_network_ids == ()
         assert query.network_manifest is held.manifest and query.network_generation == 9
         assert current_network_address_scope().manifest is held.manifest
@@ -127,7 +141,8 @@ async def test_full_policy_source_uses_one_reader_and_retains_original_data(dire
     assert reply.headers.get_list("X-Network-Generation") == ["9"]
     assert reply.headers.get_list("X-Network-Access-Scope") == [document["access_scope_sha256"]]
     assert "X-CMS-Retained-Publication" not in reply.headers
-    assert len(held.reads) == len(held.state.snapshots) == 1 and not held.state.active
+    assert len(held.reads) == len(held.state.snapshots) == 1
+    assert not held.state.active and not held.state.catalog_active
     assert [str(call.args[0]) for call in held.session.execute.await_args_list] == [
         "SET LOCAL lock_timeout = '250ms'",
         "SET LOCAL work_mem = '4MB'",
@@ -265,7 +280,8 @@ async def test_source_errors_are_sanitized_and_absence_is_specific(directory_bou
         }[status]
     )
     assert reply.status == status and reply.json == {"error": {"code": expected}}
-    assert not directory_boundary.state.active and catalog._PINNED_READ.get() is None
+    assert not directory_boundary.state.active and not directory_boundary.state.catalog_active
+    assert catalog._PINNED_READ.get() is None
 
 
 @pytest.mark.asyncio
@@ -398,4 +414,5 @@ async def test_source_cancellation_restores_the_real_request(directory_boundary,
             access_scope_sha256="a" * 64,
         )
     assert request.ctx.sa_session is held.prior and current_network_address_scope() is None
-    assert not held.state.active and catalog._PINNED_READ.get() is None
+    assert not held.state.active and not held.state.catalog_active
+    assert catalog._PINNED_READ.get() is None

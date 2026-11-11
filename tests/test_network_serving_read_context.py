@@ -275,6 +275,14 @@ async def _call_route(session, route, monkeypatch):
         20,
     )
     if route == "catalog":
+
+        @asynccontextmanager
+        async def api_snapshot(reader_session, generation_id=None):
+            assert reader_session is session and session.driver.active
+            assert generation_id is None
+            yield manifest, None
+
+        monkeypatch.setattr(network_catalog, "api_catalog_read_snapshot", api_snapshot)
         monkeypatch.setattr(
             network_catalog,
             "_read_catalog_page",

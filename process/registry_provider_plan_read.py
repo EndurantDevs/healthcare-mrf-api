@@ -16,7 +16,7 @@ from db.registry_schema import registry_schema
 from process.ext.address_canon import address_key_v1
 from process.initial import _normalize_marketplace_address_entry_base
 from process.network_address_projection import _identifier
-from process.network_approved_membership_source import pin_retained_approved_membership_source
+from process.network_approved_membership_source import ApprovedMembershipSource, pin_retained_approved_membership_source
 from process.network_approved_source_bindings import require_retained_approved_network_source_bindings
 from process.network_legacy_membership_source import (
     ACAGlobalEpochReadScope,
@@ -29,11 +29,13 @@ from process.network_legacy_membership_source import (
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_candidate_composition import _retained_memberships
 from process.registry_network_catalog_read import (
+    _PINNED_READ,
     MAX_RESPONSE_BYTES,
     RegistryNetworkCatalogError,
     _exclusions,
     _integer,
     _pin,
+    _reuse_manifest,
 )
 from process.registry_source_recipe_store import resolve_retained_registry_source_recipes
 
@@ -236,10 +238,26 @@ async def _pin_provider_plans(connection, query, manifest, control_schema):
         if generation_id is not None and generation_id != manifest.generation_id:
             raise RegistryNetworkCatalogError("registry_network_catalog_source_changed")
         generation_id = manifest.generation_id
+        if _api_approved_source(connection, manifest, control_schema) is not None:
+            return manifest
     pinned_manifest = await _pin(connection, generation_id, control_schema)
     if manifest is not None and manifest != pinned_manifest:
         raise RegistryNetworkCatalogError("registry_network_catalog_source_changed")
     return pinned_manifest
+
+
+def _api_approved_source(connection, manifest, control_schema):
+    """Reuse only the current API scope's authenticated immutable approved map."""
+    source = getattr(manifest, "_api_approved_source", None)
+    if source is None or _PINNED_READ.get() is None:
+        return None
+    _reuse_manifest(connection, manifest, manifest.generation_id, control_schema)
+    if type(source) is not ApprovedMembershipSource or (
+        source.approved_revision != manifest.approved_custom_revision
+        or source.generation_id != manifest.source_generations.get("custom_membership")
+    ):
+        raise RegistryNetworkCatalogError("registry_network_catalog_source_changed")
+    return source
 
 
 def _provider_plan_network_ids(network_ids):
@@ -282,9 +300,11 @@ async def read_registry_provider_plans(
         if not await connection.fetchval(f"SELECT EXISTS(SELECT 1 FROM {identity} WHERE npi=$1)", int(query.npi)):
             raise RegistryNetworkCatalogError("registry_network_catalog_detail_denied")
         recipes = await resolve_retained_registry_source_recipes(connection, manifest, control_schema=control_schema)
-        approved = await pin_retained_approved_membership_source(
-            connection, approved_revision=manifest.approved_custom_revision, control_schema=control_schema
-        )
+        approved = _api_approved_source(connection, manifest, control_schema)
+        if approved is None:
+            approved = await pin_retained_approved_membership_source(
+                connection, approved_revision=manifest.approved_custom_revision, control_schema=control_schema
+            )
         revision = manifest.approved_custom_revision
         candidate = _identifier(manifest.schema_name)
         sql_args = [revision, exclusions, query.npi, query.year, MAX_RESPONSE_BYTES, network_ids]

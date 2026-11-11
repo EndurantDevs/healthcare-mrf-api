@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Native batch HTTP scope precedes eligibility, paging and mutable enrichment."""
 
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -12,8 +13,21 @@ from sanic import Sanic
 from api import network_address_scope
 from api.endpoint import npi
 from process import network_serving_read
+from process.network_compact_layout import CompactAddressRelation
 from tests.network_read_execution_support import mock_approved_control_metadata, with_read_identity_receipts
 from tests.npi_location_hydration_support import unified_location_mapping
+
+
+def _install_catalog_snapshot(monkeypatch, session, driver, resolve):
+    monkeypatch.setattr(network_serving_read, "resolve_network_serving_manifest", resolve)
+
+    @asynccontextmanager
+    async def snapshot(actual, generation_id=None, control_schema=None):
+        assert actual is session and generation_id == 12
+        pinned = await resolve(driver, generation_id=generation_id, control_schema=control_schema, api_read=True)
+        yield pinned, CompactAddressRelation("registry_control", "registry_approved_record", 99)
+
+    monkeypatch.setattr("api.network_serving_api_read.api_catalog_read_snapshot", snapshot)
 
 
 @pytest.fixture
@@ -30,7 +44,8 @@ def native_network_batch(monkeypatch):
     bind_reader = AsyncMock(return_value=session)
     monkeypatch.setattr("api.network_serving_read_context.bind_network_request_reader", bind_reader)
     resolve = AsyncMock(return_value=manifest)
-    monkeypatch.setattr(network_serving_read, "resolve_network_serving_manifest", resolve)
+
+    _install_catalog_snapshot(monkeypatch, session, driver, resolve)
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-network-batch-token")
     retained_by_field = {**unified_location_mapping(), "npi": member, "inferred_npi": None}
     retained_by_field["_base_row_identities"] = [npi._base_address_row_identity(retained_by_field)]

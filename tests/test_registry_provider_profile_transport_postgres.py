@@ -496,6 +496,12 @@ async def _source_reviewed_payer(held):
         )
 
 
+def _observe_catalog_pin(monkeypatch, catalog, observer):
+    """Observe each catalog entry while retaining its genuine verification."""
+    monkeypatch.setattr(catalog, "_pin", observer)
+    monkeypatch.setattr(catalog, "catalog_pin", observer)
+
+
 @pytest.fixture
 async def source_transport(source_preparation, profile_transport, published_profile_source, monkeypatch):
     """Observe delegated real pins and bind the actual request's prior session."""
@@ -552,7 +558,7 @@ async def source_transport(source_preparation, profile_transport, published_prof
         if len(held.source_sql) < 5000:
             held.source_sql.append(statement)
 
-    monkeypatch.setattr(catalog, "_pin", pin)
+    _observe_catalog_pin(monkeypatch, catalog, pin)
     monkeypatch.setattr(catalog, "resolve_network_serving_manifest", custody)
     monkeypatch.setattr(managed, "_request_reader", request_reader)
     monkeypatch.setenv(CURSOR_KEY_ENV, base64.urlsafe_b64encode(_SOURCE_KEY).decode().rstrip("="))
@@ -901,7 +907,7 @@ async def test_native_reader_prepares_plan_temporary_tables_before_verified_snap
         calls.append("custody")
         return await original_custody(*args, **options)
 
-    monkeypatch.setattr(catalog, "_pin", pin)
+    _observe_catalog_pin(monkeypatch, catalog, pin)
     monkeypatch.setattr(catalog, "resolve_network_serving_manifest", custody)
     names = [plan.IMPORTED, plan.CANDIDATES, plan.MEMBERSHIPS, plan.OCCURRENCES, plan.PRICES, plan.SELECTED]
     held.writer_statements.clear()

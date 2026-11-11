@@ -388,18 +388,18 @@ async def _network_request_snapshot(session):
 
 
 def _request_snapshot_app(monkeypatch, observations, entered):
-    """Keep the real manifest verifier and shared NPI hydration behind real middleware."""
-    from process import network_serving_read
+    """Observe each real catalog pin before its full manifest checks and native hydration."""
+    from process import registry_network_catalog_read as catalog
 
-    original = network_serving_read.resolve_network_serving_manifest
+    original = catalog.catalog_pin
 
-    async def resolve(driver, **arguments):
+    async def pin(driver, *arguments, **options):
         snapshot = await _network_request_snapshot(current_session())
         assert snapshot[1] is driver
         observations.append(snapshot)
-        return await original(driver, **arguments)
+        return await original(driver, *arguments, **options)
 
-    monkeypatch.setattr(network_serving_read, "resolve_network_serving_manifest", resolve)
+    monkeypatch.setattr(catalog, "catalog_pin", pin)
     app = RequestLifecycleSanic("network-request-snapshot-" + uuid4().hex)
     db.init_app(app)
 

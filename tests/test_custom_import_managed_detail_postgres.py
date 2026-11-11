@@ -455,6 +455,7 @@ async def signed_collection_transport(signed_collection_coordinates, managed_imp
         monkeypatch.setattr(CustomImportReadService, name, observe)
 
     monkeypatch.setattr(catalog, "_pin", observe_pin)
+    monkeypatch.setattr(catalog, "catalog_pin", observe_pin)
     monkeypatch.setattr(catalog, "resolve_network_serving_manifest", observe_custody)
     for name in ("prepare_npi_entity_relation", "scope_npi_entity_relation", "hydrate_npi_page"):
         observe_import_method(name)
@@ -542,7 +543,7 @@ def _assert_collection_custody(case):
     arguments, options_by_name, manifest = case.custody[0]
     assert len(arguments) == 1 and arguments[0] is case.pins[0][0]
     assert case.pins[0][1:] == (context.manifest.generation_id, context.fixture.control_schema)
-    assert options_by_name == {"generation_id": case.pins[0][1], "control_schema": case.pins[0][2]}
+    assert options_by_name == {"generation_id": case.pins[0][1], "control_schema": case.pins[0][2], "api_read": True}
     assert arguments[0].get_server_pid() == context.statements[0][1][4]
     assert manifest == context.manifest
     seal = getattr(manifest, "_custody_seal_sha256", None)
@@ -727,6 +728,7 @@ async def service_claims_transport(signed_collection_transport, monkeypatch):
             case.claim_sql.append(statement)
 
     monkeypatch.setattr(catalog, "_pin", pin)
+    monkeypatch.setattr(catalog, "catalog_pin", pin)
     monkeypatch.setattr(service_http, "_service_page", page)
     context.writer_statements.clear()
     yield case

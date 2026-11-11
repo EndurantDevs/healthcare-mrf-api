@@ -5,7 +5,7 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sanic.exceptions import SanicException
@@ -119,7 +119,6 @@ def test_padded_batch_identity_does_not_broaden_legacy_semantics():
 @pytest.fixture
 def import_boundary(boundary, monkeypatch):
     boundary.session.events = []
-    monkeypatch.setattr(managed, "provider_profile_read_snapshot", collection.provider_profile_read_snapshot)
 
     @asynccontextmanager
     async def bounded(session, *, timeout_ms):
@@ -128,6 +127,33 @@ def import_boundary(boundary, monkeypatch):
 
     monkeypatch.setattr(managed, "_bounded_read_window", bounded)
     return boundary
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["list", "geo", "batch", "by-service", "billing-search"])
+async def test_imported_geo_alone_uses_projection_snapshot(import_boundary, monkeypatch, kind):
+    profile = Mock(wraps=collection.provider_profile_read_snapshot)
+    geo = Mock(wraps=collection.provider_geo_read_snapshot)
+    monkeypatch.setattr(collection, "provider_profile_read_snapshot", profile)
+    monkeypatch.setattr(collection, "provider_geo_read_snapshot", geo)
+    policy = SimpleNamespace(
+        query=SimpleNamespace(kind=kind, selector=None, network_generation=None),
+        exclusions=(),
+        scope_sha256="a" * 64,
+        organization_policy=None,
+    )
+    request = _request(_body())
+    async with managed.managed_import_collection_scope(request, policy) as (session, manifest):
+        assert session is import_boundary.session and manifest is import_boundary.manifest
+        assert request.ctx.sa_session is session
+        assert current_network_address_scope().manifest is manifest
+    selected, unused = (geo, profile) if kind == "geo" else (profile, geo)
+    selected.assert_called_once_with(
+        managed.npi.db, managed.npi._runtime_db_schema(), **({} if kind == "geo" else {"include_detail": True})
+    )
+    unused.assert_not_called()
+    assert not hasattr(request.ctx, "sa_session") and current_network_address_scope() is None
+    assert not import_boundary.state.active
 
 
 @pytest.mark.asyncio

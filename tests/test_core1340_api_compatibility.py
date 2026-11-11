@@ -2,6 +2,7 @@
 """Semantic compatibility only; native custody remains independently required."""
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -145,9 +146,13 @@ async def test_actual_canonical_scope_enforces_mapping_before_handler(monkeypatc
     session.execute = AsyncMock()
     monkeypatch.setattr(addresses, "_network_scope_claim", lambda *_: ((42,), "a" * 64, (-17,), 1))
     monkeypatch.setattr("api.network_serving_read_context.bind_network_request_reader", AsyncMock(return_value=session))
-    monkeypatch.setattr(
-        "process.network_serving_read.resolve_network_serving_manifest", AsyncMock(return_value=_manifest())
-    )
+
+    @asynccontextmanager
+    async def snapshot(actual, generation_id=None, control_schema=None):
+        assert actual is session and generation_id == 1 and control_schema is None
+        yield _manifest(), CompactAddressRelation("registry_control", "registry_approved_record", 99)
+
+    monkeypatch.setattr("api.network_serving_api_read.api_catalog_read_snapshot", snapshot)
     mock_approved_control_metadata(monkeypatch)
     reached_checksums = []
 

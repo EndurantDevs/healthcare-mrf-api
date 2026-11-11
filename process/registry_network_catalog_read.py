@@ -474,7 +474,7 @@ async def catalog_directory_fetchrow(connection, sql, parameters, relations):
     return entry
 
 
-async def catalog_pin(connection, generation_id, control_schema):
+async def catalog_pin(connection, generation_id, control_schema, *, api_read=False):
     """Pin a verified catalog generation and approved membership in the caller-owned read-only snapshot."""
     if not connection.is_in_transaction():
         raise RegistryNetworkCatalogError("registry_network_catalog_transaction_required")
@@ -484,9 +484,10 @@ async def catalog_pin(connection, generation_id, control_schema):
     )
     if transaction["isolation"] not in ("repeatable read", "serializable") or transaction["read_only"] != "on":
         raise RegistryNetworkCatalogError("registry_network_catalog_transaction_required")
-    manifest = await resolve_network_serving_manifest(
-        connection, generation_id=generation_id, control_schema=control_schema
-    )
+    pin_by_option = {"generation_id": generation_id, "control_schema": control_schema}
+    if api_read:
+        pin_by_option["api_read"] = True
+    manifest = await resolve_network_serving_manifest(connection, **pin_by_option)
     approved = await pin_retained_approved_membership_source(
         connection, approved_revision=manifest.approved_custom_revision, control_schema=control_schema
     )
@@ -756,7 +757,7 @@ async def _page(connection, manifest, query, exclusions, control_schema, network
 
 
 async def read_registry_network_catalog(
-    connection, query, *, excluded_network_ids, organization_policy=None, control_schema=None
+    connection, query, *, excluded_network_ids, organization_policy=None, control_schema=None, manifest=None
 ):
     """Read authorized approved totals and pages without opening a transaction."""
     if type(query) is not RegistryNetworkCatalogQuery:
@@ -765,7 +766,7 @@ async def read_registry_network_catalog(
     control_schema = control_schema if control_schema is not None else registry_schema()
     _identifier(control_schema)
     try:
-        manifest = await _pin(connection, query.generation_id, control_schema)
+        manifest = await _catalog_manifest(connection, query.generation_id, control_schema, manifest)
         return await _page(
             connection, manifest, query, exclusions, control_schema, organization_policy=organization_policy
         )
@@ -776,7 +777,14 @@ async def read_registry_network_catalog(
 
 
 async def read_registry_network_catalog_detail(
-    connection, network_id, *, excluded_network_ids, organization_policy=None, generation_id=None, control_schema=None
+    connection,
+    network_id,
+    *,
+    excluded_network_ids,
+    organization_policy=None,
+    generation_id=None,
+    control_schema=None,
+    manifest=None,
 ):
     """Return one permitted exact canonical identity or a value-free refusal."""
     _integer(network_id, 2147483647)
@@ -787,7 +795,7 @@ async def read_registry_network_catalog_detail(
     control_schema = control_schema if control_schema is not None else registry_schema()
     _identifier(control_schema)
     try:
-        manifest = await _pin(connection, generation_id, control_schema)
+        manifest = await _catalog_manifest(connection, generation_id, control_schema, manifest)
         page = await _page(connection, manifest, query, exclusions, control_schema, (network_id,), organization_policy)
         if page["total"] != 1 or len(page["items"]) != 1 or page["items"][0]["network_id"] != network_id:
             raise RegistryNetworkCatalogError("registry_network_catalog_detail_denied")
@@ -1083,7 +1091,9 @@ async def _autocomplete_page(connection, manifest, query, exclusions, control_sc
     return [_autocomplete_document(document) for document in plans]
 
 
-async def read_registry_network_autocomplete(connection, query, *, excluded_network_ids, control_schema=None):
+async def read_registry_network_autocomplete(
+    connection, query, *, excluded_network_ids, control_schema=None, manifest=None
+):
     """Search source-qualified visible metadata in one pinned request snapshot."""
     if type(query) is not RegistryNetworkAutocompleteQuery:
         raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
@@ -1091,7 +1101,7 @@ async def read_registry_network_autocomplete(connection, query, *, excluded_netw
     control_schema = control_schema if control_schema is not None else registry_schema()
     _identifier(control_schema)
     try:
-        manifest = await _pin(connection, query.generation_id, control_schema)
+        manifest = await _catalog_manifest(connection, query.generation_id, control_schema, manifest)
         states = await _autocomplete_zip_states(connection, query.zip_code) if query.zip_code is not None else None
         plans = await _autocomplete_page(connection, manifest, query, exclusions, control_schema, states)
         if plans is None:

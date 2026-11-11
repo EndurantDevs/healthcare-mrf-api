@@ -19,6 +19,7 @@ from api import billing_search_verified_transport as verified_billing
 from api import custom_import_billing_http as billing
 from api import custom_import_provider_collection as managed
 from api import custom_import_read_http as transport
+from api import provider_collection_network_read as collection
 from api import provider_detail_network_read as detail
 from api.network_address_scope import current_network_address_scope
 from api.provider_billing_network_read import require_managed_billing_client
@@ -91,6 +92,8 @@ def _signed(*, client="sample-client", include_filter=True, damage=None):
 def _install(monkeypatch, boundary):
     session = Session()
     session.connection = boundary.session.connection
+    session.get_transaction = boundary.session.get_transaction
+    session.get_nested_transaction = boundary.session.get_nested_transaction
     install_pipeline(monkeypatch, session)
 
     @asynccontextmanager
@@ -107,7 +110,7 @@ def _install(monkeypatch, boundary):
         assert same_session is session and session.active
         yield
 
-    monkeypatch.setattr(managed, "provider_profile_read_snapshot", snapshot)
+    monkeypatch.setattr(collection, "provider_profile_read_snapshot", snapshot)
     monkeypatch.setattr(managed, "_bounded_read_window", bounded)
     return session
 

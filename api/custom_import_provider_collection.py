@@ -12,9 +12,8 @@ from api import custom_import_read_http as transport
 from api.custom_import_provider_detail import parse_managed_provider_policy
 from api.endpoint import npi
 from api.provider_collection_network_contract import ProviderCollectionNetworkQuery, parse_managed_collection_query
-from api.provider_collection_network_read import MAX_COLLECTION_BYTES, _request_reader
+from api.provider_collection_network_read import MAX_COLLECTION_BYTES, _collection_read_snapshot, _request_reader
 from api.provider_detail_network_read import managed_provider_network_read_scope
-from api.provider_profile_snapshot import provider_profile_read_snapshot
 from process.custom_import.read_contracts import (
     DEFAULT_READ_TIMEOUT_MS,
     CustomImportReadRequestError,
@@ -77,7 +76,7 @@ async def managed_import_collection_scope(request, managed, *, temporary_setup=N
         if temporary_setup is not None:
             await stack.enter_async_context(npi.db.reader_session(temporary_setup=temporary_setup))
         session = await stack.enter_async_context(
-            provider_profile_read_snapshot(npi.db, npi._runtime_db_schema(), include_detail=True)
+            _collection_read_snapshot(npi.db, npi._runtime_db_schema(), managed.query.kind)
         )
         async with _bounded_read_window(session, timeout_ms=DEFAULT_READ_TIMEOUT_MS):
             async with managed_provider_network_read_scope(
