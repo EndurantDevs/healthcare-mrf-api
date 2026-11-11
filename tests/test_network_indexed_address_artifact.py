@@ -166,3 +166,58 @@ def test_retention_keeps_indexed_heap_indexes_and_authenticated_bootstrap(monkey
     )
     receipt_by_field = {"closure": {"relation_oids": {"network_office_edge": 60, "network_slice_ref": 61}}}
     assert retention._dependencies(candidate_by_field, receipt_by_field) == {*descriptor["dependency_oids"], 60, 61}
+
+
+@pytest.mark.parametrize("digest_kind", ["canonical", "legacy", "changed"])
+async def test_indexed_verification_keeps_exact_canonical_and_legacy_digests(monkeypatch, digest_kind):
+    from process import network_membership_serving_indexes as serving_indexes
+
+    descriptor = _descriptor()
+    physical_by_field = {"oid": 52, "schema_oid": 50, "owner_oid": 51, "relfilenode": 53}
+    canonical_digest = descriptor["index_definition_sha256"] if digest_kind == "canonical" else "f" * 64
+    native_identity = AsyncMock(return_value=(physical_by_field, descriptor["catalog"], canonical_digest))
+    monkeypatch.setattr(indexed, "_native_identity", native_identity)
+    monkeypatch.setattr(indexed.bootstrap, "verify_bootstrap_address_artifact", AsyncMock())
+    monkeypatch.setattr(artifact, "_database", AsyncMock(return_value=descriptor["database"]))
+    legacy_digest = AsyncMock(
+        return_value=descriptor["index_definition_sha256"] if digest_kind == "legacy" else "b" * 64
+    )
+    monkeypatch.setattr(serving_indexes, "_index_digest", legacy_digest)
+    if digest_kind == "changed":
+        with pytest.raises(artifact.NetworkAddressArtifactError, match="indexed_artifact_changed"):
+            await indexed.verify_indexed_address_artifact(
+                object(), descriptor, runtime_roles=tuple(descriptor["runtime_roles"])
+            )
+    else:
+        relation = await indexed.verify_indexed_address_artifact(
+            object(), descriptor, runtime_roles=tuple(descriptor["runtime_roles"])
+        )
+        assert relation.table_oid == descriptor["table"]["oid"]
+    assert legacy_digest.await_count == (digest_kind != "canonical")
+
+
+@pytest.mark.parametrize("damage", ["database", "namespace", "relfilenode", "catalog"])
+async def test_indexed_legacy_digest_cannot_bypass_physical_metadata(monkeypatch, damage):
+    from process import network_membership_serving_indexes as serving_indexes
+
+    descriptor = _descriptor()
+    physical_by_field = {"schema_oid": 50, "owner_oid": 51, "relfilenode": 53}
+    catalog, database = copy.deepcopy(descriptor["catalog"]), copy.deepcopy(descriptor["database"])
+    if damage == "database":
+        database["oid"] += 1
+    elif damage == "namespace":
+        physical_by_field["schema_oid"] += 1
+    elif damage == "relfilenode":
+        physical_by_field["relfilenode"] += 1
+    else:
+        catalog["indexes"][0]["index_oid"] += 1
+    monkeypatch.setattr(indexed, "_native_identity", AsyncMock(return_value=(physical_by_field, catalog, "f" * 64)))
+    monkeypatch.setattr(indexed.bootstrap, "verify_bootstrap_address_artifact", AsyncMock())
+    monkeypatch.setattr(artifact, "_database", AsyncMock(return_value=database))
+    legacy_digest = AsyncMock(return_value=descriptor["index_definition_sha256"])
+    monkeypatch.setattr(serving_indexes, "_index_digest", legacy_digest)
+    with pytest.raises(artifact.NetworkAddressArtifactError, match="indexed_artifact_changed"):
+        await indexed.verify_indexed_address_artifact(
+            object(), descriptor, runtime_roles=tuple(descriptor["runtime_roles"])
+        )
+    legacy_digest.assert_not_awaited()

@@ -31,6 +31,7 @@ from process.registry_retained_generation import RegistryRetainedGenerationError
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from tests.registry_candidate_custody_postgres_support import install_candidate_custody
 from tests.test_network_address_artifact_postgres import _rotate
+from tests.test_network_address_artifact_postgres import address_db as address_db
 from tests.test_network_compact_publication_postgres import _bind_offices, _candidate, _prepare, _publish, _read, _seal
 from tests.test_network_compact_publication_postgres import compact_publication_db as compact_publication_db
 from tests.test_network_custom_address_source_postgres import _bootstrap_prepare, _bootstrap_specification, _seed
@@ -504,6 +505,63 @@ async def test_indexed_dependency_verifies_read_snapshot_native_identity_and_rol
             fixture.execution_connection, descriptor, runtime_roles=tuple(descriptor["runtime_roles"]), api_read=True
         )
         assert relation.table_oid == descriptor["table"]["oid"]
+
+
+async def test_indexed_reader_digest_is_independent_of_public_schema_visibility(address_db):
+    from process.entity_address_native_publication import _catalog_evidence
+    from process.network_membership_serving_indexes import (
+        _build_serving_indexes,
+        _index_digest,
+        _serving_index_records,
+        _serving_plan,
+    )
+
+    fixture = address_db
+    plan = _serving_plan(fixture.schema)
+    for extension in ("intarray", "btree_gin", "btree_gist"):
+        await fixture.admin.execute("CREATE EXTENSION IF NOT EXISTS " + extension)
+    await _build_serving_indexes(fixture.admin, fixture.schema, plan)
+    # Schema visibility changes belong only to this fixture's disposable database.
+    await fixture.admin.execute("REVOKE USAGE ON SCHEMA public FROM PUBLIC")
+    await fixture.admin.execute(f'GRANT USAGE ON SCHEMA public TO "{fixture.roles["reader"]}"')
+    oid = fixture.descriptor["table"]["oid"]
+    handoff_by_field = {
+        "schema_name": fixture.schema,
+        "stage_relations": [
+            {"table_name": "entity_address_unified", "stage_name": "entity_address_unified", "relation_oid": oid}
+        ],
+    }
+    observations_by_role = {}
+    for name, connection, public_usage in (("publisher", fixture.publisher, False), ("reader", fixture.reader, True)):
+        assert await connection.fetchval(
+            "SELECT current_user=session_user AND current_user::text=$1", fixture.roles[name]
+        )
+        assert await connection.fetchval("SELECT has_schema_privilege(current_user,'public','USAGE')") is public_usage
+        async with connection.transaction(isolation="repeatable_read", readonly=True):
+            physical = await indexed.artifact._read_table(connection, fixture.schema, oid)
+            catalog = await _catalog_evidence(indexed.artifact._CatalogSession(connection), handoff_by_field)
+            canonical = await _index_digest(connection, fixture.schema, plan, qualified_definitions=True)
+            legacy = await _index_digest(connection, fixture.schema, plan)
+            definitions = [
+                index_record["index_definition"]
+                for index_record in await _serving_index_records(connection, fixture.schema)
+            ]
+            observations_by_role[name] = physical, catalog, canonical, legacy, definitions
+    publisher, reader = observations_by_role["publisher"], observations_by_role["reader"]
+    assert publisher[:3] == reader[:3]
+    assert publisher[2] == publisher[3] != reader[3]
+    assert any("public.st_makepoint" in definition for definition in publisher[4])
+    assert any("public.gin__int_ops" in definition for definition in publisher[4])
+    assert all("public.st_makepoint" not in definition for definition in reader[4])
+
+    await fixture.admin.execute(
+        f'ALTER INDEX "{fixture.schema}".entity_address_unified_idx_geo_idx SET (fillfactor=80)'
+    )
+    async with fixture.reader.transaction(isolation="repeatable_read", readonly=True):
+        assert await indexed.artifact._read_table(fixture.reader, fixture.schema, oid) == reader[0]
+        assert await _catalog_evidence(indexed.artifact._CatalogSession(fixture.reader), handoff_by_field) == reader[1]
+        assert await _index_digest(fixture.reader, fixture.schema, plan, qualified_definitions=True) != reader[2]
+        assert await _index_digest(fixture.reader, fixture.schema, plan) != reader[3]
 
 
 @pytest.mark.parametrize("damage", ["oid", "definition"])

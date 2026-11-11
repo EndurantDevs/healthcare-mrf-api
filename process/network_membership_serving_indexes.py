@@ -149,10 +149,14 @@ async def _build_serving_indexes(connection, schema_name, index_plan):
         await connection.execute(statement)
 
 
-async def _serving_index_records(connection, schema_name):
+async def _serving_index_records(connection, schema_name, *, qualified_definitions=False):
     """Deparse the same complete index catalog independently of caller lookup settings."""
     previous_path = await connection.fetchval("SELECT current_setting('search_path')")
-    await connection.execute("SET LOCAL search_path TO pg_catalog,public")
+    await connection.execute(
+        "SET LOCAL search_path TO pg_catalog,pg_temp"
+        if qualified_definitions
+        else "SET LOCAL search_path TO pg_catalog,public"
+    )
     try:
         index_records = await connection.fetch(
             """
@@ -176,8 +180,8 @@ async def _serving_index_records(connection, schema_name):
     return index_records
 
 
-async def _index_digest(connection, schema_name, index_plan):
-    index_records = await _serving_index_records(connection, schema_name)
+async def _index_digest(connection, schema_name, index_plan, *, qualified_definitions=False):
+    index_records = await _serving_index_records(connection, schema_name, qualified_definitions=qualified_definitions)
     actual_by_name = {record["relname"]: record for record in index_records}
     if not all(index_name in actual_by_name for index_name, _ in index_plan) or any(
         record["indrelid"] != record["table_oid"]

@@ -149,7 +149,7 @@ async def _native_identity(connection, address_source, runtime_roles, *, origin_
         },
     )
     index_digest = await _index_digest(
-        connection, address_source.schema_name, _serving_plan(address_source.schema_name)
+        connection, address_source.schema_name, _serving_plan(address_source.schema_name), qualified_definitions=True
     )
     return physical, catalog, index_digest
 
@@ -213,10 +213,12 @@ async def verify_indexed_address_artifact(connection, descriptor, *, runtime_rol
     await bootstrap.verify_bootstrap_address_artifact(
         connection, descriptor["origin_artifact"], runtime_roles=roles, api_read=api_read
     )
-    source = PinnedAddressSource(descriptor["namespace"]["name"], "entity_address_unified", descriptor["generation_id"])
+    address_source = PinnedAddressSource(
+        descriptor["namespace"]["name"], "entity_address_unified", descriptor["generation_id"]
+    )
     physical, catalog, index_digest = await _native_identity(
         connection,
-        source,
+        address_source,
         roles,
         origin_oid=descriptor["origin_artifact"]["table"]["oid"],
         expected_oid=descriptor["table"]["oid"],
@@ -225,13 +227,19 @@ async def verify_indexed_address_artifact(connection, descriptor, *, runtime_rol
     artifact._require(
         descriptor["database"] == await artifact._database(connection)
         and descriptor["namespace"]
-        == {"name": source.schema_name, "oid": physical["schema_oid"], "owner_oid": physical["owner_oid"]}
+        == {"name": address_source.schema_name, "oid": physical["schema_oid"], "owner_oid": physical["owner_oid"]}
         and descriptor["table"]["relfilenode"] == physical["relfilenode"]
-        and descriptor["catalog"] == json.loads(artifact._json(catalog))
-        and descriptor["index_definition_sha256"] == index_digest,
+        and descriptor["catalog"] == json.loads(artifact._json(catalog)),
         "indexed_artifact_changed",
     )
-    return CompactAddressRelation(source.schema_name, source.table_name, physical["oid"])
+    if descriptor["index_definition_sha256"] != index_digest:
+        from process.network_membership_serving_indexes import _index_digest, _serving_plan
+
+        legacy_digest = await _index_digest(
+            connection, address_source.schema_name, _serving_plan(address_source.schema_name)
+        )
+        artifact._require(descriptor["index_definition_sha256"] == legacy_digest, "indexed_artifact_changed")
+    return CompactAddressRelation(address_source.schema_name, address_source.table_name, physical["oid"])
 
 
 async def prove_indexed_address_equivalence(connection, descriptor):
