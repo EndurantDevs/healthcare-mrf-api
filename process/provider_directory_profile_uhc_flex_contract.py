@@ -9,21 +9,25 @@ import re
 from typing import Any, Mapping
 
 from process.provider_directory_dataset_scoped_publication import (
-    exact_dataset_variant,
     LEGACY_PRACTITIONER_VARIANT,
     ROOTED_COMBINED_VARIANT,
-)
-from process.provider_directory_resource_hash import (
-    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+    exact_dataset_variant,
 )
 from process.provider_directory_fhir_root_policy import (
     REVIEWED_ROOT_POLICY_METADATA_KEY,
     ReviewedRootPolicy,
 )
+from process.provider_directory_resource_hash import (
+    SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+)
 from process.provider_directory_rooted_graph_publication import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_RESOURCES,
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_PARTIAL_PUBLICATION_CONTRACT_ID,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_KIND,
+)
+from process.provider_directory_rooted_graph_request_coverage import (
+    has_matching_rooted_publication_coverage,
 )
 from process.provider_directory_rooted_graph_source_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
@@ -53,7 +57,6 @@ from process.uhc_flex_practitioner_twin_store_contract import (
     UHC_FLEX_PRACTITIONER_TWIN_ADMISSION_CONTRACT_ID,
 )
 
-
 UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS = (
     "provider_directory_dataset_insurance_plan",
     "provider_directory_dataset_network_plan",
@@ -79,9 +82,7 @@ UHC_FLEX_LEGACY_PROFILE_VARIANT = LEGACY_PRACTITIONER_VARIANT
 UHC_FLEX_ROOTED_PROFILE_VARIANT = ROOTED_COMBINED_VARIANT
 UHC_FLEX_LEGACY_PROFILE_RESOURCES = (UHC_FLEX_OFFICIAL_RESOURCE_TYPE,)
 UHC_FLEX_ROOTED_PROFILE_RESOURCES = PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_RESOURCES
-_UHC_FLEX_PRACTITIONER_ENDPOINT_ID = (
-    uhc_flex_practitioner_endpoint_identity().endpoint_id
-)
+_UHC_FLEX_PRACTITIONER_ENDPOINT_ID = uhc_flex_practitioner_endpoint_identity().endpoint_id
 _UHC_FLEX_ROOTED_PROFILE_RESOURCE_SET = frozenset(UHC_FLEX_ROOTED_PROFILE_RESOURCES)
 
 
@@ -128,21 +129,13 @@ def is_uhc_flex_dataset_variant_matching(
 
     variant = uhc_flex_profile_dataset_variant(dataset_id)
     return bool(
-        (
-            source_id == UHC_FLEX_PRACTITIONER_SOURCE_ID
-            and variant == LEGACY_PRACTITIONER_VARIANT
-        )
-        or (
-            source_id == PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID
-            and variant == ROOTED_COMBINED_VARIANT
-        )
+        (source_id == UHC_FLEX_PRACTITIONER_SOURCE_ID and variant == LEGACY_PRACTITIONER_VARIANT)
+        or (source_id == PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID and variant == ROOTED_COMBINED_VARIANT)
     )
 
 
 def _clean_text(raw_value: Any) -> str | None:
-    return (
-        raw_value.strip() if isinstance(raw_value, str) and raw_value.strip() else None
-    )
+    return raw_value.strip() if isinstance(raw_value, str) and raw_value.strip() else None
 
 
 def _json_object(raw_value: Any) -> dict[str, Any]:
@@ -150,7 +143,7 @@ def _json_object(raw_value: Any) -> dict[str, Any]:
     if isinstance(decoded_value, str):
         try:
             decoded_value = json.loads(decoded_value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return {}
     return dict(decoded_value) if isinstance(decoded_value, Mapping) else {}
 
@@ -161,12 +154,8 @@ def _is_rooted_publication_lineage_valid(
     root_variant = publication_metadata.get("root_variant")
     root_source_id = _clean_text(publication_metadata.get("root_source_id"))
     root_endpoint_id = _clean_text(publication_metadata.get("root_endpoint_id"))
-    acquisition_source_id = _clean_text(
-        publication_metadata.get("acquisition_source_id")
-    )
-    acquisition_endpoint_id = _clean_text(
-        publication_metadata.get("acquisition_endpoint_id")
-    )
+    acquisition_source_id = _clean_text(publication_metadata.get("acquisition_source_id"))
+    acquisition_endpoint_id = _clean_text(publication_metadata.get("acquisition_endpoint_id"))
     has_same_root_pair = bool(
         root_source_id
         and root_endpoint_id
@@ -188,8 +177,7 @@ def _is_rooted_publication_lineage_valid(
         and acquisition_endpoint_id == publication_metadata.get("endpoint_id")
         and has_same_root_pair == (root_variant == ROOTED_COMBINED_VARIANT)
         and exact_root_pair == expected_root_pair
-        and _clean_text(publication_metadata.get("practitioner_origin_source_id"))
-        == UHC_FLEX_PRACTITIONER_SOURCE_ID
+        and _clean_text(publication_metadata.get("practitioner_origin_source_id")) == UHC_FLEX_PRACTITIONER_SOURCE_ID
         and _clean_text(publication_metadata.get("practitioner_origin_endpoint_id"))
         == _UHC_FLEX_PRACTITIONER_ENDPOINT_ID
     )
@@ -207,8 +195,7 @@ def _is_rooted_resource_counts_valid(resource_counts: object) -> bool:
     return bool(
         resource_type_set == _UHC_FLEX_ROOTED_PROFILE_RESOURCE_SET
         and all(
-            type(resource_counts[resource_type]) is int
-            and resource_counts[resource_type] >= 0
+            type(resource_counts[resource_type]) is int and resource_counts[resource_type] >= 0
             for resource_type in UHC_FLEX_ROOTED_PROFILE_RESOURCES
         )
     )
@@ -224,15 +211,11 @@ def _is_flex_admission_metadata_valid(
             and _clean_text(publication_metadata.get("baseline_run_id"))
             and REVIEWED_ROOT_POLICY_METADATA_KEY not in publication_metadata
         )
-    if (
-        admission_contract_id
-        == UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID
-    ):
+    if admission_contract_id == UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID:
         return bool(
             "baseline_acquisition_id" not in publication_metadata
             and "baseline_run_id" not in publication_metadata
-            and publication_metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY)
-            == ReviewedRootPolicy(1).document()
+            and publication_metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY) == ReviewedRootPolicy(1).document()
         )
     return False
 
@@ -243,12 +226,8 @@ def _is_profile_cohort_metadata_valid(
     """Accept exact coverage or reviewed retry-exhausted single-root coverage."""
 
     single_root_admission_contract_id = {
-        UHC_FLEX_PRACTITIONER_SOURCE_ID: (
-            UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID
-        ),
-        PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID: (
-            PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID
-        ),
+        UHC_FLEX_PRACTITIONER_SOURCE_ID: (UHC_FLEX_PRACTITIONER_SINGLE_ROOT_ADMISSION_CONTRACT_ID),
+        PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID: (PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID),
     }.get(publication_metadata.get("source_id"))
     retry_exhausted_count = publication_metadata.get("retry_exhausted_count")
     if publication_metadata.get("cohort_complete") is True:
@@ -257,8 +236,7 @@ def _is_profile_cohort_metadata_valid(
         publication_metadata.get("cohort_complete") is False
         and type(retry_exhausted_count) is int
         and retry_exhausted_count > 0
-        and publication_metadata.get("admission_contract_id")
-        == single_root_admission_contract_id
+        and publication_metadata.get("admission_contract_id") == single_root_admission_contract_id
     )
 
 
@@ -266,45 +244,47 @@ def _is_rooted_admission_metadata_valid(
     publication_metadata: Mapping[str, Any],
 ) -> bool:
     admission_id = _clean_text(publication_metadata.get("admission_id")) or ""
-    publication_id = (
-        _clean_text(publication_metadata.get("publication_acquisition_id")) or ""
-    )
+    publication_id = _clean_text(publication_metadata.get("publication_acquisition_id")) or ""
     contract_id = publication_metadata.get("admission_contract_id")
-    if (
-        ADMISSION_PATTERN.fullmatch(admission_id) is None
-        or ACQUISITION_PATTERN.fullmatch(publication_id) is None
-    ):
+    if ADMISSION_PATTERN.fullmatch(admission_id) is None or ACQUISITION_PATTERN.fullmatch(publication_id) is None:
         return False
     if contract_id == PROVIDER_DIRECTORY_ROOTED_GRAPH_TWIN_ADMISSION_CONTRACT_ID:
         return bool(
-            ATTEMPT_PATTERN.fullmatch(
-                _clean_text(publication_metadata.get("attempt_id")) or ""
-            )
-            is not None
-            and ACQUISITION_PATTERN.fullmatch(
-                _clean_text(
-                    publication_metadata.get("comparison_acquisition_id")
-                )
-                or ""
-            )
+            ATTEMPT_PATTERN.fullmatch(_clean_text(publication_metadata.get("attempt_id")) or "") is not None
+            and ACQUISITION_PATTERN.fullmatch(_clean_text(publication_metadata.get("comparison_acquisition_id")) or "")
             is not None
             and REVIEWED_ROOT_POLICY_METADATA_KEY not in publication_metadata
             and "acquisition_operation_key" not in publication_metadata
         )
     return bool(
-        contract_id
-        == PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID
+        contract_id == PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID
         and "attempt_id" in publication_metadata
         and publication_metadata["attempt_id"] is None
         and "comparison_acquisition_id" in publication_metadata
         and publication_metadata["comparison_acquisition_id"] is None
-        and publication_metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY)
-        == ReviewedRootPolicy(1).document()
+        and publication_metadata.get(REVIEWED_ROOT_POLICY_METADATA_KEY) == ReviewedRootPolicy(1).document()
         and re.fullmatch(
             r"[0-9a-f]{64}",
             _clean_text(publication_metadata.get("acquisition_operation_key")) or "",
         )
         is not None
+    )
+
+
+def _is_rooted_publication_coverage_valid(publication_metadata: Mapping[str, Any]) -> bool:
+    coverage = publication_metadata.get("request_failure_coverage")
+    return bool(
+        publication_metadata.get("publication_contract_id")
+        == (
+            PROVIDER_DIRECTORY_ROOTED_GRAPH_PARTIAL_PUBLICATION_CONTRACT_ID
+            if coverage is not None
+            else PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID
+        )
+        and has_matching_rooted_publication_coverage(
+            coverage,
+            retry_exhausted_count=publication_metadata.get("retry_exhausted_count", 0),
+            rooted_graph_complete=publication_metadata.get("rooted_graph_complete"),
+        )
     )
 
 
@@ -327,18 +307,13 @@ def is_uhc_flex_publication_metadata_valid(
         and publication_metadata.get("endpoint_id") == endpoint_id
         and publication_metadata.get("acquisition_root_run_id") == evidence_run_id
         and publication_metadata.get("source_ids") == [source_id]
-        and publication_metadata.get("source_authority_id")
-        == UHC_FLEX_OFFICIAL_AUTHORITY_ID
-        and publication_metadata.get("selected_resources")
-        == list(expected_resources or ())
-        and publication_metadata.get("expected_resources")
-        == list(expected_resources or ())
-        and publication_metadata.get("resource_hash_contract")
-        == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
+        and publication_metadata.get("source_authority_id") == UHC_FLEX_OFFICIAL_AUTHORITY_ID
+        and publication_metadata.get("selected_resources") == list(expected_resources or ())
+        and publication_metadata.get("expected_resources") == list(expected_resources or ())
+        and publication_metadata.get("resource_hash_contract") == SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
         and publication_metadata.get("endpoint_collection_complete") is False
         and publication_metadata.get("endpoint_complete") is False
-        and _clean_text(publication_metadata.get("semantic_projection_as_of"))
-        is not None
+        and _clean_text(publication_metadata.get("semantic_projection_as_of")) is not None
         and _clean_text(publication_metadata.get("admission_id")) is not None
         and re.fullmatch(
             r"[0-9a-f]{64}",
@@ -350,18 +325,15 @@ def is_uhc_flex_publication_metadata_valid(
         return False
     if variant == LEGACY_PRACTITIONER_VARIANT:
         return bool(
-            publication_metadata.get("publication_contract_id")
-            == UHC_FLEX_PRACTITIONER_DATASET_PUBLICATION_CONTRACT_ID
+            publication_metadata.get("publication_contract_id") == UHC_FLEX_PRACTITIONER_DATASET_PUBLICATION_CONTRACT_ID
             and _is_flex_admission_metadata_valid(publication_metadata)
             and _is_profile_cohort_metadata_valid(publication_metadata)
         )
     resource_counts = publication_metadata.get("resource_counts")
     return bool(
         variant == ROOTED_COMBINED_VARIANT
-        and publication_metadata.get("publication_contract_id")
-        == PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID
-        and publication_metadata.get("publication_kind")
-        == PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_KIND
+        and _is_rooted_publication_coverage_valid(publication_metadata)
+        and publication_metadata.get("publication_kind") == PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_KIND
         and _is_profile_cohort_metadata_valid(publication_metadata)
         and publication_metadata.get("rooted_graph_complete") is True
         and _is_rooted_admission_metadata_valid(publication_metadata)

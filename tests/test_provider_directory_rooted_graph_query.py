@@ -2,13 +2,14 @@
 
 """Pure tests for rooted graph query construction."""
 
-from dataclasses import replace
 import urllib.parse
+from dataclasses import replace
 
 import pytest
 
 from process.provider_directory_rooted_graph_identity import (
     build_provider_directory_rooted_graph_scope,
+    provider_directory_rooted_graph_query_id,
 )
 from process.provider_directory_rooted_graph_query import (
     ROOTED_GRAPH_QUERY_DIRECT_READ,
@@ -23,17 +24,13 @@ from process.provider_directory_rooted_graph_query import (
     canonical_provider_directory_api_base,
 )
 
-
 API_BASE = "https://directory.example.test/fhir/R4"
 
 
 def _scope_id() -> str:
     return build_provider_directory_rooted_graph_scope(
         root_dataset_variant="uhc_flex_practitioner",
-        root_publication_contract_id=(
-            "healthporta.provider-directory.uhc-flex-practitioner-"
-            "dataset-publication.v1"
-        ),
+        root_publication_contract_id=("healthporta.provider-directory.uhc-flex-practitioner-dataset-publication.v1"),
         root_source_id="synthetic-root-source",
         root_endpoint_id="f" * 64,
         acquisition_source_id="synthetic-acquisition-source",
@@ -58,6 +55,7 @@ def test_practitioner_role_query_is_one_exact_reference_value():
     assert query.search_parameter == "practitioner"
     assert query.reference == "Practitioner/practitioner-a"
     assert query.page_size == 100
+    assert "role" not in query.identity_document()
     assert urllib.parse.parse_qsl(parsed.query) == [
         ("practitioner", "Practitioner/practitioner-a"),
         ("_count", "100"),
@@ -74,7 +72,7 @@ def test_affiliation_query_is_exact_participating_organization():
 
     assert query.url == (
         "https://directory.example.test/fhir/R4/OrganizationAffiliation?"
-        "participating-organization=Organization%2Fnetwork-a&_count=100"
+        "participating-organization=Organization%2Fnetwork-a&role=provider&_count=100"
     )
     assert query.identity_document() == {
         "kind": "exact_reference_search",
@@ -84,6 +82,11 @@ def test_affiliation_query_is_exact_participating_organization():
         "resource_type": "OrganizationAffiliation",
         "search_parameter": "participating-organization",
     }
+    assert query.query_id(_scope_id()) == provider_directory_rooted_graph_query_id(
+        _scope_id(), query.identity_document()
+    )
+    with pytest.raises(ProviderDirectoryRootedGraphQueryError):
+        replace(query, url=query.url.replace("&role=provider", ""))
 
 
 @pytest.mark.parametrize(
@@ -102,6 +105,7 @@ def test_direct_reads_are_limited_to_the_four_referenced_families(resource_type)
     assert query.url == f"{API_BASE}/{resource_type}/synthetic-a"
     assert query.page_size is None
     assert query.pagination == "forbidden"
+    assert "role" not in query.identity_document()
 
 
 @pytest.mark.parametrize(
@@ -221,8 +225,7 @@ def test_query_id_binds_query_to_scope_without_repr_disclosure():
 
     assert query.query_id(_scope_id()).startswith("pdrgq_")
     assert repr(query) == (
-        "<provider-directory-rooted-graph-query "
-        "kind='exact_reference_search' resource_type='PractitionerRole'>"
+        "<provider-directory-rooted-graph-query kind='exact_reference_search' resource_type='PractitionerRole'>"
     )
     assert API_BASE not in repr(query)
     assert "practitioner-a" not in repr(query)

@@ -9,6 +9,8 @@ import pytest
 
 from process import provider_directory_generic_source_artifacts as source_artifacts
 from process import provider_directory_published_replacement_followup as replacement_followup
+from process.provider_directory_rooted_graph_source_contract import PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID
+from process.uhc_flex_practitioner_contract import UHC_FLEX_PRACTITIONER_SOURCE_ID
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -30,6 +32,15 @@ def _overlay_followup_params():
         "provider_directory_dataset_followup_dataset_hash": "a" * 64,
         "provider_directory_dataset_followup_parent_run_id": "run-root",
         "provider_directory_dataset_followup_attempt": 1,
+    }
+
+
+def _rooted_overlay_followup_params():
+    return {
+        **_overlay_followup_params(),
+        "source_ids": [PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID],
+        "provider_directory_dataset_followup_source_id": PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+        "provider_directory_dataset_followup_dataset_id": "pdrgpd_" + "a" * 48,
     }
 
 
@@ -80,6 +91,89 @@ async def test_overlay_followup_uses_publication_fence_without_acquisition_prefl
     passed_fence, request = overlay_entry.bundle_publisher.await_args.args
     assert passed_fence is overlay_entry.fence
     assert request.metrics["provider_directory_dataset_followup_dataset_id"] == "dataset-current"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale", [None, "source_id", "endpoint_id", "dataset_id", "dataset_hash", "parent_run_id"])
+async def test_rooted_overlay_followup_keeps_exact_current_publication(overlay_entry, stale):
+    task = _rooted_overlay_followup_params()
+    selected = replace(
+        overlay_entry.dataset,
+        source_id=PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+        dataset_id=task["provider_directory_dataset_followup_dataset_id"],
+    )
+    overlay_entry.resolve_fence.return_value = importer.ProviderDirectoryArtifactDatasetFence((selected,))
+    if stale is not None:
+        task["provider_directory_dataset_followup_" + stale] = (
+            "b" * 64 if stale == "dataset_hash" else ("pdrgpd_" + "b" * 48 if stale == "dataset_id" else "changed")
+        )
+        if stale == "source_id":
+            task["source_ids"] = [task["provider_directory_dataset_followup_source_id"]]
+        with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="overlay_followup_selection_changed"):
+            await importer.process_data(overlay_entry.context, task)
+        overlay_entry.relation_builder.assert_not_awaited()
+        overlay_entry.bundle_publisher.assert_not_awaited()
+        return
+    metrics = await importer.process_data(overlay_entry.context, task)
+    assert metrics["address_overlay"]["published"] is True
+    overlay_entry.bundle_publisher.assert_awaited_once()
+    importer.db.all.assert_not_awaited()
+    importer.db.status.assert_not_awaited()
+
+
+@pytest.mark.parametrize("dataset_id", ["pdrgpd_" + "a" * 48, "pdufpd_" + "a" * 48, "dataset-current"])
+def test_rooted_overlay_scratch_admission_requires_the_supported_dataset(overlay_entry, dataset_id):
+    selected = replace(
+        overlay_entry.dataset,
+        source_id=PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+        dataset_id=dataset_id,
+    )
+    fence = importer.ProviderDirectoryArtifactDatasetFence((selected,))
+    request = SimpleNamespace(publish_artifacts_targets={"address_overlay"}, publish_corroboration=False)
+    if dataset_id.startswith("pdrgpd_"):
+        source_artifacts._require_published_overlay(importer, fence, request)
+    else:
+        with pytest.raises(RuntimeError, match="rest_artifact_published_overlay_required"):
+            source_artifacts._require_published_overlay(importer, fence, request)
+
+
+@pytest.mark.asyncio
+async def test_rooted_overlay_retains_the_profile_readiness_fence(monkeypatch, overlay_entry):
+    selected = replace(
+        overlay_entry.dataset,
+        source_id=PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+        dataset_id="pdrgpd_" + "a" * 48,
+    )
+    fence = importer.ProviderDirectoryArtifactDatasetFence((selected,))
+    loader = AsyncMock(return_value=None)
+    monkeypatch.setattr(importer, "load_uhc_flex_profile_dataset_readiness", loader)
+    directory = SimpleNamespace(
+        _artifact_fence_dataset_rows=AsyncMock(return_value=[]),
+        _artifact_eligible_validated_ids=AsyncMock(return_value={}),
+        _assert_locked_artifact_fence_datasets=lambda *_args: None,
+        _assert_reviewed_activation_ready=AsyncMock(),
+        _assert_uhc_flex_profile_fence_ready=importer._assert_uhc_flex_profile_fence_ready,
+    )
+    executor = object()
+    with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="dataset_scoped_readiness_changed"):
+        await source_artifacts._verify_header(directory, fence, executor, for_update=True)
+    loader.assert_awaited_once_with(selected.source_id, selected.dataset_id, database=executor)
+
+
+@pytest.mark.asyncio
+async def test_rooted_overlay_admission_does_not_grant_a_replacement_seal(overlay_entry):
+    task = _rooted_overlay_followup_params()
+    selected = replace(
+        overlay_entry.dataset,
+        source_id=PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+        dataset_id=task["provider_directory_dataset_followup_dataset_id"],
+        generic_admission_sealed=False,
+    )
+    overlay_entry.resolve_fence.return_value = importer.ProviderDirectoryArtifactDatasetFence((selected,))
+    pin = source_artifacts.replacement._descriptor_fields(importer, task)
+    with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="replacement_descriptor_stale"):
+        await source_artifacts.replacement._resolve_publication(importer, pin)
+    importer.db.status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -174,20 +268,41 @@ async def test_overlay_selection_refresh_remains_fenced(overlay_entry):
         {"run_id": " "},
     ],
 )
-def test_overlay_followup_refuses_parameter_mixing(changed_fields):
+@pytest.mark.parametrize("rooted", [False, True])
+def test_overlay_followup_refuses_parameter_mixing(changed_fields, rooted):
     """Only the exact overlay contract may use ordinary canonical preflight."""
+    task = _rooted_overlay_followup_params() if rooted else _overlay_followup_params()
     with pytest.raises(RuntimeError, match="ordinary_overlay_request_invalid"):
-        source_artifacts.ordinary_overlay_followup(importer, {**_overlay_followup_params(), **changed_fields})
+        source_artifacts.ordinary_overlay_followup(importer, {**task, **changed_fields})
 
 
-@pytest.mark.parametrize("source_id", ["cms-npd", importer.UHC_RETAINED_SOURCE_ID, "specialized-source"])
+@pytest.mark.parametrize(
+    "source_id", ["cms-npd", importer.UHC_RETAINED_SOURCE_ID, UHC_FLEX_PRACTITIONER_SOURCE_ID, "specialized-source"]
+)
 def test_overlay_followup_excludes_specialized_sources(monkeypatch, source_id):
     """Dedicated source lanes retain their existing admission paths."""
-    monkeypatch.setattr(importer, "is_uhc_flex_profile_source", lambda identifier: identifier == "specialized-source")
+    original = importer.is_uhc_flex_profile_source
+    monkeypatch.setattr(
+        importer,
+        "is_uhc_flex_profile_source",
+        lambda identifier: identifier == "specialized-source" or original(identifier),
+    )
     task_by_name = _overlay_followup_params()
     task_by_name.update(source_ids=[source_id], provider_directory_dataset_followup_source_id=source_id)
     with pytest.raises(RuntimeError, match="ordinary_overlay_request_invalid"):
         source_artifacts.ordinary_overlay_followup(importer, task_by_name)
+    with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="replacement_descriptor_invalid"):
+        source_artifacts.replacement._descriptor_fields(importer, task_by_name)
+
+
+@pytest.mark.parametrize("dataset_id", ["pdufpd_" + "a" * 48, "dataset-current"])
+def test_rooted_overlay_followup_rejects_another_dataset_variant(dataset_id):
+    task = _rooted_overlay_followup_params()
+    task["provider_directory_dataset_followup_dataset_id"] = dataset_id
+    with pytest.raises(RuntimeError, match="ordinary_overlay_request_invalid"):
+        source_artifacts.ordinary_overlay_followup(importer, task)
+    with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="replacement_descriptor_invalid"):
+        source_artifacts.replacement._descriptor_fields(importer, task)
 
 
 @pytest.mark.asyncio

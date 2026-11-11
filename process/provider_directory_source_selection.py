@@ -19,6 +19,27 @@ from process import vsp_directory_integration as vsp_directory
 QUALIFICATION_API_BASE = contextvars.ContextVar("provider_directory_qualification_api_base", default=None)
 CREDENTIAL_REQUEST_LOCKS = contextvars.ContextVar("provider_directory_credential_request_locks", default=None)
 CENSUS_REQUEST_DEFERRED_ERROR = "source_request_cooldown"
+FHIR_CONTINUATION_QUERY_NAMES = frozenset(
+    {
+        "_continuationtoken",
+        "_cursor",
+        "_getpages",
+        "_getpagesid",
+        "_getpagesoffset",
+        "_offset",
+        "_page",
+        "_page_token",
+        "_searchid",
+        "_skip",
+        "cursor",
+        "cursormark",
+        "ct",
+        "nexttoken",
+        "page",
+        "pagetoken",
+        "starting_after",
+    }
+)
 
 
 class CensusRequestDeferred(Exception):
@@ -428,19 +449,42 @@ def census_pagination_url_allowed(directory, source_record, next_url):
     api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
     if not api_base:
         return False
+    resources = directory._source_supported_resource_types(source_record)
+    return fhir_census_pagination_url_allowed(
+        api_base=api_base,
+        resource_types=directory.DEFAULT_RESOURCES if resources is None else resources,
+        next_url=next_url,
+    )
+
+
+def has_fhir_continuation_query(url: str) -> bool:
+    """Recognize existing FHIR cursor names without rewriting opaque query values."""
+    query_names = {
+        name.lower()
+        for name, _value in urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query, keep_blank_values=True)
+    }
+    return bool(FHIR_CONTINUATION_QUERY_NAMES.intersection(query_names))
+
+
+def fhir_census_pagination_url_allowed(*, api_base, resource_types, next_url):
+    """Admit exact resource paths or a source-issued cursor at the API base."""
     try:
         parsed_next = urllib.parse.urlsplit(next_url)
-        base_path = urllib.parse.urlsplit(api_base).path.rstrip("/")
-        resources = directory._source_supported_resource_types(source_record)
-        resources = directory.DEFAULT_RESOURCES if resources is None else resources
-        allowed_paths = {base_path, base_path + "/", *(f"{base_path}/{resource}" for resource in resources)}
+        parsed_base = urllib.parse.urlsplit(api_base)
+        base_path = parsed_base.path.rstrip("/")
+        allowed_paths = {base_path, base_path + "/", *(f"{base_path}/{resource}" for resource in resource_types)}
         return bool(
-            parsed_next.scheme == "https"
-            and directory._pagination_host_key(next_url) == directory._pagination_host_key(api_base)
+            parsed_base.scheme == "https"
+            and parsed_base.hostname
+            and parsed_next.scheme == "https"
+            and parsed_next.hostname == parsed_base.hostname
+            and (parsed_next.port if parsed_next.port is not None else 443)
+            == (parsed_base.port if parsed_base.port is not None else 443)
+            and parsed_next.username is None
+            and parsed_next.password is None
+            and not parsed_next.fragment
             and parsed_next.path in allowed_paths
-            and (
-                parsed_next.path not in {base_path, base_path + "/"} or directory._has_fhir_continuation_query(next_url)
-            )
+            and (parsed_next.path not in {base_path, base_path + "/"} or has_fhir_continuation_query(next_url))
             and "%" not in parsed_next.path
             and "\\" not in next_url
             and not any(ord(character) < 33 for character in next_url)

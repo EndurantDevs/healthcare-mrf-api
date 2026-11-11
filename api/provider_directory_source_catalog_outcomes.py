@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from typing import Any
 
@@ -13,17 +14,17 @@ from api.provider_directory_reviewed_publication import (
     _is_automatic_publication_metadata_valid,
     reviewed_publication_context,
 )
+from api.provider_directory_rooted_fhir_publication import (
+    ROOTED_FHIR_PUBLICATION_FIELD,
+    ROOTED_FHIR_PUBLICATION_PARTIAL_SUMMARY_CONTRACT_ID,
+    ROOTED_FHIR_SOURCE_ID_GROUP,
+    is_rooted_fhir_catalog_entry,
+    rooted_fhir_publication_summary,
+)
 from api.provider_directory_source_catalog_projection import (
     canonical_identity_text,
     catalog_source_id_groups,
     current_outcome_summary,
-)
-from api.provider_directory_rooted_fhir_publication import (
-    is_rooted_fhir_catalog_entry,
-    rooted_fhir_publication_summary,
-    ROOTED_FHIR_PUBLICATION_FIELD,
-    ROOTED_FHIR_PUBLICATION_PARTIAL_SUMMARY_CONTRACT_ID,
-    ROOTED_FHIR_SOURCE_ID_GROUP,
 )
 from api.provider_directory_source_dataset_selection import (
     _current_dataset_identities_by_id,
@@ -32,14 +33,16 @@ from api.provider_directory_source_dataset_selection import (
 )
 from api.provider_directory_sources import RUNNABLE_CLASSIFICATIONS
 from db.models import db
-from process.provider_directory_rooted_graph_publication_facade import (
-    load_provider_directory_rooted_graph_dataset_readiness,
-)
-from process.provider_directory_validated_publication_contract import ProviderDirectoryDatasetIdentity
 from process.provider_directory_fhir_root_policy import (
     LEGACY_VERIFIED_STATUS,
     ReviewedRootPolicy,
 )
+from process.provider_directory_rooted_graph_publication_facade import (
+    load_provider_directory_rooted_graph_dataset_readiness,
+)
+from process.provider_directory_validated_publication_contract import ProviderDirectoryDatasetIdentity
+
+
 def _profile_current_dataset_from_row(
     dataset_record: Mapping[str, Any],
     expected_source_id_groups: set[tuple[str, ...]],
@@ -62,10 +65,8 @@ def _profile_current_dataset_from_row(
         dataset is None
         or dataset.status != "published"
         or dataset.is_current is not True
-        or canonical_identity_text(dataset_record.get("endpoint_id"), limit=128)
-        != dataset.endpoint_id
-        or canonical_identity_text(dataset_record.get("dataset_id"), limit=128)
-        != dataset.dataset_id
+        or canonical_identity_text(dataset_record.get("endpoint_id"), limit=128) != dataset.endpoint_id
+        or canonical_identity_text(dataset_record.get("dataset_id"), limit=128) != dataset.dataset_id
         or root_run_id != dataset.acquisition_root_run_id
         or root_run_id is None
         or dataset_hash != dataset.dataset_hash
@@ -84,9 +85,7 @@ async def _profile_current_dataset_by_source_ids(
 
     if not source_id_groups:
         return {}
-    query_result = await db.execute(
-        _source_local_current_published_dataset_statement(source_id_groups)
-    )
+    query_result = await db.execute(_source_local_current_published_dataset_statement(source_id_groups))
     selected_by_source_ids: dict[
         tuple[str, ...],
         outcomes._CurrentPublishedDataset,
@@ -99,9 +98,7 @@ async def _profile_current_dataset_by_source_ids(
         if candidate is None:
             continue
         selected = selected_by_source_ids.get(candidate.source_ids)
-        if selected is None or outcomes._dataset_order_key(
-            candidate
-        ) > outcomes._dataset_order_key(selected):
+        if selected is None or outcomes._dataset_order_key(candidate) > outcomes._dataset_order_key(selected):
             selected_by_source_ids[candidate.source_ids] = candidate
     return selected_by_source_ids
 
@@ -130,18 +127,13 @@ async def _canonical_validated_datasets_by_source_id(
         except RuntimeError:
             continue
         for dataset in fence.datasets:
-            if (
-                dataset.source_id != source_id
-                or not dataset.promote_on_cutover
-            ):
+            if dataset.source_id != source_id or not dataset.promote_on_cutover:
                 continue
             is_reviewed_activation = bool(
-                dataset.reviewed_root_policy
-                in {ReviewedRootPolicy(1), ReviewedRootPolicy(2)}
+                dataset.reviewed_root_policy in {ReviewedRootPolicy(1), ReviewedRootPolicy(2)}
                 or (
                     dataset.reviewed_root_policy is None
-                    and dataset.verification_source_status
-                    == LEGACY_VERIFIED_STATUS
+                    and dataset.verification_source_status == LEGACY_VERIFIED_STATUS
                     and dataset.completion_proof_required_version == 3
                 )
             )
@@ -166,23 +158,17 @@ async def _canonical_validated_datasets_by_source_id(
 
 def _automatic_publication_source_ids(
     catalog_items: list[dict[str, Any]],
-    dataset_by_source_ids: Mapping[
-        tuple[str, ...], outcomes._CurrentPublishedDataset
-    ],
+    dataset_by_source_ids: Mapping[tuple[str, ...], outcomes._CurrentPublishedDataset],
 ) -> list[str]:
     automatic_source_ids: set[str] = set()
     for catalog_entry in catalog_items:
-        source_ids = outcomes._normalized_text_tuple(
-            catalog_entry.get("source_ids")
-        )
+        source_ids = outcomes._normalized_text_tuple(catalog_entry.get("source_ids"))
         dataset = dataset_by_source_ids.get(source_ids or ())
         is_runnable_acquisition = bool(
-            catalog_entry.get("runnable") is True
-            and catalog_entry.get("classification") in RUNNABLE_CLASSIFICATIONS
+            catalog_entry.get("runnable") is True and catalog_entry.get("classification") in RUNNABLE_CLASSIFICATIONS
         )
         is_reviewed_manual = bool(
-            catalog_entry.get("runnable") is False
-            and catalog_entry.get("classification") == "manual_acquisition"
+            catalog_entry.get("runnable") is False and catalog_entry.get("classification") == "manual_acquisition"
         )
         if (
             source_ids is not None
@@ -203,12 +189,8 @@ def _automatic_publication_source_ids(
 
 
 async def _legacy_current_identities_by_source_ids(
-    dataset_by_source_ids: Mapping[
-        tuple[str, ...], outcomes._CurrentPublishedDataset
-    ],
-    current_dataset_by_source_ids: Mapping[
-        tuple[str, ...], outcomes._CurrentPublishedDataset
-    ],
+    dataset_by_source_ids: Mapping[tuple[str, ...], outcomes._CurrentPublishedDataset],
+    current_dataset_by_source_ids: Mapping[tuple[str, ...], outcomes._CurrentPublishedDataset],
     canonical_dataset_by_source_id: Mapping[str, Any],
 ) -> dict[tuple[str, ...], ProviderDirectoryDatasetIdentity]:
     """Bind sealed candidates to scalar identities of endpoint-local incumbents."""
@@ -221,21 +203,16 @@ async def _legacy_current_identities_by_source_ids(
         and dataset.previous_dataset_id is not None
         and (
             source_ids not in current_dataset_by_source_ids
-            or current_dataset_by_source_ids[source_ids].endpoint_id
-            != dataset.endpoint_id
+            or current_dataset_by_source_ids[source_ids].endpoint_id != dataset.endpoint_id
         )
     }
     identities_by_id = await _current_dataset_identities_by_id(
-        {
-            dataset.previous_dataset_id
-            for dataset in candidates_by_source_ids.values()
-        }
+        {dataset.previous_dataset_id for dataset in candidates_by_source_ids.values()}
     )
     return {
         source_ids: identity
         for source_ids, dataset in candidates_by_source_ids.items()
-        if (identity := identities_by_id.get(dataset.previous_dataset_id))
-        is not None
+        if (identity := identities_by_id.get(dataset.previous_dataset_id)) is not None
         and identity.endpoint_id == dataset.endpoint_id
     }
 
@@ -246,13 +223,9 @@ async def _rooted_summary_for_catalog(
         outcomes._CurrentPublishedDataset,
     ],
 ) -> dict[str, Any]:
-    rooted_current_dataset = current_dataset_by_source_ids.get(
-        ROOTED_FHIR_SOURCE_ID_GROUP
-    )
+    rooted_current_dataset = current_dataset_by_source_ids.get(ROOTED_FHIR_SOURCE_ID_GROUP)
     rooted_readiness = (
-        await load_provider_directory_rooted_graph_dataset_readiness(
-            rooted_current_dataset.dataset_id
-        )
+        await load_provider_directory_rooted_graph_dataset_readiness(rooted_current_dataset.dataset_id)
         if rooted_current_dataset is not None
         else None
     )
@@ -309,15 +282,12 @@ def _publication_candidate_context(
     )
 
 
-def _attach_rooted_summary(
-    enriched_entry_map: dict[str, Any], rooted_summary: dict[str, Any]
-) -> None:
+def _attach_rooted_summary(enriched_entry_map: dict[str, Any], rooted_summary: dict[str, Any]) -> None:
     """Attach request omissions without implying complete resource coverage."""
 
     enriched_entry_map[ROOTED_FHIR_PUBLICATION_FIELD] = rooted_summary
     if (
-        rooted_summary.get("contract_id")
-        == ROOTED_FHIR_PUBLICATION_PARTIAL_SUMMARY_CONTRACT_ID
+        rooted_summary.get("contract_id") == ROOTED_FHIR_PUBLICATION_PARTIAL_SUMMARY_CONTRACT_ID
         and rooted_summary.get("state") == "partial"
     ):
         enriched_entry_map["coverage_warning"] = (
@@ -328,15 +298,9 @@ def _attach_rooted_summary(
 
 def _enriched_catalog_entry(
     catalog_entry: Mapping[str, Any],
-    dataset_by_source_ids: Mapping[
-        tuple[str, ...], outcomes._CurrentPublishedDataset
-    ],
-    current_dataset_by_source_ids: Mapping[
-        tuple[str, ...], outcomes._CurrentPublishedDataset
-    ],
-    legacy_current_identity_by_source_ids: Mapping[
-        tuple[str, ...], ProviderDirectoryDatasetIdentity
-    ],
+    dataset_by_source_ids: Mapping[tuple[str, ...], outcomes._CurrentPublishedDataset],
+    current_dataset_by_source_ids: Mapping[tuple[str, ...], outcomes._CurrentPublishedDataset],
+    legacy_current_identity_by_source_ids: Mapping[tuple[str, ...], ProviderDirectoryDatasetIdentity],
     canonical_dataset_by_source_id: Mapping[str, Any],
     rooted_summary: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -346,18 +310,14 @@ def _enriched_catalog_entry(
     source_ids = outcomes._normalized_text_tuple(catalog_entry.get("source_ids"))
     dataset = dataset_by_source_ids.get(source_ids or ())
     canonical_dataset = (
-        canonical_dataset_by_source_id.get(source_ids[0])
-        if source_ids is not None and len(source_ids) == 1
-        else None
+        canonical_dataset_by_source_id.get(source_ids[0]) if source_ids is not None and len(source_ids) == 1 else None
     )
     if dataset is not None:
         enriched_entry_map["outcome_summary"] = outcomes._outcome_summary(dataset)
     current_dataset = current_dataset_by_source_ids.get(source_ids or ())
     legacy_current_identity = legacy_current_identity_by_source_ids.get(source_ids or ())
     if current_dataset is not None:
-        enriched_entry_map["current_outcome_summary"] = (
-            current_outcome_summary(current_dataset)
-        )
+        enriched_entry_map["current_outcome_summary"] = current_outcome_summary(current_dataset)
     candidate_payload_map, reviewed_candidate_dataset = _publication_candidate_context(
         catalog_entry,
         source_ids,
@@ -369,18 +329,14 @@ def _enriched_catalog_entry(
     )
     if candidate_payload_map is not None:
         if reviewed_candidate_dataset is not None:
-            enriched_entry_map["outcome_summary"] = outcomes._outcome_summary(
-                reviewed_candidate_dataset
-            )
+            enriched_entry_map["outcome_summary"] = outcomes._outcome_summary(reviewed_candidate_dataset)
         if current_dataset is None and legacy_current_identity is not None:
             enriched_entry_map["current_outcome_summary"] = {
                 **legacy_current_identity.to_payload(),
                 "status": "published",
                 "is_current": True,
             }
-        enriched_entry_map["validated_publication_candidate"] = (
-            candidate_payload_map
-        )
+        enriched_entry_map["validated_publication_candidate"] = candidate_payload_map
     if rooted_summary is not None and is_rooted_fhir_catalog_entry(catalog_entry):
         _attach_rooted_summary(enriched_entry_map, rooted_summary)
     return enriched_entry_map
@@ -394,45 +350,24 @@ async def enrich_provider_directory_source_catalog(
     raw_items = catalog.get("items")
     if not isinstance(raw_items, list):
         return dict(catalog)
-    catalog_items = [
-        dict(catalog_entry)
-        for catalog_entry in raw_items
-        if isinstance(catalog_entry, Mapping)
-    ]
+    catalog_items = [dict(catalog_entry) for catalog_entry in raw_items if isinstance(catalog_entry, Mapping)]
     source_id_groups = catalog_source_id_groups(catalog_items)
-    has_rooted_fhir_entry = any(
-        is_rooted_fhir_catalog_entry(catalog_entry)
-        for catalog_entry in catalog_items
-    )
+    has_rooted_fhir_entry = any(is_rooted_fhir_catalog_entry(catalog_entry) for catalog_entry in catalog_items)
     if has_rooted_fhir_entry:
         source_id_groups.add(ROOTED_FHIR_SOURCE_ID_GROUP)
-    dataset_by_source_ids = await outcomes._current_published_dataset_by_source_ids(
-        source_id_groups
-    )
-    current_dataset_by_source_ids = await _profile_current_dataset_by_source_ids(
-        source_id_groups
-    )
+    dataset_by_source_ids = await outcomes._current_published_dataset_by_source_ids(source_id_groups)
+    current_dataset_by_source_ids = await _profile_current_dataset_by_source_ids(source_id_groups)
     automatic_source_ids = _automatic_publication_source_ids(
         catalog_items,
         dataset_by_source_ids,
     )
-    canonical_dataset_by_source_id = (
-        await _canonical_validated_datasets_by_source_id(
-            automatic_source_ids
-        )
+    canonical_dataset_by_source_id = await _canonical_validated_datasets_by_source_id(automatic_source_ids)
+    legacy_current_identity_by_source_ids = await _legacy_current_identities_by_source_ids(
+        dataset_by_source_ids,
+        current_dataset_by_source_ids,
+        canonical_dataset_by_source_id,
     )
-    legacy_current_identity_by_source_ids = (
-        await _legacy_current_identities_by_source_ids(
-            dataset_by_source_ids,
-            current_dataset_by_source_ids,
-            canonical_dataset_by_source_id,
-        )
-    )
-    rooted_summary = (
-        await _rooted_summary_for_catalog(current_dataset_by_source_ids)
-        if has_rooted_fhir_entry
-        else None
-    )
+    rooted_summary = await _rooted_summary_for_catalog(current_dataset_by_source_ids) if has_rooted_fhir_entry else None
 
     enriched_items = [
         _enriched_catalog_entry(
@@ -445,4 +380,20 @@ async def enrich_provider_directory_source_catalog(
         )
         for catalog_entry in catalog_items
     ]
+    if has_rooted_fhir_entry:
+        try:
+            await _attach_rooted_acquisition(enriched_items)
+        except Exception:
+            logging.getLogger(__name__).warning("Rooted acquisition descriptor read failed", exc_info=True)
     return {**dict(catalog), "items": enriched_items}
+
+
+async def _attach_rooted_acquisition(catalog_items):
+    """Attach the read-only native root descriptor only to its reviewed anchor."""
+    from process.provider_directory_rooted_graph_worker import rooted_graph_acquisition_descriptor
+
+    descriptor = await rooted_graph_acquisition_descriptor(db)
+    if descriptor is not None:
+        for entry in catalog_items:
+            if is_rooted_fhir_catalog_entry(entry):
+                entry["rooted_graph_acquisition"] = descriptor

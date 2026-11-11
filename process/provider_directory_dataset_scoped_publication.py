@@ -7,38 +7,45 @@ from __future__ import annotations
 from typing import Any
 
 from process.provider_directory_dataset_scoped_publication_contract import (
-    ExactCurrentDataset,
-    ExactDatasetPair,
     EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
     LEGACY_DATASET_PATTERN,
     LEGACY_PRACTITIONER_VARIANT,
-    ProviderDirectoryDatasetScopedPublicationError,
     ROOTED_COMBINED_VARIANT,
     ROOTED_DATASET_PATTERN,
+    ExactCurrentDataset,
+    ExactDatasetPair,
+    ProviderDirectoryDatasetScopedPublicationError,
     exact_current_matches_root,
     exact_dataset_variant,
     exact_uhc_dataset_pair,
 )
 from process.provider_directory_dataset_scoped_publication_support import (
     database_row_fields as _row_fields,
+)
+from process.provider_directory_dataset_scoped_publication_support import (
     exact_pair_registry_by_coordinate as _locked_registry_by_coordinate,
+)
+from process.provider_directory_dataset_scoped_publication_support import (
     lock_exact_pair_registry as _lock_pair_registry,
+)
+from process.provider_directory_dataset_scoped_publication_support import (
     qualified_relation as _qualified,
+)
+from process.provider_directory_dataset_scoped_publication_support import (
     schema_name as _schema_name,
+)
+from process.provider_directory_dataset_scoped_publication_support import (
     validate_exact_pair_registry as _validate_pair_registry,
 )
 from process.provider_directory_rooted_graph_contract import (
     has_matching_rooted_graph_root_publication,
 )
 
-
 LEGACY_DATASET_TABLE = "provider_directory_uhc_flex_practitioner_dataset"
 LEGACY_VALID_FUNCTION = "provider_directory_uhc_flex_practitioner_dataset_valid"
 LEGACY_READY_FUNCTION = "provider_directory_uhc_flex_practitioner_dataset_ready"
 ROOTED_DATASET_TABLE = "provider_directory_rooted_graph_dataset"
-ROOTED_INTRINSIC_VALID_FUNCTION = (
-    "provider_directory_rooted_graph_dataset_intrinsic_valid"
-)
+ROOTED_INTRINSIC_VALID_FUNCTION = "provider_directory_rooted_graph_dataset_intrinsic_valid"
 ROOTED_READY_FUNCTION = "provider_directory_rooted_graph_dataset_ready"
 ENDPOINT_DATASET_TABLE = "provider_directory_endpoint_dataset"
 
@@ -67,6 +74,8 @@ def _variant_predicates(variant: str) -> tuple[str, str, str]:
 async def _locked_legacy_header(
     database: Any,
     pair: ExactDatasetPair,
+    *,
+    lock_rows: bool = True,
 ) -> dict[str, Any]:
     return _row_fields(
         await database.first(
@@ -95,16 +104,16 @@ async def _locked_legacy_header(
                    header.semantic_projection_as_of,
                    header.operation_key, header.acquisition_root_run_id
               FROM {_qualified(LEGACY_DATASET_TABLE)} AS header
-              JOIN {_qualified('provider_directory_api_endpoint')} AS endpoint
+              JOIN {_qualified("provider_directory_api_endpoint")} AS endpoint
                 ON endpoint.endpoint_id = header.endpoint_id
-              JOIN {_qualified('provider_directory_api_endpoint')} AS graph_endpoint
+              JOIN {_qualified("provider_directory_api_endpoint")} AS graph_endpoint
                 ON graph_endpoint.endpoint_id = :rooted_endpoint_id
               JOIN {_qualified(ENDPOINT_DATASET_TABLE)} AS parent
                 ON parent.dataset_id = header.dataset_id
              WHERE header.source_id = :legacy_source_id
                AND header.endpoint_id = :legacy_endpoint_id
                AND header.is_current IS TRUE
-             FOR UPDATE OF header;
+             {"FOR UPDATE OF header" if lock_rows else ""};
             """,
             legacy_source_id=pair.legacy_source_id,
             legacy_endpoint_id=pair.legacy_endpoint_id,
@@ -117,6 +126,8 @@ async def _locked_legacy_header(
 async def _locked_rooted_header(
     database: Any,
     pair: ExactDatasetPair,
+    *,
+    lock_rows: bool = True,
 ) -> dict[str, Any]:
     return _row_fields(
         await database.first(
@@ -152,7 +163,7 @@ async def _locked_rooted_header(
                AND header.acquisition_source_id = :rooted_source_id
                AND header.acquisition_endpoint_id = :rooted_endpoint_id
                AND header.is_current IS TRUE
-             FOR UPDATE OF header;
+             {"FOR UPDATE OF header" if lock_rows else ""};
             """,
             legacy_source_id=pair.legacy_source_id,
             legacy_endpoint_id=pair.legacy_endpoint_id,
@@ -173,6 +184,8 @@ def _projection_text(value: object) -> str:
 async def _locked_parent_by_id(
     database: Any,
     pair: ExactDatasetPair,
+    *,
+    lock_rows: bool = True,
 ) -> dict[object, dict[str, Any]]:
     parent_rows = await database.all(
         f"""
@@ -182,7 +195,7 @@ async def _locked_parent_by_id(
              WHERE endpoint_id IN (:legacy_endpoint_id, :rooted_endpoint_id)
                AND is_current IS TRUE
              ORDER BY endpoint_id, dataset_id
-             FOR UPDATE;
+             {"FOR UPDATE" if lock_rows else ""};
         """,
         legacy_endpoint_id=pair.legacy_endpoint_id,
         rooted_endpoint_id=pair.rooted_endpoint_id,
@@ -197,9 +210,11 @@ async def _locked_parent_by_id(
 async def _locked_current_header(
     database: Any,
     pair: ExactDatasetPair,
+    *,
+    lock_rows: bool = True,
 ) -> tuple[str, dict[str, Any]] | None:
-    legacy_header = await _locked_legacy_header(database, pair)
-    rooted_header = await _locked_rooted_header(database, pair)
+    legacy_header = await _locked_legacy_header(database, pair, lock_rows=lock_rows)
+    rooted_header = await _locked_rooted_header(database, pair, lock_rows=lock_rows)
     current_headers = tuple(
         (variant, header)
         for variant, header in (
@@ -265,9 +280,7 @@ async def _validate_locked_header(
         or header.get("root_endpoint_id") != expected_endpoint_id
         or header.get("acquisition_source_id") != pair.rooted_source_id
         or header.get("acquisition_endpoint_id") != pair.rooted_endpoint_id
-        or not has_matching_rooted_graph_root_publication(
-            variant, header.get("root_publication_contract_id")
-        )
+        or not has_matching_rooted_graph_root_publication(variant, header.get("root_publication_contract_id"))
         or header.get("practitioner_origin_source_id") != pair.legacy_source_id
         or header.get("practitioner_origin_endpoint_id") != pair.legacy_endpoint_id
         or header.get("source_id") != expected_source_id
@@ -296,9 +309,7 @@ def _exact_current_from_header(
             acquisition_source_id=header.get("acquisition_source_id"),
             acquisition_endpoint_id=header.get("acquisition_endpoint_id"),
             practitioner_origin_source_id=header.get("practitioner_origin_source_id"),
-            practitioner_origin_endpoint_id=header.get(
-                "practitioner_origin_endpoint_id"
-            ),
+            practitioner_origin_endpoint_id=header.get("practitioner_origin_endpoint_id"),
             source_authority_id=header.get("source_authority_id"),
             endpoint_signature_sha256=header.get("endpoint_signature_sha256"),
             dataset_hash=parent.get("dataset_hash"),
@@ -308,9 +319,7 @@ def _exact_current_from_header(
             root_cohort_id=header.get("root_cohort_id"),
             cohort_complete=header.get("cohort_complete"),
             retry_exhausted_count=header.get("retry_exhausted_count"),
-            semantic_projection_as_of=_projection_text(
-                header.get("semantic_projection_as_of")
-            ),
+            semantic_projection_as_of=_projection_text(header.get("semantic_projection_as_of")),
             operation_key=header.get("operation_key"),
             acquisition_root_run_id=header.get("acquisition_root_run_id"),
             variant=variant,
@@ -325,6 +334,7 @@ async def lock_exact_current_dataset(
     *,
     pair: ExactDatasetPair,
     require_ready: bool = True,
+    lock_rows: bool = True,
 ) -> ExactCurrentDataset | None:
     """Lock one exact current, optionally admitting a stale known identity."""
 
@@ -332,11 +342,12 @@ async def lock_exact_current_dataset(
         type(pair) is not ExactDatasetPair
         or pair != exact_uhc_dataset_pair()
         or type(require_ready) is not bool
+        or type(lock_rows) is not bool
     ):
         raise ProviderDirectoryDatasetScopedPublicationError("state")
-    await _lock_pair_registry(database, pair)
-    parent_by_id = await _locked_parent_by_id(database, pair)
-    current_header = await _locked_current_header(database, pair)
+    await _lock_pair_registry(database, pair, lock_rows=lock_rows)
+    parent_by_id = await _locked_parent_by_id(database, pair, lock_rows=lock_rows)
+    current_header = await _locked_current_header(database, pair, lock_rows=lock_rows)
     if current_header is None:
         if parent_by_id:
             raise ProviderDirectoryDatasetScopedPublicationError("foreign_current")

@@ -15,11 +15,11 @@ from process.provider_directory_rooted_graph_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_ROOT_PUBLICATION_BY_VARIANT,
     has_matching_rooted_graph_root_publication,
 )
-from process.provider_directory_rooted_graph_single_root_contract import (
-    derive_single_root_identity,
-)
 from process.provider_directory_rooted_graph_publication import (
     build_provider_directory_rooted_graph_dataset_identity,
+)
+from process.provider_directory_rooted_graph_single_root_contract import (
+    derive_single_root_identity,
 )
 from tests.provider_directory_rooted_graph_publication_test_support import (
     exact_current,
@@ -59,9 +59,7 @@ ROOTED_V2 = "healthporta.provider-directory.rooted-graph-publication.v2"
         ({}, ROOTED_V2, False),
     ),
 )
-def test_parent_publication_version_is_closed_by_variant(
-    variant, contract_id, expected
-) -> None:
+def test_parent_publication_version_is_closed_by_variant(variant, contract_id, expected) -> None:
     assert has_matching_rooted_graph_root_publication(variant, contract_id) is expected
 
 
@@ -75,9 +73,7 @@ def test_v2_parent_replays_exact_scope_run_and_input_snapshot() -> None:
     assert replay == identity
     assert identity.scope.scope_id != previous.scope.scope_id
     assert identity.candidate.root_publication_contract_id == ROOTED_V2
-    assert _snapshot_from_identity(identity.candidate, "building").is_identity_match(
-        identity.candidate
-    )
+    assert _snapshot_from_identity(identity.candidate, "building").is_identity_match(identity.candidate)
     assert publication.exact_current_matches_root(current, identity.candidate)
     assert not publication.exact_current_matches_root(legacy_parent, identity.candidate)
     sealed = replace(
@@ -109,16 +105,10 @@ def test_v2_parent_flows_through_single_admission_publication_and_readiness() ->
     sealed = sealed_roots(variant="rooted_combined")[1]
     root = replace(
         sealed,
-        **{
-            field.name: getattr(candidate, field.name)
-            for field in fields(candidate)
-            if hasattr(sealed, field.name)
-        },
+        **{field.name: getattr(candidate, field.name) for field in fields(candidate) if hasattr(sealed, field.name)},
         request_failure_coverage=source_coverage,
     )
-    dataset_identity = build_provider_directory_rooted_graph_dataset_identity(
-        _admit(root), current
-    )
+    dataset_identity = build_provider_directory_rooted_graph_dataset_identity(_admit(root), current)
     assert dataset_identity.root_publication_contract_id == ROOTED_V2
     assert dataset_identity.publication_contract_id == ROOTED_V2
     ready = replace(
@@ -145,26 +135,24 @@ class _ProofDatabase:
 async def test_v2_current_requires_database_identity_and_ready_proofs(
     monkeypatch,
 ) -> None:
-    current = replace(
-        exact_current(variant="rooted_combined"), root_publication_contract_id=ROOTED_V2
-    )
+    current = replace(exact_current(variant="rooted_combined"), root_publication_contract_id=ROOTED_V2)
 
-    async def lock_registry(*_args):
-        return None
+    async def lock_registry(_database, _pair, *, lock_rows):
+        assert lock_rows is True
 
-    async def parent_by_id(*_args):
+    async def parent_by_id(_database, _pair, *, lock_rows):
+        assert lock_rows is True
         return {current.dataset_id: _parent_for(current)}
 
-    async def current_header(*_args):
+    async def current_header(_database, _pair, *, lock_rows):
+        assert lock_rows is True
         return current.variant, _header_for(current)
 
     monkeypatch.setattr(publication, "_lock_pair_registry", lock_registry)
     monkeypatch.setattr(publication, "_locked_parent_by_id", parent_by_id)
     monkeypatch.setattr(publication, "_locked_current_header", current_header)
     database = _ProofDatabase()
-    observed = await publication.lock_exact_current_dataset(
-        database, pair=publication.exact_uhc_dataset_pair()
-    )
+    observed = await publication.lock_exact_current_dataset(database, pair=publication.exact_uhc_dataset_pair())
     assert observed == current
     assert database.proof_reads == 2
     with pytest.raises(publication.ProviderDirectoryDatasetScopedPublicationError):

@@ -137,6 +137,8 @@ async def _assert_newest(directory, fence, publication, executor):
 
 def _descriptor_fields(directory, metrics):
     """Validate the existing descriptor coordinates without changing its V1 shape."""
+    from process.provider_directory_generic_source_artifacts import _supports_overlay_source
+
     expected_by_field = {name: metrics.get(_PREFIX + name) for name in _FIELDS}
     _require(
         directory,
@@ -151,8 +153,7 @@ def _descriptor_fields(directory, metrics):
         and metrics.get(_PREFIX + "stage") == "address_overlay"
         and type(metrics.get(_PREFIX + "attempt")) is int
         and metrics[_PREFIX + "attempt"] > 0
-        and expected_by_field["source_id"] not in {"cms-npd", directory.UHC_RETAINED_SOURCE_ID}
-        and not directory.is_uhc_flex_profile_source(expected_by_field["source_id"]),
+        and _supports_overlay_source(directory, expected_by_field["source_id"], expected_by_field["dataset_id"]),
         "descriptor_invalid",
     )
     return expected_by_field

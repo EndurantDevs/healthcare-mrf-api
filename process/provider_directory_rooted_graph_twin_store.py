@@ -4,61 +4,51 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import fields
 from datetime import datetime
-import json
 from typing import Any, Mapping
 
 from db.connection import db
 from process.provider_directory_dataset_scoped_publication import (
+    EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
     exact_current_matches_root,
     exact_uhc_dataset_pair,
-    EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
     lock_exact_current_dataset,
 )
+from process.provider_directory_rooted_graph_identity import SHA256_PATTERN
 from process.provider_directory_rooted_graph_store_contract import (
     ACQUISITION_PATTERN,
     ProviderDirectoryRootedGraphAcquisitionIdentity,
 )
-from process.provider_directory_rooted_graph_identity import SHA256_PATTERN
+from process.provider_directory_rooted_graph_store_support import rooted_graph_transaction
+from process.provider_directory_rooted_graph_twin_admission_contract import (
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
+)
 from process.provider_directory_rooted_graph_twin_contract import (
-    build_rooted_graph_single_root_admission,
-    build_provider_directory_rooted_graph_twin_admission,
-    build_provider_directory_rooted_graph_twin_attempt,
     ProviderDirectoryRootedGraphSealedRoot,
     ProviderDirectoryRootedGraphTwinAdmission,
     ProviderDirectoryRootedGraphTwinAttempt,
     ProviderDirectoryRootedGraphTwinError,
+    build_provider_directory_rooted_graph_twin_admission,
+    build_provider_directory_rooted_graph_twin_attempt,
+    build_rooted_graph_single_root_admission,
 )
-from process.provider_directory_rooted_graph_twin_admission_contract import (
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
-)
-
 
 ACQUISITION_TABLE = "provider_directory_rooted_graph_acquisition"
 ATTEMPT_TABLE = "provider_directory_rooted_graph_twin_attempt"
 ADMISSION_TABLE = "provider_directory_rooted_graph_twin_admission"
 
-_ROOT_COLUMNS = tuple(
-    field.name for field in fields(ProviderDirectoryRootedGraphSealedRoot)
-)
-_ATTEMPT_COLUMNS = tuple(
-    field.name for field in fields(ProviderDirectoryRootedGraphTwinAttempt)
-)
-_ADMISSION_COLUMNS = tuple(
-    field.name for field in fields(ProviderDirectoryRootedGraphTwinAdmission)
-)
+_ROOT_COLUMNS = tuple(field.name for field in fields(ProviderDirectoryRootedGraphSealedRoot))
+_ATTEMPT_COLUMNS = tuple(field.name for field in fields(ProviderDirectoryRootedGraphTwinAttempt))
+_ADMISSION_COLUMNS = tuple(field.name for field in fields(ProviderDirectoryRootedGraphTwinAdmission))
 _ROOT_IDENTITY_COLUMNS = tuple(
     field.name
     for field in fields(ProviderDirectoryRootedGraphAcquisitionIdentity)
     if hasattr(ProviderDirectoryRootedGraphSealedRoot, field.name)
 )
-_ATTEMPT_IDENTITY_COLUMNS = tuple(
-    name for name in _ATTEMPT_COLUMNS if name != "attempted_at"
-)
-_ADMISSION_IDENTITY_COLUMNS = tuple(
-    name for name in _ADMISSION_COLUMNS if name != "admitted_at"
-)
+_ATTEMPT_IDENTITY_COLUMNS = tuple(name for name in _ATTEMPT_COLUMNS if name != "attempted_at")
+_ADMISSION_IDENTITY_COLUMNS = tuple(name for name in _ADMISSION_COLUMNS if name != "admitted_at")
 
 
 def _schema() -> str:
@@ -112,19 +102,15 @@ def _root_from_row(row: Any) -> ProviderDirectoryRootedGraphSealedRoot:
     ):
         raise ProviderDirectoryRootedGraphTwinError("state")
     try:
-        return ProviderDirectoryRootedGraphSealedRoot(
-            **{name: values.get(name) for name in _ROOT_COLUMNS}
-        )
-    except (TypeError, ValueError):
+        return ProviderDirectoryRootedGraphSealedRoot(**{name: values.get(name) for name in _ROOT_COLUMNS})
+    except TypeError, ValueError:
         raise ProviderDirectoryRootedGraphTwinError("state") from None
 
 
 async def _lock_roots(
     database: Any,
     acquisition_ids: tuple[str, str],
-) -> tuple[
-    ProviderDirectoryRootedGraphSealedRoot, ProviderDirectoryRootedGraphSealedRoot
-]:
+) -> tuple[ProviderDirectoryRootedGraphSealedRoot, ProviderDirectoryRootedGraphSealedRoot]:
     first_id, second_id = sorted(acquisition_ids)
     if first_id == second_id:
         raise ProviderDirectoryRootedGraphTwinError("identity")
@@ -165,10 +151,8 @@ def _attempt_from_row(row: Any) -> ProviderDirectoryRootedGraphTwinAttempt:
         raise ProviderDirectoryRootedGraphTwinError("state")
     values["attempted_at"] = _timestamp(values.get("attempted_at"))
     try:
-        return ProviderDirectoryRootedGraphTwinAttempt(
-            **{name: values.get(name) for name in _ATTEMPT_COLUMNS}
-        )
-    except (TypeError, ValueError):
+        return ProviderDirectoryRootedGraphTwinAttempt(**{name: values.get(name) for name in _ATTEMPT_COLUMNS})
+    except TypeError, ValueError:
         raise ProviderDirectoryRootedGraphTwinError("state") from None
 
 
@@ -178,16 +162,12 @@ def _admission_from_row(row: Any) -> ProviderDirectoryRootedGraphTwinAdmission:
         raise ProviderDirectoryRootedGraphTwinError("missing")
     values["admitted_at"] = _timestamp(values.get("admitted_at"))
     try:
-        return ProviderDirectoryRootedGraphTwinAdmission(
-            **{name: values.get(name) for name in _ADMISSION_COLUMNS}
-        )
-    except (TypeError, ValueError):
+        return ProviderDirectoryRootedGraphTwinAdmission(**{name: values.get(name) for name in _ADMISSION_COLUMNS})
+    except TypeError, ValueError:
         raise ProviderDirectoryRootedGraphTwinError("state") from None
 
 
-def _exact_values(
-    candidate: object, column_names: tuple[str, ...]
-) -> tuple[object, ...]:
+def _exact_values(candidate: object, column_names: tuple[str, ...]) -> tuple[object, ...]:
     return tuple(getattr(candidate, name) for name in column_names)
 
 
@@ -196,9 +176,9 @@ def _require_exact(
     expected: object,
     column_names: tuple[str, ...],
 ) -> None:
-    if type(stored) is not type(expected) or _exact_values(
-        stored, column_names
-    ) != _exact_values(expected, column_names):
+    if type(stored) is not type(expected) or _exact_values(stored, column_names) != _exact_values(
+        expected, column_names
+    ):
         raise ProviderDirectoryRootedGraphTwinError("state")
 
 
@@ -229,8 +209,7 @@ async def _read_attempt(
     attempt_id: str,
 ) -> ProviderDirectoryRootedGraphTwinAttempt:
     row = await database.first(
-        f"SELECT {', '.join(_ATTEMPT_COLUMNS)} FROM {_table(ATTEMPT_TABLE)} "
-        "WHERE attempt_id = :attempt_id FOR SHARE;",
+        f"SELECT {', '.join(_ATTEMPT_COLUMNS)} FROM {_table(ATTEMPT_TABLE)} WHERE attempt_id = :attempt_id FOR SHARE;",
         attempt_id=attempt_id,
     )
     if row is None:
@@ -244,20 +223,14 @@ async def _insert_authority(
 ) -> None:
     columns = tuple(name for name in _ADMISSION_COLUMNS if name != "admitted_at")
     placeholders = tuple(
-        (
-            f"CAST(:{name} AS jsonb)"
-            if name in {"reviewed_root_policy_json", "request_failure_coverage"}
-            else ":" + name
-        )
+        (f"CAST(:{name} AS jsonb)" if name in {"reviewed_root_policy_json", "request_failure_coverage"} else ":" + name)
         for name in columns
     )
     values_by_column = {name: getattr(admission, name) for name in columns}
     for name in ("reviewed_root_policy_json", "request_failure_coverage"):
         document = values_by_column[name]
         values_by_column[name] = (
-            None
-            if document is None
-            else json.dumps(document, separators=(",", ":"), sort_keys=True)
+            None if document is None else json.dumps(document, separators=(",", ":"), sort_keys=True)
         )
     await database.status(
         f"INSERT INTO {_table(ADMISSION_TABLE)} ({', '.join(columns)}) VALUES "
@@ -295,13 +268,10 @@ async def _store_single_root_authority(
         _require_exact(stored, expected, _ADMISSION_IDENTITY_COLUMNS)
         return stored
     computed = await database.scalar(
-        f"SELECT {_table('provider_directory_rooted_graph_request_failure_coverage')}"
-        "(:acquisition_id);",
+        f"SELECT {_table('provider_directory_rooted_graph_request_failure_coverage')}(:acquisition_id);",
         acquisition_id=expected.publication_acquisition_id,
     )
-    coverage = _row_fields({"request_failure_coverage": computed})[
-        "request_failure_coverage"
-    ]
+    coverage = _row_fields({"request_failure_coverage": computed})["request_failure_coverage"]
     if coverage != expected.request_failure_coverage:
         raise ProviderDirectoryRootedGraphTwinError("state")
     await _insert_authority(database, expected)
@@ -311,9 +281,7 @@ async def _store_single_root_authority(
 
 
 def _candidate_root(
-    roots: tuple[
-        ProviderDirectoryRootedGraphSealedRoot, ProviderDirectoryRootedGraphSealedRoot
-    ],
+    roots: tuple[ProviderDirectoryRootedGraphSealedRoot, ProviderDirectoryRootedGraphSealedRoot],
 ) -> ProviderDirectoryRootedGraphSealedRoot:
     candidates = tuple(root for root in roots if root.acquisition_role == "candidate")
     if len(candidates) != 1:
@@ -323,8 +291,7 @@ def _candidate_root(
 
 def _validate_admission_request(*acquisition_ids: object) -> None:
     if any(
-        type(acquisition_id) is not str
-        or ACQUISITION_PATTERN.fullmatch(acquisition_id) is None
+        type(acquisition_id) is not str or ACQUISITION_PATTERN.fullmatch(acquisition_id) is None
         for acquisition_id in acquisition_ids
     ):
         raise ValueError("provider_directory_rooted_graph_acquisition_id_invalid")
@@ -332,8 +299,7 @@ def _validate_admission_request(*acquisition_ids: object) -> None:
 
 async def _lock_logical_current(database: Any):
     await database.scalar(
-        "SELECT pg_catalog.pg_advisory_xact_lock("
-        "pg_catalog.hashtextextended(:lock_identity, 0));",
+        "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(:lock_identity, 0));",
         lock_identity=EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
     )
     return await lock_exact_current_dataset(
@@ -354,15 +320,13 @@ async def admit_provider_directory_rooted_graph_twins(
     stored_attempt: ProviderDirectoryRootedGraphTwinAttempt | None = None
     stored_admission: ProviderDirectoryRootedGraphTwinAdmission | None = None
     is_root_current = False
-    async with database.transaction():
+    async with rooted_graph_transaction(database):
         current = await _lock_logical_current(database)
         roots = await _lock_roots(
             database,
             (first_acquisition_id, second_acquisition_id),
         )
-        transaction_time = _timestamp(
-            await database.scalar("SELECT transaction_timestamp();")
-        )
+        transaction_time = _timestamp(await database.scalar("SELECT transaction_timestamp();"))
         expected_attempt = build_provider_directory_rooted_graph_twin_attempt(
             roots[0], roots[1], attempted_at=transaction_time
         )
@@ -371,11 +335,7 @@ async def admit_provider_directory_rooted_graph_twins(
         _require_exact(stored_attempt, expected_attempt, _ATTEMPT_IDENTITY_COLUMNS)
         candidate = _candidate_root(roots)
         is_root_current = exact_current_matches_root(current, candidate)
-        if (
-            stored_attempt.matched
-            and is_root_current
-            and current.cohort_complete is True
-        ):
+        if stored_attempt.matched and is_root_current and current.cohort_complete is True:
             expected_admission = build_provider_directory_rooted_graph_twin_admission(
                 stored_attempt,
                 candidate,
@@ -409,23 +369,18 @@ async def admit_rooted_graph_single_root(
     """Admit one still-current candidate seal under explicit policy one."""
 
     _validate_admission_request(publication_acquisition_id)
-    if (
-        type(acquisition_operation_key) is not str
-        or SHA256_PATTERN.fullmatch(acquisition_operation_key) is None
-    ):
+    if type(acquisition_operation_key) is not str or SHA256_PATTERN.fullmatch(acquisition_operation_key) is None:
         raise ValueError("provider_directory_rooted_graph_operation_key_invalid")
     stored_admission: ProviderDirectoryRootedGraphTwinAdmission | None = None
     is_root_current = False
-    async with database.transaction():
+    async with rooted_graph_transaction(database):
         current = await _lock_logical_current(database)
         candidate = await _lock_single_root(database, publication_acquisition_id)
         from process.provider_directory_rooted_graph_single_root_contract import (
             derive_single_root_identity,
         )
 
-        transaction_time = _timestamp(
-            await database.scalar("SELECT transaction_timestamp();")
-        )
+        transaction_time = _timestamp(await database.scalar("SELECT transaction_timestamp();"))
         is_root_current = exact_current_matches_root(current, candidate)
         if is_root_current:
             expected_identity = derive_single_root_identity(
@@ -454,17 +409,11 @@ async def require_provider_directory_rooted_graph_admission(
 ) -> ProviderDirectoryRootedGraphTwinAdmission:
     """Rebuild one matched authority from its still-sealed roots."""
 
-    if (
-        type(publication_acquisition_id) is not str
-        or ACQUISITION_PATTERN.fullmatch(publication_acquisition_id) is None
-    ):
+    if type(publication_acquisition_id) is not str or ACQUISITION_PATTERN.fullmatch(publication_acquisition_id) is None:
         raise ValueError("provider_directory_rooted_graph_acquisition_id_invalid")
-    async with database.transaction():
+    async with rooted_graph_transaction(database):
         admission = await _read_admission(database, publication_acquisition_id)
-        if (
-            admission.admission_contract_id
-            == PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID
-        ):
+        if admission.admission_contract_id == PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID:
             root = await _lock_single_root(database, publication_acquisition_id)
             expected = build_rooted_graph_single_root_admission(
                 root,

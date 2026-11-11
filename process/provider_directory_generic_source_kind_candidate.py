@@ -2,6 +2,7 @@
 """One-transaction rooted/UHC candidates using native application-owned DDL."""
 
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from uuid import uuid4
 
 from db.migration_provider_dataset_online import _expected_bulk_relationships
@@ -23,7 +24,7 @@ _PROVENANCE = {
 
 _ORIGINAL_CHECKS_SQL = """
 SELECT c.oid::bigint,c.relname,n.nspname,c.relkind::text,
-       c.relowner=(SELECT oid FROM pg_roles WHERE rolname=current_user) AS is_owned,
+       c.relowner=COALESCE($3::oid,(SELECT oid FROM pg_roles WHERE rolname=current_user)) AS is_owned,
        to_regclass($2)::oid::bigint AS current_parent,
        ARRAY(SELECT inhparent::bigint FROM pg_inherits WHERE inhrelid=c.oid ORDER BY inhparent) AS parents,
        ARRAY(SELECT ARRAY[conname::text,pg_get_expr(conbin,conrelid)]
@@ -32,11 +33,23 @@ SELECT c.oid::bigint,c.relname,n.nspname,c.relkind::text,
 """
 
 
-async def _validate_original_checks(connection, policy, relations, dataset_id):
+async def _validate_original_checks(connection, policy, relations, dataset_id, *, canonical_schema=None):
     """Apply the original heap's data checks, retaining SQL CHECK null semantics."""
     from process.provider_directory_generic_source_provision import _completed_legacy_dataset_plan
 
-    plan = await _completed_legacy_dataset_plan(connection, policy)
+    history_policy = replace(policy, schema=canonical_schema) if canonical_schema else policy
+    plan = await _completed_legacy_dataset_plan(connection, history_policy)
+    history_owner = None
+    if canonical_schema:
+        history_owner = await connection.fetchval(
+            "SELECT relowner::bigint FROM pg_class WHERE oid=to_regclass($1)",
+            storage_relation(canonical_schema, RESOURCE),
+        )
+        _require(
+            history_owner is not None
+            and await connection.fetchval("SELECT pg_has_role(session_user,$1::oid,'USAGE')", history_owner),
+            "legacy_history_identity_changed",
+        )
     for root, name in relations.items():
         identity = plan["tables"].get(root)
         _require(
@@ -48,13 +61,13 @@ async def _validate_original_checks(connection, policy, relations, dataset_id):
         keys = identity.get("keys", plan.get("keys"))
         _require(type(keys) is list, "legacy_history_identity_changed")
         history = await connection.fetchrow(
-            _ORIGINAL_CHECKS_SQL, identity["original_oid"], storage_relation(policy.schema, root)
+            _ORIGINAL_CHECKS_SQL, identity["original_oid"], storage_relation(history_policy.schema, root), history_owner
         )
         _require(
             history is not None
             and history["oid"] == identity["original_oid"]
             and history["relname"] == "pd_dataset_history_" + str(identity["original_oid"])
-            and history["nspname"] == policy.schema
+            and history["nspname"] == history_policy.schema
             and history["relkind"] == "r"
             and history["is_owned"] is True
             and history["current_parent"] == identity["parent_oid"]
@@ -93,7 +106,9 @@ async def _validate_content(connection, schema, relations, dataset_id, kind):
     _require(invalid is False, "candidate_content_changed")
     provenance = _PROVENANCE[kind]
     evidence = storage_relation(schema, relations[provenance])
-    header = storage_relation(schema, provenance.removesuffix("_resource"))
+    header = storage_relation(
+        schema, relations.get(provenance.removesuffix("_resource"), provenance.removesuffix("_resource"))
+    )
     predicate = (
         "resource.payload_hash IS DISTINCT FROM evidence.published_payload_hash "
         "OR evidence.root_dataset_id IS DISTINCT FROM header.root_dataset_id "
@@ -116,12 +131,14 @@ async def _validate_content(connection, schema, relations, dataset_id, kind):
     _require(invalid is False, "candidate_content_changed")
 
 
-async def _validate_relationships(connection, schema, relations, dataset_id):
+async def _validate_relationships(connection, schema, relations, dataset_id, *, canonical_schema=None):
     for source, target, source_columns, target_columns, _ in sorted(_expected_bulk_relationships()):
         if source not in relations:
             continue
         source_ref = storage_relation(schema, relations[source])
-        target_ref = storage_relation(schema, relations.get(target, target))
+        target_ref = storage_relation(
+            schema if target in relations else canonical_schema or schema, relations.get(target, target)
+        )
         predicate = " AND ".join(
             f"s.{storage_identifier(left)}=t.{storage_identifier(right)}"
             for left, right in zip(source_columns, target_columns)
@@ -145,7 +162,7 @@ async def _provenance_indexes(connection, schema, name, kind):
     await connection.execute(f"ANALYZE {storage_relation(schema, name)}")
 
 
-async def _attach_partitions(connection, policy, relations_by_root, dataset_id):
+async def _attach_partitions(connection, policy, relations_by_root, dataset_id, *, prepared=False):
     """Bound parent lock waits, retaining stricter caller limits and restoring success."""
     previous_timeout, timeout_ms = await connection.fetchrow(
         "SELECT current_setting('lock_timeout'),setting::bigint FROM pg_settings WHERE name='lock_timeout'"
@@ -157,7 +174,8 @@ async def _attach_partitions(connection, policy, relations_by_root, dataset_id):
     await connection.execute("LOCK TABLE " + ",".join(roots) + " IN SHARE UPDATE EXCLUSIVE MODE")
     for root, name in relations_by_root.items():
         candidate_ref = storage_relation(policy.schema, name)
-        await connection.execute(f"ALTER TABLE {candidate_ref} ADD CHECK (dataset_id={literal})")
+        if not prepared:
+            await connection.execute(f"ALTER TABLE {candidate_ref} ADD CHECK (dataset_id={literal})")
         await _close_grants(connection, policy, name, readable=True)
         await connection.execute(
             f"ALTER TABLE {storage_relation(policy.schema, root)} ATTACH PARTITION {candidate_ref} "
@@ -167,10 +185,110 @@ async def _attach_partitions(connection, policy, relations_by_root, dataset_id):
     await connection.execute("SELECT set_config('lock_timeout',$1,true)", previous_timeout)
 
 
+async def _finish_kind_candidate(connection, policy, relations, dataset_id, kind, finish, detached):
+    """Index resource lookups before deriving and proving the complete private group."""
+    await _indexes(connection, policy, RESOURCE, relations[RESOURCE])
+    if finish is not None:
+        await finish()
+    for root, name in relations.items():
+        if root == _PROVENANCE[kind]:
+            await _provenance_indexes(connection, policy.schema, name, kind)
+        elif root != RESOURCE:
+            await _indexes(connection, policy, root, name)
+    await _validate_content(connection, policy.schema, relations, dataset_id, kind)
+    await _validate_original_checks(connection, policy, relations, dataset_id)
+    await _validate_relationships(connection, policy.schema, relations, dataset_id)
+    if detached:
+        literal = "'" + dataset_id.replace("'", "''") + "'"
+        for name in relations.values():
+            await connection.execute(
+                f"ALTER TABLE {storage_relation(policy.schema, name)} ADD CHECK (dataset_id={literal})"
+            )
+        await _capture(connection, policy, list(relations.values()))
+    else:
+        await _attach_partitions(connection, policy, relations, dataset_id)
+        await _capture(connection, policy, list(relations.values()), private=False)
+
+
+async def _finish_rooted_runtime_candidate(connection, runtime, relations_by_root, roots, dataset_id, finish, prepared):
+    """Finish indexes, native constraints and set proofs before handing off the private group."""
+    policy = runtime.candidate_policy
+    actual = await _capture(connection, policy, list(relations_by_root.values()))
+    _require(actual == prepared, "storage_binding_changed")
+    await _indexes(connection, policy, RESOURCE, relations_by_root[RESOURCE])
+    if finish is not None:
+        await finish()
+    for root, name in relations_by_root.items():
+        if root in roots[-2:]:
+            await connection.execute(f"ALTER TABLE {storage_relation(policy.schema, name)} ADD PRIMARY KEY(dataset_id)")
+        elif root == _PROVENANCE["rooted"]:
+            await _provenance_indexes(connection, policy.schema, name, "rooted")
+        elif root != RESOURCE:
+            await _indexes(connection, policy, root, name)
+    await _validate_content(connection, policy.schema, relations_by_root, dataset_id, "rooted")
+    output_relations_by_root = {root: relations_by_root[root] for root in roots[:-2]}
+    await _validate_original_checks(
+        connection, policy, output_relations_by_root, dataset_id, canonical_schema=runtime.catalog_schema
+    )
+    await _validate_relationships(
+        connection, policy.schema, relations_by_root, dataset_id, canonical_schema=runtime.catalog_schema
+    )
+    literal = "'" + dataset_id.replace("'", "''") + "'"
+    for name in relations_by_root.values():
+        await connection.execute(f"ALTER TABLE {storage_relation(policy.schema, name)} ADD CHECK(dataset_id={literal})")
+    from process.provider_directory_rooted_graph_candidate_indexes import prepare_rooted_parent_indexes
+
+    await prepare_rooted_parent_indexes(connection, runtime.catalog_schema, policy.schema, output_relations_by_root)
+    await _capture(connection, policy, list(relations_by_root.values()))
+
+
 @asynccontextmanager
-async def native_kind_candidate(database, directory, dataset_id, *, kind):
+async def _rooted_runtime_candidate(database, directory, dataset_id, runtime, finish):
+    """Prepare the exact private output and two header snapshots for protected freeze."""
+    roots = (
+        *RELATIONS[:4],
+        _PROVENANCE["rooted"],
+        "provider_directory_endpoint_dataset",
+        "provider_directory_rooted_graph_dataset",
+    )
+    async with runtime.transaction(database) as transaction:
+        connection, policy = transaction.connection, runtime.candidate_policy
+        relations_by_root = {root: "pdgs_" + uuid4().hex + "_r" for root in roots}
+        for root, name in relations_by_root.items():
+            template_schema = policy.schema if root == "provider_directory_endpoint_dataset" else runtime.catalog_schema
+            await connection.execute(
+                f"CREATE TABLE {storage_relation(policy.schema, name)} "
+                f"(LIKE {storage_relation(template_schema, root)} "
+                "INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING CONSTRAINTS INCLUDING STORAGE)"
+            )
+            if root == "provider_directory_rooted_graph_dataset":
+                from process.provider_directory_rooted_graph_header_checks import defer_rooted_header_check
+
+                await defer_rooted_header_check(connection, runtime.catalog_schema, policy.schema, name)
+            await connection.execute(
+                f"ALTER TABLE {storage_relation(policy.schema, name)} OWNER TO {storage_identifier(policy.owner_role)}"
+            )
+            await _close_grants(connection, policy, name)
+        prepared = await _capture(connection, policy, list(relations_by_root.values()))
+        with directory._provider_directory_artifact_relation_scope(relations_by_root):
+            yield relations_by_root
+            await _finish_rooted_runtime_candidate(
+                connection, runtime, relations_by_root, roots, dataset_id, finish, prepared
+            )
+
+
+@asynccontextmanager
+async def native_kind_candidate(database, directory, dataset_id, *, kind, finish=None, detached=False):
     """Keep the complete output group private until COPY, indexes and anti-joins finish."""
     _require(kind in _PROVENANCE and type(dataset_id) is str and 1 <= len(dataset_id) <= 96, "kind_invalid")
+    from process.provider_directory_rooted_graph_source_runtime import current_rooted_graph_runtime
+
+    runtime = current_rooted_graph_runtime(database)
+    if kind == "rooted" and runtime is not None:
+        _require(detached, "rooted_preparation_required")
+        async with _rooted_runtime_candidate(database, directory, dataset_id, runtime, finish) as relations:
+            yield relations
+        return
     async with source_owner_transaction(database) as publisher:
         connection, policy = publisher.connection, publisher.policy
         _require(policy.schema == directory._schema(), "schema_changed")
@@ -190,15 +308,6 @@ async def native_kind_candidate(database, directory, dataset_id, *, kind):
         prepared = await _capture(connection, policy, list(relations_by_root.values()))
         with directory._provider_directory_artifact_relation_scope(relations_by_root):
             yield relations_by_root
-        actual = await _capture(connection, policy, list(relations_by_root.values()))
-        _require(actual == prepared, "storage_binding_changed")
-        for root, name in relations_by_root.items():
-            if root == provenance:
-                await _provenance_indexes(connection, policy.schema, name, kind)
-            else:
-                await _indexes(connection, policy, root, name)
-        await _validate_content(connection, policy.schema, relations_by_root, dataset_id, kind)
-        await _validate_original_checks(connection, policy, relations_by_root, dataset_id)
-        await _validate_relationships(connection, policy.schema, relations_by_root, dataset_id)
-        await _attach_partitions(connection, policy, relations_by_root, dataset_id)
-        await _capture(connection, policy, list(relations_by_root.values()), private=False)
+            actual = await _capture(connection, policy, list(relations_by_root.values()))
+            _require(actual == prepared, "storage_binding_changed")
+            await _finish_kind_candidate(connection, policy, relations_by_root, dataset_id, kind, finish, detached)

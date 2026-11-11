@@ -81,9 +81,11 @@ async def _publish_historical_rooted(publication_acquisition_id, *, database, ba
 @contextmanager
 def historical_publication_scope(monkeypatch):
     """Keep old storage and its real validators confined to migration proofs."""
+    from process import provider_directory_rooted_graph_terminal as terminal
     from tests import provider_directory_rooted_graph_rotation_pg_support as rotation
 
     with monkeypatch.context() as patch:
+        patch.setattr(terminal, "PROVIDER_DIRECTORY_ROOTED_GRAPH_AFFILIATION_FILTER_RECIPE_ID", "")
         patch.setattr(practitioner, "publish_registered_uhc_flex_dataset", _publish_historical_practitioner)
         patch.setattr(rotation, "publish_registered_uhc_flex_dataset", _publish_historical_practitioner)
         patch.setattr(rooted, "publish_admitted_rooted_graph_dataset", _publish_historical_rooted)

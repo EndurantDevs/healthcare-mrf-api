@@ -125,8 +125,8 @@ result_hashes AS MATERIALIZED (
             ||missing_response_sha256||pg_catalog.chr(31)||missing_response_bytes::pg_catalog.text END,'UTF8')),'hex')
         AS result_digest FROM query_sets q
 ),
-terminal_hashes AS MATERIALIZED (
-    SELECT q.*,pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+terminal_inputs AS MATERIALIZED (
+    SELECT q.*,
         'healthporta.provider-directory.rooted-graph-terminal-record.v2'||pg_catalog.chr(31)
         ||query_identity_sha256||pg_catalog.chr(31)
         ||CASE WHEN status='error' THEN 'error'||pg_catalog.chr(31)||''||pg_catalog.chr(31)||'0'
@@ -140,8 +140,16 @@ terminal_hashes AS MATERIALIZED (
             ELSE 'completed'||pg_catalog.chr(31)||result_digest||pg_catalog.chr(31)
                 ||actual_resource_count::pg_catalog.text||pg_catalog.chr(31)||actual_edge_count::pg_catalog.text
                 ||pg_catalog.chr(31)||COALESCE(advertised_total::pg_catalog.text,'')||pg_catalog.chr(31)
-                ||terminal_page_count::pg_catalog.text||pg_catalog.chr(31)||'true'||pg_catalog.chr(31)||'' END,
-        'UTF8')),'hex') AS terminal_digest FROM result_hashes q
+                ||terminal_page_count::pg_catalog.text||pg_catalog.chr(31)||'true'||pg_catalog.chr(31) END
+        AS terminal_input FROM result_hashes q
+),
+terminal_hashes AS MATERIALIZED (
+    SELECT q.*,pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(terminal_input
+        ||CASE WHEN status='completed' AND kind='exact_reference_search' AND resource_type='OrganizationAffiliation'
+            THEN 'healthporta.provider-directory.rooted-graph-affiliation-provider-filter.v1' ELSE '' END,
+        'UTF8')),'hex') AS terminal_digest,
+        pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(terminal_input,'UTF8')),'hex')
+            AS legacy_terminal_digest FROM terminal_inputs q
 ),
 work_totals AS MATERIALIZED (
     SELECT acquisition_id,pg_catalog.count(*) AS rows,
@@ -407,7 +415,8 @@ violations(category) AS (
     )
     UNION ALL SELECT 'terminal' WHERE EXISTS (
         SELECT FROM terminal_hashes WHERE status IN ('completed','error') AND (
-            terminal_record_sha256 IS DISTINCT FROM terminal_digest
+            (terminal_record_sha256 IS DISTINCT FROM terminal_digest
+                AND terminal_record_sha256 IS DISTINCT FROM legacy_terminal_digest)
             OR (status='error' AND (actual_resource_count<>0 OR actual_edge_count<>0))
             OR (status='completed' AND (resource_count IS DISTINCT FROM actual_resource_count
                 OR edge_count IS DISTINCT FROM actual_edge_count OR resource_set_sha256 IS DISTINCT FROM resource_digest

@@ -13,29 +13,30 @@ from process.provider_directory_global_profile_followup_contract import (
     profile_followup_receipt_metadata,
 )
 from process.provider_directory_rooted_graph_operator_contract import (
-    _canonical_json,
-    _exact_operation_key,
-    _exact_publication_acquisition_id,
-    _operation_error,
     ACQUISITION_ENABLED_ENV,
-    build_rooted_graph_operator_identities,
-    build_rooted_graph_single_root_identity,
     OPERATOR_PHASES,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_ID,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_SHA256,
     PUBLICATION_ENABLED_ENV,
-    ProviderDirectoryRootedGraphOperatorError,
-    ProviderDirectoryRootedGraphOperatorIdentities,
-    RootedGraphSingleIdentity,
     REGISTRATION_ENABLED_ENV,
     SINGLE_ROOT_ACQUISITION_ENABLED_ENV,
     SINGLE_ROOT_ACQUISITION_PHASE,
+    ProviderDirectoryRootedGraphOperatorError,
+    ProviderDirectoryRootedGraphOperatorIdentities,
+    RootedGraphSingleIdentity,
+    _canonical_json,
+    _exact_operation_key,
+    _exact_publication_acquisition_id,
+    _operation_error,
+    build_rooted_graph_operator_identities,
+    build_rooted_graph_single_root_identity,
     require_rooted_graph_operator_gate,
     rooted_graph_operator_contract_payload,
 )
 from process.provider_directory_rooted_graph_single_root_contract import (
     single_root_operation_payload,
 )
+from process.provider_directory_rooted_graph_store_support import rooted_graph_transaction
 
 
 async def _register_source(database: Any) -> Any:
@@ -56,9 +57,7 @@ def _registration_json(result: Any) -> str:
             "created": result.created,
             "endpoint_created": result.endpoint_created,
             "endpoint_id": result.endpoint_id,
-            "operator_contract_sha256": (
-                PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_SHA256
-            ),
+            "operator_contract_sha256": (PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_SHA256),
             "source_created": result.source_created,
             "source_id": result.source_id,
             "status": "registered",
@@ -75,7 +74,7 @@ async def register_rooted_graph_source_operation(
     require_rooted_graph_operator_gate("register")
     try:
         return _registration_json(await _register_source(database))
-    except (asyncio.CancelledError, TimeoutError):
+    except asyncio.CancelledError, TimeoutError:
         raise
     except ProviderDirectoryRootedGraphOperatorError:
         raise
@@ -84,6 +83,27 @@ async def register_rooted_graph_source_operation(
 
 
 async def _select_exact_current_root(database: Any) -> Any:
+    from process.provider_directory_rooted_graph_source_runtime import current_rooted_graph_runtime
+
+    if current_rooted_graph_runtime(database) is not None:
+        from process.provider_directory_dataset_scoped_publication_contract import (
+            EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
+        )
+        from process.provider_directory_rooted_graph_current_preflight import (
+            prepare_current_root,
+            require_current_root_fence,
+        )
+
+        proof = await prepare_current_root(database)
+        async with rooted_graph_transaction(database):
+            await database.status("SET LOCAL lock_timeout='1500ms'")
+            locked = await database.scalar(
+                "SELECT pg_catalog.pg_try_advisory_xact_lock(pg_catalog.hashtextextended(:identity,0))",
+                identity=EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
+            )
+            if locked is not True:
+                raise ProviderDirectoryRootedGraphOperatorError("state")
+            return await require_current_root_fence(database, proof)
     from process.provider_directory_dataset_scoped_publication import (
         exact_uhc_dataset_pair,
         lock_exact_current_dataset,
@@ -93,10 +113,9 @@ async def _select_exact_current_root(database: Any) -> Any:
         ExactCurrentDataset,
     )
 
-    async with database.transaction():
+    async with rooted_graph_transaction(database):
         await database.scalar(
-            "SELECT pg_catalog.pg_advisory_xact_lock("
-            "pg_catalog.hashtextextended(:lock_identity, 0));",
+            "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(:lock_identity, 0));",
             lock_identity=EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
         )
         current = await lock_exact_current_dataset(
@@ -133,9 +152,7 @@ def _acquisition_json(
             "baseline": _root_receipt_payload(receipt.baseline),
             "candidate": _root_receipt_payload(receipt.candidate),
             "dataset_intent_id": receipt.dataset_intent_id,
-            "operator_contract_sha256": (
-                PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_SHA256
-            ),
+            "operator_contract_sha256": (PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_SHA256),
             "operation_key": operation_key,
             "publication_acquisition_id": admission.publication_acquisition_id,
             "root_dataset_hash": current.dataset_hash,
@@ -222,12 +239,12 @@ async def _run_acquisition_phase(
     """Compose exact selection, twin acquisition, and admission only."""
 
     from process.provider_directory_rooted_graph_acquisition import (
-        acquire_provider_directory_rooted_graph_twins,
         ProviderDirectoryRootedGraphAcquisitionReceipt,
+        acquire_provider_directory_rooted_graph_twins,
     )
     from process.provider_directory_rooted_graph_twin_store import (
-        admit_provider_directory_rooted_graph_twins,
         ProviderDirectoryRootedGraphTwinAdmission,
+        admit_provider_directory_rooted_graph_twins,
     )
 
     config = _acquisition_config(controls)
@@ -294,11 +311,11 @@ async def acquire_admit_rooted_graph_operation(
             controls,
             database,
         )
-    except (asyncio.CancelledError, TimeoutError):
+    except asyncio.CancelledError, TimeoutError:
         raise
     except ProviderDirectoryRootedGraphOperatorError:
         raise
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise ProviderDirectoryRootedGraphOperatorError("invalid_request") from None
     except Exception as error:
         raise _operation_error(error, "acquisition") from None
@@ -308,16 +325,17 @@ async def _run_single_root_acquisition_phase(
     operation_key: str,
     controls: _AcquisitionControls,
     database: Any,
+    expected_publication_acquisition_id: str | None = None,
 ) -> str:
     """Acquire and admit one exact candidate under reviewed policy one."""
 
     from process.provider_directory_rooted_graph_acquisition import (
-        acquire_rooted_graph_single_root,
         ProviderDirectoryRootedGraphRootReceipt,
+        acquire_rooted_graph_single_root,
     )
     from process.provider_directory_rooted_graph_twin_store import (
-        admit_rooted_graph_single_root,
         ProviderDirectoryRootedGraphTwinAdmission,
+        admit_rooted_graph_single_root,
     )
 
     config = _acquisition_config(controls)
@@ -326,6 +344,10 @@ async def _run_single_root_acquisition_phase(
         current,
         operation_key=operation_key,
     )
+    if expected_publication_acquisition_id is not None and (
+        identity.candidate.acquisition_id != expected_publication_acquisition_id
+    ):
+        raise ProviderDirectoryRootedGraphOperatorError("input_drift")
     receipt = await acquire_rooted_graph_single_root(
         identity.candidate,
         config=config,
@@ -352,9 +374,26 @@ async def _run_single_root_acquisition_phase(
         or admission.publication_authority is not True
     ):
         raise ProviderDirectoryRootedGraphOperatorError("admission")
-    return _canonical_json(
-        single_root_operation_payload(current, receipt, admission, operation_key)
-    )
+    return _canonical_json(single_root_operation_payload(current, receipt, admission, operation_key))
+
+
+async def _acquire_single_root_request(operation_key, controls, database, expected_selector=None):
+    require_rooted_graph_operator_gate(SINGLE_ROOT_ACQUISITION_PHASE)
+    try:
+        exact_operation_key = _exact_operation_key(operation_key)
+        if expected_selector is not None:
+            _exact_publication_acquisition_id(expected_selector)
+        if type(controls) is not _AcquisitionControls:
+            raise ValueError("provider_directory_rooted_graph_controls_invalid")
+        return await _run_single_root_acquisition_phase(exact_operation_key, controls, database, expected_selector)
+    except asyncio.CancelledError, TimeoutError:
+        raise
+    except ProviderDirectoryRootedGraphOperatorError:
+        raise
+    except TypeError, ValueError:
+        raise ProviderDirectoryRootedGraphOperatorError("invalid_request") from None
+    except Exception as error:
+        raise _operation_error(error, "acquisition") from None
 
 
 async def acquire_single_root_operation(
@@ -369,31 +408,28 @@ async def acquire_single_root_operation(
     database: Any,
 ) -> str:
     """Acquire and admit one policy-one candidate; never publish."""
+    controls = _AcquisitionControls(
+        concurrency=concurrency,
+        max_attempts=max_attempts,
+        lease_seconds=lease_seconds,
+        retry_base_seconds=retry_base_seconds,
+        max_retry_seconds=max_retry_seconds,
+        root_timeout_seconds=root_timeout_seconds,
+    )
+    return await _acquire_single_root_request(operation_key, controls, database)
 
-    require_rooted_graph_operator_gate(SINGLE_ROOT_ACQUISITION_PHASE)
-    try:
-        exact_operation_key = _exact_operation_key(operation_key)
-        controls = _AcquisitionControls(
-            concurrency=concurrency,
-            max_attempts=max_attempts,
-            lease_seconds=lease_seconds,
-            retry_base_seconds=retry_base_seconds,
-            max_retry_seconds=max_retry_seconds,
-            root_timeout_seconds=root_timeout_seconds,
-        )
-        return await _run_single_root_acquisition_phase(
-            exact_operation_key,
-            controls,
-            database,
-        )
-    except (asyncio.CancelledError, TimeoutError):
-        raise
-    except ProviderDirectoryRootedGraphOperatorError:
-        raise
-    except (TypeError, ValueError):
-        raise ProviderDirectoryRootedGraphOperatorError("invalid_request") from None
-    except Exception as error:
-        raise _operation_error(error, "acquisition") from None
+
+async def acquire_pinned_root_operation(
+    *,
+    operation_key: str,
+    expected_publication_acquisition_id: str,
+    controls: _AcquisitionControls,
+    database: Any,
+) -> str:
+    """Use the same gated single-root path with an enqueue-time native selector."""
+    if type(expected_publication_acquisition_id) is not str:
+        raise ProviderDirectoryRootedGraphOperatorError("invalid_request")
+    return await _acquire_single_root_request(operation_key, controls, database, expected_publication_acquisition_id)
 
 
 def _publication_json(publication_result: Any) -> str:
@@ -430,9 +466,7 @@ def _publication_json(publication_result: Any) -> str:
         "admission_id": readiness.admission_id,
         "dataset_hash": readiness.dataset_hash,
         "dataset_id": readiness.dataset_id,
-        "operator_contract_sha256": (
-            PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_SHA256
-        ),
+        "operator_contract_sha256": (PROVIDER_DIRECTORY_ROOTED_GRAPH_OPERATOR_CONTRACT_SHA256),
         "previous_dataset_id": readiness.previous_dataset_id,
         "profile_dispatch": profile_dispatch_by_field,
         "publication_acquisition_id": readiness.publication_acquisition_id,
@@ -470,8 +504,8 @@ async def publish_admitted_rooted_graph_operation(
         raise ProviderDirectoryRootedGraphOperatorError("invalid_request") from None
     try:
         from process.provider_directory_rooted_graph_publication import (
-            publish_provider_directory_rooted_graph_dataset,
             ProviderDirectoryRootedGraphPublicationResult,
+            publish_provider_directory_rooted_graph_dataset,
         )
 
         publication_result = await publish_provider_directory_rooted_graph_dataset(
@@ -480,17 +514,16 @@ async def publish_admitted_rooted_graph_operation(
             batch_size=batch_size,
         )
         if (
-            type(publication_result)
-            is not ProviderDirectoryRootedGraphPublicationResult
+            type(publication_result) is not ProviderDirectoryRootedGraphPublicationResult
             or publication_result.readiness.publication_acquisition_id != exact_selector
         ):
             raise ProviderDirectoryRootedGraphOperatorError("evidence")
         return _publication_json(publication_result)
-    except (asyncio.CancelledError, TimeoutError):
+    except asyncio.CancelledError, TimeoutError:
         raise
     except ProviderDirectoryRootedGraphOperatorError:
         raise
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise ProviderDirectoryRootedGraphOperatorError("invalid_request") from None
     except Exception as error:
         raise _operation_error(error, "publication") from None
@@ -505,7 +538,7 @@ __all__ = tuple(
         "ProviderDirectoryRootedGraphOperatorIdentities RootedGraphSingleIdentity "
         "REGISTRATION_ENABLED_ENV SINGLE_ROOT_ACQUISITION_ENABLED_ENV "
         "SINGLE_ROOT_ACQUISITION_PHASE acquire_admit_rooted_graph_operation "
-        "acquire_single_root_operation build_rooted_graph_operator_identities "
+        "acquire_single_root_operation acquire_pinned_root_operation build_rooted_graph_operator_identities "
         "build_rooted_graph_single_root_identity "
         "publish_admitted_rooted_graph_operation register_rooted_graph_source_operation "
         "require_rooted_graph_operator_gate rooted_graph_operator_contract_payload"

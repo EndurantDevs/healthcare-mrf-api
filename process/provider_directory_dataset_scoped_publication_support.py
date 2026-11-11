@@ -20,7 +20,6 @@ from process.uhc_flex_practitioner_registration import (
     uhc_flex_practitioner_endpoint_identity,
 )
 
-
 _SCHEMA_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
@@ -50,9 +49,7 @@ def database_row_fields(database_row: Any) -> dict[str, Any]:
 
     if database_row is None:
         return {}
-    mapping = (
-        database_row._mapping if hasattr(database_row, "_mapping") else database_row
-    )
+    mapping = database_row._mapping if hasattr(database_row, "_mapping") else database_row
     if not isinstance(mapping, Mapping):
         raise ProviderDirectoryDatasetScopedPublicationError("state")
     return dict(mapping)
@@ -61,6 +58,8 @@ def database_row_fields(database_row: Any) -> dict[str, Any]:
 async def exact_pair_registry_by_coordinate(
     database: Any,
     pair: ExactDatasetPair,
+    *,
+    lock_rows: bool = True,
 ) -> dict[tuple[object, object], dict[str, Any]]:
     """Lock and return the two exact registry coordinates."""
 
@@ -75,15 +74,15 @@ async def exact_pair_registry_by_coordinate(
                    AS endpoint_authority_id,
                endpoint.endpoint_signature_hash
                    AS endpoint_signature_sha256
-          FROM {qualified_relation('provider_directory_source')} AS source
-          JOIN {qualified_relation('provider_directory_api_endpoint')} AS endpoint
+          FROM {qualified_relation("provider_directory_source")} AS source
+          JOIN {qualified_relation("provider_directory_api_endpoint")} AS endpoint
             ON endpoint.endpoint_id = source.endpoint_id
          WHERE (source.source_id, source.endpoint_id) IN (
                (:legacy_source_id, :legacy_endpoint_id),
                (:rooted_source_id, :rooted_endpoint_id)
          )
          ORDER BY source.source_id, source.endpoint_id
-         FOR SHARE OF source, endpoint;
+         {"FOR SHARE OF source, endpoint" if lock_rows else ""};
         """,
         legacy_source_id=pair.legacy_source_id,
         legacy_endpoint_id=pair.legacy_endpoint_id,
@@ -111,10 +110,10 @@ def validate_exact_pair_registry(
         raise ProviderDirectoryDatasetScopedPublicationError("source_drift")
 
 
-async def lock_exact_pair_registry(database: Any, pair: ExactDatasetPair) -> None:
+async def lock_exact_pair_registry(database: Any, pair: ExactDatasetPair, *, lock_rows: bool = True) -> None:
     """Lock and validate both exact source and endpoint registry pairs."""
 
-    by_coordinate = await exact_pair_registry_by_coordinate(database, pair)
+    by_coordinate = await exact_pair_registry_by_coordinate(database, pair, lock_rows=lock_rows)
     validate_exact_pair_registry(by_coordinate, pair)
     legacy = by_coordinate[(pair.legacy_source_id, pair.legacy_endpoint_id)]
     rooted = by_coordinate[(pair.rooted_source_id, pair.rooted_endpoint_id)]
@@ -133,9 +132,7 @@ async def lock_exact_pair_registry(database: Any, pair: ExactDatasetPair) -> Non
         or legacy.get("endpoint_api_base") != canonical_base
         or rooted.get("source_api_base") != canonical_base
         or rooted.get("endpoint_api_base") != canonical_base
-        or rooted.get("endpoint_signature_sha256")
-        != PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_SIGNATURE_SHA256
-        or legacy.get("endpoint_signature_sha256")
-        != uhc_flex_practitioner_endpoint_identity().endpoint_signature_hash
+        or rooted.get("endpoint_signature_sha256") != PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_SIGNATURE_SHA256
+        or legacy.get("endpoint_signature_sha256") != uhc_flex_practitioner_endpoint_identity().endpoint_signature_hash
     ):
         raise ProviderDirectoryDatasetScopedPublicationError("source_drift")

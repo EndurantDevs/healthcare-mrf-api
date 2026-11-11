@@ -455,7 +455,7 @@ def _require_callable_definition(entry, schema, namespace):
         and all(
             definition[name] == field_value for name, field_value in expected_by_field.items() if name != "proconfig"
         )
-        and _body_digest(definition["prosrc"], schema) == digest,
+        and _is_approved_body(definition, schema, digest),
         "callable_definition_changed",
     )
 
@@ -1332,3 +1332,12 @@ async def adopt_cms_control_custody(connection, policy, before):
         "admin_transaction_changed",
     )
     return expected_checks
+
+
+def _is_approved_body(definition, schema, digest):
+    """Preserve exact body checks while admitting the fixed rooted frozen-proof successor."""
+    from db.migration_rooted_publication_freeze import is_approved_successor
+
+    return _body_digest(definition["prosrc"], schema) == digest or is_approved_successor(
+        definition["proname"], schema, definition["prosrc"], digest
+    )

@@ -15,6 +15,7 @@ from sqlalchemy import Index, MetaData, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from db.migration_nppes_evidence_candidates import upgrade_nppes_evidence_candidates
+from db.migration_rooted_publication_freeze import upgrade_rooted_publication_freeze
 from process import nppes_public_evidence_storage as storage
 from process import provider_directory_generic_source_policy as source
 from process import provider_directory_source_callable_custody as source_callables
@@ -485,6 +486,7 @@ async def _prepare_nppes_component(component, url, namespace, migrator, publicat
     await provision_source_component(engine, component.policy)
     async with engine.begin() as connection:
         await connection.run_sync(lambda sync: upgrade_nppes_evidence_candidates(sync, "mrf"))
+        await connection.run_sync(lambda sync: upgrade_rooted_publication_freeze(sync, "mrf"))
     await _enroll_native_custody(component, namespace, migrator)
     return await _install_nppes_publication(engine) if publication else None
 
@@ -535,6 +537,8 @@ async def composed_nppes_component(component, *, migration_prefixes=None):
             await _install_nppes_historical_storage(engine, engine.url, component, missing_prefixes)
         async with engine.begin() as connection:
             await connection.run_sync(lambda sync: upgrade_nppes_evidence_candidates(sync, policy.schema))
+            if migration_prefixes is None or "20260909120000" in migration_prefixes:
+                await connection.run_sync(lambda sync: upgrade_rooted_publication_freeze(sync, policy.schema))
         if migration_prefixes is None:
             await _install_existing_npi_publication(engine, policy.schema)
         await _enroll_native_custody(component, namespace, migrator, native_inputs=True)

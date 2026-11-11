@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-import re
+import hashlib
+from dataclasses import asdict
 from datetime import date
 from typing import Any
 
@@ -306,22 +307,39 @@ async def _insert_headers(
         raise ProviderDirectoryRootedGraphPublicationError("state")
 
 
-async def _dataset_hash(database: Any, dataset_id: str) -> str:
-    value = await database.scalar(
-        f"""
-        SELECT pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
-                   COALESCE(pg_catalog.string_agg(
-                       '["' || resource_type || '","' || resource_id ||
-                       '","' || payload_hash || '"]', E'\\n'
-                       ORDER BY resource_type, resource_id), ''), 'UTF8')), 'hex')
-          FROM {_table("provider_directory_dataset_resource")}
-         WHERE dataset_id = :dataset_id;
-        """,
-        dataset_id=dataset_id,
-    )
-    if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
-        raise ProviderDirectoryRootedGraphPublicationError("content")
-    return value
+async def _dataset_hash(database: Any, dataset_id: str, *, resource_relation: str | None = None) -> str:
+    """Stream the existing default-collation canonical triple digest in bounded pages."""
+    relation = resource_relation or _table("provider_directory_dataset_resource")
+    digest = hashlib.sha256()
+    cursor = None
+    while True:
+        cursor_filter = ""
+        parameters_by_name = {"dataset_id": dataset_id, "batch_size": 4096}
+        if cursor is not None:
+            cursor_filter = "AND (resource_type, resource_id) > (:cursor_type, :cursor_id)"
+            parameters_by_name.update(cursor_type=cursor[0], cursor_id=cursor[1])
+        resource_rows = await database.all(
+            f"""
+            SELECT resource_type, resource_id, payload_hash
+              FROM {relation}
+             WHERE dataset_id = :dataset_id {cursor_filter}
+             ORDER BY resource_type, resource_id LIMIT :batch_size;
+            """,
+            **parameters_by_name,
+        )
+        if not resource_rows:
+            return digest.hexdigest()
+        for resource_row in resource_rows:
+            fields = _row_fields(resource_row)
+            resource_identity_fields = tuple(
+                fields.get(name) for name in ("resource_type", "resource_id", "payload_hash")
+            )
+            if any(type(identity_value) is not str for identity_value in resource_identity_fields):
+                raise ProviderDirectoryRootedGraphPublicationError("content")
+            if cursor is not None:
+                digest.update(b"\n")
+            digest.update(canonical_json(resource_identity_fields).encode("utf-8"))
+            cursor = resource_identity_fields[:2]
 
 
 async def _validate_and_publish(
@@ -446,6 +464,109 @@ async def _locked_publication_result(
     )
 
 
+async def _prepare_rooted_candidate(database, runtime, proof, publication_acquisition_id, batch_size):
+    """Materialize and seal the exact candidate while locking only its own identity."""
+    from db.plan_release_storage import storage_relation
+    from process.provider_directory_rooted_graph_publication_candidate import (
+        retained_rooted_handoff,
+        seal_rooted_handoff,
+        validate_rooted_query_filter_recipes,
+    )
+
+    async with runtime.transaction(database, isolation="repeatable read") as transaction:
+        admission = await require_provider_directory_rooted_graph_admission(
+            publication_acquisition_id, database=database
+        )
+        if not exact_current_matches_root(proof.current, admission):
+            raise ProviderDirectoryRootedGraphPublicationError("foreign_current")
+        await validate_rooted_query_filter_recipes(transaction.connection, runtime.catalog_schema, asdict(admission))
+        identity = build_provider_directory_rooted_graph_dataset_identity(admission, proof.current)
+        locked = await database.scalar(
+            "SELECT pg_try_advisory_xact_lock(hashtextextended(:identity,0))",
+            identity="rooted_candidate:" + identity.dataset_id,
+        )
+        if locked is not True:
+            raise ProviderDirectoryRootedGraphPublicationError("state")
+        retained = await retained_rooted_handoff(runtime, transaction.connection, identity.dataset_id)
+        if retained is not None:
+            return retained
+        counts = await _preflight_counts(database, admission)
+
+        async def finish():
+            """Derive serving rows after resource indexes are ready."""
+            await build_provider_directory_dataset_serving_relations(
+                database,
+                identity.dataset_id,
+                build_run_id=admission.publication_run_id,
+                expected_acquisition_root_run_id=identity.acquisition_root_run_id,
+            )
+
+        async with prepare_dataset_candidate(
+            database, identity.dataset_id, kind="rooted", finish=finish, detached=True
+        ) as relations:
+            await _insert_headers(database, identity, admission, counts)
+            materialized = await materialize_provider_directory_rooted_graph_dataset(
+                database,
+                identity,
+                publication_run_id=admission.publication_run_id,
+                batch_size=batch_size,
+            )
+            if materialized.resource_counts != counts:
+                raise ProviderDirectoryRootedGraphPublicationError("content")
+        dataset_hash = await _dataset_hash(
+            database,
+            identity.dataset_id,
+            resource_relation=storage_relation(
+                runtime.candidate_schema, relations["provider_directory_dataset_resource"]
+            ),
+        )
+        return await seal_rooted_handoff(
+            runtime, transaction, identity, admission, relations, counts, dataset_hash, proof
+        )
+
+
+async def prepare_admitted_rooted_graph_dataset(
+    publication_acquisition_id: str,
+    *,
+    database: Any = db,
+    batch_size: int = PROVIDER_DIRECTORY_ROOTED_GRAPH_MATERIALIZATION_MAX_BATCH_ROWS,
+):
+    """Commit an exact detached candidate before protected freeze and publication."""
+    from process.provider_directory_rooted_graph_current_preflight import prepare_current_root
+    from process.provider_directory_rooted_graph_publication_candidate import (
+        retained_rooted_handoff,
+    )
+    from process.provider_directory_rooted_graph_source_runtime import current_rooted_graph_runtime
+
+    runtime = current_rooted_graph_runtime(database)
+    if runtime is None:
+        raise ProviderDirectoryRootedGraphPublicationError("state")
+    if (
+        type(batch_size) is not int
+        or not 1 <= batch_size <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MATERIALIZATION_MAX_BATCH_ROWS
+    ):
+        raise ValueError("provider_directory_rooted_graph_batch_size_invalid")
+    async with runtime.transaction(database, readonly=True) as transaction:
+        dataset_id = await transaction.connection.fetchval(
+            f"SELECT dataset_id FROM {_table(_HEADER)} WHERE publication_acquisition_id=$1",
+            publication_acquisition_id,
+        )
+        retained = await retained_rooted_handoff(
+            runtime, transaction.connection, dataset_id, publication_acquisition_id=publication_acquisition_id
+        )
+        if retained is not None:
+            published = await transaction.connection.fetchval(
+                "SELECT state='published' FROM hp_snapshot_retention.preparation WHERE preparation_id=$1::uuid",
+                retained.document["preparation_id"],
+            )
+            if published is True:
+                return retained
+    proof = await prepare_current_root(database)
+    if retained is not None:
+        return retained
+    return await _prepare_rooted_candidate(database, runtime, proof, publication_acquisition_id, batch_size)
+
+
 async def publish_admitted_rooted_graph_dataset(
     publication_acquisition_id: str,
     *,
@@ -484,3 +605,42 @@ __all__ = (
     "load_dataset_readiness",
     "publish_admitted_rooted_graph_dataset",
 )
+
+
+async def publish_prepared_rooted_graph_dataset(preparations, claim, before, *, database=db):
+    """Use the fixed short cutover for a genuine protected rooted preparation."""
+    from process.provider_directory_rooted_graph_publication_finalize import (
+        publish_prepared_rooted_graph_dataset as publish,
+    )
+
+    return await publish(preparations, claim, before, database=database)
+
+
+async def read_prepared_rooted_publication(row, *, database=db, connection=None):
+    """Read actual native readiness only after the protected atomic publication committed."""
+    from sqlalchemy import text
+
+    from process.network_cms_registry_address_capture import NativeReceiptSession
+    from process.provider_directory_rooted_graph_publication_readiness_store import (
+        _readiness_from_row,
+        _readiness_select,
+    )
+
+    if row["state"] != "published":
+        raise ProviderDirectoryRootedGraphPublicationError("state")
+    document = row["handoff"]
+    if isinstance(document, str):
+        import json
+
+        document = json.loads(document)
+    if connection is None:
+        readiness = await load_dataset_readiness(document["identity"]["dataset_id"], database=database)
+    else:
+        rows = await NativeReceiptSession(connection).execute(
+            text(_readiness_select("header.dataset_id=:dataset_id")),
+            {"dataset_id": document["identity"]["dataset_id"]},
+        )
+        readiness = _readiness_from_row(rows[0]) if len(rows) == 1 else None
+    if readiness is None or readiness.dataset_hash != document["dataset_hash"]:
+        raise ProviderDirectoryRootedGraphPublicationError("state")
+    return ProviderDirectoryRootedGraphPublicationResult(readiness, replayed=True)

@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import uuid
+from contextvars import Context
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -15,7 +17,7 @@ import asyncpg
 import pytest
 from sqlalchemy.exc import DBAPIError
 
-from db.connection import Database
+from process import provider_directory_generic_source_policy as source_policy
 from process import provider_directory_rooted_graph_bulk as bulk
 from process import provider_directory_rooted_graph_frontier as frontier
 from process import provider_directory_rooted_graph_result_store as result_store
@@ -61,12 +63,24 @@ async def _claim(context):
     )
 
 
-async def _independent_claim_during_root_load(database, identity):
+async def _independent_claim_during_root_load(component, identity):
     """A separate writer must progress while the new root transaction stays open."""
-    async with database.transaction():
-        await database.scalar("SELECT set_config('lock_timeout','100ms',true)")
-        claim = await claim_provider_directory_rooted_graph_work(identity.acquisition_id, database=database)
-        assert claim is not None
+    original_backend = source_policy.bound_publisher().connection.get_server_pid()
+
+    async def claim_with_own_publisher():
+        async with (
+            source_policy.bind_generic_source_transaction_factory(component.factory),
+            source_policy.source_transaction(component.database),
+        ):
+            publisher = source_policy.bound_publisher()
+            assert publisher.connection.get_server_pid() != original_backend
+            await component.database.scalar("SELECT set_config('lock_timeout','100ms',true)")
+            claim = await claim_provider_directory_rooted_graph_work(
+                identity.acquisition_id, database=component.database
+            )
+            assert claim is not None
+
+    await asyncio.create_task(claim_with_own_publisher(), context=Context())
 
 
 @pytest.mark.asyncio
@@ -76,22 +90,17 @@ async def test_root_initialization_builds_detached_and_rolls_back_before_attach(
         incumbent = _identity(current, "baseline", "2", "3")
         replacement = _identity(current, "candidate", "4", "5")
         await initialize_provider_directory_rooted_graph_acquisition(incumbent, database=context.database)
-        independent = Database()
-        await independent.connect()
         initialize_work = rooted_store._insert_initial_root_work
 
         async def fail_after_indexing(database, identity):
             await initialize_work(database, identity)
-            await _independent_claim_during_root_load(independent, incumbent)
+            await _independent_claim_during_root_load(context.component, incumbent)
             raise RuntimeError("synthetic root initialization failure")
 
-        try:
-            with monkeypatch.context() as patch:
-                patch.setattr(rooted_store, "_insert_initial_root_work", fail_after_indexing)
-                with pytest.raises(RuntimeError, match="synthetic root initialization failure"):
-                    await initialize_provider_directory_rooted_graph_acquisition(replacement, database=context.database)
-        finally:
-            await independent.disconnect()
+        with monkeypatch.context() as patch:
+            patch.setattr(rooted_store, "_insert_initial_root_work", fail_after_indexing)
+            with pytest.raises(RuntimeError, match="synthetic root initialization failure"):
+                await initialize_provider_directory_rooted_graph_acquisition(replacement, database=context.database)
         assert await context.connection.fetchval(
             f"SELECT count(*)=0 FROM {context.schema}.provider_directory_rooted_graph_acquisition WHERE acquisition_id=$1",
             replacement.acquisition_id,

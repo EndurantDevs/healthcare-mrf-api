@@ -108,6 +108,20 @@ async def control_provider_directory_sources(request):
     return response.json(await provider_directory_control_catalog())
 
 
+@blueprint.post("/provider-directory/rooted-graph-operation")
+async def control_provider_directory_rooted_graph_operation(request):
+    """Prepare one immutable rooted worker operation without starting acquisition."""
+    _require_control_auth(request)
+    from db.connection import db
+    from process.provider_directory_rooted_graph_worker import prepare_rooted_graph_operation
+
+    try:
+        operation = await prepare_rooted_graph_operation(db, request.json)
+    except ValueError as error:
+        raise BadRequest(str(error)) from error
+    return response.json(operation)
+
+
 @blueprint.get("/health/node")
 async def control_node_health(request):
     """Return node, database, queue, and worker health for operators."""

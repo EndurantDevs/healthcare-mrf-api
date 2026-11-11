@@ -3232,21 +3232,10 @@ def _validate_provider_directory_profile_execution_params(
     importer: str,
     params: dict[str, Any],
 ) -> None:
-    """Reject malformed proof-bearing Profile work before durable admission."""
+    """Reject malformed proof-bearing Provider Directory work before admission."""
+    from api.provider_directory_control_params import validate_provider_directory_params
 
-    if importer != "provider-directory-fhir" or not any(
-        field_name in params
-        for field_name in (
-            "provider_directory_profile_contract_id",
-            "provider_directory_profile_generation",
-            "provider_directory_profile_selection_attestation",
-        )
-    ):
-        return
-    try:
-        validated_profile_execution(params)
-    except ProviderDirectoryProfileSelectionError as exc:
-        raise ValueError(str(exc)) from exc
+    validate_provider_directory_params(importer, params, profile_validator=validated_profile_execution)
 
 
 def _validate_hospital_price_admission(params: dict[str, Any]) -> dict[str, Any]:

@@ -110,6 +110,20 @@ def test_public_relation_family_keeps_physical_identity_and_owner_checks():
             observed.fhir_catalog_relation_families(changed, roots, read_profile(), 10)
 
 
+def test_authenticated_frozen_exception_only_admits_a_direct_resource_leaf():
+    rows = physical_family()
+    roots = [(row["nspname"], row["relname"]) for row in rows if not row["parents"]]
+    rows[-1].update(relowner=11, nspname="private_payload")
+    with pytest.raises(observed.FHIRCatalogObservedSourceError, match="physical_identity_invalid"):
+        observed.fhir_catalog_relation_families(rows, roots, read_profile(), 10)
+    assert observed.fhir_catalog_relation_families(
+        rows, roots, read_profile(), 10, frozen_resource_oids=frozenset({5})
+    )[2][observed.FHIR_CATALOG_RESOURCE_TABLE] == {2, 5}
+    for invalid in (frozenset({1}), frozenset({2}), frozenset({99})):
+        with pytest.raises(observed.FHIRCatalogObservedSourceError, match="physical_identity_invalid"):
+            observed.fhir_catalog_relation_families(rows, roots, read_profile(), 10, frozen_resource_oids=invalid)
+
+
 @pytest.mark.parametrize("dataset", ["edition-one", "edition-two", "edition'quoted"])
 def test_public_list_routes_match_direct_multi_id_bounds_and_sort_leaves(dataset):
     root = relation(2, observed.FHIR_CATALOG_RESOURCE_TABLE, kind="p")

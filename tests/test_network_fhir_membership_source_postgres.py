@@ -36,11 +36,23 @@ from process.network_source_binding_store import NetworkSourceBindingBatchComman
 from process.registry_source_recipe_composition import _read_recipe_page
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from tests import network_fhir_source_epoch_content_postgres_support as epoch_content
+from tests.cms_npd_admission_postgres_support import fhir
 from tests.network_fhir_source_epoch_content_postgres_support import content_database as content_database
+from tests.provider_directory_rooted_synthetic_support import rooted_source_resources
 from tests.test_network_serving_schema_postgres import serving_schema
 from tests.test_registry_approval_store_postgres import _actor, _approve, _command, _CountedConnection, _create, _draft
 
 pytestmark = pytest.mark.asyncio
+
+
+_RESOURCE_COPY_COLUMNS = (
+    "dataset_id",
+    "resource_type",
+    "resource_id",
+    "payload_hash",
+    "payload_json",
+    "acquired_resource_sha256",
+)
 
 
 async def test_epoch_content_matches_canonical_hash_and_restores_profiles(content_database, record_property):
@@ -325,6 +337,88 @@ async def test_explicit_plan_affiliation_and_two_offices_stay_scoped(fhir_source
     await connection.execute(f'DELETE FROM "{schema}".provider_directory_insurance_network_plan_evidence')
     changed = await _read(fhir_source)
     assert changed.membership_rows == 1 and changed.unresolved_rows == 1
+
+
+async def _copy_repeated_membership_inputs(fhir_source):
+    connection, schema, _, sites = fhir_source
+    await _resource(connection, schema, "Organization", "provider-one", {"npi": 1234567893})
+    await _resource(connection, schema, "Practitioner", "root-one", {"npi": 1234567893})
+    for resource_id, network_id in (("network-new", 43), ("network-old", 44)):
+        await _resource(connection, schema, "Organization", resource_id, {"active": True})
+        await _evidence(connection, schema, "Organization", resource_id, uuid4())
+        legacy_id = uuid4()
+        await connection.execute(
+            f'INSERT INTO "{schema}".provider_directory_insurance_network_identity VALUES($1,now())', legacy_id
+        )
+        await connection.execute(
+            f'INSERT INTO "{schema}".provider_directory_insurance_network_source_binding '
+            "VALUES('source-example','Organization',$1,$2,now())",
+            resource_id,
+            legacy_id,
+        )
+        await connection.execute(
+            f'INSERT INTO "{schema}".network_registry_identity(network_id,allocation_key) '
+            "OVERRIDING SYSTEM VALUE VALUES($1,$2)",
+            network_id,
+            uuid4(),
+        )
+        await connection.execute(
+            f'INSERT INTO "{schema}".network_registry_alias VALUES '
+            "('fhir','source-example','legacy_fhir_uuid',$1,'medical',$2,'reviewed-example',now())",
+            str(legacy_id),
+            network_id,
+        )
+    source_resources_by_kind, normalized_records = rooted_source_resources(), []
+    for kind, parser in (
+        ("OrganizationAffiliation", fhir._parse_organization_affiliation_resource),
+        ("PractitionerRole", fhir._parse_practitioner_role_resource),
+    ):
+        for resource in source_resources_by_kind[kind]:
+            normalized_payload = parser(resource, {"source_id": "source-example", "resource_id": resource["id"]})[1]
+            normalized_payload["location_refs"] = ["Location/office-one"]
+            if kind == "PractitionerRole":
+                normalized_payload["practitioner_ref"] = "Practitioner/root-one"
+            normalized_records.append(
+                ("edition-one", kind, resource["id"], "a" * 64, json.dumps(normalized_payload), "a" * 64)
+            )
+    assert (
+        await connection.copy_records_to_table(
+            "provider_directory_dataset_resource",
+            schema_name=schema,
+            columns=_RESOURCE_COPY_COLUMNS,
+            records=normalized_records,
+        )
+        == "COPY 818"
+    )
+
+
+async def test_repeated_affiliations_and_role_extensions_keep_exact_office_counts(fhir_source):
+    await _copy_repeated_membership_inputs(fhir_source)
+    connection, schema, _, sites = fhir_source
+    batch = await _read(fhir_source, limit=1000)
+    assert batch.source_rows == batch.accepted_source_rows == batch.membership_rows == 818
+    assert batch.unresolved_rows == batch.unresolved_source_rows == batch.omitted_source_rows == 0
+    memberships = json.loads(batch.input_bytes)
+    assert {entry["location_id"] for entry in memberships} == {str(sites[0])}
+    assert str(sites[1]) not in {entry["location_id"] for entry in memberships}
+    unique_by_network = {
+        network_id: {
+            (entry["provider_id"], entry["location_id"]) for entry in memberships if entry["network_id"] == network_id
+        }
+        for network_id in (43, 44)
+    }
+    assert unique_by_network == {43: {("1234567893", str(sites[0]))}, 44: {("1234567893", str(sites[0]))}}
+    assert [sum(entry["network_id"] == network for entry in memberships) for network in (43, 44)] == [410, 408]
+    await connection.execute(
+        f'UPDATE "{schema}".provider_directory_dataset_resource SET payload_json='
+        "jsonb_set(payload_json::jsonb,'{network_refs}','[\"Organization/missing\"]') "
+        "WHERE dataset_id='edition-one' AND resource_type='OrganizationAffiliation' AND resource_id='affiliation-0794'"
+    )
+    unresolved = await _read(fhir_source, limit=1000)
+    assert unresolved.source_rows == 818
+    assert unresolved.accepted_source_rows == unresolved.membership_rows == 817
+    assert unresolved.unresolved_source_rows == unresolved.unresolved_rows == 1
+    assert unresolved.omitted_source_rows == 0
 
 
 @pytest.fixture

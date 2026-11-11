@@ -8,11 +8,16 @@ import secrets
 from typing import Any
 
 from db.connection import db
+from process.provider_directory_rooted_graph_bulk import copy_initial_root_work
 from process.provider_directory_rooted_graph_persistence_sql import (
     root_closure_sql,
 )
 from process.provider_directory_rooted_graph_query import (
     build_insurance_plan_census_query,
+)
+from process.provider_directory_rooted_graph_result_contract import (
+    ProviderDirectoryRootedGraphAcquisitionSummary,
+    ProviderDirectoryRootedGraphQueryResult,
 )
 from process.provider_directory_rooted_graph_result_store import (
     complete_provider_directory_rooted_graph_error,
@@ -20,11 +25,6 @@ from process.provider_directory_rooted_graph_result_store import (
     complete_provider_directory_rooted_graph_result,
     seal_provider_directory_rooted_graph_acquisition,
 )
-from process.provider_directory_rooted_graph_result_contract import (
-    ProviderDirectoryRootedGraphAcquisitionSummary,
-    ProviderDirectoryRootedGraphQueryResult,
-)
-from process.provider_directory_rooted_graph_bulk import copy_initial_root_work
 from process.provider_directory_rooted_graph_store_contract import (
     ACQUISITION_PATTERN,
     ROOTED_GRAPH_QUERY_PATTERN,
@@ -40,9 +40,10 @@ from process.provider_directory_rooted_graph_store_support import (
     ACQUISITION_TABLE,
     WORK_TABLE,
     assert_identity_row,
-    identity_fields,
     function_ref,
+    identity_fields,
     insert_work_spec,
+    rooted_graph_transaction,
     row_fields,
     set_store_action,
     table_ref,
@@ -114,7 +115,7 @@ async def _initial_work_census(
                    count(*) FILTER (
                        WHERE kind = 'full_insurance_plan_census'
                    )::bigint AS plan_count
-              FROM {table_ref('pdrgw_' + identity.acquisition_id[6:])}
+              FROM {table_ref("pdrgw_" + identity.acquisition_id[6:])}
              WHERE acquisition_id = :acquisition_id
                AND kind = 'exact_reference_search' AND resource_type = 'PractitionerRole';
             """,
@@ -132,26 +133,23 @@ async def initialize_provider_directory_rooted_graph_acquisition(
 
     if type(identity) is not ProviderDirectoryRootedGraphAcquisitionIdentity:
         raise ValueError("provider_directory_rooted_graph_identity_invalid")
-    async with database.transaction():
+    async with rooted_graph_transaction(database):
         await database.scalar(
-            "SELECT pg_catalog.pg_advisory_xact_lock("
-            "pg_catalog.hashtextextended(:identity, 0));",
+            "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(:identity, 0));",
             identity=identity.acquisition_id,
         )
         created_count = await _insert_header(database, identity)
         header = assert_identity_row(
             identity,
             await database.first(
-                f"SELECT * FROM {table_ref(ACQUISITION_TABLE)} "
-                "WHERE acquisition_id = :acquisition_id FOR SHARE;",
+                f"SELECT * FROM {table_ref(ACQUISITION_TABLE)} WHERE acquisition_id = :acquisition_id FOR SHARE;",
                 acquisition_id=identity.acquisition_id,
             ),
         )
         if header["status"] == "sealed":
             return created_count
         await database.scalar(
-            f"SELECT {function_ref('prepare_provider_directory_rooted_graph_storage')}("
-            ":acquisition_id);",
+            f"SELECT {function_ref('prepare_provider_directory_rooted_graph_storage')}(:acquisition_id);",
             acquisition_id=identity.acquisition_id,
         )
         await set_store_action(database, "initialize", identity.acquisition_id)
@@ -195,9 +193,7 @@ def _claim_from_row(database_row: Any) -> ProviderDirectoryRootedGraphWorkClaim 
 
 def _claim_sql(*, census_only: bool) -> str:
     kind_predicate = (
-        "work.kind = 'full_insurance_plan_census'"
-        if census_only
-        else "work.kind <> 'full_insurance_plan_census'"
+        "work.kind = 'full_insurance_plan_census'" if census_only else "work.kind <> 'full_insurance_plan_census'"
     )
     return f"""
         WITH candidate AS (
@@ -254,8 +250,7 @@ async def _root_closure_fields(
     assert_identity_row(
         identity,
         await database.first(
-            f"SELECT * FROM {table_ref(ACQUISITION_TABLE)} "
-            "WHERE acquisition_id = :acquisition_id FOR SHARE;",
+            f"SELECT * FROM {table_ref(ACQUISITION_TABLE)} WHERE acquisition_id = :acquisition_id FOR SHARE;",
             acquisition_id=identity.acquisition_id,
         ),
     )
@@ -320,10 +315,9 @@ async def claim_provider_directory_rooted_graph_census(
     if type(lease_seconds) is not int or not 30 <= lease_seconds <= 3600:
         raise ValueError("provider_directory_rooted_graph_lease_invalid")
     lease_token = secrets.token_hex(32)
-    async with database.transaction():
+    async with rooted_graph_transaction(database):
         await database.scalar(
-            "SELECT pg_catalog.pg_advisory_xact_lock("
-            "pg_catalog.hashtextextended(:identity, 0));",
+            "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(:identity, 0));",
             identity=identity.acquisition_id,
         )
         claimed_row, root_network_references = await _admit_and_claim_census(
@@ -353,20 +347,14 @@ async def claim_provider_directory_rooted_graph_work(
 ) -> ProviderDirectoryRootedGraphWorkClaim | None:
     """Claim non-census work with attempt and opaque-token fencing."""
 
-    if (
-        type(acquisition_id) is not str
-        or ACQUISITION_PATTERN.fullmatch(acquisition_id) is None
-    ):
+    if type(acquisition_id) is not str or ACQUISITION_PATTERN.fullmatch(acquisition_id) is None:
         raise ValueError("provider_directory_rooted_graph_acquisition_id_invalid")
-    if query_id is not None and (
-        type(query_id) is not str
-        or ROOTED_GRAPH_QUERY_PATTERN.fullmatch(query_id) is None
-    ):
+    if query_id is not None and (type(query_id) is not str or ROOTED_GRAPH_QUERY_PATTERN.fullmatch(query_id) is None):
         raise ValueError("provider_directory_rooted_graph_query_id_invalid")
     if type(lease_seconds) is not int or not 30 <= lease_seconds <= 3600:
         raise ValueError("provider_directory_rooted_graph_lease_invalid")
     lease_token = secrets.token_hex(32)
-    async with database.transaction():
+    async with rooted_graph_transaction(database):
         await set_store_action(database, "claim", acquisition_id, lease_token)
         claimed_row = await _claim_work_row(
             database,
@@ -391,10 +379,8 @@ async def heartbeat_provider_directory_rooted_graph_work(
         raise ValueError("provider_directory_rooted_graph_claim_invalid")
     if type(lease_seconds) is not int or not 30 <= lease_seconds <= 3600:
         raise ValueError("provider_directory_rooted_graph_lease_invalid")
-    async with database.transaction():
-        await set_store_action(
-            database, "heartbeat", claim.acquisition_id, claim.lease_token
-        )
+    async with rooted_graph_transaction(database):
+        await set_store_action(database, "heartbeat", claim.acquisition_id, claim.lease_token)
         count = await database.status(
             f"""
             UPDATE {table_ref(WORK_TABLE)}
@@ -426,10 +412,8 @@ async def release_provider_directory_rooted_graph_work(
 
     if type(claim) is not ProviderDirectoryRootedGraphWorkClaim:
         raise ValueError("provider_directory_rooted_graph_claim_invalid")
-    async with database.transaction():
-        await set_store_action(
-            database, "release", claim.acquisition_id, claim.lease_token
-        )
+    async with rooted_graph_transaction(database):
+        await set_store_action(database, "release", claim.acquisition_id, claim.lease_token)
         count = await database.status(
             f"""
             UPDATE {table_ref(WORK_TABLE)}

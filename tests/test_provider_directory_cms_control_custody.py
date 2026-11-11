@@ -415,6 +415,18 @@ def test_exact_latest_authentic_callable_bodies_and_types_are_required(name):
     custody._require_callable_definition(_authentic_entry(name), "snapshot_schema", 44)
 
 
+def test_rooted_successor_keeps_existing_control_callable_custody():
+    from db import migration_rooted_publication_freeze as freeze
+
+    entry = _authentic_entry(freeze.LEGACY)
+    definition = entry["definition"]
+    definition["prosrc"] = freeze.wrapped_body(freeze.LEGACY, "snapshot_schema", definition["prosrc"])
+    custody._require_callable_definition(entry, "snapshot_schema", 44)
+    definition["prosrc"] += "\n-- changed successor\n"
+    with pytest.raises(ValueError, match="callable_definition_changed"):
+        custody._require_callable_definition(entry, "snapshot_schema", 44)
+
+
 @pytest.mark.parametrize(
     "field,value",
     [

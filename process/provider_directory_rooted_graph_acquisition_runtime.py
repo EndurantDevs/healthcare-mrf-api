@@ -47,6 +47,7 @@ from process.provider_directory_rooted_graph_store_support import (
     ACQUISITION_TABLE,
     WORK_TABLE,
     assert_identity_row,
+    rooted_graph_transaction,
     row_fields,
     table_ref,
 )
@@ -82,18 +83,34 @@ async def _locked_acquisition_status(
     current_selector: Any,
     current_matcher: Any,
 ) -> str:
-    async with database.transaction():
-        await database.scalar(
-            "SELECT pg_catalog.pg_advisory_xact_lock("
-            "pg_catalog.hashtextextended(:identity, 0));",
-            identity=lock_identity,
-        )
-        current = await current_selector(database, pair=pair_factory())
+    from process.provider_directory_rooted_graph_current_preflight import (
+        prepare_current_root,
+        require_current_root_fence,
+    )
+    from process.provider_directory_rooted_graph_source_runtime import current_rooted_graph_runtime
+
+    runtime = current_rooted_graph_runtime(database)
+    proof = await prepare_current_root(database) if runtime is not None else None
+    async with rooted_graph_transaction(database):
+        if proof is None:
+            await database.scalar(
+                "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(:identity, 0));",
+                identity=lock_identity,
+            )
+            current = await current_selector(database, pair=pair_factory())
+        else:
+            await database.status("SET LOCAL lock_timeout='1500ms'")
+            locked = await database.scalar(
+                "SELECT pg_catalog.pg_try_advisory_xact_lock(pg_catalog.hashtextextended(:identity,0))",
+                identity=lock_identity,
+            )
+            if locked is not True:
+                raise ProviderDirectoryRootedGraphAcquisitionError("input_drift")
+            current = await require_current_root_fence(database, proof)
         if not current_matcher(current, identity):
             raise ProviderDirectoryRootedGraphAcquisitionError("input_drift")
         acquisition_row = await database.first(
-            f"SELECT * FROM {table_ref(ACQUISITION_TABLE)} "
-            "WHERE acquisition_id = :acquisition_id FOR SHARE;",
+            f"SELECT * FROM {table_ref(ACQUISITION_TABLE)} WHERE acquisition_id = :acquisition_id FOR SHARE;",
             acquisition_id=identity.acquisition_id,
         )
         if acquisition_row is None:
@@ -160,7 +177,7 @@ async def revalidate_provider_directory_rooted_graph_inputs(
         return _snapshot_from_identity(identity, status)
     except ProviderDirectoryRootedGraphAcquisitionError:
         raise
-    except (ImportError, TypeError, ValueError, RuntimeError):
+    except ImportError, TypeError, ValueError, RuntimeError:
         raise ProviderDirectoryRootedGraphAcquisitionError("input_drift") from None
 
 
@@ -171,28 +188,25 @@ async def provider_directory_rooted_graph_census_state(
 ) -> str:
     """Distinguish completed and proven timeout terminals from other states."""
 
-    fields = row_fields(
-        await database.first(
-            f"""
-            SELECT count(*)::bigint AS census_count,
-                   min(status) AS census_status,
-                   min(error_code) AS census_error_code
-              FROM {table_ref(WORK_TABLE)}
-             WHERE acquisition_id = :acquisition_id
-               AND kind = 'full_insurance_plan_census';
-            """,
-            acquisition_id=acquisition_id,
+    async with rooted_graph_transaction(database):
+        fields = row_fields(
+            await database.first(
+                f"""
+                SELECT count(*)::bigint AS census_count,
+                       min(status) AS census_status,
+                       min(error_code) AS census_error_code
+                  FROM {table_ref(WORK_TABLE)}
+                 WHERE acquisition_id = :acquisition_id
+                   AND kind = 'full_insurance_plan_census';
+                """,
+                acquisition_id=acquisition_id,
+            )
         )
-    )
     count = fields.get("census_count")
     status = fields.get("census_status")
     if count == 0 and status is None:
         return "absent"
-    if (
-        count == 1
-        and status == "error"
-        and fields.get("census_error_code") == "transport_timeout"
-    ):
+    if count == 1 and status == "error" and fields.get("census_error_code") == "transport_timeout":
         return "timeout_skipped"
     if count == 1 and status in CENSUS_STATES - {"absent", "timeout_skipped"}:
         return status
