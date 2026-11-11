@@ -2,8 +2,10 @@
 """Offline proxy pacing, response rejection and restart-safe evidence checks."""
 
 import asyncio
+import errno
 import hashlib
 import json
+import os
 import ssl
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
@@ -305,6 +307,54 @@ def test_artifact_root_refuses_temporary_storage_and_creates_only_the_durable_ch
     path = retained.configured_root()
     assert path == root / "vsp-directory" and path.stat().st_mode & 0o7777 == 0o2770
     assert not temporary.exists()
+
+
+def test_legacy_root_permission_failure_requires_exact_configured_scratch_path(tmp_path, monkeypatch):
+    setting = "HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT"
+    root = tmp_path / "artifacts"
+    scratch = root / "vsp-directory" / "tmp"
+    error = str(PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(scratch)))
+    monkeypatch.delenv(setting, raising=False)
+    assert retained.is_artifact_root_failure("vsp_artifact_root_invalid")
+    assert not retained.is_artifact_root_failure(error)
+    for invalid in ("relative", "/", str(tmp_path / "different")):
+        monkeypatch.setenv(setting, invalid)
+        assert not retained.is_artifact_root_failure(error)
+    monkeypatch.setenv(setting, str(root))
+    assert retained.is_artifact_root_failure(error)
+    for other in (
+        None,
+        "vsp_http_status",
+        error + " extra",
+        str(PermissionError(errno.EPERM, os.strerror(errno.EPERM), str(scratch))),
+        str(PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(scratch / "identity.json"))),
+    ):
+        assert not retained.is_artifact_root_failure(other)
+    assert not root.exists()
+
+
+def test_identity_write_permission_failure_is_not_a_pre_capture_root_failure(tmp_path, monkeypatch):
+    failure = PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(tmp_path / "identity.json"))
+
+    def denied(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(retained, "_atomic", denied)
+    with pytest.raises(PermissionError) as raised:
+        retained.VSPCaptureStore(tmp_path, "synthetic-run")
+    assert raised.value is failure
+
+
+def test_unrelated_failures_do_not_resolve_the_artifact_root(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT", "/unavailable")
+
+    def unavailable(_path):
+        raise AssertionError("unrelated failure must not resolve the configured path")
+
+    monkeypatch.setattr(retained.Path, "resolve", unavailable)
+    assert retained.is_artifact_root_failure("vsp_artifact_root_invalid")
+    for error in (None, {}, 13, "vsp_http_status", str(PermissionError(errno.EPERM, "denied", "/unavailable"))):
+        assert not retained.is_artifact_root_failure(error)
 
 
 def test_fresh_census_keeps_both_receipts_and_first_cached_observation(tmp_path):

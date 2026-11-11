@@ -1,11 +1,15 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Synthetic acquisition counts prove reuse without making source requests."""
 
+import errno
 import hashlib
+import os
+import tempfile
 from collections import Counter
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit
 
@@ -312,6 +316,77 @@ async def test_retained_capture_requires_identity_and_binding_before_requests(mo
         )
     exchange.assert_not_awaited()
     assert len(list(tmp_path.glob("*/identity.json"))) == int(has_identity)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("denied_operation", ["root_mkdir", "root_chmod", "scratch_mkdir"])
+async def test_artifact_permission_failure_can_capture_once_after_repair(
+    small_domain, monkeypatch, tmp_path, denied_operation
+):
+    offline_http = HTTP(Source())
+
+    async def exchange(_http, method, url, body, selection):
+        assert selection is None
+        return await offline_http.request(method, url, body), None
+
+    monkeypatch.setattr(acquisition.VSPHTTP, "_exchange", exchange)
+    monkeypatch.setattr(acquisition.VSPHTTP, "wait", AsyncMock())
+    volume = tmp_path / "volume"
+    root = volume / "vsp-directory"
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_ARTIFACT_ROOT", str(volume))
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path / "scratch"))
+    capture_by_argument = dict(
+        source_record={"source_id": SOURCE_ID, "canonical_api_base": ENDPOINT_SCOPE},
+        root_run_id="repaired-root",
+        proxy_binding=None,
+        progress_callback=noop,
+        cancel_check=noop,
+    )
+    if denied_operation == "root_chmod":
+        root.mkdir(parents=True)
+        root.chmod(0o700)
+    denied_path = root / "tmp" if denied_operation == "scratch_mkdir" else root
+    failure = PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(denied_path))
+    method = "chmod" if denied_operation == "root_chmod" else "mkdir"
+    original = getattr(Path, method)
+
+    def denied(path, *args, **kwargs):
+        if path == denied_path:
+            raise failure
+        return original(path, *args, **kwargs)
+
+    with monkeypatch.context() as blocked:
+        blocked.setattr(Path, method, denied)
+        with pytest.raises(VSPDirectoryError, match="^vsp_artifact_root_invalid$") as raised:
+            await acquisition.capture_vsp_directory(**capture_by_argument)
+        assert raised.value.__cause__ is failure
+    assert not list(root.glob("*/identity.json")) and not offline_http.calls
+    completed = await acquisition.capture_vsp_directory(**capture_by_argument)
+    assert len(list(completed.iter_resources())) == 10
+    assert completed.proof["http_attempts"] == offline_http.requests == 10
+    reopened = await acquisition.capture_vsp_directory(**capture_by_argument, require_retained=True)
+    assert reopened.proof == completed.proof and offline_http.requests == 10
+
+
+@pytest.mark.asyncio
+async def test_capture_permission_failure_keeps_retained_identity_and_binding(monkeypatch, tmp_path):
+    failure = PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(tmp_path / "tmp"))
+    monkeypatch.setattr(acquisition, "configured_root", lambda: tmp_path)
+    exchange = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(acquisition.VSPHTTP, "_exchange", exchange)
+    with pytest.raises(PermissionError) as raised:
+        await acquisition.capture_vsp_directory(
+            source_record={"source_id": SOURCE_ID, "canonical_api_base": ENDPOINT_SCOPE},
+            root_run_id="captured-root",
+            proxy_binding=None,
+            progress_callback=noop,
+            cancel_check=noop,
+        )
+    assert raised.value is failure
+    store = VSPCaptureStore(tmp_path, "captured-root", require_retained=True)
+    assert store.load_checkpoint("binding")["attempts"] == 1
+    assert store.load_checkpoint("complete") is None
+    exchange.assert_awaited_once()
 
 
 @pytest.mark.asyncio
