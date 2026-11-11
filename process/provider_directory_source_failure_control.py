@@ -26,7 +26,10 @@ async def orphan_candidate_status(directory, existing_by_field, candidate):
             directory, candidate, existing_by_field
         )
     metadata = existing_by_field.get("publication_metadata_json")
-    if isinstance(metadata, dict) and metadata.get("error") == "vsp_prepared_candidate_required":
+    if isinstance(metadata, dict) and metadata.get("error") in {
+        "vsp_prepared_candidate_required",
+        "vsp_artifact_root_invalid",
+    }:
         if not is_rearmed_capture_retry(existing_by_field, checkpoint):
             raise RuntimeError("provider_directory_endpoint_dataset_candidate_stale")
         return directory.ENDPOINT_DATASET_ACQUIRING, await storage.has_empty_isolated_vsp_storage(
