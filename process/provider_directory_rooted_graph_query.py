@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import urllib.parse
+from dataclasses import dataclass, field
 
 from process.provider_directory_rooted_graph_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_DIRECT_READ_PAGINATION,
@@ -18,7 +18,6 @@ from process.provider_directory_rooted_graph_identity import (
     canonical_fhir_resource_id,
     provider_directory_rooted_graph_query_id,
 )
-
 
 ROOTED_GRAPH_QUERY_EXACT_SEARCH = "exact_reference_search"
 ROOTED_GRAPH_QUERY_DIRECT_READ = "direct_read"
@@ -39,9 +38,7 @@ class ProviderDirectoryRootedGraphQueryError(ValueError):
         message_by_code = {
             "api_base_invalid": "rooted graph API base is invalid",
             "direct_read_forbidden": "rooted graph direct read is forbidden",
-            "insurance_plan_network_query_forbidden": (
-                "rooted graph InsurancePlan network query is forbidden"
-            ),
+            "insurance_plan_network_query_forbidden": ("rooted graph InsurancePlan network query is forbidden"),
             "query_invalid": "rooted graph query is invalid",
             "search_forbidden": "rooted graph search is forbidden",
         }
@@ -92,8 +89,7 @@ def _exact_search_definition(
         (
             search
             for search in PROVIDER_DIRECTORY_ROOTED_GRAPH_EXACT_SEARCHES
-            if search.resource_type == resource_type
-            and search.search_parameter == search_parameter
+            if search.resource_type == resource_type and search.search_parameter == search_parameter
         ),
         None,
     )
@@ -114,6 +110,8 @@ def _query_url(
     query_pairs: list[tuple[str, str]] = []
     if kind == ROOTED_GRAPH_QUERY_EXACT_SEARCH:
         query_pairs.append((search_parameter, reference))
+        if resource_type == "OrganizationAffiliation":
+            query_pairs.append(("role", "provider"))
     query_pairs.append(("_count", str(page_size)))
     return resource_url + "?" + urllib.parse.urlencode(query_pairs)
 
@@ -236,10 +234,7 @@ class ProviderDirectoryRootedGraphQuery:
         )
 
     def __repr__(self) -> str:
-        return (
-            "<provider-directory-rooted-graph-query "
-            f"kind={self.kind!r} resource_type={self.resource_type!r}>"
-        )
+        return f"<provider-directory-rooted-graph-query kind={self.kind!r} resource_type={self.resource_type!r}>"
 
 
 def build_rooted_graph_search_query(
@@ -252,9 +247,7 @@ def build_rooted_graph_search_query(
     """Build one of the two admitted exact reference searches."""
 
     if resource_type == "InsurancePlan" and search_parameter == "network":
-        raise ProviderDirectoryRootedGraphQueryError(
-            "insurance_plan_network_query_forbidden"
-        )
+        raise ProviderDirectoryRootedGraphQueryError("insurance_plan_network_query_forbidden")
     definition = _exact_search_definition(resource_type, search_parameter)
     if definition is None:
         raise ProviderDirectoryRootedGraphQueryError("search_forbidden")

@@ -4,15 +4,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
 import datetime as dt
 import email.utils
 import json
 import math
 import re
-from typing import Any
 import urllib.parse
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
 
 import aiohttp
 
@@ -33,11 +33,11 @@ from process.provider_directory_rooted_graph_store_contract import (
 from process.provider_directory_rooted_graph_terminal import (
     validate_rooted_graph_missing_response,
 )
-
-
-PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_MISSING_BYTES = (
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_MISSING_RESPONSE_BYTES
+from process.provider_directory_source_selection import (
+    fhir_census_pagination_url_allowed,
 )
+
+PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_MISSING_BYTES = PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_MISSING_RESPONSE_BYTES
 PROVIDER_DIRECTORY_ROOTED_GRAPH_TIMEOUT_SECONDS = 30.0
 PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_RETRY_AFTER_SECONDS = 60.0
 PROVIDER_DIRECTORY_ROOTED_GRAPH_RESPONSE_CHUNK_BYTES = 64 * 1024
@@ -82,9 +82,7 @@ class ProviderDirectoryRootedGraphHTTPError(RuntimeError):
         safe_code = code if code in _ERROR_MESSAGES else "transport_failure"
         self.code = safe_code
         self.retryable = retryable is True
-        self.retry_after_seconds = (
-            _bounded_retry_after(retry_after_seconds) if self.retryable else 0.0
-        )
+        self.retry_after_seconds = _bounded_retry_after(retry_after_seconds) if self.retryable else 0.0
         super().__init__(_ERROR_MESSAGES[safe_code])
 
 
@@ -112,18 +110,13 @@ class ProviderDirectoryRootedGraphHTTPBounds:
             (self.max_resources, PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_RESOURCES),
             (self.max_url_bytes, PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_URL_BYTES),
         )
-        if any(
-            type(value) is not int or not 0 < value <= hard_maximum
-            for value, hard_maximum in integer_bounds
-        ):
+        if any(type(value) is not int or not 0 < value <= hard_maximum for value, hard_maximum in integer_bounds):
             raise ValueError("provider_directory_rooted_graph_http_bounds_invalid")
         if (
             isinstance(self.timeout_seconds, bool)
             or not isinstance(self.timeout_seconds, (int, float))
             or not math.isfinite(float(self.timeout_seconds))
-            or not 0
-            < float(self.timeout_seconds)
-            <= PROVIDER_DIRECTORY_ROOTED_GRAPH_TIMEOUT_SECONDS
+            or not 0 < float(self.timeout_seconds) <= PROVIDER_DIRECTORY_ROOTED_GRAPH_TIMEOUT_SECONDS
         ):
             raise ValueError("provider_directory_rooted_graph_http_bounds_invalid")
 
@@ -160,9 +153,7 @@ class ProviderDirectoryRootedGraphHTTPResult:
                     self.missing_response_json_text,
                 )
         except ValueError:
-            raise ValueError(
-                "provider_directory_rooted_graph_http_result_invalid"
-            ) from None
+            raise ValueError("provider_directory_rooted_graph_http_result_invalid") from None
         if (
             type(self.query_id) is not str
             or type(self.resources) is not tuple
@@ -172,14 +163,9 @@ class ProviderDirectoryRootedGraphHTTPResult:
             or self.total_bytes < 0
             or (
                 self.advertised_total is not None
-                and (
-                    type(self.advertised_total) is not int or self.advertised_total < 0
-                )
+                and (type(self.advertised_total) is not int or self.advertised_total < 0)
             )
-            or (
-                self.missing_http_status is not None
-                and (type(self.missing_http_status) is not int or not is_missing)
-            )
+            or (self.missing_http_status is not None and (type(self.missing_http_status) is not int or not is_missing))
             or (
                 is_missing
                 and (
@@ -187,8 +173,7 @@ class ProviderDirectoryRootedGraphHTTPResult:
                     or self.advertised_total is not None
                     or self.terminal_page_count != 1
                     or self.total_bytes <= 0
-                    or self.total_bytes
-                    > PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_MISSING_BYTES
+                    or self.total_bytes > PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_MISSING_BYTES
                     or type(self.missing_response_sha256) is not str
                     or _SHA256_PATTERN.fullmatch(self.missing_response_sha256) is None
                     or type(self.missing_response_json_text) is not str
@@ -223,13 +208,11 @@ def rooted_graph_retry_after_seconds(raw_header: object) -> float:
     except ValueError:
         try:
             retry_at = email.utils.parsedate_to_datetime(header_text)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return 0.0
         if retry_at.tzinfo is None:
             retry_at = retry_at.replace(tzinfo=dt.UTC)
-        return _bounded_retry_after(
-            (retry_at - dt.datetime.now(dt.UTC)).total_seconds()
-        )
+        return _bounded_retry_after((retry_at - dt.datetime.now(dt.UTC)).total_seconds())
 
 
 def _header_value(headers: object, name: str) -> str | None:
@@ -278,11 +261,13 @@ def _validated_next_url(
         or next_link != next_link.strip()
         or next_link.startswith("//")
         or "\\" in next_link
+        or any(ord(character) < 33 for character in next_link)
         or _url_byte_length(next_link) > max_url_bytes
     ):
         raise ProviderDirectoryRootedGraphHTTPError("pagination_invalid")
     try:
         resolved_url = urllib.parse.urljoin(current_url, next_link)
+        parsed_link = urllib.parse.urlsplit(next_link)
         parsed_base = urllib.parse.urlsplit(api_base)
         parsed_collection = urllib.parse.urlsplit(collection_url)
         parsed_next = urllib.parse.urlsplit(resolved_url)
@@ -295,11 +280,7 @@ def _validated_next_url(
             parsed_next.port or 443,
         )
         decoded_path = urllib.parse.unquote(parsed_next.path, errors="strict")
-        collection_path = urllib.parse.unquote(
-            parsed_collection.path,
-            errors="strict",
-        )
-    except (UnicodeError, ValueError):
+    except UnicodeError, ValueError:
         raise ProviderDirectoryRootedGraphHTTPError("pagination_invalid") from None
     path_segments = decoded_path.split("/")
     encoded_path = parsed_next.path.casefold()
@@ -310,10 +291,15 @@ def _validated_next_url(
         or parsed_next.username is not None
         or parsed_next.password is not None
         or parsed_next.fragment
-        or decoded_path != collection_path
+        or not fhir_census_pagination_url_allowed(
+            api_base=api_base,
+            resource_types=(parsed_collection.path.rsplit("/", 1)[-1],),
+            next_url=resolved_url,
+        )
         or any(marker in encoded_path for marker in ("%2f", "%5c", "%2e"))
         or any(segment in {".", ".."} for segment in path_segments)
-        or "" in path_segments[1:]
+        or any(segment in {".", ".."} for segment in parsed_link.path.split("/"))
+        or "" in path_segments[1:-1]
         or "\\" in decoded_path
         or any(ord(character) < 32 for character in resolved_url)
     ):
@@ -342,7 +328,7 @@ def _strict_json_float(raw_value: str) -> float:
             allow_nan=False,
             separators=(",", ":"),
         )
-    except (OverflowError, ValueError):
+    except OverflowError, ValueError:
         raise ValueError
     if not math.isfinite(parsed_value) or roundtrip_token != raw_value:
         raise ValueError
@@ -386,19 +372,10 @@ def _declared_length(response: Any) -> int | None:
 
 
 def _validate_headers(response: Any) -> int | None:
-    encoding = (
-        (
-            _header_value(getattr(response, "headers", None), "Content-Encoding")
-            or "identity"
-        )
-        .strip()
-        .casefold()
-    )
+    encoding = (_header_value(getattr(response, "headers", None), "Content-Encoding") or "identity").strip().casefold()
     if encoding != "identity":
         raise ProviderDirectoryRootedGraphHTTPError("content_encoding_invalid")
-    content_type = (
-        _header_value(getattr(response, "headers", None), "Content-Type") or ""
-    )
+    content_type = _header_value(getattr(response, "headers", None), "Content-Type") or ""
     parts = [part.strip() for part in content_type.split(";")]
     if not parts or parts[0].casefold() != PROVIDER_DIRECTORY_ROOTED_GRAPH_ACCEPT:
         raise ProviderDirectoryRootedGraphHTTPError("content_type_invalid", retryable=True)
@@ -427,9 +404,7 @@ async def _read_body(
         if declared_length > query_remaining:
             raise ProviderDirectoryRootedGraphHTTPError("query_limit")
     body = bytearray()
-    async for chunk in response.content.iter_chunked(
-        PROVIDER_DIRECTORY_ROOTED_GRAPH_RESPONSE_CHUNK_BYTES
-    ):
+    async for chunk in response.content.iter_chunked(PROVIDER_DIRECTORY_ROOTED_GRAPH_RESPONSE_CHUNK_BYTES):
         if type(chunk) is not bytes:
             raise ProviderDirectoryRootedGraphHTTPError("body_invalid")
         if not chunk:
@@ -486,17 +461,11 @@ def _require_success_status(
     status = getattr(response, "status", None)
     if status == 200:
         return None
-    if (
-        claim.kind == ROOTED_GRAPH_QUERY_DIRECT_READ
-        and type(status) is int
-        and status in {404, 410}
-    ):
+    if claim.kind == ROOTED_GRAPH_QUERY_DIRECT_READ and type(status) is int and status in {404, 410}:
         return status
     if type(status) is int and 300 <= status <= 399:
         raise ProviderDirectoryRootedGraphHTTPError("redirect_forbidden")
-    is_retryable = type(status) is int and (
-        status in _TRANSIENT_HTTP_STATUSES or 500 <= status <= 599
-    )
+    is_retryable = type(status) is int and (status in _TRANSIENT_HTTP_STATUSES or 500 <= status <= 599)
     raise ProviderDirectoryRootedGraphHTTPError(
         "http_transient" if is_retryable else "http_terminal",
         retryable=is_retryable,

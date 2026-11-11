@@ -4,10 +4,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import json
 import math
 import re
+from dataclasses import dataclass, field
 from typing import Any
 
 from process.provider_directory_rooted_graph_contract import (
@@ -21,29 +21,26 @@ from process.provider_directory_rooted_graph_identity import (
 )
 from process.provider_directory_rooted_graph_query import (
     ROOTED_GRAPH_QUERY_DIRECT_READ,
+    ROOTED_GRAPH_QUERY_EXACT_SEARCH,
 )
 from process.provider_directory_rooted_graph_store_contract import (
     ProviderDirectoryRootedGraphWorkClaim,
     _sha256_text,
 )
 
-
 PROVIDER_DIRECTORY_ROOTED_GRAPH_TERMINAL_RECORD_CONTRACT_ID = (
     "healthporta.provider-directory.rooted-graph-terminal-record.v2"
 )
-PROVIDER_DIRECTORY_ROOTED_GRAPH_RESOURCE_SET_CONTRACT_ID = (
-    "healthporta.provider-directory.rooted-graph-resource-set.v1"
-)
-PROVIDER_DIRECTORY_ROOTED_GRAPH_EDGE_SET_CONTRACT_ID = (
-    "healthporta.provider-directory.rooted-graph-edge-set.v1"
+PROVIDER_DIRECTORY_ROOTED_GRAPH_RESOURCE_SET_CONTRACT_ID = "healthporta.provider-directory.rooted-graph-resource-set.v1"
+PROVIDER_DIRECTORY_ROOTED_GRAPH_EDGE_SET_CONTRACT_ID = "healthporta.provider-directory.rooted-graph-edge-set.v1"
+PROVIDER_DIRECTORY_ROOTED_GRAPH_AFFILIATION_FILTER_RECIPE_ID = (
+    "healthporta.provider-directory.rooted-graph-affiliation-provider-filter.v1"
 )
 ERROR_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,127}\Z")
 
 _MISSING_ISSUE_SHAPES_BY_STATUS = {
     status: frozenset(frozenset(issue_shape) for issue_shape in issue_shapes)
-    for status, issue_shapes in (
-        PROVIDER_DIRECTORY_ROOTED_GRAPH_MISSING_OUTCOME_ISSUE_SHAPES
-    )
+    for status, issue_shapes in (PROVIDER_DIRECTORY_ROOTED_GRAPH_MISSING_OUTCOME_ISSUE_SHAPES)
 }
 
 
@@ -68,7 +65,7 @@ def _strict_missing_json_float(raw_value: str) -> float:
             allow_nan=False,
             separators=(",", ":"),
         )
-    except (OverflowError, ValueError):
+    except OverflowError, ValueError:
         raise ValueError
     if not math.isfinite(parsed_value) or roundtrip_token != raw_value:
         raise ValueError
@@ -92,13 +89,8 @@ def validate_rooted_graph_missing_outcome_payload(
         or any(type(issue) is not dict for issue in issues)
     ):
         raise ValueError("provider_directory_rooted_graph_missing_invalid")
-    issue_shape = frozenset(
-        (issue.get("severity"), issue.get("code")) for issue in issues
-    )
-    if (
-        len(issue_shape) != len(issues)
-        or issue_shape not in _MISSING_ISSUE_SHAPES_BY_STATUS[missing_http_status]
-    ):
+    issue_shape = frozenset((issue.get("severity"), issue.get("code")) for issue in issues)
+    if len(issue_shape) != len(issues) or issue_shape not in _MISSING_ISSUE_SHAPES_BY_STATUS[missing_http_status]:
         raise ValueError("provider_directory_rooted_graph_missing_invalid")
 
 
@@ -132,9 +124,7 @@ def validate_rooted_graph_missing_response(
         type(missing_response_sha256) is not str
         or SHA256_PATTERN.fullmatch(missing_response_sha256) is None
         or type(missing_response_bytes) is not int
-        or not 0
-        < missing_response_bytes
-        <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_MISSING_RESPONSE_BYTES
+        or not 0 < missing_response_bytes <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_MISSING_RESPONSE_BYTES
         or len(encoded_response) != missing_response_bytes
         or _sha256_text(missing_response_json_text) != missing_response_sha256
     ):
@@ -174,18 +164,12 @@ class ProviderDirectoryRootedGraphMissingWitness:
                 self.missing_response_json_text,
             )
         except ValueError:
-            raise ValueError(
-                "provider_directory_rooted_graph_missing_invalid"
-            ) from None
+            raise ValueError("provider_directory_rooted_graph_missing_invalid") from None
         if (
             type(self.query_id) is not str
             or ROOTED_GRAPH_QUERY_PATTERN.fullmatch(self.query_id) is None
-            or self.missing_http_status
-            not in PROVIDER_DIRECTORY_ROOTED_GRAPH_DIRECT_MISSING_HTTP_STATUSES
-            or any(
-                type(value) is not str or SHA256_PATTERN.fullmatch(value) is None
-                for value in hashes
-            )
+            or self.missing_http_status not in PROVIDER_DIRECTORY_ROOTED_GRAPH_DIRECT_MISSING_HTTP_STATUSES
+            or any(type(value) is not str or SHA256_PATTERN.fullmatch(value) is None for value in hashes)
         ):
             raise ValueError("provider_directory_rooted_graph_missing_invalid")
 
@@ -213,10 +197,7 @@ def _resource_hash(resource_witnesses) -> str:
 
 
 def _edge_hash(edge_witnesses) -> str:
-    identity_rows = tuple(
-        witness.edge_sha256 + "\x1f" + witness.closure_scope
-        for witness in edge_witnesses
-    )
+    identity_rows = tuple(witness.edge_sha256 + "\x1f" + witness.closure_scope for witness in edge_witnesses)
     return _set_hash(
         PROVIDER_DIRECTORY_ROOTED_GRAPH_EDGE_SET_CONTRACT_ID,
         identity_rows,
@@ -241,9 +222,37 @@ def _terminal_hash(
         "" if advertised_total is None else str(advertised_total),
         str(terminal_page_count),
         "true",
-        "",
+        (
+            PROVIDER_DIRECTORY_ROOTED_GRAPH_AFFILIATION_FILTER_RECIPE_ID
+            if claim.kind == ROOTED_GRAPH_QUERY_EXACT_SEARCH and claim.resource_type == "OrganizationAffiliation"
+            else ""
+        ),
     )
     return _sha256_text("\x1f".join(fields))
+
+
+def rooted_graph_query_filter_validation_sql(schema: str) -> str:
+    """Aggregate one keyset page on the existing acquisition/query primary key."""
+    from db.plan_release_storage import storage_relation
+
+    work = storage_relation(schema, "provider_directory_rooted_graph_work")
+    header = storage_relation(schema, "provider_directory_rooted_graph_acquisition")
+    separator = "pg_catalog.chr(31)"
+    return f"""WITH page AS MATERIALIZED (
+        SELECT query_id,status,kind,resource_type,terminal_record_sha256,query_identity_sha256,
+               result_sha256,resource_count,edge_count,advertised_total,terminal_page_count
+          FROM {work} WHERE acquisition_id=$1 AND query_id>$2 ORDER BY query_id LIMIT $3)
+        SELECT jsonb_build_object('closed',(SELECT status='sealed' FROM {header} WHERE acquisition_id=$1),
+          'rows',count(*),'last_query_id',max(query_id),'valid',coalesce(bool_and(
+            status NOT IN ('pending','leased') AND (status<>'completed'
+            OR kind<>'{ROOTED_GRAPH_QUERY_EXACT_SEARCH}' OR resource_type<>'OrganizationAffiliation'
+            OR terminal_record_sha256 IS NOT DISTINCT FROM pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+            '{PROVIDER_DIRECTORY_ROOTED_GRAPH_TERMINAL_RECORD_CONTRACT_ID}'||{separator}
+            ||query_identity_sha256||{separator}||'completed'||{separator}||result_sha256||{separator}
+            ||resource_count::text||{separator}||edge_count::text||{separator}
+            ||coalesce(advertised_total::text,'')||{separator}||terminal_page_count::text||{separator}
+            ||'true'||{separator}||'{PROVIDER_DIRECTORY_ROOTED_GRAPH_AFFILIATION_FILTER_RECIPE_ID}',
+            'UTF8')),'hex'))),true)) FROM page"""
 
 
 def _missing_terminal_hash(
@@ -283,8 +292,7 @@ def build_rooted_graph_missing_witness(
         type(claim) is not ProviderDirectoryRootedGraphWorkClaim
         or claim.kind != ROOTED_GRAPH_QUERY_DIRECT_READ
         or type(missing_http_status) is not int
-        or missing_http_status
-        not in PROVIDER_DIRECTORY_ROOTED_GRAPH_DIRECT_MISSING_HTTP_STATUSES
+        or missing_http_status not in PROVIDER_DIRECTORY_ROOTED_GRAPH_DIRECT_MISSING_HTTP_STATUSES
     ):
         raise ValueError("provider_directory_rooted_graph_missing_invalid")
     validate_rooted_graph_missing_response(
@@ -349,15 +357,13 @@ def rooted_graph_error_terminal_sha256(
     return _sha256_text("\x1f".join(fields))
 
 
-build_provider_directory_rooted_graph_missing_witness = (
-    build_rooted_graph_missing_witness
-)
-provider_directory_rooted_graph_error_terminal_sha256 = (
-    rooted_graph_error_terminal_sha256
-)
+build_provider_directory_rooted_graph_missing_witness = build_rooted_graph_missing_witness
+provider_directory_rooted_graph_error_terminal_sha256 = rooted_graph_error_terminal_sha256
 
 
 __all__ = (
+    "PROVIDER_DIRECTORY_ROOTED_GRAPH_AFFILIATION_FILTER_RECIPE_ID",
+    "rooted_graph_query_filter_validation_sql",
     "build_provider_directory_rooted_graph_missing_witness",
     "build_rooted_graph_missing_witness",
     "validate_rooted_graph_missing_outcome_payload",

@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Authenticate explicitly supported original publications without creating admission."""
 
+import hashlib
 import json
 import struct
 from contextlib import contextmanager
@@ -18,6 +19,7 @@ from process.network_fhir_source_witness_contract import (
     HASH_CONTRACTS,
     OBSERVED_LEGACY_PROFILE,
     OBSERVED_PROOF_PROFILE,
+    OBSERVED_ROOTED_PROFILE,
     OBSERVED_SEMANTIC_PROFILE,
     SourceWitnessCompletionOrigin,
     require,
@@ -25,6 +27,7 @@ from process.network_fhir_source_witness_contract import (
 )
 from process.provider_directory_admission_seal import (
     ADMISSION_GENERIC_PROOF_SUMMARY_KEY,
+    ADMISSION_METADATA_SUMMARY_MAX_BYTES,
     AdmissionSealError,
     ProviderDirectoryAdmissionSeal,
 )
@@ -37,6 +40,17 @@ from process.provider_directory_source_summary import (
     validate_semantic_source_summary,
 )
 from process.uhc_canonical_proof import UHC_CANONICAL_CONTENT_PROOF_METADATA_KEY
+
+ROOTED_RESOURCE_COUNT_COLUMNS = (
+    ("Endpoint", "endpoint_resource_count"),
+    ("HealthcareService", "healthcare_service_resource_count"),
+    ("InsurancePlan", "insurance_plan_resource_count"),
+    ("Location", "location_resource_count"),
+    ("Organization", "organization_resource_count"),
+    ("OrganizationAffiliation", "organization_affiliation_resource_count"),
+    ("Practitioner", "practitioner_resource_count"),
+    ("PractitionerRole", "practitioner_role_resource_count"),
+)
 
 
 class _SkippedMetadataCapture(_Capture):
@@ -100,6 +114,11 @@ def publication_profile(header):
         require(is_sha256(header.get("completion_proof_sha256")))
     else:
         require(header["completion_absent"] is True)
+    if header.get("rooted_metadata") is not None:
+        require(contract == "semantic_content_v3" and completion is None)
+        require(not has_generic_proof and not has_uhc_proof and header["admission_absent"] is True)
+        rooted_publication_metadata(header)
+        return OBSERVED_ROOTED_PROFILE
     if contract == "semantic_content_v4":
         require(completion is None)
         return SEMANTIC_PROFILE
@@ -125,6 +144,113 @@ def publication_profile(header):
     require(kind == "generic" and has_generic_proof and not has_uhc_proof)
     require(contract in {None, "transport_bound_v1", "transport_neutral_v2"})
     return ADMITTED_TRANSPORT_PROFILE if contract == "transport_neutral_v2" else ADMITTED_LEGACY_PROFILE
+
+
+def rooted_publication_metadata(header):
+    """Read genuine rooted lineage without manufacturing a generic admission summary."""
+    from process.provider_directory_rooted_graph_publication_contract import (
+        PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_RESOURCES,
+        PROVIDER_DIRECTORY_ROOTED_GRAPH_PARTIAL_PUBLICATION_CONTRACT_ID,
+        PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID,
+        PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_KIND,
+    )
+    from process.provider_directory_rooted_graph_source_contract import (
+        PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID,
+        PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+    )
+
+    raw = header.get("rooted_metadata")
+    require(type(raw) is str and 0 < len(raw.encode()) <= ADMISSION_METADATA_SUMMARY_MAX_BYTES)
+    metadata = json.loads(raw)
+    require(type(metadata) is dict)
+    require(
+        metadata.get("publication_contract_id")
+        in {
+            PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID,
+            PROVIDER_DIRECTORY_ROOTED_GRAPH_PARTIAL_PUBLICATION_CONTRACT_ID,
+        }
+    )
+    require(metadata.get("publication_kind") == PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_KIND)
+    require(metadata.get("source_ids") == [PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID])
+    require(metadata.get("source_id") == PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID)
+    require(metadata.get("endpoint_id") == PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID)
+    require(metadata.get("endpoint_complete") is False and metadata.get("endpoint_collection_complete") is False)
+    require(type(metadata.get("cohort_complete")) is bool and type(metadata.get("rooted_graph_complete")) is bool)
+    counts = metadata.get("resource_counts")
+    require(type(counts) is dict and set(counts) == set(PROVIDER_DIRECTORY_ROOTED_GRAPH_DATASET_RESOURCES))
+    require(all(type(count) is int and count >= 0 for count in counts.values()))
+    require(is_sha256(metadata.get("rooted_graph_sha256")))
+    return metadata
+
+
+def rooted_observation_summary(header, hashes):
+    """Commit observed family roots with the existing canonical summary encoding."""
+    from process.provider_directory_source_summary import ProviderDirectorySourceSummaryBinding, build_source_summary
+
+    metadata = rooted_publication_metadata(header)
+    return build_source_summary(
+        binding=ProviderDirectorySourceSummaryBinding(
+            header["dataset_id"], header["endpoint_id"], header["acquisition_root_run_id"], header["dataset_hash"]
+        ),
+        source_ids=metadata["source_ids"],
+        selected_resources=sorted(metadata["resource_counts"]),
+        count_by_resource=metadata["resource_counts"],
+        hash_by_resource=hashes,
+    )
+
+
+async def verify_rooted_publication(reader, origin, header):
+    """Authenticate the actual rooted native proof and its complete immutable header."""
+    from db.plan_release_storage import storage_relation
+    from process.provider_directory_dataset_scoped_publication import ROOTED_INTRINSIC_VALID_FUNCTION
+
+    metadata = rooted_publication_metadata(header)
+    encoded = header["rooted_metadata"].encode()
+    require(
+        len(encoded) == origin.metadata_bytes and hashlib.sha256(encoded).hexdigest() == origin.metadata_text_sha256
+    )
+    require(
+        (metadata["source_id"], metadata["endpoint_id"], metadata["acquisition_root_run_id"])
+        == (origin.source_id, origin.endpoint_id, origin.root_run_id)
+    )
+    native = await reader.fetchrow(
+        "SELECT to_jsonb(rooted) AS document,"
+        + storage_relation(origin.schema_name, ROOTED_INTRINSIC_VALID_FUNCTION)
+        + "(rooted.dataset_id) AS intrinsic_valid FROM "
+        + storage_relation(origin.schema_name, "provider_directory_rooted_graph_dataset")
+        + " rooted WHERE rooted.dataset_id=$1",
+        origin.dataset_id,
+    )
+    require(native is not None and native["intrinsic_valid"] is True)
+    actual = native["document"]
+    actual = json.loads(actual) if type(actual) is str else actual
+    require(type(actual) is dict)
+    for field in (
+        "dataset_id",
+        "source_id",
+        "endpoint_id",
+        "acquisition_root_run_id",
+        "publication_contract_id",
+        "publication_kind",
+        "root_dataset_id",
+        "root_dataset_hash",
+        "root_content_proof_sha256",
+        "root_cohort_id",
+        "rooted_graph_sha256",
+        "cohort_complete",
+        "rooted_graph_complete",
+        "request_failure_coverage",
+    ):
+        require(actual.get(field) == metadata.get(field))
+    require(actual.get("dataset_hash") == origin.dataset_sha256)
+    require(actual.get("status") in {"published", "superseded"} and actual.get("published_at") is not None)
+    require(actual.get("resource_count") == sum(dict(origin.resource_counts).values()))
+    for kind, field in ROOTED_RESOURCE_COUNT_COLUMNS:
+        require(actual.get(field) == dict(origin.resource_counts)[kind])
+    require(metadata["rooted_graph_sha256"] == origin.proof_sha256)
+    require(metadata["semantic_projection_as_of"] == origin.semantic_projection_as_of)
+    summary = rooted_observation_summary(header, dict(origin.resource_hashes))
+    require(summary["summary_sha256"] == origin.summary_sha256)
 
 
 def _summary(summary, origin):
@@ -284,7 +410,7 @@ async def verify_publication(reader, declaration, header):
     """Revalidate original publication bytes; resource EOF and fresh replay remain independent."""
     origin = source_origin(declaration)
     require(publication_profile(header) == origin.admission_profile)
-    require(header["candidate_storage_json"] is None)
+    require(header["candidate_storage_json"] is None or origin.admission_profile == OBSERVED_ROOTED_PROFILE)
     require(
         (
             header["oid"],
@@ -312,6 +438,9 @@ async def verify_publication(reader, declaration, header):
         )
     )
     require(header["status"] in {"published", "superseded"} and header["published_at"] is not None)
+    if origin.admission_profile == OBSERVED_ROOTED_PROFILE:
+        await verify_rooted_publication(reader, origin, header)
+        return
     summary = json.loads(header["summary"]) if type(header["summary"]) is str else header["summary"]
     _summary(summary, origin)
     if type(origin) is SourceWitnessCompletionOrigin:

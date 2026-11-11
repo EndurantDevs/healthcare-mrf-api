@@ -2072,9 +2072,11 @@ OrganizationAffiliation only with exact `participating-organization` searches
 for reached Organizations, and resolves reviewed references with exact direct
 reads. InsurancePlan is covered by one finite bounded census whose complete
 payload remains an admission witness; only plans tied to the rooted
-Organization network anchors enter the published graph. Two separate sealed
-acquisitions must produce the same terminal, resource, edge, census, and budget
-proof before publication. Metrics keep rooted-graph completion separate from
+Organization network anchors enter the published graph. The supported single-root
+operation admits one sealed candidate against the exact current root, with
+terminal, resource, edge, census, and budget validation before exact-selector
+publication. The legacy twin-acquisition phase is disabled. Metrics keep
+rooted-graph completion separate from
 `collection_complete`; the latter remains false so clients and operators
 cannot mistake the curated graph for an exhaustive raw endpoint crawl.
 
@@ -2094,6 +2096,15 @@ generic current row on either reviewed endpoint, fails selection before any
 evidence SQL runs. A ready rooted generation replaces rather than unions with
 the legacy source, so source-delta removal covers all evidence and NPIs that
 belonged only to the prior generation.
+
+Before submitting a fresh shared-worker operation, call the authenticated
+`POST /control/v1/provider-directory/rooted-graph-operation` endpoint with
+`operation_key`, `root_dataset_id`, `root_dataset_hash`,
+`root_content_proof_sha256`, and `root_cohort_id`. This read-only preparation
+returns exactly those fields plus `contract_id` and the derived
+`publication_acquisition_id`; it starts no acquisition. The control plane
+verifies this complete operation before persisting a fresh request. Replays
+keep the original persisted operation without preparing another selector.
 
 Readiness also follows every rooted successor recursively to the exact legacy
 cohort and corporate official-file dataset that supplied its Practitioner set.

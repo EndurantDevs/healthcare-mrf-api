@@ -33,12 +33,14 @@ def _bounded_copy_batches(records):
 
 
 @asynccontextmanager
-async def prepare_dataset_candidate(database, dataset_id, *, kind):
+async def prepare_dataset_candidate(database, dataset_id, *, kind, finish=None, detached=False):
     """Use the explicit native publisher; no custom database prepare/finish functions."""
     from process.provider_directory_generic_source_kind_candidate import native_kind_candidate
 
     directory = import_module("process.provider_directory_fhir")
-    async with native_kind_candidate(database, directory, dataset_id, kind=kind) as relations:
+    async with native_kind_candidate(
+        database, directory, dataset_id, kind=kind, finish=finish, detached=detached
+    ) as relations:
         yield relations
 
 
@@ -46,13 +48,17 @@ async def copy_dataset_candidate_rows(database, table_name, columns, records):
     """COPY one complete bounded page using the original native publisher owner."""
     from process.provider_directory_generic_source_policy import bound_publisher
     from process.provider_directory_generic_source_storage import _copy
+    from process.provider_directory_rooted_graph_source_runtime import current_rooted_graph_runtime
 
     directory = import_module("process.provider_directory_fhir")
-    publisher = bound_publisher()
     binding = database._transaction_binding()
     relation = directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(table_name)
     if binding is None or not relation or not 1 <= len(records) <= 4096:
         raise RuntimeError("provider_directory_candidate_copy_invalid")
+    runtime = current_rooted_graph_runtime(database)
+    if runtime is not None:
+        return await runtime.copy_candidate_records(database, table_name, relation, columns, records)
+    publisher = bound_publisher()
     driver = await _copy_driver(binding.session)
     if driver is not publisher.connection or publisher.policy.schema != directory._schema():
         raise RuntimeError("provider_directory_generic_source_physical_transaction_changed")

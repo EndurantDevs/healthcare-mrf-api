@@ -13,6 +13,11 @@ from process.provider_directory_dataset_scoped_publication import (
 )
 from process.provider_directory_fhir_root_policy import ReviewedRootPolicy
 from process.provider_directory_profile_uhc_flex_contract import (
+    UHC_FLEX_LEGACY_PROFILE_RESOURCES,
+    UHC_FLEX_LEGACY_PROFILE_VARIANT,
+    UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS,
+    UHC_FLEX_ROOTED_PROFILE_RESOURCES,
+    UHC_FLEX_ROOTED_PROFILE_VARIANT,
     _clean_text,
     _is_rooted_resource_counts_valid,
     _json_object,
@@ -22,11 +27,6 @@ from process.provider_directory_profile_uhc_flex_contract import (
     uhc_flex_profile_dataset_variant,
     uhc_flex_profile_expected_resources,
     uhc_flex_profile_source_variant,
-    UHC_FLEX_LEGACY_PROFILE_RESOURCES,
-    UHC_FLEX_LEGACY_PROFILE_VARIANT,
-    UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS,
-    UHC_FLEX_ROOTED_PROFILE_RESOURCES,
-    UHC_FLEX_ROOTED_PROFILE_VARIANT,
 )
 from process.provider_directory_profile_uhc_flex_store import (
     load_profile_selection_dataset_rows,
@@ -39,8 +39,7 @@ async def lock_uhc_flex_profile_publication(database: Any) -> None:
     """Serialize Profile fences with both exact-generation publishers."""
 
     await database.status(
-        "SELECT pg_catalog.pg_advisory_xact_lock("
-        "pg_catalog.hashtextextended(:lock_identity, 0));",
+        "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(:lock_identity, 0));",
         lock_identity=EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
     )
 
@@ -54,15 +53,12 @@ def is_uhc_flex_dataset_row_ready(dataset_row: Mapping[str, Any]) -> bool:
     evidence_run_id = (
         _clean_text(dataset_row.get("acquisition_root_run_id"))
         or _clean_text(dataset_row.get("import_run_id"))
+        or _clean_text(dataset_row.get("evidence_run_id"))
         or ""
     )
     variant = uhc_flex_profile_dataset_variant(dataset_id)
     projection_value = dataset_row.get("dataset_scoped_projection_as_of")
-    projection_text = (
-        projection_value.isoformat()
-        if hasattr(projection_value, "isoformat")
-        else projection_value
-    )
+    projection_text = projection_value.isoformat() if hasattr(projection_value, "isoformat") else projection_value
     if not _is_common_dataset_row_ready(
         dataset_row,
         metadata_by_field,
@@ -96,19 +92,14 @@ def _is_common_dataset_row_ready(
             endpoint_id=endpoint_id,
             evidence_run_id=evidence_run_id,
         )
-        and metadata_by_field.get("cohort_complete")
-        is dataset_row.get("dataset_scoped_cohort_complete")
+        and metadata_by_field.get("cohort_complete") is dataset_row.get("dataset_scoped_cohort_complete")
         and metadata_by_field.get("endpoint_collection_complete") is False
         and metadata_by_field.get("endpoint_complete") is False
         and metadata_by_field.get("semantic_projection_as_of") == projection_text
-        and metadata_by_field.get("admission_id")
-        == dataset_row.get("dataset_scoped_admission_id")
-        and metadata_by_field.get("operation_key")
-        == dataset_row.get("dataset_scoped_operation_key")
-        and metadata_by_field.get("source_authority_id")
-        == dataset_row.get("dataset_scoped_authority_id")
-        and dataset_row.get("dataset_scoped_authority_id")
-        == UHC_FLEX_OFFICIAL_AUTHORITY_ID
+        and metadata_by_field.get("admission_id") == dataset_row.get("dataset_scoped_admission_id")
+        and metadata_by_field.get("operation_key") == dataset_row.get("dataset_scoped_operation_key")
+        and metadata_by_field.get("source_authority_id") == dataset_row.get("dataset_scoped_authority_id")
+        and dataset_row.get("dataset_scoped_authority_id") == UHC_FLEX_OFFICIAL_AUTHORITY_ID
     )
 
 
@@ -124,8 +115,7 @@ def _is_variant_dataset_row_ready(
         )
     return bool(
         variant == ROOTED_COMBINED_VARIANT
-        and dataset_row.get("dataset_scoped_publication_kind")
-        == ROOTED_COMBINED_VARIANT
+        and dataset_row.get("dataset_scoped_publication_kind") == ROOTED_COMBINED_VARIANT
         and type(dataset_row.get("dataset_scoped_cohort_complete")) is bool
         and dataset_row.get("dataset_scoped_rooted_graph_complete") is True
         and dataset_row.get("dataset_scoped_endpoint_collection_complete") is False
@@ -143,6 +133,7 @@ def is_uhc_flex_dataset_readiness_matching(
     evidence_run_id = (
         _clean_text(dataset_row.get("acquisition_root_run_id"))
         or _clean_text(dataset_row.get("import_run_id"))
+        or _clean_text(dataset_row.get("evidence_run_id"))
         or ""
     )
     dataset_id = _clean_text(dataset_row.get("dataset_id")) or ""
@@ -165,20 +156,13 @@ def is_uhc_flex_dataset_readiness_matching(
         and getattr(readiness, "dataset_id", None) == dataset_id
         and getattr(readiness, "endpoint_id", None) == endpoint_id
         and getattr(readiness, "source_id", None) == source_id
-        and getattr(readiness, "source_authority_id", None)
-        == UHC_FLEX_OFFICIAL_AUTHORITY_ID
-        and getattr(readiness, "dataset_hash", None)
-        == _clean_text(dataset_row.get("dataset_hash"))
-        and getattr(readiness, "resource_count", None)
-        == dataset_row.get("resource_count")
-        and getattr(readiness, "semantic_projection_as_of", None)
-        == metadata_by_field.get("semantic_projection_as_of")
-        and getattr(readiness, "admission_id", None)
-        == metadata_by_field.get("admission_id")
-        and getattr(readiness, "operation_key", None)
-        == metadata_by_field.get("operation_key")
-        and getattr(readiness, "cohort_complete", None)
-        is metadata_by_field.get("cohort_complete")
+        and getattr(readiness, "source_authority_id", None) == UHC_FLEX_OFFICIAL_AUTHORITY_ID
+        and getattr(readiness, "dataset_hash", None) == _clean_text(dataset_row.get("dataset_hash"))
+        and getattr(readiness, "resource_count", None) == dataset_row.get("resource_count")
+        and getattr(readiness, "semantic_projection_as_of", None) == metadata_by_field.get("semantic_projection_as_of")
+        and getattr(readiness, "admission_id", None) == metadata_by_field.get("admission_id")
+        and getattr(readiness, "operation_key", None) == metadata_by_field.get("operation_key")
+        and getattr(readiness, "cohort_complete", None) is metadata_by_field.get("cohort_complete")
         and readiness_retry_exhausted_count == metadata_retry_exhausted_count
         and is_uhc_flex_publication_metadata_valid(
             metadata_by_field,
@@ -190,46 +174,26 @@ def is_uhc_flex_dataset_readiness_matching(
 
 
 def _readiness_annotation(readiness: Any, is_ready: bool) -> dict[str, Any]:
-    variant = (
-        uhc_flex_profile_dataset_variant(getattr(readiness, "dataset_id", None))
-        if is_ready
-        else None
-    )
+    variant = uhc_flex_profile_dataset_variant(getattr(readiness, "dataset_id", None)) if is_ready else None
     return {
         "dataset_scoped_ready": is_ready,
         "dataset_scoped_variant": variant,
-        "dataset_scoped_publication_kind": (
-            getattr(readiness, "publication_kind", variant) if is_ready else None
-        ),
+        "dataset_scoped_publication_kind": (getattr(readiness, "publication_kind", variant) if is_ready else None),
         "dataset_scoped_projection_as_of": (
             getattr(readiness, "semantic_projection_as_of", None) if is_ready else None
         ),
-        "dataset_scoped_authority_id": (
-            getattr(readiness, "source_authority_id", None) if is_ready else None
-        ),
-        "dataset_scoped_admission_id": (
-            getattr(readiness, "admission_id", None) if is_ready else None
-        ),
-        "dataset_scoped_operation_key": (
-            getattr(readiness, "operation_key", None) if is_ready else None
-        ),
-        "dataset_scoped_cohort_complete": (
-            getattr(readiness, "cohort_complete", None) if is_ready else None
-        ),
-        "dataset_scoped_retry_exhausted_count": (
-            getattr(readiness, "retry_exhausted_count", 0) if is_ready else None
-        ),
+        "dataset_scoped_authority_id": (getattr(readiness, "source_authority_id", None) if is_ready else None),
+        "dataset_scoped_admission_id": (getattr(readiness, "admission_id", None) if is_ready else None),
+        "dataset_scoped_operation_key": (getattr(readiness, "operation_key", None) if is_ready else None),
+        "dataset_scoped_cohort_complete": (getattr(readiness, "cohort_complete", None) if is_ready else None),
+        "dataset_scoped_retry_exhausted_count": (getattr(readiness, "retry_exhausted_count", 0) if is_ready else None),
         "dataset_scoped_rooted_graph_complete": (
             getattr(readiness, "rooted_graph_complete", None) if is_ready else None
         ),
         "dataset_scoped_endpoint_collection_complete": (
-            getattr(readiness, "endpoint_collection_complete", None)
-            if is_ready
-            else None
+            getattr(readiness, "endpoint_collection_complete", None) if is_ready else None
         ),
-        "dataset_scoped_endpoint_complete": (
-            getattr(readiness, "endpoint_complete", None) if is_ready else None
-        ),
+        "dataset_scoped_endpoint_complete": (getattr(readiness, "endpoint_complete", None) if is_ready else None),
     }
 
 
@@ -306,20 +270,11 @@ def is_uhc_flex_fence_dataset_ready(dataset: Any, readiness: Any) -> bool:
         type(retry_exhausted_count) is int
         and retry_exhausted_count >= 0
         and readiness.cohort_complete is (retry_exhausted_count == 0)
-        and readiness.cohort_complete
-        is getattr(dataset, "dataset_scoped_cohort_complete", None)
-        and retry_exhausted_count
-        == getattr(dataset, "dataset_scoped_retry_exhausted_count", None)
-        and (
-            retry_exhausted_count == 0
-            or getattr(dataset, "reviewed_root_policy", None)
-            == ReviewedRootPolicy(1)
-        )
+        and readiness.cohort_complete is getattr(dataset, "dataset_scoped_cohort_complete", None)
+        and retry_exhausted_count == getattr(dataset, "dataset_scoped_retry_exhausted_count", None)
+        and (retry_exhausted_count == 0 or getattr(dataset, "reviewed_root_policy", None) == ReviewedRootPolicy(1))
     )
-    is_legacy_ready = bool(
-        dataset.dataset_scoped_variant == LEGACY_PRACTITIONER_VARIANT
-        and is_coverage_ready
-    )
+    is_legacy_ready = bool(dataset.dataset_scoped_variant == LEGACY_PRACTITIONER_VARIANT and is_coverage_ready)
     is_rooted_ready = bool(
         dataset.dataset_scoped_variant == ROOTED_COMBINED_VARIANT
         and is_coverage_ready
@@ -333,8 +288,7 @@ def is_uhc_flex_fence_dataset_ready(dataset: Any, readiness: Any) -> bool:
             dataset.source_id,
             dataset.dataset_id,
         )
-        and dataset.dataset_scoped_variant
-        == uhc_flex_profile_dataset_variant(dataset.dataset_id)
+        and dataset.dataset_scoped_variant == uhc_flex_profile_dataset_variant(dataset.dataset_id)
         and readiness.dataset_id == dataset.dataset_id
         and readiness.endpoint_id == dataset.endpoint_id
         and readiness.source_id == dataset.source_id

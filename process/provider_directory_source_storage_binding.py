@@ -145,9 +145,14 @@ def source_relation_coordinates(schema, root, scoped_name):
     """Route a closed root set; never redirect canonical identities or aliases."""
     from process import provider_directory_generic_source_policy as source
     from process.provider_directory_generic_source_storage import HEADER, RELATIONS
+    from process.provider_directory_rooted_graph_source_runtime import rooted_graph_relation_coordinates
     from process.provider_directory_source_checkpoint_catalog import CHECKPOINT_LAYOUTS
     from process.provider_directory_source_observation import current_storage_binding
     from process.provider_directory_source_proof_control import PROOF_ROOT
+
+    rooted_coordinates = rooted_graph_relation_coordinates(schema, root, scoped_name)
+    if rooted_coordinates is not None:
+        return rooted_coordinates
 
     if root in _CATALOG_ROOTS:
         factory = source._FACTORY.get()

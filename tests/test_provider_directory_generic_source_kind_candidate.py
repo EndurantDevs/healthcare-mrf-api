@@ -143,7 +143,7 @@ async def test_original_checks_use_exact_plan_heap_for_attached_or_empty_history
         'SELECT plan FROM "source_schema"."pd_dataset_migration_plan" WHERE singleton',
     )
     connection.fetchrow.assert_awaited_once_with(
-        candidate._ORIGINAL_CHECKS_SQL, history["oid"], '"source_schema"."' + next(iter(relations)) + '"'
+        candidate._ORIGINAL_CHECKS_SQL, history["oid"], '"source_schema"."' + next(iter(relations)) + '"', None
     )
     assert history["oid"] == plan["tables"][next(iter(relations))]["original_oid"]
     assert connection.fetchval.await_args.args == (

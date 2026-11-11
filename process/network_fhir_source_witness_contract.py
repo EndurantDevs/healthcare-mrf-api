@@ -23,6 +23,7 @@ COMPLETION_CONTRACT = "fhir-source-membership-witness-v2"
 OBSERVED_LEGACY_PROFILE = "observed-legacy-normalized-v1"
 OBSERVED_PROOF_PROFILE = "observed-generic-legacy-proof-v1"
 OBSERVED_SEMANTIC_PROFILE = "observed-semantic-v3-v1"
+OBSERVED_ROOTED_PROFILE = "observed-rooted-graph-v1"
 ADMITTED_LEGACY_PROFILE = "admitted-generic-legacy-v1"
 ADMITTED_TRANSPORT_PROFILE = "admitted-generic-transport-v2-v1"
 ADMITTED_UHC_PROFILE = "admitted-uhc-transport-v2-v1"
@@ -30,6 +31,7 @@ HASH_CONTRACTS = {
     OBSERVED_LEGACY_PROFILE: "transport_bound_v1",
     OBSERVED_PROOF_PROFILE: "transport_bound_v1",
     OBSERVED_SEMANTIC_PROFILE: "semantic_content_v3",
+    OBSERVED_ROOTED_PROFILE: "semantic_content_v3",
     ADMITTED_LEGACY_PROFILE: "transport_bound_v1",
     ADMITTED_TRANSPORT_PROFILE: "transport_neutral_v2",
     ADMITTED_UHC_PROFILE: "transport_neutral_v2",
@@ -158,7 +160,10 @@ class SourceWitnessOrigin:
         require(self.source_id != "cms-npd")
         require(type(self.unresolved_plan_network_count) is int and self.unresolved_plan_network_count >= 0)
         require(self.admission_profile in HASH_CONTRACTS)
-        if self.admission_profile in {OBSERVED_LEGACY_PROFILE, OBSERVED_SEMANTIC_PROFILE}:
+        if self.admission_profile == OBSERVED_ROOTED_PROFILE:
+            require(is_sha256(self.proof_sha256))
+            require(self.admission_metadata_sha256 is None and self.descriptor_counts is None)
+        elif self.admission_profile in {OBSERVED_LEGACY_PROFILE, OBSERVED_SEMANTIC_PROFILE}:
             require(
                 self.proof_sha256 is None and self.admission_metadata_sha256 is None and self.descriptor_counts is None
             )
@@ -172,7 +177,7 @@ class SourceWitnessOrigin:
                 require(is_sha256(self.admission_metadata_sha256))
                 if self.admission_profile != SEMANTIC_PROFILE:
                     require(self.descriptor_counts == self.resource_counts)
-        if self.admission_profile in {SEMANTIC_PROFILE, OBSERVED_SEMANTIC_PROFILE}:
+        if self.admission_profile in {SEMANTIC_PROFILE, OBSERVED_SEMANTIC_PROFILE, OBSERVED_ROOTED_PROFILE}:
             require(
                 type(self.semantic_projection_as_of) is str
                 and date.fromisoformat(self.semantic_projection_as_of).isoformat() == self.semantic_projection_as_of

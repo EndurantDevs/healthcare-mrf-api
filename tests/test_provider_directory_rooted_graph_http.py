@@ -11,11 +11,18 @@ from process.provider_directory_rooted_graph_http import (
     fetch_provider_directory_rooted_graph_query,
     rebind_provider_directory_rooted_graph_query,
 )
+from process.provider_directory_rooted_graph_identity import (
+    provider_directory_rooted_graph_query_id,
+)
 from process.provider_directory_rooted_graph_query import (
     build_insurance_plan_census_query,
     build_provider_directory_organization_affiliation_query,
     build_provider_directory_practitioner_role_query,
     build_rooted_graph_direct_read,
+)
+from process.provider_directory_rooted_graph_store_contract import (
+    _canonical_json,
+    _sha256_text,
 )
 from tests.provider_directory_rooted_graph_acquisition_test_support import (
     API_BASE,
@@ -119,6 +126,8 @@ async def test_affiliation_requires_exact_reference_and_match_mode() -> None:
         "network.synthetic-1",
     )
     claim = claim_for_query(query)
+    assert "&role=provider&" in query.url
+    assert rebind_provider_directory_rooted_graph_query(API_BASE, claim) == query
     valid_resource_by_field = {
         "resourceType": "OrganizationAffiliation",
         "id": "affiliation.synthetic-1",
@@ -166,15 +175,34 @@ async def test_affiliation_requires_exact_reference_and_match_mode() -> None:
         assert error_info.value.code == "response_invalid"
 
 
-@pytest.mark.asyncio
-async def test_sparse_census_continues_on_exact_collection_default_port_cursor() -> (
-    None
-):
-    query, claim = census_claim()
-    opaque_next = (
-        "https://DIRECTORY.synthetic.test:443/fhir/R4/InsurancePlan?"
-        "cursor=opaque%2Btoken&cursor=second"
+def test_affiliation_retained_identity_rebinds_required_provider_encoding() -> None:
+    query = build_provider_directory_organization_affiliation_query(
+        API_BASE,
+        "network.synthetic-1",
     )
+    claim = claim_for_query(query)
+    historical_identity_by_field = {
+        "kind": "exact_reference_search",
+        "page_size": 100,
+        "pagination": "same-origin-source-issued-until-terminal",
+        "reference": "Organization/network.synthetic-1",
+        "resource_type": "OrganizationAffiliation",
+        "search_parameter": "participating-organization",
+    }
+    historical_claim = replace(
+        claim,
+        query_id=provider_directory_rooted_graph_query_id(claim.scope_id, historical_identity_by_field),
+        query_identity_sha256=_sha256_text(_canonical_json(historical_identity_by_field)),
+    )
+    rebound = rebind_provider_directory_rooted_graph_query(API_BASE, historical_claim)
+    assert rebound == query
+    assert "&role=provider&" in rebound.url
+
+
+@pytest.mark.asyncio
+async def test_sparse_census_continues_on_exact_collection_default_port_cursor() -> None:
+    query, claim = census_claim()
+    opaque_next = "https://DIRECTORY.synthetic.test:443/fhir/R4/InsurancePlan?cursor=opaque%2Btoken&cursor=second"
     plan_by_field = {
         "resourceType": "InsurancePlan",
         "id": "plan.synthetic-1",
@@ -186,8 +214,7 @@ async def test_sparse_census_continues_on_exact_collection_default_port_cursor()
                 opaque_next,
                 bundle([plan_by_field], total=1),
                 response_url=(
-                    "https://directory.synthetic.test/fhir/R4/InsurancePlan?"
-                    "cursor=opaque%2Btoken&cursor=second"
+                    "https://directory.synthetic.test/fhir/R4/InsurancePlan?cursor=opaque%2Btoken&cursor=second"
                 ),
             ),
         ]
@@ -204,11 +231,30 @@ async def test_sparse_census_continues_on_exact_collection_default_port_cursor()
     assert fetched_result.terminal_page_count == 2
     assert [request[0] for request in session.requests] == [
         query.url,
-        (
-            "https://DIRECTORY.synthetic.test/fhir/R4/InsurancePlan?"
-            "cursor=opaque%2Btoken&cursor=second"
-        ),
+        ("https://DIRECTORY.synthetic.test/fhir/R4/InsurancePlan?cursor=opaque%2Btoken&cursor=second"),
     ]
+
+
+@pytest.mark.parametrize("base_suffix", ["", "/"])
+@pytest.mark.asyncio
+async def test_source_issued_api_base_cursor_preserves_opaque_query(base_suffix) -> None:
+    query, claim = census_claim()
+    opaque_query = "_getpages=a%2fb%2Bc%3d+opaque&_getpagesoffset=1&x=one&x=two"
+    next_path = f"/fhir/R4{base_suffix}?{opaque_query}"
+    next_url = f"{API_BASE}{base_suffix}?{opaque_query}"
+    plan_by_field = {"resourceType": "InsurancePlan", "id": "plan.synthetic-1"}
+    session = FakeSession(
+        [
+            FakeResponse(query.url, bundle([], total=1, next_url=next_path)),
+            FakeResponse(next_url, bundle([plan_by_field], total=1)),
+        ]
+    )
+
+    result = await fetch_provider_directory_rooted_graph_query(session, API_BASE, claim)
+
+    assert result.resources == (plan_by_field,)
+    assert result.terminal_page_count == 2
+    assert [request[0] for request in session.requests] == [query.url, next_url]
 
 
 @pytest.mark.parametrize(
@@ -219,12 +265,15 @@ async def test_sparse_census_continues_on_exact_collection_default_port_cursor()
         "https://directory.synthetic.test:444/fhir/R4?cursor=a",
         "https://user@directory.synthetic.test/fhir/R4?cursor=a",
         "https://directory.synthetic.test/fhir/R40?cursor=a",
-        "https://directory.synthetic.test/fhir/R4?cursor=a",
+        "https://directory.synthetic.test/fhir/R4?_count=100",
         "https://directory.synthetic.test/fhir/R4/Other?cursor=a",
         "https://directory.synthetic.test/fhir/R4%2FInsurancePlan?cursor=a",
         "https://directory.synthetic.test/fhir/R4/%2e%2e/secret",
         "https://directory.synthetic.test/fhir/R4\\secret",
         "https://directory.synthetic.test/fhir/R4?cursor=a#fragment",
+        "https://directory.synthetic.test:0/fhir/R4?_getpages=a",
+        "https://directory.synthetic.test/fhir/R4/x/../InsurancePlan?_getpages=a",
+        "https://directory.synthetic.test/fhir/R4?_getpages=a\tstate",
     ],
 )
 @pytest.mark.asyncio
@@ -232,9 +281,7 @@ async def test_next_url_rejects_origin_path_and_encoded_traversal(
     unsafe_next: str,
 ) -> None:
     query, claim = census_claim()
-    session = FakeSession(
-        [FakeResponse(query.url, bundle([], total=0, next_url=unsafe_next))]
-    )
+    session = FakeSession([FakeResponse(query.url, bundle([], total=0, next_url=unsafe_next))])
 
     with pytest.raises(ProviderDirectoryRootedGraphHTTPError) as error_info:
         await fetch_provider_directory_rooted_graph_query(
@@ -247,9 +294,7 @@ async def test_next_url_rejects_origin_path_and_encoded_traversal(
 
 
 @pytest.mark.asyncio
-async def test_census_requires_stable_total_distinct_ids_and_exact_final_count() -> (
-    None
-):
+async def test_census_requires_stable_total_distinct_ids_and_exact_final_count() -> None:
     query, claim = census_claim()
     first_plan_by_field = {"resourceType": "InsurancePlan", "id": "plan.synthetic-1"}
     second_plan_by_field = {
@@ -288,9 +333,7 @@ async def test_equivalent_host_case_default_port_cursor_cycle_is_rejected() -> N
         "https://directory.synthetic.test",
         "https://DIRECTORY.synthetic.test:443",
     )
-    session = FakeSession(
-        [FakeResponse(query.url, bundle([], total=0, next_url=equivalent_next))]
-    )
+    session = FakeSession([FakeResponse(query.url, bundle([], total=0, next_url=equivalent_next))])
 
     with pytest.raises(ProviderDirectoryRootedGraphHTTPError) as error_info:
         await fetch_provider_directory_rooted_graph_query(

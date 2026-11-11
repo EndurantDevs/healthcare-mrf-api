@@ -799,6 +799,10 @@ def _is_approved_body(definition, schema, digest):
     """Recognize only the fixed predecessor or its exact source-rendered successor."""
     if _body_digest(definition["prosrc"], schema) == digest:
         return True
+    from db.migration_rooted_publication_freeze import is_approved_successor
+
+    if is_approved_successor(definition["proname"], schema, definition["prosrc"], digest):
+        return True
     if definition["proname"] == _CMS_SEAL_GUARD and digest == ORIGINAL_SHA256:
         from db.migration_fhir_source_rollback import rollback_guard_bodies
 

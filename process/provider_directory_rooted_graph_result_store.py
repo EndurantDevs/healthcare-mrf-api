@@ -35,6 +35,7 @@ from process.provider_directory_rooted_graph_store_support import (
     WORK_TABLE,
     assert_identity_row,
     function_ref,
+    rooted_graph_transaction,
     row_fields,
     set_store_action,
     table_ref,
@@ -77,11 +78,9 @@ async def complete_provider_directory_rooted_graph_result(
     """Atomically retain witnesses and terminalize one live query lease."""
 
     validate_provider_directory_rooted_graph_query_result(claim, query_result)
-    async with database.transaction() as transaction:
+    async with rooted_graph_transaction(database) as transaction:
         await admit_result_witnesses(database, transaction, claim, query_result)
-        await set_store_action(
-            database, "terminal", claim.acquisition_id, claim.lease_token
-        )
+        await set_store_action(database, "terminal", claim.acquisition_id, claim.lease_token)
         count = await database.status(
             f"""
             UPDATE {table_ref(WORK_TABLE)}
@@ -143,7 +142,7 @@ async def complete_provider_directory_rooted_graph_missing(
         missing_response_bytes,
         missing_response_json_text,
     )
-    async with database.transaction():
+    async with rooted_graph_transaction(database):
         await set_store_action(
             database,
             "terminal",
@@ -185,10 +184,8 @@ async def complete_provider_directory_rooted_graph_error(
         claim,
         error_code,
     )
-    async with database.transaction():
-        await set_store_action(
-            database, "terminal", claim.acquisition_id, claim.lease_token
-        )
+    async with rooted_graph_transaction(database):
+        await set_store_action(database, "terminal", claim.acquisition_id, claim.lease_token)
         count = await database.status(
             f"""
             UPDATE {table_ref(WORK_TABLE)}
@@ -288,7 +285,7 @@ def _seal_update_sql() -> str:
         UPDATE {table_ref(ACQUISITION_TABLE)} AS acquisition
            SET status = 'sealed',
                rooted_graph_complete = (work_census.error_count = 0),
-               request_failure_coverage = {function_ref('provider_directory_rooted_graph_request_failure_coverage')}(
+               request_failure_coverage = {function_ref("provider_directory_rooted_graph_request_failure_coverage")}(
                    acquisition.acquisition_id
                ),
                pending_count = work_census.pending_count,
@@ -338,25 +335,22 @@ async def seal_provider_directory_rooted_graph_acquisition(
 
     if type(identity) is not ProviderDirectoryRootedGraphAcquisitionIdentity:
         raise ValueError("provider_directory_rooted_graph_identity_invalid")
-    async with database.transaction():
+    async with rooted_graph_transaction(database):
         await database.scalar(
-            "SELECT pg_catalog.pg_advisory_xact_lock("
-            "pg_catalog.hashtextextended(:identity, 0));",
+            "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(:identity, 0));",
             identity=identity.acquisition_id,
         )
         header = assert_identity_row(
             identity,
             await database.first(
-                f"SELECT * FROM {table_ref(ACQUISITION_TABLE)} "
-                "WHERE acquisition_id = :acquisition_id;",
+                f"SELECT * FROM {table_ref(ACQUISITION_TABLE)} WHERE acquisition_id = :acquisition_id;",
                 acquisition_id=identity.acquisition_id,
             ),
         )
         if header["status"] == "sealed":
             return _summary_from_row(header)
         await database.scalar(
-            f"SELECT {function_ref('finish_provider_directory_rooted_graph_storage')}("
-            ":acquisition_id);",
+            f"SELECT {function_ref('finish_provider_directory_rooted_graph_storage')}(:acquisition_id);",
             acquisition_id=identity.acquisition_id,
         )
         sealed = await _seal_header(database, identity.acquisition_id)

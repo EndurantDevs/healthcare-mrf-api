@@ -9,10 +9,10 @@ import pytest
 
 from process import provider_directory_dataset_scoped_publication as publication
 from process.provider_directory_dataset_scoped_publication import (
-    ExactCurrentDataset,
     LEGACY_PRACTITIONER_VARIANT,
-    ProviderDirectoryDatasetScopedPublicationError,
     ROOTED_COMBINED_VARIANT,
+    ExactCurrentDataset,
+    ProviderDirectoryDatasetScopedPublicationError,
     exact_current_matches_root,
     exact_uhc_dataset_pair,
     lock_exact_current_dataset,
@@ -47,9 +47,7 @@ def _legacy_current() -> ExactCurrentDataset:
         practitioner_origin_source_id=pair.legacy_source_id,
         practitioner_origin_endpoint_id=pair.legacy_endpoint_id,
         source_authority_id=UHC_FLEX_OFFICIAL_AUTHORITY_ID,
-        endpoint_signature_sha256=(
-            PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_SIGNATURE_SHA256
-        ),
+        endpoint_signature_sha256=(PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_SIGNATURE_SHA256),
         dataset_hash="2" * 64,
         resource_count=3,
         practitioner_resource_count=3,
@@ -61,17 +59,12 @@ def _legacy_current() -> ExactCurrentDataset:
         operation_key="4" * 64,
         acquisition_root_run_id="pdufpar_" + "5" * 48,
         variant=LEGACY_PRACTITIONER_VARIANT,
-        root_publication_contract_id=(
-            PROVIDER_DIRECTORY_ROOTED_GRAPH_LEGACY_ROOT_PUBLICATION_CONTRACT_ID
-        ),
+        root_publication_contract_id=(PROVIDER_DIRECTORY_ROOTED_GRAPH_LEGACY_ROOT_PUBLICATION_CONTRACT_ID),
     )
 
 
 def _header_for(current: ExactCurrentDataset) -> dict[str, object]:
-    header_by_column = {
-        field_name: getattr(current, field_name)
-        for field_name in current.__dataclass_fields__
-    }
+    header_by_column = {field_name: getattr(current, field_name) for field_name in current.__dataclass_fields__}
     header_by_column.update(status="published", is_current=True)
     return header_by_column
 
@@ -119,9 +112,7 @@ def test_exact_current_rejects_cross_variant_publication_contract() -> None:
     ):
         replace(
             _legacy_current(),
-            root_publication_contract_id=(
-                PROVIDER_DIRECTORY_ROOTED_GRAPH_COMBINED_ROOT_PUBLICATION_CONTRACT_ID
-            ),
+            root_publication_contract_id=(PROVIDER_DIRECTORY_ROOTED_GRAPH_COMBINED_ROOT_PUBLICATION_CONTRACT_ID),
         )
 
 
@@ -145,9 +136,7 @@ def test_exact_current_requires_variant_specific_root_run_id() -> None:
         root_source_id=pair.rooted_source_id,
         root_endpoint_id=pair.rooted_endpoint_id,
         variant=ROOTED_COMBINED_VARIANT,
-        root_publication_contract_id=(
-            PROVIDER_DIRECTORY_ROOTED_GRAPH_COMBINED_ROOT_PUBLICATION_CONTRACT_ID
-        ),
+        root_publication_contract_id=(PROVIDER_DIRECTORY_ROOTED_GRAPH_COMBINED_ROOT_PUBLICATION_CONTRACT_ID),
         acquisition_root_run_id="pdrgpr_" + "5" * 48,
     )
     assert rooted.acquisition_root_run_id.startswith("pdrgpr_")
@@ -219,9 +208,7 @@ def test_exact_current_root_match_binds_publication_contract() -> None:
     )
 
     assert exact_current_matches_root(current, identity) is True
-    identity.root_publication_contract_id = (
-        PROVIDER_DIRECTORY_ROOTED_GRAPH_COMBINED_ROOT_PUBLICATION_CONTRACT_ID
-    )
+    identity.root_publication_contract_id = PROVIDER_DIRECTORY_ROOTED_GRAPH_COMBINED_ROOT_PUBLICATION_CONTRACT_ID
     assert exact_current_matches_root(current, identity) is False
 
 
@@ -231,14 +218,14 @@ class _LegacyCurrentDatabase:
         self.identity_valid = True
         self.readiness = True
         self.header_reads: list[str] = []
+        self.all_reads: list[str] = []
         self.status_writes: list[str] = []
 
     async def all(self, statement: str, **_parameters: object) -> list[dict]:
+        self.all_reads.append(statement)
         pair = exact_uhc_dataset_pair()
         if "provider_directory_source" in statement:
-            legacy_signature = (
-                uhc_flex_practitioner_endpoint_identity().endpoint_signature_hash
-            )
+            legacy_signature = uhc_flex_practitioner_endpoint_identity().endpoint_signature_hash
             return [
                 {
                     "source_id": pair.legacy_source_id,
@@ -256,9 +243,7 @@ class _LegacyCurrentDatabase:
                     "endpoint_api_base": PROVIDER_DIRECTORY_ROOTED_GRAPH_API_BASE,
                     "source_authority_id": UHC_FLEX_OFFICIAL_AUTHORITY_ID,
                     "endpoint_authority_id": UHC_FLEX_OFFICIAL_AUTHORITY_ID,
-                    "endpoint_signature_sha256": (
-                        PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_SIGNATURE_SHA256
-                    ),
+                    "endpoint_signature_sha256": (PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_SIGNATURE_SHA256),
                 },
             ]
         if "provider_directory_endpoint_dataset" in statement:
@@ -276,10 +261,7 @@ class _LegacyCurrentDatabase:
 
     async def first(self, statement: str, **_parameters: object) -> dict | None:
         self.header_reads.append(statement)
-        assert (
-            "header.publication_contract_id"
-            "\n                       AS root_publication_contract_id"
-        ) in statement
+        assert ("header.publication_contract_id\n                       AS root_publication_contract_id") in statement
         if "provider_directory_uhc_flex_practitioner_dataset" in statement:
             current = self.current
             return {
@@ -291,12 +273,8 @@ class _LegacyCurrentDatabase:
                 "root_endpoint_id": current.root_endpoint_id,
                 "acquisition_source_id": current.acquisition_source_id,
                 "acquisition_endpoint_id": current.acquisition_endpoint_id,
-                "practitioner_origin_source_id": (
-                    current.practitioner_origin_source_id
-                ),
-                "practitioner_origin_endpoint_id": (
-                    current.practitioner_origin_endpoint_id
-                ),
+                "practitioner_origin_source_id": (current.practitioner_origin_source_id),
+                "practitioner_origin_endpoint_id": (current.practitioner_origin_endpoint_id),
                 "source_authority_id": current.source_authority_id,
                 "endpoint_signature_sha256": (current.endpoint_signature_sha256),
                 "status": "published",
@@ -329,8 +307,10 @@ class _LegacyCurrentDatabase:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lock_rows", [True, False])
 async def test_lock_exact_current_reads_and_returns_root_publication_contract(
     monkeypatch: pytest.MonkeyPatch,
+    lock_rows: bool,
 ) -> None:
     monkeypatch.delenv("HLTHPRT_DB_SCHEMA", raising=False)
     monkeypatch.delenv("DB_SCHEMA", raising=False)
@@ -340,10 +320,14 @@ async def test_lock_exact_current_reads_and_returns_root_publication_contract(
     current = await lock_exact_current_dataset(
         database,
         pair=exact_uhc_dataset_pair(),
+        lock_rows=lock_rows,
     )
 
     assert current == expected
     assert len(database.header_reads) == 2
+    assert all(("FOR UPDATE" in statement) is lock_rows for statement in database.header_reads)
+    assert any("FOR SHARE" in statement for statement in database.all_reads) is lock_rows
+    assert any("FOR UPDATE" in statement for statement in database.all_reads) is lock_rows
 
 
 @pytest.mark.asyncio
@@ -382,9 +366,7 @@ def test_store_local_schema_row_variant_and_projection_boundaries(monkeypatch) -
     )
     with pytest.raises(ProviderDirectoryDatasetScopedPublicationError):
         publication._variant_table_and_ready("generic")
-    assert (
-        publication._projection_text(SimpleNamespace(isoformat=lambda: "day")) == "day"
-    )
+    assert publication._projection_text(SimpleNamespace(isoformat=lambda: "day")) == "day"
     with pytest.raises(ProviderDirectoryDatasetScopedPublicationError):
         publication._projection_text(None)
 
@@ -411,10 +393,10 @@ async def test_registry_and_header_selection_reject_drift_and_split_brain(
         )
     assert drift.value.code == "source_drift"
 
-    async def legacy_header(_database, _pair):
+    async def legacy_header(_database, _pair, *, lock_rows=True):
         return _header_for(current)
 
-    async def rooted_header(_database, _pair):
+    async def rooted_header(_database, _pair, *, lock_rows=True):
         return _header_for(current)
 
     monkeypatch.setattr(publication, "_locked_legacy_header", legacy_header)
@@ -428,25 +410,22 @@ async def test_registry_and_header_selection_reject_drift_and_split_brain(
 async def test_lock_exact_current_rejects_foreign_parent_shapes(monkeypatch) -> None:
     current = _legacy_current()
 
-    async def lock_registry(_database, _pair):
+    async def lock_registry(_database, _pair, *, lock_rows=True):
         return None
 
-    async def no_header(_database, _pair):
+    async def no_header(_database, _pair, *, lock_rows=True):
         return None
 
     monkeypatch.setattr(publication, "_lock_pair_registry", lock_registry)
     monkeypatch.setattr(publication, "_locked_current_header", no_header)
 
-    async def no_parents(_database, _pair):
+    async def no_parents(_database, _pair, *, lock_rows=True):
         return {}
 
     monkeypatch.setattr(publication, "_locked_parent_by_id", no_parents)
-    assert (
-        await lock_exact_current_dataset(object(), pair=exact_uhc_dataset_pair())
-        is None
-    )
+    assert await lock_exact_current_dataset(object(), pair=exact_uhc_dataset_pair()) is None
 
-    async def foreign_parent(_database, _pair):
+    async def foreign_parent(_database, _pair, *, lock_rows=True):
         return {current.dataset_id: _parent_for(current)}
 
     monkeypatch.setattr(publication, "_locked_parent_by_id", foreign_parent)

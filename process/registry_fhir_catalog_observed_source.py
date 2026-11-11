@@ -155,25 +155,41 @@ def _descendants(rows_by_oid, root_oid):
     return selected_oids
 
 
-def _relation_families(rows, roots, profile, owner_oid):
-    rows_by_oid = {row["oid"]: row for row in rows}
-    roots_by_name = {(row["nspname"], row["relname"]): row for row in rows if not row["parents"]}
-    if len(rows_by_oid) != len(rows) or not set(roots) <= set(roots_by_name):
+def _relation_families(physical_rows, roots, profile, owner_oid, *, frozen_resource_oids=frozenset()):
+    rows_by_oid = {physical_row["oid"]: physical_row for physical_row in physical_rows}
+    roots_by_name = {
+        (physical_row["nspname"], physical_row["relname"]): physical_row
+        for physical_row in physical_rows
+        if not physical_row["parents"]
+    }
+    if len(rows_by_oid) != len(physical_rows) or not set(roots) <= set(roots_by_name):
         _fail("physical_identity_invalid")
-    for row in rows:
+    for physical_row in physical_rows:
         if (
-            row["relkind"] not in {"r", "p"}
-            or row["relpersistence"] != "p"
-            or row["relrowsecurity"] is not False
-            or row["relforcerowsecurity"] is not False
-            or row["nspname"] not in {profile.schema_name, profile.catalog_schema}
-            or not set(row["parents"]) <= set(rows_by_oid)
-            or (bool(row["parents"]) != row["relispartition"])
+            physical_row["relkind"] not in {"r", "p"}
+            or physical_row["relpersistence"] != "p"
+            or physical_row["relrowsecurity"] is not False
+            or physical_row["relforcerowsecurity"] is not False
+            or (
+                physical_row["nspname"] not in {profile.schema_name, profile.catalog_schema}
+                and physical_row["oid"] not in frozen_resource_oids
+            )
+            or not set(physical_row["parents"]) <= set(rows_by_oid)
+            or (bool(physical_row["parents"]) != physical_row["relispartition"])
         ):
             _fail("physical_identity_invalid")
     families_by_name = {name: _descendants(rows_by_oid, roots_by_name[(schema, name)]["oid"]) for schema, name in roots}
+    resource_root = roots_by_name[(profile.schema_name, _RESOURCE)]["oid"]
+    if not set(frozen_resource_oids) <= families_by_name[_RESOURCE] - {resource_root} or any(
+        rows_by_oid[oid]["relkind"] != "r" or rows_by_oid[oid]["parents"] != [resource_root]
+        for oid in frozen_resource_oids
+    ):
+        _fail("physical_identity_invalid")
     for name in (_HEADER, _RESOURCE):
-        if any(rows_by_oid[oid]["relowner"] != owner_oid for oid in families_by_name[name]):
+        if any(
+            rows_by_oid[oid]["relowner"] != owner_oid and not (name == _RESOURCE and oid in frozen_resource_oids)
+            for oid in families_by_name[name]
+        ):
             _fail("physical_owner_changed")
     return rows_by_oid, roots_by_name, families_by_name
 

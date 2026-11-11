@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
 import math
+import urllib.parse
+from dataclasses import replace
 from types import SimpleNamespace
 
 import aiohttp
@@ -15,10 +16,10 @@ import pytest
 from process.provider_directory_rooted_graph_http import (
     ProviderDirectoryRootedGraphHTTPBounds,
     ProviderDirectoryRootedGraphHTTPError,
-    _SearchState,
     _bundle_entries,
     _bundle_next_link,
     _query_for_claim,
+    _SearchState,
     _validate_bundle,
     _validate_search_resource,
     fetch_provider_directory_rooted_graph_query,
@@ -98,9 +99,7 @@ def test_url_helpers_reject_unicode_parse_and_identity_boundaries() -> None:
             api_base=API_BASE,
             collection_url=f"{API_BASE}/InsurancePlan?_count=100",
             current_url=f"{API_BASE}/InsurancePlan?_count=100",
-            next_link=(
-                "https://directory.synthetic.test:bad/fhir/R4/InsurancePlan?cursor=1"
-            ),
+            next_link=("https://directory.synthetic.test:bad/fhir/R4/InsurancePlan?cursor=1"),
             max_url_bytes=8192,
         )
     assert parse_error.value.code == "pagination_invalid"
@@ -109,20 +108,34 @@ def test_url_helpers_reject_unicode_parse_and_identity_boundaries() -> None:
     assert _request_url_identity("http://directory.synthetic.test/path") is None
 
 
+@pytest.mark.parametrize(
+    "next_link",
+    (
+        "https://DIRECTORY.synthetic.test:443/fhir/R4?_getpages=a%2Fb%2B%3d",
+        "/fhir/R4?_getpages=a%2Fb%2B%3d",
+        "/fhir/R4/?_getpages=a%2Fb%2B%3d",
+        "?_getpages=a%2Fb%2B%3d",
+    ),
+)
+def test_next_url_accepts_only_scoped_source_cursor_paths(next_link) -> None:
+    collection_url = f"{API_BASE}/PractitionerRole?practitioner=Practitioner%2Fa&_count=100"
+    assert _validated_next_url(
+        api_base=API_BASE,
+        collection_url=collection_url,
+        current_url=collection_url,
+        next_link=next_link,
+        max_url_bytes=8192,
+    ) == urllib.parse.urljoin(collection_url, next_link)
+
+
 def test_strict_float_and_header_parameters_reject_ambiguous_values() -> None:
     with pytest.raises(ValueError):
         _strict_json_float("1e999")
-    response_without_length = SimpleNamespace(
-        headers={"Content-Type": "application/fhir+json"}
-    )
+    response_without_length = SimpleNamespace(headers={"Content-Type": "application/fhir+json"})
     assert _declared_length(response_without_length) is None
     assert _validate_headers(response_without_length) is None
     with pytest.raises(ProviderDirectoryRootedGraphHTTPError) as media_error:
-        _validate_headers(
-            SimpleNamespace(
-                headers={"Content-Type": "application/fhir+json; profile=synthetic"}
-            )
-        )
+        _validate_headers(SimpleNamespace(headers={"Content-Type": "application/fhir+json; profile=synthetic"}))
     assert media_error.value.code == "content_type_invalid"
     assert media_error.value.retryable is True
 
@@ -307,8 +320,6 @@ def test_redirect_status_is_never_retried() -> None:
     )
 
     with pytest.raises(ProviderDirectoryRootedGraphHTTPError) as error_info:
-        _require_success_status(
-            SimpleNamespace(status=302, headers={}), role_claim()[1]
-        )
+        _require_success_status(SimpleNamespace(status=302, headers={}), role_claim()[1])
     assert error_info.value.code == "redirect_forbidden"
     assert error_info.value.retryable is False

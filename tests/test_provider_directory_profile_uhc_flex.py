@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib
 import json
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -20,8 +21,17 @@ from process.provider_directory_dataset_scoped_publication import (
     LEGACY_PRACTITIONER_VARIANT,
     ROOTED_COMBINED_VARIANT,
 )
+from process.provider_directory_fhir_root_policy import REVIEWED_ROOT_POLICY_METADATA_KEY, ReviewedRootPolicy
+from process.provider_directory_rooted_graph_publication import (
+    build_provider_directory_rooted_graph_dataset_identity,
+    provider_directory_rooted_graph_publication_metadata,
+)
+from process.provider_directory_rooted_graph_single_root_contract import derive_single_root_identity
 from process.provider_directory_rooted_graph_source_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+)
+from process.provider_directory_rooted_graph_twin_contract import (
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
 )
 from process.uhc_flex_practitioner_contract import (
     UHC_FLEX_PRACTITIONER_SOURCE_ID,
@@ -40,11 +50,187 @@ from tests.provider_directory_profile_uhc_flex_test_support import (
     _readiness_record,
     _rooted_dataset_rows,
     _rooted_metadata,
+    _rooted_readiness_record,
     _source_rows,
 )
-
+from tests.provider_directory_rooted_graph_publication_test_support import exact_current, resource_counts
+from tests.test_provider_directory_rooted_graph_request_admission import _admit, _coverage, _partial_root
 
 importer = importlib.import_module("process.provider_directory_fhir")
+
+
+def _bounded_artifact_metadata(metadata):
+    return {key: metadata[key] for key in importer._ARTIFACT_SELECTION_RECEIPT_METADATA_KEYS if key in metadata}
+
+
+@pytest.fixture
+def rooted_v2_metadata():
+    current = exact_current(retry_exhausted_count=1)
+    expected = derive_single_root_identity(current, operation_key="e" * 64).candidate
+    candidate = replace(
+        _partial_root(completed_count=3, error_count=0, request_failure_coverage=_coverage(rooted_failed=0)),
+        acquisition_id=expected.acquisition_id,
+        run_id=expected.run_id,
+        dataset_intent_id=expected.dataset_intent_id,
+    )
+    admission = _admit(candidate)
+    identity = build_provider_directory_rooted_graph_dataset_identity(admission, current)
+    return provider_directory_rooted_graph_publication_metadata(
+        identity, admission, previous_dataset_id=current.dataset_id, resource_counts=resource_counts()
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "damage", [None, "missing", "extra", "boolean", "inherited_count", "rooted_failure", "contract", "evidence_run_id"]
+)
+async def test_v2_rooted_artifact_coverage_keeps_profile_guards(monkeypatch, rooted_v2_metadata, damage):
+    metadata = deepcopy(rooted_v2_metadata)
+    coverage = metadata["request_failure_coverage"]
+    match damage:
+        case "missing":
+            metadata.pop("request_failure_coverage")
+        case "extra":
+            coverage["unknown"] = 0
+        case "boolean":
+            coverage["failed_requests"] = True
+        case "inherited_count":
+            coverage["failed_requests"] += 1
+        case "rooted_failure":
+            coverage.update(rooted_failed_requests=1, failed_requests=2)
+            metadata["rooted_graph_complete"] = False
+        case "contract":
+            metadata["publication_contract_id"] = "healthporta.provider-directory.rooted-graph-publication.v1"
+    projected_by_field = _bounded_artifact_metadata(metadata)
+    ready = _rooted_readiness_record(
+        **{
+            name: rooted_v2_metadata[name]
+            for name in (
+                "dataset_id",
+                "endpoint_id",
+                "source_id",
+                "source_authority_id",
+                "semantic_projection_as_of",
+                "admission_id",
+                "operation_key",
+                "publication_kind",
+                "cohort_complete",
+                "retry_exhausted_count",
+                "rooted_graph_complete",
+                "resource_counts",
+            )
+        },
+        resource_count=sum(rooted_v2_metadata["resource_counts"].values()),
+    )
+    row_by_field = {
+        **_rooted_dataset_rows()[0],
+        **vars(ready),
+        "acquisition_root_run_id": metadata["acquisition_root_run_id"],
+        "publication_metadata_json": projected_by_field,
+    }
+    row_by_field["evidence_run_id"] = row_by_field.pop("acquisition_root_run_id")
+    row_by_field.pop("import_run_id", None)
+    if damage == "evidence_run_id":
+        row_by_field["evidence_run_id"] = "wrong-evidence"
+    monkeypatch.setattr(flex_profile, "load_uhc_flex_profile_dataset_readiness", AsyncMock(return_value=ready))
+    (annotated,) = await flex_profile.annotate_uhc_flex_profile_dataset_readiness(
+        [row_by_field], database=object(), row_mapping=lambda value: value
+    )
+    assert annotated["dataset_scoped_ready"] is (damage is None)
+    assert flex_profile.is_uhc_flex_publication_metadata_valid(
+        projected_by_field,
+        dataset_id=metadata["dataset_id"],
+        endpoint_id=metadata["endpoint_id"],
+        evidence_run_id=row_by_field["evidence_run_id"],
+    ) is (damage is None)
+
+
+@pytest.mark.parametrize("missing", [None, "baseline_acquisition_id", "baseline_run_id"])
+def test_bounded_artifact_metadata_preserves_legacy_twin_proof(missing):
+    row_by_field = _artifact_dataset_row()
+    row_by_field["evidence_run_id"] = row_by_field.pop("acquisition_root_run_id")
+    row_by_field.pop("import_run_id", None)
+    metadata = row_by_field["publication_metadata_json"]
+    projected_by_field = _bounded_artifact_metadata(metadata)
+    if missing is not None:
+        projected_by_field.pop(missing)
+    row_by_field["publication_metadata_json"] = projected_by_field
+    assert flex_profile.is_uhc_flex_dataset_readiness_matching(_readiness_record(), row_by_field) is (missing is None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("single_root", [False, True])
+@pytest.mark.parametrize(
+    "damage",
+    [
+        None,
+        "admission_contract_id",
+        "publication_acquisition_id",
+        "attempt_id",
+        "dataset_hash",
+        "database",
+        "evidence_run_id",
+    ],
+)
+async def test_rooted_artifacts_preserve_bounded_admission_metadata(monkeypatch, single_root, damage):
+    metadata = _rooted_metadata()
+    if single_root:
+        metadata.update(
+            admission_contract_id=PROVIDER_DIRECTORY_ROOTED_GRAPH_SINGLE_ROOT_ADMISSION_CONTRACT_ID,
+            attempt_id=None,
+            comparison_acquisition_id=None,
+            acquisition_operation_key="d" * 64,
+            **{REVIEWED_ROOT_POLICY_METADATA_KEY: ReviewedRootPolicy(1).document()},
+        )
+    projected_by_field = _bounded_artifact_metadata(metadata)
+    row_by_field = {
+        **_rooted_dataset_rows()[0],
+        "source_id": PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
+        "publication_metadata_json": projected_by_field,
+    }
+    row_by_field["evidence_run_id"] = row_by_field.pop("acquisition_root_run_id")
+    row_by_field.pop("import_run_id", None)
+    if damage == "dataset_hash":
+        row_by_field["dataset_hash"] = "e" * 64
+    elif damage == "evidence_run_id":
+        row_by_field["evidence_run_id"] = "wrong-evidence"
+    elif damage not in {None, "database"}:
+        projected_by_field.pop(damage, None)
+    loader = AsyncMock(return_value=None if damage == "database" else _rooted_readiness_record())
+    monkeypatch.setattr(flex_profile, "load_uhc_flex_profile_dataset_readiness", loader)
+    (annotated,) = await flex_profile.annotate_uhc_flex_profile_dataset_readiness(
+        [row_by_field], database=object(), row_mapping=lambda value: value
+    )
+    assert annotated["dataset_scoped_ready"] is (damage is None)
+    assert flex_profile.is_uhc_flex_dataset_row_ready(annotated) is (damage is None)
+    options_by_name = dict(
+        endpoint_id=row_by_field["endpoint_id"],
+        dataset_id=row_by_field["dataset_id"],
+        evidence_run_id=row_by_field["evidence_run_id"],
+        selected_resources=tuple(sorted(metadata["selected_resources"])),
+        publication_metadata=projected_by_field,
+        dataset_scoped_ready=annotated["dataset_scoped_ready"],
+    )
+    if damage is None:
+        assert importer._artifact_flex_retained_resources(**options_by_name) == options_by_name["selected_resources"]
+        sql = importer._artifact_bounded_publication_metadata_sql("metadata")
+        assert all(
+            f"metadata -> '{field}'" in sql
+            for field in (
+                "admission_contract_id",
+                "publication_acquisition_id",
+                "attempt_id",
+                "comparison_acquisition_id",
+                "acquisition_operation_key",
+                "retry_exhausted_count",
+                "request_failure_coverage",
+                "baseline_acquisition_id",
+                "baseline_run_id",
+            )
+        )
+    else:
+        with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="dataset_scoped_proof_invalid"):
+            importer._artifact_flex_retained_resources(**options_by_name)
 
 
 def test_flex_profile_source_is_dataset_scoped_and_shares_authority():
@@ -143,12 +329,8 @@ def test_profile_source_helpers_fail_closed_and_render_empty_contracts(
         match="provider_directory_profile_source_authority_invalid",
     ):
         profile.profile_source_authority_id("missing-source", "endpoint-a")
-    assert profile.profile_source_authority_sql("source_id", "endpoint_id") == (
-        "endpoint_id"
-    )
-    assert profile.profile_reviewed_source_authority_sql("source_id") == (
-        "NULL::varchar"
-    )
+    assert profile.profile_source_authority_sql("source_id", "endpoint_id") == ("endpoint_id")
+    assert profile.profile_reviewed_source_authority_sql("source_id") == ("NULL::varchar")
     assert profile.dataset_scoped_profile_source_ids_sql() == ("ARRAY[]::varchar[]")
 
 
@@ -162,17 +344,13 @@ def test_dataset_variant_spec_rejects_unreviewed_group_coordinates(
 ) -> None:
     source_spec = deepcopy(profile.load_profile_source_spec())
     if mutation == "missing_authority":
-        del source_spec["authority_ids_by_source_id"][
-            PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID
-        ]
+        del source_spec["authority_ids_by_source_id"][PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID]
     elif mutation == "different_authority":
-        source_spec["authority_ids_by_source_id"][
-            PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID
-        ] = "different-authority"
+        source_spec["authority_ids_by_source_id"][PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID] = "different-authority"
     elif mutation == "same_endpoint":
-        source_spec["dataset_scoped_endpoint_ids_by_source_id"][
-            PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID
-        ] = FLEX_ENDPOINT_ID
+        source_spec["dataset_scoped_endpoint_ids_by_source_id"][PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID] = (
+            FLEX_ENDPOINT_ID
+        )
     else:
         source_spec["dataset_scoped_variant_groups"].append(
             {
@@ -200,9 +378,7 @@ def test_dataset_variant_spec_requires_exact_group_coverage(
         source_spec["dataset_scoped_variant_groups"] = []
     else:
         source_spec["dataset_scoped_entry_ids"].append("uhc-provider-files")
-        source_spec["dataset_scoped_endpoint_ids_by_source_id"][
-            OFFICIAL_SOURCE_ID
-        ] = OFFICIAL_ENDPOINT_ID
+        source_spec["dataset_scoped_endpoint_ids_by_source_id"][OFFICIAL_SOURCE_ID] = OFFICIAL_ENDPOINT_ID
     spec_path = tmp_path / "profile-sources.json"
     spec_path.write_text(json.dumps(source_spec), encoding="utf-8")
 
@@ -265,9 +441,7 @@ def test_profile_sql_reads_flex_only_from_the_selected_dataset():
 def test_public_catalog_admits_dedicated_dataset_source_without_running_probe():
     catalog = provider_directory_sources.provider_directory_source_catalog()
     generic_probe = next(
-        item
-        for item in catalog["items"]
-        if item["canonical_base"] == "https://flex.optum.com/fhirpublic/R4"
+        item for item in catalog["items"] if item["canonical_base"] == "https://flex.optum.com/fhirpublic/R4"
     )
     assert generic_probe["runnable"] is False
     assert generic_probe["profile_enabled"] is False
@@ -297,9 +471,7 @@ def test_selection_admits_only_ready_exact_cohort_and_never_generic_probe():
     assert computed.request_projection == (
         {"source_id": UHC_FLEX_PRACTITIONER_SOURCE_ID, "dataset_id": FLEX_DATASET_ID},
     )
-    assert computed.identity_payload["pairs"][0]["source_id"] == (
-        UHC_FLEX_PRACTITIONER_SOURCE_ID
-    )
+    assert computed.identity_payload["pairs"][0]["source_id"] == (UHC_FLEX_PRACTITIONER_SOURCE_ID)
     assert computed.identity_payload["operation"] == "publish"
 
     not_ready = snapshot._computed_selection_from_rows(
@@ -384,18 +556,14 @@ def test_selection_identity_binds_projection_admission_and_operation():
     )
     changed_rows = deepcopy(_dataset_rows())
     changed_rows[0]["dataset_scoped_projection_as_of"] = "2026-08-08"
-    changed_rows[0]["publication_metadata_json"][
-        "semantic_projection_as_of"
-    ] = "2026-08-08"
+    changed_rows[0]["publication_metadata_json"]["semantic_projection_as_of"] = "2026-08-08"
     second = snapshot._computed_selection_from_rows(
         _catalog(),
         node_id="test-node",
         source_rows=_source_rows(),
         dataset_rows=changed_rows,
     )
-    assert first.identity_payload["profile_input_digest"] != (
-        second.identity_payload["profile_input_digest"]
-    )
+    assert first.identity_payload["profile_input_digest"] != (second.identity_payload["profile_input_digest"])
 
 
 def test_dataset_scoped_readiness_rejects_any_closed_field_drift():

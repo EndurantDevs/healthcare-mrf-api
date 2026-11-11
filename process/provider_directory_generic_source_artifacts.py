@@ -24,6 +24,11 @@ from process.provider_directory_cms_preparation import desired_fence_hash
 from process.provider_directory_dataset_rehydrate_pages import READ_MAX_ROWS, projected_pages
 from process.provider_directory_output_snapshot_catalog import require_output
 from process.provider_directory_output_snapshot_stage import _record_batches
+from process.provider_directory_profile_uhc_flex import (
+    ROOTED_COMBINED_VARIANT,
+    is_uhc_flex_dataset_variant_matching,
+    uhc_flex_profile_source_variant,
+)
 from process.provider_directory_projection_stage import _copy_driver
 
 _ACTIVE = ContextVar("provider_directory_rest_artifact_admission", default=None)
@@ -31,6 +36,14 @@ _TERMINAL = ContextVar("provider_directory_rest_artifact_terminal", default=None
 _SOURCE_ONLY = ContextVar("provider_directory_rest_source_publication", default=None)
 _FOLLOWUP_PREFIX = "provider_directory_dataset_followup_"
 _FOLLOWUP_IDENTITIES = ("source_id", "endpoint_id", "dataset_id", "dataset_hash", "parent_run_id")
+
+
+def _supports_overlay_source(directory, source_id, dataset_id):
+    return source_id not in {"cms-npd", directory.UHC_RETAINED_SOURCE_ID} and (
+        not directory.is_uhc_flex_profile_source(source_id)
+        or uhc_flex_profile_source_variant(source_id) == ROOTED_COMBINED_VARIANT
+        and is_uhc_flex_dataset_variant_matching(source_id, dataset_id)
+    )
 
 
 async def prepare_job_tables(directory, ctx, profile_execution, *, overlay_followup=None):
@@ -92,8 +105,7 @@ def ordinary_overlay_followup(directory, task):
         and type(markers_by_field["attempt"]) is int
         and markers_by_field["attempt"] > 0
         and task.get("source_ids") == [markers_by_field["source_id"]]
-        and markers_by_field["source_id"] not in {"cms-npd", directory.UHC_RETAINED_SOURCE_ID}
-        and not directory.is_uhc_flex_profile_source(markers_by_field["source_id"]),
+        and _supports_overlay_source(directory, markers_by_field["source_id"], markers_by_field["dataset_id"]),
         "ordinary_overlay_request_invalid",
     )
     if recovery.GENERATION_PARAM in task:
@@ -758,8 +770,7 @@ def _require_published_overlay(directory, fence, request):
         and not request.publish_corroboration
         and len(fence.datasets) == 1
         and not fence.promotion_datasets
-        and fence.datasets[0].source_id not in {"cms-npd", directory.UHC_RETAINED_SOURCE_ID}
-        and not directory.is_uhc_flex_profile_source(fence.datasets[0].source_id)
+        and _supports_overlay_source(directory, fence.datasets[0].source_id, fence.datasets[0].dataset_id)
         and fence.datasets[0].status == "published"
         and fence.datasets[0].is_current is True
         and (

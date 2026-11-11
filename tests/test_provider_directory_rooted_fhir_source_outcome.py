@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -21,16 +22,26 @@ from api.provider_directory_rooted_fhir_publication import (
     rooted_fhir_publication_summary,
 )
 from api.provider_directory_sources import provider_directory_source_catalog
+from process import provider_directory_dataset_scoped_publication as scoped
+from process import provider_directory_rooted_graph_worker as worker
 from process.provider_directory_rooted_graph_publication_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID,
 )
+from process.provider_directory_rooted_graph_worker import rooted_graph_acquisition_descriptor
 from tests.provider_directory_rooted_graph_publication_test_support import (
+    exact_current,
     readiness,
 )
 from tests.test_provider_directory_source_outcomes import _MappingResult
 
-
 PUBLISHED_AT = datetime(2026, 8, 10, 12, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def acquisition_descriptor(monkeypatch):
+    descriptor = AsyncMock(return_value=None)
+    monkeypatch.setattr(worker, "rooted_graph_acquisition_descriptor", descriptor)
+    return descriptor
 
 
 def _current_dataset(proof=None, **overrides):
@@ -88,11 +99,7 @@ def _direct_catalog():
 
 def test_static_catalog_distinguishes_unavailable_rooted_proof():
     catalog = provider_directory_source_catalog()
-    entry = next(
-        item
-        for item in catalog["items"]
-        if item["entry_id"] == ROOTED_FHIR_CATALOG_ENTRY_ID
-    )
+    entry = next(item for item in catalog["items"] if item["entry_id"] == ROOTED_FHIR_CATALOG_ENTRY_ID)
 
     assert tuple(entry["source_ids"]) == ROOTED_FHIR_CATALOG_SOURCE_IDS
     assert entry[ROOTED_FHIR_PUBLICATION_FIELD] == {
@@ -145,9 +152,7 @@ def test_rooted_summary_projects_the_closed_readiness_contract():
     assert summary == {
         "contract_id": ROOTED_FHIR_PUBLICATION_SUMMARY_CONTRACT_ID,
         "state": "closed",
-        "publication_contract_id": (
-            PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID
-        ),
+        "publication_contract_id": (PROVIDER_DIRECTORY_ROOTED_GRAPH_PUBLICATION_CONTRACT_ID),
         "publication_kind": proof.publication_kind,
         "source_id": proof.source_id,
         "endpoint_id": proof.endpoint_id,
@@ -223,11 +228,13 @@ def test_rooted_summary_reports_request_partial_without_resource_coverage(inheri
 async def test_request_partial_catalog_warns_without_changing_runnable_or_profile(monkeypatch):
     proof = _request_partial_readiness()
     monkeypatch.setattr(
-        outcomes.db, "execute",
+        outcomes.db,
+        "execute",
         AsyncMock(return_value=_MappingResult([_rooted_dataset_row(proof)])),
     )
     monkeypatch.setattr(
-        catalog_outcomes, "load_provider_directory_rooted_graph_dataset_readiness",
+        catalog_outcomes,
+        "load_provider_directory_rooted_graph_dataset_readiness",
         AsyncMock(return_value=proof),
     )
     catalog = _direct_catalog()
@@ -244,9 +251,7 @@ async def test_catalog_enrichment_joins_rooted_readiness_without_scope_drift(
     monkeypatch,
 ):
     proof = readiness()
-    database_execute = AsyncMock(
-        return_value=_MappingResult([_rooted_dataset_row(proof)])
-    )
+    database_execute = AsyncMock(return_value=_MappingResult([_rooted_dataset_row(proof)]))
     readiness_loader = AsyncMock(return_value=proof)
     monkeypatch.setattr(outcomes.db, "execute", database_execute)
     monkeypatch.setattr(
@@ -270,9 +275,7 @@ async def test_catalog_enrichment_joins_rooted_readiness_without_scope_drift(
 @pytest.mark.asyncio
 async def test_catalog_enrichment_surfaces_partial_rooted_readiness(monkeypatch):
     proof = readiness(retry_exhausted_count=8)
-    database_execute = AsyncMock(
-        return_value=_MappingResult([_rooted_dataset_row(proof)])
-    )
+    database_execute = AsyncMock(return_value=_MappingResult([_rooted_dataset_row(proof)]))
     readiness_loader = AsyncMock(return_value=proof)
     monkeypatch.setattr(outcomes.db, "execute", database_execute)
     monkeypatch.setattr(
@@ -281,9 +284,7 @@ async def test_catalog_enrichment_surfaces_partial_rooted_readiness(monkeypatch)
         readiness_loader,
     )
 
-    enriched = await catalog_outcomes.enrich_provider_directory_source_catalog(
-        _direct_catalog()
-    )
+    enriched = await catalog_outcomes.enrich_provider_directory_source_catalog(_direct_catalog())
 
     summary = enriched["items"][0][ROOTED_FHIR_PUBLICATION_FIELD]
     assert summary["state"] == "partial"
@@ -304,9 +305,7 @@ async def test_catalog_enrichment_reports_missing_rooted_publication(monkeypatch
         readiness_loader,
     )
 
-    enriched = await catalog_outcomes.enrich_provider_directory_source_catalog(
-        _direct_catalog()
-    )
+    enriched = await catalog_outcomes.enrich_provider_directory_source_catalog(_direct_catalog())
 
     assert enriched["items"][0][ROOTED_FHIR_PUBLICATION_FIELD] == {
         "contract_id": ROOTED_FHIR_PUBLICATION_SUMMARY_CONTRACT_ID,
@@ -314,3 +313,90 @@ async def test_catalog_enrichment_reports_missing_rooted_publication(monkeypatch
     }
     readiness_loader.assert_not_awaited()
     assert ROOTED_FHIR_SOURCE_ID_GROUP
+
+
+@pytest.mark.asyncio
+async def test_catalog_root_acquisition_descriptor_keeps_unpublished_directory_state(
+    monkeypatch, acquisition_descriptor
+):
+    monkeypatch.setattr(outcomes.db, "execute", AsyncMock(return_value=_MappingResult([])))
+    acquisition_descriptor.return_value = {"root_dataset_id": "synthetic-root", "root_dataset_hash": "a" * 64}
+    original = _direct_catalog()
+    enriched = await catalog_outcomes.enrich_provider_directory_source_catalog(original)
+    entry = enriched["items"][0]
+    assert entry["rooted_graph_acquisition"] == acquisition_descriptor.return_value
+    assert entry[ROOTED_FHIR_PUBLICATION_FIELD]["state"] == "not_published"
+    assert entry["runnable"] is original["items"][0]["runnable"]
+    assert enriched["catalog_digest"] == original["catalog_digest"]
+    acquisition_descriptor.assert_awaited_once_with(catalog_outcomes.db)
+
+
+@pytest.mark.asyncio
+async def test_optional_descriptor_failure_preserves_enriched_control_catalog(
+    monkeypatch, acquisition_descriptor, caplog
+):
+    from api import provider_directory_control_catalog as control_catalog
+
+    proof = readiness()
+    monkeypatch.setattr(outcomes.db, "execute", AsyncMock(return_value=_MappingResult([_rooted_dataset_row(proof)])))
+    monkeypatch.setattr(
+        catalog_outcomes, "load_provider_directory_rooted_graph_dataset_readiness", AsyncMock(return_value=proof)
+    )
+    original = _direct_catalog()
+    expected = await catalog_outcomes.enrich_provider_directory_source_catalog(original)
+    assert expected["items"][0][ROOTED_FHIR_PUBLICATION_FIELD]["state"] == "closed"
+    acquisition_descriptor.side_effect = RuntimeError("synthetic descriptor database failure")
+    monkeypatch.setattr(control_catalog, "provider_directory_source_catalog", lambda: original)
+    monkeypatch.setattr(control_catalog, "current_profile_selection_request", AsyncMock(return_value=None))
+    monkeypatch.setattr(control_catalog, "cms_serving_candidate", AsyncMock(return_value=None))
+
+    assert await control_catalog.provider_directory_control_catalog() == expected
+    assert original == _direct_catalog()
+    assert "Rooted acquisition descriptor read failed" in caplog.text
+    assert "returning static catalog" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["ready", "missing", "contract_drift", "database_failure"])
+async def test_root_descriptor_reads_exact_pair_in_readonly_transaction(monkeypatch, state):
+    from process import provider_directory_rooted_graph_current_preflight as preflight
+
+    events = []
+
+    @asynccontextmanager
+    async def transaction():
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    current = exact_current()
+
+    async def select(database, **options):
+        assert options == {"lock_rows": False}
+        assert events == ["enter", "readonly"]
+        if state == "contract_drift":
+            raise scoped.ProviderDirectoryDatasetScopedPublicationError("foreign_current")
+        if state == "database_failure":
+            raise RuntimeError("synthetic database failure")
+        return current if state == "ready" else None
+
+    database = SimpleNamespace(
+        transaction=transaction, status=AsyncMock(side_effect=lambda statement: events.append("readonly"))
+    )
+    monkeypatch.setattr(preflight, "_current_metadata", select)
+    if state == "database_failure":
+        with pytest.raises(RuntimeError, match="synthetic database failure"):
+            await rooted_graph_acquisition_descriptor(database)
+    else:
+        descriptor = await rooted_graph_acquisition_descriptor(database)
+        if state == "ready":
+            assert descriptor["root_dataset_id"] == current.dataset_id
+            assert descriptor["root_dataset_hash"] == current.dataset_hash
+            assert descriptor["root_content_proof_sha256"] == current.root_content_proof_sha256
+            assert descriptor["root_cohort_id"] == current.root_cohort_id
+        else:
+            assert descriptor is None
+    database.status.assert_awaited_once_with("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+    assert events == ["enter", "readonly", "exit"]

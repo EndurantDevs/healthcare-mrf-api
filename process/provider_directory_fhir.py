@@ -1653,6 +1653,15 @@ _ARTIFACT_SELECTION_RECEIPT_METADATA_KEYS = (
     "endpoint_collection_complete",
     "endpoint_complete",
     "admission_id",
+    "admission_contract_id",
+    "publication_acquisition_id",
+    "attempt_id",
+    "comparison_acquisition_id",
+    "acquisition_operation_key",
+    "retry_exhausted_count",
+    "request_failure_coverage",
+    "baseline_acquisition_id",
+    "baseline_run_id",
     "operation_key",
     "publication_contract_id",
     "publication_kind",
@@ -1727,27 +1736,7 @@ IMMUTABLE_ENDPOINT_DATASET_STATUSES = (
     ENDPOINT_DATASET_VERIFICATION_BASELINE,
     ENDPOINT_DATASET_VERIFICATION_MISMATCH,
 )
-FHIR_CONTINUATION_QUERY_NAMES = frozenset(
-    {
-        "_continuationtoken",
-        "_cursor",
-        "_getpages",
-        "_getpagesid",
-        "_getpagesoffset",
-        "_offset",
-        "_page",
-        "_page_token",
-        "_searchid",
-        "_skip",
-        "cursor",
-        "cursormark",
-        "ct",
-        "nexttoken",
-        "page",
-        "pagetoken",
-        "starting_after",
-    }
-)
+FHIR_CONTINUATION_QUERY_NAMES = source_selection.FHIR_CONTINUATION_QUERY_NAMES
 
 
 @dataclass(frozen=True)
@@ -16787,7 +16776,7 @@ def _artifact_flex_retained_resources(
     if not (
         dataset_scoped_ready
         and expected_resources is not None
-        and selected_resources == expected_resources
+        and selected_resources == tuple(sorted(expected_resources))
         and is_uhc_flex_publication_metadata_valid(
             publication_metadata,
             dataset_id=dataset_id,
@@ -48417,14 +48406,7 @@ def _pagination_url_identity(url: str) -> str:
 
 
 def _has_fhir_continuation_query(url: str) -> bool:
-    query_names = {
-        name.lower()
-        for name, _value in urllib.parse.parse_qsl(
-            urllib.parse.urlsplit(url).query,
-            keep_blank_values=True,
-        )
-    }
-    return bool(FHIR_CONTINUATION_QUERY_NAMES.intersection(query_names))
+    return source_selection.has_fhir_continuation_query(url)
 
 
 def _is_humana_continuation_token_url(url: str) -> bool:
@@ -69402,6 +69384,10 @@ async def process_provider_directory_fhir_data(
     task: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run provider-directory discovery, import, and publication."""
+    if "rooted_graph" in (task or {}):
+        from process.provider_directory_rooted_graph_worker import process_rooted_graph_task
+
+        return await process_rooted_graph_task(sys.modules[__name__], ctx, task)
     from process.provider_directory_cms_source_runtime import CMSRegistrySourceInvocation
 
     registry_source_invocation = CMSRegistrySourceInvocation.from_context(ctx, task or {})

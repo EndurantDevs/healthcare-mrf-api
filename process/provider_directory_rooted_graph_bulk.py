@@ -14,7 +14,7 @@ from process.provider_directory_projection_stage import _copy_driver
 from process.provider_directory_rooted_graph_store_contract import (
     ProviderDirectoryRootedGraphStoreError,
 )
-from process.provider_directory_rooted_graph_store_support import function_ref, row_fields
+from process.provider_directory_rooted_graph_store_support import function_ref, rooted_graph_transaction, row_fields
 
 _RESOURCE_COLUMNS = (
     "acquisition_id",
@@ -123,7 +123,7 @@ _WORK_COLUMNS = (
 
 async def admit_work_specs(database, acquisition_id, work_specs, *, action):
     """Copy and validate a complete derived frontier within the current transaction."""
-    async with database.transaction() as transaction:
+    async with rooted_graph_transaction(database) as transaction:
         driver = await _copy_driver(transaction)
         await database.scalar(f"SELECT {function_ref('prepare_provider_directory_rooted_graph_work_stage')}()")
         await _copy_stage(
@@ -149,7 +149,7 @@ async def admit_work_specs(database, acquisition_id, work_specs, *, action):
 
 async def copy_initial_root_work(database, acquisition_id):
     """Land bounded canonical source pages before one set admission and index build."""
-    async with database.transaction() as transaction:
+    async with rooted_graph_transaction(database) as transaction:
         prepared = await database.scalar(
             f"SELECT {function_ref('initialize_provider_directory_rooted_graph_work')}(:acquisition_id)",
             acquisition_id=acquisition_id,

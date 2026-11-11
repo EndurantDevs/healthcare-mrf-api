@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import re
+from contextlib import asynccontextmanager
 from typing import Any
 
 from process.provider_directory_rooted_graph_store_contract import (
@@ -13,7 +14,6 @@ from process.provider_directory_rooted_graph_store_contract import (
     ProviderDirectoryRootedGraphStoreError,
     ProviderDirectoryRootedGraphWorkSpec,
 )
-
 
 ACQUISITION_TABLE = "provider_directory_rooted_graph_acquisition"
 WORK_TABLE = "provider_directory_rooted_graph_work"
@@ -31,6 +31,22 @@ ACQUISITION_SETTING = "healthporta.rooted_graph_acquisition"
 LEASE_SETTING = "healthporta.rooted_graph_lease"
 
 _SCHEMA_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+@asynccontextmanager
+async def rooted_graph_transaction(database):
+    """Keep issued worker writes on its physical publisher and retain manual custody."""
+    from process.provider_directory_generic_source_policy import is_source_storage_required, source_transaction
+    from process.provider_directory_rooted_graph_source_runtime import current_rooted_graph_runtime
+
+    runtime = current_rooted_graph_runtime(database)
+    if runtime is not None:
+        async with runtime.transaction(database) as transaction:
+            yield transaction.session
+        return
+    transaction = source_transaction(database) if is_source_storage_required() else database.transaction()
+    async with transaction as session:
+        yield session
 
 
 def schema_name() -> str:
@@ -65,9 +81,7 @@ def row_fields(database_row: Any) -> dict[str, Any]:
 
     if database_row is None:
         return {}
-    mapping = (
-        database_row._mapping if hasattr(database_row, "_mapping") else database_row
-    )
+    mapping = database_row._mapping if hasattr(database_row, "_mapping") else database_row
     return dict(mapping)
 
 
@@ -128,7 +142,9 @@ async def insert_work_spec(
     from process.provider_directory_rooted_graph_bulk import admit_work_specs
 
     return await admit_work_specs(
-        database, acquisition_id, (spec,),
+        database,
+        acquisition_id,
+        (spec,),
         action="census" if spec.kind == "full_insurance_plan_census" else "derive",
     )
 

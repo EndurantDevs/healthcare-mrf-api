@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from contextlib import asynccontextmanager
 from dataclasses import fields
@@ -215,22 +216,32 @@ async def test_orphan_and_header_insert_boundaries() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dataset_hash_streams_the_existing_canonical_bytes_and_default_order() -> None:
+    identity = dataset_identity()
+    first_by_field = {"resource_type": "Practitioner", "resource_id": "id-1", "payload_hash": "a" * 64}
+    second_by_field = {"resource_type": "Practitioner", "resource_id": "id.2", "payload_hash": "b" * 64}
+    expected_bytes = b"\n".join(
+        json.dumps(tuple(row.values()), separators=(",", ":")).encode() for row in (first_by_field, second_by_field)
+    )
+    database = _ScriptedDatabase(rows=([first_by_field], [second_by_field], []))
+    assert await store._dataset_hash(database, identity.dataset_id) == hashlib.sha256(expected_bytes).hexdigest()
+    assert all("COLLATE" not in statement and "string_agg" not in statement for _, statement, _ in database.calls)
+    assert database.calls[0][2] == {"dataset_id": identity.dataset_id, "batch_size": 4096}
+    assert database.calls[1][2]["cursor_id"] == "id-1"
+    assert database.calls[2][2]["cursor_id"] == "id.2"
+    assert await store._dataset_hash(_ScriptedDatabase(rows=([],)), identity.dataset_id) == hashlib.sha256().hexdigest()
+    with pytest.raises(ProviderDirectoryRootedGraphPublicationError):
+        await store._dataset_hash(_ScriptedDatabase(rows=([{"resource_type": None}],)), identity.dataset_id)
+
+
+@pytest.mark.asyncio
 async def test_dataset_hash_and_atomic_status_transitions(monkeypatch) -> None:
     identity = dataset_identity()
-    assert (
-        await store._dataset_hash(
-            _ScriptedDatabase(scalars=("a" * 64,)),
-            identity.dataset_id,
-        )
-        == "a" * 64
-    )
-    for invalid_hash in (None, "bad"):
-        with pytest.raises(ProviderDirectoryRootedGraphPublicationError):
-            await store._dataset_hash(
-                _ScriptedDatabase(scalars=(invalid_hash,)),
-                identity.dataset_id,
-            )
 
+    async def dataset_hash(*_arguments):
+        return "b" * 64
+
+    monkeypatch.setattr(store, "_dataset_hash", dataset_hash)
     superseded_currents: list[object] = []
 
     async def supersede(_database, previous):
