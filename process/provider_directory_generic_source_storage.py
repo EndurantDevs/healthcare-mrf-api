@@ -779,24 +779,34 @@ def _validated_transition_storage(policy, old_storage, new_storage):
 
 
 def _is_empty_vsp_checkpoint_failure(header, candidate_by_field, identity_by_field, expected_counts, new_storage):
-    """Recognize an empty original VSP header, including a rearmed root."""
+    """Recognize exact VSP failures that precede capture or normalized input."""
     failure_metadata = _json(header["publication_metadata_json"])
     identity_metadata = candidate_by_field["identity"]["metadata"]
     root_run_id = identity_by_field["acquisition_root_run_id"]
     return (
         header.get("resource_count") == 0
-        and header["import_run_id"] == root_run_id
+        and type(failure_metadata) is dict
         and (
             (
-                identity_by_field["failed_run_id"] == root_run_id
-                and (header["status"] == "failed" or candidate_by_field.get("storage") == new_storage)
+                header["import_run_id"] == root_run_id
+                and failure_metadata.get("error") == "vsp_prepared_candidate_required"
+                and (
+                    (
+                        identity_by_field["failed_run_id"] == root_run_id
+                        and (header["status"] == "failed" or candidate_by_field.get("storage") == new_storage)
+                    )
+                    or (identity_by_field["failed_run_id"] != root_run_id and header["status"] == "acquiring")
+                )
             )
-            or (identity_by_field["failed_run_id"] != root_run_id and header["status"] == "acquiring")
+            or (
+                header["import_run_id"] == identity_by_field["failed_run_id"] != root_run_id
+                and failure_metadata.get("error") == "vsp_artifact_root_invalid"
+                and (header["status"] == "failed" or candidate_by_field.get("storage") == new_storage)
+                and candidate_by_field["relationship_sha256"] is None
+            )
         )
         and identity_metadata.get("source_ids") == [VSP_SOURCE_ID]
-        and type(failure_metadata) is dict
-        and failure_metadata.get("error") == "vsp_prepared_candidate_required"
-        and all(failure_metadata.get(name) == value for name, value in identity_metadata.items())
+        and all(failure_metadata.get(name) == expected_value for name, expected_value in identity_metadata.items())
         and expected_counts == dict.fromkeys(VSP_RESOURCE_TYPES, 0)
         and candidate_by_field["ordinal"] == 0
         and candidate_by_field["resets"] in ({}, {"*": 0})
@@ -885,11 +895,15 @@ async def _locked_transition_candidate(
 
 
 async def _verify_transition_run(
-    connection, catalog_schema, identity_by_field, source_ids, *, has_changed_header_owner
+    connection, catalog_schema, identity_by_field, source_ids, *, has_changed_header_owner, is_empty_vsp_failure=False
 ):
     """Require the exact latest stopped run and no active same-root run."""
     root_run_id = identity_by_field["acquisition_root_run_id"]
-    failure_field = ",error::jsonb->>'message' AS error_message" if has_changed_header_owner else ""
+    failed_run_id = identity_by_field["failed_run_id"]
+    is_vsp_artifact_failure = is_empty_vsp_failure and not has_changed_header_owner and failed_run_id != root_run_id
+    failure_field = (
+        ",error::jsonb->>'message' AS error_message" if has_changed_header_owner or is_vsp_artifact_failure else ""
+    )
     run_rows = await connection.fetch(
         "SELECT run_id,status,finished_at,retry_of_run_id,created_at,"
         "params::jsonb->>'provider_directory_pagination_root_run_id' AS root_run_id,"
@@ -903,15 +917,41 @@ async def _verify_transition_run(
         root_run_id,
     )
     run_ids = {run_record["run_id"] for run_record in run_rows}
-    failed_run_id = identity_by_field["failed_run_id"]
     _verify_transition_run_rows(run_rows, run_ids, root_run_id, failed_run_id, source_ids)
+    ancestor_run_ids = _transition_run_ancestors(run_rows, root_run_id, failed_run_id)
     if has_changed_header_owner:
         _verify_rearmed_vsp_child(run_rows, root_run_id)
+    elif is_vsp_artifact_failure:
+        _verify_vsp_pre_capture_lineage(run_rows, root_run_id, ancestor_run_ids)
     return {
         "lineage_run_ids": sorted(run_ids),
-        "ancestor_run_ids": _transition_run_ancestors(run_rows, root_run_id, failed_run_id),
+        "ancestor_run_ids": ancestor_run_ids,
         "status": run_rows[0]["status"],
     }
+
+
+def _verify_vsp_pre_capture_lineage(run_rows, root_run_id, ancestor_run_ids):
+    """Allow capture creation only when every stopped ancestor failed before capture."""
+    _require(
+        len(run_rows) == len(ancestor_run_ids)
+        and run_rows[0].get("error_message") == "vsp_artifact_root_invalid"
+        and all(
+            run_record["status"] == "failed"
+            and run_record["finished_at"] is not None
+            and (
+                run_record.get("error_message") == "vsp_prepared_candidate_required"
+                if run_record["run_id"] == root_run_id
+                else run_record.get("error_message") == "vsp_artifact_root_invalid"
+                or (
+                    run_record["retry_of_run_id"] == root_run_id
+                    and run_record.get("error_message")
+                    == "provider_directory_generic_source_isolated_relation_override_changed"
+                )
+            )
+            for run_record in run_rows
+        ),
+        "transition_run_changed",
+    )
 
 
 def _verify_transition_run_rows(run_rows, run_ids, root_run_id, failed_run_id, source_ids):
@@ -1363,6 +1403,7 @@ async def transition_isolated_loading_candidate_storage(
         identity_by_field,
         candidate_by_field["identity"]["metadata"]["source_ids"],
         has_changed_header_owner=has_changed_header_owner,
+        is_empty_vsp_failure=is_empty_vsp_failure,
     )
     _require(not is_empty_vsp_failure or run_evidence_by_field["status"] == "failed", "transition_checkpoint_changed")
     await _verify_transition_inputs(

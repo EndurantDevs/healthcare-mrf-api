@@ -109,15 +109,18 @@ def is_failed_capture_retry(existing_by_field, checkpoint):
 
 
 def is_rearmed_capture_retry(existing_by_field, checkpoint):
-    """Recognize the root header rearmed after the original pre-capture failure."""
+    """Recognize a header rearmed after an exact failure before capture creation."""
     metadata = existing_by_field.get("publication_metadata_json")
-    return (
-        isinstance(metadata, dict)
-        and metadata.get("error") == "vsp_prepared_candidate_required"
-        and _empty_capture_retry_matches(
-            existing_by_field, checkpoint, getattr(checkpoint, "acquisition_root_run_id", None), "acquiring"
-        )
-    )
+    if not isinstance(metadata, dict) or checkpoint is None:
+        return False
+    error = metadata.get("error")
+    if error == "vsp_prepared_candidate_required":
+        previous_run_id = checkpoint.acquisition_root_run_id
+    elif error == "vsp_artifact_root_invalid" and checkpoint.retry_of_run_id != checkpoint.acquisition_root_run_id:
+        previous_run_id = checkpoint.retry_of_run_id
+    else:
+        return False
+    return _empty_capture_retry_matches(existing_by_field, checkpoint, previous_run_id, "acquiring")
 
 
 def _empty_capture_retry_matches(existing_by_field, checkpoint, previous_run_id, status):

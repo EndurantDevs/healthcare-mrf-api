@@ -410,6 +410,161 @@ async def test_rearmed_vsp_root_transitions_after_exact_pre_capture_child_failur
     assert len(case.writes) == 1
 
 
+def _empty_vsp_artifact_failure(case):
+    """Retain the original root, a preattachment child and the latest attached child."""
+    candidate = case.header["candidate_storage_json"]
+    candidate.update(ordinal=0, resets={"*": 0})
+    metadata = candidate["identity"]["metadata"]
+    metadata.update(
+        source_ids=[SOURCE_ID], selected_resources=list(RESOURCE_TYPES), expected_resources=list(RESOURCE_TYPES)
+    )
+    case.runs[0]["error_message"] = "provider_directory_generic_source_isolated_relation_override_changed"
+    case.runs[-1]["root_run_id"] = None
+    case.runs[-1]["error_message"] = "vsp_prepared_candidate_required"
+    case.runs.insert(0, {**case.runs[0], "run_id": "run_" + "c" * 32, "retry_of_run_id": FAILED})
+    case.runs[0]["error_message"] = "vsp_artifact_root_invalid"
+    for run in case.runs:
+        run["source_ids"] = [SOURCE_ID]
+    case.header.update(
+        status="failed",
+        resource_count=0,
+        import_run_id=case.runs[0]["run_id"],
+        publication_metadata_json={**deepcopy(metadata), "error": "vsp_artifact_root_invalid"},
+    )
+    case.checkpoints.clear()
+    case.input_rows.clear()
+    return case.runs[0]["run_id"]
+
+
+@pytest.mark.asyncio
+async def test_vsp_artifact_failure_rearms_only_the_latest_attached_child_and_replays(case):
+    failed_run_id = _empty_vsp_artifact_failure(case)
+    before = deepcopy(case.header)
+    runs = deepcopy(case.runs)
+    counts = dict.fromkeys(RESOURCE_TYPES, 0)
+    result = await _transition(case, counts, stopped_run_id=failed_run_id)
+    assert result["rows"] == 0 and result["lineage_run_ids"] == sorted(run["run_id"] for run in runs)
+    assert case.header == {
+        **before,
+        "status": "acquiring",
+        "candidate_storage_json": {**before["candidate_storage_json"], "storage": case.new},
+    }
+    assert (await _transition(case, counts, stopped_run_id=failed_run_id))["already_applied"] is True
+    assert len(case.writes) == 1 and case.runs == runs
+    assert not case.checkpoints and not case.bulk_checkpoints and not case.input_rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "drift",
+    ["capture", "root_capture", "unknown", "unfinished", "canceled", "sibling", "preparation", "preattachment"],
+)
+async def test_vsp_artifact_failure_rejects_unproven_lineage(case, drift):
+    failed_run_id = _empty_vsp_artifact_failure(case)
+    ancestor = case.runs[1]
+    match drift:
+        case "capture" | "root_capture":
+            case.runs[-1 if drift == "root_capture" else 1]["error_message"] = "vsp_http_status"
+        case "unknown":
+            ancestor["error_message"] = None
+        case "unfinished":
+            ancestor["finished_at"] = None
+        case "canceled":
+            ancestor["status"] = "canceled"
+        case "preparation":
+            ancestor["error_message"] = "vsp_prepared_candidate_required"
+        case "sibling" | "preattachment":
+            other_run_id = "run_" + "d" * 32
+            case.runs.insert(2, {**ancestor, "run_id": other_run_id, "error_message": "vsp_artifact_root_invalid"})
+            if drift == "preattachment":
+                ancestor["retry_of_run_id"] = other_run_id
+    before = deepcopy((case.header, case.runs, case.input_rows, case.checkpoints, case.bulk_checkpoints))
+    with pytest.raises(GenericCandidateError, match="^provider_directory_generic_source_transition_run_changed$"):
+        await _transition(case, dict.fromkeys(RESOURCE_TYPES, 0), stopped_run_id=failed_run_id)
+    assert not case.writes
+    assert (case.header, case.runs, case.input_rows, case.checkpoints, case.bulk_checkpoints) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "header_error",
+        "run_error",
+        "owner",
+        "endpoint",
+        "root",
+        "source",
+        "metadata",
+        "producer",
+        "acquiring",
+        "canceled",
+        "running",
+        "unfinished",
+        "latest",
+        "parent",
+        "ordinal",
+        "reset",
+        "relationship",
+        "header_rows",
+        "input",
+        "checkpoint",
+        "bulk_checkpoint",
+        "witness",
+    ],
+)
+async def test_vsp_artifact_failure_refuses_changed_failure_identity_or_retained_state(case, drift):
+    failed_run_id = _empty_vsp_artifact_failure(case)
+    candidate = case.header["candidate_storage_json"]
+    match drift:
+        case "header_error":
+            case.header["publication_metadata_json"]["error"] = "vsp_http_status"
+        case "run_error":
+            case.runs[0]["error_message"] = "vsp_http_status"
+        case "owner":
+            case.header["import_run_id"] = FAILED
+        case "endpoint" | "root":
+            case.header["endpoint_id" if drift == "endpoint" else "acquisition_root_run_id"] = "other"
+        case "source":
+            candidate["identity"]["metadata"]["source_ids"] = ["other-source"]
+        case "metadata":
+            case.header["publication_metadata_json"]["resource_hash_contract"] = "changed"
+        case "producer":
+            candidate["storage"] = {**case.old, "producer": ["d" * 40, "sha256:" + "e" * 64]}
+        case "acquiring":
+            case.header["status"] = "acquiring"
+        case "canceled" | "running":
+            case.runs[0]["status"] = drift
+        case "unfinished":
+            case.runs[0]["finished_at"] = None
+        case "latest":
+            case.runs.insert(0, {**case.runs[0], "run_id": "run_" + "d" * 32})
+        case "parent":
+            case.runs[0]["retry_of_run_id"] = "run_" + "d" * 32
+        case "ordinal":
+            candidate["ordinal"] = 1
+        case "reset":
+            candidate["resets"] = {"Organization": 0}
+        case "relationship":
+            candidate["relationship_sha256"] = "d" * 64
+        case "header_rows":
+            case.header["resource_count"] = 1
+        case "input":
+            case.input_rows.append(dict(dataset_id=DATASET, resource_type="Organization", total=1, active=1))
+        case "checkpoint":
+            case.checkpoints.append({})
+        case "bulk_checkpoint":
+            case.bulk_checkpoints.append({})
+        case "witness":
+            case.connection.fetchval.side_effect = lambda sql, *_args: (
+                "serializable" if sql == "SHOW transaction_isolation" else not sql.startswith("SELECT NOT EXISTS")
+            )
+    before = deepcopy(case.header)
+    with pytest.raises(GenericCandidateError):
+        await _transition(case, dict.fromkeys(RESOURCE_TYPES, 0), stopped_run_id=failed_run_id)
+    assert not case.writes and case.header == before
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "fixture_name,status", [("case", "failed"), ("bulk_case", "failed"), ("bulk_case", "canceled")]

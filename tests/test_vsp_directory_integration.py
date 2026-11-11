@@ -4,6 +4,7 @@
 import importlib
 import json
 from contextlib import asynccontextmanager, nullcontext
+from dataclasses import replace
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -176,23 +177,30 @@ async def _vsp_retry_candidate(monkeypatch, source_record, context, header_by_fi
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("rearmed", [False, True])
-async def test_vsp_retry_reopens_verified_detached_inputs_without_reset(monkeypatch, source_record, rearmed):
+@pytest.mark.parametrize("rearmed", [None, "vsp_prepared_candidate_required", "vsp_artifact_root_invalid"])
+async def test_vsp_retry_reopens_verified_detached_inputs_without_reset(
+    monkeypatch, source_record, rearmed, tmp_path, completed_capture
+):
     context = source_record["_pagination_checkpoint_context"]
+    if rearmed == "vsp_artifact_root_invalid":
+        context = replace(context, retry_of_run_id="failed-child-example")
+        source_record["_pagination_checkpoint_context"] = context
     header_by_field = {
         "endpoint_id": context.endpoint_id,
         "dataset_id": context.dataset_id,
         "acquisition_root_run_id": context.acquisition_root_run_id,
-        "import_run_id": context.acquisition_root_run_id if rearmed else context.retry_of_run_id,
+        "import_run_id": (
+            context.acquisition_root_run_id if rearmed == "vsp_prepared_candidate_required" else context.retry_of_run_id
+        ),
         "resource_count": 0,
         "is_current": False,
         "status": directory.ENDPOINT_DATASET_ACQUIRING if rearmed else directory.ENDPOINT_DATASET_FAILED,
     }
     candidate = await _vsp_retry_candidate(monkeypatch, source_record, context, header_by_field)
-    assert candidate.checkpoint_context.require_retained_vsp_capture is not rearmed
+    assert candidate.checkpoint_context.require_retained_vsp_capture is (not rearmed)
     header_by_field["publication_metadata_json"] = directory._endpoint_dataset_candidate_metadata(candidate)
     if rearmed:
-        header_by_field["publication_metadata_json"]["error"] = "vsp_prepared_candidate_required"
+        header_by_field["publication_metadata_json"]["error"] = rearmed
     connection = SimpleNamespace(first=AsyncMock(return_value=header_by_field))
     monkeypatch.setattr(source_policy, "source_transaction", lambda _db: nullcontext())
     monkeypatch.setattr(source_adapters, "require_source_transaction", Mock())
@@ -217,6 +225,92 @@ async def test_vsp_retry_reopens_verified_detached_inputs_without_reset(monkeypa
     with pytest.raises(RuntimeError, match="^provider_directory_endpoint_dataset_candidate_stale$"):
         await directory._ensure_endpoint_dataset_candidate(candidate)
     upsert.assert_awaited_once()
+    await _assert_capture_retry_boundary(monkeypatch, source_record, candidate, tmp_path, completed_capture)
+
+
+async def _assert_capture_retry_boundary(monkeypatch, source_record, candidate, tmp_path, completed_capture):
+    context = candidate.checkpoint_context
+    run_capture = AsyncMock(return_value=completed_capture)
+    monkeypatch.setattr(capture_api, "configured_root", lambda: tmp_path)
+    monkeypatch.setattr(capture_api.VSPCapture, "run", run_capture)
+    capture_by_argument = dict(
+        source_record=source_record,
+        root_run_id=context.acquisition_root_run_id,
+        proxy_binding=None,
+        progress_callback=None,
+        cancel_check=None,
+        require_retained=context.require_retained_vsp_capture,
+    )
+    if not context.require_retained_vsp_capture:
+        assert await capture_api.capture_vsp_directory(**capture_by_argument) is completed_capture
+        run_capture.assert_awaited_once()
+        (identity,) = tmp_path.glob("*/identity.json")
+        assert json.loads(identity.read_text())["root_run_id"] == context.acquisition_root_run_id
+    else:
+        with pytest.raises(VSPDirectoryError, match="^vsp_retained_capture_required$"):
+            await capture_api.capture_vsp_directory(**capture_by_argument)
+        run_capture.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", ["vsp_artifact_root_invalid", "vsp_http_status", "vsp_capture_binding_changed"])
+async def test_failed_vsp_retry_requires_retained_capture_until_rearmed(monkeypatch, source_record, error):
+    context = source_record["_pagination_checkpoint_context"]
+    header_by_field = {
+        "endpoint_id": context.endpoint_id,
+        "acquisition_root_run_id": context.acquisition_root_run_id,
+        "import_run_id": context.retry_of_run_id,
+        "status": "failed",
+        "resource_count": 0,
+        "is_current": False,
+        "publication_metadata_json": {"error": error},
+    }
+    candidate = await _vsp_retry_candidate(monkeypatch, source_record, context, header_by_field)
+    assert candidate.checkpoint_context.require_retained_vsp_capture is True
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "missing_metadata",
+        "invalid_metadata",
+        "missing_checkpoint",
+        "missing_error",
+        "capture_error",
+        "unknown_error",
+        "direct_root",
+        "published",
+    ],
+)
+def test_rearmed_capture_rejects_unproven_failure(source_record, drift):
+    checkpoint = source_record["_pagination_checkpoint_context"]
+    header_by_field = {
+        "acquisition_root_run_id": checkpoint.acquisition_root_run_id,
+        "import_run_id": checkpoint.acquisition_root_run_id,
+        "status": "acquiring",
+        "resource_count": 0,
+        "is_current": False,
+        "publication_metadata_json": {"error": "vsp_prepared_candidate_required"},
+    }
+    assert adapter.is_rearmed_capture_retry(header_by_field, checkpoint) is True
+    match drift:
+        case "missing_metadata":
+            del header_by_field["publication_metadata_json"]
+        case "invalid_metadata":
+            header_by_field["publication_metadata_json"] = []
+        case "missing_checkpoint":
+            checkpoint = None
+        case "missing_error":
+            header_by_field["publication_metadata_json"] = {}
+        case "capture_error" | "unknown_error" | "direct_root":
+            header_by_field["publication_metadata_json"]["error"] = {
+                "capture_error": "vsp_http_status",
+                "unknown_error": "unrecognized_failure",
+                "direct_root": "vsp_artifact_root_invalid",
+            }[drift]
+        case "published":
+            header_by_field["published_at"] = datetime(2026, 1, 1)
+    assert adapter.is_rearmed_capture_retry(header_by_field, checkpoint) is False
 
 
 @pytest.mark.asyncio
