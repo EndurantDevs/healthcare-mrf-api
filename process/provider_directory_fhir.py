@@ -418,11 +418,11 @@ from process.provider_directory_resource_hash import (
     is_resource_payload_hash_match,
     is_semantic_resource_hash_contract,
     merge_practitioner_semantic_payloads,
-    merge_semantic_resource_payloads,
     persisted_resource_hash_contract,
     resource_content_hash_payload,
     resource_payload_sha256_for_contract,
 )
+from process.provider_directory_role_merge import merge_semantic_resource_payloads, merged_role_rows
 from process.provider_directory_source_checkpoint_control import (
     RELEASE_BULK_CHECKPOINT_SQL,
     assert_bulk_checkpoint_guard_owner,
@@ -38928,9 +38928,7 @@ def _endpoint_dataset_resource_rows(
     if resource_hash_contract not in RESOURCE_HASH_CONTRACTS:
         raise ValueError("provider_directory_resource_hash_contract_invalid")
     payload_by_resource_id, acquired_hash_by_resource_id = _dataset_payloads_by_resource_id(
-        model,
-        resource_rows,
-        resource_hash_contract,
+        model, resource_rows, resource_hash_contract
     )
     resource_by_id: dict[str, dict[str, Any]] = {}
     for resource_id, payload_by_field in payload_by_resource_id.items():
@@ -56472,6 +56470,7 @@ async def _persist_endpoint_dataset_rows(
         prepared_rows = _endpoint_dataset_resource_rows(
             model, resource_rows, dataset_id=dataset_id, resource_hash_contract=resource_hash_contract
         )
+        prepared_rows = merged_role_rows(prepared_rows, resource_rows, resource_hash_contract)
         if not prepared_rows:
             return prepared_rows
         _assert_practitioner_semantic_projection_as_of(

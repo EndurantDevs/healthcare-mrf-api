@@ -36,6 +36,7 @@ from process.provider_directory_resource_hash import (
     practitioner_semantic_hash_components,
     resource_payload_sha256_for_contract,
 )
+from process.provider_directory_role_merge import composed_merged_role_sha256, merged_role_hash_components
 
 PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID = "healthporta.provider-directory.content-proof.v1"
 PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID = "healthporta.provider-directory.content-proof.v2"
@@ -213,6 +214,9 @@ def _semantic_proof_hash_fields(
             list(organization_primary_name_hashes(payload_by_field)),
             organization_semantic_payload_sha256(payload_by_field),
         )
+    role_components = merged_role_hash_components(payload_by_field) if resource_type == "PractitionerRole" else None
+    if role_components is not None:
+        return role_components[0], role_components[1], None, role_components[2]
     payload_hash = resource_payload_sha256_for_contract(
         payload_by_field,
         resource_hash_contract,
@@ -896,6 +900,9 @@ def _is_semantic_record_hash_valid(record_fields: list[Any]) -> bool:
             and set(record_fields[10]).issubset(record_fields[9])
             and record_fields[2] == expected_hash
         )
+    if record_fields[0] == "PractitionerRole" and record_fields[8] == record_fields[1]:
+        # A merged role is identified by its own base commitment.
+        return record_fields[2] == composed_merged_role_sha256(record_fields[8], record_fields[9])
     return record_fields[8] == record_fields[2] and record_fields[9] == []
 
 
@@ -1044,7 +1051,7 @@ def _has_incompatible_semantic_records(
     return bool(
         any(
             not (
-                (len(proof_record_fields) == 10 and proof_record_fields[0] == "Practitioner")
+                (len(proof_record_fields) == 10 and proof_record_fields[0] in {"Practitioner", "PractitionerRole"})
                 or (
                     len(proof_record_fields) == 11
                     and proof_record_fields[0] == "Organization"
@@ -1071,6 +1078,8 @@ def _composed_semantic_record_hash(
             base_hash,
             name_hashes,
         )
+    if resource_type == "PractitionerRole":
+        return composed_merged_role_sha256(base_hash, name_hashes)
     return composed_practitioner_semantic_sha256(base_hash, name_hashes)
 
 
