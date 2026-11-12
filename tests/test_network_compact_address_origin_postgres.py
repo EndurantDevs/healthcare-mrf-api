@@ -970,7 +970,29 @@ async def test_indexed_api_pin_refuses_native_drift_before_rows(indexed_api_db, 
     assert (await _api_rows(held, None))[0] == held.current
 
 
-@pytest.mark.parametrize("failure", ["permission", "missing_edge", "replacement"])
+async def test_published_request_serves_a_copied_candidate_table_by_name(indexed_api_db):
+    """A copied published table has another OID; its candidate-schema name identifies it."""
+    held = indexed_api_db
+    reader = held.fixture.roles["reader"]
+    namespace = '"' + held.current.compact_layout.artifacts[0].schema_name + '"'
+    expected = await _api_rows(held, None)
+    await held.fixture.connection.execute(
+        f"ALTER TABLE {namespace}.network_office_edge RENAME TO original_edge_fixture; "
+        f"CREATE TABLE {namespace}.network_office_edge (LIKE {namespace}.original_edge_fixture INCLUDING ALL); "
+        f"INSERT INTO {namespace}.network_office_edge SELECT * FROM {namespace}.original_edge_fixture; "
+        f'GRANT SELECT ON {namespace}.network_office_edge TO "{reader}"'
+    )
+    try:
+        assert await _api_rows(held, None) == expected
+    finally:
+        await held.fixture.connection.execute(
+            f"DROP TABLE {namespace}.network_office_edge; "
+            f"ALTER TABLE {namespace}.original_edge_fixture RENAME TO network_office_edge"
+        )
+    assert await _api_rows(held, None) == expected
+
+
+@pytest.mark.parametrize("failure", ["permission", "missing_edge"])
 async def test_published_request_reports_native_access_and_missing_table_errors(indexed_api_db, failure):
     from sanic.exceptions import ServiceUnavailable
 
@@ -989,19 +1011,11 @@ async def test_published_request_reports_native_access_and_missing_table_errors(
         change = f"ALTER TABLE {namespace}.network_office_edge RENAME TO missing_edge_fixture"
         restore = f"ALTER TABLE {namespace}.missing_edge_fixture RENAME TO network_office_edge"
         expected = "42P01"
-        if failure == "replacement":
-            change += (
-                f"; CREATE TABLE {namespace}.network_office_edge (LIKE {namespace}.missing_edge_fixture INCLUDING ALL)"
-            )
-            change += f'; GRANT SELECT ON {namespace}.network_office_edge TO "{fixture.roles["reader"]}"'
-            restore = f"DROP TABLE {namespace}.network_office_edge; " + restore
-            expected = None
     await fixture.connection.execute(change)
     try:
         with pytest.raises(ServiceUnavailable) as error:
             await _api_rows(held, None)
-        if expected is not None:
-            assert postgres_sqlstate(error.value.original) == expected
+        assert postgres_sqlstate(error.value.original) == expected
     finally:
         await fixture.connection.execute(restore)
     assert (await _api_rows(held, None))[0] == held.current
