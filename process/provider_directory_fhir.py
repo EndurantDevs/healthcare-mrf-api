@@ -469,6 +469,8 @@ from process.provider_directory_time_partition import (
     WindowPass,
     fingerprint_resource,
     parse_utc_instant,
+    partition_window_concurrency,
+    partition_window_slots,
     run_partition_passes,
 )
 from process.provider_directory_time_partition import (
@@ -51836,6 +51838,7 @@ async def _fetch_partition_plan_passes(
         partial(_fetch_partition_window_for_pass, source_record, resource_type, config, state, fetch_options),
         partial(_persist_fetched_partition_pass, source_record, resource_type, model, config, state, fetch_options),
         concurrency=fetch_options.window_concurrency,
+        window_slots=partition_window_slots(sys.modules[__name__], source_record, state.start_url),
     )
 
 
@@ -57393,11 +57396,7 @@ def _source_resource_scan_concurrency(source_record: dict[str, Any]) -> int:
 
 
 def _partition_window_concurrency(source_record: dict[str, Any], request_url: str) -> int:
-    """Share the bounded run transport without enabling credentialed windows."""
-    session = _rest_page_prefetch_session(source_record, request_url)
-    if session is None or session.connector is None:
-        return 1
-    return max(1, min(2, session.connector.limit_per_host, _source_resource_scan_concurrency(source_record)))
+    return partition_window_concurrency(sys.modules[__name__], source_record, request_url)
 
 
 def _is_bool_or_default(value: Any, default: bool) -> bool:

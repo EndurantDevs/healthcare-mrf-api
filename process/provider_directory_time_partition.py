@@ -126,54 +126,146 @@ class TimeWindow:
             raise PartitionPlanError("a window must have start < end")
 
 
-async def run_partition_passes[FetchResult, FailureResult](
-    plan: PartitionPlan,
-    fetch_window: Callable[[TimeWindow], Awaitable[FetchResult]],
-    persist_pass: Callable[[tuple[TimeWindow, int], FetchResult], Awaitable[FailureResult | None]],
-    *,
-    concurrency: int = 1,
-) -> FailureResult | None:
-    """Overlap downloads while one caller commits each window's ordered passes."""
+def partition_window_concurrency(directory, source_record, request_url):
+    """Share the bounded transport without enabling credentialed windows."""
+    session = directory._rest_page_prefetch_session(source_record, request_url)
+    if session is None or session.connector is None:
+        return 1
+    return max(1, min(8, session.connector.limit_per_host, directory._source_resource_scan_concurrency(source_record)))
 
-    if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency not in (1, 2):
-        raise PartitionPlanError("partition concurrency must be 1 or 2")
-    if plan.status not in (PlanStatus.ACQUIRING, PlanStatus.SUCCEEDED):
-        raise PartitionPlanError("partition downloads require a counted, active plan")
-    windows = deque(
+
+def partition_window_slots(directory, source_record, request_url):
+    """Bound fetched and uncommitted windows across one source's resource scans."""
+    concurrency = partition_window_concurrency(directory, source_record, request_url)
+    if concurrency == 1:
+        return None
+    slots = directory.SOURCE_HTTP_REQUEST_SLOTS.get()
+    if slots is None:
+        slots = source_record.setdefault("_provider_directory_request_pacing_state", {})
+    source_ids = source_record.get("_partition_checkpoint_source_ids") or (source_record.get("source_id"),)
+    if isinstance(source_ids, str):
+        source_ids = (source_ids,)
+    base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    key = ("partition_windows", base, tuple(sorted(source_ids)))
+    if key not in slots:
+        slots[key] = asyncio.BoundedSemaphore(concurrency)
+    return slots[key]
+
+
+def _pending_partition_windows(plan):
+    return deque(
         sorted(
             (window for window in plan.leaf_windows() if len(window.passes) < 2),
             key=lambda window: window.count or 0,
             reverse=True,
         )
     )
+
+
+def _start_partition_window(windows, fetch_window, passes_by_task, slots):
+    try:
+        window = windows.popleft()
+        pass_number = next(number for number in (1, 2) if number not in window.passes)
+        fetch_task = asyncio.create_task(fetch_window(window), name="provider-directory-partition-window")
+        passes_by_task[fetch_task] = (window, pass_number)
+    except BaseException:
+        slots.release()
+        raise
+
+
+async def _wait_partition_downloads(passes_by_task, admission):
+    waiting_tasks = set(passes_by_task)
+    if admission is not None:
+        waiting_tasks.add(admission)
+    settled_tasks, _ = await asyncio.wait(waiting_tasks, return_when=asyncio.FIRST_COMPLETED)
+    waiting_tasks.clear()
+    return settled_tasks
+
+
+async def _persist_partition_downloads(passes_by_task, settled_tasks, persist_pass, windows, slots):
+    while settled_tasks:
+        fetch_task = next(task for task in passes_by_task if task in settled_tasks)
+        settled_tasks.remove(fetch_task)
+        window, pass_number = passes_by_task.pop(fetch_task)
+        try:
+            failure = await persist_pass((window, pass_number), fetch_task.result())
+        finally:
+            # Free the completed buffer before another resource can spend its permit.
+            del fetch_task
+            slots.release()
+        if failure is not None:
+            return failure
+        if pass_number not in window.passes:
+            raise PartitionPlanError("partition pass was not committed")
+        if pass_number == 1:
+            windows.appendleft(window)
+    return None
+
+
+async def _close_partition_downloads(passes_by_task, admission, slots):
+    remaining_tasks = list(passes_by_task)
+    if admission is not None:
+        remaining_tasks.append(admission)
+    for fetch_task in remaining_tasks:
+        if not fetch_task.done():
+            fetch_task.cancel()
+    if remaining_tasks:
+        try:
+            await asyncio.gather(*remaining_tasks, return_exceptions=True)
+        finally:
+            for _task in passes_by_task:
+                slots.release()
+            if admission is not None and not admission.cancelled() and admission.exception() is None:
+                slots.release()
+            passes_by_task.clear()
+
+
+async def run_partition_passes[FetchResult, FailureResult](
+    plan: PartitionPlan,
+    fetch_window: Callable[[TimeWindow], Awaitable[FetchResult]],
+    persist_pass: Callable[[tuple[TimeWindow, int], FetchResult], Awaitable[FailureResult | None]],
+    *,
+    concurrency: int = 1,
+    window_slots: asyncio.Semaphore | None = None,
+) -> FailureResult | None:
+    """Overlap downloads while one caller commits each window's ordered passes."""
+
+    if isinstance(concurrency, bool) or not isinstance(concurrency, int) or not 1 <= concurrency <= 8:
+        raise PartitionPlanError("partition concurrency must be between 1 and 8")
+    if plan.status not in (PlanStatus.ACQUIRING, PlanStatus.SUCCEEDED):
+        raise PartitionPlanError("partition downloads require a counted, active plan")
+    windows = _pending_partition_windows(plan)
     passes_by_task: dict[asyncio.Task[FetchResult], tuple[TimeWindow, int]] = {}
+    slots = window_slots if window_slots is not None else asyncio.BoundedSemaphore(concurrency)
+    admission: asyncio.Task[bool] | None = None
+
+    def start_window():
+        """Transfer an acquired permit to one tracked download."""
+        _start_partition_window(windows, fetch_window, passes_by_task, slots)
+
     try:
         while windows or passes_by_task:
-            while windows and len(passes_by_task) < concurrency:
-                window = windows.popleft()
-                pass_number = next(number for number in (1, 2) if number not in window.passes)
-                fetch_task = asyncio.create_task(fetch_window(window), name="provider-directory-partition-window")
-                passes_by_task[fetch_task] = (window, pass_number)
-            settled_tasks, _ = await asyncio.wait(passes_by_task, return_when=asyncio.FIRST_COMPLETED)
-            for fetch_task in tuple(passes_by_task):
-                if fetch_task not in settled_tasks:
-                    continue
-                settled_tasks.remove(fetch_task)
-                window, pass_number = passes_by_task.pop(fetch_task)
-                failure = await persist_pass((window, pass_number), fetch_task.result())
-                if failure is not None:
-                    return failure
-                if pass_number not in window.passes:
-                    raise PartitionPlanError("partition pass was not committed")
-                if pass_number == 1:
-                    windows.appendleft(window)
+            if admission is None:
+                if windows and not passes_by_task:
+                    await slots.acquire()
+                    start_window()
+                while windows and len(passes_by_task) < concurrency and not slots.locked():
+                    await slots.acquire()
+                    start_window()
+                if windows and len(passes_by_task) < concurrency:
+                    admission = asyncio.create_task(slots.acquire(), name="provider-directory-partition-admission")
+            settled_tasks = await _wait_partition_downloads(passes_by_task, admission)
+            if admission in settled_tasks:
+                settled_tasks.remove(admission)
+                admission.result()
+                admission = None
+                start_window()
+            failure = await _persist_partition_downloads(passes_by_task, settled_tasks, persist_pass, windows, slots)
+            if failure is not None:
+                return failure
         return None
     finally:
-        for fetch_task in passes_by_task:
-            if not fetch_task.done():
-                fetch_task.cancel()
-        if passes_by_task:
-            await asyncio.gather(*passes_by_task, return_exceptions=True)
+        await _close_partition_downloads(passes_by_task, admission, slots)
 
 
 @dataclass(frozen=True)

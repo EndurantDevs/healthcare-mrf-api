@@ -2297,6 +2297,21 @@ The separately reported capped census never substitutes that sum for an
 unfiltered server total. Durable checkpoints include the contract and split
 evidence; earlier exact-census contracts retain their existing identity.
 
+Eligible anonymous time partitions share up to eight chunk-download slots per
+source, subject to the source and HTTP transport caps. Remaining resources can
+claim freed slots, including all eight when only one collection remains. A slot
+stays occupied until its fetched pass is durably committed, bounding completed
+buffers as well as active downloads. Each resource keeps its existing checkpoint
+writer, ordered content passes and sequential issued cursors. Request pacing,
+adaptive throttling, cancellation and retained-resume checks still apply.
+
+Stopped partition upgrades need both the API ancestry check and the worker's
+checkpoint verifier. The API reuses stored strategy audit, unchanged acquisition
+inputs, completed ordinary companions and a fresh worker-stop check; native
+Source validation still checks the complete retained input and census. Ordinary
+canceled REST, missing strategy evidence and canceled proxy chains remain
+ineligible. Deliver both qualified images before continuing the retained run.
+
 MVP's direct Provider Directory configures this path for Organization, Location,
 PractitionerRole and Practitioner, with chunks of at most 10,000 rows and
 100-row pages. The other four advertised collections use the ordinary REST

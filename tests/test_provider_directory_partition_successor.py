@@ -68,7 +68,9 @@ def _partition_case(case, phase):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", [0, 1, 2, 3])
 @pytest.mark.parametrize("status", ["acquiring", "failed"])
-async def test_partition_successor_preserves_counting_passes_and_post_census(case, phase, status):
+@pytest.mark.parametrize("run_status", ["failed", "canceled"])
+async def test_partition_successor_preserves_counting_passes_and_post_census(case, phase, status, run_status):
+    case.runs[0]["status"] = run_status
     counts_by_resource = _partition_case(case, phase)
     case.header["status"] = status
     before = deepcopy((case.header, case.checkpoints, case.input_rows, case.runs))
@@ -102,7 +104,9 @@ async def test_partition_successor_preserves_counting_passes_and_post_census(cas
         "input_count",
     ],
 )
-async def test_partition_successor_refuses_changed_or_incomplete_evidence(case, fault):
+@pytest.mark.parametrize("run_status", ["failed", "canceled"])
+async def test_partition_successor_refuses_changed_or_incomplete_evidence(case, fault, run_status):
+    case.runs[0]["status"] = run_status
     counts_by_resource = _partition_case(case, 2)
     checkpoint = case.checkpoints[0]
     checkpoint_payload = json.loads(checkpoint["next_url"])
@@ -204,7 +208,9 @@ async def test_partition_successor_refuses_changed_source_context(case, field, v
 
 
 @pytest.mark.asyncio
-async def test_partition_successor_keeps_completed_collection_and_pending_census(case):
+@pytest.mark.parametrize("run_status", ["failed", "canceled"])
+async def test_partition_successor_keeps_completed_collection_and_pending_census(case, run_status):
+    case.runs[0]["status"] = run_status
     counts_by_resource = _partition_case(case, 2)
     _include_completed_empty_collection(case)
     case.checkpoints[1].update(state="complete", completed_at="now", next_url=None, pages_processed=1)
@@ -220,6 +226,37 @@ async def test_partition_successor_keeps_completed_collection_and_pending_census
     assert (case.checkpoints, case.input_rows) == before[1:]
     assert case.checkpoints[0]["state"] == "active"
     assert case.checkpoints[1]["state"] == "complete"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ordinary_state", ["active", "complete"])
+async def test_canceled_partition_successor_refuses_an_ordinary_cursor(case, ordinary_state):
+    counts_by_resource = _partition_case(case, 2)
+    _include_completed_empty_collection(case)
+    case.checkpoints[1].update(
+        state=ordinary_state,
+        completed_at="now" if ordinary_state == "complete" else None,
+        next_url="https://example.test/fhir/InsurancePlan?cursor=retained",
+        pages_processed=1,
+    )
+    counts_by_resource["InsurancePlan"] = 0
+    case.runs[0]["status"] = "canceled"
+    before = deepcopy((case.header, case.checkpoints, case.input_rows, case.runs))
+    with pytest.raises(GenericCandidateError, match="transition_checkpoint_changed"):
+        await _transition(case, counts_by_resource)
+    assert (case.header, case.checkpoints, case.input_rows, case.runs) == before
+    assert case.writes == []
+    case.runs[0]["status"] = "failed"
+    assert (await _transition(case, counts_by_resource))["rows"] == 9
+
+
+@pytest.mark.asyncio
+async def test_partition_successor_refuses_a_running_capture_even_with_valid_proofs(case):
+    counts_by_resource = _partition_case(case, 2)
+    case.runs[0]["status"] = "running"
+    with pytest.raises(GenericCandidateError, match="transition_run_changed"):
+        await _transition(case, counts_by_resource)
+    assert case.writes == []
 
 
 def _record_failed_candidate_metadata(case):

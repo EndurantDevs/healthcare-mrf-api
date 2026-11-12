@@ -354,8 +354,16 @@ def test_anchor_collisions_keep_module_fixtures_together() -> None:
         assert SHARDER.shard_index_for_nodeid(node, 32) == 21 + digest % 11
 
 
+@pytest.mark.parametrize(
+    "additional_nodeid",
+    (
+        None,
+        "tests/test_registry_membership_refresh_execution_postgres.py::test_accepted_aca_refresh_publication_replay_and_pinned_second_generation",
+        "tests/test_registry_source_fact_references_postgres.py::test_retention_protects_references_and_fails_closed_on_missing_anchor",
+    ),
+)
 @pytest.mark.parametrize("shard_count", (1, 2, 4, 6, 8, 16, 32, 48))
-def test_native_proofs_use_measured_shards_without_redistributing_other_cases(shard_count) -> None:
+def test_native_proofs_use_measured_shards_without_redistributing_other_cases(shard_count, additional_nodeid) -> None:
     catalog = "tests/test_registry_execution_catalog_postgres.py"
     shards_by_nodeid = {
         "tests/test_network_fhir_source_witness_publication_postgres.py::test_distinct_source_addition_retains_prior_capture_and_readers": (
@@ -383,6 +391,8 @@ def test_native_proofs_use_measured_shards_without_redistributing_other_cases(sh
             33,
         ),
     }
+    if additional_nodeid is not None:
+        shards_by_nodeid[additional_nodeid] = (43, 33)
     nodeids = sorted(
         set(shards_by_nodeid)
         | {node + "[variant]" for node in shards_by_nodeid}

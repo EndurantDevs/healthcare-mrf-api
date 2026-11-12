@@ -77,11 +77,22 @@ def _verify_partition(directory, checkpoint, resource, counts):
     )
 
 
-def has_verified_partition_checkpoints(checkpoints, identity, counts, source_ids):
+def _verify_ordinary_companion(checkpoint, count, run_status):
+    _require(
+        _is_resumable_transition_checkpoint(checkpoint)
+        and (run_status == "failed" or (checkpoint["state"] == "complete" and not checkpoint["next_url"]))
+        and checkpoint["pages_processed"] > 0
+        and checkpoint["rows_processed"] == count,
+        "transition_checkpoint_changed",
+    )
+
+
+def has_verified_partition_checkpoints(checkpoints, identity, counts, source_ids, run_status):
     """Select only the existing planner family; ordinary and bulk keep their guards."""
     suffix = ":LastUpdatedPartition"
     if not any(checkpoint_record["resource_type"].endswith(suffix) for checkpoint_record in checkpoints):
         return False
+    _require(run_status in {"failed", "canceled"}, "transition_run_changed")
     directory = import_module("process.provider_directory_fhir")
     resources = {name for name in counts if not name.startswith("LU:")}
     partitioned_resources = {
@@ -128,10 +139,5 @@ def has_verified_partition_checkpoints(checkpoints, identity, counts, source_ids
         if resource in partitioned_resources:
             _verify_partition(directory, checkpoint_record, resource, counts)
         else:
-            _require(
-                _is_resumable_transition_checkpoint(checkpoint_record)
-                and checkpoint_record["pages_processed"] > 0
-                and checkpoint_record["rows_processed"] == counts[resource],
-                "transition_checkpoint_changed",
-            )
+            _verify_ordinary_companion(checkpoint_record, counts[resource], run_status)
     return True

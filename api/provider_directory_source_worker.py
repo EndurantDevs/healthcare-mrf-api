@@ -638,7 +638,7 @@ async def _source_route_lineage(connection, root_run_id):
     return await connection.all(
         text(
             "SELECT run_id,importer,status,retry_of_run_id,params,started_at,finished_at,phase_detail,"
-            "metrics->'cancel_signal' AS cancel_signal,"
+            "metrics->'cancel_signal' AS cancel_signal,COALESCE(metrics->'audit',metrics) AS source_audit,"
             "metrics->'audit'->'source_http_proxy'->'binding' AS source_http_proxy_binding,"
             "metrics->'audit'->'source_http_proxy'->'cooldowns' AS source_http_proxy_cooldowns FROM "
             + run_relation
@@ -651,7 +651,7 @@ async def _source_route_lineage(connection, root_run_id):
 
 async def require_fhir_source_route_ancestry(connection, launch):
     """Return the immutable launch only after native ancestry and cooldown capture."""
-    from api.provider_directory_rooted_source_retry import has_same_rooted_operation, is_stopped_rooted_route_parent
+    from api.provider_directory_rooted_source_retry import has_same_rooted_operation, is_stopped_source_route_parent
 
     if type(launch) not in (FHIRSourceWorkerLaunch, FHIRSourcePublicationLaunch) or not launch.root_run_id:
         return launch
@@ -684,11 +684,11 @@ async def require_fhir_source_route_ancestry(connection, launch):
             )
         ):
             break
-        is_stopped_rooted_parent = await is_stopped_rooted_route_parent(
+        is_stopped_source_parent = await is_stopped_source_route_parent(
             connection, launch, lineage_record, current_params
         )
         if current_id == launch.root_run_id:
-            if _is_admissible_route_root(lineage_record, launch) or is_stopped_rooted_parent:
+            if _is_admissible_route_root(lineage_record, launch) or is_stopped_source_parent:
                 return (
                     launch
                     if type(launch) is FHIRSourcePublicationLaunch
@@ -699,7 +699,7 @@ async def require_fhir_source_route_ancestry(connection, launch):
         if not (
             type(parent_id) is str
             and params.get("retry_of_run_id") == parent_id
-            and (_is_route_parent_admissible(lineage_record, launch, current_params) or is_stopped_rooted_parent)
+            and (_is_route_parent_admissible(lineage_record, launch, current_params) or is_stopped_source_parent)
             and (current_id != launch.run_id or parent_id == launch.retry_of_run_id)
         ):
             break

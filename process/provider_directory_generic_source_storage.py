@@ -1249,11 +1249,11 @@ async def _verify_transition_checkpoints(
             connection, policy, bulk_checkpoints, identity_by_field, expected_counts, lineage_run_ids
         )
         return
-    _require(run_status == "failed", "transition_run_changed")
     from process.provider_directory_partition_successor import has_verified_partition_checkpoints
 
-    if has_verified_partition_checkpoints(checkpoint_rows, identity_by_field, expected_counts, source_ids):
+    if has_verified_partition_checkpoints(checkpoint_rows, identity_by_field, expected_counts, source_ids, run_status):
         return
+    _require(run_status == "failed", "transition_run_changed")
     _require(
         len(checkpoint_rows) == len(expected_counts)
         and {checkpoint_record["resource_type"] for checkpoint_record in checkpoint_rows} == set(expected_counts)
