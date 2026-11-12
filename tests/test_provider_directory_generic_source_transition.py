@@ -367,6 +367,100 @@ async def test_vsp_pre_capture_failure_transitions_only_an_empty_original_candid
     ("drift", "error"),
     [
         (None, None),
+        ("checkpoint", "transition_checkpoint_changed"),
+        ("input", "transition_input_changed"),
+        ("run_error", "transition_run_changed"),
+        ("header_error", "transition_checkpoint_changed"),
+    ],
+)
+async def test_vsp_search_failure_transitions_without_discarding_retained_capture(
+    case, vsp_retry_candidate, drift, error
+):
+    _retain_original_root(case, "failed")
+    case.runs[0].update(source_ids=[SOURCE_ID], error_message="vsp_office_doctors_invalid")
+    case.header.update(status="failed", resource_count=0)
+    case.header["publication_metadata_json"]["error"] = "vsp_office_doctors_invalid"
+    if drift == "checkpoint":
+        case.checkpoints.append({"resource_type": "Organization"})
+    if drift != "input":
+        case.input_rows.clear()
+    if drift == "run_error":
+        case.runs[0]["error_message"] = "unrelated failure"
+    if drift == "header_error":
+        case.header["publication_metadata_json"]["error"] = "unrelated failure"
+    counts = dict.fromkeys(RESOURCE_TYPES, 0)
+    if error:
+        with pytest.raises(GenericCandidateError, match=f"^provider_directory_generic_source_{error}$"):
+            await _transition(case, counts, stopped_run_id=ROOT)
+        assert not case.writes
+        return
+    receipt = await _transition(case, counts, stopped_run_id=ROOT)
+    assert receipt["rows"] == 0 and receipt["lineage_run_ids"] == [ROOT]
+    assert case.header["status"] == "failed"
+    assert case.header["candidate_storage_json"]["storage"] == case.new
+    assert (await _transition(case, counts, stopped_run_id=ROOT))["already_applied"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrong_table", [False, True])
+async def test_vsp_retry_converts_empty_legacy_intake_to_names(case, vsp_retry_candidate, wrong_table):
+    _retain_original_root(case, "failed")
+    case.runs[0].update(source_ids=[SOURCE_ID], error_message="vsp_office_doctors_invalid")
+    case.header.update(status="failed", resource_count=0)
+    case.header["publication_metadata_json"]["error"] = "vsp_office_doctors_invalid"
+    case.input_rows.clear()
+    fields = ("catalog_schema", "storage_schema", "producer")
+    case.old, case.new = ({key: stored[key] for key in fields} for stored in (case.old, case.new))
+    candidate = case.header["candidate_storage_json"]
+    if wrong_table:
+        candidate["tables"]["witness_input"]["name"] = "pdgs_" + "b" * 32 + "_wi"
+    counts = dict.fromkeys(RESOURCE_TYPES, 0)
+
+    if wrong_table:
+        with pytest.raises(GenericCandidateError, match="table_binding_changed"):
+            await _transition(case, counts, stopped_run_id=ROOT)
+        assert case.writes == []
+    else:
+        receipt = await _transition(case, counts, stopped_run_id=ROOT)
+        assert receipt == {"dataset_id": DATASET, "rows": 0, "lineage_run_ids": [ROOT], "already_applied": False}
+        actual = case.header["candidate_storage_json"]
+        assert actual["contract"] == storage.NAMED_ISOLATED_CONTRACT
+        assert actual["storage"] == case.new and case.header["status"] == "failed"
+        assert actual["tables"] == {kind: {"name": table["name"]} for kind, table in candidate["tables"].items()}
+        assert (await _transition(case, counts, stopped_run_id=ROOT))["already_applied"] is True
+        assert len(case.writes) == 1
+    case.native.assert_not_awaited()
+    case.tables.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_named_vsp_successor_retains_an_empty_failed_retry(case, vsp_retry_candidate):
+    _retain_original_root(case, "failed")
+    case.runs[0].update(source_ids=[SOURCE_ID], error_message=storage.OFFICE_DOCTORS_INVALID)
+    case.header.update(status="failed", resource_count=0)
+    case.header["publication_metadata_json"]["error"] = storage.OFFICE_DOCTORS_INVALID
+    case.input_rows.clear()
+    fields = ("catalog_schema", "storage_schema", "producer")
+    case.old, case.new = ({key: stored[key] for key in fields} for stored in (case.old, case.new))
+    counts = dict.fromkeys(RESOURCE_TYPES, 0)
+    await _transition(case, counts, stopped_run_id=ROOT)
+    case.old = case.new
+    case.new = {**case.old, "producer": ["d" * 40, "sha256:" + "e" * 64]}
+    case.runs.insert(0, {**case.runs[0], "run_id": FAILED, "retry_of_run_id": ROOT, "root_run_id": ROOT})
+    case.header["import_run_id"] = FAILED
+    receipt = await _transition(case, counts)
+    assert receipt["rows"] == 0
+    assert receipt["lineage_run_ids"] == sorted([ROOT, FAILED])
+    assert case.header["status"] == "failed"
+    assert case.header["candidate_storage_json"]["storage"] == case.new
+    assert (await _transition(case, counts))["already_applied"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("drift", "error"),
+    [
+        (None, None),
         ("wrong_error", "transition_run_changed"),
         ("active_child", "transition_run_changed"),
         ("retained_input", "transition_input_changed"),

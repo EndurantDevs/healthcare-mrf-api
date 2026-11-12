@@ -11,6 +11,7 @@ import pytest
 
 from process import provider_directory_generic_source_completion as completion
 from process.provider_directory_generic_candidate import GenericCandidateError
+from process.provider_directory_role_merge import MERGED_ROLE_SOURCES_ENV
 from tests.test_provider_directory_generic_candidate import _merge, _resource
 from tests.test_provider_directory_generic_source_storage import _isolated_harness, harness
 
@@ -512,6 +513,53 @@ async def test_real_organization_v4_union_matches_the_existing_canonical_contrac
     )
 
 
+@pytest.mark.parametrize("outcome", ["valid", "native-conflict", "repeat-only"])
+async def test_merged_role_completion_checks_input_and_reduced_output_before_indexing(monkeypatch, outcome):
+    connection = SimpleNamespace(
+        fetchval=AsyncMock(side_effect=[outcome == "native-conflict", outcome == "repeat-only"]),
+    )
+    binding_by_field = {
+        "identity": {"metadata": {"source_ids": ["source-a"]}},
+        "tables": {"resource_input": {"name": "input_rows"}, "witness_input": {"name": "input_witness"}},
+        "resets": {},
+    }
+    tables_by_kind = {
+        completion.storage.RESOURCE: {"name": "resource_output"},
+        completion.storage.WITNESS: {"name": "witness_output"},
+    }
+    monkeypatch.setenv(MERGED_ROLE_SOURCES_ENV, "source-a")
+    monkeypatch.setattr(completion.storage, "refresh_statistics", AsyncMock())
+    monkeypatch.setattr(completion, "_observed_divergence", AsyncMock(return_value=False))
+    reduce = AsyncMock()
+    indexes = AsyncMock()
+    monkeypatch.setattr(completion, "_reduce_payloads_python", reduce)
+    monkeypatch.setattr(completion, "_indexes", indexes)
+    args = (
+        connection,
+        SimpleNamespace(schema="source"),
+        binding_by_field,
+        SimpleNamespace(source_release=None),
+        None,
+        tables_by_kind,
+    )
+    if outcome == "valid":
+        await completion._complete_payloads(*args)
+        assert indexes.await_count == 2
+    else:
+        error = (
+            "provider_directory_resource_payload_conflict"
+            if outcome == "native-conflict"
+            else "provider_directory_merged_role_observation_missing"
+        )
+        with pytest.raises(ValueError, match=error):
+            await completion._complete_payloads(*args)
+        indexes.assert_not_awaited()
+    assert reduce.await_count == (outcome != "native-conflict")
+    assert '"source"."input_rows"' in connection.fetchval.await_args_list[0].args[0]
+    if outcome != "native-conflict":
+        assert '"source"."resource_output"' in connection.fetchval.await_args_list[1].args[0]
+
+
 def _witness(resource_id="example"):
     raw_by_field = {"resourceType": "Organization", "id": resource_id}
     return dict(
@@ -604,7 +652,8 @@ async def test_attach_refuses_unvalidated_header_before_indexes_or_attach(monkey
     )
     with pytest.raises(GenericCandidateError, match="validated_admission_required"):
         await completion.attach_generic_source_candidate(
-            publisher, {"phase": "prepared", "identity": {"dataset_id": "dataset"}}
+            publisher,
+            {"contract": completion.storage.CONTRACT, "phase": "prepared", "identity": {"dataset_id": "dataset"}},
         )
     connection.execute.assert_not_awaited()
 
@@ -631,6 +680,7 @@ async def test_global_publication_conflict_occurs_after_checks_and_before_any_at
     from process import provider_directory_generic_source_auxiliary as auxiliary
 
     binding_by_field = {
+        "contract": completion.storage.CONTRACT,
         "phase": "prepared",
         "identity": {"dataset_id": "dataset", "metadata": {}},
         "relationship_sha256": None,

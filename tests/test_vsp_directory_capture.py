@@ -174,6 +174,40 @@ async def test_largest_network_reuses_shared_profiles_and_skips_subset_discovery
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("shared_identity", [True, False])
+async def test_omitted_search_summaries_preserve_linked_doctors(small_domain, writer, shared_identity):
+    source = Source()
+    summaries = source.offices["101"].pop("providerSummaries")
+    if not shared_identity:
+        summaries[0]["pid"] = 3
+    original_response = source.response
+    link = source.offices["101"]["locationDrProfileLink"]["href"]
+
+    def response(method, url, payload):
+        if method == "GET" and url.startswith(SEARCH_URL + "/101?"):
+            return {**source.offices["101"], "providerSummaries": summaries}
+        value = original_response(method, url, payload)
+        if method == "GET" and url == link:
+            value[0]["doctorPublicId"] = summaries[0]["pid"]
+        return value
+
+    source.response = response
+    run, transport = capture(source, Store())
+    result = await run.run()
+    assert run.offices["101"]["providerSummaries"] == summaries
+    assert all("101" in ids for ids in result["memberships"].values())
+    assert transport.requests == (10 if shared_identity else 11)
+    assert "providerSummaries" not in source.offices["101"]
+
+
+@pytest.mark.parametrize("summaries", [None, {}, "invalid"])
+def test_malformed_search_summaries_remain_invalid(summaries):
+    office_by_field = {**office(101), "providerSummaries": summaries}
+    with pytest.raises(VSPDirectoryError, match="^vsp_office_doctors_invalid$"):
+        acquisition.search_result({"totalCounts": 1, "locations": [office_by_field]})
+
+
+@pytest.mark.asyncio
 async def test_global_census_closure_skips_remaining_world_tiles(monkeypatch, writer):
     monkeypatch.setattr(acquisition, "world_tiles", lambda: (TILE, GeoTile(20, 30, 20, 30)))
     run, transport = capture(Source(), Store())

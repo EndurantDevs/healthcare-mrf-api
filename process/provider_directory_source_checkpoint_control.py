@@ -14,7 +14,7 @@ from process.provider_directory_generic_source_policy import bound_publisher, so
 from process.provider_directory_generic_source_storage import HEADER, _require
 from process.provider_directory_projection_stage import _copy_driver
 from process.provider_directory_source_checkpoint_catalog import BULK_ROOT, capture_checkpoint_controls
-from process.provider_directory_source_storage_binding import require_storage_schema
+from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage, require_storage_schema
 
 _CUSTODY = ContextVar("provider_directory_source_checkpoint_custody", default=None)
 _BULK_IDENTITY = ContextVar("provider_directory_bulk_checkpoint_identity", default=None)
@@ -168,7 +168,9 @@ async def require_checkpoint_executor(executor, *, bulk_identity=None):
         is_original = binding is not None and binding.session is session
     else:
         is_original = isinstance(executor, ConnectionProxy) and executor._connection is session
-    _require(is_original and await _copy_driver(session) is publisher.connection, "checkpoint_transaction_changed")
+    _require(is_original, "checkpoint_transaction_changed")
+    if not isinstance(getattr(publisher, "storage_binding", None), NamedFHIRSourceStorage):
+        _require(await _copy_driver(session) is publisher.connection, "checkpoint_transaction_changed")
     if bulk_identity is not None:
         _require(_BULK_IDENTITY.get() == _bulk_identity(bulk_identity), "checkpoint_identity_scope_changed")
         if getattr(publisher, "storage_binding", None) is not None:
@@ -312,7 +314,7 @@ async def source_checkpoint_transaction(
             require_storage_schema(publisher, expected_schema)
         token = None
         bulk_token = None
-        if _CUSTODY.get() is not publisher:
+        if _CUSTODY.get() is not publisher and not isinstance(storage_binding, NamedFHIRSourceStorage):
             if storage_binding is None:
                 await capture_checkpoint_controls(publisher.connection, publisher.policy)
             else:

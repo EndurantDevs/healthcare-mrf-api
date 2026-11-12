@@ -14,6 +14,7 @@ API_BASE = "https://api.vspglobal.com/"
 ENDPOINT_SCOPE = API_BASE.rstrip("/")
 SEARCH_URL = API_BASE + "fadbusiness-api/publiclocationsummarybusextensions"
 PROFILE_PATH = "/provider-web/publicdoctorprofile"
+OFFICE_DOCTORS_INVALID = "vsp_office_doctors_invalid"
 ADAPTER_ID = "vsp-directory-json-v1"
 TRANSPORT = "official_directory_json"
 RESOURCE_TYPES = (
@@ -143,8 +144,14 @@ def search_result(payload):
         "vsp_search_response_invalid",
     )
     require(len(locations) == min(total, MAX_LOCATIONS), "vsp_search_response_incomplete")
+    validated_offices = []
     for office in locations:
         office_position(office)
         profile_url(office)
-        require(type(office.get("providerSummaries")) is list, "vsp_office_doctors_invalid")
-    return total, locations
+        summaries = office.get("providerSummaries", [])
+        require(type(summaries) is list, OFFICE_DOCTORS_INVALID)
+        # Search can omit summaries; the linked profile still determines membership.
+        validated_offices.append(
+            office if "providerSummaries" in office else {**office, "providerSummaries": summaries}
+        )
+    return total, validated_offices
