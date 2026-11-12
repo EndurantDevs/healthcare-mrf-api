@@ -330,7 +330,12 @@ async def pin_api_retained_approved_membership_source(connection, manifest, *, c
     Re-resolve the manifest instead of trusting DTO/private JSON fields. This pin
     is not a historical seal; Source readers still require their independent seal.
     """
+    from process.network_published_api_pin import active_published_api_pin
     from process.network_serving_read import PinnedNetworkServingManifest, resolve_network_serving_manifest
+
+    published = active_published_api_pin(connection, manifest, control_schema=control_schema)
+    if published is not None:
+        return published._api_approved_source, published._api_approved_relation
 
     try:
         if type(manifest) is not PinnedNetworkServingManifest:

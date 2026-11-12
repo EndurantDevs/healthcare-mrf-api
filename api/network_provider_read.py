@@ -301,9 +301,13 @@ async def _read(connection, scope, selector, limit, offset, control_schema, offi
             "serializable",
         ):
             raise NetworkProviderReadError("Canonical providers require a caller-owned repeatable transaction")
-        current = await resolve_network_serving_manifest(
-            connection, generation_id=scope.manifest.generation_id, control_schema=control_schema, api_read=True
-        )
+        from process.network_published_api_pin import active_published_api_pin
+
+        current = active_published_api_pin(connection, scope.manifest, control_schema=control_schema)
+        if current is None:
+            current = await resolve_network_serving_manifest(
+                connection, generation_id=scope.manifest.generation_id, control_schema=control_schema, api_read=True
+            )
         if current != scope.manifest:
             raise NetworkProviderReadUnavailable("Canonical provider generation differs from the pinned scope")
         membership_page = (

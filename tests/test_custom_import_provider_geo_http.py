@@ -240,9 +240,10 @@ async def _bind_cursor(binding, session, *, geo_precision_clause="precision-v1",
 
 
 def test_geo_native_query_is_closed_bounded_and_forces_exact_total():
-    args = geo._parse_geo_native_query(_native_query(limit="50"))
+    args = geo._parse_geo_native_query(_native_query(limit="50", state="IL"))
     assert args.get("include_total") == "true"
     assert args.get("limit") == "50"
+    assert args.get("state") == "IL"
     for document in (
         _native_query(limit="51"),
         _native_query(include_total="no"),

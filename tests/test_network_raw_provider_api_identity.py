@@ -123,9 +123,7 @@ async def test_membership_page_uses_fresh_capability_and_only_consumed_pins(monk
     await readers.read_network_provider_page(connection, NetworkAddressReadScope(caller_manifest, (11,), None))
     query = connection.fetchrow.await_args.args[0]
     assert query.startswith("WITH identities AS MATERIALIZED") is trusted
-    assert {pin.table_oid for pin in verifier.await_args.args[1]} == (
-        {101, 102, 201, 202} if trusted else {101, 102, 103, 201, 202, 301}
-    )
+    assert {pin.table_oid for pin in verifier.await_args.args[1]} == {101, 102, 103, 201, 202, 301}
     assert events == ["resolve", "pid", "data", "guard", "decode"]
 
 

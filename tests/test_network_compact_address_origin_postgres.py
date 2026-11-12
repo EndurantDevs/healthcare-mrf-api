@@ -33,6 +33,7 @@ from process.network_membership_candidate_lifecycle import create_network_candid
 from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_pipeline import prepare_network_candidate
 from process.network_membership_publication import publish_network_candidate
+from process.network_published_api_pin import published_api_pin_statement
 from process.network_serving_api_sql import api_serving_pin_statement
 from process.network_serving_read import NetworkServingReadUnavailable
 from process.registry_candidate_composition import (
@@ -799,6 +800,7 @@ async def _publish_api_candidate(fixture, previous, address_sources):
 
 @pytest.fixture
 async def indexed_api_db(indexed_db, monkeypatch):
+    """Publish two indexed generations and bind their genuine request Reader."""
     fixture = indexed_db
     previous, address_sources = await _publication_address_sources(
         fixture.execution_connection,
@@ -832,15 +834,15 @@ async def indexed_api_db(indexed_db, monkeypatch):
     for name, setting_value in settings_by_name.items():
         monkeypatch.setenv("HLTHPRT_DB_" + name, setting_value)
     monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", fixture.control_schema)
-    database = Database()
+    database, requests = Database(), []
     database._database_override = url.database
-    requests = []
     native_fetchrow = asyncpg.Connection.fetchrow
-    metadata_sql = api_serving_pin_statement(fixture.control_schema)
+    control_schema = fixture.control_schema
+    metadata_sql = api_serving_pin_statement(control_schema), published_api_pin_statement(control_schema)
 
     async def observe_metadata(connection, statement, *parameters, **options):
         address_entry = await native_fetchrow(connection, statement, *parameters, **options)
-        if statement == metadata_sql:
+        if statement in metadata_sql:
             requests.append((connection, parameters, address_entry))
         return address_entry
 
@@ -868,25 +870,11 @@ async def _api_rows(held, generation_id):
         async with api_catalog_read_snapshot(session, generation_id) as (manifest, approved_relation):
             assert len(held.requests) == before + 1
             driver, parameters, entry = held.requests[-1]
-            assert parameters == (held.fixture.control_schema, generation_id, 8388608)
-            assert entry["control_consumed"] is True and entry["edge_candidate_count"] == 1
-            assert entry["current_user"] == entry["session_user"] == held.fixture.roles["reader"]
-            assert {field: entry[field] for field in identity_by_field} == identity_by_field
-            controls = manifest._api_control_relations
-            expected = await held.fixture.connection.fetch(
-                "SELECT relname,oid::bigint AS oid FROM pg_class WHERE relnamespace=to_regnamespace($1) "
-                "AND relname=ANY($2::text[]) ORDER BY relname",
-                held.fixture.control_schema,
-                [pin.table_name for pin in controls],
-            )
-            assert len(controls) == 5
-            assert sorted((pin.table_name, pin.table_oid) for pin in controls) == [
-                tuple(address_entry) for address_entry in expected
-            ]
-            assert approved_relation in controls
-            families = json.loads(entry["families_json"])
-            assert len(families) == 2
-            assert sum(family["projected_edge"] is True for family in families) == 1
+            assert parameters == (generation_id,)
+            assert manifest._api_approved_relation == approved_relation
+            assert approved_relation.table_oid == entry["approved_oid"]
+            assert not {"families_json", "control_consumed", "indexed_actor_safety_json"}.intersection(entry)
+            assert manifest.compact_layout.artifacts == held.current.compact_layout.artifacts
             async with network_address_read_session_scope(session, manifest, (42,)):
                 relation = scoped_address_relation_sql("mrf.entity_address_unified")
                 address_result = await execute_network_read(
@@ -900,7 +888,7 @@ async def _api_rows(held, generation_id):
         return manifest, address_rows
 
 
-async def test_indexed_api_pin_one_query_full_validation_and_retained_reader_parity(indexed_api_db):
+async def test_published_api_pin_one_query_and_retained_reader_parity(indexed_api_db):
     held = indexed_api_db
     expected_rows = [
         {field: address_entry[field] for field in ("location_key", "canonical_network_ids")}
@@ -947,4 +935,57 @@ async def test_indexed_api_pin_refuses_native_drift_before_rows(indexed_api_db, 
     finally:
         await fixture.connection.execute(restore)
     assert not held.database.has_reader_session()
+    assert (await _api_rows(held, None))[0] == held.current
+
+
+@pytest.mark.parametrize("failure", ["permission", "missing_edge", "replacement"])
+async def test_published_request_reports_native_access_and_missing_table_errors(indexed_api_db, failure):
+    from sanic.exceptions import ServiceUnavailable
+
+    from process.entity_address_cutover_contract import postgres_sqlstate
+
+    held = indexed_api_db
+    fixture, base = held.fixture, held.current.compact_layout.base
+    if failure == "permission":
+        table = f'"{base.schema_name}"."{base.table_name}"'
+        role = fixture.roles["reader"]
+        change, restore = f'REVOKE SELECT ON {table} FROM "{role}"', f'GRANT SELECT ON {table} TO "{role}"'
+        expected = "42501"
+    else:
+        artifact = held.current.compact_layout.artifacts[0]
+        namespace = '"' + artifact.schema_name + '"'
+        change = f"ALTER TABLE {namespace}.network_office_edge RENAME TO missing_edge_fixture"
+        restore = f"ALTER TABLE {namespace}.missing_edge_fixture RENAME TO network_office_edge"
+        expected = "42P01"
+        if failure == "replacement":
+            change += (
+                f"; CREATE TABLE {namespace}.network_office_edge (LIKE {namespace}.missing_edge_fixture INCLUDING ALL)"
+            )
+            change += f'; GRANT SELECT ON {namespace}.network_office_edge TO "{fixture.roles["reader"]}"'
+            restore = f"DROP TABLE {namespace}.network_office_edge; " + restore
+            expected = None
+    await fixture.connection.execute(change)
+    try:
+        with pytest.raises(ServiceUnavailable) as error:
+            await _api_rows(held, None)
+        if expected is not None:
+            assert postgres_sqlstate(error.value.original) == expected
+    finally:
+        await fixture.connection.execute(restore)
+    assert (await _api_rows(held, None))[0] == held.current
+
+
+@pytest.mark.parametrize("force", [False, True])
+async def test_published_pin_refuses_silent_row_level_filtering(indexed_api_db, force):
+    held = indexed_api_db
+    base = held.current.compact_layout.base
+    table = f'"{base.schema_name}"."{base.table_name}"'
+    change = "ENABLE ROW LEVEL SECURITY" if not force else "FORCE ROW LEVEL SECURITY"
+    restore = "DISABLE ROW LEVEL SECURITY" if not force else "NO FORCE ROW LEVEL SECURITY"
+    await held.fixture.connection.execute(f"ALTER TABLE {table} {change}")
+    try:
+        with pytest.raises(NetworkServingReadUnavailable):
+            await _api_rows(held, None)
+    finally:
+        await held.fixture.connection.execute(f"ALTER TABLE {table} {restore}")
     assert (await _api_rows(held, None))[0] == held.current
