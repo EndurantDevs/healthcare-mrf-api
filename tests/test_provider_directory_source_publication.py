@@ -309,24 +309,45 @@ async def test_conflicting_or_null_native_job_coordinates_are_refused(runtime, f
     assert not runtime.calls
 
 
-async def test_publication_follows_the_exact_retained_retry_root(runtime, monkeypatch):
+@pytest.mark.parametrize("predecessor", ["failed", "partition", "ordinary_canceled", "invalid_partition"])
+async def test_publication_follows_the_exact_retained_retry_root(runtime, monkeypatch, predecessor):
     root_id = "run_" + "d" * 32
     run = runtime.recorded
     run["retry_of_run_id"] = root_id
-    run["params"].update(retry_of_run_id=root_id, provider_directory_pagination_root_run_id=root_id)
+    run["params"].update(
+        retry_of_run_id=root_id,
+        provider_directory_pagination_root_run_id=root_id,
+        allow_retained_pagination_reset=False,
+    )
     document = run["metrics"]["source_candidate_handoffs"]["dataset"]["document"]
     document["identity"]["acquisition_root_run_id"] = root_id
     run["metrics"]["source_candidate_handoffs"]["dataset"] = _receipt(document)
     root_by_field = {**deepcopy(run), "run_id": root_id, "status": "failed", "retry_of_run_id": None}
     for name in ("retry_of_run_id", "provider_directory_pagination_root_run_id"):
         root_by_field["params"].pop(name)
+    if predecessor != "failed":
+        root_by_field.update(status="canceled", started_at=datetime(2026, 1, 1, tzinfo=UTC))
+    if predecessor in {"partition", "invalid_partition"}:
+        from tests.test_provider_directory_partition_source_retry import partition_rows
+
+        audit = deepcopy(partition_rows(1)[0]["source_audit"])
+        audit["source_ids"] = run["params"]["source_ids"]
+        audit["active_source_groups"][0]["source_ids"] = run["params"]["source_ids"]
+        if predecessor == "invalid_partition":
+            audit["active_source_groups"][0]["resource_scans"]["InsurancePlan"]["complete"] = False
+        root_by_field["source_audit"] = audit
     runtime.native.all.side_effect = lambda query, **kwargs: (
         [deepcopy(root_by_field), deepcopy(run)] if "source_http_proxy_binding" in str(query) else [deepcopy(run)]
     )
     routes = json.loads(workers.os.environ[publication.ROUTES_ENV])
     routes[0]["root_run_id"] = root_id
     monkeypatch.setenv(publication.ROUTES_ENV, json.dumps(routes))
-    assert (await workers.guarded_ensure_worker(_request()))["status"] == "started"
+    launch_result = await workers.guarded_ensure_worker(_request())
+    if predecessor in {"ordinary_canceled", "invalid_partition"}:
+        assert launch_result["status"] == "failed" and not runtime.jobs
+        assert all(method == "GET" for method, *_ in runtime.calls)
+        return
+    assert launch_result["status"] == "started"
     assert runtime.jobs[0]["metadata"]["annotations"]["healthporta.com/source-root-run-id"] == root_id
     assert not any(method == "DELETE" for method, *_ in runtime.calls)
 

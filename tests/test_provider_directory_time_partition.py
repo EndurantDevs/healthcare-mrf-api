@@ -614,7 +614,7 @@ async def test_partition_retry_drains_a_sibling_that_already_failed():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("concurrency", [0, 3, True, 1.0, "2"])
+@pytest.mark.parametrize("concurrency", [0, 9, True, 1.0, "2"])
 async def test_partition_rejects_invalid_concurrency_before_fetch(concurrency):
     async def unexpected_fetch(_window):
         pytest.fail("invalid concurrency reached download")

@@ -110,7 +110,10 @@ def test_http_concurrency_refuses_invalid_caps_before_allocating_transport(monke
     connector.assert_not_called()
 
 
-@pytest.mark.parametrize(("host_cap", "source_cap", "expected"), [(3, 1, 1), (1, 3, 1), (3, 3, 2), (2, None, 2)])
+@pytest.mark.parametrize(
+    ("host_cap", "source_cap", "expected"),
+    [(3, 1, 1), (1, 3, 1), (3, 3, 3), (2, None, 2), (8, None, 8), (20, None, 8)],
+)
 async def test_partition_windows_share_actual_transport_and_source_caps(host_cap, source_cap, expected):
     """An eligible anonymous partition scan obeys the narrower source or host budget."""
     source_record = _configure_neutral_parallel_source(_parallel_resource_source(), source_cap)
@@ -120,6 +123,50 @@ async def test_partition_windows_share_actual_transport_and_source_caps(host_cap
             importer._partition_window_concurrency(source_record, source_record["api_base"] + "/Location") == expected
         )
     assert session.closed
+
+
+async def test_partition_window_budget_is_shared_by_source_scope_and_transport_lifetime():
+    source_record = _configure_neutral_parallel_source(_parallel_resource_source(), None)
+    source_record["_partition_checkpoint_source_ids"] = ("entry_b", "entry_a")
+    base = source_record["api_base"]
+    async with importer._source_http_session_scope(force=True, request_concurrency=8):
+        slots = importer.partition_window_slots(importer, source_record, base + "/Location")
+        copied_source_by_field = {**source_record, "_partition_checkpoint_source_ids": ("entry_a", "entry_b")}
+        assert importer.partition_window_slots(importer, copied_source_by_field, base + "/PractitionerRole") is slots
+        other_source_by_field = {**source_record, "_partition_checkpoint_source_ids": ("entry_c",)}
+        assert importer.partition_window_slots(importer, other_source_by_field, base + "/Location") is not slots
+        forward_source_by_field = {**source_record, "_partition_checkpoint_source_ids": "alpha"}
+        reverse_source_by_field = {**source_record, "_partition_checkpoint_source_ids": "ahpla"}
+        assert importer.partition_window_slots(
+            importer, forward_source_by_field, base + "/Location"
+        ) is not importer.partition_window_slots(importer, reverse_source_by_field, base + "/Location")
+        for _ in range(8):
+            await slots.acquire()
+        assert slots.locked()
+        for _ in range(8):
+            slots.release()
+    async with importer._source_http_session_scope(force=True, request_concurrency=8):
+        assert importer.partition_window_slots(importer, source_record, base + "/Location") is not slots
+    async with importer._source_http_session_scope(force=True, request_concurrency=1):
+        assert importer.partition_window_slots(importer, source_record, base + "/Location") is None
+
+
+async def test_partition_budget_reuses_existing_pacing_scope_without_a_session_slot_map():
+    source_record = _configure_neutral_parallel_source(_parallel_resource_source(), None)
+    source_record["_provider_directory_request_pacing_state"] = {}
+    async with importer._source_http_session_scope(force=True, request_concurrency=8):
+        token = importer.SOURCE_HTTP_REQUEST_SLOTS.set(None)
+        try:
+            slots = importer.partition_window_slots(importer, source_record, source_record["api_base"] + "/Location")
+            copied_source_by_field = dict(source_record)
+            assert (
+                importer.partition_window_slots(
+                    importer, copied_source_by_field, source_record["api_base"] + "/PractitionerRole"
+                )
+                is slots
+            )
+        finally:
+            importer.SOURCE_HTTP_REQUEST_SLOTS.reset(token)
 
 
 def test_reviewed_census_remains_serial_despite_source_parallel_opt_in(monkeypatch):
