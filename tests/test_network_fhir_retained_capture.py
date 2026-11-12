@@ -629,6 +629,161 @@ async def test_admission_refusal_removes_metadata_copy(monkeypatch, tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+def _semantic_witness_metadata():
+    from process.network_fhir_source_witness_contract import source_origin
+    from process.provider_directory_admission_seal import admission_seal_from_validated_metadata
+    from tests.test_network_fhir_retained_capture_postgres import (
+        _fixture_summary,
+        _modern_metadata,
+        _modern_resources,
+        _proof_rows,
+    )
+    from tests.test_network_fhir_source_witness_contract import origin_fields
+
+    resources = _modern_resources(False)
+    resource_records, dataset_hash, counts, hashes = _proof_rows(resources, "semantic_content_v4")
+    summary = _fixture_summary(dataset_hash, counts, hashes, True, resources)
+    metadata = _modern_metadata(resource_records, summary)
+    seal = admission_seal_from_validated_metadata(metadata)
+    assert len(json.dumps(seal.metadata_summary).encode()) < 32768
+    origin = source_origin(
+        origin_fields()
+        | {
+            "dataset_sha256": dataset_hash,
+            "summary_sha256": summary["summary_sha256"],
+            "proof_sha256": seal.proof_sha256,
+            "resource_counts": tuple(sorted(counts.items())),
+            "resource_hashes": tuple(sorted(hashes.items())),
+            "descriptor_counts": tuple(sorted(counts.items())),
+            "admission_metadata_sha256": seal.metadata_sha256,
+            "unresolved_plan_network_count": 1,
+        }
+    )
+    return json.dumps(metadata).encode(), origin
+
+
+def _padded_metadata_reader(encoded, metadata_bytes):
+    padding = b" " * 65536
+
+    def chunks():
+        yield encoded
+        for offset in range(len(encoded), metadata_bytes, len(padding)):
+            yield padding[: min(len(padding), metadata_bytes - offset)]
+
+    digest = hashlib.sha256()
+    for block in chunks():
+        digest.update(block)
+    start, rollback = AsyncMock(), AsyncMock()
+
+    async def export(query, dataset_id, *, output, **options):
+        assert dataset_id == "dataset-one" and options == {"format": "binary"}
+        assert query.startswith("SELECT publication_metadata_json::text")
+        await output(b"PGCOPY\n\xff\r\n\x00" + struct.pack("!iihi", 0, 0, 1, metadata_bytes))
+        for block in chunks():
+            await output(block)
+        await output(struct.pack("!h", -1))
+        return "COPY 1"
+
+    reader = SimpleNamespace(
+        transaction=lambda: SimpleNamespace(start=start, rollback=rollback), copy_from_query=export
+    )
+    return reader, digest.hexdigest(), start, rollback
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("semantic", [False, True])
+async def test_header_copy_preserves_separate_metadata_and_resource_budgets(monkeypatch, semantic):
+    origin = retained().origin
+    if semantic:
+        origin = replace(
+            origin,
+            admission_profile=SEMANTIC_PROFILE,
+            original_admission_refusal=None,
+            admission_metadata_sha256="1" * 64,
+            semantic_projection_as_of="2026-01-01",
+            descriptor_counts=origin.resource_counts,
+            metadata_bytes=72 * 1024**2,
+        )
+    native, admitted = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(capture, "_copy_native_batch", native)
+    monkeypatch.setattr(capture, "_copy_native_spool", admitted)
+    pair = object()
+    await capture._copy_capture_header(pair, origin, "capture_example")
+    arguments = (
+        pair,
+        'SELECT * FROM "source_example"."provider_directory_endpoint_dataset" WHERE dataset_id=$1',
+        (origin.dataset_id,),
+        "capture_example",
+        TABLES[0],
+        1,
+    )
+    if semantic:
+        native.assert_not_awaited()
+        admitted.assert_awaited_once_with(*arguments, byte_limit=origin.metadata_bytes + 64 * 1024**2)
+    else:
+        admitted.assert_not_awaited()
+        native.assert_awaited_once_with(*arguments)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "semantic,field,value",
+    [
+        (False, "metadata_bytes", 64 * 1024**2 - 32768),
+        (False, "metadata_bytes", True),
+        (False, "admission_profile", "unknown"),
+        (True, "metadata_bytes", 256 * 1024**2 + 1),
+        (True, "metadata_bytes", 0),
+    ],
+)
+async def test_header_copy_refuses_invalid_budget_or_profile(monkeypatch, semantic, field, value):
+    origin = retained().origin
+    if semantic:
+        origin = replace(
+            origin,
+            admission_profile=SEMANTIC_PROFILE,
+            original_admission_refusal=None,
+            admission_metadata_sha256="1" * 64,
+            semantic_projection_as_of="2026-01-01",
+            descriptor_counts=origin.resource_counts,
+        )
+    object.__setattr__(origin, field, value)
+    native, admitted = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(capture, "_copy_native_batch", native)
+    monkeypatch.setattr(capture, "_copy_native_spool", admitted)
+    with pytest.raises(RetainedFHIRCaptureError):
+        await capture._copy_capture_header(object(), origin, "capture_example")
+    native.assert_not_awaited()
+    admitted.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_generic_resource_copy_limit_stays_64_mib():
+    from process.network_bootstrap_sources import NetworkBootstrapSourceError
+
+    with pytest.raises(NetworkBootstrapSourceError, match="Native COPY byte bound is invalid"):
+        await capture._copy_native_batch(
+            object(), "SELECT 1", (), "capture_example", TABLES[1], 1, byte_limit=64 * 1024**2 + 1
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata_bytes", [72 * 1024**2 + 17, 240 * 1024**2 + 23])
+async def test_large_semantic_metadata_stream_preserves_raw_identity(monkeypatch, tmp_path, metadata_bytes):
+    encoded, origin = _semantic_witness_metadata()
+    reader, raw_sha256, start, rollback = _padded_metadata_reader(encoded, metadata_bytes)
+    origin = replace(origin, metadata_bytes=metadata_bytes, metadata_text_sha256=raw_sha256)
+    directory_factory = capture.TemporaryDirectory
+    monkeypatch.setattr(capture, "TemporaryDirectory", lambda **options: directory_factory(dir=tmp_path, **options))
+    await capture._validate_admitted_proof(reader, origin)
+    assert list(tmp_path.iterdir()) == []
+    for changed in ({"metadata_text_sha256": "0" * 64}, {"metadata_bytes": metadata_bytes + 1}):
+        with pytest.raises(RetainedFHIRCaptureError):
+            await capture._validate_admitted_proof(reader, replace(origin, **changed))
+        assert list(tmp_path.iterdir()) == []
+    assert start.await_count == rollback.await_count == 3
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("version", [1, 2])
 async def test_parent_reader_refusal_stops_leaf_checks(version):

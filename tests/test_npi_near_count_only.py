@@ -83,7 +83,8 @@ async def test_near_count_uses_exact_pinned_filter(
     assert f'FROM ONLY "{manifest.schema_name}".entity_address_unified' in sql
     assert "LIMIT" not in sql and "cursor_" not in sql
     assert "limit" not in parameters and not any(key.startswith("cursor_") for key in parameters)
-    assert {"min_lat", "max_lat", "min_long", "max_long"} <= parameters.keys()
+    assert not {"min_lat", "max_lat", "min_long", "max_long"}.intersection(parameters)
+    assert "ST_DWithin(" in sql and "a.lat BETWEEN" not in sql and "a.long BETWEEN" not in sql
     assert parameters["exclude_npi"] == 1000000012 and parameters["provider_sex_code"] == "F"
     assert parameters["classification"] == "Internal Medicine" and parameters["entity_type_code"] == 1
     assert "a.npi <> :exclude_npi" in sql and "d.entity_type_code = :entity_type_code" in sql

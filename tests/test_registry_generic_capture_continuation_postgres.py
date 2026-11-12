@@ -2,6 +2,9 @@
 """Genuine Reader/Writer capture continuation, exact replay and transaction rollback."""
 
 import asyncio
+import hashlib
+import json
+from dataclasses import replace
 
 import pytest
 
@@ -15,7 +18,12 @@ from process.registry_generic_capture_continuation import (
     RegistryGenericCaptureTarget,
     capture_committed_generic_fhir_source,
 )
-from tests.generic_fhir_capture_postgres_support import legacy_capture_db as legacy_capture_db
+from tests.generic_fhir_capture_postgres_support import (
+    _store_fixture_admission,
+)
+from tests.generic_fhir_capture_postgres_support import (
+    legacy_capture_db as legacy_capture_db,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -74,6 +82,60 @@ async def test_native_capture_current_lookup_and_exact_postcommit_replay(legacy_
     monkeypatch.setattr(continuation, "capture_retained_fhir_source", no_copy)
     assert await _continue(fixture) == first
     assert await fixture.admin.fetchval("SELECT count(*) FROM pg_namespace WHERE oid=$1", first.schema_oid) == 1
+
+
+@pytest.mark.parametrize("legacy_capture_db", ["modern"], indirect=True)
+@pytest.mark.parametrize("ensure_ascii", [False, True])
+async def test_native_continuation_captures_large_admitted_semantic_metadata(legacy_capture_db, ensure_ascii):
+    fixture = legacy_capture_db
+    metadata = await fixture.admin.fetchval(
+        f'SELECT publication_metadata_json::text FROM "{fixture.schema}".provider_directory_endpoint_dataset'
+    )
+    document = json.loads(metadata)
+    document["native_copy_note"] = "é雪🚀"
+    await _store_fixture_admission(fixture.admin, fixture.schema, document)
+    metadata = json.dumps(document, ensure_ascii=ensure_ascii)
+    metadata += " " * (72 * 1024**2 - len(metadata.encode()))
+    await fixture.admin.execute(
+        f'UPDATE "{fixture.schema}".provider_directory_endpoint_dataset SET publication_metadata_json=$1::json',
+        metadata,
+    )
+    reader = await fixture.connect("reader")
+    async with reader.transaction(isolation="repeatable_read", readonly=True):
+        origin = await read_current_generic_fhir_input(
+            reader,
+            schema_name=fixture.schema,
+            source_id=fixture.origin.source_id,
+            endpoint_id=fixture.origin.endpoint_id,
+            preparation_schema=fixture.origin.preparation_schema,
+        )
+    assert (
+        replace(
+            origin,
+            metadata_bytes=fixture.origin.metadata_bytes,
+            metadata_text_sha256=fixture.origin.metadata_text_sha256,
+            admission_metadata_sha256=fixture.origin.admission_metadata_sha256,
+        )
+        == fixture.origin
+    )
+    assert origin.metadata_text_sha256 == hashlib.sha256(metadata.encode()).hexdigest()
+    fixture.origin = origin
+    capture = await _continue(fixture)
+    assert capture.origin.metadata_bytes == 72 * 1024**2
+    assert capture.origin.metadata_text_sha256 == fixture.origin.metadata_text_sha256
+    copied = await fixture.admin.fetchrow(
+        f"SELECT octet_length(publication_metadata_json::text) AS metadata_bytes,"
+        "encode(sha256(convert_to(publication_metadata_json::text,'UTF8')),'hex') AS metadata_sha256,"
+        "publication_metadata_sha256,publication_metadata_json->>'native_copy_note' AS note "
+        f'FROM "{capture.schema_name}".provider_directory_endpoint_dataset'
+    )
+    assert tuple(copied.values()) == (
+        origin.metadata_bytes,
+        origin.metadata_text_sha256,
+        origin.admission_metadata_sha256,
+        "é雪🚀",
+    )
+    assert await _continue(fixture) == capture
 
 
 @pytest.mark.parametrize("legacy_capture_db", ["modern"], indirect=True)

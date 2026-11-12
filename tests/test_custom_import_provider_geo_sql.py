@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -506,6 +507,86 @@ async def _seed_geo_addresses(session, address_table_sql: str, *, is_unified: bo
         ),
         address_parameters,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("address_table_sql", ("mrf.npi_address", "mrf.entity_address_unified"))
+async def test_postgres_native_geo_cursor_never_repeats_a_farther_address_alias(address_table_sql):
+    async with transaction_session() as session:
+        await session.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
+        await _seed_geo_tables(session, address_table_sql=address_table_sql)
+        nearby = _imported_geo_query(address_table_sql=address_table_sql).nearby
+        native_parameters_by_name = {"in_long": 0.0, "in_lat": 0.0, "radius": 10.0, "limit": 1}
+        cursor = None
+        seen_identities = []
+        for _ in range(8):
+            cursor_clause, cursor_parameters = npi_module._nearby_cursor_filter(cursor)
+            provider_rows = (
+                (
+                    await session.execute(
+                        text(geo_sql.build_native_nearby_sql(nearby, cursor_clause=cursor_clause)),
+                        {**native_parameters_by_name, **cursor_parameters},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            if not provider_rows:
+                break
+            provider_row = provider_rows[0]
+            identity = (provider_row["npi_code"], str(provider_row["address_key"]))
+            assert {(entry["npi_code"], str(entry["address_key"])) for entry in provider_rows} == {identity}
+            seen_identities.append(identity)
+            if identity == (1000000004, _FOURTH_ADDRESS_KEY):
+                assert provider_row["type"] == "secondary" and provider_row["lat"] == 0
+            cursor = (
+                provider_row["cursor_distance_meters"],
+                provider_row["npi_code"],
+                str(provider_row["address_key"]),
+            )
+
+        count = await session.scalar(text(geo_sql.build_native_nearby_count_sql(nearby)), native_parameters_by_name)
+        assert count == len(seen_identities) == len(set(seen_identities)) == 6
+        assert seen_identities == [
+            (1000000001, _FIRST_ADDRESS_KEY),
+            (1000000002, _SECOND_ADDRESS_KEY),
+            (1000000003, _THIRD_ADDRESS_KEY),
+            (1000000003, _FIFTH_ADDRESS_KEY),
+            (1000000004, _FOURTH_ADDRESS_KEY),
+            (1000000005, _FIFTH_ADDRESS_KEY),
+        ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "anchor_long,office_lat,office_long,expected",
+    ((0.0, 0.1454, 0.0, 6), (179.99, 0.0, -179.99, 1)),
+    ids=("equatorial-radius-edge", "antimeridian"),
+)
+async def test_postgres_native_geo_count_keeps_exact_radius_boundaries(
+    monkeypatch, anchor_long, office_lat, office_long, expected
+):
+    async with transaction_session() as session:
+        await session.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
+        await _seed_geo_tables(session)
+        await session.execute(
+            text("UPDATE mrf.npi_address SET lat=:lat, long=:long WHERE npi=1000000001"),
+            {"lat": office_lat, "long": office_long},
+        )
+
+        async def read(statement, **parameters):
+            return (await session.execute(statement, parameters)).all()
+
+        monkeypatch.setattr(npi_module, "db", SimpleNamespace(acquire=lambda: nullcontext(SimpleNamespace(all=read))))
+        monkeypatch.setattr(npi_module, "provider_geo_read_snapshot", lambda *_args: nullcontext(session))
+        monkeypatch.setattr(npi_module, "_address_serving_table_sql", _legacy_address_table)
+        monkeypatch.setattr(npi_module, "_plan_release_npi_scope", _empty_plan_scope)
+        request = SimpleNamespace(
+            args={"lat": "0", "long": str(anchor_long), "radius": "10", "count_only": "true"},
+            ctx=SimpleNamespace(sa_session=session),
+        )
+        reply = await npi_module.get_near_npi(request)
+        assert json.loads(reply.body) == {"rows": expected}
 
 
 def _postgres_request(session, *, cursor_anchor=None):

@@ -16,7 +16,7 @@ import time
 import urllib.parse
 import uuid
 from collections import OrderedDict, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from textwrap import dedent
 from types import SimpleNamespace
@@ -47,6 +47,7 @@ from api.network_address_scope import (
     scoped_address_parameters,
     scoped_address_relation_sql,
     scoped_address_statement,
+    scoped_geo_search_relation_sql,
 )
 from api.network_read_execution import direct_heap_relation_sql, execute_network_read, has_network_read_inventory
 from api.npi_detail_cache_identity import (
@@ -594,11 +595,17 @@ def _provider_card_primary_taxonomy_display(
 
 
 def _provider_card_primary_specialty(taxonomy_list: Any) -> dict[str, Any]:
-    """Return the compact primary-specialty projection for one provider."""
+    """Prefer a primary entry; break ties by taxonomy code, then display text."""
 
     taxonomy_entries = [
         dict(taxonomy_entry) for taxonomy_entry in (taxonomy_list or []) if isinstance(taxonomy_entry, Mapping)
     ]
+    taxonomy_entries.sort(
+        key=lambda entry: (
+            str(_provider_card_taxonomy_code(entry) or ""),
+            str(_provider_card_primary_taxonomy_display(entry) or ""),
+        )
+    )
     primary_taxonomy = next(
         (
             taxonomy_entry
@@ -4781,6 +4788,7 @@ def _nearby_sql_query(
         address_table_sql=address_table_sql,
         geo_precision_clause=geo_precision_clause,
         geo_type_clause=_nearby_geo_type_clause(address_table_sql),
+        search_table_sql=scoped_geo_search_relation_sql(address_table_sql, extra_clause, ilike_clause),
     )
 
 
@@ -4793,22 +4801,22 @@ def _build_nearby_sql(
     primary_only: bool = False,
     address_table_sql: str = "mrf.npi_address",
     geo_precision_clause: str = "",
-    cursor_clause: str = "",
+    **page_options,
 ) -> str:
     """Build the native KNN nearby-provider query for the selected address model."""
 
-    return build_native_nearby_sql(
-        _nearby_sql_query(
-            taxonomy_conditions,
-            extra_clause,
-            ilike_clause,
-            use_taxonomy_filter=use_taxonomy_filter,
-            primary_only=primary_only,
-            address_table_sql=address_table_sql,
-            geo_precision_clause=geo_precision_clause,
-        ),
-        cursor_clause=cursor_clause,
+    nearby = _nearby_sql_query(
+        taxonomy_conditions,
+        extra_clause,
+        ilike_clause,
+        use_taxonomy_filter=use_taxonomy_filter,
+        primary_only=primary_only,
+        address_table_sql=address_table_sql,
+        geo_precision_clause=geo_precision_clause,
     )
+    if not page_options.get("use_search_page", False):
+        nearby = replace(nearby, search_table_sql=None)
+    return build_native_nearby_sql(nearby, **page_options)
 
 
 def _build_nearby_count_sql(
@@ -4904,18 +4912,8 @@ def _nearby_cursor_filter(
         """
 
            AND (
-               Geography(
-                   ST_MakePoint(
-                       (a.long)::double precision,
-                       (a.lat)::double precision
-                   )
-               ) <-> Geography(
-                   ST_MakePoint(
-                       CAST(:in_long AS double precision),
-                       CAST(:in_lat AS double precision)
-                   )
-               ),
-               a.npi,
+               a.cursor_distance_meters,
+               a.npi_code,
                a.address_key
            ) > (
                CAST(:cursor_distance_meters AS double precision),
@@ -10658,6 +10656,7 @@ async def get_near_npi(
                 address_table_sql=address_table_sql,
                 geo_precision_clause=geo_precision_clause,
                 geo_type_clause=geo_type_clause,
+                search_table_sql=scoped_geo_search_relation_sql(address_table_sql, extra_clause, ilike_clause),
             )
             if native_scope_preparer is not None:
                 import_context = await native_scope_preparer(native_geo_entity_scope())
@@ -10714,6 +10713,7 @@ async def get_near_npi(
                         address_table_sql=address_table_sql,
                         geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
                         cursor_clause=cursor_clause,
+                        use_search_page=is_pagination_requested or bool(taxonomy_clauses),
                     )
                     batch_rows = await conn.all(
                         text(nearby_sql),
@@ -10734,26 +10734,6 @@ async def get_near_npi(
 
             return collected_rows
 
-        bbox_parameters_by_name: dict[str, float] = {}
-        bbox_clause = ""
-        if in_long is not None and in_lat is not None:
-            delta_lat = radius / 69.0
-            cos_lat = math.cos(math.radians(in_lat)) or 1e-6
-            delta_long = radius / (69.0 * cos_lat)
-            bbox_parameters_by_name = {
-                "min_lat": in_lat - delta_lat,
-                "max_lat": in_lat + delta_lat,
-                "min_long": in_long - delta_long,
-                "max_long": in_long + delta_long,
-            }
-            bbox_clause = dedent(
-                """
-
-                   AND a.lat BETWEEN :min_lat AND :max_lat
-                   AND a.long BETWEEN :min_long AND :max_long
-                """
-            ).rstrip()
-
         async def fetch_exact_total() -> int:
             """Count exact provider-address matches without the page limit."""
 
@@ -10769,10 +10749,9 @@ async def get_near_npi(
                         primary_only=is_primary_only,
                         address_table_sql=address_table_sql,
                         geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
-                        bbox_clause=bbox_clause,
                     )
                 )
-                parameters_by_name = {**query_parameters_by_name, **bbox_parameters_by_name}
+                parameters_by_name = query_parameters_by_name
             async with _provider_list_connection(db, import_context, request_session) as conn:
                 count_records = await conn.all(statement, **parameters_by_name)
             if not count_records:

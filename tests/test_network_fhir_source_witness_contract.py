@@ -157,7 +157,7 @@ def test_extra_origin_field_cannot_borrow_reader_or_completion_authority(field):
         {"dataset_sha256": "A" * 64},
         {"native_catalog_sha256": "bad"},
         {"metadata_bytes": True},
-        {"metadata_bytes": 64 * 1024**2 - 32768},
+        {"metadata_bytes": 256 * 1024**2 + 1},
         {"database_system_identifier": "01"},
         {"database_system_identifier": str(2**64)},
         {"database_system_identifier": "１２"},
@@ -469,21 +469,44 @@ def test_semantic_origin_preserves_actual_descriptor_occurrences():
     assert asdict(witness.source_origin(fields)) == fields
 
 
-def test_new_proof_profile_uses_existing_streaming_admission_bound():
+def test_rooted_observation_keeps_its_existing_metadata_budget():
+    limit = 64 * 1024**2 - 32768 - 1
     fields = origin_fields() | {
-        "admission_profile": witness.ADMITTED_LEGACY_PROFILE,
-        "semantic_projection_as_of": None,
+        "admission_profile": witness.OBSERVED_ROOTED_PROFILE,
+        "admission_metadata_sha256": None,
+        "descriptor_counts": None,
+        "metadata_bytes": limit,
+    }
+    assert witness.source_origin(fields).metadata_bytes == limit
+    with pytest.raises(ValueError):
+        witness.source_origin(fields | {"metadata_bytes": limit + 1})
+
+
+@pytest.mark.parametrize("profile", [witness.SEMANTIC_PROFILE, witness.ADMITTED_LEGACY_PROFILE])
+def test_admitted_profiles_use_existing_streaming_admission_bound(profile):
+    fields = origin_fields() | {
+        "admission_profile": profile,
+        "semantic_projection_as_of": "2026-01-01" if profile == witness.SEMANTIC_PROFILE else None,
         "metadata_bytes": 160 * 1024**2,
     }
     assert witness.source_origin(fields).metadata_bytes == 160 * 1024**2
-    limit = witness.source_metadata_max_bytes(witness.ADMITTED_LEGACY_PROFILE)
+    limit = witness.source_metadata_max_bytes(profile)
     assert limit == 256 * 1024**2
     assert witness.source_origin(fields | {"metadata_bytes": limit}).metadata_bytes == limit
     with pytest.raises(ValueError):
         witness.source_origin(fields | {"metadata_bytes": limit + 1})
-    for original in (origin_fields(), legacy_origin_fields()):
-        with pytest.raises(ValueError):
-            witness.source_origin(original | {"metadata_bytes": 64 * 1024**2 - 32768})
+    with pytest.raises(ValueError):
+        witness.source_origin(legacy_origin_fields() | {"metadata_bytes": 64 * 1024**2 - 32768})
+    with pytest.raises(ValueError):
+        replace(reader_capture().origin, metadata_bytes=64 * 1024**2 - 32768)
+
+
+@pytest.mark.parametrize("metadata_bytes", [72 * 1024**2 + 17, 240 * 1024**2 + 23])
+def test_semantic_original_metadata_size_does_not_expand_declaration(metadata_bytes):
+    origin = witness.source_origin(origin_fields() | {"metadata_bytes": metadata_bytes})
+    assert origin.metadata_bytes == metadata_bytes
+    assert len(witness.canonical(asdict(origin)).encode()) < 2048
+    assert witness.source_origin(asdict(origin)) == origin
 
 
 @pytest.mark.parametrize(

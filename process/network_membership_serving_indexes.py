@@ -241,6 +241,11 @@ async def verify_network_search_indexes(connection, candidate, *, compact_layout
         await _require_address_search_indexes(connection, compact_layout.base, compact_base=True)
         if compact_layout.custom is not None:
             await _require_address_search_indexes(connection, compact_layout.custom)
+        from process.network_geo_search import geo_search_receipt, verify_geo_search_indexes
+
+        search = geo_search_receipt(candidate)
+        if search is not None:
+            await verify_geo_search_indexes(connection, search)
         digest = await compact_index_digest(connection, candidate["schema_name"], candidate=candidate)
     else:
         relation = CompactAddressRelation(

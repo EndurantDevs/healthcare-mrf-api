@@ -5,7 +5,12 @@ import json
 from uuid import UUID
 
 from process.network_address_projection import PinnedAddressSource, _identifier
-from process.network_compact_layout import CompactAddressRelation, CompactEdgeArtifact, CompactNetworkLayout
+from process.network_compact_layout import (
+    CompactAddressRelation,
+    CompactEdgeArtifact,
+    CompactNetworkLayout,
+    bind_compact_geo_search_candidate,
+)
 from process.network_compact_readiness import _require
 from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_validation import _json_object
@@ -144,12 +149,9 @@ async def _verified_layout(connection, candidate, base, control_schema, *, api_r
         if custom.custom_pair_count or carriers is not None and carriers.materialized_address_rows:
             _require(custom_oid == closure["relation_oids"].get("entity_address_unified"))
             custom_relation = CompactAddressRelation(candidate["schema_name"], "entity_address_unified", custom_oid)
-    return CompactNetworkLayout(
-        CompactAddressRelation(candidate["schema_name"], "network_slice_ref", canonical["ref_map_oid"]),
-        base,
-        tuple(artifacts),
-        custom_relation,
-    )
+    ref_map = CompactAddressRelation(candidate["schema_name"], "network_slice_ref", canonical["ref_map_oid"])
+    layout = CompactNetworkLayout(ref_map, base, tuple(artifacts), custom_relation)
+    return bind_compact_geo_search_candidate(layout, candidate)
 
 
 async def compact_slice_ref_digest(connection, schema_name):

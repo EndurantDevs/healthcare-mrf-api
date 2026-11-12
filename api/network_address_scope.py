@@ -479,6 +479,38 @@ def is_scoped_address_relation(table_ref):
     )
 
 
+def scoped_geo_search_relation_sql(table_ref, *clauses):
+    """Use a verified projection only for supported selected-network GEO predicates."""
+    scope = _SCOPE.get()
+    if (
+        scope is None
+        or scope.network_ids is None
+        or scope.legacy_checksums is not None
+        or scope.manifest.compact_layout is None
+        or scope.manifest.compact_layout.geo_search is None
+        or not is_scoped_address_relation(table_ref)
+    ):
+        return None
+    from process.network_geo_search import SEARCH_COLUMNS
+
+    used_columns = {
+        quoted or unquoted.lower()
+        for quoted, unquoted in re.findall(
+            r'(?<!\w)"?a"?\s*\.\s*(?:"([^"]+)"|([a-z_][a-z0-9_]*))', " ".join(clauses), re.IGNORECASE
+        )
+    }
+    if not used_columns <= set(SEARCH_COLUMNS):
+        return None
+    relation = scope.manifest.compact_layout.geo_search
+    if relation not in scope.manifest.candidate_relation_pins:
+        raise ValueError("network_geo_search_pin_invalid")
+    marker = scope.read_statements.marker((relation,))
+    return (
+        f'({marker} SELECT * FROM ONLY "{relation.schema_name}"."{relation.table_name}" '
+        "WHERE canonical_network_ids && CAST(:_canonical_network_ids AS INTEGER[]))"
+    )
+
+
 def _is_reserved_parameter_equal(provided, expected):
     return (
         type(provided) is type(expected)

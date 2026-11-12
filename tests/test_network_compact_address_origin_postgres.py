@@ -904,6 +904,38 @@ async def test_published_api_pin_one_query_and_retained_reader_parity(indexed_ap
     assert len(held.requests) == 3 and not held.database.has_reader_session()
 
 
+async def test_direct_indexed_pin_retains_genuine_current_and_retained_reader_contract(indexed_api_db):
+    held = indexed_api_db
+    for generation_id, expected in (
+        (None, held.current),
+        (held.current.generation_id, held.current),
+        (held.retained.generation_id, held.retained),
+    ):
+        async with held.database.reader_session() as session:
+            identity_by_field = dict(session.info["api_reader_identity"])
+            transaction = session.get_transaction()
+            await pin_claims_reader(session, api_read=True)
+            before = len(held.requests)
+            manifest, approved, relation = await resolve_api_network_pin(session, generation_id=generation_id)
+            assert len(held.requests) == before + 1
+            driver, parameters, _entry = held.requests[-1]
+            assert parameters == (held.fixture.control_schema, generation_id, 8388608)
+            assert manifest == expected and manifest.compact_layout == expected.compact_layout
+            assert manifest.compact_layout.base.table_oid == held.current.compact_layout.base.table_oid
+            assert approved.approved_revision == expected.approved_custom_revision
+            assert approved.generation_id == expected.source_generations["custom_membership"]
+            assert relation.schema_name == held.fixture.control_schema
+            assert relation.table_name == "registry_approved_record"
+            assert relation.table_oid == await driver.fetchval(
+                "SELECT pg_catalog.to_regclass($1)::oid::bigint",
+                f'"{held.fixture.control_schema}".registry_approved_record',
+            )
+            assert driver.get_server_pid() == identity_by_field["backend_pid"]
+            assert session.info["api_reader_identity"] == identity_by_field and current_session() is session
+            assert session.get_transaction() is transaction and session.get_nested_transaction() is None
+    assert len(held.requests) == 3 and not held.database.has_reader_session()
+
+
 @pytest.mark.parametrize("damage", ["actor", "relation", "publication"])
 async def test_indexed_api_pin_refuses_native_drift_before_rows(indexed_api_db, damage):
     held = indexed_api_db

@@ -306,12 +306,15 @@ def _verified_compact_layout(candidate, base, descriptor, families):
             _require(artifact.table_oid == seal["receipt"]["closure"]["relation_oids"]["network_office_edge"])
         artifacts.append(artifact)
     custom = _custom_address_relation(candidate, descriptor)
-    return CompactNetworkLayout(
+    layout = CompactNetworkLayout(
         CompactAddressRelation(candidate["schema_name"], "network_slice_ref", canonical_by_field["ref_map_oid"]),
         base,
         tuple(artifacts),
         custom,
     )
+    from process.network_compact_layout import bind_compact_geo_search_candidate
+
+    return bind_compact_geo_search_candidate(layout, candidate)
 
 
 def _custom_address_relation(candidate, descriptor):

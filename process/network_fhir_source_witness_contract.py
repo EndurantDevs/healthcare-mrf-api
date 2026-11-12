@@ -8,10 +8,12 @@ from uuid import UUID
 
 from process.network_address_projection import _identifier
 from process.network_fhir_retained_capture_contract import (
+    LEGACY_PROFILE,
     SEMANTIC_PROFILE,
     canonical,
     digest,
     is_sha256,
+    retained_metadata_max_bytes,
     text,
 )
 from process.network_fhir_retained_capture_contract import TABLES as RETAINED_TABLES
@@ -76,10 +78,12 @@ def _pairs(value):
 
 
 def source_metadata_max_bytes(profile):
-    """Keep existing declaration bounds; new proof profiles use the original streaming admission cap."""
+    """Bound original metadata independently of projected declarations and native batches."""
     require(profile in HASH_CONTRACTS)
-    if profile in {OBSERVED_LEGACY_PROFILE, SEMANTIC_PROFILE}:
-        return 64 * 1024**2 - 32768 - 1
+    if profile in {OBSERVED_LEGACY_PROFILE, OBSERVED_ROOTED_PROFILE}:
+        return retained_metadata_max_bytes(LEGACY_PROFILE)
+    if profile == SEMANTIC_PROFILE:
+        return retained_metadata_max_bytes(profile)
     return ADMISSION_RAW_METADATA_MAX_BYTES
 
 

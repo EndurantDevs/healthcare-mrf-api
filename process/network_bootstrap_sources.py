@@ -427,6 +427,22 @@ async def _copy_native_batch(
         raise NetworkBootstrapSourceError("Native COPY byte bound is invalid")
     if import_admission is not None and not callable(import_admission):
         raise NetworkBootstrapSourceError("Native COPY import admission is invalid")
+    return await _copy_native_spool(
+        connection,
+        query,
+        arguments,
+        schema_name,
+        table_name,
+        expected_count,
+        byte_limit=byte_limit,
+        import_admission=import_admission,
+    )
+
+
+async def _copy_native_spool(
+    connection, query, arguments, schema_name, table_name, expected_count, *, byte_limit, import_admission=None
+):
+    """Copy a caller-bounded spool with exact native counts and consumption."""
     with tempfile.TemporaryFile(mode="w+b") as copy_file:
         spool_by_name = {"bytes": 0, "oversized": False, "failed": False}
 

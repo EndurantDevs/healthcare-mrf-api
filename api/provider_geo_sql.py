@@ -69,6 +69,7 @@ class NearbySqlQuery:
     address_table_sql: str
     geo_precision_clause: str
     geo_type_clause: str
+    search_table_sql: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,7 +162,8 @@ def _common_ctes(
     nearby: NearbySqlQuery,
 ) -> str:
     native_cte = _native_eligible_geo_cte(nearby)
-    relation_cte = f"{_IMPORT_RELATION} AS ({import_context.compiled.sql})"
+    materialization = " MATERIALIZED" if import_context.require_match else ""
+    relation_cte = f"{_IMPORT_RELATION} AS{materialization} ({import_context.compiled.sql})"
     eligible_cte = (
         f"eligible_geo AS MATERIALIZED (\n    SELECT * FROM {_NATIVE_GEO_RELATION}"
         f"\n     WHERE TRUE{_membership_clause(import_context)}\n)"
@@ -186,14 +188,14 @@ def _native_eligible_geo_cte(nearby: NearbySqlQuery) -> str:
     SELECT DISTINCT ON (d.npi, a.address_key)
            d.npi AS npi_code,
            a.address_key,
-           Geography(ST_MakePoint((a.long)::double precision, (a.lat)::double precision))
+           {_nearby_geography(nearby)}
                <-> Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision)))
                AS cursor_distance_meters,
            {address_key_columns}
-      FROM {nearby.address_table_sql} AS a
+      FROM {nearby.search_table_sql or nearby.address_table_sql} AS a
       JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
      WHERE ST_DWithin(
-               Geography(ST_MakePoint((a.long)::double precision, (a.lat)::double precision)),
+               {_nearby_geography(nearby)},
                Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision))),
                :radius * 1609.34
            )
@@ -205,7 +207,7 @@ def _native_eligible_geo_cte(nearby: NearbySqlQuery) -> str:
        {nearby.extra_clause}{nearby.ilike_clause}
      ORDER BY d.npi ASC,
               a.address_key ASC,
-              Geography(ST_MakePoint((a.long)::double precision, (a.lat)::double precision))
+              {_nearby_geography(nearby)}
                   <-> Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision))) ASC,
               CASE a.type
                   WHEN 'primary' THEN 0
@@ -216,6 +218,14 @@ def _native_eligible_geo_cte(nearby: NearbySqlQuery) -> str:
               END ASC,
               {nearby_row_tiebreaker(nearby.address_table_sql)}
 )"""
+
+
+def _nearby_geography(nearby: NearbySqlQuery) -> str:
+    return (
+        "a.geo"
+        if nearby.search_table_sql
+        else "Geography(ST_MakePoint((a.long)::double precision, (a.lat)::double precision))"
+    )
 
 
 def _address_row_key_columns(address_table_sql: str) -> tuple[str, ...]:
@@ -460,8 +470,34 @@ def build_native_nearby_sql(
     nearby: NearbySqlQuery,
     *,
     cursor_clause: str = "",
+    use_search_page: bool = False,
 ) -> str:
-    """Build the bounded native KNN query from normalized nearby fragments."""
+    """Keep initial KNN reads bounded and paginate canonical address identities."""
+
+    if nearby.search_table_sql and use_search_page and not cursor_clause:
+        return _native_search_page(nearby)
+    if cursor_clause:
+        # shortcut: dedupe eligible aliases first; add indexed identity selection if deep pages dominate latency.
+        return f"""WITH {_native_eligible_geo_cte(nearby)},
+page_geo AS MATERIALIZED (
+    SELECT a.*,
+           ROW_NUMBER() OVER (
+               ORDER BY a.cursor_distance_meters ASC, a.npi_code ASC, a.address_key ASC
+           ) AS _geo_page_position
+      FROM {_NATIVE_GEO_RELATION} AS a
+     WHERE TRUE{cursor_clause}
+     ORDER BY a.cursor_distance_meters ASC, a.npi_code ASC, a.address_key ASC
+     LIMIT :limit
+),
+{_hydrated_geo_cte(None, nearby)}
+SELECT hydrated_geo.*, taxonomy.*, nucc.display_name AS taxonomy_display
+  FROM hydrated_geo
+  LEFT JOIN mrf.npi_taxonomy AS taxonomy ON hydrated_geo.npi_code = taxonomy.npi
+  LEFT JOIN mrf.nucc_taxonomy AS nucc
+    ON nucc.code = taxonomy.healthcare_provider_taxonomy_code
+ ORDER BY hydrated_geo._geo_page_position ASC,
+          hydrated_geo.npi_code ASC,
+          hydrated_geo.address_key ASC"""
 
     taxonomy_from, taxonomy_where = _taxonomy_filter_parts(
         nearby,
@@ -495,6 +531,12 @@ def build_native_nearby_count_sql(
         nearby,
         filter_alias="g",
     )
+    if nearby.search_table_sql:
+        return f"""SELECT COUNT(DISTINCT (a.npi, a.address_key)) AS total_count
+  FROM {nearby.search_table_sql} AS a
+  JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
+ WHERE {_search_geo_predicates(nearby, taxonomy_where)}
+   {bbox_clause};"""
     return _NATIVE_NEARBY_COUNT_SQL_TEMPLATE.format(
         taxonomy_from=taxonomy_from,
         taxonomy_where=taxonomy_where,
@@ -505,6 +547,45 @@ def build_native_nearby_count_sql(
         ilike_clause=nearby.ilike_clause,
         address_table_sql=nearby.address_table_sql,
     )
+
+
+def _search_geo_predicates(nearby: NearbySqlQuery, taxonomy_where: str) -> str:
+    return f"""ST_DWithin(
+           a.geo,
+           Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision))),
+           :radius * 1609.34)
+   AND a.lat IS NOT NULL
+   AND a.long IS NOT NULL
+   AND a.address_key IS NOT NULL{taxonomy_where}
+   {nearby.geo_precision_clause}
+   {nearby.geo_type_clause}
+   {nearby.extra_clause}{nearby.ilike_clause}"""
+
+
+def _native_search_page(nearby: NearbySqlQuery) -> str:
+    """Limit physical search rows before hydrating wide provider/address records."""
+    taxonomy_from, taxonomy_where = _taxonomy_filter_parts(nearby, filter_alias="g")
+    return f"""WITH page_geo AS MATERIALIZED (
+    SELECT d.npi AS npi_code, a.address_key, a.location_key AS _geo_address_location_key,
+           a.geo <-> Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision)))
+               AS cursor_distance_meters
+      FROM {nearby.search_table_sql} AS a
+      JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
+     WHERE {_search_geo_predicates(nearby, taxonomy_where)}
+     ORDER BY a.geo <-> Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision))),
+              a.npi, a.address_key,
+              CASE a.type WHEN 'primary' THEN 0 WHEN 'practice' THEN 1 WHEN 'site' THEN 2 WHEN 'secondary' THEN 3 ELSE 9 END,
+              a.location_key
+     LIMIT :limit
+),
+{_hydrated_geo_cte(None, nearby, include_position=False)}
+SELECT hydrated_geo.*, taxonomy.*, nucc.display_name AS taxonomy_display
+  FROM hydrated_geo
+  LEFT JOIN mrf.npi_taxonomy AS taxonomy ON hydrated_geo.npi_code = taxonomy.npi
+  LEFT JOIN mrf.nucc_taxonomy AS nucc ON nucc.code = taxonomy.healthcare_provider_taxonomy_code
+ ORDER BY hydrated_geo.cursor_distance_meters, hydrated_geo.npi_code, hydrated_geo.address_key,
+          CASE hydrated_geo.type WHEN 'primary' THEN 0 WHEN 'practice' THEN 1 WHEN 'site' THEN 2 WHEN 'secondary' THEN 3 ELSE 9 END,
+          hydrated_geo.location_key;"""
 
 
 def _anchor_ctes() -> str:
@@ -553,17 +634,20 @@ SELECT hydrated_geo.*, taxonomy.*, nucc.display_name AS taxonomy_display, geo_to
     )
 
 
-def _hydrated_geo_cte(import_context: ProviderImportQuery, nearby: NearbySqlQuery) -> str:
+def _hydrated_geo_cte(
+    import_context: ProviderImportQuery | None, nearby: NearbySqlQuery, *, include_position: bool = True
+) -> str:
     address_key_join = "".join(
         f"\n       AND a.{column} = page_geo._geo_address_{column}"
         for column in _address_row_key_columns(nearby.address_table_sql)
     )
     import_columns = ""
-    if import_context.prepared.normalized_order_terms:
+    if import_context is not None and import_context.prepared.normalized_order_terms:
         import_columns = ",\n           page_geo._custom_import_entity_value" + "".join(
             f",\n           page_geo.sort_{ordinal}"
             for ordinal, _term in enumerate(import_context.prepared.normalized_order_terms)
         )
+    position_column = ",\n           page_geo._geo_page_position" if include_position else ""
     return f"""hydrated_geo AS MATERIALIZED (
     SELECT page_geo.npi_code,
            ROUND(
@@ -576,8 +660,7 @@ def _hydrated_geo_cte(import_context: ProviderImportQuery, nearby: NearbySqlQuer
                2
            ) AS distance,
            page_geo.cursor_distance_meters,
-           a.*, d.*{import_columns},
-           page_geo._geo_page_position
+           a.*, d.*{import_columns}{position_column}
       FROM page_geo
       JOIN {nearby.address_table_sql} AS a
         ON a.npi = page_geo.npi_code{address_key_join}

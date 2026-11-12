@@ -26,7 +26,44 @@ from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_publication import NetworkPublicationError
 from process.network_serving_read import resolve_network_serving_manifest
 from tests import test_network_compact_publication_postgres as publication
+from tests.test_api_database_jit import (
+    test_native_api_jit_covers_pool_growth_transaction_end_and_reconnect as test_native_api_jit_covers_pool_growth_transaction_end_and_reconnect,
+)
+from tests.test_network_compact_address_postgres import compact_db as compact_db
 from tests.test_network_compact_publication_postgres import compact_publication_db as compact_publication_db
+from tests.test_network_geo_search_api_sql import projection_api_case as projection_api_case
+from tests.test_network_geo_search_api_sql import (
+    test_postgres_search_projection_preserves_routes_and_unselected_fallback as test_postgres_search_projection_preserves_routes_and_unselected_fallback,
+)
+from tests.test_network_geo_search_postgres import search_db as search_db
+from tests.test_network_geo_search_postgres import (
+    test_bounded_search_matches_full_compact_rows_and_custom_precedence as test_bounded_search_matches_full_compact_rows_and_custom_precedence,
+)
+from tests.test_network_geo_search_postgres import (
+    test_old_incompatible_profile_has_no_search_receipt_or_heap as test_old_incompatible_profile_has_no_search_receipt_or_heap,
+)
+from tests.test_network_geo_search_postgres import (
+    test_search_later_batch_has_index_range_under_generic_plan as test_search_later_batch_has_index_range_under_generic_plan,
+)
+from tests.test_network_geo_search_postgres import (
+    test_search_parity_failure_rolls_back_only_its_new_projection as test_search_parity_failure_rolls_back_only_its_new_projection,
+)
+from tests.test_network_geo_search_postgres import (
+    test_search_rejects_changed_index_identity_and_receipt_scope as test_search_rejects_changed_index_identity_and_receipt_scope,
+)
+from tests.test_network_geo_search_publication_postgres import (
+    test_geo_search_preparation_custody_publication_and_retained_fallback as test_geo_search_preparation_custody_publication_and_retained_fallback,
+)
+from tests.test_network_index_catalog_postgres import (
+    test_index_catalog_reapplies_path_for_each_correlated_family as test_index_catalog_reapplies_path_for_each_correlated_family,
+)
+from tests.test_network_index_catalog_postgres import (
+    test_index_catalog_restores_exact_path_on_every_outcome as test_index_catalog_restores_exact_path_on_every_outcome,
+)
+from tests.test_network_index_catalog_postgres import (
+    test_legacy_catalog_keeps_its_original_deparse_context as test_legacy_catalog_keeps_its_original_deparse_context,
+)
+from tests.test_network_membership_slices_postgres import slice_db as slice_db
 
 
 async def _publish_ready(fixture, target):

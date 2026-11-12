@@ -230,7 +230,7 @@ def _index_rows():
 @pytest.mark.parametrize("missing", [3, 4, 5, 6, 7])
 async def test_inventory_lookup_and_identity_indexes_are_mandatory(missing):
     rows = _index_rows()
-    connection = SimpleNamespace(fetch=AsyncMock(return_value=rows))
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=rows))
     candidate = _registered(0)
     assert len(await indexes.compact_index_digest(connection, "fixture", candidate=candidate)) == 64
     rows.pop(missing)

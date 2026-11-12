@@ -74,6 +74,7 @@ _HEAPS = {
     "network_provider_only_evidence",
     "network_slice_ref",
     "network_office_edge",
+    "network_geo_search",
 }
 
 
