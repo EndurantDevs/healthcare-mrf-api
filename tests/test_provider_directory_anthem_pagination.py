@@ -149,10 +149,10 @@ def test_continuation_must_advance_and_current_sort_must_be_qualified():
     for current in (issued, issued.replace("_offset=100", "_offset=200"), START.replace("&_sort=_id", "")):
         with pytest.raises(ValueError, match="untrusted_anthem_pagination_link"):
             _resolve(issued, current=current)
-    role = BASE + "/PractitionerRole?_count=501&_sort=_id"
+    role = BASE + "/PractitionerRole?_count=1001&_sort=_id"
     with pytest.raises(ValueError, match="untrusted_anthem_pagination_link"):
         importer._resolved_fhir_next_url(
-            _source(), role, role + "&_offset=501", resource_type="PractitionerRole", page_entry_count=501
+            _source(), role, role + "&_offset=1001", resource_type="PractitionerRole", page_entry_count=1001
         )
 
 

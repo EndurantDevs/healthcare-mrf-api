@@ -87,7 +87,7 @@ def test_broad_imports_exclude_registered_endpoint_before_probes_including_catal
 def test_resource_selection_excludes_unavailable_and_non_directory_resources():
     source_by_field = _source()
     for resource_type in importer.anthem.RESOURCES:
-        count = 500 if resource_type == "PractitionerRole" else 1000
+        count = 1000
         assert importer._resource_start_url(source_by_field, resource_type, page_count=1000) == (
             f"{importer.anthem.API_BASE}/{resource_type}?_count={count}&_sort=_id"
         )
@@ -101,7 +101,7 @@ def test_full_refresh_prefers_verified_batches_and_bounded_probes_keep_their_req
     preferred = importer._source_full_refresh_page_count(source_by_field, 100, 0, 0)
     assert preferred == 1000
     assert importer._resource_start_url(source_by_field, "PractitionerRole", page_count=preferred).endswith(
-        "?_count=500&_sort=_id"
+        "?_count=1000&_sort=_id"
     )
     for row_limit, page_limit in ((1, 0), (0, 1), (1, 1)):
         assert importer._source_full_refresh_page_count(source_by_field, 2, row_limit, page_limit) == 2
@@ -109,7 +109,7 @@ def test_full_refresh_prefers_verified_batches_and_bounded_probes_keep_their_req
         "?_count=2&_sort=_id"
     )
     source_by_field["metadata_json"]["provider_directory_resource_page_count_caps"]["PractitionerRole"] = 1000
-    assert importer._source_resource_page_count(source_by_field, "PractitionerRole", 1000) == 500
+    assert importer._source_resource_page_count(source_by_field, "PractitionerRole", 1000) == 1000
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_MAX_PAGE_COUNT", "250")
     assert importer._source_full_refresh_page_count(source_by_field, 100, 0, 0) == 250
     assert importer._source_resource_page_count(source_by_field, "InsurancePlan", 1000) == 250

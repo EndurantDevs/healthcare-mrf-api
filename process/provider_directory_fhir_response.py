@@ -154,10 +154,38 @@ def resource_search_payload_error(
 
 
 async def fetch_paced_source_response(directory, source_record, url, *, timeout):
+    """Re-admit every authenticated send after any shared token renewal."""
+    if directory.source_selection.uses_credentialed_rest_transport(directory, source_record):
+
+        async def send_authenticated(options):
+            """Acquire ordinary request capacity for one authenticated GET."""
+            return await _fetch_admitted_source_response(
+                directory,
+                source_record,
+                url,
+                send=lambda: directory.source_selection.send_authenticated_page(
+                    directory, source_record, url, timeout=timeout, headers_by_name=options["headers"]
+                ),
+                ready=lambda: directory.source_selection.has_current_credentialed_rest_options(directory, options),
+            )
+
+        return await directory.source_selection.fetch_credentialed_rest_json(
+            directory, source_record, url, timeout=timeout, send=send_authenticated
+        )
+    return await _fetch_admitted_source_response(
+        directory,
+        source_record,
+        url,
+        send=lambda: directory._fetch_source_json_unpaced(source_record, url, timeout=timeout),
+    )
+
+
+async def _fetch_admitted_source_response(directory, source_record, url, *, send, ready=None):
     """Gate queued sends before pacing and publish cooldown before releasing a slot."""
     if directory.current_version_census_contract(source_record) is not None:
-        return await directory._fetch_source_json_unpaced(source_record, url, timeout=timeout)
+        return await send()
     pacing_state = source_record.get("_provider_directory_request_pacing_state")
+    pacing_options = {} if ready is None else {"ready": ready}
     request_slots = total_slots = nullcontext()
     if pacing_state is not None:
         slot_map = SOURCE_HTTP_REQUEST_SLOTS.get()
@@ -181,12 +209,14 @@ async def fetch_paced_source_response(directory, source_record, url, *, timeout)
     while True:
         async with request_slots, total_slots:
             try:
-                await directory._pace_source_request(source_record, allow_census_defer=True)
+                await directory._pace_source_request(source_record, allow_census_defer=True, **pacing_options)
             except directory.source_selection.CensusRequestDeferred:
                 return None, None, directory.source_selection.CENSUS_REQUEST_DEFERRED_ERROR, 0
             if isinstance(request_slots, AdaptiveRequestSlots) and request_slots.active > request_slots.limit:
                 continue
-            response = await directory._fetch_source_json_unpaced(source_record, url, timeout=timeout)
+            if ready is not None and not ready():
+                return None
+            response = await send()
             if isinstance(request_slots, AdaptiveRequestSlots) and _response_limits_concurrency(response):
                 previous_limit = request_slots.limit
                 request_slots.reduce()

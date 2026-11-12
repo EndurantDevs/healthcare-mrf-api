@@ -156,20 +156,123 @@ def require_credentialed_rest_spec(directory, source_record, spec):
         raise ValueError("provider_directory_credential_token_url_unapproved")
 
 
-async def credentialed_rest_options(directory, source_record, url):
-    """Share token refreshes across scans while keeping token I/O off the event loop."""
+def _uses_oauth_authorization(directory, spec):
+    """Leave static bearer and explicit Authorization overrides on their existing path."""
+    api_key_header = directory._api_key_header(spec)
+    return bool(
+        directory._oauth2_spec(spec)
+        and not directory._resolve_secret_text(spec.get("bearer_token"))
+        and not (api_key_header is not None and api_key_header[0].lower() == "authorization")
+        and not any(
+            str(name).lower() == "authorization" and directory._resolve_secret_text(value)
+            for name, value in directory._mapping(spec.get("headers")).items()
+        )
+    )
+
+
+async def _credentialed_oauth_token(directory, source_record, url, oauth, timeout):
+    """Read a bounded cancellable token response using the existing request and cache contract."""
+    request = directory._oauth2_token_request(oauth)
+    if request is None:
+        return None, 0
+    key, now = directory._oauth2_cache_key(oauth), directory.time.time()
+    cached = directory._OAUTH_TOKEN_CACHE.get(key)
+    if cached and cached[1] > now:
+        return cached
+    session = credentialed_rest_session(directory, source_record, url)
+    try:
+        owner = (
+            contextlib.nullcontext(session)
+            if session is not None
+            else directory._source_http_client_session(require_verified_tls=True)
+        )
+        async with owner as client:
+            async with client.post(
+                request.full_url,
+                data=request.data,
+                headers=dict(request.header_items()),
+                timeout=directory.aiohttp.ClientTimeout(total=min(15, timeout)),
+                allow_redirects=False,
+            ) as response:
+                if not 200 <= response.status < 300:
+                    return None, 0
+                body = await directory._read_source_http_response_body(response, timeout=timeout, max_bytes=1024 * 1024)
+                payload_by_field = directory._decode_json_body(body)
+    except Exception:
+        return None, 0
+    access_token = directory._clean_text((payload_by_field or {}).get("access_token"))
+    if not access_token:
+        return None, 0
+    try:
+        expires_in = int(payload_by_field.get("expires_in") or 3600)
+    except Exception:
+        expires_in = 3600
+    expires_at = now + max(0, expires_in)
+    if expires_at <= directory.time.time():
+        return None, 0
+    directory._OAUTH_TOKEN_CACHE[key] = (
+        access_token,
+        now + max(0, expires_in - directory.OAUTH_TOKEN_EXPIRY_SKEW_SECONDS),
+    )
+    return access_token, expires_at
+
+
+async def credentialed_rest_options(directory, source_record, url, *, rejected_authorization=None, timeout=15):
+    """Serialize token renewal and drain its cancellable HTTP cleanup under the credential lock."""
     if not credentialed_rest_request_allowed(directory, source_record, url):
         raise QualificationURLRejected("provider_directory_credential_url_outside_scope")
+    require_qualification_url(directory, url)
     spec = directory._credential_spec_for_source(source_record)
     require_credentialed_rest_spec(directory, source_record, spec)
     oauth = directory._oauth2_spec(spec)
+
+    async def resolve():
+        """Discard only the rejected OAuth token before resolving authorized request options."""
+        uses_oauth = _uses_oauth_authorization(directory, spec)
+        if rejected_authorization is not None:
+            if not uses_oauth:
+                return None
+            key = directory._oauth2_cache_key(oauth)
+            cached = directory._OAUTH_TOKEN_CACHE.get(key)
+            if cached is not None and rejected_authorization == f"Bearer {cached[0]}":
+                directory._OAUTH_TOKEN_CACHE.pop(key)
+        resolved_spec_by_field = {**spec, "oauth2": None}
+        if uses_oauth:
+            try:
+                async with asyncio.TaskGroup() as requests:
+                    token_request = requests.create_task(
+                        _credentialed_oauth_token(directory, source_record, url, oauth, timeout)
+                    )
+            except ExceptionGroup as failure:
+                raise failure.exceptions[0] from None
+            token, expires_at = token_request.result()
+            resolved_spec_by_field["bearer_token"] = token
+        options = directory._credential_request_options_for_source(source_record, url, spec=resolved_spec_by_field)
+        if uses_oauth and token:
+            options["_oauth2_expiry"] = (directory._oauth2_cache_key(oauth), expires_at)
+        return options
+
     locks = CREDENTIAL_REQUEST_LOCKS.get()
     if locks is None:
-        return await asyncio.to_thread(directory._credential_request_options_for_source, source_record, url, spec=spec)
+        return await resolve()
     key = directory._oauth2_cache_key(oauth)
     lock = locks.setdefault(key, asyncio.Lock())
     async with lock:
-        return await asyncio.to_thread(directory._credential_request_options_for_source, source_record, url, spec=spec)
+        return await resolve()
+
+
+def has_current_credentialed_rest_options(directory, options):
+    """Recheck token identity and expiry after pacing without token I/O under request permits."""
+    expiry = options.get("_oauth2_expiry")
+    if expiry is None:
+        return True
+    key, expires_at = expiry
+    cached = directory._OAUTH_TOKEN_CACHE.get(key)
+    return bool(
+        cached
+        and options["headers"].get("Authorization") == f"Bearer {cached[0]}"
+        and expires_at > directory.time.time()
+    )
 
 
 def is_anonymous_source_url(url: str) -> bool:
@@ -856,11 +959,19 @@ async def fetch_unpaced_source_json(directory, source_record, url, *, timeout):
     )
 
 
-async def fetch_credentialed_rest_json(directory, source_record, url, *, timeout):
-    """Keep missing credentials and unverified sessions out of anonymous transport."""
-    options = await directory.source_selection.credentialed_rest_options(directory, source_record, url)
-    if not any(name.lower() == "authorization" and header_value for name, header_value in options["headers"].items()):
-        return None, None, "provider_directory_credentials_unavailable", 0
+def uses_credentialed_rest_transport(directory, source_record):
+    """Keep credentialed admission behind existing proxy and anonymous transport contracts."""
+    return bool(
+        is_credentialed_rest_source(directory, source_record)
+        and directory.source_proxy.selected_run(directory, source_record) is None
+        and directory.current_version_census_contract(source_record) is None
+        and not directory.capped_partition.enabled(directory, source_record)
+        and directory._source_metadata(source_record).get("provider_directory_pagination_same_collection") is not True
+    )
+
+
+async def send_authenticated_page(directory, source_record, url, *, timeout, headers_by_name):
+    """Send one authorized page with the existing verified transport and exact URL bytes."""
     session = directory.source_selection.credentialed_rest_session(directory, source_record, url)
     if session is not None:
         return await directory._fetch_json_with_source_session(
@@ -869,12 +980,65 @@ async def fetch_credentialed_rest_json(directory, source_record, url, *, timeout
             timeout=timeout,
             allow_redirects=False,
             preserve_url_bytes=True,
-            extra_headers=options["headers"],
+            extra_headers=headers_by_name,
             allow_gzip=True,
         )
     return await directory._fetch_json_with_options(
-        url, timeout=timeout, extra_headers=options["headers"], allow_gzip=True
+        url, timeout=timeout, extra_headers=headers_by_name, allow_gzip=True
     )
+
+
+async def fetch_credentialed_rest_json(directory, source_record, url, *, timeout, send=None):
+    """Keep missing credentials and unverified sessions out of anonymous transport."""
+    options = await directory.source_selection.credentialed_rest_options(directory, source_record, url, timeout=timeout)
+    if not any(name.lower() == "authorization" and header_value for name, header_value in options["headers"].items()):
+        return None, None, "provider_directory_credentials_unavailable", 0
+    total_elapsed_ms = 0
+    has_retried = False
+    while True:
+        if has_retried and send is None:
+            try:
+                await directory._pace_source_request(
+                    source_record,
+                    allow_census_defer=True,
+                    ready=lambda: has_current_credentialed_rest_options(directory, options),
+                )
+            except CensusRequestDeferred:
+                return None, None, CENSUS_REQUEST_DEFERRED_ERROR, total_elapsed_ms
+        fetch_result = None
+        if send is not None or has_current_credentialed_rest_options(directory, options):
+            fetch_result = (
+                await send(options)
+                if send is not None
+                else await send_authenticated_page(
+                    directory, source_record, url, timeout=timeout, headers_by_name=options["headers"]
+                )
+            )
+        if fetch_result is None:
+            options = await directory.source_selection.credentialed_rest_options(
+                directory, source_record, url, timeout=timeout
+            )
+            if not any(
+                name.lower() == "authorization" and header_value for name, header_value in options["headers"].items()
+            ):
+                return None, None, "provider_directory_credentials_unavailable", total_elapsed_ms
+            continue
+        total_elapsed_ms += fetch_result[3]
+        authorizations = [
+            header_value
+            for name, header_value in options["headers"].items()
+            if name.lower() == "authorization" and header_value
+        ]
+        if fetch_result[0] != 401 or has_retried or len(authorizations) != 1:
+            return directory._source_fetch_result_with_elapsed(fetch_result, total_elapsed_ms)
+        options = await directory.source_selection.credentialed_rest_options(
+            directory, source_record, url, rejected_authorization=authorizations[0], timeout=timeout
+        )
+        if not options or not any(
+            name.lower() == "authorization" and header_value for name, header_value in options["headers"].items()
+        ):
+            return directory._source_fetch_result_with_elapsed(fetch_result, total_elapsed_ms)
+        has_retried = True
 
 
 async def fetch_source_candidate(directory, source_record, candidate_url, *, timeout, is_last_candidate):

@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Endpoint-scoped Anthem directory configuration for the shared FHIR importer."""
 
+import hashlib
 import re
 from urllib.parse import parse_qsl, urljoin, urlsplit
 
@@ -16,8 +17,9 @@ RESOURCES = (
     "HealthcareService",
     "OrganizationAffiliation",
 )
-PAGE_COUNT_CAPS = {resource: 500 if resource == "PractitionerRole" else 1000 for resource in RESOURCES}
+PAGE_COUNT_CAPS = dict.fromkeys(RESOURCES, 1000)
 SORTED_LAST_ID_KEY = "anthem_sorted_last_id"
+PAGE_COUNT_TRANSITION_KEY = "anthem_page_count_transition"
 _RESOURCE_ID = re.compile(r"[A-Za-z0-9.-]{1,64}")
 
 
@@ -108,6 +110,90 @@ def resume_url(current_url: str, next_link: str | None, resource_type: str, page
         raise ValueError("untrusted_anthem_pagination_link")
     _continuation_query(current_url, next_link, resource_type, page_count_cap)
     return next_link
+
+
+def checkpoint_start_hash(resource_type: str, start: str, checkpoint: dict, completeness: dict) -> str:
+    """Keep the original checkpoint identity for the reviewed count-only upgrade."""
+    current_hash = hashlib.sha256(start.encode()).hexdigest()
+    legacy_hash = hashlib.sha256(start_url("PractitionerRole", 500).encode()).hexdigest()
+    if (
+        resource_type == "PractitionerRole"
+        and start == start_url(resource_type, 1000)
+        and checkpoint.get("start_url_hash") == legacy_hash
+        and checkpoint.get("state") == "active"
+        and int(checkpoint.get("rows_processed") or 0) > 0
+    ):
+        query = _page_query(checkpoint.get("next_url"), resource_type, 1000)
+        if query["_count"] == "1000" and not completeness.get(PAGE_COUNT_TRANSITION_KEY):
+            raise ValueError("anthem_page_count_transition_invalid")
+        return legacy_hash
+    return current_hash
+
+
+def _validate_count_transition(proof: dict, saved: dict, rows: int, boundary: str | None) -> None:
+    if not (
+        type(proof) is dict
+        and set(proof) == {"from", "to", "issued_offset", "issued_cursor_sha256", "sorted_last_id"}
+        and type(proof["from"]) is int
+        and proof["from"] == 500
+        and type(proof["to"]) is int
+        and proof["to"] == 1000
+        and type(proof["issued_offset"]) is int
+        and 0 < proof["issued_offset"] < rows
+        and type(proof["issued_cursor_sha256"]) is str
+        and re.fullmatch(r"[0-9a-f]{64}", proof["issued_cursor_sha256"])
+        and type(proof["sorted_last_id"]) is str
+        and _RESOURCE_ID.fullmatch(proof["sorted_last_id"])
+        and boundary is not None
+        and proof["sorted_last_id"] < boundary
+        and saved["_count"] == "1000"
+        and int(saved.get("_offset", "0")) == rows
+    ):
+        raise ValueError("anthem_page_count_transition_invalid")
+
+
+def prepare_resume(start: str, saved_url: str, resource_type: str, cap: int, rows_processed: int, completeness: dict):
+    """Resize only a retained role cursor; persist its proof with the accepted page."""
+    proof_by_field = dict(completeness)
+    transition = proof_by_field.get(PAGE_COUNT_TRANSITION_KEY)
+    if resource_type != "PractitionerRole" or start != start_url(resource_type, 1000):
+        if transition is not None:
+            raise ValueError("anthem_page_count_transition_invalid")
+        return resume_url(start, saved_url, resource_type, cap), proof_by_field
+    saved = _page_query(saved_url, resource_type, cap)
+    boundary = resume_boundary(rows_processed, completeness)
+    if transition is not None:
+        _validate_count_transition(transition, saved, rows_processed, boundary)
+        return resume_url(start, saved_url, resource_type, cap), proof_by_field
+    if saved["_count"] != "500":
+        return resume_url(start, saved_url, resource_type, cap), proof_by_field
+    resume_url(start_url(resource_type, 500), saved_url, resource_type, cap)
+    if cap < 1000 or rows_processed <= 0 or int(saved["_offset"]) != rows_processed or boundary is None:
+        raise ValueError("anthem_page_count_transition_invalid")
+    proof_by_field[PAGE_COUNT_TRANSITION_KEY] = {
+        "from": 500,
+        "to": 1000,
+        "issued_offset": rows_processed,
+        "issued_cursor_sha256": hashlib.sha256(saved_url.encode()).hexdigest(),
+        "sorted_last_id": boundary,
+    }
+    prefix, query = saved_url.split("?", 1)
+    parts = query.split("&")
+    for index, part in enumerate(parts):
+        if parse_qsl(part, strict_parsing=True) == [("_count", "500")]:
+            parts[index] = part.split("=", 1)[0] + "=1000"
+    return prefix + "?" + "&".join(parts), proof_by_field
+
+
+def prepare_acquisition(start: str, resource_type: str, cap: int, resume):
+    """Prepare the trusted request and proof without changing the committed cursor."""
+    rows = resume.rows_processed if resume else 0
+    completeness = resume.completeness if resume else {}
+    boundary = resume_boundary(rows, completeness)
+    if resume and rows and not resume.complete:
+        url, completeness = prepare_resume(start, resume.next_url, resource_type, cap, rows, completeness)
+        return boundary, url, completeness
+    return boundary, None, dict(completeness)
 
 
 def next_link(payload: dict) -> str | None:

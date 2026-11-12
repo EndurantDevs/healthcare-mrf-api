@@ -1803,9 +1803,17 @@ not API credentials. The client ID and secret must belong to an approved
 production application; keep their values outside source definitions and import
 parameters.
 
+An OAuth 401 invalidates only the rejected cached token under the existing
+credential lock and retries the exact page once. Concurrent scans reuse a newer
+token when another scan has already refreshed it. A second 401, a 403, or static
+authorization remains terminal and preserves the current cursor.
+Renewal uses cancellable verified HTTP within the caller's deadline and drains
+owned cleanup before releasing its lock. Every replacement GET re-enters ordinary
+pacing and adaptive request admission. Token freshness is checked after admission;
+renewing an expired selection releases capacity and preserves the one 401 retry.
+
 The source follows server-issued REST next links using the shared durable
-checkpoints. Full refreshes prefer 1,000 rows per page for six collections and
-500 for PractitionerRole, whose larger payloads benefit from smaller pages;
+checkpoints. Full refreshes prefer 1,000 rows per page for all seven collections;
 bounded probes preserve their requested page size. These exact-source caps
 remain subject to the shared page and response-body limits. Requests negotiate
 gzip for this source while decoded responses retain the same body limit.
@@ -1816,7 +1824,15 @@ exact collection by the returned entry count. Saved cursors undergo separate
 scope validation on resume. The importer preserves the issued URL unchanged and refuses
 malformed, unsorted or overlapping resource IDs before staging the page. The
 last sorted ID is committed with each page's existing checkpoint and checked
-again on resume. Sorted page pairs for all seven collections had strictly
+again on resume. An existing PractitionerRole checkpoint can upgrade from 500
+to 1,000 entries while retaining its original start hash and exact issued offset.
+Its legacy stored 500-entry cap is upgraded before selecting the start URL;
+lower request counts and other metadata caps retain their limits.
+Only the count changes; the first accepted page commits the count-transition
+proof, sorted boundary, rows and new issued continuation together. Failures
+retain the previous checkpoint. A worker with the older 500-entry cap refuses
+the upgraded cursor. Network-filtered parallel partitions remain unqualified.
+Sorted page pairs for all seven collections had strictly
 increasing IDs and retained the issued sort. No reliable collection totals were
 observed. The sampled plans included
 Medicare, Medicaid and other product codes and multiple insurer brands; those

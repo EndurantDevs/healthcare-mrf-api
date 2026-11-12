@@ -3438,6 +3438,8 @@ def _source_resource_page_count(source: dict[str, Any], resource_type: str, page
     api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
     hard_cap = PROVIDER_DIRECTORY_RESOURCE_PAGE_COUNT_CAPS.get((api_base or "", resource_type))
     metadata_cap = _metadata_resource_page_count_cap(source, resource_type)
+    if api_base == anthem.API_BASE and resource_type == "PractitionerRole" and metadata_cap == 500:
+        metadata_cap = anthem.PAGE_COUNT_CAPS[resource_type]
     caps = [cap for cap in (hard_cap, metadata_cap) if cap]
     if not caps:
         return bounded_count
@@ -41201,7 +41203,9 @@ def _source_request_interval_seconds(source_record: dict[str, Any]) -> float:
     return max(0.0, interval_seconds)
 
 
-async def _pace_source_request(source_record: dict[str, Any], *, allow_census_defer: bool = False) -> None:
+async def _pace_source_request(
+    source_record: dict[str, Any], *, allow_census_defer: bool = False, ready: Callable[[], bool] | None = None
+) -> None:
     interval_seconds = _source_request_interval_seconds(source_record)
     pacing_state = source_record.get("_provider_directory_request_pacing_state", source_record)
     if interval_seconds <= 0 and not pacing_state.get("retry_after_monotonic"):
@@ -41220,7 +41224,8 @@ async def _pace_source_request(source_record: dict[str, Any], *, allow_census_de
             if wait_seconds <= 0:
                 break
             await asyncio.sleep(wait_seconds)
-        pacing_state["_provider_directory_last_request_monotonic"] = time.monotonic()
+        if ready is None or ready():
+            pacing_state["_provider_directory_last_request_monotonic"] = time.monotonic()
 
 
 def _source_retry_after_seconds(
@@ -53216,10 +53221,9 @@ async def _fetch_resource_rows(
                     retryable=False,
                     contract=current_version_contract,
                 )
-    is_anthem_source = (
-        _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base")) == anthem.API_BASE
-    )
-    previous_anthem_id = None
+    source_api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    is_anthem_source = source_api_base == anthem.API_BASE
+    previous_anthem_id, anthem_resume_url, anthem_proof_by_field = None, None, {}
     synthetic_resume_guard_error = molina.healthcare_service_resume_error(
         _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base")),
         resource_type,
@@ -53227,17 +53231,12 @@ async def _fetch_resource_rows(
     ) or _synthetic_position_resume_guard_error(source_record, resume_state)
     if is_anthem_source:
         try:
-            previous_anthem_id = anthem.resume_boundary(
-                resume_state.rows_processed if resume_state else 0,
-                resume_state.completeness if resume_state else {},
+            previous_anthem_id, anthem_resume_url, anthem_proof_by_field = anthem.prepare_acquisition(
+                checkpoint_start_url,
+                resource_type,
+                _source_resource_page_count(source_record, resource_type, _max_page_count()),
+                resume_state,
             )
-            if resume_state and resume_state.rows_processed and not resume_state.complete:
-                anthem.resume_url(
-                    checkpoint_start_url,
-                    resume_state.next_url,
-                    resource_type,
-                    _source_resource_page_count(source_record, resource_type, _max_page_count()),
-                )
         except ValueError as exc:
             synthetic_resume_guard_error = str(exc)
     if synthetic_resume_guard_error and resume_state is not None:
@@ -53336,7 +53335,6 @@ async def _fetch_resource_rows(
     if not is_caresource_census_enabled:
         deadline_at = time.monotonic() + deadline_seconds if deadline_seconds > 0 else None
     is_deadline_reached = False
-    source_api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
     (
         previous_synthetic_resource_identities,
         recent_synthetic_page_fingerprints,
@@ -53348,6 +53346,8 @@ async def _fetch_resource_rows(
         else _env_int("HLTHPRT_PROVIDER_DIRECTORY_MAX_FULL_PAGES", DEFAULT_FULL_REFRESH_MAX_PAGES)
     )
     pending_start_urls = [resume_state.next_url] if resume_state and resume_state.next_url else list(start_urls)
+    if anthem_resume_url is not None:
+        pending_start_urls = [anthem_resume_url]
     if is_caresource_census_enabled and caresource_proof_by_field.get("terminal_page") is not None:
         pending_start_urls = []
     is_partitioned_fetch = len(pending_start_urls) > 1
@@ -53910,7 +53910,11 @@ async def _fetch_resource_rows(
                     retained_resource_rows.append(parsed_resource_row)
                 if row_batch_handler:
                     pending_rows.append(parsed_resource_row)
-                    if not is_current_version_census_enabled and len(pending_rows) >= max(1, row_batch_size):
+                    if (
+                        not is_current_version_census_enabled
+                        and not (is_anthem_source and checkpoint_context)
+                        and len(pending_rows) >= max(1, row_batch_size)
+                    ):
                         await flush_pending_rows()
                 if not _can_limit_accept_more(rows_fetched, per_resource_limit):
                     has_reached_row_limit = entry_index < len(entries) - 1
@@ -53935,7 +53939,6 @@ async def _fetch_resource_rows(
                     error_message = str(exc)
                     has_next_url = True
                     break
-            source_api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
             try:
                 if is_current_version_census_enabled:
                     resolved_next_url = current_version_resolved_next_url
@@ -54056,7 +54059,7 @@ async def _fetch_resource_rows(
                                     if defer_caresource_terminal_checkpoint
                                     else current_version_proof_by_field
                                     if is_current_version_census_enabled
-                                    else {anthem.SORTED_LAST_ID_KEY: previous_anthem_id}
+                                    else {**anthem_proof_by_field, anthem.SORTED_LAST_ID_KEY: previous_anthem_id}
                                     if is_anthem_source
                                     else (
                                         _synthetic_position_page_guard_completeness(
@@ -61561,11 +61564,7 @@ async def _adopt_pagination_checkpoint_owner(
         is_verified_ancestor = bool(context.lineage_verified and context.dataset_id)
         if not (is_direct_predecessor or is_verified_ancestor):
             raise RuntimeError("provider_directory_pagination_checkpoint_lineage_mismatch")
-        resume_state = _compatible_pagination_resume_state(
-            checkpoint,
-            context,
-            start_url_hash,
-        )
+        resume_state = _compatible_pagination_resume_state(checkpoint, context, start_url_hash)
         if resume_state is None or _clean_text(checkpoint.get("owner_run_id")) != previous_owner_run_id:
             raise RuntimeError("provider_directory_pagination_checkpoint_lineage_mismatch")
         observed_checkpoint_params = _pagination_checkpoint_observation_params(checkpoint)
@@ -61797,11 +61796,11 @@ async def _load_or_initialize_pagination_checkpoint(
     ):
         start_url_hash = hashlib.sha256(start_url.encode("utf-8")).hexdigest()
         checkpoint = await _fetch_pagination_checkpoint(context, resource_type)
-        resume_state = _compatible_pagination_resume_state(
-            checkpoint,
-            context,
-            start_url_hash,
-        )
+        if context.canonical_api_base == anthem.API_BASE:
+            start_url_hash = anthem.checkpoint_start_hash(
+                resource_type, start_url, checkpoint, _json_object(checkpoint.get("completeness_json"))
+            )
+        resume_state = _compatible_pagination_resume_state(checkpoint, context, start_url_hash)
         if resume_state:
             previous_owner_run_id = _clean_text(checkpoint.get("owner_run_id"))
             if previous_owner_run_id and previous_owner_run_id != context.owner_run_id:
