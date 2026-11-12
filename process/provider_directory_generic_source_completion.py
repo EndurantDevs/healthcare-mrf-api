@@ -22,6 +22,12 @@ from process.provider_directory_generic_source_policy import (
     source_copy_session,
     source_owner_transaction,
 )
+from process.provider_directory_role_merge import (
+    NATIVE_ROLES,
+    is_role_repeat_source,
+    require_observed_merged_roles,
+    require_one_content_per_native_role,
+)
 from process.provider_directory_source_storage_binding import FHIRSourceCandidateHandoff
 
 _KEYS = {
@@ -68,6 +74,8 @@ def _resource_callbacks(directory, candidate):
         """Validate the existing canonical projection/hash/date before reduction."""
         resource_by_field = {name: resource_by_field.get(name) for name in RESOURCE_COLUMNS}
         resource_by_field["payload_json"] = _payload(resource_by_field)
+        # Checked against the whole input before this reduction; not part of the retained role.
+        resource_by_field["payload_json"].pop(NATIVE_ROLES, None)
         expected = directory.resource_payload_sha256_for_contract(
             resource_by_field["payload_json"], contract, resource_type=resource_by_field["resource_type"]
         )
@@ -309,7 +317,7 @@ async def _order_indexes(connection, policy, binding_by_field):
     for key in ("resource_input", "witness_input"):
         name = binding_by_field["tables"][key]["name"]
         await connection.execute(
-            f"CREATE INDEX {storage_identifier(name + '_order')} ON {storage_relation(policy.schema, name)} "
+            f"CREATE INDEX IF NOT EXISTS {storage_identifier(name + '_order')} ON {storage_relation(policy.schema, name)} "
             '(resource_type COLLATE "C",resource_id COLLATE "C",batch_ordinal,row_ordinal)'
         )
 
@@ -352,10 +360,23 @@ async def _complete_payloads(connection, policy, previous, candidate, directory,
     )
     if await _observed_divergence(connection, policy, previous, "witness_input"):
         raise storage.GenericCandidateError("provider_directory_generic_candidate_witness_replay_conflict")
-    if await _observed_divergence(connection, policy, previous, "resource_input"):
+    is_merged_role_source = is_role_repeat_source(previous["identity"]["metadata"].get("source_ids"))
+    if is_merged_role_source:
+        await require_one_content_per_native_role(
+            connection,
+            storage_relation(policy.schema, previous["tables"]["resource_input"]["name"]),
+            _active_where("resource_input"),
+            _active_arguments(previous),
+        )
+    # Only the ordered reduction drops the source-role commitments, so a listed source always takes it.
+    if is_merged_role_source or await _observed_divergence(connection, policy, previous, "resource_input"):
         await _reduce_payloads_python(connection, policy, previous, candidate, directory, tables_by_root, release_id)
     else:
         await _reduce_payloads_sql(connection, policy, previous, candidate, directory, tables_by_root, release_id)
+    if is_merged_role_source:
+        await require_observed_merged_roles(
+            connection, storage_relation(policy.schema, tables_by_root[storage.RESOURCE]["name"])
+        )
     for root in (storage.RESOURCE, storage.WITNESS):
         await _indexes(connection, policy, root, tables_by_root[root]["name"])
 

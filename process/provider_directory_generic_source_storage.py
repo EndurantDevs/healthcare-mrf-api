@@ -29,6 +29,7 @@ from process.provider_directory_generic_candidate import (
     copy_record_batches,
 )
 from process.provider_directory_generic_source_policy import source_copy_session, source_owner_transaction
+from process.provider_directory_role_merge import is_role_repeat_source, role_order_index_sql, staged_role_rows
 from process.provider_directory_source_storage_binding import require_storage_schema, storage_document
 from process.vsp_directory_contract import RESOURCE_TYPES as VSP_RESOURCE_TYPES
 from process.vsp_directory_contract import SOURCE_ID as VSP_SOURCE_ID
@@ -664,6 +665,8 @@ async def prepare_generic_source_candidate(database, directory, candidate):
                     relation,
                 )
                 await _close_grants(connection, policy, sequence_name, sequence=True)
+                if is_role_repeat_source(identity["metadata"].get("source_ids")):
+                    await connection.execute(role_order_index_sql(policy.schema, names_by_kind[key]))
         captured = await _capture(connection, policy, list(names_by_kind.values()))
         binding_by_field = dict(
             contract=CONTRACT,
@@ -1547,6 +1550,9 @@ async def append_generic_source_batch(database, directory, candidate, resources,
             storage_relation(policy.schema, previous["tables"]["resource_input"]["name"]),
         )
         _require(type(ordinal) is int and previous["ordinal"] < ordinal < 2**63 - 1, "ordinal_exhausted")
+        resources = await staged_role_rows(
+            connection, policy.schema, previous["tables"]["resource_input"]["name"], previous, resources
+        )
         for key, columns, batch_rows in (
             ("resource_input", RESOURCE_COLUMNS, resources),
             ("witness_input", WITNESS_COLUMNS, witnesses),

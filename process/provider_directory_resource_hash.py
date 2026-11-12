@@ -11,7 +11,6 @@ import json
 import re
 from typing import Any, Mapping
 
-
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 
 RESOURCE_TRANSPORT_PAYLOAD_FIELDS = frozenset(
@@ -152,14 +151,8 @@ def _without_volatile_fhir_time(
     content_by_field = dict(payload_by_field)
     fhir_meta = content_by_field.get("fhir_meta")
     if isinstance(fhir_meta, Mapping):
-        stable_fhir_metadata_by_field = {
-            key: value
-            for key, value in fhir_meta.items()
-            if key != "lastUpdated"
-        }
-        content_by_field["fhir_meta"] = (
-            stable_fhir_metadata_by_field or None
-        )
+        stable_fhir_metadata_by_field = {key: value for key, value in fhir_meta.items() if key != "lastUpdated"}
+        content_by_field["fhir_meta"] = stable_fhir_metadata_by_field or None
     return content_by_field
 
 
@@ -168,11 +161,7 @@ def resource_content_hash_payload(
 ) -> dict[str, Any]:
     """Reproduce the v2 hash view without top-level transport coordinates."""
 
-    return {
-        key: value
-        for key, value in payload_by_field.items()
-        if key not in RESOURCE_TRANSPORT_PAYLOAD_FIELDS
-    }
+    return {key: value for key, value in payload_by_field.items() if key not in RESOURCE_TRANSPORT_PAYLOAD_FIELDS}
 
 
 def semantic_resource_content_hash_payload(
@@ -180,9 +169,7 @@ def semantic_resource_content_hash_payload(
 ) -> dict[str, Any]:
     """Remove transport coordinates and volatile FHIR observation time."""
 
-    content_by_field = _without_volatile_fhir_time(
-        resource_content_hash_payload(payload_by_field)
-    )
+    content_by_field = _without_volatile_fhir_time(resource_content_hash_payload(payload_by_field))
     if _is_mapped_practitioner_payload(content_by_field):
         return canonical_practitioner_payload(content_by_field)
     return content_by_field
@@ -204,9 +191,7 @@ def practitioner_semantic_base_payload(
 ) -> dict[str, Any]:
     """Return all stable Practitioner content except repeating names."""
 
-    return _practitioner_base_payload_from_semantic(
-        semantic_resource_content_hash_payload(payload_by_field)
-    )
+    return _practitioner_base_payload_from_semantic(semantic_resource_content_hash_payload(payload_by_field))
 
 
 def _practitioner_base_payload_from_semantic(
@@ -214,11 +199,7 @@ def _practitioner_base_payload_from_semantic(
 ) -> dict[str, Any]:
     if not _is_mapped_practitioner_payload(semantic_payload):
         raise ValueError("provider_directory_practitioner_payload_invalid")
-    return {
-        key: value
-        for key, value in semantic_payload.items()
-        if key not in PRACTITIONER_NAME_PAYLOAD_FIELDS
-    }
+    return {key: value for key, value in semantic_payload.items() if key not in PRACTITIONER_NAME_PAYLOAD_FIELDS}
 
 
 def practitioner_semantic_base_sha256(
@@ -234,17 +215,13 @@ def practitioner_name_hashes(
 ) -> tuple[str, ...]:
     """Return the ordered exact mapped HumanName digest set."""
 
-    return _practitioner_name_hashes_from_canonical(
-        canonical_practitioner_payload(payload_by_field)
-    )
+    return _practitioner_name_hashes_from_canonical(canonical_practitioner_payload(payload_by_field))
 
 
 def _practitioner_name_hashes_from_canonical(
     canonical: Mapping[str, Any],
 ) -> tuple[str, ...]:
-    return tuple(
-        sorted({_payload_sha256(name_by_field) for name_by_field in canonical["names"]})
-    )
+    return tuple(sorted({_payload_sha256(name_by_field) for name_by_field in canonical["names"]}))
 
 
 def composed_practitioner_semantic_sha256(
@@ -256,11 +233,7 @@ def composed_practitioner_semantic_sha256(
     if (
         len(base_hash) != 64
         or _SHA256_HEX_RE.fullmatch(base_hash) is None
-        or any(
-            len(name_hash) != 64
-            or _SHA256_HEX_RE.fullmatch(name_hash) is None
-            for name_hash in name_hashes
-        )
+        or any(len(name_hash) != 64 or _SHA256_HEX_RE.fullmatch(name_hash) is None for name_hash in name_hashes)
     ):
         raise ValueError("provider_directory_practitioner_hash_invalid")
     canonical_name_hashes = sorted(set(name_hashes))
@@ -279,9 +252,7 @@ def practitioner_semantic_payload_sha256(
 
     canonical = _canonical_practitioner_hash_view(payload_by_field)
     _assert_practitioner_name_projection(payload_by_field, canonical)
-    return composed_practitioner_semantic_sha256(
-        *_practitioner_hash_components_from_canonical(canonical)
-    )
+    return composed_practitioner_semantic_sha256(*_practitioner_hash_components_from_canonical(canonical))
 
 
 def practitioner_semantic_hash_components(
@@ -306,24 +277,17 @@ def _assert_practitioner_name_projection(
     canonical: Mapping[str, Any],
 ) -> None:
     if any(
-        _stable_json(payload_by_field.get(field_name))
-        != _stable_json(canonical.get(field_name))
+        _stable_json(payload_by_field.get(field_name)) != _stable_json(canonical.get(field_name))
         for field_name in PRACTITIONER_NAME_PAYLOAD_FIELDS
     ):
-        raise ValueError(
-            "provider_directory_practitioner_name_projection_invalid"
-        )
+        raise ValueError("provider_directory_practitioner_name_projection_invalid")
 
 
 def _practitioner_hash_components_from_canonical(
     canonical: Mapping[str, Any],
 ) -> tuple[str, tuple[str, ...]]:
-    semantic_payload = _without_volatile_fhir_time(
-        resource_content_hash_payload(canonical)
-    )
-    base_hash = _payload_sha256(
-        _practitioner_base_payload_from_semantic(semantic_payload)
-    )
+    semantic_payload = _without_volatile_fhir_time(resource_content_hash_payload(canonical))
+    base_hash = _payload_sha256(_practitioner_base_payload_from_semantic(semantic_payload))
     return base_hash, _practitioner_name_hashes_from_canonical(canonical)
 
 
@@ -337,9 +301,7 @@ def _observation_provenance(payload_by_field: Mapping[str, Any]) -> dict[str, An
     }
     fhir_meta = payload_by_field.get("fhir_meta")
     if isinstance(fhir_meta, Mapping) and "lastUpdated" in fhir_meta:
-        provenance_by_field["fhir_meta.lastUpdated"] = copy.deepcopy(
-            fhir_meta["lastUpdated"]
-        )
+        provenance_by_field["fhir_meta.lastUpdated"] = copy.deepcopy(fhir_meta["lastUpdated"])
     return provenance_by_field
 
 
@@ -351,9 +313,7 @@ def _preferred_observation_payload(
 
     return max(
         (first_payload, second_payload),
-        key=lambda payload_by_field: _stable_json(
-            _observation_provenance(payload_by_field)
-        ),
+        key=lambda payload_by_field: _stable_json(_observation_provenance(payload_by_field)),
     )
 
 
@@ -365,46 +325,29 @@ def merge_practitioner_semantic_payloads(
 
     first = canonical_practitioner_payload(first_payload)
     second = canonical_practitioner_payload(second_payload)
-    if practitioner_semantic_base_sha256(first) != (
-        practitioner_semantic_base_sha256(second)
-    ):
-        raise ValueError(
-            "provider_directory_practitioner_identity_payload_conflict"
-        )
+    if practitioner_semantic_base_sha256(first) != (practitioner_semantic_base_sha256(second)):
+        raise ValueError("provider_directory_practitioner_identity_payload_conflict")
     merged = copy.deepcopy(first)
-    merged_names = canonical_practitioner_names(
-        [*first["names"], *second["names"]]
-    )
+    merged_names = canonical_practitioner_names([*first["names"], *second["names"]])
     merged["names"] = merged_names
     merged.update(_practitioner_primary_name_projection(merged_names))
     preferred_observation = _preferred_observation_payload(first, second)
     for field_name in RESOURCE_TRANSPORT_PAYLOAD_FIELDS:
         if field_name in preferred_observation:
-            merged[field_name] = copy.deepcopy(
-                preferred_observation[field_name]
-            )
+            merged[field_name] = copy.deepcopy(preferred_observation[field_name])
         else:
             merged.pop(field_name, None)
     first_meta = first.get("fhir_meta")
-    stable_meta = _without_volatile_fhir_time({"fhir_meta": first_meta}).get(
-        "fhir_meta"
-    )
+    stable_meta = _without_volatile_fhir_time({"fhir_meta": first_meta}).get("fhir_meta")
     preferred_meta = preferred_observation.get("fhir_meta")
-    has_last_updated = (
-        isinstance(preferred_meta, Mapping)
-        and "lastUpdated" in preferred_meta
-    )
+    has_last_updated = isinstance(preferred_meta, Mapping) and "lastUpdated" in preferred_meta
     if isinstance(stable_meta, Mapping):
         merged_meta = copy.deepcopy(dict(stable_meta))
         if has_last_updated:
-            merged_meta["lastUpdated"] = copy.deepcopy(
-                preferred_meta["lastUpdated"]
-            )
+            merged_meta["lastUpdated"] = copy.deepcopy(preferred_meta["lastUpdated"])
         merged["fhir_meta"] = merged_meta
     elif has_last_updated:
-        merged["fhir_meta"] = {
-            "lastUpdated": copy.deepcopy(preferred_meta["lastUpdated"])
-        }
+        merged["fhir_meta"] = {"lastUpdated": copy.deepcopy(preferred_meta["lastUpdated"])}
     else:
         merged["fhir_meta"] = None
     return merged
@@ -423,9 +366,7 @@ def semantic_resource_payload_sha256(
 
     if _is_mapped_practitioner_payload(payload_by_field):
         return practitioner_semantic_payload_sha256(payload_by_field)
-    return _payload_sha256(
-        semantic_resource_content_hash_payload(payload_by_field)
-    )
+    return _payload_sha256(semantic_resource_content_hash_payload(payload_by_field))
 
 
 def merge_semantic_resource_payloads(
@@ -438,9 +379,7 @@ def merge_semantic_resource_payloads(
     second_hash = semantic_resource_payload_sha256(second_payload)
     if first_hash != second_hash:
         raise ValueError("provider_directory_resource_payload_conflict")
-    return copy.deepcopy(
-        max((dict(first_payload), dict(second_payload)), key=_stable_json)
-    )
+    return copy.deepcopy(max((dict(first_payload), dict(second_payload)), key=_stable_json))
 
 
 def legacy_resource_payload_sha256(payload_by_field: Mapping[str, Any]) -> str:
@@ -457,6 +396,12 @@ def resource_payload_sha256_for_contract(
 ) -> str:
     """Hash one payload under its persisted dataset-root contract."""
 
+    if is_semantic_resource_hash_contract(resource_hash_contract):
+        from process.provider_directory_role_merge import merged_role_hash_components
+
+        role_components = merged_role_hash_components(payload_by_field)
+        if role_components is not None:
+            return role_components[2]
     if resource_hash_contract == LEGACY_RESOURCE_HASH_CONTRACT:
         return legacy_resource_payload_sha256(payload_by_field)
     if resource_hash_contract == TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT:
@@ -465,9 +410,7 @@ def resource_payload_sha256_for_contract(
         return semantic_resource_payload_sha256(payload_by_field)
     if resource_hash_contract == SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT:
         if not resource_type:
-            raise ValueError(
-                "provider_directory_resource_hash_resource_type_required"
-            )
+            raise ValueError("provider_directory_resource_hash_resource_type_required")
         if resource_type == "Organization":
             from process.provider_directory_organization_hash import (
                 organization_semantic_payload_sha256,
