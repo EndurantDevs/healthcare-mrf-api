@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import importlib
 import itertools
+import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -237,3 +239,97 @@ def test_repeat_with_a_field_outside_the_role_merge_conflicts() -> None:
     with pytest.raises(ValueError, match="provider_directory_resource_payload_conflict"):
         role_merge.merge_semantic_resource_payloads(observed_role, repeat_by_field)
     assert role_merge.merged_role_hash_components({**repeat_by_field, "specialty_codes": []}) is None
+
+
+@pytest.mark.parametrize("ordered", [False, True])
+async def test_staging_reduces_only_roles_with_an_ordered_previous_observation(monkeypatch, ordered) -> None:
+    monkeypatch.setattr(role_merge, "_ordered_input_by_name", {})
+    first_role_by_field = role_merge.merged_role_payload(role("r1", "n1"))
+    second_role_by_field = role_merge.merged_role_payload(role("r2", "n2"))
+    role_row_by_field = {
+        "resource_type": "PractitionerRole",
+        "resource_id": second_role_by_field["resource_id"],
+        "payload_json": second_role_by_field,
+    }
+    location_row_by_field = {"resource_type": "Location", "resource_id": "l1", "payload_json": {}}
+    connection = AsyncMock()
+    connection.fetchval.return_value = ordered
+    connection.fetch.return_value = [
+        {"resource_id": first_role_by_field["resource_id"], "payload_json": json.dumps(first_role_by_field)}
+    ]
+    binding_by_field = {"resets": {"*": 7, "PractitionerRole": 9}}
+
+    assert await role_merge.staged_role_rows(
+        connection, "source", "input_rows", binding_by_field, [location_row_by_field]
+    ) == [location_row_by_field]
+    connection.fetchval.assert_not_awaited()
+    staged_rows = await role_merge.staged_role_rows(
+        connection, "source", "input_rows", binding_by_field, [role_row_by_field, location_row_by_field]
+    )
+    assert staged_rows[1] is location_row_by_field
+    if not ordered:
+        assert staged_rows[0] is role_row_by_field
+        connection.fetch.assert_not_awaited()
+        return
+
+    _, ids, reset, family_resets = connection.fetch.await_args.args
+    assert (ids, reset, json.loads(family_resets)) == (
+        [second_role_by_field["resource_id"]],
+        7,
+        binding_by_field["resets"],
+    )
+    assert staged_rows[0]["payload_json"]["network_refs"] == ["Organization/n2"]
+    recovered_role_by_field = role_merge.merge_semantic_resource_payloads(
+        first_role_by_field, staged_rows[0]["payload_json"]
+    )
+    assert (
+        recovered_role_by_field["fhir_meta"] == first_role_by_field["fhir_meta"]
+        and recovered_role_by_field["resource_url"] == first_role_by_field["resource_url"]
+    )
+    assert role_merge.merged_role_hash_components(recovered_role_by_field) == role_merge.merged_role_hash_components(
+        role_merge.merge_semantic_resource_payloads(first_role_by_field, second_role_by_field)
+    )
+    connection.fetch.return_value = [
+        {"resource_id": first_role_by_field["resource_id"], "payload_json": first_role_by_field}
+    ]
+    assert (
+        await role_merge.staged_role_rows(
+            connection, "source", "input_rows", binding_by_field, [role_row_by_field, location_row_by_field]
+        )
+        == staged_rows
+    )
+    assert connection.fetchval.await_count == 1
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+async def test_completion_checks_full_observations_and_native_identity(conflict) -> None:
+    connection = AsyncMock()
+    connection.fetchval.return_value = conflict
+    checks = (
+        (role_merge.require_observed_merged_roles, (), "provider_directory_merged_role_observation_missing"),
+        (
+            role_merge.require_one_content_per_native_role,
+            ("WHERE batch_ordinal > $1", (3,)),
+            "provider_directory_resource_payload_conflict",
+        ),
+    )
+    for check, arguments, error in checks:
+        if conflict:
+            with pytest.raises(ValueError, match=error):
+                await check(connection, '"source"."roles"', *arguments)
+        else:
+            await check(connection, '"source"."roles"', *arguments)
+
+    observed_arguments, native_arguments = [call.args for call in connection.fetchval.await_args_list]
+    assert role_merge._REPEAT in observed_arguments[0]
+    assert "batch_ordinal > $1" in native_arguments[0] and native_arguments[1:] == (3,)
+
+
+def test_role_without_fhir_metadata_cannot_reuse_a_different_roles_hash() -> None:
+    first = role_merge.merged_role_payload(role("r1", "n1", fhir_meta=None))
+    second = role_merge.merged_role_payload(role("r2", "n2", fhir_meta=None))
+    assert first["resource_id"] == second["resource_id"]
+    forged_role_by_field = {**second, "location_refs": ["Location/other"]}
+    assert role_merge.merged_role_hash_components(forged_role_by_field) is None
+    with pytest.raises(ValueError, match="provider_directory_resource_payload_conflict"):
+        role_merge.merge_semantic_resource_payloads(first, forged_role_by_field)

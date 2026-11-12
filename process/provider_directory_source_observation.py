@@ -47,13 +47,13 @@ def _fields(observation):
 
 
 def _storage_binding(directory, factory):
-    from process.provider_directory_source_storage_binding import FHIRSourceStorageBinding
+    from process.provider_directory_source_storage_binding import FHIRSourceStorageBinding, NamedFHIRSourceStorage
 
     binding = getattr(factory, "storage_binding", None)
     require_output(
         directory._schema() == factory.policy.schema
         if binding is None
-        else type(binding) is FHIRSourceStorageBinding
+        else isinstance(binding, (FHIRSourceStorageBinding, NamedFHIRSourceStorage))
         and directory._schema() == binding.catalog_schema
         and factory.policy.schema == binding.storage_schema,
         "source_observation_schema_changed",
@@ -101,6 +101,13 @@ def current_storage_binding(catalog_schema):
 
 
 async def _native_origin(directory, factory, session, connection, isolation):
+    from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage
+
+    storage_binding = _storage_binding(directory, factory)
+    if isinstance(storage_binding, NamedFHIRSourceStorage):
+        transaction = session.get_transaction()
+        require_output(transaction is not None and transaction.is_active, "source_observation_transaction_changed")
+        return (transaction,)
     require_output(
         source._FACTORY.get() is factory
         and await _copy_driver(session) is connection
@@ -120,7 +127,6 @@ async def _native_origin(directory, factory, session, connection, isolation):
         and bool(actor_by_field["transaction"]),
         "source_observation_actor_changed",
     )
-    storage_binding = _storage_binding(directory, factory)
     if storage_binding is not None:
         from process.provider_directory_source_storage_binding import verify_isolated_source_storage_coordinates
 
@@ -209,7 +215,16 @@ async def observation_transaction(directory, *, isolation):
         async with directory.db.bind_existing_session(session):
             origin = await _native_origin(directory, factory, session, connection, isolation)
             observation = _Observation(
-                directory, directory.db, factory, factory.policy, task, session, connection, isolation, producer, origin,
+                directory,
+                directory.db,
+                factory,
+                factory.policy,
+                task,
+                session,
+                connection,
+                isolation,
+                producer,
+                origin,
                 _storage_binding(directory, factory),
             )
             _ISSUED[observation] = _fields(observation)

@@ -60,6 +60,20 @@ class FHIRSourceStorageBinding:
 
 
 @dataclass(frozen=True)
+class NamedFHIRSourceStorage:
+    """Schema locators supplied by Source orchestration."""
+
+    catalog_schema: str
+    storage_schema: str
+
+    def __post_init__(self):
+        for schema in (self.catalog_schema, self.storage_schema):
+            storage_identifier(schema)
+            _require(schema not in {"public", "information_schema"} and not schema.startswith("pg_"), "schema_invalid")
+        _require(self.catalog_schema != self.storage_schema, "isolated_schema_required")
+
+
+@dataclass(frozen=True)
 class FHIRSourceCandidateHandoff:
     """Candidate evidence awaiting protected custody, validation and publication."""
 

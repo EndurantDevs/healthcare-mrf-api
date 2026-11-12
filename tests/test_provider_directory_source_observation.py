@@ -11,8 +11,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process import provider_directory_source_observation as observation
-from process.provider_directory_generic_source_policy import GenericSourcePolicy
 from process import provider_directory_source_storage_binding as storage
+from process.provider_directory_generic_source_policy import GenericSourcePolicy
 
 
 class Driver:
@@ -118,6 +118,18 @@ async def test_nested_read_reuses_exact_session_and_stronger_isolation(case):
             async with observation.observation_transaction(case.directory, isolation="invalid"):
                 pytest.fail("invalid isolation exposed")
     assert len(case.factory.events) == 2
+
+
+async def test_named_observation_rejects_an_application_transaction_replacement(case):
+    factory = case.factory
+    factory.storage_binding = storage.NamedFHIRSourceStorage("catalog", factory.policy.schema)
+    case.directory._schema = lambda: "catalog"
+    transaction = SimpleNamespace(is_active=True)
+    factory.session.get_transaction = lambda: transaction
+    with pytest.raises(RuntimeError, match="observation_transaction_changed"):
+        async with observation.observation_transaction(case.directory, isolation="repeatable read"):
+            transaction = SimpleNamespace(is_active=True, replacement=True)
+    assert factory.driver.calls == []
 
 
 @pytest.mark.parametrize(
@@ -242,7 +254,9 @@ async def test_private_observation_keeps_catalog_and_storage_separate(private_ca
     async with observation.observation_transaction(case.directory, isolation="repeatable read"):
         assert observation.current_storage_binding("synthetic") is case.factory.storage_binding
         assert observation.source._PUBLISHER.get() is None and observation.source._OWNER.get() is None
-        case.verify_coordinates.assert_awaited_with(case.factory.driver, case.factory.policy, case.factory.storage_binding)
+        case.verify_coordinates.assert_awaited_with(
+            case.factory.driver, case.factory.policy, case.factory.storage_binding
+        )
         with pytest.raises(RuntimeError, match="schema_changed"):
             observation.current_storage_binding("private_source")
     assert observation.current_storage_binding("synthetic") is None
@@ -255,16 +269,20 @@ async def test_private_observation_refuses_changed_coordinates(private_case, cha
         "catalog_schema": (case.directory, "_schema", lambda: "other_catalog"),
         "storage_schema": (case.factory, "policy", replace(case.factory.policy, schema="other_private")),
         "binding": (case.factory, "storage_binding", replace(case.factory.storage_binding)),
-        "locator": (case.factory, "storage_binding",
-                    SimpleNamespace(catalog_schema="synthetic", storage_schema="private_source")),
+        "locator": (
+            case.factory,
+            "storage_binding",
+            SimpleNamespace(catalog_schema="synthetic", storage_schema="private_source"),
+        ),
     }
     with pytest.raises(ExceptionGroup, match="source_observation_and_verification_failed") as failures:
         async with observation.observation_transaction(case.directory, isolation="repeatable read"):
             setattr(*mutation_by_kind[change])
             observation.current_storage_binding("synthetic")
     assert len(failures.value.exceptions) == 2
-    assert all(isinstance(error, RuntimeError) and "source_observation" in str(error)
-               for error in failures.value.exceptions)
+    assert all(
+        isinstance(error, RuntimeError) and "source_observation" in str(error) for error in failures.value.exceptions
+    )
 
 
 async def test_private_observation_refuses_native_storage_drift(private_case):
@@ -280,6 +298,7 @@ async def test_private_observation_refuses_native_storage_drift(private_case):
 async def test_private_observation_cannot_be_inherited_by_child(private_case):
     case = private_case
     async with observation.observation_transaction(case.directory, isolation="repeatable read"):
+
         async def child():
             with pytest.raises(RuntimeError, match="observation_changed"):
                 observation.current_storage_binding("synthetic")

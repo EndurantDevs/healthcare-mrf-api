@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Batch authority, immutable native identities and no per-resource SQL."""
 
+import asyncio
 import importlib
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -13,6 +14,28 @@ from process import provider_directory_generic_source_storage as storage
 from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 from process.provider_directory_role_merge import MERGED_ROLE_SOURCES_ENV, role_order_index_sql
+
+
+@pytest.mark.parametrize("failure", [asyncio.CancelledError, TimeoutError])
+async def test_interrupted_candidate_copy_closes_transport_and_invalidates_its_owner(monkeypatch, failure):
+    connection = SimpleNamespace(copy_records_to_table=AsyncMock(side_effect=failure))
+    owner, events = object(), []
+
+    async def close(actual):
+        assert actual is connection
+        events.append("close")
+
+    async def invalidate(actual_owner, actual_connection):
+        assert actual_owner is owner and actual_connection is connection
+        events.append("invalidate")
+
+    monkeypatch.setattr(storage, "close_interrupted_copy", close)
+    monkeypatch.setattr(storage, "invalidate_copy_owner", invalidate)
+    monkeypatch.setattr(storage, "source_copy_session", lambda: owner)
+    with pytest.raises(failure):
+        await storage._copy(connection, SimpleNamespace(schema="source"), "input_rows", ("id",), [(1,)])
+    assert events == ["close", "invalidate"]
+    connection.copy_records_to_table.assert_awaited_once()
 
 
 @pytest.mark.parametrize("root", [storage.HEADER, "provider_directory_pagination_checkpoint"])
@@ -234,7 +257,9 @@ def _without_candidate_storage(harness, monkeypatch, found=()):
 
 
 @pytest.mark.asyncio
-async def test_isolated_prepare_and_complete_share_the_existing_candidate_binding(harness, monkeypatch):
+@pytest.mark.parametrize("merged_roles", [False, True])
+async def test_isolated_prepare_and_complete_share_the_existing_candidate_binding(harness, monkeypatch, merged_roles):
+    monkeypatch.setenv(MERGED_ROLE_SOURCES_ENV, "example-source" if merged_roles else "")
     async with _isolated_harness(harness, monkeypatch) as publisher:
         completion = _without_candidate_storage(harness, monkeypatch)
         reduction = AsyncMock()
@@ -242,6 +267,14 @@ async def test_isolated_prepare_and_complete_share_the_existing_candidate_bindin
         loading = await storage.prepare_generic_source_candidate(object(), harness.directory, harness.candidate)
         assert loading["contract"] == storage.ISOLATED_CONTRACT
         assert loading["storage"] == storage.storage_document(publisher)
+        indexes = [statement for statement in harness.sql if statement.startswith("CREATE INDEX IF NOT EXISTS")]
+        resource_input = loading["tables"]["resource_input"]["name"]
+        if merged_roles:
+            (index,) = indexes
+            assert f'"source_schema"."{resource_input}"' in index
+            assert 'resource_type COLLATE "C",resource_id COLLATE "C",batch_ordinal,row_ordinal' in index
+        else:
+            assert not indexes
         prepared = await completion.complete_generic_source_candidate(object(), harness.directory, harness.candidate)
         reduction.assert_awaited_once()
         assert prepared["phase"] == "prepared" and prepared["storage"] == loading["storage"]

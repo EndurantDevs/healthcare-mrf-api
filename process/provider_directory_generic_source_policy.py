@@ -12,6 +12,7 @@ from db.plan_release_storage import storage_identifier
 from process.plan_release_storage_custody import storage_profile, storage_roles
 from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_projection_stage import _copy_driver
+from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage
 
 _PUBLISHER = ContextVar("provider_directory_generic_source_publisher", default=None)
 _OWNER = ContextVar("provider_directory_generic_source_owner", default=None)
@@ -79,16 +80,20 @@ async def bind_generic_source_publisher(connection, policy, *, verify_role_profi
     _require(type(policy) is GenericSourcePolicy and callable(verify_role_profile), "explicit_policy_required")
     _require(_PUBLISHER.get() is None, "publisher_already_bound")
     _require(transaction_isolation in {"read committed", "repeatable read", "serializable"}, "isolation_required")
-    await _genuine_publisher(connection, policy)
-    _require(await connection.fetchval("SHOW transaction_isolation") == transaction_isolation, "isolation_changed")
-    await storage_roles(connection, policy.schema, **policy.role_arguments())
-    await verify_role_profile(connection, policy.schema, **policy.role_arguments())
     factory = _FACTORY.get()
     storage_binding = getattr(factory, "storage_binding", None)
+    by_name = isinstance(storage_binding, NamedFHIRSourceStorage)
+    if by_name:
+        _require(policy.schema == storage_binding.storage_schema and connection.is_in_transaction(), "schema_changed")
+    else:
+        await _genuine_publisher(connection, policy)
+        _require(await connection.fetchval("SHOW transaction_isolation") == transaction_isolation, "isolation_changed")
+        await storage_roles(connection, policy.schema, **policy.role_arguments())
+        await verify_role_profile(connection, policy.schema, **policy.role_arguments())
     publisher = _Publisher(connection, policy, asyncio.current_task(), transaction_isolation, factory, storage_binding)
     token = _PUBLISHER.set(publisher)
     try:
-        if storage_binding is not None:
+        if storage_binding is not None and not by_name:
             await _bind_isolated_storage(publisher)
         yield publisher
     finally:
@@ -125,6 +130,9 @@ async def _bind_isolated_storage(publisher):
 
     _require(bound_publisher() is publisher, "original_storage_publisher_required")
     factory, binding = publisher.factory, publisher.storage_binding
+    if isinstance(binding, NamedFHIRSourceStorage):
+        _require(publisher.policy.schema == binding.storage_schema, "schema_changed")
+        return
     _require(type(binding) is FHIRSourceStorageBinding, "storage_binding_required")
     capture = getattr(factory, "source_storage_binding", None)
     _require(callable(capture), "storage_factory_required")
@@ -389,17 +397,21 @@ async def source_owner_transaction(database):
     binding = database._transaction_binding()
     _require(binding is not None, "original_transaction_required")
     connection = await _copy_driver(binding.session)
-    _require(connection is publisher.connection, "physical_transaction_changed")
+    by_name = isinstance(publisher.storage_binding, NamedFHIRSourceStorage)
+    if not by_name:
+        _require(connection is publisher.connection, "physical_transaction_changed")
     if _OWNER.get() is not None and _OWNER.get()[0] is publisher:
-        actor = await connection.fetchrow("SELECT session_user::text AS session,current_user::text AS current")
-        _require(
-            actor["session"] == publisher.policy.publisher_role and actor["current"] == publisher.policy.owner_role,
-            "owner_transaction_changed",
-        )
+        if not by_name:
+            actor = await connection.fetchrow("SELECT session_user::text AS session,current_user::text AS current")
+            _require(
+                actor["session"] == publisher.policy.publisher_role and actor["current"] == publisher.policy.owner_role,
+                "owner_transaction_changed",
+            )
         async with _savepoint(connection):
             yield publisher
         return
-    await _genuine_publisher(connection, publisher.policy)
+    if not by_name:
+        await _genuine_publisher(connection, publisher.policy)
     async with _savepoint(connection):
         await connection.execute(f"SET LOCAL ROLE {storage_identifier(publisher.policy.owner_role)}")
         token = _OWNER.set((publisher, binding.session))

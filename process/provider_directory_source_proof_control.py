@@ -15,6 +15,7 @@ from process.provider_directory_generic_source_storage import (
 )
 from process.provider_directory_projection_stage import _copy_driver
 from process.provider_directory_source_storage_binding import (
+    NamedFHIRSourceStorage,
     require_storage_schema,
     verify_isolated_source_storage_coordinates,
 )
@@ -67,6 +68,8 @@ async def require_proof_executor(executor, schema):
     binding = getattr(publisher, "storage_binding", None)
     expected_schema = publisher.policy.schema if binding is None else binding.catalog_schema
     _require(is_original and schema == expected_schema, "proof_transaction_changed")
+    if isinstance(binding, NamedFHIRSourceStorage):
+        return publisher
     _require(await _copy_driver(session) is publisher.connection, "proof_transaction_changed")
     if binding is None:
         await verify_proof_control(publisher.connection, publisher.policy)

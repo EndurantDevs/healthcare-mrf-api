@@ -408,6 +408,7 @@ async def complete_generic_source_candidate(database, directory, candidate):
         if previous["phase"] == "prepared":
             return previous
         tables_by_root = dict(previous["tables"])
+        is_named_storage = previous["contract"] == storage.NAMED_ISOLATED_CONTRACT
         prefix = tables_by_root["resource_input"]["name"][:-3]
         for root in storage.RELATIONS:
             name = prefix + "_" + storage._SUFFIXES[root]
@@ -426,12 +427,14 @@ async def complete_generic_source_candidate(database, directory, candidate):
             if previous["contract"] == storage.CMS_ISOLATED_CONTRACT
             else await prepare_identity_candidate(publisher, identity, prefix)
         )
-        captured = await storage._capture(connection, policy, [table["name"] for table in tables_by_root.values()])
+        if not is_named_storage:
+            captured = await storage._capture(connection, policy, [table["name"] for table in tables_by_root.values()])
+            tables_by_root = {key: captured[table["name"]] for key, table in tables_by_root.items()}
         binding_by_field = {
             **previous,
             "phase": "prepared",
             "auxiliary": auxiliary,
-            "tables": {key: captured[table["name"]] for key, table in tables_by_root.items()},
+            "tables": tables_by_root,
         }
         await storage._store(connection, policy, identity, previous, binding_by_field)
         return binding_by_field
@@ -522,9 +525,10 @@ async def _prepare_final_tables(connection, policy, binding_by_field):
         relation = storage_relation(policy.schema, name)
         await connection.execute(f"ALTER TABLE {relation} ADD CHECK (dataset_id={literal})")
         await connection.execute(f"ALTER TABLE {relation} RESET (autovacuum_enabled)")
-        await storage._close_grants(
-            connection, policy, name, readable=binding_by_field.get("contract") not in storage.ISOLATED_CONTRACTS
-        )
+        if binding_by_field.get("contract") != storage.NAMED_ISOLATED_CONTRACT:
+            await storage._close_grants(
+                connection, policy, name, readable=binding_by_field.get("contract") not in storage.ISOLATED_CONTRACTS
+            )
 
 
 async def _attach_final_tables(connection, policy, binding_by_field):
@@ -571,11 +575,12 @@ async def _finish_derived_indexes(connection, policy, binding_by_field):
 async def _validated_header(publisher, binding_by_field):
     """Re-read the original protected row after complete content admission."""
     connection, policy = publisher.connection, publisher.policy
-    actor = await connection.fetchrow("SELECT session_user::text AS session,current_user::text AS current")
-    storage._require(
-        actor["session"] == policy.publisher_role and actor["current"] == policy.owner_role,
-        "owner_transaction_required",
-    )
+    if binding_by_field["contract"] != storage.NAMED_ISOLATED_CONTRACT:
+        actor = await connection.fetchrow("SELECT session_user::text AS session,current_user::text AS current")
+        storage._require(
+            actor["session"] == policy.publisher_role and actor["current"] == policy.owner_role,
+            "owner_transaction_required",
+        )
     header = await connection.fetchrow(
         f"SELECT status,is_current,dataset_hash,content_proof_admission_version,content_proof_admission_kind,"
         f"content_proof_admission_sha256,candidate_storage_json,resource_count,previous_dataset_id,"
@@ -650,12 +655,15 @@ async def prepare_generic_source_handoff(publisher, binding_by_field):
             f"DROP TABLE {storage_relation(policy.schema, binding_by_field['tables'][key]['name'])}"
         )
     names_by_root.update({root: binding_by_field["tables"][root]["name"] for root in storage.RELATIONS})
-    captured = await storage._capture(connection, policy, list(names_by_root.values()))
+    tables_by_root = {root: {"name": name} for root, name in names_by_root.items()}
+    if binding_by_field["contract"] != storage.NAMED_ISOLATED_CONTRACT:
+        captured = await storage._capture(connection, policy, list(names_by_root.values()))
+        tables_by_root = {root: captured[name] for root, name in names_by_root.items()}
     handoff_by_field = {
         **binding_by_field,
         "phase": "ready_for_freeze",
         "admission": admission_by_field,
-        "tables": {root: captured[name] for root, name in names_by_root.items()},
+        "tables": tables_by_root,
     }
     snapshot = storage_relation(policy.schema, names_by_root[storage.HEADER])
     updated = await connection.execute(
@@ -679,22 +687,22 @@ async def _prepare_handoff_controls(connection, policy, binding_by_field):
     literal = "'" + dataset_id.replace("'", "''") + "'"
     for root in storage.HANDOFF_CONTROL_ROOTS:
         name = prefix + "_" + storage._SUFFIXES[root]
-        source, target = storage_relation(policy.schema, root), storage_relation(policy.schema, name)
+        source_relation, target_relation = storage_relation(policy.schema, root), storage_relation(policy.schema, name)
         await connection.execute(
-            f"CREATE TABLE {target} (LIKE {source} INCLUDING DEFAULTS INCLUDING GENERATED "
+            f"CREATE TABLE {target_relation} (LIKE {source_relation} INCLUDING DEFAULTS INCLUDING GENERATED "
             "INCLUDING CONSTRAINTS INCLUDING STORAGE INCLUDING INDEXES)"
         )
         await storage._close_grants(connection, policy, name)
-        await connection.execute(f"ALTER TABLE {target} ADD CHECK (dataset_id={literal})")
+        await connection.execute(f"ALTER TABLE {target_relation} ADD CHECK (dataset_id={literal})")
         columns = await connection.fetch(
             "SELECT attname FROM pg_attribute WHERE attrelid=$1::regclass "
             "AND attnum>0 AND NOT attisdropped AND attgenerated='' ORDER BY attnum",
-            source,
+            source_relation,
         )
         storage._require(bool(columns), "control_snapshot_layout_changed")
         fields = ",".join(storage_identifier(column["attname"]) for column in columns)
         copied = await connection.execute(
-            f"INSERT INTO {target} ({fields}) SELECT {fields} FROM {source} WHERE dataset_id=$1",
+            f"INSERT INTO {target_relation} ({fields}) SELECT {fields} FROM {source_relation} WHERE dataset_id=$1",
             dataset_id,
         )
         storage._require(root != storage.HEADER or copied == "INSERT 0 1", "header_snapshot_changed")
@@ -949,7 +957,10 @@ async def validate_frozen_source_handoff(connection, directory, handoff, *, prot
     layout before calling. This data check never grants publication authority.
     """
     storage._require(type(handoff) is FHIRSourceCandidateHandoff, "handoff_required")
-    storage._require(handoff.document.get("contract") == storage.ISOLATED_CONTRACT, "ordinary_handoff_required")
+    storage._require(
+        handoff.document.get("contract") in {storage.ISOLATED_CONTRACT, storage.NAMED_ISOLATED_CONTRACT},
+        "ordinary_handoff_required",
+    )
     return await _validate_frozen_source_handoff(
         connection, directory, handoff, protected_owner_role=protected_owner_role
     )
@@ -982,10 +993,12 @@ async def _validate_frozen_source_handoff(connection, directory, handoff, *, pro
     document = handoff.document
     storage.validate_handoff_document(document, document.get("storage"))
     policy = SimpleNamespace(schema=document["storage"]["storage_schema"], owner_role=protected_owner_role)
-    transaction_id = await connection.fetchval("SELECT pg_current_xact_id()::text")
+    is_named_storage = document["contract"] == storage.NAMED_ISOLATED_CONTRACT
+    transaction_id = None if is_named_storage else await connection.fetchval("SELECT pg_current_xact_id()::text")
     relations = sorted(storage_relation(policy.schema, table["name"]) for table in document["tables"].values())
     await connection.execute("LOCK TABLE " + ",".join(relations) + " IN ACCESS SHARE MODE NOWAIT")
-    await _frozen_source_inventory(connection, policy, document)
+    if not is_named_storage:
+        await _frozen_source_inventory(connection, policy, document)
     header = await _frozen_handoff_header(connection, policy, document)
     for table in document["tables"].values():
         invalid = await connection.fetchval(
@@ -997,12 +1010,13 @@ async def _validate_frozen_source_handoff(connection, directory, handoff, *, pro
     await _relationships(connection, policy, document)
     await _every_row(connection, policy, document["tables"][storage.WITNESS]["name"], WITNESS_COLUMNS, _witness)
     await _frozen_projection_exact(connection, directory, policy, document)
-    await _frozen_source_inventory(connection, policy, document)
-    storage._require(
-        connection.is_in_transaction() is True
-        and await connection.fetchval("SELECT pg_current_xact_id()::text") == transaction_id,
-        "transaction_changed",
-    )
+    if not is_named_storage:
+        await _frozen_source_inventory(connection, policy, document)
+        storage._require(
+            connection.is_in_transaction() is True
+            and await connection.fetchval("SELECT pg_current_xact_id()::text") == transaction_id,
+            "transaction_changed",
+        )
     return dict(
         handoff_sha256=handoff.document_sha256,
         dataset_hash=stored.dataset_hash,

@@ -361,6 +361,9 @@ async def completed_source_scope(directory, candidate):
 async def current_endpoint_dataset_record(directory, endpoint_id, *, exclude_dataset_id):
     """Read the incumbent header through the established ordinary catalog route."""
     from process.provider_directory_generic_source_policy import _FACTORY
+    from process.provider_directory_named_edition import find_current_edition, read_edition_header
+    from process.provider_directory_projection_stage import _copy_driver
+    from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage
 
     factory = _FACTORY.get()
     binding = getattr(factory, "storage_binding", None)
@@ -372,6 +375,21 @@ async def current_endpoint_dataset_record(directory, endpoint_id, *, exclude_dat
             raise RuntimeError("provider_directory_predecessor_catalog_reader_required")
         # The private header contains candidates, not the incumbent serving generation.
         relation = storage_relation(binding.catalog_schema, directory.ProviderDirectoryEndpointDataset.__tablename__)
+    if isinstance(binding, NamedFHIRSourceStorage):
+        async with directory.db.transaction() as session:
+            connection = await _copy_driver(session)
+            pointer = await find_current_edition(connection, binding.catalog_schema, endpoint_id)
+            if pointer is not None:
+                if pointer["dataset_id"] == exclude_dataset_id:
+                    return {}
+                header = await read_edition_header(connection, pointer["schema_name"], pointer["dataset_id"])
+                _require(header is not None and header["endpoint_id"] == endpoint_id, "current_edition_changed")
+                metadata = _json(header["publication_metadata_json"])
+                return {
+                    "dataset_id": header["dataset_id"],
+                    "status": "published",
+                    "resource_counts": metadata.get("source_summary_v1", {}).get("resource_counts"),
+                }
     predecessor = await directory.db.first(
         f"""
         SELECT dataset_id, status,

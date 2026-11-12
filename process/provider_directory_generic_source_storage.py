@@ -30,7 +30,12 @@ from process.provider_directory_generic_candidate import (
 )
 from process.provider_directory_generic_source_policy import source_copy_session, source_owner_transaction
 from process.provider_directory_role_merge import is_role_repeat_source, role_order_index_sql, staged_role_rows
-from process.provider_directory_source_storage_binding import require_storage_schema, storage_document
+from process.provider_directory_source_storage_binding import (
+    NamedFHIRSourceStorage,
+    require_storage_schema,
+    storage_document,
+)
+from process.vsp_directory_contract import OFFICE_DOCTORS_INVALID
 from process.vsp_directory_contract import RESOURCE_TYPES as VSP_RESOURCE_TYPES
 from process.vsp_directory_contract import SOURCE_ID as VSP_SOURCE_ID
 from process.vsp_directory_store import is_artifact_root_failure
@@ -59,8 +64,9 @@ CMS_RESOURCE_IDENTITY_ROOT = "provider_directory_resource_identity"
 AUXILIARY_ROOTS = (*CMS_IDENTITY_ROOTS, CMS_RESOURCE_IDENTITY_ROOT)
 CONTRACT = "generic-source-candidate-v2"
 ISOLATED_CONTRACT = "generic-source-detached-v1"
+NAMED_ISOLATED_CONTRACT = "generic-source-detached-by-name-v1"
 CMS_ISOLATED_CONTRACT = "generic-source-cms-detached-v1"
-ISOLATED_CONTRACTS = (ISOLATED_CONTRACT, CMS_ISOLATED_CONTRACT)
+ISOLATED_CONTRACTS = (ISOLATED_CONTRACT, NAMED_ISOLATED_CONTRACT, CMS_ISOLATED_CONTRACT)
 # Autovacuum on a private heap competes with the bulk load and reduce for I/O; statistics come from
 # explicit ANALYZE and attached heaps get the default back right before they join their root.
 PRIVATE_HEAP_OPTIONS = " WITH (autovacuum_enabled = false)"
@@ -194,6 +200,12 @@ def _validate_binding_storage(binding_by_field, *, is_isolated):
 
 
 def _validate_isolated_binding_storage(binding_by_field, expected_storage):
+    if binding_by_field["contract"] == NAMED_ISOLATED_CONTRACT:
+        _validate_named_storage(expected_storage)
+        _require(
+            binding_by_field["identity"]["metadata"]["source_ids"] == [VSP_SOURCE_ID],
+            "isolated_kind_unsupported",
+        )
     _require(binding_by_field["storage"] == expected_storage, "storage_binding_changed")
     _require(
         binding_by_field["phase"] != "published" and binding_by_field["auxiliary"] is None,
@@ -218,6 +230,23 @@ def _validate_isolated_binding_storage(binding_by_field, expected_storage):
         _require(binding_by_field["admission"] is None, "admission_changed")
 
 
+def _validate_named_storage(document):
+    _require(
+        type(document) is dict and set(document) == {"catalog_schema", "storage_schema", "producer"},
+        "storage_binding_changed",
+    )
+    NamedFHIRSourceStorage(document["catalog_schema"], document["storage_schema"])
+    producer = document["producer"]
+    _require(
+        type(producer) is list
+        and len(producer) == 2
+        and all(type(value) is str for value in producer)
+        and re.fullmatch(r"[0-9a-f]{40}", producer[0])
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", producer[1]),
+        "storage_binding_changed",
+    )
+
+
 def validate_handoff_document(document, expected_storage):
     """Check data against issued coordinates; this grants no read or publication rights."""
     _require(type(document) is dict and document.get("contract") in ISOLATED_CONTRACTS, "isolated_storage_required")
@@ -240,21 +269,29 @@ def _validate_binding_tables(binding_by_field, identity):
         expected |= set(HANDOFF_CONTROL_ROOTS)
     _require(set(binding_by_field["tables"]) == expected, "tables_changed")
     tables_by_kind = {**binding_by_field["tables"], **_auxiliary_tables(binding_by_field, identity)}
+    is_named_storage = binding_by_field["contract"] == NAMED_ISOLATED_CONTRACT
     names = []
     for root, table in tables_by_kind.items():
         _require(
             type(table) is dict
-            and set(table) == {"name", "oid", "owner", "layout_sha256"}
+            and set(table) == ({"name"} if is_named_storage else {"name", "oid", "owner", "layout_sha256"})
             and type(table["name"]) is str
-            and _NAME.fullmatch(table["name"]) is not None
-            and type(table["oid"]) is int
-            and table["oid"] > 0
-            and type(table["owner"]) is int
-            and table["owner"] > 0
-            and type(table["layout_sha256"]) is str
-            and re.fullmatch(r"[0-9a-f]{64}", table["layout_sha256"]),
+            and _NAME.fullmatch(table["name"]) is not None,
             "table_binding_changed",
         )
+        if is_named_storage:
+            suffix = {"resource_input": "ri", "witness_input": "wi"}.get(root, _SUFFIXES.get(root))
+            _require(suffix is not None and table["name"].endswith("_" + suffix), "table_binding_changed")
+        else:
+            _require(
+                type(table["oid"]) is int
+                and table["oid"] > 0
+                and type(table["owner"]) is int
+                and table["owner"] > 0
+                and type(table["layout_sha256"]) is str
+                and re.fullmatch(r"[0-9a-f]{64}", table["layout_sha256"]),
+                "table_binding_changed",
+            )
         if root in HANDOFF_CONTROL_ROOTS or table["name"].endswith(("_h", "_p")):
             _require(
                 binding_by_field["contract"] in ISOLATED_CONTRACTS
@@ -265,6 +302,8 @@ def _validate_binding_tables(binding_by_field, identity):
             )
         names.append(table["name"])
     _require(len(set(names)) == len(names), "table_binding_changed")
+    if is_named_storage:
+        _require(len({name.rsplit("_", 1)[0] for name in names}) <= 1, "table_binding_changed")
 
 
 def validate_handoff_header(seal):
@@ -570,6 +609,8 @@ def _require_input_sequence(row, policy, owner):
 
 
 async def _verify_tables(connection, policy, binding_by_field):
+    if binding_by_field["contract"] == NAMED_ISOLATED_CONTRACT:
+        return
     proofs = binding_by_field["tables"]
     # Published attached children retain SELECT only; loading/prepared heaps are private.
     actual = await _capture(
@@ -615,6 +656,8 @@ async def _verify_tables_recently(connection, policy, binding_by_field):
     catalog capture behind it is bounded, because the private heaps are reachable
     solely through this owner's own transactions.
     """
+    if binding_by_field["contract"] == NAMED_ISOLATED_CONTRACT:
+        return
     key = _encoded(
         {
             "schema": policy.schema,
@@ -633,6 +676,35 @@ async def _verify_tables_recently(connection, policy, binding_by_field):
     _VERIFIED_CUSTODY.set((key, now))
 
 
+async def _create_source_input_heaps(connection, policy, identity, *, by_name):
+    """Create unindexed intake heaps and return the configured table records."""
+    prefix = "pdgs_" + uuid4().hex
+    names_by_kind = dict(resource_input=prefix + "_ri", witness_input=prefix + "_wi")
+    for key, root in (("resource_input", RESOURCE), ("witness_input", WITNESS)):
+        relation = storage_relation(policy.schema, names_by_kind[key])
+        identity_clause = " GENERATED BY DEFAULT AS IDENTITY" if key == "resource_input" else ""
+        await connection.execute(
+            f"CREATE TABLE {relation} (LIKE {storage_relation(policy.schema, root)} "
+            f"INCLUDING STORAGE, batch_ordinal bigint{identity_clause} NOT NULL, row_ordinal integer NOT NULL)"
+            + PRIVATE_HEAP_OPTIONS
+        )
+        await _close_grants(connection, policy, names_by_kind[key])
+        if key == "resource_input":
+            sequence_name = await connection.fetchval(
+                "SELECT c.relname FROM pg_class c WHERE c.oid=pg_get_serial_sequence($1,'batch_ordinal')::regclass",
+                relation,
+            )
+            await _close_grants(connection, policy, sequence_name, sequence=True)
+            if is_role_repeat_source(identity["metadata"].get("source_ids")):
+                await connection.execute(role_order_index_sql(policy.schema, names_by_kind[key]))
+    captured = (
+        {name: {"name": name} for name in names_by_kind.values()}
+        if by_name
+        else await _capture(connection, policy, list(names_by_kind.values()))
+    )
+    return {key: captured[name] for key, name in names_by_kind.items()}
+
+
 async def prepare_generic_source_candidate(database, directory, candidate):
     """Initialize two unindexed private input heaps, or authenticate exact resume."""
     identity = candidate_identity(directory, candidate)
@@ -648,42 +720,32 @@ async def prepare_generic_source_candidate(database, directory, candidate):
             candidate.dataset_id,
         )
         _require(old_payload is False and not candidate.reused_from_checkpoint, "legacy_acquisition_rerun_required")
-        prefix = "pdgs_" + uuid4().hex
-        names_by_kind = dict(resource_input=prefix + "_ri", witness_input=prefix + "_wi")
-        for key, root in (("resource_input", RESOURCE), ("witness_input", WITNESS)):
-            relation = storage_relation(policy.schema, names_by_kind[key])
-            identity_clause = " GENERATED BY DEFAULT AS IDENTITY" if key == "resource_input" else ""
-            await connection.execute(
-                f"CREATE TABLE {relation} (LIKE {storage_relation(policy.schema, root)} "
-                f"INCLUDING STORAGE, batch_ordinal bigint{identity_clause} NOT NULL, row_ordinal integer NOT NULL)"
-                + PRIVATE_HEAP_OPTIONS
-            )
-            await _close_grants(connection, policy, names_by_kind[key])
-            if key == "resource_input":
-                sequence_name = await connection.fetchval(
-                    "SELECT c.relname FROM pg_class c WHERE c.oid=pg_get_serial_sequence($1,'batch_ordinal')::regclass",
-                    relation,
-                )
-                await _close_grants(connection, policy, sequence_name, sequence=True)
-                if is_role_repeat_source(identity["metadata"].get("source_ids")):
-                    await connection.execute(role_order_index_sql(policy.schema, names_by_kind[key]))
-        captured = await _capture(connection, policy, list(names_by_kind.values()))
+        by_name = isinstance(isolated, NamedFHIRSourceStorage)
+        tables_by_kind = await _create_source_input_heaps(connection, policy, identity, by_name=by_name)
         binding_by_field = dict(
             contract=CONTRACT,
             identity=identity,
             phase="loading",
             ordinal=0,
             resets={},
-            tables={key: captured[name] for key, name in names_by_kind.items()},
+            tables=tables_by_kind,
             auxiliary=None,
             relationship_sha256=None,
         )
         if isolated is not None:
             binding_by_field.update(
-                contract=CMS_ISOLATED_CONTRACT if is_cms_identity(identity) else ISOLATED_CONTRACT,
+                contract=(
+                    NAMED_ISOLATED_CONTRACT
+                    if by_name
+                    else CMS_ISOLATED_CONTRACT
+                    if is_cms_identity(identity)
+                    else ISOLATED_CONTRACT
+                ),
                 storage=storage_document(publisher),
                 admission=None,
             )
+        if by_name:
+            _validate_binding(binding_by_field, identity, phases=("loading",))
         await _store(connection, policy, identity, None, binding_by_field)
         return binding_by_field
 
@@ -783,7 +845,7 @@ def _validated_transition_storage(policy, old_storage, new_storage):
 
 
 def _is_empty_vsp_checkpoint_failure(header, candidate_by_field, identity_by_field, expected_counts, new_storage):
-    """Recognize exact VSP failures that precede capture or normalized input."""
+    """Recognize exact VSP failures before any normalized input was committed."""
     failure_metadata = _json(header["publication_metadata_json"])
     identity_metadata = candidate_by_field["identity"]["metadata"]
     root_run_id = identity_by_field["acquisition_root_run_id"]
@@ -806,6 +868,15 @@ def _is_empty_vsp_checkpoint_failure(header, candidate_by_field, identity_by_fie
                 header["import_run_id"] == identity_by_field["failed_run_id"] != root_run_id
                 and is_artifact_root_failure(failure_metadata.get("error"))
                 and (header["status"] == "failed" or candidate_by_field.get("storage") == new_storage)
+                and candidate_by_field["relationship_sha256"] is None
+            )
+            or (
+                header["import_run_id"] == identity_by_field["failed_run_id"]
+                and (
+                    header["import_run_id"] == root_run_id or candidate_by_field["contract"] == NAMED_ISOLATED_CONTRACT
+                )
+                and header["status"] == "failed"
+                and failure_metadata.get("error") == OFFICE_DOCTORS_INVALID
                 and candidate_by_field["relationship_sha256"] is None
             )
         )
@@ -856,14 +927,15 @@ async def _locked_transition_header(connection, policy, identity_by_field):
 
 
 async def _locked_transition_candidate(
-    connection, policy, identity_by_field, old_storage, new_storage, expected_counts
+    connection, policy, identity_by_field, old_storage, new_storage, expected_counts, *, by_name=False
 ):
-    """Verify the complete native binding of the locked candidate."""
+    """Verify the stopped acquisition and its declared storage."""
     header = await _locked_transition_header(connection, policy, identity_by_field)
     candidate_by_field = _json(header["candidate_storage_json"])
     stored_identity = candidate_by_field.get("identity") if type(candidate_by_field) is dict else None
     _validate_binding_shape(candidate_by_field, stored_identity, phases=("loading",))
-    _validate_binding_tables(candidate_by_field, stored_identity)
+    if not by_name or candidate_by_field["contract"] == NAMED_ISOLATED_CONTRACT:
+        _validate_binding_tables(candidate_by_field, stored_identity)
     is_empty_vsp_failure = _is_empty_vsp_checkpoint_failure(
         header, candidate_by_field, identity_by_field, expected_counts, new_storage
     )
@@ -877,8 +949,13 @@ async def _locked_transition_candidate(
         )
     )
     has_changed_header_owner = header["import_run_id"] != identity_by_field["failed_run_id"]
+    candidate_storage_by_field = candidate_by_field.get("storage")
+    if by_name and candidate_by_field["contract"] == ISOLATED_CONTRACT:
+        _require(type(candidate_storage_by_field) is dict, "transition_candidate_changed")
+        candidate_storage_by_field = {key: candidate_storage_by_field.get(key) for key in old_storage}
     _require(
-        candidate_by_field["contract"] == ISOLATED_CONTRACT
+        candidate_by_field["contract"]
+        in ((ISOLATED_CONTRACT, NAMED_ISOLATED_CONTRACT) if by_name else (ISOLATED_CONTRACT,))
         and (not has_changed_header_owner or is_empty_vsp_failure)
         and candidate_by_field["admission"] is None
         and candidate_by_field["auxiliary"] is None
@@ -891,10 +968,17 @@ async def _locked_transition_candidate(
         == set(stored_identity["metadata"].get("expected_resources", ()))
         == {name for name in expected_counts if not name.startswith("LU:")}
         == {_resource_family(name) for name in expected_counts}
-        and candidate_by_field["storage"] in (old_storage, new_storage),
+        and candidate_storage_by_field in (old_storage, new_storage)
+        and (not by_name or is_empty_vsp_failure and metadata.get("error") == OFFICE_DOCTORS_INVALID),
         "transition_candidate_changed",
     )
-    await _verify_tables(connection, policy, candidate_by_field)
+    if by_name and candidate_by_field["contract"] == ISOLATED_CONTRACT:
+        tables_by_kind = {kind: {"name": table["name"]} for kind, table in candidate_by_field["tables"].items()}
+        _validate_binding_tables(
+            {**candidate_by_field, "contract": NAMED_ISOLATED_CONTRACT, "tables": tables_by_kind}, stored_identity
+        )
+    if not by_name:
+        await _verify_tables(connection, policy, candidate_by_field)
     return candidate_by_field, header["status"], is_empty_vsp_failure, has_changed_header_owner, metadata.get("error")
 
 
@@ -912,8 +996,11 @@ async def _verify_transition_run(
     root_run_id = identity_by_field["acquisition_root_run_id"]
     failed_run_id = identity_by_field["failed_run_id"]
     is_vsp_artifact_failure = is_empty_vsp_failure and not has_changed_header_owner and failed_run_id != root_run_id
+    is_retained_vsp_failure = is_empty_vsp_failure and expected_failure_error == OFFICE_DOCTORS_INVALID
     failure_field = (
-        ",error::jsonb->>'message' AS error_message" if has_changed_header_owner or is_vsp_artifact_failure else ""
+        ",error::jsonb->>'message' AS error_message"
+        if has_changed_header_owner or is_vsp_artifact_failure or is_retained_vsp_failure
+        else ""
     )
     run_rows = await connection.fetch(
         "SELECT run_id,status,finished_at,retry_of_run_id,created_at,"
@@ -932,6 +1019,15 @@ async def _verify_transition_run(
     ancestor_run_ids = _transition_run_ancestors(run_rows, root_run_id, failed_run_id)
     if has_changed_header_owner:
         _verify_rearmed_vsp_child(run_rows, root_run_id)
+    elif is_retained_vsp_failure:
+        _require(
+            len(run_rows) == len(ancestor_run_ids)
+            and run_rows[0].get("error_message") == expected_failure_error
+            and all(
+                run_record["status"] == "failed" and run_record["finished_at"] is not None for run_record in run_rows
+            ),
+            "transition_run_changed",
+        )
     elif is_vsp_artifact_failure:
         _verify_vsp_pre_capture_lineage(run_rows, root_run_id, ancestor_run_ids, expected_failure_error)
     return {
@@ -1387,33 +1483,34 @@ async def _require_transition_administrator(connection, policy):
     )
 
 
-async def transition_isolated_loading_candidate_storage(
-    connection, *, policy, identity_by_field, old_storage, new_storage, expected_resource_counts
-):
-    """Move one verified stopped private intake to an admin-issued successor producer."""
-    from process.provider_directory_generic_source_policy import GenericSourcePolicy
+async def _transition_catalog_schema(connection, policy, old_storage, new_storage, *, is_named_storage):
+    """Resolve the logical catalog for the selected transition contract."""
     from process.provider_directory_source_storage_binding import verify_isolated_source_storage_coordinates
 
-    _require(type(policy) is GenericSourcePolicy and connection.is_in_transaction(), "transition_transaction_required")
-    _require(await connection.fetchval("SHOW transaction_isolation") == "serializable", "transition_isolation_required")
+    if is_named_storage:
+        _validate_named_storage(old_storage)
+        _validate_named_storage(new_storage)
+        _require(
+            old_storage["storage_schema"] == new_storage["storage_schema"] == policy.schema
+            and old_storage["catalog_schema"] == new_storage["catalog_schema"]
+            and old_storage["producer"] != new_storage["producer"],
+            "transition_storage_changed",
+        )
+        return old_storage["catalog_schema"]
     await _require_transition_administrator(connection, policy)
-    _validated_transition_identity(identity_by_field, expected_resource_counts)
     old_binding = _validated_transition_storage(policy, old_storage, new_storage)
     await verify_isolated_source_storage_coordinates(connection, policy, old_binding)
-    locked_candidate = await _locked_transition_candidate(
-        connection,
-        policy,
-        identity_by_field,
-        old_storage,
-        new_storage,
-        expected_resource_counts,
-    )
-    candidate_by_field, previous_status, is_empty_vsp_failure, has_changed_header_owner, failure_error = (
-        locked_candidate
-    )
+    return old_binding.catalog_schema
+
+
+async def _verify_stopped_candidate(
+    connection, policy, catalog_schema, identity_by_field, locked_candidate, expected_resource_counts
+):
+    """Check the failed acquisition lineage and candidate contents before changing storage."""
+    candidate_by_field, _, is_empty_vsp_failure, has_changed_header_owner, failure_error = locked_candidate
     run_evidence_by_field = await _verify_transition_run(
         connection,
-        old_binding.catalog_schema,
+        catalog_schema,
         identity_by_field,
         candidate_by_field["identity"]["metadata"]["source_ids"],
         has_changed_header_owner=has_changed_header_owner,
@@ -1431,11 +1528,48 @@ async def transition_isolated_loading_candidate_storage(
         run_evidence_by_field["ancestor_run_ids"],
         is_empty_vsp_failure=is_empty_vsp_failure,
     )
-    successor_by_field = {**candidate_by_field, "storage": new_storage}
-    receipt_by_field = _transition_receipt(
-        candidate_by_field, old_storage, successor_by_field, expected_resource_counts, run_evidence_by_field
+    return run_evidence_by_field
+
+
+async def transition_isolated_loading_candidate_storage(
+    connection, *, policy, identity_by_field, old_storage, new_storage, expected_resource_counts
+):
+    """Move one verified stopped private intake to an admin-issued successor producer."""
+    from process.provider_directory_generic_source_policy import GenericSourcePolicy
+
+    _require(type(policy) is GenericSourcePolicy and connection.is_in_transaction(), "transition_transaction_required")
+    _require(await connection.fetchval("SHOW transaction_isolation") == "serializable", "transition_isolation_required")
+    _validated_transition_identity(identity_by_field, expected_resource_counts)
+    is_named_storage = type(new_storage) is dict and set(new_storage) == {
+        "catalog_schema",
+        "storage_schema",
+        "producer",
+    }
+    catalog_schema = await _transition_catalog_schema(
+        connection, policy, old_storage, new_storage, is_named_storage=is_named_storage
     )
-    if candidate_by_field["storage"] == new_storage:
+    locked_candidate = await _locked_transition_candidate(
+        connection,
+        policy,
+        identity_by_field,
+        old_storage,
+        new_storage,
+        expected_resource_counts,
+        by_name=is_named_storage,
+    )
+    candidate_by_field, previous_status, is_empty_vsp_failure, _, failure_error = locked_candidate
+    run_evidence_by_field = await _verify_stopped_candidate(
+        connection, policy, catalog_schema, identity_by_field, locked_candidate, expected_resource_counts
+    )
+    successor_by_field, receipt_by_field = _transition_result(
+        candidate_by_field,
+        old_storage,
+        new_storage,
+        expected_resource_counts,
+        run_evidence_by_field,
+        is_named_storage=is_named_storage,
+    )
+    if candidate_by_field == successor_by_field:
         return {**receipt_by_field, "already_applied": True}
     await _store_transition_successor(
         connection,
@@ -1444,9 +1578,31 @@ async def transition_isolated_loading_candidate_storage(
         successor_by_field,
         candidate_by_field,
         previous_status,
-        is_empty_vsp_failure,
+        is_empty_vsp_failure and failure_error != OFFICE_DOCTORS_INVALID,
     )
     return {**receipt_by_field, "already_applied": False}
+
+
+def _transition_result(
+    candidate_by_field, old_storage, new_storage, expected_resource_counts, run_evidence_by_field, *, is_named_storage
+):
+    """Build the successor and report the stopped candidate lineage."""
+    successor_by_field = {**candidate_by_field, "storage": new_storage}
+    if is_named_storage:
+        successor_by_field.update(
+            contract=NAMED_ISOLATED_CONTRACT,
+            tables={kind: {"name": table["name"]} for kind, table in candidate_by_field["tables"].items()},
+        )
+        receipt_by_field = {
+            "dataset_id": candidate_by_field["identity"]["dataset_id"],
+            "rows": 0,
+            "lineage_run_ids": run_evidence_by_field["lineage_run_ids"],
+        }
+    else:
+        receipt_by_field = _transition_receipt(
+            candidate_by_field, old_storage, successor_by_field, expected_resource_counts, run_evidence_by_field
+        )
+    return successor_by_field, receipt_by_field
 
 
 def _transition_receipt(candidate, old_storage, successor, expected_counts, run_evidence):
@@ -1462,7 +1618,7 @@ def _transition_receipt(candidate, old_storage, successor, expected_counts, run_
 
 
 async def _store_transition_successor(
-    connection, policy, identity_by_field, successor_by_field, candidate_by_field, previous_status, is_empty_vsp_failure
+    connection, policy, identity_by_field, successor_by_field, candidate_by_field, previous_status, should_rearm
 ):
     """Commit only the unchanged unpublished header preimage."""
     updated = await connection.execute(
@@ -1474,7 +1630,7 @@ async def _store_transition_successor(
         identity_by_field["dataset_id"],
         _encoded(successor_by_field),
         _encoded(candidate_by_field),
-        "acquiring" if is_empty_vsp_failure else previous_status,
+        "acquiring" if should_rearm else previous_status,
         previous_status,
     )
     _require(updated == "UPDATE 1", "transition_header_compare_failed")
