@@ -164,6 +164,112 @@ async def test_missing_candidate_pins_refuse_before_data(monkeypatch, missing):
     verifier.assert_not_awaited()
 
 
+def _provider_page():
+    """Build one valid provider and office for isolated response-boundary changes."""
+    location_by_field = dict(
+        location_id=str(UUID(int=9)),
+        location_key="a" * 64,
+        first_line="1 Example Street",
+        second_line=None,
+        city_name="Example City",
+        state_name="CA",
+        postal_code="90001",
+        country_code="US",
+        lat=10.0,
+        long=20.0,
+    )
+    provider_by_field = dict(
+        provider_system="npi",
+        provider_id="1000000491",
+        npi=1000000491,
+        display_name="Example",
+        locations=[location_by_field],
+    )
+    return dict(generation_id=7, total_count=1, providers=[provider_by_field])
+
+
+@pytest.mark.parametrize(
+    "changes,reason",
+    [
+        ({"provider_system": "unsupported"}, "identity"),
+        ({"provider_system": "manual", "provider_id": str(UUID(int=0)), "npi": None}, "identity"),
+        ({"provider_system": "manual", "provider_id": UUID(int=1).hex, "npi": None}, "identity"),
+        ({"display_name": False}, "display"),
+        ({"display_name": "x" * 513}, "display"),
+        ({"display_name": "bad\x00name"}, "display"),
+        ({"npi": True}, "NPI is unavailable"),
+        ({"npi": 1000000000}, "NPI is unavailable"),
+        ({"npi": 1000000004}, "NPI differs"),
+    ],
+)
+async def test_invalid_provider_never_returns_a_partial_page(changes, reason):
+    """One invalid provider rejects the whole page after a valid provider was decoded."""
+    document = _provider_page()
+    receipt_by_field = {"valid": True, "bounded": True, "result": json.dumps(document)}
+    assert readers._result(receipt_by_field) == document
+    document["providers"].append(_provider_page()["providers"][0] | changes)
+    document["total_count"] = 2
+    with pytest.raises(readers.NetworkProviderReadUnavailable, match=reason):
+        readers._result(receipt_by_field | {"result": json.dumps(document)})
+
+
+@pytest.mark.parametrize(
+    "changes,reason",
+    [
+        ({"location_id": str(UUID(int=0))}, "display"),
+        ({"location_key": "G" * 64}, "display"),
+        ({"first_line": 1}, "display"),
+        ({"first_line": "x" * 513}, "display"),
+        ({"city_name": "bad\x00city"}, "display"),
+        ({"lat": None}, "coordinates"),
+        ({"long": None}, "coordinates"),
+        ({"lat": True}, "coordinates"),
+        ({"lat": float("nan")}, "coordinates"),
+        ({"long": float("inf")}, "coordinates"),
+        ({"lat": 91}, "coordinates"),
+        ({"long": -181}, "coordinates"),
+    ],
+)
+async def test_invalid_office_never_returns_a_partial_page(changes, reason):
+    """Malformed office display or geometry rejects the complete bounded response."""
+    document = _provider_page()
+    receipt_by_field = {"valid": True, "bounded": True, "result": json.dumps(document)}
+    assert readers._result(receipt_by_field) == document
+    document["providers"][0]["locations"].append(_provider_page()["providers"][0]["locations"][0] | changes)
+    with pytest.raises(readers.NetworkProviderReadUnavailable, match=reason):
+        readers._result(receipt_by_field | {"result": json.dumps(document)})
+
+
+@pytest.mark.parametrize("coordinates", [(None, None), (-90, -180), (90, 180)])
+async def test_valid_office_coordinate_boundaries_are_preserved(coordinates):
+    """Optional and inclusive endpoint coordinates remain valid without coercion."""
+    document = _provider_page()
+    location = document["providers"][0]["locations"][0]
+    location["lat"], location["long"] = coordinates
+    assert readers._result({"valid": True, "bounded": True, "result": json.dumps(document)}) == document
+
+
+@pytest.mark.parametrize("pins", [[], (object(),)])
+async def test_untyped_candidate_pins_refuse_before_data(monkeypatch, pins):
+    """Physical relation inventories must retain their exact native pin types."""
+    manifest = _manifest()
+    object.__setattr__(manifest, "_candidate_relation_pins", pins)
+    connection, verifier, _events = _office_spies(monkeypatch, manifest)
+    with pytest.raises(readers.NetworkProviderReadUnavailable):
+        await readers.read_network_provider_page(connection, NetworkAddressReadScope(manifest, (11,), None))
+    connection.fetchrow.assert_not_awaited()
+    verifier.assert_not_awaited()
+
+
+async def test_untyped_office_filter_refuses_before_reader_access():
+    """A mapping cannot substitute for the typed office selection contract."""
+    connection = SimpleNamespace(is_in_transaction=Mock())
+    scope = NetworkAddressReadScope(_manifest(), (11,), None)
+    with pytest.raises(readers.NetworkProviderReadError, match="Office selection is invalid"):
+        await readers.read_network_provider_page(connection, scope, office_filters={"lat": 10})
+    connection.is_in_transaction.assert_not_called()
+
+
 @pytest.mark.parametrize("fast", [False, True])
 async def test_guard_refusal_precedes_empty_result_and_cache(monkeypatch, fast):
     manifest = _manifest(compact=fast, artifacts=fast)

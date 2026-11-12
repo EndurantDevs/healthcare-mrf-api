@@ -17,7 +17,13 @@ from ijson.backends import python as ijson_python
 from sqlalchemy import text
 
 from process.network_address_projection import _identifier
-from process.network_bootstrap_sources import _content, _copy_native_batch, _CopyBatchTooLarge
+from process.network_bootstrap_sources import (
+    _COPY_BATCH_BYTES,
+    _content,
+    _copy_native_batch,
+    _copy_native_spool,
+    _CopyBatchTooLarge,
+)
 from process.network_custom_address_source import _closed, _require_transaction
 from process.network_fhir_retained_capture_contract import (
     LEGACY_PROFILE,
@@ -31,6 +37,7 @@ from process.network_fhir_retained_capture_contract import (
     digest,
     registry_location_id,
     require,
+    retained_metadata_max_bytes,
     validate_capture,
 )
 from process.network_fhir_retained_native import (
@@ -1065,11 +1072,14 @@ async def _copy_resources(pair, origin, schema, release_id):
     _require_roots(origin, hash_by_family, counts, root)
 
 
-async def _prepare_capture_tables(pair, origin, schema, capture_id, owner_role):
-    """COPY bounded retained rows, derive exact evidence, then validate references."""
-    writer = pair.writer
-    await _create(writer, pair.reader, origin, schema, owner_role)
-    await _copy_native_batch(
+async def _copy_capture_header(pair, origin, schema):
+    """Keep raw admitted metadata separate from the unchanged native row budget."""
+    require(type(origin) is RetainedFHIRInput)
+    require(
+        type(origin.metadata_bytes) is int
+        and 0 < origin.metadata_bytes <= retained_metadata_max_bytes(origin.admission_profile)
+    )
+    arguments = (
         pair,
         f"SELECT * FROM {_relation(origin.schema_name, TABLES[0])} WHERE dataset_id=$1",
         (origin.dataset_id,),
@@ -1077,6 +1087,17 @@ async def _prepare_capture_tables(pair, origin, schema, capture_id, owner_role):
         TABLES[0],
         1,
     )
+    if origin.admission_profile == SEMANTIC_PROFILE:
+        await _copy_native_spool(*arguments, byte_limit=origin.metadata_bytes + _COPY_BATCH_BYTES)
+    else:
+        await _copy_native_batch(*arguments)
+
+
+async def _prepare_capture_tables(pair, origin, schema, capture_id, owner_role):
+    """COPY bounded retained rows, derive exact evidence, then validate references."""
+    writer = pair.writer
+    await _create(writer, pair.reader, origin, schema, owner_role)
+    await _copy_capture_header(pair, origin, schema)
     await _copy_resources(pair, origin, schema, "registry-capture:" + str(capture_id))
     for table in TABLES:
         await writer.execute(

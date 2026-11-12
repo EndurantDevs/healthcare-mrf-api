@@ -2,6 +2,26 @@
 """One bounded native metadata statement for protected API serving pins."""
 
 from process.network_address_projection import _identifier
+from process.network_index_catalog import index_catalog_statement
+
+_FAMILY_INDEX_SQL = r"""
+   SELECT relation.relname AS table_name,index_record.indexrelid::bigint AS index_oid,
+    index_record.indrelid::bigint AS table_oid,index_record.indisvalid,index_record.indisready,index_record.indislive,
+    index_record.indisprimary,index_record.indisunique,index_record.indnkeyatts,index_record.indnatts,method.amname,
+    index_record.indpred IS NULL AS no_predicate,index_record.indexprs IS NULL AS no_expressions,
+    ARRAY(SELECT attribute.attname FROM pg_catalog.unnest(index_record.indkey::smallint[]) WITH ORDINALITY key(attnum,position)
+     JOIN pg_catalog.pg_attribute attribute ON attribute.attrelid=relation.oid AND attribute.attnum=key.attnum
+     ORDER BY key.position) AS columns,pg_catalog.pg_get_indexdef(index_record.indexrelid) AS definition
+   FROM family_native_relations relation JOIN pg_catalog.pg_index index_record ON index_record.indrelid=relation.oid
+   JOIN pg_catalog.pg_class index_relation ON index_relation.oid=index_record.indexrelid
+   JOIN pg_catalog.pg_am method ON method.oid=index_relation.relam
+   WHERE relation.relnamespace=catalog.schema_oid AND relation.relkind='r'
+"""
+_FAMILY_INDEX_CATALOG = index_catalog_statement(
+    _FAMILY_INDEX_SQL,
+    geo_present="EXISTS(SELECT FROM family_native_relations relation WHERE relation.relnamespace=catalog.schema_oid "
+    "AND relation.relname='network_geo_search' AND relation.relkind='r')",
+)
 
 _METADATA_SQL = r"""
 WITH control AS MATERIALIZED (SELECT n.oid::bigint AS schema_oid,s.relowner::bigint AS owner_oid,o.*,
@@ -173,19 +193,7 @@ SELECT (SELECT schema_oid IS NOT NULL AND owner_oid IS NOT NULL AND pg_catalog.c
 
  ) privileges ON true
  LEFT JOIN LATERAL (
-  SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.to_jsonb(index_row) ORDER BY index_row.index_oid),'[]'::pg_catalog.jsonb) AS rows FROM (
-   SELECT relation.relname AS table_name,index_record.indexrelid::bigint AS index_oid,
-    index_record.indrelid::bigint AS table_oid,index_record.indisvalid,index_record.indisready,index_record.indislive,
-    index_record.indisprimary,index_record.indisunique,index_record.indnkeyatts,index_record.indnatts,method.amname,
-    index_record.indpred IS NULL AS no_predicate,index_record.indexprs IS NULL AS no_expressions,
-    ARRAY(SELECT attribute.attname FROM pg_catalog.unnest(index_record.indkey::smallint[]) WITH ORDINALITY key(attnum,position)
-     JOIN pg_catalog.pg_attribute attribute ON attribute.attrelid=relation.oid AND attribute.attnum=key.attnum
-     ORDER BY key.position) AS columns,pg_catalog.pg_get_indexdef(index_record.indexrelid) AS definition
-   FROM family_native_relations relation JOIN pg_catalog.pg_index index_record ON index_record.indrelid=relation.oid
-   JOIN pg_catalog.pg_class index_relation ON index_relation.oid=index_record.indexrelid
-   JOIN pg_catalog.pg_am method ON method.oid=index_relation.relam
-   WHERE relation.relnamespace=catalog.schema_oid AND relation.relkind='r'
-  ) index_row
+  NETWORK_INDEX_CATALOG
  ) indexes ON true
 ), approved_fingerprints AS MATERIALIZED (
  SELECT record_kind,record_key,
@@ -387,4 +395,6 @@ FROM indexed_base_evidence LEFT JOIN chosen ON true LEFT JOIN control ON true LE
 
 def api_serving_pin_statement(control_schema):
     """Quote only the admitted namespace; all runtime coordinates remain parameters."""
-    return _METADATA_SQL.replace('"PIN_CONTROL_SCHEMA"', _identifier(control_schema))
+    return _METADATA_SQL.replace("NETWORK_INDEX_CATALOG", _FAMILY_INDEX_CATALOG).replace(
+        '"PIN_CONTROL_SCHEMA"', _identifier(control_schema)
+    )

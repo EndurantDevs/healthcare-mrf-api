@@ -67,6 +67,34 @@ async def _validated_slices(connection, copy_target, address_source, candidate, 
     return report, slices
 
 
+async def _prepare_address_search(connection, copy_target, offices, slices, control_schema):
+    """Prepare custom hydration indexes and the optional exact search projection."""
+    if offices.custom is not None:
+        from process.network_membership_serving_indexes import (
+            _build_serving_indexes,
+            _require_address_search_indexes,
+            _serving_plan,
+        )
+
+        await _build_serving_indexes(connection, copy_target.schema_name, _serving_plan(copy_target.schema_name))
+        await _require_address_search_indexes(connection, offices.custom)
+    from process.network_compact_layout import CompactAddressRelation, CompactEdgeArtifact, CompactNetworkLayout
+    from process.network_geo_search import prepare_network_geo_search
+
+    edge_artifacts = await capture_compact_edge_artifacts(connection, copy_target, control_schema=control_schema)
+    layout = CompactNetworkLayout(
+        CompactAddressRelation(copy_target.schema_name, "network_slice_ref", slices.ref_map_oid),
+        offices.physical_base,
+        tuple(
+            CompactEdgeArtifact(entry["candidate_id"], entry["schema_name"], entry["table_oid"])
+            for entry in edge_artifacts
+        ),
+        offices.custom,
+    )
+    geo_search = await prepare_network_geo_search(connection, copy_target, layout)
+    return edge_artifacts, geo_search
+
+
 async def prepare_compact_network_readiness(
     connection, copy_target, address_source, *, runtime_roles, control_schema, office_authority=None, **source_options
 ):
@@ -91,15 +119,7 @@ async def prepare_compact_network_readiness(
     report, slices = await _validated_slices(
         connection, copy_target, address_source, candidate, control_schema, offices
     )
-    if offices.custom is not None:
-        from process.network_membership_serving_indexes import (
-            _build_serving_indexes,
-            _require_address_search_indexes,
-            _serving_plan,
-        )
-
-        await _build_serving_indexes(connection, copy_target.schema_name, _serving_plan(copy_target.schema_name))
-        await _require_address_search_indexes(connection, offices.custom)
+    edge_artifacts, geo_search = await _prepare_address_search(connection, copy_target, offices, slices, control_schema)
     scope = _scope_report(candidate, address_source)
     canonical_readiness_by_field = _slice_readiness(scope, report, slices)
     serving_readiness_by_field = {
@@ -110,8 +130,9 @@ async def prepare_compact_network_readiness(
         "index_profile": "compact_membership",
         "index_definition_sha256": await compact_index_digest(connection, copy_target.schema_name, candidate=candidate),
         "address_artifact": artifact,
-        "edge_artifacts": await capture_compact_edge_artifacts(connection, copy_target, control_schema=control_schema),
+        "edge_artifacts": edge_artifacts,
         "slice_ref_sha256": await compact_slice_ref_digest(connection, copy_target.schema_name),
+        **({"geo_search": geo_search} if geo_search is not None else {}),
     }
     await connection.execute(
         f"UPDATE {_identifier(control_schema)}.network_membership_candidate "

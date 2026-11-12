@@ -244,6 +244,8 @@ def verify_writer_closure_identity(current: dict, retained: dict | None, *, exte
             {"entity_address_unified"},
             {"network_slice_ref", "network_office_edge"},
             {"network_slice_ref", "network_office_edge", "entity_address_unified"},
+            {"network_slice_ref", "network_office_edge", "network_geo_search"},
+            {"network_slice_ref", "network_office_edge", "entity_address_unified", "network_geo_search"},
         )
     )
     for key in ("relation_oids", "index_oids", "index_table_oids"):

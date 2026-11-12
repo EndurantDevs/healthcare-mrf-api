@@ -9,6 +9,7 @@ from datetime import date
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from process.network_address_projection import _identifier
+from process.provider_directory_admission_seal import ADMISSION_RAW_METADATA_MAX_BYTES
 
 TABLES = (
     "provider_directory_endpoint_dataset",
@@ -64,6 +65,12 @@ def registry_location_id(source_id, resource_id):
     return uuid5(_SITE_DOMAIN, canonical([source_id, "Location", resource_id]))
 
 
+def retained_metadata_max_bytes(profile):
+    """Keep admitted semantic metadata within its existing raw admission budget."""
+    require(type(profile) is str and profile in {LEGACY_PROFILE, SEMANTIC_PROFILE})
+    return ADMISSION_RAW_METADATA_MAX_BYTES if profile == SEMANTIC_PROFILE else 64 * 1024**2 - 32768 - 1
+
+
 @dataclass(frozen=True)
 class RetainedFHIRInput:
     """Reviewed original publication, with one explicit supported admission profile."""
@@ -93,6 +100,7 @@ class RetainedFHIRInput:
     unresolved_plan_network_count: int = 0
 
     def __post_init__(self):
+        """Validate the exact profile, metadata budget and retained publication coordinates."""
         _identifier(self.schema_name)
         _identifier(self.reader_role)
         _identifier(self.preparation_schema)
@@ -103,8 +111,10 @@ class RetainedFHIRInput:
             require(type(getattr(self, name)) is int and 0 < getattr(self, name) < 2**32)
         for name in ("dataset_sha256", "metadata_text_sha256", "summary_sha256", "proof_sha256"):
             require(is_sha256(getattr(self, name)))
-        require(type(self.metadata_bytes) is int and 0 < self.metadata_bytes < 64 * 1024**2 - 32768)
-        require(type(self.admission_profile) is str and self.admission_profile in {LEGACY_PROFILE, SEMANTIC_PROFILE})
+        require(
+            type(self.metadata_bytes) is int
+            and 0 < self.metadata_bytes <= retained_metadata_max_bytes(self.admission_profile)
+        )
         require(type(self.unresolved_plan_network_count) is int and self.unresolved_plan_network_count >= 0)
         if self.admission_profile == LEGACY_PROFILE:
             require(

@@ -982,8 +982,12 @@ async def test_app_startup_prewarms_configured_pool(monkeypatch):
         pool=SimpleNamespace(size=lambda: 4),
         connect=lambda: Connection(),
     )
-    database = Database(engine=engine)
-    connect = AsyncMock()
+    database = Database()
+
+    async def connect_engine():
+        database.engine = engine
+
+    connect = AsyncMock(side_effect=connect_engine)
     monkeypatch.setattr(database, "connect", connect)
 
     database.init_app(App())

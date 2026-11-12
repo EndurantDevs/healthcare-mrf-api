@@ -56,6 +56,9 @@ def _decode_published_pin(entry, schema):
         ),
         _custom_address_relation(candidate, descriptor),
     )
+    from process.network_compact_layout import bind_compact_geo_search_candidate
+
+    layout = bind_compact_geo_search_candidate(layout, candidate)
     manifest = _pinned_manifest(
         entry,
         custody={

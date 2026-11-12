@@ -6,6 +6,7 @@ import json
 import re
 
 from process.network_address_projection import _identifier
+from process.network_index_catalog import index_catalog_statement
 from process.network_membership_validation import _json_object
 
 COMPONENT = "compact_network_serving"
@@ -32,7 +33,13 @@ def compact_serving_heaps(candidate):
     has_rows = (
         receipt is not None and receipt.custom_pair_count or carriers is not None and carriers.materialized_address_rows
     )
-    return SLICE_HEAPS | ({"entity_address_unified"} if has_rows else set())
+    from process.network_geo_search import TABLE, geo_search_receipt
+
+    return (
+        SLICE_HEAPS
+        | ({"entity_address_unified"} if has_rows else set())
+        | ({TABLE} if geo_search_receipt(candidate) is not None else set())
+    )
 
 
 def _require(condition):
@@ -60,6 +67,9 @@ def compact_readiness(candidate, report, scope):
             and receipt.get("scope") == scope
         )
     _require(serving.get("index_profile") == "compact_membership")
+    from process.network_geo_search import geo_search_receipt
+
+    geo_search_receipt(candidate)
     _require(
         type(serving.get("index_definition_sha256")) is str
         and re.fullmatch(r"[0-9a-f]{64}", serving["index_definition_sha256"]) is not None
@@ -83,7 +93,7 @@ def compact_readiness(candidate, report, scope):
 async def compact_index_digest(connection, schema_name, *, candidate=None):
     """Bind every native candidate index and require the two compact lookup paths."""
     _identifier(schema_name)
-    indexes = await connection.fetch(
+    statement = index_catalog_statement(
         """SELECT c.relname AS table_name,i.indexrelid::bigint AS index_oid,
         i.indrelid::bigint AS table_oid,i.indisvalid,i.indisready,i.indislive,
         i.indisprimary,i.indisunique,i.indnkeyatts,i.indnatts,am.amname,
@@ -94,8 +104,11 @@ async def compact_index_digest(connection, schema_name, *, candidate=None):
         FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid AND c.relkind='r'
         JOIN pg_index i ON i.indrelid=c.oid JOIN pg_class ic ON ic.oid=i.indexrelid
         JOIN pg_am am ON am.oid=ic.relam WHERE n.nspname=$1 ORDER BY i.indexrelid""",
-        schema_name,
+        geo_present="EXISTS(SELECT FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n "
+        "ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname='network_geo_search' AND c.relkind='r')",
     )
+    indexes = await connection.fetchval(statement, schema_name)
+    indexes = json.loads(indexes) if isinstance(indexes, str) else indexes
     _require(
         indexes
         and all(
@@ -108,6 +121,12 @@ async def compact_index_digest(connection, schema_name, *, candidate=None):
 
 
 def _require_index_paths(indexes, candidate):
+    if candidate is not None:
+        from process.network_geo_search import geo_search_receipt, require_geo_search_index_records
+
+        search = geo_search_receipt(candidate)
+        if search is not None:
+            require_geo_search_index_records(indexes, search)
     required_paths = [
         ("network_slice_ref", ["network_id", "office_bucket"], True, True),
         ("network_office_edge", ["slice_id", "location_key"], True, True),

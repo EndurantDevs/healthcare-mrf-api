@@ -281,6 +281,7 @@ class Database:
     _database_override: Optional[str] = field(init=False, default=None, repr=False)
     _reader_database: Optional[Database] = field(init=False, default=None, repr=False)
     _reader_login: Optional[Tuple[str, str]] = field(init=False, default=None, repr=False)
+    _api_server_started: bool = field(init=False, default=False, repr=False)
 
     text = staticmethod(sa_text)
     metadata = Base.metadata
@@ -321,18 +322,17 @@ class Database:
         pool_size = max(pool_min, 1)
         max_overflow = max(pool_max - pool_size, 0)
 
-        reader_engine_by_option = {}
+        options_by_name = {}
         if self._reader_login:
-            reader_engine_by_option = {
-                "isolation_level": "REPEATABLE READ",
-                "execution_options": {"postgresql_readonly": True},
-            }
-            # Metadata and bounded API reads do not amortize query JIT compilation.
+            options_by_name["isolation_level"] = "REPEATABLE READ"
+            options_by_name["execution_options"] = {"postgresql_readonly": True}
+        if self._api_server_started or self._reader_login:
+            # API queries do not amortize JIT; startup settings also cover new pool connections.
             if driver == "postgresql+asyncpg":
-                reader_engine_by_option["connect_args"] = {"server_settings": {"jit": "off"}}
+                options_by_name["connect_args"] = {"server_settings": {"jit": "off"}}
             elif driver == "postgresql+psycopg":
                 server_options = f"{os.getenv('PGOPTIONS', '')} -c jit=off".strip()
-                reader_engine_by_option["connect_args"] = {"options": server_options}
+                options_by_name["connect_args"] = {"options": server_options}
 
         self.engine = create_async_engine(
             url,
@@ -340,7 +340,7 @@ class Database:
             max_overflow=max_overflow,
             echo=_is_env_enabled(os.getenv("HLTHPRT_DB_ECHO")),
             hide_parameters=True,
-            **reader_engine_by_option,
+            **options_by_name,
         )
         self.session_factory = async_sessionmaker(
             self.engine,
@@ -944,24 +944,30 @@ class Database:
                     await invalidate_task
                 raise
 
+    async def _on_api_start(self, _app, _loop):
+        """Rebuild and prewarm API pools before the server accepts clients."""
+        if not self._api_server_started:
+            await self.disconnect()
+            self._api_server_started = True
+        await self.connect()
+        if self.is_api_reader_enabled():
+            await self._connect_reader()
+        assert self.engine is not None
+        async with AsyncExitStack() as connections:
+            for _ in range(self.engine.pool.size()):
+                await connections.enter_async_context(self.engine.connect())
+
     def init_app(self, app) -> None:
         """Register database lifecycle and request-session hooks on an app."""
         if _ASYNC_IMPORT_ERROR is not None:
             raise RuntimeError("SQLAlchemy async support requires SQLAlchemy >= 1.4") from _ASYNC_IMPORT_ERROR
 
-        @app.listener("before_server_start")
-        async def _on_start(_, __):
-            await self.connect()
-            if self.is_api_reader_enabled():
-                await self._connect_reader()
-            assert self.engine is not None
-            async with AsyncExitStack() as connections:
-                for _ in range(self.engine.pool.size()):
-                    await connections.enter_async_context(self.engine.connect())
+        app.listener("before_server_start")(self._on_api_start)
 
         @app.listener("before_server_stop")
         async def _on_stop(_, __):
             await self.disconnect()
+            self._api_server_started = False
 
         @app.middleware("request")
         async def _bind_session(request):

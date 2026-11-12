@@ -271,7 +271,7 @@ def test_locator_binds_admission_but_not_reader_role_or_physical_oids():
         accepted.generic_fhir_capture_id(retained().origin)
 
 
-def test_native_admission_header_projection_refuses_missing_date_or_scope():
+def _semantic_admission_header():
     import json
 
     from process.provider_directory_admission_seal import admission_seal_from_validated_metadata
@@ -284,6 +284,9 @@ def test_native_admission_header_projection_refuses_missing_date_or_scope():
     summary = support._fixture_summary(root, counts, hashes, True, resources)
     seal = admission_seal_from_validated_metadata(support._modern_metadata(resource_rows, summary))
     header_by_field = {
+        "header_oid": 10,
+        "completion_proof_required_version": None,
+        "candidate_storage_json": None,
         "dataset_id": "dataset-one",
         "endpoint_id": "endpoint-one",
         "acquisition_root_run_id": "run-one",
@@ -296,15 +299,56 @@ def test_native_admission_header_projection_refuses_missing_date_or_scope():
         "content_proof_resource_types": list(seal.resource_types),
         "publication_metadata_sha256": seal.metadata_sha256,
     }
+    return header_by_field
+
+
+def test_native_admission_header_projection_refuses_missing_date_or_scope():
+    import json
+
+    header_by_field = _semantic_admission_header()
     head, _, _ = accepted._admitted_summary(header_by_field, "source_example", "source-one")
     assert head.semantic_projection_as_of == "2026-01-01"
     for changed in ({"source_ids": ["other"]}, {"semantic_projection_as_of": None}):
         with pytest.raises((RetainedFHIRCaptureError, ValueError, KeyError)):
             accepted._admitted_summary(
-                {**header_by_field, "admitted_summary": json.dumps({**seal.metadata_summary, **changed})},
+                {
+                    **header_by_field,
+                    "admitted_summary": json.dumps({**json.loads(header_by_field["admitted_summary"]), **changed}),
+                },
                 "source_example",
                 "source-one",
             )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata_bytes", [72 * 1024**2, 256 * 1024**2, 256 * 1024**2 + 1, 0, True])
+async def test_current_generic_input_uses_semantic_metadata_budget(metadata_bytes):
+    header_by_field = _semantic_admission_header()
+    driver = SimpleNamespace(
+        is_in_transaction=lambda: True,
+        fetch=AsyncMock(return_value=[header_by_field]),
+        fetchrow=AsyncMock(
+            return_value={
+                "reader_role": "reader_example",
+                "metadata_bytes": metadata_bytes,
+                "metadata_sha256": "b" * 64,
+                "parent_oid": 11,
+                "leaf_oid": 12,
+            }
+        ),
+    )
+
+    async def read_input():
+        return await accepted.read_current_generic_fhir_input(
+            driver, schema_name="source_example", source_id="source-one", endpoint_id="endpoint-one"
+        )
+
+    if type(metadata_bytes) is int and 0 < metadata_bytes <= 256 * 1024**2:
+        origin = await read_input()
+        assert origin.admission_profile == SEMANTIC_PROFILE and origin.metadata_bytes == metadata_bytes
+    else:
+        with pytest.raises(RetainedFHIRCaptureError, match="retained_fhir_capture_unavailable"):
+            await read_input()
 
 
 def test_generic_successor_keeps_logical_scope_and_uses_physical_capture_evidence():
