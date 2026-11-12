@@ -3,7 +3,7 @@
 
 This module never obtains credentials or substitutes an ambient connection. The
 trusted caller supplies the publisher capability and the original transaction.
-Only low-volume header controls are locked; payload intake is append-only COPY.
+Intake locks low-volume header controls; stopped transitions fence private heaps.
 """
 
 import asyncio
@@ -30,6 +30,7 @@ from process.provider_directory_generic_candidate import (
 )
 from process.provider_directory_generic_source_policy import source_copy_session, source_owner_transaction
 from process.provider_directory_source_storage_binding import require_storage_schema, storage_document
+from process.uhc_flex_practitioner_async_safety import drain_operation
 from process.vsp_directory_contract import RESOURCE_TYPES as VSP_RESOURCE_TYPES
 from process.vsp_directory_contract import SOURCE_ID as VSP_SOURCE_ID
 from process.vsp_directory_store import is_artifact_root_failure
@@ -827,11 +828,17 @@ async def _locked_transition_header(connection, policy, identity_by_field):
         "control-run-worker-action:v1:" + failed_run_id,
     )
     _require(worker_lock_acquired is True, "transition_worker_action_busy")
+    return await _transition_header(connection, policy, identity_by_field, lock=True)
+
+
+async def _transition_header(connection, policy, identity_by_field, *, lock):
+    """Read the same exact header before census and under the final native fence."""
     header = await connection.fetchrow(
         "SELECT dataset_id,endpoint_id,acquisition_root_run_id,import_run_id,status,is_current,published_at,resource_count,"
         "publication_metadata_json,candidate_storage_json FROM "
         + storage_relation(policy.schema, HEADER)
-        + " WHERE dataset_id=$1 FOR UPDATE NOWAIT",
+        + " WHERE dataset_id=$1"
+        + (" FOR UPDATE NOWAIT" if lock else ""),
         identity_by_field["dataset_id"],
     )
     _require(
@@ -857,6 +864,15 @@ async def _locked_transition_candidate(
 ):
     """Verify the complete native binding of the locked candidate."""
     header = await _locked_transition_header(connection, policy, identity_by_field)
+    return await _transition_candidate(
+        connection, policy, identity_by_field, old_storage, new_storage, expected_counts, header
+    )
+
+
+async def _transition_candidate(
+    connection, policy, identity_by_field, old_storage, new_storage, expected_counts, header
+):
+    """Authenticate the complete loading binding without changing its native locks."""
     candidate_by_field = _json(header["candidate_storage_json"])
     stored_identity = candidate_by_field.get("identity") if type(candidate_by_field) is dict else None
     _validate_binding_shape(candidate_by_field, stored_identity, phases=("loading",))
@@ -1289,6 +1305,20 @@ async def _verify_transition_inputs(
         candidate_by_field["identity"]["metadata"]["source_ids"],
         is_empty_vsp_failure=is_empty_vsp_failure,
     )
+    await _verify_transition_input_census(
+        connection,
+        policy,
+        candidate_by_field,
+        identity_by_field,
+        expected_counts,
+        is_empty_vsp_failure=is_empty_vsp_failure,
+    )
+
+
+async def _verify_transition_input_census(
+    connection, policy, candidate_by_field, identity_by_field, expected_counts, *, is_empty_vsp_failure=False
+):
+    """Retain the exact complete-row census and witness validation independently of admission."""
     dataset_id = identity_by_field["dataset_id"]
     resource_relation = storage_relation(policy.schema, candidate_by_field["tables"]["resource_input"]["name"])
     input_rows = await connection.fetch(
@@ -1384,8 +1414,199 @@ async def _require_transition_administrator(connection, policy):
     )
 
 
-async def transition_isolated_loading_candidate_storage(
+_TRANSITION_CENSUS_IDENTITY_SQL = (
+    "SELECT current_database() AS database_name,a.datid::bigint AS database_oid,"
+    "a.pid,a.backend_start,a.xact_start,l.virtualtransaction,"
+    "session_user::text AS session,current_user::text AS current "
+    "FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid "
+    "WHERE a.pid=pg_backend_pid() AND l.locktype='virtualxid' "
+    "AND l.mode='ExclusiveLock' AND l.granted"
+)
+
+
+@dataclass
+class _TransitionInputCensus:
+    """One complete census, usable only while its original native heap locks survive."""
+
+    connection: object
+    task: object
+    backend: dict
+    header: dict
+    candidate: str
+    counts: str
+    identity: str
+    active: bool = True
+
+
+async def _lock_transition_inputs(connection, policy, candidate):
+    tables = sorted(candidate["tables"].values(), key=lambda table: table["oid"])
+    relations = ",".join("ONLY " + storage_relation(policy.schema, table["name"]) for table in tables)
+    await connection.execute("LOCK TABLE " + relations + " IN SHARE MODE NOWAIT")
+    await _verify_tables(connection, policy, candidate)
+    return [table["oid"] for table in tables]
+
+
+async def _rollback_transition_census(connection, transaction):
+    """Bound native rollback even when query cancellation has not drained yet."""
+    if connection.is_closed():
+        return
+    transport = getattr(connection, "_transport", None)
+    rollback = asyncio.create_task(transaction.rollback())
+    try:
+        completed, _ = await drain_operation(asyncio.wait((rollback,), timeout=1), preserve_cancellation=True)
+        if not completed:
+            raise TimeoutError
+        rollback.result()
+    except BaseException:
+        try:
+            try:
+                connection.terminate()
+            finally:
+                if transport is not None:
+                    transport.abort()
+        finally:
+            rollback.cancel()
+            await drain_operation(asyncio.wait((rollback,)), preserve_cancellation=False)
+            if not rollback.cancelled():
+                rollback.exception()
+        raise
+
+
+@asynccontextmanager
+async def isolated_source_transition_census(
     connection, *, policy, identity_by_field, old_storage, new_storage, expected_resource_counts
+):
+    """Freeze only the two private heaps while the full census runs outside shared admission."""
+    from process.provider_directory_source_storage_binding import verify_isolated_source_storage_coordinates
+
+    _require(not connection.is_in_transaction(), "transition_census_connection_active")
+    _validated_transition_identity(identity_by_field, expected_resource_counts)
+    identity_by_field = dict(identity_by_field)
+    expected_counts_by_type = dict(expected_resource_counts)
+    binding = _validated_transition_storage(policy, old_storage, new_storage)
+    census = None
+    has_failed = False
+    transaction = connection.transaction(isolation="read_committed")
+    try:
+        await transaction.start()
+        await connection.execute("SET LOCAL lock_timeout='50ms'")
+        await _require_transition_administrator(connection, policy)
+        await verify_isolated_source_storage_coordinates(connection, policy, binding)
+        header = await _transition_header(connection, policy, identity_by_field, lock=False)
+        candidate, _, is_empty, _, _ = await _transition_candidate(
+            connection, policy, identity_by_field, old_storage, new_storage, expected_counts_by_type, header
+        )
+        await _lock_transition_inputs(connection, policy, candidate)
+        _require(
+            dict(await _transition_header(connection, policy, identity_by_field, lock=False)) == dict(header),
+            "transition_candidate_changed",
+        )
+        await _verify_transition_input_census(
+            connection,
+            policy,
+            candidate,
+            identity_by_field,
+            expected_counts_by_type,
+            is_empty_vsp_failure=is_empty,
+        )
+        backend = await connection.fetchrow(_TRANSITION_CENSUS_IDENTITY_SQL)
+        _require(backend is not None and backend["virtualtransaction"], "transition_census_backend_changed")
+        census = _TransitionInputCensus(
+            connection,
+            asyncio.current_task(),
+            dict(backend),
+            dict(header),
+            _encoded(candidate),
+            _encoded(expected_counts_by_type),
+            _encoded(identity_by_field),
+        )
+        yield census
+    except BaseException:
+        has_failed = True
+        raise
+    finally:
+        if census is not None:
+            census.active = False
+        try:
+            await _rollback_transition_census(connection, transaction)
+        except BaseException:
+            if not has_failed:
+                raise
+
+
+async def _accept_transition_census(connection, policy, candidate, identity, counts, census):
+    """Transfer native SHARE custody before consuming a complete, still-live census."""
+    _require(
+        type(census) is _TransitionInputCensus
+        and census.active
+        and census.task is asyncio.current_task()
+        and census.connection is not connection
+        and not census.connection.is_closed()
+        and census.connection.is_in_transaction()
+        and census.candidate == _encoded(candidate)
+        and census.counts == _encoded(counts)
+        and census.identity == _encoded(identity),
+        "transition_census_changed",
+    )
+    oids = await _lock_transition_inputs(connection, policy, candidate)
+    backend = census.backend
+    _require(
+        dict(await census.connection.fetchrow(_TRANSITION_CENSUS_IDENTITY_SQL)) == backend,
+        "transition_census_backend_changed",
+    )
+    retained = await connection.fetchval(
+        "SELECT count(*)=$1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid "
+        "WHERE a.pid=$2 AND a.datid=$3::oid AND a.backend_start=$4 AND a.xact_start=$5 "
+        "AND l.virtualtransaction=$6 AND l.database=$3::oid AND l.relation=ANY($7::oid[]) "
+        "AND l.locktype='relation' AND l.mode='ShareLock' AND l.granted",
+        len(oids),
+        backend["pid"],
+        backend["database_oid"],
+        backend["backend_start"],
+        backend["xact_start"],
+        backend["virtualtransaction"],
+        oids,
+    )
+    _require(retained is True, "transition_census_backend_changed")
+    _require(
+        dict(await _transition_header(connection, policy, identity, lock=True)) == census.header,
+        "transition_candidate_changed",
+    )
+
+
+async def _verify_transition_census_controls(
+    connection, policy, candidate, identity, counts, run_evidence, is_empty, input_census
+):
+    """Always revalidate controls; accept only a complete census with continuous native custody."""
+    if input_census is None:
+        await _verify_transition_inputs(
+            connection,
+            policy,
+            candidate,
+            identity,
+            counts,
+            run_evidence["status"],
+            run_evidence["ancestor_run_ids"],
+            is_empty_vsp_failure=is_empty,
+        )
+        return
+    await _accept_transition_census(connection, policy, candidate, identity, counts, input_census)
+    await _verify_transition_checkpoints(
+        connection,
+        policy,
+        identity,
+        counts,
+        run_evidence["status"],
+        run_evidence["ancestor_run_ids"],
+        candidate["identity"]["metadata"]["source_ids"],
+        is_empty_vsp_failure=is_empty,
+    )
+    if is_empty:
+        await _verify_transition_witness(connection, policy, candidate, identity["dataset_id"], True)
+
+
+async def transition_isolated_loading_candidate_storage(
+    connection, *, policy, identity_by_field, old_storage, new_storage, expected_resource_counts, input_census=None
 ):
     """Move one verified stopped private intake to an admin-issued successor producer."""
     from process.provider_directory_generic_source_policy import GenericSourcePolicy
@@ -1418,15 +1639,15 @@ async def transition_isolated_loading_candidate_storage(
         expected_failure_error=failure_error,
     )
     _require(not is_empty_vsp_failure or run_evidence_by_field["status"] == "failed", "transition_checkpoint_changed")
-    await _verify_transition_inputs(
+    await _verify_transition_census_controls(
         connection,
         policy,
         candidate_by_field,
         identity_by_field,
         expected_resource_counts,
-        run_evidence_by_field["status"],
-        run_evidence_by_field["ancestor_run_ids"],
-        is_empty_vsp_failure=is_empty_vsp_failure,
+        run_evidence_by_field,
+        is_empty_vsp_failure,
+        input_census,
     )
     successor_by_field = {**candidate_by_field, "storage": new_storage}
     receipt_by_field = _transition_receipt(

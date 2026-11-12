@@ -1583,7 +1583,7 @@ BULK_EXPORT_OUTPUT_PENDING = "pending"
 BULK_EXPORT_OUTPUT_STREAMING = "streaming"
 BULK_EXPORT_OUTPUT_COMPLETE = "complete"
 BULK_EXPORT_OUTPUT_FAILED = "failed"
-BULK_EXPORT_MAX_OUTPUT_CONCURRENCY = 8
+BULK_EXPORT_MAX_OUTPUT_CONCURRENCY = 32
 BULK_EXPORT_DEFAULT_OUTPUT_CONCURRENCY = 1
 BULK_EXPORT_DEFAULT_CAPABILITY_REFRESH_ATTEMPTS = 64
 BULK_EXPORT_MAX_CAPABILITY_REFRESH_ATTEMPTS = 256
@@ -5328,7 +5328,7 @@ def _aetna_provider_directory_data_seed_rows(*, source_query: str | None = None)
                 "storage.googleapis.com",
             ],
             "provider_directory_bulk_export_range_resume": True,
-            "provider_directory_bulk_export_output_concurrency": 8,
+            "provider_directory_bulk_export_output_concurrency": 32,
             "provider_directory_expected_nonempty_resources": sorted(AETNA_COMMERCIAL_EXPECTED_NONEMPTY_RESOURCES),
         },
     }
@@ -46448,11 +46448,17 @@ class _BulkOutputStreamState:
     processed_bytes: int = field(init=False)
     committed_bytes: int = field(init=False)
     buffer: bytes = b""
+    raw_lines: list[bytes] = field(default_factory=list)
+    raw_bytes: int = 0
+    preparation_slot: asyncio.Semaphore | None = None
+    inline_preparation_slot: asyncio.Semaphore | None = None
+    log_identity: str = field(init=False)
 
     def __post_init__(self) -> None:
         resume_offset = max(0, self.context.resume_options.resume_offset)
         self.processed_bytes = resume_offset
         self.committed_bytes = resume_offset
+        self.log_identity = _bulk_capability_log_identity(self.context.url)
 
     def result(self, error: str | None) -> tuple[list[dict[str, Any]], int, int, bool, str | None]:
         """Return the retained rows and counters in the legacy stream tuple shape."""
@@ -46468,7 +46474,9 @@ class _BulkOutputStreamState:
         """Commit the bounded payload and durable byte boundary in one owner transaction."""
         handler = self.context.row_batch_handler
         progress_handler = self.context.resume_options.row_progress_handler
-        pending_rows = list(self.pending_rows)
+        pending_rows = (
+            self.pending_rows if isinstance(self.pending_rows, bulk_parallel.PreparedRows) else list(self.pending_rows)
+        )
         rows_written = self.rows_written
         committed_bytes = self.committed_bytes
         scope = source_checkpoint_transaction(db, schema=_schema()) if progress_handler else contextlib.nullcontext()
@@ -46482,8 +46490,14 @@ class _BulkOutputStreamState:
         # the in-memory boundary after their payload transaction rolled back.
         if handler:
             self.pending_rows.clear()
+            self.pending_rows = []
         self.rows_written = rows_written
         self.committed_bytes = committed_bytes
+        self.release_preparation_slot()
+
+    def release_preparation_slot(self) -> None:
+        """Release this file's bounded preparation after commit or final failure."""
+        bulk_parallel.release_preparation_slot(self)
 
     def handle_line(self, raw_line: bytes) -> str | None:
         """Parse and stage one NDJSON resource without changing error semantics."""
@@ -46512,20 +46526,7 @@ class _BulkOutputStreamState:
         return None
 
     def _parse_resource(self, resource: dict[str, Any]) -> tuple[type, dict[str, Any]] | None:
-        context = self.context
-        log_identity = _bulk_capability_log_identity(context.url)
-        return parse_fhir_resource(
-            context.source_record["source_id"],
-            resource,
-            resource_url=log_identity,
-            acquisition=FHIRAcquisitionContext(
-                fetch_url=log_identity,
-                fetch_mode="bulk_ndjson",
-                semantic_projection_as_of=(_source_semantic_projection_as_of(context.source_record)),
-            ),
-            run_id=context.run_id,
-            normalize_location_contacts=not (context.resource_type == "Location" and context.row_batch_handler),
-        )
+        return bulk_parallel.parse_stream_resource(sys.modules[__name__], self, resource)
 
 
 async def _consume_bulk_stream_chunk(state: _BulkOutputStreamState, chunk: bytes) -> tuple[bool, str | None]:
@@ -46533,7 +46534,7 @@ async def _consume_bulk_stream_chunk(state: _BulkOutputStreamState, chunk: bytes
     while b"\n" in state.buffer:
         line, state.buffer = state.buffer.split(b"\n", 1)
         state.processed_bytes += len(line) + 1
-        error = state.handle_line(line)
+        error = await bulk_parallel.stage_line(state, line)
         if error:
             return True, error
         context = state.context
@@ -46561,9 +46562,11 @@ async def _read_bulk_output_response(
             return state.result(error)
     if state.buffer:
         state.processed_bytes += len(state.buffer)
-        error = state.handle_line(state.buffer)
+        error = await bulk_parallel.stage_line(state, state.buffer)
         if error:
             return state.result(error)
+    if error := await bulk_parallel.prepare_pending(state, final=True):
+        return state.result(error)
     expected_length = state.context.resume_options.expected_content_length
     if expected_length is not None and state.processed_bytes != expected_length:
         return state.result("bulk_export_output_length_mismatch")
@@ -46655,6 +46658,8 @@ async def _stream_bulk_export_output_rows(
         if error is None:
             raise
         return state.result(error)
+    finally:
+        state.release_preparation_slot()
 
 
 def _bulk_stream_result(
@@ -56481,30 +56486,16 @@ async def _persist_endpoint_dataset_rows(
     semantic_projection_as_of: str | None,
 ) -> list[dict[str, Any]]:
     """Append observations and page proof within the original publisher transaction."""
-    from process.provider_directory_generic_source_policy import source_transaction
+    from process.provider_directory_cms_resource_batch import persist_dataset_rows
 
-    async with source_transaction(db):
-        from process.provider_directory_generic_source_adapters import persist_source_rows, require_source_transaction
-
-        require_source_transaction()
-        prepared_rows = _endpoint_dataset_resource_rows(
-            model, resource_rows, dataset_id=dataset_id, resource_hash_contract=resource_hash_contract
-        )
-        if not prepared_rows:
-            return prepared_rows
-        _assert_practitioner_semantic_projection_as_of(
-            model, resource_rows, resource_hash_contract, semantic_projection_as_of
-        )
-        await persist_source_rows(
-            sys.modules[__name__],
-            prepared_rows,
-            resource_hash_contract=resource_hash_contract,
-            semantic_projection_as_of=semantic_projection_as_of,
-        )
-        await persist_dataset_proof_shard(
-            db, _schema(), prepared_rows, dataset_id=dataset_id, expected_resource_hash_contract=resource_hash_contract
-        )
-        return prepared_rows
+    return await persist_dataset_rows(
+        sys.modules[__name__],
+        model,
+        resource_rows,
+        dataset_id,
+        resource_hash_contract=resource_hash_contract,
+        semantic_projection_as_of=semantic_projection_as_of,
+    )
 
 
 async def _lock_endpoint_dataset_proof_parent(
@@ -66444,6 +66435,7 @@ async def _prepare_resource_import_source_group(
             source_record["_endpoint_id"] = candidate.endpoint_id
             source_record["_endpoint_dataset_id"] = candidate.dataset_id
             source_record["_resource_hash_contract"] = candidate.resource_hash_contract
+            source_record["_bulk_preparation_identity"] = bulk_parallel.preparation_identity(candidate)
             if (proof_resource_scope := _candidate_proof_resource_scope(candidate)) is not None:
                 source_record["_proof_resource_scope"] = list(proof_resource_scope)
             if candidate.semantic_projection_as_of is not None:
@@ -67341,6 +67333,14 @@ class ResourceGroupScanRunner:
         )
 
     async def scan(
+        self,
+        requested_resource_types: list[str],
+    ) -> ResourceFetchResult | None:
+        """Drain every preparation worker before the source scan releases its owner."""
+        async with bulk_parallel.preparation_scope(sys.modules[__name__], self.source_record, self.options):
+            return await self._scan(requested_resource_types)
+
+    async def _scan(
         self,
         requested_resource_types: list[str],
     ) -> ResourceFetchResult | None:

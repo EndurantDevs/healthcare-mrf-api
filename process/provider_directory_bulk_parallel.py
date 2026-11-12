@@ -2,11 +2,215 @@
 """Bound independent bulk transfers without sharing physical Source sessions."""
 
 import asyncio
+import importlib
+import multiprocessing
+import os
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import replace
 from functools import partial
+from types import SimpleNamespace
 
 from process.provider_directory_fhir_response import AdaptiveRequestSlots
+
+PREPARATION_MAX_BYTES = 24 * 1024 * 1024
+
+
+class PreparedRows(list):
+    """Normalized callback rows with their immutable, worker-built COPY and proof data."""
+
+    def __init__(self, rows, dataset_rows, proof, identity, resource_type):
+        super().__init__(rows)
+        self.dataset_rows, self.proof = dataset_rows, proof
+        self.identity, self.resource_type = identity, resource_type
+
+
+def _worker_io_forbidden(*_args):
+    raise RuntimeError("bulk_preparation_io_forbidden")
+
+
+def prepare_lines(lines, fields, pending_rows, identity, final):
+    """Reuse the ordinary parser and canonical preparation without publisher authority."""
+    directory = importlib.import_module("process.provider_directory_fhir")
+    from process.provider_directory_cms_resource_batch import prepare_dataset_rows
+    from process.provider_directory_generic_source_policy import _FACTORY, _PUBLISHER
+
+    if _FACTORY.get() is not None or _PUBLISHER.get() is not None:
+        raise RuntimeError("bulk_preparation_publisher_bound")
+    context = directory._BulkOutputStreamContext(
+        session=None,
+        source_record=fields["source"],
+        url=fields["url"],
+        model=directory.RESOURCE_MODELS_BY_TYPE[fields["resource_type"]],
+        resource_type=fields["resource_type"],
+        per_resource_limit=0,
+        timeout=0,
+        run_id=fields["run_id"],
+        row_batch_handler=_worker_io_forbidden,
+        row_batch_size=fields["batch_size"],
+        retain_rows=False,
+        resume_options=directory.BulkOutputResumeOptions(
+            row_progress_handler=_worker_io_forbidden,
+            resume_offset=0,
+            expected_etag=None,
+            expected_content_length=None,
+        ),
+    )
+    stream = directory._BulkOutputStreamState(context, pending_rows=pending_rows)
+    for line in lines:
+        if error := stream.handle_line(line):
+            return stream.pending_rows, stream.rows_fetched, error
+    resource_rows = stream.pending_rows
+    if resource_rows and (final or len(resource_rows) >= fields["batch_size"]):
+        resource_rows = directory._resource_rows_with_location_contacts(context.model, resource_rows)
+        dataset_rows, proof = prepare_dataset_rows(directory, context.model, resource_rows, SimpleNamespace(**identity))
+        resource_rows = PreparedRows(resource_rows, dataset_rows, proof, identity, fields["resource_type"])
+    return resource_rows, stream.rows_fetched, None
+
+
+def preparation_identity(candidate):
+    """Copy only the immutable candidate fields needed by the CPU workers."""
+    return {
+        field_name: getattr(candidate, field_name)
+        for field_name in (
+            "dataset_id",
+            "endpoint_id",
+            "acquisition_root_run_id",
+            "source_ids",
+            "resource_hash_contract",
+            "semantic_projection_as_of",
+        )
+    }
+
+
+def release_preparation_slot(stream):
+    """Release this file's bounded preparation after commit or final failure."""
+    if stream.preparation_slot is not None:
+        stream.preparation_slot.release()
+        stream.preparation_slot = None
+    if stream.inline_preparation_slot is not None:
+        stream.inline_preparation_slot.release()
+        stream.inline_preparation_slot = None
+
+
+def parse_stream_resource(directory, stream, resource):
+    """Reuse the original capability identity and resource normalization contract."""
+    context = stream.context
+    return directory.parse_fhir_resource(
+        context.source_record["source_id"],
+        resource,
+        resource_url=stream.log_identity,
+        acquisition=directory.FHIRAcquisitionContext(
+            fetch_url=stream.log_identity,
+            fetch_mode="bulk_ndjson",
+            semantic_projection_as_of=directory._source_semantic_projection_as_of(context.source_record),
+        ),
+        run_id=context.run_id,
+        normalize_location_contacts=not (context.resource_type == "Location" and context.row_batch_handler),
+    )
+
+
+@asynccontextmanager
+async def preparation_scope(directory, source_record, options):
+    """Keep four bounded preparations alive across the scan and reap them before return."""
+    enabled = (
+        directory.is_source_storage_required()
+        and source_record.get("_bulk_preparation_identity")
+        and options.deferred_materialization
+        and options.stream_batch_size > 0
+        and options.per_resource_limit == options.page_limit == options.linked_resource_limit == 0
+        and options.source_concurrency == 1
+        and options.checkpointing_enabled
+        and directory._is_durable_bulk_checkpoint_context(source_record.get("_pagination_checkpoint_context"))
+        and directory._is_bulk_range_resume_enabled(source_record)
+        and not options.stale_cleanup
+        and not options.scan_role_reverse_lookup_planned
+        and is_bulk_scan(directory, source_record, options)
+    )
+    if not enabled:
+        yield
+        return
+    from process.provider_directory_cms_npd import _drain_stage_executor
+
+    workers = min(4, os.process_cpu_count() or 1)
+    executor = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"))
+    shared = state(directory, source_record)
+    shared["preparation"] = {
+        "executor": executor,
+        "slots": asyncio.Semaphore(workers),
+        "large_batch": asyncio.Semaphore(1),
+    }
+    try:
+        yield
+    finally:
+        shared.pop("preparation", None)
+        await _drain_stage_executor(executor)
+
+
+async def prepare_pending(stream, *, final=False):
+    """Wait for this file's one preparation without advancing its committed cursor."""
+    source_record = stream.context.source_record
+    shared = source_record.get("_provider_directory_bulk_parallel", {}).get("preparation")
+    if shared is None or stream.inline_preparation_slot is not None or isinstance(stream.pending_rows, PreparedRows):
+        return None
+    if not stream.raw_lines and not (final and stream.pending_rows):
+        return None
+    context = stream.context
+    if stream.preparation_slot is None:
+        await shared["slots"].acquire()
+        stream.preparation_slot = shared["slots"]
+    context_by_field = {
+        "source": {
+            key: source_record[key] for key in ("source_id", "_semantic_projection_as_of") if key in source_record
+        },
+        "url": context.url,
+        "resource_type": context.resource_type,
+        "run_id": context.run_id,
+        "batch_size": max(1, context.row_batch_size),
+    }
+    stream.pending_rows, fetched, error = await asyncio.get_running_loop().run_in_executor(
+        shared["executor"],
+        prepare_lines,
+        stream.raw_lines,
+        context_by_field,
+        stream.pending_rows,
+        source_record["_bulk_preparation_identity"],
+        final,
+    )
+    stream.rows_fetched += fetched
+    stream.raw_lines, stream.raw_bytes = [], 0
+    if not isinstance(stream.pending_rows, PreparedRows):
+        stream.release_preparation_slot()
+    return error
+
+
+async def stage_line(stream, raw_line):
+    """Let downloads fill bounded raw batches before reserving a CPU preparation slot."""
+    shared = stream.context.source_record.get("_provider_directory_bulk_parallel", {}).get("preparation")
+    if shared is None or stream.inline_preparation_slot is not None:
+        return stream.handle_line(raw_line)
+    if not raw_line.strip():
+        return None
+    stream.raw_lines.append(raw_line)
+    stream.raw_bytes += len(raw_line)
+    if stream.raw_bytes >= PREPARATION_MAX_BYTES:
+        # Preserve valid large records and exact proof boundaries without copying
+        # oversized normalized batches between processes. Other CPU slots stay free.
+        await shared["large_batch"].acquire()
+        stream.inline_preparation_slot = shared["large_batch"]
+        lines, stream.raw_lines, stream.raw_bytes = stream.raw_lines, [], 0
+        for index, line in enumerate(lines, 1):
+            if error := stream.handle_line(line):
+                return error
+            if index % 256 == 0:
+                await asyncio.sleep(0)
+                if stream.context.resume_options.cancel_probe is not None:
+                    await stream.context.resume_options.cancel_probe()
+        return None
+    if len(stream.raw_lines) + len(stream.pending_rows) >= max(1, stream.context.row_batch_size):
+        return await prepare_pending(stream)
+    return None
+
 
 _TRANSIENT_STREAM_ERRORS = frozenset(
     "bulk_export_transport_" + name

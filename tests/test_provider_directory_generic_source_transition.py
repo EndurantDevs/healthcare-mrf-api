@@ -1,15 +1,16 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """A successor producer may adopt only one verified, detached stopped intake."""
 
+import asyncio
 import errno
 import hashlib
 import os
 import re
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -174,7 +175,7 @@ def case(monkeypatch):
     )
 
 
-async def _transition(case, expected_counts=None, *, stopped_run_id=FAILED):
+async def _transition(case, expected_counts=None, *, stopped_run_id=FAILED, input_census=None):
     return await storage.transition_isolated_loading_candidate_storage(
         case.connection,
         policy=case.policy,
@@ -187,7 +188,267 @@ async def _transition(case, expected_counts=None, *, stopped_run_id=FAILED):
         old_storage=case.old,
         new_storage=case.new,
         expected_resource_counts={"Organization": 3} if expected_counts is None else expected_counts,
+        **({"input_census": input_census} if input_census is not None else {}),
     )
+
+
+def _census_lock_queries(case, backend_by_field):
+    """Evaluate retained lock evidence while requiring every native SQL predicate."""
+    input_oids = sorted(table["oid"] for table in case.header["candidate_storage_json"]["tables"].values())
+    locks = [dict(relation=oid, mode="ShareLock", granted=True) for oid in input_oids]
+    original_fetchval = case.connection.fetchval.side_effect
+
+    def retained_locks(query, *arguments):
+        if "FROM pg_locks l JOIN" not in query:
+            return original_fetchval(query, *arguments)
+        assert all(
+            predicate in query
+            for predicate in (
+                "SELECT count(*)=$1",
+                "a.pid=l.pid",
+                "a.pid=$2",
+                "a.datid=$3::oid",
+                "a.backend_start=$4",
+                "a.xact_start=$5",
+                "l.virtualtransaction=$6",
+                "l.database=$3::oid",
+                "l.relation=ANY($7::oid[])",
+                "l.locktype='relation'",
+                "l.mode='ShareLock'",
+                "l.granted",
+            )
+        )
+        assert arguments == (
+            len(input_oids),
+            *(
+                backend_by_field[name]
+                for name in ("pid", "database_oid", "backend_start", "xact_start", "virtualtransaction")
+            ),
+            input_oids,
+        )
+        return (
+            sum(lock["relation"] in arguments[6] and lock["mode"] == "ShareLock" and lock["granted"] for lock in locks)
+            == arguments[0]
+        )
+
+    case.connection.fetchval.side_effect = retained_locks
+    original_execute = case.connection.execute.side_effect
+
+    async def final_write(query, *arguments):
+        if query.startswith("LOCK TABLE "):
+            return "LOCK TABLE"
+        return await original_execute(query, *arguments)
+
+    case.connection.execute.side_effect = final_write
+    return locks
+
+
+def _census_connection(case):
+    """Expose native transaction and lock identity without replacing the complete census."""
+    state_by_field = {"active": False}
+    backend_by_field = dict(
+        database_name="synthetic",
+        database_oid=10,
+        pid=7,
+        backend_start="start",
+        xact_start="transaction",
+        virtualtransaction="3/7",
+        session="administrator",
+        current="administrator",
+    )
+    counts_by_type = {"Organization": 3}
+    identity_by_field = dict(
+        dataset_id=DATASET, endpoint_id=ENDPOINT, acquisition_root_run_id=ROOT, failed_run_id=FAILED
+    )
+    locks = _census_lock_queries(case, backend_by_field)
+
+    class Transaction:
+        async def start(self):
+            state_by_field["active"] = True
+
+        async def rollback(self):
+            state_by_field["active"] = False
+
+    async def census_header(query, *arguments):
+        if query == storage._TRANSITION_CENSUS_IDENTITY_SQL:
+            return dict(backend_by_field)
+        return await case.connection.fetchrow(query, *arguments)
+
+    transaction = Transaction()
+    connection = SimpleNamespace(
+        transaction=lambda **_options: transaction,
+        is_in_transaction=lambda: state_by_field["active"],
+        is_closed=lambda: False,
+        fetchrow=AsyncMock(side_effect=census_header),
+        fetchval=case.connection.fetchval,
+        fetch=case.connection.fetch,
+        execute=AsyncMock(),
+    )
+    context = storage.isolated_source_transition_census(
+        connection,
+        policy=case.policy,
+        identity_by_field=identity_by_field,
+        old_storage=case.old,
+        new_storage=case.new,
+        expected_resource_counts=counts_by_type,
+    )
+    return context, SimpleNamespace(
+        backend=backend_by_field,
+        connection=connection,
+        transaction=transaction,
+        counts=counts_by_type,
+        identity=identity_by_field,
+        locks=locks,
+    )
+
+
+@pytest.mark.asyncio
+async def test_census_rollback_timeout_aborts_exact_transport():
+    """A stuck driver cancellation cannot retain the owned socket indefinitely."""
+    terminated, finished = asyncio.Event(), asyncio.Event()
+
+    async def wait_for_native_cancellation():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await terminated.wait()
+        finally:
+            finished.set()
+
+    connection = SimpleNamespace(is_closed=lambda: False, terminate=Mock(side_effect=terminated.set), _transport=Mock())
+    transaction = SimpleNamespace(rollback=wait_for_native_cancellation)
+    operation = asyncio.create_task(storage._rollback_transition_census(connection, transaction))
+    try:
+        completed, _ = await asyncio.wait((operation,), timeout=2)
+        assert operation in completed
+        with pytest.raises(TimeoutError):
+            operation.result()
+    finally:
+        terminated.set()
+        operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
+    assert finished.is_set()
+    connection.terminate.assert_called_once_with()
+    connection._transport.abort.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rollback_fails", [False, True])
+async def test_canceled_census_begin_rolls_back_or_aborts_exact_transport(case, monkeypatch, rollback_fails):
+    """A canceled BEGIN cannot leave its caller's backend in an uncertain transaction."""
+    context, evidence = _census_connection(case)
+    entered = asyncio.Event()
+    original_start = evidence.transaction.start
+
+    async def start():
+        await original_start()
+        entered.set()
+        await asyncio.Event().wait()
+
+    rollback = AsyncMock(side_effect=RuntimeError("uncertain BEGIN") if rollback_fails else None)
+    monkeypatch.setattr(evidence.transaction, "start", start)
+    monkeypatch.setattr(evidence.transaction, "rollback", rollback)
+    evidence.connection.terminate = Mock()
+    evidence.connection._transport = Mock()
+    operation = asyncio.create_task(context.__aenter__())
+    await asyncio.wait_for(entered.wait(), 1)
+    operation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+    rollback.assert_awaited_once_with()
+    assert evidence.connection.terminate.call_count == int(rollback_fails)
+    assert evidence.connection._transport.abort.call_count == int(rollback_fails)
+    evidence.connection.execute.assert_not_awaited()
+    assert case.writes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["begin", "after_census"])
+async def test_census_freezes_validated_counts_and_identity_before_await(case, monkeypatch, phase):
+    """Caller mutation cannot change what was verified or the evidence later handed off."""
+    context, evidence = _census_connection(case)
+    target, name = (evidence.transaction, "start") if phase == "begin" else (storage, "_verify_transition_witness")
+    original = getattr(target, name)
+
+    async def mutate_caller(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        evidence.counts["Organization"] = 4
+        evidence.identity["endpoint_id"] = "different-endpoint"
+        return result
+
+    monkeypatch.setattr(target, name, mutate_caller)
+    async with context as census:
+        assert storage._json(census.counts) == {"Organization": 3}
+        assert storage._json(census.identity)["endpoint_id"] == ENDPOINT
+        receipt = await _transition(case, input_census=census)
+    assert receipt["rows"] == 3
+
+
+@pytest.mark.asyncio
+async def test_complete_census_transfers_only_with_live_native_custody(case):
+    """The full grouped census runs once; final controls remain independently revalidated."""
+    context, _ = _census_connection(case)
+    async with context as census:
+        receipt = await _transition(case, input_census=census)
+    assert receipt["rows"] == 3 and receipt["already_applied"] is False and census.active is False
+    census_calls = [
+        call for call in case.connection.fetch.await_args_list if "GROUP BY dataset_id,resource_type" in call.args[0]
+    ]
+    assert len(census_calls) == 1
+    assert any(
+        "provider_directory_pagination_checkpoint" in call.args[0] for call in case.connection.fetch.await_args_list
+    )
+    assert sum("FROM pg_locks l JOIN" in call.args[0] for call in case.connection.fetchval.await_args_list) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field", ["database_oid", "pid", "backend_start", "xact_start", "virtualtransaction", "session"]
+)
+async def test_census_rejects_changed_original_backend_identity(case, field):
+    """An identical row count cannot substitute for continuous physical transaction custody."""
+    context, evidence = _census_connection(case)
+    async with context as census:
+        evidence.backend[field] = "changed"
+        with pytest.raises(GenericCandidateError, match="transition_census_backend_changed"):
+            await _transition(case, input_census=census)
+    assert case.writes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["expired", "counts", "task"])
+async def test_census_refuses_stale_or_substituted_evidence(case, drift):
+    """Preparation is scoped to exact counts, one live task and both native heap locks."""
+    context, _ = _census_connection(case)
+    async with context as census:
+        if drift == "counts":
+            census.counts = storage._encoded({"Organization": 4})
+        elif drift == "task":
+            census.task = object()
+        if drift != "expired":
+            with pytest.raises(GenericCandidateError, match="transition_census_(?:changed|backend_changed)"):
+                await _transition(case, input_census=census)
+    if drift == "expired":
+        with pytest.raises(GenericCandidateError, match="transition_census_changed"):
+            await _transition(case, input_census=census)
+    assert case.writes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("heap", [0, 1])
+@pytest.mark.parametrize("drift", ["missing", "mode", "ungranted"])
+async def test_census_requires_both_granted_native_share_locks(case, heap, drift):
+    context, evidence = _census_connection(case)
+    async with context as census:
+        if drift == "missing":
+            evidence.locks.pop(heap)
+        elif drift == "mode":
+            evidence.locks[heap]["mode"] = "AccessShareLock"
+        else:
+            evidence.locks[heap]["granted"] = False
+        with pytest.raises(GenericCandidateError, match="transition_census_backend_changed"):
+            await _transition(case, input_census=census)
+    assert case.writes == []
 
 
 def _include_completed_empty_collection(case):
