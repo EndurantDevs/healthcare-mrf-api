@@ -84,6 +84,9 @@ from api.provider_geo_sql import (
     native_geo_entity_scope,
     nearby_batch_identities,
 )
+from api.provider_geo_sql import (
+    normalize_state_filter as _normalize_state_filter,
+)
 from api.provider_list_sql import (
     _CUSTOM_IMPORT_PROVIDER_RELATION,
     _NATIVE_PROVIDER_RELATION,
@@ -547,16 +550,6 @@ def _normalize_text_filter(raw_value: Any, *, param_name: str, max_length: int =
     if len(text_value) > max_length:
         raise sanic.exceptions.InvalidUsage(f"Parameter '{param_name}' is too long (max {max_length} chars)")
     return text_value
-
-
-def _normalize_state_filter(raw_value: Any) -> Optional[str]:
-    state_value = _normalize_text_filter(raw_value, param_name="state", max_length=2)
-    if state_value is None:
-        return None
-    normalized = state_value.upper()
-    if not re.fullmatch(r"[A-Z]{2}", normalized):
-        raise sanic.exceptions.InvalidUsage("Parameter 'state' must be a 2-letter code")
-    return normalized
 
 
 def _normalize_ccn_filter(raw_value: Any) -> Optional[str]:
@@ -10303,6 +10296,7 @@ async def get_near_npi(
     request.args.get("view")
     request.args.get("long")
     request.args.get("lat")
+    request.args.get("state")
     request.args.get("codes")
     request.args.get("plan_network")
     request.args.get("classification")
@@ -10338,6 +10332,7 @@ async def get_near_npi(
     except (TypeError, ValueError) as exc:
         raise sanic.exceptions.InvalidUsage("lat and long must be numbers") from exc
 
+    state_filter = _normalize_state_filter(args.get("state"))
     codes = args.get("codes")
     if codes:
         codes = [x.strip() for x in codes.split(",")]
@@ -10531,6 +10526,8 @@ async def get_near_npi(
 
         providers_by_identity: OrderedDict[tuple[int, str], dict[str, Any]] = OrderedDict()
         extra_filters: list[str] = []
+        if state_filter is not None:
+            extra_filters.append("a.state_name = :state")
         if unresolved_code_filter:
             extra_filters.append("1=0")
         if exclude_npi:
@@ -10645,6 +10642,8 @@ async def get_near_npi(
             **plan_scope_parameters,
             **dynamic_code_parameters_by_name,
         }
+        if state_filter is not None:
+            query_parameters_by_name["state"] = state_filter
         query_parameters_by_name = scoped_address_parameters(query_parameters_by_name)
         imported_statements = None
         if import_context is not None:

@@ -16,6 +16,7 @@ from api.plan_release_serving import PlanReleaseServingSelection, PlanReleaseSna
 from api.provider_detail_network_read import managed_provider_network_read_scope
 from db.connection import current_session
 from process.network_approved_membership_source import pin_approved_membership_source
+from process.network_published_api_pin import published_api_pin_statement
 from process.ptg_parts.result_archive_published_authority import PtgPublishedResultSourceAuthority
 from process.ptg_parts.result_archive_source_authority import result_archive_manifest_sha256
 from process.registry_ptg_published_plan_scope import _digest, _document, _parameters
@@ -35,6 +36,16 @@ pytestmark = pytest.mark.asyncio
 _ALLOWED = 9001
 _EXCLUDED = 9002
 _ARCHIVED = 9003
+
+
+def _candidate_lookup_queries(queries, control_schema):
+    routing_probes = [query for query in queries if query.query == published_api_pin_statement(control_schema)]
+    assert len(routing_probes) == 1 and routing_probes[0].exception is None
+    return [
+        query
+        for query in queries
+        if "to_jsonb(candidate)::text AS candidate_json" in query.query and query not in routing_probes
+    ]
 
 
 def _review(schema, name, company, network, revision, *, archived=False):
@@ -290,7 +301,7 @@ async def _admit(admission, selection, *, excluded=(_EXCLUDED,)):
             await asyncio.sleep(0)
             driver.remove_query_logger(queries.append)
     assert not any("binding_matches AS MATERIALIZED" in query.query for query in queries)
-    candidate_queries = [query for query in queries if "to_jsonb(candidate)::text AS candidate_json" in query.query]
+    candidate_queries = _candidate_lookup_queries(queries, held.fixture.control_schema)
     assert len(candidate_queries) == 1
     assert candidate_queries[0].args == (admission.manifest.generation_id, False, [])
     assert candidate_queries[0].exception is None

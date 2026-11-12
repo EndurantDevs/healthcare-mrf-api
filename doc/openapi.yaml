@@ -3761,6 +3761,12 @@ paths:
           schema:
             type: number
           description: Latitude of the search point
+        - name: state
+          in: query
+          schema:
+            type: string
+            pattern: '^[A-Za-z]{2}$'
+          description: Restrict matching provider locations to this state code before distance ordering, totals and pagination. Input is normalized to uppercase.
         - name: codes
           in: query
           schema:
@@ -10472,6 +10478,7 @@ components:
         radius: {$ref: '#/components/schemas/RegistryManagedNativeString'}
         section: {$ref: '#/components/schemas/RegistryManagedNativeString'}
         specialization: {$ref: '#/components/schemas/RegistryManagedNativeString'}
+        state: {$ref: '#/components/schemas/RegistryManagedNativeString'}
         view: {$ref: '#/components/schemas/RegistryManagedNativeString'}
         year: {$ref: '#/components/schemas/RegistryManagedNativeString'}
         zip_codes: {$ref: '#/components/schemas/RegistryManagedNativeString'}

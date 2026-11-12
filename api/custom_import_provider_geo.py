@@ -41,7 +41,7 @@ from process.custom_import.read_identity import verify_published_generation
 CUSTOM_IMPORT_PROVIDER_GEO_PATH = "/api/v1/extensions/custom-import/providers/geo"
 MAX_GEO_PAGE_SIZE = 50
 _GEO_QUERY_FIELDS = frozenset(
-    "lat long zip_codes radius limit cursor include_total view q exclude_npi codes plan_network "
+    "lat long state zip_codes radius limit cursor include_total view q exclude_npi codes plan_network "
     "classification specialization section display_name primary_only entity_type_code provider_sex_code "
     "procedure_codes procedure_code_system medication_codes medication_code_system year plan_release_id".split()
 )

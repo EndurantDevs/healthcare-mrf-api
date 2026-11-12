@@ -14,6 +14,7 @@ from process.network_address_artifact import CONTRACT as ADDRESS_CONTRACT
 from process.network_bootstrap_address_artifact import CONTRACT as BOOTSTRAP_CONTRACT
 from process.network_compact_layout import CompactAddressRelation
 from process.network_indexed_address_artifact import CONTRACT as INDEXED_CONTRACT
+from process.network_published_api_pin import read_published_api_pin
 from process.network_read_identity import NetworkReadIdentityError, verify_bound_network_names
 from process.network_serving_api_sql import api_serving_pin_statement
 from process.network_serving_api_validation import validate_api_serving_pin
@@ -131,19 +132,30 @@ async def api_catalog_read_snapshot(session, generation_id=None, control_schema=
     schema = registry_schema() if control_schema is None else control_schema
     transaction, reader = _reader_entry(session)
     driver, backend_pid = await _original_read_driver(session)
-    manifest, approved, relation = await resolve_api_network_pin(
-        session, generation_id=generation_id, control_schema=schema
-    )
+    try:
+        async with provider_read_savepoint(session):
+            resolved = await read_published_api_pin(driver, generation_id, schema)
+    except asyncpg.UndefinedTableError as error:
+        if not _is_missing_custody(error, schema):
+            raise
+        resolved = None
+    if resolved is None:
+        resolved = await _legacy_pin(driver, generation_id, schema)
+    await _same_reader(session, transaction, reader, driver, backend_pid)
+    manifest, approved, relation = resolved
+    object.__setattr__(manifest, "_api_request_session", session)
+    object.__setattr__(manifest, "_api_request_transaction", transaction)
     controls = getattr(manifest, "_api_control_relations", (relation,))
     object.__setattr__(manifest, "_api_approved_source", approved)
     token = _PINNED_READ.set((driver, manifest, schema))
     try:
         with network_read_name_inventory(driver, controls):
             yield manifest, relation
-            try:
-                await verify_bound_network_names(driver, controls, expected_backend_pid=backend_pid)
-            except NetworkReadIdentityError as error:
-                raise _unavailable() from error
+            if getattr(manifest, "_published_api_request", False) is not True:
+                try:
+                    await verify_bound_network_names(driver, controls, expected_backend_pid=backend_pid)
+                except NetworkReadIdentityError as error:
+                    raise _unavailable() from error
             await _same_reader(session, transaction, reader, driver, backend_pid)
     finally:
         _PINNED_READ.reset(token)

@@ -598,7 +598,7 @@ def test_npi_near_documents_exact_cursor_page_identity():
     operation = spec["paths"]["/npi/near/"]["get"]
     parameter_names = {parameter["name"] for parameter in operation["parameters"]}
 
-    assert {"cursor", "include_total", "provider_sex_code", "specialization"} <= parameter_names
+    assert {"cursor", "include_total", "provider_sex_code", "specialization", "state"} <= parameter_names
     response_schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
     assert {"$ref": "#/components/schemas/NpiNearPage"} in response_schema["oneOf"]
     page_schema = spec["components"]["schemas"]["NpiNearPage"]

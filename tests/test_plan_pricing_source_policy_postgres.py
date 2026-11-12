@@ -30,6 +30,7 @@ from tests.test_plan_pricing_projection_postgres import _create_import_run_stub,
 from tests.test_plan_pricing_projection_v3_postgres import _factorized_migration_statements
 from tests.test_provider_directory_cms_resource_batch_postgres import cms_source_template as cms_source_template
 from tests.test_provider_service_source_policy_postgres import (
+    _candidate_lookup_queries,
     _reader_identity,
     _selection,
 )
@@ -208,7 +209,7 @@ async def _admitted_reader(fixture):
             await asyncio.sleep(0)
             driver.remove_query_logger(queries.append)
     assert not any("binding_matches AS MATERIALIZED" in query.query for query in queries)
-    candidate_queries = [query for query in queries if "to_jsonb(candidate)::text AS candidate_json" in query.query]
+    candidate_queries = _candidate_lookup_queries(queries, held.fixture.control_schema)
     assert len(candidate_queries) == 1
     assert candidate_queries[0].args == (admission.manifest.generation_id, False, [])
     assert candidate_queries[0].exception is None

@@ -435,6 +435,13 @@ async def execute_network_read(session, statement, parameters=None):
 
 
 async def _verify_read_inventories(driver, backend_pid, relations, inventories):
+    from process.network_published_api_pin import active_published_api_pin
+
+    if active_published_api_pin(driver) is not None:
+        pins = tuple(dict.fromkeys((*relations, *(pin for inventory in inventories for pin in inventory.relations))))
+        absent_names = tuple(dict.fromkeys(name for inventory in inventories for name in inventory.absent_names))
+        await verify_bound_network_names(driver, pins, expected_backend_pid=backend_pid, absent_names=absent_names)
+        return
     if relations:
         await verify_consumed_network_relations(driver, relations, expected_backend_pid=backend_pid)
     for inventory in inventories:

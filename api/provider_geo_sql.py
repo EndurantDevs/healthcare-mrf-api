@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -21,6 +22,21 @@ _NATIVE_GEO_RELATION = "native_eligible_geo"
 _PAGE_LIMIT_PARAMETER = "__custom_import_geo_page_limit"
 _CURSOR_NPI_PARAMETER = "__custom_import_geo_cursor_npi"
 _CURSOR_ADDRESS_KEY_PARAMETER = "__custom_import_geo_cursor_address_key"
+
+
+def normalize_state_filter(raw_value: Any) -> str | None:
+    """Normalize the optional state constraint shared by provider location queries."""
+    if raw_value in (None, "", "null"):
+        return None
+    state_value = str(raw_value).strip()
+    if not state_value:
+        return None
+    if len(state_value) > 2:
+        raise InvalidUsage("Parameter 'state' is too long (max 2 chars)")
+    normalized = state_value.upper()
+    if not re.fullmatch(r"[A-Z]{2}", normalized):
+        raise InvalidUsage("Parameter 'state' must be a 2-letter code")
+    return normalized
 
 
 def canonical_zip_anchor_statement():

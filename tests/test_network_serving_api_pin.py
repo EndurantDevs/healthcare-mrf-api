@@ -90,6 +90,7 @@ class _PinSession(_Session):
 @pytest.fixture
 def pin_reader(monkeypatch):
     session = _PinSession()
+    monkeypatch.setattr(pins, "read_published_api_pin", AsyncMock(return_value=None))
     manifest = PinnedNetworkServingManifest(
         3, "10000000-0000-0000-0000-000000000001", "candidate", 1, {}, 1, "a" * 64, 80
     )
@@ -335,6 +336,15 @@ async def _read_catalog_body(pin_reader, outcome, failure):
 @pytest.mark.parametrize("outcome", ["success", "body_error", "cancel", "invalid_names", "reader_drift"])
 async def test_catalog_snapshot_restores_nested_contexts(pin_reader, outcome):
     session = pin_reader.session
+    # Exercise the legacy context inventory after the published routing probe.
+    object.__setattr__(
+        pin_reader.result[0],
+        "_api_control_relations",
+        (
+            CompactAddressRelation(_SCHEMA, "network_serving_manifest", 81),
+            pin_reader.result[2],
+        ),
+    )
     failure = asyncio.CancelledError() if outcome == "cancel" else RuntimeError("Synthetic body failure")
     expected = {
         "success": nullcontext(),
@@ -366,8 +376,12 @@ async def test_catalog_snapshot_restores_nested_contexts(pin_reader, outcome):
         _PINNED_READ.reset(token)
     assert session.events.count("guard") == int(outcome not in {"body_error", "cancel"})
     assert session.transaction is original and session.nested is None
-    pin_reader.legacy.assert_not_awaited()
-    pin_reader.approved_pin.assert_not_awaited()
+    pin_reader.legacy.assert_awaited_once_with(session.driver, 3, _SCHEMA, api_read=True)
+    pin_reader.approved_pin.assert_awaited_once_with(session.driver, pin_reader.result[0], control_schema=_SCHEMA)
+    pin_reader.validate.assert_not_called()
+    assert all(
+        call.args[0] != pins.api_serving_pin_statement(_SCHEMA) for call in session.driver.fetchrow.await_args_list
+    )
 
 
 def test_catalog_deparser_and_trigger_types_are_qualified_before_statement_parsing():

@@ -3280,3 +3280,40 @@ async def test_get_near_npi_applies_plan_scope_to_results_and_count(monkeypatch)
 async def test_get_near_npi_rejects_invalid_provider_filters(request_args, message):
     with pytest.raises(sanic.exceptions.InvalidUsage, match=message):
         await npi_module.get_near_npi(types.SimpleNamespace(args=request_args, app=types.SimpleNamespace()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("taxonomy", [None, "207Q00000X"])
+async def test_get_near_npi_applies_state_to_page_and_exact_count(monkeypatch, taxonomy):
+    sql_calls = []
+
+    class RecordingConnection:
+        async def all(self, sql, **params):
+            sql_text = str(sql)
+            sql_calls.append((sql_text, dict(params)))
+            return [(0,)] if "COUNT(DISTINCT" in sql_text else []
+
+    class FakeDB:
+        def acquire(self):
+            return FakeAcquire(RecordingConnection())
+
+    monkeypatch.setattr(npi_module, "db", FakeDB())
+    query_by_name = {"lat": "41", "long": "-87", "state": "il", "include_total": "true", "limit": "1"}
+    if taxonomy:
+        query_by_name["codes"] = taxonomy
+    result = await npi_module.get_near_npi(types.SimpleNamespace(args=query_by_name, app=types.SimpleNamespace()))
+    assert json.loads(result.body)["total_count"] == 0
+    page_sql = next(sql for sql, _params in sql_calls if "LIMIT :limit" in sql)
+    count_sql = next(sql for sql, _params in sql_calls if "COUNT(DISTINCT" in sql)
+    for sql in (page_sql, count_sql):
+        assert "a.state_name = :state" in sql
+    assert page_sql.index("a.state_name = :state") < page_sql.index("LIMIT :limit")
+    assert all(params["state"] == "IL" for _sql, params in sql_calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["I1", "ILL", "I", "éé"])
+async def test_get_near_npi_rejects_invalid_state_before_storage(state):
+    request = types.SimpleNamespace(args={"lat": "41", "long": "-87", "state": state}, app=types.SimpleNamespace())
+    with pytest.raises(sanic.exceptions.InvalidUsage, match="state"):
+        await npi_module.get_near_npi(request)
