@@ -12,7 +12,9 @@ from process.network_serving_read import NetworkServingReadUnavailable, _pinned_
 
 _PUBLISHED_SQL = """SELECT to_jsonb(candidate)::text AS candidate_json,
  to_jsonb(manifest)::text AS manifest_json,
- jsonb_build_object('closure',seal.receipt_json->'closure','control',seal.receipt_json->'control',
+ jsonb_build_object('closure',seal.receipt_json->'closure','control',(seal.receipt_json->'control')
+   ||jsonb_build_object('candidate_table_oid',
+     to_regclass('{control}.network_membership_candidate')::oid::bigint),
    'index_definition_sha256',seal.receipt_json->'index_definition_sha256')::text AS receipt_json,
  seal.seal_sha256,physical.relname AS base_name,space.nspname AS base_schema,
  (physical.relrowsecurity OR physical.relforcerowsecurity) AS base_rls,
@@ -23,8 +25,14 @@ _PUBLISHED_SQL = """SELECT to_jsonb(candidate)::text AS candidate_json,
  FROM {control}.network_serving_manifest manifest
  JOIN {control}.network_membership_candidate candidate USING(candidate_id)
  LEFT JOIN {control}.network_candidate_custody seal USING(candidate_id)
- LEFT JOIN pg_catalog.pg_class physical ON physical.oid=
-  (candidate.validation_json->'serving_readiness'->'address_artifact'->'table'->>'oid')::oid
+ LEFT JOIN pg_catalog.pg_class physical ON physical.oid=coalesce(
+  (SELECT sealed.oid FROM pg_catalog.pg_class sealed
+    JOIN pg_catalog.pg_namespace home ON home.oid=sealed.relnamespace
+   WHERE sealed.oid=(candidate.validation_json->'serving_readiness'->'address_artifact'->'table'->>'oid')::oid
+    AND home.nspname=coalesce(candidate.validation_json->'address_source'->>'schema_name',home.nspname)),
+  pg_catalog.to_regclass(
+   pg_catalog.quote_ident(candidate.validation_json->'address_source'->>'schema_name')||'.'
+   ||pg_catalog.quote_ident(candidate.validation_json->'address_source'->>'table_name'))::oid)
  LEFT JOIN pg_catalog.pg_namespace space ON space.oid=physical.relnamespace
  WHERE manifest.generation_id=coalesce($1::bigint,
   (SELECT generation_id FROM {control}.network_serving_control WHERE id=1))

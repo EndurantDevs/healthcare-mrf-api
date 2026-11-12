@@ -14,13 +14,22 @@ _RELATION_LOCK_MODES = (
     "ExclusiveLock",
     "AccessExclusiveLock",
 )
-_CONSUMED_SQL = """WITH expected AS MATERIALIZED (
-    SELECT * FROM unnest($1::text[],$2::bigint[]) AS pins(relation_name,relation_oid)
-), held AS MATERIALIZED (
+# Published candidate schemas are immutable and named by candidate UUID, so their relations are
+# identified by name and a copied snapshot serves on another database. Other names can rotate.
+_EXPECTED_SQL = """WITH expected AS MATERIALIZED (
+    SELECT pins.relation_name,CASE WHEN pins.relation_oid IS NOT NULL
+      AND pins.relation_name ~ '^"network_candidate_[0-9a-f]{32}"[.]'
+      THEN coalesce(pg_catalog.to_regclass(pins.relation_name)::oid::bigint,pins.relation_oid)
+      ELSE pins.relation_oid END AS relation_oid
+    FROM unnest($1::text[],$2::bigint[]) AS pins(relation_name,relation_oid)
+)"""
+_CONSUMED_SQL = (
+    _EXPECTED_SQL
+    + """, held AS MATERIALIZED (
     SELECT relation::bigint AS relation_oid FROM pg_catalog.pg_locks
     WHERE pid=pg_backend_pid() AND database=(
       SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database())
-    AND locktype='relation' AND relation::bigint=ANY($2::bigint[])
+    AND locktype='relation' AND relation::bigint IN (SELECT relation_oid FROM expected)
     AND granted AND mode=ANY($4::text[])
 )
 SELECT pg_backend_pid()=$3::integer AS backend_matches,count(*)::integer AS relation_count,
@@ -28,13 +37,15 @@ SELECT pg_backend_pid()=$3::integer AS backend_matches,count(*)::integer AS rela
       =expected.relation_oid,false) AND EXISTS(
         SELECT FROM held WHERE held.relation_oid=expected.relation_oid)),false) AS valid
 FROM expected"""
-_BOUND_NAMES_SQL = """WITH expected AS MATERIALIZED (
-    SELECT * FROM unnest($1::text[],$2::bigint[]) AS pins(relation_name,relation_oid)
 )
+_BOUND_NAMES_SQL = (
+    _EXPECTED_SQL
+    + """
 SELECT pg_backend_pid()=$3::integer AS backend_matches,count(*)::integer AS relation_count,
     coalesce(bool_and(pg_catalog.to_regclass(expected.relation_name)::oid::bigint
       IS NOT DISTINCT FROM expected.relation_oid),false) AS valid
 FROM expected"""
+)
 
 
 class NetworkReadIdentityError(RuntimeError):
