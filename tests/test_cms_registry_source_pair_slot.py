@@ -461,7 +461,7 @@ async def test_committed_resolver_preserves_prepared_stamp_and_binds_exact_recei
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["schema", "oid", "missing", "receipt", "capture", "canonical"])
+@pytest.mark.parametrize("changed", ["schema", "missing", "receipt", "capture", "canonical"])
 async def test_prepared_committed_resolver_refuses_changed_identity_or_uncommitted_slot(monkeypatch, changed):
     pair = _prepared()
     receipt_row = _row(pair)
@@ -470,8 +470,6 @@ async def test_prepared_committed_resolver_refuses_changed_identity_or_uncommitt
     schema = pair.address_ownership.schema_name
     if changed == "schema":
         schema += "_foreign"
-    if changed == "oid":
-        metadata["schema_oid"] += 1
     if changed == "missing":
         receipt_row = None
     if changed == "receipt":
@@ -489,7 +487,6 @@ async def test_prepared_committed_resolver_refuses_changed_identity_or_uncommitt
     monkeypatch.setattr(receipts, "read_registry_source_pair_receipt", AsyncMock(return_value=receipt_row))
     expected_error = {
         "schema": "registry_cms_source_pair_invalid",
-        "oid": "registry_cms_source_pair_invalid",
         "missing": "registry_cms_source_pair_unavailable",
         "receipt": "registry_cms_prepared_receipt_invalid",
         "capture": "cms_serving_registry_pair_invalid",

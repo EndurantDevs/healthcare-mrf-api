@@ -324,10 +324,14 @@ async def test_cms_default_reuses_only_active_manifest_without_selected_or_offic
     monkeypatch.setattr(
         scoped, "pin_retained_approved_membership_source", AsyncMock(return_value=ApprovedMembershipSource(4, "c" * 64))
     )
-    monkeypatch.setattr(
-        scoped, "_scope_source_generation", AsyncMock(return_value={"dataset_id": "dataset", "release_id": "release"})
-    )
-    monkeypatch.setattr(scoped, "_require_pinned_source", AsyncMock())
+    admission = AsyncMock()
+    monkeypatch.setattr(scoped, "_require_pinned_source", admission)
+
+    async def source_generation(*_arguments):
+        admission.assert_awaited()  # Row filtering is refused before the first source row is read.
+        return {"dataset_id": "dataset", "release_id": "release"}
+
+    monkeypatch.setattr(scoped, "_scope_source_generation", source_generation)
     second_pin = AsyncMock(side_effect=AssertionError("unexpected current-head lookup"))
     monkeypatch.setattr(scoped, "resolve_network_serving_manifest", second_pin)
     held.session.scalar = AsyncMock(side_effect=AssertionError("unexpected membership dependency"))
@@ -347,10 +351,54 @@ async def test_cms_default_reuses_only_active_manifest_without_selected_or_offic
         assert scope.manifest is held.manifest and scope.excluded_network_ids == ()
         assert scope.parameters_by_name["scope_network_ids"] is None
         assert scope.parameters_by_name["scope_excluded_network_ids"] == []
+    assert admission.await_args.args[1] is source_pin and admission.await_args.kwargs == {"api_read": True}
     second_pin.assert_not_awaited()
     catalog._pin.assert_awaited_once()
     with pytest.raises(catalog.RegistryNetworkCatalogError, match="source_changed"):
         await scoped.pin_cms_network_scope(held.session, '"control"', query, None)
+
+
+@pytest.mark.asyncio
+async def test_cms_scope_table_replaced_during_the_read_is_unavailable(directory_boundary, monkeypatch):
+    """A consumed-relation refusal is a 503, not an unhandled server error."""
+    from process.network_read_identity import NetworkReadIdentityError
+
+    held = directory_boundary
+    source_pin = PinnedFHIRMembershipSource(
+        "retained", "cms-npd", "endpoint", "dataset", "a" * 64, "release", 1, "alias", "2026-01-01"
+    )
+    coordinates = RegistryNetworkSourceCoordinates("fhir", "cms-npd", "retained", "dataset", "producer", "edition")
+    recipes = (RegistrySourceMembershipRecipe(source_pin, coordinates),)
+    monkeypatch.setattr(scoped, "resolve_retained_registry_source_recipes", AsyncMock(return_value=recipes))
+    monkeypatch.setattr(
+        scoped, "pin_retained_approved_membership_source", AsyncMock(return_value=ApprovedMembershipSource(4, "c" * 64))
+    )
+    monkeypatch.setattr(scoped, "_require_pinned_source", AsyncMock(side_effect=NetworkReadIdentityError("replaced")))
+    query = replace(
+        managed.parse_managed_directory_query(_query()),
+        excluded_network_ids=(),
+        network_manifest=held.manifest,
+        network_generation=9,
+    )
+    async with managed._managed_directory_scope(held.request, query, v2_envelope(_query()), (), "a" * 64):
+        with pytest.raises(contract.DirectoryReadError) as refused:
+            await scoped.pin_cms_network_scope(held.session, '"control"', query, None)
+    assert refused.value.status == 503
+
+
+@pytest.mark.asyncio
+async def test_retained_scope_generation_resolves_its_committed_pair_as_an_api_read(monkeypatch):
+    from tests.test_network_cms_registry_source_pair import _retained_pair
+
+    pair, published_at, session = _retained_pair(), datetime(2026, 1, 2, tzinfo=timezone.utc), object()
+    resolve = AsyncMock(return_value=SimpleNamespace(pair=pair, source_published_at=published_at))
+    monkeypatch.setattr(scoped, "resolve_committed_registry_cms_source_pair", resolve)
+    monkeypatch.setattr(scoped, "accepted_cms_generation", AsyncMock(side_effect=AssertionError("current selector")))
+    pin = pair.recipe.source_pin
+    generation = await scoped._scope_source_generation(session, '"control"', pin, pair.recipe)
+    resolve.assert_awaited_once_with(session, pair.recipe, api_read=True)
+    assert generation["retained_pair"] is pair and generation["observed_at"] == published_at
+    assert (generation["dataset_id"], generation["release_id"]) == (pin.dataset_id, pin.release_id)
 
 
 @pytest.mark.asyncio

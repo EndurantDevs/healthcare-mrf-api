@@ -272,32 +272,17 @@ async def _sealed_scope(connection, proof):
         raise ValueError("registry_cms_publication_unavailable")
 
 
-async def require_registry_cms_source_pair(session, pair, *, verify_content=True, api_read=False):
+async def require_registry_cms_source_pair(session, pair, *, verify_content=True):
     """Verify retained custody independently of later origin cutovers."""
     if type(pair) is not RegistryCMSRetainedSourcePair or type(verify_content) is not bool:
         raise ValueError("registry_cms_source_pair_invalid")
-    if type(api_read) is not bool or api_read and verify_content is not False:
-        raise ValueError("registry_cms_source_pair_invalid")
     await _normalize_receipt_session(session, pair.address_ownership.schema_name)
     connection = await native_driver(session)
-    from process.network_fhir_source_epoch import _require_api_metadata_read
-
-    await _require_api_metadata_read(connection, api_read, verify_content=verify_content)
-    read_options = {"api_read": True} if api_read else {}
     await require_retained_cms_fhir_source_epoch(
-        connection,
-        pair.proof.source_pin,
-        pair.recipe.source_pin.retained_epoch,
-        verify_content=verify_content,
-        **read_options,
+        connection, pair.proof.source_pin, pair.recipe.source_pin.retained_epoch, verify_content=verify_content
     )
     receipt, catalog = await address_clone_identity(
-        session,
-        pair.address_ownership,
-        pair.owner_role,
-        pair.runtime_roles,
-        verify_content=verify_content,
-        **read_options,
+        session, pair.address_ownership, pair.owner_role, pair.runtime_roles, verify_content=verify_content
     )
     comment = await connection.fetchval(
         "SELECT obj_description($1::oid,'pg_namespace')", pair.address_ownership.schema_oid
@@ -332,16 +317,9 @@ async def require_registry_cms_source_pair(session, pair, *, verify_content=True
     return pair
 
 
-async def require_registry_cms_source_pair_connection(connection, pair, *, verify_content=True, api_read=False):
+async def require_registry_cms_source_pair_connection(connection, pair, *, verify_content=True):
     """Validate on the exact native publisher transaction without opening another."""
-    if type(api_read) is not bool:
-        raise ValueError("registry_cms_source_pair_invalid")
-    return await require_registry_cms_source_pair(
-        NativeReceiptSession(connection),
-        pair,
-        verify_content=verify_content,
-        **({"api_read": True} if api_read else {}),
-    )
+    return await require_registry_cms_source_pair(NativeReceiptSession(connection), pair, verify_content=verify_content)
 
 
 @dataclass(frozen=True)
@@ -353,19 +331,20 @@ class ResolvedRegistryCMSReadPair:
 
 
 async def resolve_committed_registry_cms_source_pair(session, recipe, *, api_read=False):
-    """Resolve bounded committed evidence without widening caller read budgets."""
+    """Resolve bounded committed evidence without widening caller read budgets.
+
+    An API read finds the pair and its source by schema-qualified name and compares no recorded
+    schema, table or owner identity; its caller checks the source tables it consumes.
+    """
     if (
-        type(recipe) is not RegistrySourceMembershipRecipe
+        type(api_read) is not bool
+        or type(recipe) is not RegistrySourceMembershipRecipe
         or type(recipe.source_pin) is not PinnedFHIRMembershipSource
         or recipe.source_pin.source_id != "cms-npd"
         or recipe.source_pin.retained_epoch is None
     ):
         raise ValueError("registry_cms_source_pair_invalid")
     connection = await native_driver(session)
-    from process.network_fhir_source_epoch import _require_api_metadata_read
-
-    await _require_api_metadata_read(connection, api_read)
-    read_options = {"api_read": True} if api_read else {}
     if (
         not connection.is_in_transaction()
         or await connection.fetchval("SHOW transaction_isolation") not in {"repeatable read", "serializable"}
@@ -378,26 +357,27 @@ async def resolve_committed_registry_cms_source_pair(session, recipe, *, api_rea
     if (
         pair.recipe != recipe
         or pair.address_ownership.schema_name != schema
-        or pair.address_ownership.schema_oid != schema_oid
+        or (not api_read and pair.address_ownership.schema_oid != schema_oid)
         or epoch.admission_sha256 != pair.proof.expected_admission_sha256
         or epoch.metadata_sha256 != pair.proof.expected_metadata_sha256
     ):
         raise ValueError("registry_cms_source_pair_invalid")
-    await require_retained_cms_fhir_source_epoch(
-        connection, pair.proof.source_pin, epoch, verify_content=False, **read_options
-    )
-    _, catalog = await address_clone_identity(
-        session, pair.address_ownership, pair.owner_role, pair.runtime_roles, verify_content=False, **read_options
-    )
-    if catalog != pair.address_catalog_sha256:
-        raise ValueError("registry_cms_source_pair_invalid")
+    if not api_read:
+        await require_retained_cms_fhir_source_epoch(connection, pair.proof.source_pin, epoch, verify_content=False)
+        _, catalog = await address_clone_identity(
+            session, pair.address_ownership, pair.owner_role, pair.runtime_roles, verify_content=False
+        )
+        if catalog != pair.address_catalog_sha256:
+            raise ValueError("registry_cms_source_pair_invalid")
     if await _publication(session, pair.proof, current=False) != json.loads(pair.cms_receipt_payload):
         raise ValueError("registry_cms_source_pair_invalid")
-    if pair.witness_json is not None:
+    if pair.witness_json is not None and not api_read:
         await require_registry_cms_address_copy_witness(
             session, json.loads(pair.witness_json), clone_ownership=pair.address_ownership, verify_content=False
         )
-    return ResolvedRegistryCMSReadPair(pair, await _retained_source_publication_time(connection, pair, **read_options))
+    return ResolvedRegistryCMSReadPair(
+        pair, await _retained_source_publication_time(connection, pair, api_read=api_read)
+    )
 
 
 async def _read_committed_pair(connection, schema):
@@ -446,10 +426,8 @@ async def _read_prepared_committed_pair(connection, schema, metadata_record):
     prepared = decode_prepared_registry_cms_source_pair(metadata_record["comment"])
     if metadata_record["comment"] != _prepared_comment_prefix(prepared) + _json(prepared.as_dict()):
         raise ValueError("registry_cms_source_pair_invalid")
-    if (
-        prepared.address_ownership.schema_name != schema
-        or prepared.address_ownership.schema_oid != metadata_record["schema_oid"]
-    ):
+    # Callers that verify custody compare the returned schema identifier themselves.
+    if prepared.address_ownership.schema_name != schema:
         raise ValueError("registry_cms_source_pair_invalid")
     row = await serving.read_registry_source_pair_receipt(
         NativeReceiptSession(connection),
@@ -463,18 +441,19 @@ async def _read_prepared_committed_pair(connection, schema, metadata_record):
 
 async def _retained_source_publication_time(connection, pair, *, api_read=False):
     """Read exact copied metadata; receipt time is not source publication time."""
-    from process.network_fhir_source_epoch import _require_api_metadata_read
-
-    await _require_api_metadata_read(connection, api_read)
-    backend_pid = await connection.fetchval("SELECT pg_backend_pid()") if api_read else None
     pin = pair.recipe.source_pin
+    dataset_table = _identifier(pin.read_schema_name) + ".provider_directory_endpoint_dataset"
+    if api_read:
+        backend_pid = await connection.fetchval("SELECT pg_backend_pid()")
+        # The table this name resolves to now; a table replaced during the read is refused below.
+        current_oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", dataset_table)
     metadata_record = await connection.fetchrow(
         f"""SELECT endpoint_id,dataset_hash,acquisition_root_run_id,status,published_at,
         content_proof_admission_sha256,publication_metadata_sha256,
         CASE WHEN pg_column_size(publication_metadata_summary_json->'network_bindings') <= 8192
         THEN publication_metadata_summary_json->'network_bindings' END AS bindings,
         publication_metadata_summary_json->>'semantic_projection_as_of' AS semantic_as_of
-        FROM {_identifier(pin.read_schema_name)}.provider_directory_endpoint_dataset WHERE dataset_id=$1""",
+        FROM {dataset_table} WHERE dataset_id=$1""",
         pin.dataset_id,
     )
     if api_read:
@@ -483,13 +462,7 @@ async def _retained_source_publication_time(connection, pair, *, api_read=False)
 
         await verify_consumed_network_relations(
             connection,
-            (
-                CompactAddressRelation(
-                    pin.read_schema_name,
-                    "provider_directory_endpoint_dataset",
-                    dict(pin.retained_epoch.relation_oids)["provider_directory_endpoint_dataset"],
-                ),
-            ),
+            (CompactAddressRelation(pin.read_schema_name, "provider_directory_endpoint_dataset", current_oid),),
             expected_backend_pid=backend_pid,
         )
     declaration_by_field = {

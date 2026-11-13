@@ -9,6 +9,8 @@ import re
 from dataclasses import asdict, dataclass, replace
 from datetime import date
 
+import asyncpg
+
 from process.network_address_projection import _identifier
 from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_approved_source_bindings import (
@@ -429,7 +431,7 @@ async def _require_pinned_source(connection, source_pin, descriptor=None, retain
     if type(api_read) is not bool:
         raise FHIRMembershipSourceError("Pinned FHIR source is unavailable")
     if api_read:
-        return await _require_flat_pinned_source(connection, source_pin, descriptor, retained_read, api_read=True)
+        return await _require_api_pinned_source(connection, source_pin, descriptor, retained_read)
     if source_pin.retained_successor is None:
         return await _require_flat_pinned_source(connection, source_pin, descriptor, retained_read)
     if descriptor is None:
@@ -510,67 +512,87 @@ async def _successor_descriptor(connection, physical, original):
     return declaration
 
 
-async def _require_api_epoch_pinned_source(connection, source_pin, descriptor, retained_read):
-    """Check CMS epoch metadata; returned pins still need guards on actual payload reads."""
+_API_EPOCH_TABLES_SQL = """SELECT c.relname::text,c.oid::bigint FROM pg_catalog.pg_class c
+ WHERE c.relnamespace=pg_catalog.to_regnamespace($1)::oid AND c.relname=ANY($2::text[])
+ AND c.relkind='r' AND c.relpersistence='p'
+ AND c.relam=(SELECT oid FROM pg_catalog.pg_am WHERE amname='heap')
+ AND NOT (c.relrowsecurity OR c.relforcerowsecurity OR c.relispartition)
+ AND NOT EXISTS(SELECT FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)
+ AND NOT EXISTS(SELECT FROM pg_catalog.pg_rewrite WHERE ev_class=c.oid) ORDER BY c.relname"""
+
+
+async def _api_epoch_relations(connection, schema, namespace):
+    """Lock the retained epoch tables by name and require each to be a plain unfiltered heap."""
     from process.network_compact_layout import CompactAddressRelation
-    from process.network_fhir_source_epoch import _require_api_metadata_read
+    from process.network_fhir_source_epoch import _TABLES
+
+    locked = ",".join(f"{namespace}.{_identifier(name)}" for name in sorted(_TABLES))
+    try:
+        # The share lock lasts until the read ends, so row level security cannot be enabled meanwhile.
+        await connection.execute(f"LOCK TABLE {locked} IN ACCESS SHARE MODE")
+    except asyncpg.PostgresError as error:
+        raise FHIRMembershipSourceError("Pinned FHIR source is unavailable") from error
+    tables = await connection.fetch(_API_EPOCH_TABLES_SQL, namespace, list(_TABLES))
+    if len(tables) != len(_TABLES):
+        raise FHIRMembershipSourceError("Pinned FHIR source is unavailable")
+    return tuple(CompactAddressRelation(schema, table["relname"], table["oid"]) for table in tables)
+
+
+async def _require_api_pinned_source(connection, source_pin, descriptor, retained_read):
+    """Admit a CMS source for an API read by schema-qualified name; no recorded identity is compared.
+
+    Row filtering on a retained epoch table would return a silent partial page, so each must be a
+    plain table. Their current relations are returned for the caller's consumed-read checks.
+    """
     from process.network_read_identity import verify_consumed_network_relations
 
-    await _require_api_metadata_read(connection, True)
     if (
-        source_pin.retained_epoch is None
-        or source_pin.retained_capture is not None
+        fhir_normalized_capture(source_pin) is not None
         or source_pin.retained_successor is not None
         or retained_read is not None
+        or not connection.is_in_transaction()
     ):
         raise FHIRMembershipSourceError("Pinned FHIR source is unavailable")
-    try:
-        epoch = await require_retained_cms_fhir_source_epoch(
-            connection, source_pin, source_pin.retained_epoch, verify_content=False, api_read=True
-        )
-    except FHIRSourceEpochError as error:
-        raise FHIRMembershipSourceError("Pinned FHIR source is unavailable") from error
-    namespace = _identifier(source_pin.read_schema_name)
+    modes = await connection.fetchrow(
+        "SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only')"
+    )
+    if tuple(modes) not in (("repeatable read", "on"), ("serializable", "on")):
+        raise FHIRMembershipSourceError("Pinned FHIR source is unavailable")
+    schema = source_pin.read_schema_name
+    namespace = _identifier(schema)
+    relations = ()
+    admission = "dataset.status IN ('published','superseded') AND dataset.published_at IS NOT NULL"
+    if source_pin.retained_epoch is not None:
+        admission = "dataset.status IN ('validated','published','superseded')"
+        relations = await _api_epoch_relations(connection, schema, namespace)
     backend_pid = await connection.fetchval("SELECT pg_backend_pid()")
-    matches = await connection.fetchval(
+    is_admitted = await connection.fetchval(
         f"""SELECT EXISTS (SELECT 1 FROM {namespace}.provider_directory_endpoint_dataset dataset
           JOIN pg_namespace ns ON ns.nspname=$1
           JOIN pg_class relation ON relation.relnamespace=ns.oid
             AND relation.relname='provider_directory_dataset_resource' AND relation.relkind='r'
           WHERE dataset.dataset_id=$2 AND dataset.endpoint_id=$3 AND dataset.dataset_hash=$4
-            AND dataset.status IN ('validated','published','superseded')
+            AND {admission}
             AND dataset.publication_metadata_summary_json->'source_ids'=jsonb_build_array($5::text)
-            AND ($7::jsonb IS NULL OR dataset.publication_metadata_summary_json->'network_bindings'=$7::jsonb)
-            AND relation.oid=$6::oid)""",
-        source_pin.read_schema_name,
+            AND ($6::jsonb IS NULL OR dataset.publication_metadata_summary_json->'network_bindings'=$6::jsonb))""",
+        schema,
         source_pin.dataset_id,
         source_pin.endpoint_id,
         source_pin.dataset_sha256,
         source_pin.source_id,
-        source_pin.read_resource_table_oid,
         json.dumps(descriptor) if descriptor is not None else None,
     )
     await verify_consumed_network_relations(
         connection,
-        (
-            CompactAddressRelation(
-                epoch.schema_name,
-                "provider_directory_endpoint_dataset",
-                dict(epoch.relation_oids)["provider_directory_endpoint_dataset"],
-            ),
-        ),
+        tuple(relation for relation in relations if relation.table_name == "provider_directory_endpoint_dataset"),
         expected_backend_pid=backend_pid,
     )
-    if not matches:
+    if not is_admitted:
         raise FHIRMembershipSourceError("Pinned FHIR source is unavailable")
-    return epoch
+    return relations
 
 
-async def _require_flat_pinned_source(connection, source_pin, descriptor, retained_read=None, *, api_read=False):
-    if type(api_read) is not bool:
-        raise FHIRMembershipSourceError("Pinned FHIR source is unavailable")
-    if api_read:
-        return await _require_api_epoch_pinned_source(connection, source_pin, descriptor, retained_read)
+async def _require_flat_pinned_source(connection, source_pin, descriptor, retained_read=None):
     if source_pin.source_witness_capture is not None:
         from process.network_fhir_source_witness_capture import SourceWitnessRead
 
