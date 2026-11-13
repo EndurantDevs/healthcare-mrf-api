@@ -521,6 +521,29 @@ async def test_unsupported_structures_do_not_become_empty_success(tmp_path, body
 
 
 @pytest.mark.asyncio
+async def test_structure_field_discard_never_scans_other_structures(tmp_path):
+    # A scan per structure made a 120,000-structure index take minutes instead of seconds.
+    toc_dict = {
+        "reporting_structure": [_structure([{"plan_id": str(index)}], [_file(str(index))]) for index in range(3)]
+    }
+    statements = []
+    async with open_toc_store(URL, row_bytes=10_000, spool_bytes=2_000_000, temporary_parent=tmp_path) as spool:
+        spool.connection.set_trace_callback(statements.append)
+        await spool.read_document(_Reader(_body(toc_dict)), max_bytes=10_000)
+        spool.connection.set_trace_callback(None)
+        discards = sorted({statement for statement in statements if "+kind='structure'" in statement})
+        query_plans = [
+            " | ".join(step[-1] for step in spool.connection.execute("EXPLAIN QUERY PLAN " + statement))
+            for statement in discards
+        ]
+
+    assert len(discards) >= 2 and all(statement.startswith("DELETE FROM") for statement in discards)
+    assert all("SCAN" not in query_plan for query_plan in query_plans)
+    assert any("blocks_group" in query_plan for query_plan in query_plans)
+    assert all("blocks_metadata (kind=? AND section=?)" not in query_plan for query_plan in query_plans)
+
+
+@pytest.mark.asyncio
 async def test_duplicate_json_members_keep_last_value_and_key_position(tmp_path):
     body = b"""{"reporting_structure":[{"reporting_plans":[{"plan_id":"old"}],
     "in_network_files":[{"location":"https://files.example.test/old.json"}]}],
