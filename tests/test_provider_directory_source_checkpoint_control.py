@@ -488,3 +488,89 @@ async def test_checkpoint_transaction_passes_batch_loading_to_its_source_transac
         async with control.source_checkpoint_transaction(object()):
             pytest.fail("the transaction body must not run")
     assert opened_options == [{}]
+
+
+@asynccontextmanager
+async def _plain_transaction(database, **options):
+    yield
+
+
+@pytest.fixture
+def batch_controls(monkeypatch):
+    """Stand in for the transaction, clock and captures around one isolated publisher."""
+    publisher = SimpleNamespace(
+        connection=object(),
+        policy=SimpleNamespace(schema="private_source"),
+        storage_binding=SimpleNamespace(catalog_schema="source_schema"),
+    )
+    stand_ins = SimpleNamespace(publisher=publisher, capture=AsyncMock(), coordinates=AsyncMock(), seconds=[0.0])
+    monkeypatch.setattr(control, "source_transaction", _plain_transaction)
+    monkeypatch.setattr(control, "require_checkpoint_executor", AsyncMock(return_value=publisher))
+    monkeypatch.setattr(control, "require_storage_schema", lambda *_: None)
+    monkeypatch.setattr(control, "source_copy_session", lambda: "session")
+    monkeypatch.setattr(control, "capture_checkpoint_controls", stand_ins.capture)
+    monkeypatch.setattr(control, "verify_isolated_source_storage_coordinates", stand_ins.coordinates)
+    monkeypatch.setattr(control, "time", SimpleNamespace(monotonic=lambda: stand_ins.seconds[0]))
+    monkeypatch.setattr(control, "_BATCH_CONTROLS", [])
+    return stand_ins
+
+
+async def _open_checkpoint_transaction(stand_ins, seconds, *, is_batch_loading=True):
+    stand_ins.seconds[0] = seconds
+    async with control.source_checkpoint_transaction(object(), is_batch_loading=is_batch_loading) as session:
+        assert session == "session"
+
+
+@pytest.mark.asyncio
+async def test_bulk_batches_capture_checkpoint_controls_once_per_interval(batch_controls):
+    for seconds in (0.0, 10.0, 59.0):
+        await _open_checkpoint_transaction(batch_controls, seconds)
+    publisher = batch_controls.publisher
+    batch_controls.capture.assert_awaited_once_with(
+        publisher.connection, publisher.policy, storage_binding=publisher.storage_binding
+    )
+    # A reused capture still checks the storage coordinates on the batch's own connection.
+    assert (
+        batch_controls.coordinates.await_args_list
+        == [((publisher.connection, publisher.policy, publisher.storage_binding),)] * 2
+    )
+
+    await _open_checkpoint_transaction(batch_controls, 61.0)
+    assert batch_controls.capture.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_other_checkpoint_transactions_capture_controls_every_time(batch_controls):
+    await _open_checkpoint_transaction(batch_controls, 0.0)
+    for seconds in (1.0, 2.0):
+        await _open_checkpoint_transaction(batch_controls, seconds, is_batch_loading=False)
+    assert batch_controls.capture.await_count == 3
+    batch_controls.coordinates.assert_not_awaited()
+    # They leave nothing behind for a batch either: only the first batch's capture is on record.
+    assert control._BATCH_CONTROLS[0][3] == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["factory", "policy", "storage_binding"])
+async def test_batch_controls_are_reused_only_for_the_same_issued_storage(batch_controls, changed):
+    await _open_checkpoint_transaction(batch_controls, 0.0)
+    token = control.source._FACTORY.set(object()) if changed == "factory" else None
+    try:
+        if changed != "factory":
+            setattr(batch_controls.publisher, changed, SimpleNamespace(schema="other", catalog_schema="other"))
+        await _open_checkpoint_transaction(batch_controls, 1.0)
+    finally:
+        if token is not None:
+            control.source._FACTORY.reset(token)
+    assert batch_controls.capture.await_count == 2
+    batch_controls.coordinates.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_batch_controls_capture_is_never_reused(batch_controls):
+    batch_controls.capture.side_effect = [GenericCandidateError("checkpoint_custody_changed"), None]
+    with pytest.raises(GenericCandidateError, match="checkpoint_custody_changed"):
+        await _open_checkpoint_transaction(batch_controls, 0.0)
+    assert control._BATCH_CONTROLS == []
+    await _open_checkpoint_transaction(batch_controls, 1.0)
+    assert batch_controls.capture.await_count == 2
