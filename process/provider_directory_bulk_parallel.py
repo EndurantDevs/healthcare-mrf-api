@@ -393,7 +393,8 @@ async def renew_capabilities(
 def batch_transaction(directory, progress_handler):
     """Open the one owner transaction that commits a bulk batch and its byte boundary.
 
-    It is the only transaction whose verification may reuse a recent storage capture.
+    It is the only transaction whose verification may reuse a recent storage capture and whose
+    checkpoint controls are captured once per interval.
     """
     if not progress_handler:
         return nullcontext()

@@ -2,6 +2,7 @@
 """Original-session authority and bounded parent fences for batch checkpoints."""
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
@@ -14,10 +15,18 @@ from process.provider_directory_generic_source_policy import bound_publisher, so
 from process.provider_directory_generic_source_storage import HEADER, _require
 from process.provider_directory_projection_stage import _copy_driver
 from process.provider_directory_source_checkpoint_catalog import BULK_ROOT, capture_checkpoint_controls
-from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage, require_storage_schema
+from process.provider_directory_source_storage_binding import (
+    NamedFHIRSourceStorage,
+    require_storage_schema,
+    verify_isolated_source_storage_coordinates,
+)
 
 _CUSTODY = ContextVar("provider_directory_source_checkpoint_custody", default=None)
 _BULK_IDENTITY = ContextVar("provider_directory_bulk_checkpoint_identity", default=None)
+# At most one entry: the last checkpoint controls captured for a bulk batch,
+# as (factory, policy, storage binding, time).
+_BATCH_CONTROLS_SECONDS = 60.0
+_BATCH_CONTROLS = []
 _BULK_IDENTITY_FIELDS = (
     "checkpoint_id",
     "canonical_api_base",
@@ -294,6 +303,18 @@ async def fence_bulk_parents(publisher, dataset_ids, root_run_ids, checkpoint_id
     )
 
 
+async def _capture_batch_controls(publisher, storage_binding):
+    """Capture a bulk batch's checkpoint controls once per interval; check its storage coordinates every time."""
+    subject = (source._FACTORY.get(), publisher.policy, storage_binding)
+    recent = _BATCH_CONTROLS[0] if _BATCH_CONTROLS else None
+    if recent and recent[:3] == subject and time.monotonic() - recent[3] < _BATCH_CONTROLS_SECONDS:
+        await verify_isolated_source_storage_coordinates(publisher.connection, publisher.policy, storage_binding)
+        return
+    captured_at = time.monotonic()
+    await capture_checkpoint_controls(publisher.connection, publisher.policy, storage_binding=storage_binding)
+    _BATCH_CONTROLS[:] = [(*subject, captured_at)]
+
+
 @asynccontextmanager
 async def source_checkpoint_transaction(
     database,
@@ -326,6 +347,8 @@ async def source_checkpoint_transaction(
         if _CUSTODY.get() is not publisher and not isinstance(storage_binding, NamedFHIRSourceStorage):
             if storage_binding is None:
                 await capture_checkpoint_controls(publisher.connection, publisher.policy)
+            elif is_batch_loading:
+                await _capture_batch_controls(publisher, storage_binding)
             else:
                 await capture_checkpoint_controls(
                     publisher.connection, publisher.policy, storage_binding=storage_binding
