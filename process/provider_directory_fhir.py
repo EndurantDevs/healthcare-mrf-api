@@ -84,6 +84,7 @@ from db.models import (
     db,
 )
 from db.plan_release_storage import storage_relation
+from process import provider_directory_address_overlay_keys as overlay_keys
 from process import provider_directory_anthem as anthem
 from process import provider_directory_bulk_parallel as bulk_parallel
 from process import provider_directory_capped_partition as capped_partition
@@ -36782,7 +36783,19 @@ async def _publish_provider_directory_artifacts(
             if artifact_bundle is not None and artifact_bundle.archive_delta is not None
             else {}
         )
-        with _provider_directory_artifact_relation_scope(archive_overrides):
+        report_overlay_step = partial(
+            _mark_provider_directory_progress,
+            request.run_id,
+            phase="provider-directory publishing artifacts",
+            details=_provider_directory_progress_details(stage_ordinal=PROVIDER_DIRECTORY_PROGRESS_STAGE_PUBLISH),
+            done=3,
+            total=7,
+            metrics=request.metrics,
+        )
+        with (
+            _provider_directory_artifact_relation_scope(archive_overrides),
+            overlay_keys.step_reporter(report_overlay_step),
+        ):
             address_overlay_result = await publish_provider_directory_address_overlay(
                 **address_overlay_options_by_name,
             )
@@ -70829,6 +70842,7 @@ async def _create_provider_directory_address_overlay_indexes(
 
 
 async def _create_address_overlay_stage_indexes(schema: str, stage_table: str) -> None:
+    await overlay_keys.report_step("building indexes")
     await _create_provider_directory_address_overlay_indexes(
         schema,
         stage_table,
@@ -71582,6 +71596,7 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                 COALESCE(practitioner.npi, role.npi)::bigint AS npi,
                 CASE
                     WHEN loc.address_key ~* '{uuid_re}' THEN loc.address_key::uuid
+                    WHEN keyed.address_key IS NOT NULL THEN keyed.address_key::uuid
                     ELSE {qschema}.addr_key_v1(
                         loc.first_line,
                         loc.second_line,
@@ -71659,6 +71674,8 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                 ON loc.source_id = role.source_id
                AND (role.source_id <> 'cms-npd' OR location_ref.value ~ '^Location/[A-Za-z0-9.-]{{1,64}}$')
                AND loc.resource_id = NULLIF(regexp_replace(location_ref.value, '^.*/', ''), '')
+              LEFT JOIN {location_key_table} AS keyed
+                ON keyed.source_id = loc.source_id AND keyed.resource_id = loc.resource_id
               LEFT JOIN LATERAL (
                   SELECT telecom.value->>'value' AS telephone_number
                     FROM jsonb_array_elements(COALESCE(role.telecom::jsonb, '[]'::jsonb)) AS telecom(value)
@@ -71778,7 +71795,8 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                   WITH direct_locations AS MATERIALIZED (
                       SELECT
                           location.resource_id::varchar AS resource_id,
-                          location.address_key::varchar AS address_key,
+                          CASE WHEN location.address_key ~* '{uuid_re}' THEN location.address_key
+                               ELSE keyed.address_key END::varchar AS address_key,
                           location.first_line::varchar AS first_line,
                           location.second_line::varchar AS second_line,
                           location.city_name::varchar AS city_name,
@@ -71821,6 +71839,8 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                                 regexp_replace(location_ref.value, '^.*/', ''),
                                 ''
                              )
+                        LEFT JOIN {location_key_table} AS keyed
+                          ON keyed.source_id = location.source_id AND keyed.resource_id = location.resource_id
                        WHERE (location.status IS NULL OR lower(location.status) <> 'inactive')
                          AND NULLIF(TRIM(location.first_line), '') IS NOT NULL
                          AND NULLIF(TRIM(location.city_name), '') IS NOT NULL
@@ -71959,6 +71979,7 @@ def _address_overlay_sql_context(schema: str, stage_table: str | None, run_id: s
         "organization_table": _qt(schema, "provider_directory_organization"),
         "practitioner_table": _qt(schema, "provider_directory_practitioner"),
         "location_table": _qt(schema, "provider_directory_location"),
+        "location_key_table": overlay_keys.EMPTY_LOCATION_KEYS_SQL,
         "healthcare_service_table": _qt(schema, "provider_directory_healthcare_service"),
         "practitioner_role_table": _qt(schema, "provider_directory_practitioner_role"),
         "affiliation_table": _qt(schema, "provider_directory_organization_affiliation"),
@@ -71972,6 +71993,7 @@ def _address_overlay_component_insert_sql(
     component: str,
     run_id: str | None = None,
     source_ids: list[str] | tuple[str, ...] | None = None,
+    location_key_table: str | None = None,
 ) -> str:
     """Build one bounded insert for a Provider Directory overlay component."""
     template = ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES.get(component)
@@ -71980,6 +72002,8 @@ def _address_overlay_component_insert_sql(
         raise ValueError(f"unknown Provider Directory address overlay component: {component}")
     schema = db_schema if db_schema is not None else _schema()
     context = _address_overlay_sql_context(schema, stage_table, run_id)
+    if location_key_table:
+        context["location_key_table"] = _unscoped_qt(schema, location_key_table)
     context["component_scope"] = _provider_directory_overlay_scope_filter(
         scope_type,
         run_id=run_id,
@@ -72043,6 +72067,7 @@ async def _swap_address_overlay_stage(
     build_fence: ProviderDirectoryArtifactBuildFence | None = None,
 ) -> None:
     del stage_ref, target_ref
+    await overlay_keys.report_step("promoting stage")
     await _cutover_provider_directory_artifact_stage(
         schema=schema,
         stage_table=stage_table,
@@ -72109,48 +72134,6 @@ async def _populate_address_overlay_stage(
         "duplicates_removed": duplicates_removed,
         "stage_rows": stage_rows,
     }
-
-
-async def _insert_address_overlay_components(
-    schema: str,
-    stage_table: str,
-    run_id: str | None,
-    source_ids: list[str],
-    query_param_dict: dict[str, Any],
-    selected_components: tuple[str, ...],
-) -> tuple[dict[str, int], dict[str, float]]:
-    """Insert scoped overlay components independently and record their durations."""
-    inserted_rows_by_component: dict[str, int] = {}
-    duration_seconds_by_component: dict[str, float] = {}
-    for component in selected_components:
-        component_started = time.monotonic()
-        LOGGER.info(
-            "Provider Directory address overlay component started: %s",
-            component,
-        )
-        inserted_rows_by_component[component] = _coerce_rowcount(
-            await db.status(
-                _address_overlay_component_insert_sql(
-                    schema,
-                    stage_table,
-                    component=component,
-                    run_id=run_id,
-                    source_ids=source_ids,
-                ),
-                **query_param_dict,
-            )
-        )
-        duration_seconds_by_component[component] = round(
-            time.monotonic() - component_started,
-            3,
-        )
-        LOGGER.info(
-            "Provider Directory address overlay component completed: %s rows=%s seconds=%.3f",
-            component,
-            inserted_rows_by_component[component],
-            duration_seconds_by_component[component],
-        )
-    return inserted_rows_by_component, duration_seconds_by_component
 
 
 async def _normalize_address_overlay_stage_countries(stage_ref: str) -> int:
@@ -72390,6 +72373,7 @@ async def _backfill_address_overlay_stage_formatted_addresses(
     )
     columns_by_name = address_overlay_formatted_columns(renderer, ADDRESS_FORMAT_VERSION, ADDRESS_FORMAT_SOURCE)
     assignments = ", ".join(f"{column} = {expression}" for column, expression in columns_by_name.items())
+    label_sql = columns_by_name.pop("formatted_address")
     existing_columns = ", ".join(f"stage_row.{column}" for column in columns_by_name)
     desired_columns = ", ".join(columns_by_name.values())
     return _coerce_rowcount(
@@ -72399,7 +72383,9 @@ async def _backfill_address_overlay_stage_formatted_addresses(
                SET {assignments}
              WHERE stage_row.address_key IS NOT NULL
                {source_scope}
-               AND ROW({existing_columns}) IS DISTINCT FROM ROW({desired_columns});
+               -- Metadata first: OR stops at the first difference, so a fresh row renders once, in SET.
+               AND (ROW({existing_columns}) IS DISTINCT FROM ROW({desired_columns})
+                    OR stage_row.formatted_address IS DISTINCT FROM {label_sql});
             """,
             **({"formatted_source_ids": cleaned_source_ids} if cleaned_source_ids else {}),
         )
@@ -72413,6 +72399,7 @@ async def _hydrate_address_overlay_stage_from_archive(
     source_ids: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, int]:
     """Hydrate archive-backed premise, label, and coordinate fields."""
+    await overlay_keys.report_step("hydrating premise keys, labels and coordinates")
     premise_rows = await _backfill_address_overlay_stage_premise_keys(
         schema,
         stage_ref,
@@ -72819,6 +72806,7 @@ async def publish_provider_directory_address_overlay(
 
 
 # Stable private names retained for callers and monkeypatched contract tests.
+_insert_address_overlay_components = partial(overlay_keys.insert_components, sys.modules[__name__])
 _assert_no_provider_directory_resource_id_npi_backfill_candidates = _assert_no_resource_npi_candidates
 _assert_provider_directory_artifact_resource_projection_batches = _assert_artifact_resource_batches
 _assert_provider_directory_artifact_scope_exact_capacity = _assert_artifact_scope_projection

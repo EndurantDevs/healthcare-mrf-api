@@ -1,0 +1,176 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+
+"""Native batch address keys and component inserts for one overlay stage build."""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import time
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
+
+from process.ext import address_fast
+
+LOCATION_KEY_PAGE_ROWS = 50_000
+LOCATION_KEY_COLUMNS = ("source_id", "resource_id", "address_key")
+LOCATION_KEYED_COMPONENTS = frozenset({"practitioner_role", "organization_affiliation"})
+# Without native keys the component templates join this empty relation and keep their SQL expression.
+EMPTY_LOCATION_KEYS_SQL = (
+    "(SELECT NULL::varchar AS source_id, NULL::varchar AS resource_id, NULL::text AS address_key WHERE FALSE)"
+)
+
+StepReporter = Callable[..., Awaitable[None]]
+_STEP_REPORTER: ContextVar[StepReporter | None] = ContextVar("provider_directory_overlay_step_reporter", default=None)
+
+
+@contextmanager
+def step_reporter(reporter: StepReporter) -> Iterator[None]:
+    """Attach the run's progress writer to every overlay build step in this scope."""
+    token = _STEP_REPORTER.set(reporter)
+    try:
+        yield
+    finally:
+        _STEP_REPORTER.reset(token)
+
+
+async def report_step(message: str) -> None:
+    """Tell the run what the overlay build just finished, when a reporter is attached."""
+    reporter = _STEP_REPORTER.get()
+    if reporter is not None:
+        await reporter(message=f"Provider Directory address overlay: {message}")
+
+
+def _native_location_batch(fhir: Any) -> Any | None:
+    """Return the native batch canonicalizer for ordinary builds, otherwise None."""
+    from process.provider_directory_cms_preparation import _ACTIVE as nonprofile_admission
+
+    # shortcut: admitted CMS and Profile builds account for every relation they create, so they
+    # keep SQL keys; give them a native sidecar when their admission can own one.
+    if nonprofile_admission.get() is not None or fhir._provider_directory_profile_capacity_admission() is not None:
+        return None
+    canonicalize = getattr(address_fast._fast_module(), "canonicalize_location_batch", None)
+    return canonicalize if inspect.isbuiltin(canonicalize) else None
+
+
+def location_key_page_sql(context: dict[str, str], is_source_scoped: bool) -> str:
+    """Select one keyset page of the exact inputs the overlay passes to addr_key_v1."""
+    source_scope = "AND loc.source_id = ANY(CAST(:source_ids AS varchar[]))" if is_source_scoped else ""
+    return f"""
+        SELECT loc.source_id, loc.resource_id, loc.first_line, loc.second_line, loc.city_name,
+               COALESCE(NULLIF(loc.state_name, ''), loc.state_code) AS state_name,
+               loc.postal_code, {context["location_country_expr"]} AS country_code
+          FROM {context["location_table"]} AS loc
+         WHERE (loc.source_id, loc.resource_id)
+               > (CAST(:after_source_id AS varchar), CAST(:after_resource_id AS varchar))
+           AND (loc.address_key ~* '{context["uuid_re"]}') IS NOT TRUE
+           {source_scope}
+         ORDER BY loc.source_id, loc.resource_id
+         LIMIT :page_rows;
+    """
+
+
+async def _copy_location_keys(
+    fhir: Any,
+    schema: str,
+    key_table: str,
+    source_ids: list[str],
+    canonicalize: Any,
+) -> int:
+    """Key every scoped Location without a stamped key, one native batch per page."""
+    page_sql = location_key_page_sql(fhir._address_overlay_sql_context(schema, None, None), bool(source_ids))
+    scope_params_by_name = {"source_ids": source_ids} if source_ids else {}
+    keyed_count = 0
+    cursor = ("", "")
+    async with fhir.db.acquire() as connection:
+        driver = getattr(connection.raw_connection, "driver_connection", connection.raw_connection)
+        while True:
+            locations = list(
+                await connection.all(
+                    page_sql,
+                    **scope_params_by_name,
+                    after_source_id=cursor[0],
+                    after_resource_id=cursor[1],
+                    page_rows=LOCATION_KEY_PAGE_ROWS,
+                )
+            )
+            if not locations:
+                return keyed_count
+            canonical_keys = await asyncio.to_thread(canonicalize, [tuple(location[2:8]) for location in locations])
+            await driver.copy_records_to_table(
+                key_table,
+                schema_name=schema,
+                columns=LOCATION_KEY_COLUMNS,
+                records=[
+                    (location[0], location[1], canonical[0])
+                    for location, canonical in zip(locations, canonical_keys, strict=True)
+                ],
+            )
+            keyed_count += len(locations)
+            cursor = (locations[-1][0], locations[-1][1])
+
+
+@asynccontextmanager
+async def staged_location_keys(
+    fhir: Any,
+    schema: str,
+    run_id: str | None,
+    source_ids: list[str],
+    components: tuple[str, ...],
+) -> AsyncIterator[str | None]:
+    """Yield a filled key sidecar, or None when the SQL expression must key Locations."""
+    canonicalize = _native_location_batch(fhir) if LOCATION_KEYED_COMPONENTS.intersection(components) else None
+    if canonicalize is None:
+        yield None
+        return
+    # A stage-style name lets the existing orphan-stage cleanup reap it after a hard crash.
+    key_table = fhir._address_overlay_stage_table_name(run_id)
+    key_ref = fhir._unscoped_qt(schema, key_table)
+    started = time.monotonic()
+    await fhir.db.status(
+        f"CREATE UNLOGGED TABLE {key_ref} (source_id varchar NOT NULL, resource_id varchar NOT NULL, address_key text);"
+    )
+    try:
+        keyed_count = await _copy_location_keys(fhir, schema, key_table, source_ids, canonicalize)
+        await fhir.db.status(f"ANALYZE {key_ref};")
+        await report_step(f"keyed locations rows={keyed_count} seconds={time.monotonic() - started:.0f}")
+        yield key_table
+    finally:
+        await fhir._drop_address_overlay_stage_best_effort(key_ref)
+
+
+async def insert_components(
+    fhir: Any,
+    schema: str,
+    stage_table: str,
+    run_id: str | None,
+    source_ids: list[str],
+    query_param_dict: dict[str, Any],
+    selected_components: tuple[str, ...],
+) -> tuple[dict[str, int], dict[str, float]]:
+    """Insert scoped overlay components independently and record their durations."""
+    inserted_rows_by_component: dict[str, int] = {}
+    duration_seconds_by_component: dict[str, float] = {}
+    async with staged_location_keys(fhir, schema, run_id, source_ids, selected_components) as key_table:
+        for component in selected_components:
+            component_started = time.monotonic()
+            inserted_rows_by_component[component] = fhir._coerce_rowcount(
+                await fhir.db.status(
+                    fhir._address_overlay_component_insert_sql(
+                        schema,
+                        stage_table,
+                        component=component,
+                        run_id=run_id,
+                        source_ids=source_ids,
+                        location_key_table=key_table,
+                    ),
+                    **query_param_dict,
+                )
+            )
+            duration_seconds_by_component[component] = round(time.monotonic() - component_started, 3)
+            await report_step(
+                f"inserted {component} rows={inserted_rows_by_component[component]} "
+                f"seconds={duration_seconds_by_component[component]:.0f}",
+            )
+    return inserted_rows_by_component, duration_seconds_by_component
