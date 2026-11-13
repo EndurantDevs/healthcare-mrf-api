@@ -300,7 +300,7 @@ async def resolve_network_serving_manifest(
         if api_read:
             from process.network_published_api_pin import read_published_api_pin
 
-            published = await read_published_api_pin(connection, generation_id, namespace[1:-1])
+            published = await read_published_api_pin(connection, generation_id, namespace[1:-1], approved=False)
             if published is not None:
                 return published[0]
         # Generations published before the indexed address contract have no published routing metadata.

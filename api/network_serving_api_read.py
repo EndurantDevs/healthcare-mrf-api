@@ -3,8 +3,6 @@
 
 from contextlib import asynccontextmanager
 
-import asyncpg
-
 from api.network_read_execution import _original_read_driver, network_read_name_inventory
 from api.network_serving_read_context import _entry_snapshot, _require_reader_owner
 from api.provider_profile_snapshot import provider_read_savepoint
@@ -39,15 +37,6 @@ async def _same_reader(session, transaction, reader, driver, backend_pid):
         raise _unavailable()
 
 
-def _is_missing_custody(error, schema):
-    """Recognize only the optional historical ledger, never another SQL failure."""
-    if not isinstance(error, asyncpg.UndefinedTableError) or error.sqlstate != "42P01":
-        return False
-    if error.schema_name is not None or error.table_name is not None:
-        return error.schema_name == schema and error.table_name == "network_candidate_custody"
-    return error.message == f'relation "{schema}.network_candidate_custody" does not exist'
-
-
 async def _legacy_pin(driver, generation_id, schema):
     """Retain full historical verification; an indexed missing seal never becomes legacy."""
     from process.network_approved_membership_source import _pin_verified_api_approved_source
@@ -68,13 +57,8 @@ async def api_catalog_read_snapshot(session, generation_id=None, control_schema=
     schema = registry_schema() if control_schema is None else control_schema
     transaction, reader = _reader_entry(session)
     driver, backend_pid = await _original_read_driver(session)
-    try:
-        async with provider_read_savepoint(session):
-            resolved = await read_published_api_pin(driver, generation_id, schema)
-    except asyncpg.UndefinedTableError as error:
-        if not _is_missing_custody(error, schema):
-            raise
-        resolved = None
+    async with provider_read_savepoint(session):
+        resolved = await read_published_api_pin(driver, generation_id, schema)
     if resolved is None:
         resolved = await _legacy_pin(driver, generation_id, schema)
     await _same_reader(session, transaction, reader, driver, backend_pid)

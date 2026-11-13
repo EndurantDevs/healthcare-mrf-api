@@ -19,9 +19,7 @@ _PUBLISHED_SQL = """SELECT to_jsonb(candidate)::text AS candidate_json,
  seal.seal_sha256,physical.relname AS base_name,space.nspname AS base_schema,
  (physical.relrowsecurity OR physical.relforcerowsecurity) AS base_rls,
  to_regclass('{control}.registry_approved_record')::oid::bigint AS approved_oid,
- (SELECT coalesce(sum(jsonb_array_length(record_json->'memberships_json')),0)::bigint
-  FROM {control}.registry_approved_record WHERE approved_revision=candidate.approved_custom_revision
-   AND record_kind='membership' AND record_json->'archived'='false'::jsonb) AS approved_rows
+ {approved_rows} AS approved_rows
  FROM {control}.network_serving_manifest manifest
  JOIN {control}.network_membership_candidate candidate USING(candidate_id)
  LEFT JOIN {control}.network_candidate_custody seal USING(candidate_id)
@@ -40,9 +38,17 @@ _PUBLISHED_SQL = """SELECT to_jsonb(candidate)::text AS candidate_json,
  AND manifest.eligible AND candidate.state='published'"""
 
 
-def published_api_pin_statement(control_schema):
+_APPROVED_ROWS_SQL = """(SELECT coalesce(sum(jsonb_array_length(record_json->'memberships_json')),0)::bigint
+  FROM {control}.registry_approved_record WHERE approved_revision=candidate.approved_custom_revision
+   AND record_kind='membership' AND record_json->'archived'='false'::jsonb)"""
+
+
+def published_api_pin_statement(control_schema, *, approved=True):
     """Select the published pointer, never an uncommitted maximum generation."""
-    return _PUBLISHED_SQL.format(control=_identifier(control_schema))
+    control = _identifier(control_schema)
+    # A manifest-only reader holds no privilege on approved records.
+    approved_rows = _APPROVED_ROWS_SQL.format(control=control) if approved else "NULL::bigint"
+    return _PUBLISHED_SQL.format(control=control, approved_rows=approved_rows)
 
 
 def _require(condition):
@@ -75,7 +81,7 @@ def _custom_address_relation(candidate, descriptor):
     return None
 
 
-def _decode_published_pin(entry, schema):
+def _decode_published_pin(entry, schema, *, approved=True):
     if entry is None:
         raise NetworkServingReadUnavailable("Published network generation is unavailable")
     candidate = json.loads(entry["candidate_json"])
@@ -106,6 +112,8 @@ def _decode_published_pin(entry, schema):
             "compact_layout": layout,
         },
     )
+    if not approved:
+        return manifest, None, None
     relation = CompactAddressRelation(schema, "registry_approved_record", entry["approved_oid"])
     # Published approved revisions are append-only; approval creates a new revision.
     approved = ApprovedMembershipSource(
@@ -117,12 +125,12 @@ def _decode_published_pin(entry, schema):
     return manifest, approved, relation
 
 
-async def read_published_api_pin(connection, generation_id, schema):
+async def read_published_api_pin(connection, generation_id, schema, *, approved=True):
     """Use stored publication evidence; actual data queries report missing objects or access."""
     if generation_id is not None and (type(generation_id) is not int or not 0 < generation_id < 2**63):
         raise NetworkServingReadUnavailable("Published network generation selector is invalid")
-    entry = await connection.fetchrow(published_api_pin_statement(schema), generation_id)
-    return _decode_published_pin(entry, schema)
+    entry = await connection.fetchrow(published_api_pin_statement(schema, approved=approved), generation_id)
+    return _decode_published_pin(entry, schema, approved=approved)
 
 
 def active_published_api_pin(connection, manifest=None, *, control_schema=None):

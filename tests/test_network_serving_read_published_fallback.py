@@ -31,8 +31,8 @@ def unverifiable(monkeypatch):
 async def test_api_read_serves_the_published_pin_without_other_verification(monkeypatch):
     manifest, calls = object(), []
 
-    async def read_published(_connection, generation_id, schema):
-        calls.append((generation_id, schema))
+    async def read_published(_connection, generation_id, schema, *, approved):
+        calls.append((generation_id, schema, approved))
         return manifest, None, None
 
     async def unexpected(*_arguments, **_options):
@@ -44,7 +44,7 @@ async def test_api_read_serves_the_published_pin_without_other_verification(monk
     resolved = await serving.resolve_network_serving_manifest(
         _Connection(), generation_id=3, control_schema="registry", api_read=True
     )
-    assert resolved is manifest and calls == [(3, "registry")]
+    assert resolved is manifest and calls == [(3, "registry", False)]
 
 
 @pytest.mark.parametrize(
@@ -58,7 +58,7 @@ async def test_api_read_serves_the_published_pin_without_other_verification(monk
 async def test_api_read_refuses_without_a_published_pin(monkeypatch, unverifiable, failure, message):
     """A generation without published routing metadata keeps its original verification."""
 
-    async def read_published(_connection, _generation_id, _schema):
+    async def read_published(_connection, _generation_id, _schema, *, approved):
         if failure is not None:
             raise failure
         return None
@@ -69,7 +69,7 @@ async def test_api_read_refuses_without_a_published_pin(monkeypatch, unverifiabl
 
 
 async def test_other_reads_never_use_the_published_pin(monkeypatch, unverifiable):
-    async def read_published(*_arguments):
+    async def read_published(*_arguments, **_options):
         raise AssertionError("only API reads may use the published pin")
 
     monkeypatch.setattr(published_pin, "read_published_api_pin", read_published)

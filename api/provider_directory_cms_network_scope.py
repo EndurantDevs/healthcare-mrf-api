@@ -256,7 +256,7 @@ async def pin_cms_network_scope(session, schema, query, generation):
     driver = (await connection.get_raw_connection()).driver_connection
     try:
         manifest = await _cms_scope_manifest(driver, query)
-        recipes = await resolve_retained_registry_source_recipes(driver, manifest)
+        recipes = await resolve_retained_registry_source_recipes(driver, manifest, api_read=True)
         matching_recipes = [
             recipe
             for recipe in recipes

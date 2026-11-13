@@ -146,45 +146,11 @@ async def test_catalog_snapshot_restores_nested_contexts(pin_reader, outcome):
     pin_reader.approved_pin.assert_awaited_once_with(session.driver, pin_reader.result[0], control_schema=_SCHEMA)
 
 
-@pytest.mark.parametrize("structured", [False, True])
-async def test_published_missing_ledger_rolls_back_before_legacy(pin_reader, structured):
-    """Only the optional ledger absence may recover after its savepoint is rolled back."""
-    session = pin_reader.session
-    original = session.transaction
-    pins.read_published_api_pin.side_effect = (
-        _missing_table(_SCHEMA, "network_candidate_custody")
-        if structured
-        else _missing_table(message=f'relation "{_SCHEMA}.network_candidate_custody" does not exist')
-    )
-
-    async def legacy(*_arguments, **_options):
-        assert session.events == ["savepoint", "rollback-savepoint"]
-        assert session.transaction is original and session.nested is None
-        return pin_reader.result[0]
-
-    pin_reader.legacy.side_effect = legacy
-    previous = (object(), object(), "outer_control")
-    token = _PINNED_READ.set(previous)
-    try:
-        with _bound_reader(session) as binding:
-            inventories = execution._NAME_INVENTORIES.get()
-            await _read_catalog_body(pin_reader, "success", None)
-            assert _PINNED_READ.get() is previous and execution._NAME_INVENTORIES.get() is inventories
-            assert database._READER.get() is binding and database.current_session() is session
-    finally:
-        _PINNED_READ.reset(token)
-    pins.read_published_api_pin.assert_awaited_once_with(session.driver, 3, _SCHEMA)
-    pin_reader.legacy.assert_awaited_once_with(session.driver, 3, _SCHEMA, api_read=True)
-    pin_reader.approved_pin.assert_awaited_once_with(session.driver, pin_reader.result[0], control_schema=_SCHEMA)
-    assert session.events == ["savepoint", "rollback-savepoint", "guard"]
-    assert session.transaction is original and session.nested is None and session.driver.active
-    assert (session.begins, session.commits, session.rollbacks) == (0, 0, 0)
-
-
 @pytest.mark.parametrize(
     "failure",
     [
         _missing_table(_SCHEMA, "network_serving_manifest"),
+        _missing_table(_SCHEMA, "network_candidate_custody"),
         _missing_table("another_control", "network_candidate_custody"),
         asyncpg.InsufficientPrivilegeError("Synthetic denied relation"),
         asyncio.CancelledError(),
