@@ -37,6 +37,7 @@ from process import npi_isolated_batches as isolated_batches
 from process import npi_isolated_execution as isolated_npi
 from process import nppes_public_evidence_catalog as nppes_catalog
 from process import provider_directory_generic_source_policy as source_policy
+from process import provider_geo_search
 from process.control_cancel import raise_if_cancelled
 from process.control_lifecycle import suppress_control_run_heartbeat_persistence
 from process.entity_address_cutover_contract import lock_live_serving_relations, wait_for_publication_lock
@@ -3117,6 +3118,7 @@ WHERE
     committed_result_by_name = context.get(_NPI_CONTROL_COMMITTED_RESULT_KEY)
     if type(committed_result_by_name) is not dict:
         raise NPIPrerequisiteError("NPI publication result is invalid")
+    await provider_geo_search.refresh_after_publication("npi", test_mode=bool(ctx["context"].get("test_mode")))
     _print_time_info_best_effort(ctx["context"]["start"])
     return committed_result_by_name
 

@@ -81,6 +81,7 @@ from api.provider_directory_dataset_sql import (
 from api.provider_directory_dataset_sql import (
     provider_directory_network_resolution_sql as _provider_directory_network_resolution_sql,
 )
+from api.provider_geo_search import ProviderGeoSearch, nearby_search_fields, nearest_first_pages, request_geo_search
 from api.provider_geo_sql import (
     ImportedGeoQuery,
     ImportedGeoStatements,
@@ -4805,9 +4806,11 @@ def _nearby_sql_query(
     primary_only: bool = False,
     address_table_sql: str = "mrf.npi_address",
     geo_precision_clause: str = "",
+    provider_search: ProviderGeoSearch | None = None,
 ) -> NearbySqlQuery:
     """Return normalized query fragments for native and imported nearby SQL."""
 
+    network_search_sql = scoped_geo_search_relation_sql(address_table_sql, extra_clause, ilike_clause)
     return NearbySqlQuery(
         taxonomy_conditions=taxonomy_conditions,
         extra_clause=extra_clause,
@@ -4817,7 +4820,7 @@ def _nearby_sql_query(
         address_table_sql=address_table_sql,
         geo_precision_clause=geo_precision_clause,
         geo_type_clause=_nearby_geo_type_clause(address_table_sql),
-        search_table_sql=scoped_geo_search_relation_sql(address_table_sql, extra_clause, ilike_clause),
+        **nearby_search_fields(network_search_sql, provider_search, extra_clause, ilike_clause),
     )
 
 
@@ -10641,21 +10644,27 @@ async def get_near_npi(
         if state_filter is not None:
             query_parameters_by_name["state"] = state_filter
         query_parameters_by_name = scoped_address_parameters(query_parameters_by_name)
+        provider_search = await request_geo_search(
+            _provider_list_connection(db, import_context, request_session),
+            address_table_sql,
+            schema=_runtime_db_schema(),
+            include_service_locations=_should_include_geo_service_locations(),
+        )
+        geo_precision_clause = _exact_geo_precision_clause(address_table_sql)
+        nearby_query = _nearby_sql_query(
+            taxonomy_conditions,
+            extra_clause,
+            ilike_clause,
+            use_taxonomy_filter=bool(taxonomy_clauses),
+            primary_only=is_primary_only,
+            address_table_sql=address_table_sql,
+            geo_precision_clause=geo_precision_clause,
+            provider_search=provider_search,
+        )
+        use_search_page = is_pagination_requested or bool(taxonomy_clauses) or nearby_query.search_provider_facts
         imported_statements = None
         if import_context is not None:
-            geo_precision_clause = _exact_geo_precision_clause(address_table_sql)
-            geo_type_clause = _nearby_geo_type_clause(address_table_sql)
-            nearby_query = NearbySqlQuery(
-                taxonomy_conditions=taxonomy_conditions,
-                extra_clause=extra_clause,
-                ilike_clause=ilike_clause,
-                use_taxonomy_filter=bool(taxonomy_clauses),
-                primary_only=is_primary_only,
-                address_table_sql=address_table_sql,
-                geo_precision_clause=geo_precision_clause,
-                geo_type_clause=geo_type_clause,
-                search_table_sql=scoped_geo_search_relation_sql(address_table_sql, extra_clause, ilike_clause),
-            )
+            geo_type_clause = nearby_query.geo_type_clause
             if native_scope_preparer is not None:
                 import_context = await native_scope_preparer(native_geo_entity_scope())
             cursor_anchor = await prepare_cursor(
@@ -10695,23 +10704,23 @@ async def get_near_npi(
             batch_cursor = initial_cursor
             collected_rows: list[Any] = []
             collected_identities: set[tuple[int, str]] = set()
-            async with _provider_list_connection(db, import_context, request_session) as conn:
+            first_page_search = (
+                provider_search if initial_cursor is None and nearby_query.search_provider_facts else None
+            )
+            async with (
+                _provider_list_connection(db, import_context, request_session) as conn,
+                nearest_first_pages(conn, first_page_search),
+            ):
                 for _batch_number in range(100):
                     cursor_clause, cursor_parameters_by_name = _nearby_cursor_filter(batch_cursor)
                     batch_parameters_by_name = {
                         **query_parameters_by_name,
                         **cursor_parameters_by_name,
                     }
-                    nearby_sql = _build_nearby_sql(
-                        taxonomy_conditions,
-                        extra_clause,
-                        ilike_clause,
-                        use_taxonomy_filter=bool(taxonomy_clauses),
-                        primary_only=is_primary_only,
-                        address_table_sql=address_table_sql,
-                        geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
+                    nearby_sql = build_native_nearby_sql(
+                        nearby_query if use_search_page else replace(nearby_query, search_table_sql=None),
                         cursor_clause=cursor_clause,
-                        use_search_page=is_pagination_requested or bool(taxonomy_clauses),
+                        use_search_page=use_search_page,
                     )
                     batch_rows = await conn.all(
                         text(nearby_sql),
@@ -10738,17 +10747,7 @@ async def get_near_npi(
             if imported_statements is not None:
                 statement, parameters_by_name = imported_statements.count, imported_statements.parameters
             else:
-                statement = text(
-                    _build_nearby_count_sql(
-                        taxonomy_conditions,
-                        extra_clause,
-                        ilike_clause,
-                        use_taxonomy_filter=bool(taxonomy_clauses),
-                        primary_only=is_primary_only,
-                        address_table_sql=address_table_sql,
-                        geo_precision_clause=_exact_geo_precision_clause(address_table_sql),
-                    )
-                )
+                statement = text(build_native_nearby_count_sql(nearby_query))
                 parameters_by_name = query_parameters_by_name
             async with _provider_list_connection(db, import_context, request_session) as conn:
                 count_records = await conn.all(statement, **parameters_by_name)

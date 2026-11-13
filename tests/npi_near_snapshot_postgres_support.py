@@ -60,7 +60,7 @@ async def near_database(monkeypatch):
         await grant_profile_reader(database, schema, (*tables_by_name, successor.name))
         # The geo templates retain their documented canonical namespace; only
         # relocate that namespace into this fixture's UUID-owned schema.
-        for name in ("_build_nearby_sql", "_build_nearby_count_sql"):
+        for name in ("build_native_nearby_sql", "build_native_nearby_count_sql"):
             build = getattr(npi, name)
 
             def in_schema(*args, build=build, **kwargs):

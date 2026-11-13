@@ -259,6 +259,23 @@ def rollback_terminology_synonyms(
     click.echo(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
 
+@manage.command("rebuild-provider-geo-search")
+@click.option("--force", is_flag=True, help="Build a new generation even if the current one matches its inputs.")
+def rebuild_provider_geo_search(force: bool) -> None:
+    """Build and publish the all-address geo search projection when its address or NPI inputs changed."""
+    from process.provider_geo_search import run_provider_geo_search
+
+    click.echo(json.dumps(_run_async(run_provider_geo_search(force=force)), sort_keys=True))
+
+
+@manage.command("rollback-provider-geo-search")
+def rollback_provider_geo_search() -> None:
+    """Point readers back at the previous all-address geo search generation."""
+    from process.provider_geo_search import run_provider_geo_search
+
+    click.echo(json.dumps(_run_async(run_provider_geo_search(rollback=True)), sort_keys=True))
+
+
 @manage.command("sync-structure")
 @click.option("--skip-columns", is_flag=True, default=False, help="Skip adding missing columns")
 @click.option("--skip-indexes", is_flag=True, default=False, help="Skip creating indexes")
