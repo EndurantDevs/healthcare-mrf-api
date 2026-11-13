@@ -16,6 +16,7 @@ from api import plan_pricing_em_attribution as attribution
 from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
 from process import network_candidate_custody as custody
 from process import network_em_provider_inputs as inputs
+from process import network_published_api_pin as published_pin
 from process import network_read_identity as identity
 from process import network_serving_read as serving
 from process.network_compact_layout import CompactAddressRelation
@@ -191,6 +192,8 @@ async def _legacy_input_reader(monkeypatch):
     custody_proof = AsyncMock(return_value=None)
     monkeypatch.setattr(serving, "_read_manifest", read)
     monkeypatch.setattr(serving, "_candidate_custody", custody_proof)
+    # A legacy generation has no published routing metadata.
+    monkeypatch.setattr(published_pin, "read_published_api_pin", AsyncMock(return_value=None))
     resolver = AsyncMock(wraps=serving.resolve_network_serving_manifest)
     monkeypatch.setattr(inputs, "resolve_network_serving_manifest", resolver)
     return driver, supplied, candidate_by_field, entry_by_field, resolver, read, custody_proof, sealed_pins
