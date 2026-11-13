@@ -21,7 +21,7 @@ from process.provider_directory_artifact_scratch_inputs import (
     typed_input_projection,
 )
 from process.provider_directory_cms_preparation import desired_fence_hash
-from process.provider_directory_dataset_rehydrate_pages import READ_MAX_ROWS, projected_pages
+from process.provider_directory_dataset_rehydrate_pages import projected_pages
 from process.provider_directory_output_snapshot_catalog import require_output
 from process.provider_directory_output_snapshot_stage import _record_batches
 from process.provider_directory_profile_uhc_flex import (
@@ -558,33 +558,19 @@ async def _catalog(directory, name):
     )
 
 
-async def _resource_pages(directory, model, dataset, enrichment):
-    """Seek native resource keys before expanding one bounded typed page."""
+async def _insert_projection(directory, model, name, repair_inputs, expected, params_by_name, kind, enrichment):
+    """Fill one ordinary private heap in the database from its exact expected projection."""
     columns = ",".join(directory._q(str(column.name)) for column in model.__table__.columns)
-    projection = directory._artifact_resource_batch_select_sql(model, directory._schema())
-    statement = f"WITH projected({columns}) AS ({projection}) SELECT * FROM projected"
-    params_by_name = dict(
-        source_id=dataset.source_id,
-        dataset_id=dataset.dataset_id,
-        evidence_run_id=dataset.evidence_run_id,
-        resource_type=directory.RESOURCE_TYPES_BY_MODEL[model],
-        after_resource_id=None,
-        scope_batch_size=READ_MAX_ROWS,
+    relation = directory._unscoped_qt(directory._schema(), name)
+    # The rows never leave PostgreSQL, so there is no read transport to bound and no copy to re-verify.
+    await directory.db.status(
+        f"INSERT INTO {relation} ({columns}) SELECT {columns} FROM ({expected}) expected_rows", **params_by_name
     )
-    while True:
-        keys = await directory.db.all(
-            f"SELECT p.resource_id FROM ({statement}) p ORDER BY p.resource_id", **params_by_name
+    if kind == "npi":
+        changed = await directory.db.scalar(
+            f"SELECT count(*) FROM ({repair_inputs}) repair_rows WHERE repair_rows.repair_eligible", **params_by_name
         )
-        if not keys:
-            return
-        frontier = keys[-1]._mapping["resource_id"]
-        page, _expected, page_params, _kind, _counts = _loading_projection(
-            directory, model.__tablename__, statement, params_by_name, enrichment
-        )
-        async for rows in projected_pages(directory.db, page, page_params, model):
-            yield rows
-        # Advance by native keys even if the typed projection rejects the whole page.
-        params_by_name["after_resource_id"] = frontier
+        enrichment["metrics"]["resource_id_npis_backfilled"][directory.RESOURCE_TYPES_BY_MODEL[model]] += changed
 
 
 async def _copy(
@@ -608,10 +594,8 @@ async def _copy(
     enrichment = admission.prepared
     if model is directory.ProviderDirectorySource:
         pages = _source_pages(directory, statement, params_by_name["source_ids"])
-    elif admission.factory is not None:
-        pages = projected_pages(directory.db, statement, params_by_name, model)
     else:
-        pages = _resource_pages(directory, model, admission.fence.datasets[0], enrichment)
+        pages = projected_pages(directory.db, statement, params_by_name, model)
     try:
         async for resource_rows in pages:
             if kind is not None:
@@ -666,20 +650,18 @@ async def _prepare_model(directory, admission, model, name, created_by_relation)
             statement, expected, params_by_name, kind, _counts = _loading_projection(
                 directory, root, statement, params_by_name, admission.prepared
             )
-        if (
+        is_selected = (
             model is directory.ProviderDirectorySource
             or directory.RESOURCE_TYPES_BY_MODEL[model] in admission.resource_types
-        ):
-            await _copy(
-                directory,
-                session,
-                model,
-                name,
-                statement,
-                params_by_name,
-                admission=admission,
-                kind=kind,
+        )
+        # Ordinary resource heaps are filled inside PostgreSQL; only transported copies need tuple parity.
+        is_inserted = model is not directory.ProviderDirectorySource and admission.factory is None
+        if is_selected and is_inserted:
+            await _insert_projection(
+                directory, model, name, statement, expected, params_by_name, kind, admission.prepared
             )
+        elif is_selected:
+            await _copy(directory, session, model, name, statement, params_by_name, admission=admission, kind=kind)
         await directory._build_artifact_scope_pk(model, schema, name, status_executor=directory.db.status)
         if model in {
             directory.ProviderDirectoryPractitionerRole,
@@ -688,10 +670,7 @@ async def _prepare_model(directory, admission, model, name, created_by_relation)
             _index, sql = directory._provider_directory_profile_bucket_index_sql(schema, name)
             await directory.db.status(sql)
         await directory.db.status(f"ANALYZE {directory._unscoped_qt(schema, name)}")
-        if (
-            model is directory.ProviderDirectorySource
-            or directory.RESOURCE_TYPES_BY_MODEL[model] in admission.resource_types
-        ):
+        if is_selected and not is_inserted:
             await _verify_set_parity(session, expected, directory._unscoped_qt(schema, name), params_by_name)
 
 

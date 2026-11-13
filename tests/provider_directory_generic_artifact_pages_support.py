@@ -58,6 +58,21 @@ async def seed(connection, rows, payload_bytes):
     await connection.execute(text("ANALYZE mrf.provider_directory_dataset_resource"))
 
 
+def _executors(connection):
+    """Run every statement on the one original connection."""
+
+    async def all_rows(statement, **params):
+        return (await connection.execute(text(statement), params)).all()
+
+    async def status(statement, **params):
+        return (await connection.execute(text(statement), params)).rowcount
+
+    async def scalar(statement, **params):
+        return (await connection.execute(text(statement), params)).scalar_one()
+
+    return SimpleNamespace(all=all_rows, status=status, scalar=scalar)
+
+
 @asynccontextmanager
 async def native_case(monkeypatch, *, rows=1030, payload_bytes=128):
     """Own one disposable database; use the same original connection for reads and COPY."""
@@ -68,14 +83,11 @@ async def native_case(monkeypatch, *, rows=1030, payload_bytes=128):
             async with engine.begin() as connection:
                 await seed(connection, rows, payload_bytes)
             async with engine.connect() as connection:
-
-                async def all_rows(statement, **params):
-                    return (await connection.execute(text(statement), params)).all()
-
                 directory = SimpleNamespace(
-                    db=SimpleNamespace(all=all_rows),
+                    db=_executors(connection),
                     _schema=lambda: "mrf",
                     _q=fhir._q,
+                    _unscoped_qt=fhir._unscoped_qt,
                     _artifact_resource_batch_select_sql=fhir._artifact_resource_batch_select_sql,
                     RESOURCE_TYPES_BY_MODEL=fhir.RESOURCE_TYPES_BY_MODEL,
                     CMS_NPD_SOURCE_ID=fhir.CMS_NPD_SOURCE_ID,
@@ -98,8 +110,3 @@ def copy_inputs(case, prepared):
         resource_type="Practitioner",
     )
     return artifacts._loading_projection(case.directory, MODEL.__tablename__, statement, params_by_name, prepared)
-
-
-def copy_admission(prepared):
-    """Keep native copy inputs under one ordinary, immutable dataset selector."""
-    return SimpleNamespace(factory=None, fence=SimpleNamespace(datasets=(DATASET,)), prepared=prepared)

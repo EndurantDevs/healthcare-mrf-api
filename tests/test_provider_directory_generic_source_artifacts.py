@@ -204,20 +204,12 @@ async def test_cleanup_refuses_a_replaced_native_relation(case, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pinned", [False, True])
-async def test_typed_copy_retains_native_scalar_encoders_and_fixed_reader(case, monkeypatch, pinned):
+async def test_typed_copy_retains_native_scalar_encoders_and_fixed_reader(case, monkeypatch):
     copied_records = []
     model = SimpleNamespace(__table__=SimpleNamespace(columns=[SimpleNamespace(name=name) for name in ("time", "n")]))
     values_by_column = dict(time=datetime(2026, 1, 1), n=Decimal("1.25"))
 
-    async def pages(directory, actual_model, dataset, enrichment):
-        assert pinned is False
-        assert directory is case.directory and actual_model is model
-        assert dataset is None and enrichment is None
-        yield [values_by_column]
-
     async def pinned_pages(database, statement, params, actual_model):
-        assert pinned is True
         assert database is case.directory.db and statement == "SELECT" and params == {}
         assert actual_model is model
         yield [values_by_column]
@@ -230,11 +222,8 @@ async def test_typed_copy_retains_native_scalar_encoders_and_fixed_reader(case, 
     case.directory._schema = lambda: "sample"
     case.directory._json_columns = lambda _table: set()
     case.directory._copy_record = lambda row, columns, _json: tuple(row[column] for column in columns)
-    monkeypatch.setattr(artifacts, "_resource_pages", pages)
     monkeypatch.setattr(artifacts, "projected_pages", pinned_pages)
-    admission = SimpleNamespace(
-        factory=object() if pinned else None, fence=SimpleNamespace(datasets=(None,)), prepared=None
-    )
+    admission = SimpleNamespace(factory=object(), fence=SimpleNamespace(datasets=(None,)), prepared=None)
     assert (
         await artifacts._copy(
             case.directory,
@@ -293,7 +282,7 @@ async def test_prepared_npi_metrics_require_original_native_stages_and_selector(
 
 
 @pytest.mark.asyncio
-async def test_ordinary_preparation_reuses_repair_copy_and_full_tuple_parity(monkeypatch):
+async def test_ordinary_preparation_inserts_the_repaired_projection_in_the_database(monkeypatch):
     import importlib
 
     directory = importlib.import_module("process.provider_directory_fhir")
@@ -302,16 +291,20 @@ async def test_ordinary_preparation_reuses_repair_copy_and_full_tuple_parity(mon
         factory=None,
         fence=SimpleNamespace(datasets=(dataset,)),
         resource_types={"Practitioner"},
-        prepared=dict(plan=dict(publish_targets=["address_overlay"], decision_at="2026-01-01T00:00:00")),
+        prepared=dict(
+            plan=dict(publish_targets=["address_overlay"], decision_at="2026-01-01T00:00:00"),
+            metrics=dict(resource_id_npis_backfilled=dict(Practitioner=0)),
+        ),
     )
-    session = object()
 
     @asynccontextmanager
     async def transaction():
-        yield session
+        yield object()
 
+    status = AsyncMock()
     monkeypatch.setattr(directory.db, "transaction", transaction)
-    monkeypatch.setattr(directory.db, "status", AsyncMock())
+    monkeypatch.setattr(directory.db, "status", status)
+    monkeypatch.setattr(directory.db, "scalar", AsyncMock(return_value=3))
     monkeypatch.setattr(directory, "_create_provider_directory_artifact_scope_layout", AsyncMock())
     monkeypatch.setattr(directory, "_build_artifact_scope_pk", AsyncMock())
     monkeypatch.setattr(artifacts, "_catalog", AsyncMock(side_effect=[None, (1, 2, "r", "u")]))
@@ -324,14 +317,16 @@ async def test_ordinary_preparation_reuses_repair_copy_and_full_tuple_parity(mon
         directory, admission, directory.ProviderDirectoryPractitioner, "private_stage", created_by_relation
     )
     assert created_by_relation == {"private_stage": (1, 2, "r", "u")}
-    statement, params = copy.await_args.args[-2:]
-    assert "provider_directory_dataset_resource" in statement and "repair_eligible" in statement
-    assert copy.await_args.kwargs == dict(admission=admission, kind="npi")
+    insert_sql, params = status.await_args_list[0].args[0], status.await_args_list[0].kwargs
+    assert insert_sql.startswith('INSERT INTO "mrf"."private_stage" (')
+    assert "provider_directory_dataset_resource" in insert_sql and "i.resource_id::bigint" in insert_sql
+    assert ":update_timestamp" in insert_sql
     assert params["source_ids"] == ["source_a"] and params["dataset_ids"] == ["dataset_a"]
     assert params["evidence_run_ids"] == ["root_a"] and params["resource_type"] == "Practitioner"
-    assert parity.await_args.args[0] is session and parity.await_args.args[-1] == params
-    assert "i.resource_id::bigint" in parity.await_args.args[1]
-    assert ":update_timestamp" in parity.await_args.args[1]
+    assert "repair_eligible" in directory.db.scalar.await_args.args[0]
+    assert admission.prepared["metrics"]["resource_id_npis_backfilled"] == {"Practitioner": 3}
+    copy.assert_not_awaited()
+    parity.assert_not_awaited()
 
 
 @pytest.mark.asyncio
