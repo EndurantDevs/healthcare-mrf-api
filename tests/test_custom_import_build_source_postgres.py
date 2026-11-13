@@ -423,12 +423,21 @@ async def test_reference_proof_checks_wrong_parent_membership_and_every_bounded_
     await verify(monkeypatch)
 
 
-async def test_indexed_reference_proof_preserves_multirange_holes_and_unbounded_ranges(monkeypatch):
+async def test_partial_reference_indexes_preserve_nulls_matches_and_fallback(monkeypatch):
+    from tests.custom_import_retirement_postgres import (
+        test_partial_reference_indexes_preserve_nulls_matches_and_fallback as verify,
+    )
+
+    await verify(monkeypatch)
+
+
+@pytest.mark.parametrize("indexed", (False, True))
+async def test_indexed_reference_proof_preserves_multirange_holes_and_unbounded_ranges(monkeypatch, indexed):
     from tests.custom_import_retirement_postgres import (
         test_indexed_reference_proof_preserves_multirange_holes_and_unbounded_ranges as verify,
     )
 
-    await verify(monkeypatch)
+    await verify(monkeypatch, indexed)
 
 
 async def test_retirement_preserves_current_and_previous_publication_targets():

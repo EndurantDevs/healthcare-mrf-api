@@ -26,11 +26,9 @@ from sqlalchemy import (
     delete,
     exists,
     func,
-    or_,
     select,
     text,
     true,
-    tuple_,
 )
 
 from db.models.custom_import import (
@@ -298,48 +296,48 @@ async def _indexed_revision_references(session, table, family_id, reference_kind
 
 
 async def _reference_pages(session, table, family_id):
-    """Probe indexed ID intervals first; page only the remaining reference columns."""
+    """Probe every reference with exact membership inside its family's ID bounds."""
     reference_kinds_by_column = await _indexed_revision_references(session, table, family_id, _REFERENCES[table.name])
-    if not reference_kinds_by_column:
-        return
-    primary_columns = tuple(table.primary_key.columns)
-    if not primary_columns:
-        raise SnapshotRetirementRefused("snapshot retirement reference relation has no primary_columns key")
-    columns = tuple(dict.fromkeys((*primary_columns, *(table.c[name] for name in reference_kinds_by_column))))
-    after_keys = None
-    while True:
-        statement = (
-            select(*columns)
-            .where(or_(*(table.c[name].is_not(None) for name in reference_kinds_by_column)))
-            .order_by(*primary_columns)
-            .limit(REFERENCE_PAGE_ROWS)
+    home = CustomImportRevisionHome
+    for name, kind in reference_kinds_by_column.items():
+        target_home = (
+            select(home.revision_kind, func.range_agg(home.revision_ids).label("revision_ids"))
+            .where(home.family_id == family_id)
+            .group_by(home.revision_kind)
+            .cte("reference_home")
+            .prefix_with("MATERIALIZED")
         )
-        if after_keys is not None:
-            statement = statement.where(tuple_(*primary_columns) > tuple_(*after_keys))
-        page = statement.cte("reference_page").prefix_with("MATERIALIZED")
-        predicates = [
-            exists().where(
-                CustomImportRevisionHome.family_id == family_id,
-                CustomImportRevisionHome.revision_kind
-                == (case((page.c.kind == "root", 1), else_=2) if kind is None else kind),
-                CustomImportRevisionHome.revision_ids.op("@>")(page.c[name]),
+        # Decode the bounds once instead of repeating it during index searches.
+        span = (
+            select(
+                target_home.c.revision_kind,
+                target_home.c.revision_ids,
+                case(
+                    (func.lower_inf(target_home.c.revision_ids), -(2**63)),
+                    else_=func.lower(target_home.c.revision_ids),
+                ).label("first_id"),
+                case(
+                    (func.upper_inf(target_home.c.revision_ids), 2**63 - 1),
+                    else_=func.upper(target_home.c.revision_ids) - 1,
+                ).label("last_id"),
             )
-            for name, kind in reference_kinds_by_column.items()
-        ]
-        hit = select(exists(select(1).select_from(page).where(or_(*predicates)))).scalar_subquery()
-        reference_cursor = (
-            await session.execute(
-                select(*(page.c[column.name] for column in primary_columns), hit.label("referenced"))
-                .select_from(page)
-                .order_by(*(page.c[column.name].desc() for column in primary_columns))
-                .limit(1)
+            .cte("reference_span")
+            .prefix_with("MATERIALIZED")
+        )
+        revision_kind = case((table.c.kind == "root", 1), else_=2) if kind is None else kind
+        references = (
+            select(1)
+            .select_from(table)
+            .join(span, span.c.revision_kind == revision_kind)
+            .where(
+                table.c[name].is_not(None),
+                table.c[name] >= span.c.first_id,
+                table.c[name] <= span.c.last_id,
+                span.c.revision_ids.op("@>")(table.c[name]),
             )
-        ).first()
-        if reference_cursor is None:
-            return
-        if reference_cursor.referenced:
+        )
+        if await session.scalar(select(exists(references))):
             raise SnapshotRetirementRefused("snapshot retirement retains a revision reference")
-        after_keys = tuple(reference_cursor[:-1])
 
 
 async def _revision_references(session, family, retained, *, include_canonical=True):
