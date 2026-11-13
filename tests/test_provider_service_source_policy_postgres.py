@@ -39,8 +39,11 @@ _ARCHIVED = 9003
 
 
 def _candidate_lookup_queries(queries, control_schema):
-    routing_probes = [query for query in queries if query.query == published_api_pin_statement(control_schema)]
-    assert len(routing_probes) == 1 and routing_probes[0].exception is None
+    # The request snapshot and the legacy verifier each probe the published routing metadata once.
+    probes = [published_api_pin_statement(control_schema), published_api_pin_statement(control_schema, approved=False)]
+    routing_probes = [query for query in queries if query.query in probes]
+    assert [query.query for query in routing_probes] == probes
+    assert all(query.exception is None for query in routing_probes)
     return [
         query
         for query in queries

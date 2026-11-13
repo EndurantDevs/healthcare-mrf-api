@@ -256,7 +256,7 @@ async def pin_cms_network_scope(session, schema, query, generation):
     driver = (await connection.get_raw_connection()).driver_connection
     try:
         manifest = await _cms_scope_manifest(driver, query)
-        recipes = await resolve_retained_registry_source_recipes(driver, manifest)
+        recipes = await resolve_retained_registry_source_recipes(driver, manifest, api_read=True)
         matching_recipes = [
             recipe
             for recipe in recipes
@@ -311,7 +311,7 @@ async def _cms_scope_manifest(driver, query):
         if query.network_manifest is None:
             raise ValueError
         return await _catalog_manifest(driver, query.network_generation, registry_schema(), query.network_manifest)
-    return await resolve_network_serving_manifest(driver, generation_id=query.network_generation)
+    return await resolve_network_serving_manifest(driver, generation_id=query.network_generation, api_read=True)
 
 
 async def _validate_selected_cms_scope(session, scope, query):

@@ -284,7 +284,7 @@ def _attach_manifest_custody(pinned, custody, readiness, is_compact):
 async def resolve_network_serving_manifest(
     connection, *, generation_id: int | None = None, control_schema=None, api_read=False
 ):
-    """Pin the current or retained manifest and verify its physical custody.
+    """Pin the current or retained manifest; API reads use the published routing metadata.
 
     The caller owns the transaction and uses this same identity for every query
     in the request. An unavailable canonical generation never selects legacy data.
@@ -297,39 +297,25 @@ async def resolve_network_serving_manifest(
         raise NetworkServingReadUnavailable("Network serving reads require a caller-owned transaction")
     try:
         namespace = _identifier(control_schema if control_schema is not None else registry_schema())
+        if api_read:
+            from process.network_published_api_pin import read_published_api_pin
+
+            published = await read_published_api_pin(connection, generation_id, namespace[1:-1], approved=False)
+            if published is not None:
+                return published[0]
+        # Generations published before the indexed address contract have no published routing metadata.
         entry = await _read_manifest(connection, namespace, generation_id)
         if entry is None:
             raise NetworkServingReadUnavailable("Network serving manifest is unavailable")
         candidate = json.loads(entry["candidate_json"])
-        try:
-            custody = await _candidate_custody(
-                connection, candidate, namespace[1:-1], **({"api_read": True} if api_read else {})
-            )
-        except ValueError, TypeError, KeyError:
-            published = await _published_api_manifest(connection, generation_id, namespace[1:-1]) if api_read else None
-            if published is None:
-                raise
-            return published
+        custody = await _candidate_custody(
+            connection, candidate, namespace[1:-1], **({"api_read": True} if api_read else {})
+        )
         return _pinned_manifest(entry, custody=custody)
     except (ValueError, TypeError, KeyError, asyncpg.PostgresError) as error:
         if isinstance(error, NetworkServingReadUnavailable):
             raise
         raise NetworkServingReadUnavailable("Network serving manifest verification failed") from error
-
-
-async def _published_api_manifest(connection, generation_id, control_schema):
-    """Serve an API read from publication evidence when custody cannot be re-proved here.
-
-    A published snapshot copied to another database keeps its names and content but
-    not the physical identity custody was sealed on. Any failure keeps the refusal.
-    """
-    from process.network_published_api_pin import read_published_api_pin
-
-    try:
-        resolved = await read_published_api_pin(connection, generation_id, control_schema)
-    except ValueError, TypeError, LookupError, AttributeError, asyncpg.PostgresError:
-        return None
-    return None if resolved is None else resolved[0]
 
 
 async def resolve_retained_network_address_source(connection, address_source, *, control_schema):
