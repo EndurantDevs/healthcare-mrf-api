@@ -378,8 +378,9 @@ class TocSpool:
         return path
 
     def _discard_blocks(self, where: str, parameters: tuple) -> None:
+        # Select the few matching groups first: a per-row EXISTS scanned every plan on each call.
         self.connection.execute(
-            f"DELETE FROM plans WHERE EXISTS (SELECT 1 FROM blocks WHERE blocks.group_id=plans.group_id AND kind='metadata' AND ({where}))",
+            f"DELETE FROM plans WHERE group_id IN (SELECT group_id FROM blocks WHERE kind='metadata' AND ({where}))",
             parameters,
         )
         self.connection.execute(f"DELETE FROM blocks WHERE {where}", parameters)
@@ -883,7 +884,10 @@ class _TocEventParser:
                 self.spool.structure_error = None
             self.spool.connection.execute("DELETE FROM plans WHERE group_id=?", (f"s:{self.structure}",))
         elif field in _FILE_KEYS:
-            self.spool._discard_blocks("kind='structure' AND group_id=? AND section=?", (f"s:{self.structure}", field))
+            # Unary plus keeps SQLite on the group index; (kind, section) would visit every structure.
+            self.spool._discard_blocks(
+                "+kind='structure' AND group_id=? AND +section=?", (f"s:{self.structure}", field)
+            )
 
     def _validate_structure_event(self, prefix: str, event: str, json_value: Any) -> None:
         if self.spool.structure_error is not None:
