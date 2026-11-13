@@ -43,9 +43,9 @@ def _config(connection=None):
 
 def test_directory_pricing_join_preserves_exact_parents_without_database_work():
     scripts = ScriptDirectory.from_config(_config())
-    assert scripts.get_heads() == ["20261111010000_code_sets_publication_idempotency"]
-    assert scripts.get_revision("20261111010000_code_sets_publication_idempotency").down_revision == (
-        "20261108010000_custom_import_family_child_reference_aggregate"
+    assert scripts.get_heads() == ["20261113010000_address_canonical_space_normalization"]
+    assert scripts.get_revision("20261113010000_address_canonical_space_normalization").down_revision == (
+        "20261111010000_code_sets_publication_idempotency"
     )
     assert scripts.get_revision("20261029010000_registry_source_inventory").down_revision == (
         "20261028020000_registry_membership_refresh"

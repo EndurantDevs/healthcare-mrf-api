@@ -157,6 +157,7 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20261107010000_custom_import_child_reference_aggregate",
     "20261108010000_custom_import_family_child_reference_aggregate",
     "20261111010000_code_sets_publication_idempotency",
+    "20261113010000_address_canonical_space_normalization",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",
