@@ -469,9 +469,13 @@ async def _resolve_em_provider_inputs_api(connection, manifest, control_schema=N
         backend_pid = connection.get_server_pid()
         await _require_transaction(connection)
         namespace = _control_namespace(control_schema)
-        retained = await resolve_network_serving_manifest(
-            connection, generation_id=manifest.generation_id, control_schema=namespace[1:-1], api_read=True
-        )
+        from process.network_published_api_pin import active_published_api_pin
+
+        retained = active_published_api_pin(connection, manifest, control_schema=namespace[1:-1])
+        if retained is None:
+            retained = await resolve_network_serving_manifest(
+                connection, generation_id=manifest.generation_id, control_schema=namespace[1:-1], api_read=True
+            )
         if type(retained) is not PinnedNetworkServingManifest or retained != manifest:
             _fail()
         control = retained.custody_control
