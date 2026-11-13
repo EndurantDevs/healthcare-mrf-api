@@ -390,6 +390,16 @@ async def renew_capabilities(
         return manifest, None, polls
 
 
+def batch_transaction(directory, progress_handler):
+    """Open the one owner transaction that commits a bulk batch and its byte boundary.
+
+    It is the only transaction whose verification may reuse a recent storage capture.
+    """
+    if not progress_handler:
+        return nullcontext()
+    return directory.source_checkpoint_transaction(directory.db, schema=directory._schema(), is_batch_loading=True)
+
+
 async def begin_capability_refresh(
     directory,
     identity,

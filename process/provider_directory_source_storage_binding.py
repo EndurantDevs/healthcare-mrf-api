@@ -4,6 +4,7 @@
 import hashlib
 import json
 import re
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
@@ -747,6 +748,12 @@ async def _require_isolated_bound_proof(connection, catalog_schema, expected, ow
         )
 
 
+# At most one entry: an issued factory's latest capture made while verifying a loading transaction,
+# as (factory, subject, time, JSON).
+_LOADING_CUSTODY_SECONDS = 60.0
+_LOADING_CUSTODY = []
+
+
 async def capture_isolated_source_storage_custody(
     connection,
     policy,
@@ -757,7 +764,56 @@ async def capture_isolated_source_storage_custody(
     publication,
     expected_history_bounds=None,
 ):
-    """Attest the fixed private storage and canonical rights; never grant activation."""
+    """Attest the fixed private storage and canonical rights; never grant activation.
+
+    A batch-loading transaction is verified twice and this capture costs several times the write it guards.
+    For that verification alone, a capture of the same storage by the same issued factory is returned again
+    while it is less than a minute old, after the checks of the current connection. The caller still compares
+    it with its issued document on every transaction, and every other verification captures anew.
+    """
+    from process.provider_directory_generic_source_policy import loading_verification_factory
+
+    factory = loading_verification_factory() if expected_history_bounds is None else None
+    subject = (policy, catalog_schema, migration_role, namespace_owner_role, json.dumps(publication, sort_keys=True))
+    recent = _LOADING_CUSTODY[0] if _LOADING_CUSTODY else None
+    if (
+        factory is not None
+        and recent is not None
+        and recent[0] is factory
+        and recent[1] == subject
+        and time.monotonic() - recent[2] < _LOADING_CUSTODY_SECONDS
+    ):
+        # The capture describes catalog state; these describe this connection and are never reused.
+        _require(connection.is_in_transaction() is True, "transaction_required")
+        await _require_source_storage_publisher(connection, policy, publication)
+        _require(await connection.fetchval("SHOW session_replication_role") == "origin", "replication_role")
+        return json.loads(recent[3])
+    captured_at = time.monotonic()
+    custody_by_field = await _capture_isolated_source_storage_custody(
+        connection,
+        policy,
+        catalog_schema=catalog_schema,
+        migration_role=migration_role,
+        namespace_owner_role=namespace_owner_role,
+        publication=publication,
+        expected_history_bounds=expected_history_bounds,
+    )
+    if factory is not None:
+        _LOADING_CUSTODY[:] = [(factory, subject, captured_at, json.dumps(custody_by_field, sort_keys=True))]
+    return custody_by_field
+
+
+async def _capture_isolated_source_storage_custody(
+    connection,
+    policy,
+    *,
+    catalog_schema,
+    migration_role,
+    namespace_owner_role,
+    publication,
+    expected_history_bounds,
+):
+    """Read the private storage, roles and canonical authority from the catalog in the caller's transaction."""
     import asyncio
 
     from process.provider_directory_source_callable_custody import _READ_IDENTITY_SQL

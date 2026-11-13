@@ -296,7 +296,14 @@ async def fence_bulk_parents(publisher, dataset_ids, root_run_ids, checkpoint_id
 
 @asynccontextmanager
 async def source_checkpoint_transaction(
-    database, *, schema=None, dataset_ids=(), root_run_ids=(), checkpoint_ids=(), bulk_identity=None
+    database,
+    *,
+    schema=None,
+    dataset_ids=(),
+    root_run_ids=(),
+    checkpoint_ids=(),
+    bulk_identity=None,
+    is_batch_loading=False,
 ):
     """One existing batch transaction; never hold it over fetching or worker dispatch."""
     if bulk_identity is not None:
@@ -305,7 +312,9 @@ async def source_checkpoint_transaction(
         dataset_ids = [identity_by_field["dataset_id"]]
         root_run_ids = [identity_by_field["acquisition_root_run_id"]]
         checkpoint_ids = [identity_by_field["checkpoint_id"]]
-    async with source_transaction(database):
+    # Existing callers and their stand-ins never see the option; only a batch passes it on.
+    batch_options = {"is_batch_loading": True} if is_batch_loading else {}
+    async with source_transaction(database, **batch_options):
         publisher = await require_checkpoint_executor(database)
         storage_binding = getattr(publisher, "storage_binding", None)
         expected_schema = publisher.policy.schema if storage_binding is None else storage_binding.catalog_schema

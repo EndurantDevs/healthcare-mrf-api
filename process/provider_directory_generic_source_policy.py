@@ -3,7 +3,7 @@
 
 import asyncio
 import re
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 
@@ -17,6 +17,8 @@ from process.provider_directory_source_storage_binding import NamedFHIRSourceSto
 _PUBLISHER = ContextVar("provider_directory_generic_source_publisher", default=None)
 _OWNER = ContextVar("provider_directory_generic_source_owner", default=None)
 _FACTORY = ContextVar("provider_directory_generic_source_transaction_factory", default=None)
+_BATCH_LOADING = ContextVar("provider_directory_generic_source_batch_loading", default=False)
+_LOADING_VERIFICATION = ContextVar("provider_directory_generic_source_loading_verification", default=False)
 
 
 def _require(condition, code):
@@ -60,6 +62,21 @@ class _Publisher:
     storage_binding: object = None
 
 
+@contextmanager
+def _loading_verification():
+    """Mark the two verifications made when a transaction is opened; a batch's may reuse a storage capture."""
+    token = _LOADING_VERIFICATION.set(True)
+    try:
+        yield
+    finally:
+        _LOADING_VERIFICATION.reset(token)
+
+
+def loading_verification_factory():
+    """Return the issued factory while a batch-loading transaction is being verified, otherwise None."""
+    return _FACTORY.get() if _BATCH_LOADING.get() and _LOADING_VERIFICATION.get() else None
+
+
 async def _genuine_publisher(connection, policy):
     _require(connection.is_in_transaction() is True, "transaction_required")
     actor = await connection.fetchrow("SELECT session_user::text AS session,current_user::text AS current")
@@ -89,7 +106,8 @@ async def bind_generic_source_publisher(connection, policy, *, verify_role_profi
         await _genuine_publisher(connection, policy)
         _require(await connection.fetchval("SHOW transaction_isolation") == transaction_isolation, "isolation_changed")
         await storage_roles(connection, policy.schema, **policy.role_arguments())
-        await verify_role_profile(connection, policy.schema, **policy.role_arguments())
+        with _loading_verification():
+            await verify_role_profile(connection, policy.schema, **policy.role_arguments())
     publisher = _Publisher(connection, policy, asyncio.current_task(), transaction_isolation, factory, storage_binding)
     token = _PUBLISHER.set(publisher)
     try:
@@ -136,7 +154,8 @@ async def _bind_isolated_storage(publisher):
     _require(type(binding) is FHIRSourceStorageBinding, "storage_binding_required")
     capture = getattr(factory, "source_storage_binding", None)
     _require(callable(capture), "storage_factory_required")
-    actual = await capture(publisher.connection, publisher.policy)
+    with _loading_verification():
+        actual = await capture(publisher.connection, publisher.policy)
     _require(bound_publisher() is publisher and actual is binding, "storage_factory_changed")
     await verify_isolated_source_storage_coordinates(publisher.connection, publisher.policy, binding)
     _require(bound_publisher() is publisher, "storage_factory_changed")
@@ -284,8 +303,12 @@ def _require_isolation(publisher, isolation):
 
 
 @asynccontextmanager
-async def source_transaction(database, *, isolation="read committed"):
-    """Borrow one genuine per-task publisher transaction established before its first SQL."""
+async def source_transaction(database, *, isolation="read committed", is_batch_loading=False):
+    """Borrow one genuine per-task publisher transaction established before its first SQL.
+
+    Only a caller that commits one batch of observations passes is_batch_loading, which lets the
+    verification of the transaction it opens reuse a recent storage capture.
+    """
     _require(isolation in {"read committed", "repeatable read", "serializable"}, "isolation_required")
     if _PUBLISHER.get() is not None:
         publisher = bound_publisher()
@@ -295,11 +318,15 @@ async def source_transaction(database, *, isolation="read committed"):
         return
     factory = _FACTORY.get()
     _require(factory is not None, "publisher_connection_required")
-    async with factory.transaction(database, isolation=isolation):
-        publisher = bound_publisher()
-        _require_isolation(publisher, isolation)
-        async with source_owner_transaction(database):
-            yield database._transaction_binding().session
+    token = _BATCH_LOADING.set(is_batch_loading is True)
+    try:
+        async with factory.transaction(database, isolation=isolation):
+            publisher = bound_publisher()
+            _require_isolation(publisher, isolation)
+            async with source_owner_transaction(database):
+                yield database._transaction_binding().session
+    finally:
+        _BATCH_LOADING.reset(token)
 
 
 @asynccontextmanager
