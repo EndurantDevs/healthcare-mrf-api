@@ -26,13 +26,15 @@ _PUBLISHED_SQL = """SELECT to_jsonb(candidate)::text AS candidate_json,
  JOIN {control}.network_membership_candidate candidate USING(candidate_id)
  LEFT JOIN {control}.network_candidate_custody seal USING(candidate_id)
  LEFT JOIN pg_catalog.pg_class physical ON physical.oid=coalesce(
+  (SELECT named.oid FROM pg_catalog.pg_class named
+    JOIN pg_catalog.pg_namespace home ON home.oid=named.relnamespace
+   WHERE home.nspname=candidate.validation_json->'address_source'->>'schema_name'
+    AND named.relname=candidate.validation_json->'address_source'->>'table_name' AND named.relkind='r'),
+  -- A renamed retained base keeps its recorded OID only in the database that published it.
   (SELECT sealed.oid FROM pg_catalog.pg_class sealed
-    JOIN pg_catalog.pg_namespace home ON home.oid=sealed.relnamespace
    WHERE sealed.oid=(candidate.validation_json->'serving_readiness'->'address_artifact'->'table'->>'oid')::oid
-    AND home.nspname=coalesce(candidate.validation_json->'address_source'->>'schema_name',home.nspname)),
-  pg_catalog.to_regclass(
-   pg_catalog.quote_ident(candidate.validation_json->'address_source'->>'schema_name')||'.'
-   ||pg_catalog.quote_ident(candidate.validation_json->'address_source'->>'table_name'))::oid)
+    AND sealed.relkind='r' AND (SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database())
+     =(candidate.validation_json->'serving_readiness'->'address_artifact'->'database'->>'oid')::oid))
  LEFT JOIN pg_catalog.pg_namespace space ON space.oid=physical.relnamespace
  WHERE manifest.generation_id=coalesce($1::bigint,
   (SELECT generation_id FROM {control}.network_serving_control WHERE id=1))

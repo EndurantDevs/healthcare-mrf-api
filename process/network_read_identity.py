@@ -1,6 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Check already consumed physical relations before exposing a pinned read result."""
 
+import re
+
 from process.network_compact_layout import CompactAddressRelation, compact_identifier
 
 MAX_CONSUMED_RELATIONS = 4096
@@ -35,7 +37,8 @@ _CONSUMED_SQL = (
 SELECT pg_backend_pid()=$3::integer AS backend_matches,count(*)::integer AS relation_count,
     coalesce(bool_and(coalesce(pg_catalog.to_regclass(expected.relation_name)::oid::bigint
       =expected.relation_oid,false) AND EXISTS(
-        SELECT FROM held WHERE held.relation_oid=expected.relation_oid)),false) AS valid
+        SELECT FROM held WHERE held.relation_oid=expected.relation_oid))
+      AND count(expected.relation_oid)=count(DISTINCT expected.relation_oid),false) AS valid
 FROM expected"""
 )
 _BOUND_NAMES_SQL = (
@@ -43,9 +46,11 @@ _BOUND_NAMES_SQL = (
     + """
 SELECT pg_backend_pid()=$3::integer AS backend_matches,count(*)::integer AS relation_count,
     coalesce(bool_and(pg_catalog.to_regclass(expected.relation_name)::oid::bigint
-      IS NOT DISTINCT FROM expected.relation_oid),false) AS valid
+      IS NOT DISTINCT FROM expected.relation_oid)
+      AND count(expected.relation_oid)=count(DISTINCT expected.relation_oid),false) AS valid
 FROM expected"""
 )
+_PUBLISHED_NAME = re.compile(r'"network_candidate_[0-9a-f]{32}"[.]')
 
 
 class NetworkReadIdentityError(RuntimeError):
@@ -67,9 +72,11 @@ def _relation_pins(relations, expected_backend_pid):
         CompactAddressRelation.__post_init__(relation)
         name = compact_identifier(relation.schema_name) + "." + compact_identifier(relation.table_name)
         _require(name not in oid_by_name or oid_by_name[name] == relation.table_oid)
-        _require(relation.table_oid not in name_by_oid or name_by_oid[relation.table_oid] == name)
         oid_by_name[name] = relation.table_oid
-        name_by_oid[relation.table_oid] = name
+        if _PUBLISHED_NAME.match(name) is None:
+            # Published names resolve in the destination database, which checks their uniqueness.
+            _require(relation.table_oid not in name_by_oid or name_by_oid[relation.table_oid] == name)
+            name_by_oid[relation.table_oid] = name
     return oid_by_name
 
 
