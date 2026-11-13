@@ -111,14 +111,15 @@ class NetworkCandidateCustodyError(ValueError):
 _API_CONTROL_TABLES = frozenset(
     ("network_membership_candidate", "network_serving_manifest", "registry_approved_record")
 )
-_API_CONTROL_TABLE_SQL = """SELECT c.relname,c.oid::bigint,c.relowner::bigint,c.relkind::text,c.relpersistence::text,
+_API_CONTROL_TABLE_SQL = """SELECT c.relname,c.oid::bigint,c.relkind::text,c.relpersistence::text,
  c.relrowsecurity,c.relforcerowsecurity,c.relispartition,
  c.relam=(SELECT oid FROM pg_catalog.pg_am WHERE amname='heap') AS heap,
  EXISTS(SELECT FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) AS inherited,
  EXISTS(SELECT FROM pg_catalog.pg_rewrite WHERE ev_class=c.oid) AS rules,
  ARRAY(SELECT a.attname::text FROM pg_catalog.pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0
    AND NOT a.attisdropped ORDER BY a.attnum LIMIT $3) AS columns
- FROM pg_catalog.pg_class c WHERE c.relnamespace=$1::oid AND c.relname=ANY($2::text[]) ORDER BY c.relname"""
+ FROM pg_catalog.pg_class c WHERE c.relnamespace=pg_catalog.to_regnamespace($1)::oid
+   AND c.relname=ANY($2::text[]) ORDER BY c.relname"""
 
 
 def _require(condition):
@@ -126,13 +127,11 @@ def _require(condition):
         raise NetworkCandidateCustodyError("network_candidate_custody_unavailable")
 
 
-async def read_network_control_relation_pins(
-    connection, relation_names, *, control_schema, expected_candidate_table_oid=None
-):
-    """Authenticate bounded current control-table identities, without acquiring reader locks.
+async def read_network_control_relation_pins(connection, relation_names, *, control_schema):
+    """Read bounded current control-table identities by name, without acquiring reader locks.
 
-    These are race pins for subsequent consumed-data checks, not historical seals
-    or Source/publication authority. Existing native write guards remain intact.
+    These are race pins for subsequent consumed-data checks: a request refuses a
+    control table that is replaced after the request started.
     """
     from process.network_compact_layout import CompactAddressRelation
     from process.registry_management_permissions import _TABLES
@@ -145,13 +144,9 @@ async def read_network_control_relation_pins(
         "SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only')"
     )
     _require(tuple(modes) in (("repeatable read", "on"), ("serializable", "on")))
-    control = await _control(connection, control_schema)
-    if expected_candidate_table_oid is not None:
-        _require(type(expected_candidate_table_oid) is int and 0 < expected_candidate_table_oid < 2**32)
-        _require(control["candidate_table_oid"] == expected_candidate_table_oid)
     tables = await connection.fetch(
         _API_CONTROL_TABLE_SQL,
-        control["schema_oid"],
+        _identifier(control_schema),
         list(relation_names),
         max(len(_TABLES[name]) for name in relation_names) + 1,
     )
@@ -161,7 +156,6 @@ async def read_network_control_relation_pins(
     pins = []
     for name in relation_names:
         table = by_name[name]
-        _require(table["relowner"] == control["schema_owner_oid"])
         _require(table["relkind"] == "r" and table["relpersistence"] == "p" and table["heap"] is True)
         _require(
             not any(
@@ -170,10 +164,7 @@ async def read_network_control_relation_pins(
             )
         )
         _require(tuple(table["columns"]) == _TABLES[name])
-        if name == "network_membership_candidate":
-            _require(table["oid"] == control["candidate_table_oid"])
         pins.append(CompactAddressRelation(control_schema, name, table["oid"]))
-    _require(await _control(connection, control_schema) == control)
     return tuple(pins)
 
 

@@ -102,7 +102,6 @@ async def test_manifest_only_read_touches_no_approved_records(monkeypatch):
         "base_rls": False,
         "base_schema": "example_addresses",
         "base_name": "entity_address_unified",
-        "candidate_table_oid": 41,
     }
     manifest = SimpleNamespace(approved_custom_revision=4, source_generations={"custom_membership": "c" * 64})
     proofs = []
@@ -118,7 +117,7 @@ async def test_manifest_only_read_touches_no_approved_records(monkeypatch):
     assert "network_candidate_custody" not in statement and proofs[0]["seal_sha256"] is None
     assert proofs[0]["receipt"] == {
         "closure": {},
-        "control": {"candidate_table_oid": 41},
+        "control": {},
         "index_definition_sha256": "d" * 64,
     }
 

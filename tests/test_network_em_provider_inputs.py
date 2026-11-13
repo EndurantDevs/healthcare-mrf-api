@@ -481,15 +481,6 @@ async def test_api_input_resolution_requires_a_typed_manifest_before_catalog_rea
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pid", [True, 0, 2**31])
-async def test_legacy_control_pin_requires_a_bounded_actual_backend_identity(pid):
-    conn = connection()
-    with pytest.raises(ValueError):
-        await inputs._legacy_em_control_pins(conn, "control", pid)
-    conn.fetchrow.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_session_input_read_refuses_missing_root_transaction_before_resolution(monkeypatch):
     resolve = AsyncMock()
     monkeypatch.setattr(inputs, "resolve_em_provider_inputs", resolve)

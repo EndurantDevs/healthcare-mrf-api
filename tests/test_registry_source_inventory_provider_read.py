@@ -137,9 +137,9 @@ def _spies(monkeypatch, fixture, *, receipt=None, refusal_at=None):
         events.append("resolve")
         return fixture.manifest
 
-    async def control(actual, names, *, control_schema, expected_candidate_table_oid):
+    async def control(actual, names, *, control_schema):
         assert actual is connection and names == ("network_membership_candidate",)
-        assert control_schema == CONTROL and expected_candidate_table_oid == _CANDIDATE_RELATION.table_oid
+        assert control_schema == CONTROL
         return (_CANDIDATE_RELATION,)
 
     class PageReceipt(dict):
@@ -275,22 +275,19 @@ async def test_reference_approval_and_generation_drift_are_terminal(monkeypatch,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("missing", ["control", "network_provider_only_evidence", "network_source_inventory"])
+@pytest.mark.parametrize("missing", ["network_provider_only_evidence", "network_source_inventory"])
 async def test_missing_read_identity_refuses_before_page(monkeypatch, missing):
     fixture = _fixture()
-    if missing == "control":
-        object.__delattr__(fixture.manifest, "_custody_control")
-    else:
-        object.__setattr__(
-            fixture.manifest,
-            "_candidate_relation_pins",
-            tuple(pin for pin in fixture.manifest.candidate_relation_pins if pin.table_name != missing),
-        )
+    object.__setattr__(
+        fixture.manifest,
+        "_candidate_relation_pins",
+        tuple(pin for pin in fixture.manifest.candidate_relation_pins if pin.table_name != missing),
+    )
     connection, _, _, events = _spies(monkeypatch, fixture)
     with pytest.raises(NetworkProviderReadUnavailable):
         await readers.read_network_provider_only_page(connection, fixture.scope, control_schema=CONTROL)
     assert "page" not in events
-    assert connection.fetchrow.await_count == int(missing != "control")
+    assert connection.fetchrow.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -361,8 +358,6 @@ async def test_legacy_metadata_keeps_legacy_source_query_branch(monkeypatch):
 
 def _pin_provider_fixture_relations(manifest, legacy):
     """Attach the same authenticated physical relation pins to the synthetic manifest."""
-    object.__setattr__(manifest, "_custody_seal_sha256", "a" * 64)
-    object.__setattr__(manifest, "_custody_control", {"candidate_table_oid": _CANDIDATE_RELATION.table_oid})
     object.__setattr__(
         manifest,
         "_candidate_relation_pins",

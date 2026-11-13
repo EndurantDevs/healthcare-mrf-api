@@ -38,23 +38,6 @@ class _InputDriver:
     def __init__(self, receipt):
         self.header_guarded, self.is_valid, self.pid = False, True, 42
         self.current_control_oid, self.modes = 800, ("repeatable read", "on")
-        self.control_catalog = {
-            "table_oid": 800,
-            "backend_pid": 42,
-            **dict.fromkeys(
-                (
-                    "reader",
-                    "owners_closed",
-                    "elevated_closed",
-                    "schema_read_only",
-                    "table_read_only",
-                    "columns_read_only",
-                    "heap",
-                    "columns_valid",
-                ),
-                True,
-            ),
-        }
         self.header = _Header(
             self,
             {
@@ -82,10 +65,6 @@ class _InputDriver:
     async def fetchrow(self, query, *arguments):
         if "transaction_isolation" in query:
             return self.modes
-        if query == inputs._LEGACY_CONTROL_SQL:
-            assert arguments == ("control",)
-            self.events.append("legacy-control-catalog")
-            return self.control_catalog
         if query == identity._CONSUMED_SQL:
             names, oids, pid, _modes = arguments
             assert names == ['"control"."network_membership_candidate"'] and oids == [800] and pid == 42
@@ -113,8 +92,6 @@ async def _input_reader(monkeypatch):
     )
     supplied = input_fixture.manifest(receipt)
     actual = replace(supplied)
-    object.__setattr__(supplied, "_custody_control", {"candidate_table_oid": 999})
-    object.__setattr__(actual, "_custody_control", {"candidate_table_oid": 800})
     driver = _InputDriver(receipt)
     resolver = AsyncMock(return_value=actual)
     monkeypatch.setattr(inputs, "resolve_network_serving_manifest", resolver)
@@ -129,9 +106,7 @@ async def test_input_header_uses_the_genuine_resolved_control_pin_before_decode(
     resolver.assert_awaited_once_with(
         driver, generation_id=supplied.generation_id, control_schema="control", api_read=True
     )
-    pins.assert_awaited_once_with(
-        driver, ("network_membership_candidate",), control_schema="control", expected_candidate_table_oid=800
-    )
+    pins.assert_awaited_once_with(driver, ("network_membership_candidate",), control_schema="control")
     assert driver.events == ["header-read", "header-guard", "native-catalog"]
 
 
@@ -144,13 +119,11 @@ async def test_input_header_reuses_the_published_pin_of_the_request(monkeypatch)
     resolver.assert_not_awaited()
 
 
-@pytest.mark.parametrize("damage", ["manifest", "control", "guard", "missing", "sources", "receipt", "native", "pid"])
+@pytest.mark.parametrize("damage", ["manifest", "guard", "missing", "sources", "receipt", "native", "pid"])
 async def test_api_inputs_preserve_full_manifest_receipt_native_and_consumption_checks(monkeypatch, damage):
     driver, supplied, actual, resolver, pins = await _input_reader(monkeypatch)
     if damage == "manifest":
         resolver.return_value = replace(actual, address_table_oid=999)
-    if damage == "control":
-        object.__setattr__(actual, "_custody_control", [])
     if damage == "guard":
         driver.is_valid = False
     if damage == "missing":
@@ -170,7 +143,7 @@ async def test_api_inputs_preserve_full_manifest_receipt_native_and_consumption_
         resolver.side_effect = moved
     with pytest.raises(PlanPricingProjectionUnavailable):
         await inputs.resolve_em_provider_inputs(driver, supplied, "control", api_read=True)
-    if damage in {"manifest", "control"}:
+    if damage == "manifest":
         assert driver.events == []
         pins.assert_not_awaited()
     elif damage != "native":
@@ -219,8 +192,8 @@ async def test_legacy_api_checks_manifest_control_and_nine_receipt(monkeypatch):
     )
     read.assert_awaited_once_with(driver, '"control"', supplied.generation_id)
     assert custody_proof.await_args.kwargs == {"api_read": True}
-    sealed_pins.assert_not_awaited()
-    assert driver.events == ["legacy-control-catalog", "header-read", "header-guard", "native-catalog"]
+    sealed_pins.assert_awaited_once_with(driver, ("network_membership_candidate",), control_schema="control")
+    assert driver.events == ["header-read", "header-guard", "native-catalog"]
     assert len(execution._installed_read_inventory(session).relations) == 9
 
 
@@ -259,56 +232,12 @@ async def test_legacy_branch_cannot_infer_acceptance_from_supplied_manifest_json
     sealed_pins.assert_not_awaited()
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
-        "reader",
-        "owners_closed",
-        "elevated_closed",
-        "schema_read_only",
-        "table_read_only",
-        "columns_read_only",
-        "heap",
-        "columns_valid",
-        "backend_pid",
-        "table_oid",
-    ],
-)
-@pytest.mark.parametrize("value", [False, 0, None])
-async def test_legacy_current_control_refuses_role_write_topology_column_and_identity_damage(monkeypatch, field, value):
-    driver, supplied, *_rest = await _legacy_input_reader(monkeypatch)
-    driver.control_catalog[field] = value
-    with pytest.raises(PlanPricingProjectionUnavailable):
-        await inputs.resolve_em_provider_inputs(driver, supplied, "control", api_read=True)
-    assert driver.events == ["legacy-control-catalog"]
-
-
 async def test_legacy_header_oid_swap_is_refused_before_fields_or_receipt(monkeypatch):
     driver, supplied, *_rest = await _legacy_input_reader(monkeypatch)
     driver.current_control_oid = 801
     with pytest.raises(PlanPricingProjectionUnavailable):
         await inputs.resolve_em_provider_inputs(driver, supplied, "control", api_read=True)
-    assert driver.events == ["legacy-control-catalog", "header-read", "header-guard"]
-
-
-def test_legacy_control_checks_owners_writes_and_native_read_columns():
-    sql = inputs._LEGACY_CONTROL_SQL
-    assert "ARRAY[n.nspowner,c.relowner]" in sql and "current_user=session_user" in sql
-    for mode in ("MEMBER", "USAGE", "SET"):
-        assert f"pg_catalog.pg_has_role(r.oid,owner.oid,'{mode}')" in sql
-    assert "INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN" in sql
-    assert "has_any_column_privilege(r.oid,c.oid,'INSERT,UPDATE,REFERENCES')" in sql
-    assert "elevated.rolreplication OR elevated.rolbypassrls" in sql
-    assert "inhrelid=c.oid OR inhparent=c.oid" in sql and "pg_catalog.pg_rewrite" in sql
-    for column, native_type, typmod in (
-        ("candidate_id", "uuid", -1),
-        ("schema_name", "varchar", 68),
-        ("state", "varchar", 20),
-        ("source_generations", "jsonb", -1),
-        ("validation_json", "jsonb", -1),
-    ):
-        assert f"('{column}','pg_catalog.{native_type}'::pg_catalog.regtype,{typmod})" in sql
-    assert "a.attgenerated='' AND a.attidentity=''" in sql
+    assert driver.events == ["header-read", "header-guard"]
 
 
 class _RatesResult:

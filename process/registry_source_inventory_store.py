@@ -435,17 +435,19 @@ async def _registered_inventory_entries(connection, copy_target, candidate, *, c
 
 
 async def load_source_inventory_for_api(connection, copy_target, candidate, *, control_schema=None):
-    """Load a complete inventory after sealed API metadata proof, without explicit reader locks.
+    """Load a complete published inventory by name, without explicit reader locks.
 
     Actual count, preflight and payload reads are checked before interpretation;
     the caller retains this original RR/RO transaction through all subsequent use.
     """
-    from process.network_candidate_custody import verify_network_candidate_read_metadata
-
     _require_transaction(connection, copy_target)
+    settings = await connection.fetchrow(
+        "SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only')"
+    )
+    if tuple(settings) not in (("repeatable read", "on"), ("serializable", "on")):
+        raise RegistrySourceInventoryError("registry_source_inventory_snapshot_invalid")
     schema = _control_namespace(control_schema)[1:-1]
-    custody = await verify_network_candidate_read_metadata(connection, copy_target, control_schema=schema)
-    expected_oid = custody["receipt"]["closure"]["relation_oids"][INVENTORY_TABLE]
+    expected_oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", _relation(copy_target))
     inventory = verify_source_recipe_metadata(candidate).inventory
     if inventory is None or any(
         str(candidate[field]) != getattr(copy_target, field)

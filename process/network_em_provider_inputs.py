@@ -52,40 +52,6 @@ _MODELS = dict(
 _MAX_RECEIPT_BYTES = 32768
 _RELATION_FIELDS = {"role", "schema_name", "table_name", "generation_id", "relation_oid", "relfilenode"}
 _CUSTODY_FIELDS = {"schema_oid", "owner_oid", "owner_role", "shape_sha256", "keys_sha256"}
-_LEGACY_CONTROL_SQL = """SELECT c.oid::bigint AS table_oid,pg_catalog.pg_backend_pid() AS backend_pid,
- current_user=session_user AND pg_catalog.current_setting('role')='none' AND r.rolcanlogin
- AND NOT (r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls) AS reader,
- NOT EXISTS(SELECT FROM pg_catalog.unnest(ARRAY[n.nspowner,c.relowner]) owner(oid)
-   WHERE pg_catalog.pg_has_role(r.oid,owner.oid,'MEMBER') OR pg_catalog.pg_has_role(r.oid,owner.oid,'USAGE')
-   OR pg_catalog.pg_has_role(r.oid,owner.oid,'SET')) AS owners_closed,
- NOT pg_catalog.pg_has_role(r.oid,'pg_write_all_data','MEMBER')
- AND NOT EXISTS(SELECT FROM pg_catalog.pg_roles elevated
-   WHERE (elevated.rolsuper OR elevated.rolcreatedb OR elevated.rolcreaterole
-     OR elevated.rolreplication OR elevated.rolbypassrls)
-   AND (pg_catalog.pg_has_role(r.oid,elevated.oid,'MEMBER')
-     OR pg_catalog.pg_has_role(r.oid,elevated.oid,'SET'))) AS elevated_closed,
- pg_catalog.has_schema_privilege(r.oid,n.oid,'USAGE')
- AND NOT pg_catalog.has_schema_privilege(r.oid,n.oid,'CREATE') AS schema_read_only,
- pg_catalog.has_table_privilege(r.oid,c.oid,'SELECT')
- AND NOT pg_catalog.has_table_privilege(r.oid,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
- AS table_read_only,
- NOT pg_catalog.has_any_column_privilege(r.oid,c.oid,'INSERT,UPDATE,REFERENCES') AS columns_read_only,
- c.relkind='r' AND c.relpersistence='p' AND NOT c.relispartition AND NOT c.relrowsecurity
- AND NOT c.relforcerowsecurity AND c.relam=(SELECT oid FROM pg_catalog.pg_am WHERE amname='heap')
- AND NOT EXISTS(SELECT FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)
- AND NOT EXISTS(SELECT FROM pg_catalog.pg_rewrite WHERE ev_class=c.oid) AS heap,
- (SELECT pg_catalog.bool_and(coalesce(a.atttypid=expected.type_oid AND a.atttypmod=expected.typmod
-     AND NOT a.attisdropped AND a.attgenerated='' AND a.attidentity='',false))
-  FROM (VALUES ('candidate_id','pg_catalog.uuid'::pg_catalog.regtype,-1),
-    ('schema_name','pg_catalog.varchar'::pg_catalog.regtype,68),
-    ('state','pg_catalog.varchar'::pg_catalog.regtype,20),
-    ('source_generations','pg_catalog.jsonb'::pg_catalog.regtype,-1),
-    ('validation_json','pg_catalog.jsonb'::pg_catalog.regtype,-1)) expected(name,type_oid,typmod)
-  LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid AND a.attname=expected.name AND a.attnum>0)
- AS columns_valid
- FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid
- JOIN pg_catalog.pg_roles r ON r.rolname=current_user
- WHERE n.nspname=$1 AND c.relname='network_membership_candidate'"""
 
 
 def _fail():
@@ -425,39 +391,6 @@ async def record_em_provider_inputs(connection, copy_target, receipt, control_sc
     return receipt
 
 
-async def _legacy_em_control_pins(connection, control_schema, backend_pid):
-    """Pin current legacy header identity after independent serving acceptance, without seal authority."""
-    from process.network_address_artifact import _require_api_read_context
-    from process.network_compact_layout import CompactAddressRelation
-
-    _identifier(control_schema)
-    if type(backend_pid) is not int or not 0 < backend_pid <= 2147483647:
-        _fail()
-    await _require_api_read_context(connection, True)
-    catalog = await connection.fetchrow(_LEGACY_CONTROL_SQL, control_schema)
-    if (
-        catalog is None
-        or type(catalog["backend_pid"]) is not int
-        or catalog["backend_pid"] != backend_pid
-        or any(
-            catalog[field] is not True
-            for field in (
-                "reader",
-                "owners_closed",
-                "elevated_closed",
-                "schema_read_only",
-                "table_read_only",
-                "columns_read_only",
-                "heap",
-                "columns_valid",
-            )
-        )
-    ):
-        _fail()
-    _oid(catalog["table_oid"])
-    return (CompactAddressRelation(control_schema, "network_membership_candidate", catalog["table_oid"]),)
-
-
 async def _resolve_em_provider_inputs_api(connection, manifest, control_schema=None):
     """Guard the accepted sealed or legacy candidate header before reading its retained recipe."""
     from process.network_candidate_custody import read_network_control_relation_pins
@@ -478,20 +411,9 @@ async def _resolve_em_provider_inputs_api(connection, manifest, control_schema=N
             )
         if type(retained) is not PinnedNetworkServingManifest or retained != manifest:
             _fail()
-        control = retained.custody_control
-        if control is None:
-            if retained.compact_layout is not None:
-                _fail()
-            pins = await _legacy_em_control_pins(connection, namespace[1:-1], backend_pid)
-        elif type(control) is dict:
-            pins = await read_network_control_relation_pins(
-                connection,
-                ("network_membership_candidate",),
-                control_schema=namespace[1:-1],
-                expected_candidate_table_oid=control["candidate_table_oid"],
-            )
-        else:
-            _fail()
+        pins = await read_network_control_relation_pins(
+            connection, ("network_membership_candidate",), control_schema=namespace[1:-1]
+        )
         candidate_header = await connection.fetchrow(
             f"SELECT source_generations,validation_json FROM ONLY {namespace}.network_membership_candidate "
             "WHERE candidate_id=$1 AND schema_name=$2 AND state='published'",
