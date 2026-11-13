@@ -162,20 +162,36 @@ def _rows(count):
     ]
 
 
-@asynccontextmanager
-async def _isolated_harness(harness, monkeypatch):
-    from process import provider_directory_generic_source_policy as policy
-    from tests.test_provider_directory_generic_source_policy import _isolated_factory
-
-    factory = _isolated_factory()
-    native_by_field = {
+def _isolated_catalog_row(factory):
+    return {
         field: getattr(factory.storage_binding, field)
         for field in ("database_oid", "catalog_schema_oid", "storage_schema_oid", "owner_oid", "namespace_owner_oid")
     }
+
+
+def _set_isolated_candidate(harness, publisher, *, named):
+    binding = harness.header["candidate_storage_json"]
+    binding.update(
+        contract=storage.NAMED_ISOLATED_CONTRACT if named else storage.ISOLATED_CONTRACT,
+        storage=storage.storage_document(publisher),
+        admission=None,
+    )
+    if named:
+        for key, suffix in (("resource_input", "ri"), ("witness_input", "wi")):
+            binding["tables"][key] = {"name": "pdgs_" + "a" * 32 + "_" + suffix}
+
+
+@asynccontextmanager
+async def _isolated_harness(harness, monkeypatch, *, named=False):
+    from process import provider_directory_generic_source_policy as policy
+    from tests.test_provider_directory_generic_source_policy import _isolated_factory, _named_factory
+
+    factory = _named_factory() if named else _isolated_factory()
+    native_by_field = {} if named else _isolated_catalog_row(factory)
     harness.policy = factory.policy
     harness.directory._schema = lambda: "catalog_schema"
     metadata = harness.header["candidate_storage_json"]["identity"]["metadata"]
-    metadata["source_ids"] = ["example-source"]
+    metadata["source_ids"] = [storage.VSP_SOURCE_ID if named else "example-source"]
     harness.directory._endpoint_dataset_candidate_metadata = lambda _: metadata
     connection, actor = harness.connection, {"session": "source_publisher", "current": "source_publisher"}
 
@@ -212,11 +228,7 @@ async def _isolated_harness(harness, monkeypatch):
             connection, factory.policy, verify_role_profile=AsyncMock(), transaction_isolation="repeatable read"
         ) as publisher:
             actor["current"] = "source_owner"
-            harness.header["candidate_storage_json"].update(
-                contract=storage.ISOLATED_CONTRACT,
-                storage=storage.storage_document(publisher),
-                admission=None,
-            )
+            _set_isolated_candidate(harness, publisher, named=named)
             yield publisher
 
 
@@ -227,6 +239,113 @@ async def test_isolated_copy_uses_only_the_issued_storage_coordinates(harness, m
     assert harness.copies[0][1]["schema_name"] == "source_schema"
     assert '"source_schema"."provider_directory_endpoint_dataset"' in harness.sql[-1]
     assert not any('"catalog_schema".' in statement for statement in harness.sql)
+
+
+def _named_candidate_context(harness, monkeypatch, factory, source_id):
+    from process import provider_directory_generic_source_policy as policy
+    from tests.test_provider_directory_generic_source_policy import _connection
+
+    harness.policy = factory.policy
+    harness.directory._schema = lambda: factory.storage_binding.catalog_schema
+    metadata = harness.header["publication_metadata_json"]
+    metadata["source_ids"] = [source_id]
+    harness.directory._endpoint_dataset_candidate_metadata = lambda _: metadata
+    completion = _without_candidate_storage(harness, monkeypatch)
+    native, savepoints = _connection()
+    harness.connection.is_in_transaction = native.is_in_transaction
+    harness.connection.is_closed = native.is_closed
+    harness.connection.transaction = native.transaction
+    fetchval = harness.connection.fetchval
+    harness.connection.fetchval = AsyncMock(
+        side_effect=lambda sql, *args: (
+            harness.header["candidate_storage_json"]["ordinal"] + 1
+            if sql.startswith("SELECT nextval(")
+            else fetchval.side_effect(sql, *args)
+        )
+    )
+    capture = AsyncMock(side_effect=AssertionError("named storage does not use physical identity"))
+    monkeypatch.setattr(storage, "_capture", capture)
+
+    session = object()
+    database = SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=session))
+    monkeypatch.setattr(policy, "_copy_driver", AsyncMock(return_value=harness.connection))
+    monkeypatch.setattr(storage, "source_owner_transaction", policy.source_owner_transaction)
+    monkeypatch.setattr(completion, "source_owner_transaction", policy.source_owner_transaction)
+    return database, completion, savepoints, capture
+
+
+@asynccontextmanager
+async def _bind_named_publisher(harness, factory, verify_roles):
+    from process import provider_directory_generic_source_policy as policy
+
+    async with policy.bind_generic_source_transaction_factory(factory):
+        async with policy.bind_generic_source_publisher(
+            harness.connection,
+            factory.policy,
+            verify_role_profile=verify_roles,
+            transaction_isolation="repeatable read",
+        ):
+            yield
+
+
+@pytest.mark.asyncio
+async def test_named_candidate_refuses_unsupported_source(harness, monkeypatch):
+    from tests.test_provider_directory_generic_source_policy import _named_factory
+
+    factory = _named_factory()
+    database, _, savepoints, capture = _named_candidate_context(harness, monkeypatch, factory, "other-source")
+    async with _bind_named_publisher(harness, factory, AsyncMock()):
+        with pytest.raises(GenericCandidateError, match="isolated_kind_unsupported"):
+            await storage.prepare_generic_source_candidate(database, harness.directory, harness.candidate)
+    assert harness.header["candidate_storage_json"] is None and not harness.copies
+    assert savepoints == ["savepoint", "rollback"]
+    capture.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_named_candidate_resumes_after_committing_a_batch(harness, monkeypatch):
+    from process import provider_directory_generic_source_policy as policy
+    from tests.test_provider_directory_generic_source_policy import _named_factory
+
+    factory = _named_factory()
+    database, completion, savepoints, capture = _named_candidate_context(
+        harness, monkeypatch, factory, storage.VSP_SOURCE_ID
+    )
+    verify_roles = AsyncMock()
+    async with _bind_named_publisher(harness, factory, verify_roles):
+        loading = await storage.prepare_generic_source_candidate(database, harness.directory, harness.candidate)
+        assert loading["contract"] == storage.NAMED_ISOLATED_CONTRACT
+        assert set(loading["tables"]) == {"resource_input", "witness_input"}
+        assert all(set(table) == {"name"} for table in loading["tables"].values())
+        assert await storage.append_generic_source_batch(database, harness.directory, harness.candidate, _rows(2)) == 2
+    assert policy._PUBLISHER.get() is None
+    persisted = deepcopy(harness.header["candidate_storage_json"])
+    assert persisted["ordinal"] == 1 and persisted["tables"] == loading["tables"]
+
+    async with _bind_named_publisher(harness, _named_factory(), verify_roles):
+        async with policy.source_owner_transaction(database):
+            previous_statements = list(harness.sql)
+            resumed = await storage.prepare_generic_source_candidate(database, harness.directory, harness.candidate)
+            assert resumed == persisted and harness.sql == previous_statements
+            assert (
+                await storage.append_generic_source_batch(database, harness.directory, harness.candidate, _rows(1)) == 1
+            )
+        reduce = AsyncMock()
+        monkeypatch.setattr(completion, "_complete_payloads", reduce)
+        prepared = await completion.complete_generic_source_candidate(database, harness.directory, harness.candidate)
+        assert prepared["phase"] == "prepared" and prepared["ordinal"] == 2
+        assert set(prepared["tables"]) == {*storage.RELATIONS, "resource_input", "witness_input"}
+        assert all(set(table) == {"name"} for table in prepared["tables"].values())
+        reduce.assert_awaited_once()
+
+    assert len(harness.copies) == 2
+    for table, batch in harness.copies:
+        assert table == loading["tables"]["resource_input"]["name"]
+        assert batch["schema_name"] == factory.storage_binding.storage_schema
+    assert savepoints.count("savepoint") == savepoints.count("release") == 6
+    assert not any('"catalog_schema".' in statement for statement in harness.sql)
+    verify_roles.assert_not_awaited()
+    capture.assert_not_awaited()
 
 
 def _without_candidate_storage(harness, monkeypatch, found=()):

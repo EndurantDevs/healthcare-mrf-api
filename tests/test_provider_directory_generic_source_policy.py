@@ -12,6 +12,7 @@ import pytest
 
 from db.connection import Database
 from process import provider_directory_generic_source_policy as policy
+from process import provider_directory_named_edition as editions
 from process import provider_directory_source_storage_binding as isolated
 from process.provider_directory_generic_candidate import GenericCandidateError
 
@@ -180,6 +181,111 @@ def _isolated_factory():
     )
     factory.source_storage_binding = AsyncMock(return_value=factory.storage_binding)
     return factory
+
+
+def _named_factory():
+    factory = _identity_factory()
+    factory.storage_binding = isolated.NamedFHIRSourceStorage("catalog_schema", "source_schema")
+    return factory
+
+
+def _edition_reader(state, current_id, edition, pointer, counts_by_resource):
+    async def fetchrow(sql, *args):
+        if pointer in sql:
+            assert args == ("catalog_schema", "endpoint")
+            return None if state == "empty" else {"dataset_id": current_id, "schema_name": edition}
+        assert f'FROM "{edition}"."provider_directory_endpoint_dataset"' in sql
+        assert "status='published' AND published_at IS NOT NULL" in sql
+        assert args == (current_id,)
+        if state == "missing":
+            return None
+        return {
+            "dataset_id": current_id,
+            "endpoint_id": "foreign" if state == "foreign" else "endpoint",
+            "publication_metadata_json": json.dumps({"source_summary_v1": {"resource_counts": counts_by_resource}}),
+        }
+
+    return SimpleNamespace(
+        fetchval=AsyncMock(return_value=None if state == "legacy" else pointer),
+        fetchrow=AsyncMock(side_effect=fetchrow),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["legacy", "empty", "self", "missing", "foreign", "published"])
+async def test_named_predecessor_reads_only_the_catalog_edition(monkeypatch, state):
+    from importlib import import_module
+
+    from process import provider_directory_generic_source_adapters as adapters
+    from process import provider_directory_projection_stage as projection
+
+    directory = import_module("process.provider_directory_fhir")
+    current_id = "candidate" if state == "self" else "incumbent"
+    edition = editions.edition_schema_name(current_id)
+    pointer = '"provider_directory_editions"."current_edition"'
+    counts_by_resource = {"Practitioner": 3}
+    incumbent_by_field = {"dataset_id": current_id, "status": "published", "resource_counts": counts_by_resource}
+    legacy = AsyncMock(return_value=incumbent_by_field)
+    driver = _edition_reader(state, current_id, edition, pointer, counts_by_resource)
+    session = object()
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    native = AsyncMock(return_value=driver)
+    monkeypatch.setattr(directory, "_schema", lambda: "catalog_schema")
+    monkeypatch.setattr(directory.db, "_transaction_binding", lambda: None)
+    monkeypatch.setattr(directory.db, "transaction", transaction)
+    monkeypatch.setattr(directory.db, "first", legacy)
+    monkeypatch.setattr(projection, "_copy_driver", native)
+    async with policy.bind_generic_source_transaction_factory(_named_factory()):
+        if state in {"missing", "foreign"}:
+            with pytest.raises(GenericCandidateError, match="current_edition_changed"):
+                await adapters.current_endpoint_dataset_record(directory, "endpoint", exclude_dataset_id="candidate")
+        else:
+            assert await adapters.current_endpoint_dataset_record(
+                directory, "endpoint", exclude_dataset_id="candidate"
+            ) == ({} if state == "self" else incumbent_by_field)
+
+    native.assert_awaited_once_with(session)
+    driver.fetchval.assert_awaited_once_with("SELECT to_regclass($1)::text", pointer)
+    assert driver.fetchrow.await_count == (0 if state == "legacy" else 1 if state in {"empty", "self"} else 2)
+    if state in {"legacy", "empty"}:
+        assert legacy.await_count == 1
+        assert '"catalog_schema"."provider_directory_endpoint_dataset"' in legacy.await_args.args[0]
+    else:
+        legacy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_named_startup_uses_the_bound_schema_without_running_legacy_ddl(monkeypatch):
+    from importlib import import_module
+
+    from process import provider_directory_generic_source_adapters as adapters
+
+    directory = import_module("process.provider_directory_fhir")
+    factory = _named_factory()
+    connection, _ = _connection()
+
+    @asynccontextmanager
+    async def source_transaction(database):
+        assert database is directory.db
+        yield
+
+    monkeypatch.setattr(adapters, "source_transaction", source_transaction)
+    monkeypatch.setattr(directory, "_schema", lambda: "catalog_schema")
+    verify_roles = AsyncMock()
+    async with policy.bind_generic_source_transaction_factory(factory):
+        async with policy.bind_generic_source_publisher(
+            connection, factory.policy, verify_role_profile=verify_roles, transaction_isolation="repeatable read"
+        ):
+            assert await adapters.require_generic_source_layout(directory) is factory.storage_binding
+            monkeypatch.setattr(directory, "_schema", lambda: "other_catalog")
+            with pytest.raises(GenericCandidateError, match="schema_changed"):
+                await adapters.require_generic_source_layout(directory)
+    verify_roles.assert_not_awaited()
+    connection.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio

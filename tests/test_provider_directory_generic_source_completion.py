@@ -17,19 +17,17 @@ from tests.test_provider_directory_generic_source_storage import _isolated_harne
 
 
 @asynccontextmanager
-async def _prepared_detached(harness, monkeypatch):
+async def _prepared_detached(harness, monkeypatch, *, named=False):
     from process import provider_directory_generic_source_policy as policy
 
-    async with _isolated_harness(harness, monkeypatch) as publisher:
+    async with _isolated_harness(harness, monkeypatch, named=named) as publisher:
         binding = harness.header["candidate_storage_json"]
         binding["phase"] = "prepared"
         for index, root in enumerate(completion.storage.RELATIONS):
-            binding["tables"][root] = dict(
-                name="pdgs_" + "a" * 32 + "_" + completion.storage._SUFFIXES[root],
-                oid=30 + index,
-                owner=100,
-                layout_sha256="e" * 64,
-            )
+            name = "pdgs_" + "a" * 32 + "_" + completion.storage._SUFFIXES[root]
+            binding["tables"][root] = {"name": name}
+            if not named:
+                binding["tables"][root].update(oid=30 + index, owner=100, layout_sha256="e" * 64)
         harness.header.update(
             status="validated",
             is_current=False,
@@ -75,6 +73,60 @@ async def _prepared_detached(harness, monkeypatch):
             yield publisher, binding
         finally:
             policy._OWNER.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_named_handoff_closes_intake_and_replays_without_physical_table_identity(harness, monkeypatch):
+    async with _prepared_detached(harness, monkeypatch, named=True) as (publisher, binding):
+        handoff = await completion.attach_generic_source_candidate(publisher, binding)
+        document = handoff.document
+        assert document["phase"] == "ready_for_freeze"
+        assert set(document["tables"]) == set(completion.storage.RELATIONS + completion.storage.HANDOFF_CONTROL_ROOTS)
+        assert all(set(table) == {"name"} for table in document["tables"].values())
+        assert sum(statement.startswith("DROP TABLE") for statement in harness.sql) == 2
+        assert not any("ATTACH" in statement or "GRANT" in statement for statement in harness.sql)
+        previous_statements = list(harness.sql)
+        replay = await completion.prepare_generic_source_handoff(publisher, document)
+        assert replay.document_sha256 == handoff.document_sha256
+        assert harness.sql == previous_statements
+        completion.storage._capture.assert_not_awaited()
+    connection = SimpleNamespace(
+        is_in_transaction=lambda: True,
+        execute=AsyncMock(),
+        fetchval=AsyncMock(return_value=False),
+    )
+    inventory = AsyncMock(side_effect=AssertionError("named editions do not read a physical inventory"))
+    monkeypatch.setattr(completion, "_frozen_source_inventory", inventory)
+    header = AsyncMock(return_value=harness.header)
+    monkeypatch.setattr(completion, "_frozen_handoff_header", header)
+    stored = SimpleNamespace(
+        dataset_hash=harness.header["dataset_hash"],
+        resource_count=2,
+        resource_hashes={"Practitioner": "b" * 64},
+        resource_counts={"Practitioner": 2},
+        metadata={"proof_sha256": "c" * 64},
+    )
+    content = AsyncMock(return_value=stored)
+    monkeypatch.setattr(completion, "_frozen_content_proof", content)
+    for check in ("_relationships", "_every_row", "_frozen_projection_exact"):
+        monkeypatch.setattr(completion, check, AsyncMock())
+
+    validation = await completion.validate_frozen_source_handoff(
+        connection, harness.directory, handoff, protected_owner_role="source_owner"
+    )
+    assert validation["handoff_sha256"] == handoff.document_sha256
+    assert validation["resource_counts"] == stored.resource_counts
+    assert connection.execute.await_args.args[0].endswith(" IN ACCESS SHARE MODE NOWAIT")
+    assert connection.fetchval.await_count == len(document["tables"])
+    assert all(call.args[1:] == ("dataset",) for call in connection.fetchval.await_args_list)
+    inventory.assert_not_awaited()
+    content.reset_mock()
+    connection.fetchval.return_value = True
+    with pytest.raises(GenericCandidateError, match="dataset_changed"):
+        await completion.validate_frozen_source_handoff(
+            connection, harness.directory, handoff, protected_owner_role="source_owner"
+        )
+    content.assert_not_awaited()
 
 
 @pytest.mark.asyncio
