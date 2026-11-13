@@ -65,6 +65,15 @@ CONTROL_ROOTS = (
     *MINT_ROOTS,
 )
 ISOLATED_FHIR_ROOTS = (HEADER, *RELATIONS, PROOF_ROOT, *CHECKPOINT_LAYOUTS)
+ROOTED_SOURCE_INPUT_ROOTS = (
+    "provider_directory_rooted_graph_acquisition",
+    "provider_directory_rooted_graph_work",
+    "provider_directory_rooted_graph_resource",
+    "provider_directory_rooted_graph_edge",
+    "provider_directory_rooted_graph_twin_attempt",
+    "provider_directory_rooted_graph_twin_admission",
+)
+
 # Full pg_get_constraintdef output, with only the function namespace replaced.
 # These two checks move to protected application validation, never disappear.
 _ISOLATED_APPLICATION_CHECKS = {
@@ -112,36 +121,63 @@ _ISOLATED_DEPENDENCIES_SQL = """WITH objects(classid,objid,relation) AS (
 
 
 async def provision_isolated_fhir_source_storage(
-    connection, policy, *, catalog_schema, namespace_owner, verify_role_profile
+    connection, policy, *, catalog_schema, namespace_owner, verify_role_profile=None, rooted=False
 ):
-    """Prepare empty private native storage; this evidence cannot activate a worker."""
-    _require(type(policy) is GenericSourcePolicy and callable(verify_role_profile), "explicit_policy_required")
-    _require(connection.is_in_transaction() is True, "transaction_required")
-    role_names = (policy.owner_role, policy.publisher_role, *policy.runtime_roles)
-    for schema in (catalog_schema, policy.schema):
-        storage_identifier(schema)
-        _require(schema not in {"public", "information_schema"} and not schema.startswith("pg_"), "schema_invalid")
-    storage_identifier(namespace_owner)
-    _require(catalog_schema != policy.schema and namespace_owner not in role_names, "isolated_coordinates_required")
+    """Create one empty generation with ordinary PostgreSQL grants and native constraints."""
+    _require(type(policy) is GenericSourcePolicy, "explicit_policy_required")
+    _require(connection.is_in_transaction(), "transaction_required")
+    for name in (catalog_schema, policy.schema, namespace_owner):
+        storage_identifier(name)
+    _require(catalog_schema != policy.schema, "isolated_coordinates_required")
     async with connection.transaction():
-        await connection.execute("SET LOCAL search_path=pg_catalog,pg_temp")
-        task = asyncio.current_task()
-        identity, catalog_oid = await _isolated_admin_preimage(connection, policy, catalog_schema, namespace_owner)
-        template_rows, checks_by_name, excluded_oids = await _isolated_template_preimage(
-            connection, catalog_schema, catalog_oid
-        )
-        await _create_isolated_namespace(connection, policy, namespace_owner, verify_role_profile)
-        await _clone_isolated_templates(connection, policy, catalog_schema, template_rows, excluded_oids)
-        preparation = await _capture_isolated_preparation(
-            connection, policy, catalog_schema, catalog_oid, namespace_owner, identity, checks_by_name
-        )
-        _require(
-            connection.is_in_transaction() is True
-            and asyncio.current_task() is task
-            and await _fhir_input_identity(connection) == identity,
-            "original_admin_changed",
-        )
-        return preparation
+        namespace = storage_identifier(policy.schema)
+        await connection.execute(f"CREATE SCHEMA {namespace} AUTHORIZATION {storage_identifier(namespace_owner)}")
+        await connection.execute(f"REVOKE ALL ON SCHEMA {namespace} FROM PUBLIC")
+        await connection.execute(f"GRANT USAGE,CREATE ON SCHEMA {namespace} TO {storage_identifier(policy.owner_role)}")
+        for role in (policy.publisher_role, *policy.runtime_roles):
+            await connection.execute(f"GRANT USAGE ON SCHEMA {namespace} TO {storage_identifier(role)}")
+        roots = (*ISOLATED_FHIR_ROOTS, *(ROOTED_SOURCE_INPUT_ROOTS if rooted else ()))
+        for root in roots:
+            relation = storage_relation(policy.schema, root)
+            template_root = root + "_legacy" if root in ROOTED_SOURCE_INPUT_ROOTS[1:4] else root
+            template = storage_relation(catalog_schema, template_root)
+            await connection.execute(
+                f"CREATE TABLE {relation} (LIKE {template} INCLUDING DEFAULTS "
+                "INCLUDING GENERATED INCLUDING STORAGE INCLUDING INDEXES INCLUDING CONSTRAINTS)"
+            )
+            checkpoint_columns = CHECKPOINT_LAYOUTS.get(root, {}).get("columns", ())
+            if checkpoint_columns:
+                json_columns = await connection.fetch(
+                    "SELECT attname FROM pg_attribute WHERE attrelid=$1::regclass AND attname=ANY($2::text[]) "
+                    "AND atttypid='pg_catalog.json'::regtype AND attnum>0 AND NOT attisdropped ORDER BY attnum",
+                    relation,
+                    [column[0] for column in checkpoint_columns if column[1] == "jsonb"],
+                )
+                if json_columns:
+                    await connection.execute(
+                        f"ALTER TABLE {relation} "
+                        + ",".join(
+                            f"ALTER COLUMN {storage_identifier(column['attname'])} TYPE jsonb "
+                            f"USING {storage_identifier(column['attname'])}::jsonb"
+                            for column in json_columns
+                        )
+                    )
+            if root in ROOTED_SOURCE_INPUT_ROOTS[1:4]:
+                checks = await connection.fetch(
+                    "SELECT conname FROM pg_constraint WHERE conrelid=$1::regclass "
+                    "AND conname LIKE 'pdrg_%_legacy_scope'",
+                    relation,
+                )
+                for check in checks:
+                    await connection.execute(
+                        f"ALTER TABLE {relation} DROP CONSTRAINT {storage_identifier(check['conname'])}"
+                    )
+            if root == HEADER:
+                for check in _ISOLATED_APPLICATION_CHECKS:
+                    await connection.execute(f"ALTER TABLE {relation} DROP CONSTRAINT {storage_identifier(check)}")
+            await connection.execute(f"ALTER TABLE {relation} OWNER TO {storage_identifier(policy.owner_role)}")
+            await _close_grants(connection, policy, root)
+    return {"catalog_schema": catalog_schema, "storage_schema": policy.schema}
 
 
 async def _isolated_admin_preimage(connection, policy, catalog_schema, namespace_owner):
@@ -1238,3 +1274,56 @@ async def _require_coverage_identity(connection, policy, before):
     """Custody may change only owner and grants of the exact authenticated control."""
     after = await capture_source_coverage_control(connection, policy)
     _require(all(before[field] == after[field] for field in ("oid", "layout", "guards")), "coverage_identity_changed")
+
+
+async def freeze_fhir_source_snapshot(
+    connection, storage_schema, *, namespace_owner, reader_roles=(), application_roles=None
+):
+    """Close a complete generation before validation and the atomic pointer change."""
+    _require(connection.is_in_transaction(), "transaction_required")
+    namespace = storage_identifier(storage_schema)
+    owner = storage_identifier(namespace_owner)
+    readers = tuple(storage_identifier(role) for role in reader_roles)
+    application_roles = reader_roles if application_roles is None else application_roles
+    _require(namespace_owner not in application_roles, "snapshot_owner_overlap")
+    applications = tuple(storage_identifier(role) for role in application_roles)
+    if applications:
+        await connection.execute(f"REVOKE {owner} FROM " + ",".join(applications) + " CASCADE")
+    relations = await connection.fetch(
+        "SELECT relname,relkind FROM pg_class c JOIN pg_namespace n "
+        "ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind IN ('r','p','S') ORDER BY relname",
+        storage_schema,
+    )
+    for relation in relations:
+        name = storage_relation(storage_schema, relation["relname"])
+        kind = "SEQUENCE" if relation["relkind"] == "S" else "TABLE"
+        grants = await connection.fetch(
+            "SELECT DISTINCT CASE WHEN a.grantee=0 THEN 'PUBLIC' "
+            "ELSE pg_get_userbyid(a.grantee) END AS role, a.column_name FROM ("
+            "SELECT acl.grantee,NULL::text AS column_name FROM pg_class c CROSS JOIN LATERAL "
+            "aclexplode(coalesce(c.relacl,acldefault(CASE WHEN c.relkind='S' THEN 'S'::\"char\" ELSE 'r'::\"char\" END,c.relowner))) acl "
+            "WHERE c.oid=to_regclass($1) UNION SELECT acl.grantee,attribute.attname FROM pg_attribute attribute "
+            "CROSS JOIN LATERAL aclexplode(attribute.attacl) acl WHERE attribute.attrelid=to_regclass($1)) a",
+            name,
+        )
+        await connection.execute(f"ALTER {kind} {name} OWNER TO {owner}")
+        for grant in grants:
+            principal = "PUBLIC" if grant["role"] == "PUBLIC" else storage_identifier(grant["role"])
+            columns = " (" + storage_identifier(grant["column_name"]) + ")" if grant["column_name"] else ""
+            await connection.execute(f"REVOKE ALL PRIVILEGES{columns} ON {kind} {name} FROM {principal} CASCADE")
+        await connection.execute(f"REVOKE ALL ON {kind} {name} FROM PUBLIC")
+        if readers and kind == "TABLE":
+            await connection.execute(f"GRANT SELECT ON TABLE {name} TO " + ",".join(readers))
+    grants = await connection.fetch(
+        "SELECT DISTINCT CASE WHEN a.grantee=0 THEN 'PUBLIC' "
+        "ELSE pg_get_userbyid(a.grantee) END AS role FROM pg_namespace n CROSS JOIN LATERAL "
+        "aclexplode(coalesce(n.nspacl,acldefault('n',n.nspowner))) a WHERE n.nspname=$1",
+        storage_schema,
+    )
+    await connection.execute(f"ALTER SCHEMA {namespace} OWNER TO {owner}")
+    for grant in grants:
+        principal = "PUBLIC" if grant["role"] == "PUBLIC" else storage_identifier(grant["role"])
+        await connection.execute(f"REVOKE ALL ON SCHEMA {namespace} FROM {principal} CASCADE")
+    await connection.execute(f"REVOKE ALL ON SCHEMA {namespace} FROM PUBLIC")
+    if readers:
+        await connection.execute(f"GRANT USAGE ON SCHEMA {namespace} TO " + ",".join(readers))

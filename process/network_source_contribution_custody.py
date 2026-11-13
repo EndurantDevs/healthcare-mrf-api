@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Independently derive new source facts before sealing their reusable storage."""
+"""Independently derive and compare source facts before publication and reuse."""
 
 import hashlib
 import json
@@ -300,7 +300,7 @@ async def verify_independent_source_contributions(
     preservation=None,
     source_witness_runtime=None,
 ):
-    """Authenticate current Source facts and mappings before adding independently proved carry."""
+    """Compare current Source facts and mappings before adding independently checked carry."""
     expected = verify_registry_source_contributions(candidate)
     inventory = _inventory_source_metadata(candidate, inventory_entries)
     if inventory is not None and verify_registry_source_retention(candidate) is None:

@@ -196,29 +196,11 @@ class _RetainedObservations:
 
     @asynccontextmanager
     async def observers(self):
-        """Open a short authenticated SOURCE observation without ambient binding."""
-        from process.network_fhir_source_epoch_pin import _same_database, _virtual_xid
-
+        """Open a configured read-only SOURCE observation without ambient binding."""
         await self.verify_transaction()
         async with self.factory.observation_transaction(isolation="read committed") as session:
             connection = await native_driver(session)
-            policy = self.source_input._receipt()["policy"]
-            _require(connection is not self.driver and connection is not self.source_input.connection)
-            actor = await connection.fetchrow(
-                "SELECT session_user::text AS login,current_user::text AS actor,"
-                "current_setting('transaction_read_only') AS read_only,"
-                "current_setting('transaction_isolation') AS isolation"
-            )
-            _require(
-                dict(actor)
-                == dict(
-                    login=policy.publisher_role, actor=policy.owner_role, read_only="on", isolation="read committed"
-                )
-            )
-            await _same_database(connection, self.driver)
-            transaction = await _virtual_xid(connection)
             yield _Observers(self, ConnectionProxy(None, session, connection))
-            _require(await _virtual_xid(connection) == transaction)
             await self.verify_transaction()
         await self.verify_transaction()
 

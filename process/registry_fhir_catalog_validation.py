@@ -157,7 +157,7 @@ def _source_descriptor(document):
         "profile",
         "endpoint_id",
         "dataset_sha256",
-        "resource_table_oid",
+        "tables",
         "source_uri",
         "accepted_receipt_id",
         "accepted_receipt_sha256",
@@ -187,8 +187,14 @@ def _source_descriptor(document):
         _digest(document[field])
     if document["previous_dataset_id"] is not None:
         catalog_text(document["previous_dataset_id"], 128)
-    if type(document["resource_table_oid"]) is not int or not 0 < document["resource_table_oid"] <= 4294967295:
+    tables = document["tables"]
+    if type(tables) is not dict or set(tables) != {"header", "resource"}:
         _invalid("source_invalid")
+    for relation in tables.values():
+        if type(relation) is not dict or set(relation) != {"schema", "name"}:
+            _invalid("source_invalid")
+        storage_identifier(relation["schema"])
+        storage_identifier(relation["name"])
     if document["source_uri"] is None:
         if document["profile"] != "retained_normalized":
             _invalid("source_invalid")
@@ -375,29 +381,6 @@ def _page_query(namespace, table, after, source_generation=None):
 
 
 async def _table_digest(connection, namespace, table, source_generation=None):
-    native_keys = await connection.fetchval(
-        """SELECT jsonb_agg(jsonb_build_array(a.attname,CASE op.opcname
-          WHEN 'int4_ops' THEN 'integer' WHEN 'uuid_ops' THEN 'uuid' ELSE 'text' END)
-          ORDER BY key.ordinal)::text
-        FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class ix ON ix.oid=i.indexrelid
-        JOIN pg_catalog.pg_am am ON am.oid=ix.relam AND am.amname='btree'
-        CROSS JOIN LATERAL unnest(i.indkey::smallint[]) WITH ORDINALITY key(attnum,ordinal)
-        JOIN pg_catalog.pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=key.attnum
-        JOIN pg_catalog.pg_opclass op ON op.oid=i.indclass[(key.ordinal-1)::integer]
-        WHERE i.indrelid=pg_catalog.to_regclass($1) AND i.indisprimary AND i.indisunique
-          AND i.indisvalid AND i.indisready AND i.indislive AND i.indimmediate
-          AND i.indnkeyatts=i.indnatts AND i.indexprs IS NULL AND i.indpred IS NULL
-          AND a.attnotnull AND NOT a.attisdropped AND op.opcnamespace='pg_catalog'::regnamespace
-          AND op.opcmethod=am.oid AND op.opcname IN ('text_ops','int4_ops','uuid_ops')
-          AND (a.atttypid=op.opcintype
-            OR a.atttypid='pg_catalog.varchar'::regtype AND op.opcintype='pg_catalog.text'::regtype)
-          AND i.indcollation[(key.ordinal-1)::integer]=a.attcollation
-          AND (a.attcollation=0 OR a.attcollation='pg_catalog."C"'::regcollation)
-        GROUP BY i.indexrelid,i.indnkeyatts HAVING count(*)=i.indnkeyatts""",
-        namespace + "." + table,
-    )
-    if native_keys is None or json.loads(native_keys) != [list(key) for key in _KEYS[table]]:
-        _invalid("validation_key_invalid")
     digest, count, batches, byte_count, after_keys = hashlib.sha256(), 0, 0, 0, None
     while True:
         sql, parameters = _page_query(namespace, table, after_keys, source_generation)
@@ -408,12 +391,15 @@ async def _table_digest(connection, namespace, table, source_generation=None):
         for entry in entries:
             if entry["document"] is None or entry["row_bytes"] > PAGE_BYTES:
                 _invalid("validation_bounds")
+            entry_keys = tuple(entry[name] for name, _ in _KEYS[table])
+            if after_keys is not None and entry_keys <= after_keys:
+                _invalid("validation_order_invalid")
+            after_keys = entry_keys
             document = json.loads(entry["document"])
             _validate_document(table, document)
             digest.update(canonical_json(document).encode() + b"\n")
             count += 1
             byte_count += entry["row_bytes"]
-        after_keys = tuple(entries[-1][name] for name, _ in _KEYS[table])
     return {"rows": count, "sha256": digest.hexdigest(), "batches": batches, "bytes": byte_count}
 
 
@@ -795,9 +781,9 @@ async def validate_fhir_catalog_candidate(connection, copy_target, snapshot, *, 
 
 
 def verify_fhir_catalog_validation(snapshot, validation):
-    """Verify the retained input/content attestation without scanning sealed heaps."""
+    """Check the retained logical inputs and complete content accounting."""
     if type(validation) is not dict or set(validation) != {"metadata_generation", "inputs", "tables", "content_sha256"}:
-        _invalid("custody_invalid")
+        _invalid("validation_invalid")
     generation = metadata_generation(snapshot)
     if (
         snapshot["metadata_generation"] != generation
@@ -807,17 +793,17 @@ def verify_fhir_catalog_validation(snapshot, validation):
         _invalid("inputs_changed")
     tables = validation["tables"]
     if type(tables) is not dict or set(tables) != set(_KEYS):
-        _invalid("custody_invalid")
+        _invalid("validation_invalid")
     for report in tables.values():
         if type(report) is not dict or set(report) != {"rows", "sha256", "batches", "bytes"}:
-            _invalid("custody_invalid")
+            _invalid("validation_invalid")
         _digest(report["sha256"])
         if any(type(report[field]) is not int or report[field] < 0 for field in ("rows", "batches", "bytes")):
-            _invalid("custody_invalid")
+            _invalid("validation_invalid")
         if not (report["rows"] >= report["batches"] >= bool(report["rows"])):
-            _invalid("custody_invalid")
+            _invalid("validation_invalid")
     if validation["content_sha256"] != _content_digest(tables):
-        _invalid("custody_invalid")
+        _invalid("validation_invalid")
     accounting = snapshot.get("accounting_json")
     if type(accounting) is str:
         accounting = json.loads(accounting)

@@ -584,7 +584,7 @@ async def test_registry_scope_refuses_foreign_epoch_and_never_leaks_after_failur
                 epoch = case.pair.recipe.source_pin.retained_epoch
                 with pytest.raises(ValueError, match="publication_invalid"):
                     await runtime.require_registry_epoch_transaction(
-                        case.driver, case.pair.request.source_pin, replace(epoch, schema_oid=epoch.schema_oid + 1)
+                        case.driver, case.pair.request.source_pin, replace(epoch, content_sha256="0" * 64)
                     )
                 raise RuntimeError("synthetic callback")
         assert runtime._REGISTRY_PUBLICATION.get() is None

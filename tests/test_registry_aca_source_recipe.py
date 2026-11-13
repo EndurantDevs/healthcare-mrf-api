@@ -961,7 +961,7 @@ async def test_batch_wire_rejects_malformed_or_substituted_shared_capture(monkey
 @pytest.mark.asyncio
 async def test_singleton_wire_stays_exact_and_mixed_batches_remain_complete(monkeypatch):
     from process import registry_source_recipe_store as codec
-    from tests.test_registry_source_recipe_store_postgres import _example
+    from tests.registry_source_recipe_support import _example
 
     prepared, validation = await _prepared(monkeypatch)
     singleton = producer._recipe(prepared, validation, _ROLES)

@@ -22,7 +22,11 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture
-async def heartbeat_worker(serving_schema):
+async def heartbeat_worker(serving_schema, monkeypatch):
+    from directory_membership_test_support import prepare_registry_catalog_foundation
+
+    from tests.test_network_compact_publication_postgres import _cleanup_named_preparations
+
     connection, schema, engine = serving_schema
     role_names_by_kind = {
         kind: "heartbeat_" + kind + "_" + uuid4().hex for kind in ("api", "lifecycle", "execution", "queue", "physical")
@@ -32,7 +36,17 @@ async def heartbeat_worker(serving_schema):
     draft_record = await _draft(engine, schema, _create(), actor)
     command = await _command(connection, schema, draft_record)
     created_role_names = []
+    stack = AsyncExitStack()
+    foundation = SimpleNamespace(
+        connection=connection,
+        engine=engine,
+        control_schema=schema,
+        preparation_ids=[],
+        created_control_namespaces=[],
+    )
+    stack.push_async_callback(_cleanup_named_preparations, foundation)
     try:
+        await prepare_registry_catalog_foundation(foundation, monkeypatch)
         for kind, role in role_names_by_kind.items():
             created_role_names.append(role)
             options = f" LOGIN PASSWORD '{password}'" if kind in {"api", "lifecycle", "execution"} else " NOLOGIN"
@@ -57,13 +71,16 @@ async def heartbeat_worker(serving_schema):
             connection=connection, schema=schema, config=config, password=password, actor=actor, command=command
         )
     finally:
-        await connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-        for role in reversed(created_role_names):
-            await connection.execute(f'DROP OWNED BY "{role}"')
-            await connection.execute(f'DROP ROLE "{role}"')
-        assert not await connection.fetchval(
-            "SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=ANY($1::text[]))", created_role_names
-        )
+        try:
+            await connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+            for role in reversed(created_role_names):
+                await connection.execute(f'DROP OWNED BY "{role}"')
+                await connection.execute(f'DROP ROLE "{role}"')
+            assert not await connection.fetchval(
+                "SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=ANY($1::text[]))", created_role_names
+            )
+        finally:
+            await stack.aclose()
 
 
 @asynccontextmanager

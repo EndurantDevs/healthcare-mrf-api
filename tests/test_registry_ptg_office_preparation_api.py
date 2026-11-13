@@ -289,10 +289,14 @@ async def test_internal_physical_service_reauthorizes_source_and_generated_offic
     _, _, source_document = _fixture()
     source_command = source_document["command"]
     manifest_by_field = {"command": command, "command_sha256": capture._digest(command)}
-    descriptor = SimpleNamespace(
-        manifest_json=capture._canonical(manifest_by_field), manifest_sha256=capture._digest(manifest_by_field)
-    )
-    _capture_boundaries(monkeypatch, descriptor, calls)
+    descriptor_by_field = {
+        "capture_id": envelope()["selector"]["capture_id"],
+        "state": "handed_off",
+        "command": command,
+        "command_sha256": capture._digest(command),
+        "manifest_sha256": capture._digest(manifest_by_field),
+    }
+    _capture_boundaries(monkeypatch, descriptor_by_field, calls)
     monkeypatch.setattr(producer_service, "_source_context", AsyncMock(return_value=(object(), source_command)))
 
     def authorize(authority, document, **kwargs):

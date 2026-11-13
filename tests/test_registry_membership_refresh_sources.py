@@ -97,22 +97,22 @@ def test_source_readers_and_head_fences_cannot_share_a_connection_pool(source_fa
         fences.RegistryMembershipRefreshHeadFences(aca_sessions=sessions, generic_sessions=sessions)
 
 
-def test_generic_fence_requires_a_separate_principal_even_with_separate_pools(source_factories):
+def test_generic_fence_uses_configured_access_with_independent_pools(source_factories):
     reader, head = source_factories(), source_factories()
-    with pytest.raises(RegistryRefreshAnchorUnavailable, match="source_reader_invalid"):
-        sources.RegistryMembershipRefreshSourceReaders(
-            "control", reader, head_fences=fences.RegistryMembershipRefreshHeadFences(generic_sessions=head)
-        )
+    result = sources.RegistryMembershipRefreshSourceReaders(
+        "control", reader, head_fences=fences.RegistryMembershipRefreshHeadFences(generic_sessions=head)
+    )
+    assert result.source_reader_sessions is reader and result.head_fences.generic_sessions is head
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("target", ["shared", "different_database"])
-async def test_source_snapshot_refuses_shared_pool_or_different_database(source_factories, target):
+async def test_source_snapshot_requires_pool_capacity_for_independent_snapshot(source_factories):
     outer = source_factories()
-    child = outer if target == "shared" else source_factories(database="other_contract")
+    child = source_factories(database="copied_snapshot")
     async with outer() as session:
         with pytest.raises(RegistryRefreshAnchorUnavailable, match="source_fence_unavailable"):
-            fences._same_database(session, child)
+            fences._independent_reader(session, outer)
+        fences._independent_reader(session, child)
 
 
 def test_unretained_fhir_recipe_cannot_be_promoted_to_accepted_source():
@@ -182,29 +182,31 @@ async def test_busy_alias_fence_never_yields_or_unlocks_unowned_key(monkeypatch)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("same_identity", [False, True])
-async def test_aca_head_fence_refuses_foreign_database_or_missing_protected_owner(monkeypatch, same_identity):
-    owner = AsyncMock()
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=None))
-    identity = ("database", 7, "started")
-    monkeypatch.setattr(fences, "protected_publisher_owner", owner)
-    monkeypatch.setattr(
-        fences,
-        "_native_context",
-        AsyncMock(return_value=(connection, identity if same_identity else ("other", 8, "started"))),
+async def test_aca_head_fence_preserves_native_lock_error(monkeypatch):
+    error = PermissionError("ordinary lock denied")
+    session = SimpleNamespace(execute=AsyncMock(side_effect=[None, error]))
+
+    @asynccontextmanager
+    async def entered(*args, **kwargs):
+        yield session
+
+    session.begin = entered
+    readers = SimpleNamespace(
+        aca_store=SimpleNamespace(control_schema="control"), aca_head_fence_sessions=entered, aca_source_schema="source"
     )
-    readers = SimpleNamespace(aca_store=SimpleNamespace(control_schema="control"))
-    with pytest.raises(RegistryRefreshAnchorUnavailable, match="source_fence_unavailable"):
-        await fences._aca_lock_authority(object(), readers, identity)
-    owner.assert_awaited_once()
-    assert connection.fetchrow.await_count == int(same_identity)
+    monkeypatch.setattr(fences, "_company_approval_connection", entered)
+    with pytest.raises(PermissionError) as caught:
+        async with fences._aca_head_fence(readers, True):
+            pytest.fail("denied native lock yielded")
+    assert caught.value is error
+    assert "SHARE MODE NOWAIT" in str(session.execute.call_args.args[0])
 
 
 @pytest.mark.asyncio
 async def test_required_aca_fence_needs_an_installed_native_capability():
     readers = SimpleNamespace(aca_store=None, aca_head_fence_sessions=None)
     with pytest.raises(RegistryRefreshAnchorUnavailable, match="source_fence_unavailable"):
-        async with fences._aca_head_fence(readers, True, ("database", 7, "started")):
+        async with fences._aca_head_fence(readers, True):
             pytest.fail("unconfigured ACA fence yielded")
 
 
@@ -235,6 +237,100 @@ async def test_anchor_service_refuses_unconfigured_source_reader_and_budget(sour
         anchors.RegistryRefreshAnchorService(sessions, "control", read_budget=[1024, 1, 1])
     service = anchors.RegistryRefreshAnchorService(sessions, "control")
     with pytest.raises(RegistryRefreshAnchorUnavailable, match="source_reader_unconfigured"):
-        await service._read_source_anchors(
-            (), ApprovedMembershipSource(1, "a" * 64), (), RegistryPTGGraphReadBudget(1024)
-        )
+        await service._read_source_anchors((), ApprovedMembershipSource(1, "a" * 64), RegistryPTGGraphReadBudget(1024))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("matches", [False, True])
+async def test_anchor_reader_uses_exact_approved_fingerprint_without_database_packet(monkeypatch, matches):
+    approved = ApprovedMembershipSource(1, "a" * 64)
+    observed = approved if matches else ApprovedMembershipSource(1, "b" * 64)
+    session = SimpleNamespace(execute=AsyncMock())
+
+    @asynccontextmanager
+    async def entered(*args, **kwargs):
+        yield session
+
+    driver = object()
+    service = object.__new__(anchors.RegistryRefreshAnchorService)
+    object.__setattr__(service, "source_reader_sessions", entered)
+    object.__setattr__(service, "control_schema", "control")
+    monkeypatch.setattr(anchors, "_source_driver", AsyncMock(return_value=driver))
+    monkeypatch.setattr(anchors, "_current_pin", AsyncMock(return_value=observed))
+    derive = AsyncMock(return_value={"binding": "complete"})
+    monkeypatch.setattr(anchors, "_derive_sources", derive)
+    session.begin = entered
+    if matches:
+        assert await service._read_source_anchors(("binding",), approved, "budget") == {"binding": "complete"}
+        derive.assert_awaited_once_with(service, session, ("binding",), "budget")
+    else:
+        with pytest.raises(RegistryRefreshAnchorUnavailable, match="approved_fingerprint_mismatch"):
+            await service._read_source_anchors(("binding",), approved, "budget")
+        derive.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_source_driver_keeps_active_transaction_and_metadata_limits(monkeypatch):
+    from process import network_cms_registry_address_capture as native
+
+    session = SimpleNamespace(execute=AsyncMock())
+    connection = object()
+    expose = AsyncMock(return_value=connection)
+    monkeypatch.setattr(native, "native_driver", expose)
+    assert await anchors._source_driver(session) is connection
+    assert [str(call.args[0]) for call in session.execute.call_args_list] == [
+        "SET LOCAL statement_timeout='5s'",
+        "SET LOCAL lock_timeout='1s'",
+    ]
+    expose.assert_awaited_once_with(session)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current", [False, True])
+async def test_fresh_source_snapshot_checks_approved_data_and_releases_locks(monkeypatch, current):
+    approved = ApprovedMembershipSource(1, "a" * 64)
+    events = []
+    child = SimpleNamespace(execute=AsyncMock())
+    connection = SimpleNamespace(execution_options=AsyncMock())
+
+    @asynccontextmanager
+    async def sessions(*args, **kwargs):
+        yield child
+
+    @asynccontextmanager
+    async def snapshot(*args, **kwargs):
+        events.append("locks")
+        try:
+            yield connection
+        finally:
+            events.append("release")
+
+    child.begin = sessions
+    readers = SimpleNamespace(source_reader_sessions=sessions, control_schema="control")
+    monkeypatch.setattr(fences, "require_registry_company_approval_fence", AsyncMock())
+    monkeypatch.setattr(fences, "_independent_reader", lambda *args: None)
+    monkeypatch.setattr(fences, "_generic_endpoint_discovery", AsyncMock(return_value=()))
+    monkeypatch.setattr(fences, "_alias_snapshot_connection", snapshot)
+    monkeypatch.setattr(fences, "_aca_head_fence", snapshot)
+    from process import registry_membership_refresh_generic_fence as generic
+
+    monkeypatch.setattr(generic, "generic_refresh_head_fence", snapshot)
+    monkeypatch.setattr(fences, "native_driver", AsyncMock(return_value=object()))
+    pin = approved if current else ApprovedMembershipSource(1, "b" * 64)
+    monkeypatch.setattr(fences, "_current_pin", AsyncMock(return_value=pin))
+    if current:
+        async with fences.pinned_refresh_source_snapshot(object(), approved, readers, aca_required=False) as selected:
+            assert selected is child and events == ["locks"] * 3
+    else:
+        with pytest.raises(RegistryRefreshAnchorUnavailable):
+            async with fences.pinned_refresh_source_snapshot(object(), approved, readers, aca_required=False):
+                pytest.fail("changed approval fingerprint yielded")
+    assert events[-3:] == ["release"] * 3
+
+
+def test_copied_target_constructor_uses_logical_scope_without_connecting(source_factories):
+    outer = source_factories()
+    copied = source_factories(database="copied_snapshot")
+    service = anchors.RegistryRefreshAnchorService(outer, "control", copied)
+    assert service.source_reader_sessions is copied
+    assert outer.kw["bind"].pool.checkedout() == copied.kw["bind"].pool.checkedout() == 0

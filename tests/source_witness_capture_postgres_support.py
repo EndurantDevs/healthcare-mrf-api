@@ -16,9 +16,8 @@ import pytest
 
 from process import network_fhir_retained_capture as retained
 from process.registry_generic_accepted_capture import _admitted_summary, _current_header
-from tests import generic_source_successor_postgres_support as source
 
-SOURCE_PRODUCER_SHA256 = "0a09bf15a60cd4e3b6323d387f7b80fbbb0a3118713c08e75b9de2b07f69a71d"
+SOURCE_PRODUCER_SHA256 = "25a289da181b3706007411dca30c8e121bac966adbb462f008d614f495bb51cb"
 _RESOURCE_FIELDS = (
     "dataset_id",
     "resource_type",
@@ -59,51 +58,53 @@ async def _observed_source_descriptor(runtime, profile, candidate, catalog):
                 and row.endpoint_id == candidate.endpoint_id
             )
         assert len(descriptors) == 1
-        descriptor, identity = descriptors[0], export["database_identity"]
+        descriptor = descriptors[0]
+    snapshot_by_field = {key: descriptor[key] for key in ("coordinates", "dataset_sha256", "tables")}
+    return descriptor, snapshot_by_field
 
-    return descriptor, identity
 
-
-async def _reviewed_source_publication(runtime, profile, candidate, catalog, descriptor, identity):
+async def _reviewed_source_publication(runtime, profile, candidate, catalog, descriptor, snapshot_by_field):
     """Read original publication facts under the genuine Publisher, without creating Reader proof."""
+    from tests import generic_source_successor_postgres_support as source
+
     async with catalog._catalog_source_export_session(runtime, source_profile=profile) as scope:
-        assert await scope.connection.fetchval("SELECT session_user::text") == runtime.config.publisher_role
-        header = await _current_header(scope.connection, profile.schema_name, source.SOURCE, candidate.endpoint_id)
+        header_relation = descriptor["tables"]["header"]
+        assert snapshot_by_field == {key: descriptor[key] for key in ("coordinates", "dataset_sha256", "tables")}
+        header = await _current_header(
+            scope.connection, header_relation["schema"], source.SOURCE, candidate.endpoint_id
+        )
         head, summary, source_summary = _admitted_summary(header, profile.schema_name, source.SOURCE)
-        physical = await scope.connection.fetchrow(
+        metadata = await scope.connection.fetchrow(
             f"SELECT octet_length(publication_metadata_json::text)::bigint AS metadata_bytes,"
             "encode(sha256(convert_to(publication_metadata_json::text,'UTF8')),'hex') AS metadata_sha256 "
-            f'FROM "{profile.schema_name}".provider_directory_endpoint_dataset WHERE dataset_id=$1',
+            f'FROM "{header_relation["schema"]}"."{header_relation["name"]}" WHERE dataset_id=$1',
             candidate.dataset_id,
         )
         assert head.dataset_id == descriptor["coordinates"]["dataset_id"] == candidate.dataset_id
         assert head.endpoint_id == descriptor["endpoint_id"] == candidate.endpoint_id
         assert head.dataset_sha256 == descriptor["dataset_sha256"]
-        assert header["header_oid"] == descriptor["header_table_oid"]
-        assert scope.database_identity_by_field == identity
 
-    return head, summary, source_summary, physical
+    return head, summary, source_summary, metadata
 
 
 async def reviewed_source_origin(runtime, profile, candidate, catalog, producer):
-    """Derive all 25 inputs from actual Source observations; no Reader capture is consulted."""
-    descriptor, identity = await _observed_source_descriptor(runtime, profile, candidate, catalog)
-    head, summary, source_summary, physical = await _reviewed_source_publication(
-        runtime, profile, candidate, catalog, descriptor, identity
+    """Derive the complete named input from actual Source publication and content observations."""
+    descriptor, snapshot_by_field = await _observed_source_descriptor(runtime, profile, candidate, catalog)
+    head, summary, source_summary, metadata = await _reviewed_source_publication(
+        runtime, profile, candidate, catalog, descriptor, snapshot_by_field
     )
     counts = tuple(sorted(source_summary["resource_counts"].items()))
     declaration_by_field = {
-        "schema_name": profile.schema_name,
+        "schema_name": descriptor["tables"]["resource"]["schema"],
         "source_id": descriptor["coordinates"]["source_id"],
         "endpoint_id": head.endpoint_id,
         "dataset_id": head.dataset_id,
         "dataset_sha256": head.dataset_sha256,
         "root_run_id": head.root_run_id,
-        "header_oid": descriptor["header_table_oid"],
-        "resource_parent_oid": descriptor["resource_table_oid"],
-        "resource_leaf_oid": descriptor["resource_leaf_oids"][0],
-        "metadata_bytes": physical["metadata_bytes"],
-        "metadata_text_sha256": physical["metadata_sha256"],
+        "header_relation": descriptor["tables"]["header"],
+        "resource_relation": descriptor["tables"]["resource"],
+        "metadata_bytes": metadata["metadata_bytes"],
+        "metadata_text_sha256": metadata["metadata_sha256"],
         "summary_sha256": source_summary["summary_sha256"],
         "proof_sha256": head.proof_sha256,
         "resource_counts": counts,
@@ -115,11 +116,8 @@ async def reviewed_source_origin(runtime, profile, candidate, catalog, producer)
         "unresolved_plan_network_count": summary["dataset_network_plan"]["unresolved_reference_count"],
         "source_uri": descriptor["source_uri"],
         "source_aliases": tuple(descriptor["source_aliases"]),
-        "native_catalog_sha256": descriptor["native_catalog_sha256"],
-        "database_oid": identity["database_oid"],
-        "database_system_identifier": identity["system_identifier"],
     }
-    assert len(declaration_by_field) == 25 and set(declaration_by_field) == {
+    assert len(declaration_by_field) == 21 and set(declaration_by_field) == {
         field.name for field in fields(producer.FHIRSourceMembershipInput)
     }
     return producer.FHIRSourceMembershipInput(**declaration_by_field)
@@ -136,40 +134,47 @@ async def constructed_source_origin(source_export, profile, reviewed_origin):
         actual = export["origin"]
         assert type(actual) is type(reviewed_origin)
         assert asdict(actual) == asdict(reviewed_origin)
-        assert len(asdict(actual)) == 25
+        assert len(asdict(actual)) in {21, 23}
     return actual
 
 
 @asynccontextmanager
-async def source_witness_case(monkeypatch, *, legacy=False):
+async def source_witness_case(monkeypatch, *, legacy=False, named=False):
     """Use the existing owned native fixture and original capture Writer, without extra grants."""
     catalog, producer = source_modules()
+    from tests import generic_source_successor_postgres_support as source
+
     if legacy:
         from tests.source_witness_legacy_postgres_support import install_original_legacy_seed, reviewed_legacy_origin
 
         seeded = install_original_legacy_seed(monkeypatch)
-    async with source.native_generic_source(monkeypatch) as fixture, AsyncExitStack() as cleanup:
+    async with (
+        source.native_generic_source(monkeypatch, named=named and not legacy) as fixture,
+        AsyncExitStack() as cleanup,
+    ):
         old_capture = None if legacy else await source.publish_edition(fixture, 1)
-        profile = configure_original_runtime(fixture.component, monkeypatch)
+        if named and not legacy:
+            from process.registry_fhir_catalog_sources import FHIRCatalogSourceReadProfile
+
+            profile = FHIRCatalogSourceReadProfile(fixture.schema, fixture.schema)
+        else:
+            profile = configure_original_runtime(fixture.component, monkeypatch)
         source_export = await cleanup.enter_async_context(producer.membership_source_export_runtime())
         runtime = source_export.args[0]
-        assert runtime.config.publisher_role == fixture.component.publisher
+        expected_publisher = (
+            fixture.fixture.roles.publisher_role if named and not legacy else fixture.component.publisher
+        )
+        assert runtime.config.publisher_role == expected_publisher
         if legacy:
             assert seeded == [True]
             origin = await reviewed_legacy_origin(runtime, profile, catalog, producer)
         else:
-            origin = await reviewed_source_origin(runtime, profile, fixture.candidates[-1], catalog, producer)
+            with monkeypatch.context() as selected:
+                if named:
+                    selected.setattr(source, "SOURCE", old_capture.origin.source_id)
+                origin = await reviewed_source_origin(runtime, profile, fixture.candidates[-1], catalog, producer)
         constructed = await constructed_source_origin(source_export, profile, origin)
-        connections_by_kind = {}
-        for kind, role in (("writer", fixture.component.retained_publisher), ("reader", fixture.component.reader)):
-            connection = await asyncpg.connect(
-                fixture.component.admin_engine.url.set(drivername="postgresql", username=role).render_as_string(
-                    hide_password=False
-                )
-            )
-            cleanup.push_async_callback(connection.close)
-            assert await connection.fetchval("SELECT session_user::text") == role
-            connections_by_kind[kind] = connection
+        connections_by_kind = await _source_witness_connections(fixture, cleanup, administrator=named)
         case = SimpleNamespace(
             fixture=fixture,
             origin=origin,
@@ -182,9 +187,43 @@ async def source_witness_case(monkeypatch, *, legacy=False):
             anchors_by_id={},
             **connections_by_kind,
         )
+        if named:
+            case.application_roles = _source_witness_application_roles(fixture, legacy=legacy)
         yield case
         assert fixture.commits == [candidate.dataset_id for candidate in fixture.candidates]
         assert fixture.source_writer_rejections == fixture.commits
+
+
+async def _source_witness_connections(fixture, cleanup, *, administrator):
+    connections_by_kind = {}
+    for kind, role in (("writer", fixture.component.retained_publisher), ("reader", fixture.component.reader)):
+        if kind == "writer" and administrator:
+            connections_by_kind[kind] = fixture.admin
+            continue
+        connection = await asyncpg.connect(
+            fixture.component.admin_engine.url.set(drivername="postgresql", username=role).render_as_string(
+                hide_password=False
+            )
+        )
+        cleanup.push_async_callback(connection.close)
+        connections_by_kind[kind] = connection
+    return connections_by_kind
+
+
+def _source_witness_application_roles(fixture, *, legacy):
+    policy = fixture.component.policy if legacy else fixture.issued.policy
+    return tuple(
+        sorted(
+            {
+                policy.owner_role,
+                policy.publisher_role,
+                *policy.runtime_roles,
+                *policy.control_runtime_roles,
+                fixture.component.retained_publisher,
+            }
+            - {fixture.role_by_kind["owner"]}
+        )
+    )
 
 
 def capture_arguments(case):
@@ -218,7 +257,9 @@ async def capture_retained_source_for_roles(case, runtime_roles):
             capture_id=identity,
             owner_role=case.fixture.role_by_kind["owner"],
             runtime_roles=runtime_roles,
-            source_policy=case.fixture.component.policy,
+            source_policy=case.fixture.issued.policy
+            if getattr(case.fixture, "named", False)
+            else case.fixture.component.policy,
         )
 
 
@@ -232,7 +273,7 @@ async def source_scope(export):
         if type(cell.cell_contents) is SourceExportScope
     ]
     assert len(matches) == 1
-    await matches[0].verify()
+    assert matches[0].is_active
     return matches[0]
 
 

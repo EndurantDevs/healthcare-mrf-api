@@ -29,7 +29,7 @@ from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
-from tests.network_read_execution_support import with_read_identity_receipts
+from tests.network_read_execution_support import with_read_session
 from tests.provider_network_read_support import approved_record_relation
 from tests.test_network_catalog_routes import v2_envelope
 from tests.test_provider_collection_network_read import boundary as boundary
@@ -405,7 +405,7 @@ async def test_retained_scope_generation_resolves_its_committed_pair_as_an_api_r
 @pytest.mark.parametrize("kind", ["medical-groups", "sites"])
 async def test_doctors_default_stays_public_on_same_snapshot(directory_boundary, monkeypatch, kind):
     held = directory_boundary
-    with_read_identity_receipts(held.session, driver=held.driver)
+    with_read_session(held.session, driver=held.driver)
     held.driver = held.session.connection.return_value.get_raw_connection.return_value.driver_connection
 
     async def execute(statement, parameters=None):

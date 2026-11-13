@@ -1,19 +1,20 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """ZIP setup guards original-session results; Source authority leaves are doubles."""
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from uuid import UUID
 
 import pytest
-from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
 
-from api import network_read_execution as execution
 from api import plan_pricing_code_build as build
 from api import plan_pricing_code_read as reads
+from api import ptg_membership_storage as membership
 from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
-from process.network_read_identity import _BOUND_NAMES_SQL
+from process.network_compact_layout import CompactAddressRelation
 from tests.test_plan_pricing_code_projection import _selection
 from tests.test_plan_pricing_code_zip import _params, _scope, _zip_identity
 
@@ -21,15 +22,11 @@ from tests.test_plan_pricing_code_zip import _params, _scope, _zip_identity
 class _Result:
     def __init__(self, session, value, *, metadata=False):
         self.session, self.value, self.closed = session, value, False
-        self.before_guard, self.field_reads = session.guards, 0
-        self.before_context, self.metadata = session.acquisitions, metadata
+        self.field_reads = 0
         self.scalars = lambda: SimpleNamespace(all=self._checked)
         self.mappings = self._checked
 
     def _checked(self):
-        assert (
-            self.session.guards > self.before_guard or self.metadata and self.session.acquisitions > self.before_context
-        )
         self.field_reads += 1
         return self.value
 
@@ -47,57 +44,33 @@ class _Result:
 
 class _Driver:
     def __init__(self, session):
-        self.session, self.pid, self.active = session, 42, True
+        self.session, self.active = session, True
         self.modes = "repeatable read", "on"
 
-    def get_server_pid(self):
-        return self.pid
-
-    def is_in_transaction(self):
-        return self.active
-
     async def fetchrow(self, sql, *parameters):
-        if "current_setting('transaction_isolation')" in sql:
-            if self.session.on_modes is not None:
-                self.session.on_modes(self.session)
-            return self.modes
-        assert sql == _BOUND_NAMES_SQL
-        names, oids, pid = parameters
-        self.session.guards += 1
-        return {
-            "backend_matches": self.pid == pid,
-            "relation_count": len(names),
-            "valid": all(self.session.current.get(name) == oid for name, oid in zip(names, oids)),
-        }
+        assert "current_setting('transaction_isolation')" in sql
+        if self.session.on_modes is not None:
+            self.session.on_modes(self.session)
+        return self.modes
 
     async def fetch(self, sql, schemas, names):
         assert "FROM ROWS FROM (pg_catalog.unnest(" in sql
-        catalog_rows = []
-        for ordinal, (schema, name) in enumerate(zip(schemas, names), 100):
-            oid = None if name in self.session.absent else ordinal
-            catalog_rows.append(
-                {
-                    "schema_name": schema,
-                    "table_name": name,
-                    "oid": oid,
-                    "relkind": None if oid is None else self.session.kinds.get(name, "r"),
-                    "inherited": name in self.session.inherited,
-                    "readable": True,
-                }
-            )
-            if oid is not None:
-                self.session.current[f'"{schema}"."{name}"'] = oid
+        assert "AS available" in sql and "oid" not in sql
+        rows = [
+            {"schema_name": schema, "table_name": name, "available": name not in self.session.absent}
+            for schema, name in zip(schemas, names)
+        ]
         if self.session.on_catalog is not None:
             self.session.on_catalog(self.session)
-        return catalog_rows
+        return rows
 
 
 class _Session:
     def __init__(self):
-        self.info, self.current = {"unrelated": "preserved"}, {}
-        self.transaction, self.driver, self.guards = object(), _Driver(self), 0
+        self.info = {"unrelated": "preserved"}
+        self.transaction, self.driver = object(), _Driver(self)
         self.acquisitions = 0
-        self.absent, self.inherited, self.kinds = set(), set(), {}
+        self.absent = set()
         self.results, self.events, self.aggregate_rows = [], [], []
         self.local_source, self.attachment, self.on_query = False, True, None
         self.on_modes, self.on_catalog = None, None
@@ -163,6 +136,8 @@ def _source_leaves(monkeypatch, session, *, failure=None):
         reader.info["private-source-cache"] = "temporary"
         (await reader.execute(text("SELECT zip_api_binding"))).scalar_one()
         if failure:
+            if isinstance(failure, BaseException):
+                raise failure
             raise ValueError("original Source refusal")
         return tables, ("published-shared-generation", 1, "coverage", parameters["plan_id"], parameters["market_type"])
 
@@ -174,23 +149,29 @@ def _source_leaves(monkeypatch, session, *, failure=None):
     async def code_rows(reader, _tables, _arguments):
         return (await reader.execute(text("SELECT zip_api_code_rows"))).all()
 
-    async def membership(actual_session, _identity, *, api_read):
+    async def membership_lookup(actual_session, identity, *, api_read):
         assert actual_session is session and api_read is True
         session.events.append("membership")
-        return (object(),)
+        projection = membership.digest(identity)
+        schema = membership.native.reference_family_stage_schema(UUID(int=1))
+        header_by_field = {
+            "identity": identity,
+            "content_digest": "b" * 64,
+            "counts": {"code_coverage": [{"code_key": 1, "occurrence_count": 3}]},
+        }
+        return (
+            CompactAddressRelation(schema, "ptg_membership_manifest"),
+            header_by_field,
+            None,
+            CompactAddressRelation("hp_snapshot_retention", membership._attachment_for_digest(projection)),
+            {"owner_type": membership.CONTRACT, "owner_id": projection, "snapshot_id": identity["snapshot_id"]},
+        )
 
-    member_by_key = {
-        "code_coverage": [{"code_key": 1, "occurrence_count": 3}],
-        "projection_id": "a" * 64,
-        "content_digest": "b" * 64,
-        "active_attachment": {"name": "pm_" + "a" * 52, "relation_oid": 1001},
-        "storage": {"schema_oid": 2},
-    }
     monkeypatch.setattr(build, "binding_source", binding)
     monkeypatch.setattr(build, "source_identity", identity)
     monkeypatch.setattr(build, "load_sealed_code_rows", code_rows)
-    monkeypatch.setattr(build, "locate_membership", AsyncMock(side_effect=membership))
-    monkeypatch.setattr(build, "membership_receipt", lambda _found: member_by_key)
+    monkeypatch.setattr(build, "locate_membership", AsyncMock(side_effect=membership_lookup))
+    monkeypatch.setattr(build, "membership_receipt", membership.receipt)
 
 
 @pytest.mark.parametrize("modes", [("repeatable read", "on"), ("serializable", "on")])
@@ -207,7 +188,7 @@ async def test_api_input_identity_keeps_all_original_decoders_behind_real_sessio
     assert session.events == ["local-refusal", "binding", "identity", "membership", "code", "geo", "provider"]
     assert all(result.field_reads for result in session.results)
     assert "private-source-cache" not in session.info and session.info["unrelated"] == "preserved"
-    assert execution._installed_read_inventory(session) is not None
+    assert session.info == {"unrelated": "preserved"}
 
 
 @pytest.mark.parametrize("modes", [("read committed", "on"), ("repeatable read", "off")])
@@ -239,36 +220,20 @@ async def test_original_source_refusal_keeps_authority_and_info_private(monkeypa
     build.locate_membership.assert_not_awaited()
 
 
-@pytest.mark.parametrize("mutation", ["name", "driver", "transaction", "optional-present"])
-async def test_result_fields_stay_opaque_when_native_read_context_changes(monkeypatch, mutation):
+async def test_changed_transaction_refuses_the_complete_input_identity(monkeypatch):
     session = _Session()
-    session.absent = {"ptg2_v4_finalizer_map_root"}
     _source_leaves(monkeypatch, session)
-
-    def mutate(event, actual):
-        if event != "binding":
-            return
-        if mutation == "name":
-            actual.current[f'"{build.SCHEMA}"."npi"'] += 1
-        elif mutation == "driver":
-            actual.driver = _Driver(actual)
-        elif mutation == "transaction":
-            actual.transaction = object()
-        else:
-            actual.current[f'"{build.SCHEMA}"."ptg2_v4_finalizer_map_root"'] = 999
-
-    session.on_query = mutate
-    with pytest.raises(ServiceUnavailable):
+    session.on_query = lambda event, actual: setattr(actual, "transaction", object()) if event == "binding" else None
+    with pytest.raises(PlanPricingProjectionUnavailable, match="transaction changed"):
         await build.resolve_inputs(session, _selection(), ("CPT", "27447"), api_read=True)
-    assert session.results[-1].closed and session.results[-1].field_reads == 0
     assert session.info == {"unrelated": "preserved"}
 
 
-async def test_api_setup_has_no_uninstalled_inventory_fallback():
+async def test_api_setup_refuses_unconfigured_named_source_relations():
     session = _Session()
     setup = build._CodeAPISetup(session)
-    with pytest.raises(PlanPricingProjectionUnavailable, match="inventory"):
-        await setup.scalar(text("SELECT zip_api_binding"))
+    with pytest.raises(PlanPricingProjectionUnavailable, match="routing is unavailable"):
+        setup.source_relation(build.SCHEMA, "npi")
     assert session.events == []
 
 
@@ -315,50 +280,39 @@ async def test_public_zip_route_activates_qualified_plain_inputs(monkeypatch):
     locks.assert_not_awaited()
 
 
-@pytest.mark.parametrize("route", ["partitioned", "inherited", "local", "read_committed"])
-async def test_public_zip_route_preserves_existing_unqualified_reader(monkeypatch, route):
+@pytest.mark.parametrize("route", ["local", "read_committed"])
+async def test_public_zip_route_refuses_unqualified_inputs_without_legacy_fallback(monkeypatch, route):
     session = _Session()
-    if route == "partitioned":
-        session.kinds["ptg2_v3_code"] = "p"
-    elif route == "inherited":
-        session.inherited.add("ptg2_v3_code")
-    elif route == "local":
-        session.local_source = True
-    else:
+    session.local_source = route == "local"
+    if route == "read_committed":
         session.driver.modes = "read committed", "on"
-    inputs = AsyncMock(return_value=(_zip_identity(), []))
-    locate, locks = AsyncMock(return_value=(SimpleNamespace(schema_name="synthetic"),)), AsyncMock()
-    monkeypatch.setattr(build, "resolve_inputs", inputs)
+    _source_leaves(monkeypatch, session)
+    locate, locks = AsyncMock(), AsyncMock()
     monkeypatch.setattr(reads, "locate", locate)
     monkeypatch.setattr(reads, "_lock_provider_relations", locks)
-    capability = await reads.resolve_code_pricing(
-        session, _selection(), {**_params(expected=False), "include_providers": "false"}
-    )
-    assert capability.api_read is False
-    inputs.assert_awaited_once_with(
-        session,
-        _selection(),
-        ("CPT", "27447"),
-        scope={key: value for key, value in _scope().items() if key != "geo_cells"},
-    )
-    locate.assert_awaited_once_with(session, _zip_identity())
-    locks.assert_awaited_once_with(session)
+    with pytest.raises(PlanPricingProjectionUnavailable):
+        await reads.resolve_code_pricing(
+            session, _selection(), {**_params(expected=False), "include_providers": "false"}
+        )
+    locate.assert_not_awaited()
+    locks.assert_not_awaited()
     assert session.info == {"unrelated": "preserved"}
 
 
 async def test_api_route_drift_does_not_become_a_legacy_fallback(monkeypatch):
     session = _Session()
+    _source_leaves(monkeypatch, session)
     session.on_query = lambda event, actual: (
         setattr(actual, "transaction", object()) if event == "local-refusal" else None
     )
     locks = AsyncMock()
     monkeypatch.setattr(reads, "_lock_provider_relations", locks)
-    with pytest.raises(ServiceUnavailable):
+    with pytest.raises(PlanPricingProjectionUnavailable, match="transaction changed"):
         await reads.resolve_code_pricing(
             session, _selection(), {**_params(expected=False), "include_providers": "false"}
         )
     locks.assert_not_awaited()
-    assert session.results[-1].closed and session.results[-1].field_reads == 0
+    assert session.info == {"unrelated": "preserved"}
 
 
 @pytest.mark.parametrize("stage", ["modes", "catalog"])
@@ -367,32 +321,19 @@ async def test_ineligible_metadata_cannot_hide_original_transaction_drift(monkey
     if stage == "modes":
         session.driver.modes = "read committed", "on"
     else:
-        session.kinds["ptg2_v3_code"] = "p"
+        session.absent.add("npi")
     setattr(session, "on_" + stage, lambda actual: setattr(actual, "transaction", object()))
-    locks = AsyncMock()
-    monkeypatch.setattr(reads, "_lock_provider_relations", locks)
     with pytest.raises(PlanPricingProjectionUnavailable, match="transaction changed"):
-        await reads.resolve_code_pricing(
-            session, _selection(), {**_params(expected=False), "include_providers": "false"}
-        )
-    locks.assert_not_awaited()
-    assert session.events == ["attachment"] and session.info == {"unrelated": "preserved"}
+        await build.can_read_code_api(session, _selection())
+    assert session.events == [] and session.info == {"unrelated": "preserved"}
 
 
 @pytest.mark.parametrize("present", [False, True])
-@pytest.mark.parametrize("mutation", ["transaction", "driver"])
 @pytest.mark.parametrize("api_read", [None, True])
-async def test_attachment_discovery_drift_cannot_fallback_or_establish_a_new_baseline(
-    monkeypatch, present, mutation, api_read
-):
+async def test_attachment_discovery_drift_cannot_fallback_or_establish_a_new_baseline(monkeypatch, present, api_read):
     session = _Session()
     session.attachment = present
-
-    def mutate(event, actual):
-        assert event == "attachment"
-        setattr(actual, mutation, object() if mutation == "transaction" else _Driver(actual))
-
-    session.on_query = mutate
+    session.on_query = lambda event, actual: setattr(actual, "transaction", object())
     locks, inputs = AsyncMock(), AsyncMock()
     monkeypatch.setattr(reads, "_lock_provider_relations", locks)
     monkeypatch.setattr(build, "resolve_inputs", inputs)
@@ -402,11 +343,10 @@ async def test_attachment_discovery_drift_cannot_fallback_or_establish_a_new_bas
         )
     locks.assert_not_awaited()
     inputs.assert_not_awaited()
-    assert session.events == ["attachment"]
-    assert session.results[0].closed and session.results[0].field_reads == 0
+    assert session.events == ["attachment"] and session.results[0].closed and session.results[0].field_reads == 0
 
 
-async def test_setup_helpers_keep_the_original_transaction_and_physical_connection():
+async def test_setup_helpers_borrow_the_configured_session_transaction():
     session = _Session()
     setup = build._CodeAPISetup(session)
     assert setup.original_read_session is session
@@ -426,7 +366,7 @@ async def test_session_without_native_transaction_interface_declines_api_without
 
 
 @pytest.mark.parametrize("damage", ["missing", "duplicate", "order"])
-async def test_fixed_input_census_cannot_be_partial_duplicated_or_reordered(monkeypatch, damage):
+async def test_fixed_named_input_inventory_cannot_be_partial_duplicated_or_reordered(monkeypatch, damage):
     session = _Session()
     original = session.driver.fetch
 
@@ -440,7 +380,7 @@ async def test_fixed_input_census_cannot_be_partial_duplicated_or_reordered(monk
 
     monkeypatch.setattr(session.driver, "fetch", fetch)
     with pytest.raises(PlanPricingProjectionUnavailable, match="inventory differs"):
-        await build.can_read_code_api(session, _selection())
+        await build._api_input_inventory(session, session.driver)
     assert session.events == [] and session.info == {"unrelated": "preserved"}
 
 
@@ -452,36 +392,41 @@ async def test_nonboolean_api_mode_is_refused_before_reading_any_source(api_read
     assert session.events == [] and session.acquisitions == 0
 
 
-@pytest.mark.parametrize("source_kind", ["v", "m", "f"])
-async def test_unsupported_source_relation_never_enters_the_api_source_helpers(source_kind):
+async def test_ineligible_selection_preserves_captured_names_and_private_session_info():
     session = _Session()
-    session.kinds["ptg2_v3_code"] = source_kind
-    assert await build.can_read_code_api(session, _selection()) is False
-    assert session.events == [] and session.info == {"unrelated": "preserved"}
-
-
-async def test_legacy_selection_restores_the_existing_inventory_instead_of_replacing_it():
-    session = _Session()
-    await build._api_input_inventory(session, session.driver)
-    previous = session.info[execution._SESSION_INVENTORY_KEY]
+    names = await build._api_input_inventory(session, session.driver)
+    original_names = set(names)
     session.local_source = True
     assert await build.can_read_code_api(session, _selection()) is False
-    assert session.info[execution._SESSION_INVENTORY_KEY] is previous
-    assert session.info["unrelated"] == "preserved"
+    assert names == original_names and session.info == {"unrelated": "preserved"}
     assert session.events == ["local-refusal"]
 
 
-async def test_api_page_guards_geo_and_real_aggregate_decoder(monkeypatch):
+async def test_api_page_preserves_zip_scope_and_the_real_aggregate_decoder(monkeypatch):
+    from api import plan_pricing_code_storage as storage
     from api import plan_pricing_projection_read as projection
     from api.plan_pricing_projection_contract import code_projection_scope
     from tests import test_plan_pricing_projection_v3_read as packs
 
     session = _Session()
-    async with build._api_input_reader(session, _selection()) as setup:
-        assert setup.original_read_session is session
-    capability = reads.CodePricingCapability(
-        _zip_identity(), (SimpleNamespace(schema_name="synthetic"),), api_read=True
+    _source_leaves(monkeypatch, session)
+    identity, _inputs = await build.resolve_inputs(
+        session,
+        _selection(),
+        ("CPT", "27447"),
+        scope={key: scope_value for key, scope_value in _scope().items() if key != "geo_cells"},
+        api_read=True,
     )
+    key = storage.identity_digest(identity)
+    schema = membership.native.reference_family_stage_schema(UUID(int=2))
+    found = (
+        CompactAddressRelation(schema, "plan_pricing_code_manifest"),
+        {"identity": identity, "content_digest": "b" * 64, "counts": {}},
+        key,
+        CompactAddressRelation("hp_snapshot_retention", storage.attachment_name(identity)),
+    )
+    capability = reads.CodePricingCapability(identity, found, api_read=True)
+    assert storage.receipt(found)["projection_id"] == capability.projection_id
     monkeypatch.setattr(packs, "PROJECTION_ID", capability.projection_id)
     session.aggregate_rows = [packs._pack_row(packs._record("48104"), packs._record("48105"))]
     request = projection._ProjectionRequest(
@@ -494,4 +439,45 @@ async def test_api_page_guards_geo_and_real_aggregate_decoder(monkeypatch):
         )
     assert response["pagination"]["total"] == 2
     assert session.events[-2:] == ["geo", "aggregate"]
-    assert all(result.field_reads for result in session.results)
+    assert all(query_result.field_reads for query_result in session.results)
+
+
+async def test_optional_named_source_inputs_remain_scoped_to_the_captured_inventory():
+    from api.ptg2_tables import PTG2_SCHEMA
+
+    session = _Session()
+    session.absent.add("ptg2_v4_finalizer_map_root")
+    names = await build._api_input_inventory(session, session.driver)
+    setup = build._CodeAPISetup(session, names)
+    session.absent.clear()
+    with pytest.raises(PlanPricingProjectionUnavailable, match="routing is unavailable"):
+        setup.source_relation(PTG2_SCHEMA, "ptg2_v4_finalizer_map_root")
+    assert setup.source_relation(PTG2_SCHEMA, "ptg2_snapshot") == f'"{PTG2_SCHEMA}"."ptg2_snapshot"'
+
+
+@pytest.mark.parametrize("failure", [ValueError("Source refused"), asyncio.CancelledError()])
+async def test_original_failure_and_cancellation_survive_transaction_drift(monkeypatch, failure):
+    session = _Session()
+    _source_leaves(monkeypatch, session, failure=failure)
+    session.on_query = lambda event, actual: setattr(actual, "transaction", object()) if event == "binding" else None
+    with pytest.raises(type(failure)) as caught:
+        await build.resolve_inputs(session, _selection(), ("CPT", "27447"), api_read=True)
+    assert caught.value is failure
+    assert "transaction changed" in caught.value.__notes__[-1]
+    assert session.info == {"unrelated": "preserved"}
+
+
+@pytest.mark.parametrize("available", [None, 1, "true"])
+async def test_named_inventory_refuses_malformed_availability_without_selecting_legacy(monkeypatch, available):
+    session = _Session()
+    original = session.driver.fetch
+
+    async def fetch(*arguments):
+        rows = await original(*arguments)
+        rows[0]["available"] = available
+        return rows
+
+    monkeypatch.setattr(session.driver, "fetch", fetch)
+    with pytest.raises(PlanPricingProjectionUnavailable, match="inventory differs"):
+        await build.can_read_code_api(session, _selection())
+    assert session.events == []

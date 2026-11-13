@@ -6,6 +6,8 @@ import os
 import re
 from contextlib import AsyncExitStack, aclosing, asynccontextmanager
 from functools import partial
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -22,10 +24,12 @@ from process import provider_directory_generic_source_policy as source
 from process import provider_directory_source_local_publication as publication
 from process import registry_membership_refresh_runtime as runtime
 from process.network_cms_registry_address_capture import native_driver
-from process.network_fhir_retained_capture_contract import RetainedFHIRCaptureError
-from process.network_generic_source_published_snapshot import _require_source_actors
 from process.registry_company_approval_fence import registry_company_approval_transaction
-from process.registry_generic_accepted_capture import generic_fhir_capture_id, read_current_generic_fhir_input
+from process.registry_generic_accepted_capture import (
+    generic_fhir_capture_id,
+    read_current_generic_fhir_head,
+    read_current_generic_fhir_input,
+)
 from process.registry_generic_capture_continuation import RegistryGenericCaptureTarget
 from process.registry_membership_refresh_generic_fence import _TABLES
 from tests import generic_fhir_capture_postgres_support as retained
@@ -40,7 +44,6 @@ from tests.cms_registry_complete_publication_postgres_support import (
 from tests.generic_refresh_fence_postgres_support import fixed_factory
 from tests.nppes_candidate_postgres_support import composed_nppes_component
 from tests.provider_directory_source_postgres_support import source_component_database
-from tests.provider_profile_detail_load_postgres_support import _install_detail_tables
 from tests.test_registry_generic_fhir_reuse_postgres import _native_generic_offices
 from tests.test_registry_membership_refresh_generic_postgres import _approved_bindings
 
@@ -83,7 +86,7 @@ def _edition_rows(edition, dataset):
     for kind, key, normalized_by_field in resources:
         if kind == "Organization":
             normalized_by_field = canonical_organization_payload(normalized_by_field)
-        elif kind == "Practitioner":
+        if kind == "Practitioner":
             normalized_by_field = canonical_practitioner_payload({**normalized_by_field, "names": []})
         resource_rows.append(
             dict(
@@ -103,6 +106,8 @@ def _edition_rows(edition, dataset):
 
 async def publish_edition(fixture, edition):
     """Acquire with bounded native COPY, then use genuine admission and Source-local promotion."""
+    if getattr(fixture, "named", False):
+        return await _publish_named_edition(fixture, edition)
     database = fixture.component.database
     dataset = "generic-successor-edition-" + str(edition)
     resource_rows = _edition_rows(edition, dataset)
@@ -159,25 +164,26 @@ async def _drop_captures(fixture):
 
 
 async def _assert_source_writer_excluded(component, fixture, reader, writer, head):
-    """Reject the real Source Publisher as capture Writer without granting or changing roles."""
+    """Exercise real write refusal on the selected published payload under the application login."""
+    from sqlalchemy.exc import DBAPIError
+
     origin = await read_current_generic_fhir_input(
-        reader,
-        schema_name=head.schema_name,
-        source_id=head.source_id,
-        endpoint_id=head.endpoint_id,
+        reader, schema_name=fixture.schema, source_id=head.source_id, endpoint_id=head.endpoint_id
     )
-    await _require_source_actors(reader, writer, origin, component.policy)
-    async with component.database.engine.connect() as connection:
-        await connection.exec_driver_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        rejected = (await connection.get_raw_connection()).driver_connection
-        actor_by_field = await rejected.fetchrow(
-            "SELECT session_user::text AS login,current_user::text AS actor,current_setting('role') AS role,"
-            "pg_has_role(session_user,$1,'SET') AS source_owner_set",
-            component.policy.owner_role,
+    relation = origin.resource_relation
+    table = '"' + relation["schema"] + '"."' + relation["name"] + '"'
+    async with component.database.engine.begin() as connection:
+        assert await connection.scalar(text("SHOW transaction_read_only")) == "off"
+        statements = (
+            "UPDATE " + table + " SET payload_hash=payload_hash WHERE false",
+            "DELETE FROM " + table + " WHERE false",
+            "INSERT INTO " + table + " SELECT * FROM " + table + " WHERE false",
         )
-        assert tuple(actor_by_field) == (component.publisher, component.publisher, "none", True)
-        with pytest.raises(RetainedFHIRCaptureError):
-            await _require_source_actors(reader, rejected, origin, component.policy)
+        for statement in statements:
+            with pytest.raises(DBAPIError) as refused:
+                async with connection.begin_nested():
+                    await connection.execute(text(statement))
+            assert refused.value.orig.sqlstate == "42501"
     fixture.source_writer_rejections.append(head.dataset_id)
 
 
@@ -185,7 +191,7 @@ async def _continuation(component, fixture, stack, monkeypatch):
     component.factory._require_current_policy()
     assert component.factory._native_input_producer is not None
     reader = await fixed_factory(stack, component.admin_engine.url.set(username=component.reader))
-    writer = await fixed_factory(stack, component.admin_engine.url.set(username=component.retained_publisher))
+    writer = await fixed_factory(stack, component.admin_engine.url)
     component.factory.generic_fhir_capture_continuation = continuation.GenericSourceCaptureContinuation(
         reader,
         writer,
@@ -247,8 +253,18 @@ async def _owned_source_database(monkeypatch):
 
 
 @asynccontextmanager
-async def native_generic_source(monkeypatch):
-    """Own one disposable Source database; no manufactured publication or admission metadata."""
+async def native_generic_source(monkeypatch, *, named=False):
+    """Select the current named worker explicitly while preserving historical fixture callers."""
+    selected = _named_generic_source if named else _legacy_generic_source
+    async with selected(monkeypatch) as fixture:
+        yield fixture
+
+
+@asynccontextmanager
+async def _legacy_generic_source(monkeypatch):
+    """Own the historical attached Source fixture without changing its publication path."""
+    from tests.provider_profile_detail_load_postgres_support import _install_detail_tables
+
     migrations = source_component_native_migrations()
     monkeypatch.setattr(native_source, "bootstrap_source_component", _bootstrap_native_source)
     async with (
@@ -285,7 +301,6 @@ async def native_generic_source(monkeypatch):
         owner = fixture.role_by_kind["owner"]
         await admin.execute(f'CREATE ROLE "{owner}" NOLOGIN')
         created_roles.append(owner)
-        await admin.execute(f'GRANT "{owner}" TO "{component.retained_publisher}" WITH INHERIT FALSE, SET TRUE')
         monkeypatch.setattr(directory, "db", component.database)
         await _continuation(component, fixture, stack, monkeypatch)
         async with source.source_transaction(component.database):
@@ -307,6 +322,179 @@ async def native_generic_source(monkeypatch):
         yield fixture
 
 
+def _edition_fhir_resources(edition):
+    """Acquire the same office move and provider-only replacement through real R4 pages."""
+    resources_by_kind = {kind: [] for kind in directory.RESOURCE_MODELS_BY_TYPE}
+    for stored_resource in _edition_rows(edition, "unused-normalization-input"):
+        resources_by_kind[stored_resource["resource_type"]].append(_r4_resource_from_normalized(stored_resource))
+    return resources_by_kind
+
+
+def _fhir_references(values):
+    return [{"reference": value} for value in values]
+
+
+def _r4_resource_from_normalized(stored_resource):
+    """Express each normalized fixture fact through its actual FHIR mapping fields."""
+    kind, payload_by_field = stored_resource["resource_type"], stored_resource["payload_json"]
+    resource_by_field = {"id": stored_resource["resource_id"], "active": True}
+    if kind == "Organization":
+        resource_by_field.update(name=payload_by_field["name"], type=[{"coding": [{"code": "ntwk"}]}])
+    if kind == "Location":
+        address_by_field = {
+            "line": [
+                line for name in ("first_line", "second_line") if (line := payload_by_field.get(name)) is not None
+            ],
+            "city": payload_by_field.get("city_name"),
+            "state": payload_by_field.get("state_code") or payload_by_field.get("state_name"),
+            "postalCode": payload_by_field.get("postal_code"),
+            "country": payload_by_field.get("country_code"),
+        }
+        address_by_field = {
+            name: address_value
+            for name, address_value in address_by_field.items()
+            if address_value is not None and address_value != []
+        }
+        resource_by_field["status"] = "active"
+        if address_by_field:
+            resource_by_field["address"] = address_by_field
+    if kind == "Practitioner":
+        resource_by_field["identifier"] = [
+            {"system": "http://hl7.org/fhir/sid/us-npi", "value": payload_by_field["npi"]}
+        ]
+    if kind == "InsurancePlan":
+        resource_by_field.update(
+            name=payload_by_field["name"], network=_fhir_references(payload_by_field["network_refs"])
+        )
+    if kind == "PractitionerRole":
+        resource_by_field.update(
+            practitioner={"reference": payload_by_field["practitioner_ref"]},
+            identifier=[{"system": "http://hl7.org/fhir/sid/us-npi", "value": payload_by_field["npi"]}],
+            location=_fhir_references(payload_by_field["location_refs"]),
+            network=_fhir_references(payload_by_field["network_refs"]),
+            insurancePlan=_fhir_references(payload_by_field["insurance_plan_refs"]),
+        )
+    return resource_by_field
+
+
+@asynccontextmanager
+async def _named_generic_source(monkeypatch):
+    """Use ordinary named enrollment, real HTTP acquisition and administrator freeze."""
+    from directory_membership_test_support import _source_test_helpers
+
+    with _source_test_helpers(monkeypatch) as settings, TemporaryDirectory(prefix="generic-successor-") as temporary:
+        from native_tests import fhir_source_catalog_transition_checks as checks
+        from native_tests import fhir_source_legacy_support as worker_fixture
+        from native_tests.fhir_source_catalog_transition_support import configure_isolated_enrollment, source_catalog
+        from native_tests.test_fhir_source_catalog_transition_postgres import (
+            _configure_current_source_publication,
+            catalog_enrollment_database,
+        )
+
+        tmp_path = Path(temporary)
+        request = SimpleNamespace(param="protected")
+        async with aclosing(catalog_enrollment_database.__wrapped__(settings, tmp_path, request)) as databases:
+            state = await anext(databases)
+            async with source_catalog(state, tmp_path, settings, ordinary_overlay=True) as catalog:
+                configure_isolated_enrollment(catalog, state, tmp_path, settings)
+                enrollment_result = await checks.enroll(catalog, state)
+                issued = await checks.assert_isolated_worker_manifest(
+                    catalog, state, enrollment_result["manifest"], settings
+                )
+                _configure_current_source_publication(catalog, state, settings)
+                async with (
+                    worker_fixture.isolated_worker_database(state, tmp_path, settings) as (database, tasks),
+                    AsyncExitStack() as stack,
+                ):
+                    component = SimpleNamespace(**{**vars(state.component), "database": database})
+                    fixture = SimpleNamespace(
+                        named=True,
+                        component=component,
+                        admin=catalog.admin,
+                        schema=issued.storage_binding.catalog_schema,
+                        role_by_kind={"owner": component.retention_owner, "reader": component.reader},
+                        captures=[],
+                        namespaces=[],
+                        commits=[],
+                        candidates=[],
+                        source_writer_rejections=[],
+                        state=state,
+                        fixture=catalog,
+                        issued=issued,
+                        settings=settings,
+                        checks=checks,
+                        worker_fixture=worker_fixture,
+                        task=tasks[0],
+                    )
+                    fixture.reader = await fixed_factory(stack, state.url.set(username=component.reader))
+                    stack.push_async_callback(_drop_captures, fixture)
+                    yield fixture
+
+
+async def _publish_named_edition(fixture, edition):
+    """Publish and freeze each distinct generation before its independent retained capture."""
+    from native_tests.fhir_source_enrollment_support import _PASSWORD
+
+    if edition == 2:
+        previous = fixture.candidates[-1]
+        await fixture.checks.prepare_distinct_generation(fixture, fixture.settings, current=previous)
+    resources = fixture.state.rest_endpoint[1]
+    resources.clear()
+    resources.update(_edition_fhir_resources(edition))
+    task = fixture.worker_fixture.rest_task(
+        fixture.task["seed_db_path"], fixture.task["source_ids"][0], "run_" + uuid4().hex
+    )
+    publisher = fixture.state.url.set(username=fixture.state.names.publisher, password=_PASSWORD)
+    with fixture.checks.administrative_generation_freeze(fixture.fixture, fixture.state, fixture.settings):
+        metrics = await fixture.worker_fixture.run_isolated_control_job(
+            fixture.component.database, fixture.state, task, publisher, fixture.issued
+        )
+    assert metrics["resource_rows"] == {kind: len(rows) for kind, rows in resources.items()}
+    assert fixture.component.database._transaction_binding() is None and source._FACTORY.get() is None
+    return await _capture_named_edition(fixture, task)
+
+
+async def _capture_named_edition(fixture, task):
+    """Re-read the genuine committed header under the original reader and admin preparation."""
+    async with fixture.reader() as session, session.begin(), fixture.admin.transaction(isolation="repeatable_read"):
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        reader = await native_driver(session)
+        head = await read_current_generic_fhir_head(
+            reader,
+            schema_name=fixture.schema,
+            source_id=task["source_ids"][0],
+            endpoint_id=fixture.state.legacy_endpoint_id,
+        )
+        assert head.root_run_id == task["run_id"]
+        fixture.commits.append(head.dataset_id)
+        await _assert_source_writer_excluded(fixture.component, fixture, reader, fixture.admin, head)
+        namespace = "registry_fhir_capture_" + generic_fhir_capture_id(head).hex
+        fixture.namespaces.append(namespace)
+        capture = await continuation.capture_committed_generic_fhir_source(
+            reader,
+            fixture.admin,
+            schema_name=fixture.schema,
+            source_id=head.source_id,
+            endpoint_id=head.endpoint_id,
+            target=RegistryGenericCaptureTarget(fixture.role_by_kind["owner"], (fixture.component.reader,)),
+            expected_head=head,
+            source_policy=fixture.issued.policy,
+        )
+        assert capture.origin.schema_name == fixture.issued.storage_binding.storage_schema
+        assert capture.origin.header_relation["schema"] == fixture.schema
+        fixture.captures.append(capture)
+        fixture.candidates.append(
+            SimpleNamespace(
+                dataset_id=head.dataset_id,
+                dataset_hash=head.dataset_sha256,
+                endpoint_id=head.endpoint_id,
+                acquisition_root_run_id=head.root_run_id,
+            )
+        )
+        fixture.origin = fixture.captures[0].origin
+        return capture
+
+
 class GenericRefreshExecution(execution.RefreshExecution):
     async def _assert_source_fenced(self):
         """A real independent writer cannot acquire the selected Source publication locks."""
@@ -315,13 +503,13 @@ class GenericRefreshExecution(execution.RefreshExecution):
                 await self.connection.fetchval(
                     "SELECT dataset_id FROM mrf.provider_directory_endpoint_dataset "
                     "WHERE endpoint_id=$1 AND is_current FOR UPDATE NOWAIT",
-                    ENDPOINT,
+                    self.source_endpoint,
                 )
         async with self.connection.transaction():
             assert (
                 await self.connection.fetchval(
                     "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))",
-                    ENDPOINT,
+                    self.source_endpoint,
                 )
                 is False
             )
@@ -350,10 +538,6 @@ async def generic_refresh_execution(source_fixture, monkeypatch):
     async with aclosing(registry.serving_schema.__wrapped__()) as serving_generator, AsyncExitStack() as stack:
         serving = await anext(serving_generator)
         connection, schema, engine = serving
-        identity_sql = "SELECT current_database(),oid FROM pg_database WHERE datname=current_database()"
-        assert tuple(await connection.fetchrow(identity_sql)) == tuple(
-            await source_fixture.admin.fetchrow(identity_sql)
-        )
         assert await connection.fetchval("SELECT current_database()") == component.admin_engine.url.database
         custom_generator = await stack.enter_async_context(aclosing(custom.custom_db.__wrapped__(serving)))
         custom_fixture = await anext(custom_generator)
@@ -366,6 +550,7 @@ async def generic_refresh_execution(source_fixture, monkeypatch):
             case, (None, SimpleNamespace(aca_head_fence_sessions=head_sessions), schema, None, [])
         )
         fixture.connection = connection
+        fixture.source_endpoint = source_fixture.candidates[0].endpoint_id
         fixture.cas_checks = []
         original_cas = network_publication._insert_manifest
 
@@ -417,6 +602,6 @@ async def start_refresh_runtime(fixture, source_fixture, serving, stack, head_ur
             source_profiles={"generic": {"head_fence_dsn": head_url.render_as_string(hide_password=False)}},
         )
     )
-    fixture.bundle = await runtime._build_native_bundle(settings, stack, fixture.roles_by_kind["execution"])
+    fixture.bundle = await runtime._build_native_bundle(settings, stack)
     await fixture.bundle.runtime.authorize._client.aclose()
     fixture.bundle.runtime.authorize._client = httpx.AsyncClient(transport=httpx.MockTransport(fixture.http))

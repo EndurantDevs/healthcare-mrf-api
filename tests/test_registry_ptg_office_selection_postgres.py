@@ -405,6 +405,19 @@ def _event_worker_roles(tmp_path):
     return execution_role, owner_role, password, registered_roles
 
 
+def _source_event_consumer(worker):
+    configured = worker.consumer
+    return consumer.RegistryPTGSourceConsumerConfig(
+        configured.control_schema,
+        configured.execution_role,
+        configured.physical_owner_role,
+        reader_roles=configured.reader_roles,
+        composition_runtime=configured.composition_runtime,
+        seal_candidate=configured.seal_candidate,
+        preparation_roles=configured.preparation_roles,
+    )
+
+
 @pytest.mark.asyncio
 async def test_accepted_ptg_event_refuses_unselected_then_rolls_back_retries_and_replays(
     coordinator_db, tmp_path, monkeypatch
@@ -417,7 +430,7 @@ async def test_accepted_ptg_event_refuses_unselected_then_rolls_back_retries_and
     service, recipes, _ = await _review_offices(native, select=False)
     event_by_name = _source_event_header(recipes[0])
     execution_role, owner_role, password, registered_roles = _event_worker_roles(tmp_path)
-    resources = SimpleNamespace(created=[], engine=None, connection=None, pool=None)
+    resources = SimpleNamespace(created=[], engine=None, connection=None, pool=None, worker=None)
     try:
         for role in registered_roles:
             assert not await native.custom.connection.fetchval(
@@ -430,7 +443,9 @@ async def test_accepted_ptg_event_refuses_unselected_then_rolls_back_retries_and
                 + '" '
                 + (f"LOGIN PASSWORD '{password}'" if role == execution_role else "NOLOGIN")
             )
-        resources.engine, runtime, resources.connection = await _worker(native, execution_role, owner_role, password)
+        resources.engine, _, resources.connection, resources.worker = await _worker(
+            native, execution_role, owner_role, password
+        )
         reader_role = service.reader_sessions.kw["bind"].url.username
         resources.pool = await asyncpg.create_pool(
             service.reader_sessions.kw["bind"].url.set(drivername="postgresql").render_as_string(hide_password=False),
@@ -440,13 +455,7 @@ async def test_accepted_ptg_event_refuses_unselected_then_rolls_back_retries_and
         async with resources.pool.acquire() as reader, reader.transaction(isolation="repeatable_read", readonly=True):
             identity = await qualify_registry_ptg_source_notifications(reader, service.store, reader_role=reader_role)
             assert await reader.fetchrow("SELECT current_user::text,session_user::text") == (reader_role, reader_role)
-        config = consumer.RegistryPTGSourceConsumerConfig(
-            native.custom.control_schema,
-            execution_role,
-            owner_role,
-            reader_roles=(native.custom.roles["reader"], native.roles_by_kind["publisher"]),
-            composition_runtime=runtime,
-        )
+        config = _source_event_consumer(resources.worker)
         arguments_by_name = dict(
             connection=resources.connection,
             notification_pool=resources.pool,
@@ -465,4 +474,4 @@ async def test_accepted_ptg_event_refuses_unselected_then_rolls_back_retries_and
     finally:
         if resources.pool is not None:
             await resources.pool.close()
-        await _cleanup_worker(native, resources.connection, resources.engine, resources.created)
+        await _cleanup_worker(native, resources.connection, resources.engine, resources.created, resources.worker)

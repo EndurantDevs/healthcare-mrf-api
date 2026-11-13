@@ -1,12 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Pure scope and refusal checks; guard doubles never confer Source or candidate custody."""
+"""Pure approval, catalog scope, and complete Source replay checks."""
 
 import builtins
-import sys
 from contextlib import asynccontextmanager
-from dataclasses import asdict, make_dataclass, replace
+from dataclasses import asdict, replace
 from datetime import datetime
-from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import UUID
@@ -23,7 +21,7 @@ from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.registry_fhir_catalog_sources import FHIRCatalogSourceReadProfile
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from tests.test_network_fhir_source_witness_contract import captured
-from tests.test_network_fhir_source_witness_recipe import _LEGACY_COORDINATES, _reader_recipe, _source_recipe
+from tests.test_network_fhir_source_witness_recipe import _NAMED_COORDINATES, _reader_recipe, _source_recipe
 
 pytestmark = pytest.mark.asyncio
 
@@ -101,7 +99,7 @@ async def test_derived_replay_refuses_an_oversized_single_row_before_fetching(mo
 
 
 def _profile(schema_name="source_example"):
-    return FHIRCatalogSourceReadProfile(schema_name, "source_owner", ("source_publisher", "source_reader"))
+    return FHIRCatalogSourceReadProfile(schema_name)
 
 
 def _runtime(**changes):
@@ -186,7 +184,7 @@ async def test_default_read_context_preserves_legacy_absence():
 @pytest.mark.parametrize("kind", ["Source", "Reader", "legacy"])
 async def test_provider_only_scope_preserves_each_distinct_pin(kind):
     if kind == "legacy":
-        pin = PinnedFHIRMembershipSource(**_LEGACY_COORDINATES)
+        pin = PinnedFHIRMembershipSource(**_NAMED_COORDINATES)
         expected = ("alias_scope", "medical")
     else:
         pin = (_source_recipe() if kind == "Source" else _reader_recipe()).source_pin
@@ -204,7 +202,7 @@ async def test_provider_only_scope_preserves_each_distinct_pin(kind):
 async def test_missing_runtime_cannot_borrow_a_producer_read(runtime, cached, source_refusals):
     recipe = _source_recipe()
     fake_read = SimpleNamespace(verify=AsyncMock())
-    cache = {recipe.source_pin.source_witness_capture: fake_read} if cached else None
+    cache = {recipe.source_pin.source_witness_capture.capture_sha256: fake_read} if cached else None
     connection = SimpleNamespace(fetchval=AsyncMock())
     with pytest.raises(composition.RegistrySourceCompositionError, match="custody_unavailable"):
         await composition.require_registry_source_recipe_custody(
@@ -217,23 +215,6 @@ async def test_missing_runtime_cannot_borrow_a_producer_read(runtime, cached, so
         )
     connection.fetchval.assert_not_awaited()
     fake_read.verify.assert_not_awaited()
-
-
-@pytest.mark.parametrize(
-    "changes",
-    [
-        {"capture_owner_role": "other_capture_owner"},
-        {"runtime_roles": ("reader_example", "source_operator")},
-        {"runtime_roles": ("metadata_owner_actor", "reader_example")},
-    ],
-)
-async def test_approved_receipt_cannot_choose_its_owner_or_actor_census(changes, protected_selection, source_refusals):
-    connection, recipe, approved, guard = protected_selection
-    runtime = _runtime(**changes)
-    with pytest.raises(composition.RegistrySourceCompositionError, match="census_differs"):
-        await composition.require_source_witness_read(connection, recipe, approved, "control_example", runtime)
-    guard.assert_awaited_once()
-    runtime.source_export.assert_not_called()
 
 
 async def test_metadata_owner_label_is_not_an_actor_exemption():
@@ -259,7 +240,7 @@ async def test_configured_profile_refusal_does_not_use_producer_cache(protected_
             recipe,
             approved,
             "control_example",
-            retained_fhir_reads={recipe.source_pin.source_witness_capture: fake_read},
+            retained_fhir_reads={recipe.source_pin.source_witness_capture.capture_sha256: fake_read},
             source_witness_runtime=runtime,
         )
     fake_read.verify.assert_not_awaited()
@@ -272,7 +253,13 @@ async def test_rehashed_core_labels_do_not_replace_protected_capture_sha(label, 
     capture = original.source_pin.source_witness_capture
     if label == "capture_id":
         identity = str(UUID(int=2))
-        changed = replace(capture, capture_id=identity, schema_name=witness.SCHEMA_PREFIX + UUID(identity).hex)
+        schema = witness.SCHEMA_PREFIX + UUID(identity).hex
+        changed = replace(
+            capture,
+            capture_id=identity,
+            schema_name=schema,
+            tables={name: {"schema": schema, "name": name} for name in witness.TABLES},
+        )
     else:
         changed = replace(capture, observed_at="2026-01-03T00:00:00.000000+00:00")
     changed = replace(changed, capture_sha256=witness.capture_digest(changed))
@@ -288,7 +275,7 @@ async def test_rehashed_core_labels_do_not_replace_protected_capture_sha(label, 
     runtime.source_export.assert_not_called()
 
 
-@pytest.mark.parametrize("field", ["catalog_sha256", "content_sha256"])
+@pytest.mark.parametrize("field", ["content_sha256"])
 async def test_whole_capture_digest_precedes_approval_and_receipt_labels(field, monkeypatch, source_refusals):
     recipe = _source_recipe()
     damaged = replace(recipe.source_pin.source_witness_capture, **{field: "f" * 64})
@@ -345,12 +332,12 @@ async def test_missing_installed_source_adapter_has_no_reader_fallback(
 
 
 def _retained_origin(capture, with_completion):
-    """Build explicit synthetic input types without issuing native source custody."""
-    origin_type = make_dataclass("MembershipInput", [], bases=(witness.SourceWitnessOrigin,), frozen=True)
-    completion_type = make_dataclass("CompletionInput", [], bases=(witness.SourceWitnessCompletionOrigin,), frozen=True)
-    origin = origin_type(**asdict(capture.origin))
+    """Use the installed Source declarations for current and completion exports."""
+    from directory_membership_runtime import FHIRSourceMembershipCompletionInput, FHIRSourceMembershipInput
+
+    origin = FHIRSourceMembershipInput(**asdict(capture.origin))
     if with_completion:
-        origin = completion_type(
+        origin = FHIRSourceMembershipCompletionInput(
             **(
                 asdict(capture.origin)
                 | {
@@ -361,26 +348,26 @@ def _retained_origin(capture, with_completion):
                 }
             )
         )
-    return origin, origin_type, completion_type
+    return origin
 
 
 @pytest.fixture
 def retained_replay(monkeypatch, request):
-    """Model the installed adapter and native row IO; no native custody is issued."""
+    """Model retained export rows while preserving the installed named declaration."""
     capture = captured()
-    origin, origin_type, completion_type = _retained_origin(capture, getattr(request, "param", False))
+    with_completion = getattr(request, "param", False)
+    origin = _retained_origin(capture, with_completion)
     case = SimpleNamespace(
         origin=origin,
         anchor=witness.SourceWitnessCaptureAnchor(capture.capture_id, capture.release_id, capture.observed_at),
-        identity=capture.source_database,
         profile=_profile(),
         events=[],
         pages=([{"fixture": "page one"}], [{"fixture": "page two"}]),
         stream_error=None,
         is_current=False,
     )
-    case.exported_origin, case.exported_identity = case.origin, case.identity
-    case.contract = witness.COMPLETION_CONTRACT if type(origin) is completion_type else witness.CONTRACT
+    case.exported_origin = case.origin
+    case.contract = witness.COMPLETION_CONTRACT if with_completion else witness.CONTRACT
 
     async def pages():
         try:
@@ -393,27 +380,18 @@ def retained_replay(monkeypatch, request):
             case.events.append("source.closed")
 
     @asynccontextmanager
-    async def source_export(runtime, *, source_profile, origin):
-        assert runtime is case.runtime and source_profile is case.profile
-        assert origin is case.origin and not case.is_current
+    async def source_export(*, source_profile, origin):
+        assert source_profile is case.profile
+        assert witness.source_origin(origin) == witness.source_origin(case.origin) and not case.is_current
         case.events.append("source.retained")
         yield dict(
             contract=case.contract,
             origin=case.exported_origin,
-            database_identity=case.exported_identity,
             resources=pages,
         )
         case.events.append("source.exit")
 
-    case.runtime = SimpleNamespace(config=SimpleNamespace(publisher_role="source_publisher"))
-    adapter = SimpleNamespace(
-        CatalogSnapshotRuntime=type(case.runtime),
-        FHIRSourceMembershipInput=origin_type,
-        FHIRSourceMembershipCompletionInput=completion_type,
-        open_membership_source_export=source_export,
-    )
-    monkeypatch.setitem(sys.modules, "directory_membership_runtime", adapter)
-    case.factory = partial(source_export, case.runtime)
+    case.factory = source_export
     case.compare, case.finish = AsyncMock(), AsyncMock()
     monkeypatch.setattr(capture_reads, "_compare_source_page", case.compare)
     monkeypatch.setattr(capture_reads, "_finish_source_replay", case.finish)
@@ -427,7 +405,6 @@ async def _replay(case, *, reviewed_origin=None):
         source_profile=case.profile,
         reviewed_origin=reviewed_origin if reviewed_origin is not None else case.origin,
         expected_anchor=case.anchor,
-        expected_identity=case.identity,
     )
 
 
@@ -441,7 +418,7 @@ async def test_retained_replay_passes_bound_origin_and_finishes_after_eof(retain
         case.events.append("candidate.checked")
 
     case.finish.side_effect = finish
-    assert await _replay(case) == case.identity
+    assert await _replay(case) is None
     case.finish.assert_awaited_once()
     assert case.events == ["source.retained", "source.eof", "source.closed", "candidate.checked", "source.exit"]
 
@@ -455,7 +432,7 @@ async def test_completion_replay_requires_original_version_and_proof_identity(re
     elif change == "completion":
         case.exported_origin = replace(case.origin, completion_sha256="b" * 64)
     if change is None:
-        assert await _replay(case) == case.identity
+        assert await _replay(case) is None
         case.finish.assert_awaited_once()
         assert case.events[-1] == "source.exit"
     else:
@@ -465,15 +442,9 @@ async def test_completion_replay_requires_original_version_and_proof_identity(re
         case.finish.assert_not_awaited()
 
 
-@pytest.mark.parametrize("fault", ["origin", "database", "identity"])
-async def test_retained_replay_rejects_mismatched_export_before_rows(retained_replay, fault):
+async def test_retained_replay_rejects_mismatched_export_before_rows(retained_replay):
     case = retained_replay
-    if fault == "origin":
-        case.exported_origin = replace(case.origin, header_oid=case.origin.header_oid + 1)
-    elif fault == "database":
-        case.exported_identity = replace(case.identity, database_oid=case.identity.database_oid + 1)
-    else:
-        case.exported_identity = replace(case.identity, postmaster_started="2026-01-03T00:00:00.000000+00:00")
+    case.exported_origin = replace(case.origin, dataset_id="other-dataset")
     with pytest.raises(ValueError):
         await _replay(case)
     case.compare.assert_not_awaited()
@@ -481,13 +452,12 @@ async def test_retained_replay_rejects_mismatched_export_before_rows(retained_re
     assert case.events == ["source.retained"]
 
 
-async def test_retained_replay_requires_installed_origin_type(retained_replay):
+async def test_retained_replay_accepts_equivalent_named_origin(retained_replay):
     case = retained_replay
-    with pytest.raises(ValueError):
-        await _replay(case, reviewed_origin=witness.source_origin(case.origin))
-    assert case.events == []
-    case.compare.assert_not_awaited()
-    case.finish.assert_not_awaited()
+    assert await _replay(case, reviewed_origin=witness.source_origin(case.origin)) is None
+    assert case.events == ["source.retained", "source.eof", "source.closed", "source.exit"]
+    assert case.compare.await_count == len(case.pages)
+    case.finish.assert_awaited_once()
 
 
 async def test_retained_replay_stream_failure_does_not_finish(retained_replay):

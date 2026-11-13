@@ -204,8 +204,6 @@ def _settings(configured):
         for selected_head_url in (head_url, generic_url):
             if selected_head_url is not None and _target(selected_head_url) != _target(urls[0]):
                 raise _unavailable()
-        if generic_url is not None and generic_url.username in {url.username for url in urls}:
-            raise _unavailable()
         if len({_target(url) for url in urls}) != 1:
             raise _unavailable()
         profile = RegistryMembershipRefreshAddressProfile(
@@ -320,49 +318,12 @@ async def _driver(session):
     return await native_driver(session)
 
 
-async def _native_identity(driver, schema):
-    return tuple(
-        await driver.fetchrow(
-            "SELECT current_database(),oid::bigint,pg_postmaster_start_time(),inet_server_addr()::text,"
-            "current_setting('port'),to_regnamespace($1)::oid::bigint FROM pg_database WHERE datname=current_database()",
-            schema,
-        )
-    )
-
-
-async def _qualify_native_actor(driver, expected_login):
-    """Qualify the genuine fixed login without assuming a role or granting privileges."""
-    safe = await driver.fetchval(
-        "SELECT current_user=$1 AND session_user=$1 AND current_setting('role')='none' "
-        "AND NOT (r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls) "
-        "AND NOT EXISTS(SELECT FROM pg_roles elevated WHERE "
-        "(elevated.rolsuper OR elevated.rolcreatedb OR elevated.rolcreaterole OR elevated.rolreplication OR elevated.rolbypassrls) "
-        "AND (pg_has_role(r.oid,elevated.oid,'MEMBER') OR pg_has_role(r.oid,elevated.oid,'SET'))) "
-        "FROM pg_roles r WHERE r.rolname=current_user",
-        expected_login,
-    )
-    if safe is not True:
-        raise _unavailable()
-
-
-async def _qualify_reader(sessions, url, schema):
-    async with sessions() as session, session.begin():
-        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-        driver = await _driver(session)
-        await _qualify_native_actor(driver, url.username)
-        identity = await _native_identity(driver, schema)
-        if identity[-1] is None:
-            raise _unavailable()
-        return identity
-
-
 @dataclass(frozen=True)
 class _Resources:
     settings: _Settings = field(repr=False)
     fence_sessions: object = field(repr=False)
     source_sessions: object = field(repr=False)
     address_sessions: object = field(repr=False)
-    identity: tuple = field(repr=False)
     readers: object = field(repr=False)
 
     @asynccontextmanager
@@ -371,12 +332,8 @@ class _Resources:
         async with self.address_sessions() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
             driver = await _driver(session)
-            if await _native_identity(driver, self.settings.control_schema) != self.identity:
-                raise _unavailable()
-            authority = await address.generation.read_entity_address_result_generation_authority(
-                address._CatalogSession(driver), schema_name=self.settings.address_profile.schema_name
-            )
-            generation = address._digest(address._authority_document(authority))
+            authority, _legacy_key = await address._current_authority(driver, self.settings.address_profile.schema_name)
+            generation = address._digest(authority)
             pin = PinnedAddressSource(self.settings.address_profile.schema_name, "entity_address_unified", generation)
             descriptor = await address.capture_network_address_artifact(
                 driver, pin, runtime_roles=self.settings.address_profile.runtime_roles
@@ -518,8 +475,8 @@ async def _approved(driver, schema, revision):
 class _SourceResolver:
     """Bind full native source fences to one fixed address profile and execution role."""
 
-    def __init__(self, resources, execution_role=None):
-        self.resources, self.execution_role = resources, execution_role
+    def __init__(self, resources):
+        self.resources = resources
 
     @asynccontextmanager
     async def pin_sources(self, connection, envelope, source_manifest):
@@ -528,10 +485,6 @@ class _SourceResolver:
 
         envelope = frozen_membership_refresh_envelope(envelope)
         resources = self.resources
-        if await _native_identity(connection, resources.settings.control_schema) != resources.identity:
-            raise _unavailable()
-        if self.execution_role is not None and await connection.fetchval("SELECT current_user") != self.execution_role:
-            raise _unavailable()
         command = envelope["command"]
         async with registry_company_approval_transaction(
             resources.fence_sessions, control_schema=resources.settings.control_schema
@@ -790,17 +743,12 @@ class RegistryMembershipRefreshRuntimeBundle:
     anchors_service: RegistryRefreshAnchorService
 
 
-async def _head_fence_sessions(settings, cleanup, url, identity):
-    """Qualify each fixed metadata pool against the already authenticated database."""
-    if url is None:
-        return None
-    sessions = _worker_sessions(settings, cleanup, url)
-    if await _qualify_reader(sessions, url, settings.control_schema) != identity:
-        raise _unavailable()
-    return sessions
+def _head_fence_sessions(settings, cleanup, url):
+    """Open the configured optional metadata pool with the existing SQL limits."""
+    return None if url is None else _worker_sessions(settings, cleanup, url)
 
 
-async def _build_native_bundle(settings, cleanup, execution_role=None):
+async def _build_native_bundle(settings, cleanup):
     from process.registry_membership_refresh_source_fence import RegistryMembershipRefreshHeadFences
     from process.registry_membership_refresh_sources import RegistryMembershipRefreshSourceReaders
 
@@ -809,18 +757,8 @@ async def _build_native_bundle(settings, cleanup, execution_role=None):
         _worker_sessions(settings, cleanup, url)
         for url in (settings.fence_url, settings.source_reader_url, settings.address_reader_url)
     )
-    identities = [
-        await _qualify_reader(sessions, url, settings.control_schema)
-        for sessions, url in zip(
-            factories, (settings.fence_url, settings.source_reader_url, settings.address_reader_url), strict=True
-        )
-    ]
-    if len(set(identities)) != 1:
-        raise _unavailable()
-    head_sessions = await _head_fence_sessions(settings, cleanup, settings.aca_head_fence_url, identities[0])
-    generic_head_sessions = await _head_fence_sessions(
-        settings, cleanup, settings.generic_head_fence_url, identities[0]
-    )
+    head_sessions = _head_fence_sessions(settings, cleanup, settings.aca_head_fence_url)
+    generic_head_sessions = _head_fence_sessions(settings, cleanup, settings.generic_head_fence_url)
     profiles = settings.source_profiles
     readers = RegistryMembershipRefreshSourceReaders(
         settings.control_schema,
@@ -832,11 +770,11 @@ async def _build_native_bundle(settings, cleanup, execution_role=None):
         aca_source_schema=settings.aca_source_schema,
         head_fences=RegistryMembershipRefreshHeadFences(head_sessions, generic_head_sessions),
     )
-    resources = _Resources(settings, *factories, identities[0], readers)
+    resources = _Resources(settings, *factories, readers)
     authority = await cleanup.enter_async_context(
         RegistryMembershipRefreshAuthorityClient(settings.app_origin, settings.service_token, enabled=True)
     )
-    resolver = _SourceResolver(resources, execution_role)
+    resolver = _SourceResolver(resources)
     runtime = RegistryMembershipRefreshRuntime(
         authority, settings.address_profile, resolver.resolve_sources, resolver.pin_sources
     )
@@ -868,22 +806,6 @@ def _api_settings(configured):
     return _settings(configured)
 
 
-async def _api_identity(schema):
-    from db.models import db
-
-    async with asyncio.timeout(5):
-        rows = await db.all(
-            text(
-                "SELECT current_database(),oid::bigint,pg_postmaster_start_time(),inet_server_addr()::text,"
-                "current_setting('port'),to_regnamespace(:schema)::oid::bigint FROM pg_database WHERE datname=current_database()"
-            ),
-            schema=schema,
-        )
-    if len(rows) != 1:
-        raise _unavailable()
-    return tuple(rows[0])
-
-
 async def build_registry_membership_refresh_runtime(configured, cleanup):
     """Install only closed server configuration aligned with the actual ordinary API registry."""
     from db.registry_schema import registry_schema
@@ -894,10 +816,7 @@ async def build_registry_membership_refresh_runtime(configured, cleanup):
             return None
         if settings.control_schema != registry_schema():
             raise _unavailable()
-        bundle = await _build_native_bundle(settings, cleanup)
-        if await _api_identity(settings.control_schema) != bundle.inputs_service.resources.identity:
-            raise _unavailable()
-        return bundle
+        return await _build_native_bundle(settings, cleanup)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -929,9 +848,7 @@ async def membership_refresh_worker_runtime(worker_config, cleanup):
                 if getattr(settings.sql_limits, name) > getattr(limits, name):
                     raise _unavailable()
             limits = settings.sql_limits
-        bundle = await _build_native_bundle(
-            replace(settings, sql_limits=limits), cleanup, worker_config.consumer.execution_role
-        )
+        bundle = await _build_native_bundle(replace(settings, sql_limits=limits), cleanup)
         return bundle.runtime
     except asyncio.CancelledError:
         raise

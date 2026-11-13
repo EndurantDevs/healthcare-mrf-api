@@ -12,12 +12,7 @@ from typing import Any
 from db.connection import db
 from process.provider_directory_dataset_candidate import prepare_dataset_candidate
 from process.provider_directory_dataset_scoped_publication import (
-    EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
-    ProviderDirectoryDatasetScopedPublicationError,
     exact_current_matches_root,
-    exact_uhc_dataset_pair,
-    lock_exact_current_dataset,
-    supersede_exact_current_dataset,
 )
 from process.provider_directory_fhir import (
     build_provider_directory_dataset_serving_relations,
@@ -41,7 +36,6 @@ from process.provider_directory_rooted_graph_publication_materialization import 
 )
 from process.provider_directory_rooted_graph_publication_readiness_store import (
     load_dataset_readiness,
-    load_replay_readiness,
 )
 from process.provider_directory_rooted_graph_publication_store_support import (
     publication_row_fields as _row_fields,
@@ -342,128 +336,6 @@ async def _dataset_hash(database: Any, dataset_id: str, *, resource_relation: st
             cursor = resource_identity_fields[:2]
 
 
-async def _validate_and_publish(
-    database: Any,
-    identity: ProviderDirectoryRootedGraphDatasetIdentity,
-    previous: Any,
-) -> None:
-    dataset_hash = await _dataset_hash(database, identity.dataset_id)
-    parent_validated = await database.status(
-        f"""
-        UPDATE {_table(_PARENT)} SET status = 'validated',
-               dataset_hash = :dataset_hash,
-               validated_at = transaction_timestamp()
-         WHERE dataset_id = :dataset_id AND status = 'building'
-           AND is_current IS FALSE AND dataset_hash IS NULL;
-        """,
-        dataset_id=identity.dataset_id,
-        dataset_hash=dataset_hash,
-    )
-    header_validated = await database.status(
-        f"""
-        UPDATE {_table(_HEADER)} SET status = 'validated',
-               dataset_hash = :dataset_hash,
-               validated_at = transaction_timestamp()
-         WHERE dataset_id = :dataset_id AND status = 'building'
-           AND is_current IS FALSE AND dataset_hash IS NULL;
-        """,
-        dataset_id=identity.dataset_id,
-        dataset_hash=dataset_hash,
-    )
-    if parent_validated != 1 or header_validated != 1:
-        raise ProviderDirectoryRootedGraphPublicationError("state")
-    await supersede_exact_current_dataset(database, previous)
-    parent_published = await database.status(
-        f"""
-        UPDATE {_table(_PARENT)} SET status = 'published', is_current = true,
-               published_at = transaction_timestamp()
-         WHERE dataset_id = :dataset_id AND status = 'validated'
-           AND is_current IS FALSE;
-        """,
-        dataset_id=identity.dataset_id,
-    )
-    header_published = await database.status(
-        f"""
-        UPDATE {_table(_HEADER)} SET status = 'published', is_current = true,
-               published_at = transaction_timestamp()
-         WHERE dataset_id = :dataset_id AND status = 'validated'
-           AND is_current IS FALSE;
-        """,
-        dataset_id=identity.dataset_id,
-    )
-    if parent_published != 1 or header_published != 1:
-        raise ProviderDirectoryRootedGraphPublicationError("state")
-
-
-async def _materialize_and_publish(
-    database: Any,
-    admission: ProviderDirectoryRootedGraphTwinAdmission,
-    current: Any,
-    batch_size: int,
-) -> ProviderDirectoryRootedGraphPublicationResult:
-    identity = build_provider_directory_rooted_graph_dataset_identity(
-        admission,
-        current,
-    )
-    await _assert_no_orphan_parent(database, identity)
-    count_by_resource_type = await _preflight_counts(database, admission)
-    await _insert_headers(
-        database,
-        identity,
-        admission,
-        count_by_resource_type,
-    )
-    async with prepare_dataset_candidate(database, identity.dataset_id, kind="rooted"):
-        materialized = await materialize_provider_directory_rooted_graph_dataset(
-            database,
-            identity,
-            publication_run_id=admission.publication_run_id,
-            batch_size=batch_size,
-        )
-        if materialized.resource_counts != count_by_resource_type:
-            raise ProviderDirectoryRootedGraphPublicationError("content")
-        await build_provider_directory_dataset_serving_relations(
-            database,
-            identity.dataset_id,
-            build_run_id=admission.publication_run_id,
-            expected_acquisition_root_run_id=identity.acquisition_root_run_id,
-        )
-    await _validate_and_publish(database, identity, current)
-    readiness = await load_dataset_readiness(
-        identity.dataset_id,
-        database=database,
-    )
-    if readiness is None:
-        raise ProviderDirectoryRootedGraphPublicationError("state")
-    return ProviderDirectoryRootedGraphPublicationResult(readiness, replayed=False)
-
-
-async def _locked_publication_result(
-    database: Any,
-    publication_acquisition_id: str,
-    batch_size: int,
-) -> ProviderDirectoryRootedGraphPublicationResult:
-    current = await lock_exact_current_dataset(
-        database,
-        pair=exact_uhc_dataset_pair(),
-    )
-    admission = await require_provider_directory_rooted_graph_admission(
-        publication_acquisition_id,
-        database=database,
-    )
-    replay = await load_replay_readiness(database, publication_acquisition_id)
-    if replay is not None:
-        return ProviderDirectoryRootedGraphPublicationResult(replay, replayed=True)
-    if current is None or not exact_current_matches_root(current, admission):
-        raise ProviderDirectoryRootedGraphPublicationError("foreign_current")
-    return await _materialize_and_publish(
-        database,
-        admission,
-        current,
-        batch_size,
-    )
-
-
 async def _prepare_rooted_candidate(database, runtime, proof, publication_acquisition_id, batch_size):
     """Materialize and seal the exact candidate while locking only its own identity."""
     from db.plan_release_storage import storage_relation
@@ -554,13 +426,14 @@ async def prepare_admitted_rooted_graph_dataset(
         retained = await retained_rooted_handoff(
             runtime, transaction.connection, dataset_id, publication_acquisition_id=publication_acquisition_id
         )
-        if retained is not None:
+    if retained is not None:
+        async with runtime.transaction(database, readonly=True, publication=True) as transaction:
             published = await transaction.connection.fetchval(
                 "SELECT state='published' FROM hp_snapshot_retention.preparation WHERE preparation_id=$1::uuid",
                 retained.document["preparation_id"],
             )
-            if published is True:
-                return retained
+        if published is True:
+            return retained
     proof = await prepare_current_root(database)
     if retained is not None:
         return retained
@@ -573,32 +446,8 @@ async def publish_admitted_rooted_graph_dataset(
     database: Any = db,
     batch_size: int = PROVIDER_DIRECTORY_ROOTED_GRAPH_MATERIALIZATION_MAX_BATCH_ROWS,
 ) -> ProviderDirectoryRootedGraphPublicationResult:
-    """Build, prove, supersede, and publish under one logical-current lock."""
-    from process.provider_directory_generic_source_adapters import require_source_transaction
-    from process.provider_directory_generic_source_policy import source_owner_transaction, source_transaction
-
-    require_source_transaction(repeatable_read=True)
-
-    if (
-        type(batch_size) is not int
-        or not 1 <= batch_size <= PROVIDER_DIRECTORY_ROOTED_GRAPH_MATERIALIZATION_MAX_BATCH_ROWS
-    ):
-        raise ValueError("provider_directory_rooted_graph_batch_size_invalid")
-    try:
-        async with source_transaction(database, isolation="repeatable read"):
-            async with source_owner_transaction(database):
-                await database.scalar(
-                    "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(:lock_identity, 0));",
-                    lock_identity=EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
-                )
-                return await _locked_publication_result(
-                    database,
-                    publication_acquisition_id,
-                    batch_size,
-                )
-    except ProviderDirectoryDatasetScopedPublicationError as error:
-        code = error.code if error.code in {"foreign_current", "source_drift"} else "state"
-        raise ProviderDirectoryRootedGraphPublicationError(code) from error
+    """Require prepared named publication so candidate writes close before validation."""
+    raise RuntimeError("Rooted publication requires a prepared named generation through the Source operator")
 
 
 __all__ = (

@@ -20,7 +20,7 @@ from process import cms_doctors_immutable as immutable
 from process import cms_doctors_preparation as preparation
 from process import reference_family_result_generation as generation
 from process import reference_source_generation as revisions
-from tests.network_read_execution_support import with_read_identity_receipts
+from tests.network_read_execution_support import with_read_session
 from tests.test_cms_doctors_organizations import _unit_source_transaction
 from tests.test_provider_profile_cms import CMS_GENERATION, NPI, _credential_row, _education_row
 
@@ -57,7 +57,7 @@ def _reader_and_writer_session(state_by_field):
     """Keep native receipt identity stable while semantic authority changes after publication."""
     session = SimpleNamespace(info={}, execute=AsyncMock(), scalar=AsyncMock(return_value=True))
     session.in_transaction = lambda: bool(state_by_field.get("reader") or state_by_field.get("binding"))
-    with_read_identity_receipts(session)
+    with_read_session(session)
 
     async def execute(statement, _parameters=None):
         if "SELECT EXISTS" in str(statement) and generation.TABLE_NAME in str(statement):

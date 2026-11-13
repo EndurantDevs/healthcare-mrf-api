@@ -78,17 +78,22 @@ def test_scope_factory_requires_owned_native_single_connection_pool():
         fence._source_engine(async_sessionmaker(other))
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "body", "cancel", "lock", "unlock"])
-@pytest.mark.parametrize("is_exclusive", [False, True])
-async def test_scope_connection_fence_precedes_rr_and_never_leaks(monkeypatch, failure, is_exclusive):
-    events = []
+def _fence_connection(events):
     connection = SimpleNamespace(sync_connection=object(), in_transaction=lambda: False)
     connection.start = AsyncMock(side_effect=lambda: events.append("start"))
     connection.execution_options = AsyncMock(side_effect=lambda **options: events.append(options["isolation_level"]))
     connection.commit = AsyncMock(side_effect=lambda: events.append("commit"))
     connection.close = AsyncMock(side_effect=lambda: events.append("close"))
     connection.invalidate = AsyncMock(side_effect=lambda: events.append("invalidate"))
+    return connection
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "body", "cancel", "lock", "unlock"])
+@pytest.mark.parametrize("is_exclusive", [False, True])
+async def test_scope_connection_fence_precedes_rr_and_never_leaks(monkeypatch, failure, is_exclusive):
+    events = []
+    connection = _fence_connection(events)
 
     async def is_lock_success(statement, parameters):
         operation = "unlock" if "unlock" in str(statement) else "lock"
@@ -101,7 +106,13 @@ async def test_scope_connection_fence_precedes_rr_and_never_leaks(monkeypatch, f
     connection.scalar = is_lock_success
     monkeypatch.setattr(fence, "_source_engine", lambda sessions: SimpleNamespace(connect=lambda: connection))
     transaction = object()
-    session = SimpleNamespace(info={}, get_transaction=lambda: transaction)
+
+    async def start_native(statement):
+        assert str(statement) == "SHOW transaction_isolation"
+        assert events[-1] == "begin"
+        events.append("native-begin")
+
+    session = SimpleNamespace(info={}, get_transaction=lambda: transaction, execute=AsyncMock(side_effect=start_native))
 
     @asynccontextmanager
     async def begin():
@@ -120,7 +131,8 @@ async def test_scope_connection_fence_precedes_rr_and_never_leaks(monkeypatch, f
         async with fence.registry_company_approval_transaction(
             sessions, control_schema="synthetic_control", is_exclusive=is_exclusive
         ) as owned:
-            assert owned is session and fence._FENCE_INFO in session.info
+            assert owned is session
+            assert events[-1] == "native-begin"
             if failure == "body":
                 raise RuntimeError("synthetic failure")
             if failure == "cancel":
@@ -136,80 +148,6 @@ async def test_scope_connection_fence_precedes_rr_and_never_leaks(monkeypatch, f
         assert events.index("commit") < events.index("REPEATABLE READ") < events.index("begin")
     assert events[-1] == "close" and not session.info
     assert ("invalidate" in events) is bool(failure)
-
-
-@pytest.mark.asyncio
-async def test_detached_scope_session_has_no_fence_authority():
-    session = SimpleNamespace(info={}, get_transaction=lambda: object(), in_transaction=lambda: True)
-    with pytest.raises(ValueError, match="fence_unavailable"):
-        await fence.require_registry_company_approval_fence(session, "synthetic_control")
-
-
-@pytest.mark.asyncio
-async def test_inherited_task_cannot_borrow_the_original_approval_fence():
-    transaction = object()
-    session = SimpleNamespace(
-        info={}, get_transaction=lambda: transaction, in_transaction=lambda: True, scalar=AsyncMock(return_value=True)
-    )
-    session.info[fence._FENCE_INFO] = fence._ScopeFence(
-        session, transaction, "synthetic_control", fence._fence_key("synthetic_control"), asyncio.current_task()
-    )
-    fence._ISSUED_FENCE.set(session.info[fence._FENCE_INFO])
-    with pytest.raises(ValueError, match="fence_unavailable"):
-        await asyncio.create_task(fence.require_registry_company_approval_fence(session, "synthetic_control"))
-    session.scalar.assert_not_awaited()
-    await fence.require_registry_company_approval_fence(session, "synthetic_control")
-    session.scalar.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["unissued", "wrong_key", "replacement"])
-async def test_unissued_or_rebound_fences_refuse_before_native_control_reads(damage):
-    transaction = object()
-    session = SimpleNamespace(
-        info={}, get_transaction=lambda: transaction, in_transaction=lambda: True, scalar=AsyncMock(return_value=True)
-    )
-    key = fence._fence_key("synthetic_control")
-    original = fence._ScopeFence(session, transaction, "synthetic_control", key, asyncio.current_task())
-    session.info[fence._FENCE_INFO] = original
-    if damage != "unissued":
-        issued = original
-        if damage == "wrong_key":
-            issued = fence._ScopeFence(session, transaction, "synthetic_control", key + 1, asyncio.current_task())
-            session.info[fence._FENCE_INFO] = issued
-        fence._ISSUED_FENCE.set(issued)
-    if damage == "replacement":
-        session.info[fence._FENCE_INFO] = fence._ScopeFence(
-            session, transaction, "synthetic_control", key, asyncio.current_task()
-        )
-    with pytest.raises(ValueError, match="fence_unavailable"):
-        await fence.require_registry_company_approval_fence(session, "synthetic_control")
-    session.scalar.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("held", [False, True])
-async def test_scope_context_requires_actual_native_shared_lock(held):
-    transaction = object()
-    session = SimpleNamespace(
-        info={}, get_transaction=lambda: transaction, in_transaction=lambda: True, scalar=AsyncMock(return_value=held)
-    )
-    key = fence._fence_key("synthetic_control")
-    session.info[fence._FENCE_INFO] = fence._ScopeFence(
-        session, transaction, "synthetic_control", key, asyncio.current_task()
-    )
-    fence._ISSUED_FENCE.set(session.info[fence._FENCE_INFO])
-    if held:
-        await fence.require_registry_company_approval_fence(session, "synthetic_control")
-    else:
-        with pytest.raises(ValueError, match="fence_unavailable"):
-            await fence.require_registry_company_approval_fence(session, "synthetic_control")
-    statement, parameters = session.scalar.await_args.args
-    assert "pg_backend_pid()" in str(statement) and "mode='ShareLock'" in str(statement)
-    assert parameters == {"high": (key >> 32) & 0xFFFFFFFF, "low": key & 0xFFFFFFFF}
-    session.get_transaction = lambda: object()
-    with pytest.raises(ValueError, match="fence_unavailable"):
-        await fence.require_registry_company_approval_fence(session, "synthetic_control")
 
 
 @pytest.mark.asyncio
@@ -254,20 +192,13 @@ async def test_actual_pointer_approval_fences_before_selection_and_exact_replay(
 
 
 @pytest.mark.asyncio
-async def test_exclusive_cleanup_requires_original_native_lock_and_exact_context():
-    transaction = object()
-    session = SimpleNamespace(
-        info={}, get_transaction=lambda: transaction, in_transaction=lambda: True, scalar=AsyncMock(return_value=True)
-    )
-    key = fence._fence_key("synthetic_control")
-    session.info[fence._FENCE_INFO] = fence._ScopeFence(
-        session, transaction, "synthetic_control", key, asyncio.current_task()
-    )
-    fence._ISSUED_FENCE.set(session.info[fence._FENCE_INFO])
-    await fence.require_registry_company_approval_fence(session, "synthetic_control", is_exclusive=True)
-    assert "mode='ExclusiveLock'" in str(session.scalar.await_args.args[0])
-    session.scalar.return_value = False
-    with pytest.raises(ValueError, match="fence_unavailable"):
-        await fence.require_registry_company_approval_fence(session, "synthetic_control", is_exclusive=True)
-    with pytest.raises(ValueError, match="fence_unavailable"):
-        await fence.require_registry_company_approval_fence(session, "synthetic_control", is_exclusive=1)
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("is_exclusive", [False, True, 1])
+async def test_approval_work_requires_active_transaction_without_identity_packet(active, is_exclusive):
+    session = SimpleNamespace(in_transaction=lambda: active, scalar=AsyncMock())
+    if active and type(is_exclusive) is bool:
+        await fence.require_registry_company_approval_fence(session, "synthetic_control", is_exclusive=is_exclusive)
+    else:
+        with pytest.raises(ValueError, match="fence_unavailable"):
+            await fence.require_registry_company_approval_fence(session, "synthetic_control", is_exclusive=is_exclusive)
+    session.scalar.assert_not_awaited()

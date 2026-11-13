@@ -18,6 +18,7 @@ from process.network_compact_custom_offices import (
     prepare_compact_custom_offices,
     verify_compact_custom_offices,
 )
+from process.network_compact_layout import CompactAddressRelation
 from process.network_compact_offices import CompactOfficeSources
 from process.network_compact_readiness import _require
 from process.network_custom_address_source import _APPROVED_CTE
@@ -84,9 +85,10 @@ async def _merge_bindings(connection, receipt):
             "location_key=excluded.location_key,entity_type=excluded.entity_type,entity_id=excluded.entity_id"
         )
         await connection.execute(f"DROP TABLE {namespace}.custom_provider_location_binding")
-    oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", namespace + ".provider_location_binding")
-    _require(type(oid) is int)
-    return replace(receipt, binding_table_oid=oid)
+    await connection.fetch(f"SELECT * FROM {namespace}.provider_location_binding LIMIT 0")
+    return replace(
+        receipt, binding_relation=CompactAddressRelation(receipt.target.schema_name, "provider_location_binding")
+    )
 
 
 async def prepare_compact_custom_contribution(

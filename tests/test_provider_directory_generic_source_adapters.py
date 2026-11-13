@@ -109,27 +109,6 @@ def test_repeatable_read_is_required_for_validation_and_cutover(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_retained_connection_proxy_must_match_the_original_physical_publisher(monkeypatch):
-    from importlib import import_module
-
-    from db.connection import ConnectionProxy
-    from process import provider_directory_projection_stage as projection
-
-    directory = import_module("process.provider_directory_fhir")
-    session = object()
-    driver = object()
-    monkeypatch.setattr(policy, "bound_publisher", lambda: SimpleNamespace(connection=driver))
-    copy_driver = AsyncMock(return_value=driver)
-    monkeypatch.setattr(projection, "_copy_driver", copy_driver)
-    proxy = ConnectionProxy(object(), session, None)
-    await directory._require_source_native_connection(proxy)
-    copy_driver.assert_awaited_once_with(session)
-    copy_driver.return_value = object()
-    with pytest.raises(RuntimeError, match="physical_transaction_changed"):
-        await directory._require_source_native_connection(proxy)
-
-
-@pytest.mark.asyncio
 async def test_named_retained_executor_uses_issued_copy_session_without_driver_identity_check(monkeypatch):
     from db.connection import ConnectionProxy
     from process import provider_directory_projection_stage as projection
@@ -149,6 +128,19 @@ async def test_named_retained_executor_uses_issued_copy_session_without_driver_i
     session.execute.assert_awaited_once()
     assert executor._connection is session
     driver_lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retained_explicit_executor_does_not_establish_physical_authority(monkeypatch):
+    from db.connection import ConnectionProxy
+    from process import provider_directory_projection_stage as projection
+
+    executor = ConnectionProxy(None, object(), None)
+    monkeypatch.setattr(policy, "bound_publisher", lambda: SimpleNamespace(storage_binding=None))
+    lookup = AsyncMock(side_effect=AssertionError("physical identity lookup"))
+    monkeypatch.setattr(projection, "_copy_driver", lookup)
+    assert await policy.source_native_executor(executor) is executor
+    lookup.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -181,29 +173,38 @@ async def test_identity_batches_reuse_the_original_owner_transaction_without_new
 
 
 def _loading_count_facts():
-    from tests.test_provider_directory_generic_source_storage import _case, _catalog_row, _sequence_row
-
     directory = import_module("process.provider_directory_fhir")
-    _, _, header_by_field = _case()
     metadata = dict(
         source_ids=["source-a"],
         selected_resources=["Organization"],
         resource_hash_contract=directory.LEGACY_RESOURCE_HASH_CONTRACT,
-        source_release={"vector_sha256": "a" * 64},
     )
-    binding = header_by_field["candidate_storage_json"]
-    binding["identity"]["metadata"] = deepcopy(metadata)
-    binding.update(ordinal=4, resets={"*": 1, "Organization": 2})
-    header_by_field["publication_metadata_json"] = deepcopy(metadata)
-    catalog_rows = []
-    for table in binding["tables"].values():
-        catalog = _catalog_row() | dict(relname=table["name"], oid=table["oid"], relowner=1, nspname="mrf")
-        table.update(storage._layout_proof(catalog))
-        if table["name"].endswith("_ri"):
-            table["layout_sha256"] = storage._input_layout_hash(
-                table["layout_sha256"], _sequence_row(owner=1, schema="mrf")
-            )
-        catalog_rows.append(catalog)
+    identity_by_field = dict(
+        dataset_id="dataset", endpoint_id="endpoint", acquisition_root_run_id="root", metadata=metadata
+    )
+    binding_by_field = dict(
+        contract=storage.NAMED_ISOLATED_CONTRACT,
+        identity=identity_by_field,
+        phase="loading",
+        ordinal=4,
+        resets={"*": 1, "Organization": 2},
+        tables={
+            kind: {"schema": "source_schema", "name": "pdgs_" + "a" * 32 + suffix}
+            for kind, suffix in (("resource_input", "_ri"), ("witness_input", "_wi"))
+        },
+        auxiliary=None,
+        relationship_sha256=None,
+        storage={"catalog_schema": "mrf", "storage_schema": "source_schema"},
+        admission=None,
+    )
+    header_by_field = dict(
+        endpoint_id="endpoint",
+        acquisition_root_run_id="root",
+        status="acquiring",
+        is_current=False,
+        publication_metadata_json=deepcopy(metadata),
+        candidate_storage_json=binding_by_field,
+    )
     context = directory.PaginationCheckpointContext(
         canonical_api_base="https://directory.example/fhir",
         source_scope_hash="scope",
@@ -213,12 +214,14 @@ def _loading_count_facts():
         dataset_id="dataset",
         endpoint_id="endpoint",
     )
-    return context, header_by_field, catalog_rows
+    return context, header_by_field
 
 
 async def _loading_scalar(case, query, *arguments):
     if query.startswith("SELECT nextval("):
         return case.header["candidate_storage_json"]["ordinal"] + 1
+    if query.startswith("SELECT candidate_storage_json FROM"):
+        return deepcopy(case.header["candidate_storage_json"])
     if query.startswith('SELECT count(DISTINCT resource_id COLLATE "C")'):
         case.aggregates.append((query, arguments))
         dataset, resource, cutoff, ordinal = arguments
@@ -231,10 +234,12 @@ async def _loading_scalar(case, query, *arguments):
                 and cutoff < row["batch_ordinal"] <= ordinal
             }
         )
-    return "repeatable read" if query == "SHOW transaction_isolation" else 1
+    assert query == "SHOW transaction_isolation"
+    return "repeatable read"
 
 
 async def _loading_execute(case, role_execute, query, *arguments):
+    case.queries.append((query, arguments))
     if query.startswith("UPDATE"):
         assert storage._json(arguments[2]) == case.header["candidate_storage_json"]
         case.header["candidate_storage_json"] = storage._json(arguments[1])
@@ -244,63 +249,56 @@ async def _loading_execute(case, role_execute, query, *arguments):
 
 @asynccontextmanager
 async def _loading_count_case(monkeypatch):
-    """Supply unit native catalog and COPY state while real Source and custody guards execute."""
-    from process.plan_release_storage_catalog import CATALOG_SQL
+    """Exercise named candidate queries and COPY within the existing Source transaction fixture."""
+    from process.provider_directory_source_storage_binding import FHIRSourceStorageBinding
     from tests.test_provider_directory_generic_source_policy import synthetic_source_database
 
     directory = import_module("process.provider_directory_fhir")
-    context, header, catalog_rows = _loading_count_facts()
+    context, header_by_field = _loading_count_facts()
     domain = SimpleNamespace(first=AsyncMock(return_value={"unique_candidate_rows": 0}), status=AsyncMock())
-    async with synthetic_source_database(monkeypatch, domain) as database, policy.source_transaction(database):
-        monkeypatch.setattr(directory, "db", database)
-        native = policy.bound_publisher().connection
-        case = SimpleNamespace(
-            directory=directory,
-            context=context,
-            header=header,
-            catalog_rows=catalog_rows,
-            database=database,
-            domain=domain,
-            native=native,
-            observations=[],
-            aggregates=[],
-            savepoints=[],
-        )
-        role_fetch, role_execute = native.fetch, native.execute.side_effect
-        original_transaction = native.transaction
+    async with synthetic_source_database(monkeypatch, domain, schema="source_schema") as database:
+        policy._FACTORY.get().storage_binding = FHIRSourceStorageBinding("mrf", "source_schema")
+        async with policy.source_transaction(database):
+            monkeypatch.setattr(directory, "db", database)
+            monkeypatch.setattr(directory, "_schema", lambda: "mrf")
+            native = policy.bound_publisher().connection
+            case = SimpleNamespace(
+                directory=directory,
+                context=context,
+                header=header_by_field,
+                database=database,
+                domain=domain,
+                native=native,
+                observations=[],
+                aggregates=[],
+                savepoints=[],
+                queries=[],
+            )
+            role_execute = native.execute.side_effect
+            original_transaction = native.transaction
 
-        def transaction():
-            savepoint = original_transaction()
-            case.savepoints.append(savepoint)
-            return savepoint
+            def transaction():
+                savepoint = original_transaction()
+                case.savepoints.append(savepoint)
+                return savepoint
 
-        native.transaction = transaction
-
-        async def fetch(query, *arguments):
-            if query == storage._INPUT_SEQUENCES_SQL:
-                from tests.test_provider_directory_generic_source_storage import _sequence_row
-
-                return [_sequence_row(owner=1, schema="mrf")]
-            if query == CATALOG_SQL:
-                assert arguments[1:] == (1, [])
-                return deepcopy(case.catalog_rows)
-            return await role_fetch(query, *arguments)
-
-        async def first(query, *arguments):
-            if "candidate_storage_json FROM" in query:
+            async def first(query, *arguments):
+                assert "candidate_storage_json FROM" in query
+                assert '"source_schema"."provider_directory_endpoint_dataset"' in query
+                case.queries.append((query, arguments))
                 return deepcopy(case.header)
-            assert query == "SELECT session_user::text AS session,current_user::text AS current"
-            return native.fetchrow.return_value
 
-        async def copy(_name, *, records, columns, **_options):
-            case.observations.extend(dict(zip(columns, values)) for values in records)
-            return f"COPY {len(records)}"
+            async def copy(_name, *, records, columns, **_options):
+                case.observations.extend(dict(zip(columns, values)) for values in records)
+                return f"COPY {len(records)}"
 
-        native.fetch, native.fetchrow.side_effect = fetch, first
-        native.fetchval.side_effect = partial(_loading_scalar, case)
-        native.copy_records_to_table.side_effect = copy
-        native.execute.side_effect = partial(_loading_execute, case, role_execute)
-        yield case
+            native.transaction = transaction
+            native.fetch = AsyncMock(return_value=[])
+            native.fetchrow.side_effect = first
+            native.fetchval.side_effect = partial(_loading_scalar, case)
+            native.copy_records_to_table.side_effect = copy
+            native.execute.side_effect = partial(_loading_execute, case, role_execute)
+            yield case
 
 
 @pytest.mark.asyncio
@@ -319,18 +317,76 @@ async def test_loading_count_tracks_unique_copy(monkeypatch):
             ]
         )
         candidate = await storage.resolve_existing_source_candidate(case.database, case.directory, "dataset")
-        rows = _rows(2)
-        await storage.append_generic_source_batch(case.database, case.directory, candidate, [*rows, rows[0]])
+        resource_rows = _rows(2)
+        assert (
+            await storage.append_generic_source_batch(
+                case.database, case.directory, candidate, [*resource_rows, resource_rows[0]]
+            )
+            == 3
+        )
+        copy_call = case.native.copy_records_to_table.await_args
+        assert copy_call.args == (case.header["candidate_storage_json"]["tables"]["resource_input"]["name"],)
+        assert copy_call.kwargs["schema_name"] == "source_schema"
+        assert copy_call.kwargs["columns"] == (*storage.RESOURCE_COLUMNS, "batch_ordinal", "row_ordinal")
+        assert [(copied_values[-2], copied_values[-1]) for copied_values in copy_call.kwargs["records"]] == [
+            (5, 0),
+            (5, 1),
+            (5, 2),
+        ]
+        assert case.header["candidate_storage_json"]["ordinal"] == 5
         before = deepcopy((case.header, case.observations))
         case.native.execute.reset_mock()
         count = await case.directory._caresource_unique_candidate_count(case.context, "Organization")
         assert count == 2
         assert len(case.aggregates) == 1 and case.aggregates[0][1] == ("dataset", "Organization", 2, 5)
-        assert '"mrf"."pdgs_' in case.aggregates[0][0]
+        assert '"source_schema"."pdgs_' in case.aggregates[0][0]
         assert (case.header, case.observations) == before
         assert case.header["candidate_storage_json"]["phase"] == "loading"
-        assert len(case.native.execute.await_args_list) == 1
-        assert "pg_advisory_xact_lock" in case.native.execute.await_args.args[0]
+        statements = [call.args[0] for call in case.native.execute.await_args_list]
+        assert len(statements) == 3
+        assert sum("pg_advisory_xact_lock" in statement for statement in statements) == 1
+        assert sum(statement.startswith("SELECT 1 FROM") for statement in statements) == 2
+        case.domain.first.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [None, "policy", "storage", "producer", "transaction"])
+async def test_loading_count_rechecks_logical_source_scope_after_the_aggregate(monkeypatch, changed):
+    async with _loading_count_case(monkeypatch) as case:
+        scalar = case.native.fetchval.side_effect
+        tokens = []
+
+        async def rewrap(query, *arguments):
+            result = await scalar(query, *arguments)
+            if not query.startswith("SELECT count(DISTINCT"):
+                return result
+            current = policy.bound_publisher()
+            publisher_by_field = dict(policy=replace(current.policy), storage_binding=replace(current.storage_binding))
+            if changed == "policy":
+                publisher_by_field["policy"] = replace(current.policy, owner_role="other_owner")
+            elif changed == "storage":
+                publisher_by_field["storage_binding"] = replace(current.storage_binding, catalog_schema="other_catalog")
+            elif changed == "producer":
+                publisher_by_field["producer_identity"] = ("c" * 40, "sha256:" + "d" * 64)
+            elif changed == "transaction":
+                case.native.is_in_transaction = lambda: False
+            tokens.append(policy._PUBLISHER.set(replace(current, **publisher_by_field)))
+            return result
+
+        case.native.fetchval.side_effect = rewrap
+        try:
+            if changed is None:
+                assert await adapters.candidate_resource_count(case.directory, case.context, "Organization") == 0
+            else:
+                with pytest.raises(
+                    GenericCandidateError, match="owner_transaction_required|policy_changed|transaction_required"
+                ):
+                    await adapters.candidate_resource_count(case.directory, case.context, "Organization")
+        finally:
+            for token in reversed(tokens):
+                policy._PUBLISHER.reset(token)
+        assert len(case.aggregates) == 1
+        case.native.copy_records_to_table.assert_not_awaited()
         case.domain.first.assert_not_awaited()
 
 
@@ -355,7 +411,13 @@ async def test_retry_reader_pins_before_family_lock_and_bounds_committed_batches
         assert "batch_ordinal<=$5" in query
         assert arguments == ("LU:Organization:pass:2", 2, None, None, 4)
         assert all("FOR UPDATE" not in call.args[0] for call in case.native.fetchrow.await_args_list)
-        assert "pg_advisory_xact_lock" in case.native.execute.await_args.args[0]
+        family_lock = next(
+            index for index, (statement, _) in enumerate(case.queries) if "pg_advisory_xact_lock" in statement
+        )
+        header_reads = [
+            index for index, (statement, _) in enumerate(case.queries) if "candidate_storage_json FROM" in statement
+        ]
+        assert header_reads[0] < family_lock < header_reads[-1]
         case.native.copy_records_to_table.assert_not_awaited()
 
 
@@ -511,37 +573,38 @@ async def test_partition_deferral_keeps_requested_reference_seeds(monkeypatch, m
         "resource",
         "dataset",
         "schema",
+        "storage",
+        "table_schema",
+        "duplicate_table",
         "name",
-        "oid",
-        "owner",
         "phase",
         "prepared",
-        "actor",
-        "session",
-        "child",
     ],
 )
 async def test_loading_count_refuses_substitution(monkeypatch, change):
-    """No inherited authority or altered native binding can reach the aggregate."""
+    """Altered acquisition, producer, family, or qualified storage scope cannot reach the aggregate."""
     async with _loading_count_case(monkeypatch) as case:
         context, resource = case.context, "Organization"
-        original_binding = case.database._transaction_binding
-        original_actor = case.native.fetchrow.return_value
         if change in {"root", "endpoint", "dataset"}:
             field = {"root": "acquisition_root_run_id", "endpoint": "endpoint_id", "dataset": "dataset_id"}[change]
             context = replace(context, **{field: "other"})
         if change == "producer":
             context = replace(context, source_ids=("other",))
         if change == "metadata":
-            case.header["publication_metadata_json"]["source_release"]["vector_sha256"] = "b" * 64
+            case.header["publication_metadata_json"]["resource_hash_contract"] = "changed-contract"
         if change == "resource":
             resource = "Location"
         if change == "schema":
             monkeypatch.setattr(case.directory, "_schema", lambda: "other")
+        if change == "storage":
+            case.header["candidate_storage_json"]["storage"]["storage_schema"] = "other"
+        if change == "table_schema":
+            case.header["candidate_storage_json"]["tables"]["resource_input"]["schema"] = "other"
+        if change == "duplicate_table":
+            tables = case.header["candidate_storage_json"]["tables"]
+            tables["witness_input"] = deepcopy(tables["resource_input"])
         if change == "name":
             case.header["candidate_storage_json"]["tables"]["resource_input"]["name"] = 'invalid";name'
-        if change in {"oid", "owner"}:
-            case.catalog_rows[0]["oid" if change == "oid" else "relowner"] = 999
         if change == "phase":
             case.header["status"] = "published"
         if change == "prepared":
@@ -549,30 +612,12 @@ async def test_loading_count_refuses_substitution(monkeypatch, change):
             binding["phase"] = "prepared"
             binding["tables"].update(
                 {
-                    root: dict(
-                        name="pdgs_" + "a" * 32 + "_" + storage._SUFFIXES[root],
-                        oid=20 + index,
-                        owner=1,
-                        layout_sha256="c" * 64,
-                    )
-                    for index, root in enumerate(storage.RELATIONS)
+                    root: dict(schema="source_schema", name="pdgs_" + "a" * 32 + "_" + storage._SUFFIXES[root])
+                    for root in storage.RELATIONS
                 }
             )
-        if change == "actor":
-            case.native.fetchrow.return_value = dict(session="source_publisher", current="other")
-        if change == "session":
-            case.database._transaction_binding = lambda: SimpleNamespace(
-                session=SimpleNamespace(copy_to_table=object())
-            )
-        try:
-            with pytest.raises(GenericCandidateError):
-                if change == "child":
-                    await asyncio.create_task(case.directory._caresource_unique_candidate_count(context, resource))
-                else:
-                    await case.directory._caresource_unique_candidate_count(context, resource)
-        finally:
-            case.database._transaction_binding = original_binding
-            case.native.fetchrow.return_value = original_actor
+        with pytest.raises(ValueError if change == "name" else GenericCandidateError):
+            await case.directory._caresource_unique_candidate_count(context, resource)
         assert case.aggregates == []
         case.domain.first.assert_not_awaited()
         case.native.copy_records_to_table.assert_not_awaited()
@@ -582,7 +627,7 @@ async def test_loading_count_refuses_substitution(monkeypatch, change):
 async def test_candidate_count_keeps_legacy_reader(monkeypatch):
     """Unenrolled callers retain the original mapped relation and row conversion API."""
     directory = import_module("process.provider_directory_fhir")
-    context, _header, _catalog = _loading_count_facts()
+    context, _header = _loading_count_facts()
     database = SimpleNamespace(first=AsyncMock(return_value={"unique_candidate_rows": 7}))
     monkeypatch.setattr(directory, "db", database)
     assert await directory._caresource_unique_candidate_count(context, "Organization") == 7
@@ -628,39 +673,168 @@ async def test_loading_count_rejects_invalid_cardinality(monkeypatch, result):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["session", "actor"])
-async def test_loading_count_rechecks_original_owner(monkeypatch, change):
-    """The original session and actor must survive the awaited aggregate before its result escapes."""
+@pytest.mark.parametrize("failure", [RuntimeError("aggregate failed"), asyncio.CancelledError()])
+async def test_loading_count_rolls_back_on_query_failure(monkeypatch, failure):
+    """SQL errors and cancellation unwind the count savepoint without changing candidate data."""
     async with _loading_count_case(monkeypatch) as case:
         scalar = case.native.fetchval.side_effect
-        original_binding, original_actor = case.database._transaction_binding, case.native.fetchrow.return_value
 
-        async def altered(query, *arguments):
+        async def interrupted(query, *arguments):
             observed = await scalar(query, *arguments)
             if query.startswith("SELECT count(DISTINCT"):
-                if change == "session":
-                    case.database._transaction_binding = lambda: SimpleNamespace(session=object())
-                if change == "actor":
-                    case.native.fetchrow.return_value = dict(session="source_publisher", current="other")
+                raise failure
             return observed
 
-        case.native.fetchval.side_effect = altered
-        try:
-            with pytest.raises(GenericCandidateError, match="transaction_changed"):
-                await case.directory._caresource_unique_candidate_count(case.context, "Organization")
-        finally:
-            case.database._transaction_binding, case.native.fetchrow.return_value = original_binding, original_actor
+        case.native.fetchval.side_effect = interrupted
+        before = deepcopy((case.header, case.observations))
+        with pytest.raises(type(failure)) as caught:
+            await case.directory._caresource_unique_candidate_count(case.context, "Organization")
+        assert caught.value is failure
+        assert (case.header, case.observations) == before
         assert len(case.aggregates) == 1
         assert sum(point.rollback.await_count for point in case.savepoints) == 1
         case.domain.first.assert_not_awaited()
+        case.native.copy_records_to_table.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_candidate_count_missing_dataset(monkeypatch):
     directory = import_module("process.provider_directory_fhir")
-    context, _header, _catalog = _loading_count_facts()
+    context, _header = _loading_count_facts()
     database = SimpleNamespace(first=AsyncMock())
     monkeypatch.setattr(directory, "db", database)
     with pytest.raises(RuntimeError, match="caresource_dataset_id_missing"):
         await directory._caresource_unique_candidate_count(replace(context, dataset_id=None), "Organization")
     database.first.assert_not_awaited()
+
+
+@pytest.fixture
+def candidate_admission_scope(monkeypatch):
+    from db.plan_release_storage import storage_relation
+    from process.provider_directory_source_storage_binding import FHIRSourceStorageBinding
+
+    directory = SimpleNamespace(
+        _schema=lambda: "catalog",
+        _qt=storage_relation,
+        ProviderDirectoryAPIEndpoint=SimpleNamespace(__tablename__="provider_directory_api_endpoint"),
+    )
+    connection = SimpleNamespace(
+        scalar=AsyncMock(return_value=True), first=AsyncMock(return_value={"endpoint_id": "endpoint"})
+    )
+    publisher = SimpleNamespace(
+        policy=SimpleNamespace(schema="candidate_a"), storage_binding=FHIRSourceStorageBinding("catalog", "candidate_a")
+    )
+    token = policy._PUBLISHER.set(publisher)
+    try:
+        yield SimpleNamespace(directory=directory, connection=connection, publisher=publisher)
+    finally:
+        policy._PUBLISHER.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_isolated_candidate_admission_reads_catalog_and_scopes_candidate_lock(candidate_admission_scope):
+    case = candidate_admission_scope
+    await adapters.lock_endpoint_dataset_candidate_admission(case.directory, case.connection, "endpoint")
+    assert case.connection.scalar.await_args.kwargs == {
+        "admission_scope": "provider-directory-source-candidate:catalog:candidate_a:endpoint"
+    }
+    query = case.connection.first.await_args.args[0]
+    assert 'FROM "catalog"."provider_directory_api_endpoint"' in query
+    assert "FOR UPDATE" not in query and "FOR SHARE" not in query
+    assert case.connection.first.await_args.kwargs == {"endpoint_id": "endpoint"}
+    assert "pg_try_advisory_xact_lock" in case.connection.scalar.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_separate_candidate_schemas_use_independent_admission_scopes(candidate_admission_scope):
+    from process.provider_directory_source_storage_binding import FHIRSourceStorageBinding
+
+    case = candidate_admission_scope
+    for schema in ("candidate_a", "candidate_b"):
+        case.publisher.policy.schema = schema
+        case.publisher.storage_binding = FHIRSourceStorageBinding("catalog", schema)
+        await adapters.lock_endpoint_dataset_candidate_admission(case.directory, case.connection, "endpoint")
+    scopes = [call.kwargs["admission_scope"] for call in case.connection.scalar.await_args_list]
+    assert len(set(scopes)) == 2 and all(scope.endswith(":endpoint") for scope in scopes)
+
+
+@pytest.mark.asyncio
+async def test_legacy_candidate_admission_keeps_endpoint_serialization_without_waiting(candidate_admission_scope):
+    case = candidate_admission_scope
+    case.publisher.storage_binding = None
+    await adapters.lock_endpoint_dataset_candidate_admission(case.directory, case.connection, "endpoint")
+    assert case.connection.scalar.await_args.kwargs == {"admission_scope": "endpoint"}
+    assert "pg_try_advisory_xact_lock" in case.connection.scalar.await_args.args[0]
+    assert case.connection.first.await_args.args[0].endswith("FOR UPDATE NOWAIT;")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("acquired", [False, None, "true"])
+async def test_candidate_admission_busy_stops_before_catalog_lookup(candidate_admission_scope, acquired):
+    case = candidate_admission_scope
+    case.connection.scalar.return_value = acquired
+    with pytest.raises(RuntimeError, match="candidate_admission_busy"):
+        await adapters.lock_endpoint_dataset_candidate_admission(case.directory, case.connection, "endpoint")
+    case.connection.first.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["catalog", "storage"])
+async def test_candidate_admission_rejects_mismatched_binding_before_sql(candidate_admission_scope, changed):
+    case = candidate_admission_scope
+    if changed == "catalog":
+        case.directory._schema = lambda: "other_catalog"
+    else:
+        case.publisher.policy.schema = "other_candidate"
+    with pytest.raises(GenericCandidateError, match="schema_changed"):
+        await adapters.lock_endpoint_dataset_candidate_admission(case.directory, case.connection, "endpoint")
+    case.connection.scalar.assert_not_awaited()
+    case.connection.first.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fhir_candidate_admission_entrypoint_uses_shared_adapter(monkeypatch):
+    directory = import_module("process.provider_directory_fhir")
+    lock = AsyncMock()
+    monkeypatch.setattr(adapters, "lock_endpoint_dataset_candidate_admission", lock)
+    connection = object()
+    await directory._lock_endpoint_dataset_candidate_admission(connection, "endpoint")
+    lock.assert_awaited_once_with(directory, connection, "endpoint")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint_exists", [True, False])
+async def test_fhir_validation_uses_shared_candidate_lock(monkeypatch, endpoint_exists):
+    directory = import_module("process.provider_directory_fhir")
+    lock = AsyncMock(return_value={"endpoint_id": "endpoint"} if endpoint_exists else None)
+    monkeypatch.setattr(adapters, "lock_endpoint_dataset_candidate_admission", lock)
+    candidate = SimpleNamespace(endpoint_id="endpoint", dataset_id="candidate")
+    connection = SimpleNamespace(first=AsyncMock(return_value={"dataset_id": "candidate"}))
+
+    if endpoint_exists:
+        assert await directory._locked_endpoint_dataset_candidate_record(connection, candidate) == {
+            "dataset_id": "candidate"
+        }
+        assert connection.first.await_args.args[0].strip().endswith("FOR UPDATE;")
+        assert connection.first.await_args.kwargs == {"dataset_id": "candidate", "endpoint_id": "endpoint"}
+    else:
+        with pytest.raises(RuntimeError, match="api_endpoint_missing_during_validation"):
+            await directory._locked_endpoint_dataset_candidate_record(connection, candidate)
+        connection.first.assert_not_awaited()
+    lock.assert_awaited_once_with(directory, connection, "endpoint")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["advisory", "catalog"])
+async def test_candidate_admission_preserves_sql_failure(candidate_admission_scope, stage):
+    case = candidate_admission_scope
+    failure = RuntimeError("admission SQL failed")
+    if stage == "advisory":
+        case.connection.scalar.side_effect = failure
+    else:
+        case.connection.first.side_effect = failure
+    with pytest.raises(RuntimeError, match="admission SQL failed") as caught:
+        await adapters.lock_endpoint_dataset_candidate_admission(case.directory, case.connection, "endpoint")
+    assert caught.value is failure
+    if stage == "advisory":
+        case.connection.first.assert_not_awaited()

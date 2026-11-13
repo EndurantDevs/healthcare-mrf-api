@@ -4,6 +4,8 @@
 import asyncio
 import json
 from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import replace
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -13,19 +15,20 @@ from sqlalchemy import MetaData, text
 
 from db.models import EntityAddressUnified
 from process import registry_membership_refresh_runtime as runtime
-from process.network_candidate_custody import seal_network_candidate_custody
-from process.registry_candidate_custody_preparation import split_registry_candidate_custody
+from process.network_address_projection import _identifier
+from process.network_membership_publication import load_named_network_preparation
 from process.registry_management_permissions import _aca_controls, _catalog, install_registry_management_permissions
 from process.registry_membership_refresh_authority import AUTHORITY_PATH, COMMIT_AUTHORITY_PATH
 from process.registry_membership_refresh_contract import SERVICE_ACTOR, accepted_membership_source_sha256
 from process.registry_membership_refresh_queue import enqueue_registry_membership_refresh
 from process.registry_publication_consumer import RegistryPublicationConsumerConfig, consume_registry_publication_once
 from process.registry_publication_ptg_runtime import RegistryPublicationSQLLimits
-from process.registry_publication_worker import _BoundedPool, _close_pool, _pool_options
+from process.registry_publication_worker import _BoundedPool, _close_pool, _configured_worker_runtime, _pool_options
 from process.registry_publication_worker_permissions import install_registry_publication_worker_permissions
 from tests import registry_aca_refresh_anchor_postgres_support as accepted
 from tests import registry_compact_source_office_postgres_support as offices
 from tests import test_mrf_publication_receipt_postgres as mrf
+from tests.registry_candidate_custody_postgres_support import administrative_freeze_callback
 from tests.test_registry_membership_refresh_authority import receipt
 from tests.test_registry_membership_refresh_sources_postgres import _aca_context
 from tests.test_registry_publication_authority import _reply
@@ -122,7 +125,7 @@ async def _worker_roles(fixture, stack):
     await connection.execute(f"ALTER ROLE \"{fixture.case.names.reader}\" SET temp_file_limit='256MB'")
     head_role = fixture.readers.aca_head_fence_sessions.kw["bind"].url.username
     await connection.execute(f"ALTER ROLE \"{head_role}\" SET temp_file_limit='256MB'")
-    tables, sequences = await _catalog(connection, await connection.fetchval("SELECT to_regnamespace($1)::oid", schema))
+    tables, sequences = await _catalog(connection, schema)
     controls = await _aca_controls(connection, schema)
     await connection.execute(f'ALTER SCHEMA "{schema}" OWNER TO "{role_by_kind["queue"]}"')
     for relation in tables + controls + sequences:
@@ -140,20 +143,12 @@ async def _worker_roles(fixture, stack):
     await connection.execute(
         f'GRANT "{role_by_kind["execution"]}" TO "{role_by_kind["custodian"]}" WITH ADMIN FALSE, INHERIT TRUE, SET FALSE'
     )
-    for owner in (role_by_kind["physical"], role_by_kind["custody"]):
-        await connection.execute(
-            f'GRANT "{owner}" TO "{role_by_kind["custodian"]}" WITH ADMIN FALSE, INHERIT FALSE, SET TRUE'
-        )
+    await connection.execute(
+        f'GRANT "{role_by_kind["physical"]}" TO "{role_by_kind["custodian"]}" WITH ADMIN FALSE, INHERIT FALSE, SET TRUE'
+    )
     await connection.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO "{role_by_kind["custody"]}"')
     database = await connection.fetchval("SELECT quote_ident(current_database())")
     await connection.execute(f'GRANT CREATE ON DATABASE {database} TO "{role_by_kind["custody"]}"')
-    async with fixture.engine.begin() as sql_connection:
-        await split_registry_candidate_custody(
-            sql_connection,
-            owner_role=role_by_kind["queue"],
-            custody_owner_role=role_by_kind["custody"],
-            control_schema=schema,
-        )
 
 
 async def _address_origin(fixture, stack, raw, canonical):
@@ -188,6 +183,12 @@ async def _address_origin(fixture, stack, raw, canonical):
     fixture.address_schema = namespace
 
 
+async def _assert_write_denied(connection, statement):
+    async with connection.transaction():
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await connection.execute(statement)
+
+
 class RefreshExecution:
     """Test lifecycle; every source, queue and storage operation uses native credentials."""
 
@@ -218,7 +219,6 @@ class RefreshExecution:
         document = json.loads(request.content)
         assert document["actor"] == SERVICE_ACTOR
         if request.url.path == COMMIT_AUTHORITY_PATH:
-            await self._assert_source_fenced()
             if self.cancel_commit:
                 raise asyncio.CancelledError
             if self.denied_commit:
@@ -233,21 +233,16 @@ class RefreshExecution:
                 )
 
     async def seal(self, target):
-        async def authorize(connection, supplied):
-            assert connection is self.custodian and supplied == target
-            return await connection.fetchval(
-                "SELECT current_user=session_user AND current_user::text=$1", self.roles_by_kind["custodian"]
-            )
-
-        await seal_network_candidate_custody(
-            self.custodian,
-            target,
-            control_schema=self.control_schema,
-            runtime_roles=(self.case.names.reader,),
-            authorize=authorize,
-        )
+        await self.prepare_candidate(target)
         if self.after_seal is not None:
             await self.after_seal(target)
+
+    @asynccontextmanager
+    async def _pinned_sources(self, connection, envelope, source_pin):
+        async with self.bundle.runtime.pin_sources(connection, envelope, source_pin) as sources:
+            await self._assert_source_fenced()
+            yield sources
+            await self._assert_source_fenced()
 
     async def enqueue(self, command):
         async with self.api.transaction(isolation="repeatable_read"):
@@ -286,16 +281,46 @@ class RefreshExecution:
             **self.permission_roles,
             reader_roles=(self.case.names.reader,),
             seal_candidate=self.seal,
+            preparation_roles=self.preparation_roles,
             only_request_id=UUID(request_id),
             membership_refresh_only=True,
-            membership_refresh_runtime=self.bundle.runtime,
+            membership_refresh_runtime=replace(self.bundle.runtime, pin_sources=self._pinned_sources),
         )
-        return await consume_registry_publication_once(
+        completed = await consume_registry_publication_once(
             lifecycle_pool=self.lifecycle_pool,
             execution_pool=self.execution_pool,
             authorize=self.bundle.runtime.authorize,
             config=config,
         )
+        if completed is not None:
+            await self.assert_published_readonly(completed["result"]["candidate_id"])
+        return completed
+
+    async def assert_published_readonly(self, candidate_id):
+        handoff = await load_named_network_preparation(
+            self.connection, candidate_id, control_schema=self.control_schema
+        )
+        assert handoff is not None
+        relation_names_by_sql = {
+            f"{_identifier(table['schema'])}.{_identifier(table['name'])}": table["name"]
+            for table in handoff["tables"]
+            if table["name"] in {"network_membership", "provider_location_binding"}
+        }
+        assert set(relation_names_by_sql.values()) == {"network_membership", "provider_location_binding"}
+        async with AsyncExitStack() as stack:
+            execution = await stack.enter_async_context(self.execution_pool.acquire())
+            lifecycle = await stack.enter_async_context(self.lifecycle_pool.acquire())
+            for connection in (self.api, self.custodian, execution, lifecycle):
+                for relation, name in relation_names_by_sql.items():
+                    statements = [
+                        f"DELETE FROM {relation} WHERE false",
+                        f"INSERT INTO {relation} SELECT * FROM {relation} WHERE false",
+                        f"TRUNCATE {relation}",
+                    ]
+                    if name == "network_membership":
+                        statements.append(f"UPDATE {relation} SET provider_id=provider_id WHERE false")
+                    for statement in statements:
+                        await _assert_write_denied(connection, statement)
 
 
 async def _connect_workers(fixture, stack):
@@ -322,6 +347,25 @@ async def _connect_workers(fixture, stack):
         pool = await asyncpg.create_pool(**options_by_name)
         stack.push_async_callback(_close_pool, pool)
         setattr(fixture, kind + "_pool", _BoundedPool(pool, limits.connect_timeout_seconds))
+    settings = SimpleNamespace(
+        consumer=RegistryPublicationConsumerConfig(
+            **fixture.permission_roles,
+            reader_roles=(fixture.case.names.reader,),
+        ),
+        execution_url=fixture.engine.url.set(username=fixture.roles_by_kind["execution"], password=fixture.password),
+        preparation_roles={
+            "namespace_owner_role": fixture.roles_by_kind["custody"],
+            "publisher_role": fixture.roles_by_kind["execution"],
+            "application_roles": sorted(
+                (set(fixture.roles_by_kind.values()) | {fixture.case.names.reader}) - {fixture.roles_by_kind["custody"]}
+            ),
+        },
+        sql_limits=limits,
+        ptg=None,
+    )
+    consumer = await _configured_worker_runtime(settings, stack)
+    fixture.preparation_roles = consumer.preparation_roles
+    fixture.prepare_candidate = administrative_freeze_callback(fixture, consumer)
 
 
 async def _runtime(fixture, stack):
@@ -349,7 +393,7 @@ async def _runtime(fixture, stack):
             },
         )
     )
-    fixture.bundle = await runtime._build_native_bundle(settings, stack, fixture.roles_by_kind["execution"])
+    fixture.bundle = await runtime._build_native_bundle(settings, stack)
     authority = fixture.bundle.runtime.authorize
     await authority._client.aclose()
     authority._client = httpx.AsyncClient(transport=httpx.MockTransport(fixture.http))

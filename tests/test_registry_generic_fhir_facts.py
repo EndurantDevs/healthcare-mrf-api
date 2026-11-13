@@ -194,7 +194,7 @@ async def test_provider_scope_selection_keeps_cms_alias_and_original_generic_cap
     monkeypatch.setattr(readers, "verify_registry_source_recipes", lambda _: (recipe,))
     from process.network_compact_layout import CompactAddressRelation
 
-    relation = CompactAddressRelation("control_example", "registry_approved_record", 101)
+    relation = CompactAddressRelation("control_example", "registry_approved_record")
     approval_pin = AsyncMock(return_value=(approved, relation))
     mapping_pin = AsyncMock()
     monkeypatch.setattr(readers, "pin_api_retained_approved_membership_source", approval_pin)

@@ -18,8 +18,9 @@ from api import provider_directory_retained_fhir_metadata as metadata
 from api.provider_directory_retained_fhir_metadata import verify_retained_fhir_metadata
 from process import provider_directory_source_checkpoint_control as control
 from process.network_fhir_retained_capture_contract import TABLES, RetainedFHIRCaptureError, capture_digest
-from process.network_fhir_source_epoch import _catalog_relations
-from tests.generic_fhir_capture_postgres_support import _capture, legacy_capture_db
+from process.registry_execution_catalog import RegistryExecutionCatalogError
+from tests.generic_fhir_capture_postgres_support import _capture
+from tests.generic_fhir_capture_postgres_support import legacy_capture_db as legacy_capture_db
 from tests.test_network_fhir_retained_capture import pin
 
 _WAIT_SQL = """WITH activity AS MATERIALIZED (
@@ -136,8 +137,8 @@ async def _no_capture_locks(reader, capture):
         "SELECT c.relname,l.mode FROM pg_catalog.pg_locks l "
         "JOIN pg_catalog.pg_class c ON c.oid=l.relation "
         "JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
-        "WHERE l.pid=pg_catalog.pg_backend_pid() AND l.locktype='relation' AND n.oid=$1::oid",
-        capture.schema_oid,
+        "WHERE l.pid=pg_catalog.pg_backend_pid() AND l.locktype='relation' AND n.nspname=$1",
+        capture.schema_name,
     )
     assert locks == []
 
@@ -152,11 +153,15 @@ async def test_genuine_capture_metadata_preserves_original_readonly_snapshot_wit
     capture = await _capture(fixture)
     reader = await fixture.connect("reader")
     async with reader.transaction(isolation=isolation, readonly=True):
-        identity = await reader.fetchrow("SELECT pg_backend_pid(),transaction_timestamp(),session_user,current_user")
+        snapshot = await reader.fetchrow(
+            "SELECT transaction_timestamp(),current_setting('transaction_isolation'),current_setting('transaction_read_only')"
+        )
         assert await verify_retained_fhir_metadata(reader, pin(capture)) == capture
         assert (
-            await reader.fetchrow("SELECT pg_backend_pid(),transaction_timestamp(),session_user,current_user")
-            == identity
+            await reader.fetchrow(
+                "SELECT transaction_timestamp(),current_setting('transaction_isolation'),current_setting('transaction_read_only')"
+            )
+            == snapshot
         )
         await _no_capture_locks(reader, capture)
 
@@ -175,15 +180,20 @@ async def test_metadata_does_not_acquire_even_transient_locks_on_capture_heaps(l
 
 
 @pytest.mark.parametrize("legacy_capture_db", ["legacy", "modern"], indirect=True)
-async def test_raw_catalog_preserves_original_native_receipt_bytes(legacy_capture_db):
+async def test_named_catalog_preserves_original_logical_receipt_and_content(legacy_capture_db):
     fixture = legacy_capture_db
     capture = await _capture(fixture)
     reader = await fixture.connect("reader")
     async with reader.transaction(isolation="repeatable_read", readonly=True):
         await reader.execute("SET LOCAL search_path TO pg_catalog")
-        rebuilt = await metadata._catalog_relations_metadata(reader, capture.schema_name)
-        original = await _catalog_relations(reader, capture.schema_name)
-        assert rebuilt == [dict(relation) for relation in original]
+        from process.network_fhir_retained_capture import require_retained_fhir_capture
+
+        rows = await reader.fetch(metadata._CATALOG_SQL, capture.schema_name)
+        metadata._require_retained_fhir_relations([dict(row) for row in rows], capture.schema_name)
+        assert tuple(row["relname"] for row in rows) == tuple(sorted(TABLES))
+        assert sum(len(json.loads(row["indexes"])) for row in rows) == 9
+        assert await verify_retained_fhir_metadata(reader, pin(capture)) == capture
+        assert await require_retained_fhir_capture(reader, capture) == capture
 
 
 async def test_extra_check_is_refused_without_deparsing_or_locking_its_heap(legacy_capture_db):
@@ -200,7 +210,7 @@ async def test_extra_check_is_refused_without_deparsing_or_locking_its_heap(lega
             async with _metadata_wait_observer(fixture, reader):
                 with pytest.raises(RetainedFHIRCaptureError) as refused:
                     await verify_retained_fhir_metadata(reader, pin(capture))
-                assert refused.value.__cause__ is None
+                assert isinstance(refused.value.__cause__, RegistryExecutionCatalogError)
                 await _no_capture_locks(reader, capture)
 
 
@@ -219,10 +229,10 @@ async def test_untrusted_search_path_cannot_replace_native_types_and_is_restored
 
 async def _metadata_caller_state(reader):
     return await reader.fetchrow(
-        "SELECT pg_backend_pid(),transaction_timestamp(),session_user,current_user,"
+        "SELECT transaction_timestamp(),current_setting('transaction_isolation') AS isolation,"
+        "current_setting('transaction_read_only') AS read_only,"
         "current_setting('jit') AS jit,current_setting('search_path') AS path,"
         "current_setting('statement_timeout') AS timeout,"
-        "(SELECT virtualxid FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='virtualxid' AND granted) AS xid,"
         "(SELECT count(*) FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='advisory' AND granted) AS prior_locks"
     )
 
@@ -241,13 +251,17 @@ async def _verify_metadata_outcome(reader, capture, outcome, entered):
     else:
         with pytest.raises(RetainedFHIRCaptureError) as refused:
             await verify_retained_fhir_metadata(reader, pin(capture))
-        cause_by_outcome = {"database_error": asyncpg.DivisionByZeroError, "timeout": asyncpg.QueryCanceledError}
+        cause_by_outcome = {
+            "refusal": RegistryExecutionCatalogError,
+            "database_error": asyncpg.DivisionByZeroError,
+            "timeout": asyncpg.QueryCanceledError,
+        }
         assert type(refused.value.__cause__) is cause_by_outcome.get(outcome, type(None))
 
 
 @pytest.mark.parametrize("caller_jit", ("on", "off"))
 @pytest.mark.parametrize("outcome", ("success", "refusal", "database_error", "timeout", "cancel"))
-async def test_metadata_restores_caller_settings_identity_and_prior_locks(
+async def test_metadata_restores_caller_settings_snapshot_and_prior_locks(
     legacy_capture_db, monkeypatch, caller_jit, outcome
 ):
     fixture = legacy_capture_db
@@ -256,18 +270,18 @@ async def test_metadata_restores_caller_settings_identity_and_prior_locks(
         await fixture.admin.execute(
             f'ALTER TABLE "{capture.schema_name}"."{TABLES[1]}" ADD CONSTRAINT unexpected CHECK (resource_id<>\'never\') NOT VALID'
         )
-    original, entered = metadata._catalog_relations_metadata, asyncio.Event()
+    original, entered = metadata._catalog_metadata, asyncio.Event()
 
-    async def inspect_settings(connection, schema):
+    async def inspect_settings(connection, selected_capture):
         assert await connection.fetchval("SHOW jit") == "off"
         entered.set()
         if outcome == "database_error":
             await connection.execute("SELECT 1/0")
         elif outcome in {"timeout", "cancel"}:
             await connection.execute("SELECT pg_sleep(5)")
-        return await original(connection, schema)
+        return await original(connection, selected_capture)
 
-    monkeypatch.setattr(metadata, "_catalog_relations_metadata", inspect_settings)
+    monkeypatch.setattr(metadata, "_catalog_metadata", inspect_settings)
     reader = await fixture.connect("reader")
     async with fixture.admin.transaction():
         await fixture.admin.execute(f'LOCK TABLE "{capture.schema_name}"."{TABLES[1]}" IN ACCESS EXCLUSIVE MODE NOWAIT')
@@ -275,7 +289,7 @@ async def test_metadata_restores_caller_settings_identity_and_prior_locks(
             await reader.execute(f"SET LOCAL jit={caller_jit}")
             await reader.execute(f'SET LOCAL search_path TO "{fixture.schema}",pg_catalog')
             await reader.execute("SET LOCAL statement_timeout='1000ms'")
-            await reader.fetchval("SELECT pg_advisory_xact_lock($1::int,$2::int)", capture.schema_oid % 2147483647, 1)
+            await reader.fetchval("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", capture.schema_name)
             previous = await _metadata_caller_state(reader)
             await _verify_metadata_outcome(reader, capture, outcome, entered)
             assert await _metadata_caller_state(reader) == previous
@@ -303,27 +317,45 @@ async def test_native_readonly_repeatable_snapshot_is_mandatory(legacy_capture_d
         await verify_retained_fhir_metadata(reader, pin(capture))
 
 
-async def test_publisher_cannot_pose_as_capture_api_reader(legacy_capture_db):
+async def _assert_write_denied(connection, statement):
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        async with connection.transaction():
+            await connection.execute(statement)
+
+
+async def test_published_capture_denies_application_dml(legacy_capture_db):
+    from process.network_fhir_retained_capture import require_retained_fhir_capture
+
     fixture = legacy_capture_db
     capture = await _capture(fixture)
-    publisher = await fixture.connect("publisher")
-    async with publisher.transaction(isolation="repeatable_read", readonly=True):
-        with pytest.raises(RetainedFHIRCaptureError):
-            await verify_retained_fhir_metadata(publisher, pin(capture))
-        await _no_capture_locks(publisher, capture)
+    for role in ("reader", "publisher"):
+        application = await fixture.connect(role)
+        async with application.transaction(isolation="repeatable_read"):
+            for table in TABLES:
+                key = "dataset_id" if table in TABLES[:2] else "source_id"
+                for operation in (
+                    f'INSERT INTO "{capture.schema_name}"."{table}" DEFAULT VALUES',
+                    f'UPDATE "{capture.schema_name}"."{table}" SET "{key}"="{key}" WHERE false',
+                    f'DELETE FROM "{capture.schema_name}"."{table}" WHERE false',
+                    f'TRUNCATE "{capture.schema_name}"."{table}"',
+                ):
+                    await _assert_write_denied(application, operation)
+        async with application.transaction(isolation="repeatable_read", readonly=True):
+            assert await verify_retained_fhir_metadata(application, pin(capture)) == capture
+            assert await require_retained_fhir_capture(application, capture) == capture
 
 
-async def test_origin_graft_and_sibling_capture_oids_do_not_authenticate(legacy_capture_db):
+async def test_origin_graft_and_sibling_named_tables_cannot_replace_the_selected_capture(legacy_capture_db):
     fixture = legacy_capture_db
     capture, sibling = await _capture(fixture), await _capture(fixture)
     forged_origin = replace(capture.origin, endpoint_id="different-endpoint")
     grafted = replace(capture, origin=forged_origin)
     grafted = replace(grafted, capture_sha256=capture_digest(grafted))
-    sibling_oids = replace(capture, relation_oids=sibling.relation_oids)
-    sibling_oids = replace(sibling_oids, capture_sha256=capture_digest(sibling_oids))
+    sibling_tables = replace(capture, tables=sibling.tables)
+    sibling_tables = replace(sibling_tables, capture_sha256=capture_digest(sibling_tables))
     reader = await fixture.connect("reader")
     async with reader.transaction(isolation="repeatable_read", readonly=True):
-        for forged in (grafted, sibling_oids):
+        for forged in (grafted, sibling_tables):
             with pytest.raises(RetainedFHIRCaptureError):
                 await verify_retained_fhir_metadata(reader, pin(forged))
         assert await verify_retained_fhir_metadata(reader, pin(sibling)) == sibling
@@ -331,43 +363,21 @@ async def test_origin_graft_and_sibling_capture_oids_do_not_authenticate(legacy_
         await _no_capture_locks(reader, sibling)
 
 
-@pytest.mark.parametrize("drift", ["comment", "write_grant", "owner_reach", "index", "shape", "owner_login", "storage"])
+@pytest.mark.parametrize("drift", ["comment", "index", "shape", "storage"])
 async def test_native_metadata_drift_is_refused(legacy_capture_db, drift):
     fixture = legacy_capture_db
     capture = await _capture(fixture)
-    schema, reader_role, owner = capture.schema_name, fixture.role_by_kind["reader"], fixture.role_by_kind["owner"]
+    schema = capture.schema_name
     statement_by_drift = {
         "comment": f"COMMENT ON SCHEMA \"{schema}\" IS 'changed-receipt'",
-        "write_grant": f'GRANT UPDATE ON "{schema}"."{TABLES[1]}" TO "{reader_role}"',
-        "owner_reach": f'GRANT "{owner}" TO "{reader_role}" WITH INHERIT FALSE, SET TRUE',
         "index": f'DROP INDEX "{schema}".retained_lookup_1_0',
         "shape": f'ALTER TABLE "{schema}"."{TABLES[1]}" ADD COLUMN unexpected integer',
-        "owner_login": f'ALTER ROLE "{owner}" LOGIN',
         "storage": f'ALTER INDEX "{schema}".retained_lookup_1_0 SET (fillfactor=90)',
     }
     await fixture.admin.execute(statement_by_drift[drift])
     reader = await fixture.connect("reader")
     async with reader.transaction(isolation="repeatable_read", readonly=True):
         with pytest.raises(RetainedFHIRCaptureError, match="^retained_fhir_capture_unavailable$"):
-            await verify_retained_fhir_metadata(reader, pin(capture))
-        await _no_capture_locks(reader, capture)
-
-
-async def test_unpinned_native_definer_escape_is_refused(legacy_capture_db):
-    fixture = legacy_capture_db
-    capture = await _capture(fixture)
-    schema = "capture_escape_" + capture.capture_id.replace("-", "")
-    fixture.captures.append(schema)
-    owner, reader_role = fixture.role_by_kind["owner"], fixture.role_by_kind["reader"]
-    await fixture.admin.execute(f'CREATE SCHEMA "{schema}" AUTHORIZATION "{owner}"')
-    await fixture.admin.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO "{reader_role}"')
-    await fixture.admin.execute(
-        f"CREATE FUNCTION \"{schema}\".escape() RETURNS integer LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'"
-    )
-    await fixture.admin.execute(f'ALTER FUNCTION "{schema}".escape() OWNER TO "{owner}"')
-    reader = await fixture.connect("reader")
-    async with reader.transaction(isolation="repeatable_read", readonly=True):
-        with pytest.raises(RetainedFHIRCaptureError):
             await verify_retained_fhir_metadata(reader, pin(capture))
         await _no_capture_locks(reader, capture)
 

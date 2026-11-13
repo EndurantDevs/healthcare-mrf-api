@@ -763,7 +763,7 @@ async def retained_catalog_input(request, monkeypatch):
 @pytest.mark.asyncio(loop_scope="function")
 @pytest.mark.parametrize("retained_catalog_input", ["legacy", "modern"], indirect=True)
 async def test_retained_fhir_capture_is_certified_only_with_complete_native_custody(retained_catalog_input):
-    """Use genuine capture and execution logins inside a dedicated native database."""
+    """Validate genuine named capture data and native read roles in an owned database."""
     from tests.test_network_fhir_retained_capture_postgres import _capture as capture_retained
 
     prepared = retained_catalog_input
@@ -782,8 +782,11 @@ async def test_retained_fhir_capture_is_certified_only_with_complete_native_cust
             async with connection.begin():
                 observed = await _capture(fixture)
                 assert _verify(fixture, observed)["contract"] == catalog.CONTRACT
-                certificate = observed["retained_fhir_catalogs"][str(capture.schema_oid)]
-                assert certificate["closed"] is True and len(certificate["catalog"]) == 5
+                certificate = observed["retained_fhir_catalogs"][capture.schema_name]
+                assert len(certificate["catalog"]) == 5
+                assert tuple(relation_row["relname"] for relation_row in certificate["catalog"]) == tuple(
+                    sorted(capture.tables)
+                )
                 assert (
                     sum(len(json.loads(native_relation["indexes"])) for native_relation in certificate["catalog"]) == 9
                 )
@@ -797,6 +800,12 @@ async def test_retained_fhir_capture_is_certified_only_with_complete_native_cust
         await engine.dispose()
 
 
+async def _assert_write_denied(connection, statement):
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        async with connection.transaction():
+            await connection.execute(statement)
+
+
 async def _retained_fhir_execution_read(supplied, execution, capture, password):
     from process.network_fhir_retained_capture import require_retained_fhir_capture
 
@@ -806,30 +815,32 @@ async def _retained_fhir_execution_read(supplied, execution, capture, password):
         .render_as_string(hide_password=False)
     )
     try:
+        async with connection.transaction(isolation="repeatable_read"):
+            for table in capture.tables:
+                key = (
+                    "dataset_id"
+                    if table in {"provider_directory_endpoint_dataset", "provider_directory_dataset_resource"}
+                    else "source_id"
+                )
+                for statement in (
+                    f'INSERT INTO "{capture.schema_name}"."{table}" DEFAULT VALUES',
+                    f'UPDATE "{capture.schema_name}"."{table}" SET "{key}"="{key}" WHERE false',
+                    f'DELETE FROM "{capture.schema_name}"."{table}" WHERE false',
+                    f'TRUNCATE "{capture.schema_name}"."{table}"',
+                ):
+                    await _assert_write_denied(connection, statement)
         async with connection.transaction(isolation="repeatable_read", readonly=True):
-            assert await connection.fetchval("SELECT session_user=current_user AND current_user=$1", execution)
             assert await require_retained_fhir_capture(connection, capture) == capture
     finally:
         await connection.close()
 
 
 async def _retained_fhir_refusals(fixture, capture):
-    schema, role = capture.schema_name, fixture.roles_by_kind["execution"]
+    schema = capture.schema_name
     mutations = (
-        f'GRANT CREATE ON SCHEMA "{schema}" TO "{role}"',
-        f'GRANT USAGE ON SCHEMA "{schema}" TO PUBLIC',
-        f'GRANT USAGE ON SCHEMA "{schema}" TO "{fixture.roles_by_kind["reader"]}"',
-        f'GRANT SELECT ON ALL TABLES IN SCHEMA "{schema}" TO "{fixture.roles_by_kind["reader"]}"',
-        f'GRANT SELECT ON ALL TABLES IN SCHEMA "{schema}" TO PUBLIC',
-        f'GRANT SELECT ON ALL TABLES IN SCHEMA "{schema}" TO "{role}" WITH GRANT OPTION',
-        f'GRANT UPDATE ON ALL TABLES IN SCHEMA "{schema}" TO "{role}"',
-        f'GRANT "{capture.owner_role}" TO "{role}" WITH INHERIT FALSE, SET TRUE',
-        f'ALTER DEFAULT PRIVILEGES IN SCHEMA "{schema}" GRANT SELECT ON TABLES TO PUBLIC',
         f'CREATE TABLE "{schema}".unexpected(value integer)',
         f'CREATE SEQUENCE "{schema}".unexpected',
         f'ALTER TABLE "{schema}".provider_directory_entity_source_binding ENABLE ROW LEVEL SECURITY',
-        f'GRANT UPDATE(resource_id) ON "{schema}".provider_directory_entity_source_binding TO "{role}"',
-        f'GRANT MAINTAIN ON ALL TABLES IN SCHEMA "{schema}" TO "{role}"',
         f'ALTER TABLE "{schema}".provider_directory_entity_source_binding ADD COLUMN unexpected integer',
         f'DROP INDEX "{schema}".retained_lookup_1_0',
         f"CREATE FUNCTION \"{schema}\".unexpected() RETURNS integer LANGUAGE sql AS 'SELECT 1'",
@@ -847,19 +858,21 @@ async def _retained_fhir_refusals(fixture, capture):
 
 
 async def _retained_fhir_forged_receipts(fixture, capture):
-    from dataclasses import replace
+    from process.network_fhir_retained_capture_contract import canonical
 
-    from process.network_fhir_retained_capture_contract import canonical, capture_digest
-
-    for changes in (
-        {"schema_oid": capture.schema_oid + 1},
-        {"owner_role": fixture.roles_by_kind["queue"]},
-        {"catalog_sha256": "0" * 64},
-        {"relation_oids": tuple((name, oid + 1) for name, oid in capture.relation_oids)},
-    ):
-        changed = replace(capture, **changes)
-        changed = replace(changed, capture_sha256=capture_digest(changed))
-        document = "retained-normalized-fhir-v1:" + canonical(changed.as_dict())
+    documents = []
+    for damage in ("schema", "table", "digest", "unknown"):
+        changed = capture.as_dict()
+        if damage == "schema":
+            changed["schema_name"] = "registry_fhir_capture_" + "f" * 32
+        elif damage == "table":
+            changed["tables"]["provider_directory_dataset_resource"]["name"] = "unrecorded_resource"
+        elif damage == "digest":
+            changed["capture_sha256"] = "0" * 64
+        else:
+            changed["unknown"] = True
+        documents.append("retained-normalized-fhir-v1:" + canonical(changed))
+    for document in documents:
         transaction = await fixture.connection.begin_nested()
         try:
             await fixture.connection.exec_driver_sql(
@@ -897,9 +910,9 @@ async def _retained_fhir_deparser_tripwire(fixture, capture):
         finally:
             await probe.rollback()
         observed = await _capture(fixture)
-        native = observed["retained_fhir_catalogs"][str(capture.schema_oid)]["catalog"]
-        assert all(index["definition"] is None for relation in native for index in json.loads(relation["indexes"]))
-        assert all(key[3] is None for relation in native for key in json.loads(relation["constraints"]))
+        native = observed["retained_fhir_catalogs"][capture.schema_name]["catalog"]
+        assert all("definition" not in index for relation in native for index in json.loads(relation["indexes"]))
+        assert all("definition" not in key for relation in native for key in json.loads(relation["constraints"]))
         with pytest.raises(ValueError):
             _verify(fixture, observed)
     finally:
@@ -922,9 +935,9 @@ async def _retained_fhir_unsupported_deparsers(fixture, capture):
             for statement in statements:
                 await fixture.connection.exec_driver_sql(statement)
             observed = await _capture(fixture)
-            native = observed["retained_fhir_catalogs"][str(capture.schema_oid)]["catalog"]
-            assert all(index["definition"] is None for relation in native for index in json.loads(relation["indexes"]))
-            assert all(key[3] is None for relation in native for key in json.loads(relation["constraints"]))
+            native = observed["retained_fhir_catalogs"][capture.schema_name]["catalog"]
+            assert all("definition" not in index for relation in native for index in json.loads(relation["indexes"]))
+            assert all("definition" not in key for relation in native for key in json.loads(relation["constraints"]))
             with pytest.raises(ValueError):
                 _verify(fixture, observed)
         finally:
@@ -932,16 +945,14 @@ async def _retained_fhir_unsupported_deparsers(fixture, capture):
 
 
 async def _retained_fhir_oversized_comment(fixture, capture):
-    document = "retained-normalized-fhir-v1:" + json.dumps(
-        {"runtime_roles": list(capture.runtime_roles), "padding": "x" * 65537}
-    )
+    document = "retained-normalized-fhir-v1:" + json.dumps({**capture.as_dict(), "padding": "x" * 65537})
     transaction = await fixture.connection.begin_nested()
     try:
         await fixture.connection.exec_driver_sql(
             f'COMMENT ON SCHEMA "{capture.schema_name}" IS ' + "'" + document + "'"
         )
         observed = await _capture(fixture)
-        assert observed["retained_fhir_catalogs"][str(capture.schema_oid)]["closed"] is False
+        assert len(observed["retained_fhir_catalogs"][capture.schema_name]["catalog"]) == 5
         with pytest.raises(ValueError):
             _verify(fixture, observed)
     finally:

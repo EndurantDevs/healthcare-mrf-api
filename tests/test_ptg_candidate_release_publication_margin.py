@@ -83,18 +83,7 @@ def test_rollback_coordinates_and_report_are_explicit():
     assert report["global_pointer"] == "deferred"
 
 
-def test_rollback_cache_clear_and_row_normalizers(monkeypatch):
-    from api import ptg2_snapshot
-
-    snapshot_cache_by_key = {"synthetic": object()}
-    monkeypatch.setattr(
-        ptg2_snapshot,
-        "_PTG2_SNAPSHOT_RESOLVE_CACHE",
-        snapshot_cache_by_key,
-        raising=False,
-    )
-    rollback._clear_ptg2_snapshot_cache()
-    assert not snapshot_cache_by_key
+def test_rollback_row_normalizers():
     assert rollback_relations._row_mapping({"value": 1}) == {"value": 1}
     assert rollback_store._row_mapping({"value": 1}) == {"value": 1}
 

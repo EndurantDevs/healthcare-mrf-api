@@ -55,7 +55,7 @@ from api.custom_import_provider_service_sql import (
 )
 from api.endpoint.pagination import PaginationParams, parse_pagination
 from api.network_address_scope import canonical_network_read
-from api.network_read_execution import direct_heap_relation_sql, execute_network_read, has_network_read_inventory
+from api.network_read_execution import qualified_relation_sql
 from api.plan_pricing_em_distance import (
     _request_code_index as _em_distance_request_code_index,
 )
@@ -1038,8 +1038,7 @@ async def _lookup_zip_context(session, zip5: str | None) -> dict[str, Any] | Non
     normalized_zip = _normalize_zip5(zip5)
     if not normalized_zip:
         return None
-    lookup_result = await execute_network_read(
-        session,
+    lookup_result = await session.execute(
         select(
             geo_zip_table.c.zip_code.label("zip5"),
             geo_zip_table.c.state.label("state"),
@@ -1115,8 +1114,7 @@ async def _query_zip_radius_rows(
     ]
     if state_filter:
         filters.append(geo_zip_table.c.state == state_filter)
-    query_result = await execute_network_read(
-        session,
+    query_result = await session.execute(
         select(
             geo_zip_table.c.zip_code.label("zip5"),
             geo_zip_table.c.state.label("state"),
@@ -1556,8 +1554,7 @@ async def _build_dynamic_zip_peer_stats(
         if specialty_candidate != "__all__":
             filters.append(provider_procedure_cost_profile_table.c.specialty_key == specialty_candidate)
 
-        candidate_result = await execute_network_read(
-            session,
+        candidate_result = await session.execute(
             select(
                 provider_procedure_cost_profile_table.c.npi,
                 provider_procedure_cost_profile_table.c.claim_count,
@@ -1809,8 +1806,7 @@ async def _load_provider_cost_profiles(
     geography_clauses: list[Any],
 ) -> list[dict[str, Any]]:
     """Load provider profiles admitted by the requested geography scope."""
-    profile_result = await execute_network_read(
-        session,
+    profile_result = await session.execute(
         select(provider_procedure_cost_profile_table).where(
             and_(
                 provider_procedure_cost_profile_table.c.year == year,
@@ -1926,7 +1922,7 @@ async def _load_provider_cost_peers(session, peer_key_candidates: set[_ProviderC
             setting_key,
         ) in peer_key_candidates
     ]
-    peer_result = await execute_network_read(session, select(procedure_peer_stats_table).where(or_(*peer_clauses)))
+    peer_result = await session.execute(select(procedure_peer_stats_table).where(or_(*peer_clauses)))
     return [_row_to_dict(peer_stats_row) for peer_stats_row in peer_result]
 
 
@@ -2026,7 +2022,7 @@ async def _enrich_provider_service_cost_indices(
 
 
 async def _default_year(session, table) -> int:
-    result = await execute_network_read(session, select(func.max(table.c.year)))
+    result = await session.execute(select(func.max(table.c.year)))
     year = result.scalar()
     if year is None:
         raise sanic.exceptions.NotFound("No pricing data available")
@@ -2042,7 +2038,7 @@ async def _resolve_year(session, table, requested_year: int | None) -> tuple[int
 
 
 async def _is_table_available(session, table_name: str) -> bool:
-    use_cache = ENABLE_PRICING_SCHEMA_CACHE and not has_network_read_inventory(session)
+    use_cache = ENABLE_PRICING_SCHEMA_CACHE and not (getattr(session, "info", {}).get("api_reader_verified") is True)
     qualified_name = table_name if "." in table_name else f"{PRICING_SCHEMA}.{table_name}"
     if use_cache:
         cached = _PRICING_TABLE_EXISTS_CACHE.get(qualified_name)
@@ -2051,7 +2047,7 @@ async def _is_table_available(session, table_name: str) -> bool:
             if (time.monotonic() - cached_at) <= _PRICING_SCHEMA_CACHE_TTL_SECONDS:
                 return bool(cached_value)
             _PRICING_TABLE_EXISTS_CACHE.pop(qualified_name, None)
-    result = await execute_network_read(session, text("SELECT to_regclass(:name)"), {"name": qualified_name})
+    result = await session.execute(text("SELECT to_regclass(:name)"), {"name": qualified_name})
     exists = bool(result.scalar())
     if use_cache:
         _PRICING_TABLE_EXISTS_CACHE[qualified_name] = (time.monotonic(), exists)
@@ -2059,7 +2055,7 @@ async def _is_table_available(session, table_name: str) -> bool:
 
 
 async def _table_columns(session, table_name: str) -> set[str]:
-    use_cache = ENABLE_PRICING_SCHEMA_CACHE and not has_network_read_inventory(session)
+    use_cache = ENABLE_PRICING_SCHEMA_CACHE and not (getattr(session, "info", {}).get("api_reader_verified") is True)
     qualified_name = table_name if "." in table_name else f"{PRICING_SCHEMA}.{table_name}"
     schema_name, simple_name = qualified_name.split(".", 1)
     if use_cache:
@@ -2069,8 +2065,7 @@ async def _table_columns(session, table_name: str) -> set[str]:
             if (time.monotonic() - cached_at) <= _PRICING_SCHEMA_CACHE_TTL_SECONDS:
                 return set(cached_columns)
             _PRICING_TABLE_COLUMNS_CACHE.pop(qualified_name, None)
-    result = await execute_network_read(
-        session,
+    result = await session.execute(
         text(
             """
             SELECT column_name
@@ -2237,7 +2232,7 @@ async def _query_terminology(
         )
         .limit(limit)
     )
-    terminology_result = await execute_network_read(session, query)
+    terminology_result = await session.execute(query)
     return [_terminology_item(_row_to_dict(terminology_row)) for terminology_row in terminology_result]
 
 
@@ -2410,8 +2405,7 @@ async def _query_procedure_autocomplete_terminology(
     if not await _is_terminology_available(session):
         return None
 
-    terminology_result = await execute_network_read(
-        session,
+    terminology_result = await session.execute(
         _PROCEDURE_AUTOCOMPLETE_TERMINOLOGY_SQL,
         {
             "search_terms": json.dumps((full_term, *search_tokens)),
@@ -2436,15 +2430,14 @@ async def _query_procedure_autocomplete_catalog(
     """Query the live procedure catalog with literal substring semantics."""
     escaped_query = search_query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     catalog_query = _PROCEDURE_AUTOCOMPLETE_CATALOG_SQL
-    if has_network_read_inventory(session):
+    if getattr(session, "info", {}).get("api_reader_verified") is True:
         catalog_query = text(
             _PROCEDURE_AUTOCOMPLETE_CATALOG_TEMPLATE.replace(
                 "{procedure_relation}",
-                direct_heap_relation_sql(session, PRICING_SCHEMA, PricingProcedure.__tablename__),
+                qualified_relation_sql(PRICING_SCHEMA, PricingProcedure.__tablename__),
             )
         )
-    catalog_result = await execute_network_read(
-        session,
+    catalog_result = await session.execute(
         catalog_query,
         {
             "q_like": f"%{escaped_query}%",
@@ -2601,8 +2594,8 @@ async def _internal_rx_codes_from_terminology(session, rows: list[dict[str, Any]
     internal_codes, external_clauses = _rx_terminology_candidates(rows, code_crosswalk_table)
     if external_clauses:
         try:
-            crosswalk_query = await execute_network_read(
-                session, select(code_crosswalk_table.c.to_code).where(or_(*external_clauses))
+            crosswalk_query = await session.execute(
+                select(code_crosswalk_table.c.to_code).where(or_(*external_clauses))
             )
             for crosswalk_row in crosswalk_query:
                 internal_code = (
@@ -2631,9 +2624,7 @@ async def _resolve_quality_year(session, requested_year: int | None) -> tuple[in
         return requested_year, "request"
     if PRICING_DEFAULT_YEAR is not None:
         return PRICING_DEFAULT_YEAR, "env"
-    result = await execute_network_read(
-        session, text(f"SELECT MAX(year) FROM {PRICING_SCHEMA}.{QUALITY_SCORE_TABLE_NAME}")
-    )
+    result = await session.execute(text(f"SELECT MAX(year) FROM {PRICING_SCHEMA}.{QUALITY_SCORE_TABLE_NAME}"))
     year = result.scalar()
     if year is None:
         raise sanic.exceptions.NotFound("No provider quality score data available")
@@ -2659,8 +2650,7 @@ async def _resolve_quality_benchmark_mode(
 ) -> tuple[str, str]:
     if requested_mode in QUALITY_BENCHMARK_MODE_ORDER:
         return requested_mode, "request"
-    benchmark_query = await execute_network_read(
-        session,
+    benchmark_query = await session.execute(
         text(
             f"""
             SELECT benchmark_mode
@@ -3702,8 +3692,8 @@ def _provider_quality_profile_query(
         "npi_address_cte",
     )
     provider_relation = f"{PRICING_SCHEMA}.{PricingProvider.__tablename__}"
-    if has_network_read_inventory(session):
-        provider_relation = direct_heap_relation_sql(session, PRICING_SCHEMA, PricingProvider.__tablename__)
+    if getattr(session, "info", {}).get("api_reader_verified") is True:
+        provider_relation = qualified_relation_sql(PRICING_SCHEMA, PricingProvider.__tablename__)
     return _PROVIDER_QUALITY_PROFILE_QUERY_TEMPLATE.format(
         provider_relation=provider_relation,
         provider_year_filter="AND p.year = :year" if year is not None else "",
@@ -3733,8 +3723,7 @@ async def _load_provider_quality_profile(
     year: int | None,
 ) -> dict[str, Any] | None:
     """Load provider identity, location, taxonomy, and enrichment attributes."""
-    profile_query_result = await execute_network_read(
-        session,
+    profile_query_result = await session.execute(
         text(_provider_quality_profile_query(year, await _provider_quality_profile_ctes(session), session=session)),
         {"npi": npi, "year": year},
     )
@@ -3826,8 +3815,7 @@ async def _load_estimated_score_row(
         "COALESCE(LOWER(BTRIM(COALESCE(s.score_method, 'direct'))), 'direct') <> 'unavailable'",
     ]
     where_sql = " AND ".join([*score_filters, *cohort.feature_filters])
-    score_result = await execute_network_read(
-        session,
+    score_result = await session.execute(
         text(
             f"""
             SELECT
@@ -3868,8 +3856,7 @@ async def _load_estimated_domain_payloads(
     """Load per-domain medians for one estimated peer cohort."""
 
     domain_payloads_by_name = _empty_domain_payloads_by_name()
-    domain_result = await execute_network_read(
-        session,
+    domain_result = await session.execute(
         text(
             f"""
             SELECT
@@ -4084,8 +4071,7 @@ async def _load_provider_qpp_scores(
     year: int,
 ) -> tuple[float | None, float | None]:
     try:
-        qpp_result = await execute_network_read(
-            session,
+        qpp_result = await session.execute(
             text(
                 f"""
                 SELECT quality_score, cost_score
@@ -4117,8 +4103,7 @@ async def _load_provider_rx_totals(
     year: int,
 ) -> tuple[float, float]:
     try:
-        rx_result = await execute_network_read(
-            session,
+        rx_result = await session.execute(
             select(
                 func.coalesce(func.sum(provider_prescription_table.c.total_claims), 0.0).label("total_rx_claims"),
                 func.coalesce(func.sum(provider_prescription_table.c.total_benes), 0.0).label("total_rx_beneficiaries"),
@@ -4147,8 +4132,7 @@ async def _load_provider_svi(session, *, zip5: str | None, year: int) -> float:
     if not zip5:
         return PROVIDER_QUALITY_DEFAULT_SVI
     try:
-        svi_result = await execute_network_read(
-            session,
+        svi_result = await session.execute(
             text(
                 f"""
                 SELECT svi_overall
@@ -4171,8 +4155,8 @@ async def _load_provider_svi(session, *, zip5: str | None, year: int) -> float:
 
 async def _load_provider_quality_observed(session, *, npi: int, year: int) -> dict[str, Any] | None:
     """Load observed utilization, cost, prescription, and QPP measures for a provider and year."""
-    provider_result = await execute_network_read(
-        session, select(provider_table).where(and_(provider_table.c.npi == npi, provider_table.c.year == year))
+    provider_result = await session.execute(
+        select(provider_table).where(and_(provider_table.c.npi == npi, provider_table.c.year == year))
     )
     provider_row = provider_result.first()
     if provider_row is None:
@@ -4287,16 +4271,16 @@ async def _load_quality_peer_targets(
     fast_query, scoped_fallback_query = _quality_peer_target_query_variants(select_sql, state_enabled, zip_enabled)
 
     try:
-        peer_target_query_result = await execute_network_read(session, text(fast_query), parameter_map)
+        peer_target_query_result = await session.execute(text(fast_query), parameter_map)
         peer_target_rows = [_row_to_dict(peer_target_row) for peer_target_row in peer_target_query_result]
         if peer_target_rows:
             return peer_target_rows
         # Safety fallback for unexpected geography-key formats.
-        fallback_result = await execute_network_read(session, text(scoped_fallback_query), parameter_map)
+        fallback_result = await session.execute(text(scoped_fallback_query), parameter_map)
         fallback_rows = [_row_to_dict(peer_target_row) for peer_target_row in fallback_result]
         if fallback_rows:
             return fallback_rows
-        fallback_result = await execute_network_read(session, text(select_sql), parameter_map)
+        fallback_result = await session.execute(text(select_sql), parameter_map)
         return [_row_to_dict(peer_target_row) for peer_target_row in fallback_result]
     except sanic.exceptions.ServiceUnavailable:
         raise
@@ -4718,8 +4702,7 @@ async def _precomputed_procedure_provider_count(
     year: int,
     procedure_code: int,
 ) -> int | None:
-    result = await execute_network_read(
-        session,
+    result = await session.execute(
         select(procedure_table.c.provider_count)
         .where(
             and_(
@@ -4798,7 +4781,7 @@ async def _query_crosswalk_edges(session, pairs: set[tuple[str, str]]) -> list[d
                 func.upper(code_crosswalk_table.c.to_code) == code,
             )
         )
-    result = await execute_network_read(session, select(code_crosswalk_table).where(or_(*clauses)))
+    result = await session.execute(select(code_crosswalk_table).where(or_(*clauses)))
     return [_row_to_dict(row) for row in result]
 
 
@@ -5312,7 +5295,7 @@ async def _load_procedure_taxonomy_evidence(
         return []
 
     cache_key = _procedure_taxonomy_evidence_cache_key(year, internal_codes, limit)
-    has_guarded_read = has_network_read_inventory(session)
+    has_guarded_read = getattr(session, "info", {}).get("api_reader_verified") is True
     # Cached evidence is not bound to the independently proved current claims generation.
     cached_evidence_items = None if has_guarded_read else _procedure_taxonomy_evidence_cache_get(cache_key)
     if cached_evidence_items is not None:
@@ -5367,11 +5350,11 @@ async def _load_procedure_taxonomy_evidence(
     procedure_relation = f"{PRICING_SCHEMA}.{PricingProviderProcedure.__tablename__}"
     provider_relation = f"{PRICING_SCHEMA}.{PricingProvider.__tablename__}"
     feature_relation = f"{PRICING_SCHEMA}.{QUALITY_FEATURE_TABLE_NAME}"
-    if has_network_read_inventory(session):
-        procedure_relation = direct_heap_relation_sql(session, PRICING_SCHEMA, PricingProviderProcedure.__tablename__)
-        provider_relation = direct_heap_relation_sql(session, PRICING_SCHEMA, PricingProvider.__tablename__)
+    if getattr(session, "info", {}).get("api_reader_verified") is True:
+        procedure_relation = qualified_relation_sql(PRICING_SCHEMA, PricingProviderProcedure.__tablename__)
+        provider_relation = qualified_relation_sql(PRICING_SCHEMA, PricingProvider.__tablename__)
         if quality_feature_exists:
-            feature_relation = direct_heap_relation_sql(session, PRICING_SCHEMA, QUALITY_FEATURE_TABLE_NAME)
+            feature_relation = qualified_relation_sql(PRICING_SCHEMA, QUALITY_FEATURE_TABLE_NAME)
     quality_join_sql = (
         f"""
         LEFT JOIN {feature_relation} qf
@@ -5397,8 +5380,7 @@ async def _load_procedure_taxonomy_evidence(
         "internal_codes": list(internal_codes),
         "limit": limit,
     }
-    query_result = await execute_network_read(
-        session,
+    query_result = await session.execute(
         text(
             f"""
             WITH base AS (
@@ -5495,8 +5477,7 @@ async def _load_precomputed_procedure_taxonomy_evidence(
 ) -> list[dict[str, Any]]:
     """Load one bounded evidence basis from the published signal table."""
 
-    query_result = await execute_network_read(
-        session,
+    query_result = await session.execute(
         select(
             procedure_taxonomy_signal_table.c.taxonomy_code,
             procedure_taxonomy_signal_table.c.classification,
@@ -5546,13 +5527,12 @@ async def _load_quality_procedure_taxonomy_evidence(
         "feature_relation": QUALITY_FEATURE_TABLE_NAME,
     }
     relations_by_slot = {
-        slot: direct_heap_relation_sql(session, PRICING_SCHEMA, name)
-        if has_network_read_inventory(session)
+        slot: qualified_relation_sql(PRICING_SCHEMA, name)
+        if (getattr(session, "info", {}).get("api_reader_verified") is True)
         else f"{PRICING_SCHEMA}.{name}"
         for slot, name in relation_names_by_slot.items()
     }
-    query_result = await execute_network_read(
-        session,
+    query_result = await session.execute(
         text(_QUALITY_PROCEDURE_TAXONOMY_EVIDENCE_SQL.format(**relations_by_slot)),
         query_params_by_name,
     )
@@ -5629,7 +5609,7 @@ async def _resolve_internal_rx_codes_for_request(
             )
         )
 
-    crosswalk_result = await execute_network_read(session, select(code_crosswalk_table).where(or_(*clauses)))
+    crosswalk_result = await session.execute(select(code_crosswalk_table).where(or_(*clauses)))
     crosswalk_rows = [_row_to_dict(crosswalk_row) for crosswalk_row in crosswalk_result]
     resolved_codes, crosswalk_matches = _resolved_rx_crosswalk_matches(
         crosswalk_rows,
@@ -5675,7 +5655,7 @@ async def _resolve_external_rx_codes_for_internal(
             ),
         )
     )
-    crosswalk_result = await execute_network_read(session, query)
+    crosswalk_result = await session.execute(query)
     crosswalk_rows = [_row_to_dict(crosswalk_row) for crosswalk_row in crosswalk_result]
 
     external_codes_by_internal: dict[str, dict[str, list[str]]] = {}
@@ -5948,8 +5928,7 @@ async def _current_allowed_amount_snapshots_for_plan(
         "plan_ids": list(ein_plan_id_variants(plan_id)),
         "requested_source_key": str(args.get("source_key") or "").strip().lower(),
     }
-    snapshot_result = await execute_network_read(
-        session,
+    snapshot_result = await session.execute(
         text(_ALLOWED_AMOUNT_CURRENT_SNAPSHOT_SQL),
         query_parameter_map,
     )
@@ -6694,8 +6673,7 @@ async def _allowed_amount_detail_rows_for_page(
             "detail_limit": _ALLOWED_AMOUNT_DETAIL_LIMIT,
         }
     )
-    detail_result = await execute_network_read(
-        session,
+    detail_result = await session.execute(
         _allowed_amount_detail_sql(),
         detail_parameter_map,
     )
@@ -6887,7 +6865,7 @@ async def _allowed_amount_page_rows(
         parameter_map=query_parameter_map,
         office_inputs=office_inputs,
     )
-    page_result = await execute_network_read(session, page_query, query_parameter_map)
+    page_result = await session.execute(page_query, query_parameter_map)
     return (
         [_row_to_dict(page_by_field) for page_by_field in page_result],
         query_parameter_map,
@@ -7957,7 +7935,7 @@ async def group_plan_providers(request, *, native_args=None):
          ORDER BY bounded_group_member.npi
          LIMIT :limit
         """
-    provider_rows = (await execute_network_read(session, text(provider_sql), query_params_by_name)).fetchall()
+    provider_rows = (await session.execute(text(provider_sql), query_params_by_name)).fetchall()
     provider_npis = [int(provider_record.npi) for provider_record in provider_rows if provider_record.npi is not None]
     total_distinct = None
     is_count_requested = (args.get("count") or "").strip().lower() in ("1", "true", "yes")
@@ -7978,7 +7956,7 @@ async def group_plan_providers(request, *, native_args=None):
                  FROM {group_member_table} gm
                  WHERE gm.npi BETWEEN :npi_min AND :npi_max{taxonomy_where}{provider_sex_where}{location_where}
                 """
-        total_distinct = int((await execute_network_read(session, text(count_sql), query_params_by_name)).scalar() or 0)
+        total_distinct = int((await session.execute(text(count_sql), query_params_by_name)).scalar() or 0)
     provider_items: list[dict[str, Any]] = [{"npi": npi} for npi in provider_npis]
     addresses_by_npi: dict[int, list[dict[str, Any]]] = {}
     if needs_address_scope and provider_npis:
@@ -8033,8 +8011,7 @@ async def group_plan_providers(request, *, native_args=None):
         )
         address_rows = (
             (
-                await execute_network_read(
-                    session,
+                await session.execute(
                     text(
                         f"""
                 SELECT addr.npi,
@@ -8080,8 +8057,7 @@ async def group_plan_providers(request, *, native_args=None):
             addresses_by_npi.setdefault(int(address_row["npi"]), []).append(provider_address_by_field)
     if include_enrichment and provider_npis:
         enrich_rows = (
-            await execute_network_read(
-                session,
+            await session.execute(
                 select(
                     npi_data_table.c.npi,
                     npi_data_table.c.provider_first_name,
@@ -8197,10 +8173,10 @@ async def pricing_statistics(request):
         procedure_zip_codes_result,
     ) = await gather_reader_calls(
         db,
-        execute_network_read(session, medicare_individuals_stmt),
-        execute_network_read(session, providers_with_procedures_stmt),
-        execute_network_read(session, procedure_codes_stmt),
-        execute_network_read(session, procedure_zip_codes_stmt),
+        session.execute(medicare_individuals_stmt),
+        session.execute(providers_with_procedures_stmt),
+        session.execute(procedure_codes_stmt),
+        session.execute(procedure_zip_codes_stmt),
     )
 
     medicare_individuals = medicare_individuals_result.scalar()
@@ -8308,14 +8284,12 @@ async def _pricing_provider_list_query(session, year, where_clause, benchmark_mo
 
 
 async def _pricing_provider_list_total(session, where_clause):
-    count_result = await execute_network_read(
-        session, select(func.count()).select_from(provider_table).where(where_clause)
-    )
+    count_result = await session.execute(select(func.count()).select_from(provider_table).where(where_clause))
     return int(count_result.scalar() or 0)
 
 
 async def _pricing_provider_list_page(session, query, total, pagination, include_legacy_fields):
-    query_result = await execute_network_read(session, query.limit(pagination.limit).offset(pagination.offset))
+    query_result = await session.execute(query.limit(pagination.limit).offset(pagination.offset))
     return {
         "total": total,
         "items": [
@@ -8435,21 +8409,19 @@ async def get_pricing_provider(request, npi: str):
         raise InvalidUsage("Path parameter 'npi' must be provided")
 
     year, year_source = await _resolve_year(session, provider_table, year)
-    provider_result = await execute_network_read(
-        session, select(provider_table).where(and_(provider_table.c.npi == provider_npi, provider_table.c.year == year))
+    provider_result = await session.execute(
+        select(provider_table).where(and_(provider_table.c.npi == provider_npi, provider_table.c.year == year))
     )
     provider_row = provider_result.first()
     if provider_row is None:
         raise sanic.exceptions.NotFound("Provider not found")
 
-    service_count_result = await execute_network_read(
-        session,
+    service_count_result = await session.execute(
         select(func.count())
         .select_from(provider_procedure_table)
         .where(and_(provider_procedure_table.c.npi == provider_npi, provider_procedure_table.c.year == year)),
     )
-    location_count_result = await execute_network_read(
-        session,
+    location_count_result = await session.execute(
         select(func.count(func.distinct(location_table.c.location_key)))
         .select_from(location_table)
         .where(and_(location_table.c.npi == provider_npi, location_table.c.year == year)),
@@ -8740,7 +8712,7 @@ async def get_pricing_provider_score(request, npi: str):
         WHERE npi = :npi AND year = :year
         """
     )
-    score_result = await execute_network_read(session, score_query, {"npi": provider_npi, "year": year})
+    score_result = await session.execute(score_query, {"npi": provider_npi, "year": year})
     score_rows = [_row_to_dict(score_row) for score_row in score_result]
     if not score_rows:
         return await _fallback_response(year_used=year, year_source_value=year_source)
@@ -8801,7 +8773,7 @@ async def get_pricing_provider_score(request, npi: str):
         WHERE npi = :npi AND year = :year
         """
     )
-    domain_result = await execute_network_read(session, domain_query, {"npi": provider_npi, "year": year})
+    domain_result = await session.execute(domain_query, {"npi": provider_npi, "year": year})
     for domain_row in domain_result:
         row_data = _row_to_dict(domain_row)
         mode = str(row_data.get("benchmark_mode") or "").strip().lower()
@@ -9007,9 +8979,7 @@ async def list_provider_procedures(request, npi: str):
         filters.append(provider_procedure_table.c.total_allowed_amount >= min_total_cost)
 
     where_clause = and_(*filters)
-    count_result = await execute_network_read(
-        session, select(func.count()).select_from(provider_procedure_table).where(where_clause)
-    )
+    count_result = await session.execute(select(func.count()).select_from(provider_procedure_table).where(where_clause))
     total = int(count_result.scalar() or 0)
 
     query = select(provider_procedure_table).where(where_clause)
@@ -9037,7 +9007,7 @@ async def list_provider_procedures(request, npi: str):
     )
     query = query.limit(pagination.limit).offset(pagination.offset)
 
-    query_result = await execute_network_read(session, query)
+    query_result = await session.execute(query)
     procedure_items = [
         _normalize_service_payload(
             {**_row_to_dict(procedure_record), "__include_legacy_fields__": include_legacy_fields}
@@ -9139,9 +9109,7 @@ async def _provider_procedure_detail(
         args,
         default_system=default_code_system,
     )
-    procedure_query_result = await execute_network_read(
-        session, _provider_procedure_detail_query(provider_npi, internal_codes, year)
-    )
+    procedure_query_result = await session.execute(_provider_procedure_detail_query(provider_npi, internal_codes, year))
     procedure_row = procedure_query_result.first()
     if procedure_row is None:
         raise sanic.exceptions.NotFound("Provider procedure not found")
@@ -9244,8 +9212,7 @@ async def _provider_procedure_cost_level(
     if specialty_key:
         base_profile_filters.append(provider_procedure_cost_profile_table.c.specialty_key == specialty_key)
 
-    base_profile_result = await execute_network_read(
-        session,
+    base_profile_result = await session.execute(
         select(provider_procedure_cost_profile_table)
         .where(and_(*base_profile_filters))
         .order_by(
@@ -9263,8 +9230,7 @@ async def _provider_procedure_cost_level(
             provider_procedure_cost_profile_table.c.procedure_code.in_(internal_codes),
             provider_procedure_cost_profile_table.c.setting_key == setting_key,
         ]
-        fallback_profile_result = await execute_network_read(
-            session,
+        fallback_profile_result = await session.execute(
             select(provider_procedure_cost_profile_table)
             .where(and_(*fallback_profile_filters))
             .order_by(
@@ -9378,8 +9344,7 @@ async def _provider_procedure_cost_level(
                 )
             ]
 
-        peer_result = await execute_network_read(
-            session,
+        peer_result = await session.execute(
             select(procedure_peer_stats_table).where(
                 and_(
                     procedure_peer_stats_table.c.procedure_code == procedure_internal_code,
@@ -9441,8 +9406,7 @@ async def _provider_procedure_cost_level(
     procedure_code_text = str(procedure_internal_code)
     procedure_name = None
     reported_code = None
-    procedure_detail_result = await execute_network_read(
-        session,
+    procedure_detail_result = await session.execute(
         select(
             provider_procedure_table.c.service_description,
             provider_procedure_table.c.reported_code,
@@ -9466,8 +9430,7 @@ async def _provider_procedure_cost_level(
             reported_code = str(reported_code_raw).strip().upper() or None
 
     if not procedure_name:
-        catalog_result = await execute_network_read(
-            session,
+        catalog_result = await session.execute(
             select(code_catalog_table.c.display_name, code_catalog_table.c.short_description)
             .where(
                 and_(
@@ -9633,10 +9596,7 @@ async def _query_provider_procedure_location_page(
 ) -> dict[str, Any]:
     where_clause = and_(*filters)
     total = int(
-        (
-            await execute_network_read(session, select(func.count()).select_from(location_table).where(where_clause))
-        ).scalar()
-        or 0
+        (await session.execute(select(func.count()).select_from(location_table).where(where_clause))).scalar() or 0
     )
 
     query = select(location_table).where(where_clause)
@@ -9655,7 +9615,7 @@ async def _query_provider_procedure_location_page(
     )
     query = query.limit(pagination.limit).offset(pagination.offset)
 
-    location_query_result = await execute_network_read(session, query)
+    location_query_result = await session.execute(query)
     location_entries = [
         _normalize_service_payload(
             {
@@ -9843,7 +9803,7 @@ def _procedure_provider_grouped_query(where_clause):
 
 async def _procedure_provider_list_page(session, pagination, where_clause, include_legacy_fields, order_by, order):
     grouped_subquery = _procedure_provider_grouped_query(where_clause).subquery()
-    count_result = await execute_network_read(session, select(func.count()).select_from(grouped_subquery))
+    count_result = await session.execute(select(func.count()).select_from(grouped_subquery))
     query = (
         _apply_ordering(
             select(grouped_subquery),
@@ -9866,7 +9826,7 @@ async def _procedure_provider_list_page(session, pagination, where_clause, inclu
         .limit(pagination.limit)
         .offset(pagination.offset)
     )
-    query_result = await execute_network_read(session, query)
+    query_result = await session.execute(query)
     return {
         "total": int(count_result.scalar() or 0),
         "order": order,
@@ -9992,7 +9952,7 @@ async def _procedure_benchmark_values(session, where_clause):
         )
         .where(where_clause)
     )
-    aggregate_result = await execute_network_read(session, aggregate_query)
+    aggregate_result = await session.execute(aggregate_query)
     aggregate = _row_to_dict(aggregate_result.first() or {})
 
     provider_costs_subquery = (
@@ -10013,7 +9973,7 @@ async def _procedure_benchmark_values(session, where_clause):
         func.percentile_cont(0.60).within_group(provider_costs_subquery.c.provider_total_allowed_amount).label("p60"),
         func.percentile_cont(0.80).within_group(provider_costs_subquery.c.provider_total_allowed_amount).label("p80"),
     )
-    threshold_result = await execute_network_read(session, threshold_query)
+    threshold_result = await session.execute(threshold_query)
     thresholds = _row_to_dict(threshold_result.first() or {})
     return aggregate, thresholds
 
@@ -10144,7 +10104,7 @@ async def _procedure_geo_scope_benchmark(
         .select_from(procedure_geo_benchmark_table)
         .where(and_(*filters))
     )
-    benchmark_query_result = await execute_network_read(session, query)
+    benchmark_query_result = await session.execute(query)
     benchmark_row = _row_to_dict(benchmark_query_result.first() or {})
     return _procedure_geo_benchmark_payload(benchmark_row, scope, geography_value)
 
@@ -10925,7 +10885,7 @@ async def _load_provider_specialty_page(
         .limit(pagination.limit)
         .offset(pagination.offset)
     )
-    specialty_rows = [_row_to_dict(specialty_row) for specialty_row in await execute_network_read(session, page_query)]
+    specialty_rows = [_row_to_dict(specialty_row) for specialty_row in await session.execute(page_query)]
     count_query = select(func.count()).select_from(
         select(provider_table.c.provider_type)
         .select_from(scope.from_clause)
@@ -10933,7 +10893,7 @@ async def _load_provider_specialty_page(
         .group_by(provider_table.c.provider_type)
         .subquery()
     )
-    count_result = await execute_network_read(session, count_query)
+    count_result = await session.execute(count_query)
     return _ProviderSpecialtyPage(
         specialty_rows=specialty_rows,
         total=int(count_result.scalar() or 0),
@@ -11173,8 +11133,7 @@ async def _load_prescription_autocomplete_page(
         q_like=q_like,
         terminology_internal_codes=terminology_internal_codes,
     )
-    query_result = await execute_network_read(
-        session,
+    query_result = await session.execute(
         _prescription_autocomplete_page_query(
             grouped_subquery,
             q_prefix=f"{search_query}%",
@@ -11187,14 +11146,13 @@ async def _load_prescription_autocomplete_page(
     if prescription_rows:
         return prescription_rows, int(prescription_rows[0].get("_pagination_total") or 0)
     if pagination.offset:
-        count_result = await execute_network_read(session, select(func.count()).select_from(grouped_subquery))
+        count_result = await session.execute(select(func.count()).select_from(grouped_subquery))
         return prescription_rows, int(count_result.scalar() or 0)
     return prescription_rows, 0
 
 
 async def _is_prescription_autocomplete_rollup_current(session) -> bool:
-    result = await execute_network_read(
-        session,
+    result = await session.execute(
         select(literal(1))
         .select_from(provider_prescription_autocomplete_table)
         .where(
@@ -11741,8 +11699,7 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
         and is_owned_reader(session)
     ):
         # The HTTP Reader owns this transaction through response encoding.
-        await execute_network_read(
-            session,
+        await session.execute(
             text("SELECT set_config('jit', 'off', true), set_config('plan_cache_mode', 'force_custom_plan', true)"),
         )
     ptg_specialty_filter = None
@@ -12375,10 +12332,10 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
         claims_statements = await build_provider_service_claims_statements(
             grouped, import_context, min_claims, min_total_cost, order_by, order
         )
-        count_result = await execute_network_read(session, claims_statements.count_statement)
+        count_result = await session.execute(claims_statements.count_statement)
         total = int(count_result.scalar() or 0)
         query = claims_statements.page_statement.limit(pagination.limit).offset(pagination.offset)
-    query_result = await execute_network_read(session, query)
+    query_result = await session.execute(query)
     provider_items = [
         _normalize_provider_service_aggregate(_row_to_dict(provider_record), include_legacy=include_legacy_fields)
         for provider_record in query_result
@@ -12604,7 +12561,7 @@ async def list_providers_by_prescription(request):
         )
     )
     grouped_subquery = grouped.subquery()
-    count_result = await execute_network_read(session, select(func.count()).select_from(grouped_subquery))
+    count_result = await session.execute(select(func.count()).select_from(grouped_subquery))
     total = int(count_result.scalar() or 0)
 
     order = _normalize_order(args.get("order"))
@@ -12624,7 +12581,7 @@ async def list_providers_by_prescription(request):
         },
     )
     query = query.limit(pagination.limit).offset(pagination.offset)
-    query_result = await execute_network_read(session, query)
+    query_result = await session.execute(query)
     provider_items = [
         _normalize_prescription_provider_aggregate(_row_to_dict(provider_record)) for provider_record in query_result
     ]
@@ -12734,8 +12691,8 @@ async def _provider_prescription_list_where(session, args, provider_npi, year, l
 
 
 async def _provider_prescription_list_page(session, pagination, where_clause, order_by, order):
-    count_result = await execute_network_read(
-        session, select(func.count()).select_from(provider_prescription_table).where(where_clause)
+    count_result = await session.execute(
+        select(func.count()).select_from(provider_prescription_table).where(where_clause)
     )
     query = (
         _apply_ordering(
@@ -12755,7 +12712,7 @@ async def _provider_prescription_list_page(session, pagination, where_clause, or
         .limit(pagination.limit)
         .offset(pagination.offset)
     )
-    query_result = await execute_network_read(session, query)
+    query_result = await session.execute(query)
     prescription_items = [
         _normalize_prescription_payload(_row_to_dict(prescription_record)) for prescription_record in query_result
     ]
@@ -12894,7 +12851,7 @@ async def _provider_prescription_detail(request, npi: str, rx_code_system: str, 
         .limit(1)
     )
 
-    prescription_row = (await execute_network_read(session, query)).first()
+    prescription_row = (await session.execute(query)).first()
     if prescription_row is None:
         raise sanic.exceptions.NotFound("Provider prescription not found")
 
@@ -13062,7 +13019,7 @@ async def _prescription_provider_total(session, grouped_subquery) -> int:
     """Count grouped providers before validating page ordering."""
 
     count_query = select(func.count()).select_from(grouped_subquery)
-    count_result = await execute_network_read(session, count_query)
+    count_result = await session.execute(count_query)
     return int(count_result.scalar() or 0)
 
 
@@ -13092,7 +13049,7 @@ async def _load_prescription_provider_entries(
         .limit(pagination.limit)
         .offset(pagination.offset)
     )
-    query_result = await execute_network_read(session, query)
+    query_result = await session.execute(query)
     return [_normalize_prescription_provider_aggregate(_row_to_dict(row)) for row in query_result]
 
 
@@ -13198,7 +13155,7 @@ async def _prescription_benchmark_values(session, where_clause):
         .select_from(provider_prescription_table)
         .where(where_clause)
     )
-    aggregate_result = await execute_network_read(session, aggregate_query)
+    aggregate_result = await session.execute(aggregate_query)
     aggregate = _row_to_dict(aggregate_result.first() or {})
 
     provider_costs_subquery = (
@@ -13217,7 +13174,7 @@ async def _prescription_benchmark_values(session, where_clause):
         func.percentile_cont(0.60).within_group(provider_costs_subquery.c.provider_total_drug_cost).label("p60"),
         func.percentile_cont(0.80).within_group(provider_costs_subquery.c.provider_total_drug_cost).label("p80"),
     )
-    threshold_result = await execute_network_read(session, threshold_query)
+    threshold_result = await session.execute(threshold_query)
     thresholds = _row_to_dict(threshold_result.first() or {})
     return aggregate, thresholds
 

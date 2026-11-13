@@ -1,16 +1,16 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Pure custody and replay contracts; genuine PostgreSQL qualification is separate."""
+"""Named publication and replay contracts; genuine PostgreSQL qualification is separate."""
 
 from dataclasses import FrozenInstanceError, asdict, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import asyncpg
 import pytest
 
 from api import plan_pricing_em_attribution as attribution
 from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
 from api.plan_release_serving import PlanReleaseServingSelection, PlanReleaseSnapshotBinding
-from process.network_custom_address_source import NetworkCustomAddressSourceError
 
 
 def _binding(ordinal=3, source="source-a"):
@@ -32,23 +32,20 @@ def _selection(*bindings):
 
 def _relations():
     common_by_field = {
-        "relowner": 7,
         "relpersistence": b"p",
         "relrowsecurity": False,
         "relforcerowsecurity": False,
         "relhastriggers": False,
         "relhasrules": False,
     }
-    relations = [common_by_field | {"relname": "rates", "oid": 11, "filenode": 21, "relkind": b"r"}]
-    for name, oid, filenode, keys in [("rates_lookup", 12, 22, "2 3 1"), ("rates_pkey", 13, 23, "1 2 3")]:
+    relations = [common_by_field | {"relname": "rates", "relkind": b"r"}]
+    for name, keys in [("rates_lookup", "2 3 1"), ("rates_pkey", "1 2 3")]:
         relations.append(
             common_by_field
             | {
                 "relname": name,
-                "oid": oid,
-                "filenode": filenode,
                 "relkind": b"i",
-                "indrelid": 11,
+                "table_name": "rates",
                 "indisvalid": True,
                 "indisready": True,
                 "indislive": True,
@@ -67,9 +64,7 @@ def _relations():
 
 def _catalog():
     return {
-        "namespace": {"oid": 5, "nspowner": 7},
         "relations": _relations(),
-        "heaps": {"rates": 11},
         "shape": {"columns": [], "constraints": []},
     }
 
@@ -78,14 +73,6 @@ def _receipt(selection=None, **changes):
     selection = selection or _selection()
     receipt = attribution.EMAttributionReceipt(
         *attribution._identity(selection),
-        "artifact_owner",
-        ("artifact_reader",),
-        5,
-        7,
-        11,
-        21,
-        (("rates_lookup", 12, 22), ("rates_pkey", 13, 23)),
-        attribution._catalog_digest(_catalog()),
         12,
         2,
         (3, 17),
@@ -97,14 +84,17 @@ def _receipt(selection=None, **changes):
     return replace(receipt, receipt_sha256=attribution._receipt_digest(receipt))
 
 
-def _role(**changes):
-    return {
-        "oid": 7,
-        **{
-            flag: False
-            for flag in ("rolcanlogin", "rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
-        },
-        **changes,
+def _legacy_document(receipt):
+    return receipt.as_dict() | {
+        "owner_role": "old_owner",
+        "runtime_roles": ["old_reader"],
+        "schema_oid": 5,
+        "owner_oid": 7,
+        "table_oid": 11,
+        "table_filenode": 21,
+        "index_identities": [["rates_lookup", 12, 22], ["rates_pkey", 13, 23]],
+        "catalog_sha256": "d" * 64,
+        "receipt_sha256": "e" * 64,
     }
 
 
@@ -132,8 +122,9 @@ def _resolver_setup(monkeypatch, selection=None, receipt=None):
     selection = selection or _selection()
     receipt = receipt or _receipt(selection)
     driver = SimpleNamespace(
-        execute=AsyncMock(), fetchrow=AsyncMock(return_value=_role()), fetchval=AsyncMock(return_value='"publisher"')
+        execute=AsyncMock(), fetch=AsyncMock(return_value=[]), fetchval=AsyncMock(return_value='"publisher"')
     )
+    monkeypatch.setattr(attribution, "freeze_fhir_source_snapshot", AsyncMock())
     monkeypatch.setattr(attribution, "_lock_preparation", AsyncMock())
     monkeypatch.setattr(attribution, "_driver", AsyncMock(return_value=driver))
     monkeypatch.setattr(attribution.builder, "_selected_release", AsyncMock(return_value=selection))
@@ -141,8 +132,6 @@ def _resolver_setup(monkeypatch, selection=None, receipt=None):
         attribution, "_namespace", AsyncMock(return_value={"receipt": attribution._canonical(receipt.as_dict())})
     )
     monkeypatch.setattr(attribution, "_catalog", AsyncMock(return_value=_catalog()))
-    monkeypatch.setattr(attribution, "_closed", AsyncMock())
-    monkeypatch.setattr(attribution, "_check_roles", AsyncMock())
     monkeypatch.setattr(attribution, "_content", AsyncMock(side_effect=AssertionError("Reader must not rehash rows")))
     return driver, selection, receipt
 
@@ -166,6 +155,7 @@ def test_full_recipe_retains_duplicates_without_double_price_contribution():
 def test_receipt_is_immutable_closed_and_canonical():
     receipt = _receipt()
     assert attribution._decode(attribution._canonical(receipt.as_dict())) == receipt
+    assert set(receipt.as_dict()) == {"contract", *asdict(receipt)}
     assert receipt.rates_relation == f'"{receipt.schema_name}"."rates"'
     with pytest.raises(FrozenInstanceError):
         receipt.row_count = 1
@@ -191,12 +181,9 @@ def test_receipt_is_immutable_closed_and_canonical():
         {"code_accounting": ((0, 12, "1"),)},
         {"code_accounting": tuple((index, 2, "0") for index in range(6))},
         {"code_accounting": tuple((index, 3, "38") for index in range(6))},
-        {"table_filenode": 0},
-        {"index_identities": ((),)},
-        {"runtime_roles": ("artifact_owner",)},
     ],
 )
-def test_accounting_and_native_identity_refuse_invalid_receipts(changes):
+def test_accounting_refuses_invalid_logical_receipts(changes):
     with pytest.raises((ValueError, TypeError)):
         attribution._validate_receipt(_receipt(**changes))
 
@@ -216,7 +203,6 @@ def test_accounting_and_native_identity_refuse_invalid_receipts(changes):
         ("indisunique", True),
         ("no_predicate", False),
         ("no_expression", False),
-        ("filenode", 0),
     ],
 )
 def test_native_relation_shapes_are_closed(field, change):
@@ -227,12 +213,15 @@ def test_native_relation_shapes_are_closed(field, change):
 
 
 @pytest.mark.asyncio
-async def test_reader_revalidates_current_full_selection_and_custody(monkeypatch):
+async def test_reader_revalidates_full_selection_and_named_publication(monkeypatch):
     driver, selection, receipt = _resolver_setup(monkeypatch)
     session = object()
     assert await attribution.resolve_em_attribution(session, selection) == receipt
-    assert driver.execute.await_args.args == (f"LOCK TABLE {receipt.rates_relation} IN ACCESS SHARE MODE",)
-    attribution._closed.assert_awaited_once_with(driver, 5, 7, ("artifact_reader",), None)
+    driver.execute.assert_not_awaited()
+    assert driver.fetch.await_args.args == (
+        "SELECT binding_ordinal,npi,code_index,minimum_rate,maximum_rate,rate_count "
+        f"FROM {receipt.rates_relation} LIMIT 0",
+    )
     attribution._content.assert_not_awaited()
     attribution.builder._selected_release.assert_awaited_once_with(
         session, selection.plan_release_id, selection.serving_revision_id
@@ -240,9 +229,7 @@ async def test_reader_revalidates_current_full_selection_and_custody(monkeypatch
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "fault", ["absent", "malformed", "stale", "filtered", "filenode", "index", "privilege", "owner"]
-)
+@pytest.mark.parametrize("fault", ["absent", "malformed", "stale", "filtered", "privilege"])
 async def test_reader_refuses_missing_stale_or_open_artifacts(monkeypatch, fault):
     driver, selection, receipt = _resolver_setup(monkeypatch)
     if fault in {"absent", "malformed"}:
@@ -251,14 +238,8 @@ async def test_reader_refuses_missing_stale_or_open_artifacts(monkeypatch, fault
         attribution.builder._selected_release.return_value = replace(selection, binding_set_digest="e" * 64)
     if fault == "filtered":
         selection = replace(selection, bindings=(selection.bindings[0],))
-    if fault in {"filenode", "index"}:
-        catalog = _catalog()
-        catalog["relations"][0 if fault == "filenode" else 1]["filenode"] += 1
-        attribution._catalog.return_value = catalog
     if fault == "privilege":
-        attribution._closed.side_effect = NetworkCustomAddressSourceError("private privilege detail")
-    if fault == "owner":
-        driver.fetchrow.return_value = _role(rolcanlogin=True)
+        driver.fetch.side_effect = asyncpg.InsufficientPrivilegeError("SELECT denied")
     with pytest.raises(PlanPricingProjectionUnavailable, match="^E&M attribution is unavailable$"):
         await attribution.resolve_em_attribution(object(), selection)
     attribution._content.assert_not_awaited()
@@ -284,7 +265,7 @@ async def test_replay_checks_full_recipe_and_never_rebuilds(monkeypatch):
     assert session.outcomes == ["entered", "released"]
     attribution.builder._create_stage_tables.assert_not_awaited()
     for roles in [("other_owner", ("artifact_reader",)), ("artifact_owner", ("other_reader",))]:
-        with pytest.raises(PlanPricingProjectionUnavailable):
+        assert (
             await attribution.prepare_em_attribution_in_session(
                 session,
                 plan_release_id=selection.plan_release_id,
@@ -292,6 +273,10 @@ async def test_replay_checks_full_recipe_and_never_rebuilds(monkeypatch):
                 owner_role=roles[0],
                 runtime_roles=roles[1],
             )
+            == receipt
+        )
+    driver = attribution._driver.return_value
+    driver.execute.assert_not_awaited()
     attribution._namespace.return_value = {"receipt": None}
     with pytest.raises(PlanPricingProjectionUnavailable):
         await attribution.prepare_em_attribution_in_session(
@@ -309,7 +294,6 @@ async def test_prepare_reuses_full_builder_and_rollback_savepoint(monkeypatch):
     selection = _selection(first, replace(first, binding_ordinal=19), _binding(17, "source-b"))
     _, _, receipt = _resolver_setup(monkeypatch, selection)
     attribution._namespace.return_value = None
-    monkeypatch.setattr(attribution, "_check_roles", AsyncMock())
     monkeypatch.setattr(attribution.builder, "_create_stage_tables", AsyncMock())
     projections = [object(), object()]
     monkeypatch.setattr(attribution.builder, "_binding_projections", AsyncMock(return_value=projections))
@@ -375,12 +359,19 @@ async def test_transaction_requirement_uses_actual_session_driver():
 
 
 @pytest.mark.asyncio
-async def test_operator_scope_restores_role_even_when_verification_fails(monkeypatch):
-    receipt = _receipt()
+async def test_operator_role_is_restored_when_final_validation_fails(monkeypatch):
     connection = SimpleNamespace(execute=AsyncMock(), fetchval=AsyncMock(return_value='"publisher"'))
-    monkeypatch.setattr(attribution, "_verify", AsyncMock(side_effect=ValueError("custody changed")))
-    with pytest.raises(ValueError, match="custody changed"):
-        await attribution._owner_verify(connection, receipt, receipt.identity_json)
+    monkeypatch.setattr(attribution, "_create_rates", AsyncMock())
+    freeze = AsyncMock()
+    monkeypatch.setattr(attribution, "freeze_fhir_source_snapshot", freeze)
+    failure = ValueError("invalid named output")
+    monkeypatch.setattr(attribution, "_catalog", AsyncMock(side_effect=failure))
+    with pytest.raises(ValueError) as caught:
+        await attribution._publish(
+            connection, _selection(), attribution._identity(_selection()), "artifact_owner", ("artifact_reader",)
+        )
+    assert caught.value is failure
+    freeze.assert_awaited_once()
     assert [call.args[0] for call in connection.execute.await_args_list] == [
         'SET LOCAL ROLE "artifact_owner"',
         'SET LOCAL ROLE "publisher"',
@@ -390,13 +381,25 @@ async def test_operator_scope_restores_role_even_when_verification_fails(monkeyp
 @pytest.mark.asyncio
 async def test_publication_hashes_native_chunks_and_restores_operator(monkeypatch):
     selection = _selection()
-    connection = SimpleNamespace(execute=AsyncMock(), fetchval=AsyncMock(side_effect=[7, '"publisher"', "'receipt'"]))
+    connection = SimpleNamespace(execute=AsyncMock(), fetchval=AsyncMock(side_effect=['"publisher"', "'receipt'"]))
     monkeypatch.setattr(attribution, "_create_rates", AsyncMock())
     accounting = (12, 2, (3, 17), tuple((index, 2, "38") for index in range(6)))
     monkeypatch.setattr(attribution, "_accounting", AsyncMock(return_value=accounting))
     monkeypatch.setattr(attribution, "_content", AsyncMock(return_value=(12, "c" * 64)))
     monkeypatch.setattr(attribution, "_catalog", AsyncMock(return_value=_catalog()))
-    monkeypatch.setattr(attribution, "_transfer_and_grant", AsyncMock())
+    monkeypatch.setattr(attribution, "freeze_fhir_source_snapshot", AsyncMock())
+
+    def final_shape(*_arguments):
+        attribution.freeze_fhir_source_snapshot.assert_awaited_once_with(
+            connection,
+            attribution._identity(selection)[2],
+            namespace_owner="artifact_owner",
+            reader_roles=("artifact_reader",),
+            application_roles=("artifact_reader",),
+        )
+        return _catalog()
+
+    attribution._catalog.side_effect = final_shape
 
     async def verify_native(_connection, receipt, identity_json):
         attribution._validate_receipt(receipt)
@@ -413,12 +416,36 @@ async def test_publication_hashes_native_chunks_and_restores_operator(monkeypatc
     assert "COMMENT ON SCHEMA" in connection.execute.await_args_list[1].args[0]
     assert connection.execute.await_args_list[2].args == ('SET LOCAL ROLE "publisher"',)
     attribution._content.return_value = (11, "c" * 64)
-    attribution._transfer_and_grant.reset_mock()
+    connection.fetchval.side_effect = ['"publisher"']
+    connection.execute.reset_mock()
+    attribution.freeze_fhir_source_snapshot.reset_mock()
     with pytest.raises(ValueError, match="content accounting"):
         await attribution._publish(
             connection, selection, attribution._identity(selection), "artifact_owner", ("artifact_reader",)
         )
-    attribution._transfer_and_grant.assert_not_awaited()
+    attribution.freeze_fhir_source_snapshot.assert_awaited_once()
+    assert not any("COMMENT" in call.args[0] for call in connection.execute.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_named_read_reuses_legacy_publication_without_metadata_rewrite(monkeypatch):
+    driver, selection, receipt = _resolver_setup(monkeypatch)
+    original = attribution._canonical(_legacy_document(receipt))
+    attribution._namespace.return_value = {"receipt": original}
+    assert await attribution.resolve_em_attribution(object(), selection) == receipt
+    assert attribution._namespace.return_value == {"receipt": original}
+    attribution._catalog.assert_not_awaited()
+    driver.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_named_receipt_transfer_is_bounded_before_decode():
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value={"receipt": None}))
+    await attribution._namespace(connection, "named_rates")
+    query, schema_name, maximum = connection.fetchrow.await_args.args
+    assert schema_name == "named_rates" and maximum == attribution._MAX_RECEIPT_BYTES
+    assert "CASE WHEN octet_length(obj_description" in query and "THEN obj_description" in query
+    assert "nspowner" not in query
 
 
 @pytest.mark.asyncio
@@ -449,7 +476,7 @@ async def test_native_columns_and_constraints_require_exact_shape():
         for name, (kind, keys) in attribution._CONSTRAINT_KEYS.items()
     ]
     connection = SimpleNamespace(fetch=AsyncMock(side_effect=[columns, constraints]))
-    shape = await attribution._table_shape(connection, 11)
+    shape = await attribution._table_shape(connection, '"named_rates"."rates"')
     assert len(shape["columns"]) == 6 and len(shape["constraints"]) == 7
     assert "AND contype<>'n'" in connection.fetch.await_args.args[0]
     for invalid_columns, invalid_constraints in [
@@ -461,7 +488,7 @@ async def test_native_columns_and_constraints_require_exact_shape():
     ]:
         connection.fetch.side_effect = [invalid_columns, invalid_constraints]
         with pytest.raises(ValueError):
-            await attribution._table_shape(connection, 11)
+            await attribution._table_shape(connection, '"named_rates"."rates"')
 
 
 @pytest.mark.asyncio
@@ -570,7 +597,7 @@ async def test_busy_prepare_rolls_back_before_namespace_or_builder(monkeypatch):
         )
     attribution._lock_preparation.assert_awaited_once_with(driver, attribution._identity(selection)[1])
     attribution._namespace.assert_not_awaited()
-    attribution._check_roles.assert_not_awaited()
+    attribution.freeze_fhir_source_snapshot.assert_not_awaited()
     attribution.builder._create_stage_tables.assert_not_awaited()
     assert session.outcomes == ["entered", "rollback"]
 

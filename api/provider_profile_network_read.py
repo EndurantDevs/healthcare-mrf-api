@@ -6,7 +6,6 @@ from datetime import date
 from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
 
-from api.network_read_execution import execute_network_read
 from api.provider_directory_entities_contract import DirectoryReadError
 from api.provider_profile_network_contract import bind_managed_profile_generation
 from api.provider_profile_network_facts import pin_cms_profile_scope
@@ -94,7 +93,7 @@ async def _directory_profile(session, driver, manifest, npi, query, excluded, sc
         profile_as_of=date.fromisoformat(pin.as_of),
     )
     await provider._disable_provider_directory_evidence_jit(session)
-    profile_row = (await execute_network_read(session, text(statement), parameters)).mappings().one_or_none()
+    profile_row = (await session.execute(text(statement), parameters)).mappings().one_or_none()
     if profile_row is None:
         return None
     if profile_row["profile_json"] is None or profile_row["evidence_json"] is None:

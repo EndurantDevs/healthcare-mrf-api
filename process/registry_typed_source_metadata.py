@@ -31,6 +31,13 @@ _CONTRIBUTION_FIELDS = {
     "mapping_sha256",
     "counters",
 }
+_OFFICE_CONTEXT_FIELDS = (
+    "office_policy",
+    "canonicalizer_version",
+    "approved_revision",
+    "approved_generation_sha256",
+    "address_source",
+)
 _DERIVATION_FIELDS = {
     "derivation_version",
     "recipe_sha256",
@@ -42,7 +49,6 @@ _DERIVATION_FIELDS = {
     "approved_revision",
     "approved_generation_sha256",
     "address_source",
-    "address_identity",
     "matched_offices",
     "missing_offices",
 }
@@ -104,9 +110,14 @@ def validate_typed_contribution(document):
 
 
 def validate_typed_derivation(document):
-    """Keep native address identity and exact approval in the new policy contract."""
+    """Keep named address generations and exact logical approval."""
     from process.network_fhir_typed_contract import POLICY
 
+    document = (
+        {key: field_value for key, field_value in document.items() if key != "address_identity"}
+        if type(document) is dict
+        else document
+    )
     _closed(document, _DERIVATION_FIELDS)
     if (
         type(document["derivation_version"]) is not int
@@ -143,12 +154,6 @@ def _office_context(document):
     _sha(document["approved_generation_sha256"])
     _closed(document["address_source"], {"schema_name", "table_name", "generation_id"})
     PinnedAddressSource(**document["address_source"])
-    identity = document["address_identity"]
-    _closed(identity, {"schema_oid", "table_oid", "owner_oid", "identity_sha256"})
-    for name in ("schema_oid", "table_oid", "owner_oid"):
-        if type(identity[name]) is not int or not 0 < identity[name] < 2**32:
-            raise ValueError("registry_typed_metadata_invalid")
-    _sha(identity["identity_sha256"])
 
 
 def _legacy_fields(version, offices):
@@ -231,17 +236,7 @@ def _summary(root, documents, *, offices):
         "legacy": legacy_summaries,
     }
     if offices:
-        context_by_name = {
-            name: typed_documents[0][name]
-            for name in (
-                "office_policy",
-                "canonicalizer_version",
-                "approved_revision",
-                "approved_generation_sha256",
-                "address_source",
-                "address_identity",
-            )
-        }
+        context_by_name = {name: typed_documents[0][name] for name in _OFFICE_CONTEXT_FIELDS}
         if any(
             any(document[name] != context_value for name, context_value in context_by_name.items())
             for document in typed_documents
@@ -284,7 +279,7 @@ def _validate_legacy_summary(document, expected, offices):
 
 
 def validate_typed_summary(document, root, *, offices=False):
-    """Commit mixed formats without converting their distinct accounting or custody contracts."""
+    """Validate complete mixed-format accounting and logical office context."""
     from process.registry_source_inventory_contract import SourceInventoryRoot
 
     if type(root) is not SourceInventoryRoot or type(offices) is not bool:
@@ -299,41 +294,42 @@ def validate_typed_summary(document, root, *, offices=False):
         "counters",
         "legacy",
     }
-    _closed(document, fields | ({"context"} if offices else set()))
+    document_by_field = document
+    if offices and type(document_by_field) is dict and type(document_by_field.get("context")) is dict:
+        document_by_field = {
+            **document_by_field,
+            "context": {
+                key: context_value
+                for key, context_value in document_by_field["context"].items()
+                if key != "address_identity"
+            },
+        }
+    _closed(document_by_field, fields | ({"context"} if offices else set()))
     expected = root.derivation_count if offices else root.contribution_count
     if (
-        type(document["revision"]) is not int
-        or document["revision"] != 6
-        or document["component"] != ("registry_initial_source_offices" if offices else "registry_source_contributions")
-        or type(document["source_count"]) is not int
-        or document["source_count"] != expected
+        type(document_by_field["revision"]) is not int
+        or document_by_field["revision"] != 6
+        or document_by_field["component"]
+        != ("registry_initial_source_offices" if offices else "registry_source_contributions")
+        or type(document_by_field["source_count"]) is not int
+        or document_by_field["source_count"] != expected
         or expected == 0
-        or document["inventory_entries_sha256"] != root.entries_sha256
-        or len(canonical(document).encode()) > 4096
+        or document_by_field["inventory_entries_sha256"] != root.entries_sha256
+        or len(canonical(document_by_field).encode()) > 4096
     ):
         raise ValueError("registry_typed_metadata_invalid")
-    _sha(document["sources_sha256"])
-    _counter(document["typed_source_count"])
-    if not 0 < document["typed_source_count"] <= expected:
+    _sha(document_by_field["sources_sha256"])
+    _counter(document_by_field["typed_source_count"])
+    if not 0 < document_by_field["typed_source_count"] <= expected:
         raise ValueError("registry_typed_metadata_invalid")
-    _validate_legacy_summary(document, expected, offices)
+    _validate_legacy_summary(document_by_field, expected, offices)
     if offices:
-        _closed(document["counters"], {"matched_offices", "missing_offices"})
-        context = document["context"]
-        _closed(
-            context,
-            {
-                "office_policy",
-                "canonicalizer_version",
-                "approved_revision",
-                "approved_generation_sha256",
-                "address_source",
-                "address_identity",
-            },
-        )
+        _closed(document_by_field["counters"], {"matched_offices", "missing_offices"})
+        context = document_by_field["context"]
+        _closed(context, set(_OFFICE_CONTEXT_FIELDS))
         _office_context(context)
-        for counter_value in document["counters"].values():
+        for counter_value in document_by_field["counters"].values():
             _counter(counter_value)
     else:
-        _counts(document["counters"])
-    return _defensive(document)
+        _counts(document_by_field["counters"])
+    return _defensive(document_by_field)

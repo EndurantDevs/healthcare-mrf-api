@@ -880,8 +880,11 @@ async def _resolve_site_binding(session, command, fields_by_name, schema):
     connection = await session.connection()
     driver = (await connection.get_raw_connection()).driver_connection
     resolved = await resolve_site_binding_fields(driver, fields_by_name, control_schema=schema)
-    if retained_receipt is not None and retained_receipt != resolved["source_receipt_json"]:
-        raise RegistryRecordConflict("registry_site_binding_source_conflict")
+    if retained_receipt is not None:
+        from process.registry_retained_site_adoption import retained_site_receipt_document
+
+        if retained_site_receipt_document(retained_receipt) != resolved["source_receipt_json"]:
+            raise RegistryRecordConflict("registry_site_binding_source_conflict")
     return resolved
 
 

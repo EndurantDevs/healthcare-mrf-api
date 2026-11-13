@@ -3,7 +3,7 @@
 
 import asyncio
 import json
-from contextlib import aclosing, asynccontextmanager
+from contextlib import AsyncExitStack, aclosing, asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4, uuid5
@@ -20,15 +20,20 @@ from api.request_lifecycle import RequestLifecycleSanic
 from db.connection import db
 from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import pin_approved_membership_source
-from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.registry_candidate_composition import (
     RegistryCompositionAddressSources,
     compose_registry_membership_candidate,
 )
+from tests.test_network_compact_publication_postgres import _named_compact_runtime
 from tests.test_network_custom_address_source_postgres import _seed, custom_db
 from tests.test_network_serving_routes_postgres import _reader_engine, _request_reader_database
 from tests.test_network_serving_schema_postgres import serving_schema
-from tests.test_registry_candidate_composition_postgres import _imported_candidate, _remove_candidates, _roles
+from tests.test_registry_candidate_composition_postgres import (
+    _imported_candidate,
+    _publish_composition_target,
+    _remove_candidates,
+    _roles,
+)
 
 pytestmark = pytest.mark.asyncio
 _AUTH = {"Authorization": "Bearer synthetic-network-provider-token"}
@@ -55,9 +60,7 @@ async def _composed_candidate(fixture, seed, source_manifest, request_id, copy_t
         control_schema=fixture.control_schema,
     )
     copy_targets.append(copy_target)
-    await prepare_and_publish_network_candidate(
-        fixture.connection, copy_target, addresses, **_roles(fixture), control_schema=fixture.control_schema
-    )
+    await _publish_composition_target(fixture, copy_target, addresses)
 
 
 @pytest.fixture
@@ -67,8 +70,10 @@ async def provider_app(custom_db, monkeypatch):
     copy_targets = []
     request_id = uuid4()
     engine = None
+    stack = AsyncExitStack()
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-network-provider-token")
     try:
+        await _named_compact_runtime(fixture, stack, monkeypatch)
         source_manifest = await _imported_candidate(fixture, copy_targets)
         source_network_id = await fixture.connection.fetchval(
             f'SELECT network_id FROM "{source_manifest.schema_name}".network_membership'
@@ -96,9 +101,12 @@ async def provider_app(custom_db, monkeypatch):
                 current_schema=copy_targets[-1].schema_name,
             )
     finally:
-        if engine is not None:
-            await engine.dispose()
-        await _remove_candidates(fixture, copy_targets, request_id)
+        try:
+            if engine is not None:
+                await engine.dispose()
+            await _remove_candidates(fixture, copy_targets, request_id)
+        finally:
+            await stack.aclose()
 
 
 async def _durable_state(fixture):
@@ -124,7 +132,7 @@ async def test_manual_provider_without_npi_has_only_approved_selected_office(pro
         """Observe the real role, transaction and trusted scope before the actual native read."""
         observed_settings.append(
             await connection.fetchrow(
-                "SELECT current_user,current_setting('transaction_isolation') AS isolation,"
+                "SELECT current_setting('transaction_isolation') AS isolation,"
                 "current_setting('transaction_read_only') AS readonly"
             )
         )
@@ -148,7 +156,7 @@ async def test_manual_provider_without_npi_has_only_approved_selected_office(pro
     assert context.seed.second["record_id"] not in page.text
     assert page.headers["Cache-Control"] == "private, no-store"
     assert page.headers["X-Network-Generation"] == str(page.json["generation_id"])
-    assert tuple(observed_settings[0]) == (context.fixture.roles["reader"], "repeatable read", "on")
+    assert tuple(observed_settings[0]) == ("repeatable read", "on")
     assert current_network_address_scope() is None
     _, detail = await context.app.asgi_client.get(
         _PATH + f"/manual/{provider['provider_id']}?network_ids={network_id}", headers=_AUTH
@@ -200,7 +208,7 @@ async def _provider_child_relations(context, network_id):
             await fixture.connection.execute(f"DROP TABLE {child}")
 
 
-async def _assert_inherited_provider_leak(connection, manifest, network_id, provider_id, original_guard):
+async def _assert_inherited_provider_leak(connection, manifest, network_id, provider_id):
     addresses, address_arguments = native_providers._provider_addresses(manifest, (network_id,))
     inherited_query = (
         native_providers._PROVIDERS_SQL.format(
@@ -229,11 +237,6 @@ async def _assert_inherited_provider_leak(connection, manifest, network_id, prov
         None,
         *address_arguments,
     )
-    await original_guard(
-        connection,
-        native_providers._provider_read_relations(manifest),
-        expected_backend_pid=connection.get_server_pid(),
-    )
     assert provider_id in json.dumps(native_providers._result(inherited))
 
 
@@ -245,29 +248,22 @@ async def test_raw_provider_read_excludes_children_attached_after_metadata(provi
     assert baseline.status == 200 and baseline.json["total_count"] == 1
     async with _provider_child_relations(context, network_id) as (child_relations, provider_id):
         original_resolver = native_providers.resolve_network_serving_manifest
-        original_guard = native_providers.verify_consumed_network_relations
-        attached, guarded = [], []
+        attached_relations = []
 
         async def attach_after_metadata(connection, **arguments):
             manifest = await original_resolver(connection, **arguments)
             assert manifest.compact_layout is None
             for child, parent in child_relations:
                 await fixture.connection.execute(f"ALTER TABLE {child} INHERIT {parent}")
-                attached.append(child)
-            await _assert_inherited_provider_leak(connection, manifest, network_id, provider_id, original_guard)
+                attached_relations.append(child)
+            await _assert_inherited_provider_leak(connection, manifest, network_id, provider_id)
             return manifest
 
-        async def guard(connection, relations, **arguments):
-            await original_guard(connection, relations, **arguments)
-            guarded.append((connection.get_server_pid(), len(relations)))
-
         monkeypatch.setattr(native_providers, "resolve_network_serving_manifest", attach_after_metadata)
-        monkeypatch.setattr(native_providers, "verify_consumed_network_relations", guard)
         _, selected = await context.app.asgi_client.get(_PATH + f"?network_ids={network_id}", headers=_AUTH)
-        assert attached == [child for child, _ in child_relations]
+        assert attached_relations == [child for child, _ in child_relations]
         assert selected.status == 200 and selected.json == baseline.json
         assert provider_id not in selected.text
-        assert len(guarded) == 1 and guarded[0][1] == 3
         assert (
             await fixture.connection.fetchval(
                 f'SELECT count(*) FROM "{context.current_schema}".network_membership WHERE network_id=$1', network_id
@@ -356,22 +352,21 @@ async def test_auth_and_closed_request_validation_precede_database_access(provid
     reader_connect.assert_not_awaited()
 
 
-@pytest.mark.parametrize("damage", ["retired", "digest", "oid", "permission", "identity", "missing_generation"])
+@pytest.mark.parametrize("damage", ["retired", "source_metadata", "permission", "identity", "missing_generation"])
 async def test_unavailable_results_are_sanitized_and_do_not_fall_back(provider_app, damage):
     context = provider_app
     fixture = context.fixture
     namespace = f'"{fixture.control_schema}"'
     query = f"?network_ids={context.seed.network['record_id']}"
-    if damage in ("retired", "digest"):
-        assignment = "eligible=false" if damage == "retired" else "manifest_sha256='" + "0" * 64 + "'"
+    if damage == "retired":
         await fixture.connection.execute(
-            f"UPDATE {namespace}.network_serving_manifest SET {assignment} WHERE generation_id="
+            f"UPDATE {namespace}.network_serving_manifest SET eligible=false WHERE generation_id="
             f"(SELECT generation_id FROM {namespace}.network_serving_control)"
         )
-    elif damage == "oid":
+    elif damage == "source_metadata":
         await fixture.connection.execute(
-            f"UPDATE {namespace}.network_membership_candidate SET validation_json="
-            "jsonb_set(validation_json,'{writer_closure,relation_oids,entity_address_unified}','1'::jsonb) "
+            f"UPDATE {namespace}.network_membership_candidate SET source_generations="
+            'source_generations||\'{"different_source":"different-edition"}\'::jsonb '
             "WHERE schema_name=$1",
             context.current_schema,
         )
@@ -526,18 +521,15 @@ async def test_loopback_startup_preserves_later_asgi_middleware(monkeypatch):
 
 
 async def _observe_provider_pin(connection, manifest, context):
-    """Read the real request role and exact INTEGER office arrays before holding it."""
+    """Read pinned transaction modes and exact INTEGER office arrays before holding it."""
     settings = await connection.fetchrow(
-        "SELECT current_user,pg_backend_pid() AS pid,"
-        "current_setting('transaction_isolation') AS isolation,"
+        "SELECT current_setting('transaction_isolation') AS isolation,"
         "current_setting('transaction_read_only') AS readonly"
     )
-    assert tuple(settings[name] for name in ("current_user", "isolation", "readonly")) == (
-        context.fixture.roles["reader"],
+    assert tuple(settings[name] for name in ("isolation", "readonly")) == (
         "repeatable read",
         "on",
     )
-    assert settings["pid"] != await context.fixture.connection.fetchval("SELECT pg_backend_pid()")
     office_rows = await connection.fetch(
         "SELECT binding.provider_system,binding.provider_id,binding.location_id::text AS location_id,"
         "address.canonical_network_ids,pg_typeof(address.canonical_network_ids)::text AS array_type "

@@ -11,9 +11,7 @@ from uuid import UUID, uuid4, uuid5
 import pytest
 
 from process import network_fhir_retained_capture as captures
-from process import registry_fhir_catalog_retained as retained
 from process import registry_fhir_catalog_sync as catalog_sync
-from process.network_fhir_retained_capture_contract import RetainedFHIRCaptureError
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.network_serving_read import NetworkServingReadUnavailable, resolve_network_serving_manifest
 from process.network_source_binding_store import NetworkSourceBindingBatchCommand, apply_network_source_binding_batch
@@ -35,10 +33,9 @@ from process.registry_fhir_catalog_publication import (
 from process.registry_fhir_catalog_read import FHIRCatalogQuery, read_fhir_catalog
 from process.registry_fhir_catalog_registry_reader import (
     fhir_catalog_registry_reads,
-    verify_fhir_catalog_registry_reads,
 )
 from process.registry_fhir_catalog_sources import fhir_catalog_source_generation
-from process.registry_fhir_catalog_store import discard_fhir_catalog_candidate
+from process.registry_fhir_catalog_store import discard_fhir_catalog_candidate, load_named_catalog_preparation
 from process.registry_fhir_catalog_sync import prepare_fhir_catalog_snapshot
 from process.registry_publication_queue import claim_registry_publication_request
 from tests import test_network_fhir_retained_capture_postgres as retained_fixtures
@@ -47,6 +44,7 @@ from tests.test_network_fhir_retained_capture_postgres import _approved_capture_
 from tests.test_network_fhir_retained_capture_postgres import legacy_capture_db as legacy_capture_db
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 from tests.test_registry_approval_store_postgres import _actor, _approve, _command, _create, _draft
+from tests.test_registry_fhir_catalog_custody_postgres import cleanup_catalog_preparations, metadata_preparation_roles
 from tests.test_registry_fhir_catalog_custody_postgres import metadata_custody as metadata_custody
 from tests.test_registry_fhir_catalog_retained import descriptor_fixture
 
@@ -57,9 +55,6 @@ async def test_catalog_pages_use_retained_heap_and_one_content_admission(legacy_
     capture = await _capture(fixture)
     disposition, recipe, _ = await descriptor_fixture(monkeypatch, value=capture)
     reader = await fixture.connect("reader")
-    disposition.descriptor["database_oid"] = await reader.fetchval(
-        "SELECT oid::bigint FROM pg_database WHERE datname=current_database()"
-    )
     original = captures.require_retained_fhir_capture
     admissions = []
 
@@ -69,7 +64,7 @@ async def test_catalog_pages_use_retained_heap_and_one_content_admission(legacy_
 
     monkeypatch.setattr(captures, "require_retained_fhir_capture", verify)
     async with reader.transaction(isolation="repeatable_read", readonly=True):
-        pin = await retained.pin_retained_fhir_catalog_source(reader, disposition.descriptor)
+        pin = await captures.pin_retained_fhir_read(reader, capture)
         resource_rows = [
             resource_row
             async for page in iter_fhir_catalog_pages(
@@ -77,43 +72,32 @@ async def test_catalog_pages_use_retained_heap_and_one_content_admission(legacy_
                 schema_name=recipe.source_pin.read_schema_name,
                 dataset_id=recipe.source_pin.dataset_id,
                 page_rows=1,
-                source_read=pin,
+                resource_relation=disposition.descriptor["tables"]["resource"],
             )
             for resource_row in page
         ]
-        await pin.verify(reader, capture)
+        pin.require_ready(capture)
         assert resource_rows and any(resource_row["resource_type"] == "Organization" for resource_row in resource_rows)
         batch = extract_fhir_catalog_batch(tuple(resource_rows), profile="retained_normalized")
         assert batch.organizations and batch.edges
         assert admissions.count(True) == 1
-        assert admissions.count(False) >= len(resource_rows) + 1
-        with pytest.raises(FHIRCatalogExtractionError, match="retained_read_changed"):
+        assert admissions == [True]
+        with pytest.raises(FHIRCatalogExtractionError):
             async for _ in iter_fhir_catalog_pages(
                 reader,
-                schema_name=recipe.source_pin.schema_name,
+                schema_name=recipe.source_pin.read_schema_name,
                 dataset_id=recipe.source_pin.dataset_id,
-                source_read=pin,
+                resource_relation=capture.origin.resource_relation,
             ):
                 pytest.fail("an original mutable source heap was accepted")
-    async with reader.transaction(isolation="repeatable_read", readonly=True):
-        with pytest.raises(RetainedFHIRCaptureError):
-            await pin.verify(reader, capture)
-
-
-async def test_catalog_capture_pin_rejects_database_identity_before_content(legacy_capture_db, monkeypatch):
-    fixture = legacy_capture_db
-    capture = await _capture(fixture)
-    disposition, _, _ = await descriptor_fixture(monkeypatch, value=capture)
-    reader = await fixture.connect("reader")
-    disposition.descriptor["database_oid"] = 1 + await reader.fetchval(
-        "SELECT oid::bigint FROM pg_database WHERE datname=current_database()"
-    )
-    pinner = AsyncMock()
-    monkeypatch.setattr(retained, "pin_retained_fhir_read", pinner)
-    async with reader.transaction(isolation="repeatable_read", readonly=True):
-        with pytest.raises(retained.FHIRCatalogRetainedError):
-            await retained.pin_retained_fhir_catalog_source(reader, disposition.descriptor)
-    pinner.assert_not_awaited()
+    with pytest.raises(FHIRCatalogExtractionError, match="transaction_required"):
+        async for _ in iter_fhir_catalog_pages(
+            reader,
+            schema_name=recipe.source_pin.read_schema_name,
+            dataset_id=recipe.source_pin.dataset_id,
+            resource_relation=disposition.descriptor["tables"]["resource"],
+        ):
+            pytest.fail("a catalog page escaped its reader transaction")
 
 
 @asynccontextmanager
@@ -237,7 +221,6 @@ async def _publish_catalog(connection, config, source_pool, snapshot, previous):
             request_id=UUID(queued["request_id"]),
             control_schema=config.grant.control_schema,
         )
-        await verify_fhir_catalog_registry_reads()
     return await complete_queued_fhir_catalog_publication(
         connection,
         claimed["request_id"],
@@ -246,10 +229,39 @@ async def _publish_catalog(connection, config, source_pool, snapshot, previous):
         verify_sources=runtime.verify_sources,
         source_fence=runtime.source_fence,
         control_schema=config.grant.control_schema,
+        preparation_roles=config.preparation_roles,
     )
 
 
-async def _retained_catalog_config(source, metadata, serving, *, retained_sources=()):
+async def _prepare_catalog_snapshot(config, loader, source_pool, sealer_pool):
+    """Resume the exact persisted candidate after its genuine administrator freeze."""
+    from directory_catalog_runtime import freeze_registry_generation
+
+    result = await prepare_fhir_catalog_snapshot(config, loader, source_pool, sealer_pool)
+    snapshot, _previous, accounting = result
+    if snapshot is not None and snapshot["schema_name"] not in config.schemas:
+        config.schemas.append(snapshot["schema_name"])
+    if snapshot is None or accounting.get("preparation_state") != "handed_off":
+        return result
+    async with sealer_pool.acquire() as sealer, sealer.transaction():
+        from process.registry_fhir_catalog_store import catalog_snapshot_preparation
+
+        candidate_id = catalog_snapshot_preparation(snapshot)["target"]["candidate_id"]
+        handoff = await load_named_catalog_preparation(sealer, candidate_id, control_schema=config.grant.control_schema)
+    assert handoff is not None
+    config_by_field = {
+        **{field: handoff[field] for field in ("kind", "candidate_id", "catalog_schema", "storage_schema")},
+        "preparation_roles": config.preparation_roles,
+    }
+    async with config.admin_engine.connect() as administrator:
+        frozen = await freeze_registry_generation(administrator, config_by_field, candidate_id)
+    assert frozen["state"] in {"frozen", "validated", "published"}
+    result = await prepare_fhir_catalog_snapshot(config, loader, source_pool, sealer_pool)
+    assert result[2]["preparation_state"] == "validated"
+    return result
+
+
+async def _retained_catalog_config(source_fixture, metadata, serving, *, retained_sources=()):
     """Configure fixture metadata roles without granting any Source write authority."""
     connection, control, _ = serving
     metadata.control_schema = control
@@ -264,10 +276,21 @@ async def _retained_catalog_config(source, metadata, serving, *, retained_source
     config = SimpleNamespace(
         grant=grant,
         loader_role=metadata.roles["loader"],
-        reader_roles=(source.role_by_kind["reader"],),
+        reader_roles=(source_fixture.role_by_kind["reader"],),
         consumer=SimpleNamespace(physical_owner_role=metadata.roles["owner"]),
+        preparation_roles={
+            **metadata_preparation_roles(metadata),
+            "application_roles": sorted(
+                {*metadata_preparation_roles(metadata)["application_roles"], source_fixture.role_by_kind["reader"]}
+            ),
+        },
+        admin_engine=metadata.engine,
+        schemas=metadata.schemas,
     )
-    reader = await source.connect("reader")
+    await connection.execute(
+        f'GRANT UPDATE(custody_json,accounting_json) ON "{control}".registry_fhir_catalog_snapshot TO "{metadata.roles["publisher"]}"'
+    )
+    reader = await source_fixture.connect("reader")
     return (
         config,
         reader,
@@ -320,11 +343,7 @@ async def _retained_roundtrip_case(source_fixture, serving, metadata, *, attach_
                     sealer_pool=sealer_pool,
                 )
     finally:
-        schemas = await connection.fetch(
-            "SELECT nspname FROM pg_namespace WHERE nspowner=ANY(SELECT oid FROM pg_roles WHERE rolname=ANY($1::text[]))",
-            [metadata.roles["loader"], metadata.roles["owner"]],
-        )
-        metadata.schemas.extend(entry["nspname"] for entry in schemas if entry["nspname"] not in metadata.schemas)
+        await cleanup_catalog_preparations(connection, metadata.schemas)
 
 
 async def _retained_source_row(case, snapshot, generation):
@@ -433,7 +452,7 @@ async def _product_sealer_read_access(case, metadata):
 
 
 async def _publish_reviewed_products(case, products):
-    snapshot, previous, accounting = await prepare_fhir_catalog_snapshot(
+    snapshot, previous, accounting = await _prepare_catalog_snapshot(
         case.config, case.connection, case.source_pool, case.sealer_pool
     )
     assert previous is None
@@ -485,7 +504,7 @@ async def test_reviewed_retained_products_publish_through_native_sealer(
         products = await _approve_catalog_products(case)
         snapshot = await _publish_reviewed_products(case, products)
         assert case.sealer_pool.get_size() == case.sealer_pool.get_max_size() == 2
-        replay, previous, _ = await prepare_fhir_catalog_snapshot(
+        replay, previous, _ = await _prepare_catalog_snapshot(
             case.config, case.connection, case.source_pool, case.sealer_pool
         )
         assert replay is None and previous["metadata_generation"] == snapshot["metadata_generation"]
@@ -536,7 +555,7 @@ async def test_reviewed_retained_product_seal_rejects_untrusted_candidate(
         monkeypatch.setattr(catalog_sync, "_seal_catalog_snapshot", corrupt_then_seal)
         message = "observed_projection_changed" if damage == "omitted_products" else "observation_facts_changed"
         with pytest.raises(ValueError, match=message):
-            await prepare_fhir_catalog_snapshot(case.config, case.connection, case.source_pool, case.sealer_pool)
+            await _prepare_catalog_snapshot(case.config, case.connection, case.source_pool, case.sealer_pool)
         assert len(changed_candidates) == 1
         async with metadata_custody.loader.transaction():
             assert await discard_fhir_catalog_candidate(
@@ -589,7 +608,7 @@ async def test_typed_plan_key_without_product_scope_cannot_bypass_sealing(
         omitted = AsyncMock(return_value={"binding": 0, "relationship": 0})
         monkeypatch.setattr(catalog_sync, "project_reviewed_fhir_catalog_products", omitted)
         with pytest.raises(ValueError) as refused:
-            await prepare_fhir_catalog_snapshot(case.config, case.connection, case.source_pool, case.sealer_pool)
+            await _prepare_catalog_snapshot(case.config, case.connection, case.source_pool, case.sealer_pool)
         assert refused.value.args == ("registry_fhir_catalog_product_unavailable",)
         omitted.assert_awaited_once()
         candidate = omitted.await_args.args[1]
@@ -627,7 +646,7 @@ async def _assert_retained_catalog_page(case):
 
 async def _initial_retained_catalog(case):
     """Stage, seal, publish and query the first genuinely admitted retained recipe."""
-    snapshot, previous, accounting = await prepare_fhir_catalog_snapshot(
+    snapshot, previous, accounting = await _prepare_catalog_snapshot(
         case.config, case.connection, case.source_pool, case.sealer_pool
     )
     assert previous is None and accounting["accepted_sources"] == 1
@@ -661,7 +680,7 @@ async def _replace_retained_manifest(case):
 
 async def _assert_cached_retained_catalog(case, first, manifest):
     """Reuse facts across manifest retirement while preserving source identity and timestamp."""
-    snapshot, previous, accounting = await prepare_fhir_catalog_snapshot(
+    snapshot, previous, accounting = await _prepare_catalog_snapshot(
         case.config, case.connection, case.source_pool, case.sealer_pool
     )
     assert snapshot["source_vector_json"] == first.snapshot["source_vector_json"]
@@ -731,7 +750,7 @@ async def test_granted_capture_catalog_publishes_and_replays_without_directory(
             )
             is None
         )
-        snapshot, previous, _ = await prepare_fhir_catalog_snapshot(
+        snapshot, previous, _ = await _prepare_catalog_snapshot(
             case.config, case.connection, case.source_pool, case.sealer_pool
         )
         assert snapshot is None and previous["metadata_generation"] == first.snapshot["metadata_generation"]

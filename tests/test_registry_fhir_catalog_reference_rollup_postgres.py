@@ -13,6 +13,7 @@ import pytest
 
 from process import registry_fhir_catalog_reference_rollup as rollup
 from process.registry_fhir_catalog_extraction import iter_fhir_catalog_pages
+from process.registry_fhir_catalog_observed_source import catalog_observation_tables, collect_fhir_catalog_observation
 from tests.test_registry_fhir_catalog_observed_source_postgres import observed_source_db as observed_source_db
 
 
@@ -288,10 +289,8 @@ async def test_temp_staging_keeps_source_read_only(reference_database):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("observed_source_db", [("SCOPED", 2)], indirect=True)
-async def test_published_leaves_share_one_global_keyset_and_reference_accounting(observed_source_db):
-    """Interleave physical leaves without resetting cursors or duplicating rollup counts."""
-    from process.registry_fhir_catalog_published_read import pin_fhir_catalog_published_read
-
+async def test_named_partitioned_resources_share_one_keyset_and_complete_reference_accounting(observed_source_db):
+    """Interleave named partitioned data without resetting cursors or double counting."""
     fixture = observed_source_db
     await fixture.admin.execute(f'DELETE FROM "{fixture.schema}".resources_one')
     resources = [
@@ -311,16 +310,14 @@ async def test_published_leaves_share_one_global_keyset_and_reference_accounting
     reader = await fixture.connect()
     async with rollup.fhir_catalog_reference_workspace(reader) as workspace:
         async with reader.transaction(isolation="repeatable_read", readonly=True):
-            published = await pin_fhir_catalog_published_read(
-                reader, fixture.profile, endpoint_id="endpoint-one", dataset_id="dataset-one"
-            )
+            tables = await catalog_observation_tables(reader, fixture.profile, "dataset-one")
             pages = [
                 page
                 async for page in iter_fhir_catalog_pages(
                     reader,
                     schema_name=fixture.schema,
                     dataset_id="dataset-one",
-                    source_read=published,
+                    resource_relation=tables["resource"],
                     page_rows=3,
                     page_bytes=1800,
                 )
@@ -332,7 +329,7 @@ async def test_published_leaves_share_one_global_keyset_and_reference_accounting
                 reader,
                 schema_name=fixture.schema,
                 dataset_id="dataset-one",
-                source_read=published,
+                resource_relation=tables["resource"],
                 workspace=workspace,
                 page_rows=3,
                 page_bytes=1800,
@@ -342,20 +339,18 @@ async def test_published_leaves_share_one_global_keyset_and_reference_accounting
                 assert stage.accounting.resource_counts == {"OrganizationAffiliation": 9, "PractitionerRole": 9}
                 assert stage.accounting.distinct_references == len(edges) == 6
                 assert sum(edge.reference_rows for edge in edges) == 18
-            with pytest.raises(asyncpg.ReadOnlySQLTransactionError):
+            with pytest.raises((asyncpg.InsufficientPrivilegeError, asyncpg.ReadOnlySQLTransactionError)):
                 async with reader.transaction():
                     await reader.execute(
-                        f'INSERT INTO "{fixture.schema}".resources_low VALUES(NULL,NULL,NULL,NULL,NULL)'
+                        f'INSERT INTO "{fixture.schema}".provider_directory_dataset_resource VALUES(NULL,NULL,NULL,NULL,NULL)'
                     )
     assert await reader.fetchval("SELECT to_regclass($1)", "pg_temp." + workspace.table_name) is None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("observed_source_db", [("SCOPED", 2)], indirect=True)
-async def test_published_cross_leaf_duplicate_is_refused_before_keyset_traversal(observed_source_db):
-    """Detect duplicate logical keys even when a cursor would skip their second leaf."""
-    from process.registry_fhir_catalog_published_read import pin_fhir_catalog_published_read
-
+async def test_duplicate_resource_keys_are_refused_by_complete_observation(observed_source_db):
+    """A complete observation refuses duplicate keys that a keyset cursor could skip."""
     fixture = observed_source_db
     await fixture.admin.execute(
         f'INSERT INTO "{fixture.schema}".resources_low '
@@ -363,7 +358,7 @@ async def test_published_cross_leaf_duplicate_is_refused_before_keyset_traversal
     )
     assert (
         await fixture.admin.fetchval(
-            f'SELECT count(DISTINCT tableoid) FROM "{fixture.schema}".resources_one '
+            f'SELECT count(*) FROM "{fixture.schema}".resources_one '
             f"WHERE resource_type='Organization' AND resource_id='network'"
         )
         == 2
@@ -371,17 +366,15 @@ async def test_published_cross_leaf_duplicate_is_refused_before_keyset_traversal
     reader = await fixture.connect()
     async with reader.transaction(isolation="repeatable_read", readonly=True):
         with pytest.raises(ValueError):
-            await pin_fhir_catalog_published_read(
+            await collect_fhir_catalog_observation(
                 reader, fixture.profile, endpoint_id="endpoint-one", dataset_id="dataset-one"
             )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("observed_source_db", [("SCOPED", 2)], indirect=True)
-async def test_published_consumers_preserve_byte_bounds(observed_source_db):
+async def test_named_consumers_preserve_byte_bounds(observed_source_db):
     """Both metadata pages and native reference pages reject one oversized source row."""
-    from process.registry_fhir_catalog_published_read import pin_fhir_catalog_published_read
-
     fixture = observed_source_db
     await fixture.admin.execute(
         f"UPDATE \"{fixture.schema}\".resources_one SET payload_json=payload_json||jsonb_build_object('name',repeat('x',2000))"
@@ -389,15 +382,13 @@ async def test_published_consumers_preserve_byte_bounds(observed_source_db):
     reader = await fixture.connect()
     async with rollup.fhir_catalog_reference_workspace(reader) as workspace:
         async with reader.transaction(isolation="repeatable_read", readonly=True):
-            published = await pin_fhir_catalog_published_read(
-                reader, fixture.profile, endpoint_id="endpoint-one", dataset_id="dataset-one"
-            )
+            tables = await catalog_observation_tables(reader, fixture.profile, "dataset-one")
             with pytest.raises(ValueError):
                 async for _ in iter_fhir_catalog_pages(
                     reader,
                     schema_name=fixture.schema,
                     dataset_id="dataset-one",
-                    source_read=published,
+                    resource_relation=tables["resource"],
                     page_bytes=100,
                 ):
                     pytest.fail("oversized metadata was yielded")
@@ -406,7 +397,7 @@ async def test_published_consumers_preserve_byte_bounds(observed_source_db):
                     reader,
                     schema_name=fixture.schema,
                     dataset_id="dataset-one",
-                    source_read=published,
+                    resource_relation=tables["resource"],
                     workspace=workspace,
                     page_bytes=100,
                 ):
@@ -416,26 +407,22 @@ async def test_published_consumers_preserve_byte_bounds(observed_source_db):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("observed_source_db", [("SCOPED", 2)], indirect=True)
-async def test_published_reference_cancellation_closes_workspace_snapshot_and_leaf_locks(observed_source_db):
-    """Cancel real scoped staging and prove its exact TEMP and transaction locks close."""
-    from process.registry_fhir_catalog_published_read import pin_fhir_catalog_published_read
-
+async def test_named_reference_cancellation_closes_workspace_snapshot_and_read_locks(observed_source_db):
+    """Cancel real staging and prove its temporary data and read transaction close."""
     fixture, entered, state = observed_source_db, asyncio.Event(), {}
     reader = await fixture.connect()
 
     async def stage_until_cancelled():
-        """Keep the real task-bound reader and workspace alive until cancellation."""
+        """Keep the actual reader snapshot and workspace alive until cancellation."""
         async with rollup.fhir_catalog_reference_workspace(reader) as workspace:
             state["workspace"] = workspace
             async with reader.transaction(isolation="repeatable_read", readonly=True):
-                published = await pin_fhir_catalog_published_read(
-                    reader, fixture.profile, endpoint_id="endpoint-one", dataset_id="dataset-one"
-                )
+                tables = await catalog_observation_tables(reader, fixture.profile, "dataset-one")
                 async with rollup.staged_fhir_catalog_references(
                     reader,
                     schema_name=fixture.schema,
                     dataset_id="dataset-one",
-                    source_read=published,
+                    resource_relation=tables["resource"],
                     workspace=workspace,
                 ) as stage:
                     assert [batch async for batch in stage.iter_batches()]
@@ -452,37 +439,53 @@ async def test_published_reference_cancellation_closes_workspace_snapshot_and_le
     assert not reader.is_in_transaction()
     assert await reader.fetchval("SELECT to_regclass($1)", "pg_temp." + state["workspace"].table_name) is None
     async with fixture.admin.transaction():
-        await fixture.admin.execute(f'LOCK TABLE ONLY "{fixture.schema}".resources_low IN ACCESS EXCLUSIVE MODE NOWAIT')
+        await fixture.admin.execute(
+            f'LOCK TABLE "{fixture.schema}".provider_directory_dataset_resource IN ACCESS EXCLUSIVE MODE NOWAIT'
+        )
+
+
+async def _consume_unreadable_relation(reader, fixture, consumer, resource_relation, workspace):
+    if consumer == "metadata":
+        async for _ in iter_fhir_catalog_pages(
+            reader,
+            schema_name=fixture.schema,
+            dataset_id="dataset-one",
+            resource_relation=resource_relation,
+        ):
+            pytest.fail("invalid or unreadable metadata relation was accepted")
+    else:
+        async with rollup.staged_fhir_catalog_references(
+            reader,
+            schema_name=fixture.schema,
+            dataset_id="dataset-one",
+            resource_relation=resource_relation,
+            workspace=workspace,
+        ):
+            pytest.fail("invalid or unreadable reference relation was accepted")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("observed_source_db", [("SCOPED", 2)], indirect=True)
 @pytest.mark.parametrize("consumer", ["metadata", "references"])
-async def test_published_consumers_refuse_unbranded_source_read(observed_source_db, consumer):
-    """An unknown read object cannot select payloads or fall back to the denied parent."""
+@pytest.mark.parametrize("relation_kind", ["invalid", "private"])
+async def test_named_consumers_require_valid_names_and_actual_select_privileges(
+    observed_source_db, consumer, relation_kind
+):
+    """A name map cannot replace validation or native SELECT permission on its data."""
     fixture, reader = observed_source_db, await observed_source_db.connect()
+    resource_relation = (
+        object() if relation_kind == "invalid" else {"schema": fixture.schema, "name": "resources_detached"}
+    )
+    error = ValueError if relation_kind == "invalid" else asyncpg.InsufficientPrivilegeError
     async with (
         rollup.fhir_catalog_reference_workspace(reader) as workspace,
         reader.transaction(isolation="repeatable_read", readonly=True),
     ):
-        with pytest.raises(ValueError):
-            if consumer == "metadata":
-                async for _ in iter_fhir_catalog_pages(
-                    reader,
-                    schema_name=fixture.schema,
-                    dataset_id="dataset-one",
-                    source_read=object(),
-                ):
-                    pytest.fail("unbranded metadata scope was accepted")
-            else:
-                async with rollup.staged_fhir_catalog_references(
-                    reader,
-                    schema_name=fixture.schema,
-                    dataset_id="dataset-one",
-                    source_read=object(),
-                    workspace=workspace,
-                ):
-                    pytest.fail("unbranded reference scope was accepted")
+        with pytest.raises(error):
+            async with reader.transaction():
+                await _consume_unreadable_relation(reader, fixture, consumer, resource_relation, workspace)
+    assert not reader.is_in_transaction()
+    assert await reader.fetchval("SELECT to_regclass($1)", "pg_temp." + workspace.table_name) is None
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 import asyncpg
 
 from process.network_address_projection import _identifier
+from process.network_compact_layout import CompactAddressRelation
 from process.network_membership_copy import MAX_INPUT_BYTES, MAX_ROWS, _encode
 from process.network_serving_read import PinnedNetworkServingManifest, resolve_network_serving_manifest
 from process.uhc_flex_practitioner_async_safety import drain_operation
@@ -40,12 +41,9 @@ class RetainedSiteAdoptionReceipt:
     source_generations: tuple[tuple[str, str], ...]
     approved_custom_revision: int
     manifest_sha256: str
-    schema_oid: int
-    address_table_oid: int
-    binding_table_oid: int
-    owner_role_oid: int
+    address_relation: CompactAddressRelation
     records: tuple[RetainedSiteAdoption, ...]
-    compact_address_relations: tuple[tuple[str, str, str, int], ...] = ()
+    compact_address_relations: tuple[tuple[str, str, str], ...] = ()
 
     def as_dict(self):
         """Return a fresh JSON envelope without exposing mutable receipt state."""
@@ -56,6 +54,53 @@ class RetainedSiteAdoptionReceipt:
         if relations:
             envelope["compact_address_relations"] = [list(relation) for relation in relations]
         return envelope
+
+
+def retained_site_receipt_document(document):
+    """Project the known historical receipt to names while retaining its exact data selection."""
+    fields = {
+        "generation_id",
+        "candidate_id",
+        "schema_name",
+        "schema_revision",
+        "source_generations",
+        "approved_custom_revision",
+        "manifest_sha256",
+        "records",
+    }
+    retired_fields = {"schema_oid", "address_table_oid", "binding_table_oid", "owner_role_oid"}
+    if type(document) is not dict:
+        raise RetainedSiteAdoptionError("Retained site receipt is invalid")
+    required = set(document) - {"compact_address_relations"}
+    if required not in (fields | retired_fields, fields | {"address_relation"}):
+        raise RetainedSiteAdoptionError("Retained site receipt is invalid")
+    has_legacy_fields = required == fields | retired_fields
+    receipt_by_field = {key: document[key] for key in fields}
+    _identifier(receipt_by_field["schema_name"])
+    relations = []
+    for relation in document.get("compact_address_relations", []):
+        if type(relation) not in (tuple, list) or len(relation) != (4 if has_legacy_fields else 3):
+            raise RetainedSiteAdoptionError("Retained site receipt is invalid")
+        role, schema, table = relation[:3]
+        if role not in {"base", "custom"} or role in {selected_relation[0] for selected_relation in relations}:
+            raise RetainedSiteAdoptionError("Retained site receipt is invalid")
+        _identifier(schema)
+        _identifier(table)
+        relations.append([role, schema, table])
+    address_by_field = document.get("address_relation")
+    if address_by_field is None:
+        address_by_field = {"schema_name": document["schema_name"], "table_name": "entity_address_unified"}
+        if relations:
+            base = next((relation for relation in relations if relation[0] == "base"), None)
+            if base is None:
+                raise RetainedSiteAdoptionError("Retained site receipt is invalid")
+            address_by_field = {"schema_name": base[1], "table_name": base[2]}
+    if type(address_by_field) is not dict or set(address_by_field) != {"schema_name", "table_name"}:
+        raise RetainedSiteAdoptionError("Retained site receipt is invalid")
+    receipt_by_field["address_relation"] = asdict(CompactAddressRelation(**address_by_field))
+    if relations:
+        receipt_by_field["compact_address_relations"] = relations
+    return receipt_by_field
 
 
 def _unique_object(pairs):
@@ -97,9 +142,9 @@ def _input_rows(input_bytes):
 
 
 async def _selected_rows(connection, manifest, selection_rows):
-    """Resolve the entire selection and physical receipt coordinates in one query."""
+    """Resolve every selected binding and complete retained address row in one query."""
     namespace = _identifier(manifest.schema_name)
-    addresses, address_oid_sql, address_arguments = _source_addresses(manifest, namespace)
+    addresses, address_arguments = _source_addresses(manifest, namespace)
     return await connection.fetchrow(
         f"""WITH requested AS MATERIALIZED (
           SELECT * FROM jsonb_to_recordset($1::jsonb) AS item(provider_system text,provider_id text,
@@ -120,62 +165,61 @@ async def _selected_rows(connection, manifest, selection_rows):
           jsonb_agg(jsonb_build_object('provider_system',provider_system,'provider_id',provider_id,
             'location_id',location_id::text,'location_key',location_key,'entity_type',entity_type,
             'entity_id',entity_id,'address_row_sha256',address_row_sha256)
-            ORDER BY provider_system,provider_id,location_id)::text AS records_json,
-          (SELECT oid::bigint FROM pg_namespace WHERE nspname=$2) AS schema_oid,
-          {address_oid_sql} AS address_table_oid,
-          (SELECT oid::bigint FROM pg_class WHERE relnamespace=to_regnamespace($2)
-            AND relname='provider_location_binding' AND relkind='r') AS binding_table_oid,
-          (SELECT nspowner::bigint FROM pg_namespace WHERE nspname=$2) AS owner_role_oid
+            ORDER BY provider_system,provider_id,location_id)::text AS records_json
         FROM matched""",
         json.dumps(selection_rows, separators=(",", ":")),
-        namespace[1:-1],
         *address_arguments,
     )
 
 
 def _source_addresses(source, namespace):
     if source.compact_layout is None:
-        oid_sql = "(SELECT oid::bigint FROM pg_class WHERE relnamespace=to_regnamespace($2) "
-        oid_sql += "AND relname='entity_address_unified' AND relkind='r')"
-        return namespace + ".entity_address_unified", oid_sql, ()
+        return namespace + ".entity_address_unified", ()
     from api.network_compact_address import compact_address_native_sql
 
-    addresses, arguments = compact_address_native_sql(
-        source.compact_layout, first_parameter=4, visible_membership_sql="TRUE"
-    )
-    return addresses, "$3::bigint", (source.address_table_oid, *arguments)
+    return compact_address_native_sql(source.compact_layout, first_parameter=2, visible_membership_sql="TRUE")
 
 
 def _compact_relations(source):
     if source.compact_layout is None:
         return ()
     layout = source.compact_layout
-    relations = [("base", layout.base.schema_name, "entity_address_unified", layout.base.table_oid)]
+    relations = [("base", layout.base.schema_name, layout.base.table_name)]
     if layout.custom is not None:
-        relations.append(("custom", layout.custom.schema_name, "entity_address_unified", layout.custom.table_oid))
+        relations.append(("custom", layout.custom.schema_name, layout.custom.table_name))
     return tuple(relations)
 
 
-def _receipt(source, selected):
-    """Seal verified native coordinates and reject aggregate or response overflow."""
+def _receipt(source_manifest, selected):
+    """Bind complete selected data to its named generation and enforce response bounds."""
     count = selected["requested_count"]
-    oid_fields = ("schema_oid", "address_table_oid", "binding_table_oid", "owner_role_oid")
     if (
         selected["pair_count"] != count
         or selected["matched_count"] != count
         or selected["unresolved_count"] != 0
-        or selected["address_table_oid"] != source.address_table_oid
-        or any(type(selected[field]) is not int or selected[field] <= 0 for field in oid_fields)
         or len(selected["records_json"].encode()) > MAX_INPUT_BYTES
     ):
         raise RetainedSiteAdoptionError("Retained site adoption selection is unresolved")
-    manifest = asdict(source)
-    manifest["source_generations"] = tuple(sorted(source.source_generations.items()))
+    manifest_by_field = {
+        field: getattr(source_manifest, field)
+        for field in (
+            "generation_id",
+            "candidate_id",
+            "schema_name",
+            "schema_revision",
+            "source_generations",
+            "approved_custom_revision",
+            "manifest_sha256",
+            "address_relation",
+        )
+    }
+    manifest_by_field["source_generations"] = tuple(sorted(source_manifest.source_generations.items()))
     receipt = RetainedSiteAdoptionReceipt(
-        **manifest,
-        **{field: selected[field] for field in oid_fields if field != "address_table_oid"},
-        records=tuple(RetainedSiteAdoption(**row) for row in json.loads(selected["records_json"])),
-        compact_address_relations=_compact_relations(source),
+        **manifest_by_field,
+        records=tuple(
+            RetainedSiteAdoption(**record_by_field) for record_by_field in json.loads(selected["records_json"])
+        ),
+        compact_address_relations=_compact_relations(source_manifest),
     )
     if len(json.dumps(receipt.as_dict(), separators=(",", ":"), sort_keys=True).encode()) > MAX_INPUT_BYTES:
         raise RetainedSiteAdoptionError("Retained site adoption receipt exceeds the byte limit")
@@ -205,9 +249,8 @@ async def resolve_retained_site_adoptions(
 ) -> RetainedSiteAdoptionReceipt:
     """Read exact reviewed tuples in the caller's repeatable snapshot without writes.
 
-    The source must remain eligible and physically closed. No mutable binding
-    head, provider-wide address expansion or live-source fallback is consulted.
-    Hashes cover each complete retained address row in native JSONB text form.
+    The source remains eligible in the pinned repeatable snapshot. Hashes cover
+    each complete retained address row in native JSONB text form.
     """
     try:
         if type(source) is not PinnedNetworkServingManifest:

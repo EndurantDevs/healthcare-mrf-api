@@ -15,12 +15,11 @@ import asyncpg
 from db.plan_release_storage import storage_identifier
 from db.registry_fhir_catalog import PROJECTOR_VERSION, SNAPSHOT_COLUMNS
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
-from process.network_membership_writer_closure import writer_role_names
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_fhir_catalog_custody import (
     FHIRCatalogTarget,
-    freeze_fhir_catalog_snapshot,
-    verify_fhir_catalog_snapshot,
+    validate_fhir_catalog_snapshot_data,
+    validate_fhir_catalog_snapshot_record,
 )
 from process.registry_fhir_catalog_enrichment import (
     FHIRCatalogEnrichmentContext,
@@ -29,7 +28,6 @@ from process.registry_fhir_catalog_enrichment import (
 )
 from process.registry_fhir_catalog_extraction import (
     FHIRCatalogOrganization,
-    FHIRCatalogReferenceEdge,
     catalog_reference_edge,
     iter_fhir_catalog_batches,
     iter_fhir_catalog_pages,
@@ -48,10 +46,8 @@ from process.registry_fhir_catalog_grant import (
     verify_current_fhir_catalog_source_companies,
 )
 from process.registry_fhir_catalog_identity import FHIRNetworkIdentityInput, allocate_fhir_catalog_network_ids
-from process.registry_fhir_catalog_permissions import verify_fhir_catalog_preparation_permissions
 from process.registry_fhir_catalog_projection import SourceCatalogContext, format_fhir_catalog_projection
 from process.registry_fhir_catalog_publication import OPERATION, enqueue_fhir_catalog_publication
-from process.registry_fhir_catalog_published_read import fhir_catalog_published_reads, pin_fhir_catalog_published_read
 from process.registry_fhir_catalog_reference_rollup import (
     fhir_catalog_reference_workspace,
     staged_fhir_catalog_references,
@@ -60,11 +56,9 @@ from process.registry_fhir_catalog_reference_rollup import (
 from process.registry_fhir_catalog_registry_reader import (
     fhir_catalog_registry_connection,
     fhir_catalog_registry_reads,
-    verify_fhir_catalog_registry_reads,
 )
 from process.registry_fhir_catalog_reporting import current_fhir_catalog_report
 from process.registry_fhir_catalog_retained import (
-    pin_retained_fhir_catalog_source,
     resolve_fhir_catalog_retained_sources,
     resolve_granted_fhir_catalog_sources,
     retained_fhir_catalog_read_source,
@@ -80,19 +74,22 @@ from process.registry_fhir_catalog_sources import (
     fhir_catalog_source_generation,
     iter_fhir_catalog_sources,
     parse_fhir_catalog_source_profile,
-    require_current_fhir_catalog_sources,
     validate_fhir_catalog_source_descriptor,
 )
 from process.registry_fhir_catalog_store import (
     TABLE_COLUMNS,
+    admit_catalog_preparation,
+    catalog_snapshot_preparation,
+    checkpoint_fhir_catalog_snapshot,
     copy_fhir_catalog_snapshot,
     create_fhir_catalog_candidate,
     create_fhir_catalog_indexes,
     discard_fhir_catalog_candidate,
+    named_catalog_preparation_roles,
     replace_fhir_catalog_relationships,
     write_fhir_catalog_rows,
 )
-from process.registry_fhir_catalog_validation import canonical_json, metadata_generation
+from process.registry_fhir_catalog_validation import canonical_json, metadata_generation, snapshot_inputs
 from process.registry_fhir_plan_tier import extraction_transform, needs_plan_tier_refresh, supports_plan_tiers
 from process.registry_publication_consumer import consume_registry_publication_once
 
@@ -139,6 +136,7 @@ async def reconcile_fhir_catalog(config, *, source_export=None, source_companies
             pools.append(pool)
         source_pool, loader_pool, sealer_pool, lifecycle_pool, execution_pool = pools
         runtime = build_fhir_catalog_publication_runtime(config.grant, source_pool, **producer_options)
+        runtime = replace(runtime, preparation_roles=named_catalog_preparation_roles(config))
         async with loader_pool.acquire() as loader:
             await _preflight_catalog_reader(config, loader, runtime)
             lock_key = "registry-fhir-catalog:" + config.grant.control_schema
@@ -151,6 +149,13 @@ async def reconcile_fhir_catalog(config, *, source_export=None, source_companies
                 )
                 if snapshot is None:
                     return {"state": "unchanged", **accounting}
+                if accounting.get("preparation_state") == "handed_off":
+                    return {
+                        "state": "waiting_admin_freeze",
+                        "metadata_generation": snapshot["metadata_generation"],
+                        "candidate_id": catalog_snapshot_preparation(snapshot)["target"]["candidate_id"],
+                        **accounting,
+                    }
                 if report := current_fhir_catalog_report():
                     report.publication_started()
                 cas_by_field = {"expected_approved_revision": accounting.get("publication_approved_revision")}
@@ -163,22 +168,15 @@ async def reconcile_fhir_catalog(config, *, source_export=None, source_companies
 
 
 async def _preflight_catalog_reader(config, loader, runtime):
-    """Refuse missing registry custody before discovery, then release its short snapshot."""
+    """Read the logical registry head before source discovery."""
     async with fhir_catalog_registry_reads(loader), loader.transaction(isolation="repeatable_read", readonly=True):
-        await verify_fhir_catalog_preparation_permissions(
-            loader,
-            replace(config.consumer, metadata_runtime=runtime, metadata_only=True),
-            loader_role=config.loader_role,
-            sealer_role=config.sealer_url.username,
-            role=config.loader_role,
-        )
         await _catalog_registry_head(loader, config.grant)
 
 
 async def _publish_catalog_snapshot(
     config, loader, snapshot, previous, runtime, lifecycle_pool, execution_pool, *, expected_approved_revision=None
 ):
-    """Queue and consume only the exact sealed catalog candidate."""
+    """Queue and consume the selected validated catalog candidate."""
     command_by_field = {
         "operation": OPERATION,
         "metadata_generation": snapshot["metadata_generation"],
@@ -196,7 +194,6 @@ async def _publish_catalog_snapshot(
             authorize_metadata=runtime.authorize_metadata,
             control_schema=config.grant.control_schema,
         )
-        await verify_fhir_catalog_registry_reads()
     consumer = replace(
         config.consumer, metadata_runtime=runtime, metadata_only=True, only_request_id=UUID(request["request_id"])
     )
@@ -216,7 +213,7 @@ async def _publish_catalog_snapshot(
 async def prepare_fhir_catalog_snapshot(
     config, loader, source_pool, sealer_pool, *, source_export=None, source_companies_only=False
 ):
-    """Build and seal one isolated candidate; the current reader pointer stays intact."""
+    """Build and validate one isolated candidate while readers retain their pinned generation."""
     staged_by_kind = {}
     try:
         options_by_name = {"source_export": source_export} if source_export is not None else {}
@@ -226,14 +223,14 @@ async def prepare_fhir_catalog_snapshot(
             config, loader, source_pool, sealer_pool, staged_by_kind, **options_by_name
         )
     except BaseException as error:
-        if target := staged_by_kind.get("target"):
+        if (target := staged_by_kind.get("target")) and not staged_by_kind.get("checkpointed"):
             try:
                 async with loader.transaction():
                     await discard_fhir_catalog_candidate(
                         loader, target, loader_role=config.loader_role, control_schema=config.grant.control_schema
                     )
             except Exception:
-                error.add_note("Unsealed catalog candidate cleanup failed: " + target.schema_name)
+                error.add_note("Catalog candidate cleanup failed: " + target.schema_name)
         raise
 
 
@@ -242,11 +239,7 @@ async def _catalog_source_reads(source_pool, sealer_pool, grant, source_export):
     profiles_by_key = {}
     if source_export is not None:
         for profile in grant.source_profiles:
-            if profile.published_read_scope is not None:
-                if source_pool is None:
-                    raise ValueError("registry_fhir_catalog_source_reader_required")
-            else:
-                profiles_by_key[canonical_json(profile.document())] = profile
+            profiles_by_key[canonical_json(profile.document())] = profile
         if len(profiles_by_key) > 1:
             raise ValueError("registry_fhir_catalog_source_export_profiles_unsupported")
     async with AsyncExitStack() as reads:
@@ -255,7 +248,6 @@ async def _catalog_source_reads(source_pool, sealer_pool, grant, source_export):
             source_connection = await reads.enter_async_context(source_pool.acquire())
             workspace = await reads.enter_async_context(fhir_catalog_reference_workspace(source_connection))
             await reads.enter_async_context(source_connection.transaction(isolation="repeatable_read", readonly=True))
-            reads.enter_context(fhir_catalog_published_reads(source_connection))
             await source_connection.execute("SET LOCAL search_path = pg_catalog, pg_temp, public")
         elif source_export is None:
             raise ValueError("registry_fhir_catalog_source_reader_required")
@@ -273,7 +265,7 @@ async def _catalog_source_reads(source_pool, sealer_pool, grant, source_export):
 async def _prepare_fhir_catalog_snapshot(
     config, loader, source_pool, sealer_pool, staged, *, source_export=None, source_companies_only=False
 ):
-    """Pin source and registry reads, prepare privately, then seal the candidate."""
+    """Pin source and registry reads, prepare privately, then register the validated candidate."""
     started = perf_counter()
     producer_options = {"source_export": source_export} if source_export is not None else {}
     if source_companies_only:
@@ -286,12 +278,22 @@ async def _prepare_fhir_catalog_snapshot(
             snapshot, previous, accounting_by_phase, copy_target = await _stage_catalog_candidate(
                 config, loader, source_reads, sealer_pool, staged, dispositions, **producer_options
             )
-            await verify_fhir_catalog_registry_reads()
-    if copy_target is None:
-        return snapshot, previous, accounting_by_phase
+        if copy_target is None:
+            return snapshot, previous, accounting_by_phase
     if report := current_fhir_catalog_report():
         report.progress("sealing")
-    await _seal_catalog_snapshot(
+    async with sealer_pool.acquire() as sealer, sealer.transaction():
+        if catalog_snapshot_preparation(snapshot) is None:
+            await checkpoint_fhir_catalog_snapshot(
+                sealer,
+                copy_target,
+                snapshot,
+                previous,
+                accounting_by_phase,
+                control_schema=config.grant.control_schema,
+            )
+    staged["checkpointed"] = True
+    accounting_by_phase["preparation_state"] = await _seal_catalog_snapshot(
         config, copy_target, snapshot, sealer_pool, source_pool=source_pool, **producer_options
     )
     accounting_by_phase["prepare_seconds"] = perf_counter() - started
@@ -344,7 +346,7 @@ async def _preparation_catalog_sources(config, loader, manifest, previous, accep
 async def _stage_catalog_candidate(
     config, loader, source_reads, sealer_pool, staged, dispositions, *, source_export=None, source_companies_only=False
 ):
-    """Stage one isolated postimage under Loader RR, retaining exact reusable custody when possible."""
+    """Stage one isolated postimage under Loader RR and reuse matching logical content."""
     accepted, unavailable = dispositions
     head, manifest, previous = await _catalog_registry_head(loader, config.grant)
     accepted = await _preparation_catalog_sources(
@@ -372,34 +374,87 @@ async def _stage_catalog_candidate(
         await require_fhir_catalog_membership_reuse(
             loader, manifest, snapshot, control_schema=config.grant.control_schema
         )
-    retained = await _reusable_catalog_snapshot(loader, config.grant, snapshot["metadata_generation"])
+    retained = await _reusable_catalog_snapshot(
+        loader,
+        config.grant,
+        snapshot["metadata_generation"],
+        expected_snapshot=snapshot,
+        previous_generation=None if previous is None else previous["metadata_generation"],
+    )
     if retained is not None:
+        preparation_target = _reused_catalog_preparation_target(
+            retained, snapshot, previous, staged, accounting_by_phase
+        )
+        if preparation_target is not None:
+            return retained, previous, accounting_by_phase, preparation_target
         await _verify_reused_source_companies(loader, config.grant, retained, sealer_pool, source_export)
         accounting_by_phase["resumed_snapshot"] = True
         return retained, previous, accounting_by_phase, None
+    build_accounting_by_phase, copy_target = await _stage_new_catalog_candidate(
+        config,
+        loader,
+        source_reads,
+        staged,
+        snapshot,
+        previous,
+        current_by_generation,
+        source_companies_only=source_companies_only,
+    )
+    accounting_by_phase.update(build_accounting_by_phase)
+    return snapshot, previous, accounting_by_phase, copy_target
+
+
+def _reused_catalog_preparation_target(retained, snapshot, previous, staged, accounting_by_phase):
+    """Preserve resumed accounting and require the saved preparation's original head."""
+    if retained["metadata_generation"] != snapshot["metadata_generation"]:
+        accounting_by_phase.update(
+            resumed_metadata_generation=retained["metadata_generation"],
+            resumed_snapshot_as_of=retained["as_of"].isoformat(),
+        )
+    preparation = catalog_snapshot_preparation(retained)
+    if preparation is not None and not retained["accounting_json"]:
+        current_previous = None if previous is None else previous["metadata_generation"]
+        if preparation["previous_metadata_generation"] != current_previous:
+            raise ValueError("registry_fhir_catalog_preparation_head_changed")
+        staged["checkpointed"] = True
+        accounting_by_phase.update(preparation["accounting"], resumed_snapshot=True)
+        return FHIRCatalogTarget(**preparation["target"])
+    return None
+
+
+async def _stage_new_catalog_candidate(
+    config,
+    loader,
+    source_reads,
+    staged,
+    snapshot,
+    previous,
+    current_by_generation,
+    *,
+    source_companies_only,
+):
+    """Build a new isolated candidate only after unchanged and retained reuse paths decline it."""
     candidate = uuid4()
     copy_target = FHIRCatalogTarget(
         str(uuid4()), str(uuid4()), str(uuid4()), str(candidate), "fhir_catalog_" + candidate.hex
     )
     staged["target"] = copy_target
     snapshot["schema_name"] = copy_target.schema_name
-    accounting_by_phase.update(
-        await _build_source_catalog_candidate(
-            config,
-            loader,
-            source_reads,
-            copy_target,
-            snapshot,
-            previous,
-            current_by_generation,
-            **({"source_companies_only": True} if source_companies_only else {}),
-        )
+    build_accounting_by_phase = await _build_source_catalog_candidate(
+        config,
+        loader,
+        source_reads,
+        copy_target,
+        snapshot,
+        previous,
+        current_by_generation,
+        **({"source_companies_only": True} if source_companies_only else {}),
     )
-    return snapshot, previous, accounting_by_phase, copy_target
+    return build_accounting_by_phase, copy_target
 
 
 async def _verify_reused_source_companies(loader, grant, snapshot, sealer_pool, source_export):
-    """Independently reread current labels before reusing an already sealed candidate."""
+    """Independently reread current labels before reusing a validated candidate."""
     vector = snapshot["source_vector_json"]
     if not any(entry["status"] == "current" and "source_companies" in entry for entry in vector):
         return
@@ -552,7 +607,7 @@ async def _catalog_registry_head(loader, grant):
         else None
     )
     if previous:
-        await verify_fhir_catalog_snapshot(loader, previous)
+        await validate_fhir_catalog_snapshot_record(loader, previous)
     return head, manifest, previous
 
 
@@ -620,7 +675,7 @@ def _validate_catalog_sources(accepted, previous):
         raise ValueError("registry_fhir_catalog_duplicate_source_profile")
 
 
-async def _reusable_catalog_snapshot(loader, grant, generation):
+async def _reusable_catalog_snapshot(loader, grant, generation, *, expected_snapshot=None, previous_generation=None):
     if generation is None:
         return None
     control = storage_identifier(grant.control_schema)
@@ -631,8 +686,30 @@ async def _reusable_catalog_snapshot(loader, grant, generation):
             generation,
         )
     )
-    if retained is not None:
-        await verify_fhir_catalog_snapshot(loader, retained)
+    if retained is None and expected_snapshot is not None:
+        pending = _snapshot(
+            await loader.fetchrow(
+                f"SELECT {','.join(SNAPSHOT_COLUMNS)} FROM {control}.registry_fhir_catalog_snapshot "
+                "WHERE standing_grant_sha256=$1 AND published_at IS NULL "
+                "ORDER BY as_of DESC,metadata_generation DESC LIMIT 1",
+                grant.sha256,
+            )
+        )
+        if pending is not None:
+            preparation = catalog_snapshot_preparation(pending)
+            expected_inputs, pending_inputs = snapshot_inputs(expected_snapshot), snapshot_inputs(pending)
+            expected_inputs.pop("as_of")
+            pending_inputs.pop("as_of")
+            if (
+                preparation is not None
+                and preparation["previous_metadata_generation"] == previous_generation
+                and pending_inputs == expected_inputs
+            ):
+                if metadata_generation(pending) != pending["metadata_generation"]:
+                    raise ValueError("registry_fhir_catalog_preparation_inputs_changed")
+                retained = pending
+    if retained is not None and (retained["accounting_json"] or catalog_snapshot_preparation(retained) is None):
+        await validate_fhir_catalog_snapshot_record(loader, retained)
     return retained
 
 
@@ -934,8 +1011,6 @@ def _source_catalog_export(descriptor, exports_by_profile):
     ):
         return None
     profile = parse_fhir_catalog_source_profile(descriptor["native_read_profile"])
-    if profile.published_read_scope is not None:
-        return None
     export = exports_by_profile.get(canonical_json(profile.document()))
     if export is None:
         raise ValueError("registry_fhir_catalog_source_export_required")
@@ -945,6 +1020,21 @@ def _source_catalog_export(descriptor, exports_by_profile):
 async def _seal_catalog_snapshot(
     config, copy_target, snapshot, sealer_pool, *, source_pool=None, source_export=None, source_companies_only=False
 ):
+    """Validate frozen candidate data before recording completion through its existing claim."""
+    async with sealer_pool.acquire() as connection, connection.transaction():
+        store, preparation_record, claim = await admit_catalog_preparation(
+            connection,
+            snapshot,
+            control_schema=config.grant.control_schema,
+            roles=named_catalog_preparation_roles(config),
+        )
+        if claim is not None:
+            await store.yield_named_claim(claim)
+        if preparation_record["state"] == "handed_off":
+            return "handed_off"
+        if preparation_record["state"] not in {"frozen", "validated"}:
+            raise ValueError("registry_fhir_catalog_preparation_state_invalid")
+    preparation = catalog_snapshot_preparation(snapshot)
     async with (
         sealer_pool.acquire() as registry_reader,
         fhir_catalog_reference_workspace(registry_reader) as registry_workspace,
@@ -953,12 +1043,9 @@ async def _seal_catalog_snapshot(
         fhir_catalog_registry_reads(sealer, registry_reader),
         sealer.transaction(),
     ):
-        receipt = await freeze_fhir_catalog_snapshot(
+        receipt = await validate_fhir_catalog_snapshot_data(
             sealer,
             copy_target,
-            writer_roles=writer_role_names(
-                config.consumer.physical_owner_role, (config.loader_role,), config.reader_roles
-            ),
             expected_snapshot=snapshot,
             control_schema=config.grant.control_schema,
             standing_grant=config.grant,
@@ -971,18 +1058,38 @@ async def _seal_catalog_snapshot(
                 **({"source_companies_only": True} if source_companies_only else {}),
             ),
         )
-        snapshot.update(custody_json=receipt, accounting_json=receipt["validation"]["tables"])
-        columns = tuple(key for key in SNAPSHOT_COLUMNS if key != "published_at")
-        json_columns = {"custody_json", "accounting_json", "source_vector_json"}
-        parameters = ",".join(
-            f"${index}" + ("::jsonb" if key in json_columns else "") for index, key in enumerate(columns, 1)
+        snapshot.update(custody_json={**receipt, "preparation": preparation}, accounting_json=receipt["tables"])
+    await _record_catalog_validation(config, copy_target, snapshot, sealer_pool, receipt)
+    return "validated"
+
+
+async def _record_catalog_validation(config, copy_target, snapshot, sealer_pool, receipt):
+    """Persist completed data validation and yield the claim in the same sealer transaction."""
+    async with sealer_pool.acquire() as sealer, sealer.transaction():
+        store, preparation_record, claim = await admit_catalog_preparation(
+            sealer,
+            snapshot,
+            control_schema=config.grant.control_schema,
+            roles=named_catalog_preparation_roles(config),
+        )
+        if claim is None or preparation_record["state"] not in {"frozen", "validated"}:
+            raise ValueError("registry_fhir_catalog_preparation_state_invalid")
+        await store.validate_named(
+            claim,
+            {
+                "kind": "catalog",
+                "candidate_id": copy_target.candidate_id,
+                "data": {key: receipt[key] for key in ("metadata_generation", "tables", "content_sha256")},
+            },
         )
         await sealer.execute(
-            f"INSERT INTO {storage_identifier(config.grant.control_schema)}.registry_fhir_catalog_snapshot"
-            f"({','.join(columns)}) VALUES({parameters})",
-            *(canonical_json(snapshot[key]) if key in json_columns else snapshot[key] for key in columns),
+            f"UPDATE {storage_identifier(config.grant.control_schema)}.registry_fhir_catalog_snapshot "
+            "SET custody_json=$2::jsonb,accounting_json=$3::jsonb WHERE metadata_generation=$1 AND published_at IS NULL",
+            snapshot["metadata_generation"],
+            canonical_json(snapshot["custody_json"]),
+            canonical_json(snapshot["accounting_json"]),
         )
-        await verify_fhir_catalog_registry_reads()
+        await store.yield_named_claim(claim)
 
 
 async def project_manual_fhir_catalog(connection, target, snapshot, *, loader_role, control_schema):
@@ -1198,25 +1305,23 @@ async def replay_fhir_catalog_observations(source_connection, descriptor, observ
     descriptor = validate_fhir_catalog_source_descriptor(descriptor)
     coordinates = descriptor["coordinates"]
     read_dataset_id = coordinates["dataset_id"]
-    retained_read = None
     if descriptor["profile"] == "retained_normalized":
-        retained_read = await pin_retained_fhir_catalog_source(source_connection, descriptor)
-        physical = retained_fhir_catalog_read_source(descriptor)
-        read_schema, read_dataset_id = physical.read_schema_name, physical.dataset_id
-    elif descriptor["admission"]["kind"] == "catalog_observation":
-        read_schema = coordinates["dataset_schema"]
+        retained = retained_fhir_catalog_read_source(descriptor)
+        from process.network_fhir_retained_capture import require_retained_fhir_capture
+
+        await require_retained_fhir_capture(source_connection, retained.retained_capture)
+        read_schema, read_dataset_id = retained.read_schema_name, retained.dataset_id
+        resource_relation_by_field = {"schema": read_schema, "name": "provider_directory_dataset_resource"}
     else:
-        await require_current_fhir_catalog_sources(source_connection, (descriptor,))
         read_schema = coordinates["dataset_schema"]
-    published_read = await _published_read(source_connection, descriptor)
-    source_read = retained_read if retained_read is not None else published_read
+        resource_relation_by_field = descriptor["tables"]["resource"]
     generation = fhir_catalog_source_generation(descriptor)
     count = await _stage_plan_observations(
         source_connection,
         read_schema,
         read_dataset_id,
         descriptor,
-        source_read,
+        resource_relation_by_field,
         observations,
         generation,
     )
@@ -1225,15 +1330,11 @@ async def replay_fhir_catalog_observations(source_connection, descriptor, observ
         read_schema,
         read_dataset_id,
         descriptor,
-        source_read,
+        resource_relation_by_field,
         reference_workspace,
         observations,
         generation,
     )
-    if retained_read is not None:
-        await retained_read.verify(source_connection, retained_read.capture)
-    if published_read is not None:
-        await published_read.verify(source_connection, descriptor=descriptor)
     return count
 
 
@@ -1255,7 +1356,7 @@ async def _stage_plan_observations(
     read_schema,
     dataset_id,
     descriptor,
-    source_read,
+    resource_relation,
     observations,
     generation,
 ):
@@ -1265,7 +1366,7 @@ async def _stage_plan_observations(
         schema_name=read_schema,
         dataset_id=dataset_id,
         resource_types=("Organization", "InsurancePlan"),
-        source_read=source_read,
+        resource_relation=resource_relation,
     ):
         for batch in iter_fhir_catalog_batches(
             resource_batch,
@@ -1293,7 +1394,7 @@ async def _stage_reference_observations(
     read_schema,
     dataset_id,
     descriptor,
-    source_read,
+    resource_relation,
     reference_workspace,
     observations,
     generation,
@@ -1306,7 +1407,7 @@ async def _stage_reference_observations(
         schema_name=read_schema,
         dataset_id=dataset_id,
         source_uri=descriptor["source_uri"],
-        source_read=source_read,
+        resource_relation=resource_relation,
         workspace=reference_workspace,
     ) as references:
         async for batch in references.iter_batches():
@@ -1351,7 +1452,6 @@ async def project_fhir_catalog_source(
     namespace = storage_identifier(copy_target.schema_name)
     started = perf_counter()
     counts_by_kind = {"created_networks": 0, "networks": 0, "relationships": 0, "batches": 0}
-    published_read = await _published_read(source_connection, descriptor) if source_export is None else None
     await _create_network_targets(connection, namespace, generation)
     after = ""
     while True:
@@ -1364,7 +1464,6 @@ async def project_fhir_catalog_source(
             descriptor,
             tuple(organization_record["resource_id"] for organization_record in organization_records),
             storage_identifier(grant.control_schema),
-            published_read=published_read,
             **({"source_export": source_export} if source_export is not None else {}),
         )
         created, count = await _project_network_page(
@@ -1692,26 +1791,8 @@ async def _carried_plan_tier_relationships(
     return count
 
 
-async def _published_read(connection, descriptor):
-    if descriptor["profile"] == "retained_normalized":
-        return None
-    profile = parse_fhir_catalog_source_profile(descriptor["native_read_profile"])
-    if profile.published_read_scope is None:
-        return None
-    if connection is None:
-        raise ValueError("registry_fhir_catalog_published_reader_required")
-    return await pin_fhir_catalog_published_read(
-        connection,
-        profile,
-        endpoint_id=descriptor["endpoint_id"],
-        dataset_id=descriptor["coordinates"]["dataset_id"],
-        require_current=descriptor["admission"]["kind"] != "catalog_observation",
-        descriptor=descriptor,
-    )
-
-
 async def _legacy_identity_inputs(
-    source_connection, loader, descriptor, organization_ids, control, *, published_read=None, source_export=None
+    source_connection, loader, descriptor, organization_ids, control, *, source_export=None
 ):
     """Read genuine source UUIDs and existing scoped aliases in two batch queries."""
     if source_export is not None:
@@ -1719,14 +1800,9 @@ async def _legacy_identity_inputs(
     if source_connection is None:
         return {}
     binding_relation = (
-        f"{storage_identifier(descriptor['coordinates']['dataset_schema'])}"
+        f"{storage_identifier(parse_fhir_catalog_source_profile(descriptor['native_read_profile']).schema_name)}"
         ".provider_directory_insurance_network_source_binding"
     )
-    if descriptor["native_read_profile"].get("published_read_scope") is not None:
-        if published_read is None:
-            raise ValueError("registry_fhir_catalog_published_reader_required")
-        await published_read.verify(source_connection, descriptor=descriptor)
-        binding_relation = published_read.binding_relation
     source_bindings = await source_connection.fetch(
         f"SELECT resource_id,network_id::text FROM {binding_relation} "
         "WHERE source_id=ANY($1::text[]) AND resource_id=ANY($2::text[])",

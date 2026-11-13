@@ -1,20 +1,15 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Component replay-format checks; doubles do not establish native Source authority."""
 
-from contextlib import asynccontextmanager
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
 
-from process import network_candidate_custody as custody
 from process import registry_candidate_composition as composition
 from process import registry_composition_resume as resume
-from process import registry_publication_worker as worker
 from process.network_address_projection import PinnedAddressSource
-from tests.test_registry_publication_address_preparation import _PreparationConnection, _settings, _sources
 
 
 @pytest.mark.asyncio
@@ -22,6 +17,7 @@ from tests.test_registry_publication_address_preparation import _PreparationConn
     "inventory,physical,requested,recognized,refuses",
     [
         (None, None, False, False, False),
+        (None, None, True, False, False),
         (False, False, False, True, False),
         (False, True, True, False, False),
         (True, True, True, False, False),
@@ -69,58 +65,3 @@ async def test_composer_preserves_registered_policy_and_refuses_preparation_race
     if inventory is None:
         format_pin.assert_not_awaited()
         legacy_pin.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "registered,requested,expected",
-    [(None, True, True), (False, True, False), (True, True, True), (True, False, None)],
-)
-async def test_qualified_preparer_freezes_format_before_preparing_addresses(
-    monkeypatch, registered, requested, expected
-):
-    settings, connection = _settings(1), _PreparationConnection()
-    identity_by_field = {
-        "schema_owner_role": settings.consumer.queue_owner_role,
-        "custody_owner_role": "registry_custody_owner",
-    }
-    source_descriptors = replace(_sources(), compact=requested)
-    format_pin = AsyncMock(return_value=registered)
-    monkeypatch.setattr(resume, "resolve_registered_compact_format", format_pin)
-    monkeypatch.setattr(worker, "_custody_identity", AsyncMock(return_value=identity_by_field))
-    monkeypatch.setattr(custody, "_q_reach_closed", AsyncMock())
-    prepared_sources = []
-
-    async def prepare(actual, **options):
-        assert actual is connection and connection.active
-        prepared_sources.append(options["address_sources"])
-        assert options["address_sources"].compact is expected
-        return None
-
-    monkeypatch.setattr(composition, "prepare_registry_composition_address_artifact", prepare)
-
-    @asynccontextmanager
-    async def acquire():
-        yield connection
-
-    callback = worker._address_preparer(
-        settings, settings.consumer, SimpleNamespace(acquire=acquire), identity_by_field, "custodian_login"
-    )
-    request = UUID(int=9)
-    operation = callback(
-        request_id=request,
-        approved_revision=4,
-        source_manifest=None,
-        expected_head=0,
-        address_sources=source_descriptors,
-    )
-    if expected is None:
-        with pytest.raises(ValueError, match="registered_compact_format_required"):
-            await operation
-        assert not prepared_sources
-        assert not connection.committed
-    else:
-        operation_result = await operation
-        assert operation_result is prepared_sources[0] and operation_result.compact is expected
-        assert connection.committed
-    format_pin.assert_awaited_once_with(connection, request, 4, 0, control_schema="registry")

@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Pure capture orchestration; compiled codec cases run in the native family."""
 
-import asyncio
 import hashlib
 import json
 import os
@@ -15,6 +14,8 @@ from uuid import UUID
 import pytest
 
 from process import registry_ptg_office_capture as capture
+from process.network_compact_layout import CompactAddressRelation
+from process.registry_ptg_office_custody import RegistryPTGOfficeCustodyProfile
 
 ID = UUID("11111111-1111-4111-8111-111111111111")
 OTHER = UUID("22222222-2222-4222-8222-222222222222")
@@ -134,6 +135,7 @@ def _context(**changes):
             "synthetic_control",
             "capture_owner",
             ("capture_reader",),
+            RegistryPTGOfficeCustodyProfile("capture_owner", "capture_publisher"),
         ),
         **changes,
     )
@@ -290,7 +292,14 @@ def test_whole_review_command_binds_scope_source_offices_and_generation():
     from process.network_serving_read import PinnedNetworkServingManifest
 
     serving = PinnedNetworkServingManifest(
-        3, str(OTHER), "synthetic_serving", 1, {"custom": "retained"}, 2, "b" * 64, 9
+        3,
+        str(OTHER),
+        "synthetic_serving",
+        1,
+        {"custom": "retained"},
+        2,
+        "b" * 64,
+        CompactAddressRelation("synthetic_serving", "entity_address_unified"),
     )
     command = capture.office_review_command(
         _request(),
@@ -313,11 +322,8 @@ def test_whole_review_command_binds_scope_source_offices_and_generation():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("interrupted", [False, True])
 async def test_prepare_closes_only_complete_candidate_in_caller_savepoint(monkeypatch, interrupted):
-    from process.network_serving_read import PinnedNetworkServingManifest
-
-    serving = PinnedNetworkServingManifest(
-        3, str(OTHER), "synthetic_serving", 1, {"custom": "retained"}, 2, "b" * 64, 9
-    )
+    """Complete and close one candidate in its caller savepoint, rolling back interruptions."""
+    serving = _capture_serving_manifest()
     events = []
     driver = SimpleNamespace(is_in_transaction=lambda: True, fetchval=AsyncMock(return_value=None), execute=AsyncMock())
     transaction = object()
@@ -341,11 +347,13 @@ async def test_prepare_closes_only_complete_candidate_in_caller_savepoint(monkey
     monkeypatch.setattr(capture, "resolve_network_serving_manifest", AsyncMock(return_value=serving))
     monkeypatch.setattr(capture, "_validate_rows", AsyncMock())
 
-    async def close(*args):
-        events.append("closed")
-        return {"table_oid": 17, "manifest_table_oid": 18}
+    from process import registry_ptg_office_preparation as preparation
 
-    monkeypatch.setattr(capture, "_close", close)
+    async def handoff(*args, **kwargs):
+        events.append("handed_off")
+        return None, {"state": "handed_off"}, None
+
+    monkeypatch.setattr(preparation, "admit_office_preparation", handoff)
 
     async def adopt(driver, source, rows, control):
         return _adoption_receipt(rows)
@@ -361,14 +369,29 @@ async def test_prepare_closes_only_complete_candidate_in_caller_savepoint(monkey
         assert events == ["savepoint", "rollback"]
         assert not any("INSERT" in call.args[0] for call in driver.execute.await_args_list)
     else:
-        descriptor = await invocation
-        assert events == ["savepoint", "closed", "prepared"]
-        assert type(descriptor) is capture.RegistryPTGOfficeCaptureDescriptor
-        document = descriptor.as_dict()
-        assert document["manifest"]["state"] == "prepared" and "authorized" not in document
-        assert descriptor.manifest_sha256 == capture._digest(document["manifest"])
-        document["manifest"]["state"] = "changed"
-        assert descriptor.as_dict()["manifest"]["state"] == "prepared"
+        pending = await invocation
+        assert events == ["savepoint", "handed_off", "prepared"]
+        assert pending["state"] == "handed_off" and pending["capture_id"] == str(_request().capture_id)
+        assert set(pending) == {"capture_id", "state", "command", "command_sha256", "manifest_sha256"}
+        assert pending["command_sha256"] == capture._digest(pending["command"])
+        assert not any("SET " in call.args[0] or "GRANT " in call.args[0] for call in driver.execute.await_args_list)
+
+
+def _capture_serving_manifest():
+    """Build the same retained serving DTO for the capture orchestration fixture."""
+    from process.network_serving_read import PinnedNetworkServingManifest
+
+    serving = PinnedNetworkServingManifest(
+        3,
+        str(OTHER),
+        "synthetic_serving",
+        1,
+        {"custom": "retained"},
+        2,
+        "b" * 64,
+        CompactAddressRelation("synthetic_serving", "entity_address_unified"),
+    )
+    return serving
 
 
 def test_transaction_guard_refuses_reassigned_or_closed_native_connection():
@@ -418,10 +441,15 @@ async def test_native_catalog_shape_refuses_changed_copy_columns(substitution):
         columns[0]["atthasdef"] = True
     if substitution == "missing":
         columns.pop()
-    driver = SimpleNamespace(fetch=AsyncMock(return_value=columns))
-    invocation = capture._column_identity(driver, 17, capture.COPY_COLUMNS, capture._COLUMN_TYPES)
+    manifest_columns = [
+        dict(attname=name, type=kind, attnotnull=True, atthasdef=False)
+        for name, kind in zip(("id", "manifest_sha256", "manifest_json"), ("integer", "text", "jsonb"), strict=True)
+    ]
+    driver = SimpleNamespace(fetch=AsyncMock(side_effect=[columns, manifest_columns]))
+    invocation = capture._require_office_layout(driver, "synthetic_capture", is_published=False)
     if substitution:
-        with pytest.raises(capture.RegistryPTGOfficeCaptureError, match="custody_invalid"):
+        with pytest.raises(capture.RegistryPTGOfficeCaptureError, match="layout_invalid"):
             await invocation
     else:
-        assert await invocation == capture._digest(columns)
+        assert await invocation is None
+        assert driver.fetch.await_args_list[0].args[1] == '"synthetic_capture"."office_assertion"'

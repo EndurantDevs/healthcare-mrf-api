@@ -11,8 +11,6 @@ from api.network_address_scope import network_address_read_scope, scoped_address
 from api.network_provider_read import NetworkOfficeSelection, read_network_provider_detail, read_network_provider_page
 from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import pin_approved_membership_source
-from process.network_candidate_custody import seal_network_candidate_custody
-from process.network_membership_pipeline import prepare_and_publish_network_candidate, prepare_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
 from process.network_source_binding_store import NetworkSourceBindingBatchCommand, apply_network_source_binding_batch
 from process.registry_candidate_composition import (
@@ -129,40 +127,6 @@ async def _prepare_directory_artifact(case, request, approved, predecessor, addr
     return artifact
 
 
-async def _seal_directory_candidate(case, execution, copy_target, addresses, readers, runtime_roles):
-    """Run actual independent native custody before the ordinary publication path."""
-    connection = case.fixture.connection
-    await prepare_network_candidate(
-        execution,
-        copy_target,
-        addresses,
-        owner_role=case.worker.roles_by_kind["physical"],
-        loader_roles=(),
-        reader_roles=readers,
-        control_schema=case.fixture.control_schema,
-    )
-
-    async def is_exact_target(_connection, actual):
-        return actual == copy_target
-
-    await seal_network_candidate_custody(
-        connection,
-        copy_target,
-        control_schema=case.fixture.control_schema,
-        runtime_roles=runtime_roles,
-        authorize=is_exact_target,
-    )
-    await prepare_and_publish_network_candidate(
-        execution,
-        copy_target,
-        addresses,
-        owner_role=case.worker.roles_by_kind["physical"],
-        loader_roles=(),
-        reader_roles=readers,
-        control_schema=case.fixture.control_schema,
-    )
-
-
 async def publish_directory(case, pair, approved, predecessor, *, ordinary=False):
     """Publish one complete native source vector and register exact candidate cleanup."""
     request = uuid4()
@@ -198,7 +162,7 @@ async def publish_directory(case, pair, approved, predecessor, *, ordinary=False
                 },
                 control_schema=case.fixture.control_schema,
             )
-            await _seal_directory_candidate(case, execution, copy_target, addresses, readers, runtime_roles)
+            await integration.publish_directory_candidate(case, execution, copy_target, addresses, readers)
     finally:
         # Candidate namespaces use a different identity from the address composition.
         # The fixture owner cleanup also owns any interrupted candidate from this request.

@@ -47,7 +47,6 @@ async def _has_retained_address(connection, command_by_field, current, control_s
         or pinned.source_generations.get("network_address_origin") != command_by_field["address_artifact_sha256"]
     ):
         raise RegistryMembershipRefreshUnavailable("registry_membership_refresh_retained_address_unproved")
-    _hash(getattr(pinned, "_custody_seal_sha256", None))
     return True
 
 
@@ -55,10 +54,8 @@ async def _require_address(connection, command_by_field, current, profile, contr
     try:
         if await _has_retained_address(connection, command_by_field, current, control_schema):
             return
-        authority = await address.generation.read_entity_address_result_generation_authority(
-            address._CatalogSession(connection), schema_name=profile.schema_name
-        )
-        generation = address._digest(address._authority_document(authority))
+        authority, _legacy_key = await address._current_authority(connection, profile.schema_name)
+        generation = address._digest(authority)
         source = PinnedAddressSource(profile.schema_name, "entity_address_unified", generation)
         descriptor = await address.capture_network_address_artifact(
             connection, source, runtime_roles=profile.runtime_roles

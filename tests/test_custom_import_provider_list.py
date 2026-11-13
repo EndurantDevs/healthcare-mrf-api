@@ -18,10 +18,10 @@ from sqlalchemy import Integer, String, literal, select, text
 from api import provider_list_sql as provider_list_sql_module
 from api.custom_import_provider_sql import ProviderImportQuery, compile_npi_entity_relation
 from api.endpoint import npi as npi_module
-from api.network_read_execution import NetworkReadConnectionProxy
+from db.connection import ConnectionProxy
 from process.custom_import.read_core import PreparedNpiEntityRelation, ReadOrderTerm
 from tests.custom_import_postgres_support import transaction_session
-from tests.network_read_execution_support import with_read_identity_receipts
+from tests.network_read_execution_support import with_read_session
 
 
 class _TransactionConnection:
@@ -65,7 +65,7 @@ class _Session:
         self.proxy_databases: list[Any] = []
         self.proxy_inputs: list[Any] = []
         self.events: list[str] = []
-        with_read_identity_receipts(self)
+        with_read_session(self)
 
     async def all(self, statement, **parameters):
         return await self._connection.all(statement, **parameters)
@@ -75,7 +75,7 @@ class _Session:
         return SimpleNamespace(all=lambda: rows)
 
 
-class _TrackingConnectionProxy(NetworkReadConnectionProxy):
+class _TrackingConnectionProxy(ConnectionProxy):
     def __init__(self, database, connection: _Session, raw_connection) -> None:
         assert raw_connection is None
         super().__init__(database, connection, raw_connection)
@@ -147,7 +147,7 @@ async def _empty_enrichment(npis, *, include_chain=False, session=None):
 def _configure_imported_page_dependencies(monkeypatch) -> None:
     monkeypatch.setattr(
         provider_list_sql_module,
-        "NetworkReadConnectionProxy",
+        "ConnectionProxy",
         _TrackingConnectionProxy,
     )
     monkeypatch.setattr(npi_module, "_address_serving_table_sql", _legacy_address_table)
@@ -615,7 +615,7 @@ async def test_postgres_filter_only_pages_preserve_exact_text_membership_and_emp
             assert all(row._provider_total == 4 for row in rows)
 
 
-class _PostgresConnectionProxy(NetworkReadConnectionProxy):
+class _PostgresConnectionProxy(ConnectionProxy):
     def __init__(self, _database, connection, raw_connection) -> None:
         assert raw_connection is None
         super().__init__(_database, connection, raw_connection)
@@ -827,7 +827,7 @@ async def _empty_postgres_enrichment(*_args, **_kwargs) -> dict[int, dict[str, A
 def _configure_postgres_provider_list(monkeypatch) -> None:
     monkeypatch.setattr(
         provider_list_sql_module,
-        "NetworkReadConnectionProxy",
+        "ConnectionProxy",
         _PostgresConnectionProxy,
     )
     monkeypatch.setattr(npi_module, "_address_serving_table_sql", _legacy_address_table)

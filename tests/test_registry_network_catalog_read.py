@@ -5,11 +5,13 @@ import copy
 import json
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from process import registry_network_catalog_read as catalog
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
 
 
@@ -67,13 +69,14 @@ def batch_boundary(monkeypatch):
         {"custom_membership": "a" * 64},
         4,
         "b" * 64,
-        123,
+        CompactAddressRelation("candidate_sample", "entity_address_unified"),
     )
     pinned_revisions = []
 
     async def resolve(_connection, *, generation_id, control_schema, api_read=False):
         assert _connection is connection and control_schema == "sample_control"
         assert generation_id in (None, 9)
+        assert api_read is True
         return manifest
 
     async def retained(_connection, *, approved_revision, control_schema):
@@ -211,7 +214,7 @@ async def test_caller_owned_pinned_read_only_transaction_required(batch_boundary
 
 
 @pytest.mark.asyncio
-async def test_directory_refuses_a_changed_approved_source(batch_boundary):
+async def test_directory_requires_the_pinned_approved_source_generation(batch_boundary):
     connection, manifest, _ = batch_boundary
     manifest.source_generations["custom_membership"] = "c" * 64
     with pytest.raises(catalog.RegistryNetworkCatalogError, match="source_changed"):
@@ -707,6 +710,30 @@ def test_autocomplete_accepts_valid_aca_plan_variant_without_truncating_labels()
     assert catalog._autocomplete_document(document) == document
 
 
+@pytest.mark.asyncio
+async def test_pin_resolves_the_requested_logical_generation_once(batch_boundary, monkeypatch):
+    connection, manifest, revisions = batch_boundary
+    resolve = AsyncMock(return_value=manifest)
+    monkeypatch.setattr(catalog, "resolve_network_serving_manifest", resolve)
+    assert await catalog._pin(connection, 9, "sample_control") is manifest
+    resolve.assert_awaited_once_with(connection, generation_id=9, control_schema="sample_control", api_read=True)
+    assert revisions == [4]
+    assert len(connection.calls) == 1 and "current_setting" in connection.calls[0][0]
+
+
+@pytest.mark.asyncio
+async def test_catalog_refuses_changed_approved_source(batch_boundary, monkeypatch):
+    connection, _manifest, _ = batch_boundary
+    monkeypatch.setattr(
+        catalog,
+        "pin_retained_approved_membership_source",
+        AsyncMock(return_value=SimpleNamespace(generation_id="changed")),
+    )
+    with pytest.raises(catalog.RegistryNetworkCatalogError, match="source_changed"):
+        await catalog._pin(connection, 9, "sample_control")
+    assert len(connection.calls) == 1
+
+
 def test_all_four_company_roles_roundtrip_without_requiring_a_group():
     company_by_field = {
         "company_id": "11111111-1111-4111-8111-111111111111",
@@ -724,8 +751,16 @@ def test_all_four_company_roles_roundtrip_without_requiring_a_group():
 
 
 @pytest.mark.asyncio
-async def test_pin_reads_only_the_transaction_mode(batch_boundary):
-    connection, manifest, revisions = batch_boundary
+async def test_pin_uses_publication_metadata_without_extra_catalog_queries(batch_boundary):
+    connection, manifest, _ = batch_boundary
     assert await catalog._pin(connection, 9, "sample_control") is manifest
-    assert revisions == [4]
-    assert len(connection.calls) == 1 and "current_setting" in connection.calls[0][0]
+    assert len(connection.calls) == 1
+    assert "current_setting('transaction_isolation')" in connection.calls[0][0]
+
+
+@pytest.mark.asyncio
+async def test_manifest_reuse_rejects_changed_logical_generation(batch_boundary):
+    connection, manifest, _ = batch_boundary
+    async with catalog.registry_catalog_read_snapshot(connection, 9, "sample_control"):
+        with pytest.raises(catalog.RegistryNetworkCatalogError, match="source_changed"):
+            catalog._reuse_manifest(connection, replace(manifest, generation_id=10), 9, "sample_control")

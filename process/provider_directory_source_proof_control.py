@@ -1,24 +1,15 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Fixed native custody and application checks for batch proof controls."""
+"""Named proof layout and application checks for complete source batches."""
 
-from db.connection import ConnectionProxy, Database
 from db.plan_release_storage import storage_identifier, storage_relation
-from process.plan_release_storage_catalog import CATALOG_SQL
-from process.plan_release_storage_custody import storage_roles
-from process.provider_directory_generic_source_policy import bound_publisher, source_copy_session
+from process.provider_directory_generic_source_policy import bound_publisher
 from process.provider_directory_generic_source_storage import (
     HEADER,
     _json,
     _require,
     _validate_binding,
-    require_private_source_readers_closed,
 )
-from process.provider_directory_projection_stage import _copy_driver
-from process.provider_directory_source_storage_binding import (
-    NamedFHIRSourceStorage,
-    require_storage_schema,
-    verify_isolated_source_storage_coordinates,
-)
+from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage
 
 PROOF_ROOT = "provider_directory_dataset_proof_shard"
 _COLUMNS = (
@@ -54,63 +45,73 @@ PROOF_HOOKS = {
     "pd_trr_proof_row": (31, "guard_provider_directory_terminal_root_retirement_child"),
     "pd_trr_proof_truncate": (34, "guard_provider_directory_terminal_root_retirement_child"),
 }
+_PROOF_LAYOUT_SQL = """SELECT
+ (SELECT coalesce(jsonb_agg(jsonb_build_array(a.attname,format_type(a.atttypid,a.atttypmod),
+    a.attnotnull,pg_get_expr(d.adbin,d.adrelid)) ORDER BY a.attnum),'[]'::jsonb)
+  FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+  WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped) AS columns,
+ (SELECT coalesce(jsonb_agg(jsonb_build_object('name',conname,'type',contype::text,
+    'definition',pg_get_constraintdef(oid),'valid',convalidated,
+    'columns',conkey) ORDER BY conname),'[]'::jsonb)
+  FROM pg_constraint WHERE conrelid=c.oid AND contype<>'n') AS constraints,
+ (SELECT coalesce(jsonb_agg(jsonb_build_object(
+   'valid',i.indisvalid AND i.indisready AND i.indislive,'method',am.amname,
+   'native',i.indimmediate AND i.indnkeyatts=i.indnatts AND NOT i.indisexclusion AND coalesce((
+      SELECT bool_and(op.opcnamespace='pg_catalog'::regnamespace
+       AND op.opcname=CASE attribute.atttypid WHEN 'pg_catalog.int4'::regtype THEN 'int4_ops'
+                       WHEN 'pg_catalog.varchar'::regtype THEN 'text_ops' ELSE '' END
+       AND index_key.flags=0 AND index_key.collation_oid=attribute.attcollation)
+      FROM unnest(i.indkey::smallint[],i.indclass::oid[],i.indcollation::oid[],i.indoption::smallint[])
+        index_key(attnum,opclass_oid,collation_oid,flags)
+      JOIN pg_attribute attribute ON attribute.attrelid=c.oid AND attribute.attnum=index_key.attnum
+      JOIN pg_opclass op ON op.oid=index_key.opclass_oid),false),
+   'predicate',pg_get_expr(i.indpred,i.indrelid),'expression',pg_get_expr(i.indexprs,i.indrelid),
+   'keys',ARRAY(SELECT a.attname FROM unnest(i.indkey::smallint[]) WITH ORDINALITY k(attnum,ordinal)
+     LEFT JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum=k.attnum ORDER BY k.ordinal))
+   ORDER BY index_class.relname),'[]'::jsonb)
+  FROM pg_index i JOIN pg_class index_class ON index_class.oid=i.indexrelid
+  JOIN pg_am am ON am.oid=index_class.relam WHERE i.indrelid=c.oid) AS indexes
+ FROM pg_class c WHERE c.oid=to_regclass($1)"""
 
 
 async def require_proof_executor(executor, schema):
-    """Require the Source task and proof namespace before parent or payload IO."""
+    """Select the bound writer transaction; caller objects grant no SQL authority."""
     publisher = bound_publisher()
-    session = source_copy_session()
     binding = getattr(publisher, "storage_binding", None)
+    _require(binding is None or type(binding) is NamedFHIRSourceStorage, "storage_changed")
     expected_schema = publisher.policy.schema if binding is None else binding.catalog_schema
-    _require(schema == expected_schema, "proof_transaction_changed")
+    _require(
+        publisher.connection.is_in_transaction() is True and schema == expected_schema,
+        "proof_transaction_changed",
+    )
     if isinstance(binding, NamedFHIRSourceStorage):
+        _require(publisher.policy.schema == binding.storage_schema, "storage_changed")
         return publisher
-    if isinstance(executor, Database):
-        transaction_binding = executor._transaction_binding()
-        is_original = transaction_binding is not None and transaction_binding.session is session
-    else:
-        is_original = isinstance(executor, ConnectionProxy) and executor._connection is session
-    _require(is_original, "proof_transaction_changed")
-    _require(await _copy_driver(session) is publisher.connection, "proof_transaction_changed")
-    if binding is None:
-        await verify_proof_control(publisher.connection, publisher.policy)
-    else:
-        require_storage_schema(publisher, schema)
-        await verify_proof_control(publisher.connection, publisher.policy, storage_binding=binding)
+    _require(binding is None, "storage_changed")
+    await verify_proof_control(publisher.connection, publisher.policy)
     return publisher
 
 
 async def verify_proof_control(connection, policy, *, storage_binding=None):
-    """Preserve legacy custody; private controls use parent fences without foreign keys."""
+    """Validate the named table's essential layout using ordinary PostgreSQL access."""
+    _require(connection.is_in_transaction() is True, "proof_transaction_changed")
     if storage_binding is not None:
-        await verify_isolated_source_storage_coordinates(connection, policy, storage_binding)
-    owner, readers = await storage_roles(connection, policy.schema, **policy.role_arguments())
-    proof_rows = await connection.fetch(
-        CATALOG_SQL, [storage_relation(policy.schema, PROOF_ROOT)], owner, readers if storage_binding is None else []
-    )
-    _require(len(proof_rows) == 1, "proof_control_missing")
-    proof_by_field = proof_rows[0]
-    _require(
-        proof_by_field["relname"] == PROOF_ROOT
-        and proof_by_field["nspname"] == policy.schema
-        and proof_by_field["relowner"] == owner
-        and proof_by_field["relkind"] == "r"
-        and proof_by_field["relpersistence"] == "p"
-        and not proof_by_field["parents"]
-        and not proof_by_field["relrowsecurity"]
-        and not proof_by_field["relforcerowsecurity"]
-        and proof_by_field["native_checks"]
-        and proof_by_field["direct_acl_closed"]
-        and proof_by_field["readers_closed"],
-        "proof_control_custody_changed",
-    )
+        _require(
+            type(storage_binding) is NamedFHIRSourceStorage and storage_binding.storage_schema == policy.schema,
+            "storage_changed",
+        )
+    relation = storage_relation(policy.schema, PROOF_ROOT)
+    await connection.execute(f"SELECT dataset_id FROM {relation} LIMIT 0")
+    proof_by_field = await connection.fetchrow(_PROOF_LAYOUT_SQL, relation)
+    _require(proof_by_field is not None, "proof_control_missing")
     _require_proof_layout(proof_by_field, isolated=storage_binding is not None)
     if storage_binding is None:
-        await _require_batch_foreign_key(connection, policy.schema, proof_by_field["oid"])
-    else:
-        _require(proof_by_field["inert"], "proof_control_hooks_changed")
-        await require_private_source_readers_closed(connection, [proof_by_field["oid"]], readers)
-    return proof_by_field
+        await _require_batch_foreign_key(connection, policy.schema, relation)
+    return {
+        "schema": policy.schema,
+        "name": PROOF_ROOT,
+        **{field: _json(proof_by_field[field]) for field in ("columns", "constraints", "indexes")},
+    }
 
 
 async def retire_proof_control_hooks(connection, policy):
@@ -174,7 +175,7 @@ def _require_proof_layout(proof_by_field, *, isolated=False):
     )
 
 
-async def _require_batch_foreign_key(connection, schema, proof_oid):
+async def _require_batch_foreign_key(connection, schema, proof_relation):
     hooks = await connection.fetch(
         "SELECT t.tgtype,t.tgenabled::text,t.tgisinternal,p.proname,pn.nspname AS function_schema,"
         "k.conname,k.contype::text,k.convalidated,k.condeferrable,k.confupdtype::text,k.confdeltype::text,"
@@ -184,8 +185,8 @@ async def _require_batch_foreign_key(connection, schema, proof_oid):
         "EXISTS(SELECT FROM pg_rewrite WHERE ev_class=t.tgrelid) AS has_rules "
         "FROM pg_trigger t LEFT JOIN pg_constraint k ON k.oid=t.tgconstraint "
         "JOIN pg_proc p ON p.oid=t.tgfoid JOIN pg_namespace pn ON pn.oid=p.pronamespace "
-        "WHERE t.tgrelid=$1",
-        proof_oid,
+        "WHERE t.tgrelid=to_regclass($1)",
+        proof_relation,
         storage_relation(schema, HEADER),
     )
     _require(

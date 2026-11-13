@@ -2,7 +2,6 @@
 """Prepare immutable official NPI sets before the short cohort publication fence."""
 
 import asyncio
-import copy
 import importlib
 from dataclasses import dataclass
 from uuid import uuid4
@@ -22,7 +21,6 @@ from process.provider_directory_generic_source_policy import (
     source_transaction_available,
 )
 from process.provider_directory_generic_source_storage import _capture, _close_grants
-from process.provider_directory_projection_stage import _copy_driver
 from process.uhc_flex_official_cohort_contract import UHCFlexOfficialCohortError, build_uhc_flex_official_cohort
 
 MEMBER = "provider_directory_uhc_flex_npi_member"
@@ -39,9 +37,6 @@ def _require(condition):
 class _Replay:
     cohort: object
     snapshot: object
-    policy: object
-    custody: object
-    database_oid: int
 
 
 def child_name(cohort_id):
@@ -52,68 +47,20 @@ def child_name(cohort_id):
     return "pdufcm_" + cohort_id[6:]
 
 
-async def _custody(connection, policy, cohort_id=None):
-    from process.provider_directory_generic_source_policy import source_cohort_snapshot_custody
-
-    return await source_cohort_snapshot_custody(connection, policy, cohort_id=cohort_id)
-
-
 async def _issue(connection, publisher, cohort, snapshot):
-    custody = await _custody(connection, publisher.policy, cohort.cohort_id)
-    database_oid = await connection.fetchval("SELECT oid::bigint FROM pg_database WHERE datname=current_database()")
-    _ISSUED.setdefault(asyncio.current_task(), {})[cohort.cohort_id] = _Replay(
-        cohort, snapshot, publisher.policy, copy.deepcopy(custody), database_oid
-    )
-
-
-async def _replay_origin(database, issued):
-    binding = database._transaction_binding()
-    _require(binding is not None)
-    connection = await _copy_driver(binding.session)
-    _require(connection.is_in_transaction() is True)
-    actor = await connection.fetchrow(
-        "SELECT session_user::text AS login,current_user::text AS actor,"
-        "(SELECT oid::bigint FROM pg_database WHERE datname=current_database()) AS database_oid,"
-        "pg_backend_pid() AS backend,pg_current_xact_id()::text AS xid"
-    )
-    publisher = source_transaction_available()
-    if publisher is None:
-        _require(actor["login"] == actor["actor"] and actor["actor"] in issued.policy.control_runtime_roles)
-    else:
-        _require(
-            publisher.connection is connection
-            and publisher.policy is issued.policy
-            and source_copy_session() is binding.session
-            and actor["login"] == issued.policy.publisher_role
-            and actor["actor"] == issued.policy.owner_role
-        )
-    _require(actor["database_oid"] == issued.database_oid and actor["backend"] == connection.get_server_pid())
-    return binding, connection, dict(actor)
+    _ISSUED.setdefault(asyncio.current_task(), {})[cohort.cohort_id] = _Replay(cohort, snapshot)
 
 
 async def replay_cohort(database, expected):
-    """Use only an issued same-task cohort in the original admission transaction."""
+    """Reuse a cohort only while its logical official dataset and member totals still match."""
     from process import uhc_flex_official_cohort_store as store
-    from process.provider_directory_source_acquisition_custody import capture_cohort_snapshot_custody
 
     issued = _ISSUED.get(asyncio.current_task(), {}).get(expected.cohort_id)
     _require(issued is not None and issued.cohort == expected)
-    origin = await _replay_origin(database, issued)
-    roles = issued.custody["namespace_roles"]
-    _require(type(roles) is tuple and len(roles) == 2)
     snapshot = await store._current_official_snapshot(database)
     _require(snapshot == issued.snapshot)
-    custody = await capture_cohort_snapshot_custody(
-        origin[1],
-        issued.policy,
-        migration_role=roles[0],
-        namespace_owner_role=roles[1],
-        cohort_id=expected.cohort_id,
-    )
-    _require(custody == issued.custody)
     cohort = await store._stored_cohort_for_dataset(database, snapshot.dataset_id)
-    final = await _replay_origin(database, issued)
-    _require(cohort == expected and final[0] is origin[0] and final[1] is origin[1] and final[2] == origin[2])
+    _require(cohort == expected and await store._current_official_snapshot(database) == snapshot)
     return store.UHCFlexOfficialCohortSyncResult(cohort, False)
 
 
@@ -198,7 +145,6 @@ async def _publish(database, pin, directory, snapshot, cohort, name, prepared):
     request = _request(snapshot)
     runtime = _runtime(database, directory)
     _require((await _load_dataset_scope(runtime, request, lock=True)).fence_identity == pin.scope.fence_identity)
-    _require(await _custody(connection, policy) is not None)
     _require((await _capture(connection, policy, [name]))[name] == prepared)
     existing = await store._stored_cohort_for_dataset(database, snapshot.dataset_id)
     if existing is not None:
@@ -264,7 +210,6 @@ async def prepare_cohort(database):
         async with source_transaction(database):
             publisher = bound_publisher()
             connection, policy = publisher.connection, publisher.policy
-            _require(await _custody(connection, policy) is not None)
             existing = await store._stored_cohort_for_dataset(database, snapshot.dataset_id)
             if existing is not None:
                 _require(store._is_cohort_snapshot_match(existing, snapshot))

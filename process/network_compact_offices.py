@@ -8,7 +8,7 @@ from process.network_compact_layout import CompactAddressRelation
 
 
 class CompactOfficeSourceError(ValueError):
-    """The exact physical office relations differ from the prepared candidate."""
+    """Office relation names, logical scope or data projection differ."""
 
 
 @dataclass(frozen=True)
@@ -33,7 +33,7 @@ class CompactOfficeSources:
 
 
 def compact_base_relation_sql(office_sources):
-    """Use the authenticated retained name when the original alias has rotated."""
+    """Use the retained qualified name when the original alias has rotated."""
     base = office_sources.physical_base or office_sources.base
     if base.schema_name != office_sources.base.schema_name:
         raise CompactOfficeSourceError("Physical office namespace differs")
@@ -41,7 +41,7 @@ def compact_base_relation_sql(office_sources):
 
 
 def compact_office_relation_sql(office_sources):
-    """Render validated physical names; the caller supplies custody and native pins."""
+    """Render qualified names from the pinned source and candidate contributions."""
     if type(office_sources) is not CompactOfficeSources:
         raise CompactOfficeSourceError("Exact compact office sources are required")
     base = compact_base_relation_sql(office_sources)
@@ -53,7 +53,7 @@ def compact_office_relation_sql(office_sources):
 
 
 def compact_bound_office_sql(office_sources):
-    """Keep each native office lookup inside its pinned physical UNION arm."""
+    """Keep each office lookup inside its pinned source UNION arm."""
     fields = "a.location_key,a.entity_type,a.entity_id"
     exact = "(" + fields + ")=(b.location_key,b.entity_type,b.entity_id)"
     arms = [
@@ -70,30 +70,23 @@ def compact_bound_office_sql(office_sources):
 async def _shape(connection, table_name):
     # LIKE can reset informational array dimensions without changing the native type.
     return await connection.fetch(
-        "SELECT attname,atttypid::bigint,atttypmod,attnotnull,attcollation::bigint,attgenerated::text "
-        "FROM pg_attribute WHERE attrelid=to_regclass($1) AND attnum>0 AND NOT attisdropped ORDER BY attnum",
+        "SELECT a.attname,format_type(a.atttypid,a.atttypmod) AS type_name,a.attnotnull,"
+        "cn.nspname AS collation_schema,c.collname AS collation_name,a.attgenerated::text "
+        "FROM pg_attribute a LEFT JOIN pg_collation c ON c.oid=a.attcollation "
+        "LEFT JOIN pg_namespace cn ON cn.oid=c.collnamespace "
+        "WHERE a.attrelid=to_regclass($1) AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum",
         table_name,
     )
 
 
 async def pin_compact_office_sources(connection, copy_target, office_sources):
-    """Check candidate storage without granting ownership or source authority.
-
-    The caller independently verifies retained EAU custody and closes candidate
-    writers and rederives the entire direct-plus-carrier contribution before custody.
-    """
+    """Check candidate scope, column semantics and public/custom row separation."""
     if type(office_sources) is not CompactOfficeSources or not connection.is_in_transaction():
         raise CompactOfficeSourceError("Exact compact office sources and transaction are required")
     base = compact_base_relation_sql(office_sources)
     if office_sources.base.schema_name == copy_target.schema_name:
         raise CompactOfficeSourceError("Public addresses must be retained outside the candidate")
-    await connection.execute(f"LOCK TABLE ONLY {base} IN ACCESS SHARE MODE NOWAIT")
-    if (
-        office_sources.physical_base is not None
-        and await connection.fetchval("SELECT to_regclass($1)::oid::bigint", base)
-        != office_sources.physical_base.table_oid
-    ):
-        raise CompactOfficeSourceError("Physical office identity changed")
+    await connection.fetch(f"SELECT * FROM {base} LIMIT 0")
     await _projection_columns(connection, base)
     base_shape = await _shape(connection, base)
     if "row_origin" not in {attribute["attname"] for attribute in base_shape}:
@@ -108,16 +101,14 @@ async def _pin_custom(connection, copy_target, custom, base_table, base_shape, c
     if custom.schema_name != copy_target.schema_name or custom.table_name != "entity_address_unified":
         raise CompactOfficeSourceError("Custom offices must be the exact candidate contribution")
     table = _identifier(custom.schema_name) + "." + _identifier(custom.table_name)
-    await connection.execute(f"LOCK TABLE ONLY {table} IN ACCESS SHARE MODE NOWAIT")
-    if await connection.fetchval("SELECT to_regclass($1)::oid::bigint", table) != custom.table_oid:
-        raise CompactOfficeSourceError("Custom office physical identity changed")
+    await connection.fetch(f"SELECT * FROM {table} LIMIT 0")
     await _projection_columns(connection, table)
     if await _shape(connection, table) != base_shape:
         raise CompactOfficeSourceError("Custom office column shape differs")
     has_carriers = False
     if carriers is not None:
-        if carriers.target != copy_target or carriers.address_table_oid != custom.table_oid:
-            raise CompactOfficeSourceError("Compact carrier physical scope differs")
+        if carriers.target != copy_target or carriers.address_relation != custom:
+            raise CompactOfficeSourceError("Compact carrier logical scope differs")
         has_carriers = carriers.materialized_address_rows > 0
     if await connection.fetchval(
         f"SELECT EXISTS(SELECT FROM {table} custom LEFT JOIN {base_table} base USING(location_key) "

@@ -36,39 +36,18 @@ from process.registry_source_recipe_store import (
     resolve_retained_registry_source_recipes,
     verify_registry_source_recipes,
 )
-from tests.test_network_custom_address_source_postgres import custom_db
-from tests.test_network_fhir_membership_source_postgres import fhir_source, reviewed_fhir_source
+from tests.registry_source_recipe_support import _example
+from tests.test_network_custom_address_source_postgres import custom_db as custom_db
+from tests.test_network_fhir_membership_source_postgres import fhir_source as fhir_source
+from tests.test_network_fhir_membership_source_postgres import reviewed_fhir_source as reviewed_fhir_source
 from tests.test_network_fhir_retained_capture_postgres import _capture
 from tests.test_network_fhir_retained_capture_postgres import legacy_capture_db as legacy_capture_db
-from tests.test_network_legacy_membership_source_postgres import reviewed_aca_source
-from tests.test_network_serving_schema_postgres import serving_schema
+from tests.test_network_legacy_membership_source_postgres import reviewed_aca_source as reviewed_aca_source
+from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 from tests.test_registry_candidate_composition_postgres import _roles
 from tests.test_registry_retained_site_adoption_postgres import _source_addresses
 
 pytestmark = pytest.mark.asyncio
-
-
-def _example(index=0):
-    source = PinnedFHIRMembershipSource(
-        "source_example",
-        "source-example",
-        "endpoint-example",
-        f"dataset-{index}",
-        "a" * 64,
-        "release-one",
-        123,
-        "medical",
-        "2026-10-01",
-    )
-    coordinates = RegistryNetworkSourceCoordinates(
-        "fhir",
-        source.source_id,
-        source.schema_name,
-        source.dataset_id,
-        "producer-example",
-        "edition-one",
-    )
-    return RegistrySourceMembershipRecipe(source, coordinates)
 
 
 def _candidate(recipes):
@@ -103,10 +82,6 @@ def _cms_custody_recipe():
         legacy.source_pin,
         source_id="cms-npd",
         release_id="e" * 64,
-        custody_owner_role="cms_owner",
-        custody_runtime_roles=("cms_reader", "cms_writer"),
-        custody_proof_sha256="b" * 64,
-        custody_catalog_sha256="c" * 64,
     )
     return RegistrySourceMembershipRecipe(source, replace(legacy.binding_coordinates, source_id="cms-npd"))
 
@@ -124,8 +99,11 @@ async def test_cms_custody_wire_preserves_legacy_generation_and_binds_complete_r
     canonical = canonical_registry_source_recipes((recipe,))
     assert decode_registry_source_recipes(canonical) == (recipe,)
     pin = json.loads(canonical)[0]["source_pin"]
-    assert len(pin) == 13 and pin["custody_runtime_roles"] == ["cms_reader", "cms_writer"]
-    assert replace(recipe.source_pin, custody_catalog_sha256="d" * 64).generation_id != recipe.source_pin.generation_id
+    assert len(pin) == 9 and pin["resource_relation"] == {
+        "schema": recipe.source_pin.schema_name,
+        "name": "provider_directory_dataset_resource",
+    }
+    assert replace(recipe.source_pin, dataset_sha256="d" * 64).generation_id != recipe.source_pin.generation_id
 
 
 def _cms_epoch_recipe():
@@ -136,21 +114,16 @@ def _cms_epoch_recipe():
         tuple(source_pin.coordinates.values()),
         identity,
         "registry_cms_epoch_" + identity.hex,
-        1000,
-        tuple((name, 2000 + index) for index, name in enumerate(sorted(_TABLES))),
-        "cms_epoch_owner",
-        ("cms_reader",),
         "b" * 64,
         "c" * 64,
         "d" * 64,
-        "f" * 64,
     )
     return RegistrySourceMembershipRecipe(
         replace(source_pin, retained_epoch=epoch), replace(legacy.binding_coordinates, source_id="cms-npd")
     )
 
 
-async def test_cms_epoch_wire_preserves_origin_and_binds_physical_custody():
+async def test_cms_epoch_wire_preserves_origin_and_named_content():
     recipe = _cms_epoch_recipe()
     canonical = canonical_registry_source_recipes((recipe,))
     assert decode_registry_source_recipes(canonical) == (recipe,)
@@ -559,7 +532,7 @@ def _capture_recipe(capture):
         origin.dataset_id,
         origin.dataset_sha256,
         capture.release_id,
-        origin.resource_parent_oid,
+        origin.resource_relation,
         "registry-source-one",
         "2026-01-01",
         retained_capture=capture,

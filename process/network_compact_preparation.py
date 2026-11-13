@@ -22,7 +22,7 @@ async def _previous_slices(connection, candidate, control_schema):
             connection, generation_id=candidate["expected_head"], control_schema=control_schema
         )
         if head.compact_layout is not None:
-            return PinnedMembershipSlices(head.candidate_id, head.schema_name, head.compact_layout.ref_map.table_oid)
+            return PinnedMembershipSlices(head.candidate_id, head.schema_name)
     return None
 
 
@@ -36,8 +36,8 @@ def _slice_readiness(scope, report, slices):
             field: report[field]
             for field in ("membership_rows", "distinct_memberships", "projected_locations", "orphan_bindings")
         },
-        "ref_map_oid": slices.ref_map_oid,
-        "edge_heap_oid": slices.edge_heap_oid,
+        "ref_map": asdict(slices.ref_map),
+        "edge_heap": asdict(slices.edge_heap),
         "slices": asdict(slices),
     }
 
@@ -83,12 +83,9 @@ async def _prepare_address_search(connection, copy_target, offices, slices, cont
 
     edge_artifacts = await capture_compact_edge_artifacts(connection, copy_target, control_schema=control_schema)
     layout = CompactNetworkLayout(
-        CompactAddressRelation(copy_target.schema_name, "network_slice_ref", slices.ref_map_oid),
+        CompactAddressRelation(copy_target.schema_name, "network_slice_ref"),
         offices.physical_base,
-        tuple(
-            CompactEdgeArtifact(entry["candidate_id"], entry["schema_name"], entry["table_oid"])
-            for entry in edge_artifacts
-        ),
+        tuple(CompactEdgeArtifact(entry["candidate_id"], entry["schema_name"]) for entry in edge_artifacts),
         offices.custom,
     )
     geo_search = await prepare_network_geo_search(connection, copy_target, layout)

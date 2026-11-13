@@ -110,7 +110,6 @@ async def test_native_profile_rejects_missing_or_wrong_geo_taxonomy(serving_inde
     relation = CompactAddressRelation(
         schema,
         "entity_address_unified",
-        await fixture.connection.fetchval("SELECT to_regclass($1)::oid::bigint", schema + ".entity_address_unified"),
     )
     options = {"compact_base": True} if compact_base else {"canonical": True}
     if compact_base:
@@ -166,9 +165,6 @@ async def test_custom_indexes_build_before_seal_and_partial_ddl_rolls_back(compa
         custom = CompactAddressRelation(
             copy_target.schema_name,
             "entity_address_unified",
-            await fixture.connection.fetchval(
-                "SELECT to_regclass($1)::oid::bigint", copy_target.schema_name + ".entity_address_unified"
-            ),
         )
         await indexes._require_address_search_indexes(fixture.execution_connection, custom)
     await compact._seal(fixture, copy_target)

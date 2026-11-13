@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Bounded, explicitly sampled raw Source checks; exhaustive custody remains mandatory."""
+"""Bounded deterministic raw source samples against named graph data."""
 
 import json
 import re
@@ -10,9 +10,8 @@ from uuid import uuid4
 
 from process.network_address_projection import _identifier
 from process.network_fhir_source_epoch import _borrowed_epoch_settings, _set_content_settings
-from process.network_fhir_source_witness_capture import _original_source_factory
-from process.network_fhir_source_witness_contract import canonical, database_identity, digest, source_origin
-from process.network_fhir_typed_capture import SealedTypedGraphRead, TypedGraphAnchor, load_typed_graph_capture
+from process.network_fhir_source_witness_contract import canonical, digest, source_origin
+from process.network_fhir_typed_capture import TypedGraphAnchor, TypedGraphRead, load_typed_graph_capture
 from process.network_fhir_typed_contract import (
     PAIR_COLUMNS,
     TypedFHIRGraphError,
@@ -34,7 +33,6 @@ _PAIR_FIELDS = PAIR_COLUMNS[:6]
 _PAIR_KEYS = ("resource_type", "resource_id", "network_source_key", "location_resource_id")
 _ROLE_KINDS = {"OrganizationAffiliation", "PractitionerRole"}
 _ID = re.compile(r"[A-Za-z0-9.-]{1,64}")
-_READ_BRAND = object()
 _LIMITATIONS = [
     "Ten disjoint series partition one sample without replacement; statistical independence is not claimed.",
     "Source units are role witnesses; derived provider-office pairs do not have equal inclusion probabilities.",
@@ -136,7 +134,6 @@ def validate_sampled_semantic_receipt(receipt):
             "capture_id",
             "observed_at",
             "capture_sha256",
-            "database_identity",
             "membership_as_of",
             "networks",
             "limitations",
@@ -157,7 +154,6 @@ def validate_sampled_semantic_receipt(receipt):
         "sample_receipt",
     )
     TypedGraphAnchor(receipt["capture_id"], receipt["observed_at"])
-    database_identity(receipt["database_identity"])
     policy_date(receipt["membership_as_of"])
     for field in ("source_origin_sha256", "capture_sha256", "receipt_sha256"):
         require(type(receipt[field]) is str and re.fullmatch(r"[0-9a-f]{64}", receipt[field]), "sample_receipt")
@@ -172,47 +168,45 @@ def validate_sampled_semantic_receipt(receipt):
 
 @dataclass(frozen=True)
 class SampledTypedGraphRead:
-    """Distinct transaction-bound capability; it never marks the full graph checked."""
+    """Sample results bound to a logical graph edition and content capture."""
 
-    sealed_read: SealedTypedGraphRead
+    graph_read: TypedGraphRead
     receipt_json: str
-    brand: object
 
     @property
     def document(self):
-        """Expose the unchanged graph descriptor without exhaustive semantic authority."""
-        return self.sealed_read.document
+        """Return the selected logical graph description."""
+        return self.graph_read.document
 
     @property
     def capture(self):
-        """Expose the native capture descriptor bound to this sampled read."""
-        return self.sealed_read.capture
+        """Return the graph content capture."""
+        return self.graph_read.capture
 
     @property
     def anchor(self):
-        """Return the independently supplied native capture anchor."""
-        return self.sealed_read.anchor
+        """Return the selected logical capture coordinates."""
+        return self.graph_read.anchor
 
     @property
     def receipt(self):
-        """Return a detached receipt so callers cannot mutate this capability."""
+        """Return an independent copy of the sampling results."""
         return json.loads(self.receipt_json)
 
     def relation(self, kind):
-        """Resolve only a relation already admitted by native capture custody."""
-        return self.sealed_read.relation(kind)
+        """Resolve one named table from the selected graph edition."""
+        return self.graph_read.relation(kind)
 
-    async def verify(self, connection):
-        """Recheck transaction scope, native relation identities and sampled receipt bindings."""
-        require(self.brand is _READ_BRAND and type(self.sealed_read) is SealedTypedGraphRead, "sample_read")
-        await self.sealed_read.verify(connection)
+    def require_ready(self, *, complete=True):
+        """Validate deterministic sample results and their logical graph edition."""
+        require(type(self.graph_read) is TypedGraphRead, "sample_read")
+        self.graph_read.require_ready(complete=False)
         receipt = validate_sampled_semantic_receipt(self.receipt)
         require(
             receipt["capture_sha256"] == self.capture["capture_sha256"]
             and receipt["capture_id"] == self.anchor.capture_id
             and receipt["observed_at"] == self.anchor.observed_at
             and receipt["source_origin_sha256"] == digest(asdict(source_origin(self.document["origin"])))
-            and receipt["database_identity"] == self.document["database_identity"]
             and receipt["membership_as_of"] == self.document["membership_as_of"]
             and not any(
                 direction["failures"]
@@ -243,25 +237,22 @@ def _candidate_wire_rows(rows):
     return tuple(tuple(str(row[field]) for field in _PAIR_FIELDS) for row in rows)
 
 
-async def _candidate_selection(connection, sealed, keys, policy):
+async def _candidate_selection(connection, graph_read, keys, policy):
     sampler = _candidate_sampler(keys, policy)
-    query = "SELECT " + ",".join(_PAIR_FIELDS) + " FROM " + sealed.relation("pairs")
+    query = "SELECT " + ",".join(_PAIR_FIELDS) + " FROM " + graph_read.relation("pairs")
     cursor = await connection.cursor(query)
     while rows := await cursor.fetch(1000):
         sampler.add_candidate_batch(_candidate_wire_rows(rows))
     return sampler
 
 
-def _source_selection(export, origin, identity, policy, keys):
+def _source_selection(export, origin, policy, keys):
     require(
-        type(export) is dict and set(export) == {"contract", "origin", "database_identity", "sampling", "resources"},
+        type(export) is dict and set(export) == {"contract", "origin", "sampling", "resources"},
         "sample_contract",
     )
     require(export["contract"] == SOURCE_CONTRACT and source_origin(export["origin"]) == origin, "sample_contract")
-    require(
-        database_identity(export["database_identity"]) == database_identity(identity) and callable(export["resources"]),
-        "sample_identity",
-    )
+    require(callable(export["resources"]), "sample_contract")
     sample = export["sampling"]
     require(
         type(sample) is dict
@@ -333,7 +324,7 @@ async def _fetch_resources(export, connection, replay, keys, origin, as_of):
 
 
 async def _replay_roles(export, connection, replay, roles, origin, as_of, *, required, bound_fanout=False):
-    await replay.verify(connection, complete=False)
+    replay.require_ready(complete=False)
     for kind in replay.names:
         await connection.execute("DELETE FROM " + replay.relation(kind))
     present = await _fetch_resources(export, connection, replay, roles, origin, as_of)
@@ -369,39 +360,21 @@ async def _replay_roles(export, connection, replay, roles, origin, as_of, *, req
     return None
 
 
-async def _sample_replay_indexes(connection, replay):
+@asynccontextmanager
+async def _sample_replay_batch(connection, replay):
+    """Discard each batch's temp files without changing the Reader's transaction or sample."""
     require(type(replay) is TypedFHIRGraphStage, "replay_workspace")
-    await replay.verify(connection, complete=False)
+    replay.require_ready(complete=False)
     require(
-        replay.schema_name == "pg_temp"
-        and set(replay.names) == set(replay.oids) == {"cells", "checks", "pairs", "addresses"},
+        replay.schema_name == "pg_temp" and set(replay.names) == {"cells", "checks", "pairs", "addresses"},
         "replay_workspace",
     )
-    indexes = await connection.fetch(
-        "SELECT i.indrelid::bigint table_oid,c.relname index_name FROM pg_index i "
-        "JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_class t ON t.oid=i.indrelid "
-        "JOIN pg_roles owner ON owner.oid=t.relowner WHERE i.indrelid=ANY($1::oid[]) "
-        "AND i.indisprimary AND i.indisunique AND i.indisvalid AND i.indisready AND i.indislive "
-        "AND t.relpersistence='t' AND t.relkind='r' AND t.relnamespace=pg_my_temp_schema() "
-        "AND c.relowner=t.relowner AND c.relnamespace=t.relnamespace "
-        "AND owner.rolname=session_user AND current_user=session_user",
-        list(replay.oids.values()),
-    )
-    indexes_by_oid = {index["table_oid"]: index["index_name"] for index in indexes}
-    require(len(indexes) == 4 and set(indexes_by_oid) == set(replay.oids.values()), "replay_workspace")
     require(
         await connection.fetchval(
             "SELECT " + " AND ".join("NOT EXISTS(SELECT FROM " + replay.relation(kind) + ")" for kind in replay.names)
         ),
         "restart_from_zero",
     )
-    return indexes_by_oid
-
-
-@asynccontextmanager
-async def _sample_replay_batch(connection, replay):
-    """Discard each batch's temp files without changing the Reader's transaction or sample."""
-    indexes_by_oid = await _sample_replay_indexes(connection, replay)
     savepoint, state = _identifier("sample_replay_" + uuid4().hex), SimpleNamespace(started=False)
 
     async def _start_savepoint():
@@ -411,8 +384,8 @@ async def _sample_replay_batch(connection, replay):
     try:
         await drain_operation(_start_savepoint(), preserve_cancellation=True)
         # Rollback restores the original empty files instead of accumulating deleted heap versions.
-        for kind, oid in replay.oids.items():
-            await connection.execute("CLUSTER " + replay.relation(kind) + " USING " + _identifier(indexes_by_oid[oid]))
+        for kind, name in replay.names.items():
+            await connection.execute("CLUSTER " + replay.relation(kind) + " USING " + _identifier(name + "_pkey"))
         yield
     finally:
         if state.started:
@@ -427,7 +400,7 @@ async def _sample_replay_batch(connection, replay):
                 raise
 
 
-async def _source_direction(export, connection, sealed, replay, origin, as_of, network):
+async def _source_direction(export, connection, graph_read, replay, origin, as_of, network):
     roles = [tuple(role) for series in network["series"] for role in series]
     direction_by_field = {
         "unit": "source-role-witness",
@@ -447,7 +420,7 @@ async def _source_direction(export, connection, sealed, replay, origin, as_of, n
         await _replay_roles(export, connection, replay, roles, origin, as_of, required=True)
         counts = await connection.fetchrow(
             "SELECT count(*)::bigint total,count(*) FILTER(WHERE NOT EXISTS(SELECT FROM "
-            + sealed.relation("pairs")
+            + graph_read.relation("pairs")
             + " actual WHERE "
             + equal
             + "))::bigint failures FROM "
@@ -507,9 +480,9 @@ def _candidate_coverage(sampler):
     return directions_by_network
 
 
-async def _candidate_direction(export, connection, sealed, replay, origin, as_of, sampler):
+async def _candidate_direction(export, connection, graph_read, replay, origin, as_of, sampler):
     directions_by_network = _candidate_coverage(sampler)
-    query = "SELECT " + ",".join(PAIR_COLUMNS) + " FROM " + sealed.relation("pairs")
+    query = "SELECT " + ",".join(PAIR_COLUMNS) + " FROM " + graph_read.relation("pairs")
     cursor = await connection.cursor(query)
     pending_rows = []
     while rows := await cursor.fetch(1000):
@@ -530,7 +503,7 @@ async def _replay_workspace(connection, replay_stage):
         async with _workspace(connection) as replay:
             yield replay
     else:
-        await replay_stage.verify(connection, complete=False)
+        replay_stage.require_ready(complete=False)
         require(
             replay_stage.schema_name == "pg_temp"
             and set(replay_stage.names) == {"cells", "checks", "pairs", "addresses"},
@@ -553,14 +526,14 @@ async def _sampling_settings(connection):
     await _set_content_settings(connection, ["work_mem"], ["16MB"])
 
 
-async def _verify_samples(source_export, connection, sealed, scope, policy):
+async def _verify_samples(source_export, connection, graph_read, scope, policy):
     from directory_membership_runtime import open_membership_source_sample
 
     origin = source_origin(scope.reviewed_origin)
-    identity, as_of = sealed.document["database_identity"], policy_date(sealed.document["membership_as_of"])
+    as_of = policy_date(graph_read.document["membership_as_of"])
     async with _borrowed_epoch_settings(connection):
         await _sampling_settings(connection)
-        selections_by_network = await _candidate_selection(connection, sealed, scope.network_source_keys, policy)
+        selections_by_network = await _candidate_selection(connection, graph_read, scope.network_source_keys, policy)
         async with (
             open_membership_source_sample(
                 source_export.args[0],
@@ -573,19 +546,19 @@ async def _verify_samples(source_export, connection, sealed, scope, policy):
             ) as export,
             _replay_workspace(connection, scope.replay_stage) as replay,
         ):
-            networks = _source_selection(export, origin, identity, policy, scope.network_source_keys)
+            networks = _source_selection(export, origin, policy, scope.network_source_keys)
             source_by_network = {}
             for network in networks:
                 source_by_network[network["network_source_key"]] = await _source_direction(
-                    export, connection, sealed, replay, origin, as_of, network
+                    export, connection, graph_read, replay, origin, as_of, network
                 )
             candidate_by_network = await _candidate_direction(
-                export, connection, sealed, replay, origin, as_of, selections_by_network
+                export, connection, graph_read, replay, origin, as_of, selections_by_network
             )
     return source_by_network, candidate_by_network
 
 
-def _sample_receipt(sealed, policy, source_by_network, candidate_by_network):
+def _sample_receipt(graph_read, policy, source_by_network, candidate_by_network):
     receipt_by_field = {
         "contract": CONTRACT,
         "mode": "sampled",
@@ -593,12 +566,11 @@ def _sample_receipt(sealed, policy, source_by_network, candidate_by_network):
         "algorithm": ALGORITHM,
         "series_count": SERIES_COUNT,
         "items_per_series": ITEMS_PER_SERIES,
-        "source_origin_sha256": digest(asdict(source_origin(sealed.document["origin"]))),
-        "capture_id": sealed.capture["capture_id"],
-        "observed_at": sealed.capture["observed_at"],
-        "capture_sha256": sealed.capture["capture_sha256"],
-        "database_identity": sealed.document["database_identity"],
-        "membership_as_of": sealed.document["membership_as_of"],
+        "source_origin_sha256": digest(asdict(source_origin(graph_read.document["origin"]))),
+        "capture_id": graph_read.capture["capture_id"],
+        "observed_at": graph_read.capture["observed_at"],
+        "capture_sha256": graph_read.capture["capture_sha256"],
+        "membership_as_of": graph_read.document["membership_as_of"],
         "networks": [
             {
                 "network_source_key": key,
@@ -614,7 +586,7 @@ def _sample_receipt(sealed, policy, source_by_network, candidate_by_network):
 
 
 async def verify_sampled_typed_capture(source_export, connection, document, *, scope, policy):
-    """Keep full native capture proof, but replay only preselected raw semantic witnesses."""
+    """Validate capture content and replay deterministically selected source records."""
     require(type(policy) is SemanticSamplingPolicy and type(scope) is SampledCaptureScope, "sample_policy")
     policy.__post_init__()
     keys = scope.network_source_keys
@@ -625,13 +597,15 @@ async def verify_sampled_typed_capture(source_export, connection, document, *, s
         and tuple(sorted(set(keys))) == keys,
         "sample_networks",
     )
-    _original_source_factory(source_export, scope.reviewed_origin)
+    require(callable(source_export) and bool(getattr(source_export, "args", ())), "source_factory")
     origin = source_origin(scope.reviewed_origin)
-    require(scope.source_profile.schema_name == origin.schema_name, "source_profile")
-    sealed = await load_typed_graph_capture(connection, document, expected_anchor=scope.expected_anchor)
-    require(source_origin(sealed.document["origin"]) == origin, "verification_scope")
-    source_by_network, candidate_by_network = await _verify_samples(source_export, connection, sealed, scope, policy)
-    receipt = _sample_receipt(sealed, policy, source_by_network, candidate_by_network)
+    require(scope.source_profile.catalog_schema == origin.header_relation["schema"], "source_profile")
+    graph_read = await load_typed_graph_capture(connection, document, expected_anchor=scope.expected_anchor)
+    require(source_origin(graph_read.document["origin"]) == origin, "verification_scope")
+    source_by_network, candidate_by_network = await _verify_samples(
+        source_export, connection, graph_read, scope, policy
+    )
+    receipt = _sample_receipt(graph_read, policy, source_by_network, candidate_by_network)
     if any(
         direction["failures"]
         for network in receipt["networks"]
@@ -640,6 +614,6 @@ async def verify_sampled_typed_capture(source_export, connection, document, *, s
         error = TypedFHIRGraphError("registry_fhir_typed_sample_failed")
         error.receipt = receipt
         raise error
-    sampled_read = SampledTypedGraphRead(sealed, canonical(receipt), _READ_BRAND)
-    await sampled_read.verify(connection)
+    sampled_read = SampledTypedGraphRead(graph_read, canonical(receipt))
+    sampled_read.require_ready()
     return sampled_read

@@ -1,17 +1,17 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Authenticate an exact retained registry generation without reactivating it."""
+"""Resolve an exact retained registry generation by its logical publication locator."""
 
 from process.network_address_projection import _identifier
 from process.network_membership_validation import _json_object
 
 
 class RegistryRetainedGenerationError(ValueError):
-    """The selected manifest or its independent physical custody is unavailable."""
+    """The selected published logical generation is unavailable or inconsistent."""
 
 
 async def resolve_registry_retained_generation(connection, candidate, *, control_schema):
-    """The candidate's digest is a locator; verify the stored manifest and seal."""
-    from process.network_membership_publication import _candidate_custody
+    """Read retained routing names while keeping the selected edition and rollback state."""
+    from process.network_published_api_pin import published_network_layout
     from process.network_serving_read import _pinned_manifest, _read_manifest
 
     locator = _json_object(candidate["source_generations"]).get("retained_network_source")
@@ -26,7 +26,6 @@ async def resolve_registry_retained_generation(connection, candidate, *, control
     if len(manifest_rows) != 1 or manifest_rows[0]["state"] != "published":
         raise RegistryRetainedGenerationError("registry_retained_generation_unavailable")
     retained_candidate_by_field = dict(manifest_rows[0])
-    custody = await _candidate_custody(connection, retained_candidate_by_field, control_schema)
     entry = await _read_manifest(
         connection,
         _identifier(control_schema),
@@ -35,7 +34,18 @@ async def resolve_registry_retained_generation(connection, candidate, *, control
     )
     if entry is None:
         raise RegistryRetainedGenerationError("registry_retained_generation_unavailable")
-    manifest = _pinned_manifest(entry, custody=custody)
-    if manifest.manifest_sha256 != locator:
+    published_candidate_by_field = _json_object(entry["candidate_json"])
+    manifest = _pinned_manifest(entry, layout=published_network_layout(published_candidate_by_field))
+    if (
+        manifest.manifest_sha256 != locator
+        or manifest.generation_id != retained_candidate_by_field["generation_id"]
+        or manifest.candidate_id != str(retained_candidate_by_field["candidate_id"])
+        or manifest.schema_name != retained_candidate_by_field["schema_name"]
+        or manifest.source_generations != _json_object(retained_candidate_by_field["source_generations"])
+        or any(
+            str(published_candidate_by_field[field]) != str(retained_candidate_by_field[field])
+            for field in ("dataset_id", "schema_id", "producer_id", "schema_revision", "approved_custom_revision")
+        )
+    ):
         raise RegistryRetainedGenerationError("registry_retained_generation_changed")
     return manifest, retained_candidate_by_field

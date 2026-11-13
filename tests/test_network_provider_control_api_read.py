@@ -1,238 +1,191 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Control/fact metadata API wiring; mocks establish no native authority."""
+"""Pinned logical approval scope and complete named source-fact metadata reads."""
 
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
+from uuid import UUID
 
 import pytest
 
 from process import network_approved_membership_source as approved
 from process import network_approved_source_bindings as bindings
-from process import network_candidate_custody as custody
 from process import network_serving_read as serving
 from process import registry_source_contribution_artifacts as artifacts
 from process import registry_source_inventory_store as inventory
 from process.network_compact_layout import CompactAddressRelation
-from process.network_read_identity import NetworkReadIdentityError
-from process.registry_management_permissions import _TABLES
+from process.network_serving_read import PinnedNetworkServingManifest
 from tests.test_network_approved_source_bindings import COORDINATES, boundary, scope_row
-from tests.test_network_raw_provider_api_identity import _manifest
 from tests.test_registry_source_inventory_fact_owners import CONTROL, _owner, _selected
 
 pytestmark = pytest.mark.asyncio
-_PID = 77
 
 
-def _control_fixture(monkeypatch):
-    table_records = [
-        dict(
-            relname=name,
-            oid=oid,
-            relkind="r",
-            relpersistence="p",
-            heap=True,
-            relrowsecurity=False,
-            relforcerowsecurity=False,
-            relispartition=False,
-            inherited=False,
-            rules=False,
-            columns=list(_TABLES[name]),
-        )
-        for name, oid in (
-            ("network_membership_candidate", 11),
-            ("network_serving_manifest", 12),
-            ("registry_approved_record", 13),
-        )
-    ]
-    # Control pins are read by name; the ledger's physical profile is never consulted.
-    native = AsyncMock(side_effect=AssertionError("control custody was read"))
-    monkeypatch.setattr(custody, "_control", native)
-    connection = SimpleNamespace(
-        is_in_transaction=lambda: True,
-        fetchrow=AsyncMock(return_value=("repeatable read", "on")),
-        fetch=AsyncMock(return_value=table_records),
-        execute=AsyncMock(),
+def _manifest():
+    identity = str(UUID(int=1))
+    schema = "network_candidate_" + UUID(identity).hex
+    return PinnedNetworkServingManifest(
+        7,
+        identity,
+        schema,
+        1,
+        {"custom_membership": "b" * 64},
+        3,
+        "a" * 64,
+        CompactAddressRelation(schema, "entity_address_unified"),
     )
-    return connection, table_records, native
 
 
-async def test_current_control_profiles_are_read_by_name(monkeypatch):
-    connection, rows, native = _control_fixture(monkeypatch)
-    pins = await custody.read_network_control_relation_pins(
-        connection, tuple(row["relname"] for row in rows), control_schema=CONTROL
+async def test_approved_api_reuses_selected_logical_generation_and_named_control(monkeypatch):
+    manifest = _manifest()
+    resolver = AsyncMock(return_value=manifest)
+    scoped = AsyncMock(return_value=approved.ApprovedMembershipSource(3, "b" * 64))
+    monkeypatch.setattr(serving, "resolve_network_serving_manifest", resolver)
+    monkeypatch.setattr(approved, "_scope", scoped)
+    connection = object()
+    result, relation = await approved.pin_api_retained_approved_membership_source(
+        connection, replace(manifest), control_schema=CONTROL
     )
-    assert [pin.table_oid for pin in pins] == [11, 12, 13]
-    assert all(pin.schema_name == CONTROL for pin in pins)
-    assert connection.fetch.await_args.args[1] == f'"{CONTROL}"'
-    connection.execute.assert_not_awaited()
+    assert result.generation_id == "b" * 64
+    assert relation == CompactAddressRelation(CONTROL, "registry_approved_record")
+    resolver.assert_awaited_once_with(
+        connection, generation_id=manifest.generation_id, control_schema=CONTROL, api_read=True
+    )
+    scoped.assert_awaited_once_with(connection, manifest.approved_custom_revision, '"' + CONTROL + '"', retained=True)
+
+
+@pytest.mark.parametrize("changed", ["generation", "schema", "approval", "source"])
+async def test_approved_api_refuses_changed_logical_manifest_before_approval_reads(monkeypatch, changed):
+    manifest = _manifest()
+    current = replace(
+        manifest,
+        **{
+            "generation": {"generation_id": 8},
+            "schema": {"schema_name": "another_snapshot"},
+            "approval": {"approved_custom_revision": 4},
+            "source": {"source_generations": {"custom_membership": "c" * 64}},
+        }[changed],
+    )
+    monkeypatch.setattr(serving, "resolve_network_serving_manifest", AsyncMock(return_value=current))
+    scoped = AsyncMock()
+    monkeypatch.setattr(approved, "_scope", scoped)
+    with pytest.raises(approved.ApprovedMembershipSourceError, match="manifest differs"):
+        await approved.pin_api_retained_approved_membership_source(object(), manifest, control_schema=CONTROL)
+    scoped.assert_not_awaited()
+
+
+async def test_approved_api_requires_the_manifest_approved_generation(monkeypatch):
+    manifest = _manifest()
+    monkeypatch.setattr(serving, "resolve_network_serving_manifest", AsyncMock(return_value=manifest))
+    monkeypatch.setattr(approved, "_scope", AsyncMock(return_value=approved.ApprovedMembershipSource(3, "c" * 64)))
+    with pytest.raises(approved.ApprovedMembershipSourceError, match="generation differs"):
+        await approved.pin_api_retained_approved_membership_source(object(), manifest, control_schema=CONTROL)
 
 
 @pytest.mark.parametrize(
-    "field,value",
+    "changes",
     [
-        ("relkind", "v"),
-        ("heap", False),
-        ("relrowsecurity", True),
-        ("rules", True),
-        ("inherited", True),
-        ("columns", ["wrong"]),
+        None,
+        {"approved_revision": 4},
+        {"isolation": "read committed"},
+        {"is_bounded": False},
+        {"invalid_documents": 1},
+        {"unresolved_rows": 1},
     ],
 )
-async def test_changed_control_profile_refuses(monkeypatch, field, value):
-    connection, rows, _ = _control_fixture(monkeypatch)
-    rows[0][field] = value
-    with pytest.raises(custody.NetworkCandidateCustodyError):
-        await custody.read_network_control_relation_pins(
-            connection, tuple(row["relname"] for row in rows), control_schema=CONTROL
-        )
+async def test_approval_scope_checks_complete_data_bounds_and_snapshot(changes):
+    connection = SimpleNamespace(
+        is_in_transaction=lambda: True,
+        fetchrow=AsyncMock(return_value={**scope_row(3, "b" * 64), **(changes or {})}),
+        execute=AsyncMock(),
+    )
+    operation = approved._scope(connection, 3, '"' + CONTROL + '"', retained=True)
+    if changes is None:
+        assert await operation == approved.ApprovedMembershipSource(3, "b" * 64)
+    else:
+        with pytest.raises(approved.ApprovedMembershipSourceError):
+            await operation
+    query, revision, limit, schema = connection.fetchrow.await_args.args
+    assert '"' + CONTROL + '".registry_approved_record' in query
+    assert revision == 3 and limit == approved.MAX_INPUT_BYTES and schema == CONTROL
     connection.execute.assert_not_awaited()
 
 
-@pytest.mark.parametrize("names", [(), [], ("other_table",), ("registry_approved_record",) * 2])
-async def test_control_selection_is_closed(monkeypatch, names):
-    connection, _, native = _control_fixture(monkeypatch)
-    with pytest.raises(custody.NetworkCandidateCustodyError):
-        await custody.read_network_control_relation_pins(connection, names, control_schema=CONTROL)
-
-
-async def test_read_write_control_context_refuses(monkeypatch):
-    connection, _, native = _control_fixture(monkeypatch)
-    connection.fetchrow.return_value = ("repeatable read", "off")
-    with pytest.raises(custody.NetworkCandidateCustodyError):
-        await custody.read_network_control_relation_pins(
-            connection, ("registry_approved_record",), control_schema=CONTROL
-        )
-
-
-async def test_approved_helper_reauthenticates_caller_manifest(monkeypatch):
-    manifest = _manifest()
-    manifest.source_generations["custom_membership"] = "b" * 64
-    caller = replace(manifest)
-    pin = CompactAddressRelation(CONTROL, "registry_approved_record", 13)
-    resolver = AsyncMock(return_value=manifest)
-    native = AsyncMock(return_value=(pin,))
-    scope = AsyncMock(return_value=approved.ApprovedMembershipSource(3, "b" * 64))
-    monkeypatch.setattr(serving, "resolve_network_serving_manifest", resolver)
-    monkeypatch.setattr(custody, "read_network_control_relation_pins", native)
-    monkeypatch.setattr(approved, "_scope", scope)
-    connection = SimpleNamespace(get_server_pid=lambda: _PID)
-    result, relation = await approved.pin_api_retained_approved_membership_source(
-        connection, caller, control_schema=CONTROL
+@pytest.mark.parametrize("invalid", [False, True])
+async def test_retained_bindings_validate_all_coordinates_against_selected_approval(invalid):
+    connection, calls = boundary(current_revision=3, fingerprint="b" * 64, invalid=invalid)
+    operation = bindings.require_retained_approved_network_source_bindings(
+        connection, approved.ApprovedMembershipSource(3, "b" * 64), COORDINATES, control_schema="sample_control"
     )
-    assert result.generation_id == "b" * 64 and relation == pin
-    assert resolver.await_args.kwargs["api_read"] is True
-    native.assert_awaited_once_with(connection, ("registry_approved_record",), control_schema=CONTROL)
-    assert scope.await_args.kwargs["read_identity"] == (pin, _PID)
-
-
-@pytest.mark.parametrize("failure", [False, True])
-async def test_scope_guard_runs_before_scalar_interpretation(monkeypatch, failure):
-    events = []
-
-    class Receipt(dict):
-        def __getitem__(self, key):
-            assert events == ["guard"]
-            return super().__getitem__(key)
-
-    connection = SimpleNamespace(
-        is_in_transaction=lambda: True, fetchrow=AsyncMock(return_value=Receipt(scope_row(3, "b" * 64)))
-    )
-    pin = CompactAddressRelation(CONTROL, "registry_approved_record", 13)
-
-    async def verify(actual, relations, *, expected_backend_pid):
-        assert actual is connection and relations == (pin,) and expected_backend_pid == _PID
-        if failure:
-            raise NetworkReadIdentityError("synthetic mismatch")
-        events.append("guard")
-
-    monkeypatch.setattr(approved, "verify_consumed_network_relations", AsyncMock(side_effect=verify))
-    if failure:
-        with pytest.raises(approved.ApprovedMembershipSourceError):
-            await approved._scope(connection, 3, '"' + CONTROL + '"', retained=True, read_identity=(pin, _PID))
+    if invalid:
+        with pytest.raises(bindings.ApprovedNetworkSourceBindingError, match="binding_invalid"):
+            await operation
     else:
-        assert (
-            await approved._scope(connection, 3, '"' + CONTROL + '"', retained=True, read_identity=(pin, _PID))
-        ).generation_id == "b" * 64
-
-
-async def test_binding_checks_guard_each_actual_fetch(monkeypatch):
-    connection, calls = boundary(current_revision=3, fingerprint="b" * 64)
-    pin = CompactAddressRelation("sample_control", "registry_approved_record", 13)
-    guard = AsyncMock()
-    monkeypatch.setattr(approved, "verify_consumed_network_relations", guard)
-    result = await bindings.require_retained_approved_network_source_bindings(
-        connection,
-        approved.ApprovedMembershipSource(3, "b" * 64),
-        COORDINATES,
-        control_schema="sample_control",
-        read_identity=(pin, _PID),
-    )
-    assert result == 2 and len(calls) == guard.await_count == 2
-    assert all(call.kwargs["expected_backend_pid"] == _PID for call in guard.await_args_list)
+        assert await operation == 2
+    assert len(calls) == 2
+    assert calls[1][1][:7] == (3, *COORDINATES.sql_parameters)
+    assert "invalid_scopes" in calls[1][0] and "duplicate_digests" in calls[1][0]
 
 
 @pytest.mark.parametrize("legacy", [False, True])
-async def test_fact_owner_api_preserves_required_authentication(monkeypatch, legacy):
-    owner = _owner(2, legacy=legacy)
+async def test_source_metadata_resolves_named_generation_and_complete_registered_inventory(monkeypatch, legacy):
+    original = _owner(2, legacy=legacy)
     connection = SimpleNamespace(
         is_in_transaction=lambda: True,
-        get_server_pid=lambda: _PID,
-        fetchval=AsyncMock(side_effect=["repeatable read", "on", True]),
-        fetch=AsyncMock(return_value=[owner.candidate]),
+        fetchval=AsyncMock(side_effect=["repeatable read", "on"]),
+        fetch=AsyncMock(return_value=[original.candidate]),
+        fetchrow=AsyncMock(return_value={**original.candidate, "manifest_sha256": original.generation_id}),
+        execute=AsyncMock(),
     )
-    pins = (
-        CompactAddressRelation(CONTROL, "network_membership_candidate", 11),
-        CompactAddressRelation(CONTROL, "network_serving_manifest", 12),
-    )
-    loader = AsyncMock(return_value=(owner.reference, owner.entries))
-    locked = AsyncMock(side_effect=AssertionError("API selected locking owner verification"))
-    monkeypatch.setattr(custody, "read_network_control_relation_pins", AsyncMock(return_value=pins))
-    monkeypatch.setattr(artifacts, "verify_network_candidate_custody", locked)
-    monkeypatch.setattr(inventory, "load_source_inventory_for_api", loader)
-    guard = AsyncMock()
-    monkeypatch.setattr(artifacts, "verify_consumed_network_relations", guard)
-    selected = _selected(owner, owner.sources[:1])
+    loader = AsyncMock(return_value=(original.reference, original.entries))
+    monkeypatch.setattr(inventory, "load_source_inventory", loader)
+    selected = _selected(original, original.sources[:1])
     resolved = await artifacts.authenticate_anchored_source_fact_metadata(
         connection, selected, control_schema=CONTROL, api_read=True
     )
-    assert len(resolved) == 1 and resolved[selected[0]["recipe_sha256"]].reference.fact_table_oid == 42
+    result = resolved[selected[0]["recipe_sha256"]]
+    assert len(resolved) == 1 and result.reference.fact_candidate_id == original.candidate["candidate_id"]
+    assert result.reference.fact_schema_name == original.candidate["schema_name"]
+    assert result.reference.fact_generation_id == original.generation_id
+    assert result.reference.fact_table_name == artifacts.CONTRIBUTION_TABLE
+    assert result.descriptor == original.sources[0]
     assert loader.await_count == int(not legacy)
-    assert guard.await_args.args[1] == pins
-    locked.assert_not_awaited()
-    fact_heap_check = connection.fetchval.await_args_list[-1].args
-    assert "relrowsecurity" in fact_heap_check[0]
-    assert fact_heap_check[1] == f'"{owner.candidate["schema_name"]}".network_source_contribution'
+    if not legacy:
+        assert loader.await_args.args[2] == original.candidate
+        assert loader.await_args.kwargs == {"control_schema": CONTROL}
+    assert "network_serving_manifest" in connection.fetchrow.await_args.args[0]
+    connection.execute.assert_not_awaited()
 
 
-@pytest.mark.parametrize("unfiltered", [False, None])
-async def test_fact_owner_api_refuses_a_row_filtered_fact_table(monkeypatch, unfiltered):
-    owner = _owner(2)
+@pytest.mark.parametrize("field", ["dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name"])
+async def test_source_metadata_refuses_changed_logical_scope_before_inventory(monkeypatch, field):
+    original = _owner(1)
+    current_by_field = {
+        **original.candidate,
+        "manifest_sha256": original.generation_id,
+        field: "another_snapshot" if field == "schema_name" else str(UUID(int=99)),
+    }
     connection = SimpleNamespace(
         is_in_transaction=lambda: True,
-        get_server_pid=lambda: _PID,
-        fetchval=AsyncMock(side_effect=["repeatable read", "on", unfiltered]),
-        fetch=AsyncMock(return_value=[owner.candidate]),
+        fetchval=AsyncMock(side_effect=["repeatable read", "on"]),
+        fetch=AsyncMock(return_value=[original.candidate]),
+        fetchrow=AsyncMock(return_value=current_by_field),
     )
-    pins = (
-        CompactAddressRelation(CONTROL, "network_membership_candidate", 11),
-        CompactAddressRelation(CONTROL, "network_serving_manifest", 12),
-    )
-    loader = AsyncMock(side_effect=AssertionError("a filtered fact table must refuse before its inventory is read"))
-    monkeypatch.setattr(custody, "read_network_control_relation_pins", AsyncMock(return_value=pins))
-    monkeypatch.setattr(inventory, "load_source_inventory_for_api", loader)
-    monkeypatch.setattr(artifacts, "verify_consumed_network_relations", AsyncMock())
-    with pytest.raises(artifacts.RegistrySourceContributionError, match="physical_identity_changed"):
+    loader = AsyncMock()
+    monkeypatch.setattr(inventory, "load_source_inventory", loader)
+    with pytest.raises(ValueError, match="owner_unavailable"):
         await artifacts.authenticate_anchored_source_fact_metadata(
-            connection, _selected(owner, owner.sources[:1]), control_schema=CONTROL, api_read=True
+            connection, _selected(original), control_schema=CONTROL, api_read=True
         )
+    loader.assert_not_awaited()
 
 
 async def test_empty_fact_metadata_api_still_requires_readonly():
     connection = SimpleNamespace(
-        is_in_transaction=lambda: True, fetchval=AsyncMock(side_effect=["repeatable read", "off"])
+        is_in_transaction=lambda: True, fetchval=AsyncMock(side_effect=["repeatable read", "off"]), fetch=AsyncMock()
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="scope_invalid"):
         await artifacts.authenticate_anchored_source_fact_metadata(
             connection, (), control_schema=CONTROL, api_read=True
         )
+    connection.fetch.assert_not_awaited()

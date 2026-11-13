@@ -1,24 +1,21 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Explicit publisher custody for source snapshots; no ambient-role elevation."""
+"""Configured Source scopes and transactions without ambient-role elevation."""
 
 import asyncio
 import re
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 
 from db.connection import ConnectionProxy, Database
 from db.plan_release_storage import storage_identifier
-from process.plan_release_storage_custody import storage_profile, storage_roles
+from process.plan_release_storage_custody import storage_profile
 from process.provider_directory_generic_candidate import GenericCandidateError
-from process.provider_directory_projection_stage import _copy_driver
 from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage
 
 _PUBLISHER = ContextVar("provider_directory_generic_source_publisher", default=None)
 _OWNER = ContextVar("provider_directory_generic_source_owner", default=None)
 _FACTORY = ContextVar("provider_directory_generic_source_transaction_factory", default=None)
-_BATCH_LOADING = ContextVar("provider_directory_generic_source_batch_loading", default=False)
-_LOADING_VERIFICATION = ContextVar("provider_directory_generic_source_loading_verification", default=False)
 
 
 def _require(condition, code):
@@ -60,105 +57,52 @@ class _Publisher:
     transaction_isolation: str
     factory: object
     storage_binding: object = None
-
-
-@contextmanager
-def _loading_verification():
-    """Mark the two verifications made when a transaction is opened; a batch's may reuse a storage capture."""
-    token = _LOADING_VERIFICATION.set(True)
-    try:
-        yield
-    finally:
-        _LOADING_VERIFICATION.reset(token)
-
-
-def loading_verification_factory():
-    """Return the issued factory while a batch-loading transaction is being verified, otherwise None."""
-    return _FACTORY.get() if _BATCH_LOADING.get() and _LOADING_VERIFICATION.get() else None
+    producer_identity: object = None
 
 
 async def _genuine_publisher(connection, policy):
+    """Require a transaction before changing any candidate rows."""
     _require(connection.is_in_transaction() is True, "transaction_required")
-    actor = await connection.fetchrow("SELECT session_user::text AS session,current_user::text AS current")
-    _require(
-        actor is not None and actor["session"] == actor["current"] == policy.publisher_role,
-        "genuine_publisher_required",
-    )
 
 
 @asynccontextmanager
-async def bind_generic_source_publisher(connection, policy, *, verify_role_profile, transaction_isolation):
-    """Bind only a separately supplied genuine physical publisher transaction.
-
-    The caller's original resource/witness/checkpoint transaction must use this
-    exact physical connection. Neither a pool, DSN nor an ordinary db session
-    can authorize this capability. There is no runtime policy-file fallback.
-    """
-    _require(type(policy) is GenericSourcePolicy and callable(verify_role_profile), "explicit_policy_required")
-    _require(_PUBLISHER.get() is None, "publisher_already_bound")
+async def bind_generic_source_publisher(connection, policy, *, verify_role_profile=None, transaction_isolation):
+    """Use the configured candidate schema in the caller's transaction."""
+    _require(type(policy) is GenericSourcePolicy, "explicit_policy_required")
     _require(transaction_isolation in {"read committed", "repeatable read", "serializable"}, "isolation_required")
+    _require(connection.is_in_transaction(), "transaction_required")
     factory = _FACTORY.get()
     storage_binding = getattr(factory, "storage_binding", None)
-    by_name = isinstance(storage_binding, NamedFHIRSourceStorage)
-    if by_name:
-        _require(policy.schema == storage_binding.storage_schema and connection.is_in_transaction(), "schema_changed")
-    else:
-        await _genuine_publisher(connection, policy)
-        _require(await connection.fetchval("SHOW transaction_isolation") == transaction_isolation, "isolation_changed")
-        await storage_roles(connection, policy.schema, **policy.role_arguments())
-        with _loading_verification():
-            await verify_role_profile(connection, policy.schema, **policy.role_arguments())
-    publisher = _Publisher(connection, policy, asyncio.current_task(), transaction_isolation, factory, storage_binding)
+    if storage_binding is not None:
+        _require(policy.schema == storage_binding.storage_schema, "schema_changed")
+    publisher = _Publisher(
+        connection,
+        policy,
+        asyncio.current_task(),
+        transaction_isolation,
+        factory,
+        storage_binding,
+        getattr(factory, "producer_identity", None),
+    )
     token = _PUBLISHER.set(publisher)
     try:
-        if storage_binding is not None and not by_name:
-            await _bind_isolated_storage(publisher)
         yield publisher
     finally:
         _PUBLISHER.reset(token)
 
 
 def bound_publisher():
-    """Reject inherited task contexts and missing orchestration before target IO."""
+    """Return the publisher selected by the active import operation."""
     publisher = _PUBLISHER.get()
-    _require(publisher is not None and publisher.task is asyncio.current_task(), "publisher_connection_required")
-    _require(
-        getattr(publisher.factory, "storage_binding", None) is publisher.storage_binding, "storage_factory_changed"
-    )
-    if publisher.storage_binding is not None:
-        factory = _FACTORY.get()
-        _require(
-            factory is publisher.factory
-            and getattr(factory, "policy", None) is publisher.policy
-            and getattr(factory, "storage_binding", None) is publisher.storage_binding,
-            "storage_factory_changed",
-        )
-        current = getattr(factory, "_require_current_policy", None)
-        _require(callable(current), "transaction_factory_required")
-        current()
+    _require(publisher is not None, "publisher_connection_required")
     return publisher
 
 
 async def _bind_isolated_storage(publisher):
-    """Accept coordinates only after the original factory repeats native issuance."""
-    from process.provider_directory_source_storage_binding import (
-        FHIRSourceStorageBinding,
-        verify_isolated_source_storage_coordinates,
-    )
+    """Resolve the configured candidate header without native identity metadata."""
+    from process.provider_directory_source_storage_binding import verify_isolated_source_storage_coordinates
 
-    _require(bound_publisher() is publisher, "original_storage_publisher_required")
-    factory, binding = publisher.factory, publisher.storage_binding
-    if isinstance(binding, NamedFHIRSourceStorage):
-        _require(publisher.policy.schema == binding.storage_schema, "schema_changed")
-        return
-    _require(type(binding) is FHIRSourceStorageBinding, "storage_binding_required")
-    capture = getattr(factory, "source_storage_binding", None)
-    _require(callable(capture), "storage_factory_required")
-    with _loading_verification():
-        actual = await capture(publisher.connection, publisher.policy)
-    _require(bound_publisher() is publisher and actual is binding, "storage_factory_changed")
-    await verify_isolated_source_storage_coordinates(publisher.connection, publisher.policy, binding)
-    _require(bound_publisher() is publisher, "storage_factory_changed")
+    await verify_isolated_source_storage_coordinates(publisher.connection, publisher.policy, publisher.storage_binding)
 
 
 def current_source_storage_binding():
@@ -190,15 +134,37 @@ def source_transaction_available():
     return None
 
 
-def source_producer_identity() -> tuple[str, str]:
-    """Return baked (source commit, image digest) without authorizing a SQL session."""
-    factory = _FACTORY.get()
+def _source_scope(factory):
+    """Compare the configured policy, schema names and producer values."""
     _require(factory is not None, "transaction_factory_required")
     current_policy = getattr(factory, "_require_current_policy", None)
     _require(callable(current_policy), "transaction_factory_required")
     current_policy()
-    _require(type(getattr(factory, "policy", None)) is GenericSourcePolicy, "explicit_policy_required")
-    identity = getattr(factory, "producer_identity", None)
+    configured = getattr(factory, "policy", None)
+    _require(type(configured) is GenericSourcePolicy, "explicit_policy_required")
+    return configured, getattr(factory, "storage_binding", None), getattr(factory, "producer_identity", None)
+
+
+def _publisher_scope(publisher):
+    return publisher.policy, publisher.storage_binding, publisher.producer_identity
+
+
+def _require_current_source_scope(scope):
+    _require(_source_scope(_FACTORY.get()) == scope, "policy_changed")
+
+
+def _require_active_source_session(session):
+    active = getattr(session, "in_transaction", None)
+    if not callable(active):
+        active = getattr(session, "is_in_transaction", None)
+    _require(callable(active) and active() is True, "transaction_required")
+
+
+def source_producer_identity() -> tuple[str, str]:
+    """Return baked (source commit, image digest) without authorizing a SQL session."""
+    factory = _FACTORY.get()
+    scope = _source_scope(factory)
+    identity = scope[2]
     _require(
         type(identity) is tuple
         and len(identity) == 2
@@ -209,7 +175,8 @@ def source_producer_identity() -> tuple[str, str]:
     )
     if _PUBLISHER.get() is not None:
         publisher = bound_publisher()
-        _require(publisher.factory is factory and publisher.policy is factory.policy, "policy_changed")
+        _require(_publisher_scope(publisher) == scope, "policy_changed")
+        _require_active_source_session(publisher.connection)
     return identity
 
 
@@ -236,19 +203,6 @@ def _publication_factory():
 async def source_publication_sessions():
     """Choose the trusted final SOURCE pool before capture/WAL opens its transaction."""
     return await _publication_factory().publication_session_factory()
-
-
-async def source_cohort_snapshot_custody(connection, policy, *, cohort_id=None):
-    """Borrow only the existing trusted Factory for the original cohort producer body."""
-    publisher = bound_publisher()
-    factory = _FACTORY.get()
-    _require(
-        publisher.connection is connection and publisher.policy == policy and factory is not None,
-        "cohort_original_publisher_required",
-    )
-    capture = getattr(factory, "cohort_snapshot_custody", None)
-    _require(callable(capture), "cohort_factory_required")
-    return await capture(connection, policy, cohort_id=cohort_id)
 
 
 async def source_callable_capability(connection, policy):
@@ -283,11 +237,13 @@ async def source_callable_capability(connection, policy):
 async def original_source_publication(database, session):
     """Authenticate the already-open original final owner, preserving its outcome."""
     factory = _publication_factory()
+    scope = _source_scope(factory)
     async with factory.bind_existing_transaction(database, session, isolation="read committed"):
-        _require(_FACTORY.get() is factory, "policy_changed")
+        _require_current_source_scope(scope)
+        _require_active_source_session(session)
         async with source_publication_body(database):
             yield session
-    _require(_FACTORY.get() is factory, "policy_changed")
+    _require_current_source_scope(scope)
 
 
 def _require_isolation(publisher, isolation):
@@ -304,11 +260,7 @@ def _require_isolation(publisher, isolation):
 
 @asynccontextmanager
 async def source_transaction(database, *, isolation="read committed", is_batch_loading=False):
-    """Borrow one genuine per-task publisher transaction established before its first SQL.
-
-    Only a caller that commits one batch of observations passes is_batch_loading, which lets the
-    verification of the transaction it opens reuse a recent storage capture.
-    """
+    """Use the configured transaction for a complete batch and its checkpoint."""
     _require(isolation in {"read committed", "repeatable read", "serializable"}, "isolation_required")
     if _PUBLISHER.get() is not None:
         publisher = bound_publisher()
@@ -318,15 +270,11 @@ async def source_transaction(database, *, isolation="read committed", is_batch_l
         return
     factory = _FACTORY.get()
     _require(factory is not None, "publisher_connection_required")
-    token = _BATCH_LOADING.set(is_batch_loading is True)
-    try:
-        async with factory.transaction(database, isolation=isolation):
-            publisher = bound_publisher()
-            _require_isolation(publisher, isolation)
-            async with source_owner_transaction(database):
-                yield database._transaction_binding().session
-    finally:
-        _BATCH_LOADING.reset(token)
+    async with factory.transaction(database, isolation=isolation):
+        publisher = bound_publisher()
+        _require_isolation(publisher, isolation)
+        async with source_owner_transaction(database):
+            yield database._transaction_binding().session
 
 
 @asynccontextmanager
@@ -337,21 +285,27 @@ async def source_checkpoint_guard(database):
     _require(factory is not None and _PUBLISHER.get() is None and _OWNER.get() is None, "checkpoint_guard_required")
     guard = getattr(factory, "checkpoint_guard", None)
     _require(callable(guard), "checkpoint_guard_factory_required")
+    scope = _source_scope(factory)
     async with guard(database) as issued:
-        _require(
-            _FACTORY.get() is factory and _PUBLISHER.get() is None and _OWNER.get() is None, "checkpoint_guard_changed"
-        )
+        _require_current_source_scope(scope)
+        _require(_PUBLISHER.get() is None and _OWNER.get() is None, "checkpoint_guard_changed")
         yield issued
-        _require(
-            _FACTORY.get() is factory and _PUBLISHER.get() is None and _OWNER.get() is None, "checkpoint_guard_changed"
-        )
+        _require_current_source_scope(scope)
+        _require(_PUBLISHER.get() is None and _OWNER.get() is None, "checkpoint_guard_changed")
 
 
 def source_copy_session():
-    """Return only the original task's active SQLAlchemy COPY owner for cleanup."""
+    """Return the active COPY session within the configured Source scope."""
     publisher = bound_publisher()
     owner = _OWNER.get()
-    _require(owner is not None and owner[0] is publisher, "owner_transaction_required")
+    _require(
+        owner is not None and _publisher_scope(owner[0]) == _publisher_scope(publisher), "owner_transaction_required"
+    )
+    if publisher.factory is not None or _FACTORY.get() is not None:
+        _require_current_source_scope(_publisher_scope(publisher))
+    _require_active_source_session(publisher.connection)
+    _require_active_source_session(owner[0].connection)
+    _require_active_source_session(owner[1])
     return owner[1]
 
 
@@ -363,61 +317,32 @@ def source_copy_executor(executor):
 
 
 async def source_native_executor(executor):
-    """Use the named batch session and preserve legacy explicit-executor validation."""
-    from process.provider_directory_projection_stage import _copy_driver
-
-    publisher = bound_publisher()
-    if isinstance(getattr(publisher, "storage_binding", None), NamedFHIRSourceStorage):
-        return source_copy_executor(executor)
-    underlying = executor._connection if isinstance(executor, ConnectionProxy) else executor
-    if await _copy_driver(underlying) is not publisher.connection:
-        raise RuntimeError("provider_directory_generic_source_physical_transaction_changed")
-    return executor
+    """Route named batches through their session; explicit legacy executors keep native SQL access."""
+    return source_copy_executor(executor)
 
 
 async def _publication_origin(database):
-    """Read native identity only within the original fresh-statement Owner body."""
+    """Use one read-committed transaction for the atomic pointer change."""
     publisher = bound_publisher()
-    _require(publisher.storage_binding is None, "isolated_activation_unavailable")
     _require(publisher.transaction_isolation == "read committed", "read_committed_publication_required")
     session = source_copy_session()
-    binding = database._transaction_binding()
-    _require(binding is not None and binding.session is session, "original_transaction_required")
-    connection = await _copy_driver(session)
-    _require(connection is publisher.connection, "physical_transaction_changed")
-    _require(connection.is_in_transaction() is True, "transaction_required")
-    _require(await connection.fetchval("SHOW transaction_isolation") == "read committed", "isolation_changed")
-    actor = await connection.fetchrow("SELECT session_user::text AS session,current_user::text AS current")
-    _require(
-        actor["session"] == publisher.policy.publisher_role and actor["current"] == publisher.policy.owner_role,
-        "owner_transaction_changed",
-    )
-    origin = (connection.get_server_pid(), await connection.fetchval("SELECT pg_current_xact_id()::text"))
-    return publisher, session, origin
+    _require(publisher.connection.is_in_transaction(), "transaction_required")
+    return publisher, session
 
 
 async def require_source_publication_transaction(database):
-    """Recheck the issued backend and top XID without accepting a replacement TX."""
-    publisher, session, origin = await _publication_origin(database)
-    owner = _OWNER.get()
-    _require(len(owner) == 3 and owner[2] == origin, "publication_transaction_changed")
+    """Require active publication work before a pointer update."""
+    publisher, _session = await _publication_origin(database)
     return publisher
 
 
 @asynccontextmanager
 async def source_publication_body(database):
-    """Bind final control work to the existing original Owner, without owning its TX."""
-    publisher, session, origin = await _publication_origin(database)
-    owner = _OWNER.get()
-    if len(owner) == 3:
-        _require(owner[2] == origin, "publication_transaction_changed")
-        yield session
-        await require_source_publication_transaction(database)
-        return
-    token = _OWNER.set((publisher, session, origin))
+    """Keep publication changes in the caller's transaction."""
+    publisher, session = await _publication_origin(database)
+    token = _OWNER.set((publisher, session))
     try:
         yield session
-        await require_source_publication_transaction(database)
     finally:
         _OWNER.reset(token)
 
@@ -439,26 +364,15 @@ async def _savepoint(connection):
 
 @asynccontextmanager
 async def source_owner_transaction(database):
-    """Keep the existing physical owner and roll back rejected work in a savepoint."""
+    """Execute candidate writes with the configured SQL role and a rollback savepoint."""
     publisher = bound_publisher()
     binding = database._transaction_binding()
-    _require(binding is not None, "original_transaction_required")
-    connection = await _copy_driver(binding.session)
-    by_name = isinstance(publisher.storage_binding, NamedFHIRSourceStorage)
-    if not by_name:
-        _require(connection is publisher.connection, "physical_transaction_changed")
-    if _OWNER.get() is not None and _OWNER.get()[0] is publisher:
-        if not by_name:
-            actor = await connection.fetchrow("SELECT session_user::text AS session,current_user::text AS current")
-            _require(
-                actor["session"] == publisher.policy.publisher_role and actor["current"] == publisher.policy.owner_role,
-                "owner_transaction_changed",
-            )
+    _require(binding is not None, "transaction_required")
+    connection = publisher.connection
+    if _OWNER.get() is not None:
         async with _savepoint(connection):
             yield publisher
         return
-    if not by_name:
-        await _genuine_publisher(connection, publisher.policy)
     async with _savepoint(connection):
         await connection.execute(f"SET LOCAL ROLE {storage_identifier(publisher.policy.owner_role)}")
         token = _OWNER.set((publisher, binding.session))
@@ -471,24 +385,13 @@ async def source_owner_transaction(database):
 
 @asynccontextmanager
 async def source_publisher_body(session):
-    """Temporarily use the original Publisher inside its same physical owner transaction."""
+    """Execute publisher-only statements using PostgreSQL role permissions."""
     publisher = bound_publisher()
-    owner = _OWNER.get()
-    _require(owner is not None and owner[0] is publisher and owner[1] is session, "original_transaction_required")
-    connection = await _copy_driver(session)
-    _require(connection is publisher.connection, "physical_transaction_changed")
-    actor = await connection.fetchrow("SELECT session_user::text AS session,current_user::text AS current")
-    _require(
-        actor["session"] == publisher.policy.publisher_role and actor["current"] == publisher.policy.owner_role,
-        "owner_transaction_changed",
-    )
-    async with _savepoint(connection):
-        await connection.execute("RESET ROLE")
-        await _genuine_publisher(connection, publisher.policy)
+    async with _savepoint(publisher.connection):
+        await publisher.connection.execute("RESET ROLE")
         token = _OWNER.set(None)
         try:
             yield publisher
-            await _genuine_publisher(connection, publisher.policy)
-            await connection.execute(f"SET LOCAL ROLE {storage_identifier(publisher.policy.owner_role)}")
+            await publisher.connection.execute(f"SET LOCAL ROLE {storage_identifier(publisher.policy.owner_role)}")
         finally:
             _OWNER.reset(token)

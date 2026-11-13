@@ -21,9 +21,9 @@ from process.registry_source_inventory_reference import INVENTORY_DIGEST_KEY, So
 from process.registry_source_recipe_composition import RegistrySourceRecipeStage
 from process.registry_source_retention import SUMMARY_KEY as RETENTION_KEY
 from process.registry_source_retention import registry_source_retention_sha256
+from tests.registry_source_recipe_support import _example
 from tests.test_registry_source_contributions import _descriptor
 from tests.test_registry_source_inventory_preparation import _aca_recipe
-from tests.test_registry_source_recipe_store_postgres import _example
 
 APPROVED = ApprovedMembershipSource(7, "b" * 64, 1)
 

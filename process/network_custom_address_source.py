@@ -20,7 +20,6 @@ from process.network_address_projection import (
     _projection_columns,
 )
 from process.network_approved_site_source import copy_approved_site_rows, verify_approved_site_sources
-from process.network_membership_writer_closure import _NATIVE_WRITER_PRIVILEGES_SQL, _protected_owner
 
 
 class NetworkCustomAddressSourceError(ValueError):
@@ -38,15 +37,6 @@ class CustomAddressSourceReceipt:
     control_schema: str
     base_source: PinnedAddressSource
     npi_source: PinnedAddressSource | None
-    source_oids: tuple[int, int, int, str]
-    npi_oids: tuple[int, int, int, str] | None
-    owner_role: str
-    runtime_roles: tuple[str, ...]
-    schema_oid: int
-    address_table_oid: int
-    binding_table_oid: int
-    office_lookup_index_oid: int
-    owner_oid: int
     custom_pair_count: int
     approved_records_sha256: str
     generation_sha256: str
@@ -55,8 +45,11 @@ class CustomAddressSourceReceipt:
     aca_carry_sha256: str | None = None
     source_aliases: bool = False
     fhir_carry_sha256: str | None = None
+    revision: int = 7
 
     def __post_init__(self):
+        if type(self.revision) is not int or self.revision not in {2, 3, 4, 5, 6, 7}:
+            raise NetworkCustomAddressSourceError("Composition receipt revision is invalid")
         if type(self.source_aliases) is not bool:
             raise NetworkCustomAddressSourceError("Source alias layout is invalid")
         for name in ("ptg_carry_sha256", "aca_carry_sha256", "fhir_carry_sha256"):
@@ -69,33 +62,8 @@ class CustomAddressSourceReceipt:
                 raise NetworkCustomAddressSourceError("Address carry digest is invalid")
 
     def as_dict(self):
-        """Return the complete bounded protected schema receipt."""
-        document = asdict(self)
-        ptg_digest = document.pop("ptg_carry_sha256")
-        aca_digest = document.pop("aca_carry_sha256")
-        source_aliases = document.pop("source_aliases")
-        fhir_digest = document.pop("fhir_carry_sha256")
-        if source_aliases:
-            document["source_aliases"] = True
-        if ptg_digest is not None:
-            document["ptg_carry_sha256"] = ptg_digest
-        if aca_digest is not None:
-            document["aca_carry_sha256"] = aca_digest
-        if fhir_digest is not None:
-            document["fhir_carry_sha256"] = fhir_digest
-        return {
-            "component": "network_custom_address_source",
-            "revision": 6
-            if source_aliases and fhir_digest is not None
-            else 5
-            if source_aliases or fhir_digest is not None
-            else 4
-            if aca_digest is not None
-            else 3
-            if ptg_digest is not None
-            else 2,
-            **document,
-        }
+        """Return the complete logical recipe and its named address edition."""
+        return {"component": "network_custom_address_source", **asdict(self)}
 
 
 def _digest(document):
@@ -103,6 +71,8 @@ def _digest(document):
 
 
 def _generation(receipt):
+    if receipt.revision < 7:
+        return receipt.generation_sha256
     document = receipt.as_dict()
     document.pop("generation_sha256")
     document.pop("address_source")
@@ -124,17 +94,6 @@ def _arguments(base_source, composition_id, approved_revision, owner_role, runti
         raise NetworkCustomAddressSourceError("Pinned composition input is invalid")
     if npi_source is not None and (type(npi_source) is not PinnedAddressSource or npi_source.table_name != "npi"):
         raise NetworkCustomAddressSourceError("Pinned NPI source is invalid")
-    _identifier(owner_role)
-    if (
-        type(runtime_roles) is not tuple
-        or not 1 <= len(runtime_roles) <= 128
-        or tuple(sorted(set(runtime_roles))) != runtime_roles
-    ):
-        raise NetworkCustomAddressSourceError("Runtime roles must be a sorted unique bounded tuple")
-    for role in runtime_roles:
-        _identifier(role)
-    if owner_role in runtime_roles:
-        raise NetworkCustomAddressSourceError("Protected owner cannot be a runtime role")
     schema_name = "network_composition_" + parsed.hex
     if base_source.schema_name == schema_name or (npi_source is not None and npi_source.schema_name == schema_name):
         raise NetworkCustomAddressSourceError("Composition sources must be external retained relations")
@@ -147,196 +106,6 @@ async def _require_transaction(connection):
         "serializable",
     }:
         raise NetworkCustomAddressSourceError("Composition requires a caller repeatable-read transaction")
-
-
-async def _source_identity(connection, pinned_source, runtime_roles, *, address=False, control_schema=None):
-    if pinned_source.schema_name.startswith("network_bootstrap_"):
-        from process.network_bootstrap_read_access import bootstrap_pin_read_roles
-
-        runtime_roles = await bootstrap_pin_read_roles(connection, pinned_source, runtime_roles)
-    return await _source_identity_with_read_roles(
-        connection, pinned_source, runtime_roles, address=address, control_schema=control_schema
-    )
-
-
-async def verify_artifact_dependency_identity(
-    connection, pinned_source, runtime_roles, *, address=False, control_schema=None
-):
-    """Use sealed input-reader intent without dropping any actual output actor."""
-    if pinned_source.schema_name.startswith("network_bootstrap_"):
-        from process.network_bootstrap_read_access import bootstrap_pin_read_roles
-
-        runtime_roles = await bootstrap_pin_read_roles(connection, pinned_source, (), runtime_actors=runtime_roles)
-    elif address and pinned_source.schema_name.startswith(("network_composition_", "entity_address_archive_")):
-        readers = await _retained_dependency_readers(connection, pinned_source)
-        if readers is not None:
-            await _dependency_actors_closed(connection, pinned_source, tuple(sorted(set((*readers, *runtime_roles)))))
-            runtime_roles = readers
-    elif address and pinned_source.schema_name.startswith("network_candidate_") and control_schema is not None:
-        await _dependency_actors_closed(connection, pinned_source, runtime_roles)
-    return await _source_identity(
-        connection, pinned_source, runtime_roles, address=address, control_schema=control_schema
-    )
-
-
-_artifact_dependency_identity = verify_artifact_dependency_identity
-
-
-async def _retained_dependency_readers(connection, pinned_source):
-    """Authenticate reader intent from the existing independently owned source receipt."""
-    if pinned_source.schema_name.startswith("network_composition_"):
-        document = await connection.fetchval(
-            "SELECT CASE WHEN octet_length(obj_description(oid,'pg_namespace'))<=65536 "
-            "THEN obj_description(oid,'pg_namespace') END FROM pg_namespace WHERE nspname=$1",
-            pinned_source.schema_name,
-        )
-        receipt = _from_document(document)
-        if receipt.address_source != pinned_source:
-            raise NetworkCustomAddressSourceError("Retained composition dependency differs")
-        await verify_retained_custom_address_source(connection, receipt)
-        return receipt.runtime_roles
-    from process.network_cms_registry_source_pair import (
-        _COMMENT,
-        _COMMENT_V2,
-        _read_committed_pair,
-        require_registry_cms_source_pair_connection,
-    )
-    from process.network_registry_cms_prepared_pair import _PREPARED_COMMENT, _PREPARED_COMMENT_V2
-
-    prefixes = (_COMMENT, _COMMENT_V2, _PREPARED_COMMENT, _PREPARED_COMMENT_V2)
-    comment = await connection.fetchval(
-        "SELECT left(obj_description(oid,'pg_namespace'),$2) FROM pg_namespace WHERE nspname=$1",
-        pinned_source.schema_name,
-        max(map(len, prefixes)),
-    )
-    if comment is None or not comment.startswith(prefixes):
-        return None
-    pair, schema_oid = await _read_committed_pair(connection, pinned_source.schema_name)
-    if pair.address_source != pinned_source or pair.address_ownership.schema_oid != schema_oid:
-        raise NetworkCustomAddressSourceError("Retained CMS address dependency differs")
-    await require_registry_cms_source_pair_connection(connection, pair, verify_content=False)
-    return pair.runtime_roles
-
-
-async def _dependency_actors_closed(connection, pinned_source, runtime_roles):
-    """Include direct, inherited and SET-only actor authority in the unchanged owner/write guard."""
-    from process.network_candidate_custody import NetworkCandidateCustodyError, _retained_address_runtime_closure
-
-    rows = await connection.fetch(
-        "SELECT DISTINCT reachable.rolname::text AS name FROM unnest($1::text[]) configured(name) "
-        "LEFT JOIN pg_roles actor ON actor.rolname=configured.name LEFT JOIN pg_roles reachable "
-        "ON reachable.oid=actor.oid OR pg_has_role(actor.oid,reachable.oid,'MEMBER') "
-        "OR pg_has_role(actor.oid,reachable.oid,'USAGE') OR pg_has_role(actor.oid,reachable.oid,'SET') "
-        "ORDER BY name LIMIT 129",
-        list(runtime_roles),
-    )
-    actors = tuple(row["name"] for row in rows)
-    if not 1 <= len(actors) <= 128 or any(actor is None for actor in actors):
-        raise NetworkCustomAddressSourceError("Retained dependency actor census differs")
-    try:
-        await _retained_address_runtime_closure(connection, pinned_source, actors)
-    except NetworkCandidateCustodyError as error:
-        raise NetworkCustomAddressSourceError("Retained dependency actor authority is not closed") from error
-
-
-async def _source_identity_with_read_roles(
-    connection, pinned_source, runtime_roles, *, address=False, control_schema=None
-):
-    """Check exact retained relation custody with roles already resolved by the caller."""
-    if address:
-        native = await _native_address_identity(connection, pinned_source, runtime_roles)
-        if native is not None:
-            return native
-    catalog = await connection.fetchrow(
-        """SELECT namespace.oid::bigint AS schema_oid,relation.oid::bigint AS table_oid,
-        owner.oid::bigint AS owner_oid,owner.*,relation.relkind,relation.relpersistence,
-        relation.relrowsecurity,relation.relforcerowsecurity,namespace.nspowner=relation.relowner AS same_owner
-        FROM pg_namespace namespace JOIN pg_class relation ON relation.relnamespace=namespace.oid
-        JOIN pg_roles owner ON owner.oid=relation.relowner
-        WHERE namespace.nspname=$1 AND relation.relname=$2""",
-        pinned_source.schema_name,
-        pinned_source.table_name,
-    )
-    if (
-        catalog is None
-        or not _protected_owner(catalog)
-        or not catalog["same_owner"]
-        or catalog["relkind"] != b"r"
-        or catalog["relpersistence"] != b"p"
-        or catalog["relrowsecurity"]
-        or catalog["relforcerowsecurity"]
-    ):
-        raise NetworkCustomAddressSourceError("Retained source is unavailable or unprotected")
-    if address and pinned_source.schema_name.startswith("network_candidate_") and control_schema is not None:
-        from process.network_serving_read import NetworkServingReadUnavailable, resolve_retained_network_address_source
-
-        try:
-            retained_manifest = await resolve_retained_network_address_source(
-                connection, pinned_source, control_schema=control_schema
-            )
-        except NetworkServingReadUnavailable as error:
-            raise NetworkCustomAddressSourceError("Retained source custody is unavailable") from error
-        if retained_manifest.address_table_oid != catalog["table_oid"]:
-            raise NetworkCustomAddressSourceError("Retained source physical identity differs")
-    else:
-        await _closed(
-            connection, catalog["schema_oid"], catalog["owner_oid"], runtime_roles, [pinned_source.table_name]
-        )
-    shape_sha256 = await _source_shape(connection, catalog["table_oid"], address=address)
-    return (
-        catalog["schema_oid"],
-        catalog["table_oid"],
-        catalog["owner_oid"],
-        shape_sha256,
-    )
-
-
-async def _source_shape(connection, table_oid, *, address):
-    """Retain exact native column order, shape and defaults for each pinned source."""
-    columns = await connection.fetch(
-        "SELECT attname,atttypid::regtype::text AS type,atttypmod,attnotnull,pg_get_expr(d.adbin,d.adrelid) AS default_expr FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE attrelid=$1::oid AND attnum>0 AND NOT attisdropped ORDER BY attnum",
-        table_oid,
-    )
-    # Metadata compaction can replace a column at the end. The receipt below
-    # still pins its exact native order, types, nullability and defaults.
-    if address and sorted(column["attname"] for column in columns) != sorted(
-        EntityAddressUnified.__table__.columns.keys()
-    ):
-        raise NetworkCustomAddressSourceError("Retained unified address shape differs")
-    if not address and not any(column["attname"] == "npi" and column["type"] == "bigint" for column in columns):
-        raise NetworkCustomAddressSourceError("Retained NPI shape differs")
-    return _digest([dict(column) for column in columns])
-
-
-async def _native_address_identity(connection, source, runtime_roles):
-    from process.network_address_artifact import capture_network_address_artifact
-
-    authority = await connection.fetchval(
-        "SELECT to_regclass($1)::oid", _identifier(source.schema_name) + ".entity_address_result_generation"
-    )
-    if authority is None:
-        return None
-    descriptor = await capture_network_address_artifact(connection, source, runtime_roles=runtime_roles)
-    await _source_shape(connection, descriptor["table"]["oid"], address=True)
-    return (
-        descriptor["namespace"]["oid"],
-        descriptor["table"]["oid"],
-        descriptor["protected_owner_oid"],
-        descriptor["descriptor_sha256"],
-    )
-
-
-async def _closed(connection, schema_oid, owner_oid, runtime_roles, relation_names):
-    closed = await connection.fetchval(
-        "WITH closure_scope AS (SELECT $1::oid AS schema_oid,$2::oid AS owner_oid,$3::text[] AS role_names,$4::text[] AS relation_names)"
-        + _NATIVE_WRITER_PRIVILEGES_SQL,
-        schema_oid,
-        owner_oid,
-        list(runtime_roles),
-        relation_names,
-    )
-    if closed is not True:
-        raise NetworkCustomAddressSourceError("Native owner or runtime privileges are not closed")
 
 
 # Let exact kind/key predicates use the approved-record primary key.
@@ -417,7 +186,7 @@ def _has_source_aliases(receipts):
 
 async def _build_heaps(connection, recipe, schema_name, control, office_inputs):
     base_source, npi_source = recipe.base_source, recipe.npi_source
-    revision, base_oid = recipe.approved_revision, recipe.source_oids[1]
+    revision = recipe.approved_revision
     site_sources = await verify_approved_site_sources(
         connection, approved_revision=revision, control_schema=control[1:-1]
     )
@@ -425,12 +194,9 @@ async def _build_heaps(connection, recipe, schema_name, control, office_inputs):
     address_table = namespace + ".entity_address_unified"
     base_table = f"{_identifier(base_source.schema_name)}.{_identifier(base_source.table_name)}"
     npi_table = f"{_identifier(npi_source.schema_name)}.{_identifier(npi_source.table_name)}" if npi_source else None
-    await connection.execute(f"LOCK TABLE {base_table} IN ACCESS SHARE MODE NOWAIT")
-    if await connection.fetchval("SELECT to_regclass($1)::oid::bigint", base_table) != base_oid:
-        raise NetworkCustomAddressSourceError("Retained address native identity differs")
     # Validate the existing native key; retention keeps every original column.
     await _projection_columns(connection, base_table)
-    await _create_artifact_schema(connection, schema_name, recipe.owner_role)
+    await _create_artifact_schema(connection, schema_name)
     await connection.execute(f"CREATE TABLE {address_table} (LIKE {base_table} INCLUDING DEFAULTS)")
     await connection.execute(f"ALTER TABLE {address_table} ADD PRIMARY KEY(location_key)")
     copied_rows = await _copy_projection_rows(
@@ -487,11 +253,10 @@ async def _source_alias_layout(connection, schema_name, *, writing=False):
     return layout["source_aliases"]
 
 
-_INSERT_ADDRESS_SQL = """INSERT INTO {address_table} (
- entity_type,entity_id,npi,entity_name,location_key,row_origin,address_precision,checksum,type,
+_CUSTOM_ADDRESS_COLUMNS = """entity_type,entity_id,npi,entity_name,location_key,row_origin,address_precision,checksum,type,
  first_line,second_line,city_name,state_name,postal_code,country_code,address_key,premise_key,zip5,state_code,city_norm,
- taxonomy_array,plans_network_array,procedures_array,medications_array,canonical_network_ids)
- SELECT provider_system,provider_id,CASE WHEN provider_system='npi' THEN provider_id::bigint
+ taxonomy_array,plans_network_array,procedures_array,medications_array,canonical_network_ids"""
+_CUSTOM_ADDRESS_SELECT = """SELECT provider_system,provider_id,CASE WHEN provider_system='npi' THEN provider_id::bigint
    ELSE (provider->>'npi')::bigint END,
  CASE WHEN provider_system='manual' THEN provider->>'display_name' ELSE 'NPI '||provider_id END,
  location_key,'network_custom','street',('x'||substr(location_key,1,16))::bit(64)::bigint,'practice',
@@ -499,148 +264,63 @@ _INSERT_ADDRESS_SQL = """INSERT INTO {address_table} (
  site->'address_json'->>'state',site->'address_json'->>'zip',site->'address_json'->>'country',
  (site->'canonical_address_json'->>'address_key')::uuid,(site->'canonical_address_json'->>'premise_key')::uuid,
  site->'canonical_address_json'->>'zip5',site->'canonical_address_json'->>'state_code',site->'canonical_address_json'->>'city_norm',
- '{{}}'::integer[],'{{}}'::integer[],'{{}}'::integer[],'{{}}'::integer[],'{{}}'::integer[] FROM custom
-"""
+ '{{}}'::integer[],'{{}}'::integer[],'{{}}'::integer[],'{{}}'::integer[],'{{}}'::integer[] FROM custom"""
+_INSERT_ADDRESS_SQL = "INSERT INTO {address_table} (" + _CUSTOM_ADDRESS_COLUMNS + ") " + _CUSTOM_ADDRESS_SELECT
 
 
 async def _freeze(connection, schema_name, owner_role, runtime_roles):
-    namespace, owner = _identifier(schema_name), _identifier(owner_role)
-    role = await connection.fetchrow("SELECT * FROM pg_roles WHERE rolname=$1", owner_role)
-    if not _protected_owner(role) or not await connection.fetchval(
-        "SELECT pg_has_role(current_user,$1::name,'SET')", owner_role
-    ):
-        raise NetworkCustomAddressSourceError("Protected composition owner is unavailable")
-    if (
-        await connection.fetchval(
-            "SELECT nspowner=$2::oid FROM pg_namespace WHERE nspname=$1", schema_name, role["oid"]
-        )
-        is not True
-    ):
-        raise NetworkCustomAddressSourceError("Composition schema protected owner differs")
-    for table in ("entity_address_unified", "provider_location_binding"):
-        await connection.execute(f"ALTER TABLE {namespace}.{table} OWNER TO {owner}")
-    original = await connection.fetchval("SELECT quote_ident(current_user)")
-    await connection.execute(f"SET LOCAL ROLE {owner}")
+    from process.provider_directory_generic_source_provision import freeze_fhir_source_snapshot
+
     try:
-        await _freeze_artifact_grants(connection, schema_name, role["oid"], runtime_roles)
-    finally:
-        await connection.execute(f"SET LOCAL ROLE {original}")
-    return role["oid"]
-
-
-async def _create_artifact_schema(connection, schema_name, owner_role):
-    """Create under the final owner without granting that owner database CREATE."""
-    namespace, owner = _identifier(schema_name), _identifier(owner_role)
-    role = await connection.fetchrow("SELECT * FROM pg_roles WHERE rolname=$1", owner_role)
-    if not _protected_owner(role) or not await connection.fetchval(
-        "SELECT pg_has_role(current_user,$1::name,'SET')", owner_role
-    ):
-        raise NetworkCustomAddressSourceError("Protected composition owner is unavailable")
-    original = await connection.fetchval("SELECT quote_ident(current_user)")
-    await connection.execute(f"CREATE SCHEMA {namespace} AUTHORIZATION {owner}")
-    await connection.execute(f"SET LOCAL ROLE {owner}")
-    try:
-        # The existing custodian already has SET to this owner. This target-only
-        # construction grant is removed before any artifact may be returned.
-        await connection.execute(f"GRANT USAGE,CREATE ON SCHEMA {namespace} TO {original}")
-    finally:
-        await connection.execute(f"SET LOCAL ROLE {original}")
-
-
-async def _freeze_artifact_grants(connection, schema_name, owner_oid, runtime_roles):
-    """Remove construction access while the original custodian assumes the final owner."""
-    namespace = _identifier(schema_name)
-    acl_rows = await connection.fetch(
-        """SELECT DISTINCT CASE WHEN a.grantee=0 THEN 'PUBLIC' ELSE quote_ident(r.rolname) END AS grantee
-      FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid
-      CROSS JOIN LATERAL aclexplode(coalesce(n.nspacl,acldefault('n',n.nspowner))||coalesce(c.relacl,acldefault('r',c.relowner))) a
-      LEFT JOIN pg_roles r ON r.oid=a.grantee WHERE n.nspname=$1 AND a.grantee<>$2::oid""",
-        schema_name,
-        owner_oid,
-    )
-    for acl in acl_rows:
-        await connection.execute(f"REVOKE ALL ON SCHEMA {namespace} FROM {acl['grantee']} CASCADE")
-        await connection.execute(f"REVOKE ALL ON ALL TABLES IN SCHEMA {namespace} FROM {acl['grantee']} CASCADE")
-    for runtime in runtime_roles:
-        await connection.execute(f"GRANT USAGE ON SCHEMA {namespace} TO {_identifier(runtime)}")
-        await connection.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA {namespace} TO {_identifier(runtime)}")
-
-
-async def _artifact_identity(connection, schema_name, owner_oid, runtime_roles, *, source_aliases=False):
-    if not _protected_owner(await connection.fetchrow("SELECT * FROM pg_roles WHERE oid=$1::oid", owner_oid)):
-        raise NetworkCustomAddressSourceError("Composition protected owner differs")
-    schema_oid = await connection.fetchval(
-        "SELECT oid::bigint FROM pg_namespace WHERE nspname=$1 AND nspowner=$2::oid", schema_name, owner_oid
-    )
-    relations = await connection.fetch(
-        """SELECT c.oid::bigint,c.relname,c.relkind,c.relowner::bigint,c.relpersistence,c.relrowsecurity,c.relforcerowsecurity,c.relhastriggers,i.indrelid::bigint,i.indisvalid,i.indisready
-      FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid=c.oid WHERE c.relnamespace=$1::oid ORDER BY c.relname LIMIT 9""",
-        schema_oid,
-    )
-    heap_oids_by_name = {relation["relname"]: relation["oid"] for relation in relations if relation["relkind"] == b"r"}
-    if (
-        schema_oid is None
-        or set(heap_oids_by_name) != {"entity_address_unified", "provider_location_binding"}
-        or len(relations) > 8
-        or any(
-            relation["relowner"] != owner_oid
-            or relation["relpersistence"] != b"p"
-            or relation["relrowsecurity"]
-            or relation["relforcerowsecurity"]
-            or relation["relhastriggers"]
-            or relation["relkind"] not in {b"r", b"i"}
-            or (
-                relation["relkind"] == b"i"
-                and (
-                    relation["indrelid"] not in heap_oids_by_name.values()
-                    or not relation["indisvalid"]
-                    or not relation["indisready"]
-                )
-            )
-            for relation in relations
+        await freeze_fhir_source_snapshot(
+            connection,
+            schema_name,
+            namespace_owner=owner_role,
+            reader_roles=runtime_roles,
+            application_roles=runtime_roles,
         )
-    ):
-        raise NetworkCustomAddressSourceError("Composition native relation identity differs")
-    if await connection.fetchval("SELECT EXISTS(SELECT 1 FROM pg_proc WHERE pronamespace=$1::oid)", schema_oid):
-        raise NetworkCustomAddressSourceError("Composition contains unsupported stored routines")
-    await _binding_shape(connection, heap_oids_by_name["provider_location_binding"], source_aliases=source_aliases)
-    lookup_oid = await _office_lookup_identity(connection, schema_oid, heap_oids_by_name["entity_address_unified"])
-    await _closed(connection, schema_oid, owner_oid, runtime_roles, None)
-    return (
-        schema_oid,
-        heap_oids_by_name["entity_address_unified"],
-        heap_oids_by_name["provider_location_binding"],
-        lookup_oid,
+    except (ValueError, asyncpg.PostgresError) as error:
+        raise NetworkCustomAddressSourceError("Composition native freeze failed") from error
+
+
+async def _create_artifact_schema(connection, schema_name):
+    await connection.execute(f"CREATE SCHEMA {_identifier(schema_name)}")
+
+
+async def _source_columns(connection, source, *, address):
+    """Check the named source's actual columns and required data types."""
+    relation = _identifier(source.schema_name) + "." + _identifier(source.table_name)
+    columns = await connection.fetch(
+        "SELECT attname,atttypid::regtype::text AS type,atttypmod,attnotnull,"
+        "pg_get_expr(d.adbin,d.adrelid) AS default_expr FROM pg_attribute a "
+        "LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum "
+        "WHERE attrelid=to_regclass($1) AND attnum>0 AND NOT attisdropped ORDER BY attnum",
+        relation,
     )
+    if address:
+        if sorted(column["attname"] for column in columns) != sorted(EntityAddressUnified.__table__.columns.keys()):
+            raise NetworkCustomAddressSourceError("Retained unified address shape differs")
+        await _projection_columns(connection, relation)
+    elif not any(column["attname"] == "npi" and column["type"] == "bigint" for column in columns):
+        raise NetworkCustomAddressSourceError("Retained NPI shape differs")
+    return tuple(dict(column) for column in columns)
 
 
-async def _office_lookup_identity(connection, schema_oid, address_oid):
+async def _office_lookup_shape(connection, schema_name):
     index = await connection.fetchrow(
-        """SELECT c.oid::bigint AS oid,am.amname,i.indrelid::bigint,i.indisvalid,i.indisready,
-        i.indisunique,i.indnkeyatts,i.indnatts,i.indexprs IS NULL AS plain,i.indpred IS NULL AS complete,
-        ARRAY(SELECT a.attname::text FROM unnest(i.indkey) WITH ORDINALITY key(attnum,ordinal)
-          JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=key.attnum ORDER BY ordinal) AS columns
-        FROM pg_class c JOIN pg_index i ON i.indexrelid=c.oid JOIN pg_am am ON am.oid=c.relam
-        WHERE c.relnamespace=$1::oid AND c.relname='entity_address_unified_network_office_lookup'""",
-        schema_oid,
+        """SELECT am.amname,i.indisvalid,i.indisready,i.indisunique,
+      i.indnkeyatts,i.indnatts,i.indexprs IS NULL AS plain,i.indpred IS NULL AS complete,
+      ARRAY(SELECT a.attname::text FROM unnest(i.indkey) WITH ORDINALITY key(attnum,ordinal)
+        JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=key.attnum ORDER BY ordinal) AS columns
+      FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_index i ON i.indexrelid=c.oid
+      JOIN pg_class target ON target.oid=i.indrelid JOIN pg_am am ON am.oid=c.relam
+      WHERE n.nspname=$1 AND c.relname='entity_address_unified_network_office_lookup'
+        AND target.relname='entity_address_unified'""",
+        schema_name,
     )
-    if index is None or tuple(
-        index[field]
-        for field in (
-            "amname",
-            "indrelid",
-            "indisvalid",
-            "indisready",
-            "indisunique",
-            "indnkeyatts",
-            "indnatts",
-            "plain",
-            "complete",
-            "columns",
-        )
-    ) != ("btree", address_oid, True, True, False, 2, 2, True, True, ["npi", "address_key"]):
+    expected = ("btree", True, True, False, 2, 2, True, True, ["npi", "address_key"])
+    if index is None or tuple(index.values()) != expected:
         raise NetworkCustomAddressSourceError("Composition exact office lookup index differs")
-    return index["oid"]
 
 
 async def _prepare_office_lookup(connection, schema_name):
@@ -651,10 +331,10 @@ async def _prepare_office_lookup(connection, schema_name):
     await connection.execute(f"ANALYZE {address}(npi,address_key)")
 
 
-async def _binding_shape(connection, binding_oid, *, source_aliases=False):
+async def _binding_shape(connection, binding_relation, *, source_aliases=False):
     columns = await connection.fetch(
-        "SELECT attname,atttypid::regtype::text AS type,atttypmod,attnotnull FROM pg_attribute WHERE attrelid=$1::oid AND attnum>0 AND NOT attisdropped ORDER BY attnum",
-        binding_oid,
+        "SELECT attname,atttypid::regtype::text AS type,atttypmod,attnotnull FROM pg_attribute WHERE attrelid=to_regclass($1) AND attnum>0 AND NOT attisdropped ORDER BY attnum",
+        binding_relation,
     )
     expected_columns = [
         ("provider_system", "text", -1, True),
@@ -665,8 +345,8 @@ async def _binding_shape(connection, binding_oid, *, source_aliases=False):
         ("entity_id", "text", -1, True),
     ]
     constraints = await connection.fetch(
-        "SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid=$1::oid AND contype IN ('p','u') ORDER BY contype",
-        binding_oid,
+        "SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid=to_regclass($1) AND contype IN ('p','u') ORDER BY contype",
+        binding_relation,
     )
     expected_constraints = {"PRIMARY KEY (provider_system, provider_id, location_id)"}
     if not source_aliases:
@@ -677,25 +357,63 @@ async def _binding_shape(connection, binding_oid, *, source_aliases=False):
         raise NetworkCustomAddressSourceError("Composition binding shape differs")
 
 
+async def _verify_custom_rows(connection, receipt):
+    """Compare the complete approved direct contribution using indexed named data."""
+    namespace = _identifier(receipt.address_source.schema_name)
+    columns = tuple(column.strip() for column in _CUSTOM_ADDRESS_COLUMNS.split(","))
+    # Membership publication rebuilds and validates canonical network arrays separately.
+    compared_columns = tuple(column for column in columns if column != "canonical_network_ids")
+    actual_values = ",".join("address." + column for column in compared_columns)
+    expected_values = ",".join("expected." + column for column in compared_columns)
+    matches = await connection.fetchval(
+        _APPROVED_CTE.format(control=_identifier(receipt.control_schema))
+        + f""", expected_addresses ({_CUSTOM_ADDRESS_COLUMNS}) AS MATERIALIZED (
+            {_CUSTOM_ADDRESS_SELECT.format()}
+        ), expected_bindings AS MATERIALIZED (
+            SELECT provider_system,provider_id,location_id,location_key,
+              provider_system AS entity_type,provider_id AS entity_id FROM custom
+        ), actual_bindings AS MATERIALIZED (
+            SELECT binding.provider_system,binding.provider_id,binding.location_id,binding.location_key,
+              binding.entity_type,binding.entity_id FROM {namespace}.provider_location_binding binding
+            LEFT JOIN {namespace}.entity_address_unified address USING(location_key)
+            WHERE (binding.provider_system,binding.provider_id,binding.location_id)
+              IN (SELECT provider_system,provider_id,location_id FROM expected_bindings)
+              OR binding.location_key IN (SELECT location_key FROM expected_bindings)
+              OR ((address.row_origin='network_custom' OR binding.location_key=encode(sha256(convert_to(
+                jsonb_build_array('network_custom',binding.provider_system,binding.provider_id,binding.location_id)::text,
+                'UTF8')),'hex')) AND NOT EXISTS(
+                  SELECT FROM approved retained WHERE retained.record_kind='site_binding'
+                    AND retained.record_json->'archived'='false'::jsonb
+                    AND (retained.record_json->>'provider_system',retained.record_json->>'provider_id',
+                      retained.record_json->>'location_id')
+                      =(binding.provider_system,binding.provider_id,binding.location_id::text)))
+        ) SELECT NOT EXISTS(
+            (SELECT * FROM expected_bindings EXCEPT ALL SELECT * FROM actual_bindings)
+            UNION ALL (SELECT * FROM actual_bindings EXCEPT ALL SELECT * FROM expected_bindings)
+        ) AND NOT EXISTS(
+            SELECT FROM expected_addresses expected LEFT JOIN {namespace}.entity_address_unified address USING(location_key)
+            WHERE address.location_key IS NULL OR ({actual_values}) IS DISTINCT FROM ({expected_values})
+        )""",
+        receipt.approved_revision,
+    )
+    if matches is not True:
+        raise NetworkCustomAddressSourceError("Approved custom bindings or address data differ")
+
+
 def _recipe_identity(receipt):
-    identity = (
+    return (
+        receipt.composition_id,
         receipt.base_source,
         receipt.npi_source,
-        receipt.source_oids,
-        receipt.npi_oids,
         receipt.approved_revision,
-        receipt.owner_role,
-        receipt.runtime_roles,
         receipt.control_schema,
+        receipt.custom_pair_count,
         receipt.approved_records_sha256,
         receipt.ptg_carry_sha256,
         receipt.aca_carry_sha256,
+        receipt.source_aliases,
+        receipt.fhir_carry_sha256,
     )
-    if receipt.fhir_carry_sha256 is None:
-        return (*identity, receipt.source_aliases)
-    if receipt.source_aliases:
-        return (*identity, True, receipt.fhir_carry_sha256)
-    return (*identity, receipt.fhir_carry_sha256)
 
 
 async def _replay_custom_artifact(connection, recipe, schema_name, office_inputs, stored):
@@ -717,7 +435,7 @@ async def _replay_custom_artifact(connection, recipe, schema_name, office_inputs
 
 
 async def _prepare_artifact(connection, recipe, schema_name, control, office_inputs):
-    """Close all carries and alias layout before freezing; rederive stored recipes on replay."""
+    """Complete every data carry and alias layout before recording the named recipe."""
     stored = await connection.fetchval(
         "SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=$1", schema_name
     )
@@ -741,18 +459,7 @@ async def _prepare_artifact(connection, recipe, schema_name, control, office_inp
         source_aliases=has_source_aliases,
         fhir_carry_sha256=fhir_digest,
     )
-    owner_oid = await _freeze(connection, schema_name, recipe.owner_role, recipe.runtime_roles)
-    schema_oid, address_oid, binding_oid, lookup_oid = await _artifact_identity(
-        connection, schema_name, owner_oid, recipe.runtime_roles, source_aliases=recipe.source_aliases
-    )
-    receipt = replace(
-        recipe,
-        schema_oid=schema_oid,
-        address_table_oid=address_oid,
-        binding_table_oid=binding_oid,
-        office_lookup_index_oid=lookup_oid,
-        owner_oid=owner_oid,
-    )
+    receipt = recipe
     generation = _generation(receipt)
     receipt = replace(
         receipt, generation_sha256=generation, address_source=replace(receipt.address_source, generation_id=generation)
@@ -760,13 +467,9 @@ async def _prepare_artifact(connection, recipe, schema_name, control, office_inp
     document = json.dumps(receipt.as_dict(), sort_keys=True, separators=(",", ":"))
     if len(document.encode()) > 65536:
         raise NetworkCustomAddressSourceError("Composition receipt exceeds its bound")
+    await _verify_custom_rows(connection, receipt)
     quoted_document = await connection.fetchval("SELECT quote_literal($1::text)", document)
-    original = await connection.fetchval("SELECT quote_ident(current_user)")
-    await connection.execute(f"SET LOCAL ROLE {_identifier(recipe.owner_role)}")
-    try:
-        await connection.execute(f"COMMENT ON SCHEMA {_identifier(schema_name)} IS {quoted_document}")
-    finally:
-        await connection.execute(f"SET LOCAL ROLE {original}")
+    await connection.execute(f"COMMENT ON SCHEMA {_identifier(schema_name)} IS {quoted_document}")
     return receipt
 
 
@@ -841,11 +544,14 @@ async def prepare_custom_address_source(
     arguments = CustomAddressSourceArguments(
         composition_id, approved_revision, owner_role, runtime_roles, control_schema, npi_source
     )
-    return await prepare_recipe_address_source(connection, base_source, arguments)
+    async with connection.transaction():
+        receipt = await prepare_recipe_address_source(connection, base_source, arguments)
+        await _freeze(connection, receipt.address_source.schema_name, owner_role, runtime_roles)
+        return receipt
 
 
 async def prepare_recipe_address_source(connection, base_source, arguments, office_inputs=((), None)):
-    """Prepare under the caller snapshot with exact recipes and native office custody."""
+    """Stage complete address data and its logical recipe in the caller snapshot."""
     if type(arguments) is not CustomAddressSourceArguments:
         raise NetworkCustomAddressSourceError("Composition arguments are required")
     composition_id, approved_revision = arguments.composition_id, arguments.approved_revision
@@ -858,34 +564,20 @@ async def prepare_recipe_address_source(connection, base_source, arguments, offi
     try:
         async with connection.transaction():
             summary = await _approved_identity(connection, control, approved_revision)
-            source_oids = await _artifact_dependency_identity(
-                connection, base_source, runtime_roles, address=True, control_schema=control_name
-            )
+            await _source_columns(connection, base_source, address=True)
             effective_npi_source = npi_source or (
                 PinnedAddressSource(base_source.schema_name, "npi", base_source.generation_id)
                 if summary["npi_pairs"]
                 else None
             )
-            npi_oids = (
-                await _artifact_dependency_identity(connection, effective_npi_source, runtime_roles)
-                if effective_npi_source
-                else None
-            )
+            if effective_npi_source is not None:
+                await _source_columns(connection, effective_npi_source, address=False)
             recipe = CustomAddressSourceReceipt(
                 composition_id,
                 approved_revision,
                 control_name,
                 base_source,
                 effective_npi_source,
-                source_oids,
-                npi_oids,
-                owner_role,
-                runtime_roles,
-                0,
-                0,
-                0,
-                0,
-                0,
                 summary["pairs"],
                 summary["fingerprint"],
                 "",
@@ -921,40 +613,88 @@ def _receipt_features(parsed, revision):
             raise ValueError
 
 
+_LOGICAL_RECEIPT_FIELDS = frozenset(CustomAddressSourceReceipt.__dataclass_fields__) - {"revision"}
+_LEGACY_PHYSICAL_FIELDS = {
+    "source_oids",
+    "npi_oids",
+    "owner_role",
+    "runtime_roles",
+    "schema_oid",
+    "address_table_oid",
+    "binding_table_oid",
+    "office_lookup_index_oid",
+    "owner_oid",
+}
+_OPTIONAL_RECEIPT_FIELDS = {"ptg_carry_sha256", "aca_carry_sha256", "source_aliases", "fhir_carry_sha256"}
+
+
+def _named_receipt(parsed_by_field, revision):
+    """Decode named pins and validate complete logical scope and current recipe digest."""
+    for field in ("base_source", "address_source", "npi_source"):
+        if parsed_by_field[field] is not None:
+            parsed_by_field[field] = PinnedAddressSource(**parsed_by_field[field])
+    receipt = CustomAddressSourceReceipt(**parsed_by_field, revision=revision)
+    schema_name = _arguments(
+        receipt.base_source, receipt.composition_id, receipt.approved_revision, None, (), receipt.npi_source
+    )
+    _identifier(receipt.control_schema)
+    if type(receipt.custom_pair_count) is not int or not 0 <= receipt.custom_pair_count < 2**63:
+        raise ValueError
+    for digest in (receipt.approved_records_sha256, receipt.generation_sha256):
+        if (
+            type(digest) is not str
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError
+    if receipt.address_source != PinnedAddressSource(schema_name, "entity_address_unified", receipt.generation_sha256):
+        raise ValueError
+    if revision == 7 and _generation(receipt) != receipt.generation_sha256:
+        raise ValueError
+    return receipt
+
+
 def _from_document(document):
     if type(document) is not str or len(document.encode()) > 65536:
         raise NetworkCustomAddressSourceError("Retained composition receipt exceeds its bound")
     try:
-        parsed = json.loads(document, object_pairs_hook=_receipt_object)
-        if type(parsed) is not dict:
+        parsed_by_field = json.loads(document, object_pairs_hook=_receipt_object)
+        if type(parsed_by_field) is not dict or parsed_by_field.pop("component") != "network_custom_address_source":
             raise ValueError
-        if parsed.pop("component") != "network_custom_address_source":
+        revision = parsed_by_field.pop("revision")
+        if type(revision) is not int or revision not in {2, 3, 4, 5, 6, 7}:
             raise ValueError
-        revision = parsed.pop("revision")
-        if type(revision) is not int or revision not in {2, 3, 4, 5, 6}:
-            raise ValueError
-        _receipt_features(parsed, revision)
-        if revision == 2 and ({"ptg_carry_sha256", "aca_carry_sha256"} & set(parsed)):
-            raise ValueError
-        if revision == 3 and "aca_carry_sha256" in parsed:
-            raise ValueError
-        if revision in {3, 4}:
-            carry_digest = parsed.get("ptg_carry_sha256" if revision == 3 else "aca_carry_sha256")
-            if (
-                type(carry_digest) is not str
-                or len(carry_digest) != 64
-                or any(character not in "0123456789abcdef" for character in carry_digest)
-            ):
+        if revision == 7:
+            if set(parsed_by_field) != _LOGICAL_RECEIPT_FIELDS:
                 raise ValueError
-        if revision == 4 and "ptg_carry_sha256" in parsed and parsed["ptg_carry_sha256"] is None:
-            raise ValueError
-        for field in ("base_source", "address_source", "npi_source"):
-            if parsed[field] is not None:
-                parsed[field] = PinnedAddressSource(**parsed[field])
-        for field in ("source_oids", "npi_oids", "runtime_roles"):
-            if parsed[field] is not None:
-                parsed[field] = tuple(parsed[field])
-        return CustomAddressSourceReceipt(**parsed)
+        elif set(parsed_by_field) != _LOGICAL_RECEIPT_FIELDS:
+            expected = (_LOGICAL_RECEIPT_FIELDS - _OPTIONAL_RECEIPT_FIELDS) | _LEGACY_PHYSICAL_FIELDS
+            if not expected <= set(parsed_by_field) or not set(parsed_by_field) <= expected | _OPTIONAL_RECEIPT_FIELDS:
+                raise ValueError
+            _receipt_features(parsed_by_field, revision)
+            if revision == 2 and {"ptg_carry_sha256", "aca_carry_sha256"} & parsed_by_field.keys():
+                raise ValueError
+            if revision == 3 and ("ptg_carry_sha256" not in parsed_by_field or "aca_carry_sha256" in parsed_by_field):
+                raise ValueError
+            if revision == 4 and "aca_carry_sha256" not in parsed_by_field:
+                raise ValueError
+            parsed_by_field = {
+                key: field_value for key, field_value in parsed_by_field.items() if key in _LOGICAL_RECEIPT_FIELDS
+            }
+        if revision < 7:
+            features_by_name = {
+                name: field_value
+                for name, field_value in parsed_by_field.items()
+                if name in _OPTIONAL_RECEIPT_FIELDS
+                and field_value is not None
+                and (name != "source_aliases" or field_value is True)
+            }
+            _receipt_features(features_by_name, revision)
+            if revision == 2 and features_by_name or revision == 3 and set(features_by_name) != {"ptg_carry_sha256"}:
+                raise ValueError
+            if revision == 4 and "aca_carry_sha256" not in features_by_name:
+                raise ValueError
+        return _named_receipt(parsed_by_field, revision)
     except KeyError, TypeError, ValueError:
         raise NetworkCustomAddressSourceError("Retained composition receipt is invalid") from None
 
@@ -963,17 +703,13 @@ async def _verify_custom_address_source(connection, receipt, *, retained=False):
     if type(receipt) is not CustomAddressSourceReceipt:
         raise NetworkCustomAddressSourceError("Composition receipt is required")
     schema_name = _arguments(
-        receipt.base_source,
-        receipt.composition_id,
-        receipt.approved_revision,
-        receipt.owner_role,
-        receipt.runtime_roles,
-        receipt.npi_source,
+        receipt.base_source, receipt.composition_id, receipt.approved_revision, None, (), receipt.npi_source
     )
     await _require_transaction(connection)
     if (
         receipt.address_source != PinnedAddressSource(schema_name, "entity_address_unified", receipt.generation_sha256)
-        or _generation(receipt) != receipt.generation_sha256
+        or receipt.revision == 7
+        and _generation(receipt) != receipt.generation_sha256
     ):
         raise NetworkCustomAddressSourceError("Composition receipt digest differs")
     summary = await _approved_identity(
@@ -992,42 +728,30 @@ async def _verify_custom_address_source(connection, receipt, *, retained=False):
         raise NetworkCustomAddressSourceError("Composition source alias layout differs")
     if summary["fingerprint"] != receipt.approved_records_sha256 or summary["pairs"] != receipt.custom_pair_count:
         raise NetworkCustomAddressSourceError("Approved composition records differ")
-    if await _artifact_dependency_identity(
-        connection, receipt.base_source, receipt.runtime_roles, address=True, control_schema=receipt.control_schema
-    ) != receipt.source_oids or (
-        receipt.npi_source is not None
-        and await _artifact_dependency_identity(connection, receipt.npi_source, receipt.runtime_roles)
-        != receipt.npi_oids
-    ):
-        raise NetworkCustomAddressSourceError("Retained source physical identity differs")
-    if await _artifact_identity(
-        connection, schema_name, receipt.owner_oid, receipt.runtime_roles, source_aliases=receipt.source_aliases
-    ) != (
-        receipt.schema_oid,
-        receipt.address_table_oid,
-        receipt.binding_table_oid,
-        receipt.office_lookup_index_oid,
-    ):
-        raise NetworkCustomAddressSourceError("Composition physical identity differs")
-    artifact_source = await _source_identity(connection, receipt.address_source, receipt.runtime_roles, address=True)
-    base_shape = await _source_shape(connection, receipt.source_oids[1], address=True)
-    if artifact_source[3] != base_shape:
+    base_columns = await _source_columns(connection, receipt.base_source, address=True)
+    artifact_columns = await _source_columns(connection, receipt.address_source, address=True)
+    if base_columns != artifact_columns:
         raise NetworkCustomAddressSourceError("Composition address shape differs")
-    stored = await connection.fetchval("SELECT obj_description($1::oid,'pg_namespace')", receipt.schema_oid)
+    if receipt.npi_source is not None:
+        await _source_columns(connection, receipt.npi_source, address=False)
+    await _binding_shape(
+        connection, _identifier(schema_name) + ".provider_location_binding", source_aliases=receipt.source_aliases
+    )
+    await _verify_custom_rows(connection, receipt)
+    await _office_lookup_shape(connection, schema_name)
+    stored = await connection.fetchval(
+        "SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=$1", schema_name
+    )
     if stored is None or _from_document(stored) != receipt:
         raise NetworkCustomAddressSourceError("Retained composition recipe differs")
     return receipt
 
 
 async def verify_custom_address_source(connection, receipt):
-    """Require the unchanged recipe, current approved map and native closure."""
+    """Compare the complete named recipe, current approved map and actual data layout."""
     return await _verify_custom_address_source(connection, receipt)
 
 
 async def verify_retained_custom_address_source(connection, receipt):
-    """Read only: verify the exact historical map, recipe and native closure.
-
-    This proves retained source identity, without authorizing its older approval
-    as the current map. The caller binds this receipt to a serving manifest.
-    """
+    """Compare the recorded historical approval, named recipe and actual data layout."""
     return await _verify_custom_address_source(connection, receipt, retained=True)

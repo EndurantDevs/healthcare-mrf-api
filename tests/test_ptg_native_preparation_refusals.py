@@ -103,7 +103,7 @@ def _preparation_observations():
     }
     columns = _local_catalog_columns()
     objects = [
-        {"kind": "relation", "oid": oid, "name": name, "owner": physical.owner_oid, "definition": "r:p:1:0"}
+        {"kind": "relation", "oid": oid, "name": name, "owner": 102, "definition": "r:p:1:0"}
         for name, oid in ownership.relation_oids
     ]
     protected["catalog_sha256"] = native._local_catalog_digest(ownership, objects, columns)
@@ -154,7 +154,7 @@ def _preparation_session(monkeypatch, observed):
         if sql.startswith("LOCK TABLE"):
             return _query_result()
         if "c.relowner::bigint AS owner_oid" in sql:
-            return _query_result([{"owner_oid": observed.physical.owner_oid, "protected": True}])
+            return _query_result([{"owner_oid": 102, "protected": True}])
         if sql.startswith("SELECT * FROM hp_snapshot_retention.reference_preparation"):
             return _query_result([observed.header])
         if sql.startswith("SELECT ordinal,table_name"):
@@ -268,9 +268,7 @@ async def test_prepared_header_rejects_unbound_inventory_before_any_heap_lock(mo
         observed.header["inventory_sha256"] = observed.header["validation"]["inventory_sha256"] = "0" * 64
         observed.header["validation_sha256"] = native._native_metadata_digest(observed.header["validation"])
     with pytest.raises(native.PTG2PhysicalBindingError, match="preparation is unavailable|protected inventory"):
-        await native._prepared_local_header(
-            session, observed.physical.snapshot_id, owner_oid=observed.physical.owner_oid
-        )
+        await native._prepared_local_header(session, observed.physical.snapshot_id, owner_oid=102)
     assert not any(str(call.args[0]).startswith("LOCK TABLE") for call in session.execute.await_args_list)
 
 
@@ -283,14 +281,16 @@ def test_prepared_descriptor_cannot_relabel_or_truncate_a_family(fault):
         "extra": ("extra", True),
         "uuid": ("dataset_id", "invalid"),
         "importer": ("importer_id", "nucc"),
-        "schema": ("schema_name", "other"),
+        "schema": ("schema_name", "invalid.schema"),
         "relations": ("relation_oids", ownership["relation_oids"][:-1]),
         "sequence": ("sequence_oids", ()),
     }
     field, value = mutations_by_fault[fault]
     ownership[field] = value
-    with pytest.raises(native.PTG2PhysicalBindingError, match="descriptor differs|sequence inventory differs"):
-        native._prepared_local_binding(evidence, physical.snapshot_id, physical.owner_oid)
+    with pytest.raises(
+        native.PTG2PhysicalBindingError, match="descriptor differs|sequence inventory differs|schema is invalid"
+    ):
+        native._prepared_local_binding(evidence, physical.snapshot_id, 102)
 
 
 @pytest.mark.asyncio
@@ -328,36 +328,31 @@ async def test_driver_custody_refuses_no_transaction_or_missing_catalog_row(in_t
 @pytest.mark.asyncio
 @pytest.mark.parametrize("in_transaction", (False, True))
 async def test_published_control_refuses_missing_transaction_or_actual_control(monkeypatch, in_transaction):
-    physical, _candidate, evidence, publication = _published_control_fixture()
-    ownership = _ownership(physical)
-    observed = _preparation_observations()
-    evidence["catalog_sha256"] = native._local_catalog_digest(ownership, observed.objects, observed.columns)
+    _physical, _candidate, evidence, publication = _published_control_fixture()
     connection = SimpleNamespace(
         is_in_transaction=lambda: in_transaction,
-        fetchrow=AsyncMock(side_effect=[{"object_count": 43, "closed": True}, None]),
-        fetch=AsyncMock(side_effect=[observed.objects, observed.columns]),
+        fetchrow=AsyncMock(return_value=None),
+        fetch=AsyncMock(),
     )
     with pytest.raises(native.PTG2PhysicalBindingError, match="requires a transaction|control is unavailable"):
         await native.require_local_published_control(connection, evidence=evidence, publication=publication)
-    assert connection.fetchrow.await_count == 2 * int(in_transaction)
-    assert connection.fetch.await_count == 2 * int(in_transaction)
+    assert connection.fetchrow.await_count == int(in_transaction)
+    connection.fetch.assert_not_awaited()
 
 
-@pytest.mark.parametrize("fault", ("contract", "extra", "payload-key", "schema-oid", "dataset"))
+@pytest.mark.parametrize("fault", ("contract", "extra", "payload-key", "schema-name", "dataset"))
 def test_publication_binding_rejects_valid_shape_with_different_physical_custody(fault):
     _physical, _candidate, evidence, publication = _published_control_fixture()
     changes_by_fault = {
         "contract": ("contract", "other"),
         "extra": ("extra", True),
         "payload-key": ("payload_snapshot_key", 20),
-        "schema-oid": ("schema_oid", 103),
+        "schema-name": ("schema_name", "other_snapshot"),
         "dataset": ("dataset_id", str(UUID(int=2))),
     }
     field, value = changes_by_fault[fault]
     publication[field] = value
-    with pytest.raises(
-        native.PTG2PhysicalBindingError, match="publication receipt differs|published inventory differs"
-    ):
+    with pytest.raises(native.PTG2PhysicalBindingError, match="publication fields differ|logical publication differs"):
         native._local_publication_binding(evidence, publication)
 
 
@@ -399,23 +394,6 @@ async def test_audit_selector_never_chooses_ambiguous_or_foreign_local_authority
             await native.local_candidate_audit_state(session, **selector_by_field)
     assert session.execute.await_count == int(selector != "missing")
     session.scalar.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("safe", (False, None, 1))
-async def test_read_view_cannot_promote_owner_membership_or_schema_create(monkeypatch, safe):
-    session = SimpleNamespace(
-        in_transaction=lambda: True,
-        execute=AsyncMock(return_value=_query_result([{"owner_oid": 102, "protected": True}])),
-        scalar=AsyncMock(return_value=safe),
-    )
-    with pytest.raises(native.PTG2PhysicalBindingError, match="reader privileges differ"):
-        await native.require_local_physical_read_view(session, is_prepared=False)
-    assert session.execute.await_count == 3
-    assert not any(str(call.args[0]).startswith("LOCK") for call in session.execute.await_args_list)
-    assert "'MEMBER'" in str(session.scalar.await_args.args[0])
-    assert "publication_sha256" in native._local_read_view_columns(False)
-    assert "publication_sha256" not in native._local_read_view_columns(True)
 
 
 @pytest.mark.asyncio

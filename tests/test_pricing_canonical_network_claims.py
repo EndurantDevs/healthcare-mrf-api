@@ -11,6 +11,7 @@ from sanic.exceptions import InvalidUsage, SanicException, ServiceUnavailable
 from sqlalchemy.dialects import postgresql
 
 from api import network_address_scope as scope_module
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
 from tests.network_read_execution_support import mock_approved_control_metadata
 from tests.test_pricing_api import FakeResult, make_request, pricing_module
@@ -24,7 +25,7 @@ MANIFEST = PinnedNetworkServingManifest(
     {},
     4,
     "c" * 64,
-    81,
+    CompactAddressRelation("network_candidate_00000000000000000000000000000001", "entity_address_unified"),
 )
 
 

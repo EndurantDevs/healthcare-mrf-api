@@ -7,7 +7,7 @@ from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -339,20 +339,116 @@ async def test_ordinary_preparation_inserts_the_repaired_projection_in_the_datab
 
 
 @pytest.mark.asyncio
-async def test_ordinary_scope_retains_normal_terminal_fences_and_rejects_factory_rebinding(case):
+async def test_ordinary_scope_retains_normal_terminal_fences_and_rejects_factory_rebinding(case, monkeypatch):
+    events = []
+    _ordinary_terminal_case(case, monkeypatch, events, profile=False)
     factory_token = artifacts.source._FACTORY.set(None)
     admission = replace(case.admission, factory=None, producer=None, task=asyncio.current_task())
     token = artifacts._ACTIVE.set(admission)
     try:
         assert artifacts.current(case.directory) is admission
         async with artifacts.terminal_fence(case.directory):
-            assert artifacts.is_fence_held(case.directory, case.fence, None) is False
+            assert artifacts.is_fence_held(case.directory, case.fence, None) is True
             rebound = artifacts.source._FACTORY.set(case.factory)
             try:
                 with pytest.raises(RuntimeError, match="rest_artifact_admission_changed"):
                     artifacts.current(case.directory)
             finally:
                 artifacts.source._FACTORY.reset(rebound)
+    finally:
+        artifacts._ACTIVE.reset(token)
+        artifacts.source._FACTORY.reset(factory_token)
+    assert events.count("header read") == 2 and "profile locked" not in events
+    assert artifacts._TERMINAL.get() is None
+
+
+def _ordinary_terminal_case(case, monkeypatch, events, *, profile=True, drift=False):
+    """Exercise real control ordering and the complete read-only header verification chain."""
+    controls, verify = artifacts._lock_ordinary_controls, artifacts._verify_header
+    _configure_terminal_case(case, monkeypatch, None, events)
+    monkeypatch.setattr(artifacts, "_lock_ordinary_controls", controls)
+    monkeypatch.setattr(artifacts, "_verify_header", verify)
+    directory = case.directory
+    directory.is_uhc_flex_profile_source = lambda _source_id: profile
+
+    def step(name, result=None):
+        return AsyncMock(side_effect=lambda *_args, **_kwargs: (events.append(name), result)[1])
+
+    async def header(_fence, executor, *, for_update):
+        assert executor is directory.db and for_update is False
+        events.append("header read")
+        return ("changed" if drift and events.count("header read") == 2 else "current",)
+
+    def assert_header(_fence, rows, eligible):
+        assert eligible == {}
+        events.append("header checked")
+        if rows != ("current",):
+            raise ValueError("header changed")
+
+    directory.lock_uhc_flex_profile_publication = step("profile locked")
+    directory._lock_artifact_fence_endpoint_advisories = step("endpoint advisory")
+    directory._lock_artifact_fence_endpoints = step("endpoint rows")
+    directory._lock_artifact_fence_aliases = step("alias rows", [])
+    directory._assert_locked_artifact_fence_aliases = Mock(side_effect=lambda *_args: events.append("aliases checked"))
+    directory._artifact_fence_dataset_rows = header
+    directory._artifact_eligible_validated_ids = step("eligibility checked", {})
+    directory._assert_locked_artifact_fence_datasets = assert_header
+    directory._assert_reviewed_activation_ready = step("activation checked")
+    directory._assert_uhc_flex_profile_fence_ready = step("readiness checked")
+    monkeypatch.setattr(artifacts.replacement, "verify_locked", step("replacement checked"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", [None, "header", "body", "cancel"])
+async def test_ordinary_terminal_fence_rechecks_before_commit(case, monkeypatch, fault):
+    from process import provider_directory_profile_artifact_custody as custody
+
+    events = []
+    _ordinary_terminal_case(case, monkeypatch, events, drift=fault == "header")
+    factory_token = artifacts.source._FACTORY.set(None)
+    admission = replace(case.admission, factory=None, producer=None, task=asyncio.current_task())
+    token = artifacts._ACTIVE.set(admission)
+    original = asyncio.CancelledError() if fault == "cancel" else ValueError("publication failed")
+    try:
+        try:
+            async with custody.cutover_transaction(case.directory, "bundle", object()):
+                assert artifacts.is_fence_held(case.directory, case.fence, case.directory.db)
+                events.append("swapped")
+                if fault in {"body", "cancel"}:
+                    raise original
+        except (ValueError, asyncio.CancelledError) as error:
+            assert fault is not None
+            assert error is original if fault in {"body", "cancel"} else str(error) == "header changed"
+    finally:
+        artifacts._ACTIVE.reset(token)
+        artifacts.source._FACTORY.reset(factory_token)
+    assert events[:6] == [
+        "ordinary opened",
+        "profile locked",
+        "endpoint advisory",
+        "endpoint rows",
+        "alias rows",
+        "aliases checked",
+    ]
+    assert events.count("header read") == (1 if fault in {"body", "cancel"} else 2)
+    assert events.count("readiness checked") == (2 if fault is None else 1)
+    assert events[-1] == ("ordinary committed" if fault is None else "ordinary rolled back")
+    assert "Source opened" not in events and artifacts._TERMINAL.get() is None
+
+
+@pytest.mark.asyncio
+async def test_replacement_keeps_its_default_terminal_fence(case, monkeypatch):
+    scope = object()
+    factory_token = artifacts.source._FACTORY.set(None)
+    admission = replace(
+        case.admission, factory=None, producer=None, replacement_scope=scope, task=asyncio.current_task()
+    )
+    monkeypatch.setattr(artifacts.replacement, "selected", lambda *_args: scope)
+    token = artifacts._ACTIVE.set(admission)
+    try:
+        async with artifacts.terminal_fence(case.directory):
+            assert artifacts.is_fence_held(case.directory, case.fence, None) is False
+        assert artifacts._TERMINAL.get() is None
     finally:
         artifacts._ACTIVE.reset(token)
         artifacts.source._FACTORY.reset(factory_token)

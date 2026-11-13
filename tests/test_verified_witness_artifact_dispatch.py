@@ -36,7 +36,9 @@ def test_explicit_witness_artifact_preserves_original_anchor_and_identity(anchor
     assert (reference is not None) is anchored
     if anchored:
         assert reference.fact_candidate_id == str(UUID(int=9))
-        assert reference.fact_table_oid == 71
+        assert reference.fact_schema_name == "synthetic_original_facts"
+        assert reference.fact_table_name == "network_source_contribution"
+        assert reference.fact_generation_id == "f" * 64
     assert descriptor["fact_candidate_id"] == (str(UUID(int=9)) if anchored else None)
 
 
@@ -57,7 +59,9 @@ def test_artifact_cannot_relabel_or_partially_anchor_witnesses(change):
 
 def test_reused_witness_mapping_can_change_but_original_fact_identity_cannot():
     _, descriptor, _ = rows()
-    reference = artifacts.SourceFactArtifactReference(str(UUID(int=3)), 17, "a" * 64)
+    reference = artifacts.SourceFactArtifactReference(
+        str(UUID(int=3)), "synthetic_original_facts", "network_source_contribution", "a" * 64
+    )
     artifact = artifacts.ResolvedSourceFactArtifact(reference, "synthetic_original_facts", descriptor)
     mapped = copy.deepcopy(descriptor)
     mapped.update(mapping_sha256="b" * 64, source_generation=store._digest([mapped["capture_sha256"], "b" * 64]))

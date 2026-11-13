@@ -13,7 +13,7 @@ from uuid import UUID
 
 from process.registry_membership_refresh_authority import COMMIT_AUTHORITY_PATH
 from process.registry_membership_refresh_contract import membership_refresh_command_sha256
-from tests.test_registry_generic_source_successor_postgres import _heap_oids, _read
+from tests.test_registry_generic_source_successor_postgres import _read
 from tests.test_registry_membership_refresh_execution_postgres import _counts, _storage_rows
 
 
@@ -46,16 +46,15 @@ def frozen_ic_recovery():
 
 
 async def request_record(fixture, request_id):
-    """Read full native request and MVCC identity without issuing a queue operation."""
+    """Read every logical request field without issuing a queue operation."""
     return await fixture.connection.fetchrow(
-        f'SELECT request.*,xmin::text AS row_xmin,ctid::text AS row_ctid FROM "{fixture.control_schema}".'
-        "registry_publication_request request WHERE request_id=$1",
+        f'SELECT request.* FROM "{fixture.control_schema}".registry_publication_request request WHERE request_id=$1',
         UUID(request_id),
     )
 
 
 async def serving_state(fixture, manifest):
-    """Observe old physical storage, serving head and publication/custody counts."""
+    """Observe complete named storage, serving head and publication counts."""
     return {
         "counts": await _counts(fixture),
         "head": tuple(
@@ -64,7 +63,6 @@ async def serving_state(fixture, manifest):
             )
         ),
         "storage": await _storage_rows(fixture, manifest.schema_name),
-        "heap_oids": await _heap_oids(fixture, manifest),
         "cas": tuple(fixture.cas_checks),
         "commit_calls": fixture.calls.count(COMMIT_AUTHORITY_PATH),
     }
@@ -75,7 +73,7 @@ async def assert_serving_unchanged(fixture, original, old_reader, before_by_fiel
     after_by_field = await serving_state(fixture, original[0])
     assert after_by_field["counts"][0] == before_by_field["counts"][0]
     assert after_by_field["counts"][2:] == before_by_field["counts"][2:]
-    for name in ("head", "storage", "heap_oids", "cas", "commit_calls"):
+    for name in ("head", "storage", "cas", "commit_calls"):
         assert after_by_field[name] == before_by_field[name], name
     async with fixture.api.transaction(isolation="repeatable_read", readonly=True):
         assert await _read(fixture, fixture.api) == original

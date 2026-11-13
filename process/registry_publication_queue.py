@@ -1073,6 +1073,22 @@ async def renew_registry_publication_lease(connection, request_id, lease_id, *, 
     )
 
 
+async def release_registry_publication_request(connection, request_id, lease_id, *, control_schema=None):
+    """Return an exact live request to the existing queue after a durable preparation handoff."""
+    if not isinstance(request_id, UUID) or not isinstance(lease_id, UUID) or not connection.is_in_transaction():
+        raise ValueError("registry_queue_lease_invalid")
+    changed = await connection.fetchval(
+        f"UPDATE {_namespace(control_schema)}.registry_publication_request "
+        "SET state='queued',lease_id=NULL,lease_expires_at=NULL,updated_at=now() "
+        "WHERE request_id=$1 AND lease_id=$2 AND state='running' "
+        "AND lease_expires_at>clock_timestamp() RETURNING request_id",
+        request_id,
+        lease_id,
+    )
+    if changed != request_id:
+        raise RegistryApprovalConflict("registry_queue_lease_conflict")
+
+
 async def finish_registry_publication_request(connection, request_id, lease_id, *, state, result, control_schema=None):
     """Complete one active controller lease in the caller's atomic transaction."""
     if state not in {"completed", "rejected"} or type(result) is not dict or len(_json(result).encode()) > 65536:

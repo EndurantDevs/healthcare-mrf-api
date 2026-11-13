@@ -15,7 +15,7 @@ from process import registry_source_inventory_summaries as summary_module
 from process import registry_source_recipe_store as recipes
 from process.registry_source_inventory_summaries import contribution_summary_v3
 from tests import test_registry_source_contributions as legacy_fixtures
-from tests.test_registry_source_recipe_store_postgres import _example
+from tests.registry_source_recipe_support import _example
 
 
 def _inventory(count, *, contributions_present=True):

@@ -1,8 +1,7 @@
 """Protocol/unit checks only: actual Source and office authority need separate native verification."""
 
-import asyncio
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -16,11 +15,11 @@ from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_fhir_membership_source import FHIRMembershipBatchBoundsError, FHIRSourceWitnessPageV2
 from process.registry_source_contribution_artifacts import ResolvedSourceFactArtifact, SourceFactArtifactReference
+from process.registry_source_office_custody import _office_inputs
 from process.registry_verified_witness_offices import WitnessOfficeSource
+from tests.registry_source_recipe_support import _descriptor, _example
 from tests.test_registry_ptg_office_membership_recipe import _recipe as ptg_recipe
-from tests.test_registry_source_inventory_preparation import _descriptor
-from tests.test_registry_source_recipe_store_postgres import _example
-from tests.test_verified_inventory_v2 import context, derivation, rows
+from tests.test_verified_inventory_v2 import context, rows
 from tests.test_verified_office_source_witnesses_v2 import _edge, _header
 
 APPROVED = ApprovedMembershipSource(7, "a" * 64)
@@ -69,14 +68,27 @@ async def test_unsupported_scope_preserves_unbound_guard_before_native_io(kind):
         )
 
 
-def test_nonempty_approved_snapshot_still_uses_witness_scope():
+@pytest.mark.parametrize("roles", [None, ("reader",), tuple(f"reader_{index:02}" for index in range(32))])
+def test_nonempty_approved_snapshot_still_uses_witness_scope(roles):
     recipe, _, _ = rows()
     approved = replace(APPROVED, total_rows=1)
-    stage._require_witness_scope((recipe,), approved, (ADDRESS, ("reader",)))
+    offices = _office_inputs({"validation_json": {"address_source": asdict(ADDRESS)}})
+    assert offices == (ADDRESS, ())
+    stage._require_witness_scope((recipe,), approved, offices if roles is None else (offices[0], roles))
     from process.registry_membership_refresh_runtime import _uses_witness_office_policy
 
     assert _uses_witness_office_policy(approved, (recipe,)) is True
     assert _uses_witness_office_policy(approved, (recipe, ptg_recipe())) is False
+
+
+@pytest.mark.parametrize(
+    "roles",
+    [[], (1,), ("reader", "reader"), ("z", "a"), ("bad-role",), tuple(f"reader_{index:02}" for index in range(33))],
+)
+def test_named_office_scope_preserves_known_role_tuple_shape_and_cap(roles):
+    recipe, _, _ = rows()
+    with pytest.raises(ValueError):
+        stage._require_witness_scope((recipe,), APPROVED, (ADDRESS, roles))
 
 
 async def test_capture_uses_actual_decoder_and_drained_copy_and_requires_terminal_page(monkeypatch):
@@ -142,7 +154,11 @@ async def test_per_recipe_maps_actual_witness_contract_and_keeps_original_anchor
     monkeypatch.setattr(stage, "map_fhir_source_witnesses_v2", mapper)
     artifact = (
         ResolvedSourceFactArtifact(
-            SourceFactArtifactReference(str(UUID(int=9)), 71, "f" * 64), "synthetic_original", descriptor
+            SourceFactArtifactReference(
+                str(UUID(int=9)), "synthetic_original", "network_source_contribution", "f" * 64
+            ),
+            "synthetic_original",
+            descriptor,
         )
         if reuse
         else None
@@ -212,7 +228,8 @@ async def test_finish_returns_complete_policy_commitments_and_selection_accounti
     assert finish.await_args.args[-1] == 0
 
 
-async def test_entire_stage_savepoint_rolls_back_late_failure_and_passes_exact_baseline(monkeypatch):
+@pytest.mark.parametrize("roles", [None, ("reader",)])
+async def test_entire_stage_savepoint_rolls_back_late_failure_and_passes_exact_baseline(monkeypatch, roles):
     recipe, _, _ = rows()
     transitions = []
 
@@ -234,6 +251,7 @@ async def test_entire_stage_savepoint_rolls_back_late_failure_and_passes_exact_b
     monkeypatch.setattr(stage, "_stage_witness_source", AsyncMock(return_value=object()))
     monkeypatch.setattr(stage, "_finish_witness_inventory", AsyncMock(side_effect=RuntimeError("late mapping failure")))
     baseline = object()
+    offices = _office_inputs({"validation_json": {"address_source": asdict(ADDRESS)}})
     with pytest.raises(RuntimeError, match="late mapping failure"):
         await stage.stage_verified_witness_inventory(
             connection,
@@ -242,7 +260,7 @@ async def test_entire_stage_savepoint_rolls_back_late_failure_and_passes_exact_b
             request_id=UUID(int=7),
             control_schema="synthetic",
             retained_fhir_reads={},
-            verified_office_inputs=(ADDRESS, ("reader",)),
+            verified_office_inputs=offices if roles is None else (offices[0], roles),
             source_manifest=baseline,
         )
     assert transitions == ["enter", "rollback"] and create.await_count == 1
@@ -265,7 +283,9 @@ async def test_retained_selection_uses_exact_supplied_generation_and_explicit_id
         artifacts, "retained_source_fact_descriptors", AsyncMock(return_value=(legacy_by_field, witness))
     )
     artifact = ResolvedSourceFactArtifact(
-        SourceFactArtifactReference(str(UUID(int=9)), 71, "f" * 64), "synthetic_original", selected
+        SourceFactArtifactReference(str(UUID(int=9)), "synthetic_original", "network_source_contribution", "f" * 64),
+        "synthetic_original",
+        selected,
     )
     authenticate = AsyncMock(return_value={selected["recipe_sha256"]: artifact})
     monkeypatch.setattr(artifacts, "verify_anchored_source_fact_contents", authenticate)

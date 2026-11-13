@@ -17,14 +17,11 @@ from process.registry_source_recipe_store import (
     canonical_registry_source_recipes,
     registry_source_recipes_sha256,
 )
+from tests.registry_source_recipe_support import _example
 from tests.test_registry_ptg_office_membership_recipe import _recipe as _ptg_recipe
 from tests.test_registry_source_contributions import _descriptor
 from tests.test_registry_source_office_summary_v3 import _derivation
-from tests.test_registry_source_recipe_store_postgres import (
-    _cms_custody_recipe,
-    _cms_epoch_recipe,
-    _example,
-)
+from tests.test_registry_source_recipe_store_postgres import _cms_custody_recipe, _cms_epoch_recipe
 
 
 def _entries(recipes):

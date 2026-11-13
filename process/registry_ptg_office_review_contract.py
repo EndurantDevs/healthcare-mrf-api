@@ -101,9 +101,82 @@ def _source(source_by_field, command_by_field):
         raise ValueError("registry_ptg_office_review_invalid")
 
 
+_SERVING_FIELDS = frozenset(
+    {
+        "generation_id",
+        "candidate_id",
+        "schema_name",
+        "schema_revision",
+        "source_generations",
+        "approved_custom_revision",
+        "manifest_sha256",
+    }
+)
+
+
+def is_legacy_office_review_command(document):
+    """Recognize only the historical wire record or its logical read projection."""
+    if type(document) is not dict or type(document.get("retained_serving")) is not dict:
+        return False
+    fields = set(document["retained_serving"])
+    return (set(document) == FIELDS and fields == _SERVING_FIELDS | {"address_table_oid"}) or (
+        set(document) == FIELDS - {"retained_serving_sha256"} and fields == _SERVING_FIELDS
+    )
+
+
+def _retained_serving(document, is_legacy):
+    """Decode logical generation metadata and the address name when recorded."""
+    from process.network_address_projection import _identifier
+    from process.network_compact_layout import CompactAddressRelation
+
+    serving = document["retained_serving"]
+    expected = _SERVING_FIELDS | ({"address_table_oid"} if is_legacy and "address_table_oid" in serving else set())
+    if not is_legacy:
+        expected = _SERVING_FIELDS | {"address_relation"}
+    _object(serving, expected)
+    _uuid(serving["candidate_id"])
+    _identifier(serving["schema_name"])
+    _digest(serving["manifest_sha256"])
+    for name in ("generation_id", "schema_revision"):
+        if type(serving[name]) is not int or not 0 < serving[name] < 2**63:
+            raise ValueError("registry_ptg_office_review_invalid")
+    if (
+        serving["generation_id"] != document["retained_generation_id"]
+        or type(serving["approved_custom_revision"]) is not int
+        or not 0 <= serving["approved_custom_revision"] < 2**63
+        or type(serving["source_generations"]) is not dict
+    ):
+        raise ValueError("registry_ptg_office_review_invalid")
+    named_by_field = {field: serving[field] for field in _SERVING_FIELDS}
+    if not is_legacy:
+        location = _object(serving["address_relation"], {"schema_name", "table_name"})
+        CompactAddressRelation(**location)
+        named_by_field["address_relation"] = dict(location)
+    return named_by_field
+
+
+def named_office_review_command(document):
+    """Project only the closed retained-serving representation for internal data readers."""
+    is_legacy = is_legacy_office_review_command(document)
+    expected_fields = (
+        FIELDS - {"retained_serving_sha256"} if is_legacy and "retained_serving_sha256" not in document else FIELDS
+    )
+    _object(document, expected_fields)
+    normalized_by_field = {**document, "retained_serving": _retained_serving(document, is_legacy)}
+    if is_legacy:
+        normalized_by_field.pop("retained_serving_sha256", None)
+    else:
+        _digest(document["retained_serving_sha256"])
+    return normalized_by_field
+
+
 def validated_office_review_command(document):
-    """Authenticate this exact command later; syntax never admits prepared offices."""
-    _object(document, FIELDS)
+    """Decode the closed logical command before fresh client/source authorization."""
+    is_legacy = is_legacy_office_review_command(document)
+    expected_fields = (
+        FIELDS - {"retained_serving_sha256"} if is_legacy and "retained_serving_sha256" not in document else FIELDS
+    )
+    _object(document, expected_fields)
     if document["operation"] != OPERATION or document["office_evidence_kind"] not in {
         "payer_exact_office",
         "reviewed_exact_office",
@@ -111,8 +184,10 @@ def validated_office_review_command(document):
         raise ValueError("registry_ptg_office_review_invalid")
     for name in ("capture_id", "scope_id"):
         _uuid(document[name])
-    for name in ("scope_approval_sha256", "canonical_input_sha256", "retained_serving_sha256"):
+    for name in ("scope_approval_sha256", "canonical_input_sha256"):
         _digest(document[name])
+    if not is_legacy:
+        _digest(document["retained_serving_sha256"])
     for name, maximum in (("client_id", 64), ("reason", 1000), ("idempotency_key", 128)):
         _text(document[name], maximum)
     if document["client_id"] in {"system", "__platform__"}:
@@ -121,22 +196,12 @@ def validated_office_review_command(document):
         if type(document[name]) is not int or not 1 <= document[name] <= maximum:
             raise ValueError("registry_ptg_office_review_invalid")
     _source(document["source"], document)
-    _object(
-        document["retained_serving"],
-        {
-            "generation_id",
-            "candidate_id",
-            "schema_name",
-            "schema_revision",
-            "source_generations",
-            "approved_custom_revision",
-            "manifest_sha256",
-            "address_table_oid",
-        },
-    )
+    normalized_by_field = named_office_review_command(document)
     _object(document["retained_sites"], {"identity", "rows_sha256"})
     _digest(document["retained_sites"]["rows_sha256"])
-    encoded = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+    encoded = json.dumps(
+        normalized_by_field, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode()
     if len(encoded) > 131072:
         raise ValueError("registry_ptg_office_review_invalid")
     return json.loads(encoded)

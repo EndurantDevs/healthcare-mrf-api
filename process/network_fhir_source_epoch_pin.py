@@ -8,12 +8,13 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from weakref import WeakKeyDictionary
 
+from sqlalchemy import text
+
 from db.connection import Database
 from db.plan_release_storage import storage_relation
 from process import network_fhir_source_custody as custody
 from process import network_fhir_source_epoch as epoch
 from process import provider_directory_generic_source_storage as storage
-from process.provider_directory_dataset_rehydrate_pin import _close_reader, _require_reader, _same_database
 from process.provider_directory_generic_source_policy import (
     bound_publisher,
     source_transaction,
@@ -113,7 +114,6 @@ class PinnedCMSFHIRSourceEpochInput:
             receipt["policy"].owner_role,
         )
         _require(actor["login"] == actor["actor"] and not actor["source_owner"])
-        await _same_database(self.connection, connection)
 
 
 async def _virtual_xid(connection):
@@ -272,9 +272,10 @@ async def pinned_cms_source_epoch(directory, source_pin, *, expected_admission_s
             )
             reader_database = await directory.db._connect_reader()
             session = reader_database.session_factory()
-            cleanup.push_async_callback(_close_reader, session)
-            driver = await _require_reader(session, reader_database, policy)
-            await _same_database(publisher.connection, driver)
+            cleanup.push_async_callback(session.close)
+            await cleanup.enter_async_context(session.begin())
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            driver = (await (await session.connection()).get_raw_connection()).driver_connection
             await _pin(driver, policy, native, relations)
             _require(await _header(driver, source_pin) == header)
             _require(await _control_custody(driver, policy) == controls)

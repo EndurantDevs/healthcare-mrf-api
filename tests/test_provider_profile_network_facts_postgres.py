@@ -194,7 +194,7 @@ async def _prepare_profile_source(fixture, pair, copy_targets, stack, *, public_
     ]
     await _profile_addresses(fixture, public_contacts=public_contacts)
     await _grant_profile_reader(fixture)
-    await install_source_contribution_custody(fixture, pin, stack)
+    await install_source_contribution_custody(fixture, pin, stack, source_readers=pair.runtime_roles)
     manifest = await _compose_profile_manifest(fixture, None, approved, copy_targets, initial_recipe=pair.recipe)
     source_manifest = manifest
     manifest, revision = await _remove_profile_office(

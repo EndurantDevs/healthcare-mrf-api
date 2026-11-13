@@ -4,6 +4,7 @@
 import csv
 import io
 import json
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
@@ -22,6 +23,7 @@ from process.registry_required_target_store import (
     RegistryRequiredTargetError,
     admit_registry_required_targets,
 )
+from tests.test_network_compact_publication_postgres import _named_compact_runtime
 from tests.test_network_custom_address_source_postgres import _draft, _seed
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
 from tests.test_network_provider_routes_postgres import _composed_candidate, _durable_state
@@ -176,12 +178,31 @@ async def _approved_company_link_with_pending_clear(fixture, seed):
     return {"company": company, "grouped_company": grouped_company, "link": link, "pending_link": pending_link}
 
 
+async def _approve_target_review(fixture, seed, edition, review_document_dict, reviewed_binding):
+    """Persist the reviewed target binding and preserve its approved revision."""
+    review_edition, review = await _review(
+        (fixture.connection, fixture.control_schema, fixture.engine), edition, review_document_dict
+    )
+    reviewed_binding.update(evidence_id=review["evidence_id"], evidence_sha256=review["artifact_sha256"])
+    binding = (await _bind(fixture.connection, fixture.control_schema, reviewed_binding, seed.actor))["records"][0]
+    approval = await _approve(
+        fixture.connection,
+        fixture.control_schema,
+        await _command(fixture.connection, fixture.control_schema, binding),
+        seed.actor,
+    )
+    seed.revision = approval["approved_revision"]
+    return review_edition, review
+
+
 @pytest.fixture
-async def coverage_db(custom_db, request):
+async def coverage_db(custom_db, request, monkeypatch):
     fixture = custom_db
     copy_targets = []
     request_id = uuid4()
+    stack = AsyncExitStack()
     try:
+        await _named_compact_runtime(fixture, stack, monkeypatch)
         source_manifest = await _imported_candidate(fixture, copy_targets)
         seed = await _seed(fixture)
         scenario = getattr(request, "param", None)
@@ -200,18 +221,9 @@ async def coverage_db(custom_db, request):
                 )
             ],
         }
-        review_edition, review = await _review(
-            (fixture.connection, fixture.control_schema, fixture.engine), edition, review_document_dict
+        review_edition, review = await _approve_target_review(
+            fixture, seed, edition, review_document_dict, reviewed_binding
         )
-        reviewed_binding.update(evidence_id=review["evidence_id"], evidence_sha256=review["artifact_sha256"])
-        binding = (await _bind(fixture.connection, fixture.control_schema, reviewed_binding, seed.actor))["records"][0]
-        approval = await _approve(
-            fixture.connection,
-            fixture.control_schema,
-            await _command(fixture.connection, fixture.control_schema, binding),
-            seed.actor,
-        )
-        seed.revision = approval["approved_revision"]
         scenario = getattr(request, "param", None)
         scenario_context_dict = {}
         if scenario in ("different_networks", "explicit_conflict"):
@@ -235,7 +247,10 @@ async def coverage_db(custom_db, request):
             **scenario_context_dict,
         )
     finally:
-        await _remove_candidates(fixture, copy_targets, request_id)
+        try:
+            await _remove_candidates(fixture, copy_targets, request_id)
+        finally:
+            await stack.aclose()
 
 
 async def _read(context, *, edition=None, generation_id=None):

@@ -187,9 +187,9 @@ def _orm_session(native):
 
 def _pins():
     return (
-        CompactAddressRelation(_SCHEMA, storage.LEGACY_BINDING_TABLE, 104),
-        CompactAddressRelation(_SCHEMA, storage.REVISION_TABLE, 103),
-        CompactAddressRelation(_SCHEMA, "ptg2_snapshot_pin", 105),
+        CompactAddressRelation(_SCHEMA, storage.LEGACY_BINDING_TABLE),
+        CompactAddressRelation(_SCHEMA, storage.REVISION_TABLE),
+        CompactAddressRelation(_SCHEMA, "ptg2_snapshot_pin"),
     )
 
 

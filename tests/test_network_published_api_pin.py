@@ -1,7 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Published-request reuse stays local to its original connection and scope."""
+"""Published pins use logical generations and schema-qualified names."""
 
 import json
+from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -11,49 +12,68 @@ from process import network_published_api_pin as published
 from process.registry_network_catalog_read import _PINNED_READ
 
 
-def test_supplied_manifest_flag_cannot_skip_request_audits():
-    connection = SimpleNamespace(is_in_transaction=lambda: True)
-    manifest = SimpleNamespace(_published_api_request=True)
-    assert published.active_published_api_pin(connection, manifest) is None
+@pytest.fixture
+def published_entry():
+    candidate_by_field = {
+        "candidate_id": "00000000-0000-0000-0000-000000000001",
+        "schema_name": "network_candidate_00000000000000000000000000000001",
+        "schema_revision": 1,
+        "approved_custom_revision": 4,
+        "source_generations": {"custom_membership": "a" * 64},
+        "state": "published",
+        "validation_json": {
+            "address_source": {
+                "schema_name": "published_addresses",
+                "table_name": "entity_address_unified_v1",
+                "generation_id": "b" * 64,
+            },
+            "serving_readiness": {
+                "component": "compact_network_serving",
+                "address_artifact": {
+                    "namespace": {"name": "published_addresses"},
+                    "table": {"name": "entity_address_unified_v1"},
+                },
+                "edge_artifacts": [
+                    {
+                        "candidate_id": "00000000-0000-0000-0000-000000000001",
+                        "schema_name": "network_candidate_00000000000000000000000000000001",
+                    }
+                ],
+            },
+        },
+    }
+    manifest_by_field = {
+        key: candidate_by_field[key]
+        for key in ("candidate_id", "schema_revision", "source_generations", "approved_custom_revision")
+    }
+    manifest_by_field.update(generation_id=7, manifest_sha256="c" * 64, eligible=True)
+    return {
+        "candidate_json": json.dumps(candidate_by_field),
+        "manifest_json": json.dumps(manifest_by_field),
+        "approved_rows": 3,
+    }
 
 
-@pytest.mark.parametrize("damage", [None, "connection", "manifest", "schema", "transaction", "replaced", "unpublished"])
-def test_reuse_requires_exact_connection_manifest_and_active_scope(damage):
-    connection = SimpleNamespace(is_in_transaction=lambda: damage != "transaction")
-    transaction = object()
-    session = SimpleNamespace(get_transaction=lambda: object() if damage == "replaced" else transaction)
-    manifest = SimpleNamespace(
-        _published_api_request=damage != "unpublished",
-        _api_request_session=session,
-        _api_request_transaction=transaction,
-    )
-    token = _PINNED_READ.set((connection, manifest, "example_control"))
-    try:
-        actual = object() if damage == "connection" else connection
-        requested = object() if damage == "manifest" else manifest
-        schema = "other_control" if damage == "schema" else "example_control"
-        if damage in {"manifest", "schema", "transaction", "replaced"}:
-            with pytest.raises(published.NetworkServingReadUnavailable):
-                published.active_published_api_pin(actual, requested, control_schema=schema)
-        else:
-            resolved = published.active_published_api_pin(actual, requested, control_schema=schema)
-            assert resolved is (manifest if damage is None else None)
-    finally:
-        _PINNED_READ.reset(token)
+def _candidate(entry):
+    return json.loads(entry["candidate_json"])
+
+
+def test_published_query_reads_pointer_and_metadata():
+    query = published.published_api_pin_statement("example_control")
+    assert '"example_control".network_serving_control' in query
+    assert "manifest.eligible AND candidate.state='published'" in query
+    assert "pg_catalog" not in query
+    assert "custody" not in query
+    assert "oid" not in query
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("generation", [True, False, 0, -1, 1.0, "1", 2**63])
-async def test_invalid_generation_never_runs_metadata_sql(generation):
+@pytest.mark.parametrize("generation", [False, True, 0, -1, 1.0, "3", 2**63])
+async def test_invalid_generation_refuses_before_query(generation):
     connection = SimpleNamespace(fetchrow=AsyncMock())
     with pytest.raises(published.NetworkServingReadUnavailable):
         await published.read_published_api_pin(connection, generation, "example_control")
     connection.fetchrow.assert_not_awaited()
-
-
-def _published_entry(serving_readiness, *, base_rls=False, own_rls=False):
-    candidate_json = json.dumps({"validation_json": {"serving_readiness": serving_readiness, "writer_closure": {}}})
-    return {"candidate_json": candidate_json, "base_rls": base_rls, "own_rls": own_rls}
 
 
 @pytest.mark.asyncio
@@ -61,166 +81,199 @@ async def test_missing_published_generation_is_unavailable():
     connection = SimpleNamespace(fetchrow=AsyncMock(return_value=None))
     with pytest.raises(published.NetworkServingReadUnavailable, match="generation is unavailable"):
         await published.read_published_api_pin(connection, 3, "example_control")
-    statement, generation = connection.fetchrow.await_args.args
-    assert '"example_control".network_serving_manifest' in statement and generation == 3
 
 
 @pytest.mark.asyncio
-async def test_generation_without_a_compact_layout_resolves_from_its_validation_report(monkeypatch):
-    """A generation published before the compact layout needs neither a ledger row nor a base heap."""
-    entry = _published_entry({"index_definition_sha256": "d" * 64}, base_rls=None)
-    manifest, proofs = SimpleNamespace(), []
-    monkeypatch.setattr(published, "_pinned_manifest", lambda _entry, custody: proofs.append(custody) or manifest)
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=entry))
-    resolved = await published.read_published_api_pin(connection, None, "example_control", approved=False)
-    assert resolved == (manifest, None, None)
-    assert proofs[0]["compact_layout"] is None and proofs[0]["seal_sha256"] is None
+async def test_published_pin_uses_stored_names(published_entry):
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=published_entry))
+    manifest, approved, relation = await published.read_published_api_pin(connection, None, "example_control")
+    assert manifest.generation_id == 7
+    assert approved.total_rows == 3
+    assert asdict(relation) == {"schema_name": "example_control", "table_name": "registry_approved_record"}
+    assert asdict(manifest.compact_layout.base) == {
+        "schema_name": "published_addresses",
+        "table_name": "entity_address_unified_v1",
+    }
+    assert manifest.address_relation == manifest.compact_layout.base
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("own_rls", [True, None], ids=["row security", "no address table"])
-async def test_generation_without_a_compact_layout_refuses_a_row_filtered_address_table(own_rls):
-    entry = _published_entry({"index_definition_sha256": "d" * 64}, base_rls=None, own_rls=own_rls)
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=entry))
-    with pytest.raises(published.NetworkServingReadUnavailable, match="address rows are unavailable"):
-        await published.read_published_api_pin(connection, None, "example_control", approved=False)
-    assert "AS own_rls" in connection.fetchrow.await_args.args[0]
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("generation", [None, 7])
+async def test_manifest_only_read_touches_no_approved_records(published_entry, compact, generation):
+    candidate = _candidate(published_entry)
+    if not compact:
+        candidate["validation_json"]["serving_readiness"]["component"] = "unified_address_serving"
+    published_entry["candidate_json"] = json.dumps(candidate)
+    del published_entry["approved_rows"]
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=published_entry))
+    manifest, approved, relation = await published.read_published_api_pin(
+        connection, generation, "example_control", approved=False
+    )
+    assert manifest.generation_id == 7 and manifest.approved_custom_revision == 4
+    assert (manifest.compact_layout is not None) is compact
+    assert approved is None and relation is None
+    assert not hasattr(manifest, "_published_api_request")
+    query, selector = connection.fetchrow.await_args.args
+    assert selector == generation and "NULL::bigint AS approved_rows" in query
+    assert "registry_approved_record" not in query
+    assert "pg_catalog" not in query and "custody" not in query and "oid" not in query
+    token = _PINNED_READ.set((manifest, "example_control"))
+    try:
+        assert published.active_published_api_pin(connection, manifest) is None
+    finally:
+        _PINNED_READ.reset(token)
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("base_rls", [True, None], ids=["row security", "no heap under either name"])
-async def test_unreadable_published_address_heap_is_unavailable(base_rls):
-    entry = _published_entry({"component": "compact_network_serving", "address_artifact": {}}, base_rls=base_rls)
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=entry))
-    with pytest.raises(published.NetworkServingReadUnavailable, match="address rows are unavailable"):
-        await published.read_published_api_pin(connection, None, "example_control")
+def test_supplied_manifest_flag_cannot_skip_request_audits():
+    manifest = SimpleNamespace(_published_api_request=True)
+    token = _PINNED_READ.set(None)
+    try:
+        assert published.active_published_api_pin(object(), manifest) is None
+    finally:
+        _PINNED_READ.reset(token)
 
 
-@pytest.mark.asyncio
-async def test_manifest_only_read_touches_no_approved_records(monkeypatch):
-    """A reader without access to approved records still resolves the published manifest."""
-    from process import network_compact_layout as layouts
+def test_historical_physical_fields_do_not_change_named_layout(published_entry):
+    original = _candidate(published_entry)
+    expected = published.published_network_layout(original)
+    artifact = original["validation_json"]["serving_readiness"]["address_artifact"]
+    artifact["namespace"].update(oid=123, owner_oid=456)
+    artifact["table"].update(oid=789, relfilenode=999)
+    original["validation_json"]["writer_closure"] = {"relation_oids": {"network_slice_ref": 234}}
+    original["validation_json"]["serving_readiness"]["edge_artifacts"][0].update(table_oid=345, seal_sha256="d" * 64)
+    assert published.published_network_layout(original) == expected
+    assert "oid" not in json.dumps(asdict(expected))
 
-    report_by_field = {
-        "serving_readiness": {
-            "component": "compact_network_serving",
-            # The address contract does not matter: every compact generation is named by its report.
-            "address_artifact": {"contract": "network_address_artifact.postgres.v1", "table": {"oid": 11}},
-            "edge_artifacts": [],
-            "index_definition_sha256": "d" * 64,
+
+@pytest.mark.parametrize("damage", ["schema", "candidate", "source_generation", "revision"])
+def test_changed_logical_generation_refuses(published_entry, damage):
+    candidate = _candidate(published_entry)
+    match damage:
+        case "schema":
+            candidate["schema_name"] = 'unsafe"schema'
+        case "candidate":
+            candidate["candidate_id"] = "other-candidate"
+        case "source_generation":
+            candidate["source_generations"] = {"custom_membership": "different"}
+        case "revision":
+            candidate["approved_custom_revision"] += 1
+    published_entry["candidate_json"] = json.dumps(candidate)
+    with pytest.raises(ValueError):
+        published._decode_published_pin(published_entry, "example_control")
+
+
+def test_flat_published_generation_is_supported(published_entry):
+    candidate = _candidate(published_entry)
+    candidate["validation_json"]["serving_readiness"]["component"] = "unified_address_serving"
+    published_entry["candidate_json"] = json.dumps(candidate)
+    manifest, _approved, _relation = published._decode_published_pin(published_entry, "example_control")
+    assert manifest.compact_layout is None
+    assert manifest.address_relation.table_name == "entity_address_unified"
+
+
+def test_active_pin_keeps_request_generation(published_entry):
+    manifest, _approved, _relation = published._decode_published_pin(published_entry, "example_control")
+    token = _PINNED_READ.set((manifest, "example_control"))
+    try:
+        assert published.active_published_api_pin(object(), manifest, control_schema="example_control") is manifest
+        with pytest.raises(published.NetworkServingReadUnavailable):
+            published.active_published_api_pin(object(), SimpleNamespace(generation_id=8))
+    finally:
+        _PINNED_READ.reset(token)
+    assert published.active_published_api_pin(object()) is None
+
+
+@pytest.mark.parametrize("field", ["generation_id", "schema_name", "approved_custom_revision", "source_generations"])
+def test_active_pin_refuses_changed_logical_metadata(published_entry, field):
+    from dataclasses import replace
+
+    manifest, _approved, _relation = published._decode_published_pin(published_entry, "example_control")
+    value = {
+        "generation_id": 8,
+        "schema_name": "another_snapshot",
+        "approved_custom_revision": 5,
+        "source_generations": {"custom_membership": "d" * 64},
+    }[field]
+    token = _PINNED_READ.set((manifest, "example_control"))
+    try:
+        assert published.active_published_api_pin(object(), replace(manifest)) is manifest
+        with pytest.raises(published.NetworkServingReadUnavailable):
+            published.active_published_api_pin(object(), replace(manifest, **{field: value}))
+        with pytest.raises(published.NetworkServingReadUnavailable):
+            published.active_published_api_pin(object(), manifest, control_schema="other_control")
+    finally:
+        _PINNED_READ.reset(token)
+
+
+def test_query_relations_include_the_named_compact_search_inputs(published_entry):
+    from process.network_compact_layout import CompactAddressRelation, bind_compact_geo_search
+
+    manifest, _approved, _relation = published._decode_published_pin(published_entry, "example_control")
+    layout = manifest.compact_layout
+    projection = CompactAddressRelation(manifest.schema_name, "network_geo_search")
+    bind_compact_geo_search(layout, projection)
+    assert manifest.candidate_relation_pins == (
+        CompactAddressRelation(manifest.schema_name, "network_membership"),
+        CompactAddressRelation(manifest.schema_name, "provider_location_binding"),
+        layout.ref_map,
+        layout.base,
+        CompactAddressRelation(layout.artifacts[0].schema_name, "network_office_edge"),
+        projection,
+    )
+
+
+def test_duplicate_named_query_relations_are_refused(published_entry):
+    from dataclasses import replace
+
+    from process.network_compact_layout import CompactAddressRelation
+
+    manifest, _approved, _relation = published._decode_published_pin(published_entry, "example_control")
+    duplicate = CompactAddressRelation(manifest.schema_name, "network_membership")
+    layout = replace(manifest.compact_layout, base=duplicate)
+    manifest = published._pinned_manifest(published_entry, layout=layout)
+    with pytest.raises(published.NetworkServingReadUnavailable, match="must be unique"):
+        _ = manifest.candidate_relation_pins
+
+
+def test_geo_search_metadata_projects_historical_ids_to_names(published_entry):
+    from process.network_geo_search import TABLE, geo_search_receipt
+
+    candidate = _candidate(published_entry)
+    candidate.update(
+        {name: "00000000-0000-0000-0000-000000000002" for name in ("dataset_id", "schema_id", "producer_id")}
+    )
+    layout = published.published_network_layout(candidate)
+    sources_by_kind = json.loads(json.dumps(asdict(layout)))
+    for name in ("base", "ref_map"):
+        sources_by_kind[name]["table_oid"] = 123
+    sources_by_kind["artifacts"][0]["table_oid"] = 456
+    serving = candidate["validation_json"]["serving_readiness"]
+    serving["geo_search"] = {
+        "contract": "network_geo_search.postgres.v1",
+        "scope": {
+            key: candidate[key] for key in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
         },
-        "candidate_readiness": {"ref_map_oid": 12},
-        "writer_closure": {},
+        "table_name": TABLE,
+        "table_oid": 789,
+        "row_count": 1,
+        "sources": sources_by_kind,
+        "indexes": [
+            {"name": TABLE + suffix, "index_oid": number, "table_oid": 789, "definition": "example definition"}
+            for suffix, number in (("_pkey", 987), ("_gn", 654))
+        ],
+        "sha256": "e" * 64,
     }
-    entry_by_field = {
-        "candidate_json": json.dumps(
-            {"schema_name": "network_candidate_" + "a" * 32, "validation_json": report_by_field}
-        ),
-        "base_rls": False,
-        "base_schema": "example_addresses",
-        "base_name": "entity_address_unified",
-    }
-    manifest = SimpleNamespace(approved_custom_revision=4, source_generations={"custom_membership": "c" * 64})
-    proofs = []
-    monkeypatch.setattr(published, "_pinned_manifest", lambda _entry, custody: proofs.append(custody) or manifest)
-    monkeypatch.setattr(layouts, "bind_compact_geo_search_candidate", lambda layout, _candidate: layout)
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=entry_by_field))
-    resolved = await published.read_published_api_pin(connection, 3, "example_control", approved=False)
-    assert resolved == (manifest, None, None) and not hasattr(manifest, "_published_api_request")
-    approved_records = 'FROM "example_control".registry_approved_record'
-    statement = connection.fetchrow.await_args.args[0]
-    assert "NULL::bigint AS approved_rows" in statement and approved_records not in statement
-    # The candidate's own validation report supplies the relation names; the ledger is never read.
-    assert "network_candidate_custody" not in statement and proofs[0]["seal_sha256"] is None
-    assert proofs[0]["compact_layout"].base == layouts.CompactAddressRelation(
-        "example_addresses", "entity_address_unified", 11
-    )
-    assert proofs[0]["receipt"] == {
-        "closure": {},
-        "control": {},
-        "index_definition_sha256": "d" * 64,
-    }
-
-    entry_by_field.update(approved_oid=31, approved_rows=5)
-    pinned, approved, relation = await published.read_published_api_pin(connection, 3, "example_control")
-    assert approved_records in connection.fetchrow.await_args.args[0]
-    assert pinned is manifest and manifest._published_api_request is True
-    assert (approved.approved_revision, approved.generation_id, approved.total_rows) == (4, "c" * 64, 5)
-    assert (relation.schema_name, relation.table_name, relation.table_oid) == (
-        "example_control",
-        "registry_approved_record",
-        31,
-    )
+    descriptor = geo_search_receipt(candidate)
+    assert descriptor["row_count"] == 1
+    assert "oid" not in json.dumps(descriptor)
+    assert descriptor["sources"]["base"] == asdict(layout.base)
 
 
-def _custom_candidate():
-    closure_by_field = {
-        "relation_oids": {"provider_location_binding": 21, "entity_address_unified": 22},
-        "loader_roles": [],
-        "reader_roles": ["example_reader"],
-    }
-    source_by_field = {
-        "schema_name": "example_addresses",
-        "table_name": "entity_address_unified",
-        "generation_id": "a" * 64,
-    }
-    return {
-        "schema_name": "network_candidate_" + "a" * 32,
-        "validation_json": {"address_source": source_by_field, "writer_closure": closure_by_field},
-    }
-
-
-def _custom_receipt(**changes):
-    values_by_field = {
-        "base_source": published.PinnedAddressSource("example_addresses", "entity_address_unified", "a" * 64),
-        "base_artifact_sha256": "b" * 64,
-        "binding_table_oid": 21,
-        "runtime_roles": ("example_reader",),
-        "address_table_oid": 22,
-        "custom_pair_count": 1,
-        "materialized_address_rows": 0,
-    }
-    return SimpleNamespace(**(values_by_field | changes))
-
-
-@pytest.mark.parametrize(
-    ("custom", "carrier", "expected_oid"),
-    [
-        (_custom_receipt(), None, 22),
-        (_custom_receipt(custom_pair_count=0), None, None),
-        (_custom_receipt(custom_pair_count=0, address_table_oid=23), _custom_receipt(materialized_address_rows=3), 22),
-        (_custom_receipt(custom_pair_count=0), _custom_receipt(), None),
-    ],
-    ids=["custom offices", "no custom offices", "carrier offices", "empty carrier"],
-)
-def test_custom_address_relation_follows_the_recorded_preparation(monkeypatch, custom, carrier, expected_oid):
-    monkeypatch.setattr(published, "compact_custom_receipt", lambda _candidate: custom)
-    monkeypatch.setattr(published, "compact_carrier_receipt", lambda _candidate: carrier)
-    candidate = _custom_candidate()
-    relation = published._custom_address_relation(candidate, {"descriptor_sha256": "b" * 64})
-    if expected_oid is None:
-        assert relation is None
-    else:
-        assert (relation.schema_name, relation.table_name, relation.table_oid) == (
-            candidate["schema_name"],
-            "entity_address_unified",
-            expected_oid,
-        )
-
-
-@pytest.mark.parametrize(
-    ("custom", "carrier"),
-    [
-        (_custom_receipt(binding_table_oid=99), None),
-        (_custom_receipt(base_artifact_sha256="f" * 64), None),
-        (_custom_receipt(address_table_oid=99), None),
-        (_custom_receipt(), _custom_receipt(runtime_roles=("other_reader",))),
-        (_custom_receipt(), _custom_receipt(address_table_oid=99)),
-    ],
-    ids=["binding", "artifact", "address", "carrier roles", "carrier address"],
-)
-def test_custom_address_relation_refuses_inconsistent_preparation(monkeypatch, custom, carrier):
-    monkeypatch.setattr(published, "compact_custom_receipt", lambda _candidate: custom)
-    monkeypatch.setattr(published, "compact_carrier_receipt", lambda _candidate: carrier)
-    with pytest.raises(published.NetworkServingReadUnavailable, match="metadata is unavailable"):
-        published._custom_address_relation(_custom_candidate(), {"descriptor_sha256": "b" * 64})
+def test_nullable_legacy_validation_metadata_keeps_flat_named_generation(published_entry):
+    candidate = _candidate(published_entry)
+    candidate["validation_json"] = None
+    published_entry["candidate_json"] = json.dumps(candidate)
+    manifest, approved, _relation = published._decode_published_pin(published_entry, "example_control")
+    assert manifest.compact_layout is None and manifest.address_relation.schema_name == candidate["schema_name"]
+    assert manifest.address_relation.table_name == "entity_address_unified" and approved.total_rows == 3

@@ -20,11 +20,11 @@ from process.network_fhir_membership_source import FHIR_SOURCE_WITNESS_TRANSFORM
 from process.registry_source_inventory_reference import INVENTORY_DIGEST_KEY, SourceInventoryReference
 from process.registry_source_recipe_store import RECIPE_DIGEST_KEY, canonical_registry_source_recipes
 from tests import test_verified_inventory_v2 as witness_metadata
+from tests.registry_source_recipe_support import _derivation as legacy_derivation
+from tests.registry_source_recipe_support import _descriptor as legacy_descriptor
+from tests.registry_source_recipe_support import _example
 from tests.test_registry_source_inventory_fact_owners import _owner
-from tests.test_registry_source_inventory_preparation import _derivation as legacy_derivation
-from tests.test_registry_source_inventory_preparation import _descriptor as legacy_descriptor
 from tests.test_registry_source_inventory_summaries import OneShot
-from tests.test_registry_source_recipe_store_postgres import _example
 
 
 def _mapping(recipe=None, *, witness=True, **changes):
@@ -406,7 +406,9 @@ def test_old_fact_owner_keeps_mapping_v3_metadata(witness):
     original.update(fact_rows=2 if witness else 1, fact_sha256="d" * 64, accepted_raw_source_rows=1)
     if witness:
         original.update(unresolved_rows=0, unresolved_raw_source_rows=0)
-    reference = artifacts.SourceFactArtifactReference(str(UUID(int=9)), 42, "f" * 64)
+    reference = artifacts.SourceFactArtifactReference(
+        str(UUID(int=9)), "synthetic_original", "network_source_contribution", "f" * 64
+    )
     artifact = artifacts.ResolvedSourceFactArtifact(reference, "synthetic_original", original)
     descriptor = _mapping(recipe, witness=witness)
     anchored = artifacts.anchored_source_fact_descriptor(descriptor, artifact)
@@ -422,7 +424,9 @@ def test_old_fact_owner_keeps_mapping_v3_metadata(witness):
 
 def test_legacy_owner_cannot_be_relabelled_witness():
     recipe = _example()
-    reference = artifacts.SourceFactArtifactReference(str(UUID(int=9)), 42, "f" * 64)
+    reference = artifacts.SourceFactArtifactReference(
+        str(UUID(int=9)), "synthetic_original", "network_source_contribution", "f" * 64
+    )
     artifact = artifacts.ResolvedSourceFactArtifact(reference, "synthetic_original", legacy_descriptor(recipe))
     with pytest.raises(contributions.RegistrySourceContributionError, match="identity_changed"):
         artifacts.anchored_source_fact_descriptor(_mapping(recipe), artifact)
@@ -448,8 +452,8 @@ async def test_owner_inventory_authenticates_exact_summary_five(monkeypatch):
         }
     )
     load = AsyncMock(return_value=(reference, (entry,)))
-    monkeypatch.setattr(inventory_store, "_load_locked_source_inventory", load)
-    actual = await artifacts._owner_sources(object(), candidate, owner.custody, "synthetic_control")
+    monkeypatch.setattr(inventory_store, "load_source_inventory", load)
+    actual = await artifacts._owner_sources(object(), candidate, "synthetic_control")
     assert actual == (descriptor,)
     load.assert_awaited_once()
     corrupted_by_field = {**descriptor, "membership_rows": 1}
@@ -458,4 +462,4 @@ async def test_owner_inventory_authenticates_exact_summary_five(monkeypatch):
         (inventory.make_source_inventory_entry(1, _example(), contribution=corrupted_by_field),),
     )
     with pytest.raises(contributions.RegistrySourceContributionError, match="inventory_changed"):
-        await artifacts._owner_sources(object(), candidate, owner.custody, "synthetic_control")
+        await artifacts._owner_sources(object(), candidate, "synthetic_control")

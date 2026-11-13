@@ -26,18 +26,12 @@ from process.provider_directory_rooted_graph_store_contract import (
 )
 from process.provider_directory_rooted_graph_store_support import (
     ACQUISITION_TABLE,
-    EDGE_SET_FUNCTION,
     EDGE_TABLE,
-    RESOURCE_SET_FUNCTION,
     RESOURCE_TABLE,
-    ROOT_FUNCTION,
-    TERMINAL_SET_FUNCTION,
     WORK_TABLE,
     assert_identity_row,
-    function_ref,
     rooted_graph_transaction,
     row_fields,
-    set_store_action,
     table_ref,
 )
 
@@ -80,7 +74,6 @@ async def complete_provider_directory_rooted_graph_result(
     validate_provider_directory_rooted_graph_query_result(claim, query_result)
     async with rooted_graph_transaction(database) as transaction:
         await admit_result_witnesses(database, transaction, claim, query_result)
-        await set_store_action(database, "terminal", claim.acquisition_id, claim.lease_token)
         count = await database.status(
             f"""
             UPDATE {table_ref(WORK_TABLE)}
@@ -98,8 +91,7 @@ async def complete_provider_directory_rooted_graph_result(
                    updated_at = transaction_timestamp()
              WHERE acquisition_id = :acquisition_id AND query_id = :query_id
                AND status = 'leased' AND attempt_count = :attempt
-               AND lease_token = :lease_token
-               AND lease_expires_at > clock_timestamp();
+               AND lease_token = :lease_token;
             """,
             acquisition_id=claim.acquisition_id,
             query_id=claim.query_id,
@@ -143,12 +135,6 @@ async def complete_provider_directory_rooted_graph_missing(
         missing_response_json_text,
     )
     async with rooted_graph_transaction(database):
-        await set_store_action(
-            database,
-            "terminal",
-            claim.acquisition_id,
-            claim.lease_token,
-        )
         count = await database.status(
             _complete_missing_sql(),
             acquisition_id=claim.acquisition_id,
@@ -185,7 +171,6 @@ async def complete_provider_directory_rooted_graph_error(
         error_code,
     )
     async with rooted_graph_transaction(database):
-        await set_store_action(database, "terminal", claim.acquisition_id, claim.lease_token)
         count = await database.status(
             f"""
             UPDATE {table_ref(WORK_TABLE)}
@@ -285,9 +270,7 @@ def _seal_update_sql() -> str:
         UPDATE {table_ref(ACQUISITION_TABLE)} AS acquisition
            SET status = 'sealed',
                rooted_graph_complete = (work_census.error_count = 0),
-               request_failure_coverage = {function_ref("provider_directory_rooted_graph_request_failure_coverage")}(
-                   acquisition.acquisition_id
-               ),
+               request_failure_coverage = CAST(:coverage AS jsonb),
                pending_count = work_census.pending_count,
                leased_count = work_census.leased_count,
                completed_count = work_census.completed_count,
@@ -296,18 +279,10 @@ def _seal_update_sql() -> str:
                edge_count = edge_census.edge_count,
                insurance_plan_count = plan_census.insurance_plan_count,
                insurance_plan_page_count = plan_census.insurance_plan_page_count,
-               terminal_set_sha256 = {function_ref(TERMINAL_SET_FUNCTION)}(
-                   acquisition.acquisition_id
-               ),
-               resource_set_sha256 = {function_ref(RESOURCE_SET_FUNCTION)}(
-                   acquisition.acquisition_id
-               ),
-               edge_set_sha256 = {function_ref(EDGE_SET_FUNCTION)}(
-                   acquisition.acquisition_id
-               ),
-               rooted_graph_sha256 = {function_ref(ROOT_FUNCTION)}(
-                   acquisition.acquisition_id
-               ),
+               terminal_set_sha256 = :terminal_set_sha256,
+               resource_set_sha256 = :resource_set_sha256,
+               edge_set_sha256 = :edge_set_sha256,
+               rooted_graph_sha256 = :rooted_graph_sha256,
                sealed_at = transaction_timestamp(),
                updated_at = transaction_timestamp()
           FROM work_census, witness_census, edge_census, plan_census
@@ -318,12 +293,23 @@ def _seal_update_sql() -> str:
 
 
 async def _seal_header(database: Any, acquisition_id: str) -> Any:
-    """Apply counts and comparison roots under exact acquisition storage locks."""
+    """Bind complete counts and content digests from this isolated acquisition."""
+    import json
 
-    return await database.first(
-        _seal_census_sql() + _seal_update_sql(),
-        acquisition_id=acquisition_id,
-    )
+    from process.provider_directory_rooted_graph_bulk import named_acquisition_hashes, named_request_coverage
+    from process.provider_directory_rooted_graph_source_runtime import current_rooted_graph_runtime
+
+    if current_rooted_graph_runtime(database) is None:
+        raise RuntimeError(
+            "Rooted writes require a configured isolated generation prepared through the Source operator"
+        )
+    coverage = await named_request_coverage(database, acquisition_id)
+    parameters_by_name = {
+        "acquisition_id": acquisition_id,
+        "coverage": json.dumps(coverage) if coverage is not None else None,
+    }
+    parameters_by_name.update(await named_acquisition_hashes(database, acquisition_id))
+    return await database.first(_seal_census_sql() + _seal_update_sql(), **parameters_by_name)
 
 
 async def seal_provider_directory_rooted_graph_acquisition(
@@ -349,10 +335,9 @@ async def seal_provider_directory_rooted_graph_acquisition(
         )
         if header["status"] == "sealed":
             return _summary_from_row(header)
-        await database.scalar(
-            f"SELECT {function_ref('finish_provider_directory_rooted_graph_storage')}(:acquisition_id);",
-            acquisition_id=identity.acquisition_id,
-        )
+        from process.provider_directory_rooted_graph_bulk import finish_named_acquisition_storage
+
+        await finish_named_acquisition_storage(database, identity.acquisition_id)
         sealed = await _seal_header(database, identity.acquisition_id)
         if sealed is None:
             raise ProviderDirectoryRootedGraphStoreError("state")

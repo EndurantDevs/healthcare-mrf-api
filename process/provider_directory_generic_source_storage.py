@@ -10,17 +10,14 @@ import asyncio
 import hashlib
 import json
 import re
-import time
 import urllib.parse
 from contextlib import asynccontextmanager, nullcontext
-from contextvars import ContextVar
 from dataclasses import dataclass
 from importlib import import_module
 from uuid import uuid4
 
 from db.plan_release_storage import storage_identifier, storage_relation
 from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner
-from process.plan_release_storage_catalog import CATALOG_SQL
 from process.plan_release_storage_provision import _GRANTEES_SQL
 from process.provider_directory_generic_candidate import (
     RESOURCE_COLUMNS,
@@ -32,6 +29,7 @@ from process.provider_directory_generic_source_policy import source_copy_session
 from process.provider_directory_role_merge import is_role_repeat_source, role_order_index_sql, staged_role_rows
 from process.provider_directory_source_storage_binding import (
     NamedFHIRSourceStorage,
+    named_source_document,
     require_storage_schema,
     storage_document,
 )
@@ -80,20 +78,7 @@ HANDOFF_HEADER_FIELDS = (
     "previous_dataset_id",
     "completion_proof_required_version",
     "completion_proof_sha256",
-    "content_proof_admission_sha256",
 )
-_INPUT_SEQUENCES_SQL = """SELECT t.relname AS input_name,a.attname,a.attidentity::text,
- d.deptype::text,s.oid::bigint,s.relname,n.nspname,s.relowner::bigint,
- s.relkind::text,s.relpersistence::text,q.seqtypid::regtype::text,
- q.seqstart,q.seqincrement,q.seqmax,q.seqmin,q.seqcache,q.seqcycle,
- NOT EXISTS(SELECT FROM aclexplode(coalesce(s.relacl,acldefault('S',s.relowner))) grant_entry
-  WHERE grant_entry.grantee<>s.relowner) AS acl_closed
- FROM pg_class t JOIN pg_depend d ON d.refclassid='pg_class'::regclass AND d.refobjid=t.oid
-  AND d.classid='pg_class'::regclass AND d.deptype IN ('a','i')
- JOIN pg_class s ON s.oid=d.objid AND s.relkind='S'
- JOIN pg_namespace n ON n.oid=s.relnamespace JOIN pg_sequence q ON q.seqrelid=s.oid
- JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=d.refobjsubid
- WHERE t.oid=ANY(ARRAY(SELECT to_regclass(name)::oid FROM unnest($1::text[]) names(name)))"""
 
 
 @dataclass(frozen=True)
@@ -126,7 +111,8 @@ def _require(condition, code):
 
 
 def _json(value):
-    return json.loads(value) if isinstance(value, str) else value
+    decoded = json.loads(value) if isinstance(value, str) else value
+    return named_source_document(decoded)
 
 
 def _encoded(value):
@@ -201,8 +187,8 @@ def _validate_binding_storage(binding_by_field, *, is_isolated):
 
 def _validate_isolated_binding_storage(binding, expected_storage):
     metadata = binding["identity"]["metadata"]
+    _validate_named_storage(expected_storage)
     if binding["contract"] == NAMED_ISOLATED_CONTRACT:
-        _validate_named_storage(expected_storage)
         _require_named_source_identity(binding["identity"])
     _require(binding["storage"] == expected_storage, "storage_binding_changed")
     _require(binding["phase"] != "published" and binding["auxiliary"] is None, "isolated_kind_unsupported")
@@ -226,19 +212,9 @@ def _validate_isolated_binding_storage(binding, expected_storage):
 
 def _validate_named_storage(document):
     _require(
-        type(document) is dict and set(document) == {"catalog_schema", "storage_schema", "producer"},
-        "storage_binding_changed",
+        type(document) is dict and set(document) == {"catalog_schema", "storage_schema"}, "storage_binding_changed"
     )
-    NamedFHIRSourceStorage(document["catalog_schema"], document["storage_schema"])
-    producer = document["producer"]
-    _require(
-        type(producer) is list
-        and len(producer) == 2
-        and all(type(value) is str for value in producer)
-        and re.fullmatch(r"[0-9a-f]{40}", producer[0])
-        and re.fullmatch(r"sha256:[0-9a-f]{64}", producer[1]),
-        "storage_binding_changed",
-    )
+    NamedFHIRSourceStorage(**document)
 
 
 def named_source_resources(source_ids):
@@ -282,54 +258,27 @@ def validate_handoff_document(document, expected_storage):
 
 
 def _validate_binding_tables(binding_by_field, identity):
-    """Require the complete phase-specific native inventory, without aliases."""
+    """Validate the complete logical table group and its schema-qualified names."""
     _require(type(binding_by_field["tables"]) is dict, "tables_changed")
-    expected = (
-        set()
-        if binding_by_field["phase"] in {"published", "disposed", "ready_for_freeze"}
-        else {"resource_input", "witness_input"}
-    )
-    if binding_by_field["phase"] in {"prepared", "published", "ready_for_freeze"}:
-        expected |= set(RELATIONS)
-    if binding_by_field["phase"] == "ready_for_freeze":
-        expected |= set(HANDOFF_CONTROL_ROOTS)
+    phase = binding_by_field["phase"]
+    expected = set() if phase in {"published", "disposed", "ready_for_freeze"} else {"resource_input", "witness_input"}
+    if phase in {"prepared", "published", "ready_for_freeze"}:
+        expected.update(RELATIONS)
+    if phase == "ready_for_freeze":
+        expected.update(HANDOFF_CONTROL_ROOTS)
     _require(set(binding_by_field["tables"]) == expected, "tables_changed")
-    tables_by_kind = {**binding_by_field["tables"], **_auxiliary_tables(binding_by_field, identity)}
-    is_named_storage = binding_by_field["contract"] == NAMED_ISOLATED_CONTRACT
+    references = list(binding_by_field["tables"].values()) + list(
+        _auxiliary_tables(binding_by_field, identity).values()
+    )
     names = []
-    for root, table in tables_by_kind.items():
-        _require(
-            type(table) is dict
-            and set(table) == ({"name"} if is_named_storage else {"name", "oid", "owner", "layout_sha256"})
-            and type(table["name"]) is str
-            and _NAME.fullmatch(table["name"]) is not None,
-            "table_binding_changed",
-        )
-        if is_named_storage:
-            suffix = {"resource_input": "ri", "witness_input": "wi"}.get(root, _SUFFIXES.get(root))
-            _require(suffix is not None and table["name"].endswith("_" + suffix), "table_binding_changed")
-        else:
-            _require(
-                type(table["oid"]) is int
-                and table["oid"] > 0
-                and type(table["owner"]) is int
-                and table["owner"] > 0
-                and type(table["layout_sha256"]) is str
-                and re.fullmatch(r"[0-9a-f]{64}", table["layout_sha256"]),
-                "table_binding_changed",
-            )
-        if root in HANDOFF_CONTROL_ROOTS or table["name"].endswith(("_h", "_p")):
-            _require(
-                binding_by_field["contract"] in ISOLATED_CONTRACTS
-                and binding_by_field["phase"] == "ready_for_freeze"
-                and root in HANDOFF_CONTROL_ROOTS
-                and table["name"].endswith("_" + _SUFFIXES[root]),
-                "table_binding_changed",
-            )
-        names.append(table["name"])
+    for table in references:
+        _require(type(table) is dict and set(table) == {"schema", "name"}, "table_binding_changed")
+        storage_identifier(table["schema"])
+        storage_identifier(table["name"])
+        if "storage" in binding_by_field:
+            _require(table["schema"] == binding_by_field["storage"]["storage_schema"], "table_binding_changed")
+        names.append((table["schema"], table["name"]))
     _require(len(set(names)) == len(names), "table_binding_changed")
-    if is_named_storage:
-        _require(len({name.rsplit("_", 1)[0] for name in names}) <= 1, "table_binding_changed")
 
 
 def validate_handoff_header(seal):
@@ -349,10 +298,7 @@ def validate_handoff_header(seal):
         )
     )
     _require(
-        all(
-            type(seal[key]) is str and re.fullmatch(r"[0-9a-f]{64}", seal[key])
-            for key in ("dataset_hash", "content_proof_admission_sha256")
-        )
+        all(type(seal[key]) is str and re.fullmatch(r"[0-9a-f]{64}", seal[key]) for key in ("dataset_hash",))
         and type(seal["resource_count"]) is int
         and 0 <= seal["resource_count"] < 2**63
         and completion_valid
@@ -501,13 +447,23 @@ async def _locked(connection, policy, identity, *, phases=("loading",), lock="UP
     return binding_by_field
 
 
-async def _store(connection, policy, identity, previous, binding_by_field):
+async def _store(connection, policy, identity, previous, binding_by_field, *, header_name=HEADER):
+    raw_previous = None
+    if previous is not None:
+        raw_previous = await connection.fetchval(
+            f"SELECT candidate_storage_json FROM {storage_relation(policy.schema, header_name)} "
+            "WHERE dataset_id=$1 FOR NO KEY UPDATE",
+            identity["dataset_id"],
+        )
+        _require(_json(raw_previous) == previous, "header_compare_failed")
+        if isinstance(raw_previous, str):
+            raw_previous = json.loads(raw_previous)
     status = await connection.execute(
-        f"UPDATE {storage_relation(policy.schema, HEADER)} SET candidate_storage_json=$2::jsonb "
+        f"UPDATE {storage_relation(policy.schema, header_name)} SET candidate_storage_json=$2::jsonb "
         "WHERE dataset_id=$1 AND candidate_storage_json IS NOT DISTINCT FROM $3::jsonb",
         identity["dataset_id"],
         _encoded(binding_by_field),
-        None if previous is None else _encoded(previous),
+        None if raw_previous is None else _encoded(raw_previous),
     )
     _require(status == "UPDATE 1", "header_compare_failed")
 
@@ -527,61 +483,13 @@ async def _close_grants(connection, policy, name, *, readable=False, sequence=Fa
         await connection.execute(f"GRANT SELECT ON TABLE {relation} TO {readers}")
 
 
-def _table_proof(row, *, private):
-    columns, constraints, indexes = (_json(row[key]) for key in ("columns", "constraints", "indexes"))
-    _require(
-        row["relkind"] == "r"
-        and row["relpersistence"] == "p"
-        and not row["relrowsecurity"]
-        and not row["relforcerowsecurity"]
-        and row["inert"]
-        and row["native_checks"]
-        and row["direct_acl_closed"]
-        and (private or row["readers_closed"])
-        and (
-            not row["parents"] and not row["relispartition"]
-            if private
-            else len(row["parents"]) == 1 and row["relispartition"]
-        )
-        and all(constraint["type"] in {"c", "p", "u"} and constraint["valid"] for constraint in constraints)
-        and all(index["valid"] for index in indexes),
-        "storage_custody_changed",
-    )
-    return _layout_proof(row)
-
-
-def _layout_proof(row):
-    """Hash the native layout only after the caller authenticates its exact storage shape."""
-    layout_by_field = {key: _json(row[key]) for key in ("columns", "constraints", "indexes")}
-    layout_by_field["parents"] = list(row["parents"])
-    return dict(
-        name=row["relname"],
-        oid=row["oid"],
-        owner=row["relowner"],
-        layout_sha256=hashlib.sha256(_encoded(layout_by_field).encode()).hexdigest(),
-    )
-
-
 async def _capture(connection, policy, names, *, private=True):
-    owner = await connection.fetchval("SELECT oid::bigint FROM pg_roles WHERE rolname=$1", policy.owner_role)
-    readers = (
-        []
-        if private
-        else list(
-            await connection.fetchval(
-                "SELECT array_agg(oid ORDER BY oid) FROM pg_roles WHERE rolname=ANY($1::text[])",
-                list(policy.runtime_roles),
-            )
-        )
-    )
-    qualified_names = [storage_relation(policy.schema, name) for name in names]
-    rows = await connection.fetch(CATALOG_SQL, qualified_names, owner, readers)
-    _require(len(rows) == len(names) and {row["relname"] for row in rows} == set(names), "storage_missing")
-    _require(all(row["relowner"] == owner and row["nspname"] == policy.schema for row in rows), "storage_owner_changed")
-    proof_by_name = {row["relname"]: _table_proof(row, private=private) for row in rows}
-    for name, sequence in (await _capture_input_sequences(connection, policy, names, owner)).items():
-        proof_by_name[name]["layout_sha256"] = _input_layout_hash(proof_by_name[name]["layout_sha256"], sequence)
-    return proof_by_name
+    """Resolve table names with ordinary SQL permissions and record portable coordinates."""
+    references_by_name = {}
+    for name in names:
+        await connection.execute("SELECT 1 FROM " + storage_relation(policy.schema, name) + " LIMIT 0")
+        references_by_name[name] = {"schema": policy.schema, "name": name}
+    return references_by_name
 
 
 _PRIVATE_READERS_CLOSED_SQL = (
@@ -601,57 +509,11 @@ async def require_private_source_readers_closed(connection, relation_oids, reade
     _require(closed is True, "private_reader_access")
 
 
-def _input_layout_hash(table_layout, sequence):
-    return hashlib.sha256(_encoded({"table_layout": table_layout, "sequence": dict(sequence)}).encode()).hexdigest()
-
-
-async def _capture_input_sequences(connection, policy, names, owner):
-    """Bind each input ordinal sequence to its exact protected native identity."""
-    inputs = [name for name in names if name.endswith(("_ri", "_wi"))]
-    if not inputs:
-        return {}
-    sequences = await connection.fetch(_INPUT_SEQUENCES_SQL, [storage_relation(policy.schema, name) for name in inputs])
-    resource_inputs = {name for name in inputs if name.endswith("_ri")}
-    _require(
-        len(sequences) == len(resource_inputs) and {row["input_name"] for row in sequences} == resource_inputs,
-        "input_sequence_changed",
-    )
-    for row in sequences:
-        _require_input_sequence(row, policy, owner)
-    return {row["input_name"]: dict(row) for row in sequences}
-
-
-def _require_input_sequence(row, policy, owner):
-    _require(
-        row["attname"] == "batch_ordinal"
-        and row["attidentity"] == "d"
-        and row["deptype"] == "i"
-        and row["nspname"] == policy.schema
-        and row["relowner"] == owner
-        and row["relkind"] == "S"
-        and row["relpersistence"] == "p"
-        and row["seqtypid"] == "bigint"
-        and row["seqstart"] == row["seqincrement"] == row["seqmin"] == row["seqcache"] == 1
-        and row["seqmax"] == 2**63 - 1
-        and row["seqcycle"] is False
-        and row["acl_closed"] is True,
-        "input_sequence_changed",
-    )
-
-
 async def _verify_tables(connection, policy, binding_by_field):
-    if binding_by_field["contract"] == NAMED_ISOLATED_CONTRACT:
-        return
-    proofs = binding_by_field["tables"]
-    # Published attached children retain SELECT only; loading/prepared heaps are private.
-    actual = await _capture(
-        connection,
-        policy,
-        [table["name"] for table in proofs.values()],
-        private=binding_by_field["phase"] != "published",
-    )
-    _require(all(actual[proof["name"]] == proof for proof in proofs.values()), "storage_binding_changed")
-    await _verify_auxiliary_tables(connection, policy, binding_by_field["auxiliary"])
+    """Check the logical group before resolving its SQL relations."""
+    _validate_binding_tables(binding_by_field, binding_by_field["identity"])
+    for table in binding_by_field["tables"].values():
+        await connection.execute("SELECT 1 FROM " + storage_relation(table["schema"], table["name"]) + " LIMIT 0")
 
 
 async def _verify_auxiliary_tables(connection, policy, auxiliary):
@@ -674,37 +536,9 @@ async def refresh_statistics(connection, schema, names):
         await connection.execute(f"ANALYZE {storage_relation(schema, name)}")
 
 
-_VERIFY_INTERVAL_SECONDS = 60.0
-_VERIFIED_CUSTODY: ContextVar[tuple[str, float] | None] = ContextVar(
-    "provider_directory_generic_source_verified_custody", default=None
-)
-
-
 async def _verify_tables_recently(connection, policy, binding_by_field):
-    """Re-read native custody at most once per interval for an unchanged loading binding.
-
-    Every batch still re-reads and compares the locked header binding; only the
-    catalog capture behind it is bounded, because the private heaps are reachable
-    solely through this owner's own transactions.
-    """
-    if binding_by_field["contract"] == NAMED_ISOLATED_CONTRACT:
-        return
-    key = _encoded(
-        {
-            "schema": policy.schema,
-            "owner": policy.owner_role,
-            "phase": binding_by_field["phase"],
-            "tables": binding_by_field["tables"],
-            "auxiliary": binding_by_field["auxiliary"],
-            "storage": binding_by_field.get("storage"),
-        }
-    )
-    verified = _VERIFIED_CUSTODY.get()
-    now = time.monotonic()
-    if verified is not None and verified[0] == key and now - verified[1] < _VERIFY_INTERVAL_SECONDS:
-        return
-    await _verify_tables(connection, policy, binding_by_field)
-    _VERIFIED_CUSTODY.set((key, now))
+    """Validate the locked logical binding before another intake batch."""
+    _validate_binding_tables(binding_by_field, binding_by_field["identity"])
 
 
 async def _create_source_input_heaps(connection, policy, identity, *, by_name):
@@ -729,7 +563,7 @@ async def _create_source_input_heaps(connection, policy, identity, *, by_name):
             if is_role_repeat_source(identity["metadata"].get("source_ids")):
                 await connection.execute(role_order_index_sql(policy.schema, names_by_kind[key]))
     captured = (
-        {name: {"name": name} for name in names_by_kind.values()}
+        {name: {"schema": policy.schema, "name": name} for name in names_by_kind.values()}
         if by_name
         else await _capture(connection, policy, list(names_by_kind.values()))
     )
@@ -845,38 +679,20 @@ def _validated_transition_identity(identity_by_field, expected_resource_counts):
     )
 
 
-def _validated_transition_storage(policy, old_storage, new_storage):
-    """Keep all native coordinates fixed except the issued producer seal."""
-    from process.provider_directory_source_storage_binding import FHIRSourceStorageBinding
-
-    binding_fields = set(FHIRSourceStorageBinding.__dataclass_fields__)
-    _require(
-        type(old_storage) is type(new_storage) is dict
-        and set(old_storage) == set(new_storage) == binding_fields | {"producer"},
-        "transition_storage_invalid",
-    )
-    old_binding = FHIRSourceStorageBinding(**{key: old_storage[key] for key in binding_fields})
-    new_binding = FHIRSourceStorageBinding(**{key: new_storage[key] for key in binding_fields})
-    _require(
-        old_binding.storage_schema == new_binding.storage_schema == policy.schema
-        and {key: old_storage[key] for key in binding_fields - {"enrollment_sha256"}}
-        == {key: new_storage[key] for key in binding_fields - {"enrollment_sha256"}}
-        and old_binding.enrollment_sha256 != new_binding.enrollment_sha256
-        and all(
-            type(storage_by_field["producer"]) is list
-            and len(storage_by_field["producer"]) == 2
-            and re.fullmatch(r"[0-9a-f]{40}", storage_by_field["producer"][0])
-            and re.fullmatch(r"sha256:[0-9a-f]{64}", storage_by_field["producer"][1])
-            for storage_by_field in (old_storage, new_storage)
-        )
-        and old_storage["producer"] != new_storage["producer"],
-        "transition_storage_changed",
-    )
-    return old_binding
-
-
-def _is_empty_vsp_checkpoint_failure(header, candidate_by_field, identity_by_field, expected_counts, new_storage):
+def _is_empty_vsp_checkpoint_failure(
+    header, candidate_by_field, identity_by_field, expected_counts, new_storage, *, manifest_replay=False
+):
     """Recognize exact VSP failures before any normalized input was committed."""
+    recorded_storage = candidate_by_field.get("storage")
+    is_same_producer = recorded_storage == new_storage
+    if type(recorded_storage) is dict and "producer" in recorded_storage:
+        is_same_producer = {
+            key: recorded_storage.get(key) for key in ("catalog_schema", "storage_schema", "producer")
+        } == new_storage
+    elif manifest_replay and type(new_storage) is dict:
+        is_same_producer = recorded_storage == {
+            key: new_storage.get(key) for key in ("catalog_schema", "storage_schema")
+        }
     failure_metadata = _json(header["publication_metadata_json"])
     identity_metadata = candidate_by_field["identity"]["metadata"]
     root_run_id = identity_by_field["acquisition_root_run_id"]
@@ -890,7 +706,7 @@ def _is_empty_vsp_checkpoint_failure(header, candidate_by_field, identity_by_fie
                 and (
                     (
                         identity_by_field["failed_run_id"] == root_run_id
-                        and (header["status"] == "failed" or candidate_by_field.get("storage") == new_storage)
+                        and (header["status"] == "failed" or is_same_producer)
                     )
                     or (identity_by_field["failed_run_id"] != root_run_id and header["status"] == "acquiring")
                 )
@@ -898,7 +714,7 @@ def _is_empty_vsp_checkpoint_failure(header, candidate_by_field, identity_by_fie
             or (
                 header["import_run_id"] == identity_by_field["failed_run_id"] != root_run_id
                 and is_artifact_root_failure(failure_metadata.get("error"))
-                and (header["status"] == "failed" or candidate_by_field.get("storage") == new_storage)
+                and (header["status"] == "failed" or is_same_producer)
                 and candidate_by_field["relationship_sha256"] is None
             )
             or (
@@ -970,33 +786,73 @@ def _transition_metadata_matches(metadata, expected, status):
     )
 
 
+def _transition_candidate_document(stored_document, old_storage, new_storage):
+    """Project only known saved candidate encodings onto qualified logical names."""
+    raw = json.loads(stored_document) if isinstance(stored_document, str) else stored_document
+    identity = raw.get("identity") if type(raw) is dict else None
+    _validate_binding_shape(raw, identity, phases=("loading",))
+    _require(raw["contract"] in (ISOLATED_CONTRACT, NAMED_ISOLATED_CONTRACT), "transition_candidate_changed")
+    recorded = raw["storage"]
+    names = {"catalog_schema", "storage_schema"}
+    legacy_fields = {
+        "database_oid",
+        "catalog_schema_oid",
+        "storage_schema_oid",
+        "owner_oid",
+        "namespace_owner_oid",
+        "enrollment_sha256",
+    }
+    _require(
+        type(recorded) is dict and set(recorded) in (names, names | {"producer"}, names | legacy_fields | {"producer"}),
+        "transition_storage_changed",
+    )
+    if "producer" in recorded:
+        _require(
+            recorded["producer"] in (old_storage["producer"], new_storage["producer"]), "transition_storage_changed"
+        )
+    storage_by_field = {field: recorded[field] for field in names}
+    _validate_named_storage(storage_by_field)
+    tables_by_kind = {}
+    _require(type(raw["tables"]) is dict, "table_binding_changed")
+    for kind, table in raw["tables"].items():
+        _require(
+            type(table) is dict
+            and set(table) in ({"name"}, {"schema", "name"}, {"name", "oid", "owner", "layout_sha256"}),
+            "table_binding_changed",
+        )
+        tables_by_kind[kind] = {
+            "schema": table.get("schema", storage_by_field["storage_schema"]),
+            "name": table["name"],
+        }
+    candidate_by_field = {**raw, "storage": storage_by_field, "tables": tables_by_kind}
+    _validate_binding_tables(candidate_by_field, identity)
+    return raw, candidate_by_field
+
+
 async def _locked_transition_candidate(
-    connection, policy, identity_by_field, old_storage, new_storage, expected_counts, *, by_name=False
+    connection, policy, identity_by_field, old_storage, new_storage, expected_counts, *, manifest_replay=False
 ):
     """Verify the stopped acquisition and its declared storage."""
     header = await _locked_transition_header(connection, policy, identity_by_field)
-    candidate_by_field = _json(header["candidate_storage_json"])
+    raw_candidate, candidate_by_field = _transition_candidate_document(
+        header["candidate_storage_json"], old_storage, new_storage
+    )
     stored_identity = candidate_by_field.get("identity") if type(candidate_by_field) is dict else None
     _validate_binding_shape(candidate_by_field, stored_identity, phases=("loading",))
-    if not by_name or candidate_by_field["contract"] == NAMED_ISOLATED_CONTRACT:
-        _validate_binding_tables(candidate_by_field, stored_identity)
+    _validate_binding_tables(candidate_by_field, stored_identity)
     is_empty_vsp_failure = _is_empty_vsp_checkpoint_failure(
-        header, candidate_by_field, identity_by_field, expected_counts, new_storage
+        header, raw_candidate, identity_by_field, expected_counts, new_storage, manifest_replay=manifest_replay
     )
     metadata = _json(header["publication_metadata_json"])
     has_identity_metadata = _transition_metadata_matches(metadata, stored_identity["metadata"], header["status"])
     has_changed_header_owner = header["import_run_id"] != identity_by_field["failed_run_id"]
     candidate_storage_by_field = candidate_by_field.get("storage")
     source_ids = stored_identity["metadata"].get("source_ids")
-    is_named_fhir = by_name and source_ids != [VSP_SOURCE_ID] and named_source_resources(source_ids) is not None
-    if is_named_fhir:
+    if source_ids != [VSP_SOURCE_ID] and named_source_resources(source_ids) is not None:
         _require_named_source_identity(stored_identity)
-    if by_name and candidate_by_field["contract"] == ISOLATED_CONTRACT:
-        _require(type(candidate_storage_by_field) is dict, "transition_candidate_changed")
-        candidate_storage_by_field = {key: candidate_storage_by_field.get(key) for key in old_storage}
+    expected_storage_by_field = {key: old_storage[key] for key in ("catalog_schema", "storage_schema")}
     _require(
-        candidate_by_field["contract"]
-        in ((ISOLATED_CONTRACT, NAMED_ISOLATED_CONTRACT) if by_name else (ISOLATED_CONTRACT,))
+        candidate_by_field["contract"] in (ISOLATED_CONTRACT, NAMED_ISOLATED_CONTRACT)
         and (not has_changed_header_owner or is_empty_vsp_failure)
         and candidate_by_field["admission"] is None
         and candidate_by_field["auxiliary"] is None
@@ -1009,23 +865,18 @@ async def _locked_transition_candidate(
         == set(stored_identity["metadata"].get("expected_resources", ()))
         == {name for name in expected_counts if not name.startswith("LU:")}
         == {_resource_family(name) for name in expected_counts}
-        and candidate_storage_by_field in (old_storage, new_storage)
-        and (
-            not by_name
-            or is_named_fhir
-            or is_empty_vsp_failure
-            and metadata.get("error") in (OFFICE_DOCTORS_INVALID, SEARCH_RESPONSE_INVALID)
-        ),
+        and candidate_storage_by_field == expected_storage_by_field,
         "transition_candidate_changed",
     )
-    if by_name and candidate_by_field["contract"] == ISOLATED_CONTRACT:
-        tables_by_kind = {kind: {"name": table["name"]} for kind, table in candidate_by_field["tables"].items()}
-        _validate_binding_tables(
-            {**candidate_by_field, "contract": NAMED_ISOLATED_CONTRACT, "tables": tables_by_kind}, stored_identity
-        )
-    if not by_name:
-        await _verify_tables(connection, policy, candidate_by_field)
-    return candidate_by_field, header["status"], is_empty_vsp_failure, has_changed_header_owner, metadata.get("error")
+    await _verify_tables(connection, policy, candidate_by_field)
+    return (
+        candidate_by_field,
+        header["status"],
+        is_empty_vsp_failure,
+        has_changed_header_owner,
+        metadata.get("error"),
+        raw_candidate,
+    )
 
 
 async def _verify_transition_run(
@@ -1542,46 +1393,62 @@ async def _verify_transition_witness(connection, policy, candidate_by_field, dat
     _require(await connection.fetchval(check, dataset_id) is True, "transition_witness_changed")
 
 
-async def _require_transition_administrator(connection, policy):
-    """Bind the transition to the original independent admin session."""
-    actor = await connection.fetchrow(
-        "SELECT session_user::text AS session,current_user::text AS current,"
-        "(SELECT rolsuper FROM pg_roles WHERE rolname=current_user) AS administrator"
-    )
-    _require(
-        actor is not None
-        and actor["session"] == actor["current"]
-        and actor["administrator"] is True
-        and actor["current"] not in {policy.owner_role, policy.publisher_role, *policy.runtime_roles},
-        "transition_admin_required",
-    )
-
-
-async def _transition_catalog_schema(connection, policy, old_storage, new_storage, *, is_named_storage):
+def _transition_catalog_schema(policy, old_storage, new_storage):
     """Resolve the logical catalog for the selected transition contract."""
-    from process.provider_directory_source_storage_binding import verify_isolated_source_storage_coordinates
-
-    if is_named_storage:
-        _validate_named_storage(old_storage)
-        _validate_named_storage(new_storage)
+    for packet in (old_storage, new_storage):
         _require(
-            old_storage["storage_schema"] == new_storage["storage_schema"] == policy.schema
-            and old_storage["catalog_schema"] == new_storage["catalog_schema"]
-            and old_storage["producer"] != new_storage["producer"],
+            type(packet) is dict and set(packet) == {"catalog_schema", "storage_schema", "producer"},
+            "transition_storage_invalid",
+        )
+        _validate_named_storage({key: packet[key] for key in ("catalog_schema", "storage_schema")})
+        producer = packet["producer"]
+        _require(
+            type(producer) is list
+            and len(producer) == 2
+            and type(producer[0]) is str
+            and re.fullmatch(r"[0-9a-f]{40}", producer[0])
+            and producer[0] != "0" * 40
+            and type(producer[1]) is str
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", producer[1])
+            and producer[1] != "sha256:" + "0" * 64,
             "transition_storage_changed",
         )
-        return old_storage["catalog_schema"]
-    await _require_transition_administrator(connection, policy)
-    old_binding = _validated_transition_storage(policy, old_storage, new_storage)
-    await verify_isolated_source_storage_coordinates(connection, policy, old_binding)
-    return old_binding.catalog_schema
+    _require(
+        old_storage["storage_schema"] == new_storage["storage_schema"] == policy.schema
+        and old_storage["catalog_schema"] == new_storage["catalog_schema"]
+        and old_storage["producer"] != new_storage["producer"],
+        "transition_storage_changed",
+    )
+    return old_storage["catalog_schema"]
+
+
+async def _validate_transition_payloads(connection, policy, candidate_by_field):
+    """Validate each retained observation in bounded reads without reducing or rewriting it."""
+    from process import provider_directory_generic_source_completion as completion
+
+    directory = import_module("process.provider_directory_fhir")
+    identity = candidate_by_field["identity"]
+    metadata = identity["metadata"]
+    contract = metadata.get(directory.RESOURCE_HASH_CONTRACT_METADATA_KEY)
+    _require(contract in directory.RESOURCE_HASH_CONTRACTS, "hash_contract_changed")
+    candidate = _StoredCandidate(identity, contract, metadata.get(directory.SEMANTIC_PROJECTION_AS_OF_METADATA_KEY))
+    prepare, _merge = completion._resource_callbacks(directory, candidate)
+    for key, columns, validate in (
+        ("resource_input", RESOURCE_COLUMNS, prepare),
+        ("witness_input", WITNESS_COLUMNS, completion._witness),
+    ):
+        async for row in completion._active_rows(connection, policy, candidate_by_field, key, columns):
+            _require(row["dataset_id"] == identity["dataset_id"], "transition_input_changed")
+            validate(row)
 
 
 async def _verify_stopped_candidate(
     connection, policy, catalog_schema, identity_by_field, locked_candidate, expected_resource_counts
 ):
     """Check the failed acquisition lineage and candidate contents before changing storage."""
-    candidate_by_field, _, is_empty_vsp_failure, has_changed_header_owner, failure_error = locked_candidate
+    candidate_by_field, _, is_empty_vsp_failure, has_changed_header_owner, failure_error, _raw_candidate = (
+        locked_candidate
+    )
     run_evidence_by_field = await _verify_transition_run(
         connection,
         catalog_schema,
@@ -1602,26 +1469,22 @@ async def _verify_stopped_candidate(
         run_evidence_by_field["ancestor_run_ids"],
         is_empty_vsp_failure=is_empty_vsp_failure,
     )
+    if any(expected_resource_counts.values()):
+        await _validate_transition_payloads(connection, policy, candidate_by_field)
     return run_evidence_by_field
 
 
 async def transition_isolated_loading_candidate_storage(
-    connection, *, policy, identity_by_field, old_storage, new_storage, expected_resource_counts
+    connection, *, policy, identity_by_field, old_storage, new_storage, expected_resource_counts, manifest_replay=False
 ):
     """Move one verified stopped private intake to an admin-issued successor producer."""
     from process.provider_directory_generic_source_policy import GenericSourcePolicy
 
+    _require(type(manifest_replay) is bool, "transition_replay_invalid")
     _require(type(policy) is GenericSourcePolicy and connection.is_in_transaction(), "transition_transaction_required")
     _require(await connection.fetchval("SHOW transaction_isolation") == "serializable", "transition_isolation_required")
     _validated_transition_identity(identity_by_field, expected_resource_counts)
-    is_named_storage = type(new_storage) is dict and set(new_storage) == {
-        "catalog_schema",
-        "storage_schema",
-        "producer",
-    }
-    catalog_schema = await _transition_catalog_schema(
-        connection, policy, old_storage, new_storage, is_named_storage=is_named_storage
-    )
+    catalog_schema = _transition_catalog_schema(policy, old_storage, new_storage)
     locked_candidate = await _locked_transition_candidate(
         connection,
         policy,
@@ -1629,9 +1492,9 @@ async def transition_isolated_loading_candidate_storage(
         old_storage,
         new_storage,
         expected_resource_counts,
-        by_name=is_named_storage,
+        manifest_replay=manifest_replay,
     )
-    candidate_by_field, previous_status, is_empty_vsp_failure, _, failure_error = locked_candidate
+    candidate_by_field, previous_status, is_empty_vsp_failure, _, failure_error, raw_candidate = locked_candidate
     run_evidence_by_field = await _verify_stopped_candidate(
         connection, policy, catalog_schema, identity_by_field, locked_candidate, expected_resource_counts
     )
@@ -1641,41 +1504,27 @@ async def transition_isolated_loading_candidate_storage(
         new_storage,
         expected_resource_counts,
         run_evidence_by_field,
-        is_named_storage=is_named_storage,
     )
-    if candidate_by_field == successor_by_field:
-        return {**receipt_by_field, "already_applied": True}
+    is_already_applied = candidate_by_field == successor_by_field and raw_candidate == candidate_by_field
     await _store_transition_successor(
         connection,
         policy,
         identity_by_field,
         successor_by_field,
-        candidate_by_field,
+        raw_candidate,
         previous_status,
         is_empty_vsp_failure and failure_error not in (OFFICE_DOCTORS_INVALID, SEARCH_RESPONSE_INVALID),
     )
-    return {**receipt_by_field, "already_applied": False}
+    return {**receipt_by_field, "already_applied": is_already_applied}
 
 
-def _transition_result(
-    candidate_by_field, old_storage, new_storage, expected_resource_counts, run_evidence_by_field, *, is_named_storage
-):
+def _transition_result(candidate_by_field, old_storage, new_storage, expected_resource_counts, run_evidence_by_field):
     """Build the successor and report the stopped candidate lineage."""
-    successor_by_field = {**candidate_by_field, "storage": new_storage}
-    if is_named_storage:
-        successor_by_field.update(
-            contract=NAMED_ISOLATED_CONTRACT,
-            tables={kind: {"name": table["name"]} for kind, table in candidate_by_field["tables"].items()},
-        )
-        receipt_by_field = {
-            "dataset_id": candidate_by_field["identity"]["dataset_id"],
-            "rows": sum(expected_resource_counts.values()),
-            "lineage_run_ids": run_evidence_by_field["lineage_run_ids"],
-        }
-    else:
-        receipt_by_field = _transition_receipt(
-            candidate_by_field, old_storage, successor_by_field, expected_resource_counts, run_evidence_by_field
-        )
+    storage_by_field = {key: old_storage[key] for key in ("catalog_schema", "storage_schema")}
+    successor_by_field = {**candidate_by_field, "contract": NAMED_ISOLATED_CONTRACT, "storage": storage_by_field}
+    receipt_by_field = _transition_receipt(
+        candidate_by_field, storage_by_field, successor_by_field, expected_resource_counts, run_evidence_by_field
+    )
     return successor_by_field, receipt_by_field
 
 
@@ -1908,3 +1757,38 @@ async def generic_source_relation_scope(database, directory, candidate):
             isolated_scope = isolated_source_relation_scope(publisher, relations_by_root) if isolated else nullcontext()
             with isolated_scope, directory._provider_directory_artifact_relation_scope(relations_by_root):
                 yield publisher, binding_by_field
+
+
+def _table_proof(row, *, private):
+    columns, constraints, indexes = (_json(row[key]) for key in ("columns", "constraints", "indexes"))
+    _require(
+        row["relkind"] == "r"
+        and row["relpersistence"] == "p"
+        and not row["relrowsecurity"]
+        and not row["relforcerowsecurity"]
+        and row["inert"]
+        and row["native_checks"]
+        and row["direct_acl_closed"]
+        and (private or row["readers_closed"])
+        and (
+            not row["parents"] and not row["relispartition"]
+            if private
+            else len(row["parents"]) == 1 and row["relispartition"]
+        )
+        and all(constraint["type"] in {"c", "p", "u"} and constraint["valid"] for constraint in constraints)
+        and all(index["valid"] for index in indexes),
+        "storage_custody_changed",
+    )
+    return _layout_proof(row)
+
+
+def _layout_proof(row):
+    """Hash the native layout only after the caller authenticates its exact storage shape."""
+    layout_by_field = {key: _json(row[key]) for key in ("columns", "constraints", "indexes")}
+    layout_by_field["parents"] = list(row["parents"])
+    return dict(
+        name=row["relname"],
+        oid=row["oid"],
+        owner=row["relowner"],
+        layout_sha256=hashlib.sha256(_encoded(layout_by_field).encode()).hexdigest(),
+    )

@@ -3,7 +3,7 @@
 
 import json
 import os
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
@@ -15,7 +15,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process.network_address_projection import PinnedAddressSource
-from process.network_membership_pipeline import prepare_and_publish_network_candidate
+from process.network_membership_publication import publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_candidate_composition import RegistryCompositionAddressSources
 from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
@@ -147,24 +147,25 @@ async def _review_offices(native, *, select=True):
         f'GRANT "{native.custom.roles["reader"]}" TO "{source_service.store.approval_role}" WITH ADMIN FALSE, INHERIT TRUE, SET FALSE'
     )
     envelope_by_name = {name: native.request[name] for name in ("actor", "session_token_sha256", "read_limits")}
-    from process.registry_company_approval_fence import registry_company_approval_transaction
     from process.registry_ptg_producer_scope import _protected_store
     from process.registry_ptg_published_plan_scope import _read_protected_published_scope
 
-    async with registry_company_approval_transaction(
-        source_service.approval_sessions, control_schema=native.custom.control_schema
-    ) as session:
+    async with source_service.reader_sessions() as session, session.begin():
         table = await _protected_store(
-            session, source_service.store, write=True, table_name="registry_ptg_published_plan_scope"
+            session, source_service.store, write=False, table_name="registry_ptg_published_plan_scope"
         )
-        with pytest.raises(ValueError, match="published_lock_privileges_unprotected"):
-            await _read_protected_published_scope(
-                session,
-                table,
-                native.request["selector"]["scope_id"],
-                native.request["selector"]["client_id"],
-                native.request["selector"]["scope_approval_sha256"],
-            )
+        document = await _read_protected_published_scope(
+            session,
+            table,
+            native.request["selector"]["scope_id"],
+            native.request["selector"]["client_id"],
+            native.request["selector"]["scope_approval_sha256"],
+        )
+        assert document["approval_sha256"] == native.request["selector"]["scope_approval_sha256"]
+        driver = (await (await session.connection()).get_raw_connection()).driver_connection
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with session.begin_nested():
+                await driver.execute(f"UPDATE {table} SET approval_json=approval_json")
     approval = await source_service.approve_offices({**envelope_by_name, "command": command})
     recipes = decode_registry_source_recipes(json.dumps(approval["source_recipes"]))
     approved_revision = command["source"]["approved_revision"]
@@ -176,6 +177,8 @@ async def _review_offices(native, *, select=True):
 
 
 async def _worker(native, execution_role, physical_owner, execution_password):
+    from process.registry_publication_worker import _configured_worker_runtime
+
     source_service = native.service.preparation.scope_service
     await native.custom.connection.execute(
         f'GRANT "{native.fixture.source.roles[2]}" TO "{execution_role}" WITH ADMIN FALSE, INHERIT TRUE, SET FALSE'
@@ -190,19 +193,104 @@ async def _worker(native, execution_role, physical_owner, execution_password):
             physical_owner_role=physical_owner,
             control_schema=native.custom.control_schema,
         )
-    engine = create_async_engine(
-        native.custom.engine.url.set(username=execution_role, password=execution_password),
-        pool_size=1,
-        max_overflow=0,
-        hide_parameters=True,
+        await native.custom.connection.execute(f"ALTER ROLE \"{execution_role}\" SET temp_file_limit='256MB'")
+    settings = _native_worker_settings(native, execution_role, physical_owner, execution_password, source_service)
+    connection, cleanup = None, AsyncExitStack()
+    try:
+        configured = await _configured_worker_runtime(settings, cleanup)
+        runtime = configured.composition_runtime
+        engine = runtime.sessions.kw["bind"]
+        connection = await asyncpg.connect(
+            settings.execution_url.set(drivername="postgresql").render_as_string(hide_password=False),
+            timeout=settings.sql_limits.connect_timeout_seconds,
+            server_settings=settings.sql_limits.server_settings(),
+        )
+        await settings.sql_limits.verify(connection)
+        configured = _administrative_consumer(native, configured)
+        return engine, runtime, connection, SimpleNamespace(consumer=configured, cleanup=cleanup)
+    except BaseException:
+        await cleanup.aclose()
+        if connection is not None:
+            await connection.close()
+        raise
+
+
+def _administrative_consumer(native, configured):
+    from tests.registry_candidate_custody_postgres_support import administrative_freeze_callback
+
+    callback = administrative_freeze_callback(native.custom, configured)
+
+    async def seal_candidate(copy_target, **options):
+        """Register the exact candidate before genuine preparation admission."""
+        if copy_target.candidate_id not in native.custom.preparation_ids:
+            native.custom.preparation_ids.append(copy_target.candidate_id)
+        return await callback(copy_target, **options)
+
+    return replace(configured, seal_candidate=seal_candidate)
+
+
+def _worker_administrator(native, monkeypatch):
+    from process import registry_publication_worker as worker
+
+    configure = worker._configured_worker_runtime
+
+    async def configured_with_admin(config, stack):
+        return _administrative_consumer(native, await configure(config, stack))
+
+    monkeypatch.setattr(worker, "_configured_worker_runtime", configured_with_admin)
+
+
+def _native_worker_settings(native, execution_role, physical_owner, password, source_service):
+    from process.registry_publication_consumer import RegistryPublicationConsumerConfig
+    from process.registry_publication_worker import _PTGWorkerConfig
+
+    consumer = RegistryPublicationConsumerConfig(
+        native.custom.control_schema,
+        native.roles_by_kind["queue"],
+        execution_role,
+        native.roles_by_kind["management"],
+        native.custom.roles["owner"],
+        physical_owner,
+        reader_roles=(native.custom.roles["reader"], native.roles_by_kind["publisher"]),
     )
-    runtime = RegistryPublicationPTGRuntime(
-        async_sessionmaker(engine), source_service.store, RegistryPTGGraphReadBudget(16 * 1024 * 1024)
+    return SimpleNamespace(
+        consumer=consumer,
+        ptg=_PTGWorkerConfig(source_service.store, RegistryPTGGraphReadBudget(16 * 1024 * 1024)),
+        execution_url=native.custom.engine.url.set(username=execution_role, password=password),
+        sql_limits=native.custom.sql_limits,
+        preparation_roles=_worker_preparation_roles(native, execution_role, physical_owner, source_service),
     )
-    connection = await asyncpg.connect(
-        os.environ["NETWORK_REGISTRY_TEST_DSN"], user=execution_role, password=execution_password
-    )
-    return engine, runtime, connection
+
+
+def _worker_preparation_roles(native, execution_role, physical_owner, source_service):
+    roles = native.custom.preparation_roles
+    return {
+        "namespace_owner_role": roles["namespace_owner_role"],
+        "publisher_role": execution_role,
+        "application_roles": sorted(
+            set(roles["application_roles"])
+            | {
+                execution_role,
+                physical_owner,
+                source_service.store.approval_role,
+                *native.roles_by_kind.values(),
+            }
+        ),
+    }
+
+
+async def _publish_composed(native, connection, copy_target, address_source, worker):
+    from process.registry_publication_execution import prepare_registry_candidate_for_context
+
+    await prepare_registry_candidate_for_context(connection, copy_target, address_source, worker.consumer)
+    await worker.consumer.seal_candidate(copy_target)
+    async with connection.transaction(isolation="repeatable_read"):
+        return await publish_network_candidate(
+            connection,
+            copy_target,
+            control_schema=native.custom.control_schema,
+            preparation_roles=worker.consumer.preparation_roles,
+        )
 
 
 async def _retained_pin(native):
@@ -268,7 +356,9 @@ async def _archive_company(native):
     return approval["approved_revision"]
 
 
-async def _cleanup_worker(native, connection, engine, created_roles):
+async def _cleanup_worker(native, connection, engine, created_roles, worker=None):
+    if worker is not None:
+        await worker.cleanup.aclose()
     if connection is not None:
         await connection.close()
     if engine is not None:
@@ -289,7 +379,7 @@ async def test_genuine_ptg_runtime_reuses_old_capture_then_refuses_archived_comp
     native = coordinator_db
     execution_role, physical_owner = "ptg_execution_" + uuid4().hex, "ptg_network_owner_" + uuid4().hex
     execution_password = uuid4().hex
-    created_roles, engine, connection = [], None, None
+    created_roles, engine, connection, worker = [], None, None, None
     try:
         service, recipes, historical_revision = await _review_offices(native)
         original = await native.custom.connection.fetchrow(
@@ -306,7 +396,7 @@ async def test_genuine_ptg_runtime_reuses_old_capture_then_refuses_archived_comp
             )
         for role in (execution_role, native.roles_by_kind["queue"]):
             await native.custom.connection.execute(f"ALTER ROLE \"{role}\" SET temp_file_limit='256MB'")
-        engine, runtime, connection = await _worker(native, execution_role, physical_owner, execution_password)
+        engine, runtime, connection, worker = await _worker(native, execution_role, physical_owner, execution_password)
         current_revision = await _unrelated_approval(native)
         assert current_revision > historical_revision
         source_pin = await _retained_pin(native)
@@ -317,15 +407,7 @@ async def test_genuine_ptg_runtime_reuses_old_capture_then_refuses_archived_comp
             await connection.fetchval(f'SELECT count(*) FROM "{copy_target.schema_name}".network_membership_source')
             == 1
         )
-        await prepare_and_publish_network_candidate(
-            connection,
-            copy_target,
-            address_source,
-            owner_role=physical_owner,
-            loader_roles=(),
-            reader_roles=(native.custom.roles["reader"], native.roles_by_kind["publisher"]),
-            control_schema=native.custom.control_schema,
-        )
+        await _publish_composed(native, connection, copy_target, address_source, worker)
         published = await _retained_pin(native)
         assert published.generation_id != source_pin.generation_id
         assert await connection.fetchval(f'SELECT count(*) FROM "{published.schema_name}".network_membership') == 1
@@ -341,7 +423,7 @@ async def test_genuine_ptg_runtime_reuses_old_capture_then_refuses_archived_comp
             await _compose(runtime, connection, native, recipes, revoked_revision, published, physical_owner)
         assert (await _retained_pin(native)).generation_id == published.generation_id
     finally:
-        await _cleanup_worker(native, connection, engine, created_roles)
+        await _cleanup_worker(native, connection, engine, created_roles, worker)
 
 
 def _worker_configuration(native, execution_role, physical_owner, service, execution_password):
@@ -373,8 +455,34 @@ def _worker_configuration(native, execution_role, physical_owner, service, execu
             "approval_role": service.store.approval_role,
             "read_limits": {"maximum_bytes": 16 * 1024 * 1024, "maximum_pages": 256, "maximum_coordinates": 4096},
         },
+        "preparation_roles": _worker_preparation_roles(native, execution_role, physical_owner, service),
     }
     return parse_registry_publication_worker_config(json.dumps(configured_by_name))
+
+
+def test_ptg_native_worker_configuration_uses_distinct_named_preparation_roles(monkeypatch):
+    from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
+    from process.registry_publication_worker import _application_role_names
+
+    monkeypatch.setenv("NETWORK_REGISTRY_TEST_DSN", "postgresql://localhost/registry_test")
+    native = SimpleNamespace(
+        custom=SimpleNamespace(
+            control_schema="registry_test",
+            roles={"owner": "queue_owner", "reader": "registry_reader"},
+            preparation_roles={
+                "namespace_owner_role": "snapshot_owner",
+                "publisher_role": "prior_publisher",
+                "application_roles": ["queue_owner", "registry_reader"],
+            },
+        ),
+        roles_by_kind={"queue": "queue_role", "management": "management_role", "publisher": "office_publisher"},
+        fixture=SimpleNamespace(consumer_password="test"),
+    )
+    service = SimpleNamespace(store=RegistryPTGProducerScopeStore("scope_owner", "scope_approver", "registry_test"))
+    config = _worker_configuration(native, "worker_role", "candidate_owner", service, "test")
+    assert config.preparation_roles["publisher_role"] == "worker_role"
+    assert set(_application_role_names(config)) <= set(config.preparation_roles["application_roles"])
+    assert "snapshot_owner" not in config.preparation_roles["application_roles"]
 
 
 def _worker_authority(monkeypatch, *, refuse_after=None):
@@ -471,11 +579,11 @@ async def _run_ptg_worker_requests(native, config, original, monkeypatch):
 
 
 @pytest.fixture
-async def ptg_worker_db(coordinator_db):
+async def ptg_worker_db(coordinator_db, monkeypatch):
     native = coordinator_db
     execution_role, physical_owner = "ptg_worker_" + uuid4().hex, "ptg_worker_owner_" + uuid4().hex
     execution_password = uuid4().hex
-    created_roles, engine, connection = [], None, None
+    created_roles, engine, connection, worker = [], None, None, None
     try:
         service, recipes, _ = await _review_offices(native)
         for role in (physical_owner, execution_role):
@@ -488,27 +596,20 @@ async def ptg_worker_db(coordinator_db):
             )
         for role in (execution_role, native.roles_by_kind["queue"]):
             await native.custom.connection.execute(f"ALTER ROLE \"{role}\" SET temp_file_limit='256MB'")
-        engine, runtime, connection = await _worker(native, execution_role, physical_owner, execution_password)
+        engine, runtime, connection, worker = await _worker(native, execution_role, physical_owner, execution_password)
         revision = await _unrelated_approval(native)
         source_pin = await _retained_pin(native)
         copy_target, addresses = await _compose(
             runtime, connection, native, recipes, revision, source_pin, physical_owner
         )
-        await prepare_and_publish_network_candidate(
-            connection,
-            copy_target,
-            addresses,
-            owner_role=physical_owner,
-            loader_roles=(),
-            reader_roles=(native.custom.roles["reader"], native.roles_by_kind["publisher"]),
-            control_schema=native.custom.control_schema,
-        )
+        await _publish_composed(native, connection, copy_target, addresses, worker)
         original = await _retained_pin(native)
-        await engine.dispose()
+        await worker.cleanup.aclose()
         config = _worker_configuration(native, execution_role, physical_owner, service, execution_password)
+        _worker_administrator(native, monkeypatch)
         yield SimpleNamespace(native=native, config=config, original=original, connection=connection)
     finally:
-        await _cleanup_worker(native, connection, engine, created_roles)
+        await _cleanup_worker(native, connection, engine, created_roles, worker)
 
 
 @pytest.mark.asyncio
@@ -572,7 +673,7 @@ async def _retained_ptg_preview_family(native, tmp_path):
     execution_role, owner_role = "ptg_preview_execution_" + uuid4().hex, "ptg_preview_owner_" + uuid4().hex
     roles = [owner_role, execution_role]
     _registered(tmp_path / "ptg-preview-cleanup.json", {"roles": roles, "schemas": [], "phase": "registered"})
-    resources = SimpleNamespace(created=[], engine=None, connection=None)
+    resources = SimpleNamespace(created=[], engine=None, connection=None, worker=None)
     password = uuid4().hex
     try:
         _, recipes, approved_revision = await _review_offices(native)
@@ -587,23 +688,17 @@ async def _retained_ptg_preview_family(native, tmp_path):
                 + '" '
                 + (f"LOGIN PASSWORD '{password}'" if role == execution_role else "NOLOGIN")
             )
-        resources.engine, runtime, resources.connection = await _worker(native, execution_role, owner_role, password)
+        resources.engine, runtime, resources.connection, resources.worker = await _worker(
+            native, execution_role, owner_role, password
+        )
         previous = await _retained_pin(native)
         copy_target, addresses = await _compose(
             runtime, resources.connection, native, recipes, approved_revision, previous, owner_role
         )
-        await prepare_and_publish_network_candidate(
-            resources.connection,
-            copy_target,
-            addresses,
-            owner_role=owner_role,
-            loader_roles=(),
-            reader_roles=(native.custom.roles["reader"], native.roles_by_kind["publisher"]),
-            control_schema=native.custom.control_schema,
-        )
+        await _publish_composed(native, resources.connection, copy_target, addresses, resources.worker)
         yield recipes, await _retained_pin(native)
     finally:
-        await _cleanup_worker(native, resources.connection, resources.engine, resources.created)
+        await _cleanup_worker(native, resources.connection, resources.engine, resources.created, resources.worker)
 
 
 @pytest.mark.asyncio
@@ -708,7 +803,19 @@ async def _native_ptg_copy_setup(connection, source_schema, target_schema, locat
         f'FROM "{source_schema}".entity_address_unified address'
     )
     adoption = RetainedSiteAdoption("npi", "1234567893", str(location_id), location_key, "npi", "1234567893", row_hash)
-    return RetainedSiteAdoptionReceipt(1, str(uuid4()), source_schema, 1, (), 1, "f" * 64, 1, 2, 3, 4, (adoption,))
+    from process.network_compact_layout import CompactAddressRelation
+
+    return RetainedSiteAdoptionReceipt(
+        1,
+        str(uuid4()),
+        source_schema,
+        1,
+        (),
+        1,
+        "f" * 64,
+        CompactAddressRelation(source_schema, "entity_address_unified"),
+        (adoption,),
+    )
 
 
 @pytest.mark.asyncio

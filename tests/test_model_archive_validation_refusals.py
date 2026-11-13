@@ -639,38 +639,40 @@ async def test_retained_nucc_cleanup_rechecks_references_and_custody_before_rest
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "protected", "replaced", "claimed", "uncertain", "empty"])
+@pytest.mark.parametrize("failure", [None, "protected", "lookup", "claimed", "uncertain", "empty"])
 async def test_legacy_nucc_rotation_cannot_erase_any_protected_ledger_claim(monkeypatch, failure):
     from process import nucc_retention_read_view as claims
 
     session = _session()
     monkeypatch.setattr(archive, "is_nucc_native_handoff_required", AsyncMock(return_value=failure == "protected"))
-    oids = [None, None] if failure == "empty" else [100, 999 if failure == "replaced" else 100, None]
-    monkeypatch.setattr(archive, "_relation_oid", AsyncMock(side_effect=oids))
+    session.scalar.side_effect = (
+        [False, False] if failure == "empty" else [None if failure == "lookup" else True, False]
+    )
     check = AsyncMock(
         side_effect=claims.NuccRetentionReadError("protected claim exists or is uncertain")
         if failure in {"claimed", "uncertain"}
         else None
     )
-    monkeypatch.setattr(claims, "require_unretained_nucc_oids", check)
-    if failure in {"protected", "replaced", "claimed", "uncertain"}:
+    monkeypatch.setattr(claims, "require_unretained_nucc_relations", check)
+    if failure in {"protected", "lookup", "claimed", "uncertain"}:
         with pytest.raises(archive.ReferenceFamilyArchiveError):
             await archive.require_nucc_unretained_rotation(session, schema_name="mrf")
     else:
         await archive.require_nucc_unretained_rotation(session, schema_name="mrf")
-    if failure in {"protected", "empty"}:
+    if failure in {"protected", "empty", "lookup"}:
         session.execute.assert_not_awaited()
+    if failure == "protected":
         session.scalar.assert_not_awaited()
-    else:
+    if failure not in {"protected", "empty", "lookup"}:
         assert (
             str(session.execute.await_args.args[0])
             == 'LOCK TABLE ONLY "mrf"."nucc_taxonomy" IN ACCESS EXCLUSIVE MODE NOWAIT'
         )
         assert all("DROP" not in str(call.args[0]) for call in session.execute.await_args_list)
-    if failure in {"protected", "empty", "replaced"}:
+    if failure in {"protected", "empty", "lookup"}:
         check.assert_not_awaited()
     else:
-        check.assert_awaited_once_with(session, [100])
+        check.assert_awaited_once_with(session, schema_name="mrf", relation_names=["nucc_taxonomy"])
 
 
 @pytest.mark.asyncio

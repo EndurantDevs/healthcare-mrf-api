@@ -13,9 +13,8 @@ from uuid import UUID, uuid4, uuid5
 import asyncpg
 import pytest
 
-from process.network_address_projection import PinnedAddressSource, _identifier
+from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import pin_approved_membership_source
-from process.network_candidate_custody import seal_network_candidate_custody
 from process.network_custom_address_source import prepare_custom_address_source
 from process.network_fhir_membership_source import read_fhir_membership_batch
 from process.network_fhir_retained_capture_contract import RetainedFHIRCaptureError
@@ -26,6 +25,7 @@ from process.network_membership_candidate_lifecycle import (
 )
 from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
+from process.network_membership_publication import NetworkPublicationError
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_candidate_composition import (
     RegistryAddressArtifactCustody,
@@ -68,7 +68,10 @@ from tests.cms_registry_recipe_postgres_support import (
 from tests.cms_registry_recipe_postgres_support import (
     serving_schema as serving_schema,
 )
-from tests.source_contribution_custody_postgres_support import install_source_contribution_custody
+from tests.source_contribution_custody_postgres_support import (
+    install_source_contribution_custody,
+    publish_source_contribution_candidate,
+)
 from tests.test_network_address_projection_postgres import projection_db as projection_db
 from tests.test_network_custom_address_source_postgres import _seed
 from tests.test_network_custom_address_source_postgres import bootstrap_db as bootstrap_db
@@ -108,7 +111,13 @@ pytestmark = pytest.mark.asyncio
 @asynccontextmanager
 async def _complete_cms_office_source(database, serving_schema, monkeypatch, tmp_path):
     """Declare a canonical street office before real admission hashes and seals the source."""
+    from directory_membership_test_support import (
+        prepare_registry_catalog_foundation,
+        retire_empty_registry_catalog_placeholder,
+    )
+
     from tests import cms_registry_recipe_postgres_support as support
+    from tests.test_network_compact_publication_postgres import _cleanup_named_preparations
 
     original = support._membership_resource_rows
 
@@ -118,12 +127,24 @@ async def _complete_cms_office_source(database, serving_schema, monkeypatch, tmp
         office["address"].update(state="CA", postalCode="90210", country="US")
         return documents
 
-    with monkeypatch.context() as settings:
-        settings.setattr(support, "_membership_resource_rows", resources)
-        async with aclosing(
-            support.reviewed_cms_source.__wrapped__(database, serving_schema, settings, tmp_path)
-        ) as sources:
-            yield await anext(sources)
+    async with AsyncExitStack() as stack:
+        with monkeypatch.context() as settings:
+            fixture = SimpleNamespace(
+                connection=serving_schema[0],
+                engine=database.engine,
+                control_schema=serving_schema[1],
+                created_control_namespaces=[],
+                preparation_ids=[],
+            )
+            assert database._source_component.created_control_namespaces == ["hp_snapshot_retention"]
+            await retire_empty_registry_catalog_placeholder(fixture.connection)
+            stack.push_async_callback(_cleanup_named_preparations, fixture)
+            await prepare_registry_catalog_foundation(fixture, settings)
+            settings.setattr(support, "_membership_resource_rows", resources)
+            async with aclosing(
+                support.reviewed_cms_source.__wrapped__(database, serving_schema, settings, tmp_path)
+            ) as source_generations:
+                yield await anext(source_generations)
 
 
 @pytest.fixture
@@ -228,7 +249,16 @@ async def _prepare_raw_recipe_candidate(fixture, request_id, reviewed_source, co
                 composition_id=str(artifact_id),
                 approved_revision=approved.approved_revision,
                 owner_role=fixture.roles["owner"],
-                runtime_roles=(fixture.roles["reader"],),
+                runtime_roles=tuple(
+                    sorted(
+                        {
+                            fixture.roles["reader"],
+                            fixture.executor_role,
+                            fixture.custody_roles["loading"],
+                            fixture.custody_roles["custodian"],
+                        }
+                    )
+                ),
                 control_schema=schema,
             )
             summary, generations_by_source, office_reads_by_capture = await _prepare_raw_recipe_office_phase(
@@ -260,7 +290,7 @@ async def _prepare_raw_recipe_office_phase(connection, recipes, approved, artifa
         recipes,
         approved,
         artifact.address_source,
-        OfficeSummaryRequest(runtime_roles=artifact.runtime_roles, control_schema=schema),
+        OfficeSummaryRequest(runtime_roles=(), control_schema=schema),
         retained_fhir_reads=office_reads_by_capture,
     )
     generations_by_source = {
@@ -299,7 +329,7 @@ async def _register_raw_recipe_candidate(connection, copy_target, recipes, appro
         recipes,
         approved,
         artifact.address_source,
-        runtime_roles=artifact.runtime_roles,
+        runtime_roles=(),
         control_schema=schema,
         office_phase=(None, office_reads_by_capture),
     )
@@ -314,22 +344,22 @@ async def _publish_raw_recipe_manifest(
     fixture, connection, copy_target, address_source, schema, seal_candidate, writer_roles
 ):
     """Publish the prepared native recipe with its selected seal hook and return the pinned manifest."""
-    await prepare_and_publish_network_candidate(
-        connection,
-        copy_target,
-        address_source,
-        **(writer_roles or getattr(fixture, "writer_roles", _roles(fixture))),
-        control_schema=schema,
-        seal_candidate=seal_candidate or getattr(fixture, "seal_candidate", None),
-    )
+    roles = writer_roles or getattr(fixture, "writer_roles", _roles(fixture))
+    callback = seal_candidate or getattr(fixture, "seal_candidate", None)
+    if callback is None:
+        await prepare_and_publish_network_candidate(
+            connection, copy_target, address_source, **roles, control_schema=schema
+        )
+    else:
+        await publish_source_contribution_candidate(
+            fixture, connection, copy_target, address_source, writer_roles=roles, seal_candidate=callback
+        )
     async with connection.transaction(isolation="repeatable_read", readonly=True):
         return await resolve_network_serving_manifest(connection, control_schema=schema)
 
 
 async def _publish_replayed_source(fixture, original, approved, request_id, copy_targets):
     """Prepare independent address custody, prove missing-seal refusal, then publish."""
-    from tests.test_network_provider_only_read_postgres import _assert_seal_required
-
     address_sources = await fixture.prepare_address_sources(
         request_id=request_id,
         approved_revision=approved.approved_revision,
@@ -350,19 +380,30 @@ async def _publish_replayed_source(fixture, original, approved, request_id, copy
         control_schema=fixture.control_schema,
     )
     copy_targets.append(copy_target)
-    executing_fixture = SimpleNamespace(
-        connection=fixture.execution_connection,
-        writer_roles=fixture.writer_roles,
-        control_schema=fixture.control_schema,
+    with pytest.raises(NetworkPublicationError, match="Generation data validation is incomplete"):
+        await prepare_and_publish_network_candidate(
+            fixture.execution_connection,
+            copy_target,
+            addresses,
+            **fixture.writer_roles,
+            control_schema=fixture.control_schema,
+        )
+    assert (
+        await fixture.execution_connection.fetchval(
+            f'SELECT generation_id FROM "{fixture.control_schema}".network_serving_control'
+        )
+        == original.generation_id
     )
-    await _assert_seal_required(executing_fixture, copy_target, addresses, original.generation_id)
-    await prepare_and_publish_network_candidate(
-        fixture.execution_connection,
-        copy_target,
-        addresses,
-        **fixture.writer_roles,
-        control_schema=fixture.control_schema,
-        seal_candidate=fixture.seal_candidate,
+    assert (
+        await fixture.execution_connection.fetchval(
+            f"SELECT validation_json->'final_validation' FROM \"{fixture.control_schema}\".network_membership_candidate "
+            "WHERE candidate_id=$1",
+            UUID(copy_target.candidate_id),
+        )
+        is None
+    )
+    await publish_source_contribution_candidate(
+        fixture, fixture.execution_connection, copy_target, addresses, writer_roles=fixture.writer_roles
     )
     return copy_target
 
@@ -381,13 +422,15 @@ async def _compose_custodied_source(context, *, revision, source_manifest):
         manifest = await resolve_network_serving_manifest(
             fixture.execution_connection, control_schema=fixture.control_schema
         )
-        assert (
-            await fixture.execution_connection.fetchval(
-                f'SELECT count(*) FROM "{fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1',
-                UUID(copy_target.candidate_id),
-            )
-            == 1
+        candidate = await fixture.execution_connection.fetchrow(
+            f'SELECT state,validation_json FROM "{fixture.control_schema}".network_membership_candidate '
+            "WHERE candidate_id=$1",
+            UUID(copy_target.candidate_id),
         )
+        validation = json.loads(candidate["validation_json"])["final_validation"]
+        assert candidate["state"] == "published"
+        assert validation["candidate_id"] == copy_target.candidate_id
+        assert validation["schema_name"] == copy_target.schema_name and validation["complete"] is True
     return manifest
 
 
@@ -396,43 +439,30 @@ async def source_composition_custody(custom_db, reviewed_cms_office_source):
     async with AsyncExitStack() as stack:
         source_pin = reviewed_cms_office_source[0][2]
         await install_source_contribution_custody(custom_db, source_pin, stack)
-        for role in sorted(set(source_pin.retained_epoch.runtime_roles)):
-            await custom_db.connection.execute(
-                f"GRANT {_identifier(role)} TO {_identifier(custom_db.executor_role)} "
-                "WITH ADMIN FALSE, INHERIT TRUE, SET FALSE"
-            )
-        custodian = custom_db.source_custodian
         runtime_roles = tuple(
             sorted((custom_db.roles["reader"], custom_db.executor_role, custom_db.writer_roles["owner_role"]))
         )
-        custody = RegistryAddressArtifactCustody(
-            custom_db.custody_roles["owner"], runtime_roles, custom_db.control_schema
-        )
+        custody = RegistryAddressArtifactCustody(custom_db.roles["owner"], runtime_roles, custom_db.control_schema)
 
         async def prepare_address_sources(**arguments):
+            from process.network_custom_address_source import _freeze
+
             address_sources = arguments["address_sources"]
-            async with custodian.transaction(isolation="repeatable_read"):
-                artifact = await prepare_registry_composition_address_artifact(custodian, custody=custody, **arguments)
+            async with custom_db.connection.transaction(isolation="repeatable_read"):
+                artifact = await prepare_registry_composition_address_artifact(
+                    custom_db.connection, custody=custody, **arguments
+                )
+                if artifact is not None:
+                    await _freeze(
+                        custom_db.connection,
+                        artifact.address_source.schema_name,
+                        custody.owner_role,
+                        custody.runtime_roles,
+                    )
             return address_sources if artifact is None else replace(address_sources, prepared_address_artifact=artifact)
 
-        async def seal_candidate(target):
-            async def authorize(connection, supplied):
-                assert connection is custodian and supplied == target
-                return await connection.fetchval(
-                    "SELECT current_user=session_user AND current_user::text=$1", custom_db.custody_roles["custodian"]
-                )
-
-            return await seal_network_candidate_custody(
-                custodian,
-                target,
-                control_schema=custom_db.control_schema,
-                runtime_roles=runtime_roles,
-                authorize=authorize,
-            )
-
-        custom_db.seal_candidate = seal_candidate
         custom_db.prepare_address_sources = prepare_address_sources
-        yield seal_candidate
+        yield custom_db.seal_candidate
 
 
 @pytest.mark.parametrize("operation", ["rebind", "close"])

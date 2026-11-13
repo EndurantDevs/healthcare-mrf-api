@@ -1,18 +1,17 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Protected approval and final publication with fresh authority and exact leases."""
 
+import asyncio
 import hashlib
 import json
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from uuid import UUID
 
 import asyncpg
 
 from process import network_bootstrap_sources as bootstrap_sources
-from process import network_candidate_custody as candidate_custody
 from process.network_address_projection import PinnedAddressSource, _identifier
-from process.network_candidate_custody import verify_network_candidate_custody
 from process.network_custom_address_source import (
     _from_document as _custom_address_receipt,
 )
@@ -26,10 +25,10 @@ from process.network_membership_pipeline import prepare_network_candidate
 from process.network_membership_publication import (
     _lock_publication_controls,
     _publication_readiness,
+    _require_final_validation,
     publish_network_candidate,
 )
 from process.network_membership_serving_indexes import _index_digest, _serving_plan
-from process.network_membership_writer_closure import verify_network_candidate_writer_closure
 from process.network_serving_reactivation import reactivate_network_serving_generation
 from process.network_serving_read import NetworkServingReadUnavailable, resolve_network_serving_manifest
 from process.registry_approval_store import (
@@ -169,17 +168,23 @@ def _require_outside_transaction(connection):
 async def locked_publication_request_transaction(connection, request_id, lease_id, namespace):
     """Refresh a snapshot raced by renewal before any publication work starts."""
     _require_outside_transaction(connection)
-    for attempt in range(3):
-        has_request_lock = False
-        try:
-            async with connection.transaction(isolation="repeatable_read"):
-                request_record = await _request(connection, request_id, lease_id, namespace, lock=True)
-                has_request_lock = True
-                yield request_record
-            return
-        except asyncpg.SerializationError:
-            if has_request_lock or attempt == 2 or connection.is_in_transaction():
-                raise
+    async with asyncio.timeout(5):
+        for attempt in range(3):
+            has_request_lock = False
+            try:
+                async with connection.transaction(isolation="repeatable_read"):
+                    await connection.execute(
+                        "SELECT set_config(name,least(nullif(setting::bigint,0),budget)::text,true) "
+                        "FROM pg_settings JOIN (VALUES ('statement_timeout',3000),('lock_timeout',250)) "
+                        "limits(name,budget) USING(name)"
+                    )
+                    request_record = await _request(connection, request_id, lease_id, namespace, lock=True)
+                    has_request_lock = True
+                    yield request_record
+                return
+            except asyncpg.SerializationError:
+                if has_request_lock or attempt == 2 or connection.is_in_transaction():
+                    raise
 
 
 _locked_request_transaction = locked_publication_request_transaction
@@ -451,21 +456,10 @@ async def _verified_source_rollback_candidate(connection, copy_target, command, 
         command.expected_approved_revision,
     ):
         raise RegistryApprovalConflict("registry_source_rollback_candidate_conflict")
-    from process.network_candidate_custody import verify_network_candidate_custody
     from process.network_compact_readiness import compact_index_digest, is_compact_candidate
-    from process.registry_source_inventory_reference import source_inventory_heaps
 
     is_compact = is_compact_candidate(candidate_by_name)
-    custody = await verify_network_candidate_custody(
-        connection,
-        copy_target,
-        control_schema=control_schema,
-        required=is_compact or bool(source_inventory_heaps(candidate_by_name)),
-    )
-    if custody is None:
-        await verify_network_candidate_writer_closure(
-            connection, copy_target, **writer_roles, control_schema=control_schema
-        )
+    _require_final_validation(candidate_by_name)
     readiness = _publication_readiness(candidate_by_name)
     if is_compact:
         index_digest = await compact_index_digest(connection, copy_target.schema_name, candidate=candidate_by_name)
@@ -479,8 +473,6 @@ async def _verified_source_rollback_candidate(connection, copy_target, command, 
         "validation": _document(candidate_by_name["validation_json"]),
         "source_recipes": _document(candidate_by_name["source_recipes_json"]),
     }
-    if custody is not None:
-        readiness_receipt_by_name["candidate_custody"] = custody
     return candidate_by_name, hashlib.sha256(_json(readiness_receipt_by_name).encode()).hexdigest()
 
 
@@ -591,10 +583,13 @@ def _compact_address_sources(candidate, address_pin):
         descriptor = descriptor["origin_artifact"]
     if descriptor.get("contract") == bootstrap_artifact.CONTRACT:
         descriptor = bootstrap_artifact._descriptor(descriptor)
-        receipt = bootstrap_sources._decode(_json(descriptor["bootstrap_receipt"]))
-        if receipt.address_source != original_address_pin or npi_source not in (None, receipt.npi_source):
+        receipt = bootstrap_artifact._receipt(descriptor["bootstrap_receipt"])
+        schema = descriptor["namespace"]["name"]
+        address = PinnedAddressSource(schema, "entity_address_unified", receipt["generation_sha256"])
+        npi = PinnedAddressSource(schema, "npi", receipt["generation_sha256"])
+        if address != original_address_pin or npi_source not in (None, npi):
             raise ValueError("registry_source_rollback_address_changed")
-        npi_source = receipt.npi_source
+        npi_source = npi
     return RegistryCompositionAddressSources(address_pin, npi_source, compact=True)
 
 
@@ -718,7 +713,7 @@ async def complete_queued_registry_source_rollback_preview(
     final audit transaction while serving readers retain their current head.
     """
     _require_outside_transaction(connection)
-    if set(custody_callbacks) - {"seal_candidate", "prepare_address_sources"}:
+    if set(custody_callbacks) - {"seal_candidate", "prepare_address_sources", "source_witness_runtime"}:
         raise ValueError("registry_publication_address_preparation_invalid")
     seal_candidate = custody_callbacks.get("seal_candidate")
     prepare_address_sources = custody_callbacks.get("prepare_address_sources")
@@ -735,7 +730,7 @@ async def complete_queued_registry_source_rollback_preview(
         writer_roles,
         control_schema,
         composition_runtime,
-        prepare_address_sources,
+        custody_callbacks,
         authorize,
     )
     if seal_candidate is not None:
@@ -764,17 +759,21 @@ async def _prepare_rollback_candidate(
     writer_roles,
     control_schema,
     composition_runtime,
-    prepare_address_sources,
+    preparation_options,
     authorize,
 ):
     """Prepare historical source with the current approved custom rows before the separate seal."""
+    source_witness_runtime = preparation_options.get("source_witness_runtime")
     source_pin, current_pin = await _source_rollback_pins(connection, command, control_schema)
+    address_sources = await _source_rollback_address_sources(connection, source_pin, control_schema)
+    if source_witness_runtime is not None:
+        address_sources = replace(address_sources, source_witness_runtime=source_witness_runtime)
     address_sources = await _prepared_operation_addresses(
         connection,
         request_record,
         source_pin,
-        await _source_rollback_address_sources(connection, source_pin, control_schema),
-        prepare_address_sources,
+        address_sources,
+        preparation_options.get("prepare_address_sources"),
         authorize,
         control_schema,
         "prepare_source_rollback",
@@ -889,7 +888,7 @@ async def _verify_source_rollback_publication_target(
 
 
 async def complete_queued_registry_source_rollback_publication(
-    connection, request_id, lease_id, *, authorize, writer_roles, control_schema=None
+    connection, request_id, lease_id, *, authorize, writer_roles, control_schema=None, preparation_roles=None
 ):
     """Publish only the reviewed READY candidate and commit its terminal audit atomically.
 
@@ -921,6 +920,7 @@ async def complete_queued_registry_source_rollback_publication(
             copy_target,
             control_schema=control_schema,
             source_rollback_authority=RegistrySourceRollbackPublicationAuthority(request_id, lease_id, authorize),
+            preparation_roles=preparation_roles,
         )
         result_by_name = {
             "operation": "publish_source_rollback",
@@ -958,15 +958,7 @@ async def require_registry_source_rollback_publication_authority(
         connection, authority.request_id, authority.lease_id, _namespace(control_schema), lock=True
     )
     command = await _fresh_retained_operation_authority(authority.authorize, request, "publish_source_rollback")
-    closure = _publication_readiness(candidate)[3]
-    roles_by_kind = {
-        "owner_role": closure["owner_role"],
-        "loader_roles": tuple(closure["loader_roles"]),
-        "reader_roles": tuple(closure["reader_roles"]),
-    }
-    reviewed = await _verify_source_rollback_publication_target(
-        connection, command, roles_by_kind, control_schema, lock=True
-    )
+    reviewed = await _verify_source_rollback_publication_target(connection, command, None, control_schema, lock=True)
     if reviewed != copy_target:
         raise ValueError("registry_source_rollback_candidate_changed")
     _, preview = await _source_rollback_publication_target(connection, command, _namespace(control_schema), lock=True)
@@ -1105,36 +1097,12 @@ async def _verify_initial_inventory_candidate(connection, copy_target, bootstrap
         raise ValueError("registry_initial_inventory_source_mismatch")
     await verify_retained_custom_address_source(connection, artifact)
     await bootstrap_sources._verify_capture(connection, bootstrap, verify_content=False)
-    await verify_network_candidate_custody(connection, copy_target, control_schema=control_schema, required=True)
     return report_by_name["membership_rows"]
-
-
-async def _require_initial_custody_enrollment(connection, readers, control_schema):
-    """Require the direct ledger grants the native seal would otherwise add."""
-    await candidate_custody._require_reader_enrollment(connection, readers, control_schema)
-
-
-async def _initial_candidate_custody_enrollment(connection, copy_target, writer_context):
-    async with connection.transaction(isolation="repeatable_read", readonly=True):
-        candidate = await connection.fetchrow(
-            f"SELECT * FROM {_namespace(writer_context.control_schema)}.network_membership_candidate WHERE candidate_id=$1",
-            UUID(copy_target.candidate_id),
-        )
-        catalog = await candidate_custody._catalog(connection, copy_target, dict(candidate))
-        runtime_roles = tuple(role for role in writer_context.custody_roles if role != writer_context.queue_owner_role)
-        readers = await candidate_custody._existing_readers(connection, catalog, runtime_roles)
-        await _require_initial_custody_enrollment(connection, readers, writer_context.control_schema)
 
 
 async def _initial_inventory_sources(connection, request_record, command, writer_context, sources, authorize):
     """Keep enrollment and bootstrap admission ahead of any independently prepared artifact."""
-    known_readers = (writer_context.execution_role, writer_context.physical_owner_role)
     control_schema = writer_context.control_schema
-    await _require_initial_custody_enrollment(
-        connection,
-        tuple(sorted(set(known_readers + writer_context.loader_roles + writer_context.reader_roles))),
-        control_schema,
-    )
     bootstrap = await _initial_inventory_bootstrap(connection, command, sources, control_schema)
     sources = await _prepared_operation_addresses(
         connection,
@@ -1192,7 +1160,6 @@ async def complete_queued_registry_initial_inventory(
         ),
     )
     await _fresh_operation_authority(authorize, request_record, "publish_initial_inventory")
-    await _initial_candidate_custody_enrollment(connection, copy_target, writer_context)
     await writer_context.seal_candidate(copy_target, pre_enrolled_only=True)
     return await _finish_initial_inventory(
         connection,
@@ -1202,11 +1169,12 @@ async def complete_queued_registry_initial_inventory(
         bootstrap,
         authorize=authorize,
         control_schema=control_schema,
+        preparation_roles=writer_context.preparation_roles,
     )
 
 
 async def _finish_initial_inventory(
-    connection, request_record, lease_id, copy_target, bootstrap, *, authorize, control_schema
+    connection, request_record, lease_id, copy_target, bootstrap, *, authorize, control_schema, preparation_roles=None
 ):
     """Fence retained evidence and commit initial manifest and queue completion together."""
     namespace = _namespace(control_schema)
@@ -1219,7 +1187,9 @@ async def _finish_initial_inventory(
         await _require_empty_initial_inventory(connection, namespace)
         membership_rows = await _verify_initial_inventory_candidate(connection, copy_target, bootstrap, control_schema)
         _command, policy_revision = await _fresh_operation_authority(authorize, locked, "publish_initial_inventory")
-        manifest = await publish_network_candidate(connection, copy_target, control_schema=control_schema)
+        manifest = await publish_network_candidate(
+            connection, copy_target, control_schema=control_schema, preparation_roles=preparation_roles
+        )
         result_by_name = dict(
             operation="publish_initial_inventory",
             candidate_id=copy_target.candidate_id,
@@ -1330,10 +1300,20 @@ async def _approval(connection, namespace, request_record):
 
 
 async def _finish_approved_publication(
-    connection, request_id, lease_id, copy_target, approval_by_name, policy_revision, candidate_scope, control_schema
+    connection,
+    request_id,
+    lease_id,
+    copy_target,
+    approval_by_name,
+    policy_revision,
+    candidate_scope,
+    writer_context,
 ):
     """Publish and finish its exact success receipt inside the caller's already-fenced transaction."""
-    manifest_by_name = await publish_network_candidate(connection, copy_target, control_schema=control_schema)
+    control_schema = writer_context.control_schema
+    manifest_by_name = await publish_network_candidate(
+        connection, copy_target, control_schema=control_schema, preparation_roles=writer_context.preparation_roles
+    )
     receipt_by_name = {
         **approval_by_name,
         "serving_generation": manifest_by_name["generation_id"],
@@ -1384,13 +1364,13 @@ async def complete_queued_registry_publication(
     await _fresh_authority(authorize, request_record)
     if seal_candidate is not None:
         await seal_candidate(copy_target)
+    request_record = await _request(connection, request_id, lease_id, namespace)
+    policy_revision = await _fresh_authority(authorize, request_record)
     async with _locked_request_transaction(connection, request_id, lease_id, namespace) as locked_request:
         if locked_request["request_sha256"] != request_record["request_sha256"]:
             raise RegistryApprovalConflict("registry_queue_request_changed")
-        await _fresh_authority(authorize, locked_request)
         await _lock_publication_controls(connection, namespace)
         await _locked_candidate(connection, copy_target, namespace)
-        policy_revision = await _fresh_authority(authorize, locked_request)
         approval_by_name = await _approval(connection, namespace, locked_request)
         candidate_scope = await connection.fetchrow(
             f"SELECT approved_custom_revision,expected_head,expected_rows,validation_json,source_generations,source_recipes_json "
@@ -1407,7 +1387,7 @@ async def complete_queued_registry_publication(
             approval_by_name,
             policy_revision,
             candidate_scope,
-            control_schema,
+            writer_context,
         )
 
 

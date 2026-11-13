@@ -103,7 +103,7 @@ async def _select_exact_current_root(database: Any) -> Any:
             )
             if locked is not True:
                 raise ProviderDirectoryRootedGraphOperatorError("state")
-            return await require_current_root_fence(database, proof)
+            return await require_current_root_fence(database, proof, lock_rows=False)
     from process.provider_directory_dataset_scoped_publication import (
         exact_uhc_dataset_pair,
         lock_exact_current_dataset,

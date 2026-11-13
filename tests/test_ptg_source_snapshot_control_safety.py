@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from api import ptg2_snapshot
 from process.ptg_parts import source_snapshot_control
 
 
@@ -327,19 +326,3 @@ async def test_unscoped_pointer_delete_omits_source_filter(monkeypatch):
     ) == (2, 1)
     assert all(call.kwargs == {"snapshot_id": "snapshot-a"} for call in status.await_args_list)
     assert all("source_key = :source_key" not in call.args[0] for call in status.await_args_list)
-
-
-def test_snapshot_cache_clear_uses_available_resolver_cache(monkeypatch):
-    """Snapshot pointer changes clear an installed resolver cache."""
-
-    resolver_cache_by_snapshot = {"snapshot-a": object()}
-    monkeypatch.setattr(
-        ptg2_snapshot,
-        "_PTG2_SNAPSHOT_RESOLVE_CACHE",
-        resolver_cache_by_snapshot,
-        raising=False,
-    )
-
-    source_snapshot_control._clear_ptg2_snapshot_cache()
-
-    assert resolver_cache_by_snapshot == {}

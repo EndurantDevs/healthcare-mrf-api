@@ -14,7 +14,6 @@ from sqlalchemy.dialects import postgresql
 
 from db.models.registry_aca_source_notification import RegistryACASourceNotification
 from db.registry_fhir_catalog import SNAPSHOT_COLUMNS
-from process.network_membership_writer_closure import _NATIVE_WRITER_PRIVILEGES_SQL
 from process.registry_management_permissions import _MODELS, _PTG_TABLES, _TABLES
 
 CONTRACT = "registry-native-execution/v1"
@@ -426,18 +425,27 @@ def _require_identity_sequences(catalog, relations, heaps_by_name, attributes, i
 
 
 def _require_storage_owners(catalog, relations):
+    named_fhir_namespace_ids = {
+        row["oid"] for row in catalog["private_namespaces"] if row["nspname"].startswith("registry_fhir_capture_")
+    }
     for index in catalog["indexes"]:
         _require(
             index["indexrelid"] in relations
             and index["indrelid"] in relations
-            and relations[index["indexrelid"]]["relowner"] == relations[index["indrelid"]]["relowner"],
+            and (
+                relations[index["indrelid"]]["relnamespace"] in named_fhir_namespace_ids
+                or relations[index["indexrelid"]]["relowner"] == relations[index["indrelid"]]["relowner"]
+            ),
             "index_custody",
         )
     for relation in relations.values():
         if relation["reltoastrelid"] != "0":
             _require(
                 relation["reltoastrelid"] in relations
-                and relations[relation["reltoastrelid"]]["relowner"] == relation["relowner"],
+                and (
+                    relation["relnamespace"] in named_fhir_namespace_ids
+                    or relations[relation["reltoastrelid"]]["relowner"] == relation["relowner"]
+                ),
                 "toast_custody",
             )
 
@@ -589,61 +597,156 @@ def _require_archive_identity(document, namespace, heaps_by_name, relations):
         )
 
 
-def _require_retained_fhir_input(catalog, namespace, document, heaps_by_name):
-    """Certify the existing closed capture receipt against its complete native metadata."""
+def _decode_retained_fhir_document(document):
+    """Decode only canonical current or supported saved capture metadata."""
     import json
 
-    from process.network_fhir_retained_capture import _require_indexes
-    from process.network_fhir_retained_capture_contract import TABLES, canonical, digest, validate_capture
+    from process.network_fhir_retained_capture_contract import canonical, validate_capture
 
     prefix = "retained-normalized-fhir-v1:"
-    _require(document.startswith(prefix) and len(document.encode()) <= 65536 + len(prefix), "fhir_receipt")
-    capture = validate_capture(json.loads(document[len(prefix) :]))
-    _require(document == prefix + canonical(capture.as_dict()), "fhir_receipt_encoding")
-    observed = catalog.get("retained_fhir_catalogs", {}).get(namespace["oid"])
-    _require(type(observed) is dict and observed.get("closed") is True, "fhir_native_closure")
-    native_relations = observed["catalog"]
     _require(
-        capture.schema_name == namespace["nspname"]
-        and str(capture.schema_oid) == namespace["oid"]
-        and capture.owner_role == observed["owner_role"]
-        and {name: str(oid) for name, oid in capture.relation_oids}
-        == {name: native_row["oid"] for name, native_row in heaps_by_name.items()}
-        and set(heaps_by_name) == set(TABLES)
-        and type(native_relations) is list
-        and tuple(native_row["relname"] for native_row in native_relations) == tuple(sorted(TABLES))
-        and all(
-            str(native_row["nspowner"]) == namespace["nspowner"]
-            and not any(native_row[key] for key in ("relhastriggers", "defaults", "inherited"))
-            for native_row in native_relations
-        )
-        and digest(native_relations) == capture.catalog_sha256,
-        "fhir_identity",
+        type(document) is str and document.startswith(prefix) and len(document.encode()) <= 65536 + len(prefix),
+        "fhir_receipt",
     )
-    _require_indexes(native_relations, int(namespace["nspowner"]), capture.schema_name)
-    _require_retained_fhir_columns(catalog, heaps_by_name)
-    _require(observed.get("cursor_closed") is True, "fhir_cursor")
+    try:
+        saved = json.loads(document[len(prefix) :])
+        _require(document == prefix + canonical(saved), "fhir_receipt_encoding")
+        return validate_capture(saved)
+    except (TypeError, ValueError, KeyError) as error:
+        raise RegistryExecutionCatalogError("registry_execution_catalog_fhir_receipt") from error
 
 
-def _require_retained_fhir_columns(catalog, heaps_by_name):
-    """Retained input columns have only the same built-in, ordinary native types as capture."""
-    types_by_oid = _by_oid(catalog["types"])
-    ids = {row["oid"] for row in heaps_by_name.values()}
-    columns = [row for row in catalog["attributes"] if row["attrelid"] in ids and row["attnum"] > 0]
+def _require_retained_fhir_columns(table, columns):
+    """Check complete declared columns and the native publication key requirements."""
+    from process.network_fhir_retained_capture import _DERIVED_DDL, _KEYS
+    from process.network_fhir_retained_capture_contract import TABLES
+
     _require(
-        bool(columns)
-        and all(
-            not row["attisdropped"]
-            and not row["attgenerated"]
-            and not row["attidentity"]
-            and not row["atthasdef"]
-            and row["atttypid"] in types_by_oid
-            and types_by_oid[row["atttypid"]]["typnamespace"] == "11"
-            and row["attcollation"] == types_by_oid[row["atttypid"]]["typcollation"]
-            for row in columns
-        ),
+        type(columns) is list
+        and bool(columns)
+        and len({column["name"] for column in columns}) == len(columns)
+        and all(column["native"] is True and column["generated"] == column["identity"] == "" for column in columns),
         "fhir_columns",
     )
+    by_name = {column["name"]: (column["type"], column["required"]) for column in columns}
+    if table in _DERIVED_DDL:
+        expected_by_name = {}
+        for definition in _DERIVED_DDL[table].split(","):
+            name, column_type = definition.split(" ", 1)
+            is_required = column_type.endswith(" NOT NULL")
+            column_type = (
+                column_type.removesuffix(" NOT NULL")
+                .replace("varchar", "character varying")
+                .replace("timestamptz", "timestamp with time zone")
+            )
+            expected_by_name[name] = column_type, is_required
+        _require(by_name == expected_by_name, "fhir_columns")
+    else:
+        from db.models import ProviderDirectoryDatasetResource, ProviderDirectoryEndpointDataset
+
+        model = ProviderDirectoryEndpointDataset if table == TABLES[0] else ProviderDirectoryDatasetResource
+        _require(set(by_name) <= {column.name for column in model.__table__.columns}, "fhir_columns")
+        required_types_by_name = {"dataset_id": {"character varying(96)"}}
+        if table == TABLES[0]:
+            required_types_by_name["publication_metadata_json"] = {"json", "jsonb"}
+        else:
+            required_types_by_name.update(
+                resource_type={"character varying(64)"},
+                resource_id={"character varying(256)"},
+                payload_hash={"character varying(64)"},
+                payload_json={"json", "jsonb"},
+            )
+        _require(
+            all(name in by_name and by_name[name][0] in types for name, types in required_types_by_name.items()),
+            "fhir_columns",
+        )
+    _require(all(by_name.get(key, (None, False))[1] is True for key in _KEYS[table]), "fhir_columns")
+
+
+def _require_retained_fhir_indexes(table, indexes):
+    """Require completed native indexes and deterministic opaque-cursor ordering."""
+    from process.network_fhir_retained_capture import _KEYS, _LOOKUPS
+    from process.network_fhir_retained_capture_contract import TABLES
+
+    expected = {(True, True, _KEYS[table])} | {(False, False, keys) for keys in _LOOKUPS.get(table, ())}
+    _require(
+        type(indexes) is list
+        and len(indexes) == len(expected)
+        and {(index["primary"], index["unique"], tuple(index["columns"])) for index in indexes} == expected
+        and all(
+            index["method"] == "btree"
+            and index["native"] is True
+            and index["valid"] is index["ready"] is index["live"] is True
+            for index in indexes
+        ),
+        "fhir_indexes",
+    )
+    for number, keys in enumerate(_LOOKUPS.get(table, ())):
+        lookup = next(index for index in indexes if not index["primary"] and tuple(index["columns"]) == keys)
+        _require(lookup["name"] == "retained_lookup_" + str(TABLES.index(table)) + "_" + str(number), "fhir_indexes")
+        if table == TABLES[1]:
+            _require(lookup["collations"] == ["native", "C", "C"], "fhir_cursor")
+
+
+def _require_retained_fhir_relations(relations, schema):
+    """Require named native data columns, essential keys and completed lookup indexes."""
+    import json
+
+    from process.network_fhir_retained_capture import _KEYS
+    from process.network_fhir_retained_capture_contract import TABLES
+
+    def _decoded(value):
+        return json.loads(value) if type(value) is str else value
+
+    _require(
+        type(relations) is list
+        and tuple(relation_row["relname"] for relation_row in relations) == tuple(sorted(TABLES)),
+        "fhir_relations",
+    )
+    for relation_row in relations:
+        table = relation_row["relname"]
+        _require(
+            relation_row["schema_name"] == schema
+            and relation_row["relkind"] == "r"
+            and relation_row["relpersistence"] == "p"
+            and not any(
+                relation_row[key]
+                for key in (
+                    "relispartition",
+                    "relhastriggers",
+                    "relrowsecurity",
+                    "relforcerowsecurity",
+                    "inherited",
+                    "defaults",
+                )
+            ),
+            "fhir_storage",
+        )
+        _require_retained_fhir_columns(table, _decoded(relation_row["columns"]))
+        constraints = _decoded(relation_row["constraints"])
+        _require(
+            type(constraints) is list
+            and len(constraints) == 1
+            and constraints[0]["type"] == "p"
+            and tuple(constraints[0]["columns"]) == _KEYS[table]
+            and constraints[0]["validated"] is True
+            and constraints[0]["deferrable"] is constraints[0]["deferred"] is False,
+            "fhir_constraints",
+        )
+        _require_retained_fhir_indexes(table, _decoded(relation_row["indexes"]))
+
+
+def _require_retained_fhir_input(catalog, namespace, document, heaps_by_name):
+    """Validate named capture metadata; admission and content remain separate checks."""
+    from process.network_fhir_retained_capture_contract import TABLES
+
+    capture = _decode_retained_fhir_document(document)
+    observed = catalog.get("retained_fhir_catalogs", {}).get(namespace["nspname"])
+    _require(
+        capture.schema_name == namespace["nspname"] and set(heaps_by_name) == set(TABLES) and type(observed) is dict,
+        "fhir_relations",
+    )
+    _require_retained_fhir_relations(observed["catalog"], capture.schema_name)
 
 
 def _require_private_read_surfaces(catalog, relations):
@@ -672,12 +775,7 @@ def _require_private_read_surfaces(catalog, relations):
 
             receipt = _decode(comments_by_oid[oid])
             _require(
-                _schema_name(receipt.specification) == name
-                and str(receipt.schema_oid) == oid
-                and str(receipt.owner_oid) == namespace["nspowner"]
-                and {table: str(table_oid) for table, table_oid in receipt.relation_oids}
-                == {table: relation["oid"] for table, relation in heaps_by_name.items()}
-                and set(heaps_by_name) == {"npi", "entity_address_unified"},
+                _schema_name(receipt.specification) == name and set(heaps_by_name) == {"npi", "entity_address_unified"},
                 "bootstrap_identity",
             )
         elif name.startswith("registry_fhir_capture_"):
@@ -686,7 +784,10 @@ def _require_private_read_surfaces(catalog, relations):
             _require_archive_identity(comments_by_oid[oid], namespace, heaps_by_name, relations)
         _require(
             all(
-                native_row["relowner"] == namespace["nspowner"]
+                (
+                    name.startswith(("registry_fhir_capture_", "network_bootstrap_"))
+                    or native_row["relowner"] == namespace["nspowner"]
+                )
                 and native_row["relkind"] in {"r", "i", "S"}
                 and native_row["relpersistence"] == "p"
                 and not native_row["relrowsecurity"]
@@ -791,92 +892,70 @@ _REGISTRY_DEPENDENCY_EDGES_SQL = """
 """
 
 
-# CASE guards are mandatory: catalog deparsing of unsupported constants can invoke user I/O.
-_RETAINED_FHIR_DEPARSE_SAFE_SQL = """
-SELECT
- (SELECT count(*)=5 AND bool_and(c.relkind='r' AND c.relpersistence='p'
- AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity AND NOT c.relhastriggers
- AND c.relname=ANY(ARRAY['provider_directory_endpoint_dataset','provider_directory_dataset_resource',
- 'provider_directory_entity_source_binding','provider_directory_entity_release_evidence',
- 'provider_directory_insurance_network_plan_evidence']))
- FROM pg_class c WHERE c.relnamespace=selected_capture.oid AND c.relkind<>'i')
- AND NOT EXISTS(SELECT FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid
- LEFT JOIN pg_type t ON t.oid=a.atttypid WHERE c.relnamespace=selected_capture.oid AND c.relkind='r' AND a.attnum>0
- AND (a.attisdropped OR a.atthasdef OR a.attgenerated<>'' OR a.attidentity<>'' OR t.oid IS NULL
- OR t.typnamespace<>'pg_catalog'::regnamespace OR t.oid>=16384 OR t.typowner<>10 OR a.attcollation<>t.typcollation))
- AND NOT EXISTS(SELECT FROM pg_attrdef d JOIN pg_class c ON c.oid=d.adrelid WHERE c.relnamespace=selected_capture.oid)
- AND NOT EXISTS(SELECT FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid OR c.oid=i.inhparent
- WHERE c.relnamespace=selected_capture.oid)
- AND (SELECT count(*)=5 AND bool_and(k.contype='p' AND k.convalidated AND k.conenforced
- AND NOT k.condeferrable AND NOT k.condeferred AND k.conparentid=0)
- FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid
- WHERE c.relnamespace=selected_capture.oid AND k.contype<>'n')
- AND NOT EXISTS(SELECT FROM pg_class c WHERE c.relnamespace=selected_capture.oid AND c.relkind='r'
- AND (SELECT count(*) FROM pg_constraint k WHERE k.conrelid=c.oid AND k.contype='p')<>1)
- AND (SELECT count(*)=9 AND bool_and(ix.relam=403 AND i.indisvalid AND i.indisready AND i.indislive
- AND i.indexprs IS NULL AND i.indpred IS NULL AND i.indnkeyatts=i.indnatts
- AND i.indnkeyatts>0 AND NOT EXISTS(SELECT FROM unnest(i.indkey::smallint[]) key(attnum) WHERE key.attnum<=0))
- FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid JOIN pg_class ix ON ix.oid=i.indexrelid
- WHERE c.relnamespace=selected_capture.oid)
-"""
-
-
-# Match the retained capture's native catalog fingerprint, including its index filenodes.
-_RETAINED_FHIR_RELATIONS_SQL = """SELECT c.oid::bigint,c.relname,c.relkind,c.relpersistence,c.relowner::bigint,c.relhastriggers,
-      c.relrowsecurity,c.relforcerowsecurity,pg_relation_filenode(c.oid)::bigint AS filenode,n.oid::bigint AS schema_oid,n.nspowner::bigint,
-      EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) AS inherited,
-      (SELECT jsonb_agg(jsonb_build_array(a.attname,a.atttypid,a.atttypmod,a.attnotnull,a.attgenerated,a.attidentity) ORDER BY a.attnum)
-       FROM pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped)::text AS columns,
-      EXISTS(SELECT 1 FROM pg_attrdef d WHERE d.adrelid=c.oid) AS defaults,
-      (SELECT jsonb_agg(jsonb_build_object('oid',i.indexrelid::bigint,'name',ix.relname,'method',am.amname,
-        'owner_oid',ix.relowner::bigint,'filenode',pg_relation_filenode(ix.oid)::bigint,'unique',i.indisunique,'primary',i.indisprimary,
-        'valid',i.indisvalid,'ready',i.indisready,'live',i.indislive,'key_count',i.indnkeyatts,'attribute_count',i.indnatts,
-        'expressions',i.indexprs IS NOT NULL,'predicate',i.indpred IS NOT NULL,'options',i.indoption::text,
-        'columns',(SELECT jsonb_agg(a.attname ORDER BY key.ordinal) FROM unnest(i.indkey::smallint[]) WITH ORDINALITY key(attnum,ordinal)
-          LEFT JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=key.attnum),
-        'definition',CASE WHEN shape.deparse_safe AND i.indexprs IS NULL AND i.indpred IS NULL
-          THEN pg_catalog.pg_get_indexdef(i.indexrelid) END) ORDER BY ix.relname)
-        FROM pg_index i JOIN pg_class ix ON ix.oid=i.indexrelid JOIN pg_am am ON am.oid=ix.relam
-        WHERE i.indrelid=c.oid)::text AS indexes,
-      (SELECT jsonb_agg(jsonb_build_array(k.oid,k.contype,k.conindid,CASE WHEN shape.deparse_safe AND k.contype='p'
-          THEN pg_catalog.pg_get_constraintdef(k.oid) END) ORDER BY k.oid)
-        FROM pg_constraint k WHERE k.conrelid=c.oid AND k.contype<>'n')::text AS constraints
-      FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid WHERE n.oid=selected_capture.oid AND c.relkind IN ('r','p','v','m','f','S') ORDER BY c.relname"""
+# Read logical native shape directly; no deparser opens a retained source heap.
+_RETAINED_FHIR_RELATIONS_SQL = """SELECT n.nspname AS schema_name,c.relname,c.relkind::text,c.relpersistence::text,
+ c.relispartition,c.relhastriggers,c.relrowsecurity,c.relforcerowsecurity,
+ EXISTS(SELECT FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) AS inherited,
+ EXISTS(SELECT FROM pg_attrdef WHERE adrelid=c.oid) AS defaults,
+ (SELECT jsonb_agg(jsonb_build_object('name',a.attname,'type',pg_catalog.format_type(a.atttypid,a.atttypmod),
+   'required',a.attnotnull,'generated',a.attgenerated::text,'identity',a.attidentity::text,
+   'native',tn.nspname='pg_catalog' AND a.attcollation=t.typcollation AND NOT a.attisdropped) ORDER BY a.attnum)
+  FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid JOIN pg_namespace tn ON tn.oid=t.typnamespace
+  WHERE a.attrelid=c.oid AND a.attnum>0)::text AS columns,
+ (SELECT coalesce(jsonb_agg(jsonb_build_object('type',k.contype,'validated',k.convalidated AND k.conenforced,
+   'deferrable',k.condeferrable,'deferred',k.condeferred,
+   'columns',(SELECT jsonb_agg(a.attname ORDER BY key.ordinal) FROM unnest(k.conkey) WITH ORDINALITY key(attnum,ordinal)
+     LEFT JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum=key.attnum)) ORDER BY k.conname),'[]'::jsonb)
+  FROM pg_constraint k WHERE k.conrelid=c.oid AND k.contype<>'n')::text AS constraints,
+ (SELECT coalesce(jsonb_agg(jsonb_build_object('name',ix.relname,'method',am.amname,
+   'primary',i.indisprimary,'unique',i.indisunique,'valid',i.indisvalid,'ready',i.indisready,'live',i.indislive,
+   'columns',keys.columns,'collations',keys.collations,
+   'native',ix.relkind='i' AND ix.relpersistence='p' AND ix.reloptions IS NULL
+     AND NOT i.indnullsnotdistinct AND i.indnkeyatts=i.indnatts AND i.indexprs IS NULL AND i.indpred IS NULL
+     AND keys.supported) ORDER BY ix.relname),'[]'::jsonb)
+  FROM pg_index i JOIN pg_class ix ON ix.oid=i.indexrelid JOIN pg_am am ON am.oid=ix.relam
+  CROSS JOIN LATERAL (
+   SELECT jsonb_agg(a.attname ORDER BY key.ordinal) AS columns,
+     jsonb_agg(CASE WHEN co.collname='C' AND cn.nspname='pg_catalog' THEN 'C' ELSE 'native' END ORDER BY key.ordinal) AS collations,
+     count(*)=i.indnatts AND bool_and(coalesce(
+       a.attnum>0 AND NOT a.attisdropped AND indexed.attnum=key.ordinal
+       AND NOT indexed.attisdropped AND indexed.attoptions IS NULL
+       AND i.indoption[key.ordinal::int-1]=0 AND op.opcdefault
+       AND op.opcnamespace='pg_catalog'::regnamespace AND op.opcmethod=ix.relam
+       AND ((op.opcintype=a.atttypid AND (SELECT count(*)=1 FROM pg_opclass candidate
+         WHERE candidate.opcmethod=ix.relam AND candidate.opcdefault AND candidate.opcintype=a.atttypid)) OR
+         (a.atttypid='varchar'::regtype AND op.opcintype='text'::regtype
+           AND NOT EXISTS(SELECT FROM pg_opclass candidate WHERE candidate.opcmethod=ix.relam
+             AND candidate.opcdefault AND candidate.opcintype=a.atttypid)
+           AND (SELECT count(*)=1 AND bool_and(candidate.oid=op.oid)
+             FROM pg_opclass candidate JOIN pg_type input ON input.oid=candidate.opcintype
+             JOIN pg_type actual ON actual.oid=a.atttypid
+             WHERE candidate.opcmethod=ix.relam AND candidate.opcdefault
+               AND input.typispreferred AND input.typcategory=actual.typcategory
+               AND (candidate.opcintype=a.atttypid OR EXISTS(SELECT FROM pg_cast conversion
+                 WHERE conversion.castsource=a.atttypid AND conversion.casttarget=candidate.opcintype
+                   AND conversion.castmethod='b' AND conversion.castcontext='i')))))
+       AND (i.indcollation[key.ordinal::int-1]=a.attcollation OR
+         (c.relname='provider_directory_dataset_resource' AND ix.relname='retained_lookup_1_0'
+           AND a.attname IN ('resource_type','resource_id')
+           AND i.indcollation[key.ordinal::int-1]='pg_catalog."C"'::regcollation)),false)) AS supported
+   FROM unnest(i.indkey::smallint[]) WITH ORDINALITY key(attnum,ordinal)
+   LEFT JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=key.attnum
+   LEFT JOIN pg_attribute indexed ON indexed.attrelid=i.indexrelid AND indexed.attnum=key.ordinal
+   LEFT JOIN pg_opclass op ON op.oid=i.indclass[key.ordinal::int-1]
+   LEFT JOIN pg_collation co ON co.oid=i.indcollation[key.ordinal::int-1]
+   LEFT JOIN pg_namespace cn ON cn.oid=co.collnamespace
+  ) keys WHERE i.indrelid=c.oid)::text AS indexes
+ FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid
+ WHERE n.nspname=$1 AND c.relkind IN ('r','p','v','m','f','S') ORDER BY c.relname"""
 _RETAINED_FHIR_CERTIFICATE_SQL = (
     """retained_fhir_catalogs AS (
- SELECT selected_capture.oid AS schema_oid,owner.rolname AS owner_role,
+ SELECT selected_capture.nspname AS schema_name,
  (SELECT jsonb_agg(to_jsonb(observed) ORDER BY observed.relname) FROM LATERAL (
 """
-    + _RETAINED_FHIR_RELATIONS_SQL
-    + """) observed) AS catalog,
- (WITH closure_scope AS (SELECT selected_capture.oid AS schema_oid,selected_capture.nspowner AS owner_oid,
- CASE WHEN jsonb_typeof(receipt.document->'runtime_roles')='array'
- THEN ARRAY(SELECT jsonb_array_elements_text(receipt.document->'runtime_roles')) ELSE ARRAY[]::text[] END AS role_names,
- NULL::text[] AS relation_names)
-"""
-    + _NATIVE_WRITER_PRIVILEGES_SQL
-    + """) AND
- (WITH configured AS (SELECT r.* FROM unnest(CASE WHEN jsonb_typeof(receipt.document->'runtime_roles')='array'
- THEN ARRAY(SELECT jsonb_array_elements_text(receipt.document->'runtime_roles')) ELSE ARRAY[]::text[] END) selected(name)
- LEFT JOIN pg_roles r ON r.rolname=selected.name)
- SELECT NOT EXISTS(SELECT FROM configured r WHERE r.oid IS NULL OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls
- OR has_parameter_privilege(r.oid,'session_replication_role','SET'))
- AND NOT EXISTS(SELECT FROM pg_proc p WHERE p.prosecdef AND p.prorettype NOT IN ('trigger'::regtype,'event_trigger'::regtype)
- AND EXISTS(SELECT FROM pg_roles definer WHERE definer.oid=p.proowner AND (definer.rolsuper OR definer.rolcreaterole
- OR pg_has_role(definer.oid,selected_capture.nspowner,'MEMBER') OR pg_has_role(definer.oid,selected_capture.nspowner,'SET')))
- AND EXISTS(SELECT FROM configured r WHERE has_schema_privilege(r.oid,p.pronamespace,'USAGE') AND has_function_privilege(r.oid,p.oid,'EXECUTE')))) AS closed,
- (SELECT count(*)=1 AND bool_and(i.indcollation[0]=(SELECT a.attcollation FROM pg_attribute a WHERE a.attrelid=i.indrelid AND a.attname='dataset_id') AND i.indcollation[1]='pg_catalog."C"'::regcollation AND i.indcollation[2]='pg_catalog."C"'::regcollation AND NOT EXISTS(SELECT FROM unnest(i.indclass::oid[]) selected(oid) LEFT JOIN pg_opclass o ON o.oid=selected.oid WHERE o.oid IS NULL OR o.opcnamespace<>'pg_catalog'::regnamespace OR o.opcname<>'text_ops' OR o.opcintype<>'text'::regtype OR o.opckeytype<>0 OR o.opcmethod<>(SELECT oid FROM pg_am WHERE amname='btree'))) FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid WHERE i.indrelid=(SELECT c.oid FROM pg_class c WHERE c.relnamespace=selected_capture.oid AND c.relname='provider_directory_dataset_resource') AND c.relname='retained_lookup_1_0') AS cursor_closed
- FROM private_namespaces selected_capture JOIN pg_roles owner ON owner.oid=selected_capture.nspowner
- CROSS JOIN LATERAL (SELECT (
-"""
-    + _RETAINED_FHIR_DEPARSE_SAFE_SQL
-    + """) AS deparse_safe) shape
- LEFT JOIN pg_description description ON description.classoid='pg_namespace'::regclass
- AND description.objoid=selected_capture.oid AND description.objsubid=0
- CROSS JOIN LATERAL (SELECT CASE WHEN octet_length(description.description)<=65536+length('retained-normalized-fhir-v1:')
- THEN CASE WHEN description.description LIKE 'retained-normalized-fhir-v1:%'
- AND substr(description.description,length('retained-normalized-fhir-v1:')+1) IS JSON OBJECT WITH UNIQUE KEYS
- THEN substr(description.description,length('retained-normalized-fhir-v1:')+1)::jsonb END END AS document) receipt
+    + _RETAINED_FHIR_RELATIONS_SQL.replace("n.nspname=$1", "n.nspname=selected_capture.nspname")
+    + """) observed) AS catalog
+ FROM private_namespaces selected_capture
  WHERE selected_capture.nspname ~ '^registry_fhir_capture_[0-9a-f]{32}$'),
 """
 )
@@ -957,13 +1036,13 @@ SELECT jsonb_build_object('contract','registry-native-execution/v1','database_oi
  AND n.oid NOT IN (SELECT oid FROM private_namespaces)
  AND n.nspname !~ '^pg_(toast_)?temp_' AND has_schema_privilege(r.oid,n.oid,'USAGE'))
  AND NOT EXISTS(SELECT FROM private_namespaces n JOIN pg_roles owner ON owner.oid=n.nspowner
- WHERE owner.rolcanlogin OR owner.rolsuper OR owner.rolcreatedb OR owner.rolcreaterole
+ WHERE n.nspname !~ '^registry_fhir_capture_[0-9a-f]{32}$' AND (owner.rolcanlogin OR owner.rolsuper OR owner.rolcreatedb OR owner.rolcreaterole
  OR owner.rolreplication OR owner.rolbypassrls OR EXISTS(SELECT FROM execution_principals r
- WHERE pg_has_role(r.oid,owner.oid,'MEMBER') OR pg_has_role(r.oid,owner.oid,'SET')))
+ WHERE pg_has_role(r.oid,owner.oid,'MEMBER') OR pg_has_role(r.oid,owner.oid,'SET'))))
  AND NOT EXISTS(SELECT FROM private_namespaces n CROSS JOIN LATERAL aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) a
- WHERE a.privilege_type='CREATE' AND a.grantee<>n.nspowner)
+ WHERE n.nspname !~ '^registry_fhir_capture_[0-9a-f]{32}$' AND a.privilege_type='CREATE' AND a.grantee<>n.nspowner)
  AND NOT EXISTS(SELECT FROM execution_principals r CROSS JOIN pg_class c WHERE
- c.relnamespace IN (SELECT oid FROM private_namespaces) AND (
+ c.relnamespace IN (SELECT oid FROM private_namespaces WHERE nspname !~ '^registry_fhir_capture_[0-9a-f]{32}$') AND (
  (c.relkind IN ('r','p','v','m','f') AND (has_table_privilege(r.oid,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN')
  OR has_any_column_privilege(r.oid,c.oid,'INSERT,UPDATE,REFERENCES')))
  OR (c.relkind='S' AND has_sequence_privilege(r.oid,c.oid,'SELECT,USAGE,UPDATE'))))
@@ -1009,7 +1088,7 @@ SELECT jsonb_build_object('contract','registry-native-execution/v1','database_oi
     + _PUBLIC_VIEW_REACHABILITY_SQL
     + """))
  || CASE WHEN EXISTS(SELECT FROM retained_fhir_catalogs) THEN jsonb_build_object('retained_fhir_catalogs',
- (SELECT jsonb_object_agg(schema_oid::text,to_jsonb(f)-'schema_oid') FROM retained_fhir_catalogs f)) ELSE '{}'::jsonb END
+ (SELECT jsonb_object_agg(schema_name,to_jsonb(f)-'schema_name') FROM retained_fhir_catalogs f)) ELSE '{}'::jsonb END
 """
 )
 

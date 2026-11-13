@@ -12,6 +12,7 @@ from process.network_address_projection import (
     _identifier,
     _projection_columns,
 )
+from process.network_compact_layout import CompactAddressRelation
 from process.network_custom_address_source import (
     _APPROVED_CTE,
     _INSERT_ADDRESS_SQL,
@@ -19,7 +20,6 @@ from process.network_custom_address_source import (
     NetworkCustomAddressUnresolved,
     _approved_identity,
     _require_transaction,
-    _source_identity,
 )
 from process.network_membership_candidate_lifecycle import _locked_candidate
 from process.network_membership_copy import MembershipCopyTarget
@@ -34,17 +34,15 @@ class CustomOfficeRowsReceipt:
     target: MembershipCopyTarget
     approved_revision: int
     base_source: PinnedAddressSource
-    base_identity: tuple[int, int, int, str]
     npi_source: PinnedAddressSource | None
-    npi_identity: tuple[int, int, int, str] | None
     approved_records_sha256: str
     custom_pair_count: int
-    address_table_oid: int
-    binding_table_oid: int
+    address_relation: CompactAddressRelation
+    binding_relation: CompactAddressRelation
 
     def as_dict(self):
-        """Return preparation evidence; the integrating path supplies custody."""
-        return {"component": "network_custom_office_rows", "revision": 1, **asdict(self)}
+        """Return logical input scope, counts and named candidate outputs."""
+        return {"component": "network_custom_office_rows", "revision": 2, **asdict(self)}
 
 
 def _validate_inputs(copy_target, base_source, approved_revision, runtime_roles, npi_source):
@@ -56,7 +54,7 @@ def _validate_inputs(copy_target, base_source, approved_revision, runtime_roles,
         raise NetworkCustomAddressSourceError("Pinned NPI source is invalid")
     if (
         type(runtime_roles) is not tuple
-        or not 1 <= len(runtime_roles) <= 32
+        or not 0 <= len(runtime_roles) <= 128
         or runtime_roles != tuple(sorted(set(runtime_roles)))
     ):
         raise NetworkCustomAddressSourceError("Runtime roles must be a sorted unique bounded tuple")
@@ -69,16 +67,12 @@ def _validate_inputs(copy_target, base_source, approved_revision, runtime_roles,
 
 
 async def _pin_source(connection, pinned_source, runtime_roles, *, address=False, control_schema=None):
-    identity = await _source_identity(
-        connection, pinned_source, runtime_roles, address=address, control_schema=control_schema
-    )
+    await _require_transaction(connection)
     table = _identifier(pinned_source.schema_name) + "." + _identifier(pinned_source.table_name)
-    await connection.execute(f"LOCK TABLE {table} IN ACCESS SHARE MODE NOWAIT")
-    if await connection.fetchval("SELECT to_regclass($1)::oid::bigint", table) != identity[1]:
-        raise NetworkCustomAddressSourceError("Retained source native identity differs")
+    await connection.fetch(f"SELECT * FROM {table} LIMIT 0")
     if address:
         await _projection_columns(connection, table)
-    return identity
+    return asdict(pinned_source)
 
 
 async def _direct_custom_identity(connection, namespace, revision):
@@ -158,36 +152,28 @@ async def _prepare_custom_rows(
         ):
             raise NetworkCustomAddressSourceError("Custom offices require the exact approved sealed candidate")
         summary = await _direct_custom_identity(connection, control, approved_revision)
-        base_identity = await _pin_source(
-            connection, base_source, runtime_roles, address=True, control_schema=control[1:-1]
-        )
+        await _pin_source(connection, base_source, runtime_roles, address=True, control_schema=control[1:-1])
         effective_npi = npi_source or (
             PinnedAddressSource(base_source.schema_name, "npi", base_source.generation_id)
             if summary["npi_pairs"]
             else None
         )
-        npi_identity = None if effective_npi is None else await _pin_source(connection, effective_npi, runtime_roles)
+        if effective_npi is not None:
+            await _pin_source(connection, effective_npi, runtime_roles)
         row_count = await _insert_custom_rows(
             connection, copy_target, base_source, effective_npi, control, approved_revision
         )
         if row_count != summary["pairs"]:
             raise NetworkCustomAddressSourceError("Approved direct custom office accounting differs")
-        address_oid, binding_oid = await connection.fetchrow(
-            "SELECT to_regclass($1)::oid::bigint,to_regclass($2)::oid::bigint",
-            copy_target.schema_name + ".entity_address_unified",
-            copy_target.schema_name + ".custom_provider_location_binding",
-        )
     return CustomOfficeRowsReceipt(
         copy_target,
         approved_revision,
         base_source,
-        base_identity,
         effective_npi,
-        npi_identity,
         summary["fingerprint"],
         row_count,
-        address_oid,
-        binding_oid,
+        CompactAddressRelation(copy_target.schema_name, "entity_address_unified"),
+        CompactAddressRelation(copy_target.schema_name, "custom_provider_location_binding"),
     )
 
 

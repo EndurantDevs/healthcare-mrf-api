@@ -66,7 +66,10 @@ def _install_native_scope(monkeypatch, access, candidates):
         ),
     )
     pin = pagination.BillingSearchGenerationPin(
-        pagination.billing_search_snapshot_set_sha256(fixture.selection), "8" * 64, 1001, 1002
+        pagination.billing_search_snapshot_set_sha256(fixture.selection),
+        "8" * 64,
+        "mrf.entity_address_unified",
+        "mrf.entity_address_evidence",
     )
     monkeypatch.setattr(pagination, "capture_billing_search_generation_pin", AsyncMock(return_value=pin))
     geo_witnesses = tuple(witness for candidate in candidates for witness in candidate.geo_witnesses)

@@ -97,3 +97,40 @@ async def require_published_lock_privileges(session, schema_name, *, pin_writer=
         or any(header["protected"] is not True for header in headers)
     ):
         raise RegistryPTGProducerScopeError("registry_ptg_published_lock_privileges_unprotected")
+
+
+async def install_registry_ptg_office_preparation_permissions(connection, *, profile, store, reader_roles):
+    """Install ordinary office preparation permissions in the caller's administrator transaction."""
+    from types import SimpleNamespace
+
+    from process.registry_fhir_catalog_permissions import (
+        _grant_named_preparation_control,
+        _revoke_named_preparation_writes,
+    )
+    from process.registry_ptg_office_custody import office_preparation_roles
+    from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
+
+    if not connection.is_in_transaction() or type(store) is not RegistryPTGProducerScopeStore:
+        raise ValueError("registry_ptg_office_profile_unavailable")
+    roles = office_preparation_roles(
+        SimpleNamespace(
+            office_custody=profile,
+            owner_role=profile.owner_role,
+            reader_roles=tuple(sorted({*reader_roles, store.approval_role})),
+        )
+    )
+    publisher = _identifier(roles["publisher_role"])
+    owner = _identifier(roles["namespace_owner_role"])
+    applications = ",".join(_identifier(role) for role in roles["application_roles"])
+    await connection.execute(f"REVOKE {owner} FROM {applications}")
+    database = await connection.fetchval("SELECT quote_ident(current_database())")
+    await connection.execute(f"GRANT CREATE ON DATABASE {database} TO {publisher}")
+    await _grant_named_preparation_control(connection, roles["publisher_role"], store.approval_role)
+    readers = sorted(set(reader_roles) - {roles["publisher_role"], store.approval_role})
+    if readers:
+        recipients = ",".join(_identifier(role) for role in readers)
+        await connection.execute(f"GRANT USAGE ON SCHEMA hp_snapshot_retention TO {recipients}")
+        tables = "hp_snapshot_retention.preparation,hp_snapshot_retention.preparation_claim,hp_snapshot_retention.preparation_relation,hp_snapshot_retention.relation"
+        await connection.execute(f"REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON {tables} FROM {recipients}")
+        await _revoke_named_preparation_writes(connection, *readers)
+        await connection.execute(f"GRANT SELECT ON {tables} TO {recipients}")

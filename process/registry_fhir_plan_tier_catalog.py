@@ -191,7 +191,7 @@ async def replace_plan_tier_bindings(connection, relations, descriptor, keys):
     """Replace only the same typed source identities in the isolated candidate."""
     from process.registry_fhir_catalog_observed_source import catalog_replacement_scope, catalog_replacement_scope_sql
 
-    is_named = "catalog_schema" in descriptor
+    is_named = "catalog_schema" in descriptor or "tables" in descriptor
     source_join = (
         f" JOIN {relations['source']} source ON "
         "binding.document_json->'source_scope'->>'source_generation'=source.source_generation"

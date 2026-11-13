@@ -48,7 +48,7 @@ def _source_recipe(capture, anchor):
         origin.dataset_id,
         origin.dataset_sha256,
         capture.release_id,
-        origin.resource_parent_oid,
+        origin.resource_relation,
         PRODUCER,
         source_witness_membership_date(capture, anchor),
         source_witness_capture=capture,

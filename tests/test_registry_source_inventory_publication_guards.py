@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Inventory metadata never permits the legacy missing-custody fallback."""
+"""Inventory publication keeps complete named payloads and completed logical validation."""
 
 import json
 from types import SimpleNamespace
@@ -15,9 +15,9 @@ from process import network_serving_read as serving
 from process import registry_candidate_composition as composition
 from process.registry_source_inventory_contract import source_inventory_root
 from process.registry_source_inventory_reference import SourceInventoryReference, source_inventory_heaps
+from tests.registry_source_recipe_support import _example
 from tests.test_registry_source_inventory_contract import _entries
 from tests.test_registry_source_inventory_reference import _candidate
-from tests.test_registry_source_recipe_store_postgres import _example
 
 
 def _registered(count):
@@ -31,91 +31,116 @@ def _registered(count):
     }
 
 
+def _validated(candidate):
+    fields = (
+        "raw_rows",
+        "batch_rows",
+        "batch_count",
+        "membership_rows",
+        "distinct_memberships",
+        "projected_locations",
+        "orphan_bindings",
+        "unknown_network_rows",
+    )
+    report_by_field = dict(candidate["validation_json"])
+    report_by_field.update(dict.fromkeys(fields, 0))
+    report_by_field["final_validation"] = {
+        "candidate_id": candidate["candidate_id"],
+        "schema_name": candidate["schema_name"],
+        "source_generations": candidate["source_generations"],
+        "complete": True,
+        "counts": {field: report_by_field[field] for field in fields},
+    }
+    return {**candidate, "validation_json": report_by_field}
+
+
 @pytest.mark.parametrize("count", [0, 1])
-async def test_inventory_custody_is_required_even_without_contributions(monkeypatch, count):
+def test_inventory_snapshot_names_include_both_payload_tables(count):
     candidate = _registered(count)
-    verify = AsyncMock(return_value={"seal_sha256": "a" * 64})
-    monkeypatch.setattr(publication, "verify_network_candidate_custody", verify)
-    result = await publication._candidate_custody(object(), candidate, "fixture")
-    assert result == {"seal_sha256": "a" * 64}
-    assert verify.await_args.kwargs == {"control_schema": "fixture", "required": True}
+    tables = publication._publication_snapshot_tables(candidate, candidate["validation_json"])
+    assert tables["schema_name"] == candidate["schema_name"]
+    assert set(tables["tables"]) == {
+        "network_membership",
+        "provider_location_binding",
+        "entity_address_unified",
+        "network_source_inventory",
+        "network_provider_only_evidence",
+    }
     assert source_inventory_heaps(candidate) == {"network_source_inventory", "network_provider_only_evidence"}
 
 
-async def test_ready_inventory_without_seal_revalidates_before_custody(monkeypatch):
-    from process import network_compact_validation as compact
+@pytest.mark.parametrize("failure", [None, "validation", "readiness"])
+async def test_ready_inventory_replay_keeps_current_validation_and_readiness(monkeypatch, failure):
     from process import network_membership_pipeline as pipeline
 
-    candidate_by_name = {**_registered(1), "state": "ready"}
-    verify = AsyncMock(return_value=None)
-    closure = AsyncMock()
-    final_proof = AsyncMock()
-    monkeypatch.setattr(publication, "verify_network_candidate_custody", verify)
-    monkeypatch.setattr(pipeline, "_locked_candidate", AsyncMock(return_value=candidate_by_name))
+    candidate_by_field = {**_registered(1), "state": "ready"}
+    events = []
+    monkeypatch.setattr(pipeline, "_locked_candidate", AsyncMock(return_value=candidate_by_field))
     monkeypatch.setattr(pipeline, "_scope_report", lambda *args: {})
-    monkeypatch.setattr(pipeline, "_validated_replay", lambda *args: None)
-    monkeypatch.setattr(pipeline, "_publication_readiness", lambda *args: ())
-    monkeypatch.setattr(pipeline, "verify_network_candidate_writer_closure", closure)
-    monkeypatch.setattr(indexes, "is_compact_candidate", lambda _: True)
-    monkeypatch.setattr(compact, "verify_compact_final_proof", final_proof)
-    connection, target, address = object(), object(), object()
-    await pipeline._prepare_phase_snapshot(connection, target, address, {}, "fixture")
-    assert verify.await_args.kwargs == {"control_schema": "fixture", "required": False}
-    closure.assert_awaited_once_with(connection, target, control_schema="fixture")
-    final_proof.assert_awaited_once_with(
-        connection, target, candidate_by_name, control_schema="fixture", office_authority=None
-    )
 
-    verify.side_effect = ValueError("damaged_seal")
-    with pytest.raises(ValueError, match="^damaged_seal$"):
-        await pipeline._prepare_phase_snapshot(connection, target, address, {}, "fixture")
-    assert closure.await_count == final_proof.await_count == 1
+    def check(stage):
+        def validate(*arguments):
+            events.append(stage)
+            if failure == stage:
+                raise ValueError("changed_" + stage)
+
+        return validate
+
+    monkeypatch.setattr(pipeline, "_validated_replay", check("validation"))
+    monkeypatch.setattr(pipeline, "_publication_readiness", check("readiness"))
+    if failure:
+        with pytest.raises(ValueError, match="changed_" + failure):
+            await pipeline._prepare_phase_snapshot(object(), object(), object(), {}, "fixture")
+    else:
+        await pipeline._prepare_phase_snapshot(object(), object(), object(), {}, "fixture")
+    assert events == (["validation"] if failure == "validation" else ["validation", "readiness"])
 
 
-@pytest.mark.parametrize("state,allow_unsealed", [("published", True), ("sealed", True), ("ready", 1)])
-async def test_optional_inventory_seal_is_preparation_only(monkeypatch, state, allow_unsealed):
-    candidate_by_name = {**_registered(1), "state": state}
-    verify = AsyncMock()
-    monkeypatch.setattr(publication, "verify_network_candidate_custody", verify)
-    with pytest.raises(publication.NetworkPublicationError, match="verification mode"):
-        await publication._candidate_custody(object(), candidate_by_name, "fixture", allow_unsealed=allow_unsealed)
-    verify.assert_not_awaited()
+@pytest.mark.parametrize("damage", ["complete", "candidate", "source", "counts"])
+def test_inventory_final_validation_requires_exact_logical_data(damage):
+    candidate = _validated(_registered(1))
+    assert publication._require_final_validation(candidate) is candidate["validation_json"]["final_validation"]
+    record = candidate["validation_json"]["final_validation"]
+    if damage == "complete":
+        record["complete"] = False
+    elif damage == "candidate":
+        record["candidate_id"] = str(UUID(int=2))
+    elif damage == "source":
+        record["source_generations"] = {}
+    else:
+        record["counts"]["membership_rows"] = 1
+    with pytest.raises(publication.NetworkPublicationError):
+        publication._require_final_validation(candidate)
 
 
 @pytest.mark.parametrize("compact", [False, True])
 @pytest.mark.parametrize("count", [0, 1])
-async def test_rollback_requires_inventory_custody_and_matching_physical_indexes(monkeypatch, compact, count):
-    from process import network_candidate_custody as custody
+async def test_rollback_requires_final_data_and_matching_structural_indexes(monkeypatch, compact, count):
     from process import registry_publication_execution as execution
 
-    candidate_by_name = {**_registered(count), "state": "ready", "expected_head": 1, "approved_custom_revision": 2}
+    candidate_by_field = {**_registered(count), "state": "ready", "expected_head": 1, "approved_custom_revision": 2}
     if compact:
-        candidate_by_name["validation_json"] = {"serving_readiness": {"component": indexes.COMPONENT}}
-    copy_target = SimpleNamespace(schema_name=candidate_by_name["schema_name"])
+        candidate_by_field["validation_json"] = {"serving_readiness": {"component": indexes.COMPONENT}}
+    candidate_by_field = _validated(candidate_by_field)
+    copy_target = SimpleNamespace(schema_name=candidate_by_field["schema_name"])
     command = SimpleNamespace(expected_serving_generation=1, expected_approved_revision=2)
-    monkeypatch.setattr(execution, "_locked_candidate", AsyncMock(return_value=candidate_by_name))
-    native = AsyncMock(return_value={"seal_sha256": "a" * 64})
-    monkeypatch.setattr(custody, "verify_network_candidate_custody", native)
-    monkeypatch.setattr(execution, "verify_network_candidate_writer_closure", AsyncMock())
+    monkeypatch.setattr(execution, "_locked_candidate", AsyncMock(return_value=candidate_by_field))
     monkeypatch.setattr(
         execution, "_publication_readiness", lambda _: ({}, None, {"index_definition_sha256": "b" * 64})
     )
-    legacy = AsyncMock(return_value="b" * 64)
-    compact_indexes = AsyncMock(return_value="b" * 64)
+    legacy, compact_indexes = AsyncMock(return_value="b" * 64), AsyncMock(return_value="b" * 64)
     monkeypatch.setattr(execution, "_catalog_readiness", AsyncMock())
     monkeypatch.setattr(execution, "_index_digest", legacy)
     monkeypatch.setattr(indexes, "compact_index_digest", compact_indexes)
     actual, digest = await execution._verified_source_rollback_candidate(object(), copy_target, command, {}, "fixture")
-    assert actual == candidate_by_name and len(digest) == 64
-    assert native.await_args.kwargs == {"control_schema": "fixture", "required": True}
+    assert actual == candidate_by_field and len(digest) == 64
     assert compact_indexes.await_count == int(compact) and legacy.await_count == int(not compact)
     if compact:
-        assert compact_indexes.await_args.kwargs == {"candidate": candidate_by_name}
+        assert compact_indexes.await_args.kwargs == {"candidate": candidate_by_field}
     selected = compact_indexes if compact else legacy
     selected.return_value = "c" * 64
     with pytest.raises(ValueError, match="registry_source_rollback_candidate_changed"):
         await execution._verified_source_rollback_candidate(object(), copy_target, command, {}, "fixture")
-    execution.verify_network_candidate_writer_closure.assert_not_awaited()
 
 
 @pytest.mark.parametrize("count", [0, 1])
@@ -150,50 +175,6 @@ async def test_rollback_selection_requirement_uses_verified_count_not_reference_
     else:
         preview_by_name = await operation
         assert preview_by_name["source_selection"] == {"mapped_rows": 0, "omitted_rows": 0}
-
-
-@pytest.mark.parametrize("missing", ["network_source_inventory", "network_provider_only_evidence"])
-def test_publication_closure_requires_both_inventory_heaps(missing):
-    candidate = _registered(0)
-    relation_oid_by_name = {
-        name: index + 1
-        for index, name in enumerate(
-            (
-                "network_membership",
-                "provider_location_binding",
-                "entity_address_unified",
-                "network_source_inventory",
-                "network_provider_only_evidence",
-            )
-        )
-    }
-    closure_by_field = {
-        "component": "network_candidate_writer_closure",
-        "revision": 1,
-        "scope": {
-            field: candidate[field]
-            for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
-        },
-        "owner_role": "owner_fixture",
-        "loader_roles": [],
-        "reader_roles": [],
-        "relation_oids": relation_oid_by_name,
-    }
-    assert publication._publication_writer_closure(candidate, {"writer_closure": closure_by_field}) == closure_by_field
-    relation_oid_by_name.pop(missing)
-    with pytest.raises(publication.NetworkPublicationError, match="serving storage"):
-        publication._publication_writer_closure(candidate, {"writer_closure": closure_by_field})
-
-
-def test_unsealed_empty_inventory_cannot_use_legacy_manifest_closure(monkeypatch):
-    candidate = _registered(0)
-    monkeypatch.setattr(serving, "_publication_readiness", lambda _candidate: (None, None, None, None))
-    monkeypatch.setattr(serving, "_retained_manifest", lambda *_args, **_kwargs: candidate)
-    monkeypatch.setattr(
-        serving, "_verified_writer_closure", lambda *_args: pytest.fail("Unsealed inventory reached legacy closure")
-    )
-    with pytest.raises(serving.NetworkServingReadUnavailable, match="protected custody"):
-        serving._pinned_manifest({"candidate_json": json.dumps(candidate), "manifest_json": "{}"})
 
 
 def _index_rows():

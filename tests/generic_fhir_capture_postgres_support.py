@@ -240,10 +240,8 @@ async def _legacy_input(admin, schema, reader_role, metadata, summary, modern=Fa
         "dataset-one",
         summary["dataset_hash"],
         "run-one",
-        await admin.fetchval("SELECT to_regclass($1)::oid::bigint", f'"{schema}".provider_directory_endpoint_dataset'),
-        await admin.fetchval("SELECT to_regclass($1)::oid::bigint", f'"{schema}".provider_directory_dataset_resource'),
-        await admin.fetchval("SELECT to_regclass($1)::oid::bigint", f'"{schema}".retained_input'),
-        reader_role,
+        {"schema": schema, "name": "provider_directory_endpoint_dataset"},
+        {"schema": schema, "name": "provider_directory_dataset_resource"},
         len(metadata.encode()),
         hashlib.sha256(metadata.encode()).hexdigest(),
         summary["summary_sha256"],
@@ -393,7 +391,8 @@ async def legacy_capture_db(request):
 
 
 async def _capture(fixture, origin=None, *, runtime_roles=None):
-    reader, writer = await fixture.connect("reader"), await fixture.connect("publisher")
+    """Prepare and freeze through the administrator, exporting only through the source reader."""
+    reader, writer = await fixture.connect("reader"), fixture.admin
     identity = uuid4()
     fixture.captures.append("registry_fhir_capture_" + identity.hex)
     async with (
@@ -408,7 +407,6 @@ async def _capture(fixture, origin=None, *, runtime_roles=None):
             owner_role=fixture.role_by_kind["owner"],
             runtime_roles=runtime_roles or (fixture.role_by_kind["reader"],),
         )
-        assert await writer.fetchval("SELECT current_user") == fixture.role_by_kind["publisher"]
     return value
 
 
@@ -476,7 +474,7 @@ async def _approved_capture_recipe(fixture, serving, capture, *, organization="n
         fixture.origin.dataset_id,
         fixture.origin.dataset_sha256,
         capture.release_id,
-        fixture.origin.resource_parent_oid,
+        fixture.origin.resource_relation,
         "medical",
         "2026-10-01",
         retained_capture=capture,

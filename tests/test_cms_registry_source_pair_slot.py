@@ -19,7 +19,7 @@ from process.entity_address_snapshot_alias import EntityAddressAliasAuthority
 from process.entity_address_snapshot_ownership import EntityAddressArchiveStageOwnership
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
-from process.network_fhir_source_epoch import _ORIGIN_FIELDS, _TABLES, RetainedCMSFHIRSourceEpoch
+from process.network_fhir_source_epoch import _ORIGIN_FIELDS, RetainedCMSFHIRSourceEpoch
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from tests.provider_directory_cms_capacity_test_support import cms_execution
 from tests.test_provider_directory_cms_preflight import _retention_policy
@@ -45,14 +45,9 @@ def _prepared():
         tuple(getattr(pin, field) for field in _ORIGIN_FIELDS),
         capture,
         "registry_cms_epoch_" + capture.hex,
-        98,
-        tuple((name, index) for index, name in enumerate(sorted(_TABLES), 100)),
-        policy["owner_role"],
-        tuple(policy["runtime_roles"]),
         request.expected_admission_sha256,
         request.expected_metadata_sha256,
         "a" * 64,
-        "b" * 64,
     )
     models = (*address._models(), EntityAddressAliasAuthority)
     tables = tuple(
@@ -74,8 +69,8 @@ def _prepared():
         receipt,
         "d" * 64,
         tuple((name, name + "_candidate", index) for index, name in enumerate(sorted(prepared.RELATION_NAMES), 300)),
-        epoch.owner_role,
-        epoch.runtime_roles,
+        policy["owner_role"],
+        tuple(policy["runtime_roles"]),
         "e" * 64,
         "f" * 64,
         "a" * 64,

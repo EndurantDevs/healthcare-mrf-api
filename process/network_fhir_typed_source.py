@@ -10,16 +10,15 @@ from uuid import UUID, uuid4
 
 from process.network_address_projection import _identifier
 from process.network_fhir_retained_capture_contract import registry_location_id
-from process.network_fhir_source_epoch_pin import _virtual_xid
-from process.network_fhir_source_witness_capture import _export_identity, _original_source_factory
 from process.network_fhir_source_witness_contract import (
-    database_identity,
+    COMPLETION_CONTRACT,
+    CONTRACT,
+    SourceWitnessCompletionOrigin,
     is_completion_v3_origin,
     source_origin,
     source_resource_marker_valid,
 )
 from process.network_fhir_typed_contract import (
-    _BRAND,
     ADDRESS_FIELDS,
     CELL_COLUMNS,
     KINDS,
@@ -57,28 +56,17 @@ _DATE = re.compile(
 )
 
 
-async def bind_typed_graph_stage(connection, *, schema_name, table_names, expected_oids=None, document=None):
-    """Bind caller-owned tables to this task/transaction; native ACL/anchor admission stays with the caller."""
+async def bind_typed_graph_stage(connection, *, schema_name, table_names, document=None):
+    """Bind the qualified graph names used by the caller's transaction."""
     require(connection.is_in_transaction(), "transaction_required")
     _identifier(schema_name)
     require(type(table_names) is dict and set(table_names) in ({"cells", "addresses", "pairs"}, set(_DDL)), "tables")
     for name in table_names.values():
         _identifier(name)
-    oids_by_kind = {
-        kind: await connection.fetchval("SELECT to_regclass($1)::oid::bigint", schema_name + "." + name)
-        for kind, name in table_names.items()
-    }
-    require(all(type(oid) is int and oid > 0 for oid in oids_by_kind.values()), "tables_missing")
-    require(expected_oids is None or expected_oids == oids_by_kind, "tables_changed")
     return TypedFHIRGraphStage(
-        connection,
-        asyncio.current_task(),
-        await _virtual_xid(connection),
         dict(table_names),
-        oids_by_kind,
         schema_name=schema_name,
-        document=document,
-        brand=_BRAND,
+        document=validate_graph_document(document) if document is not None else None,
     )
 
 
@@ -116,15 +104,6 @@ async def _workspace(connection):
         except BaseException:
             connection.terminate()
         raise
-
-
-async def _require_writer(connection, publisher):
-    identity = await connection.fetchrow(
-        "SELECT session_user::text actor,current_user::text effective,current_setting('transaction_read_only') readonly,"
-        "current_setting('session_replication_role') replication"
-    )
-    require(identity["actor"] == identity["effective"] and identity["actor"] != publisher, "writer_actor")
-    require(identity["readonly"] == "off" and identity["replication"] == "origin", "writer_scope")
 
 
 def _page_rows(page, origin, counts, after):
@@ -295,7 +274,7 @@ async def _check_page(connection, stage, rows, base, as_of):
             require(copied == "COPY " + str(len(rows)), "copy_count")
 
 
-async def _consume(source_export, connection, stage, profile, reviewed, *, checker, expected_identity, as_of):
+async def _consume(source_export, connection, stage, profile, reviewed, *, checker, as_of):
     origin = source_origin(reviewed)
     counts, after = dict.fromkeys(dict(origin.resource_counts), 0), None
     selection = (
@@ -304,11 +283,14 @@ async def _consume(source_export, connection, stage, profile, reviewed, *, check
         else {key: getattr(reviewed, key) for key in ("source_id", "endpoint_id", "dataset_id")}
     )
     async with source_export(source_profile=profile, **selection) as export:
-        identity = _export_identity(export, origin, expected_identity)
+        require(type(export) is dict and set(export) == {"contract", "origin", "resources"}, "source_export")
+        contract = COMPLETION_CONTRACT if type(origin) is SourceWitnessCompletionOrigin else CONTRACT
+        require(export["contract"] == contract and source_origin(export["origin"]) == origin, "source_origin")
+        require(callable(export["resources"]), "source_export")
         iterator = export["resources"]()
         try:
             async for page in iterator:
-                await stage.verify(connection, complete=False)
+                stage.require_ready(complete=False)
                 rows, after = _page_rows(page, origin, counts, after)
                 if checker:
                     await _check_page(connection, stage, rows, origin.source_uri.rstrip("/"), as_of)
@@ -318,7 +300,7 @@ async def _consume(source_export, connection, stage, profile, reviewed, *, check
             await drain_operation(iterator.aclose(), preserve_cancellation=True)
         require(counts == dict(origin.resource_counts), "source_counts")
     # Only normal return after true iterator EOF and successful Source context exit is accepted.
-    return identity, sum(counts.values())
+    return sum(counts.values())
 
 
 def _valid_canonical_address_records(pending_by_key, canonical):
@@ -468,15 +450,14 @@ async def _same_rows(connection, left, right, columns, keys):
     require(await connection.fetchval(query), "raw_graph_differs")
 
 
-async def _verify_in_replay(source_export, connection, stage, replay, source_profile, reviewed_origin, identity, as_of):
-    _, total = await _consume(
+async def _verify_in_replay(source_export, connection, stage, replay, source_profile, reviewed_origin, as_of):
+    total = await _consume(
         source_export,
         connection,
         replay,
         source_profile,
         reviewed_origin,
         checker=True,
-        expected_identity=identity,
         as_of=as_of,
     )
     await _same_rows(
@@ -502,31 +483,28 @@ async def _verify_in_replay(source_export, connection, stage, replay, source_pro
 
 
 async def verify_typed_source_graph(
-    source_export, connection, stage, *, source_profile, reviewed_origin, identity, membership_as_of, replay_stage=None
+    source_export, connection, stage, *, source_profile, reviewed_origin, membership_as_of, replay_stage=None
 ):
     """Reopen original Source, independently project policy cells and check exact graph multiplicities."""
-    _original_source_factory(source_export, reviewed_origin)
-    await stage.verify(connection, complete=False)
+    stage.require_ready(complete=False)
     as_of = policy_date(membership_as_of)
     document = validate_graph_document(stage.document)
-    identity = database_identity(identity)
     require(
         source_origin(document["origin"]) == source_origin(reviewed_origin)
-        and database_identity(document["database_identity"]) == identity
         and document["membership_as_of"] == membership_as_of,
         "verification_scope",
     )
     if replay_stage is not None:
-        await replay_stage.verify(connection, complete=False)
+        replay_stage.require_ready(complete=False)
         require(replay_stage.schema_name == "pg_temp" and "checks" in replay_stage.names, "replay_workspace")
         await _empty_tables(connection, replay_stage)
         total = await _verify_in_replay(
-            source_export, connection, stage, replay_stage, source_profile, reviewed_origin, identity, as_of
+            source_export, connection, stage, replay_stage, source_profile, reviewed_origin, as_of
         )
     else:
         async with _workspace(connection) as replay:
             total = await _verify_in_replay(
-                source_export, connection, stage, replay, source_profile, reviewed_origin, identity, as_of
+                source_export, connection, stage, replay, source_profile, reviewed_origin, as_of
             )
     require(document["counts"] == await _counts(connection, stage, total), "verification_counts")
     stage.checked = True
@@ -561,29 +539,24 @@ async def _counts(connection, stage, total):
 async def produce_typed_source_graph(
     source_export, connection, stage, *, source_profile, reviewed_origin, membership_as_of
 ):
-    """Populate already-authenticated candidate tables once; this does not seal or approve their custody."""
-    from dataclasses import asdict
-
-    publisher = _original_source_factory(source_export, reviewed_origin)
+    """Populate isolated graph tables and record complete content accounting."""
     origin, as_of = source_origin(reviewed_origin), policy_date(membership_as_of)
-    require(source_profile.schema_name == origin.schema_name, "source_profile")
-    await _require_writer(connection, publisher)
-    await stage.verify(connection, complete=False)
+    require(source_profile.catalog_schema == origin.header_relation["schema"], "source_profile")
+    stage.require_ready(complete=False)
     await _empty_tables(connection, stage)
-    identity, total = await _consume(
+    total = await _consume(
         source_export,
         connection,
         stage,
         source_profile,
         reviewed_origin,
         checker=False,
-        expected_identity=None,
         as_of=as_of,
     )
     await _canonicalize(connection, stage)
     await _pairs(connection, stage, origin, as_of)
     counts = await _counts(connection, stage, total)
-    stage.document = graph_document(reviewed_origin, asdict(identity), membership_as_of, counts)
+    stage.document = graph_document(reviewed_origin, membership_as_of, counts)
     return stage.document
 
 
@@ -606,12 +579,11 @@ async def typed_source_graph(source_export, connection, *, source_profile, revie
                 stage,
                 source_profile=source_profile,
                 reviewed_origin=reviewed_origin,
-                identity=document["database_identity"],
                 membership_as_of=membership_as_of,
             )
             == document["counts"]["source_rows"],
             "source_counts",
         )
         stage.checked = True
-        await stage.verify(connection)
+        stage.require_ready()
         yield stage

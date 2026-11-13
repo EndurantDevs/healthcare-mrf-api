@@ -278,8 +278,8 @@ async def test_bulk_identity_cannot_be_combined_with_another_parent_scope():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("active", [None, {**_IDENTITY, "dataset_id": "different"}, _IDENTITY])
 async def test_connection_child_requires_same_original_immutable_bulk_scope(monkeypatch, active):
-    session = object()
-    native = object()
+    session = SimpleNamespace(in_transaction=lambda: True)
+    native = SimpleNamespace(is_in_transaction=lambda: True)
     publisher = SimpleNamespace(connection=native)
     monkeypatch.setattr(control, "bound_publisher", lambda: publisher)
     monkeypatch.setattr(control, "source_copy_session", lambda: session)
@@ -302,11 +302,14 @@ async def test_connection_child_requires_same_original_immutable_bulk_scope(monk
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", [None, "missing", "dataset_id", "endpoint_id", "resource_type"])
 async def test_private_output_writer_fences_its_exact_checkpoint_parent(monkeypatch, change):
-    session = object()
+    session = SimpleNamespace(in_transaction=lambda: True)
     checkpoint_by_field = {**_IDENTITY}
     if change not in {None, "missing"}:
         checkpoint_by_field[change] = "other"
-    native = SimpleNamespace(fetchrow=AsyncMock(return_value=None if change == "missing" else checkpoint_by_field))
+    native = SimpleNamespace(
+        fetchrow=AsyncMock(return_value=None if change == "missing" else checkpoint_by_field),
+        is_in_transaction=lambda: True,
+    )
     publisher = SimpleNamespace(
         connection=native, policy=SimpleNamespace(schema="private_source"), storage_binding=object()
     )
@@ -330,6 +333,30 @@ async def test_private_output_writer_fences_its_exact_checkpoint_parent(monkeypa
         assert query.endswith("FOR SHARE") and checkpoint == _IDENTITY["checkpoint_id"]
     finally:
         control._BULK_IDENTITY.reset(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("executor_kind", ["database", "proxy"])
+@pytest.mark.parametrize("inactive", [None, "session", "driver", "publisher"])
+async def test_checkpoint_executor_uses_the_actual_active_batch_session(monkeypatch, executor_kind, inactive):
+    session = SimpleNamespace(in_transaction=lambda: inactive != "session")
+    batch_driver = SimpleNamespace(is_in_transaction=lambda: inactive != "driver")
+    publisher = SimpleNamespace(connection=SimpleNamespace(is_in_transaction=lambda: inactive != "publisher"))
+    monkeypatch.setattr(control, "bound_publisher", lambda: publisher)
+    monkeypatch.setattr(control, "source_copy_session", lambda: SimpleNamespace(in_transaction=lambda: True))
+    driver_lookup = AsyncMock(return_value=batch_driver)
+    monkeypatch.setattr(control, "_copy_driver", driver_lookup)
+    if executor_kind == "database":
+        executor = control.Database()
+        executor._transaction_binding = lambda: SimpleNamespace(session=session)
+    else:
+        executor = control.ConnectionProxy(None, session, None)
+    if inactive is None:
+        assert await control.require_checkpoint_executor(executor) is publisher
+        driver_lookup.assert_awaited_once_with(session)
+    else:
+        with pytest.raises(GenericCandidateError, match="transaction_required"):
+            await control.require_checkpoint_executor(executor)
 
 
 @pytest.mark.asyncio
@@ -500,7 +527,7 @@ def named_writer(monkeypatch):
     directory = importlib.import_module("process.provider_directory_fhir")
     monkeypatch.setattr(directory, "_schema", lambda: factory.storage_binding.catalog_schema)
     native.fetchrow = AsyncMock(return_value=dict(_IDENTITY))
-    session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(rowcount=1)))
+    session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(rowcount=1)), in_transaction=lambda: True)
     driver_lookup = AsyncMock(side_effect=AssertionError("named SQL needs no connection identity probe"))
     monkeypatch.setattr(control, "_copy_driver", driver_lookup)
 
@@ -588,11 +615,13 @@ async def test_named_bulk_children_route_wrong_executor_to_copy_and_checkpoint_s
 
 
 @pytest.mark.asyncio
-async def test_named_checkpoint_routing_preserves_original_task_and_cursor_scope(named_writer):
+async def test_named_checkpoint_routing_preserves_active_session_and_cursor_scope(named_writer):
     executor = _unrelated_executor("proxy")
     async with named_writer() as writer:
-        with pytest.raises(GenericCandidateError, match="publisher_connection_required"):
+        assert (
             await asyncio.create_task(control.require_checkpoint_executor(executor, bulk_identity=writer.identity))
+            is writer.publisher
+        )
         token = control._BULK_IDENTITY.set({**_IDENTITY, "dataset_id": "different"})
         try:
             with pytest.raises(GenericCandidateError, match="checkpoint_identity_scope_changed"):

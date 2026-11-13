@@ -34,9 +34,7 @@ def test_office_sources_require_exact_supported_component_types(office_inputs, f
 
 def test_physical_alias_must_remain_in_original_source_namespace(office_inputs):
     _target, base = office_inputs
-    sources = compact.CompactOfficeSources(
-        base, physical_base=CompactAddressRelation("other_source", "address_heap", 11)
-    )
+    sources = compact.CompactOfficeSources(base, physical_base=CompactAddressRelation("other_source", "address_heap"))
     with pytest.raises(compact.CompactOfficeSourceError, match="namespace differs"):
         compact.compact_office_relation_sql(sources)
     with pytest.raises(compact.CompactOfficeSourceError, match="Exact compact"):
@@ -62,7 +60,7 @@ async def test_compact_physical_oid_drift_refuses_before_column_access(monkeypat
     connection = SimpleNamespace(
         is_in_transaction=lambda: True, execute=AsyncMock(), fetchval=AsyncMock(return_value=12)
     )
-    sources = compact.CompactOfficeSources(base, physical_base=CompactAddressRelation(base.schema_name, "old_heap", 11))
+    sources = compact.CompactOfficeSources(base, physical_base=CompactAddressRelation(base.schema_name, "old_heap"))
     monkeypatch.setattr(compact, "_projection_columns", AsyncMock())
     with pytest.raises(compact.CompactOfficeSourceError, match="identity changed"):
         await compact.pin_compact_office_sources(connection, target, sources)

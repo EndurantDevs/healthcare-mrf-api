@@ -7,23 +7,23 @@ import os
 from typing import Any
 
 from db.connection import db
-from process.ptg_parts.ptg2_lifecycle_lock import (
-    acquire_ptg2_source_lifecycle_lock,
-)
 from process.ptg_parts.ptg2_legacy_global_projection_queue import (
     drain_legacy_global_projection_queue,
     mark_legacy_global_projection_dirty,
 )
+from process.ptg_parts.ptg2_lifecycle_lock import (
+    acquire_ptg2_source_lifecycle_lock,
+)
 from process.ptg_parts.source_pointers import _allowed_source_pointer_key
 from process.ptg_parts.source_snapshot_rollback_state import rollback_decision
-from process.ptg_parts.source_snapshot_rollback_types import (
-    ROLLBACK_PIN_OWNER_TYPE,
-    RollbackDecision,
-)
 from process.ptg_parts.source_snapshot_rollback_store import (
     apply_rollback,
     database_utc_timestamp,
     load_rollback_context,
+)
+from process.ptg_parts.source_snapshot_rollback_types import (
+    ROLLBACK_PIN_OWNER_TYPE,
+    RollbackDecision,
 )
 
 
@@ -45,21 +45,10 @@ def _normalized_coordinates(
         str(rollback_owner_id or "").strip(),
     )
     if not all(normalized_coordinates):
-        raise ValueError(
-            "source_key, snapshot_id, expected_current_snapshot_id, "
-            "and rollback_owner_id are required"
-        )
+        raise ValueError("source_key, snapshot_id, expected_current_snapshot_id, and rollback_owner_id are required")
     if normalized_coordinates[1] == normalized_coordinates[2]:
         raise ValueError("rollback target and expected current snapshot must differ")
     return normalized_coordinates
-
-
-def _clear_ptg2_snapshot_cache() -> None:
-    try:
-        from api.ptg2_snapshot import _PTG2_SNAPSHOT_RESOLVE_CACHE
-    except Exception:
-        return
-    _PTG2_SNAPSHOT_RESOLVE_CACHE.clear()
 
 
 def _rollback_report(
@@ -72,11 +61,7 @@ def _rollback_report(
     global_pointer_status: str,
 ) -> dict[str, Any]:
     report_by_field: dict[str, Any] = {
-        "status": (
-            "already_rolled_back"
-            if decision.is_already_rolled_back
-            else "rolled_back"
-        ),
+        "status": ("already_rolled_back" if decision.is_already_rolled_back else "rolled_back"),
         "source_key": source_key,
         "snapshot_id": snapshot_id,
         "previous_snapshot_id": expected_current_snapshot_id,
@@ -87,11 +72,7 @@ def _rollback_report(
     }
     if decision.allowed_action not in {"unchanged", "verified"}:
         report_by_field["allowed_amount_pointer"] = {
-            "status": (
-                "removed"
-                if decision.allowed_action == "delete"
-                else "reversed"
-            ),
+            "status": ("removed" if decision.allowed_action == "delete" else "reversed"),
             "source_key": _allowed_source_pointer_key(source_key),
             "snapshot_id": decision.allowed_snapshot_id,
             "previous_snapshot_id": decision.allowed_previous_snapshot_id,
@@ -132,10 +113,7 @@ async def rollback_pinned_ptg2_source_snapshot(
         max_requests=1,
         source_key=normalized_source_key,
     )
-    global_pointer_status = (
-        "reconciled" if projection_drain.reconciled == 1 else "deferred"
-    )
-    _clear_ptg2_snapshot_cache()
+    global_pointer_status = "reconciled" if projection_drain.reconciled == 1 else "deferred"
     return _rollback_report(
         source_key=normalized_source_key,
         snapshot_id=normalized_snapshot_id,
@@ -181,9 +159,7 @@ async def _rollback_under_source_fence(
             source_key=source_key,
             snapshot_id=snapshot_id,
             expected_current_snapshot_id=expected_current_snapshot_id,
-            target_import_month=rollback_context.target_snapshot_by_field[
-                "import_month"
-            ],
+            target_import_month=rollback_context.target_snapshot_by_field["import_month"],
             updated_at=await database_utc_timestamp(session),
             decision=decision,
         )

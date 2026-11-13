@@ -21,16 +21,19 @@ from process.registry_fhir_catalog_sources import (
     validate_fhir_catalog_source_descriptor,
 )
 from tests.test_registry_fhir_catalog_grant import CatalogConnection, command, snapshot, standing_grant
+from tests.test_registry_fhir_catalog_grant import descriptor as admitted_content_descriptor
 from tests.test_registry_fhir_catalog_observation import _receipt
 from tests.test_registry_fhir_catalog_source_companies import source_company
 from tests.test_registry_fhir_catalog_source_producer import _boundary
-from tests.test_registry_fhir_catalog_sources import descriptor, read_profile, scoped_read_profile
+from tests.test_registry_fhir_catalog_sources import catalog_schema_descriptor, descriptor, read_profile
 
 
 def observed_descriptor(profile=None, dataset="dataset-one"):
     profile = read_profile() if profile is None else profile
     selected = descriptor()
     selected["coordinates"].update(dataset_schema=profile.schema_name, dataset_id=dataset, edition_id=dataset)
+    selected["tables"]["header"]["schema"] = profile.catalog_schema
+    selected["tables"]["resource"]["schema"] = profile.schema_name
     selected.update(native_read_profile=profile.document(), admission=_receipt())
     digest = catalog_observation_descriptor_digest(selected)
     selected.update(
@@ -40,25 +43,9 @@ def observed_descriptor(profile=None, dataset="dataset-one"):
 
 
 def scoped_observed_descriptor():
-    selected = observed_descriptor()
-    profile = scoped_read_profile(projection="catalog_observation_v1")
-    scope = profile.published_read_scope
-    publication_sha = hashlib.sha256(
-        validation.canonical_json(selected["admission"]["publication"]).encode()
-    ).hexdigest()
-    scope = replace(scope, datasets=(replace(scope.datasets[0], publication_sha256=publication_sha),))
-    profile = replace(profile, published_read_scope=scope)
-    selected.update(
-        native_read_profile=profile.document(),
-        resource_table_oid=scope.resource_root.relation_oid,
-        resource_leaf_oids=[leaf.relation_oid for leaf in scope.datasets[0].resource_leaves],
-        header_table_oid=scope.header.relation.relation_oid,
-    )
-    digest = catalog_observation_descriptor_digest(selected)
-    selected.update(
-        accepted_receipt_id=grants.CATALOG_OBSERVATION_CONTRACT + ":" + digest, accepted_receipt_sha256=digest
-    )
-    return validate_fhir_catalog_source_descriptor(selected), profile
+    """Keep the admitted dataset and observation projection on a portable named profile."""
+    profile = read_profile()
+    return observed_descriptor(profile=profile), profile
 
 
 def compact_rows(selected):
@@ -158,7 +145,7 @@ async def verify(case, **options):
 @pytest.mark.asyncio
 async def test_sealer_replay_groups_exact_profiles_and_exits_before_success(monkeypatch):
     first = read_profile()
-    second = replace(first, schema_name="second_payload", owner_role="second_owner", runtime_roles=("second_reader",))
+    second = replace(first, schema_name="second_payload", catalog_schema_name="second_catalog")
     descriptors = (
         observed_descriptor(first),
         observed_descriptor(second, "dataset-two"),
@@ -201,7 +188,7 @@ async def test_protected_descriptor_inventory_refuses_bounds_missing_rows_or_ide
     }
     writer = CatalogConnection((selected,))
     writer.fetch = AsyncMock(side_effect=[[] if failure == "missing" else [entry_by_field], []])
-    monkeypatch.setattr(grants, "verify_fhir_catalog_snapshot", AsyncMock())
+    monkeypatch.setattr(grants, "validate_fhir_catalog_snapshot_record", AsyncMock())
     runtime = grants.build_fhir_catalog_publication_runtime(grant, None)
     reason = {"bounded_document": "descriptor_bounds", "missing": "descriptor_unavailable"}.get(
         failure, "descriptor_changed"
@@ -213,7 +200,7 @@ async def test_protected_descriptor_inventory_refuses_bounds_missing_rows_or_ide
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["missing", "writer"])
 async def test_semantic_source_fence_never_borrows_the_catalog_writer_as_its_reader(monkeypatch, route):
-    selected_source = descriptor()
+    selected_source = admitted_content_descriptor()
     grant = standing_grant()
     selected = snapshot(grant, (selected_source,))
     writer = CatalogConnection((selected,), (selected_source,))
@@ -222,7 +209,7 @@ async def test_semantic_source_fence_never_borrows_the_catalog_writer_as_its_rea
     async def acquire_writer():
         yield writer
 
-    monkeypatch.setattr(grants, "verify_fhir_catalog_snapshot", AsyncMock())
+    monkeypatch.setattr(grants, "validate_fhir_catalog_snapshot_record", AsyncMock())
     pool = None if route == "missing" else SimpleNamespace(acquire=acquire_writer)
     runtime = grants.build_fhir_catalog_publication_runtime(grant, pool)
     with pytest.raises(grants.FHIRCatalogGrantError, match="reader_required"):
@@ -297,16 +284,33 @@ async def test_source_replay_cannot_return_partial_or_untyped_row_counts(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_database_oid_mismatch_refuses_before_replay(monkeypatch):
-    value = observed_descriptor()
-    value["database_oid"] = 105
-    digest = catalog_observation_descriptor_digest(value)
-    value.update(accepted_receipt_id=grants.CATALOG_OBSERVATION_CONTRACT + ":" + digest, accepted_receipt_sha256=digest)
-    case = verifier_case(monkeypatch, (value,))
-    with pytest.raises(grants.FHIRCatalogGrantError, match="database_changed"):
-        await verify(case)
-    case.export["replay"].assert_not_awaited()
-    assert case.events[-1] == ("exit",)
+@pytest.mark.parametrize("damage", ["source_uri", "content", "edition"])
+async def test_catalog_schema_publication_refuses_mutated_pinned_descriptor_before_replay(monkeypatch, damage):
+    stored = catalog_schema_descriptor()
+    admitted = validate_fhir_catalog_source_descriptor(stored)
+    grant = standing_grant(observation_contract=grants.CATALOG_OBSERVATION_CONTRACT)
+    selected = snapshot(grant, (admitted,))
+    generation = selected["source_vector_json"][0]["source_generation"]
+    if damage == "source_uri":
+        stored["source_uri"] = "https://another-directory.example.test/fhir/"
+    elif damage == "content":
+        stored["admission"]["families"]["Organization"]["rows"] = 1
+    else:
+        stored["coordinates"].update(dataset_id="dataset-two", edition_id="dataset-two")
+    assert fhir_catalog_source_generation(stored) != generation
+    writer = CatalogConnection((selected,))
+    writer.fetch = AsyncMock(
+        side_effect=[
+            [{"source_generation": generation, "source_id": "alias-a", "document": validation.canonical_json(stored)}],
+            [],
+        ]
+    )
+    monkeypatch.setattr(grants, "validate_fhir_catalog_snapshot_record", AsyncMock())
+    factory = Mock()
+    runtime = grants.build_fhir_catalog_publication_runtime(grant, None, source_export=factory)
+    with pytest.raises(grants.FHIRCatalogGrantError, match="descriptor_changed"):
+        await runtime.authorize_metadata(command=command(grant, selected), snapshot=selected, connection=writer)
+    factory.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -314,7 +318,9 @@ async def test_database_oid_mismatch_refuses_before_replay(monkeypatch):
 async def test_unadmitted_profile_or_contract_refuses_before_source_entry(monkeypatch, damage):
     case = verifier_case(monkeypatch)
     if damage == "profile":
-        case.grant = replace(case.grant, source_profiles=(replace(read_profile(), owner_role="other_owner"),))
+        case.grant = replace(
+            case.grant, source_profiles=(replace(read_profile(), catalog_schema_name="other_catalog"),)
+        )
     else:
         case.grant = replace(case.grant, observation_contract=None)
     with pytest.raises(grants.FHIRCatalogGrantError, match="source_not_admitted|reader_required"):
@@ -415,7 +421,7 @@ async def test_carried_observations_keep_prior_verification_without_source_expor
 async def test_publication_fence_for_observations_stays_reader_free(monkeypatch):
     case = verifier_case(monkeypatch)
     writer = CatalogConnection((case.snapshot,), tuple(case.descriptors.values()))
-    monkeypatch.setattr(grants, "verify_fhir_catalog_snapshot", AsyncMock())
+    monkeypatch.setattr(grants, "validate_fhir_catalog_snapshot_record", AsyncMock())
     runtime = grants.build_fhir_catalog_publication_runtime(case.grant, case.pool, source_export=case.factory)
     async with runtime.source_fence(snapshot=case.snapshot, connection=writer):
         await runtime.authorize_metadata(
@@ -444,15 +450,13 @@ async def test_default_verifier_keeps_original_reader_replay(monkeypatch):
 
     monkeypatch.setattr(rollup, "fhir_catalog_reference_workspace", reference)
     monkeypatch.setattr(grants, "_readonly_snapshot", reference)
-    identity, fresh = AsyncMock(), AsyncMock()
-    monkeypatch.setattr(grants, "_reader_identity", identity)
+    fresh = AsyncMock()
     monkeypatch.setattr(grants, "_verify_fresh_observation", fresh)
     callback = grants.build_fhir_catalog_observation_verifier(case.grant, SimpleNamespace(acquire=acquire))
     await callback(
         connection=case.connection, copy_target=case.target, snapshot=case.snapshot, standing_grant=case.grant
     )
     descriptor = next(iter(case.descriptors.values()))
-    identity.assert_awaited_once_with(reader, case.connection, (descriptor,))
     fresh.assert_awaited_once_with(
         reader, case.connection, case.snapshot, next(iter(case.descriptors)), descriptor, workspace
     )
@@ -461,45 +465,26 @@ async def test_default_verifier_keeps_original_reader_replay(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("native_pool_available", [False, True])
-async def test_mixed_profiles_keep_scoped_replay_on_required_native_reader(monkeypatch, native_pool_available):
-    scoped, profile = scoped_observed_descriptor()
+async def test_named_profiles_replay_each_dataset_through_source_export(monkeypatch, native_pool_available):
+    selected, profile = scoped_observed_descriptor()
     ordinary = observed_descriptor(dataset="dataset-ordinary")
-    case = verifier_case(monkeypatch, (ordinary, scoped), (read_profile(), profile))
-    reader, workspace = object(), object()
-
-    @asynccontextmanager
-    async def acquire():
-        yield reader
-
-    @asynccontextmanager
-    async def reference(selected_reader):
-        assert selected_reader is reader
-        yield workspace
-
-    from process import registry_fhir_catalog_reference_rollup as rollup
-
-    monkeypatch.setattr(rollup, "fhir_catalog_reference_workspace", reference)
-    monkeypatch.setattr(grants, "_readonly_snapshot", reference)
-    identity, fresh = AsyncMock(), AsyncMock()
-    monkeypatch.setattr(grants, "_reader_identity", identity)
-    monkeypatch.setattr(grants, "_verify_fresh_observation", fresh)
-    case.pool = SimpleNamespace(acquire=acquire) if native_pool_available else None
+    case = verifier_case(monkeypatch, (ordinary, selected), (profile,))
+    native_pool = case.pool
     if not native_pool_available:
-        with pytest.raises(grants.FHIRCatalogGrantError, match="reader_required"):
-            await verify(case)
-        case.factory.assert_not_called()
-        identity.assert_not_awaited()
-        validation.validate_fhir_catalog_observed_projection.assert_not_awaited()
-        return
+        case.pool = None
     await verify(case)
-    case.factory.assert_called_once_with(source_profile=read_profile())
-    assert case.export["replay"].await_count == 1
-    assert case.export["replay"].await_args.args[0] == ordinary
-    identity.assert_awaited_once_with(reader, case.connection, (scoped,))
-    fresh.assert_awaited_once_with(
-        reader, case.connection, case.snapshot, fhir_catalog_source_generation(scoped), scoped, workspace
-    )
+    case.factory.assert_called_once_with(source_profile=profile)
+    assert case.export["replay"].await_count == 2
+    assert sorted(
+        validation.canonical_json(request.args[0]) for request in case.export["replay"].await_args_list
+    ) == sorted(validation.canonical_json(descriptor) for descriptor in (ordinary, selected))
+    assert {event[1] for event in case.events if event[0] == "replay"} == {"dataset-one", "dataset-ordinary"}
+    assert selected["native_read_profile"] == profile.document()
+    assert selected["coordinates"]["dataset_schema"] == profile.schema_name
+    assert selected["admission"]["contract"] == grants.CATALOG_OBSERVATION_CONTRACT
     assert case.events[-3:] == [("exit",), ("retained",), ("projection",)]
+    case.export["inventory"].assert_not_called()
+    native_pool.acquire.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -621,7 +606,7 @@ async def test_metadata_only_publication_requires_exact_previous_vector(monkeypa
     case.snapshot["source_vector_json"][0]["source_companies"] = [source_company()]
     case.snapshot["metadata_generation"] = validation.metadata_generation(case.snapshot)
     writer = CatalogConnection((prior, case.snapshot), tuple(case.descriptors.values()))
-    monkeypatch.setattr(grants, "verify_fhir_catalog_snapshot", AsyncMock())
+    monkeypatch.setattr(grants, "validate_fhir_catalog_snapshot_record", AsyncMock())
     runtime = grants.build_fhir_catalog_publication_runtime(
         case.grant, case.pool, source_export=case.factory, source_companies_only=True
     )

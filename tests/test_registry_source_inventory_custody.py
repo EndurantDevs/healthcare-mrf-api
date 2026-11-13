@@ -24,11 +24,9 @@ from process.registry_source_inventory_summaries import office_summary_v4
 from process.registry_source_recipe_composition import RegistrySourceRecipeStage
 from process.registry_source_recipe_store import canonical_registry_source_recipes
 from process.registry_source_retention import registry_source_retention_sha256
+from tests.registry_source_recipe_support import _capture_recipe, _derivation, _descriptor, _example
 from tests.test_network_provider_only_projection import _target
 from tests.test_registry_ptg_office_membership_recipe import _recipe as _ptg_recipe
-from tests.test_registry_source_inventory_preparation import _derivation, _descriptor
-from tests.test_registry_source_inventory_store_postgres import _capture_recipe
-from tests.test_registry_source_recipe_store_postgres import _example
 
 _APPROVED = SimpleNamespace(approved_revision=7, generation_id="b" * 64)
 _ADDRESS = PinnedAddressSource("synthetic_addresses", "entity_address_unified", "c" * 64)

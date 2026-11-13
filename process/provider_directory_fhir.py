@@ -1037,9 +1037,11 @@ _PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE: contextvars.ContextVar[str | None
     "provider_directory_credentials_file_override",
     default=None,
 )
-_PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
-    "provider_directory_artifact_relation_overrides",
-    default={},
+_PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES: contextvars.ContextVar[dict[str, str | tuple[str, str]]] = (
+    contextvars.ContextVar(
+        "provider_directory_artifact_relation_overrides",
+        default={},
+    )
 )
 _PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS: contextvars.ContextVar[dict[str, int]] = contextvars.ContextVar(
     "provider_directory_artifact_owned_relation_oids",
@@ -2905,6 +2907,10 @@ def _qt(schema: str, table: str) -> str:
     from process.provider_directory_source_storage_binding import source_relation_coordinates
 
     scoped_table = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(table, table)
+    if type(scoped_table) is not str:
+        from process.provider_directory_generic_source_adapters import named_artifact_input_relation
+
+        return named_artifact_input_relation(sys.modules[__name__], table, scoped_table)
     return _unscoped_qt(*source_relation_coordinates(schema, table, scoped_table))
 
 
@@ -8164,7 +8170,7 @@ class ProviderDirectoryArtifactBundle:
 
 @contextlib.contextmanager
 def _provider_directory_artifact_relation_scope(
-    relation_overrides: dict[str, str],
+    relation_overrides: dict[str, str | tuple[str, str]],
 ) -> Iterator[None]:
     """Temporarily route artifact dependencies to prepared stage relations."""
     merged_overrides_by_relation = dict(_PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get())
@@ -60137,19 +60143,9 @@ async def _lock_endpoint_dataset_candidate_admission(
     connection: Any,
     endpoint_id: str,
 ) -> None:
-    await connection.first(
-        "SELECT pg_advisory_xact_lock(hashtextextended(:endpoint_id, 0));",
-        endpoint_id=endpoint_id,
-    )
-    await connection.first(
-        f"""
-        SELECT endpoint_id
-          FROM {_qt(_schema(), ProviderDirectoryAPIEndpoint.__tablename__)}
-         WHERE endpoint_id = :endpoint_id
-         FOR UPDATE;
-        """,
-        endpoint_id=endpoint_id,
-    )
+    from process.provider_directory_generic_source_adapters import lock_endpoint_dataset_candidate_admission
+
+    await lock_endpoint_dataset_candidate_admission(sys.modules[__name__], connection, endpoint_id)
 
 
 async def _reset_new_endpoint_candidate(
@@ -64950,16 +64946,16 @@ async def _locked_endpoint_dataset_candidate_record(
     connection: Any,
     candidate: EndpointDatasetCandidate,
 ) -> dict[str, Any]:
-    """Lock the endpoint and return its mutable candidate row."""
+    """Serialize within the configured storage scope and return the mutable candidate row."""
 
-    endpoint_ref = _qt(_schema(), ProviderDirectoryAPIEndpoint.__tablename__)
-    dataset_ref = _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)
-    endpoint_record = await connection.first(
-        f"SELECT endpoint_id FROM {endpoint_ref} WHERE endpoint_id = :endpoint_id FOR UPDATE;",
-        endpoint_id=candidate.endpoint_id,
+    from process.provider_directory_generic_source_adapters import lock_endpoint_dataset_candidate_admission
+
+    endpoint_record = await lock_endpoint_dataset_candidate_admission(
+        sys.modules[__name__], connection, candidate.endpoint_id
     )
     if endpoint_record is None:
         raise RuntimeError("provider_directory_api_endpoint_missing_during_validation")
+    dataset_ref = _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)
     candidate_record = await connection.first(
         f"""
         SELECT dataset_id, acquisition_root_run_id, is_current, status,
@@ -65147,17 +65143,20 @@ async def _lock_validated_candidate_sources(
     connection: Any,
     candidate: EndpointDatasetCandidate,
 ) -> None:
-    """Serialize candidate admission with source-scoped artifact cutover."""
+    """Validate the declared source set and retain legacy artifact-cutover fencing."""
+
+    from process.provider_directory_generic_source_policy import current_source_storage_binding
 
     source_ref = _qt(_schema(), ProviderDirectorySource.__tablename__)
     expected_source_ids = tuple(sorted(set(candidate.source_ids)))
+    row_lock = "FOR NO KEY UPDATE OF source" if current_source_storage_binding() is None else ""
     source_rows = await connection.all(
         f"""
         SELECT source.source_id
           FROM {source_ref} AS source
          WHERE source.source_id = ANY(CAST(:source_ids AS varchar[]))
          ORDER BY source.source_id
-         FOR NO KEY UPDATE OF source;
+         {row_lock};
         """,
         source_ids=list(expected_source_ids),
     )

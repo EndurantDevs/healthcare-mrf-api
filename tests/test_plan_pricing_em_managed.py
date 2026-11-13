@@ -12,13 +12,11 @@ from api import network_address_scope as address_scope
 from api import plan_pricing_em_distance as distance
 from api import plan_pricing_em_managed as managed
 from api import ptg2_serving
-from api.network_read_execution import NetworkReadStatements, install_network_read_inventory
 from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
 from api.plan_release_serving import PlanReleaseServingSelection, PlanReleaseSnapshotBinding
 from api.ptg2_serving import PTG2LocationScopeError
 from process import network_em_provider_inputs as input_contract
-from process.network_compact_layout import CompactAddressRelation
-from tests.network_read_execution_support import with_read_identity_receipts
+from tests.network_read_execution_support import with_read_session
 
 
 @pytest.fixture
@@ -44,7 +42,6 @@ def held(monkeypatch):
         legacy_checksums=None,
         excluded_network_ids=(7,),
         address_predicate_sql=address_scope._default_address_predicate(),
-        read_statements=NetworkReadStatements(["a" * 64, None, (7,), "b" * 64]),
     )
     inputs = _retained_inputs()
     state = SimpleNamespace(
@@ -79,19 +76,11 @@ def _mock_authority_resolvers(state, monkeypatch):
     async def artifact(actual_session, actual, *, api_read=False):
         assert actual_session is state.session and actual is state.selection and api_read is True
         state.events.append("artifact")
-        await install_network_read_inventory(actual_session, (CompactAddressRelation("held_rates", "rate", 100),))
         return SimpleNamespace(rates_relation='"held_rates"."rate"')
 
     async def resolve_inputs(actual_session, manifest):
         assert actual_session is state.session and manifest is state.scope.manifest
         state.events.append("inputs")
-        await install_network_read_inventory(
-            actual_session,
-            tuple(
-                CompactAddressRelation(item.schema_name, item.table_name, item.relation_oid)
-                for item in state.inputs.relations
-            ),
-        )
         return state.inputs
 
     state.session = _reader_session(state)
@@ -122,10 +111,8 @@ def _retained_inputs():
     )
     return input_contract.EMProviderInputs(
         tuple(
-            input_contract.EMProviderInputRelation(
-                role, "held_example", role.replace(".", "_"), "example_generation", index + 1, index + 20
-            )
-            for index, role in enumerate(roles)
+            input_contract.EMProviderInputRelation(role, "held_example", role.replace(".", "_"), "example_generation")
+            for role in roles
         )
     )
 
@@ -169,7 +156,7 @@ def _reader_session(state):
 
     state.driver = SimpleNamespace(fetchrow=AsyncMock(side_effect=fetchrow))
     transaction = object()
-    return with_read_identity_receipts(
+    return with_read_session(
         SimpleNamespace(
             execute=AsyncMock(side_effect=execute),
             get_transaction=lambda: transaction,

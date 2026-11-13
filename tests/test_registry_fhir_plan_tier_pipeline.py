@@ -14,6 +14,10 @@ from process.network_approved_membership_source import pin_approved_membership_s
 from process.network_fhir_retained_capture_contract import registry_location_id
 from process.network_source_binding_store import apply_network_source_binding_batch
 from process.registry_fhir_catalog_extraction import extract_fhir_catalog_batch
+from process.registry_fhir_catalog_observation import (
+    CATALOG_OBSERVATION_CONTRACT,
+    catalog_observation_descriptor_digest,
+)
 from process.registry_fhir_catalog_sources import fhir_catalog_source_generation
 from process.registry_fhir_plan_tier import (
     TRANSFORM_VERSION,
@@ -100,6 +104,11 @@ def test_typed_extraction_is_explicit_and_previous_transform_is_unchanged():
     descriptor["profile"] = "published_normalized"
     descriptor["coordinates"]["source_id"] = UHC_PROVIDER_FILE_SOURCE_ID
     descriptor["source_aliases"] = [UHC_PROVIDER_FILE_SOURCE_ID]
+    content_digest = catalog_observation_descriptor_digest(descriptor)
+    descriptor.update(
+        accepted_receipt_sha256=content_digest,
+        accepted_receipt_id=CATALOG_OBSERVATION_CONTRACT + ":" + content_digest,
+    )
     generation = fhir_catalog_source_generation(descriptor)
     source_entry_by_field = dict(source_generation=generation, source_id=UHC_PROVIDER_FILE_SOURCE_ID, status="current")
     prior_snapshot_by_field = dict(projector_version="fhir-catalog/v1", source_vector_json=[source_entry_by_field])
@@ -262,11 +271,16 @@ from tests.test_registry_fhir_catalog_observation_sync_postgres import (
 async def _catalog_plan_rows(case):
     await case.source.admin.execute(f'DELETE FROM "{case.source.catalog}".provider_directory_source')
     await case.source.admin.execute(
-        f"INSERT INTO \"{case.source.catalog}\".provider_directory_source VALUES ($1,'endpoint-one')",
+        f"INSERT INTO \"{case.source.catalog}\".provider_directory_source(source_id,endpoint_id) VALUES ($1,'endpoint-one')",
         UHC_PROVIDER_FILE_SOURCE_ID,
     )
     await case.source.admin.execute(f'DELETE FROM "{case.source.schema}".provider_directory_dataset_resource')
     rows = plan_tier_rows(1, "dataset-one")
+    await case.source.admin.execute(
+        f'UPDATE "{case.source.header_schema}".provider_directory_endpoint_dataset SET resource_count=$1 '
+        "WHERE dataset_id='dataset-one'",
+        len(rows),
+    )
     await case.source.admin.copy_records_to_table(
         "provider_directory_dataset_resource",
         schema_name=case.source.schema,
@@ -283,6 +297,22 @@ async def _catalog_plan_rows(case):
     )
 
 
+async def _typed_plan_networks(case):
+    page = await _query(case)
+    typed_networks = [
+        network_row
+        for network_row in page["items"]
+        if any(
+            binding["source_scope"].get("kind") == "uhc_plan_tier_v1"
+            for binding in network_row["source_bindings"]["items"]
+        )
+    ]
+    assert len(typed_networks) == 1
+    relationships = typed_networks[0]["matching_relationships"]["items"]
+    assert len(relationships) == 1 and relationships[0]["plan"]["resource_id"] == tier_document()["plan_resource_id"]
+    return typed_networks
+
+
 @pytest.mark.asyncio
 async def test_catalog_upgrade_and_carried_typed_relationships(observation_case, monkeypatch):
     """Preserve old sealed metadata, target one source upgrade, then carry exact typed facts."""
@@ -293,6 +323,19 @@ async def test_catalog_upgrade_and_carried_typed_relationships(observation_case,
         first, _, _ = await _prepare(case)
     # A sealed old-version job can still complete with the current runtime.
     await _publish(case, first)
+    stored_source = json.loads(
+        await case.fixture.loader.fetchval(
+            f'SELECT descriptor_json FROM "{first["schema_name"]}".registry_fhir_catalog_source'
+        )
+    )
+    assert stored_source["native_read_profile"] == {
+        "schema_name": case.source.schema,
+        "catalog_schema_name": case.source.header_schema,
+    }
+    assert stored_source["tables"] == {
+        "header": {"schema": case.source.header_schema, "name": "provider_directory_endpoint_dataset"},
+        "resource": {"schema": case.source.schema, "name": "provider_directory_dataset_resource"},
+    }
     original_vector = first["source_vector_json"]
     assert original_vector[0].get("extraction_transform") is None
     endpoint = await case.source.admin.fetchrow(
@@ -313,18 +356,7 @@ async def test_catalog_upgrade_and_carried_typed_relationships(observation_case,
     assert accounting["sources"][0]["extraction"].get("reused_observations") is not True
     assert accounting["sources"][0]["projection"]["created_networks"] == 1
     await _publish(case, second, previous)
-    page = await _query(case)
-    typed_networks = [
-        network_row
-        for network_row in page["items"]
-        if any(
-            binding["source_scope"].get("kind") == "uhc_plan_tier_v1"
-            for binding in network_row["source_bindings"]["items"]
-        )
-    ]
-    assert len(typed_networks) == 1
-    relationships = typed_networks[0]["matching_relationships"]["items"]
-    assert len(relationships) == 1 and relationships[0]["plan"]["resource_id"] == tier_document()["plan_resource_id"]
+    typed_networks = await _typed_plan_networks(case)
     await case.source.admin.execute(f'DELETE FROM "{case.source.catalog}".provider_directory_api_endpoint')
     third, prior, _ = await _prepare(case)
     await _publish(case, third, prior)

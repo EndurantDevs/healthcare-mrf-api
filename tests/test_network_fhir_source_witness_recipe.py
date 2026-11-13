@@ -28,17 +28,18 @@ from process.registry_source_recipe_store import (
     RegistrySourceRecipeError,
     canonical_registry_source_recipes,
     decode_registry_source_recipes,
+    verify_registry_source_recipes,
 )
 from tests.test_network_fhir_source_witness_contract import captured, reader_capture
 
-_LEGACY_COORDINATES = {
+_NAMED_COORDINATES = {
     "schema_name": "source_example",
     "source_id": "source-example",
     "endpoint_id": "endpoint-example",
     "dataset_id": "dataset-one",
     "dataset_sha256": "a" * 64,
     "release_id": "release-one",
-    "resource_table_oid": 123,
+    "resource_relation": {"schema": "source_example", "name": "provider_directory_dataset_resource"},
     "alias_scope": "medical",
     "as_of": "2026-10-01",
 }
@@ -64,7 +65,7 @@ def _source_recipe(*, legacy=False):
         origin.dataset_id,
         origin.dataset_sha256,
         capture.release_id,
-        origin.resource_parent_oid,
+        origin.resource_relation,
         "medical",
         witness.source_witness_membership_date(capture, anchor),
         source_witness_capture=capture,
@@ -83,7 +84,7 @@ def _reader_recipe():
         origin.dataset_id,
         origin.dataset_sha256,
         capture.release_id,
-        origin.resource_parent_oid,
+        origin.resource_relation,
         "medical",
         "2026-01-01",
         retained_capture=capture,
@@ -95,8 +96,10 @@ def _canonical(document):
     return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
-def test_old_pin_bytes_and_generation_remain_exact():
-    pin = fhir.PinnedFHIRMembershipSource(**_LEGACY_COORDINATES)
+def test_old_pin_projects_names_and_preserves_saved_recipe_version():
+    from process.registry_source_recipe_store import RECIPE_DIGEST_KEY
+
+    pin = fhir.PinnedFHIRMembershipSource(**_NAMED_COORDINATES)
     coordinates = _coordinates(pin, "producer-example", "edition-one")
     recipe = RegistrySourceMembershipRecipe(pin, coordinates)
     expected_wire = _canonical(
@@ -105,14 +108,22 @@ def test_old_pin_bytes_and_generation_remain_exact():
                 "binding_coordinates": asdict(coordinates),
                 "selection_policy": "approved-bindings-only",
                 "source_kind": "fhir",
-                "source_pin": _LEGACY_COORDINATES,
+                "source_pin": {
+                    **{key: value for key, value in _NAMED_COORDINATES.items() if key != "resource_relation"},
+                    "resource_table_oid": 123,
+                },
             }
         ]
     )
-    assert pin.coordinates == _LEGACY_COORDINATES
-    assert pin.generation_id == hashlib.sha256(_canonical(_LEGACY_COORDINATES).encode()).hexdigest()
-    assert canonical_registry_source_recipes((recipe,)) == expected_wire
+    assert pin.coordinates == _NAMED_COORDINATES
+    assert pin.generation_id == hashlib.sha256(_canonical(_NAMED_COORDINATES).encode()).hexdigest()
     assert decode_registry_source_recipes(expected_wire) == (recipe,)
+    saved_by_field = {
+        "source_recipes_json": expected_wire,
+        "source_generations": {RECIPE_DIGEST_KEY: hashlib.sha256(expected_wire.encode()).hexdigest()},
+    }
+    assert verify_registry_source_recipes(saved_by_field) == (recipe,)
+    assert saved_by_field["source_recipes_json"] == expected_wire
     assert "source_witness" not in expected_wire
 
 
@@ -120,7 +131,7 @@ def test_reader_recipe_bytes_and_generation_keep_the_old_capture():
     recipe = _reader_recipe()
     pin = recipe.source_pin
     expected_pin_by_field = {
-        **{name: getattr(pin, name) for name in _LEGACY_COORDINATES},
+        **{name: getattr(pin, name) for name in _NAMED_COORDINATES},
         "retained_capture": reader_capture().as_dict(),
     }
     expected_wire = _canonical(
@@ -148,15 +159,15 @@ def test_source_pair_has_closed_roundtrip_and_original_coordinates():
     decoded = decode_registry_source_recipes(wire)
     assert decoded == (recipe,) and canonical_registry_source_recipes(decoded) == wire
     document = json.loads(wire)[0]["source_pin"]
-    assert set(document) == set(_LEGACY_COORDINATES) | {"source_witness_capture", "source_witness_anchor"}
+    assert set(document) == set(_NAMED_COORDINATES) | {"source_witness_capture", "source_witness_anchor"}
     assert document["source_witness_capture"] == capture.as_dict()
     assert document["source_witness_anchor"] == asdict(pin.source_witness_anchor)
     assert type(decoded[0].source_pin.source_witness_capture) is witness.SourceWitnessCapture
     assert type(decoded[0].source_pin.source_witness_anchor) is witness.SourceWitnessCaptureAnchor
     assert pin.schema_name == capture.origin.schema_name
     assert pin.read_schema_name == capture.schema_name and pin.read_schema_name != pin.schema_name
-    assert pin.resource_table_oid == capture.origin.resource_parent_oid
-    assert pin.read_resource_table_oid == dict(capture.relation_oids)["provider_directory_dataset_resource"]
+    assert pin.resource_relation == capture.origin.resource_relation
+    assert pin.read_resource_relation == capture.tables["provider_directory_dataset_resource"]
     assert pin.release_id == capture.release_id and pin.as_of == capture.origin.semantic_projection_as_of
     assert fhir.fhir_normalized_capture(pin) is capture and pin.retained_capture is None
 
@@ -175,7 +186,7 @@ def test_source_pair_has_closed_roundtrip_and_original_coordinates():
     ],
 )
 def test_source_pair_requires_genuine_types_without_mixed_custody(changes):
-    with pytest.raises(ValueError):
+    with pytest.raises((ValueError, TypeError)):
         replace(_source_recipe().source_pin, **changes)
 
 
@@ -187,7 +198,7 @@ def test_source_pair_requires_genuine_types_without_mixed_custody(changes):
         ("endpoint_id", "other-endpoint"),
         ("dataset_id", "other-dataset"),
         ("dataset_sha256", "f" * 64),
-        ("resource_table_oid", 999),
+        ("resource_relation", {"schema": "source_example", "name": "other_resource"}),
         ("release_id", "another-release"),
         ("as_of", "2026-01-03"),
     ],
@@ -311,6 +322,7 @@ def test_rehashed_capture_cannot_replace_the_root_anchor():
     capture = recipe.source_pin.source_witness_capture
     identity = "00000000-0000-0000-0000-000000000002"
     changed = replace(capture, capture_id=identity, schema_name=witness.SCHEMA_PREFIX + UUID(identity).hex)
+    changed = replace(changed, tables={name: {"schema": changed.schema_name, "name": name} for name in witness.TABLES})
     changed = replace(changed, capture_sha256=witness.capture_digest(changed))
     assert witness.validate_capture(changed) == changed
     with pytest.raises(ValueError):
@@ -342,7 +354,7 @@ def test_normalized_fact_scope_keeps_source_capture_provenance():
     capture = pin.source_witness_capture
     assert facts.fhir_fact_transform(pin) == facts.GENERIC_TRANSFORM_VERSION
     assert facts.fhir_fact_transform(_reader_recipe().source_pin) == facts.GENERIC_TRANSFORM_VERSION
-    assert facts.fhir_fact_transform(fhir.PinnedFHIRMembershipSource(**_LEGACY_COORDINATES)) == facts.TRANSFORM_VERSION
+    assert facts.fhir_fact_transform(fhir.PinnedFHIRMembershipSource(**_NAMED_COORDINATES)) == facts.TRANSFORM_VERSION
     fact_by_field = {
         "source_key": "network-one",
         "source_scope_json": {
@@ -373,7 +385,7 @@ def test_source_sql_uses_normalized_hashes_and_no_reader_header():
 
 @pytest.mark.parametrize("kind", ["source", "reader", "legacy"])
 def test_inventory_indexes_exact_capture_or_legacy_scope(kind):
-    legacy = fhir.PinnedFHIRMembershipSource(**_LEGACY_COORDINATES)
+    legacy = fhir.PinnedFHIRMembershipSource(**_NAMED_COORDINATES)
     recipes_by_kind = {
         "source": _source_recipe(),
         "reader": _reader_recipe(),
@@ -457,7 +469,8 @@ async def test_fact_office_page_requires_a_genuine_source_read(read):
 async def test_final_composition_refuses_source_receipt_even_with_cached_reads(cached):
     recipe = _source_recipe()
     connection = SimpleNamespace(fetchval=AsyncMock(), fetchrow=AsyncMock(), execute=AsyncMock())
-    retained_reads = {recipe.source_pin.source_witness_capture: object()} if cached else {}
+    capture = recipe.source_pin.source_witness_capture
+    retained_reads = {(capture.schema_name, capture.capture_id, capture.capture_sha256): object()} if cached else {}
     with pytest.raises(composition.RegistrySourceCompositionError):
         await composition.require_registry_source_recipe_custody(connection, recipe, retained_fhir_reads=retained_reads)
     connection.fetchval.assert_not_awaited()

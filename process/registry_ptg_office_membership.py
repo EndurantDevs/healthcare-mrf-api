@@ -2,7 +2,6 @@
 """Read immutable approved exact offices under the genuine composition snapshot."""
 
 import hashlib
-import json
 from dataclasses import asdict, dataclass
 from uuid import UUID
 
@@ -14,7 +13,13 @@ from process.network_address_projection import _identifier
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_membership_copy import MAX_INPUT_BYTES, MAX_ROWS
 from process.registry_company_approval_fence import require_registry_company_approval_fence
-from process.registry_ptg_office_capture import RegistryPTGOfficeCaptureContext, _canonical, _digest, _same_transaction
+from process.registry_ptg_office_capture import (
+    RegistryPTGOfficeCaptureContext,
+    _canonical,
+    _digest,
+    _same_transaction,
+    named_office_evidence,
+)
 from process.registry_ptg_office_membership_contract import PinnedPTGOfficeMembershipSource
 from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore, _protected_store
 
@@ -26,7 +31,6 @@ class PTGOfficeBatchBoundsError(ValueError):
 @dataclass(frozen=True)
 class _VerifiedOfficeSource:
     session: object
-    driver: object
     transaction: object
     pin: PinnedPTGOfficeMembershipSource
     context: object
@@ -82,9 +86,11 @@ async def _retained_documents(session, store, pin):
         or len(_canonical(document)) > 131072
         or len(_canonical(hold)) > 32768
         or document_row["approval_sha256"] != pin.approval_sha256
-        or _digest(document) != pin.approval_sha256
+        or "custody" not in document.get("witness", {})
+        and _digest(document) != pin.approval_sha256
         or document_row["hold_sha256"] != pin.hold_sha256
-        or _digest(hold) != pin.hold_sha256
+        or "custody" not in hold
+        and _digest(hold) != pin.hold_sha256
         or document["capture_id"] != pin.capture_id
         or document["client_id"] != pin.client_id
         or document["manifest_sha256"] != pin.manifest_sha256
@@ -131,8 +137,8 @@ async def _recipe_context(session, store, document, pin, control_schema):
         _graph_identity(identity),
         store,
         control_schema,
-        document["witness"]["custody"]["owner_role"],
-        tuple(document["witness"]["custody"]["reader_roles"]),
+        store.owner_role,
+        (store.approval_role,),
     )
     return context, _request(command)
 
@@ -141,7 +147,7 @@ async def _verify_recipe_source(session, driver, pin, approved, store, control_s
     from process.network_serving_read import resolve_network_serving_manifest
     from process.ptg_parts.result_archive_published_authority import lock_ptg_published_result_for_clone
     from process.registry_ptg_office_approval import _descriptor
-    from process.registry_ptg_office_retention import office_hold_document
+    from process.registry_ptg_office_retention import is_office_hold_match
     from process.registry_ptg_office_witness import verify_registry_ptg_office_witness
 
     document, hold = await _retained_documents(session, store, pin)
@@ -155,6 +161,8 @@ async def _verify_recipe_source(session, driver, pin, approved, store, control_s
     ):
         raise ValueError("registry_ptg_office_recipe_source_changed")
     descriptor = await _descriptor(session, context, request)
+    if descriptor.manifest_sha256 != pin.manifest_sha256:
+        raise ValueError("registry_ptg_office_recipe_changed")
     witness = await verify_registry_ptg_office_witness(
         session,
         context,
@@ -163,16 +171,17 @@ async def _verify_recipe_source(session, driver, pin, approved, store, control_s
         read_budget=read_budget,
         retained_approved_revision=approved.approved_revision,
     )
-    observed = witness.as_dict()
+    observed = named_office_evidence(witness.as_dict(), document["command"])
+    retained_evidence = named_office_evidence(document["witness"], document["command"])
     if {name: field_value for name, field_value in observed.items() if name != "graph_budget"} != {
-        name: field_value for name, field_value in document["witness"].items() if name != "graph_budget"
-    } or office_hold_document(descriptor, type(witness)(_canonical(document["witness"])), pin.approval_sha256) != hold:
+        name: field_value for name, field_value in retained_evidence.items() if name != "graph_budget"
+    } or not is_office_hold_match(hold, document, pin.approval_sha256):
         raise ValueError("registry_ptg_office_recipe_witness_changed")
     serving = await resolve_network_serving_manifest(
         driver, generation_id=request.retained_generation_id, control_schema=control_schema
     )
     _same_transaction(session, driver, transaction)
-    return _VerifiedOfficeSource(session, driver, transaction, pin, context, request, descriptor, serving)
+    return _VerifiedOfficeSource(session, transaction, pin, context, request, descriptor, serving)
 
 
 async def require_ptg_office_authority(driver, control_schema, office_authority):
@@ -190,8 +199,6 @@ async def require_ptg_office_authority(driver, control_schema, office_authority)
     ):
         raise ValueError("registry_ptg_office_recipe_owner_unavailable")
     await require_registry_company_approval_fence(session, control_schema)
-    if (await (await session.connection()).get_raw_connection()).driver_connection is not driver:
-        raise ValueError("registry_ptg_office_recipe_owner_unavailable")
     transaction = session.get_transaction()
     _same_transaction(session, driver, transaction)
     return session, store, read_budget
@@ -256,8 +263,7 @@ async def read_ptg_office_membership_batch(driver, verified, approved, after, li
         raise ValueError("registry_ptg_office_recipe_owner_unavailable")
     _same_transaction(verified.session, driver, verified.transaction)
     if (
-        verified.driver is not driver
-        or type(limit) is not int
+        type(limit) is not int
         or not 1 <= limit <= MAX_ROWS
         or type(after) not in {int, type(None)}
         or (after is not None and after < 0)

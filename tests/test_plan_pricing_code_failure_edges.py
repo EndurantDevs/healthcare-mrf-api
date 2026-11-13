@@ -191,7 +191,14 @@ async def test_retirement_refuses_forged_identity_before_any_mutation(monkeypatc
 @pytest.mark.asyncio
 @pytest.mark.parametrize("found", [None, _capability().found])
 async def test_attached_but_missing_capability_fails_closed(monkeypatch, found):
-    session = SimpleNamespace(scalar=AsyncMock(return_value=True), execute=AsyncMock(), commit=AsyncMock())
+    transaction = object()
+    session = SimpleNamespace(
+        scalar=AsyncMock(),
+        execute=AsyncMock(return_value=SimpleNamespace(scalar_one=lambda: True)),
+        get_transaction=lambda: transaction,
+        in_transaction=lambda: True,
+        commit=AsyncMock(),
+    )
     monkeypatch.setattr(build, "resolve_inputs", AsyncMock(return_value=(_identity(), [])))
     monkeypatch.setattr(read, "locate", AsyncMock(return_value=found))
     if found is None:
@@ -200,7 +207,9 @@ async def test_attached_but_missing_capability_fails_closed(monkeypatch, found):
     else:
         capability = await read.resolve_code_pricing(session, _selection(), {"code_system": "CPT", "code": "27447"})
         assert capability.identity == _identity() and capability.found is found
-    session.execute.assert_not_awaited()
+    session.execute.assert_awaited_once()
+    assert "to_regclass" in str(session.execute.await_args.args[0])
+    session.scalar.assert_not_awaited()
     session.commit.assert_not_awaited()
 
 

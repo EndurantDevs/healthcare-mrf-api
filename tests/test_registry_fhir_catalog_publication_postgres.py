@@ -15,7 +15,6 @@ from sqlalchemy.schema import CreateTable
 
 from db.models.network_registry import NetworkRegistryAlias
 from db.models.registry_publication_request import RegistryPublicationRequest
-from db.registry_fhir_catalog import PROJECTOR_VERSION, table_sql
 from process import registry_fhir_catalog_fingerprints as fingerprints
 from process import registry_fhir_catalog_publication as publication
 from process import registry_publication_consumer as consumer
@@ -27,7 +26,6 @@ from process.registry_fhir_catalog_grant import (
 )
 from process.registry_fhir_catalog_registry_reader import (
     fhir_catalog_registry_reads,
-    verify_fhir_catalog_registry_reads,
 )
 from process.registry_fhir_catalog_validation import metadata_generation
 from process.registry_publication_queue import (
@@ -35,7 +33,11 @@ from process.registry_publication_queue import (
     finish_registry_publication_request,
     read_registry_publication_request,
 )
-from tests.test_registry_fhir_catalog_custody_postgres import expected_snapshot, freeze_metadata
+from tests.test_registry_fhir_catalog_custody_postgres import (
+    expected_snapshot,
+    freeze_metadata,
+    metadata_preparation_roles,
+)
 from tests.test_registry_fhir_catalog_custody_postgres import metadata_custody as metadata_custody
 
 GENERATION = "a" * 64
@@ -54,8 +56,6 @@ async def catalog_publication(metadata_custody, monkeypatch, request):
       INSERT INTO {namespace}.network_serving_control VALUES(1,9,NULL)""")
     queue_table = RegistryPublicationRequest.__table__.to_metadata(MetaData(), schema=fixture.control_schema)
     await fixture.connection.execute(str(CreateTable(queue_table).compile(dialect=postgresql.dialect())))
-    for statement in table_sql(namespace, "registry_fhir_catalog_snapshot"):
-        await fixture.connection.execute(statement)
     selected = expected_snapshot(fixture)
     if not attached:
         await fixture.connection.execute(f"UPDATE {namespace}.network_serving_control SET generation_id=NULL")
@@ -63,23 +63,6 @@ async def catalog_publication(metadata_custody, monkeypatch, request):
         selected["metadata_generation"] = metadata_generation(selected)
     snapshot_by_field = await freeze_metadata(fixture, snapshot=selected)
     fixture.generation = snapshot_by_field["metadata_generation"]
-    await fixture.connection.execute(
-        f"INSERT INTO {namespace}.registry_fhir_catalog_snapshot "
-        "(metadata_generation,schema_name,custody_json,network_generation,manifest_sha256,metadata_approved_revision,"
-        "membership_mapping_sha256,mapping_sha256,standing_grant_sha256,source_vector_json,projector_version,accounting_json,as_of) "
-        "VALUES($1,$2,$3::jsonb,$4,$5,6,$6,$7,$8,'[]'::jsonb,$9,$10::jsonb,$11)",
-        fixture.generation,
-        fixture.target.schema_name,
-        json.dumps(snapshot_by_field["custody_json"]),
-        snapshot_by_field["network_generation"],
-        snapshot_by_field["manifest_sha256"],
-        snapshot_by_field["membership_mapping_sha256"],
-        snapshot_by_field["mapping_sha256"],
-        GRANT,
-        PROJECTOR_VERSION,
-        json.dumps(snapshot_by_field["accounting_json"]),
-        snapshot_by_field["as_of"],
-    )
     monkeypatch.setattr(
         publication,
         "resolve_network_serving_manifest",
@@ -218,7 +201,6 @@ async def _enqueue(fixture, authorize=_authorize):
         receipt = await publication.enqueue_fhir_catalog_publication(
             fixture.connection, fixture.command, authorize_metadata=authorize, control_schema=fixture.control_schema
         )
-        await verify_fhir_catalog_registry_reads()
         return receipt
 
 
@@ -243,6 +225,7 @@ async def _complete(fixture, receipt, lease_id, *, authorize=_authorize, verify_
         verify_sources=verify_sources or AsyncMock(return_value=True),
         source_fence=_source_fence,
         control_schema=fixture.control_schema,
+        preparation_roles=metadata_preparation_roles(fixture),
     )
 
 

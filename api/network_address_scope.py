@@ -19,9 +19,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql import visitors
 from sqlalchemy.sql.elements import TextClause
 
-from api.network_read_execution import NetworkReadStatements
 from db.models import EntityAddressUnified
-from process.network_compact_layout import CompactAddressRelation
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 
 _SCOPE = ContextVar("canonical_network_address_scope", default=None)
@@ -36,7 +34,6 @@ class NetworkAddressReadScope:
     excluded_network_ids: tuple[int, ...] | None = None
     address_predicate_sql: str | None = None
     organization_policy: RegistryOrganizationVisibility | None = None
-    read_statements: NetworkReadStatements | None = None
     legacy_checksums: tuple[int, ...] | None = None
 
 
@@ -228,12 +225,12 @@ def _validate_network_scope_inputs(
         if (
             type(manifest.compact_layout) is not CompactNetworkLayout
             or manifest.compact_layout.ref_map.schema_name != manifest.schema_name
-            or manifest.compact_layout.base.table_oid != manifest.address_table_oid
+            or manifest.compact_layout.base != manifest.address_relation
         ):
             raise ValueError("network_address_scope_invalid")
 
 
-def _build_address_relation(manifest, network_ids, predicate_sql, read_statements, legacy_checksums):
+def _build_address_relation(manifest, network_ids, predicate_sql, legacy_checksums):
     """Build the exact pinned flat or compact relation before installing request scope."""
     if manifest.compact_layout is not None:
         from api.network_compact_address import compact_address_selectable
@@ -244,7 +241,6 @@ def _build_address_relation(manifest, network_ids, predicate_sql, read_statement
             visible_membership_sql="TRUE"
             if legacy_checksums is not None
             else (_visible_membership_predicate() if network_ids is None else None),
-            read_statements=read_statements,
         )
         if legacy_checksums is not None:
             relation = (
@@ -267,13 +263,9 @@ def _build_address_relation(manifest, network_ids, predicate_sql, read_statement
             predicate = physical.c.plans_network_array.op("&&")(
                 bindparam("_legacy_network_checksums", type_=ARRAY(INTEGER))
             )
-        marker = read_statements.marker(
-            (CompactAddressRelation(manifest.schema_name, "entity_address_unified", manifest.address_table_oid),)
-        )
         relation = (
             select(physical)
             .with_hint(physical, "ONLY", "postgresql")
-            .prefix_with(marker)
             .where(predicate)
             .subquery("entity_address_unified")
         )
@@ -303,10 +295,7 @@ def network_address_read_scope(
     ):
         raise ValueError("network_legacy_scope_invalid")
     predicate_sql = _default_address_predicate() if network_ids is None else None
-    read_statements = NetworkReadStatements(
-        [manifest.manifest_sha256, network_ids, excluded_network_ids, access_scope_sha256, legacy_checksums]
-    )
-    relation = _build_address_relation(manifest, network_ids, predicate_sql, read_statements, legacy_checksums)
+    relation = _build_address_relation(manifest, network_ids, predicate_sql, legacy_checksums)
     token = _SCOPE.set(
         NetworkAddressReadScope(
             manifest,
@@ -316,7 +305,6 @@ def network_address_read_scope(
             excluded_network_ids,
             predicate_sql,
             organization_policy,
-            read_statements,
             legacy_checksums,
         )
     )
@@ -338,12 +326,12 @@ async def network_address_read_session_scope(
     legacy_checksums=None,
 ):
     """Authenticate control pins and guard actual buffered reads on the original Reader."""
-    from api.network_read_execution import _original_read_driver
+    from api.network_read_execution import _read_driver
     from process.network_approved_membership_source import pin_api_retained_approved_membership_source
 
     transaction = session.get_transaction()
     try:
-        driver, backend_pid = await _original_read_driver(session)
+        driver = await _read_driver(session)
         _approved, approved_relation = await pin_api_retained_approved_membership_source(driver, manifest)
     except (ValueError, TypeError, KeyError) as error:
         raise ServiceUnavailable(
@@ -353,7 +341,6 @@ async def network_address_read_session_scope(
         session,
         transaction,
         driver,
-        backend_pid,
         manifest,
         approved_relation,
         network_ids,
@@ -367,39 +354,30 @@ async def network_address_read_session_scope(
 
 @asynccontextmanager
 async def _bound_address_read_session_scope(
-    session, transaction, driver, backend_pid, manifest, approved_relation, network_ids, **scope_options
+    session, transaction, driver, manifest, approved_relation, network_ids, **scope_options
 ):
-    """Keep the verified pin on the same Reader until all buffered reads finish."""
-    from api.network_read_execution import _original_read_driver, network_read_name_inventory
-
-    current_driver, current_pid = await _original_read_driver(session)
-    if current_driver is not driver or current_pid != backend_pid or session.get_transaction() is not transaction:
+    """Keep filtering and legacy scope checks in the selected generation's transaction."""
+    if session.get_transaction() is not transaction or transaction is None:
         raise ServiceUnavailable(
             "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
         )
-    with network_read_name_inventory(driver, (*manifest.candidate_relation_pins, approved_relation)):
-        with network_address_read_scope(manifest, network_ids, **scope_options) as scope:
-            if scope.legacy_checksums is not None:
-                await _require_legacy_mapping(
-                    session,
-                    driver,
-                    backend_pid,
-                    transaction,
-                    approved_relation,
-                    manifest,
-                    network_ids,
-                    scope.legacy_checksums,
-                )
-            yield scope
+    with network_address_read_scope(manifest, network_ids, **scope_options) as scope:
+        if scope.legacy_checksums is not None:
+            await _require_legacy_mapping(driver, approved_relation, manifest, network_ids, scope.legacy_checksums)
+        if session.get_transaction() is not transaction:
+            raise ServiceUnavailable(
+                "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
+            )
+        yield scope
+        if session.get_transaction() is not transaction:
+            raise ServiceUnavailable(
+                "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
+            )
 
 
-async def _require_legacy_mapping(
-    session, driver, backend_pid, transaction, approved_relation, manifest, network_ids, legacy_checksums
-):
-    """Verify the actual approved-map read before inspecting its signed subset match."""
-    from api.network_read_execution import _original_read_driver
+async def _require_legacy_mapping(driver, approved_relation, manifest, network_ids, legacy_checksums):
+    """Compare the approved legacy map with its authenticated canonical subset."""
     from process.network_address_projection import _identifier
-    from process.network_read_identity import NetworkReadIdentityError, verify_consumed_network_relations
     from process.registry_network_catalog_read import _LEGACY_BATCH_SQL
 
     try:
@@ -410,13 +388,7 @@ async def _require_legacy_mapping(
             "checksum_network",
             (),
         )
-        await verify_consumed_network_relations(driver, (approved_relation,), expected_backend_pid=backend_pid)
-        current_driver, current_pid = await _original_read_driver(session)
-        if current_driver is not driver or current_pid != backend_pid or session.get_transaction() is not transaction:
-            raise ServiceUnavailable(
-                "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
-            )
-    except (asyncpg.PostgresError, DBAPIError, NetworkReadIdentityError) as error:
+    except (asyncpg.PostgresError, DBAPIError) as error:
         raise ServiceUnavailable(
             "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
         ) from error
@@ -435,7 +407,7 @@ def scoped_address_relation_sql(table_ref, *, location_lookup=False):
     if scope is None or not table_ref.endswith(".entity_address_unified"):
         return table_ref
     if scope.manifest.compact_layout is not None:
-        from api.network_compact_address import compact_address_read_relations, compact_address_relation_sql
+        from api.network_compact_address import compact_address_relation_sql
 
         relation = compact_address_relation_sql(
             scope.manifest.compact_layout,
@@ -450,7 +422,6 @@ def scoped_address_relation_sql(table_ref, *, location_lookup=False):
                 f"(SELECT * FROM {relation} legacy_office "
                 "WHERE plans_network_array && CAST(:_legacy_network_checksums AS INTEGER[]))"
             )
-        relations = compact_address_read_relations(scope.manifest.compact_layout)
     elif scope.network_ids is None:
         relation = f'(SELECT * FROM ONLY "{scope.manifest.schema_name}".entity_address_unified WHERE {scope.address_predicate_sql})'
     else:
@@ -460,14 +431,7 @@ def scoped_address_relation_sql(table_ref, *, location_lookup=False):
             else "canonical_network_ids && CAST(:_canonical_network_ids AS INTEGER[])"
         )
         relation = f'(SELECT * FROM ONLY "{scope.manifest.schema_name}".entity_address_unified WHERE {predicate})'
-    if scope.manifest.compact_layout is None:
-        relations = (
-            CompactAddressRelation(
-                scope.manifest.schema_name, "entity_address_unified", scope.manifest.address_table_oid
-            ),
-        )
-    marker = scope.read_statements.marker(relations)
-    return "(" + marker + " " + relation[1:]
+    return relation
 
 
 def is_scoped_address_relation(table_ref):
@@ -504,9 +468,8 @@ def scoped_geo_search_relation_sql(table_ref, *clauses):
     relation = scope.manifest.compact_layout.geo_search
     if relation not in scope.manifest.candidate_relation_pins:
         raise ValueError("network_geo_search_pin_invalid")
-    marker = scope.read_statements.marker((relation,))
     return (
-        f'({marker} SELECT * FROM ONLY "{relation.schema_name}"."{relation.table_name}" '
+        f'(SELECT * FROM ONLY "{relation.schema_name}"."{relation.table_name}" '
         "WHERE canonical_network_ids && CAST(:_canonical_network_ids AS INTEGER[]))"
     )
 
@@ -722,7 +685,7 @@ def _network_scope_claim(request, args):
 
 @asynccontextmanager
 async def _pin_network_scope(request, args):
-    from api.network_read_execution import _original_read_driver
+    from api.network_read_execution import _read_driver
     from api.network_serving_api_read import api_catalog_read_snapshot
     from api.network_serving_read_context import bind_network_request_reader
 
@@ -731,7 +694,7 @@ async def _pin_network_scope(request, args):
     await session.execute(text("SET LOCAL lock_timeout='1s'"))
     transaction = session.get_transaction()
     try:
-        driver, backend_pid = await _original_read_driver(session)
+        driver = await _read_driver(session)
     except (ValueError, TypeError, KeyError) as error:
         raise ServiceUnavailable(
             "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
@@ -749,7 +712,6 @@ async def _pin_network_scope(request, args):
             session,
             transaction,
             driver,
-            backend_pid,
             manifest,
             approved_relation,
             network_ids,

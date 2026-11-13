@@ -4,7 +4,6 @@
 import json
 from copy import deepcopy
 from dataclasses import asdict
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -397,131 +396,67 @@ async def test_page_iterator_refuses_unpinned_or_overlarge_pages(mode):
         connection.fetch.assert_not_awaited()
 
 
-@pytest.fixture
-def published_scope(monkeypatch):
-    from process.registry_fhir_catalog_published_read import FHIRCatalogPublishedRead
-
-    verify = AsyncMock()
-    select = Mock(
-        return_value='SELECT * FROM ONLY "source_schema"."leaf_one" '
-        'UNION ALL SELECT * FROM ONLY "source_schema"."leaf_two"'
-    )
-    monkeypatch.setattr(FHIRCatalogPublishedRead, "verify", verify)
-    monkeypatch.setattr(FHIRCatalogPublishedRead, "resource_sql", select)
-    return SimpleNamespace(read=object.__new__(FHIRCatalogPublishedRead), verify=verify, select=select)
-
-
 @pytest.mark.asyncio
-async def test_published_pages_keep_one_global_keyset_and_bound(published_scope):
+async def test_named_pages_keep_one_global_keyset_and_bound():
     connection = Mock(
         is_in_transaction=Mock(return_value=True),
         fetchval=AsyncMock(return_value="repeatable read"),
-        fetch=AsyncMock(),
+        fetch=AsyncMock(side_effect=[[page_record("one")], [page_record("two")], []]),
     )
-
-    async def fetch(*args):
-        assert published_scope.verify.await_count == connection.fetch.await_count + 1
-        return [[page_record("one")], [page_record("two")], []][connection.fetch.await_count - 1]
-
-    connection.fetch.side_effect = fetch
     pages = [
         page
         async for page in iter_fhir_catalog_pages(
             connection,
             schema_name="source_schema",
             dataset_id="dataset",
-            source_read=published_scope.read,
+            resource_relation={"schema": "source_schema", "name": "dataset_resources"},
             page_rows=2,
             page_bytes=1024,
         )
     ]
     assert [page[0]["resource_id"] for page in pages] == ["one", "two"]
-    assert connection.fetch.await_args_list[1].args[3:5] == ("Organization", "one")
-    assert connection.fetch.await_args_list[2].args[3:5] == ("Organization", "two")
-    query = connection.fetch.await_args_list[0].args[0]
-    assert "FROM (" + published_scope.select.return_value + ") AS catalog_resources" in query
-    assert "provider_directory_dataset_resource" not in query
-    assert query.count("LIMIT $5") == 1 and query.count("sum(row_bytes)") == 1
-    assert 'ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT $5' in query
-    assert connection.fetch.await_args_list[0].args[-2:] == (2, 1024)
-    assert published_scope.verify.await_count == 4
-    for verification in published_scope.verify.await_args_list:
-        assert verification.args == (connection,)
-        assert verification.kwargs == {"schema_name": "source_schema", "dataset_id": "dataset"}
+    calls = connection.fetch.await_args_list
+    assert calls[1].args[3:5] == ("Organization", "one")
+    assert calls[2].args[3:5] == ("Organization", "two")
+    sql = calls[0].args[0]
+    assert 'FROM "source_schema"."dataset_resources"' in sql
+    assert sql.count("LIMIT $5") == 1 and sql.count("sum(row_bytes)") == 1
+    assert calls[0].args[-2:] == (2, 1024)
 
 
 @pytest.mark.asyncio
-async def test_published_page_reverification_refuses_before_the_next_page(published_scope):
+async def test_page_iteration_refuses_ended_transaction_before_next_query():
     connection = Mock(
         is_in_transaction=Mock(return_value=True),
         fetchval=AsyncMock(return_value="repeatable read"),
         fetch=AsyncMock(return_value=[page_record("one")]),
     )
-    published_scope.verify.side_effect = [None, None, ValueError("published read changed")]
-    pages = iter_fhir_catalog_pages(
-        connection, schema_name="source_schema", dataset_id="dataset", source_read=published_scope.read
-    )
+    pages = iter_fhir_catalog_pages(connection, schema_name="source_schema", dataset_id="dataset")
     assert (await anext(pages))[0]["resource_id"] == "one"
-    with pytest.raises(ValueError, match="published read changed"):
+    connection.is_in_transaction.return_value = False
+    with pytest.raises(ValueError, match="transaction_required"):
         await anext(pages)
     assert connection.fetch.await_count == 1
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["duck", "coordinates"])
-async def test_published_page_scope_refuses_unverified_input_before_resource_sql(published_scope, mode):
+@pytest.mark.parametrize(
+    "relation", [None, {}, {"schema": "other", "name": "rows"}, {"schema": "source_schema", "name": 'bad"name'}]
+)
+async def test_named_pages_validate_relation_names_before_query(relation):
+    relation_by_field = relation
+    if relation_by_field is None:
+        relation_by_field = {"schema": "source_schema", "name": "rows", "extra": True}
     connection = Mock(
-        is_in_transaction=Mock(return_value=True),
-        fetchval=AsyncMock(return_value="repeatable read"),
-        fetch=AsyncMock(),
+        is_in_transaction=Mock(return_value=True), fetchval=AsyncMock(return_value="repeatable read"), fetch=AsyncMock()
     )
-    source_read = published_scope.read
-    if mode == "duck":
-        source_read = SimpleNamespace(verify=AsyncMock(), resource_sql=Mock())
-    else:
-        published_scope.verify.side_effect = ValueError("dataset changed")
     with pytest.raises(ValueError):
         await anext(
             iter_fhir_catalog_pages(
-                connection, schema_name="source_schema", dataset_id="dataset", source_read=source_read
+                connection, schema_name="source_schema", dataset_id="dataset", resource_relation=relation_by_field
             )
         )
     connection.fetch.assert_not_awaited()
-    published_scope.select.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_retained_source_pages_preserve_heap_and_native_verification(monkeypatch):
-    from process.network_fhir_retained_capture import RetainedFHIRRead
-
-    capture = SimpleNamespace(
-        schema_name="source_schema",
-        origin=SimpleNamespace(dataset_id="dataset"),
-        relation_oids=(("provider_directory_dataset_resource", 123),),
-    )
-    source_read = object.__new__(RetainedFHIRRead)
-    object.__setattr__(source_read, "capture", capture)
-    verify = AsyncMock()
-    monkeypatch.setattr(RetainedFHIRRead, "verify", verify)
-    connection = Mock(
-        is_in_transaction=Mock(return_value=True),
-        fetchval=AsyncMock(side_effect=["repeatable read", 123]),
-        fetch=AsyncMock(side_effect=[[page_record("one")], []]),
-    )
-    pages = [
-        page
-        async for page in iter_fhir_catalog_pages(
-            connection, schema_name="source_schema", dataset_id="dataset", source_read=source_read
-        )
-    ]
-    assert [page[0]["resource_id"] for page in pages] == ["one"]
-    assert 'FROM "source_schema".provider_directory_dataset_resource' in connection.fetch.await_args.args[0]
-    assert verify.await_count == 3
-    assert all(call.args == (connection, capture) for call in verify.await_args_list)
-    assert connection.fetchval.await_args.args == (
-        "SELECT to_regclass($1)::oid::bigint",
-        "source_schema.provider_directory_dataset_resource",
-    )
 
 
 @pytest.mark.parametrize(
@@ -607,32 +542,3 @@ async def test_page_decode_refuses_invalid_or_underreported_json_before_yield(pa
             )
         )
     connection.fetch.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_retained_page_refuses_replaced_heap_before_fetch(monkeypatch):
-    from process.network_fhir_retained_capture import RetainedFHIRRead
-
-    source_read = object.__new__(RetainedFHIRRead)
-    object.__setattr__(
-        source_read,
-        "capture",
-        SimpleNamespace(
-            schema_name="source_schema",
-            origin=SimpleNamespace(dataset_id="dataset"),
-            relation_oids=(("provider_directory_dataset_resource", 123),),
-        ),
-    )
-    monkeypatch.setattr(RetainedFHIRRead, "verify", AsyncMock())
-    connection = Mock(
-        is_in_transaction=Mock(return_value=True),
-        fetchval=AsyncMock(side_effect=["repeatable read", 456]),
-        fetch=AsyncMock(),
-    )
-    with pytest.raises(FHIRCatalogExtractionError, match="retained_read_changed"):
-        await anext(
-            iter_fhir_catalog_pages(
-                connection, schema_name="source_schema", dataset_id="dataset", source_read=source_read
-            )
-        )
-    connection.fetch.assert_not_awaited()

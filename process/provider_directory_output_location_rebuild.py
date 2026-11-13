@@ -13,12 +13,7 @@ from process import provider_directory_output_snapshot_journal as journal
 from process import provider_directory_output_snapshot_stage as stages
 from process.plan_release_storage_catalog import ROLE_SQL
 from process.provider_directory_dataset_rehydrate_pages import projected_pages
-from process.provider_directory_dataset_rehydrate_pin import (
-    _close_reader,
-    _require_reader,
-    _same_database,
-    _SourceReader,
-)
+from process.provider_directory_dataset_rehydrate_pin import _SourceReader
 from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
 from process.provider_directory_output_snapshot_catalog import output_models, require_output
 from process.uhc_flex_practitioner_async_safety import drain_operation
@@ -73,8 +68,8 @@ async def _preservation_reader(directory, operation, stage):
     try:
         async with custody.output_snapshot_transaction(directory, operation=operation, targets=(TARGET,)) as capability:
             await stages._stage_row(capability, stage, phases={"loading"})
-            driver = await _require_reader(session, reader_database, capability.policy)
-            await _same_database(capability.connection, driver)
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            driver = (await (await session.connection()).get_raw_connection()).driver_connection
             await driver.execute(f"LOCK TABLE {storage_relation(stage.schema, TARGET)} IN ACCESS SHARE MODE NOWAIT")
             require_output(
                 await driver.fetchval(
@@ -89,7 +84,7 @@ async def _preservation_reader(directory, operation, stage):
     finally:
         if reader is not None:
             reader.deactivate()
-        await _close_reader(session)
+        await session.close()
 
 
 async def _prepare_location(directory, operation, selector, expected_incumbent, prepared_stages):

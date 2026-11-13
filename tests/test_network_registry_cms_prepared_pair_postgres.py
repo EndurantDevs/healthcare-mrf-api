@@ -1293,7 +1293,9 @@ def _assert_original_heap_growth(growth_events, created_relations, retained, pre
     assert len(created_relations) == len(set(created_relations)) == 18
     assert len({oid for _schema, _logical, oid in created_relations}) == 18
     epoch = retained.recipe.source_pin.retained_epoch
-    for logical, oid in epoch.relation_oids:
+    for schema, logical, oid in created_relations:
+        if schema != epoch.schema_name:
+            continue
         events = [event for event in growth_events if event[1] == logical]
         assert all(event[2] == oid for event in events)
         for phase in ("created", "before_insert"):

@@ -14,6 +14,7 @@ from api import plan_release_supporting_metadata as supporting
 from process import registry_pricing_release_binding_lookup as lookup
 from process import registry_required_target_coverage as coverage
 from process.network_approved_catalog_evidence import ApprovedNetworkCatalogEvidenceRecord
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
 from tests.test_plan_release_serving import PLAN_RELEASE_ID, _binding_row
 from tests.test_plan_release_supporting_metadata import _committed_rows, commitment_page
@@ -371,7 +372,7 @@ async def test_actual_report_body_consumes_the_metadata_phase_once(monkeypatch):
         candidate_id="00000000-0000-0000-0000-000000000001",
         schema_revision=1,
         manifest_sha256="b" * 64,
-        address_table_oid=1,
+        address_relation=CompactAddressRelation("sample_serving", "entity_address_unified"),
     )
 
     async def fetchrow(sql, *parameters):

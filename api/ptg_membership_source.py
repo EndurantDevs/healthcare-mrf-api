@@ -55,7 +55,38 @@ async def _finalizer_identity(session, schema, key):
     return finalizer_by_field
 
 
-async def _source_storage(session, schema, snapshot_id):
+async def _named_source_storage(session, schema, required_relations, optional_relations):
+    """Require the complete qualified inventory for an authenticated API read."""
+    from api.network_read_execution import qualified_relation_sql
+
+    qualified_relation_sql(schema, "ptg2_v4_snapshot_map_root")
+    names = sorted(required_relations | optional_relations)
+    inventory_rows = (
+        (
+            await session.execute(
+                text(
+                    "SELECT expected.name AS relname FROM unnest(CAST(:names AS text[])) expected(name) "
+                    "WHERE pg_catalog.to_regclass(pg_catalog.format('%I.%I',:schema,expected.name)) IS NOT NULL "
+                    "ORDER BY expected.name"
+                ),
+                {"schema": schema, "names": names},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    present_relations = [inventory_row["relname"] for inventory_row in inventory_rows]
+    if (
+        len(present_relations) != len(set(present_relations))
+        or not required_relations <= set(present_relations)
+        or not set(present_relations) <= set(names)
+    ):
+        raise PTG2ManifestArtifactError("membership source relation inventory is incomplete")
+    return {"schema_name": schema, "relations": [[schema, name] for name in sorted(present_relations)]}
+
+
+async def _source_storage(session, schema, snapshot_id, *, api_read=False):
+    """Resolve the saved source inventory using the caller's selected read mode."""
     from api import ptg2_serving as serving
 
     required_relations = {
@@ -70,6 +101,8 @@ async def _source_storage(session, schema, snapshot_id):
         "ptg2_v3_provider_group",
     }
     optional_relations = {"ptg2_v4_finalizer_map_root", "ptg2_v4_finalizer_map_pack", "ptg2_v4_finalizer_map_target"}
+    if api_read:
+        return await _named_source_storage(session, schema, required_relations, optional_relations)
     storage_rows = (
         (
             await session.execute(
@@ -111,14 +144,22 @@ async def _source_storage(session, schema, snapshot_id):
 
 
 async def source_identity(session, source_key, snapshot_id, code_system, code, *, tables=None, api_read=False):
-    """Resolve fresh audited source custody and its immutable physical/code identity."""
+    """Resolve the exact source graph, code and named payload inventory."""
     expected = tables
     if type(api_read) is not bool:
         raise ValueError("membership Source API mode is invalid")
+    if api_read:
+        from api.ptg_membership_storage import _api_read_snapshot
+
+        transaction = await _api_read_snapshot(session)
     tables = await snapshot_serving_tables(session, snapshot_id, **({"api_read": True} if api_read else {}))
     key, schema = _require_source_custody(tables, expected, source_key, snapshot_id)
     root = await load_v4_graph_root(session, key, schema_name=schema, refresh=True)
     finalizer_by_field = await _finalizer_identity(session, schema, key)
     document = identity(tables, root, finalizer_by_field, code_system, code)
-    document["source_storage"] = await _source_storage(session, schema, snapshot_id)
+    document["source_storage"] = await _source_storage(
+        session, schema, snapshot_id, **({"api_read": True} if api_read else {})
+    )
+    if api_read and (session.get_transaction() is not transaction or session.in_transaction() is not True):
+        raise PTG2ManifestArtifactError("membership source API read transaction changed")
     return tables, root, document

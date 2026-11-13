@@ -40,7 +40,7 @@ async def compact_office_db(slice_db):
         "SELECT to_regclass($1)::oid::bigint", namespace + ".entity_address_unified"
     )
     fixture.offices = CompactOfficeSources(
-        fixture.source, CompactAddressRelation(fixture.target.schema_name, "entity_address_unified", oid)
+        fixture.source, CompactAddressRelation(fixture.target.schema_name, "entity_address_unified")
     )
     yield fixture
 

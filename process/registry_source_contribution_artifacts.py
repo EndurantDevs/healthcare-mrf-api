@@ -1,9 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Direct references to original independently sealed source-fact owners.
-
-This leaf validates references only. Its DTOs grant no phase authority for a new
-candidate's own facts, and it never changes source receipts or copies fact rows.
-"""
+"""Resolve named published source facts and verify their complete bounded content."""
 
 import json
 import re
@@ -11,12 +7,12 @@ from dataclasses import asdict, dataclass
 from uuid import UUID
 
 from process.network_address_projection import _identifier
-from process.network_candidate_custody import MAX_RECEIPT_BYTES as CUSTODY_MAX_RECEIPT_BYTES
-from process.network_candidate_custody import verify_network_candidate_custody
 from process.network_membership_copy import MembershipCopyTarget
-from process.network_read_identity import NetworkReadIdentityError, verify_consumed_network_relations
 from process.registry_source_contribution_store import (
+    ALL_FACT_ANCHOR_FIELDS,
     CONTRIBUTION_TABLE,
+    FACT_ANCHOR_FIELDS,
+    LEGACY_FACT_ANCHOR_FIELDS,
     MAX_RECEIPT_BYTES,
     SUMMARY_KEY,
     RegistrySourceContributionError,
@@ -26,29 +22,33 @@ from process.registry_source_contribution_store import (
     verify_registry_source_contributions,
 )
 
-_ANCHOR_FIELDS = frozenset(("fact_candidate_id", "fact_table_oid", "fact_seal_sha256"))
+_ANCHOR_FIELDS = FACT_ANCHOR_FIELDS
+_MAX_ARTIFACT_METADATA_BYTES = 2 * 1024 * 1024
 _FACT_IDENTITY_FIELDS = ("recipe_sha256", "capture_sha256", "transform_version", "fact_sha256", "fact_rows")
 
 
 @dataclass(frozen=True)
 class SourceFactArtifactReference:
-    """A direct physical owner and expected independent seal; never an alias head."""
+    """A named fact snapshot and its logical published generation."""
 
     fact_candidate_id: str
-    fact_table_oid: int
-    fact_seal_sha256: str
+    fact_schema_name: str | None = None
+    fact_table_name: str | None = None
+    fact_generation_id: str | None = None
 
     def __post_init__(self):
         try:
             identity = UUID(self.fact_candidate_id) if type(self.fact_candidate_id) is str else None
+            if identity is None or not identity.int or str(identity) != self.fact_candidate_id:
+                raise ValueError
+            names = self.fact_schema_name, self.fact_table_name, self.fact_generation_id
+            if names == (None, None, None):
+                return
+            _identifier(self.fact_schema_name)
             if (
-                identity is None
-                or not identity.int
-                or str(identity) != self.fact_candidate_id
-                or type(self.fact_table_oid) is not int
-                or not 0 < self.fact_table_oid < 2**32
-                or type(self.fact_seal_sha256) is not str
-                or re.fullmatch(r"[0-9a-f]{64}", self.fact_seal_sha256) is None
+                self.fact_table_name != CONTRIBUTION_TABLE
+                or type(self.fact_generation_id) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", self.fact_generation_id) is None
             ):
                 raise ValueError
         except ValueError, TypeError, AttributeError:
@@ -57,15 +57,20 @@ class SourceFactArtifactReference:
 
 @dataclass(frozen=True)
 class ResolvedSourceFactArtifact:
-    """An authenticated direct fact owner; API payload reads need their separate identity guard."""
+    """Resolved published fact data and its immutable logical descriptor."""
 
     reference: SourceFactArtifactReference
     schema_name: str
     descriptor: dict
 
+    def __post_init__(self):
+        _identifier(self.schema_name)
+        if self.reference.fact_schema_name is not None and self.schema_name != self.reference.fact_schema_name:
+            raise RegistrySourceContributionError("registry_source_artifact_reference_invalid")
+
     @property
     def relation(self):
-        """Return the exact native heap name established by independent custody."""
+        """Return the schema-qualified published fact relation."""
         return f"{_identifier(self.schema_name)}.{CONTRIBUTION_TABLE}"
 
 
@@ -76,11 +81,11 @@ def _validated_descriptor(descriptor):
         raise RegistrySourceContributionError("registry_source_artifact_reference_invalid")
     if "descriptor_version" in descriptor:
         document = validate_source_contribution_descriptor(descriptor)
-        return {key: value for key, value in document.items() if key not in _ANCHOR_FIELDS}
-    anchor_fields = set(descriptor) & _ANCHOR_FIELDS
-    if anchor_fields and anchor_fields != _ANCHOR_FIELDS:
+        return {key: value for key, value in document.items() if key not in ALL_FACT_ANCHOR_FIELDS}
+    anchor_fields = set(descriptor) & ALL_FACT_ANCHOR_FIELDS
+    if anchor_fields and anchor_fields not in (FACT_ANCHOR_FIELDS, LEGACY_FACT_ANCHOR_FIELDS):
         raise RegistrySourceContributionError("registry_source_artifact_reference_invalid")
-    descriptor_by_field = {key: value for key, value in descriptor.items() if key not in _ANCHOR_FIELDS}
+    descriptor_by_field = {key: value for key, value in descriptor.items() if key not in ALL_FACT_ANCHOR_FIELDS}
     validate_registry_source_contribution_receipt(
         {
             "component": SUMMARY_KEY,
@@ -93,14 +98,14 @@ def _validated_descriptor(descriptor):
 
 
 def source_fact_artifact_reference(descriptor):
-    """Validate all-or-none anchor fields; absent fields describe locally owned facts."""
+    """Decode names or project a known retained reference to its logical candidate locator."""
     _validated_descriptor(descriptor)
-    anchor_by_field = {key: descriptor.get(key) for key in _ANCHOR_FIELDS}
-    if all(value is None for value in anchor_by_field.values()):
+    fields = set(descriptor) & ALL_FACT_ANCHOR_FIELDS
+    if not fields or all(descriptor[field] is None for field in fields):
         return None
-    if any(value is None for value in anchor_by_field.values()):
-        raise RegistrySourceContributionError("registry_source_artifact_reference_invalid")
-    return SourceFactArtifactReference(**anchor_by_field)
+    if fields == LEGACY_FACT_ANCHOR_FIELDS:
+        return SourceFactArtifactReference(descriptor["fact_candidate_id"])
+    return SourceFactArtifactReference(**{field: descriptor[field] for field in FACT_ANCHOR_FIELDS})
 
 
 def anchored_source_fact_descriptor(descriptor, artifact):
@@ -110,6 +115,8 @@ def anchored_source_fact_descriptor(descriptor, artifact):
         native[field] != artifact.descriptor[field] for field in _FACT_IDENTITY_FIELDS
     ):
         raise RegistrySourceContributionError("registry_source_artifact_identity_changed")
+    if artifact.reference.fact_schema_name is None:
+        raise RegistrySourceContributionError("registry_source_artifact_reference_invalid")
     return {**native, **asdict(artifact.reference)}
 
 
@@ -129,26 +136,14 @@ def _owning_descriptor(candidate, requested, *, sources=None):
 
 async def _published_artifact_candidates(connection, control_schema, candidate_ids, *, api_read=False):
     namespace = _identifier(control_schema)
-    if api_read:
-        from process.network_candidate_custody import read_network_control_relation_pins
-
-        relations = await read_network_control_relation_pins(
-            connection, ("network_membership_candidate", "network_serving_manifest"), control_schema=control_schema
-        )
-        pid = connection.get_server_pid()
     candidates = await connection.fetch(
         f"SELECT c.* FROM {namespace}.network_membership_candidate c JOIN {namespace}.network_serving_manifest m "
         "USING(candidate_id) WHERE c.candidate_id=ANY($1::uuid[]) AND c.state='published' "
         "AND octet_length(c.validation_json::text)+octet_length(c.source_recipes_json::text) "
         "+octet_length(c.source_generations::text)<=$2 ORDER BY c.candidate_id",
         [UUID(identity) for identity in sorted(candidate_ids)],
-        CUSTODY_MAX_RECEIPT_BYTES,
+        _MAX_ARTIFACT_METADATA_BYTES,
     )
-    if api_read:
-        try:
-            await verify_consumed_network_relations(connection, relations, expected_backend_pid=pid)
-        except NetworkReadIdentityError as error:
-            raise RegistrySourceContributionError("registry_source_artifact_owner_unavailable") from error
     by_identity = {str(candidate["candidate_id"]): dict(candidate) for candidate in candidates}
     if set(by_identity) != candidate_ids:
         raise RegistrySourceContributionError("registry_source_artifact_owner_unavailable")
@@ -170,21 +165,64 @@ def _artifact_copy_target(candidate):
     )
 
 
-async def _verify_artifact_owner(connection, candidate, control_schema):
-    return await verify_network_candidate_custody(
-        connection, _artifact_copy_target(candidate), control_schema=control_schema, required=True
+async def load_published_artifact_validation(connection, candidate, control_schema):
+    """Read the published logical generation and its completed data-validation report."""
+    if not connection.is_in_transaction():
+        raise RegistrySourceContributionError("registry_source_artifact_snapshot_required")
+    copy_target = _artifact_copy_target(candidate)
+    manifest = await connection.fetchrow(
+        f"SELECT c.dataset_id,c.schema_id,c.producer_id,c.candidate_id,c.schema_name,c.source_generations,c.validation_json,m.manifest_sha256 "
+        f"FROM {_identifier(control_schema)}.network_membership_candidate c "
+        f"JOIN {_identifier(control_schema)}.network_serving_manifest m USING(candidate_id) "
+        "WHERE c.candidate_id=$1 AND c.state='published'",
+        UUID(copy_target.candidate_id),
     )
+    if manifest is None or any(
+        str(manifest[field]) != getattr(copy_target, field)
+        for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
+    ):
+        raise RegistrySourceContributionError("registry_source_artifact_owner_unavailable")
+    generation = manifest["manifest_sha256"]
+    if type(generation) is not str or re.fullmatch(r"[0-9a-f]{64}", generation) is None:
+        raise RegistrySourceContributionError("registry_source_artifact_generation_invalid")
+    report = (
+        json.loads(manifest["validation_json"])
+        if type(manifest["validation_json"]) is str
+        else manifest["validation_json"]
+    )
+    if type(report) is not dict:
+        raise RegistrySourceContributionError("registry_source_artifact_validation_invalid")
+    validation = report.get("final_validation")
+    if validation is not None and (
+        type(validation) is not dict
+        or validation.get("candidate_id") != copy_target.candidate_id
+        or validation.get("schema_name") != copy_target.schema_name
+        or validation.get("complete") is not True
+        or "source_generations" in validation
+        and validation["source_generations"]
+        != (
+            json.loads(manifest["source_generations"])
+            if type(manifest["source_generations"]) is str
+            else manifest["source_generations"]
+        )
+    ):
+        raise RegistrySourceContributionError("registry_source_artifact_validation_invalid")
+    return {
+        "candidate_id": copy_target.candidate_id,
+        "generation_id": generation,
+        "validation": validation,
+        "semantic_validation": validation.get("semantic_validation") if validation is not None else None,
+    }
 
 
-async def _owner_sources(connection, candidate, custody, control_schema, *, api_read=False):
+async def _owner_sources(connection, candidate, control_schema, *, api_read=False, inventory_data=None):
     receipt = verify_registry_source_contributions(candidate)
     if receipt is None:
         raise RegistrySourceContributionError("registry_source_artifact_owner_missing")
     if "sources" in receipt:
         return tuple(receipt["sources"])
-    from db.registry_source_inventory_schema import INVENTORY_TABLE
     from process.registry_source_inventory_reference import verify_source_recipe_metadata
-    from process.registry_source_inventory_store import _load_locked_source_inventory
+    from process.registry_source_inventory_store import load_source_inventory
     from process.registry_source_inventory_summaries import (
         contribution_summary_v3,
         contribution_summary_v4,
@@ -193,23 +231,14 @@ async def _owner_sources(connection, candidate, custody, control_schema, *, api_
 
     try:
         expected = verify_source_recipe_metadata(candidate).inventory
-        if api_read:
-            from process.registry_source_inventory_store import load_source_inventory_for_api
-
-            reference, entries = await load_source_inventory_for_api(
+        if expected is None:
+            raise ValueError
+        if inventory_data is None:
+            reference, entries = await load_source_inventory(
                 connection, _artifact_copy_target(candidate), candidate, control_schema=control_schema
             )
         else:
-            inventory_oid = custody["receipt"]["closure"]["relation_oids"][INVENTORY_TABLE]
-            if type(inventory_oid) is not int or not 0 < inventory_oid < 2**32:
-                raise ValueError
-            reference, entries = await _load_locked_source_inventory(
-                connection,
-                _artifact_copy_target(candidate),
-                candidate,
-                expected_table_oid=inventory_oid,
-                control_schema=control_schema,
-            )
+            reference, entries = inventory_data
         source_descriptors = tuple(
             json.loads(entry.contribution_json) for entry in entries if entry.contribution_json is not None
         )
@@ -251,18 +280,19 @@ def _selected_by_owner(descriptors):
     return selected_by_owner
 
 
-def _authenticate_owned_source(owner, custody, descriptor, reference, *, sources=None):
-    # API reads pass no custody: a published owner is identified by its schema name.
-    if owner["schema_name"] != "network_candidate_" + UUID(reference.fact_candidate_id).hex or (
-        custody is not None
-        and (
-            custody["seal_sha256"] != reference.fact_seal_sha256
-            or custody["receipt"]["closure"]["relation_oids"].get(CONTRIBUTION_TABLE) != reference.fact_table_oid
-        )
+def _resolved_owned_source(candidate, generation, descriptor, reference, *, sources):
+    if str(candidate["candidate_id"]) != reference.fact_candidate_id:
+        raise RegistrySourceContributionError("registry_source_artifact_generation_changed")
+    coordinates = candidate["schema_name"], CONTRIBUTION_TABLE, generation
+    if reference.fact_schema_name is not None and coordinates != (
+        reference.fact_schema_name,
+        reference.fact_table_name,
+        reference.fact_generation_id,
     ):
-        raise RegistrySourceContributionError("registry_source_artifact_physical_identity_changed")
-    owning = _owning_descriptor(owner, descriptor, sources=sources)
-    return ResolvedSourceFactArtifact(reference, owner["schema_name"], dict(owning))
+        raise RegistrySourceContributionError("registry_source_artifact_generation_changed")
+    owning = _owning_descriptor(candidate, descriptor, sources=sources)
+    named = SourceFactArtifactReference(reference.fact_candidate_id, *coordinates)
+    return ResolvedSourceFactArtifact(named, candidate["schema_name"], dict(owning))
 
 
 _UNFILTERED_FACT_HEAP_SQL = """SELECT c.relkind='r' AND c.relpersistence='p'
@@ -283,29 +313,17 @@ async def _require_unfiltered_fact_heap(connection, schema_name):
 async def _resolve_owner_page(connection, owners_by_identity, selected_by_owner, control_schema, *, api_read=False):
     resolved_by_recipe = {}
     for identity, candidate in owners_by_identity.items():
-        custody = None
-        if api_read:
-            await _require_unfiltered_fact_heap(connection, candidate["schema_name"])
-        else:
-            custody = await _verify_artifact_owner(connection, candidate, control_schema)
-        sources = await _owner_sources(
-            connection, candidate, custody, control_schema, **({"api_read": True} if api_read else {})
-        )
+        evidence = await load_published_artifact_validation(connection, candidate, control_schema)
+        sources = await _owner_sources(connection, candidate, control_schema, api_read=api_read)
         for descriptor, reference in selected_by_owner[identity]:
-            resolved_by_recipe[descriptor["recipe_sha256"]] = _authenticate_owned_source(
-                candidate, custody, descriptor, reference, sources=sources
+            resolved_by_recipe[descriptor["recipe_sha256"]] = _resolved_owned_source(
+                candidate, evidence["generation_id"], descriptor, reference, sources=sources
             )
     return resolved_by_recipe
 
 
 async def authenticate_anchored_source_fact_metadata(connection, descriptors, *, control_schema, api_read=False):
-    """Resolve bounded direct owners once each, including retained ineligible manifests.
-
-    Own-source descriptors are omitted: their physical identity requires the
-    caller's checked creation/closure phase. No predecessor chains are followed.
-    This authenticates metadata and native closure, without reading fact payloads.
-    Staging additionally calls the distinct bounded content verifier below.
-    """
+    """Resolve complete source scope and original named generations in bounded pages."""
     if (
         type(api_read) is not bool
         or not connection.is_in_transaction()
@@ -339,7 +357,7 @@ async def authenticate_anchored_source_fact_metadata(connection, descriptors, *,
 
 
 async def verify_anchored_source_fact_contents(connection, descriptors, *, control_schema):
-    """Authenticate direct owners and verify bounded native content before stage reuse."""
+    """Resolve original named generations and compare complete fact content before reuse."""
     try:
         if type(descriptors) not in {tuple, list} or len(descriptors) > 1000:
             raise ValueError
@@ -365,18 +383,34 @@ async def verify_anchored_source_fact_contents(connection, descriptors, *, contr
 
 
 async def retained_source_fact_descriptors(connection, candidate_id, *, control_schema):
-    """Bind each published source to its original own heap or its existing direct anchor."""
+    """Bind retained source facts to recorded names and logical published generations."""
     candidates = await _published_artifact_candidates(connection, control_schema, {candidate_id})
     candidate = candidates[candidate_id]
-    custody = await _verify_artifact_owner(connection, candidate, control_schema)
-    sources = await _owner_sources(connection, candidate, custody, control_schema)
+    evidence = await load_published_artifact_validation(connection, candidate, control_schema)
+    sources = await _owner_sources(connection, candidate, control_schema)
     reference = SourceFactArtifactReference(
-        candidate_id, custody["receipt"]["closure"]["relation_oids"][CONTRIBUTION_TABLE], custody["seal_sha256"]
+        candidate_id, candidate["schema_name"], CONTRIBUTION_TABLE, evidence["generation_id"]
     )
-    return tuple(
-        {**source, **asdict(reference)} if source_fact_artifact_reference(source) is None else dict(source)
+    legacy_sources = [
+        source
         for source in sources
+        if source_fact_artifact_reference(source) is not None
+        and source_fact_artifact_reference(source).fact_schema_name is None
+    ]
+    resolved = (
+        await authenticate_anchored_source_fact_metadata(connection, legacy_sources, control_schema=control_schema)
+        if legacy_sources
+        else {}
     )
+    named_sources = []
+    for source in sources:
+        selected = source_fact_artifact_reference(source)
+        if selected is None:
+            selected = reference
+        elif selected.fact_schema_name is None:
+            selected = resolved[source["recipe_sha256"]].reference
+        named_sources.append({**_validated_descriptor(source), **asdict(selected)})
+    return tuple(named_sources)
 
 
 resolve_anchored_source_facts = verify_anchored_source_fact_contents

@@ -54,24 +54,13 @@ async def _preservation_reader(directory, pinned_source, capability, stage):
     session = reader_database.session_factory()
     reader = None
     try:
-        async with asyncio.timeout(5):
-            driver = await pin._require_reader(session, reader_database, capability.policy)
-            await pin._same_database(capability.connection, driver)
-            await driver.execute(
-                f"LOCK TABLE {storage_relation(stage.schema, stage.target)} IN ACCESS SHARE MODE NOWAIT"
-            )
-            locked = await driver.fetchval(
-                "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='relation' "
-                "AND relation=$1::oid AND mode='AccessShareLock' AND granted)",
-                stage.incumbent.oid,
-            )
-            _require(locked is True, "incumbent_changed")
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
         reader = pin._SourceReader(session, stage.schema, {})
         yield reader
     finally:
         if reader is not None:
             reader.deactivate()
-        await pin._close_reader(session)
+        await session.close()
 
 
 async def _verify_projection(capability, stage, statement, params_by_name):

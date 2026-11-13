@@ -15,12 +15,7 @@ from process import provider_directory_output_snapshot_custody as custody
 from process import provider_directory_output_snapshot_journal as journal
 from process import provider_directory_output_snapshot_stage as stages
 from process.provider_directory_dataset_rehydrate_pages import projected_pages
-from process.provider_directory_dataset_rehydrate_pin import (
-    _close_reader,
-    _require_reader,
-    _same_database,
-    _SourceReader,
-)
+from process.provider_directory_dataset_rehydrate_pin import _SourceReader
 from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
 from process.provider_directory_output_snapshot_catalog import (
     OUTPUT_CATALOG_SQL,
@@ -222,8 +217,8 @@ async def _preservation_reader(directory, capability, input_receipts):
     database = await directory.db._connect_reader()
     session, reader = database.session_factory(), None
     try:
-        driver = await _require_reader(session, database, capability.policy)
-        await _same_database(capability.connection, driver)
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        driver = (await (await session.connection()).get_raw_connection()).driver_connection
         await driver.execute(
             "LOCK TABLE "
             + ",".join(storage_relation(receipt.schema, receipt.target) for receipt in input_receipts.values())
@@ -242,14 +237,13 @@ async def _preservation_reader(directory, capability, input_receipts):
     finally:
         if reader is not None:
             reader.deactivate()
-        await _close_reader(session)
+        await session.close()
 
 
 async def _fresh_controls(directory, expected, parent_driver):
     """Authenticate a fresh second native snapshot while the original cut locks are held."""
     async with source_transaction(directory.db, isolation="read committed") as session:
         publisher = bound_publisher()
-        await _same_database(parent_driver, publisher.connection)
         actual = await _control_witness(session, publisher.connection, publisher.policy)
         require_output(actual == expected, "canonical_control_changed")
 

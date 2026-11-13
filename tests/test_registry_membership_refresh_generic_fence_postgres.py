@@ -10,7 +10,6 @@ from sqlalchemy import text
 
 from process.registry_company_approval_fence import registry_company_approval_transaction
 from process.registry_generic_accepted_capture import read_current_generic_fhir_head
-from process.registry_membership_refresh_contract import RegistryMembershipRefreshUnavailable
 from process.registry_membership_refresh_source_fence import RegistryMembershipRefreshHeadFences
 from process.registry_membership_refresh_sources import (
     observe_registry_membership_refresh_sources,
@@ -170,34 +169,18 @@ async def test_existing_endpoint_publisher_lock_refuses_source_pin_and_releases_
     await _assert_heads_released(context, writer)
 
 
-@pytest.mark.parametrize(
-    "failure",
-    ("bad_current_index", "missing_lock_privilege", "missing_metadata_select", "unsafe_login", "unsafe_owner"),
-)
-async def test_native_head_qualification_fails_closed(generic_head_db, failure):
+@pytest.mark.parametrize("failure", ["missing_lock_privilege", "missing_metadata_select"])
+async def test_native_head_access_denial_fails_closed(generic_head_db, failure):
     context = generic_head_db
     admin, schema, role = context.source.admin, context.source.schema, context.roles_by_kind["head"]
-    if failure == "bad_current_index":
-        await admin.execute(f'DROP INDEX "{schema}".provider_directory_endpoint_dataset_current_idx')
-        await admin.execute(
-            f"CREATE INDEX provider_directory_endpoint_dataset_current_idx "
-            f'ON "{schema}".provider_directory_endpoint_dataset(endpoint_id) WHERE is_current=true'
-        )
-    elif failure == "missing_lock_privilege":
+    if failure == "missing_lock_privilege":
         await admin.execute(f'REVOKE UPDATE(endpoint_id) ON "{schema}".provider_directory_api_endpoint FROM "{role}"')
-    elif failure == "missing_metadata_select":
-        await admin.execute(f'REVOKE SELECT(status) ON "{schema}".provider_directory_endpoint_dataset FROM "{role}"')
-    elif failure == "unsafe_login":
-        await admin.execute(f'ALTER ROLE "{role}" CREATEDB')
     else:
-        await admin.execute(f'ALTER ROLE "{context.source.role_by_kind["source"]}" LOGIN')
-    expected_error = (
-        RegistryMembershipRefreshUnavailable if failure == "unsafe_login" else RegistryRefreshAnchorUnavailable
-    )
-    with pytest.raises(expected_error):
+        await admin.execute(f'REVOKE SELECT(status) ON "{schema}".provider_directory_endpoint_dataset FROM "{role}"')
+    with pytest.raises(RegistryRefreshAnchorUnavailable):
         async with registry_company_approval_transaction(context.outer, control_schema=context.schema) as session:
             async with _pin(context, session):
-                pytest.fail("Unqualified native metadata authority was accepted")
+                pytest.fail("Native metadata access denial yielded source pins")
     await _assert_heads_released(context, await actor_connection(context, "writer"))
 
 

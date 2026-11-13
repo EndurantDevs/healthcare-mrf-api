@@ -39,7 +39,7 @@ from api.code_systems import (
 )
 from api.endpoint.pagination import PaginationParams
 from api.network_address_scope import current_network_address_scope
-from api.network_read_execution import direct_heap_relation_sql, execute_network_read, has_network_read_inventory
+from api.network_read_execution import qualified_relation_sql
 from api.plan_pricing_em_distance import search_plan_pricing_em_distance
 from api.plan_pricing_projection import (
     PlanPricingProjectionUnavailable,
@@ -410,8 +410,7 @@ async def _is_relation_available(session: Any, table_name: str) -> bool:
     """Probe optional reference-data relations, never snapshot serving layouts."""
 
     try:
-        result = await execute_network_read(
-            session,
+        result = await session.execute(
             text("SELECT to_regclass(:table_name)"),
             {"table_name": table_name},
         )
@@ -1640,7 +1639,7 @@ async def _optional_ptg2_query(session, statement, parameters_by_name):
     """Roll back optional failures only to a savepoint, preserving read fences."""
 
     async with provider_read_savepoint(session):
-        return await execute_network_read(session, statement, parameters_by_name)
+        return await session.execute(statement, parameters_by_name)
 
 
 def _ptg2_row_address_key(row: dict[str, Any]) -> str | None:
@@ -2297,8 +2296,7 @@ async def _provider_set_ids_for_keys(
         "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
         "provider_set_keys": keys,
     }
-    provider_set_rows = await execute_network_read(
-        session,
+    provider_set_rows = await session.execute(
         text(
             f"""
             SELECT provider_set_key, provider_set_global_id_128
@@ -2334,8 +2332,7 @@ async def _hydrate_provider_set_network_names(
     )
     if not provider_set_ids:
         return
-    network_metadata_query = await execute_network_read(
-        session,
+    network_metadata_query = await session.execute(
         text(
             f"""
             SELECT encode(provider_set_global_id_128, 'hex') AS provider_set_id,
@@ -2440,8 +2437,7 @@ async def _provider_set_metadata_for_ids(
         "shared_snapshot_key": _required_shared_snapshot_key(serving_tables),
         "provider_set_ids": [bytes.fromhex(provider_set_id) for provider_set_id in normalized_ids],
     }
-    query_result = await execute_network_read(
-        session,
+    query_result = await session.execute(
         text(
             f"""
             SELECT provider_set.provider_set_key,
@@ -3700,8 +3696,7 @@ async def _execute_manifest_reverse_code_rows(
 ) -> list[dict[str, Any]]:
     """Execute the fixed reverse-code metadata projection."""
 
-    code_row_result = await execute_network_read(
-        session,
+    code_row_result = await session.execute(
         text(
             f"""
             SELECT code_metadata.code_key,
@@ -4578,8 +4573,7 @@ async def _shared_provider_group_ids_for_keys(
     keys = tuple(sorted({int(provider_group_key) for provider_group_key in provider_group_keys}))
     if not keys:
         return {}
-    result = await execute_network_read(
-        session,
+    result = await session.execute(
         text(
             f"""
             SELECT provider_group_key, provider_group_global_id_128
@@ -4608,8 +4602,7 @@ async def _shared_provider_group_keys_for_ids(
     ids = tuple(_deduplicate_ptg2_manifest_ids(tuple(provider_group_ids)))
     if not ids:
         return {}
-    result = await execute_network_read(
-        session,
+    result = await session.execute(
         text(
             f"""
             SELECT provider_group_key, provider_group_global_id_128
@@ -5993,8 +5986,7 @@ async def _shared_rate_code_rows(
 ) -> list[dict[str, Any]]:
     """Read bound code metadata for one shared plan/code scope."""
 
-    code_query_result = await execute_network_read(
-        session,
+    code_query_result = await session.execute(
         text(
             f"""
             SELECT code_metadata.code_key,
@@ -7469,8 +7461,7 @@ async def _version_three_dictionary_query(
 ):
     _require_strict_shared_v3(serving_tables)
     dictionary_table = _shared_v3_price_attr_table(serving_tables)
-    return await execute_network_read(
-        session,
+    return await session.execute(
         text(
             f"""
             SELECT attribute_kind, attribute_key, value
@@ -8059,8 +8050,7 @@ async def _taxonomy_rows_for_npis(
         taxonomy_table,
     ) or not await _is_relation_available(session, vocabulary_table):
         return {}
-    taxonomy_query = await execute_network_read(
-        session,
+    taxonomy_query = await session.execute(
         text(
             f"""
             SELECT
@@ -8364,8 +8354,8 @@ async def _enriched_provider_rows_for_npis(
     # and spend hundreds of milliseconds compiling JIT code for this tiny,
     # bounded provider page. Keep imports independently tunable and disable JIT
     # for the remainder of this request transaction (`SET LOCAL` scope).
-    await execute_network_read(session, text("SET LOCAL jit = off"))
-    enrichment_query = await execute_network_read(session, enrich_stmt, {"npis": npis})
+    await session.execute(text("SET LOCAL jit = off"))
+    enrichment_query = await session.execute(enrich_stmt, {"npis": npis})
     enriched_provider_rows = [_row_mapping(provider_record) for provider_record in enrichment_query]
     return await _overlay_provider_directory_corroboration(
         session,
@@ -9122,8 +9112,7 @@ async def _filter_npis_by_taxonomy(
     )
     if not predicates:
         return candidate_npis[: max(int(limit), 1)]
-    filtered_npi_query = await execute_network_read(
-        session,
+    filtered_npi_query = await session.execute(
         text(
             f"""
             SELECT source_npis.npi
@@ -9916,8 +9905,7 @@ async def _membership_exact_scope_npis(
     )
     predicate_sql = " AND ".join(predicates)
     projection_sql = _membership_scope_projection_sql(args, query_parameters_by_name)
-    exact_scope = await execute_network_read(
-        session,
+    exact_scope = await session.execute(
         text(
             f"""
             SELECT scope_npis.npi
@@ -10782,8 +10770,7 @@ async def _hydrate_address_provenance(
     if use_stored_only and not is_evidence_relation_available:
         return "unavailable"
     if location_requests and is_evidence_relation_available:
-        provenance_result = await execute_network_read(
-            session,
+        provenance_result = await session.execute(
             text(_ADDRESS_PROVENANCE_SQL if candidate_inputs is None else _address_provenance_sql(candidate_inputs)),
             {
                 "location_keys": [request[0] for request in location_requests],
@@ -11024,7 +11011,7 @@ async def _execute_membership_location_sql(
     uses_large_npi_scope = len(candidate_npis) > _MEMBERSHIP_KNN_SPARSE_SCOPE_LIMIT
     if offset == 0 and (query_context.knn_order_sql is not None or uses_large_npi_scope):
         prior_planner_settings = await _enable_serial_knn_planning(session)
-    query_result = await execute_network_read(session, text(location_sql), query_context.parameter_map)
+    query_result = await session.execute(text(location_sql), query_context.parameter_map)
     try:
         return [_row_mapping(query_row) for query_row in query_result]
     finally:
@@ -17842,8 +17829,8 @@ async def _procedure_details_for_rows(
         query_parameters_by_name[f"code_system_{idx}"] = code_system
         query_parameters_by_name[f"code_{idx}"] = code
     catalog_relation = f"{PTG2_SCHEMA}.code_catalog"
-    if has_network_read_inventory(session):
-        catalog_relation = direct_heap_relation_sql(session, PTG2_SCHEMA, "code_catalog")
+    if getattr(session, "info", {}).get("api_reader_verified") is True:
+        catalog_relation = qualified_relation_sql(PTG2_SCHEMA, "code_catalog")
     try:
         procedure_catalog_query = await _optional_ptg2_query(
             session,
@@ -19872,8 +19859,7 @@ async def _has_ptg2_table_plan_code(
         column="code_metadata.reported_code_system",
         code_system=requested_system,
     )
-    exists_result = await execute_network_read(
-        session,
+    exists_result = await session.execute(
         text(
             f"""
             SELECT EXISTS (
@@ -20031,8 +20017,7 @@ async def _is_cached_network_serving_tables_current(
     snapshot_ids = tuple(serving_tables_by_snapshot_id)
     if not snapshot_ids:
         return True
-    validation_result = await execute_network_read(
-        session,
+    validation_result = await session.execute(
         text(_PTG2_NETWORK_SERVING_TABLES_REVALIDATION_SQL),
         {
             "snapshot_ids": list(snapshot_ids),
@@ -20348,8 +20333,7 @@ async def _factorized_card_candidates(
         return _FactorizedCardCandidateSelection({}, 0, True)
     taxonomy_sql, taxonomy_parameters = _factorized_card_frozen_taxonomy(args)
     candidate_limit = max(_ptg2_manifest_location_match_limit(), target_count)
-    candidate_result = await execute_network_read(
-        session,
+    candidate_result = await session.execute(
         _factorized_card_candidate_query(
             taxonomy_sql,
             **({"binding_ordinals": binding_ordinals} if binding_ordinals is not None else {}),
@@ -20509,8 +20493,7 @@ async def _factorized_card_complete_selected_npis(
     if not selected_npis or binding_ordinals == ():
         return []
     taxonomy_sql, taxonomy_parameters = _factorized_card_frozen_taxonomy(args)
-    completion_result = await execute_network_read(
-        session,
+    completion_result = await session.execute(
         _factorized_card_completion_query(
             taxonomy_sql,
             **({"binding_ordinals": binding_ordinals} if binding_ordinals is not None else {}),

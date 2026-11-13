@@ -1,10 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Close an exact live EUA/NPI capture without claiming original ingestion lineage.
-
-The two parents share one caller-owned MVCC snapshot. ACCESS SHARE protects their
-native identities while routine source writes continue. Only newly created
-heaps change ownership; legacy guards and generation authority remain intact.
-"""
+"""Capture named generation-zero EUA/NPI data in one caller-owned MVCC snapshot."""
 
 from __future__ import annotations
 
@@ -15,23 +10,15 @@ import struct
 import tempfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from types import SimpleNamespace
 from uuid import UUID
 
 import asyncpg
 
 from db.models import EntityAddressUnified, NPIData
-from process.entity_address_result_generation import validate_entity_address_result_generation_authority
 from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_cms_registry_address_equivalence import _declared_type
-from process.network_custom_address_source import (
-    NetworkCustomAddressSourceError,
-    _closed,
-    _digest,
-    _source_identity_with_read_roles,
-)
-from process.network_membership_writer_closure import NetworkWriterClosureError, _check_roles, _transfer_and_grant
-from process.npi_result_generation import validate_npi_result_generation_authority
+from process.network_custom_address_source import _digest
+from process.provider_directory_generic_source_provision import freeze_fhir_source_snapshot
 from process.provider_directory_proof_store import _drain_proof_steps_async, _merged_spool_lines, _RecordSpool
 
 _COPY_BATCH_ROWS = 4096
@@ -52,20 +39,12 @@ class NetworkBootstrapSourceSpecification:
     bootstrap_id: str
     address_schema: str
     npi_schema: str
-    address_table_oid: int
-    npi_table_oid: int
 
 
 @dataclass(frozen=True)
 class BootstrapParentReceipt:
     schema_name: str
     table_name: str
-    schema_oid: int
-    table_oid: int
-    owner_oid: int
-    authority_table_oid: int
-    authority_json: str
-    shape_sha256: str
     row_count: int
     rows_sha256: str
 
@@ -73,30 +52,30 @@ class BootstrapParentReceipt:
 @dataclass(frozen=True)
 class NetworkBootstrapSourceReceipt:
     specification: NetworkBootstrapSourceSpecification
-    owner_role: str
-    runtime_roles: tuple[str, ...]
     parent_receipts: tuple[BootstrapParentReceipt, ...]
-    capture_snapshot: str
     captured_at: str
-    schema_oid: int
-    owner_oid: int
-    relation_oids: tuple[tuple[str, int], ...]
-    index_oids: tuple[tuple[str, int], ...]
     generation_sha256: str
 
     @property
     def address_source(self):
-        """Return the exact protected address pin for composition."""
+        """Return the named address edition for composition."""
         return PinnedAddressSource(_schema_name(self.specification), "entity_address_unified", self.generation_sha256)
 
     @property
     def npi_source(self):
-        """Return the matching protected NPI pin from the same capture."""
+        """Return the matching NPI edition from the same capture."""
         return PinnedAddressSource(_schema_name(self.specification), "npi", self.generation_sha256)
 
     def as_dict(self):
-        """Return the bounded immutable capture receipt."""
-        return {"component": "network_bootstrap_sources", "revision": 1, **asdict(self)}
+        """Return portable names, capture time and complete data accounting."""
+        return {
+            "component": "network_bootstrap_sources",
+            "revision": 2,
+            "bootstrap_id": self.specification.bootstrap_id,
+            "parent_receipts": [asdict(parent) for parent in self.parent_receipts],
+            "captured_at": self.captured_at,
+            "generation_sha256": self.generation_sha256,
+        }
 
 
 def _schema_name(specification):
@@ -110,9 +89,6 @@ def _schema_name(specification):
         raise NetworkBootstrapSourceError("Bootstrap identity is invalid")
     for schema_name in (specification.address_schema, specification.npi_schema):
         _identifier(schema_name)
-    for relation_oid in (specification.address_table_oid, specification.npi_table_oid):
-        if type(relation_oid) is not int or not 1 <= relation_oid <= 4294967295:
-            raise NetworkBootstrapSourceError("Expected parent OID is invalid")
     schema_name = "network_bootstrap_" + identity.hex
     if schema_name in (specification.address_schema, specification.npi_schema):
         raise NetworkBootstrapSourceError("Capture parents must be external")
@@ -142,15 +118,15 @@ async def _transaction(connection):
         raise NetworkBootstrapSourceError("Bootstrap requires a caller repeatable-read transaction")
 
 
-async def _shape(connection, table_oid):
+async def _shape(connection, schema_name, table_name):
+    """Read actual named columns and declared types without storing native identity."""
+    relation = f"{_identifier(schema_name)}.{_identifier(table_name)}"
     columns = await connection.fetch(
-        """SELECT attname,atttypid::regtype::text AS type,atttypmod,attnotnull,
-      pg_get_expr(d.adbin,d.adrelid) AS default_expr FROM pg_attribute a LEFT JOIN pg_attrdef d
-      ON d.adrelid=a.attrelid AND d.adnum=a.attnum
-      WHERE attrelid=$1::oid AND attnum>0 AND NOT attisdropped ORDER BY attnum""",
-        table_oid,
+        "SELECT attname,format_type(atttypid,atttypmod) AS type FROM pg_attribute "
+        "WHERE attrelid=to_regclass($1) AND attnum>0 AND NOT attisdropped ORDER BY attnum",
+        relation,
     )
-    return tuple(column["attname"] for column in columns), _digest([dict(column) for column in columns])
+    return tuple((column["attname"], column["type"]) for column in columns)
 
 
 async def _content(connection, schema_name, table_name):
@@ -185,132 +161,54 @@ async def _content(connection, schema_name, table_name):
     return total_rows, digest.hexdigest()
 
 
-async def _parent_shape(connection, table_oid, model):
-    """Validate named model types while retaining the exact ordered native shape."""
-    columns, shape_sha256 = await _shape(connection, table_oid)
-    expected_type_by_name = {column.name: _declared_type(column) for column in model.__table__.columns}
-    if sorted(columns) != sorted(expected_type_by_name):
+async def _parent_shape(connection, schema_name, table_name, model):
+    """Require every named model column and its actual declared type."""
+    columns = await _shape(connection, schema_name, table_name)
+    expected_types_by_column = {column.name: _declared_type(column) for column in model.__table__.columns}
+    if len(columns) != len(expected_types_by_column) or {name for name, _ in columns} != set(expected_types_by_column):
         raise NetworkBootstrapSourceError("Parent model shape differs")
-    native_types = await connection.fetch(
-        "SELECT attname,format_type(atttypid,atttypmod) AS type FROM pg_attribute "
-        "WHERE attrelid=$1::oid AND attnum>0 AND NOT attisdropped ORDER BY attnum",
-        table_oid,
-    )
-    if (
-        len(native_types) != len(columns)
-        or {column["attname"]: column["type"] for column in native_types} != expected_type_by_name
-    ):
+    if dict(columns) != expected_types_by_column:
         raise NetworkBootstrapSourceError("Parent model type differs")
-    return shape_sha256
 
 
-async def _parent(connection, schema_name, table_name, expected_oid):
-    """Admit one exact generation-zero parent without changing its native layout."""
+async def _parent(connection, schema_name, table_name):
+    """Admit a named, explicitly untracked generation-zero parent."""
     authority_name = (
         "entity_address_result_generation" if table_name == "entity_address_unified" else "npi_result_generation"
     )
     parent = f"{_identifier(schema_name)}.{_identifier(table_name)}"
     authority = f"{_identifier(schema_name)}.{_identifier(authority_name)}"
     await connection.execute(f"LOCK TABLE {parent},{authority} IN ACCESS SHARE MODE NOWAIT")
-    locked_oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", parent)
-    catalog = await connection.fetchrow(
-        """SELECT n.oid::bigint AS schema_oid,c.oid::bigint AS table_oid,
-      c.relowner::bigint AS owner_oid,c.relkind,c.relpersistence,c.relrowsecurity,c.relforcerowsecurity
-      FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid WHERE n.nspname=$1 AND c.relname=$2""",
-        schema_name,
-        table_name,
-    )
-    if (
-        catalog is None
-        or locked_oid != expected_oid
-        or catalog["table_oid"] != expected_oid
-        or catalog["relkind"] != b"r"
-        or catalog["relpersistence"] != b"p"
-        or catalog["relrowsecurity"]
-        or catalog["relforcerowsecurity"]
-    ):
-        raise NetworkBootstrapSourceError("Exact native parent identity differs")
     model = EntityAddressUnified if table_name == "entity_address_unified" else NPIData
-    shape_sha256 = await _parent_shape(connection, expected_oid, model)
-    validator = (
-        validate_entity_address_result_generation_authority
-        if table_name == "entity_address_unified"
-        else validate_npi_result_generation_authority
-    )
-    authority_row = await connection.fetchrow(f"SELECT * FROM {authority} WHERE singleton IS TRUE")
+    await _parent_shape(connection, schema_name, table_name, model)
+    authority_rows = await connection.fetch(f"SELECT * FROM {authority} LIMIT 2")
+    if len(authority_rows) != 1:
+        raise NetworkBootstrapSourceError("Parent generation authority is unavailable")
+    authority_by_field = dict(authority_rows[0])
     try:
-        authority_document = validator(dict(authority_row) if authority_row else None).as_dict()
-    except ValueError, RuntimeError:
+        lineage = str(authority_by_field["local_lineage_id"])
+        if not UUID(lineage).int or str(UUID(lineage)) != lineage or authority_by_field["singleton"] is not True:
+            raise ValueError
+    except KeyError, TypeError, ValueError:
         raise NetworkBootstrapSourceError("Parent generation authority is unavailable") from None
-    if authority_document["local_generation"] != 0 or authority_document["serving_generation"] is not None:
+    if type(authority_by_field.get("local_generation")) is not int or authority_by_field["local_generation"] != 0:
         raise NetworkBootstrapSourceError("Bootstrap requires an explicit untracked generation-zero parent")
-    if authority_document.get("canonical_provenance") is not None or authority_document["relation_oids"] is not None:
-        raise NetworkBootstrapSourceError("Parent publication lineage is not a bootstrap input")
-    authority_oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", authority)
-    row_count, rows_sha256 = await _content(connection, schema_name, table_name)
-    return BootstrapParentReceipt(
-        schema_name,
-        table_name,
-        catalog["schema_oid"],
-        expected_oid,
-        catalog["owner_oid"],
-        authority_oid,
-        json.dumps(authority_document, sort_keys=True, separators=(",", ":")),
-        shape_sha256,
-        row_count,
-        rows_sha256,
-    )
-
-
-async def _catalog(connection, schema_name):
-    from process.network_membership_serving_indexes import _serving_plan
-
-    namespace = await connection.fetchrow(
-        "SELECT oid::bigint,nspowner::bigint FROM pg_namespace WHERE nspname=$1", schema_name
-    )
-    if namespace is None:
-        raise NetworkBootstrapSourceError("Retained bootstrap namespace is absent")
-    legacy_objects = {"entity_address_unified", "npi", "entity_address_unified_pkey", "npi_pkey"}
-    indexed_objects = legacy_objects | {name for name, _ in _serving_plan(schema_name)}
-    relations = await connection.fetch(
-        """SELECT c.oid::bigint,c.relname,c.relowner::bigint,c.relkind,
-      c.relpersistence,c.relrowsecurity,c.relforcerowsecurity,c.relhastriggers,i.indrelid::bigint,
-      i.indisvalid,i.indisready,i.indislive FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid=c.oid
-      WHERE c.relnamespace=$1::oid ORDER BY c.relname LIMIT $2""",
-        namespace["oid"],
-        len(indexed_objects) + 1,
-    )
-    heap_oids_by_name = {relation["relname"]: relation["oid"] for relation in relations if relation["relkind"] == b"r"}
-    if (
-        set(heap_oids_by_name) != {"entity_address_unified", "npi"}
-        or {relation["relname"] for relation in relations} not in (legacy_objects, indexed_objects)
-        or any(
-            relation["relkind"] not in {b"r", b"i"}
-            or relation["relpersistence"] != b"p"
-            or relation["relrowsecurity"]
-            or relation["relforcerowsecurity"]
-            or relation["relhastriggers"]
-            or (
-                relation["relkind"] == b"i"
-                and (
-                    relation["indrelid"]
-                    != heap_oids_by_name["npi" if relation["relname"] == "npi_pkey" else "entity_address_unified"]
-                    or not relation["indisvalid"]
-                    or not relation["indisready"]
-                    or not relation["indislive"]
-                )
+    logical_fields = {"origin_lineage_id", "origin_generation", "published_at"}
+    if table_name == "npi":
+        logical_fields.update(
+            (
+                "canonical_publication_ref",
+                "canonical_publication_generation",
+                "canonical_chain_ref",
+                "canonical_import_date",
             )
-            for relation in relations
         )
-    ):
-        raise NetworkBootstrapSourceError("Retained bootstrap object inventory differs")
-    if await connection.fetchval("SELECT EXISTS(SELECT 1 FROM pg_proc WHERE pronamespace=$1::oid)", namespace["oid"]):
-        raise NetworkBootstrapSourceError("Retained bootstrap contains stored routines")
-    return {
-        "namespace": dict(namespace),
-        "relations": [dict(relation) for relation in relations],
-        "heaps": heap_oids_by_name,
-    }
+    if not logical_fields <= authority_by_field.keys():
+        raise NetworkBootstrapSourceError("Parent generation authority is unavailable")
+    if any(authority_by_field[field] is not None for field in logical_fields):
+        raise NetworkBootstrapSourceError("Parent publication lineage is not a bootstrap input")
+    row_count, rows_sha256 = await _content(connection, schema_name, table_name)
+    return BootstrapParentReceipt(schema_name, table_name, row_count, rows_sha256)
 
 
 def _generation(receipt):
@@ -320,26 +218,31 @@ def _generation(receipt):
 
 
 def _decode(document):
+    """Read current or exact historical receipts without carrying physical metadata forward."""
+    from process.network_bootstrap_address_artifact import _receipt
+
     if type(document) is not str or len(document.encode()) > 16384:
         raise NetworkBootstrapSourceError("Retained bootstrap receipt is unavailable")
     try:
         fields = json.loads(document)
-        if type(fields) is not dict:
-            raise ValueError
-        component, revision = fields.pop("component"), fields.pop("revision")
-        if component != "network_bootstrap_sources" or type(revision) is not int or revision != 1:
-            raise ValueError
-        fields["specification"] = NetworkBootstrapSourceSpecification(**fields["specification"])
-        fields["parent_receipts"] = tuple(BootstrapParentReceipt(**parent) for parent in fields["parent_receipts"])
-        fields["runtime_roles"] = tuple(fields["runtime_roles"])
-        for key in ("relation_oids", "index_oids"):
-            fields[key] = tuple(tuple(identity) for identity in fields[key])
-        receipt = NetworkBootstrapSourceReceipt(**fields)
         if (
-            tuple(parent.table_name for parent in receipt.parent_receipts) != ("entity_address_unified", "npi")
-            or any(type(parent.row_count) is not int or parent.row_count < 0 for parent in receipt.parent_receipts)
-            or _generation(receipt) != receipt.generation_sha256
+            type(fields) is not dict
+            or fields.get("component") != "network_bootstrap_sources"
+            or type(fields.get("revision")) is not int
+            or fields["revision"] not in (1, 2)
         ):
+            raise ValueError
+        is_legacy = fields["revision"] == 1
+        fields = _receipt(fields)
+        parents = tuple(BootstrapParentReceipt(**parent) for parent in fields["parent_receipts"])
+        receipt = NetworkBootstrapSourceReceipt(
+            NetworkBootstrapSourceSpecification(fields["bootstrap_id"], parents[0].schema_name, parents[1].schema_name),
+            parents,
+            fields["captured_at"],
+            fields["generation_sha256"],
+        )
+        _schema_name(receipt.specification)
+        if not is_legacy and _generation(receipt) != receipt.generation_sha256:
             raise ValueError
         return receipt
     except KeyError, TypeError, ValueError:
@@ -347,55 +250,34 @@ def _decode(document):
 
 
 async def _verify_capture(connection, receipt, *, verify_content):
-    """Check native custody; fresh uncommitted copies already proved content parity."""
-    from process.network_bootstrap_read_access import bootstrap_read_roles
-
+    """Validate the stored logical edition and actual named schema and data."""
     await _transaction(connection)
     if type(receipt) is not NetworkBootstrapSourceReceipt:
         raise NetworkBootstrapSourceError("An immutable bootstrap receipt is required")
     schema_name = _schema_name(receipt.specification)
-    _roles(receipt.owner_role, receipt.runtime_roles)
     stored = await connection.fetchval(
         "SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=$1", schema_name
     )
     if _decode(stored) != receipt:
         raise NetworkBootstrapSourceError("Retained bootstrap recipe differs")
-    catalog = await _catalog(connection, schema_name)
-    current_owner_oid = await connection.fetchval(
-        "SELECT oid::bigint FROM pg_roles WHERE rolname=$1", receipt.owner_role
-    )
-    indexes = tuple(
-        (relation["relname"], relation["oid"]) for relation in catalog["relations"] if relation["relkind"] == b"i"
-    )
-    if (
-        current_owner_oid != receipt.owner_oid
-        or catalog["namespace"] != {"oid": receipt.schema_oid, "nspowner": receipt.owner_oid}
-        or tuple(sorted(catalog["heaps"].items())) != receipt.relation_oids
-        or indexes != receipt.index_oids
-        or any(relation["relowner"] != receipt.owner_oid for relation in catalog["relations"])
-    ):
-        raise NetworkBootstrapSourceError("Retained native bootstrap identities differ")
-    try:
-        read_roles = await bootstrap_read_roles(connection, receipt)
-        await _closed(connection, receipt.schema_oid, receipt.owner_oid, read_roles, None)
-        for parent in receipt.parent_receipts:
-            pin = receipt.address_source if parent.table_name == "entity_address_unified" else receipt.npi_source
-            identity = await _source_identity_with_read_roles(
-                connection, pin, read_roles, address=parent.table_name == "entity_address_unified"
-            )
-            if identity[3] != parent.shape_sha256 or (
-                verify_content
-                and await _content(connection, schema_name, parent.table_name) != (parent.row_count, parent.rows_sha256)
-            ):
-                raise NetworkBootstrapSourceError("Retained bootstrap content or shape differs")
-    except NetworkCustomAddressSourceError:
-        raise NetworkBootstrapSourceError("Retained bootstrap ownership or privileges differ") from None
+    for parent in receipt.parent_receipts:
+        model = EntityAddressUnified if parent.table_name == "entity_address_unified" else NPIData
+        await _parent_shape(connection, schema_name, parent.table_name, model)
+        await connection.execute(f"SELECT * FROM {_identifier(schema_name)}.{_identifier(parent.table_name)} LIMIT 0")
+        if verify_content and await _content(connection, schema_name, parent.table_name) != (
+            parent.row_count,
+            parent.rows_sha256,
+        ):
+            raise NetworkBootstrapSourceError("Retained bootstrap content differs")
     return receipt
 
 
 async def verify_network_bootstrap_sources(connection, receipt):
-    """Revalidate complete retained content and custody without recapturing live parents."""
-    return await _verify_capture(connection, receipt, verify_content=True)
+    """Revalidate complete retained data without recapturing mutable parents."""
+    try:
+        return await _verify_capture(connection, receipt, verify_content=True)
+    except asyncpg.PostgresError:
+        raise NetworkBootstrapSourceError("Named bootstrap data is unavailable") from None
 
 
 async def _copy_key(connection, parent):
@@ -404,9 +286,9 @@ async def _copy_key(connection, parent):
     indexed = await connection.fetchval(
         """SELECT EXISTS(SELECT 1 FROM pg_index i JOIN pg_attribute a
         ON a.attrelid=i.indrelid AND a.attnum=i.indkey[0]
-        WHERE i.indrelid=$1::oid AND i.indisprimary AND i.indisvalid AND i.indisready
+        WHERE i.indrelid=to_regclass($1) AND i.indisprimary AND i.indisvalid AND i.indisready
         AND i.indnkeyatts=1 AND a.attname=$2 AND a.attnotnull)""",
-        parent.table_oid,
+        f"{_identifier(parent.schema_name)}.{_identifier(parent.table_name)}",
         key,
     )
     if indexed is not True:
@@ -537,28 +419,21 @@ async def _copy_parent_heaps(connection, schema_name, parents):
 
 
 async def _persist_capture(connection, receipt):
-    """Store the closed receipt before commit and check native custody without rescanning rows."""
+    """Store the data receipt before native DCL closes the new snapshot."""
     namespace = _identifier(_schema_name(receipt.specification))
-    owner_role = receipt.owner_role
     receipt = replace(receipt, generation_sha256=_generation(receipt))
     document = json.dumps(receipt.as_dict(), sort_keys=True, separators=(",", ":"))
     if len(document.encode()) > 16384:
         raise NetworkBootstrapSourceError("Bootstrap receipt exceeds its bound")
-    publisher = await connection.fetchval("SELECT quote_ident(current_user)")
     quoted = await connection.fetchval("SELECT quote_literal($1::text)", document)
-    await connection.execute(f"SET LOCAL ROLE {_identifier(owner_role)}")
-    try:
-        async with connection.transaction():
-            await connection.execute(f"COMMENT ON SCHEMA {namespace} IS {quoted}")
-            return await _verify_capture(connection, receipt, verify_content=False)
-    finally:
-        await connection.execute(f"SET LOCAL ROLE {publisher}")
+    await connection.execute(f"COMMENT ON SCHEMA {namespace} IS {quoted}")
+    return receipt
 
 
 async def prepare_network_bootstrap_sources(connection, specification, *, owner_role, runtime_roles):
-    """Prepare once, atomically close the capture, or replay its exact protected receipt."""
+    """Copy once, freeze with native DCL, or replay the existing named edition."""
     schema_name = _schema_name(specification)
-    roles = _roles(owner_role, runtime_roles)
+    _roles(owner_role, runtime_roles)
     await _transaction(connection)
     try:
         async with connection.transaction():
@@ -567,51 +442,27 @@ async def prepare_network_bootstrap_sources(connection, specification, *, owner_
             )
             if stored is not None:
                 receipt = _decode(stored)
-                if (receipt.specification, receipt.owner_role, receipt.runtime_roles) != (
-                    specification,
-                    owner_role,
-                    runtime_roles,
-                ):
+                if receipt.specification != specification:
                     raise NetworkBootstrapSourceError("Retained bootstrap recipe differs")
                 return await verify_network_bootstrap_sources(connection, receipt)
-            await _check_roles(connection, roles)
             parents = (
-                await _parent(
-                    connection, specification.address_schema, "entity_address_unified", specification.address_table_oid
-                ),
-                await _parent(connection, specification.npi_schema, "npi", specification.npi_table_oid),
+                await _parent(connection, specification.address_schema, "entity_address_unified"),
+                await _parent(connection, specification.npi_schema, "npi"),
             )
-            capture = await connection.fetchrow(
-                "SELECT pg_current_snapshot()::text AS snapshot,transaction_timestamp()::text AS captured_at"
-            )
-            if len(capture["snapshot"].encode()) > 8192:
-                raise NetworkBootstrapSourceError("Capture snapshot exceeds the receipt bound")
-            namespace = _identifier(schema_name)
-            await connection.execute(f"CREATE SCHEMA {namespace}")
+            captured_at = await connection.fetchval("SELECT transaction_timestamp()::text")
+            await connection.execute(f"CREATE SCHEMA {_identifier(schema_name)}")
             await _copy_parent_heaps(connection, schema_name, parents)
-            catalog = await _catalog(connection, schema_name)
-            await _transfer_and_grant(connection, SimpleNamespace(schema_name=schema_name), roles, catalog)
-            owner_oid = await connection.fetchval("SELECT oid::bigint FROM pg_roles WHERE rolname=$1", owner_role)
-            await _closed(connection, catalog["namespace"]["oid"], owner_oid, runtime_roles, None)
-            receipt = NetworkBootstrapSourceReceipt(
-                specification,
-                owner_role,
-                runtime_roles,
-                parents,
-                capture["snapshot"],
-                capture["captured_at"],
-                catalog["namespace"]["oid"],
-                owner_oid,
-                tuple(sorted(catalog["heaps"].items())),
-                tuple(
-                    (relation["relname"], relation["oid"])
-                    for relation in catalog["relations"]
-                    if relation["relkind"] == b"i"
-                ),
-                "",
+            receipt = await _persist_capture(
+                connection, NetworkBootstrapSourceReceipt(specification, parents, captured_at, "")
             )
-            return await _persist_capture(connection, receipt)
+            await _verify_capture(connection, receipt, verify_content=False)
+            await freeze_fhir_source_snapshot(
+                connection,
+                schema_name,
+                namespace_owner=owner_role,
+                reader_roles=runtime_roles,
+                application_roles=runtime_roles,
+            )
+            return receipt
     except asyncpg.PostgresError, OSError:
         raise NetworkBootstrapSourceError("Native bootstrap preparation failed") from None
-    except NetworkCustomAddressSourceError, NetworkWriterClosureError:
-        raise NetworkBootstrapSourceError("Protected bootstrap roles or privileges are unavailable") from None

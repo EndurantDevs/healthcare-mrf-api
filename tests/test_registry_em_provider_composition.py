@@ -12,15 +12,15 @@ import pytest
 from process import registry_candidate_composition as composition
 from process import registry_publication_worker as worker
 from process.network_address_projection import PinnedAddressSource
+from process.network_compact_layout import CompactAddressRelation
 from process.network_em_provider_inputs import _ROLES, EMProviderInputRelation, EMProviderInputs
 from process.network_serving_read import PinnedNetworkServingManifest
-from process.registry_source_recipe_composition import RegistrySourceRecipeStage
 
 
 def _inputs():
     return EMProviderInputs(
         tuple(
-            EMProviderInputRelation(role, "retained_provider", "held_" + str(i), "edition-one", 100 + i, 200 + i)
+            EMProviderInputRelation(role, "retained_provider", "held_" + str(i), "edition-one")
             for i, role in enumerate(_ROLES)
         )
     )
@@ -35,7 +35,14 @@ def _sources(inputs=None):
 def _manifest(generations):
     identity = UUID("11111111-1111-4111-8111-111111111111")
     return PinnedNetworkServingManifest(
-        3, str(identity), "network_candidate_" + identity.hex, 1, generations, 2, "f" * 64, 1000
+        3,
+        str(identity),
+        "network_candidate_" + identity.hex,
+        1,
+        generations,
+        2,
+        "f" * 64,
+        CompactAddressRelation("network_candidate_" + identity.hex, "entity_address_unified"),
     )
 
 

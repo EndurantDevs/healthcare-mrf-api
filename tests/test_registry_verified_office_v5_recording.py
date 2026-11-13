@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Pure v5 metadata/control flow; mocked native boundaries grant no authority."""
 
-import asyncio
 import copy
 import json
 from contextlib import asynccontextmanager
@@ -85,11 +84,7 @@ def _sample(*, recorded=False, source_rows=None):
 def _stage(sample):
     matches = native._OfficeMatches(
         "actual_matches",
-        42,
         sample.address_source,
-        tuple(sample.context["address_identity"].values()),
-        (17, "19", "reader"),
-        asyncio.current_task(),
         {
             f"page-{index}": (source_row[2]["office_rows"], "e" * 64)
             for index, source_row in enumerate(sample.source_rows)
@@ -124,6 +119,7 @@ def _inverse_sha_sources():
             origin=replace(capture.origin, source_id=f"source-{index}"),
             capture_id=str(identity),
             schema_name="registry_fhir_capture_" + identity.hex,
+            tables={name: {"schema": "registry_fhir_capture_" + identity.hex, "name": name} for name in capture.tables},
         )
         capture = replace(capture, capture_sha256=capture_digest(capture))
         source_rows.append(metadata.rows(metadata.pin(capture)))
@@ -161,7 +157,7 @@ def _native_boundaries(monkeypatch, sample):
     monkeypatch.setattr(offices, "_locked_candidate", AsyncMock(return_value=sample.candidate))
     monkeypatch.setattr(offices, "pin_retained_approved_membership_source", AsyncMock(return_value=sample.approved))
     monkeypatch.setattr(offices, "_office_summary", AsyncMock(side_effect=AssertionError("strict policy selected")))
-    policy = AsyncMock(return_value=(copy.deepcopy(sample.context), ()))
+    policy = AsyncMock(return_value=copy.deepcopy(sample.context))
     verified, copied = AsyncMock(return_value="native-checked"), AsyncMock()
     monkeypatch.setattr(witness_native, "_policy_context", policy)
     monkeypatch.setattr(native, "verified_retained_offices", verified)
@@ -352,7 +348,7 @@ async def test_registered_v5_keeps_storage_revision_and_verified_inputs(monkeypa
         witness_native, "_policy_context", AsyncMock(side_effect=AssertionError("metadata read used native proof"))
     )
     inputs = await resume.resolve_registered_verified_office_inputs(connection, sample.request_id, 7, 9)
-    assert inputs == (sample.address_source, ("loader", "reader"))
+    assert inputs == (sample.address_source, ())
     assert connection.fetchval.await_args.args == ("SHOW transaction_isolation",)
 
 

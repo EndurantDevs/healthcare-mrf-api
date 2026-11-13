@@ -26,9 +26,10 @@ class _CleanupEngine:
 
     def __init__(self, errors):
         self.errors = errors
-        self.state = {"retention": 42, "roles": {"owner_role", "publisher_role"}, "reassigned": []}
+        self.state = {"retention": "fixture-empty", "roles": {"owner_role", "publisher_role"}, "reassigned": []}
         self.starts, self.outcomes = [], []
         self.cancels = 0
+        self.drop_error = None
 
     @asynccontextmanager
     async def begin(self):
@@ -36,9 +37,9 @@ class _CleanupEngine:
         attempt = len(self.starts)
         self.starts.append(deepcopy(before))
 
-        async def scalar(statement, parameters=None):
+        async def has_role(statement, parameters=None):
             if "to_regnamespace" in str(statement):
-                return self.state["retention"]
+                raise AssertionError("cleanup must use recorded names, not physical identity")
             return parameters["role"] in self.state["roles"]
 
         async def execute(statement):
@@ -48,6 +49,9 @@ class _CleanupEngine:
                 self.cancels += 1
                 return
             if sql.startswith("DROP SCHEMA"):
+                assert sql == "DROP SCHEMA IF EXISTS hp_snapshot_retention RESTRICT"
+                if self.drop_error is not None:
+                    raise self.drop_error
                 self.state["retention"] = None
                 return
             role = sql.split('"')[1]
@@ -59,7 +63,7 @@ class _CleanupEngine:
                 self.state["roles"].remove(role)
 
         try:
-            yield SimpleNamespace(scalar=scalar, execute=execute)
+            yield SimpleNamespace(scalar=has_role, execute=execute)
         except BaseException:
             self.state = before
             self.outcomes.append("rollback")
@@ -71,7 +75,7 @@ class _CleanupEngine:
 async def _cleanup(engine, *, owned_reader=False):
     database = SimpleNamespace(_reader_database=object(), disconnect=AsyncMock())
     await source_fixture._cleanup_native_source_component(
-        engine, database, owned_reader, 42, ["owner_role", "publisher_role"], "admin_role"
+        engine, database, owned_reader, ["hp_snapshot_retention"], ["owner_role", "publisher_role"], "admin_role"
     )
     database.disconnect.assert_awaited_once()
     return database
@@ -112,14 +116,30 @@ async def test_other_sql_failures_and_cancellation_are_not_retried(error):
     assert engine.state == initial
 
 
-async def test_retention_identity_refusal_is_not_retried():
+async def test_populated_retention_namespace_is_never_dropped_cascade():
     engine = _CleanupEngine([None])
-    engine.state["retention"] = 43
+    engine.drop_error = _sql_error("2BP01")
     initial = deepcopy(engine.state)
-    with pytest.raises(AssertionError):
+    with pytest.raises(DBAPIError) as caught:
         await _cleanup(engine)
+    assert caught.value is engine.drop_error
     assert engine.starts == [initial] and engine.outcomes == ["rollback"]
     assert engine.state == initial
+
+
+@pytest.mark.parametrize("remaining", [None, "replacement-empty"])
+async def test_recorded_namespace_cleanup_allows_normal_foundation_lifecycle(remaining):
+    engine = _CleanupEngine([None])
+    engine.state["retention"] = remaining
+    await _cleanup(engine)
+    assert engine.outcomes == ["commit"]
+    assert engine.state["retention"] is None and engine.state["roles"] == set()
+
+
+async def test_unrecorded_retention_namespace_is_not_removed():
+    engine = _CleanupEngine([None])
+    await source_fixture._cleanup_native_source_component(engine, None, False, [], [], "admin_role")
+    assert engine.state["retention"] == "fixture-empty" and engine.outcomes == ["commit"]
 
 
 async def test_cancellation_during_backoff_preserves_completed_rollback(monkeypatch):

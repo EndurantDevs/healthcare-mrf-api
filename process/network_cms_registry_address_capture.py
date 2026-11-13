@@ -10,7 +10,6 @@ from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
 from process.entity_address_snapshot_ownership import verify_entity_address_archive_stage_ownership
 from process.entity_address_snapshot_receipt import capture_entity_address_archive_receipt
 from process.network_address_projection import _identifier
-from process.network_custom_address_source import _closed
 from process.network_fhir_source_epoch import _catalog_relations
 from process.network_membership_writer_closure import _check_roles
 
@@ -178,9 +177,6 @@ async def address_clone_identity(session, ownership, owner_role, runtime_roles, 
         for relation_record in relations
     ):
         raise ValueError("registry_cms_address_custody_invalid")
-    await _closed(
-        connection, ownership.schema_oid, owner_oid, runtime_roles, [name for name, _ in ownership.relation_oids]
-    )
     if await connection.fetchval(
         """SELECT EXISTS(SELECT 1 FROM pg_class c
       CROSS JOIN LATERAL aclexplode(coalesce(c.relacl,acldefault('s',c.relowner))) a

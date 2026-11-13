@@ -1,16 +1,9 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Fixed native layouts and authentic low-volume checkpoint guard contracts."""
-
-import hashlib
-import re
+"""Qualified checkpoint relations with fixed native data and transition contracts."""
 
 from db.migration_expression_adoption import _normalized_expression
 from db.plan_release_storage import storage_identifier, storage_relation
-from process.plan_release_storage_catalog import CATALOG_SQL
-from process.plan_release_storage_custody import storage_roles
-from process.provider_directory_cms_routine_settings import approved_cms_routine_settings
-from process.provider_directory_generic_source_storage import _json, _require, require_private_source_readers_closed
-from process.provider_directory_source_coverage_control import _GUARD_SQL, _digest
+from process.provider_directory_generic_source_storage import _json, _require
 
 BULK_ROOT = "provider_directory_bulk_acquisition_checkpoint"
 RETIRED_BULK_HOOKS = frozenset(
@@ -346,6 +339,47 @@ _BODIES = {
     "guard_provider_directory_subset_abandonment_checkpoint": "0923658f97c6fd101e92460c14a3310120c344de1478e97b6d5f475aef77e892",
 }
 
+_LAYOUT_SQL = """SELECT n.nspname,c.relname,c.relkind::text,c.relpersistence::text,c.relispartition,
+ c.relrowsecurity,c.relforcerowsecurity,
+ ARRAY(SELECT quote_ident(pn.nspname)||'.'||quote_ident(parent.relname)
+  FROM pg_inherits i JOIN pg_class parent ON parent.oid=i.inhparent
+  JOIN pg_namespace pn ON pn.oid=parent.relnamespace WHERE i.inhrelid=c.oid ORDER BY pn.nspname,parent.relname) AS parents,
+ ARRAY(SELECT quote_ident(cn.nspname)||'.'||quote_ident(child.relname)
+  FROM pg_inherits i JOIN pg_class child ON child.oid=i.inhrelid
+  JOIN pg_namespace cn ON cn.oid=child.relnamespace WHERE i.inhparent=c.oid ORDER BY cn.nspname,child.relname) AS children,
+ (SELECT coalesce(jsonb_agg(jsonb_build_array(a.attname,format_type(a.atttypid,a.atttypmod),
+  a.attnotnull,pg_get_expr(d.adbin,d.adrelid)) ORDER BY a.attnum),'[]'::jsonb)
+  FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+  WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped) AS columns,
+ (SELECT coalesce(jsonb_agg(jsonb_build_object('type',k.contype::text,
+  'definition',pg_get_constraintdef(k.oid),
+  'valid',k.convalidated AND coalesce((to_jsonb(k)->>'conenforced')::boolean,true)) ORDER BY k.conname),'[]'::jsonb)
+  FROM pg_constraint k WHERE k.conrelid=c.oid AND k.contype<>'n') AS constraints,
+ (SELECT coalesce(jsonb_agg(jsonb_build_object('primary',i.indisprimary,'unique',i.indisunique,
+  'valid',i.indisvalid AND i.indisready AND i.indislive,'method',am.amname,
+  'predicate',pg_get_expr(i.indpred,i.indrelid),'expression',pg_get_expr(i.indexprs,i.indrelid),
+  'keys',ARRAY(SELECT a.attname FROM unnest(i.indkey::smallint[]) WITH ORDINALITY key(attnum,ordinal)
+   LEFT JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum=key.attnum ORDER BY key.ordinal))
+  ORDER BY idx.relname),'[]'::jsonb)
+  FROM pg_index i JOIN pg_class idx ON idx.oid=i.indexrelid JOIN pg_am am ON am.oid=idx.relam
+  WHERE i.indrelid=c.oid) AS indexes,
+ NOT EXISTS(SELECT FROM pg_constraint k JOIN pg_depend d
+  ON d.classid='pg_constraint'::regclass AND d.objid=k.oid
+  JOIN pg_proc p ON d.refclassid='pg_proc'::regclass AND d.refobjid=p.oid
+  WHERE k.conrelid=c.oid AND p.pronamespace<>'pg_catalog'::regnamespace) AS native_checks,
+ NOT EXISTS(SELECT FROM pg_trigger t WHERE t.tgrelid=c.oid AND NOT t.tgisinternal) AS inert
+ FROM unnest($1::text[]) requested(name) JOIN pg_class c ON c.oid=to_regclass(requested.name)
+ JOIN pg_namespace n ON n.oid=c.relnamespace ORDER BY n.nspname,c.relname"""
+
+_GUARD_SQL = """SELECT t.tgname,t.tgtype,t.tgenabled::text,t.tgnargs,t.tgqual IS NULL AS unconditional,
+ t.tgoldtable,t.tgnewtable,t.tgargs,t.tgdeferrable,t.tginitdeferred,
+ ARRAY(SELECT a.attname::text FROM unnest(t.tgattr::smallint[]) WITH ORDINALITY watched(attnum,ordinal)
+  JOIN pg_attribute a ON a.attrelid=t.tgrelid AND a.attnum=watched.attnum
+  WHERE NOT a.attisdropped ORDER BY watched.ordinal) AS update_columns,
+ p.proname,n.nspname FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid
+ JOIN pg_namespace n ON n.oid=p.pronamespace
+ WHERE t.tgrelid=to_regclass($1) AND NOT t.tgisinternal ORDER BY t.tgname"""
+
 _NATIVE_SQL = """
 SELECT NOT EXISTS(SELECT FROM pg_rewrite WHERE ev_class=$1::oid)
  AND NOT EXISTS(SELECT FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid
@@ -409,6 +443,7 @@ def _require_layout(relation, schema, *, isolated=False):
         and relation["relpersistence"] == "p"
         and not relation["relispartition"]
         and not relation["parents"]
+        and not relation.get("children", ())
         and not relation["relrowsecurity"]
         and not relation["relforcerowsecurity"]
         and relation["native_checks"]
@@ -419,6 +454,18 @@ def _require_layout(relation, schema, *, isolated=False):
         and actual_indexes == expected["indexes"],
         "checkpoint_layout_changed",
     )
+    return {
+        "columns": _json(relation["columns"]),
+        "constraints": [
+            {"type": kind, "definition": definition, "valid": True} for kind, definition in actual_constraints
+        ],
+        "indexes": [
+            dict(
+                zip(("primary", "unique", "method", "predicate", "expression", "keys"), entry, strict=True), valid=True
+            )
+            for entry in actual_indexes
+        ],
+    }
 
 
 def _require_guards(guards, root, policy, *, legacy):
@@ -438,9 +485,6 @@ def _require_guards(guards, root, policy, *, legacy):
             guard["tgnewtable"],
             guard["proname"],
         )
-        body = re.sub(
-            r"\s+", " ", guard["prosrc"].replace(storage_identifier(policy.schema) + ".", '"__schema__".')
-        ).strip()
         _require(
             invocation == expected[guard["tgname"]]
             and guard["tgenabled"] == "A"
@@ -448,64 +492,62 @@ def _require_guards(guards, root, policy, *, legacy):
             and not guard["update_columns"]
             and guard["tgnargs"] == 0
             and bytes(guard["tgargs"]) == b""
-            and guard["nspname"] == policy.schema
-            and guard["pronargs"] == 0
-            and guard["lanname"] == "plpgsql"
-            and guard["returns_trigger"]
-            and guard["prosecdef"]
-            and guard["provolatile"] == "v"
-            and guard["proconfig"] in approved_cms_routine_settings(["search_path=pg_catalog"])
-            and guard["function_owner"] in (policy.owner_role, *policy.control_runtime_roles)
-            and hashlib.sha256(body.encode()).hexdigest() == _BODIES[guard["proname"]],
+            and guard["nspname"] == policy.schema,
             "checkpoint_guard_changed",
         )
 
 
 async def capture_checkpoint_controls(connection, policy, *, legacy=False, storage_binding=None):
-    """Attest every fixed root before its original-session control transaction."""
+    """Validate every declared checkpoint relation without database-local identity metadata."""
     if storage_binding is not None:
         from process.provider_directory_source_storage_binding import verify_isolated_source_storage_coordinates
 
         _require(not legacy, "checkpoint_contract_conflict")
         await verify_isolated_source_storage_coordinates(connection, policy, storage_binding)
-    owner, readers = await storage_roles(connection, policy.schema, **policy.role_arguments())
     roots = [storage_relation(policy.schema, name) for name in CHECKPOINT_LAYOUTS]
-    relations = await connection.fetch(CATALOG_SQL, roots, owner, readers if storage_binding is None else [])
+    relations = await connection.fetch(_LAYOUT_SQL, roots)
     _require(
         len(relations) == len(roots) and {relation["relname"] for relation in relations} == set(CHECKPOINT_LAYOUTS),
         "checkpoint_missing",
     )
-    proof_by_root = {}
+    controls_by_root = {}
+    native_sql = _NATIVE_SQL.replace("$1::oid", "to_regclass($1)::oid")
     for relation in relations:
+        name = relation["relname"]
+        qualified = storage_relation(policy.schema, name)
         _require(relation["nspname"] == policy.schema, "checkpoint_namespace_changed")
-        _require_layout(relation, policy.schema, isolated=storage_binding is not None)
-        if legacy:
-            permitted = await connection.fetchval(
-                "SELECT $1::oid=ANY(ARRAY(SELECT oid FROM pg_roles WHERE rolname=ANY($2::text[])))",
-                relation["relowner"],
-                [policy.owner_role, *policy.control_runtime_roles],
-            )
-            _require(permitted is True, "checkpoint_legacy_owner_changed")
-        else:
-            _require(
-                relation["relowner"] == owner and relation["direct_acl_closed"] and relation["readers_closed"],
-                "checkpoint_custody_changed",
-            )
-        _require(await connection.fetchval(_NATIVE_SQL, relation["oid"]) is True, "checkpoint_native_contract_changed")
+        layout = _require_layout(relation, policy.schema, isolated=storage_binding is not None)
+        await connection.execute("SELECT 1 FROM " + qualified + " LIMIT 0")
+        _require(await connection.fetchval(native_sql, qualified) is True, "checkpoint_native_contract_changed")
         if storage_binding is None:
-            guards = await connection.fetch(_GUARD_SQL, relation["oid"])
-            _require_guards(guards, relation["relname"], policy, legacy=legacy)
+            guards = await connection.fetch(_GUARD_SQL, qualified)
+            _require_guards(guards, name, policy, legacy=legacy)
         else:
             _require(relation["inert"], "checkpoint_hooks_changed")
             guards = []
-        proof_by_root[relation["relname"]] = {
-            "oid": relation["oid"],
-            "layout": _digest({key: _json(relation[key]) for key in ("columns", "constraints", "indexes")}),
-            "guards": [dict(guard) for guard in guards if guard["tgname"] not in RETIRED_BULK_HOOKS],
+        controls_by_root[name] = {
+            "schema": policy.schema,
+            "name": name,
+            "layout": layout,
+            "guards": [
+                {
+                    key: guard[key]
+                    for key in (
+                        "tgname",
+                        "tgtype",
+                        "tgdeferrable",
+                        "tginitdeferred",
+                        "tgoldtable",
+                        "tgnewtable",
+                        "proname",
+                        "nspname",
+                    )
+                }
+                for guard in guards
+                if guard["tgname"] not in RETIRED_BULK_HOOKS
+            ],
         }
-    if storage_binding is not None:
-        await require_private_source_readers_closed(connection, [relation["oid"] for relation in relations], readers)
-    return proof_by_root
+    return controls_by_root
 
 
 async def retire_bulk_abandonment_hooks(connection, policy, before):

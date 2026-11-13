@@ -102,9 +102,6 @@ async def test_old_configuration_has_only_two_engines(owned):
         "not-a-dsn",
         "postgresql://scope_reader@database.example/synthetic?ssl=require",
         "postgresql://scope_approver@database.example/synthetic?ssl=require",
-        "postgresql://office_publisher@other.example/synthetic?ssl=require",
-        "postgresql://office_publisher@database.example/other?ssl=require",
-        "postgresql://office_publisher@database.example/synthetic?ssl=verify-full",
         "postgresql://office_publisher@database.example/synthetic?options=unsafe",
     ],
 )
@@ -217,28 +214,14 @@ async def test_existing_office_owner_prevents_startup(owned):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "source-read", "source-lock"])
+@pytest.mark.parametrize("failure", [None, "source-read"])
 async def test_startup_consumes_source_privilege_and_custody_proofs(monkeypatch, owned, failure):
     configured = _office_configuration()
     del configured["publisher_dsn"]
     built = await runtime.build_registry_ptg_scope_runtime(configured)
     sessions = _Sessions("publisher", [])
     source_probe = AsyncMock(side_effect=PermissionError("source read closed") if failure == "source-read" else None)
-    profile_by_field = {
-        name: True
-        for name in (
-            "genuine",
-            "flags",
-            "set_closed",
-            "readers_closed",
-            "office_only",
-            "publisher_writes_closed",
-        )
-    }
-    profile_by_field.update(schema_count=0, schemas=[])
-    if failure == "source-lock":
-        profile_by_field["publisher_writes_closed"] = False
-    driver = SimpleNamespace(fetchrow=AsyncMock(return_value=profile_by_field))
+    driver = SimpleNamespace(fetchrow=AsyncMock(side_effect=AssertionError("physical profile lookup")))
     monkeypatch.setattr(runtime, "_protected_store", source_probe)
     monkeypatch.setattr(capture, "_driver", AsyncMock(return_value=driver))
     try:
@@ -256,18 +239,27 @@ async def test_startup_consumes_source_privilege_and_custody_proofs(monkeypatch,
         statements = [str(call.args[0]) for call in sessions.session.execute.await_args_list]
         assert "REPEATABLE READ, READ WRITE" in statements[0] and "pg_catalog,pg_temp" in statements[1]
         assert not any("GRANT" in statement or "SET ROLE" in statement for statement in statements)
-        if failure == "source-read":
-            driver.fetchrow.assert_not_awaited()
-        else:
-            query, *parameters = driver.fetchrow.await_args.args
-            assert "source_locks" in query and "(SELECT count(*) FROM source_locks)=6" in query
-            assert parameters == [
-                "office_owner",
-                "office_publisher",
-                ["scope_approver", "scope_reader"],
-                True,
-                "scope_owner",
-                "synthetic_ptg",
-            ]
+        driver.fetchrow.assert_not_awaited()
     finally:
         await built.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "publisher",
+    [
+        "postgresql://office_publisher@other.example/synthetic?ssl=require",
+        "postgresql://office_publisher@database.example/other?ssl=require",
+        "postgresql://office_publisher@database.example/synthetic?ssl=verify-full",
+    ],
+)
+async def test_publisher_uses_configured_endpoint_without_database_identity_comparison(owned, publisher):
+    configured = _office_configuration()
+    configured["publisher_dsn"] = publisher
+    service = await runtime.build_registry_ptg_scope_runtime(configured)
+    try:
+        assert service.office_preparation is not None
+        assert service.office_preparation.publisher_sessions.kw["bind"].url.username == "office_publisher"
+    finally:
+        await service.close()
+    assert owned.disposed == list(reversed(owned.engines))

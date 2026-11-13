@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process import registry_ptg_office_selection as selection
-from process.registry_ptg_office_capture import _canonical, _digest
+from process.registry_ptg_office_capture import _canonical, _digest, office_storage
 from process.registry_ptg_office_membership_contract import approved_office_recipe_receipt
 from process.registry_source_recipe_composition import RegistrySourceRecipeStage
 from process.registry_source_recipe_store import decode_registry_source_recipes
@@ -24,7 +24,22 @@ def _pair():
         "client_id": command["client_id"],
         "command": command,
         "manifest_sha256": "a" * 64,
-        "witness": {"custody": {"owner_role": "owner"}},
+        "witness": {
+            "contract": "registry_ptg_office_witness.v1",
+            "capture_id": command["capture_id"],
+            "schema_name": "registry_ptg_office_" + command["capture_id"].replace("-", ""),
+            "manifest_sha256": "a" * 64,
+            "command_sha256": _digest(command),
+            "scope_id": command["scope_id"],
+            "client_id": command["client_id"],
+            "scope_approval_sha256": command["scope_approval_sha256"],
+            "source": command["source"],
+            "accounting": {
+                "input_row_count": command["input_row_count"],
+                "canonical_input_sha256": command["canonical_input_sha256"],
+            },
+            "storage": office_storage("registry_ptg_office_" + command["capture_id"].replace("-", ""), "a" * 64),
+        },
         "source_pin": {},
         "actor": {},
     }
@@ -36,7 +51,7 @@ def _pair():
         "manifest_sha256": "a" * 64,
         "witness_sha256": _digest(approval_by_field["witness"]),
         "schema_name": "registry_ptg_office_" + command["capture_id"].replace("-", ""),
-        "custody": approval_by_field["witness"]["custody"],
+        "storage": approval_by_field["witness"]["storage"],
         "retained_serving": command["retained_serving"],
     }
     hold_sha = _digest(hold_by_field)
@@ -566,3 +581,23 @@ def test_source_stage_keeps_mapping_and_carry_accounting_distinct():
         "registry_source_membership": stage.generation_sha256,
         "initial_source_recipe_0": "d" * 64,
     }
+
+
+def test_synthetic_legacy_hold_projects_names_and_preserves_opaque_editions():
+    from process.registry_ptg_office_capture import _LEGACY_CUSTODY_FIELDS
+
+    binding, paired, recipe = _pair()
+    approval, hold = json.loads(paired["approval_json"]), json.loads(paired["hold_json"])
+    approval["witness"].pop("storage")
+    approval["witness"]["custody"] = {name: "historical ignored field" for name in _LEGACY_CUSTODY_FIELDS}
+    hold.pop("storage")
+    hold["custody"] = {name: None for name in _LEGACY_CUSTODY_FIELDS}
+    hold["witness_sha256"] = "f" * 64
+    paired["approval_json"], paired["hold_json"] = _canonical(approval).decode(), _canonical(hold).decode()
+    before = deepcopy(paired)
+    assert selection._paired_recipe(paired, binding) == recipe
+    assert paired == before
+    approval["witness"]["client_id"] = "different_client"
+    paired["approval_json"] = _canonical(approval).decode()
+    with pytest.raises(ValueError, match="selection_changed"):
+        selection._paired_recipe(paired, binding)

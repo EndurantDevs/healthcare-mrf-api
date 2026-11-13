@@ -4,28 +4,28 @@
 from db.plan_release_storage import storage_relation
 from process import provider_directory_generic_source_storage as storage
 from process.network_fhir_retained_capture_contract import SEMANTIC_PROFILE, require
-from process.network_fhir_source_custody import _require_routine_capabilities
-from process.plan_release_storage_catalog import CATALOG_SQL, ROLE_SQL
-from process.plan_release_storage_custody import storage_roles
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
-from process.provider_directory_generic_source_provision import (
-    PAYLOAD_ROOTS,
-    _native_control_references,
-    _require_reader_family,
-)
 from process.provider_directory_resource_hash import SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT
 
 
-def published_generic_binding(header, *, dataset_id, endpoint_id, root_run_id, source_id):
+def published_generic_binding(header, *, dataset_id, endpoint_id, root_run_id, source_id, schema_name=None):
     """Check publication metadata only; a valid document grants no native capability."""
     require(header["completion_proof_required_version"] is None)
     binding = storage._json(header["candidate_storage_json"])
     if binding is None:
         return None
-    require(type(binding) is dict and binding.get("contract") == storage.CONTRACT)
+    require(type(binding) is dict)
+    if binding.get("contract") == storage.NAMED_ISOLATED_CONTRACT:
+        binding = _named_published_binding(header, binding, schema_name)
+    else:
+        require(binding.get("contract") == storage.CONTRACT)
+        binding = _named_attached_binding(binding, schema_name)
     identity = binding.get("identity")
     require(type(identity) is dict and type(identity.get("metadata")) is dict)
-    storage._validate_binding(binding, identity, phases=("published",))
+    if binding["contract"] == storage.CONTRACT:
+        storage._validate_binding(binding, identity, phases=("published",))
+        if schema_name is not None:
+            require(all(table["schema"] == schema_name for table in binding["tables"].values()))
     require(
         (identity["dataset_id"], identity["endpoint_id"], identity["acquisition_root_run_id"])
         == (dataset_id, endpoint_id, root_run_id)
@@ -35,108 +35,82 @@ def published_generic_binding(header, *, dataset_id, endpoint_id, root_run_id, s
     return binding
 
 
-async def _require_source_actors(reader, writer, origin, policy):
-    """Use the fixed host policy, excluding Source authority from the retained Writer."""
+def _named_published_binding(header, binding, catalog_schema):
+    """Validate the unchanged named handoff against its actual published catalog row."""
+    require(type(catalog_schema) is str and type(binding.get("storage")) is dict)
+    storage.validate_handoff_document(
+        binding,
+        {"catalog_schema": catalog_schema, "storage_schema": binding["storage"].get("storage_schema")},
+    )
+    require(
+        header["status"] in {"published", "superseded"}
+        and header["published_at"] is not None
+        and header["is_current"] is (header["status"] == "published")
+        and {field: header[field] for field in storage.HANDOFF_HEADER_FIELDS} == binding["admission"]
+    )
+    return binding
+
+
+def _named_attached_binding(binding, schema_name):
+    """Project the one historical attached table layout using its recorded names."""
+    if type(binding.get("tables")) is not dict:
+        return binding
+    table_by_root = {}
+    legacy_fields = {"name", "oid", "owner", "layout_sha256"}
+    for root, table in binding["tables"].items():
+        if type(table) is dict and set(table) == legacy_fields:
+            require(type(schema_name) is str)
+            table_by_root[root] = {"schema": schema_name, "name": table["name"]}
+        else:
+            table_by_root[root] = table
+    return {**binding, "tables": table_by_root}
+
+
+async def _require_header_binding(reader, origin, binding):
+    """Match every immutable acquisition field against the complete published header."""
+    header = await reader.fetchrow(
+        f"SELECT candidate_storage_json,completion_proof_required_version,endpoint_id,acquisition_root_run_id,"
+        "dataset_hash,status,published_at,is_current,resource_count,previous_dataset_id,completion_proof_sha256,"
+        "NOT EXISTS(SELECT FROM jsonb_each($2::jsonb) acquisition(key,value) "
+        "WHERE coalesce(d.publication_metadata_json->acquisition.key,'null'::jsonb) "
+        "IS DISTINCT FROM acquisition.value) AS metadata_matches "
+        f"FROM {storage_relation(origin.header_relation['schema'], origin.header_relation['name'])} d "
+        "WHERE dataset_id=$1",
+        origin.dataset_id,
+        storage._encoded(binding["identity"]["metadata"]),
+    )
+    require(
+        header is not None
+        and header["status"] in {"published", "superseded"}
+        and header["published_at"] is not None
+        and header["metadata_matches"] is True
+        and (header["endpoint_id"], header["acquisition_root_run_id"], header["dataset_hash"])
+        == (origin.endpoint_id, origin.root_run_id, origin.dataset_sha256)
+    )
+    current = published_generic_binding(
+        header,
+        dataset_id=origin.dataset_id,
+        endpoint_id=origin.endpoint_id,
+        root_run_id=origin.root_run_id,
+        source_id=origin.source_id,
+        schema_name=origin.header_relation["schema"],
+    )
+    require(current == binding)
+
+
+async def require_native_generic_snapshot(reader, writer, origin, policy, binding):
+    """Validate the original named publication using the fixed Source policy and data scope."""
     require(
         type(policy) is GenericSourcePolicy
         and policy.schema == origin.schema_name
         and origin.admission_profile == SEMANTIC_PROFILE
-        and origin.reader_role in policy.runtime_roles
-        and origin.reader_role not in policy.control_runtime_roles
-        and reader is not writer
         and reader.is_in_transaction()
         and writer.is_in_transaction()
+        and binding is not None
     )
-    actor = await reader.fetchrow(
-        "SELECT session_user::text AS login,current_user::text AS actor,current_setting('role') AS role,"
-        "current_setting('transaction_read_only') AS readonly,current_setting('transaction_isolation') AS isolation"
-    )
-    require(
-        (actor["login"], actor["actor"], actor["role"], actor["readonly"], actor["isolation"])
-        == (origin.reader_role, origin.reader_role, "none", "on", "repeatable read")
-    )
-    roles = await reader.fetch(
-        ROLE_SQL,
-        [origin.reader_role],
-        policy.owner_role,
-        policy.publisher_role,
-        policy.schema,
-    )
-    require(len(roles) == 1 and roles[0]["namespace_owner_protected"] is True)
-    require(
-        await writer.fetchval(
-            "SELECT session_user=current_user AND NOT EXISTS(SELECT FROM unnest($1::text[]) source_roles(name) "
-            "WHERE pg_has_role(session_user,name,'MEMBER') OR pg_has_role(session_user,name,'USAGE') "
-            "OR pg_has_role(session_user,name,'SET'))",
-            [policy.owner_role, policy.publisher_role],
-        )
-        is True
-    )
-
-
-def _require_bound_children(family, binding, origin):
-    """Require each published leaf's exact named parent and complete native proof."""
-    by_name = {row["relname"]: row for row in family}
-    require(by_name[storage.RESOURCE]["oid"] == origin.resource_parent_oid)
-    require(binding["tables"][storage.RESOURCE]["oid"] == origin.resource_leaf_oid)
-    for root in storage.RELATIONS:
-        proof = binding["tables"][root]
-        leaf = by_name.get(proof["name"])
-        require(
-            leaf is not None
-            and list(leaf["parents"]) == [by_name[root]["oid"]]
-            and storage._table_proof(leaf, private=False) == proof
-        )
-
-
-async def _require_header_binding(reader, origin, binding):
-    """Match every immutable acquisition field without exporting raw metadata."""
-    require(
-        await reader.fetchval(
-            f"SELECT d.tableoid::oid::bigint=$2 AND d.endpoint_id=$3 AND d.acquisition_root_run_id=$4 "
-            "AND d.dataset_hash=$5 AND d.status IN ('published','superseded') AND d.published_at IS NOT NULL "
-            "AND d.candidate_storage_json=$6::jsonb AND NOT EXISTS(SELECT FROM jsonb_each($7::jsonb) acquisition(key,value) "
-            "WHERE coalesce(d.publication_metadata_json->acquisition.key,'null'::jsonb) IS DISTINCT FROM acquisition.value) "
-            f"FROM {storage_relation(origin.schema_name, storage.HEADER)} d WHERE d.dataset_id=$1",
-            origin.dataset_id,
-            origin.header_oid,
-            origin.endpoint_id,
-            origin.root_run_id,
-            origin.dataset_sha256,
-            storage._encoded(binding),
-            storage._encoded(binding["identity"]["metadata"]),
-        )
-        is True
-    )
-
-
-async def require_native_generic_snapshot(reader, writer, origin, policy, binding):
-    """Use the frozen Source factory policy's full ordinary/control role tuple.
-
-    The concrete policy arrives only from the postcommit owning continuation;
-    serialized capture, candidate and request documents never select these roles.
-    """
-    await _require_source_actors(reader, writer, origin, policy)
-    require(binding is not None)
     await _require_header_binding(reader, origin, binding)
-    await reader.execute(
-        "LOCK TABLE "
-        + ",".join(storage_relation(policy.schema, binding["tables"][root]["name"]) for root in storage.RELATIONS)
-        + " IN ACCESS SHARE MODE NOWAIT"
-    )
-    owner, readers = await storage_roles(reader, policy.schema, **policy.role_arguments())
-    family = await reader.fetch(
-        CATALOG_SQL,
-        [storage_relation(policy.schema, root) for root in PAYLOAD_ROOTS],
-        owner,
-        readers,
-    )
-    _require_reader_family(
-        family, policy.schema, owner, await _native_control_references(reader, policy.schema, family)
-    )
-    _require_bound_children(family, binding, origin)
-    writer_login = await writer.fetchval("SELECT session_user::text")
-    require(type(writer_login) is str and bool(writer_login))
-    ordinary_readers = tuple(role for role in policy.runtime_roles if role not in policy.control_runtime_roles)
-    await _require_routine_capabilities(reader, (*ordinary_readers, writer_login), policy.schema, owner)
-    return [dict(relation_by_field) for relation_by_field in family]
+    resource = binding["tables"][storage.RESOURCE]
+    require(origin.resource_relation in (resource, {"schema": origin.schema_name, "name": storage.RESOURCE}))
+    for relation in binding["tables"].values():
+        await reader.fetch("SELECT * FROM " + storage_relation(relation["schema"], relation["name"]) + " LIMIT 0")
+    return tuple((root, table["schema"], table["name"]) for root, table in sorted(binding["tables"].items()))

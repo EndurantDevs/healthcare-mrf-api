@@ -79,7 +79,7 @@ async def _assert_rejected_recovery(fixture, original, old_reader, rejected_stat
 
 async def test_cheap_readiness_defers_mapper_refusal_and_recovers_exact_rejected_request(monkeypatch, record_property):
     ic = frozen_ic_recovery()
-    async with source.native_generic_source(monkeypatch) as source_fixture:
+    async with source.native_generic_source(monkeypatch, named=True) as source_fixture:
         assert re.fullmatch(r"hc_cms_admission_test_[0-9a-f]{32}", source_fixture.component.admin_engine.url.database)
         original_capture = await source.publish_edition(source_fixture, 1)
         async with source.generic_refresh_execution(source_fixture, monkeypatch) as (fixture, serving, stack, head_url):
@@ -107,5 +107,5 @@ async def test_cheap_readiness_defers_mapper_refusal_and_recovers_exact_rejected
             record_property(
                 "qualification",
                 "genuine Source admission/captures/native roles; existing App mock; cheap ready, actual worker refusal, "
-                "exact rejected xmin/ctid, unchanged G1 head/offices/heaps/OIDs/custody; no durable IC dispatch proof",
+                "exact rejected request fields, unchanged G1 head/offices/complete named rows; no durable IC dispatch proof",
             )

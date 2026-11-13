@@ -288,7 +288,6 @@ async def require_retained_approved_network_source_bindings(
     *,
     control_schema=None,
     published_plan_store=None,
-    read_identity=None,
 ):
     """Validate one exact retained map after the caller verifies its serving manifest.
 
@@ -303,18 +302,16 @@ async def require_retained_approved_network_source_bindings(
         control_schema=control_schema,
         published_plan_store=published_plan_store,
         retained=True,
-        **({"read_identity": read_identity} if read_identity is not None else {}),
     )
 
 
 async def _require_network_source_bindings(
-    connection, approved_source, coordinates, *, control_schema, published_plan_store, retained, read_identity=None
+    connection, approved_source, coordinates, *, control_schema, published_plan_store, retained
 ):
     """Share complete validation; only the exact approved-map pin policy differs."""
     if (
         type(approved_source) is not ApprovedMembershipSource
         or type(coordinates) is not RegistryNetworkSourceCoordinates
-        or (read_identity is not None and not retained)
     ):
         raise ApprovedNetworkSourceBindingError("registry_approved_source_binding_invalid")
     try:
@@ -323,7 +320,6 @@ async def _require_network_source_bindings(
             connection,
             approved_revision=approved_source.approved_revision,
             control_schema=control_schema,
-            **({"read_identity": read_identity} if read_identity is not None else {}),
         )
         if current != approved_source:
             raise ApprovedNetworkSourceBindingError("registry_approved_source_binding_pin_changed")
@@ -338,10 +334,6 @@ async def _require_network_source_bindings(
             _TRIM_CHARACTERS,
             UHC_PROVIDER_FILE_SOURCE_ID,
         )
-        if read_identity is not None:
-            from process.network_approved_membership_source import _verify_approved_consumption
-
-            await _verify_approved_consumption(connection, namespace, read_identity)
     except (asyncpg.PostgresError, ApprovedMembershipSourceError, NetworkReadIdentityError) as error:
         raise ApprovedNetworkSourceBindingError("registry_approved_source_binding_unavailable") from error
     if checks is None or checks["invalid"]:

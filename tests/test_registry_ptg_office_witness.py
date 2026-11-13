@@ -13,6 +13,7 @@ import pytest
 
 from process import registry_ptg_office_capture as capture
 from process import registry_ptg_office_witness as witness
+from process.network_compact_layout import CompactAddressRelation
 from tests import test_registry_ptg_graph_reader as graph_fixture
 from tests import test_registry_ptg_office_capture as office_fixture
 
@@ -108,6 +109,13 @@ class _Driver:
     def is_in_transaction(self):
         return not self.closed
 
+    async def fetchval(self, sql, *parameters):
+        if sql.startswith("SELECT to_regclass"):
+            return parameters[0]
+        if "SELECT manifest_json" in sql:
+            return json.loads(self.descriptor.manifest_json)
+        raise AssertionError(sql)
+
     async def execute(self, sql):
         self.calls.append(sql)
         assert sql.startswith("LOCK TABLE ") and "registry_ptg_office_" in sql
@@ -117,6 +125,8 @@ class _Driver:
 
     async def fetchrow(self, sql, *parameters):
         self.calls.append(sql)
+        if "FROM hp_snapshot_retention.preparation" in sql:
+            return None
         if "sum(octet_length" in sql:
             rows = self._page(*parameters)
             return {"rows": len(rows), "bytes": sum(len(capture._canonical(row)) for row in rows)}
@@ -133,12 +143,30 @@ class _Driver:
 
     async def fetch(self, sql, *parameters):
         self.calls.append(sql)
+        if "FROM pg_attribute" in sql:
+            names, kinds = (
+                (("id", "manifest_sha256", "manifest_json"), ("integer", "text", "jsonb"))
+                if "capture_manifest" in parameters[0]
+                else (capture.COPY_COLUMNS, capture._COLUMN_TYPES)
+            )
+            is_published = "source_scope" in json.loads(self.descriptor.manifest_json)["command"]["source"]
+            return [
+                dict(
+                    attname=name,
+                    type=kind,
+                    attnotnull=not (is_published and name in {"company_key", "cohort_id"}),
+                    atthasdef=False,
+                )
+                for name, kind in zip(names, kinds, strict=True)
+            ]
         if "capture_manifest LIMIT 2" in sql:
             return [
                 {
                     "id": 1,
                     "manifest_sha256": self.descriptor.manifest_sha256,
-                    "manifest_json": {} if self.manifest_changed else json.loads(self.descriptor.manifest_json),
+                    "manifest_json": ("{}" if self.manifest_changed else self.descriptor.manifest_json.decode())
+                    if "AS manifest_json" in sql
+                    else ({} if self.manifest_changed else json.loads(self.descriptor.manifest_json)),
                 }
             ]
         return self._page(*parameters)
@@ -149,7 +177,16 @@ def _prepared(office_rows):
     scope = _scope()
     from process.network_serving_read import PinnedNetworkServingManifest
 
-    serving = PinnedNetworkServingManifest(3, str(UUID(int=900)), "synthetic_serving", 1, {}, 3, "b" * 64, 45)
+    serving = PinnedNetworkServingManifest(
+        3,
+        str(UUID(int=900)),
+        "synthetic_serving",
+        1,
+        {},
+        3,
+        "b" * 64,
+        CompactAddressRelation("synthetic_serving", "entity_address_unified"),
+    )
     digest = hashlib.sha256()
     identity = capture._retained_accounting(office_fixture._adoption_receipt(office_rows), office_rows, digest, None)
     accounting_by_field = {
@@ -166,7 +203,9 @@ def _prepared(office_rows):
         "command_sha256": capture._digest(command),
         "accounting": accounting_by_field,
     }
-    custody_by_field = {"table_oid": 17, "manifest_table_oid": 18, "schema_oid": 19, "owner_oid": 20}
+    custody_by_field = capture.office_storage(
+        "registry_ptg_office_" + request.capture_id.hex, capture._digest(manifest_by_field)
+    )
     descriptor = capture.RegistryPTGOfficeCaptureDescriptor(
         request.capture_id,
         "registry_ptg_office_" + request.capture_id.hex,
@@ -189,7 +228,6 @@ def arrange(monkeypatch):
         )
         monkeypatch.setattr(capture, "_driver", AsyncMock(return_value=driver))
         monkeypatch.setattr(capture, "_scope", AsyncMock(return_value=_scope()))
-        monkeypatch.setattr(capture, "_custody", AsyncMock(return_value=custody_by_field))
         monkeypatch.setattr(capture, "resolve_network_serving_manifest", AsyncMock(return_value=serving))
         monkeypatch.setattr(witness.source, "_physical_binding", AsyncMock(return_value=None))
         monkeypatch.setattr(witness.source, "_require_frozen_source", AsyncMock())
@@ -248,15 +286,17 @@ async def test_incomplete_or_extra_source_stream_never_returns_evidence(arrange,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("replacement", ["schema", "manifest", "custody", "scope", "source", "serving", "transaction"])
+@pytest.mark.parametrize("replacement", ["schema", "manifest", "storage", "scope", "source", "serving", "transaction"])
 async def test_context_or_relation_replacement_fails_closed(arrange, monkeypatch, replacement):
     prepared = arrange()
     if replacement == "schema":
         prepared.descriptor = replace(prepared.descriptor, schema_name="synthetic_ptg")
     if replacement == "manifest":
         prepared.driver.manifest_changed = True
-    if replacement == "custody":
-        monkeypatch.setattr(capture, "_custody", AsyncMock(side_effect=[prepared.custody_by_field, {"table_oid": 42}]))
+    if replacement == "storage":
+        prepared.descriptor = replace(
+            prepared.descriptor, storage_json=capture._canonical({**prepared.custody_by_field, "tables": []})
+        )
     if replacement == "scope":
         scope = _scope()
         scope["file_versions"][0]["raw_sha256"] = "0" * 64
@@ -269,19 +309,24 @@ async def test_context_or_relation_replacement_fails_closed(arrange, monkeypatch
         monkeypatch.setattr(
             capture,
             "resolve_network_serving_manifest",
-            AsyncMock(side_effect=[actual, replace(actual, address_table_oid=99)]),
+            AsyncMock(
+                side_effect=[
+                    actual,
+                    replace(actual, address_relation=CompactAddressRelation("other_serving", "entity_address_unified")),
+                ]
+            ),
         )
     if replacement == "transaction":
 
-        async def changed(*args):
+        async def changed(*args, **kwargs):
             prepared.session.transaction = object()
             return prepared.custody_by_field
 
-        monkeypatch.setattr(capture, "_custody", changed)
+        monkeypatch.setattr(capture, "_require_office_layout", changed)
     reasons_by_replacement = {
         "schema": "^registry_ptg_office_descriptor_invalid$",
         "manifest": "^registry_ptg_office_manifest_changed$",
-        "custody": "^registry_ptg_office_custody_changed$",
+        "storage": "^registry_ptg_office_descriptor_invalid$",
         "scope": "^registry_ptg_office_context_changed$",
         "source": "^registry_ptg_office_source_changed$",
         "serving": "^registry_ptg_office_context_changed$",
@@ -354,3 +399,29 @@ async def test_payload_bounds_are_checked_before_office_fetch(arrange, monkeypat
     with pytest.raises(witness.RegistryPTGOfficeWitnessError, match="page_bounds"):
         await _verify(prepared)
     assert not prepared.session.witness_calls
+
+
+@pytest.mark.asyncio
+async def test_legacy_command_rechecks_named_generation_and_complete_content(arrange):
+    prepared = arrange()
+    manifest = json.loads(prepared.descriptor.manifest_json)
+    manifest["command"]["retained_serving"].pop("address_relation")
+    manifest["command"]["retained_serving"]["address_table_oid"] = 17
+    manifest["command_sha256"] = "9" * 64
+    prepared.descriptor = replace(
+        prepared.descriptor,
+        manifest_json=capture._canonical(manifest),
+        manifest_sha256="8" * 64,
+        storage_json=capture._canonical(capture.office_storage(prepared.descriptor.schema_name, "8" * 64)),
+    )
+    prepared.driver.descriptor = prepared.descriptor
+    evidence = (await _verify(prepared)).as_dict()
+    assert evidence["command_sha256"] == "9" * 64 and evidence["manifest_sha256"] == "8" * 64
+    assert "address_table_oid" not in evidence["retained_serving"]
+    assert prepared.session.witness_calls == [0, len(prepared.rows)]
+    assert capture.resolve_network_serving_manifest.await_count == 2
+    for invocation in capture.resolve_network_serving_manifest.await_args_list:
+        assert invocation.kwargs == {
+            "generation_id": prepared.request.retained_generation_id,
+            "control_schema": prepared.context.control_schema,
+        }

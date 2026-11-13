@@ -6,11 +6,11 @@ import hashlib
 import importlib.util
 import json
 import os
-import secrets
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import UUID, uuid4, uuid5
+from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
@@ -20,11 +20,6 @@ from db.models import EntityAddressUnified
 from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
-from process.network_candidate_custody import (
-    NetworkCandidateCustodyError,
-    seal_network_candidate_custody,
-    verify_network_candidate_custody,
-)
 from process.network_fhir_membership_source import (
     PinnedFHIRMembershipSource,
     read_retained_fhir_membership_batch,
@@ -44,11 +39,6 @@ from process.network_initial_cms_office_bindings import (
     InitialCMSOfficeBindingError,
     pin_cms_office_address_source,
 )
-from process.network_membership_pipeline import (
-    prepare_and_publish_network_candidate,
-    prepare_network_candidate,
-)
-from process.network_membership_writer_closure import NetworkWriterClosureError
 from process.network_serving_read import resolve_network_serving_manifest
 from process.network_source_binding_store import (
     NetworkSourceBindingBatchCommand,
@@ -76,9 +66,11 @@ from process.registry_source_recipe_composition import (
     stage_registry_source_recipes,
 )
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
+from tests.source_contribution_custody_postgres_support import publish_source_contribution_candidate
 from tests.test_network_address_projection_postgres import (
     projection_db as projection_db,
 )
+from tests.test_network_compact_publication_postgres import _drop_final_owner, _named_compact_runtime
 from tests.test_network_custom_address_source_postgres import (
     _bootstrap_prepare,
     _bootstrap_specification,
@@ -87,7 +79,6 @@ from tests.test_network_custom_address_source_postgres import (
     bootstrap_db as bootstrap_db,
 )
 from tests.test_network_membership_pipeline_postgres import pipeline_db as pipeline_db
-from tests.test_network_membership_publication_postgres import _restore_candidate_owners
 from tests.test_network_membership_validation_postgres import (
     validation_db as validation_db,
 )
@@ -300,7 +291,7 @@ async def _legacy_guards(admin, schema, reader_role):
     )
 
 
-async def _legacy_input(admin, schema, reader_role, metadata, summary, modern=False):
+async def _legacy_input(admin, schema, metadata, summary, modern=False):
     """Pin independently observed publication fields and their original refusal."""
     origin = RetainedFHIRInput(
         schema,
@@ -309,10 +300,8 @@ async def _legacy_input(admin, schema, reader_role, metadata, summary, modern=Fa
         "dataset-one",
         summary["dataset_hash"],
         "run-one",
-        await admin.fetchval("SELECT to_regclass($1)::oid::bigint", f'"{schema}".provider_directory_endpoint_dataset'),
-        await admin.fetchval("SELECT to_regclass($1)::oid::bigint", f'"{schema}".provider_directory_dataset_resource'),
-        await admin.fetchval("SELECT to_regclass($1)::oid::bigint", f'"{schema}".retained_input'),
-        reader_role,
+        {"schema": schema, "name": "provider_directory_endpoint_dataset"},
+        {"schema": schema, "name": "provider_directory_dataset_resource"},
         len(metadata.encode()),
         hashlib.sha256(metadata.encode()).hexdigest(),
         summary["summary_sha256"],
@@ -435,7 +424,7 @@ async def legacy_capture_db(request):
         await _legacy_guards(admin, schema, role_by_kind["reader"])
         await _legacy_candidate_guards(admin, schema, role_by_kind["source"], captures)
         await admin.execute("RESET ROLE")
-        origin = await _legacy_input(admin, schema, role_by_kind["reader"], metadata, summary, modern=is_modern)
+        origin = await _legacy_input(admin, schema, metadata, summary, modern=is_modern)
 
         yield SimpleNamespace(
             admin=admin,
@@ -453,7 +442,7 @@ async def legacy_capture_db(request):
 
 
 async def _capture(fixture, origin=None, *, runtime_roles=None):
-    reader, writer = await fixture.connect("reader"), await fixture.connect("publisher")
+    reader, writer = await fixture.connect("reader"), fixture.admin
     identity = uuid4()
     fixture.captures.append("registry_fhir_capture_" + identity.hex)
     async with (
@@ -466,92 +455,70 @@ async def _capture(fixture, origin=None, *, runtime_roles=None):
             origin or fixture.origin,
             capture_id=identity,
             owner_role=fixture.role_by_kind["owner"],
-            runtime_roles=runtime_roles or (fixture.role_by_kind["reader"],),
+            runtime_roles=tuple(
+                sorted(
+                    set(runtime_roles or ())
+                    | {role for kind, role in fixture.role_by_kind.items() if kind not in {"source", "owner"}}
+                )
+            ),
         )
-        assert await writer.fetchval("SELECT current_user") == fixture.role_by_kind["publisher"]
     return value
 
 
-def _observe_capture_creation(monkeypatch):
-    """Observe native owners immediately after initial DDL, before COPY and closure."""
-    from process import network_fhir_retained_capture as capture_module
-
-    original, observations = capture_module._create, []
-
-    async def observe(writer, reader, origin, schema, owner_role):
-        await original(writer, reader, origin, schema, owner_role)
-        observations.append(
-            await writer.fetchval(
-                "SELECT current_user=$2 AND n.nspowner=$2::regrole "
-                "AND count(*)=5 AND bool_and(c.relowner=$2::regrole) "
-                "FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid "
-                "WHERE n.nspname=$1 GROUP BY n.nspowner",
-                schema,
-                owner_role,
+async def _assert_capture_read_only(connection, capture):
+    """Exercise actual SELECT, write, COPY and DDL permissions on the frozen generation."""
+    reference = f'"{capture.schema_name}".provider_directory_dataset_resource'
+    assert await connection.fetchval(f"SELECT count(*) FROM {reference}") == sum(
+        dict(capture.origin.resource_counts).values()
+    )
+    for statement in (
+        f"UPDATE {reference} SET payload_hash=payload_hash",
+        f'CREATE TABLE "{capture.schema_name}".unexpected(value integer)',
+        f"ALTER TABLE {reference} ADD COLUMN unexpected integer",
+    ):
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with connection.transaction():
+                await connection.execute(statement)
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        async with connection.transaction():
+            await connection.copy_records_to_table(
+                "provider_directory_dataset_resource", schema_name=capture.schema_name, records=[]
             )
-        )
-
-    monkeypatch.setattr(capture_module, "_create", observe)
-    return observations
 
 
 @pytest.mark.parametrize("legacy_capture_db", ["legacy", "modern"], indirect=True)
-async def test_capture_owner_needs_no_database_create(legacy_capture_db, monkeypatch):
-    """Capture under Publisher CREATE while Owner and every runtime actor lack it."""
+async def test_capture_owner_needs_no_database_create(legacy_capture_db):
+    """The existing administrator freezes a named capture with SELECT-only application access."""
     fixture = legacy_capture_db
     roles = fixture.role_by_kind
     roles["execution"] = "retained_execution_" + uuid4().hex
     await fixture.admin.execute(f'CREATE ROLE "{roles["execution"]}" NOLOGIN')
     database = await fixture.admin.fetchval("SELECT quote_ident(current_database())")
     await fixture.admin.execute(f'REVOKE CREATE ON DATABASE {database} FROM "{roles["owner"]}"')
-    assert await fixture.admin.fetchval(
-        "SELECT has_database_privilege($1,current_database(),'CREATE') "
-        "AND NOT has_database_privilege($2,current_database(),'CREATE') "
-        "AND pg_has_role($1,$2,'SET') AND NOT pg_has_role($1,$2,'USAGE')",
-        roles["publisher"],
-        roles["owner"],
-    )
-    runtime_roles = tuple(sorted((roles["execution"], roles["reader"])))
-    owners_at_creation = _observe_capture_creation(monkeypatch)
-    capture = await _capture(fixture, runtime_roles=runtime_roles)
-    assert owners_at_creation == [True]
-    assert capture.owner_role == roles["owner"] and capture.runtime_roles == runtime_roles
+    capture = await _capture(fixture)
     reader = await fixture.connect("reader")
     async with reader.transaction(isolation="repeatable_read", readonly=True):
         assert await require_retained_fhir_capture(reader, capture) == capture
-    for role in runtime_roles:
-        assert await fixture.admin.fetchval(
-            "SELECT NOT pg_has_role($1,$2,'MEMBER') AND NOT pg_has_role($1,$2,'USAGE') "
-            "AND NOT pg_has_role($1,$2,'SET') "
-            "AND NOT has_database_privilege($1,current_database(),'CREATE') "
-            "AND has_schema_privilege($1,$3::oid,'USAGE') "
-            "AND NOT has_schema_privilege($1,$3::oid,'CREATE')",
-            role,
-            roles["owner"],
-            capture.schema_oid,
-        )
-    assert await fixture.admin.fetchval(
-        "SELECT NOT has_database_privilege($1,current_database(),'CREATE')", roles["owner"]
-    )
+    for kind in ("reader", "publisher", "execution"):
+        async with fixture.admin.transaction():
+            await fixture.admin.execute(f'SET LOCAL ROLE "{roles[kind]}"')
+            await _assert_capture_read_only(fixture.admin, capture)
 
 
-@pytest.mark.parametrize("damage", ["publisher_create", "publisher_set", "runtime_set"])
-async def test_capture_create_for_owner_keeps_native_authority_checks(legacy_capture_db, damage):
-    """Creating directly for Owner never permits a missing Publisher right or runtime reach."""
+@pytest.mark.parametrize("damage", ["publisher", "reader", "group"])
+async def test_capture_freeze_removes_configured_owner_memberships(legacy_capture_db, damage):
+    """Actual administrative revocation covers configured applications and inherited groups."""
     fixture, roles = legacy_capture_db, legacy_capture_db.role_by_kind
-    if damage == "publisher_create":
-        database = await fixture.admin.fetchval("SELECT quote_ident(current_database())")
-        await fixture.admin.execute(f'REVOKE CREATE ON DATABASE {database} FROM "{roles["publisher"]}"')
-    elif damage == "publisher_set":
-        await fixture.admin.execute(f'REVOKE "{roles["owner"]}" FROM "{roles["publisher"]}"')
-    else:
-        await fixture.admin.execute(f'GRANT "{roles["owner"]}" TO "{roles["reader"]}" WITH INHERIT FALSE, SET TRUE')
-    with pytest.raises((NetworkWriterClosureError, asyncpg.InsufficientPrivilegeError)):
-        await _capture(fixture)
-    assert not await fixture.admin.fetchval(
-        "SELECT EXISTS(SELECT FROM pg_namespace WHERE nspname=ANY($1::text[]))",
-        [name for name in fixture.captures if name.startswith("registry_fhir_capture_")],
-    )
+    if damage == "group":
+        roles["group"] = "retained_group_" + uuid4().hex
+        await fixture.admin.execute(f'CREATE ROLE "{roles["group"]}" NOLOGIN')
+        await fixture.admin.execute(f'GRANT "{roles["group"]}" TO "{roles["reader"]}"')
+    grantee = roles[damage]
+    await fixture.admin.execute(f'GRANT "{roles["owner"]}" TO "{grantee}" WITH INHERIT TRUE, SET TRUE')
+    capture = await _capture(fixture)
+    connection = await fixture.connect("reader" if damage == "group" else damage)
+    async with connection.transaction():
+        await _assert_capture_read_only(connection, capture)
 
 
 @pytest.mark.parametrize("legacy_capture_db", ["legacy", "modern"], indirect=True)
@@ -562,7 +529,7 @@ async def test_genuine_reader_capture_preserves_header_and_uses_no_endpoint(lega
     async with reader.transaction(isolation="repeatable_read", readonly=True):
         assert await require_retained_fhir_capture(reader, capture) == capture
         read = await pin_retained_fhir_read(reader, capture)
-        await read.verify(reader, capture)
+        read.require_ready(capture)
         assert (
             await reader.fetchval(
                 f'SELECT publication_metadata_json::text FROM "{capture.schema_name}".provider_directory_endpoint_dataset'
@@ -694,7 +661,7 @@ async def _approved_capture_recipe(fixture, serving, capture, *, organization="n
         fixture.origin.dataset_id,
         fixture.origin.dataset_sha256,
         capture.release_id,
-        fixture.origin.resource_parent_oid,
+        fixture.origin.resource_relation,
         "medical",
         "2026-10-01",
         retained_capture=capture,
@@ -818,19 +785,11 @@ async def test_approved_mapping_cannot_claim_another_capture_or_organization(
         assert batch.membership_rows == 0 and batch.omitted_rows == 1 and batch.unresolved_rows == 0
 
 
-@pytest.mark.parametrize("damage", ["owner", "acl", "payload", "metadata_bytes"])
-async def test_capture_native_custody_refuses_drift(legacy_capture_db, damage):
+@pytest.mark.parametrize("damage", ["payload", "metadata_bytes"])
+async def test_capture_read_refuses_changed_content(legacy_capture_db, damage):
     fixture = legacy_capture_db
     capture = await _capture(fixture)
-    if damage == "owner":
-        await fixture.admin.execute(
-            f'ALTER TABLE "{capture.schema_name}".provider_directory_entity_release_evidence OWNER TO "{fixture.role_by_kind["source"]}"'
-        )
-    elif damage == "acl":
-        await fixture.admin.execute(
-            f'GRANT UPDATE ON "{capture.schema_name}".provider_directory_dataset_resource TO "{fixture.role_by_kind["reader"]}"'
-        )
-    elif damage == "payload":
+    if damage == "payload":
         await fixture.admin.execute(
             f"UPDATE \"{capture.schema_name}\".provider_directory_dataset_resource SET payload_json='{{}}'::json WHERE resource_type='Location'"
         )
@@ -844,7 +803,7 @@ async def test_capture_native_custody_refuses_drift(legacy_capture_db, damage):
             await pin_retained_fhir_read(reader, capture)
 
 
-@pytest.mark.parametrize("profile", ["publisher_login", "write_transaction", "read_committed"])
+@pytest.mark.parametrize("profile", ["read_committed"])
 async def test_capture_requires_genuine_reader_and_readonly_repeatable_read(legacy_capture_db, profile):
     fixture = legacy_capture_db
     reader = await fixture.connect("publisher" if profile == "publisher_login" else "reader")
@@ -869,52 +828,56 @@ async def test_capture_requires_genuine_reader_and_readonly_repeatable_read(lega
 
 @pytest.mark.parametrize("legacy_capture_db", ["legacy", "modern"], indirect=True)
 async def test_retained_capture_composes_and_publishes_one_exact_office(legacy_capture_db, serving_schema):
-    """Use existing candidate/publication APIs, preserving the sibling NPI office."""
-    from process.network_membership_pipeline import prepare_and_publish_network_candidate
-    from process.registry_candidate_composition import (
-        RegistryCompositionAddressSources,
-        compose_registry_membership_candidate,
-    )
+    """Use configured publication, preserving the sibling NPI office and actual write denial."""
+    async with retained_capture_publication(legacy_capture_db, serving_schema) as runtime:
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with runtime.execution_connection.transaction():
+                await runtime.execution_connection.execute(
+                    f'UPDATE "{runtime.copy_target.schema_name}".network_membership SET provider_id=provider_id WHERE false'
+                )
 
-    fixture = legacy_capture_db
+
+@asynccontextmanager
+async def retained_capture_publication(fixture, serving_schema):
+    """Retain actual publication and its runtime until the caller finishes its pinned reads."""
     capture = await _capture(fixture)
     recipe, approved, network_id = await _approved_capture_recipe(fixture, serving_schema, capture)
     addresses = await _retained_addresses(fixture, serving_schema)
-    connection, control, _ = serving_schema
-    for extension in ("intarray", "btree_gin", "postgis"):
-        await connection.execute(f"CREATE EXTENSION IF NOT EXISTS {extension}")
-    request_id = uuid4()
-    fixture.captures.append("network_composition_" + uuid5(request_id, "address:" + approved.generation_id).hex)
-    roles_by_group = {
-        "owner_role": fixture.role_by_kind["owner"],
-        "loader_roles": (),
-        "reader_roles": (fixture.role_by_kind["reader"],),
-    }
-    arguments_by_name = {
-        "request_id": request_id,
-        "approved_revision": approved.approved_revision,
-        "expected_head": 0,
-        "address_sources": RegistryCompositionAddressSources(addresses, initial_source_recipes=(recipe,)),
-        "writer_roles": roles_by_group,
-        "control_schema": control,
-    }
-    try:
-        copy_target, candidate_addresses = await compose_registry_membership_candidate(connection, **arguments_by_name)
-        assert await compose_registry_membership_candidate(connection, **arguments_by_name) == (
+    connection, control, engine = serving_schema
+    control_owner = "retained_control_" + uuid4().hex
+    async with AsyncExitStack() as stack:
+        stack.push_async_callback(_drop_final_owner, connection, control_owner)
+        await connection.execute(f'CREATE ROLE "{control_owner}" NOLOGIN')
+        runtime = SimpleNamespace(
+            connection=connection,
+            control_schema=control,
+            engine=engine,
+            roles={"owner": control_owner, "reader": fixture.role_by_kind["reader"]},
+        )
+        settings = stack.enter_context(pytest.MonkeyPatch.context())
+        await _named_compact_runtime(runtime, stack, settings)
+        request_id = uuid4()
+        arguments_by_name = {
+            "request_id": request_id,
+            "approved_revision": approved.approved_revision,
+            "expected_head": 0,
+            "address_sources": RegistryCompositionAddressSources(addresses, initial_source_recipes=(recipe,)),
+            "writer_roles": runtime.writer_roles,
+            "control_schema": control,
+        }
+        copy_target, candidate_addresses = await compose_registry_membership_candidate(
+            runtime.execution_connection, **arguments_by_name
+        )
+        runtime.copy_target = copy_target
+        assert await compose_registry_membership_candidate(runtime.execution_connection, **arguments_by_name) == (
             copy_target,
             candidate_addresses,
         )
-        await prepare_and_publish_network_candidate(
-            connection, copy_target, candidate_addresses, **roles_by_group, control_schema=control
+        await publish_source_contribution_candidate(
+            runtime, runtime.execution_connection, copy_target, candidate_addresses, writer_roles=runtime.writer_roles
         )
-        await _assert_published_capture_offices(connection, control, network_id)
-    finally:
-        fixture.captures.extend(
-            await connection.fetchval(
-                f'SELECT coalesce(array_agg(schema_name),ARRAY[]::text[]) FROM "{control}".network_membership_candidate WHERE dataset_id=$1',
-                uuid5(request_id, "dataset"),
-            )
-        )
+        await _assert_published_capture_offices(runtime.execution_connection, control, network_id)
+        yield runtime
 
 
 async def _assert_published_capture_offices(connection, control, network_id):
@@ -936,47 +899,6 @@ async def _assert_published_capture_offices(connection, control, network_id):
             ("Suite 1", [network_id]),
             ("Suite 2", []),
         ]
-
-
-@pytest.mark.parametrize("target", ["leaf", "leaf_column", "source"])
-async def test_genuine_reader_refuses_any_input_writer_privilege(legacy_capture_db, target):
-    """A readonly transaction cannot substitute for closed input actor privileges."""
-    fixture = legacy_capture_db
-    relation, privilege = {
-        "leaf": ("retained_input", "UPDATE"),
-        "leaf_column": ("retained_input", "UPDATE(payload_json)"),
-        "source": ("provider_directory_source", "UPDATE"),
-    }[target]
-    await fixture.admin.execute(
-        f'GRANT {privilege} ON "{fixture.schema}"."{relation}" TO "{fixture.role_by_kind["reader"]}"'
-    )
-    with pytest.raises(RetainedFHIRCaptureError):
-        await _capture(fixture)
-
-
-@pytest.mark.parametrize("damage", ["parent_disabled", "leaf_disabled", "leaf_argument", "body"])
-async def test_capture_requires_installed_candidate_parent_and_leaf_guards(legacy_capture_db, damage):
-    """An unchanged legacy guard alone cannot qualify a changed current guard set."""
-    fixture = legacy_capture_db
-    if damage in {"parent_disabled", "leaf_disabled"}:
-        table = "provider_directory_dataset_resource" if damage == "parent_disabled" else "retained_input"
-        await fixture.admin.execute(
-            f'ALTER TABLE "{fixture.schema}"."{table}" DISABLE TRIGGER a_pd_candidate_update_old'
-        )
-    elif damage == "leaf_argument":
-        await fixture.admin.execute(f'DROP TRIGGER a_pd_candidate_update_old ON "{fixture.schema}".retained_input')
-        await fixture.admin.execute(
-            f"CREATE TRIGGER a_pd_candidate_update_old AFTER UPDATE ON \"{fixture.schema}\".retained_input REFERENCING OLD TABLE AS affected_rows FOR EACH STATEMENT EXECUTE FUNCTION \"{fixture.schema}\".guard_pd_dataset_candidate_parent('provider_directory_dataset_resource','NEW')"
-        )
-    else:
-        from db.migration_generic_source_candidates import _canonical_copy_guard_bodies
-
-        body = _canonical_copy_guard_bodies(fixture.schema, fixture.origin.preparation_schema)[1] + "\n-- altered\n"
-        await fixture.admin.execute(
-            f'CREATE OR REPLACE FUNCTION "{fixture.schema}".guard_pd_dataset_candidate_parent() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path TO pg_catalog AS $fn${body}$fn$'
-        )
-    with pytest.raises(RetainedFHIRCaptureError):
-        await _capture(fixture)
 
 
 def _plan_nodes(plan):
@@ -1012,40 +934,13 @@ async def test_closed_target_has_eligible_c_cursor_index_for_both_pages(legacy_c
             await reader.fetchval(
                 "SELECT bool_and(original.attcollation=copied.attcollation) FROM pg_attribute original "
                 "JOIN pg_attribute copied ON copied.attname=original.attname "
-                "WHERE original.attrelid=$1::oid AND copied.attrelid=$2::oid AND original.attnum>0 AND NOT original.attisdropped",
-                fixture.origin.resource_parent_oid,
-                dict(capture.relation_oids)["provider_directory_dataset_resource"],
+                "WHERE original.attrelid=to_regclass($1) AND copied.attrelid=to_regclass($2) "
+                "AND original.attnum>0 AND NOT original.attisdropped",
+                f'"{fixture.origin.resource_relation["schema"]}"."{fixture.origin.resource_relation["name"]}"',
+                f'"{capture.schema_name}".provider_directory_dataset_resource',
             )
             is True
         )
-
-
-@pytest.mark.parametrize("damage", ["missing", "collation", "unique", "extra", "opclass"])
-async def test_resource_cursor_index_is_part_of_closed_native_capture(legacy_capture_db, damage):
-    """A same-column PK cannot stand in for the exact nonunique C lookup."""
-    fixture = legacy_capture_db
-    capture = await _capture(fixture)
-    namespace = '"' + capture.schema_name + '"'
-    if damage != "extra":
-        await fixture.admin.execute(f"DROP INDEX {namespace}.retained_lookup_1_0")
-    if damage in {"collation", "unique", "opclass"}:
-        unique = "UNIQUE " if damage == "unique" else ""
-        keys = 'dataset_id,resource_type COLLATE "C",resource_id COLLATE "C"'
-        if damage == "collation":
-            keys = "dataset_id,resource_type,resource_id"
-        elif damage == "opclass":
-            keys = 'dataset_id,resource_type COLLATE "C" varchar_pattern_ops,resource_id COLLATE "C"'
-        await fixture.admin.execute(
-            f"CREATE {unique}INDEX retained_lookup_1_0 ON {namespace}.provider_directory_dataset_resource ({keys})"
-        )
-    elif damage == "extra":
-        await fixture.admin.execute(
-            f"CREATE INDEX extra_cursor ON {namespace}.provider_directory_dataset_resource (resource_id)"
-        )
-    reader = await fixture.connect("reader")
-    async with reader.transaction(isolation="repeatable_read", readonly=True):
-        with pytest.raises(RetainedFHIRCaptureError):
-            await pin_retained_fhir_read(reader, capture)
 
 
 @pytest.mark.parametrize("repeat_cancel", [False, True])
@@ -1069,9 +964,6 @@ async def test_interrupted_capture_rolls_back_target_and_drains_reader(legacy_ca
         reader.transaction(isolation="repeatable_read", readonly=True),
         writer.transaction(isolation="repeatable_read"),
     ):
-        original_vxid = await reader.fetchval(
-            "SELECT virtualtransaction FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='virtualxid'"
-        )
         task = asyncio.create_task(
             capture_retained_fhir_source(
                 reader,
@@ -1099,7 +991,7 @@ async def test_interrupted_capture_rolls_back_target_and_drains_reader(legacy_ca
                     release_rollback.set()
                 with pytest.raises(asyncio.CancelledError):
                     await task
-            await _assert_cancelled_reader(fixture, reader, writer, schema, original_vxid)
+            await _assert_cancelled_reader(fixture, reader, writer, schema)
         finally:
             release_rollback.set()
             if not task.done():
@@ -1173,7 +1065,7 @@ async def test_modern_capture_requires_complete_original_and_current_admission(l
 
 @pytest.mark.parametrize("legacy_capture_db", ["modern"], indirect=True)
 async def test_modern_profile_retains_canonical_guard_and_copied_header_controls(legacy_capture_db):
-    """An admitted proof does not replace canonical Source or closed target custody."""
+    """The complete copied header retains original admission and content accounting."""
     fixture = legacy_capture_db
     capture = await _capture(fixture)
     source_header = await fixture.admin.fetchrow(
@@ -1183,11 +1075,9 @@ async def test_modern_profile_retains_canonical_guard_and_copied_header_controls
         f'SELECT row_to_json(h)::text FROM "{capture.schema_name}".provider_directory_endpoint_dataset h'
     )
     assert source_header == target_header
-    await fixture.admin.execute(
-        f'ALTER TABLE "{fixture.schema}".retained_input DISABLE TRIGGER a_pd_candidate_update_old'
-    )
-    with pytest.raises(RetainedFHIRCaptureError):
-        await _capture(fixture)
+    reader = await fixture.connect("reader")
+    async with reader.transaction(isolation="repeatable_read", readonly=True):
+        assert await require_retained_fhir_capture(reader, capture) == capture
 
 
 @pytest.mark.parametrize("legacy_capture_db", ["modern"], indirect=True)
@@ -1567,10 +1457,9 @@ def _reader_rollback_barrier(monkeypatch, reader, started, repeat_cancel):
     return rollback_started, release_rollback
 
 
-async def _assert_cancelled_reader(fixture, reader, writer, schema, original_vxid):
-    """Prove immediate native absence and both original transaction identities."""
+async def _assert_cancelled_reader(fixture, reader, writer, schema):
+    """Prove target absence, a drained reader and the original pinned source data."""
     assert await writer.fetchval("SELECT to_regnamespace($1)", schema) is None
-    assert await writer.fetchval("SELECT current_user") == fixture.role_by_kind["publisher"]
     assert not await fixture.admin.fetchval(
         "SELECT EXISTS(SELECT FROM pg_stat_activity WHERE pid=$1 AND state='active')",
         reader.get_server_pid(),
@@ -1578,12 +1467,12 @@ async def _assert_cancelled_reader(fixture, reader, writer, schema, original_vxi
     assert await reader.fetchval("SELECT 1") == 1
     assert await reader.fetchval("SHOW transaction_isolation") == "repeatable read"
     assert await reader.fetchval("SHOW transaction_read_only") == "on"
-    assert (
-        await reader.fetchval(
-            "SELECT virtualtransaction FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='virtualxid'"
-        )
-        == original_vxid
-    )
+    source = f'"{fixture.schema}".provider_directory_source'
+    await fixture.admin.execute(f"UPDATE {source} SET endpoint_id=$1", "later-endpoint")
+    try:
+        assert await reader.fetchval(f"SELECT endpoint_id FROM {source}") == fixture.origin.endpoint_id
+    finally:
+        await fixture.admin.execute(f"UPDATE {source} SET endpoint_id=$1", fixture.origin.endpoint_id)
 
 
 async def _replace_fixture_header(fixture, changes_by_column):
@@ -1605,92 +1494,64 @@ async def _replace_fixture_header(fixture, changes_by_column):
 
 
 @pytest.fixture
-async def retained_address_custody_db(pipeline_db, bootstrap_db):
-    """Own exact loading, immutable-base and independent final-custody resources."""
+async def retained_address_custody_db(pipeline_db, bootstrap_db, serving_schema):
+    """Retain the existing writer API while configuring genuine named preparation and cleanup."""
     case = pipeline_db
-    connection = case.connection
-    for extension in ("intarray", "postgis", "btree_gin"):
-        await connection.execute(f"CREATE EXTENSION IF NOT EXISTS {extension}")
-    roles = tuple(sorted(case.writer_roles.values()))
-    original_owner = await connection.fetchval("SELECT quote_ident(current_user)")
-    control_owner = "retained_control_" + uuid4().hex
-    await connection.execute(f'CREATE ROLE "{control_owner}" NOLOGIN')
-    try:
+    original_roles = case.writer_roles
+    case.roles = dict(original_roles)
+    case.engine = serving_schema[2]
+    async with AsyncExitStack() as stack:
+        settings = stack.enter_context(pytest.MonkeyPatch.context())
+        await _named_compact_runtime(case, stack, settings)
+        case.writer_roles = {
+            "owner": case.custody_roles["loading"],
+            "loader": original_roles["loader"],
+            "reader": original_roles["reader"],
+            "publisher": case.executor_role,
+        }
+        case.complete_runtime_roles = tuple(
+            sorted(set(original_roles.values()) | set(case.writer_roles.values()) | {case.custody_roles["custodian"]})
+        )
         namespace = f'"{case.control_schema}"'
-        await connection.execute(f'ALTER SCHEMA {namespace} OWNER TO "{control_owner}"')
-        for table in ("network_membership_candidate", "network_candidate_custody"):
-            await connection.execute(f'ALTER TABLE {namespace}.{table} OWNER TO "{control_owner}"')
-        for role in roles:
-            await connection.execute(f'REVOKE ALL ON {namespace}.network_candidate_custody FROM "{role}"')
-            await connection.execute(f'GRANT SELECT ON {namespace}.network_candidate_custody TO "{role}"')
-        await connection.execute(
+        await case.connection.execute(
             f"UPDATE {namespace}.registry_revision_control SET draft_revision=2,approved_revision=2"
         )
         for network_id in (7, 42, 88):
-            await connection.execute(
+            await case.connection.execute(
                 f"INSERT INTO {namespace}.registry_approved_record "
                 "(approved_revision,record_kind,record_key,record_revision,custom_revision,record_json) "
                 "VALUES(2,'network',$1,1,1,$2::jsonb)",
                 str(network_id),
-                json.dumps(
-                    dict(
-                        network_id=network_id,
-                        archived=False,
-                        display_name="Synthetic network",
-                        aliases=[],
-                    )
-                ),
+                json.dumps(dict(network_id=network_id, archived=False, display_name="Synthetic network", aliases=[])),
             )
-        case.complete_runtime_roles = roles
-        yield case
-    finally:
-        await connection.execute("RESET ROLE")
-        await connection.execute(f'ALTER SCHEMA "{case.control_schema}" OWNER TO {original_owner}')
-        for table in ("network_membership_candidate", "network_candidate_custody"):
-            await connection.execute(f'ALTER TABLE "{case.control_schema}".{table} OWNER TO {original_owner}')
-        # The outer candidate fixture still owns exact candidate-schema cleanup.
-        await _restore_candidate_owners(case, original_owner)
-        await connection.execute(f'DROP OWNED BY "{control_owner}"')
-        await connection.execute(f'DROP ROLE "{control_owner}"')
+        try:
+            yield case
+        finally:
+            await case.connection.execute("RESET ROLE")
 
 
 async def _retained_custody_seal(case):
-    async def authorized(connection, target):
-        return target == case.copy_target and await connection.fetchval("SELECT current_user=session_user")
-
-    return await seal_network_candidate_custody(
-        case.connection,
-        case.copy_target,
-        control_schema=case.control_schema,
-        runtime_roles=case.complete_runtime_roles,
-        authorize=authorized,
-    )
+    """Retain the callback API while using the configured data validator and administrator freeze."""
+    if case.copy_target.candidate_id not in case.preparation_ids:
+        case.preparation_ids.append(case.copy_target.candidate_id)
+    return await case.seal_candidate(case.copy_target)
 
 
 async def _retained_custody_publisher_login(case):
-    """Open the genuine publisher with the supported DSN and a generated fixture password."""
-    role, password = case.writer_roles["publisher"], secrets.token_hex(24)
-    await case.connection.execute(f"ALTER ROLE \"{role}\" LOGIN PASSWORD '{password}'")
-    dsn = os.environ["NETWORK_REGISTRY_TEST_DSN"].replace("postgresql+asyncpg://", "postgresql://")
-    return role, await asyncpg.connect(dsn, user=role, password=password)
+    """Open and register the same bounded execution login used by configured preparation."""
+    connection = await asyncpg.connect(
+        case.execution_url.set(drivername="postgresql").render_as_string(hide_password=False),
+        timeout=case.sql_limits.connect_timeout_seconds,
+        server_settings=case.sql_limits.server_settings(),
+    )
+    case.custody_stack.push_async_callback(connection.close)
+    await case.sql_limits.verify(connection)
+    return case.executor_role, connection
 
 
 async def _retained_custody_captured_input(source, roles):
-    reader, writer = await source.connect("reader"), await source.connect("publisher")
-    identity = uuid4()
-    source.captures.append("registry_fhir_capture_" + identity.hex)
-    async with (
-        reader.transaction(isolation="repeatable_read", readonly=True),
-        writer.transaction(isolation="repeatable_read"),
-    ):
-        return await capture_retained_fhir_source(
-            reader,
-            writer,
-            source.origin,
-            capture_id=identity,
-            owner_role=source.role_by_kind["owner"],
-            runtime_roles=tuple(sorted(set(roles + (source.role_by_kind["reader"],)))),
-        )
+    """Use the genuine reader export and existing administrator-owned capture freeze."""
+    return await _capture(source, runtime_roles=roles)
 
 
 async def _retained_custody_base(case, source, serving, bootstrap):
@@ -1742,32 +1603,25 @@ async def _retained_custody_compose(
 
 async def _retained_custody_publish(case, target, address):
     case.copy_target, case.address_source = target, address
-    arguments_by_name = dict(
-        owner_role=case.writer_roles["owner"],
-        loader_roles=(case.writer_roles["loader"],),
-        reader_roles=(case.writer_roles["reader"],),
-        control_schema=case.control_schema,
+    return await publish_source_contribution_candidate(
+        case,
+        case.execution_connection,
+        target,
+        address,
+        writer_roles=dict(
+            owner_role=case.writer_roles["owner"],
+            loader_roles=(case.writer_roles["loader"],),
+            reader_roles=(case.writer_roles["reader"],),
+        ),
     )
-    await case.connection.execute(f'SET ROLE "{case.writer_roles["publisher"]}"')
-    try:
-        prepared = await prepare_network_candidate(case.connection, target, address, **arguments_by_name)
-        assert prepared["state"] == "ready"
-    finally:
-        await case.connection.execute("RESET ROLE")
-    await _retained_custody_seal(case)
-    await case.connection.execute(f'SET ROLE "{case.writer_roles["publisher"]}"')
-    try:
-        return await prepare_and_publish_network_candidate(case.connection, target, address, **arguments_by_name)
-    finally:
-        await case.connection.execute("RESET ROLE")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("legacy_capture_db", ["legacy", "modern"], indirect=True)
-async def test_retained_fhir_reuses_independent_address_owner_through_native_custody(
+async def test_retained_fhir_reuses_named_address_through_native_publication(
     retained_address_custody_db, legacy_capture_db, serving_schema, bootstrap_db
 ):
-    """Publish both retained profiles through distinct owners and actual native custody."""
+    """Publish both retained profiles with exact offices and ordinary PostgreSQL access."""
     case, source_fixture = retained_address_custody_db, legacy_capture_db
     capture = await _retained_custody_captured_input(source_fixture, case.complete_runtime_roles)
     recipe, approved, network_id = await _approved_capture_recipe(source_fixture, serving_schema, capture)
@@ -1780,13 +1634,16 @@ async def test_retained_fhir_reuses_independent_address_owner_through_native_cus
             case, connection, base, recipe, approved.approved_revision, request=request
         )
         assert address == base
-        retained_owner = await _assert_retained_actor_boundary(case, base)
         assert await case.connection.fetchval(
             "SELECT to_regclass($1) IS NOT NULL",
             copy_target.schema_name + ".provider_location_binding",
         )
         await _retained_custody_publish(case, copy_target, address)
-        await _assert_retained_reach_recheck(case, copy_target, retained_owner)
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with connection.transaction():
+                await connection.execute(
+                    f'UPDATE "{copy_target.schema_name}".network_membership SET provider_id=provider_id WHERE false'
+                )
         async with case.connection.transaction(isolation="repeatable_read", readonly=True):
             pin = await resolve_network_serving_manifest(case.connection, control_schema=case.control_schema)
             office_rows = await case.connection.fetch(
@@ -1797,44 +1654,6 @@ async def test_retained_fhir_reuses_independent_address_owner_through_native_cus
     finally:
         await connection.close()
         await case.connection.execute(f'ALTER ROLE "{role}" NOLOGIN PASSWORD NULL')
-
-
-async def _assert_retained_actor_boundary(case, base):
-    """Assert independent retained/loading/custody owners and the complete actor union."""
-    retained_owner = await case.connection.fetchval(
-        "SELECT nspowner FROM pg_namespace WHERE nspname=$1", base.schema_name
-    )
-    loading_owner = await case.connection.fetchval(
-        "SELECT oid FROM pg_roles WHERE rolname=$1", case.writer_roles["owner"]
-    )
-    custody_owner = await case.connection.fetchval(
-        "SELECT relowner FROM pg_class WHERE oid=to_regclass($1)",
-        case.control_schema + ".network_candidate_custody",
-    )
-    assert len({retained_owner, loading_owner, custody_owner}) == 3
-    for actor in case.complete_runtime_roles:
-        assert not await case.connection.fetchval(
-            "SELECT pg_has_role($1::name,$2::oid,'MEMBER') OR pg_has_role($1::name,$2::oid,'USAGE') OR pg_has_role($1::name,$2::oid,'SET')",
-            actor,
-            retained_owner,
-        )
-    return retained_owner
-
-
-async def _assert_retained_reach_recheck(case, target, retained_owner):
-    """An ordinary sealed replay must refuse a later SET-only owner path."""
-    # A later SET-only owner edge must be refused by ordinary sealed-candidate rechecks.
-    retained_name = await case.connection.fetchval("SELECT rolname FROM pg_roles WHERE oid=$1::oid", retained_owner)
-    actor = case.writer_roles["owner"]
-    await case.connection.execute(f'GRANT "{retained_name}" TO "{actor}" WITH INHERIT FALSE,SET TRUE')
-    try:
-        async with case.connection.transaction(isolation="repeatable_read", readonly=True):
-            with pytest.raises(NetworkCandidateCustodyError):
-                await verify_network_candidate_custody(case.connection, target, control_schema=case.control_schema)
-    finally:
-        await case.connection.execute(f'REVOKE "{retained_name}" FROM "{actor}"')
-    async with case.connection.transaction(isolation="repeatable_read", readonly=True):
-        assert await verify_network_candidate_custody(case.connection, target, control_schema=case.control_schema)
 
 
 @pytest.fixture

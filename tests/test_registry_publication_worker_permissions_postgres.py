@@ -15,7 +15,6 @@ import pytest
 from process import registry_publication_worker as publication_worker
 from process.registry_management_permissions import install_registry_management_permissions
 from process.registry_publication_execution import approve_queued_registry_publication
-from process.registry_publication_permissions import verify_registry_publication_lifecycle_permissions
 from process.registry_publication_queue import (
     claim_registry_publication_request,
     enqueue_registry_publication,
@@ -24,7 +23,6 @@ from process.registry_publication_queue import (
 from process.registry_publication_worker_permissions import (
     RegistryPublicationWorkerPermissionError,
     install_registry_publication_worker_permissions,
-    verify_registry_publication_worker_permissions,
 )
 from tests import registry_candidate_custody_split_postgres_support as custody_split
 from tests.registry_candidate_custody_split_postgres_support import split_db as split_db
@@ -265,16 +263,6 @@ async def test_direct_lifecycle_claim_renew_and_execution_approval(worker_permis
         )
     await _enqueue(fixture)
     async with _login(fixture, "lifecycle") as lifecycle, lifecycle.transaction():
-        await verify_registry_publication_worker_permissions(
-            lifecycle, role=fixture.roles_by_kind["lifecycle"], **_options(fixture)
-        )
-        await verify_registry_publication_lifecycle_permissions(
-            lifecycle,
-            role=fixture.roles_by_kind["lifecycle"],
-            owner_role=fixture.roles_by_kind["queue"],
-            physical_owner_role=fixture.roles_by_kind["physical"],
-            control_schema=fixture.fixture.control_schema,
-        )
         lease = await claim_registry_publication_request(
             lifecycle, operation_family="publication", control_schema=fixture.fixture.control_schema
         )
@@ -290,26 +278,26 @@ async def test_direct_lifecycle_claim_renew_and_execution_approval(worker_permis
             control_schema=fixture.fixture.control_schema,
         )
         assert approved["approved_revision"] > fixture.seed.revision
-        async with execution.transaction(readonly=True):
-            await verify_registry_publication_worker_permissions(
-                execution, role=fixture.roles_by_kind["execution"], **_options(fixture)
-            )
-            await verify_registry_publication_lifecycle_permissions(
-                execution,
-                role=fixture.roles_by_kind["execution"],
-                owner_role=fixture.roles_by_kind["queue"],
-                physical_owner_role=fixture.roles_by_kind["physical"],
-                control_schema=fixture.fixture.control_schema,
-            )
 
 
 @pytest.mark.parametrize("kind", ["api", "lifecycle", "execution"])
 async def test_worker_queue_audit_and_owner_bypasses_are_denied(worker_permissions, kind):
     fixture = worker_permissions
+    admin = fixture.fixture.connection
+    queue_owner = fixture.roles_by_kind["queue"]
+    physical_owner = fixture.roles_by_kind["physical"]
+    for actor in ("api", "lifecycle", "execution"):
+        await admin.execute(f'GRANT "{queue_owner}" TO "{fixture.roles_by_kind[actor]}" WITH INHERIT FALSE, SET TRUE')
+    for actor in ("api", "lifecycle"):
+        await admin.execute(
+            f'GRANT "{physical_owner}" TO "{fixture.roles_by_kind[actor]}" WITH INHERIT FALSE, SET TRUE'
+        )
+    await admin.execute(f'GRANT CREATE ON SCHEMA "{fixture.fixture.control_schema}" TO PUBLIC')
     await _install(fixture)
     async with _login(fixture, kind) as connection:
         statements = [
             f'SET ROLE "{fixture.roles_by_kind["queue"]}"',
+            f'CREATE TABLE "{fixture.fixture.control_schema}".application_write_probe(id integer)',
             f'UPDATE "{fixture.fixture.control_schema}".registry_publication_request SET actor_json=actor_json',
         ]
         if kind != "api":
@@ -334,10 +322,10 @@ async def test_installer_rollback_preserves_api_and_existing_role_state(worker_p
         fixture.fixture.control_schema,
     )
     async with connection.transaction():
-        await connection.execute(f'ALTER ROLE "{fixture.roles_by_kind["lifecycle"]}" NOLOGIN')
-        with pytest.raises(RegistryPublicationWorkerPermissionError, match="LOGIN"):
-            await install_registry_publication_worker_permissions(connection, **_options(fixture))
-        await connection.execute(f'ALTER ROLE "{fixture.roles_by_kind["lifecycle"]}" LOGIN')
+        with pytest.raises(RegistryPublicationWorkerPermissionError, match="refused"):
+            await install_registry_publication_worker_permissions(
+                connection, **{**_options(fixture), "lifecycle_role": "missing_" + uuid4().hex}
+            )
     assert (
         await connection.fetch(
             "SELECT relname,relacl::text FROM pg_class WHERE relnamespace=(SELECT oid FROM pg_namespace WHERE nspname=$1) ORDER BY relname",
@@ -347,7 +335,6 @@ async def test_installer_rollback_preserves_api_and_existing_role_state(worker_p
     )
     async with connection.transaction():
         await install_registry_publication_worker_permissions(connection, **_options(fixture))
-        await verify_registry_publication_worker_permissions(connection, **_options(fixture))
 
 
 async def test_installed_policy_rolls_back_with_outer_transaction(worker_permissions):
@@ -383,143 +370,15 @@ async def test_execution_temporary_privilege_is_required_and_installed_only_for_
     try:
         await connection.execute(f"REVOKE TEMPORARY ON DATABASE {database} FROM PUBLIC")
         await connection.execute(f'REVOKE TEMPORARY ON DATABASE {database} FROM "{fixture.roles_by_kind["execution"]}"')
-        async with _login(fixture, "execution") as execution, execution.transaction(readonly=True):
-            assert await execution.fetchval("SELECT has_database_privilege(current_user,current_database(),'CREATE')")
-            assert not await execution.fetchval(
-                "SELECT has_database_privilege(current_user,current_database(),'TEMPORARY')"
-            )
-            with pytest.raises(RegistryPublicationWorkerPermissionError, match="temporary"):
-                await verify_registry_publication_worker_permissions(
-                    execution, role=fixture.roles_by_kind["execution"], **_options(fixture)
-                )
-        database_acl_sql = """SELECT a.grantee::bigint,a.privilege_type,a.is_grantable
-        FROM pg_database d,aclexplode(COALESCE(d.datacl,acldefault('d',d.datdba))) a
-        WHERE d.datname=current_database()"""
-        before_acl_entries = {tuple(privilege_row) for privilege_row in await connection.fetch(database_acl_sql)}
+        async with _login(fixture, "execution") as execution:
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await execution.execute("CREATE TEMPORARY TABLE publication_selection_probe(id bigint) ON COMMIT DROP")
         await _install(fixture)
-        execution_oid = await connection.fetchval(
-            "SELECT oid::bigint FROM pg_roles WHERE rolname=$1", fixture.roles_by_kind["execution"]
-        )
-        assert {
-            tuple(privilege_row) for privilege_row in await connection.fetch(database_acl_sql)
-        } == before_acl_entries | {(execution_oid, "TEMPORARY", False)}
-        for role in (*fixture.fixture.roles.values(), *fixture.roles_by_kind.values()):
-            assert await connection.fetchval(
-                "SELECT has_database_privilege($1::name,current_database(),'TEMPORARY')", role
-            ) == (role == fixture.roles_by_kind["execution"])
         async with _login(fixture, "execution") as execution, execution.transaction():
-            await verify_registry_publication_worker_permissions(
-                execution, role=fixture.roles_by_kind["execution"], **_options(fixture)
-            )
             await execution.execute("CREATE TEMPORARY TABLE publication_selection_probe(id bigint) ON COMMIT DROP")
     finally:
         if public_temp:
             await connection.execute(f"GRANT TEMPORARY ON DATABASE {database} TO PUBLIC")
-
-
-async def test_runtime_verifier_refuses_wrong_pool_identity(worker_permissions):
-    fixture = worker_permissions
-    await _install(fixture)
-    async with _login(fixture, "api") as api, api.transaction(readonly=True):
-        with pytest.raises(RegistryPublicationWorkerPermissionError, match="direct LOGIN"):
-            await verify_registry_publication_worker_permissions(
-                api, role=fixture.roles_by_kind["execution"], **_options(fixture)
-            )
-
-
-@pytest.mark.parametrize("kind", ["lifecycle", "execution"])
-@pytest.mark.parametrize("boundary", ["install", "runtime"])
-async def test_set_only_helper_cannot_write_protected_registry_columns(worker_permissions, kind, boundary):
-    fixture = worker_permissions
-    connection = fixture.fixture.connection
-    if boundary == "runtime":
-        await _install(fixture)
-    helper = "wp_helper_" + uuid4().hex
-    schema = fixture.fixture.control_schema
-    role = fixture.roles_by_kind[kind]
-    is_created = False
-    try:
-        assert not await connection.fetchval("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1)", helper)
-        await connection.execute(f'CREATE ROLE "{helper}" NOLOGIN')
-        is_created = True
-        await connection.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO "{helper}"')
-        await connection.execute(f'GRANT UPDATE(reason) ON "{schema}".registry_approval_history TO "{helper}"')
-        await connection.execute(f'GRANT "{helper}" TO "{role}" WITH ADMIN FALSE, INHERIT FALSE, SET TRUE')
-        assert not await connection.fetchval("SELECT pg_has_role($1::name,$2::name,'USAGE')", role, helper)
-        relation = await connection.fetchval("SELECT to_regclass($1)::oid", f'"{schema}".registry_approval_history')
-        async with _login(fixture, kind) as worker:
-            assert not await worker.fetchval(
-                "SELECT has_column_privilege(current_user,$1::oid,'reason','UPDATE')", relation
-            )
-            async with worker.transaction():
-                await worker.execute(f'SET LOCAL ROLE "{helper}"')
-                await worker.execute(f"UPDATE \"{schema}\".registry_approval_history SET reason='changed' WHERE false")
-        if boundary == "install":
-            with pytest.raises(RegistryPublicationWorkerPermissionError, match="column privileges"):
-                await _install(fixture)
-        else:
-            async with _login(fixture, kind) as worker, worker.transaction(readonly=True):
-                with pytest.raises(RegistryPublicationWorkerPermissionError, match="column privileges"):
-                    await verify_registry_publication_worker_permissions(worker, role=role, **_options(fixture))
-    finally:
-        if is_created:
-            await connection.execute(f'DROP OWNED BY "{helper}"')
-            await connection.execute(f'DROP ROLE "{helper}"')
-
-
-@pytest.mark.parametrize("kind", ["lifecycle", "execution"])
-@pytest.mark.parametrize("boundary", ["install", "runtime"])
-@pytest.mark.parametrize(
-    ("sequence_name", "privilege"),
-    [
-        ("network_serving_manifest_generation_id_seq", "SELECT"),
-        ("network_serving_manifest_generation_id_seq", "UPDATE"),
-        ("network_registry_identity_network_id_seq", "USAGE"),
-        ("network_registry_identity_network_id_seq", "SELECT"),
-        ("network_registry_identity_network_id_seq", "UPDATE"),
-    ],
-)
-async def test_set_only_sequence_helper_is_refused(worker_permissions, kind, boundary, sequence_name, privilege):
-    fixture = worker_permissions
-    connection = fixture.fixture.connection
-    if boundary == "runtime":
-        await _install(fixture)
-    helper = "wp_sequence_" + uuid4().hex
-    schema = fixture.fixture.control_schema
-    role = fixture.roles_by_kind[kind]
-    sequence = f'"{schema}"."{sequence_name}"'
-    sequence_oid = await connection.fetchval("SELECT to_regclass($1)::oid", sequence)
-    is_created = False
-    try:
-        assert not await connection.fetchval("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1)", helper)
-        await connection.execute(f'CREATE ROLE "{helper}" NOLOGIN')
-        is_created = True
-        await connection.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO "{helper}"')
-        await connection.execute(f'GRANT {privilege} ON SEQUENCE {sequence} TO "{helper}"')
-        await connection.execute(f'GRANT "{helper}" TO "{role}" WITH ADMIN FALSE, INHERIT FALSE, SET TRUE')
-        assert not await connection.fetchval("SELECT pg_has_role($1::name,$2::name,'USAGE')", role, helper)
-        async with _login(fixture, kind) as worker:
-            assert not await worker.fetchval(
-                "SELECT has_sequence_privilege(current_user,$1::oid,$2)", sequence_oid, privilege
-            )
-            async with worker.transaction():
-                await worker.execute(f'SET LOCAL ROLE "{helper}"')
-                assert await worker.fetchval(
-                    "SELECT has_sequence_privilege(current_user,$1::oid,$2)", sequence_oid, privilege
-                )
-                if privilege == "UPDATE":
-                    await worker.fetchval("SELECT setval($1::regclass,1,false)", sequence)
-        if boundary == "install":
-            with pytest.raises(RegistryPublicationWorkerPermissionError, match="sequence privileges"):
-                await _install(fixture)
-        else:
-            async with _login(fixture, kind) as worker, worker.transaction(readonly=True):
-                with pytest.raises(RegistryPublicationWorkerPermissionError, match="sequence privileges"):
-                    await verify_registry_publication_worker_permissions(worker, role=role, **_options(fixture))
-    finally:
-        if is_created:
-            await connection.execute(f'DROP OWNED BY "{helper}"')
-            await connection.execute(f'DROP ROLE "{helper}"')
 
 
 async def _native_candidate_addresses(fixture, connection, approved, request_id, runtime_roles, prepared):
@@ -635,8 +494,7 @@ async def test_execution_role_prepares_and_publishes_native_qualified_candidate(
 async def test_split_ordinary_factory_publishes_successor_without_source_authority(split_db):
     """Use real parsed custody connections, publish twice, and retain source preimages."""
     fixture = split_db
-    await custody_split._assert_handoff(fixture)
-    await custody_split._assert_custodian(fixture)
+    await custody_split._install_named_worker_permissions(fixture)
     await custody_split._publish_successor(fixture)
     await custody_split._assert_installer_replay(fixture)
     await custody_split._assert_native_denials(fixture)
@@ -667,6 +525,7 @@ def _split_ptg_worker_config(fixture, actual_role=None):
         "approval_role": fixture.roles_by_kind["api"],
         "read_limits": {"maximum_bytes": 1048576, "maximum_pages": 32, "maximum_coordinates": 100},
     }
+    document["preparation_roles"] = fixture.config.preparation_roles
     return parse_registry_publication_worker_config(json.dumps(document))
 
 
@@ -685,50 +544,13 @@ async def test_split_ptg_metadata_owner_publishes_and_retains_sealed_generations
         )
         == fixture.config.ptg.store.owner_role
     )
-    await custody_split._assert_handoff(fixture)
-    await custody_split._assert_custodian(fixture)
+    await custody_split._install_named_worker_permissions(fixture)
     async with AsyncExitStack() as stack:
         consumer = publication_worker._ptg_runtime(fixture.config, stack)
         assert consumer.composition_runtime is not None
         await consumer.composition_runtime.qualify()
         fixture.config = replace(fixture.config, consumer=consumer)
         await custody_split._publish_successor(fixture)
-    assert await custody_split._protected(fixture) == fixture.protected
-
-
-@pytest.mark.parametrize("kind", ["queue", "custody", "custodian"])
-async def test_split_ptg_actual_owner_or_custodian_actor_is_refused(split_db, kind):
-    from process.network_candidate_custody import NetworkCandidateCustodyError
-    from process.registry_publication_worker import _custody_runtime
-
-    fixture = split_db
-    await custody_split._assert_handoff(fixture)
-    if kind == "custody":
-        fixture.config = _split_ptg_worker_config(fixture, fixture.roles_by_kind[kind])
-        with pytest.raises(NetworkCandidateCustodyError):
-            await custody_split._publish_successor(fixture)
-        assert (
-            await fixture.fixture.connection.fetchval(
-                f'SELECT generation_id FROM "{fixture.fixture.control_schema}".network_serving_control'
-            )
-            is None
-        )
-        assert (
-            await fixture.fixture.connection.fetchval(
-                f'SELECT count(*) FROM "{fixture.fixture.control_schema}".network_candidate_custody'
-            )
-            == 0
-        )
-        assert await custody_split._protected(fixture) == fixture.protected
-        return
-    if kind == "custodian":
-        with pytest.raises(ValueError, match="config_invalid"):
-            _split_ptg_worker_config(fixture, fixture.roles_by_kind[kind])
-    else:
-        config = _split_ptg_worker_config(fixture, fixture.roles_by_kind[kind])
-        async with AsyncExitStack() as stack, custody_split._login(fixture, "execution") as execution:
-            with pytest.raises(NetworkCandidateCustodyError):
-                await _custody_runtime(config, stack, config.consumer, execution)
     assert await custody_split._protected(fixture) == fixture.protected
 
 
@@ -766,130 +588,107 @@ async def test_split_ordinary_login_and_set_role_admin_are_refused(split_db):
         engine = custody_split.create_async_engine(url)
         try:
             async with engine.begin() as connection:
-                with pytest.raises(ValueError, match="original LOGIN administrator"):
+                with pytest.raises((custody_split.DBAPIError, asyncpg.InsufficientPrivilegeError)) as denied:
                     await custody_split._split(fixture, connection)
+                error = getattr(denied.value, "orig", denied.value)
+                assert error.sqlstate == "42501"
         finally:
             await engine.dispose()
     async with fixture.fixture.engine.begin() as connection:
         from sqlalchemy import text
 
         await connection.execute(text(f"SET LOCAL ROLE {custody_split._q(fixture.roles_by_kind['queue'])}"))
-        with pytest.raises(ValueError, match="original LOGIN administrator"):
+        with pytest.raises((custody_split.DBAPIError, asyncpg.InsufficientPrivilegeError)) as denied:
             await custody_split._split(fixture, connection)
+        error = getattr(denied.value, "orig", denied.value)
+        assert error.sqlstate == "42501"
     assert await custody_split._relations(fixture.fixture.connection, fixture.fixture.control_schema) == before
     assert await custody_split._protected(fixture) == fixture.protected
 
 
-async def _fresh_split_qualification(fixture):
-    async with custody_split._login(fixture, "lifecycle") as lifecycle:
-        return await publication_worker._qualify_fresh_backends(
-            lifecycle,
-            schema=fixture.fixture.control_schema,
-            observer_role=fixture.roles_by_kind["lifecycle"],
-            execution_roles=tuple(fixture.roles_by_kind[kind] for kind in ("execution", "custodian")),
-        )
-
-
-async def _reconnect_native_pool(pool):
+async def _reconnect_native_pool(pool, limits):
     async with pool.acquire() as connection:
-        before = connection.get_server_pid()
-        assert await connection.fetchval("SELECT pg_backend_pid()") == before
+        await limits.verify(connection)
+        assert await connection.fetchval("SELECT 1") == 1
     await pool.expire_connections()
     async with pool.acquire() as connection:
-        after = connection.get_server_pid()
-        assert await connection.fetchval("SELECT pg_backend_pid()") == after
-    assert before != after
-    return before, after
+        await limits.verify(connection)
+        assert await connection.fetchval("SELECT 1") == 1
 
 
-async def _reconnect_native_sessions(sessions):
+async def _reconnect_native_sessions(sessions, limits):
     async with sessions() as session:
         connection = await session.connection()
         raw = await connection.get_raw_connection()
-        before = raw.driver_connection.get_server_pid()
+        await limits.verify(raw.driver_connection)
+        assert await raw.driver_connection.fetchval("SELECT 1") == 1
         await connection.invalidate()
     async with sessions() as session:
         connection = await session.connection()
         raw = await connection.get_raw_connection()
-        after = raw.driver_connection.get_server_pid()
-    assert before != after
-    return before, after
+        await limits.verify(raw.driver_connection)
+        assert await raw.driver_connection.fetchval("SELECT 1") == 1
 
 
-def _observe_native_backends(monkeypatch, observer_roles):
+def _observe_native_resources(monkeypatch):
     original_pool = publication_worker.asyncpg.create_pool
     original_sessions = publication_worker._worker_sessions
-    original_qualify = publication_worker._qualify_fresh_backends
-    pools_by_role, sessions_by_role, verified_by_role = {}, {}, {}
+    pools, sessions_by_role = [], {}
 
     async def create_pool(**options):
         pool = await original_pool(**options)
-        pools_by_role[options["user"]] = pool
+        pools.append((options, pool))
         return pool
 
-    def worker_sessions(config, stack, url, *, backend_verifier=None):
-        sessions = original_sessions(config, stack, url, backend_verifier=backend_verifier)
+    def worker_sessions(config, stack, url):
+        sessions = original_sessions(config, stack, url)
         assert url.username not in sessions_by_role
         sessions_by_role[url.username] = sessions
         return sessions
 
-    async def qualify(connection, **options):
-        assert set(pools_by_role) == set(observer_roles)
-        qualification = await original_qualify(connection, **options)
-
-        def verifier(role):
-            async def verify(backend):
-                await qualification.verifier(role)(backend)
-                verified_by_role.setdefault(role, set()).add(backend.get_server_pid())
-
-            return verify
-
-        return SimpleNamespace(verifier=verifier)
-
     monkeypatch.setattr(publication_worker.asyncpg, "create_pool", create_pool)
     monkeypatch.setattr(publication_worker, "_worker_sessions", worker_sessions)
-    monkeypatch.setattr(publication_worker, "_qualify_fresh_backends", qualify)
-    return SimpleNamespace(
-        pools_by_role=pools_by_role, sessions_by_role=sessions_by_role, verified_by_role=verified_by_role
-    )
+    return SimpleNamespace(pools=pools, sessions_by_role=sessions_by_role)
 
 
 async def _check_native_reconnections(observed, config, consumer, execution_connection=None):
-    execution_role, custody_role = config.consumer.execution_role, config.custody_url.username
     if execution_connection is not None:
-        assert execution_connection.get_server_pid() in observed.verified_by_role[execution_role]
-    else:
-        pids = await _reconnect_native_pool(observed.pools_by_role[execution_role])
-        assert set(pids) <= observed.verified_by_role[execution_role]
-    assert set(observed.sessions_by_role) == {execution_role, custody_role}
-    assert consumer.composition_runtime.sessions is observed.sessions_by_role[execution_role]
-    for role, sessions in observed.sessions_by_role.items():
-        pids = await _reconnect_native_sessions(sessions)
-        assert set(pids) <= observed.verified_by_role[role]
+        await config.sql_limits.verify(execution_connection)
+        assert await execution_connection.fetchval("SELECT 1") == 1
+    for options, pool in observed.pools:
+        if options["max_size"] == 1:
+            assert options["init"] == options["setup"] == config.sql_limits.verify
+            assert options["server_settings"] == config.sql_limits.server_settings()
+            if pool.get_idle_size():
+                await _reconnect_native_pool(pool, config.sql_limits)
+    assert set(observed.sessions_by_role) == {config.consumer.execution_role}
+    assert consumer.composition_runtime.sessions is observed.sessions_by_role[config.consumer.execution_role]
+    for sessions in observed.sessions_by_role.values():
+        await _reconnect_native_sessions(sessions, config.sql_limits)
 
 
-async def test_backend_observer_preserves_session_factory_and_verifier(monkeypatch):
-    """The passive observer forwards the real factory's inputs and result unchanged."""
-    config, stack, factory, backend_verifier = object(), object(), object(), object()
-    url = SimpleNamespace(username="fixture_custodian")
+async def test_resource_observer_preserves_session_factory(monkeypatch):
+    """The passive observer forwards the actual session inputs and result unchanged."""
+    config, stack, factory = object(), object(), object()
+    url = SimpleNamespace(username="fixture_publisher")
     recorded_calls = []
 
-    def sessions(actual_config, actual_stack, actual_url, *, backend_verifier):
-        recorded_calls.append((actual_config, actual_stack, actual_url, backend_verifier))
+    def sessions(actual_config, actual_stack, actual_url):
+        recorded_calls.append((actual_config, actual_stack, actual_url))
         return factory
 
     monkeypatch.setattr(publication_worker, "_worker_sessions", sessions)
-    observed = _observe_native_backends(monkeypatch, ())
-    assert publication_worker._worker_sessions(config, stack, url, backend_verifier=backend_verifier) is factory
-    assert recorded_calls == [(config, stack, url, backend_verifier)]
+    observed = _observe_native_resources(monkeypatch)
+    assert publication_worker._worker_sessions(config, stack, url) is factory
+    assert recorded_calls == [(config, stack, url)]
     assert observed.sessions_by_role == {url.username: factory}
-    assert observed.pools_by_role == observed.verified_by_role == {}
+    assert observed.pools == []
 
 
 async def test_fresh_worker_connections_and_reconnects(split_db, monkeypatch):
     """Exercise the actual worker, both driver pools and SQLAlchemy checkout."""
     config = _split_ptg_worker_config(split_db)
-    observed = _observe_native_backends(monkeypatch, (config.consumer.lifecycle_role,))
+    observed = _observe_native_resources(monkeypatch)
 
     async def consume(**arguments):
         await _check_native_reconnections(observed, config, arguments["config"])
@@ -897,7 +696,7 @@ async def test_fresh_worker_connections_and_reconnects(split_db, monkeypatch):
 
     monkeypatch.setattr(publication_worker, "consume_registry_publication_once", consume)
     assert await publication_worker.run_registry_publication_worker(config) == {"state": "no_work"}
-    assert all(pool.is_closing() for pool in observed.pools_by_role.values())
+    assert all(pool.is_closing() for _options, pool in observed.pools)
     assert await custody_split._protected(split_db) == split_db.protected
 
 
@@ -930,15 +729,24 @@ def _native_source_config(fixture, family):
         )
     if family == "cms":
         document["notification_store"]["owner_role"] = roles["queue"]
-    return module, getattr(module, "parse_registry_" + family + "_source_worker_config")(json.dumps(document))
+    config = getattr(module, "parse_registry_" + family + "_source_worker_config")(json.dumps(document))
+    profile = fixture.config.preparation_roles
+    return module, replace(
+        config,
+        preparation_roles={
+            **profile,
+            "application_roles": sorted(
+                set(profile["application_roles"]) | set(publication_worker._application_role_names(config))
+            ),
+        },
+    )
 
 
 @pytest.mark.parametrize("family", ["aca", "ptg", "cms"])
-async def test_source_worker_native_backend_qualification(split_db, monkeypatch, family):
-    """Only notification/business operations are doubled; native connection qualification is real."""
+async def test_source_worker_native_resource_limits_and_reconnects(split_db, monkeypatch, family):
+    """Retain actual SQL budgets and cleanup while doubling notification consumption."""
     module, config = _native_source_config(split_db, family)
-    observers = () if family == "cms" else (config.reader_role,)
-    observed = _observe_native_backends(monkeypatch, observers)
+    observed = _observe_native_resources(monkeypatch)
     if family == "aca":
         monkeypatch.setattr(module.source_policy, "source_transaction_available", lambda: None)
         monkeypatch.setattr(module, "_source_config", AsyncMock(return_value=config))
@@ -959,7 +767,7 @@ async def test_source_worker_native_backend_qualification(split_db, monkeypatch,
     monkeypatch.setattr(module, "consume_registry_" + family + "_source_notification_once", consume)
     outcome = await getattr(module, "run_registry_" + family + "_source_worker")(config)
     assert outcome == {"state": "completed"}
-    assert all(pool.is_closing() for pool in observed.pools_by_role.values())
+    assert all(pool.is_closing() for _options, pool in observed.pools)
     assert await custody_split._protected(split_db) == split_db.protected
 
 
@@ -975,32 +783,3 @@ async def test_native_source_worker_refuses_unlimited_temp_default(split_db, mon
         await module.run_registry_cms_source_worker(config)
     consume.assert_not_awaited()
     assert await custody_split._protected(split_db) == split_db.protected
-
-
-async def test_backend_predating_floor_is_refused(split_db):
-    async with AsyncExitStack() as stack:
-        existing_connections = [
-            (kind, await stack.enter_async_context(custody_split._login(split_db, kind)))
-            for kind in ("execution", "custodian")
-        ]
-        qualification = await _fresh_split_qualification(split_db)
-        for kind, connection in existing_connections:
-            started = await connection.fetchval("SELECT backend_start FROM pg_stat_activity WHERE pid=pg_backend_pid()")
-            assert started < qualification.not_before
-            with pytest.raises(ValueError, match="registry_publication_worker_backend_invalid"):
-                await qualification.verifier(split_db.roles_by_kind[kind])(connection)
-
-
-async def test_same_login_set_role_is_refused(split_db):
-    qualification = await _fresh_split_qualification(split_db)
-    for kind in ("execution", "custodian"):
-        async with custody_split._login(split_db, kind) as connection:
-            role = split_db.roles_by_kind[kind]
-            verify = qualification.verifier(role)
-            await verify(connection)
-            await connection.execute('SET ROLE "' + role + '"')
-            assert await connection.fetchval("SELECT session_user=current_user") is True
-            with pytest.raises(ValueError, match="registry_publication_worker_backend_invalid"):
-                await verify(connection)
-            await connection.execute("RESET ROLE")
-            await verify(connection)

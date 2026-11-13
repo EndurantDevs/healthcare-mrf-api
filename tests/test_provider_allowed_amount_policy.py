@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock
 import pytest
 from sanic.exceptions import ServiceUnavailable
 
-from api import network_address_scope
 from api import provider_allowed_amount_policy as allowed
 from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
 from process.ptg_parts.result_archive_published_authority import PtgPublishedResultSourceAuthority
@@ -127,8 +126,8 @@ def HeldInputs():
 
     return EMProviderInputs(
         tuple(
-            EMProviderInputRelation(role, "held_inputs", role.replace(".", "_"), "example_generation", i + 1, i + 21)
-            for i, role in enumerate(_ROLES)
+            EMProviderInputRelation(role, "held_inputs", role.replace(".", "_"), "example_generation")
+            for role in _ROLES
         )
     )
 

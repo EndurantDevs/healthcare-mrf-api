@@ -580,11 +580,22 @@ async def _other_edition_write(connection, writer):
     await connection.execute("RESET ROLE")
 
 
+async def _assert_epoch_write_denied(driver, epoch, runtime_role):
+    async with driver.transaction():
+        await driver.execute(f'SET LOCAL ROLE "{runtime_role}"')
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with driver.transaction():
+                await driver.execute(
+                    f'UPDATE "{epoch.schema_name}".provider_directory_endpoint_dataset SET status=status'
+                )
+
+
 async def _assert_epoch_capture(driver, source_pin, capture_options_by_field, damage):
-    """Check immutable replay, wrong trusted proof, and task-owned capability drift."""
+    """Check named replay, independently admitted data, functional indexes and denied writes."""
     from process.network_fhir_membership_source import _require_pinned_source
     from process.network_fhir_source_epoch import (
         FHIRSourceEpochError,
+        _content,
         capture_retained_cms_fhir_source_epoch,
         require_retained_cms_fhir_source_epoch,
         validate_retained_cms_fhir_source_epoch,
@@ -602,15 +613,11 @@ async def _assert_epoch_capture(driver, source_pin, capture_options_by_field, da
             return
         epoch = await capture_retained_cms_fhir_source_epoch(driver, source_pin, **capture_options_by_field)
         assert validate_retained_cms_fhir_source_epoch(epoch.as_dict()) == epoch
-        from process.network_fhir_source_epoch import _content
-
+        await _assert_legacy_epoch_compatibility(driver, source_pin, epoch)
         assert await _content(driver, source_pin.schema_name) == epoch.content_sha256
         assert await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch) == epoch
         assert await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch, verify_content=False) == epoch
         _assert_epoch_wire(epoch)
-        assert not await driver.fetchval(
-            "SELECT pg_has_role($1,$2,'SET') OR pg_has_role($1,$2,'MEMBER')", runtime_role, epoch.owner_role
-        )
         if damage == "query_plan":
             await _assert_epoch_lookup_plans(driver, source_pin, epoch)
         retained_pin = replace(source_pin, retained_epoch=epoch)
@@ -618,8 +625,18 @@ async def _assert_epoch_capture(driver, source_pin, capture_options_by_field, da
         if damage in {"drop_index", "recreate_index", "wrong_index"}:
             await _assert_epoch_index_damage(driver, source_pin, epoch, damage)
         if damage == "epoch_write":
-            await driver.execute(f'GRANT UPDATE ON ALL TABLES IN SCHEMA "{epoch.schema_name}" TO "{runtime_role}"')
-            with pytest.raises(FHIRSourceEpochError, match="^fhir_source_epoch_unavailable$"):
+            await _assert_epoch_write_denied(driver, epoch, runtime_role)
+            assert await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch) == epoch
+        if damage == "retained_payload":
+            await driver.execute(
+                f'UPDATE "{epoch.schema_name}".provider_directory_dataset_resource '
+                "SET payload_json=(payload_json::jsonb || $1::jsonb)::json",
+                json.dumps({"unexpected": True}),
+            )
+            assert (
+                await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch, verify_content=False) == epoch
+            )
+            with pytest.raises(FHIRSourceEpochError):
                 await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch)
         if damage == "origin_change":
             await driver.execute(
@@ -629,8 +646,29 @@ async def _assert_epoch_capture(driver, source_pin, capture_options_by_field, da
             await _require_pinned_source(driver, retained_pin)
 
 
+async def _assert_legacy_epoch_compatibility(driver, source_pin, epoch):
+    """Historical physical fields have no authority over the native named edition."""
+    from process.network_fhir_source_epoch import _TABLES, require_retained_cms_fhir_source_epoch
+
+    for offset in (1000, 2000):
+        historical_by_field = {
+            **epoch.as_dict(),
+            "schema_oid": offset,
+            "relation_oids": [[name, offset + ordinal] for ordinal, name in enumerate(sorted(_TABLES), 1)],
+            "owner_role": "historical_owner_" + str(offset),
+            "runtime_roles": ["historical_reader_" + str(offset)],
+            "catalog_sha256": str(offset // 1000) * 64,
+        }
+        historical_by_field["origin_coordinates"][6] = offset + 500
+        assert await require_retained_cms_fhir_source_epoch(driver, source_pin, historical_by_field) == epoch
+        assert (
+            await require_retained_cms_fhir_source_epoch(driver, source_pin, historical_by_field, verify_content=False)
+            == epoch
+        )
+
+
 async def _assert_epoch_index_damage(driver, source_pin, epoch, damage):
-    """Deny missing, differently keyed or identically rebuilt indexes through cheap custody."""
+    """Reject missing or wrongly keyed indexes and accept equivalent rebuilds by function."""
     from process.network_fhir_source_epoch import FHIRSourceEpochError, require_retained_cms_fhir_source_epoch
 
     await driver.execute(f'DROP INDEX "{epoch.schema_name}".cms_epoch_entity_site')
@@ -639,8 +677,12 @@ async def _assert_epoch_index_damage(driver, source_pin, epoch, damage):
         await driver.execute(
             f'CREATE INDEX cms_epoch_entity_site ON "{epoch.schema_name}".provider_directory_entity_source_binding ({column})'
         )
-    with pytest.raises(FHIRSourceEpochError, match="^fhir_source_epoch_unavailable$"):
-        await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch, verify_content=False)
+    assert await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch, verify_content=False) == epoch
+    if damage == "recreate_index":
+        assert await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch) == epoch
+    else:
+        with pytest.raises(FHIRSourceEpochError, match="^fhir_source_epoch_unavailable$"):
+            await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch)
 
 
 def _enlarge_epoch_source_rows(monkeypatch, size):
@@ -715,7 +757,7 @@ def _assert_epoch_wire(epoch):
     from process.network_fhir_source_epoch import FHIRSourceEpochError, validate_retained_cms_fhir_source_epoch
 
     for field, invalid in (
-        ("runtime_roles", epoch.runtime_roles[0]),
+        ("runtime_roles", "reader"),
         ("origin_coordinates", "abc"),
         ("relation_oids", "abc"),
         ("epoch_id", str(epoch.epoch_id).upper()),
@@ -747,6 +789,7 @@ def _tamper_epoch_export(monkeypatch):
         None,
         "expectation",
         "epoch_write",
+        "retained_payload",
         "origin_change",
         "source_payload",
         "drop_index",

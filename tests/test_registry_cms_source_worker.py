@@ -253,11 +253,12 @@ def resources(monkeypatch, *, wrong_database=False, fail_connect=False, fail_clo
     )
     verify = AsyncMock()
     monkeypatch.setattr(worker.RegistryPublicationSQLLimits, "verify", verify)
-    monkeypatch.setattr(
-        worker,
-        "_worker_backend_qualification",
-        AsyncMock(return_value=SimpleNamespace(verifier=lambda role: AsyncMock())),
-    )
+
+    async def configured_runtime(config, stack):
+        harness.options["configured_consumer"] = config.consumer
+        return config.consumer
+
+    monkeypatch.setattr(worker, "_configured_worker_runtime", configured_runtime)
 
     async def create_pool(**kwargs):
         harness.options["pool"] = kwargs
@@ -287,6 +288,7 @@ async def test_one_consume_has_finite_actual_checkout_limits_and_state_only_outp
 
     async def consume(**kwargs):
         assert kwargs["notification_sessions"] is sessions
+        assert kwargs["config"] is options["configured_consumer"]
         assert kwargs["receipt_id"] == "a" * 64
         assert not kwargs["connection"].is_in_transaction()
         events.append("consume")
@@ -447,10 +449,11 @@ async def test_periodic_scope_attack_refuses_before_resources(monkeypatch, damag
 
 
 @pytest.mark.parametrize("identity", ("source_publisher", "inbox_owner", "source_reader"))
-def test_custody_refuses_all_notification_writer_and_reader_identities(identity):
-    from process.registry_publication_worker import _custody_roles
-
+def test_legacy_preparation_url_preserves_notification_scope(identity):
+    """The historical transport input remains parseable without defining preparation authority."""
     config = parsed()
-    assert identity in _custody_roles(config)
-    with pytest.raises(ValueError, match="registry_publication_worker_config_invalid"):
-        replace(config, custody_url=config.execution_url.set(username=identity))
+    changed = replace(config, custody_url=config.execution_url.set(username=identity))
+    assert changed.custody_url.username == identity
+    assert changed.notification_url == config.notification_url
+    assert changed.notification_store == config.notification_store
+    assert changed.consumer == config.consumer and changed.preparation_roles == config.preparation_roles

@@ -10,11 +10,9 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import SimpleNamespace
 from uuid import UUID
 
 from ijson.backends import python as ijson_python
-from sqlalchemy import text
 
 from process.network_address_projection import _identifier
 from process.network_bootstrap_sources import (
@@ -24,7 +22,7 @@ from process.network_bootstrap_sources import (
     _copy_native_spool,
     _CopyBatchTooLarge,
 )
-from process.network_custom_address_source import _closed, _require_transaction
+from process.network_custom_address_source import _require_transaction
 from process.network_fhir_retained_capture_contract import (
     LEGACY_PROFILE,
     SEMANTIC_PROFILE,
@@ -48,12 +46,10 @@ from process.network_fhir_retained_native import (
 from process.network_fhir_source_epoch import (
     _CONTENT_SETTINGS,
     _borrowed_epoch_settings,
-    _catalog_relations,
     _set_content_settings,
 )
-from process.network_fhir_source_epoch_pin import _columns, _virtual_xid
+from process.network_fhir_source_epoch_pin import _columns
 from process.network_generic_source_published_snapshot import published_generic_binding, require_native_generic_snapshot
-from process.network_membership_writer_closure import _check_roles, _protected_owner, _transfer_and_grant
 from process.provider_directory_admission_seal import (
     ADMISSION_GENERIC_PROOF_SUMMARY_KEY,
     ADMISSION_METADATA_SUMMARY_MAX_BYTES,
@@ -62,9 +58,8 @@ from process.provider_directory_admission_seal import (
     validate_generic_admission_copy,
 )
 from process.provider_directory_admission_stream import _copy_field_reader
-from process.provider_directory_cms_routine_settings import approved_cms_routine_settings
-from process.provider_directory_dataset_rehydrate_pin import _same_database
 from process.provider_directory_fhir_subset_canonical import canonical_payload_sha256
+from process.provider_directory_generic_source_provision import freeze_fhir_source_snapshot
 from process.provider_directory_resource_hash import (
     LEGACY_RESOURCE_HASH_CONTRACT,
     SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
@@ -98,33 +93,26 @@ _LOOKUPS = {
     TABLES[3]: (("source_id", "release_id"),),
     TABLES[4]: (("source_id", "release_id", "insurance_plan_resource_id"),),
 }
-_READ_BRAND = object()
 _DERIVED_BATCH_ROWS = 5000
 _DERIVED_BATCH_BYTES = 64 * 1024**2
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True)
 class RetainedFHIRRead:
-    """One caller-owned content admission, bound to its original native transaction."""
+    """Named retained data selected for a bounded read operation."""
 
-    connection: object
     capture: RetainedFHIRCapture
-    task: object
-    virtual_xid: str
-    brand: object
 
-    async def verify(self, connection, capture):
-        """Recheck native custody per page without a global cache or full-table rehash."""
-        require(self.brand is _READ_BRAND and connection is self.connection and capture == self.capture)
-        require(self.task is asyncio.current_task() and connection.is_in_transaction())
-        require(await _virtual_xid(connection) == self.virtual_xid)
-        await require_retained_fhir_capture(connection, capture, verify_content=False)
+    def require_ready(self, capture=None):
+        """Validate the selected logical capture and any explicitly requested edition."""
+        selected = validate_capture(self.capture)
+        if capture is not None:
+            require(selected == validate_capture(capture))
 
 
 async def pin_retained_fhir_read(connection, capture):
-    """Verify complete immutable content once before this operation's page traversal."""
-    capture = await require_retained_fhir_capture(connection, capture)
-    return RetainedFHIRRead(connection, capture, asyncio.current_task(), await _virtual_xid(connection), _READ_BRAND)
+    """Validate copied metadata bytes and complete content before reading retained rows."""
+    return RetainedFHIRRead(await require_retained_fhir_capture(connection, capture))
 
 
 def _relation(schema, table):
@@ -136,15 +124,10 @@ class _ReaderCopy:
 
     def __init__(self, reader, writer):
         self.reader, self.writer = reader, writer
-        self.task = asyncio.current_task()
-        self.virtual_xid = None
 
     async def verify(self):
-        """Refuse export/import after either original transaction or task changed."""
-        require(
-            self.task is asyncio.current_task() and self.reader.is_in_transaction() and self.writer.is_in_transaction()
-        )
-        require(await _virtual_xid(self.reader) == self.virtual_xid)
+        """Require both caller-owned transactions to remain open during bounded COPY."""
+        require(self.reader.is_in_transaction() and self.writer.is_in_transaction())
 
     def transaction(self):
         """Nest only the target COPY import in a writer savepoint."""
@@ -177,52 +160,13 @@ async def _reader_export(reader, *arguments, **options):
             await drain_operation(transaction.rollback(), preserve_cancellation=True)
 
 
-async def _reader_identity(reader, origin):
-    await _require_transaction(reader)
-    actor = await reader.fetchrow(
-        "SELECT session_user::text AS login,current_user::text AS actor,rolsuper,rolcreatedb,rolcreaterole,"
-        "rolreplication,rolbypassrls,current_setting('transaction_read_only') AS readonly,"
-        "current_setting('session_replication_role') AS replication_role FROM pg_roles WHERE rolname=session_user"
-    )
-    require(actor and actor["login"] == actor["actor"] == origin.reader_role and actor["readonly"] == "on")
-    require(
-        actor["replication_role"] == "origin"
-        and not any(
-            actor[key] for key in ("rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
-        )
-    )
-    source_oid = await reader.fetchval(
-        "SELECT c.oid::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-        "WHERE n.nspname=$1 AND c.relname='provider_directory_source' AND c.relkind='r' "
-        "AND c.relpersistence='p' AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity",
-        origin.schema_name,
-    )
-    require(type(source_oid) is int and source_oid > 0)
-    require(
-        await reader.fetchval(
-            "SELECT NOT has_schema_privilege(current_user,$1,'CREATE') "
-            "AND NOT has_parameter_privilege(current_user,'session_replication_role','SET') "
-            "AND NOT EXISTS(SELECT FROM pg_class c "
-            "WHERE c.oid=ANY($2::oid[]) AND (has_table_privilege(current_user,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER,MAINTAIN') "
-            "OR has_any_column_privilege(current_user,c.oid,'INSERT,UPDATE,REFERENCES') "
-            "OR pg_has_role(current_user,c.relowner,'MEMBER') OR pg_has_role(current_user,c.relowner,'USAGE') "
-            "OR pg_has_role(current_user,c.relowner,'SET')))",
-            origin.schema_name,
-            [origin.header_oid, origin.resource_parent_oid, origin.resource_leaf_oid, source_oid],
-        )
-        is True
-    )
-
-
 async def _origin_header(reader, origin):
     """Bind original bytes and published coordinates, never fill a missing admission seal."""
-    header = _relation(origin.schema_name, TABLES[0])
-    await reader.execute(
-        f"LOCK TABLE ONLY {header}, ONLY {_relation(origin.schema_name, TABLES[1])}, "
-        f"ONLY {_relation(origin.schema_name, 'provider_directory_source')} IN ACCESS SHARE MODE NOWAIT"
-    )
+    header = _relation(origin.header_relation["schema"], origin.header_relation["name"])
     header = await reader.fetchrow(
-        f"SELECT tableoid::oid::bigint AS oid,endpoint_id,acquisition_root_run_id,dataset_hash,status,published_at,resource_count,"
+        "SELECT endpoint_id,acquisition_root_run_id,dataset_hash,status,published_at,is_current,resource_count,"
+        "to_jsonb(d)->>'previous_dataset_id' AS previous_dataset_id,"
+        "to_jsonb(d)->>'completion_proof_sha256' AS completion_proof_sha256,"
         "candidate_storage_json,completion_proof_required_version,publication_metadata_sha256,"
         "content_proof_admission_version,content_proof_admission_kind,content_proof_admission_sha256,content_proof_resource_types,"
         "CASE WHEN octet_length(publication_metadata_summary_json::text)<="
@@ -237,7 +181,7 @@ async def _origin_header(reader, origin):
         "publication_metadata_json->>'resource_hash_contract' AS hash_contract,"
         "publication_metadata_json->>'semantic_projection_as_of' AS semantic_as_of,"
         "publication_metadata_json->'provider_directory_content_proof_v1'->>'proof_sha256' AS proof_sha256 "
-        f"FROM {header} WHERE dataset_id=$1",
+        f"FROM {header} d WHERE dataset_id=$1",
         origin.dataset_id,
     )
     binding = _require_header_fields(header, origin)
@@ -252,14 +196,12 @@ def _require_header_fields(header, origin):
     require(
         header
         and (
-            header["oid"],
             header["endpoint_id"],
             header["acquisition_root_run_id"],
             header["dataset_hash"],
             header["resource_count"],
         )
         == (
-            origin.header_oid,
             origin.endpoint_id,
             origin.root_run_id,
             origin.dataset_sha256,
@@ -273,6 +215,7 @@ def _require_header_fields(header, origin):
         endpoint_id=origin.endpoint_id,
         root_run_id=origin.root_run_id,
         source_id=origin.source_id,
+        schema_name=origin.header_relation["schema"],
     )
     if origin.admission_profile == LEGACY_PROFILE:
         require(binding is None and header["hash_contract"] is None and header["admission_absent"] is True)
@@ -370,7 +313,7 @@ async def _publication_metadata_copy(reader, origin):
 
             status = await _reader_export(
                 reader,
-                f"SELECT publication_metadata_json::text FROM {_relation(origin.schema_name, TABLES[0])} WHERE dataset_id=$1",
+                f"SELECT publication_metadata_json::text FROM {_relation(origin.header_relation['schema'], origin.header_relation['name'])} WHERE dataset_id=$1",
                 origin.dataset_id,
                 output=bounded_write,
                 format="binary",
@@ -436,156 +379,11 @@ async def _origin_resource(reader, origin):
     """Retain exact parent/leaf routing and the Reader's native relation lock."""
     require(
         await reader.fetchval(
-            f"SELECT endpoint_id FROM {_relation(origin.schema_name, 'provider_directory_source')} WHERE source_id=$1",
+            f"SELECT endpoint_id FROM {_relation(origin.header_relation['schema'], 'provider_directory_source')} WHERE source_id=$1",
             origin.source_id,
         )
         == origin.endpoint_id
     )
-    require(
-        await reader.fetchval("SELECT to_regclass($1)::oid::bigint", _relation(origin.schema_name, TABLES[1]))
-        == origin.resource_parent_oid
-    )
-    require(
-        await reader.fetchval(
-            "SELECT EXISTS(SELECT FROM pg_inherits WHERE inhparent=$1::oid AND inhrelid=$2::oid)",
-            origin.resource_parent_oid,
-            origin.resource_leaf_oid,
-        )
-        is True
-    )
-    require(
-        await reader.fetchval(
-            "SELECT p.partstrat='l' AND p.partnatts=1 AND a.attname='dataset_id' FROM pg_partitioned_table p "
-            "JOIN pg_attribute a ON a.attrelid=p.partrelid AND a.attnum=p.partattrs[0] WHERE p.partrelid=$1::oid",
-            origin.resource_parent_oid,
-        )
-        is True
-    )
-    actual_leaf = await reader.fetchval(
-        f"SELECT tableoid::oid::bigint FROM {_relation(origin.schema_name, TABLES[1])} "
-        'WHERE dataset_id=$1 ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT 1',
-        origin.dataset_id,
-    )
-    require(actual_leaf == origin.resource_leaf_oid)
-    require(
-        await reader.fetchval(
-            "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='relation' AND relation=$1::oid AND mode='AccessShareLock' AND granted)",
-            actual_leaf,
-        )
-        is True
-    )
-
-
-async def _origin_guard(reader, origin):
-    """Retain the existing exact ALWAYS statement guard protecting published rows."""
-    from process.network_fhir_source_custody import _REACHABLE_FUNCTIONS
-    from process.provider_directory_cms_receipt_guard import _normalized
-
-    guard = await reader.fetchrow(
-        "SELECT p.prosrc,p.prosecdef,p.proconfig,l.lanname,p.provolatile::text,"
-        "count(*) FILTER(WHERE t.tgenabled='A' AND NOT t.tgisinternal AND t.tgattr=''::int2vector "
-        "AND t.tgqual IS NULL AND t.tgnargs=0 AND t.tgconstraint=0 AND t.tgparentid=0 "
-        "AND ((t.tgtype=4 AND t.tgoldtable IS NULL AND t.tgnewtable='new_rows') "
-        "OR(t.tgtype=16 AND t.tgoldtable='old_rows' AND t.tgnewtable='new_rows') "
-        "OR(t.tgtype=8 AND t.tgoldtable='old_rows' AND t.tgnewtable IS NULL) "
-        "OR(t.tgtype=34 AND t.tgoldtable IS NULL AND t.tgnewtable IS NULL))) AS guards "
-        "FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid JOIN pg_namespace n ON n.oid=p.pronamespace "
-        "JOIN pg_language l ON l.oid=p.prolang WHERE t.tgrelid=$1::oid AND n.nspname=$2 "
-        "AND p.proname='guard_tin_npi_connector_dataset_resource' "
-        "GROUP BY p.prosrc,p.prosecdef,p.proconfig,l.lanname,p.provolatile",
-        origin.resource_parent_oid,
-        origin.schema_name,
-    )
-    require(
-        guard
-        and guard["guards"] == 4
-        and guard["prosecdef"]
-        and guard["proconfig"] in approved_cms_routine_settings(["search_path=pg_catalog"])
-        and guard["lanname"] == "plpgsql"
-        and guard["provolatile"] == "v"
-    )
-    normalized = _normalized(guard["prosrc"].replace(_identifier(origin.schema_name) + ".", '"__schema__".'))
-    require(
-        hashlib.sha256(normalized.encode()).hexdigest()
-        == _REACHABLE_FUNCTIONS["guard_tin_npi_connector_dataset_resource"][0]
-    )
-    await _origin_candidate_guards(reader, origin)
-
-
-async def _origin_candidate_guards(reader, origin):
-    """Require existing canonical-copy parent authority and exact direct-leaf guards."""
-    try:
-        function_oid = await _candidate_parent_proof(reader, origin)
-    except RuntimeError:
-        raise RetainedFHIRCaptureError("retained_fhir_capture_unavailable") from None
-    guards = await reader.fetch(
-        "SELECT t.tgname,t.tgtype,t.tgenabled::text,t.tgargs,t.tgoldtable,t.tgnewtable,"
-        "t.tgattr=''::int2vector AND t.tgqual IS NULL AND t.tgnargs=2 AND t.tgconstraint=0 "
-        "AND t.tgparentid=0 AND NOT t.tgdeferrable AND NOT t.tginitdeferred AS unconditional "
-        "FROM pg_trigger t WHERE t.tgrelid=$1::oid AND NOT t.tgisinternal AND "
-        "(t.tgfoid=$2::oid OR t.tgtype & 1=1)",
-        origin.resource_leaf_oid,
-        function_oid,
-    )
-    expected_guards = {
-        (
-            "a_pd_candidate_" + operation + "_" + image.lower(),
-            flag,
-            (TABLES[1] + "\0" + image + "\0").encode(),
-            "affected_rows" if image == "OLD" else None,
-            "affected_rows" if image == "NEW" else None,
-        )
-        for operation, image, flag in (
-            ("insert", "NEW", 4),
-            ("update", "NEW", 16),
-            ("update", "OLD", 16),
-            ("delete", "OLD", 8),
-        )
-    }
-    require(len(guards) == 4 and all(guard["tgenabled"] in {"O", "A"} and guard["unconditional"] for guard in guards))
-    require(
-        {tuple(guard[name] for name in ("tgname", "tgtype", "tgargs", "tgoldtable", "tgnewtable")) for guard in guards}
-        == expected_guards
-    )
-
-
-async def _candidate_parent_proof(reader, origin):
-    """Reuse exact native guard predicates without extra private-schema USAGE."""
-    from db import migration_generic_source_candidates as guards
-    from process.network_cms_registry_address_capture import NativeReceiptSession
-
-    session = NativeReceiptSession(reader)
-    signature = _relation(origin.schema_name, "guard_pd_dataset_candidate_parent") + "()"
-    observed = (await session.execute(guards._COPY_GUARD_SNAPSHOT, {"signature": signature})).one_or_none()
-    require(
-        observed is not None
-        and observed["body"]
-        in (
-            guards._canonical_copy_guard_bodies(origin.schema_name, origin.preparation_schema)[1],
-            guards._cms_canonical_copy_guard_body(origin.schema_name, origin.preparation_schema),
-        )
-    )
-    preparation_oid = await reader.fetchval(
-        "SELECT c.oid::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-        "WHERE n.nspname=$1 AND c.relname='preparation'",
-        origin.preparation_schema,
-    )
-    require(type(preparation_oid) is int and preparation_oid > 0)
-    reader_sql = str(guards._COPY_GUARD_READER)
-    lookup = "to_regclass(:preparation)"
-    require(reader_sql.count(lookup) == 1)
-    # Only name resolution changes; the complete restricted privilege predicate stays exact.
-    reader_sql = text(reader_sql.replace(lookup, "CAST(:preparation_oid AS oid)"))
-    _, trigger_parameters = guards._canonical_copy_guard_input_parameters(
-        origin.schema_name, origin.preparation_schema, observed["identity"]
-    )
-    guards._require_canonical_copy_guard_observations(
-        await session.scalar(
-            reader_sql, {"owner": int(observed["identity"]["proowner"]), "preparation_oid": preparation_oid}
-        ),
-        await session.execute(guards._COPY_GUARD_TRIGGERS, trigger_parameters),
-    )
-    return int(observed["identity"]["oid"])
 
 
 async def _copied_header_bytes(connection, schema, origin):
@@ -599,129 +397,6 @@ async def _copied_header_bytes(connection, schema, origin):
     require(observed and (observed["sha"], observed["bytes"]) == (origin.metadata_text_sha256, origin.metadata_bytes))
 
 
-async def _catalog(connection, schema, owner_role, runtime_roles):
-    """Pin fixed heap identities and close every ordinary runtime write path."""
-    await connection.execute(
-        "LOCK TABLE " + ",".join(_relation(schema, table) for table in TABLES) + " IN ACCESS SHARE MODE NOWAIT"
-    )
-    relations = await _catalog_relations(connection, schema)
-    owner = await connection.fetchrow("SELECT * FROM pg_roles WHERE rolname=$1", owner_role)
-    require(_protected_owner(owner) and tuple(relation["relname"] for relation in relations) == tuple(sorted(TABLES)))
-    require(
-        all(
-            relation["relkind"] == b"r"
-            and relation["relpersistence"] == b"p"
-            and relation["relowner"] == relation["nspowner"] == owner["oid"]
-            and not any(
-                relation[key]
-                for key in ("relhastriggers", "relrowsecurity", "relforcerowsecurity", "inherited", "defaults")
-            )
-            for relation in relations
-        )
-    )
-    require(
-        await connection.fetchval(
-            "SELECT NOT EXISTS(SELECT FROM pg_proc WHERE pronamespace=$1::oid) AND NOT EXISTS(SELECT FROM pg_rewrite r JOIN pg_class c ON c.oid=r.ev_class WHERE c.relnamespace=$1::oid)",
-            relations[0]["schema_oid"],
-        )
-        is True
-    )
-    await _closed(connection, relations[0]["schema_oid"], owner["oid"], runtime_roles, list(TABLES))
-    require(
-        await connection.fetchval(
-            "WITH configured AS (SELECT r.* FROM unnest($1::text[]) selected(name) LEFT JOIN pg_roles r ON r.rolname=selected.name) "
-            "SELECT NOT EXISTS(SELECT FROM configured r WHERE r.oid IS NULL OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls "
-            "OR has_parameter_privilege(r.oid,'session_replication_role','SET')) AND NOT EXISTS(SELECT FROM pg_proc p "
-            "WHERE p.prosecdef AND p.prorettype NOT IN ('trigger'::regtype,'event_trigger'::regtype) "
-            "AND EXISTS(SELECT FROM pg_roles definer WHERE definer.oid=p.proowner AND (definer.rolsuper OR definer.rolcreaterole "
-            "OR pg_has_role(definer.oid,$2::oid,'MEMBER') OR pg_has_role(definer.oid,$2::oid,'SET'))) "
-            "AND EXISTS(SELECT FROM configured r WHERE has_schema_privilege(r.oid,p.pronamespace,'USAGE') AND has_function_privilege(r.oid,p.oid,'EXECUTE')))",
-            list(runtime_roles),
-            owner["oid"],
-        )
-        is True
-    )
-    _require_indexes(relations, owner["oid"], schema)
-    await _require_cursor_index(
-        connection, dict((relation["relname"], relation["oid"]) for relation in relations)[TABLES[1]]
-    )
-    return (
-        relations[0]["schema_oid"],
-        tuple((relation["relname"], relation["oid"]) for relation in relations),
-        digest(
-            [
-                {
-                    name: catalog_value.decode("ascii") if type(catalog_value) is bytes else catalog_value
-                    for name, catalog_value in relation.items()
-                }
-                for relation in relations
-            ]
-        ),
-    )
-
-
-def _require_indexes(relations, owner_oid, schema):
-    """Require fixed primary/lookup index shapes and no extra constraints."""
-    for relation in relations:
-        indexes = json.loads(relation["indexes"] or "[]")
-        profiles = [
-            (_KEYS[relation["relname"]], True),
-            *[(keys, False) for keys in _LOOKUPS.get(relation["relname"], ())],
-        ]
-        require(len(indexes) == len(profiles))
-        for keys, primary in profiles:
-            selected_indexes = [
-                index for index in indexes if tuple(index["columns"]) == keys and index["primary"] is primary
-            ]
-            require(len(selected_indexes) == 1)
-            index = selected_indexes[0]
-            require(
-                index["primary"] is primary
-                and index["unique"] is primary
-                and index["valid"]
-                and index["ready"]
-                and index["live"]
-            )
-            require(
-                index["owner_oid"] == owner_oid
-                and index["method"] == "btree"
-                and index["key_count"] == index["attribute_count"] == len(keys)
-                and index["options"] == " ".join("0" for _ in keys)
-                and not index["expressions"]
-                and not index["predicate"]
-            )
-            if relation["relname"] == TABLES[1] and not primary:
-                require(index["name"] == "retained_lookup_1_0" and index["definition"] == _cursor_definition(schema))
-        constraints = json.loads(relation["constraints"] or "[]")
-        require(len(constraints) == 1 and constraints[0][1] == "p")
-
-
-def _cursor_definition(schema):
-    """Pin the target-only canonical-order index without changing copied columns."""
-    return (
-        "CREATE INDEX retained_lookup_1_0 ON " + schema + ".provider_directory_dataset_resource USING btree "
-        '(dataset_id, resource_type COLLATE "C", resource_id COLLATE "C")'
-    )
-
-
-async def _require_cursor_index(connection, resource_oid):
-    """Require exact native C collations and built-in text operator classes."""
-    require(
-        await connection.fetchval(
-            "SELECT count(*)=1 AND bool_and(i.indcollation[0]=(SELECT a.attcollation FROM pg_attribute a "
-            "WHERE a.attrelid=i.indrelid AND a.attname='dataset_id') "
-            "AND i.indcollation[1]='pg_catalog.\"C\"'::regcollation "
-            "AND i.indcollation[2]='pg_catalog.\"C\"'::regcollation "
-            "AND NOT EXISTS(SELECT FROM unnest(i.indclass::oid[]) selected(oid) LEFT JOIN pg_opclass o ON o.oid=selected.oid "
-            "WHERE o.oid IS NULL OR o.opcnamespace<>'pg_catalog'::regnamespace OR o.opcname<>'text_ops' "
-            "OR o.opcintype<>'text'::regtype OR o.opckeytype<>0 OR o.opcmethod<>(SELECT oid FROM pg_am WHERE amname='btree'))) "
-            "FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid WHERE i.indrelid=$1::oid AND c.relname='retained_lookup_1_0'",
-            resource_oid,
-        )
-        is True
-    )
-
-
 async def _content_tables(connection, schema):
     async with _borrowed_epoch_settings(connection):
         await _set_content_settings(
@@ -730,10 +405,15 @@ async def _content_tables(connection, schema):
         return digest([(table, *(await _content(connection, schema, table))) for table in sorted(TABLES)])
 
 
-async def _create(writer, reader, origin, schema, owner_role):
-    columns = await _columns(reader, {table: _relation(origin.schema_name, table) for table in TABLES[:2]})
-    await writer.execute(f"CREATE SCHEMA {_identifier(schema)} AUTHORIZATION {_identifier(owner_role)}")
-    await writer.execute(f"SET LOCAL ROLE {_identifier(owner_role)}")
+async def _create(writer, reader, origin, schema):
+    columns = await _columns(
+        reader,
+        {
+            TABLES[0]: _relation(origin.header_relation["schema"], origin.header_relation["name"]),
+            TABLES[1]: _relation(origin.resource_relation["schema"], origin.resource_relation["name"]),
+        },
+    )
+    await writer.execute(f"CREATE SCHEMA {_identifier(schema)}")
     for table in TABLES:
         definition = columns[table] if table in columns else _DERIVED_DDL[table]
         await writer.execute(f"CREATE TABLE {_relation(schema, table)} ({definition})")
@@ -745,7 +425,7 @@ async def _resources(reader, origin, after, limit):
     if after is not None:
         predicate += ' AND (resource_type COLLATE "C",resource_id COLLATE "C")>($2 COLLATE "C",$3 COLLATE "C")'
         arguments += after
-    query = f'SELECT * FROM {_relation(origin.schema_name, TABLES[1])} WHERE {predicate} ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT {limit}'
+    query = f'SELECT * FROM {_relation(origin.resource_relation["schema"], origin.resource_relation["name"])} WHERE {predicate} ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT {limit}'
     bounds = await reader.fetchrow(
         "WITH batch AS MATERIALIZED ("
         + query
@@ -981,13 +661,12 @@ def _fold_prepared(prepared, hash_by_family, counts, root, total):
     return total + prepared.row_count
 
 
-async def _copy_prepared(pair, schema, prepared):
+async def _copy_prepared(writer, schema, prepared):
     """Drain each bounded binary import and require exact native COPY accounting."""
     for table, batches in zip(TABLES[2:], prepared.copy_batches):
         for encoded, count in batches:
-            await pair.verify()
             copied = await drain_operation(
-                pair.writer.copy_to_table(table, schema_name=schema, source=memoryview(encoded), format="binary"),
+                writer.copy_to_table(table, schema_name=schema, source=memoryview(encoded), format="binary"),
                 preserve_cancellation=True,
             )
             require(copied == f"COPY {count}")
@@ -998,28 +677,38 @@ async def _verify_resources(connection, schema, origin):
     hash_by_family = {kind: hashlib.sha256() for kind, _ in origin.resource_counts}
     counts, root, total, after, limit = dict.fromkeys(hash_by_family, 0), hashlib.sha256(), 0, None, 1000
     while True:
-        query, arguments, bounds = await _resources(connection, replace(origin, schema_name=schema), after, limit)
+        local_origin = replace(
+            origin,
+            schema_name=schema,
+            resource_relation={"schema": schema, "name": TABLES[1]},
+        )
+        query, arguments, bounds = await _resources(connection, local_origin, after, limit)
         if bounds["count"] == 0:
             break
         if bounds["bytes"] + 21 > 64 * 1024**2:
             require(limit > 1)
             limit = max(1, limit // 2)
             continue
-        rows = await connection.fetch(query, *arguments)
-        require(len(rows) == bounds["count"] and all(row["dataset_id"] == origin.dataset_id for row in rows))
+        resource_rows = await connection.fetch(query, *arguments)
+        require(
+            len(resource_rows) == bounds["count"]
+            and all(resource["dataset_id"] == origin.dataset_id for resource in resource_rows)
+        )
         try:
             prepared = await drain_operation(
-                asyncio.to_thread(_prepare_native_resources, rows, origin, "retained-verification", None, False),
+                asyncio.to_thread(
+                    _prepare_native_resources, resource_rows, origin, "retained-verification", None, False
+                ),
                 preserve_cancellation=True,
             )
         except _CopyBatchTooLarge:
-            if len(rows) > 1:
-                limit = max(1, len(rows) // 2)
+            if len(resource_rows) > 1:
+                limit = max(1, len(resource_rows) // 2)
                 continue
-            total = _fold_rows(rows, origin, hash_by_family, counts, root, total)
+            total = _fold_rows(resource_rows, origin, hash_by_family, counts, root, total)
         else:
             total = _fold_prepared(prepared, hash_by_family, counts, root, total)
-        after = rows[-1]["resource_type"], rows[-1]["resource_id"]
+        after = resource_rows[-1]["resource_type"], resource_rows[-1]["resource_id"]
     _require_roots(origin, hash_by_family, counts, root)
 
 
@@ -1066,7 +755,7 @@ async def _copy_resources(pair, origin, schema, release_id):
             await _derived(pair.writer, schema, origin, release_id, resource_rows, observed_at, verify=pair.verify)
             total = _fold_rows(resource_rows, origin, hash_by_family, counts, root, total)
         else:
-            await _copy_prepared(pair, schema, prepared)
+            await _copy_prepared(pair.writer, schema, prepared)
             total = _fold_prepared(prepared, hash_by_family, counts, root, total)
         after = resource_rows[-1]["resource_type"], resource_rows[-1]["resource_id"]
     _require_roots(origin, hash_by_family, counts, root)
@@ -1081,7 +770,7 @@ async def _copy_capture_header(pair, origin, schema):
     )
     arguments = (
         pair,
-        f"SELECT * FROM {_relation(origin.schema_name, TABLES[0])} WHERE dataset_id=$1",
+        f"SELECT * FROM {_relation(origin.header_relation['schema'], origin.header_relation['name'])} WHERE dataset_id=$1",
         (origin.dataset_id,),
         schema,
         TABLES[0],
@@ -1093,10 +782,10 @@ async def _copy_capture_header(pair, origin, schema):
         await _copy_native_batch(*arguments)
 
 
-async def _prepare_capture_tables(pair, origin, schema, capture_id, owner_role):
+async def _prepare_capture_tables(pair, origin, schema, capture_id):
     """COPY bounded retained rows, derive exact evidence, then validate references."""
     writer = pair.writer
-    await _create(writer, pair.reader, origin, schema, owner_role)
+    await _create(writer, pair.reader, origin, schema)
     await _copy_capture_header(pair, origin, schema)
     await _copy_resources(pair, origin, schema, "registry-capture:" + str(capture_id))
     for table in TABLES:
@@ -1174,34 +863,19 @@ def _lookup_key(table, key):
 
 
 async def _seal_capture(writer, origin, schema, capture_id, owner_role, runtime_roles):
-    """Close writers before verifying copied content and recording native custody."""
-    relations = await _catalog_relations(writer, schema)
-    catalog_by_field = {
-        "namespace": {"oid": relations[0]["schema_oid"], "nspowner": relations[0]["nspowner"]},
-        "relations": [dict(relation) for relation in relations],
-        "heaps": {relation["relname"]: relation["oid"] for relation in relations},
-    }
-    await _transfer_and_grant(
-        writer,
-        SimpleNamespace(schema_name=schema),
-        {"owner_role": owner_role, "loader_roles": [], "reader_roles": list(runtime_roles)},
-        catalog_by_field,
+    """Freeze through the existing administrator connection and validate the complete copied data."""
+    await freeze_fhir_source_snapshot(
+        writer, schema, namespace_owner=owner_role, reader_roles=runtime_roles, application_roles=runtime_roles
     )
-    await writer.execute(f"SET LOCAL ROLE {_identifier(owner_role)}")
-    schema_oid, relation_oids, catalog_sha = await _catalog(writer, schema, owner_role, runtime_roles)
     await _verify_resources(writer, schema, origin)
     await _copied_header_bytes(writer, schema, origin)
     capture = RetainedFHIRCapture(
-        origin,
-        str(capture_id),
-        schema,
-        schema_oid,
-        relation_oids,
-        owner_role,
-        runtime_roles,
-        catalog_sha,
-        await _content_tables(writer, schema),
-        "0" * 64,
+        origin=origin,
+        capture_id=str(capture_id),
+        schema_name=schema,
+        tables={name: {"schema": schema, "name": name} for name in TABLES},
+        content_sha256=await _content_tables(writer, schema),
+        capture_sha256="0" * 64,
     )
     capture = validate_capture(replace(capture, capture_sha256=capture_digest(capture)))
     await writer.execute(
@@ -1217,66 +891,39 @@ async def _seal_capture(writer, origin, schema, capture_id, owner_role, runtime_
 async def capture_retained_fhir_source(
     reader, writer, origin, *, capture_id, owner_role, runtime_roles, source_policy=None
 ):
-    """Freeze a genuine Reader's complete supported snapshot in a distinct registry domain."""
+    """Copy a complete named edition through the existing administrator preparation connection."""
     require(type(origin) is RetainedFHIRInput and type(capture_id) is UUID and capture_id.int)
-    require(
-        reader is not writer and type(runtime_roles) is tuple and tuple(sorted(set(runtime_roles))) == runtime_roles
-    )
-    await _reader_identity(reader, origin)
+    origin.__post_init__()
+    require(type(runtime_roles) is tuple and bool(runtime_roles) and tuple(sorted(set(runtime_roles))) == runtime_roles)
+    _identifier(owner_role)
+    require(owner_role not in runtime_roles)
+    for role in runtime_roles:
+        _identifier(role)
+    await _require_transaction(reader)
     await _require_transaction(writer)
-    actor = await writer.fetchrow(
-        "SELECT session_user::text AS login,current_user::text AS actor,rolcanlogin,rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls FROM pg_roles WHERE rolname=session_user"
-    )
-    require(
-        actor
-        and actor["login"] == actor["actor"]
-        and actor["rolcanlogin"]
-        and not any(
-            actor[key] for key in ("rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
-        )
-    )
-    await _check_roles(writer, {"owner_role": owner_role, "loader_roles": [], "reader_roles": list(runtime_roles)})
-    await _same_database(writer, reader)
     binding = await _origin_header(reader, origin)
-    if binding is None:
-        await _origin_guard(reader, origin)
-        source_family = None
-    else:
+    source_family = None
+    if binding is not None:
         source_family = await require_native_generic_snapshot(reader, writer, origin, source_policy, binding)
     schema = "registry_fhir_capture_" + capture_id.hex
-    original_role = await writer.fetchval(
-        "SELECT CASE WHEN current_setting('role')='none' THEN 'NONE' ELSE quote_ident(current_user) END"
-    )
     pair = _ReaderCopy(reader, writer)
-    pair.virtual_xid = await _virtual_xid(reader)
-    try:
-        async with writer.transaction():
-            require(await writer.fetchval("SELECT to_regnamespace($1)", schema) is None)
-            await _prepare_capture_tables(pair, origin, schema, capture_id, owner_role)
-            await writer.execute(f"SET LOCAL ROLE {original_role}")
-            capture = await _seal_capture(writer, origin, schema, capture_id, owner_role, runtime_roles)
-            await pair.verify()
-            if binding is not None:
-                await writer.execute(f"SET LOCAL ROLE {original_role}")
-                require(
-                    await require_native_generic_snapshot(reader, writer, origin, source_policy, binding)
-                    == source_family
-                )
-            return capture
-    finally:
-        if writer.is_in_transaction():
-            await writer.execute(f"SET LOCAL ROLE {original_role}")
+    async with writer.transaction():
+        require(await writer.fetchval("SELECT to_regnamespace($1)", schema) is None)
+        await _prepare_capture_tables(pair, origin, schema, capture_id)
+        capture = await _seal_capture(writer, origin, schema, capture_id, owner_role, runtime_roles)
+        await pair.verify()
+        if binding is not None:
+            require(
+                await require_native_generic_snapshot(reader, writer, origin, source_policy, binding) == source_family
+            )
+        return capture
 
 
 async def require_retained_fhir_capture(connection, capture, *, verify_content=True):
-    """Require authentic closed native custody, independent of a later source head."""
+    """Validate the selected named edition and its complete content accounting."""
     capture = validate_capture(capture)
     await _require_transaction(connection)
     require(type(verify_content) is bool)
-    observed = await _catalog(connection, capture.schema_name, capture.owner_role, capture.runtime_roles)
-    require(observed == (capture.schema_oid, capture.relation_oids, capture.catalog_sha256))
-    comment = await connection.fetchval("SELECT obj_description($1::oid,'pg_namespace')", capture.schema_oid)
-    require(comment == "retained-normalized-fhir-v1:" + canonical(capture.as_dict()))
     if verify_content:
         await _copied_header_bytes(connection, capture.schema_name, capture.origin)
         require(await _content_tables(connection, capture.schema_name) == capture.content_sha256)

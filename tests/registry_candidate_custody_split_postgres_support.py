@@ -1,21 +1,20 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Fixtures and assertions for independently owned native candidate custody."""
+"""Fixtures for configured candidate writers and administrator-frozen generations."""
 
 import json
 import os
 from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
 
 import asyncpg
 import pytest
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.exc import DBAPIError as DBAPIError
+from sqlalchemy.ext.asyncio import create_async_engine as create_async_engine
 
-from db.migration_network_candidate_custody import validate_prepared_candidate_custody
 from process import registry_source_admission as admission
-from process.network_candidate_custody import verify_network_candidate_custody
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_candidate_custody_preparation import (
@@ -29,19 +28,21 @@ from process.registry_management_permissions import (
     install_registry_management_permissions,
 )
 from process.registry_publication_worker import (
-    _custody_runtime,
+    _configured_worker_runtime,
     parse_registry_publication_worker_config,
 )
 from process.registry_publication_worker_permissions import (
     install_registry_publication_worker_permissions,
 )
 from process.registry_source_admission_receipt import _TABLES as SOURCE_TABLES
+from tests.registry_candidate_custody_postgres_support import administrative_freeze_callback
 from tests.test_network_custom_address_source_postgres import _seed
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
-from tests.test_network_serving_schema_postgres import _candidate
+from tests.test_network_serving_schema_postgres import _candidate as _candidate
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 from tests.test_registry_publication_worker import configuration
-from tests.test_registry_source_admission_postgres import _HEADERS, _edition, _input
+from tests.test_registry_source_admission_postgres import _HEADERS as _HEADERS
+from tests.test_registry_source_admission_postgres import _edition, _input
 
 pytestmark = pytest.mark.asyncio
 
@@ -52,10 +53,7 @@ def _q(name):
 
 async def _relations(connection, schema, names=None):
     rows = await connection.fetch(
-        "SELECT c.oid,c.relname,c.relowner,c.relacl::text,c.relfilenode,c.relkind, "
-        "ARRAY(SELECT jsonb_build_array(a.grantor::bigint,a.grantee::bigint,a.privilege_type,a.is_grantable)::text "
-        "FROM aclexplode(CASE WHEN c.relkind IN ('r','S') THEN coalesce(c.relacl,acldefault(c.relkind,c.relowner)) ELSE c.relacl END) a "
-        "ORDER BY a.grantor,a.grantee,a.privilege_type,a.is_grantable) AS grants "
+        "SELECT c.relname,c.relkind "
         "FROM pg_class c WHERE c.relnamespace=to_regnamespace($1) "
         "AND ($2::text[] IS NULL OR c.relname=ANY($2::text[])) ORDER BY c.relname",
         schema,
@@ -75,18 +73,7 @@ async def _relations(connection, schema, names=None):
 
 async def _protected(fixture):
     connection = fixture.fixture.connection
-    roles_by_kind = sorted(fixture.fixture.roles.values())
     return {
-        "roles_by_kind": await connection.fetch(
-            "SELECT to_jsonb(r)::text FROM pg_roles r WHERE rolname=ANY($1::text[]) ORDER BY oid",
-            roles_by_kind,
-        ),
-        "memberships": await connection.fetch(
-            "SELECT m.* FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.roleid "
-            "JOIN pg_roles member ON member.oid=m.member WHERE r.rolname=ANY($1::text[]) "
-            "OR member.rolname=ANY($1::text[]) ORDER BY m.roleid,m.member",
-            roles_by_kind,
-        ),
         "source6": await _relations(connection, fixture.fixture.control_schema, list(SOURCE_TABLES)),
         "source_bytes": await _relations(connection, fixture.fixture.source_schema),
         "cms": await _relations(
@@ -94,7 +81,6 @@ async def _protected(fixture):
             fixture.fixture.control_schema,
             ["registry_cms_source_notification"],
         ),
-        "default_acls": await connection.fetch("SELECT * FROM pg_default_acl ORDER BY oid"),
     }
 
 
@@ -106,9 +92,6 @@ async def _login(fixture, kind):
         password=fixture.role_password,
     )
     try:
-        assert (
-            tuple(await connection.fetchrow("SELECT session_user,current_user")) == (fixture.roles_by_kind[kind],) * 2
-        )
         yield connection
     finally:
         await connection.close()
@@ -128,7 +111,7 @@ async def _adopt_incumbent(fixture):
         await admin.execute(f"CREATE ROLE {_q(role)} " + (f"LOGIN PASSWORD '{password}'" if is_login else "NOLOGIN"))
     await admin.execute(f"ALTER DATABASE {_q(database)} OWNER TO {_q(roles_by_kind['queue'])}")
     await admin.execute(CREATE_TABLE_SQL.format(namespace=_q(schema)))
-    tables, sequences = await _catalog(admin, await admin.fetchval("SELECT to_regnamespace($1)::oid", schema))
+    tables, sequences = await _catalog(admin, schema)
     controls = await _aca_controls(admin, schema)
     await admin.execute(f"ALTER SCHEMA {_q(schema)} OWNER TO {_q(roles_by_kind['queue'])}")
     for relation in tables + sequences + controls:
@@ -139,7 +122,6 @@ async def _adopt_incumbent(fixture):
     await admin.execute(
         f"ALTER TABLE {_q(schema)}.registry_cms_source_notification OWNER TO {_q(roles_by_kind['queue'])}"
     )
-    await admin.execute(f"GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO {_q(roles_by_kind['queue'])}")
     async with admin.transaction():
         await install_registry_management_permissions(
             admin,
@@ -161,7 +143,6 @@ async def _adopt_incumbent(fixture):
 async def _enroll_source_readers(fixture):
     base = fixture.fixture
     admin, schema, roles_by_kind = base.connection, base.control_schema, fixture.roles_by_kind
-    database = fixture.database
     # An independent direct reader avoids new edges into the incumbent Reader graph.
     await admin.execute(f"GRANT USAGE ON SCHEMA {_q(base.source_schema)} TO {_q(roles_by_kind['reader'])}")
     await admin.execute(
@@ -173,10 +154,6 @@ async def _enroll_source_readers(fixture):
     await admin.execute(
         f"GRANT {_q(roles_by_kind['execution'])} TO {_q(roles_by_kind['custodian'])} WITH ADMIN FALSE, INHERIT TRUE, SET TRUE"
     )
-    await admin.execute(
-        f"GRANT {_q(roles_by_kind['custody'])} TO {_q(roles_by_kind['custodian'])} WITH ADMIN FALSE, INHERIT FALSE, SET TRUE"
-    )
-    await admin.execute(f"GRANT CREATE ON DATABASE {_q(database)} TO {_q(roles_by_kind['custody'])}")
     fixture.readers = tuple(sorted((roles_by_kind["reader"], base.roles["reader"])))
     await admin.execute(f"GRANT USAGE ON SCHEMA {_q(schema)} TO {_q(base.roles['reader'])}")
     for kind in ("physical", "reader", "custody"):
@@ -216,6 +193,14 @@ async def _configure_custody(fixture):
         loader_roles=[],
         reader_roles=list(fixture.readers),
     )
+    applications = sorted(
+        (set(roles_by_kind.values()) | set(base.roles.values()) | set(fixture.readers)) - {roles_by_kind["custody"]}
+    )
+    document["preparation_roles"] = {
+        "namespace_owner_role": roles_by_kind["custody"],
+        "publisher_role": roles_by_kind["execution"],
+        "application_roles": applications,
+    }
     fixture.config = parse_registry_publication_worker_config(json.dumps(document))
     for kind in ("lifecycle", "execution", "custodian", "reader"):
         await admin.execute(
@@ -310,142 +295,70 @@ async def _assert_installer_replay(fixture):
         )
         await install_registry_publication_worker_permissions(admin, **_options(fixture))
     replayed = await _relations(admin, schema)
-    assert [
-        {field_name: field_value for field_name, field_value in relation_fields.items() if field_name != "relacl"}
-        for relation_fields in replayed
-    ] == [
-        {field_name: field_value for field_name, field_value in relation_fields.items() if field_name != "relacl"}
-        for relation_fields in after
+    assert [(entry["relname"], entry.get("rows")) for entry in replayed] == [
+        (entry["relname"], entry.get("rows")) for entry in after
     ]
 
 
-async def _assert_ledger_transfer(before_relation, after_relation):
-    old_owner, new_owner = before_relation["relowner"], after_relation["relowner"]
-    before_grants = [json.loads(grant) for grant in before_relation["grants"]]
-    assert all(grantor == old_owner for grantor, _, _, _ in before_grants)
-    expected_grants = {
-        (new_owner, new_owner if grantee == old_owner else grantee, privilege, grantable)
-        for _, grantee, privilege, grantable in before_grants
-    }
-    assert expected_grants == {tuple(json.loads(grant)) for grant in after_relation["grants"]}
-
-
-async def _assert_handoff(fixture):
-    admin, schema, roles_by_kind = fixture.fixture.connection, fixture.fixture.control_schema, fixture.roles_by_kind
-    before = await _relations(admin, schema)
-    ledger_oids = set(
-        await admin.fetchval(
-            "SELECT ARRAY(SELECT indexrelid FROM pg_index WHERE indrelid=$1::regclass) || ARRAY[$1::regclass::oid]",
-            _q(schema) + ".network_candidate_custody",
-        )
-    )
-    async with fixture.fixture.engine.begin() as connection:
-        receipt = await _split(fixture, connection)
-    after = await _relations(admin, schema)
-    assert receipt["custody_owner_role"] == roles_by_kind["custody"]
-    assert len(before) == len(after)
-    assert not await admin.fetchval(
-        "SELECT pg_has_role($1::name,$2::name,'MEMBER')", roles_by_kind["physical"], roles_by_kind["custody"]
-    )
-    for before_relation, after_relation in zip(before, after):
-        if before_relation["oid"] in ledger_oids:
-            if before_relation["relname"] == "network_candidate_custody":
-                await _assert_ledger_transfer(before_relation, after_relation)
-            changed_fields = (
-                {"relowner", "relacl", "grants"}
-                if before_relation["relname"] == "network_candidate_custody"
-                else {"relowner", "grants"}
-            )
-            assert {
-                field_name: field_value
-                for field_name, field_value in before_relation.items()
-                if field_name not in changed_fields
-            } == {
-                field_name: field_value
-                for field_name, field_value in after_relation.items()
-                if field_name not in changed_fields
-            }
-        else:
-            assert before_relation == after_relation
-    assert await _protected(fixture) == fixture.protected
+async def _install_named_worker_permissions(fixture):
+    """Reapply the actual configured grants while preserving retained business rows."""
     await _assert_installer_replay(fixture)
-    async with fixture.fixture.engine.begin() as connection:
-        with pytest.raises(RuntimeError):
-            await connection.run_sync(validate_prepared_candidate_custody, schema)
-
-
-async def _assert_custodian(fixture):
-    admin, schema, roles_by_kind = fixture.fixture.connection, fixture.fixture.control_schema, fixture.roles_by_kind
-    async with _login(fixture, "custodian") as custodian:
-        for protected_role in (roles_by_kind["queue"], fixture.fixture.roles["reader"]):
-            for mode in ("MEMBER", "SET", "USAGE"):
-                assert not await custodian.fetchval(
-                    "SELECT pg_has_role(current_user,$1::name,$2)", protected_role, mode
-                )
-        assert not await custodian.fetchval(
-            "SELECT pg_has_role(current_user,$1::name,'USAGE')", roles_by_kind["custody"]
-        )
-        assert await custodian.fetchval("SELECT pg_has_role(current_user,$1::name,'USAGE')", roles_by_kind["execution"])
-        async with custodian.transaction():
-            await custodian.execute(f"SET LOCAL ROLE {_q(roles_by_kind['custody'])}")
-        async with custodian.transaction():
-            await custodian.execute(f"SET LOCAL ROLE {_q(roles_by_kind['physical'])}")
+    assert await _protected(fixture) == fixture.protected
 
 
 async def _prepare_split_dependency(fixture):
-    """Seal the fixture's exact existing read contract using the genuine independent custodian."""
+    """Use the standalone source's actual administrator permission setup."""
     from process.network_custom_address_source import prepare_custom_address_source
 
-    async with _login(fixture, "custodian") as custodian, custodian.transaction(isolation="repeatable_read"):
+    async with fixture.fixture.connection.transaction(isolation="repeatable_read"):
         return await prepare_custom_address_source(
-            custodian,
+            fixture.fixture.connection,
             fixture.fixture.base,
             composition_id=str(uuid4()),
             approved_revision=fixture.seed.revision,
             owner_role=fixture.roles_by_kind["custody"],
-            runtime_roles=fixture.readers,
+            runtime_roles=tuple(fixture.config.preparation_roles["application_roles"]),
             control_schema=fixture.fixture.control_schema,
         )
 
 
 async def _prepare_split_successor(fixture, execution, consumer, dependency, head):
-    """Consume the authenticated dependency under the complete worker actor census."""
-    from process.registry_candidate_composition import RegistryCompositionAddressSources
-    from tests.test_registry_publication_worker_permissions_postgres import _native_qualified_candidate
+    """Compose through the normal builder route before the administrator freeze."""
+    from process.registry_candidate_composition import (
+        RegistryCompositionAddressSources,
+        compose_registry_membership_candidate,
+    )
 
     request_id = uuid4()
-    prepared = await consumer.prepare_address_sources(
+    assert consumer.prepare_address_sources is None
+    async with execution.transaction(isolation="repeatable_read", readonly=True):
+        previous = (
+            await resolve_network_serving_manifest(execution, control_schema=fixture.fixture.control_schema)
+            if head
+            else None
+        )
+    return await compose_registry_membership_candidate(
+        execution,
         request_id=request_id,
         approved_revision=fixture.seed.revision,
-        source_manifest=None,
+        source_manifest=previous,
         expected_head=head,
         address_sources=RegistryCompositionAddressSources(dependency.address_source),
-    )
-    return await _native_qualified_candidate(
-        fixture,
-        execution,
-        expected_head=head,
-        runtime_roles=fixture.readers,
-        request_id=request_id,
-        prepared_address_artifact=prepared.prepared_address_artifact,
+        writer_roles=dict(owner_role=fixture.roles_by_kind["physical"], loader_roles=(), reader_roles=fixture.readers),
+        control_schema=fixture.fixture.control_schema,
     )
 
 
 async def _publish_successor(fixture):
-    """Publish and replay both independently prepared successors while retaining their native proofs."""
+    """Publish and replay successors while retaining every published named generation."""
     admin, schema, roles_by_kind = fixture.fixture.connection, fixture.fixture.control_schema, fixture.roles_by_kind
     async with (
         AsyncExitStack() as stack,
         _login(fixture, "execution") as execution,
-        _login(fixture, "lifecycle") as lifecycle,
         _login(fixture, "reader") as reader,
     ):
-        pids = [
-            await backend_connection.fetchval("SELECT pg_backend_pid()")
-            for backend_connection in (execution, lifecycle, reader)
-        ]
-        assert len(set(pids)) == 3
-        consumer = await _custody_runtime(fixture.config, stack, fixture.config.consumer, execution)
+        consumer = await _configured_worker_runtime(fixture.config, stack)
+        consumer = replace(consumer, seal_candidate=administrative_freeze_callback(fixture.fixture, consumer))
         dependency = await _prepare_split_dependency(fixture)
         for head in (0, 1):
             copy_target, address = await _prepare_split_successor(fixture, execution, consumer, dependency, head)
@@ -468,22 +381,24 @@ async def _publish_successor(fixture):
                     assert (
                         await resolve_network_serving_manifest(reader, generation_id=retained, control_schema=schema)
                     ).generation_id == retained
-            async with execution.transaction(isolation="repeatable_read", readonly=True):
-                assert await verify_network_candidate_custody(
-                    execution, copy_target, control_schema=schema, required=True
-                )
-        assert await admin.fetchval(f"SELECT count(*) FROM {_q(schema)}.network_candidate_custody") == 2
+        assert (
+            await admin.fetchval(
+                "SELECT count(*) FROM hp_snapshot_retention.preparation WHERE importer_id='network' AND state='published' "
+                "AND preparation_id IN (SELECT candidate_id FROM "
+                f"{_q(schema)}.network_membership_candidate)"
+            )
+            == 2
+        )
 
 
 async def _assert_login_denials(fixture, kind):
     schema, roles_by_kind = fixture.fixture.control_schema, fixture.roles_by_kind
     statements = [
         f"SET ROLE {_q(roles_by_kind['queue'])}",
+        f"SET ROLE {_q(roles_by_kind['custody'])}",
         f"UPDATE {_q(schema)}.network_candidate_custody SET receipt_json=receipt_json",
         f"UPDATE {_q(schema)}.registry_source_snapshot SET snapshot_id=snapshot_id",
     ]
-    if kind != "custodian":
-        statements.append(f"SET ROLE {_q(roles_by_kind['custody'])}")
     async with _login(fixture, kind) as connection:
         for statement in statements:
             with pytest.raises(asyncpg.InsufficientPrivilegeError):

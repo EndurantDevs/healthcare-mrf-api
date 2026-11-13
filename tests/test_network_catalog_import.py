@@ -218,7 +218,7 @@ async def test_catalog_role_cleanup_preserves_primary_failure(monkeypatch, tmp_p
         connection=AsyncMock(return_value=driver_wrapper),
         begin_nested=savepoint,
     )
-    for name in ("verify_registry_management_permissions", "assume_registry_source_owner"):
+    for name in ("assume_registry_source_owner",):
         monkeypatch.setattr(catalog_import, name, AsyncMock())
     monkeypatch.setattr(
         catalog_import, "adopt_legacy_network_aliases", AsyncMock(return_value=[SimpleNamespace(network_id=42)])

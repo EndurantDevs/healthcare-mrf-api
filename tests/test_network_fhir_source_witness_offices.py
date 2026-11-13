@@ -1,7 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Pure office orchestration/refusal checks; mocks establish no Source or address custody."""
 
-import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -16,7 +16,7 @@ from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_fhir_membership_source import FHIR_SOURCE_WITNESS_TRANSFORM_V2
 from process.network_fhir_source_witness_capture import SourceWitnessRead
-from process.network_fhir_source_witness_contract import SourceWitnessContractError
+from process.network_fhir_source_witness_contract import SourceWitnessContractError, capture_digest
 from tests.test_network_fhir_source_witness_recipe import _reader_recipe, _source_recipe
 
 APPROVED = ApprovedMembershipSource(7, "a" * 64)
@@ -88,14 +88,19 @@ async def test_source_office_read_refuses_missing_or_duck_capabilities(read):
 
 
 @pytest.mark.asyncio
-async def test_actual_source_read_type_still_requires_its_native_brand():
+@pytest.mark.parametrize("changed", [False, True])
+async def test_source_office_read_requires_matching_named_capture(changed):
     connection = SimpleNamespace(fetch=AsyncMock(), fetchval=AsyncMock())
     recipe = _source_recipe()
-    unissued = SourceWitnessRead(
-        connection, recipe.source_pin.source_witness_capture, asyncio.current_task(), "1/1", object()
-    )
-    with pytest.raises(SourceWitnessContractError):
-        await legacy._verify_retained_office_read(connection, recipe.source_pin, unissued)
+    capture = recipe.source_pin.source_witness_capture
+    selected = replace(capture, content_sha256="e" * 64) if changed else capture
+    selected = replace(selected, capture_sha256=capture_digest(selected))
+    read = SourceWitnessRead(selected)
+    if changed:
+        with pytest.raises(SourceWitnessContractError):
+            await legacy._verify_retained_office_read(connection, recipe.source_pin, read)
+    else:
+        await legacy._verify_retained_office_read(connection, recipe.source_pin, read)
     connection.fetch.assert_not_awaited()
     connection.fetchval.assert_not_awaited()
 
@@ -150,7 +155,7 @@ async def test_mapping_reauthorizes_source_using_only_the_supplied_runtime(monke
     options = offices._WitnessOfficeContext(APPROVED, "registry_example", "e" * 64, runtime)
     connection = SimpleNamespace(execute=AsyncMock())
     monkeypatch.setattr(offices, "_require_transaction", AsyncMock())
-    monkeypatch.setattr(offices, "_policy_context", AsyncMock(return_value=({}, (1, 2, 3, "f" * 64))))
+    monkeypatch.setattr(offices, "_policy_context", AsyncMock(return_value={}))
     marker = RuntimeError("unit_source_refused")
     authorizer = AsyncMock(side_effect=marker)
     monkeypatch.setattr(composition, "_require_recipe_custody", authorizer)

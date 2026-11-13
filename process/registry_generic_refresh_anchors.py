@@ -64,7 +64,7 @@ async def read_original_generic_capture_metadata(driver, coordinates, read_budge
         raise RegistryRefreshAnchorUnavailable("registry_refresh_generic_capture_unavailable")
     read_budget.reserve(({"raw_byte_count": _MAX_CAPTURE_BYTES},))
     header = await driver.fetchrow(
-        "SELECT oid::bigint AS schema_oid,CASE WHEN octet_length(obj_description(oid,'pg_namespace'))<=$2 "
+        "SELECT CASE WHEN octet_length(obj_description(oid,'pg_namespace'))<=$2 "
         "THEN obj_description(oid,'pg_namespace') END AS capture_comment "
         "FROM pg_namespace WHERE nspname=$1",
         "registry_fhir_capture_" + edition.hex,
@@ -75,11 +75,10 @@ async def read_original_generic_capture_metadata(driver, coordinates, read_budge
         raise RegistryRefreshAnchorUnavailable("registry_refresh_generic_capture_unavailable")
     capture = validate_capture(json.loads(comment[len(_PREFIX) :], object_pairs_hook=_unique_object))
     origin = capture.origin
-    if (
-        capture.schema_oid != header["schema_oid"]
-        or capture.capture_id != coordinates.edition_id
-        or (origin.schema_name, origin.source_id, origin.dataset_id)
-        != (coordinates.dataset_schema, coordinates.source_id, coordinates.dataset_id)
+    if capture.capture_id != coordinates.edition_id or (origin.schema_name, origin.source_id, origin.dataset_id) != (
+        coordinates.dataset_schema,
+        coordinates.source_id,
+        coordinates.dataset_id,
     ):
         raise RegistryRefreshAnchorMismatch("registry_refresh_generic_capture_origin_differs")
     return await require_retained_fhir_capture(driver, capture, verify_content=False)
@@ -94,7 +93,7 @@ async def read_original_generic_capture(driver, coordinates, read_budget):
 
 
 async def _organization_scopes(driver, retained, bindings, budget):
-    await retained.verify(driver, retained.capture)
+    retained.require_ready(retained.capture)
     return await original_generic_capture_scopes(driver, retained.capture, bindings, budget)
 
 

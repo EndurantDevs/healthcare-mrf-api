@@ -26,11 +26,6 @@ from process.network_membership_candidate_lifecycle import (
     seal_network_candidate,
 )
 from process.network_membership_copy import MembershipCopyTarget
-from process.network_membership_pipeline import _retain_closure
-from process.network_membership_writer_closure import (
-    freeze_network_candidate_writers,
-    verify_network_candidate_writer_closure,
-)
 from process.network_serving_read import (
     PinnedNetworkServingManifest,
     resolve_network_serving_manifest,
@@ -341,10 +336,6 @@ async def _copy_composition(connection, copy_target, control_schema, source_stag
             command_stage=command_stage,
             **inventory_options,
         )
-        closure = await freeze_network_candidate_writers(
-            connection, copy_target, **writer_roles, control_schema=control_schema
-        )
-        await _retain_closure(connection, copy_target, _namespace(control_schema)[1:-1], closure)
 
 
 async def _prepare_provider_only_rows(connection, target, candidate, entries, stage, control_schema):
@@ -621,7 +612,7 @@ async def _record_source_receipts(
             recipes,
             approved,
             artifact.address_source,
-            runtime_roles=artifact.runtime_roles,
+            runtime_roles=(),
             control_schema=control_schema,
             office_phase=(office_authority, retained_fhir_reads, verified_matches),
         )
@@ -632,7 +623,7 @@ async def _record_source_receipts(
             recipes,
             artifact.address_source,
             OfficeSummaryRequest(
-                artifact.runtime_roles,
+                (),
                 control_schema,
                 office_authority,
                 initial_summary.get("origin_manifest_sha256"),
@@ -652,7 +643,7 @@ async def _record_witness_offices(connection, copy_target, recipes, approved, ar
         recipes,
         approved,
         artifact.address_source,
-        artifact.runtime_roles,
+        (),
         stage.selected_stage if stage.selected_stage is not None else stage,
         control_schema=control_schema,
     )
@@ -1266,24 +1257,14 @@ async def _complete_composition(connection, prepared, source_manifest, control_s
 
 async def _complete_closed_composition(connection, prepared, state, control_schema):
     """Verify a newer completed phase without reopening or recopying its candidate."""
-    copy_target, _address, _old_state, source_stage, command_stage, writer_roles = prepared
-    custody = None
-    if state in {"ready", "published"}:
-        from process.network_candidate_custody import verify_network_candidate_custody
-
-        custody = await verify_network_candidate_custody(
-            connection, copy_target, control_schema=control_schema, required=False
-        )
-    if custody is None:
+    copy_target, _address, _old_state, source_stage, command_stage, _writer_roles = prepared
+    if state not in {"ready", "published"}:
         await seal_network_candidate(
             connection,
             copy_target,
             control_schema=control_schema,
             source_stage=source_stage,
             command_stage=command_stage,
-        )
-        await verify_network_candidate_writer_closure(
-            connection, copy_target, **writer_roles, control_schema=control_schema
         )
 
 
@@ -1455,7 +1436,7 @@ async def _prepare_preserved_address_inputs(inputs, recipes, preservation, reque
                 office_authority,
                 (recipes, preservation),
             )
-            verified_inputs = (phase_artifact.address_source, phase_artifact.runtime_roles)
+            verified_inputs = (phase_artifact.address_source, ())
     return verified_inputs, phase_artifact
 
 

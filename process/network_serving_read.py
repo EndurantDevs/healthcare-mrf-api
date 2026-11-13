@@ -1,49 +1,21 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Resolve exact retained serving identities without a mutable-table fallback."""
+"""Resolve a published network generation by its schema-qualified names."""
 
 from __future__ import annotations
 
 import json
 import re
 from dataclasses import dataclass
-from uuid import UUID
 
 import asyncpg
 
 from db.registry_schema import registry_schema
 from process.network_address_projection import PinnedAddressSource, _identifier
-from process.network_membership_publication import (
-    _candidate_custody,
-    _publication_readiness,
-    _publication_writer_closure,
-    _retained_manifest,
-)
-from process.network_membership_writer_closure import (
-    _NATIVE_WRITER_PRIVILEGES_SQL,
-    _check_identity,
-    _protected_owner,
-    _role_names,
-)
-
-_READONLY_WRITER_JOIN_SQL = f"""
-        LEFT JOIN LATERAL (
-          WITH closure_scope AS (
-            SELECT physical_schema.oid AS schema_oid,protected_owner.oid AS owner_oid,
-              ARRAY(SELECT jsonb_array_elements_text(
-                CASE WHEN jsonb_typeof(candidate.validation_json->'writer_closure'->'loader_roles')='array'
-                  THEN candidate.validation_json->'writer_closure'->'loader_roles' ELSE '[]'::jsonb END)
-                UNION SELECT jsonb_array_elements_text(
-                CASE WHEN jsonb_typeof(candidate.validation_json->'writer_closure'->'reader_roles')='array'
-                  THEN candidate.validation_json->'writer_closure'->'reader_roles' ELSE '[]'::jsonb END)
-                UNION SELECT unnest($3::text[])
-                LIMIT 65) AS role_names,NULL::text[] AS relation_names)
-          {_NATIVE_WRITER_PRIVILEGES_SQL}
-        ) privileges ON true
-"""
+from process.network_compact_layout import CompactAddressRelation, CompactNetworkLayout
 
 
 class NetworkServingReadUnavailable(ValueError):
-    """No eligible, ready and physically retained serving identity is available."""
+    """The selected published generation is unavailable."""
 
 
 @dataclass(frozen=True)
@@ -55,36 +27,53 @@ class PinnedNetworkServingManifest:
     source_generations: dict[str, str]
     approved_custom_revision: int
     manifest_sha256: str
-    address_table_oid: int
+    address_relation: CompactAddressRelation
 
     @property
     def compact_layout(self):
-        """Keep verified physical routing outside the public manifest wire format."""
+        """Return the selected generation's compact routing layout, when present."""
         return getattr(self, "_compact_layout", None)
 
     @property
     def supports_location_lookup(self):
-        """Only independently verified indexed dependencies permit bounded probes."""
+        """Report whether the selected generation supports location lookup."""
         return getattr(self, "_supports_location_lookup", False) is True
 
     @property
     def supports_membership_pages(self):
-        """Sealed typed membership and office parity permit paging before hydration."""
+        """Report whether the selected generation supports membership paging."""
         return getattr(self, "_supports_membership_pages", False) is True
 
     @property
     def candidate_relation_pins(self):
-        """Verified candidate data identities, outside the public manifest wire format."""
-        return getattr(self, "_candidate_relation_pins", ())
+        """Return the selected generation's complete schema-qualified query inputs."""
+        relations = [
+            CompactAddressRelation(self.schema_name, name)
+            for name in ("network_membership", "provider_location_binding")
+        ]
+        layout = self.compact_layout
+        if layout is not None:
+            CompactNetworkLayout.__post_init__(layout)
+            relations.extend((layout.ref_map, layout.base))
+            relations.extend(
+                CompactAddressRelation(artifact.schema_name, "network_office_edge") for artifact in layout.artifacts
+            )
+            if layout.custom is not None:
+                relations.append(layout.custom)
+            if layout.geo_search is not None:
+                from process.network_compact_layout import bind_compact_geo_search
 
-    @property
-    def custody_control(self):
-        """Independent control identity for API snapshot checks; metadata is not payload authority."""
-        return getattr(self, "_custody_control", None)
+                bind_compact_geo_search(layout, layout.geo_search)
+                relations.append(layout.geo_search)
+        for relation in relations:
+            CompactAddressRelation.__post_init__(relation)
+        if len(set(relations)) != len(relations):
+            raise NetworkServingReadUnavailable("Published network query relations must be unique")
+        return tuple(relations)
 
 
 def parse_canonical_network_ids(value: str) -> tuple[int, ...]:
-    """Parse the explicit network_ids selector, independently of legacy checksums."""
+    """Parse canonical network IDs used by the public filter."""
     if (
         type(value) is not str
         or len(value) > 1099
@@ -97,205 +86,107 @@ def parse_canonical_network_ids(value: str) -> tuple[int, ...]:
     return tuple(sorted(network_ids))
 
 
+def _object(value):
+    value = json.loads(value) if isinstance(value, str) else value
+    if type(value) is not dict:
+        raise NetworkServingReadUnavailable("Published network metadata is invalid")
+    return value
+
+
 async def _read_manifest(connection, namespace, generation_id, *, include_ineligible=False):
-    entry = await _read_manifest_with(connection, namespace, generation_id, include_ineligible, ())
-    if (
-        entry is not None
-        and entry["retained_proof"] is True
-        and json.loads(entry["catalog_json"])["privileges_closed"] is not True
-    ):
-        from process.network_retained_read_access import retained_extra_readers
-
-        # Only an owner-proven direct reader of a retained candidate may join its recorded closure.
-        readers = await retained_extra_readers(connection, entry)
-        if readers:
-            generation = json.loads(entry["manifest_json"])["generation_id"]
-            entry = await _read_manifest_with(connection, namespace, generation, include_ineligible, readers)
-    return entry
-
-
-async def _read_manifest_with(connection, namespace, generation_id, include_ineligible, extra_readers):
     return await connection.fetchrow(
-        f"""SELECT to_jsonb(candidate)::text AS candidate_json,to_jsonb(manifest)::text AS manifest_json,
-          jsonb_build_object('schema_oid',physical_schema.oid::bigint,
-            'schema_owner_matches',physical_schema.nspowner=protected_owner.oid,
-            'owner_attributes',jsonb_build_object('rolcanlogin',protected_owner.rolcanlogin,
-              'rolsuper',protected_owner.rolsuper,'rolcreatedb',protected_owner.rolcreatedb,
-              'rolcreaterole',protected_owner.rolcreaterole,'rolreplication',protected_owner.rolreplication,
-              'rolbypassrls',protected_owner.rolbypassrls),
-            'relation_oids',inventory.relation_oids,'index_oids',inventory.index_oids,
-            'index_table_oids',inventory.index_table_oids,'owners_match',inventory.owners_match,
-            'unsupported_relations',inventory.unsupported_relations,'relation_count',inventory.relation_count,
-            'has_routines',EXISTS(SELECT 1 FROM pg_proc WHERE pronamespace=physical_schema.oid),
-            'address_table_oid',inventory.address_table_oid,'privileges_closed',privileges.closed)::text AS catalog_json,
-          to_regnamespace('network_retained_access_'||substr(candidate.schema_name,19)) IS NOT NULL AS retained_proof
-        FROM {namespace}.network_serving_manifest manifest
-        JOIN {namespace}.network_membership_candidate candidate ON candidate.candidate_id=manifest.candidate_id
-        LEFT JOIN pg_namespace physical_schema ON physical_schema.nspname=candidate.schema_name
-        LEFT JOIN pg_roles protected_owner ON protected_owner.rolname=candidate.validation_json->'writer_closure'->>'owner_role'
-        LEFT JOIN LATERAL (
-          SELECT jsonb_object_agg(relation.relname,relation.oid::bigint) FILTER(WHERE relation.relkind='r') AS relation_oids,
-            coalesce(jsonb_object_agg(relation.relname,relation.oid::bigint) FILTER(WHERE relation.relkind='i'),'{{}}'::jsonb)
-              AS index_oids,
-            coalesce(jsonb_object_agg(relation.relname,index_record.indrelid::bigint) FILTER(WHERE relation.relkind='i'),
-              '{{}}'::jsonb) AS index_table_oids,
-            bool_and(relation.relowner=protected_owner.oid AND relation.relpersistence='p'
-              AND (relation.relkind<>'i' OR relation.relacl IS NULL)) AS owners_match,
-            count(*) AS relation_count,
-            count(*) FILTER(WHERE relation.relkind NOT IN ('r','i')) AS unsupported_relations,
-            min(relation.oid::bigint) FILTER(WHERE relation.relname='entity_address_unified' AND relation.relkind='r')
-              AS address_table_oid
-          FROM (SELECT * FROM pg_class WHERE relnamespace=physical_schema.oid ORDER BY relname LIMIT 129) relation
-          LEFT JOIN pg_index index_record ON index_record.indexrelid=relation.oid
-        ) inventory ON true
-        {_READONLY_WRITER_JOIN_SQL}
-        WHERE manifest.generation_id=coalesce($1::bigint,
-          (SELECT generation_id FROM {namespace}.network_serving_control WHERE id=1))
-          AND (manifest.eligible OR $2::boolean) AND candidate.state='published'
-          AND octet_length(candidate.validation_json::text)<=1048576""",
+        """SELECT jsonb_build_object(
+ 'candidate_id',candidate.candidate_id,'dataset_id',candidate.dataset_id,
+ 'schema_id',candidate.schema_id,'producer_id',candidate.producer_id,
+ 'schema_name',candidate.schema_name,'schema_revision',candidate.schema_revision,
+ 'source_generations',candidate.source_generations,
+ 'approved_custom_revision',candidate.approved_custom_revision,
+ 'validation_json',candidate.validation_json)::text AS candidate_json,
+ jsonb_build_object('candidate_id',manifest.candidate_id,'generation_id',manifest.generation_id,
+ 'schema_revision',manifest.schema_revision,'source_generations',manifest.source_generations,
+ 'approved_custom_revision',manifest.approved_custom_revision,
+ 'manifest_sha256',manifest.manifest_sha256,'eligible',manifest.eligible)::text AS manifest_json
+ FROM {namespace}.network_serving_manifest manifest
+ JOIN {namespace}.network_membership_candidate candidate USING(candidate_id)
+ WHERE manifest.generation_id=coalesce($1::bigint,
+  (SELECT generation_id FROM {namespace}.network_serving_control WHERE id=1))
+ AND ($2::boolean OR manifest.eligible) AND candidate.state='published'
+ AND coalesce(octet_length(candidate.validation_json::text),0)<=1048576
+ AND octet_length(candidate.source_generations::text)<=1048576
+ AND octet_length(manifest.source_generations::text)<=1048576""".format(namespace=namespace),
         generation_id,
         include_ineligible,
-        list(extra_readers),
     )
 
 
-def _verified_writer_closure(candidate, catalog):
-    closure = _publication_writer_closure(candidate, candidate["validation_json"])
-    current_by_field = {
-        "component": "network_candidate_writer_closure",
-        "revision": 1,
-        "scope": {
-            field: str(candidate[field])
-            for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
-        },
-        **_role_names(closure["owner_role"], tuple(closure["loader_roles"]), tuple(closure["reader_roles"])),
-        **{field: catalog[field] for field in ("schema_oid", "relation_oids", "index_oids", "index_table_oids")},
-    }
-    _check_identity(current_by_field, closure, extending=False)
-    if not _protected_owner(catalog["owner_attributes"]) or (
-        catalog["schema_owner_matches"] is not True
-        or catalog["owners_match"] is not True
-        or catalog["unsupported_relations"] != 0
-        or catalog["relation_count"] > 128
-        or catalog["has_routines"] is not False
-        or catalog["privileges_closed"] is not True
-        or any(
-            table_oid not in current_by_field["relation_oids"].values()
-            for table_oid in current_by_field["index_table_oids"].values()
-        )
+def _pinned_manifest(entry, *, layout=None):
+    """Keep the selected logical generation and its immutable routing names."""
+    if entry is None:
+        raise NetworkServingReadUnavailable("Published network generation is unavailable")
+    candidate, manifest = _object(entry["candidate_json"]), _object(entry["manifest_json"])
+    schema = candidate["schema_name"]
+    _identifier(schema)
+    generations = _object(manifest["source_generations"])
+    if (
+        str(manifest["candidate_id"]) != str(candidate["candidate_id"])
+        or manifest["schema_revision"] != candidate["schema_revision"]
+        or generations != _object(candidate["source_generations"])
+        or manifest["approved_custom_revision"] != candidate["approved_custom_revision"]
+        or type(manifest["generation_id"]) is not int
+        or manifest["generation_id"] <= 0
+        or type(manifest["approved_custom_revision"]) is not int
+        or manifest["approved_custom_revision"] < 0
     ):
-        raise NetworkServingReadUnavailable("Network serving physical owner or runtime privileges are not protected")
-    address_table_oid = closure["relation_oids"]["entity_address_unified"]
-    if address_table_oid != catalog["address_table_oid"]:
-        raise NetworkServingReadUnavailable("Network serving address table differs")
-    return address_table_oid
-
-
-def _pinned_manifest(entry, *, custody=None):
-    """Authenticate the retained manifest and bind its protected physical dependencies."""
-    candidate = json.loads(entry["candidate_json"])
-    manifest = json.loads(entry["manifest_json"])
-    readiness = _publication_readiness(candidate)
-    retained = _retained_manifest(manifest, readiness, replayed=True)
-    if retained["schema_name"] != "network_candidate_" + UUID(retained["candidate_id"]).hex:
-        raise NetworkServingReadUnavailable("Network serving schema identity differs")
-    from process.network_compact_readiness import is_compact_candidate
-
-    is_compact = is_compact_candidate(candidate)
-    if is_compact and (custody is None or custody.get("compact_layout") is None):
-        raise NetworkServingReadUnavailable("Compact network dependencies lack protected custody")
-    from process.registry_source_contribution_store import verify_registry_source_contributions
-    from process.registry_source_inventory_reference import source_inventory_heaps
-
-    if custody is None and (
-        source_inventory_heaps(candidate) or verify_registry_source_contributions(candidate) is not None
-    ):
-        raise NetworkServingReadUnavailable("Source contribution dependencies lack protected custody")
-    if custody is None:
-        address_table_oid = _verified_writer_closure(candidate, json.loads(entry["catalog_json"]))
-    else:
-        if custody["receipt"]["index_definition_sha256"] != readiness[2]["index_definition_sha256"]:
-            raise NetworkServingReadUnavailable("Sealed native index definitions differ from validation")
-        address_table_oid = (
-            custody["compact_layout"].base.table_oid
-            if is_compact
-            else custody["receipt"]["closure"]["relation_oids"]["entity_address_unified"]
-        )
+        raise NetworkServingReadUnavailable("Published network generation metadata differs")
+    if layout is not None and type(layout) is not CompactNetworkLayout:
+        raise NetworkServingReadUnavailable("Published network layout is invalid")
     pinned = PinnedNetworkServingManifest(
-        **{
-            field: retained[field]
-            for field in (
-                "generation_id",
-                "candidate_id",
-                "schema_name",
-                "schema_revision",
-                "source_generations",
-                "approved_custom_revision",
-                "manifest_sha256",
-            )
-        },
-        address_table_oid=address_table_oid,
+        generation_id=manifest["generation_id"],
+        candidate_id=str(candidate["candidate_id"]),
+        schema_name=schema,
+        schema_revision=manifest["schema_revision"],
+        source_generations=generations,
+        approved_custom_revision=manifest["approved_custom_revision"],
+        manifest_sha256=manifest["manifest_sha256"],
+        address_relation=layout.base
+        if layout is not None
+        else CompactAddressRelation(schema, "entity_address_unified"),
     )
-    _attach_manifest_custody(pinned, custody, readiness, is_compact)
-    if is_compact and custody is not None:
-        from process.registry_initial_source_composition import verify_initial_source_office_receipt
-
-        contributions = verify_registry_source_contributions(candidate)
-        offices = verify_initial_source_office_receipt(candidate)
+    if layout is not None:
+        if layout.ref_map.schema_name != schema:
+            raise NetworkServingReadUnavailable("Published network layout schema differs")
+        object.__setattr__(pinned, "_compact_layout", layout)
+        report = _object(candidate["validation_json"])
+        serving = report["serving_readiness"]
+        has_indexed_addresses = (
+            serving.get("address_artifact", {}).get("contract") == "network_indexed_address_artifact.postgres.v1"
+        )
+        contributions = report.get("registry_source_contributions") or {}
+        offices = report.get("registry_initial_source_offices") or {}
+        has_membership_pages = contributions.get("revision") == 6 and offices.get("revision") == 6
         object.__setattr__(
-            pinned,
-            "_supports_membership_pages",
-            contributions is not None
-            and contributions["revision"] == 6
-            and offices is not None
-            and offices["revision"] == 6,
+            pinned, "_supports_location_lookup", has_indexed_addresses or serving.get("location_lookup") is True
+        )
+        object.__setattr__(
+            pinned, "_supports_membership_pages", has_membership_pages or serving.get("membership_pages") is True
         )
     return pinned
-
-
-def _attach_manifest_custody(pinned, custody, readiness, is_compact):
-    from process.network_compact_layout import CompactAddressRelation
-
-    physical_closure = custody["receipt"]["closure"] if custody is not None else readiness[3]
-    object.__setattr__(
-        pinned,
-        "_candidate_relation_pins",
-        tuple(
-            CompactAddressRelation(pinned.schema_name, name, oid)
-            for name, oid in sorted(physical_closure["relation_oids"].items())
-        ),
-    )
-    if custody is not None:
-        # Keep custody proof outside serialized retained/public manifest contracts.
-        object.__setattr__(pinned, "_custody_seal_sha256", custody["seal_sha256"])
-        object.__setattr__(pinned, "_custody_control", dict(custody["receipt"]["control"]))
-    if is_compact:
-        from process.network_indexed_address_artifact import CONTRACT as INDEXED_ADDRESS_CONTRACT
-
-        object.__setattr__(pinned, "_compact_layout", custody["compact_layout"])
-        object.__setattr__(
-            pinned,
-            "_supports_location_lookup",
-            readiness[2]["address_artifact"].get("contract") == INDEXED_ADDRESS_CONTRACT,
-        )
 
 
 async def resolve_network_serving_manifest(
     connection, *, generation_id: int | None = None, control_schema=None, api_read=False
 ):
-    """Pin the current or retained manifest; API reads use the published routing metadata.
-
-    The caller owns the transaction and uses this same identity for every query
-    in the request. An unavailable canonical generation never selects legacy data.
-    """
+    """Pin the current or requested published generation within the caller's transaction."""
     if type(api_read) is not bool:
-        raise NetworkServingReadUnavailable("Network read verification mode is invalid")
-    if generation_id is not None and (type(generation_id) is not int or not 0 < generation_id <= 9223372036854775807):
+        raise NetworkServingReadUnavailable("Network read mode is invalid")
+    if generation_id is not None and (type(generation_id) is not int or not 0 < generation_id < 2**63):
         raise NetworkServingReadUnavailable("Network serving generation is invalid")
     if not connection.is_in_transaction():
-        raise NetworkServingReadUnavailable("Network serving reads require a caller-owned transaction")
+        raise NetworkServingReadUnavailable("Network serving reads require an active transaction")
     try:
-        namespace = _identifier(control_schema if control_schema is not None else registry_schema())
+        from process.network_published_api_pin import published_network_layout
+
+        namespace = _identifier(registry_schema() if control_schema is None else control_schema)
         if api_read:
             from process.network_published_api_pin import read_published_api_pin
 
@@ -303,47 +194,31 @@ async def resolve_network_serving_manifest(
             return published[0]
         entry = await _read_manifest(connection, namespace, generation_id)
         if entry is None:
-            raise NetworkServingReadUnavailable("Network serving manifest is unavailable")
-        candidate = json.loads(entry["candidate_json"])
-        custody = await _candidate_custody(connection, candidate, namespace[1:-1])
-        return _pinned_manifest(entry, custody=custody)
+            raise NetworkServingReadUnavailable("Published network generation is unavailable")
+        return _pinned_manifest(entry, layout=published_network_layout(_object(entry["candidate_json"])))
     except (ValueError, TypeError, KeyError, asyncpg.PostgresError) as error:
         if isinstance(error, NetworkServingReadUnavailable):
             raise
-        raise NetworkServingReadUnavailable("Network serving manifest verification failed") from error
+        raise NetworkServingReadUnavailable("Published network metadata is unavailable") from error
 
 
 async def resolve_retained_network_address_source(connection, address_source, *, control_schema):
-    """Verify retained physical custody without granting serving eligibility."""
-    if (
-        type(address_source) is not PinnedAddressSource
-        or address_source.table_name != "entity_address_unified"
-        or re.fullmatch(r"network_candidate_[0-9a-f]{32}", address_source.schema_name) is None
-        or re.fullmatch(r"[0-9a-f]{64}", address_source.generation_id) is None
-        or not connection.is_in_transaction()
-    ):
+    """Resolve the retained published address schema from logical generation metadata."""
+    if type(address_source) is not PinnedAddressSource or not connection.is_in_transaction():
         raise NetworkServingReadUnavailable("Retained network address source is invalid")
-    try:
-        namespace = _identifier(control_schema)
-        generation_id = await connection.fetchval(
-            f"SELECT manifest.generation_id FROM {namespace}.network_serving_manifest manifest "
-            f"JOIN {namespace}.network_membership_candidate candidate USING(candidate_id) "
-            "WHERE candidate.schema_name=$1 AND manifest.manifest_sha256=$2",
-            address_source.schema_name,
-            address_source.generation_id,
-        )
-        if generation_id is None:
-            raise NetworkServingReadUnavailable("Retained network address source is unavailable")
-        entry = await _read_manifest(connection, namespace, generation_id, include_ineligible=True)
-        if entry is None:
-            raise NetworkServingReadUnavailable("Retained network address manifest is unavailable")
-        candidate = json.loads(entry["candidate_json"])
-        custody = await _candidate_custody(connection, candidate, control_schema)
-        pinned = _pinned_manifest(entry, custody=custody)
-        if pinned.schema_name != address_source.schema_name or pinned.manifest_sha256 != address_source.generation_id:
-            raise NetworkServingReadUnavailable("Retained network address source changed")
-        return pinned
-    except (ValueError, TypeError, KeyError, asyncpg.PostgresError) as error:
-        if isinstance(error, NetworkServingReadUnavailable):
-            raise
-        raise NetworkServingReadUnavailable("Retained network address verification failed") from error
+    namespace = _identifier(control_schema)
+    generation_id = await connection.fetchval(
+        f"SELECT manifest.generation_id FROM {namespace}.network_serving_manifest manifest "
+        f"JOIN {namespace}.network_membership_candidate candidate USING(candidate_id) "
+        "WHERE candidate.schema_name=$1 AND manifest.manifest_sha256=$2",
+        address_source.schema_name,
+        address_source.generation_id,
+    )
+    if generation_id is None:
+        raise NetworkServingReadUnavailable("Retained network address source is unavailable")
+    entry = await _read_manifest(connection, namespace, generation_id, include_ineligible=True)
+    from process.network_published_api_pin import published_network_layout
+
+    if entry is None:
+        raise NetworkServingReadUnavailable("Retained network address source is unavailable")
+    return _pinned_manifest(entry, layout=published_network_layout(_object(entry["candidate_json"])))

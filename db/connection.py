@@ -192,11 +192,7 @@ _SESSION: contextvars.ContextVar[Optional[AsyncSession]] = contextvars.ContextVa
 
 
 async def _execute_buffered_reader_statement(session, statement, parameters):
-    """Guard active fixed-name inventories on the original buffered execution seam."""
-    from api.network_read_execution import execute_network_read, has_network_read_inventory
-
-    if has_network_read_inventory(session):
-        return await execute_network_read(session, statement, parameters)
+    """Execute through the configured request session."""
     return await session.execute(statement, parameters)
 
 
@@ -652,7 +648,6 @@ class Database:
                 else reader.session()
             )
             async with self._verified_reader_session(
-                reader,
                 scope,
                 temporary_setup=temporary_setup is not None,
                 prepare_plan_workspace=prepare_plan_workspace,
@@ -660,23 +655,12 @@ class Database:
                 yield session
 
     @asynccontextmanager
-    async def _verified_reader_session(self, reader, scope, *, temporary_setup, prepare_plan_workspace):
-        """Verify login and prepared modes while owning binding cleanup and cancellation."""
+    async def _verified_reader_session(self, scope, *, temporary_setup, prepare_plan_workspace):
+        """Bind configured Reader transactions and preserve cleanup and cancellation."""
         prepared = temporary_setup or prepare_plan_workspace
         async with scope as session:
             reader_context_token = None
             try:
-                identity_result = await session.execute(
-                    sa_text(
-                        "SELECT session_user, current_user, "
-                        "(SELECT oid FROM pg_catalog.pg_roles WHERE rolname=current_user), "
-                        "(SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database()), "
-                        "host(inet_server_addr()), inet_server_port(), pg_backend_pid()"
-                    )
-                )
-                identity_values = tuple(identity_result.first())
-                if identity_values[:2] != (reader._reader_login[0], reader._reader_login[0]):
-                    raise RuntimeError("Reader session login identity differs")
                 if prepared:
                     modes = await session.execute(
                         sa_text(
@@ -685,13 +669,8 @@ class Database:
                     )
                     if tuple(modes.first()) != ("repeatable read", "on"):
                         raise RuntimeError("Prepared Reader must remain repeatable read and read only")
-                session.info["api_reader_identity"] = dict(
-                    zip(
-                        ("role_oid", "database_oid", "server_address", "server_port", "backend_pid"),
-                        identity_values[2:],
-                        strict=True,
-                    )
-                )
+                else:
+                    await session.connection()
                 session.info["api_reader_verified"] = True
                 if prepare_plan_workspace:
                     session.info["native_plan_workspace"] = True
@@ -705,16 +684,14 @@ class Database:
                 if reader_context_token is not None:
                     _READER.reset(reader_context_token)
                 session.info.pop("api_reader_verified", None)
-                session.info.pop("api_reader_identity", None)
                 session.info.pop("native_plan_workspace", None)
-                session.info.pop("api_network_read_inventory", None)
 
     async def bind_request_reader(self, request):
         """Replace only this request's unused ordinary session with a genuine Reader."""
         session = getattr(request.ctx, "sa_session", None)
         if session is not None and self.has_reader_session() and current_session() is session:
             if session.info.get("api_reader_verified") is not True:
-                raise RuntimeError("Request Reader identity is unavailable")
+                raise RuntimeError("Request Reader binding is unavailable")
             return session
         if (
             session is None

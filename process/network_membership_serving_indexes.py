@@ -3,7 +3,6 @@
 
 import hashlib
 import json
-import os
 from uuid import UUID
 
 from db.registry_schema import registry_schema
@@ -160,8 +159,7 @@ async def _serving_index_records(connection, schema_name, *, qualified_definitio
     try:
         index_records = await connection.fetch(
             """
-            SELECT index_relation.oid AS index_oid,index_relation.relname,index_record.indrelid,
-                projected.oid AS table_oid,index_record.indisvalid,index_record.indisready,index_record.indislive,
+            SELECT index_relation.relname,index_record.indisvalid,index_record.indisready,index_record.indislive,
                 pg_get_indexdef(index_relation.oid) AS index_definition
             FROM pg_class projected JOIN pg_namespace namespace ON namespace.oid=projected.relnamespace
             JOIN pg_index index_record ON index_record.indrelid=projected.oid
@@ -184,9 +182,7 @@ async def _index_digest(connection, schema_name, index_plan, *, qualified_defini
     index_records = await _serving_index_records(connection, schema_name, qualified_definitions=qualified_definitions)
     actual_by_name = {record["relname"]: record for record in index_records}
     if not all(index_name in actual_by_name for index_name, _ in index_plan) or any(
-        record["indrelid"] != record["table_oid"]
-        or record["index_oid"] <= 0
-        or not all(record[field] is True for field in ("indisvalid", "indisready", "indislive"))
+        not all(record[field] is True for field in ("indisvalid", "indisready", "indislive"))
         for record in index_records
     ):
         raise NetworkServingIndexesError("Native serving indexes are missing or invalid on the exact candidate table")
@@ -202,10 +198,6 @@ async def _require_address_search_indexes(connection, relation, *, canonical=Fal
 
     if not compact_base and relation.table_name != "entity_address_unified":
         raise NetworkServingIndexesError("Search address relation differs")
-    table = f"{_identifier(relation.schema_name)}.{_identifier(relation.table_name)}"
-    await connection.execute(f"LOCK TABLE ONLY {table} IN ACCESS SHARE MODE NOWAIT")
-    if await connection.fetchval("SELECT to_regclass($1)::oid::bigint", table) != relation.table_oid:
-        raise NetworkServingIndexesError("Search address table identity differs")
     if canonical or compact_base:
         await _catalog_readiness(connection, relation.schema_name, table_name=relation.table_name, canonical=canonical)
     digest = (
@@ -218,7 +210,6 @@ async def _require_address_search_indexes(connection, relation, *, canonical=Fal
             _required_geo_taxonomy_stage_index_sql(
                 relation.schema_name,
                 relation.table_name,
-                **({"table_oid": relation.table_oid} if compact_base else {}),
             )
         )
         is not True
@@ -251,7 +242,6 @@ async def verify_network_search_indexes(connection, candidate, *, compact_layout
         relation = CompactAddressRelation(
             candidate["schema_name"],
             "entity_address_unified",
-            report["writer_closure"]["relation_oids"]["entity_address_unified"],
         )
         digest = await _require_address_search_indexes(connection, relation, canonical=True)
     if digest != report["serving_readiness"]["index_definition_sha256"]:

@@ -11,6 +11,7 @@ from api import plan_pricing_em_attribution as attribution
 from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
 from tests.test_plan_pricing_em_attribution import (
     _binding,
+    _legacy_document,
     _receipt,
     _relations,
     _resolver_setup,
@@ -110,19 +111,32 @@ async def test_valid_digest_does_not_authorize_invalid_price_accounting(monkeypa
     attribution._content.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("changes", [{"table_oid": 14}, {"table_filenode": 24}])
-async def test_retained_receipt_cannot_substitute_another_physical_price_table(monkeypatch, changes):
-    driver, selection, _ = _resolver_setup(monkeypatch, receipt=_receipt(**changes))
-    with pytest.raises(PlanPricingProjectionUnavailable, match="^E&M attribution is unavailable$"):
-        await attribution.resolve_em_attribution(object(), selection)
-    assert driver.execute.await_count == 1
-    attribution._closed.assert_not_awaited()
-    attribution._content.assert_not_awaited()
+@pytest.mark.parametrize("changes", [{"table_oid": 14}, {"table_filenode": 24}, {"owner_role": "copied_owner"}])
+def test_legacy_receipt_projects_named_data_without_physical_authority(changes):
+    receipt = _receipt()
+    document = _legacy_document(receipt) | changes
+    decoded = attribution._decode(attribution._canonical(document))
+    assert decoded == receipt
+    assert not {"table_oid", "table_filenode", "owner_role", "catalog_sha256"} & decoded.as_dict().keys()
+
+
+@pytest.mark.parametrize("damage", ["missing", "extra", "content", "recipe"])
+def test_legacy_projection_keeps_closed_metadata_and_logical_validation(damage):
+    document = _legacy_document(_receipt())
+    if damage == "missing":
+        document.pop("table_oid")
+    elif damage == "extra":
+        document["unknown"] = True
+    elif damage == "content":
+        document["content_sha256"] = None
+    else:
+        document["identity_sha256"] = "f" * 64
+    with pytest.raises(ValueError):
+        attribution._decode(attribution._canonical(document))
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("namespace", [None, {"oid": 5, "nspowner": 7}])
+@pytest.mark.parametrize("namespace", [None, {"receipt": None}])
 async def test_catalog_rejects_missing_namespace_or_added_database_behavior(monkeypatch, namespace):
     monkeypatch.setattr(attribution, "_namespace", AsyncMock(return_value=namespace))
     shape_reader = AsyncMock(side_effect=AssertionError("Unsafe catalog must stop before table inspection"))
@@ -133,10 +147,8 @@ async def test_catalog_rejects_missing_namespace_or_added_database_behavior(monk
     shape_reader.assert_not_awaited()
 
 
-def test_price_catalog_rejects_partitioned_heap_and_unknown_scalar_encoding():
+def test_price_catalog_rejects_partitioned_heap():
     relations = _relations()
     relations[0]["relkind"] = b"p"
     with pytest.raises(ValueError, match="heap differs"):
         attribution._validate_relations(relations)
-    with pytest.raises(TypeError, match="unexpected native catalog scalar"):
-        attribution._catalog_digest({"relkind": b"unexpected"})

@@ -816,6 +816,23 @@ def _publication_admission(directory, fence, request, resource_types):
 
 
 @asynccontextmanager
+async def _resource_input_scope(directory, admission):
+    """Resolve the ordinary published dataset once for every preparation read."""
+    if admission.factory is not None:
+        yield
+        return
+    from process.provider_directory_source_storage_binding import dataset_source_relations
+
+    root = directory.ProviderDirectoryDatasetResource.__tablename__
+    relations_by_root = await dataset_source_relations(
+        directory.db, directory._schema(), admission.fence.datasets[0].dataset_id, (root,)
+    )
+    relation = relations_by_root[root]
+    with directory._provider_directory_artifact_relation_scope({root: (relation["schema"], relation["name"])}):
+        yield
+
+
+@asynccontextmanager
 async def publication_scope(directory, fence, request, resource_types):
     """Prepare the existing recipe and always drain its exact native scratch tables."""
     admission = _publication_admission(directory, fence, request, resource_types)
@@ -836,7 +853,8 @@ async def publication_scope(directory, fence, request, resource_types):
                 == ((factory.policy.control_runtime_roles[0],) * 2 if factory is not None else (actor[0],) * 2),
                 "rest_artifact_ordinary_actor_required",
             )
-            projection = await _prepare(directory, admission, relation_by_table, created_by_relation)
+            async with _resource_input_scope(directory, admission):
+                projection = await _prepare(directory, admission, relation_by_table, created_by_relation)
             oid_by_table = {root: created_by_relation[name][0] for root, name in relation_by_table.items()}
             token = _ACTIVE.set(admission)
             try:
@@ -959,7 +977,7 @@ async def lock_address_source_fence(directory, database, schema, context):
 async def terminal_fence(directory):
     """Authenticate Source before commit; keep ordinary-owned locks until settlement."""
     admission = current(directory)
-    if admission is None or admission.factory is None:
+    if admission is None or admission.factory is None and admission.replacement_scope is not None:
         yield
         return
     require_output(_TERMINAL.get() is None, "rest_artifact_terminal_nested")
@@ -968,7 +986,23 @@ async def terminal_fence(directory):
     await directory.db.status(
         f"SET LOCAL statement_timeout='{directory.PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT}'"
     )
+    if admission.factory is None and any(
+        directory.is_uhc_flex_profile_source(dataset.source_id) for dataset in admission.fence.datasets
+    ):
+        await directory.lock_uhc_flex_profile_publication(directory.db)
     await _lock_ordinary_controls(directory, admission.fence, directory.db)
+    if admission.factory is None:
+        await _verify_header(directory, admission.fence, directory.db, for_update=False)
+        await replacement.verify_locked(directory, admission.fence, directory.db)
+        token = _TERMINAL.set((admission, session))
+        try:
+            yield
+            current(directory)
+            require_output(_publication_session(directory.db) is session, "rest_artifact_transaction_changed")
+            await _verify_header(directory, admission.fence, directory.db, for_update=False)
+        finally:
+            _TERMINAL.reset(token)
+        return
     async with admission.factory.artifact_fence(directory.db) as executor:
         await executor.status(f"SET LOCAL lock_timeout='{directory.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT}'")
         await executor.status(

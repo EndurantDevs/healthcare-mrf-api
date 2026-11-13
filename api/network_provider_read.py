@@ -12,8 +12,6 @@ import asyncpg
 
 from api.network_address_scope import NetworkAddressReadScope
 from process.network_address_projection import _identifier
-from process.network_compact_layout import CompactAddressRelation
-from process.network_read_identity import NetworkReadIdentityError, verify_consumed_network_relations
 from process.network_serving_read import (
     NetworkServingReadUnavailable,
     PinnedNetworkServingManifest,
@@ -316,8 +314,6 @@ async def _read(connection, scope, selector, limit, offset, control_schema, offi
             and all(filter_value is None for filter_value in office_filters)
         )
         addresses, address_arguments = _provider_addresses(current, scope.network_ids, membership_page=membership_page)
-        relations = _provider_read_relations(current, membership_page=membership_page)
-        backend_pid = connection.get_server_pid()
         receipt = await connection.fetchrow(
             (_MEMBERSHIP_PROVIDERS_SQL if membership_page else _PROVIDERS_SQL).format(
                 namespace=_identifier(current.schema_name),
@@ -337,44 +333,17 @@ async def _read(connection, scope, selector, limit, offset, control_schema, offi
             *office_filters,
             *address_arguments,
         )
-        await verify_consumed_network_relations(connection, relations, expected_backend_pid=backend_pid)
         return _result(receipt)
     except NetworkProviderReadError:
         raise
     except (
         NetworkServingReadUnavailable,
-        NetworkReadIdentityError,
         asyncpg.PostgresError,
         ValueError,
         TypeError,
         KeyError,
     ):
         raise NetworkProviderReadUnavailable("Canonical providers are unavailable") from None
-
-
-def _candidate_relations(manifest, names):
-    """Select exact candidate pins from the resolver's authenticated native closure."""
-    pins = manifest.candidate_relation_pins
-    if type(pins) is not tuple or any(type(pin) is not CompactAddressRelation for pin in pins):
-        raise NetworkProviderReadUnavailable("Pinned provider physical relations are unavailable")
-    selected_pins = []
-    for name in names:
-        matches = [pin for pin in pins if pin.schema_name == manifest.schema_name and pin.table_name == name]
-        if len(matches) != 1:
-            raise NetworkProviderReadUnavailable("Pinned provider physical relations are unavailable")
-        selected_pins.append(matches[0])
-    return tuple(selected_pins)
-
-
-def _provider_read_relations(manifest, *, membership_page=False):
-    relations = _candidate_relations(manifest, ("network_membership", "provider_location_binding"))
-    if manifest.compact_layout is None:
-        return relations + (
-            CompactAddressRelation(manifest.schema_name, "entity_address_unified", manifest.address_table_oid),
-        )
-    from api.network_compact_address import compact_address_read_relations
-
-    return relations + compact_address_read_relations(manifest.compact_layout)
 
 
 def _provider_addresses(manifest, network_ids, *, membership_page=False):

@@ -178,7 +178,9 @@ async def privacy_publication(monkeypatch, tmp_path):
                 reviewed = await _review_both_networks(fixture, pair)
                 await _profile_addresses(fixture)
                 await _grant_profile_reader(fixture)
-                await install_source_contribution_custody(fixture, pair.recipe.source_pin, stack)
+                await install_source_contribution_custody(
+                    fixture, pair.recipe.source_pin, stack, source_readers=pair.runtime_roles
+                )
                 manifest = await _compose_profile_manifest(
                     fixture, None, reviewed[-1], copy_targets, initial_recipe=pair.recipe
                 )

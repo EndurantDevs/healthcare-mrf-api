@@ -79,6 +79,7 @@ from process.mrf_address_publication import (
 )
 from process.mrf_publication_receipt import require_completed_publication
 from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner, native_model_copy_driver
+from process.nucc_retention_read_view import require_nucc_unretained_rotation as require_nucc_unretained_rotation
 from process.provider_quality_parts.table_helpers import _index_name_for_table
 from process.reference_family_composition import (
     ReferenceModelContribution as ReferenceModelContribution,
@@ -2522,33 +2523,6 @@ async def rename_nucc_published_indexes(session, *, schema_name, expected_relati
         await session.execute(
             text(f"ALTER INDEX {_quoted(schema)}.{_quoted(name)} RENAME TO {_quoted(f'nucc_published_idx_{oid:x}')}")
         )
-
-
-async def require_nucc_unretained_rotation(session, *, schema_name):
-    """Legacy rotation cannot erase serving or predecessor heaps in protected custody."""
-    _require_transaction(session)
-    schema = _schema_name(schema_name)
-    if await is_nucc_native_handoff_required(session, schema_name=schema):
-        raise ReferenceFamilyArchiveError("NUCC protected custody requires publisher rotation")
-    oids = []
-    for table in (models.NUCCTaxonomy.__tablename__, models.NUCCTaxonomy.__tablename__ + "_old"):
-        oid = await _relation_oid(session, schema, table)
-        if oid is None:
-            continue
-        await session.execute(
-            text(f"LOCK TABLE ONLY {_quoted(schema)}.{_quoted(table)} IN ACCESS EXCLUSIVE MODE NOWAIT")
-        )
-        if await _relation_oid(session, schema, table) != oid:
-            raise ReferenceFamilyArchiveError("NUCC incumbent identity differs")
-        oids.append(oid)
-    if not oids:
-        return
-    from process.nucc_retention_read_view import NuccRetentionReadError, require_unretained_nucc_oids
-
-    try:
-        await require_unretained_nucc_oids(session, oids)
-    except NuccRetentionReadError as error:
-        raise ReferenceFamilyArchiveError(str(error)) from error
 
 
 def nucc_native_digest(value):

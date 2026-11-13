@@ -17,10 +17,10 @@ from process import registry_source_inventory_contract as inventory
 from process import registry_source_inventory_summaries as summaries
 from process import registry_source_office_summary_v3 as legacy_offices
 from process.registry_source_recipe_store import RegistrySourceRecipeError, canonical_registry_source_recipes
+from tests.registry_source_recipe_support import _example
 from tests.test_registry_ptg_office_membership_recipe import _recipe as ptg_recipe
 from tests.test_registry_source_contributions import _descriptor
 from tests.test_registry_source_office_summary_v3 import _derivation
-from tests.test_registry_source_recipe_store_postgres import _example
 
 _APPROVED = SimpleNamespace(approved_revision=7, generation_id="b" * 64)
 _ADDRESS = SimpleNamespace(generation_id="c" * 64)

@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Exact approved Source captures through real queue, independent custody and publication."""
+"""Exact approved named Source captures through the real publication queue."""
 
 import asyncio
 import json
@@ -15,7 +15,6 @@ import pytest
 from process import network_fhir_source_witness_capture as capture_module
 from process import registry_source_recipe_composition as recipes
 from process.network_approved_membership_source import pin_approved_membership_source
-from process.network_candidate_custody import seal_network_candidate_custody
 from process.network_fhir_retained_capture import require_retained_fhir_capture
 from process.network_fhir_retained_capture_contract import registry_location_id
 from process.network_fhir_source_witness_contract import (
@@ -27,9 +26,7 @@ from process.network_fhir_source_witness_contract import (
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_approval_store import RegistryApprovalConflict
 from process.registry_candidate_composition import (
-    RegistryAddressArtifactCustody,
     RegistryCompositionAddressSources,
-    prepare_registry_composition_address_artifact,
 )
 from process.registry_publication_consumer import RegistryPublicationConsumerConfig, consume_registry_publication_once
 from process.registry_publication_queue import (
@@ -38,7 +35,6 @@ from process.registry_publication_queue import (
     enqueue_registry_source_rollback_preview,
     enqueue_registry_source_rollback_publication,
 )
-from process.registry_publication_worker_permissions import verify_registry_publication_worker_permissions
 from process.registry_record_store import RegistryActor
 from tests.source_witness_capture_postgres_support import (
     capture_arguments,
@@ -62,7 +58,6 @@ from tests.test_registry_publication_consumer_postgres import (
 from tests.test_registry_publication_consumer_postgres import (
     _enqueue_ordinary,
     _head,
-    _retained_recipe_custodian,
     _status,
 )
 from tests.test_registry_publication_worker_permissions_postgres import _login, _options, _worker_roles
@@ -77,7 +72,6 @@ async def _consumer(worker, **options_by_name):
         config = arguments_by_name["config"]
         readers = tuple(sorted({*config.reader_roles, worker.roles_by_kind["api"]}))
         arguments_by_name["config"] = replace(config, reader_roles=readers)
-        assert arguments_by_name["config"].custody_roles == config.custody_roles
         assert tuple(sorted(set(config.loader_roles + readers))) == worker.address_reader_roles
         yield arguments_by_name, calls
 
@@ -87,26 +81,28 @@ async def _single_worker_install(monkeypatch, worker):
     from tests import test_registry_publication_consumer_postgres as consumer_fixture
 
     original_install = consumer_fixture._install
-    counts = SimpleNamespace(installations=0, verifications=0)
+    counts = SimpleNamespace(installations=0, reads=0, receipt=None)
 
-    async def install_or_verify(supplied):
+    async def install_once(supplied):
         assert supplied is worker
         if not counts.installations:
-            result = await original_install(worker)
+            counts.receipt = await original_install(worker)
             counts.installations += 1
-            return result
-        async with _login(worker, "execution") as connection:
-            async with connection.transaction(isolation="repeatable_read", readonly=True):
-                result = await verify_registry_publication_worker_permissions(
-                    connection, **_options(worker), role=worker.roles_by_kind["execution"]
+        else:
+            async with _login(worker, "execution") as connection:
+                assert (
+                    await connection.fetchrow(
+                        f'SELECT id FROM "{worker.fixture.control_schema}".registry_revision_control WHERE id=1'
+                    )
+                    is not None
                 )
-        counts.verifications += 1
-        return result
+            counts.reads += 1
+        return counts.receipt
 
     with monkeypatch.context() as patch:
-        patch.setattr(consumer_fixture, "_install", install_or_verify)
+        patch.setattr(consumer_fixture, "_install", install_once)
         yield counts
-    assert counts.installations == 1 and counts.verifications > 1
+    assert counts.installations == 1 and counts.reads > 1
 
 
 async def _remove_address_inputs(connection, schemas):
@@ -115,72 +111,101 @@ async def _remove_address_inputs(connection, schemas):
         assert await connection.fetchval("SELECT to_regnamespace($1)", schema) is None
 
 
-def _actor_censuses(worker, operator, source_reader, custodian_role):
+async def _named_publication_foundation(fixture, stack, monkeypatch, *, legacy_component=None):
+    """Register exact cleanup before replacing the owned empty placeholder with normal controls."""
+    from directory_membership_test_support import (
+        prepare_registry_catalog_foundation,
+        retire_empty_registry_catalog_placeholder,
+    )
+
+    from tests.test_network_compact_publication_postgres import _cleanup_named_preparations
+
+    fixture.created_control_namespaces, fixture.preparation_ids = [], []
+    stack.push_async_callback(_cleanup_named_preparations, fixture)
+    if legacy_component is not None:
+        assert legacy_component.created_control_namespaces == ["hp_snapshot_retention"]
+        await retire_empty_registry_catalog_placeholder(fixture.connection)
+    await prepare_registry_catalog_foundation(fixture, monkeypatch)
+
+
+def _actor_censuses(worker, operator, source_reader, custodian_role, *, named=False):
     config = RegistryPublicationConsumerConfig(
         **_options(worker),
         reader_roles=tuple(sorted((worker.fixture.roles["reader"], worker.roles_by_kind["api"]))),
     )
-    source_roles = tuple(
-        sorted(
-            {
-                *worker.roles_by_kind.values(),
-                *config.custody_roles,
-                custodian_role,
-                operator.owner_role,
-                source_reader,
-            }
+    candidate_roles = tuple(sorted(config.permission_roles.values()))
+    source_roles = tuple(sorted({*worker.roles_by_kind.values(), *candidate_roles, source_reader}))
+    return candidate_roles, source_roles, tuple(sorted(set(config.loader_roles + config.reader_roles)))
+
+
+def _named_preparation_roles(context):
+    """Keep every configured application role in the administrator freeze profile."""
+    return {
+        "namespace_owner_role": context.case.fixture.role_by_kind["owner"],
+        "publisher_role": context.worker.roles_by_kind["execution"],
+        "application_roles": sorted(
+            set(context.case.application_roles)
+            | set(context.runtime.runtime_roles)
+            | set(context.worker.fixture.roles.values())
+            | set(context.worker.roles_by_kind.values())
+        ),
+    }
+
+
+async def _named_publication_callbacks(context, stack):
+    """Use the configured application callback and the original administrator freeze."""
+    from process.network_membership_publication import load_named_network_preparation
+    from process.registry_publication_ptg_runtime import RegistryPublicationSQLLimits
+    from process.registry_publication_worker import RegistryPublicationWorkerConfig, _configured_worker_runtime
+    from tests.registry_candidate_custody_postgres_support import administrative_freeze_callback
+
+    worker, fixture = context.worker, context.worker.fixture
+    limits = RegistryPublicationSQLLimits()
+    worker.sql_limits = limits
+    for kind in ("execution", "lifecycle"):
+        await fixture.connection.execute(
+            f'ALTER ROLE "{worker.roles_by_kind[kind]}" '
+            f"SET temp_file_limit='{limits.temp_file_limit_bytes // 1024}kB'"
         )
+    url = fixture.engine.url.set(password=worker.role_password)
+    config = RegistryPublicationWorkerConfig(
+        lifecycle_url=url.set(username=worker.roles_by_kind["lifecycle"]),
+        execution_url=url.set(username=worker.roles_by_kind["execution"]),
+        app_origin="https://authority.example.test",
+        service_token="synthetic-service-token",
+        consumer=RegistryPublicationConsumerConfig(
+            **_options(worker),
+            reader_roles=tuple(sorted((fixture.roles["reader"], worker.roles_by_kind["api"]))),
+        ),
+        initial_address_sources=_initial_sources(context),
+        preparation_roles=_named_preparation_roles(context),
+        sql_limits=limits,
     )
-    return config.custody_roles, source_roles, tuple(sorted(set(config.loader_roles + config.reader_roles)))
+    consumer = await _configured_worker_runtime(config, stack)
+    freeze_and_validate = administrative_freeze_callback(fixture, consumer)
+    schemas = []
+    stack.push_async_callback(_remove_address_inputs, fixture.connection, schemas)
 
-
-def _publication_callbacks(context):
-    worker, operator = context.worker, context.operator
-    custody = RegistryAddressArtifactCustody(
-        operator.owner_role,
-        context.candidate_roles,
-        worker.fixture.control_schema,
-        address_reader_roles=context.address_reader_roles,
-    )
-
-    async def prepare_address_sources(**arguments_by_name):
-        sources = replace(arguments_by_name["address_sources"], source_witness_runtime=context.runtime)
-        arguments_by_name = {
-            **arguments_by_name,
-            "request_id": UUID(str(arguments_by_name["request_id"])),
-            "address_sources": sources,
-        }
-        async with operator.connection.transaction(isolation="repeatable_read"):
-            artifact = await prepare_registry_composition_address_artifact(
-                operator.connection, custody=custody, **arguments_by_name
-            )
-        assert artifact is None and sources.compact
-        return sources
-
-    async def seal_candidate(target):
-        state = await operator.connection.fetchval(
-            f'SELECT state FROM "{worker.fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
-            UUID(target.candidate_id),
-        )
-        assert state == "ready"
+    async def validate_candidate(target, **options):
+        if target.candidate_id not in fixture.preparation_ids:
+            fixture.preparation_ids.append(target.candidate_id)
         context.ready_targets.append(target)
-
-        async def authorize(connection, selected):
-            assert connection is operator.connection and selected == target
-            return await connection.fetchval("SELECT current_user=session_user")
-
-        result = await seal_network_candidate_custody(
-            operator.connection,
-            target,
-            control_schema=worker.fixture.control_schema,
-            runtime_roles=context.candidate_roles,
-            authorize=authorize,
-            source_witness_runtime=context.runtime,
-        )
+        if target.schema_name not in schemas:
+            schemas.append(target.schema_name)
+        try:
+            result = await freeze_and_validate(target, **options)
+        finally:
+            handoff = await load_named_network_preparation(
+                fixture.connection, target.candidate_id, control_schema=fixture.control_schema
+            )
+            for table in () if handoff is None else handoff["tables"]:
+                if table["schema"] not in schemas:
+                    schemas.append(table["schema"])
+        assert result["state"] == "validated"
         context.sealed_targets.append(target)
         return result
 
-    return {"seal_candidate": seal_candidate, "prepare_address_sources": prepare_address_sources}
+    return {"seal_candidate": validate_candidate, "preparation_roles": consumer.preparation_roles}
 
 
 async def _source_capture_for_workers(
@@ -198,9 +223,6 @@ async def _source_capture_for_workers(
     runtime = recipes.SourceWitnessRuntime(
         case.source_export, (case.source_profile,), case.fixture.role_by_kind["owner"], source_roles
     )
-    assert capture.owner_role == runtime.capture_owner_role and capture.runtime_roles == runtime.runtime_roles
-    raw_writer = await case.writer.fetchval("SELECT session_user")
-    assert raw_writer not in source_roles and raw_writer != await operator.connection.fetchval("SELECT session_user")
     return SimpleNamespace(
         case=case,
         worker=worker,
@@ -219,20 +241,25 @@ async def _source_capture_for_workers(
 
 
 @asynccontextmanager
-async def _publication_case(monkeypatch, *, legacy=False):
-    async with source_witness_case(monkeypatch, legacy=legacy) as case, AsyncExitStack() as stack:
+async def _publication_case(monkeypatch, *, legacy=False, named=True):
+    from tests import test_registry_publication_consumer_postgres as consumer_fixture
+
+    async with source_witness_case(monkeypatch, legacy=legacy, named=named) as case, AsyncExitStack() as stack:
         serving = await stack.enter_async_context(_registry_on_source(case.fixture, monkeypatch))
         custom = await stack.enter_async_context(aclosing(custom_db.__wrapped__(serving)))
         fixture = await anext(custom)
+        await _named_publication_foundation(
+            fixture, stack, monkeypatch, legacy_component=case.fixture.component if legacy else None
+        )
         for extension in ("intarray", "btree_gin", "postgis"):
             await fixture.connection.execute('CREATE EXTENSION IF NOT EXISTS "' + extension + '"')
         worker = await stack.enter_async_context(_worker_roles(fixture, SimpleNamespace(actor=_actor())))
+        worker.named_preparation = True
         installation = await stack.enter_async_context(_single_worker_install(monkeypatch, worker))
-        operator = await stack.enter_async_context(_retained_recipe_custodian(worker))
+        operator = SimpleNamespace(connection=case.fixture.admin, owner_role=case.fixture.role_by_kind["owner"])
         await _registry_read_bootstrap(case, serving)
-        custodian_role = await operator.connection.fetchval("SELECT session_user")
         candidate_roles, source_roles, address_reader_roles = _actor_censuses(
-            worker, operator, case.fixture.component.reader, custodian_role
+            worker, operator, case.fixture.component.reader, None, named=True
         )
         worker.address_reader_roles = address_reader_roles
         context = await _source_capture_for_workers(
@@ -240,7 +267,8 @@ async def _publication_case(monkeypatch, *, legacy=False):
         )
         context.installation = installation
         context.serving = serving
-        worker.publication_custody_by_name = _publication_callbacks(context)
+        worker.publication_custody_by_name = await _named_publication_callbacks(context, stack)
+        await consumer_fixture._install(worker)
         yield context
 
 
@@ -272,8 +300,6 @@ async def _require_recipe(context, connection, *, recipe=None, runtime=None, use
 
 async def _assert_runtime_and_approval_guards(context):
     capture, runtime = context.capture, context.runtime
-    custodian_role = await context.operator.connection.fetchval("SELECT session_user")
-    assert {context.worker.roles_by_kind["queue"], custodian_role} <= set(runtime.runtime_roles)
     async with _login(context.worker, "execution") as connection:
         with pytest.raises(
             recipes.RegistrySourceCompositionError,
@@ -281,37 +307,15 @@ async def _assert_runtime_and_approval_guards(context):
         ):
             await _require_recipe(context, connection, runtime=None, use_default_runtime=False)
         for invalid in (
+            lambda: replace(runtime, source_profiles=()),
+            lambda: replace(runtime, runtime_roles=("reader", "reader")),
             lambda: replace(
-                runtime,
-                runtime_roles=tuple(
-                    role for role in runtime.runtime_roles if role != context.worker.roles_by_kind["queue"]
-                ),
-            ),
-            lambda: replace(
-                runtime, runtime_roles=tuple(role for role in runtime.runtime_roles if role != custodian_role)
-            ),
-            lambda: replace(runtime, capture_owner_role=context.worker.roles_by_kind["physical"]),
-            lambda: replace(
-                runtime, source_profiles=(replace(context.case.source_profile, schema_name="other_source"),)
-            ),
-            lambda: replace(
-                runtime,
-                source_profiles=(
-                    replace(context.case.source_profile, owner_role=context.worker.fixture.roles["owner"]),
-                ),
+                runtime, source_profiles=(replace(context.case.source_profile, catalog_schema_name="other_source"),)
             ),
         ):
             with pytest.raises(ValueError):
                 await _require_recipe(context, connection, runtime=invalid(), use_default_runtime=False)
-        raw_writer = await context.case.writer.fetchval("SELECT session_user")
-        assert raw_writer not in runtime.runtime_roles
-        with pytest.raises(recipes.RegistrySourceCompositionError, match="runtime_census_differs"):
-            await _require_recipe(
-                context,
-                connection,
-                runtime=replace(runtime, capture_owner_role=raw_writer),
-                use_default_runtime=False,
-            )
+        await _assert_capture_write_refused(connection, capture)
         wrong_capture = replace(
             capture,
             observed_at=canonical_timestamp(datetime.fromisoformat(capture.observed_at) + timedelta(microseconds=1)),
@@ -323,40 +327,48 @@ async def _assert_runtime_and_approval_guards(context):
         with pytest.raises(recipes.RegistrySourceCompositionError, match="approval_unavailable"):
             await _require_recipe(context, connection, recipe=_source_recipe(wrong_capture, anchor))
         read = await _require_recipe(context, connection)
+        read.require_ready(capture)
         with pytest.raises(SourceWitnessContractError):
-            await read.verify(connection, capture)
+            read.require_ready(wrong_capture)
+
+
+async def _assert_capture_write_refused(connection, capture):
+    relation = capture.tables["provider_directory_dataset_resource"]
+    table = '"' + relation["schema"] + '"."' + relation["name"] + '"'
+    async with connection.transaction():
+        assert await connection.fetchval(f"SELECT count(*) FROM {table}") > 0
+        for statement in (
+            f"UPDATE {table} SET payload_hash=payload_hash WHERE false",
+            f"DELETE FROM {table} WHERE false",
+            f"INSERT INTO {table} SELECT * FROM {table} WHERE false",
+        ):
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                async with connection.transaction():
+                    await connection.execute(statement)
 
 
 async def _assert_original_source_identity_guards(context):
     origin, capture = context.case.constructed_origin, context.capture
     anchor = context.case.anchors_by_id[capture.capture_id]
-    identity = capture.source_database
+    profile = context.case.source_profile
     cases = [
-        (
-            replace(
-                origin,
-                source_id="unselected-source",
-                source_aliases=tuple(sorted({*origin.source_aliases, "unselected-source"})),
-            ),
-            context.case.source_profile,
-            identity,
-        ),
-        (replace(origin, header_oid=origin.header_oid + 1), context.case.source_profile, identity),
-        (replace(origin, resource_leaf_oid=origin.resource_leaf_oid + 1), context.case.source_profile, identity),
-        (origin, context.case.source_profile, replace(identity, database_oid=identity.database_oid + 1)),
-        (
+        replace(
             origin,
-            context.case.source_profile,
-            replace(identity, system_identifier=str(int(identity.system_identifier) + 1)),
+            source_id="unselected-source",
+            source_aliases=tuple(sorted({*origin.source_aliases, "unselected-source"})),
         ),
-        (
-            replace(origin, schema_name="unselected_source"),
-            replace(context.case.source_profile, schema_name="unselected_source"),
-            identity,
+        replace(origin, header_relation={**origin.header_relation, "schema": "other_source"}),
+        replace(origin, header_relation={**origin.header_relation, "name": "other_header"}),
+        replace(origin, resource_relation={**origin.resource_relation, "name": "other_resources"}),
+        replace(origin, endpoint_id="unselected-endpoint"),
+        replace(origin, dataset_id="unselected-dataset"),
+        replace(origin, root_run_id="unselected-run"),
+        replace(
+            origin, schema_name="other_source", resource_relation={**origin.resource_relation, "schema": "other_source"}
         ),
     ]
     async with _login(context.worker, "execution") as connection:
-        for reviewed_origin, profile, expected_identity in cases:
+        for reviewed_origin in cases:
             replays_before = len(context.replay_actors)
             async with connection.transaction(isolation="repeatable_read", readonly=True):
                 with pytest.raises(ValueError) as refused:
@@ -366,7 +378,6 @@ async def _assert_original_source_identity_guards(context):
                         source_profile=profile,
                         reviewed_origin=reviewed_origin,
                         expected_anchor=anchor,
-                        expected_identity=expected_identity,
                     )
                 assert "_verify_source_rows" in _traceback_functions(refused.value)
             assert len(context.replay_actors) == replays_before
@@ -383,9 +394,8 @@ def _traceback_functions(error):
 
 
 async def _change_capture_row(context, *, derived, restore=None):
-    writer, capture = context.case.writer, context.capture
+    writer, capture = context.operator.connection, context.capture
     async with writer.transaction(isolation="repeatable_read"):
-        await writer.execute(f'SET LOCAL ROLE "{capture.owner_role}"')
         if derived:
             relation = f'"{capture.schema_name}".provider_directory_entity_source_binding'
             original = await writer.fetchval(
@@ -424,7 +434,7 @@ async def _assert_native_capture_tamper_refuses(context):
 
 
 async def _assert_source_replay_lifecycle_guards(context, monkeypatch):
-    async def partial(factory, connection, *, source_profile, reviewed_origin, expected_anchor, expected_identity):
+    async def partial(factory, connection, *, source_profile, reviewed_origin, expected_anchor):
         async with factory(
             source_profile=source_profile,
             source_id=reviewed_origin.source_id,
@@ -433,7 +443,7 @@ async def _assert_source_replay_lifecycle_guards(context, monkeypatch):
         ) as export:
             async with aclosing(export["resources"]()) as pages:
                 assert await anext(pages)
-            return expected_identity
+            return None
 
     async with _login(context.worker, "execution") as connection:
         with monkeypatch.context() as patch:
@@ -445,12 +455,13 @@ async def _assert_source_replay_lifecycle_guards(context, monkeypatch):
 
 
 async def _assert_replay_exit_failure(context, connection, monkeypatch):
-    original_identity, original_finish = capture_module._export_identity, capture_module._finish_source_replay
+    original_validate = capture_module._validate_source_export
+    original_finish = capture_module._finish_source_replay
     observed_by_field = {}
 
-    def observe_export(export, reviewed, expected_identity=None):
+    def observe_export(export, reviewed):
         observed_by_field["export"] = export
-        return original_identity(export, reviewed, expected_identity)
+        return original_validate(export, reviewed)
 
     async def close_after_eof(reader, replay):
         result = await original_finish(reader, replay)
@@ -461,7 +472,7 @@ async def _assert_replay_exit_failure(context, connection, monkeypatch):
         return result
 
     with monkeypatch.context() as patch:
-        patch.setattr(capture_module, "_export_identity", observe_export)
+        patch.setattr(capture_module, "_validate_source_export", observe_export)
         patch.setattr(capture_module, "_finish_source_replay", close_after_eof)
         with pytest.raises(asyncpg.InterfaceError, match="connection is closed"):
             await _require_recipe(context, connection)
@@ -582,7 +593,11 @@ async def _consume_expected_success(context, arguments_by_name, queued):
 
 async def _publish_once(context, *, head=0, sources=None):
     async with _consumer(context.worker) as (arguments, calls):
-        arguments["initial_address_sources"] = sources or (_initial_sources(context) if not head else None)
+        if sources is None:
+            sources = _initial_sources(context)
+            if head:
+                sources = replace(sources, initial_source_recipes=())
+        arguments["initial_address_sources"] = sources
         queued = await _enqueue_ordinary(context.worker, head)
         completed = await _consume_expected_success(context, arguments, queued)
         assert completed["request_id"] == queued["request_id"]
@@ -695,6 +710,7 @@ async def _prepare_source_rollback(context, source_manifest, incumbent, *, requi
     replays_before = len(context.replay_actors)
     sealed_before = len(context.sealed_targets)
     async with _consumer(context.worker) as (arguments, _):
+        arguments["initial_address_sources"] = replace(_initial_sources(context), initial_source_recipes=())
         completed = await _consume_expected_success(context, _exact_request_arguments(arguments, queued), queued)
     assert completed["request_id"] == queued["request_id"]
     assert completed["result"]["operation"] == "prepare_source_rollback"
@@ -702,10 +718,8 @@ async def _prepare_source_rollback(context, source_manifest, incumbent, *, requi
     assert completed["result"]["approved_custom_revision"] == incumbent.approved_custom_revision
     assert completed["result"]["validation"]["state"] == "ready"
     assert len(context.sealed_targets) == sealed_before + 1
-    actors = context.replay_actors[replays_before:]
     if require_witness_replay:
-        assert context.worker.roles_by_kind["execution"] in actors
-        assert await context.operator.connection.fetchval("SELECT session_user") in actors
+        assert len(context.replay_actors) > replays_before
     assert await _head(context.worker) == incumbent.generation_id
     return completed, actor
 
@@ -744,21 +758,23 @@ async def _publish_source_rollback(context, target, incumbent, *, require_witnes
 
 
 async def _ready_custody_snapshot(context, candidate_id):
+    from process.network_membership_publication import load_named_network_preparation
+
     schema = context.worker.fixture.control_schema
-    row = await context.worker.fixture.connection.fetchrow(
-        f"SELECT candidate.state,custody.seal_sha256,custody.receipt_json::text "
-        f'FROM "{schema}".network_membership_candidate candidate '
-        f'JOIN "{schema}".network_candidate_custody custody USING(candidate_id) WHERE candidate_id=$1',
-        UUID(candidate_id),
+    connection = context.worker.fixture.connection
+    state = await connection.fetchval(
+        f'SELECT state FROM "{schema}".network_membership_candidate WHERE candidate_id=$1', UUID(candidate_id)
     )
-    assert row is not None and row["state"] == "ready"
+    preparation = await load_named_network_preparation(connection, candidate_id, control_schema=schema)
+    assert state == "ready" and preparation is not None
+    assert preparation["candidate_id"] == str(candidate_id)
     assert (
-        await context.worker.fixture.connection.fetchval(
+        await connection.fetchval(
             f'SELECT count(*) FROM "{schema}".network_serving_manifest WHERE candidate_id=$1', UUID(candidate_id)
         )
         == 0
     )
-    return tuple(row)
+    return {"state": state, "preparation": preparation}
 
 
 def _require_completed_head_race(error):
@@ -875,7 +891,7 @@ async def test_source_witness_exact_capture_consumer_publication(monkeypatch, re
 
     async def observe_completed_replay(factory, connection, **arguments):
         result = await original_replay(factory, connection, **arguments)
-        replay_actors.append(await connection.fetchval("SELECT session_user"))
+        replay_actors.append(None)
         return result
 
     monkeypatch.setattr(capture_module, "_verify_source_rows", observe_completed_replay)
@@ -892,8 +908,7 @@ async def test_source_witness_exact_capture_consumer_publication(monkeypatch, re
             await _assert_lease_and_cancel(context, monkeypatch, fault)
         await _assert_stale_approval_after_seal(context)
         await _assert_publications_keep_pinned_readers(context)
-        assert context.worker.roles_by_kind["execution"] in replay_actors
-        assert await context.operator.connection.fetchval("SELECT session_user") in replay_actors
+        assert replay_actors
         assert context.case.old_capture.as_dict() == old_reader_wire
         async with context.case.reader.transaction(isolation="repeatable_read", readonly=True):
             assert (
@@ -911,7 +926,7 @@ async def test_source_witness_exact_capture_consumer_publication(monkeypatch, re
         )
         record_property(
             "authority",
-            "protected approved full capture SHA; independent original Source replay and real queue/K custody",
+            "approved full capture content; complete original Source replay and real queued publication",
         )
         record_property(
             "limits",
@@ -988,7 +1003,7 @@ async def test_source_witness_introduction_preserves_retained_generation(monkeyp
         record_property("pinned_reader_publication_and_rollback", "unchanged")
         record_property(
             "limits",
-            "Local queued G1-to-G2 adoption and reviewed source rollback; same physical Source, distinct recipes; no automatic refresh",
+            "Local queued G1-to-G2 adoption and reviewed source rollback; same logical Source, distinct recipes; no automatic refresh",
         )
 
 
@@ -1000,7 +1015,7 @@ async def test_legacy_source_witness_publication_keeps_api_readers_pinned_throug
 
     async def observe_completed_replay(factory, connection, **arguments):
         capture = await original_replay(factory, connection, **arguments)
-        replay_actors.append(await connection.fetchval("SELECT session_user"))
+        replay_actors.append(None)
         return capture
 
     monkeypatch.setattr(capture_module, "_verify_source_rows", observe_completed_replay)
@@ -1013,67 +1028,89 @@ async def test_legacy_source_witness_publication_keeps_api_readers_pinned_throug
         assert origin.semantic_projection_as_of is origin.descriptor_counts is None
         assert context.recipe.source_pin.as_of == context.capture.observed_at[:10]
         await _assert_publications_keep_pinned_readers(context)
-        assert context.worker.roles_by_kind["execution"] in replay_actors
-        assert await context.operator.connection.fetchval("SELECT session_user") in replay_actors
+        assert replay_actors
 
 
 async def _stage_additional_source(fixture, monkeypatch):
-    """Create an independent Source candidate through the genuine writer transaction."""
+    """Acquire the independent endpoint with its own enrolled named generation."""
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+
+    from native_tests.fhir_source_enrollment_support import _PASSWORD
+
     from tests import generic_source_successor_postgres_support as source
 
-    source_id, endpoint = "generic-second-source", "generic-second-endpoint"
-    dataset, root = "generic-second-edition-1", "generic-second-root-1"
-    database, directory = fixture.component.database, source.directory
-    with monkeypatch.context() as selected:
-        selected.setattr(source, "SOURCE", source_id)
-        resource_rows = source._edition_rows(1, dataset)
-    kinds = tuple(sorted({resource_row["resource_type"] for resource_row in resource_rows}))
-    candidate = directory.EndpointDatasetCandidate(
-        endpoint_id=endpoint,
-        dataset_id=dataset,
-        acquisition_root_run_id=root,
-        source_ids=(source_id,),
-        selected_resources=kinds,
-        expected_resources=kinds,
-        import_run_id=root,
-        previous_dataset_id=None,
-        resource_hash_contract=directory.SEMANTIC_CONTENT_V4_RESOURCE_HASH_CONTRACT,
-        semantic_projection_as_of="2026-10-01",
-        proof_resource_scope=directory._provider_directory_proof_resource_scope(kinds),
-    )
-    async with (
-        source.source.source_transaction(database),
-        database.acquire() as connection,
-    ):
-        await database.status(
-            "INSERT INTO mrf.provider_directory_api_endpoint "
-            "(endpoint_id,canonical_api_base,credential_descriptor_hash,endpoint_signature_hash) "
-            "VALUES (:endpoint,:base,repeat('e',64),repeat('f',64))",
-            endpoint=endpoint,
-            base="https://second.example.test/fhir",
+    await fixture.checks.prepare_distinct_generation(fixture, fixture.settings, current=fixture.candidates[-1])
+    base = fixture.state.rest_endpoint[0].replace("/ProviderDirectory/v1", "/independent/ProviderDirectory/v1")
+    seed_by_field = {**fixture.worker_fixture.rest_seed(base), "id": "generic-rest-independent"}
+    publisher = fixture.state.url.set(username=fixture.state.names.publisher, password=_PASSWORD)
+    with TemporaryDirectory(prefix="source-addition-") as temporary, monkeypatch.context() as selected:
+        canonical_base = source.directory._canonical_base(base)
+        assert canonical_base in source.directory.PAGINATION_CHECKPOINT_API_BASES
+        assert canonical_base in source.directory.REST_PAGE_PREFETCH_PILOT_API_BASES
+        task = fixture.worker_fixture._isolated_worker_task(
+            source.directory, Path(temporary), seed_by_field, "run_" + uuid4().hex
         )
-        await database.status(
-            "INSERT INTO mrf.provider_directory_source "
-            "(source_id,org_name,endpoint_id,canonical_api_base,requires_registration,requires_api_key) "
-            "VALUES (:source,'Synthetic second Source',:endpoint,:base,false,false)",
-            source=source_id,
-            endpoint=endpoint,
-            base="https://second.example.test/fhir",
+        selected.setattr(
+            source.directory.profile_artifact,
+            "configured_profile_source_ids",
+            lambda: tuple(sorted({fixture.task["source_ids"][0], task["source_ids"][0]})),
         )
-        await directory._ensure_endpoint_dataset_candidate(candidate)
-        for kind in kinds:
-            await directory._upsert_dataset_resource_rows_on_connection(
-                connection,
-                [resource_row for resource_row in resource_rows if resource_row["resource_type"] == kind],
-                persist_content_proof=True,
-                resource_hash_contract=candidate.resource_hash_contract,
-                semantic_projection_as_of=candidate.semantic_projection_as_of,
+        with fixture.checks.administrative_generation_freeze(fixture.fixture, fixture.state, fixture.settings):
+            metrics = await fixture.worker_fixture.run_isolated_control_job(
+                fixture.component.database, fixture.state, task, publisher, fixture.issued
             )
-    return candidate, resource_rows
+        assert metrics["resource_rows"] == {
+            kind: len(resource_rows) for kind, resource_rows in fixture.state.rest_endpoint[1].items()
+        }
+    return await _capture_additional_named_source(fixture, task, seed_by_field)
+
+
+async def _capture_additional_named_source(fixture, task, seed_by_field):
+    """Read the real committed header, deny application writes, and capture its data."""
+    from sqlalchemy import text
+
+    from tests import generic_source_successor_postgres_support as source
+
+    source_record = source.directory._source_row_from_seed(seed_by_field)
+    endpoint = source.directory._attach_provider_directory_endpoint_ids([source_record])[0]["endpoint_id"]
+    assert task["source_ids"] == [source_record["source_id"]]
+    async with fixture.reader() as session, session.begin(), fixture.admin.transaction(isolation="repeatable_read"):
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        reader = await source.native_driver(session)
+        head = await source.read_current_generic_fhir_head(
+            reader, schema_name=fixture.schema, source_id=source_record["source_id"], endpoint_id=endpoint
+        )
+        assert head.root_run_id == task["run_id"]
+        fixture.commits.append(head.dataset_id)
+        await source._assert_source_writer_excluded(fixture.component, fixture, reader, fixture.admin, head)
+        namespace = "registry_fhir_capture_" + source.generic_fhir_capture_id(head).hex
+        fixture.namespaces.append(namespace)
+        capture = await source.continuation.capture_committed_generic_fhir_source(
+            reader,
+            fixture.admin,
+            schema_name=fixture.schema,
+            source_id=head.source_id,
+            endpoint_id=head.endpoint_id,
+            target=source.RegistryGenericCaptureTarget(fixture.role_by_kind["owner"], (fixture.component.reader,)),
+            expected_head=head,
+            source_policy=fixture.issued.policy,
+        )
+    fixture.captures.append(capture)
+    candidate = SimpleNamespace(
+        dataset_id=head.dataset_id,
+        dataset_hash=head.dataset_sha256,
+        endpoint_id=head.endpoint_id,
+        acquisition_root_run_id=head.root_run_id,
+        source_ids=(head.source_id,),
+    )
+    fixture.candidates.append(candidate)
+    assert fixture.source_writer_rejections[-1] == candidate.dataset_id == capture.origin.dataset_id
+    return candidate
 
 
 async def _additional_source_capture(context, monkeypatch):
-    """Parameterize the existing single-Source fixture; all admission/capture code is genuine."""
+    """Capture the independent SDK publication through the original Source export."""
     from tests import generic_source_successor_postgres_support as source
     from tests.source_witness_capture_postgres_support import (
         constructed_source_origin,
@@ -1082,49 +1119,19 @@ async def _additional_source_capture(context, monkeypatch):
     )
 
     case, fixture = context.case, context.case.fixture
-    candidate, resource_rows = await _stage_additional_source(fixture, monkeypatch)
-    source_id, dataset = candidate.source_ids[0], candidate.dataset_id
-    database, directory = fixture.component.database, source.directory
-    kinds = candidate.expected_resources
-    validated = await directory._validate_endpoint_dataset_candidate(
-        candidate,
-        {
-            kind: {
-                "rows_fetched": sum(resource_row["resource_type"] == kind for resource_row in resource_rows),
-                "complete": True,
-            }
-            for kind in kinds
-        },
-    )
-    assert validated["validated"] is True and validated["published"] is False
-    with source.artifacts.source_publication_request(directory, [{"source_id": source_id}], True):
-        await source.artifacts.publish_source_candidate(directory, candidate)
-    fixture.candidates.append(candidate)
-    assert fixture.commits[-1] == fixture.source_writer_rejections[-1] == dataset
-    assert fixture.captures[-1].origin.dataset_id == dataset
-    assert database._transaction_binding() is None and source.source._PUBLISHER.get() is None
-
+    candidate = await _stage_additional_source(fixture, monkeypatch)
     catalog, producer = source_modules()
     with monkeypatch.context() as selected:
-        selected.setattr(source, "SOURCE", source_id)
+        selected.setattr(source, "SOURCE", candidate.source_ids[0])
         origin = await reviewed_source_origin(case.source_runtime, case.source_profile, candidate, catalog, producer)
     assert await constructed_source_origin(case.source_export, case.source_profile, origin) == origin
     second = SimpleNamespace(**{**vars(case), "origin": origin})
-    capture_arguments_by_name = {
-        **capture_arguments(second),
-        "runtime_roles": context.runtime.runtime_roles,
-    }
+    capture_arguments_by_name = {**capture_arguments(second), "runtime_roles": context.runtime.runtime_roles}
     capture = await _capture(second, capture_module, capture_arguments_by_name)
     anchor = second.anchors_by_id[capture.capture_id]
     recipe = _source_recipe(capture, anchor)
     approved, network = await _approve_mapping(context.serving, recipe, capture, organization="network-one")
-    return SimpleNamespace(
-        capture=capture,
-        anchor=anchor,
-        recipe=recipe,
-        network=network,
-        approved=approved,
-    )
+    return SimpleNamespace(capture=capture, anchor=anchor, recipe=recipe, network=network, approved=approved)
 
 
 async def _assert_source_addition_readers(
@@ -1196,14 +1203,14 @@ async def test_distinct_source_addition_retains_prior_capture_and_readers(monkey
         prior_capture, additional_capture = context.capture, other.capture
         assert all(
             getattr(prior_capture.origin, field) != getattr(additional_capture.origin, field)
-            for field in ("source_id", "endpoint_id", "dataset_id", "root_run_id", "resource_leaf_oid")
+            for field in ("source_id", "endpoint_id", "dataset_id", "root_run_id", "resource_relation")
         )
         assert (
             prior_capture.capture_id != additional_capture.capture_id
             and prior_capture.capture_sha256 != additional_capture.capture_sha256
         )
-        assert prior_capture.owner_role == additional_capture.owner_role == context.runtime.capture_owner_role
-        assert prior_capture.runtime_roles == additional_capture.runtime_roles == context.runtime.runtime_roles
+        assert prior_capture.origin.header_relation == additional_capture.origin.header_relation
+        assert prior_capture.tables != additional_capture.tables
         source_composition = replace(
             a_sources, replacement_source_recipes=(*a_sources.replacement_source_recipes, other.recipe)
         )

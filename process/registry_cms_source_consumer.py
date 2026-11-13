@@ -70,6 +70,7 @@ class RegistryCMSSourceConsumerConfig:
     operation_seconds: int = 300
     composition_runtime: RegistryPublicationPTGRuntime | None = field(default=None, repr=False)
     seal_candidate: Callable[[MembershipCopyTarget], Awaitable[None]] | None = field(default=None, repr=False)
+    preparation_roles: dict | None = field(default=None, repr=False)
     prepare_address_sources: Callable[..., Awaitable[RegistryCompositionAddressSources]] | None = field(
         default=None, repr=False
     )
@@ -464,7 +465,9 @@ async def _attempt(connection, notice, event, config, source_endpoint_id=None, *
         update_status = await connection.execute(*checkpoint)
         if config.seal_candidate is not None and update_status != "UPDATE 1":
             raise _invalid()
-        manifest = await publish_network_candidate(connection, copy_target, control_schema=config.control_schema)
+        manifest = await publish_network_candidate(
+            connection, copy_target, control_schema=config.control_schema, preparation_roles=config.preparation_roles
+        )
     return {"state": "completed", "event_id": event["event_id"], "manifest": manifest}
 
 

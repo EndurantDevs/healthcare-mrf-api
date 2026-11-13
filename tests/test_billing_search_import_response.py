@@ -69,7 +69,12 @@ def test_matched_import_result_requires_order_proof_even_when_native_sorted(boun
 
 def test_public_cursor_reauthenticates_composed_query_authority_and_generation():
     access, result, scope = _composed_result()
-    pin = BillingSearchGenerationPin(billing_search_snapshot_set_sha256(result.selection), "8" * 64, 1001, 1002)
+    pin = BillingSearchGenerationPin(
+        billing_search_snapshot_set_sha256(result.selection),
+        "8" * 64,
+        "mrf.entity_address_unified",
+        "mrf.entity_address_evidence",
+    )
     binding = build_billing_search_cursor_binding(
         access.request, access.authorization_context, pin, trusted_now=TRUSTED_NOW, import_scope=scope
     )

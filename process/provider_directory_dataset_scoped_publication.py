@@ -23,9 +23,6 @@ from process.provider_directory_dataset_scoped_publication_support import (
     database_row_fields as _row_fields,
 )
 from process.provider_directory_dataset_scoped_publication_support import (
-    exact_pair_registry_by_coordinate as _locked_registry_by_coordinate,
-)
-from process.provider_directory_dataset_scoped_publication_support import (
     lock_exact_pair_registry as _lock_pair_registry,
 )
 from process.provider_directory_dataset_scoped_publication_support import (
@@ -33,9 +30,6 @@ from process.provider_directory_dataset_scoped_publication_support import (
 )
 from process.provider_directory_dataset_scoped_publication_support import (
     schema_name as _schema_name,
-)
-from process.provider_directory_dataset_scoped_publication_support import (
-    validate_exact_pair_registry as _validate_pair_registry,
 )
 from process.provider_directory_rooted_graph_contract import (
     has_matching_rooted_graph_root_publication,
@@ -254,19 +248,7 @@ async def _validate_locked_header(
         pair,
         variant,
     )
-    _table_name, identity_function, ready_function = _variant_predicates(variant)
-    is_identity_valid = await database.scalar(
-        f"SELECT {_qualified(identity_function)}(:dataset_id);",
-        dataset_id=header.get("dataset_id"),
-    )
-    is_ready = (
-        await database.scalar(
-            f"SELECT {_qualified(ready_function)}(:dataset_id);",
-            dataset_id=header.get("dataset_id"),
-        )
-        if require_ready
-        else None
-    )
+    is_identity_valid, is_ready = await _locked_variant_readiness(database, variant, header, require_ready)
     has_matching_shared_values = (
         parent.get("endpoint_id") == header.get("endpoint_id")
         and parent.get("dataset_hash") == header.get("dataset_hash")
@@ -292,6 +274,32 @@ async def _validate_locked_header(
         or (require_ready and is_ready is not True)
     ):
         raise ProviderDirectoryDatasetScopedPublicationError("foreign_current")
+
+
+async def _locked_variant_readiness(database, variant, header, require_ready):
+    """Read the existing variant identity and optional readiness predicates under the caller's lock."""
+    _table_name, identity_function, ready_function = _variant_predicates(variant)
+    if variant == ROOTED_COMBINED_VARIANT:
+        from db.migration_rooted_publication_freeze import native_receipt_sql
+
+        is_identity_valid = await database.scalar(
+            native_receipt_sql(_schema_name(), ":dataset_id"), dataset_id=header.get("dataset_id")
+        )
+        is_ready = is_identity_valid if require_ready else None
+    else:
+        is_identity_valid = await database.scalar(
+            f"SELECT {_qualified(identity_function)}(:dataset_id);",
+            dataset_id=header.get("dataset_id"),
+        )
+        is_ready = (
+            await database.scalar(
+                f"SELECT {_qualified(ready_function)}(:dataset_id);",
+                dataset_id=header.get("dataset_id"),
+            )
+            if require_ready
+            else None
+        )
+    return is_identity_valid, is_ready
 
 
 def _exact_current_from_header(
@@ -368,6 +376,17 @@ async def lock_exact_current_dataset(
     return _exact_current_from_header(variant, header, parent)
 
 
+async def _locked_supersession_current(database):
+    """Keep prevalidated Rooted cutovers to the existing locked metadata and input CAS."""
+    from process.provider_directory_rooted_graph_source_runtime import current_rooted_graph_runtime
+
+    if current_rooted_graph_runtime(database) is None:
+        return await lock_exact_current_dataset(database, pair=exact_uhc_dataset_pair(), require_ready=False)
+    from process.provider_directory_rooted_graph_current_preflight import current_root_proof, require_current_root_fence
+
+    return await require_current_root_fence(database, current_root_proof(database))
+
+
 async def supersede_exact_current_dataset(
     database: Any,
     current: ExactCurrentDataset | None,
@@ -378,11 +397,7 @@ async def supersede_exact_current_dataset(
         return
     if type(current) is not ExactCurrentDataset:
         raise ProviderDirectoryDatasetScopedPublicationError("state")
-    locked = await lock_exact_current_dataset(
-        database,
-        pair=exact_uhc_dataset_pair(),
-        require_ready=False,
-    )
+    locked = await _locked_supersession_current(database)
     if locked is None or locked != current:
         raise ProviderDirectoryDatasetScopedPublicationError("foreign_current")
     table_name, _ready_function = _variant_table_and_ready(locked.variant)

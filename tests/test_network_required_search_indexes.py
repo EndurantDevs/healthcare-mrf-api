@@ -34,7 +34,7 @@ def test_geo_profile_refuses_non_native_oid_before_sql_rendering(table_oid):
 @pytest.mark.asyncio
 async def test_nonbase_address_profile_refuses_other_relation_before_sql():
     connection = SimpleNamespace(execute=AsyncMock(), fetchval=AsyncMock())
-    relation = CompactAddressRelation("candidate_example", "npi", 44)
+    relation = CompactAddressRelation("candidate_example", "npi")
     with pytest.raises(indexes.NetworkServingIndexesError, match="Search address relation differs"):
         await indexes._require_address_search_indexes(connection, relation)
     connection.execute.assert_not_awaited()
@@ -46,9 +46,9 @@ async def test_nonbase_address_profile_refuses_other_relation_before_sql():
 async def test_every_effective_address_heap_and_membership_digest_are_checked(monkeypatch, custom):
     from process import network_compact_readiness
 
-    base = CompactAddressRelation("base_example", "entity_address_unified", 41)
-    extra = CompactAddressRelation("candidate_example", "entity_address_unified", 44) if custom else None
-    layout = CompactNetworkLayout(CompactAddressRelation("candidate_example", "network_slice_ref", 45), base, (), extra)
+    base = CompactAddressRelation("base_example", "entity_address_unified")
+    extra = CompactAddressRelation("candidate_example", "entity_address_unified") if custom else None
+    layout = CompactNetworkLayout(CompactAddressRelation("candidate_example", "network_slice_ref"), base, (), extra)
     profile = AsyncMock(return_value="b" * 64)
     digest = AsyncMock(return_value="a" * 64)
     monkeypatch.setattr(indexes, "_require_address_search_indexes", profile)
@@ -73,7 +73,7 @@ async def test_noncompact_profile_uses_exact_closure_oid_and_requires_retained_d
     candidate = _candidate(False)
     await indexes.verify_network_search_indexes(connection, candidate)
     profile.assert_awaited_once_with(
-        connection, CompactAddressRelation("candidate_example", "entity_address_unified", 44), canonical=True
+        connection, CompactAddressRelation("candidate_example", "entity_address_unified"), canonical=True
     )
     profile.return_value = "c" * 64
     with pytest.raises(indexes.NetworkServingIndexesError, match="definitions differ"):
@@ -82,7 +82,7 @@ async def test_noncompact_profile_uses_exact_closure_oid_and_requires_retained_d
 
 @pytest.mark.asyncio
 async def test_compact_base_checks_exact_rotated_heap_without_canonical_array_authority(monkeypatch):
-    relation = CompactAddressRelation("base_example", "entity_address_unified_retained_2c", 44)
+    relation = CompactAddressRelation("base_example", "entity_address_unified_retained_2c")
     connection = SimpleNamespace(execute=AsyncMock(), fetchval=AsyncMock(side_effect=[44, True]))
     catalog = AsyncMock()
     digest = AsyncMock(side_effect=AssertionError("Compact edges own membership"))
@@ -113,7 +113,7 @@ async def test_unbound_layout_or_missing_transaction_cannot_authorize_search(mon
 @pytest.mark.asyncio
 @pytest.mark.parametrize("damage", ["oid", "geo", "profile"])
 async def test_address_profile_refuses_changed_identity_or_missing_native_paths(monkeypatch, damage):
-    relation = CompactAddressRelation("candidate_example", "entity_address_unified", 44)
+    relation = CompactAddressRelation("candidate_example", "entity_address_unified")
     connection = SimpleNamespace(
         execute=AsyncMock(), fetchval=AsyncMock(side_effect=[45 if damage == "oid" else 44, False])
     )

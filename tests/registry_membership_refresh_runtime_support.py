@@ -35,7 +35,6 @@ class ObservationCase:
             settings=runtime._settings(configuration()),
             readers=SimpleNamespace(ptg_store=None),
             address=self.address,
-            identity=("example", 3),
             fence_sessions=object(),
         )
         self.prepare = AsyncMock(return_value=True)

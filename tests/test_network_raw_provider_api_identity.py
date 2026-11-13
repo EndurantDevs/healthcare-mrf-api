@@ -24,12 +24,14 @@ _PID = 77
 def _manifest(*, compact=False, artifacts=False):
     identity = str(UUID(int=1))
     schema = "network_candidate_" + UUID(identity).hex
-    manifest = PinnedNetworkServingManifest(7, identity, schema, 1, {}, 3, "a" * 64, 42)
+    manifest = PinnedNetworkServingManifest(
+        7, identity, schema, 1, {}, 3, "a" * 64, CompactAddressRelation(schema, "entity_address_unified")
+    )
     object.__setattr__(
         manifest,
         "_candidate_relation_pins",
         tuple(
-            CompactAddressRelation(schema, name, oid)
+            CompactAddressRelation(schema, name)
             for name, oid in (
                 ("network_membership", 101),
                 ("provider_location_binding", 102),
@@ -40,12 +42,13 @@ def _manifest(*, compact=False, artifacts=False):
     if compact:
         artifact_id = str(UUID(int=2))
         layout = CompactNetworkLayout(
-            CompactAddressRelation(schema, "network_slice_ref", 103),
-            CompactAddressRelation("synthetic_addresses", "entity_address_unified", 201),
-            (CompactEdgeArtifact(artifact_id, "network_candidate_" + UUID(artifact_id).hex, 301),) if artifacts else (),
-            CompactAddressRelation("synthetic_custom", "entity_address_unified", 202),
+            CompactAddressRelation(schema, "network_slice_ref"),
+            CompactAddressRelation("synthetic_addresses", "entity_address_unified"),
+            (CompactEdgeArtifact(artifact_id, "network_candidate_" + UUID(artifact_id).hex),) if artifacts else (),
+            CompactAddressRelation("synthetic_custom", "entity_address_unified"),
         )
         object.__setattr__(manifest, "_compact_layout", layout)
+        object.__setattr__(manifest, "address_relation", manifest.compact_layout.base)
     return manifest
 
 
@@ -321,12 +324,12 @@ async def test_provider_only_projection_guards_real_tables(monkeypatch, provider
         manifest,
         "_candidate_relation_pins",
         (
-            CompactAddressRelation(manifest.schema_name, "network_provider_only_evidence", 21),
-            CompactAddressRelation(manifest.schema_name, "network_source_inventory", 22),
+            CompactAddressRelation(manifest.schema_name, "network_provider_only_evidence"),
+            CompactAddressRelation(manifest.schema_name, "network_source_inventory"),
         ),
     )
-    header = CompactAddressRelation(CONTROL, "network_membership_candidate", 11)
-    approved_pin = CompactAddressRelation(CONTROL, "registry_approved_record", 13)
+    header = CompactAddressRelation(CONTROL, "network_membership_candidate")
+    approved_pin = CompactAddressRelation(CONTROL, "registry_approved_record")
     connection = SimpleNamespace(
         is_in_transaction=lambda: True,
         get_server_pid=lambda: _PID,
@@ -369,8 +372,8 @@ async def test_provider_only_refusal_precedes_projection_decode(monkeypatch, fai
         fixture.manifest,
         "_candidate_relation_pins",
         (
-            CompactAddressRelation(fixture.manifest.schema_name, "network_provider_only_evidence", 21),
-            CompactAddressRelation(fixture.manifest.schema_name, "network_source_inventory", 22),
+            CompactAddressRelation(fixture.manifest.schema_name, "network_provider_only_evidence"),
+            CompactAddressRelation(fixture.manifest.schema_name, "network_source_inventory"),
         ),
     )
     connection = SimpleNamespace(
@@ -383,12 +386,12 @@ async def test_provider_only_refusal_precedes_projection_decode(monkeypatch, fai
     monkeypatch.setattr(
         custody,
         "read_network_control_relation_pins",
-        AsyncMock(return_value=(CompactAddressRelation(CONTROL, "network_membership_candidate", 11),)),
+        AsyncMock(return_value=(CompactAddressRelation(CONTROL, "network_membership_candidate"),)),
     )
     monkeypatch.setattr(
         provider_only,
         "pin_api_retained_approved_membership_source",
-        AsyncMock(return_value=(APPROVED, CompactAddressRelation(CONTROL, "registry_approved_record", 13))),
+        AsyncMock(return_value=(APPROVED, CompactAddressRelation(CONTROL, "registry_approved_record"))),
     )
     guard = AsyncMock(side_effect=[None] * (failure_at - 1) + [NetworkReadIdentityError("synthetic mismatch")])
     monkeypatch.setattr(provider_only, "verify_consumed_network_relations", guard)

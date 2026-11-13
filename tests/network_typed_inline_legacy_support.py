@@ -82,7 +82,6 @@ async def _stage_legacy_candidate(context, writer, recipe, roles_by_group):
 
 
 async def _require_legacy_manifest(context, recipe):
-    from process.network_membership_publication import _candidate_custody
     from process.registry_source_contribution_store import verify_registry_source_contributions
     from process.registry_source_recipe_store import resolve_retained_registry_source_recipes
 
@@ -95,7 +94,6 @@ async def _require_legacy_manifest(context, recipe):
         candidate = await reader.fetchrow(
             f'SELECT * FROM "{schema}".network_membership_candidate WHERE candidate_id=$1', UUID(manifest.candidate_id)
         )
-        assert await _candidate_custody(reader, candidate, schema) is None
         assert verify_registry_source_contributions(candidate) is None
         assert await resolve_retained_registry_source_recipes(
             reader, manifest, control_schema=schema, api_read=True
@@ -105,8 +103,9 @@ async def _require_legacy_manifest(context, recipe):
 
 
 async def _publish_inline_legacy(context, recipe):
-    """Use the supported legacy low-level writer; never delete a modern seal."""
-    from process.network_membership_pipeline import prepare_and_publish_network_candidate
+    """Publish the genuine inline candidate through the configured administrator handoff."""
+    from process.network_membership_pipeline import prepare_network_candidate
+    from process.network_membership_publication import publish_network_candidate
 
     async with publication._consumer(context.worker) as (arguments, _):
         assert await publication.consume_registry_publication_once(**arguments) is None
@@ -114,9 +113,23 @@ async def _publish_inline_legacy(context, recipe):
     async with publication._login(context.worker, "execution") as writer:
         async with writer.transaction(isolation="repeatable_read"):
             copy_target = await _stage_legacy_candidate(context, writer, recipe, roles_by_group)
-        await prepare_and_publish_network_candidate(
-            writer, copy_target, context.address, **roles_by_group, control_schema=context.worker.fixture.control_schema
+        await prepare_network_candidate(
+            writer,
+            copy_target,
+            context.address,
+            **roles_by_group,
+            control_schema=context.worker.fixture.control_schema,
+            compact=False,
         )
+        callbacks = context.worker.publication_custody_by_name
+        await callbacks["seal_candidate"](copy_target)
+        async with writer.transaction(isolation="repeatable_read"):
+            await publish_network_candidate(
+                writer,
+                copy_target,
+                control_schema=context.worker.fixture.control_schema,
+                preparation_roles=callbacks["preparation_roles"],
+            )
     return await _require_legacy_manifest(context, recipe)
 
 
@@ -182,34 +195,26 @@ async def _assert_publication_readers(context, first, source_inputs):
     return second
 
 
-async def _assert_modern_typed_seal_required(context, manifest, recipe):
+async def _assert_published_typed_content(context, manifest, recipe):
     from process.registry_typed_retained_source import retained_typed_source_proofs
 
-    admin, schema = context.worker.fixture.connection, context.worker.fixture.control_schema
-    transaction = admin.transaction(isolation="repeatable_read")
-    await transaction.start()
-    try:
-        assert (
-            await admin.execute(
-                f'DELETE FROM "{schema}".network_candidate_custody WHERE candidate_id=$1', UUID(manifest.candidate_id)
-            )
-            == "DELETE 1"
-        )
-        with pytest.raises(ValueError):
-            await retained_typed_source_proofs(admin, manifest, (recipe,), schema)
-    finally:
-        await transaction.rollback()
+    schema = context.worker.fixture.control_schema
     async with (
         publication._login(context.worker, "api") as reader,
         reader.transaction(isolation="repeatable_read", readonly=True),
     ):
+        proofs = await retained_typed_source_proofs(reader, manifest, (recipe,), schema)
+        assert len(proofs) == 1
+        proof = next(iter(proofs.values()))
+        assert proof.candidate_id == manifest.candidate_id and proof.generation_id == manifest.manifest_sha256
+        assert proof.capture_sha256 == recipe.source_pin.generation_id
         assert (
             await publication.resolve_network_serving_manifest(reader, control_schema=schema, api_read=True) == manifest
         )
 
 
 async def test_unsealed_inline_retained_source_to_typed_reference_preserves_readers(monkeypatch):
-    """Actual legacy native closure remains readable while its all-typed successor publishes."""
+    """Actual inline retained data stays readable while its all-typed successor publishes."""
     async with (
         publication._publication_case(monkeypatch) as context,
         _legacy_bootstrap(context, monkeypatch) as bootstrap,
@@ -234,4 +239,4 @@ async def test_unsealed_inline_retained_source_to_typed_reference_preserves_read
         )
         await _assert_replacement_refusals(context, first, source_inputs, retained, prepared)
         second = await _assert_publication_readers(context, first, source_inputs)
-        await _assert_modern_typed_seal_required(context, second, prepared.recipe)
+        await _assert_published_typed_content(context, second, prepared.recipe)

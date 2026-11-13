@@ -10,6 +10,7 @@ import pytest
 from api import provider_profile_network_facts as facts
 from api.provider_directory_cms_network_scope import CMSNetworkScope, _mapped_networks
 from api.provider_directory_entities_contract import DirectoryReadError
+from process.network_compact_layout import CompactAddressRelation
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 
 NPI = "1000000004"
@@ -165,7 +166,14 @@ async def test_missing_exact_retained_recipe_refuses_before_fact_query(monkeypat
     from process.network_serving_read import PinnedNetworkServingManifest
 
     manifest = PinnedNetworkServingManifest(
-        1, "11111111-1111-4111-8111-111111111111", "network_candidate_" + "1" * 32, 1, {}, 1, "a" * 64, 7
+        1,
+        "11111111-1111-4111-8111-111111111111",
+        "network_candidate_" + "1" * 32,
+        1,
+        {},
+        1,
+        "a" * 64,
+        CompactAddressRelation("network_candidate_" + "1" * 32, "entity_address_unified"),
     )
     native = object()
     connection = SimpleNamespace(get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=native)))
@@ -197,7 +205,7 @@ async def test_profile_payload_guard_precedes_fact_decode(monkeypatch, refuse):
     driver.is_in_transaction = lambda: True
     driver.fetchrow = AsyncMock(return_value={"backend_matches": True, "relation_count": 1, "valid": not refuse})
     pinned = replace(
-        scope(()), read_relations=(CompactAddressRelation("source", "provider_directory_dataset_resource", 7),)
+        scope(()), read_relations=(CompactAddressRelation("source", "provider_directory_dataset_resource"),)
     )
     monkeypatch.setattr(facts, "pin_cms_profile_scope", AsyncMock(return_value=pinned))
 

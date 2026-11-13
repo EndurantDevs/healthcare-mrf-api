@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Pure transaction/Reader boundary regressions; native authority is verified separately."""
+"""Pure transaction and configured Reader boundary regressions."""
 
 import asyncio
 import json
@@ -14,14 +14,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from api import network_serving_read_context as reads
 from api.endpoint import network_catalog, network_providers, network_serving
 from db import connection as database
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import NetworkServingReadUnavailable, PinnedNetworkServingManifest
 
 
 class _Driver:
     def __init__(self, *, active=False, modes=("read committed", "off")):
         self.active, self.modes, self.pid = active, modes, 42
-        self.identity = (11, 22, "127.0.0.1", 5432, 42)
-        self.direct_login = True
         self.checks = 0
         self.after_check = None
 
@@ -30,17 +29,8 @@ class _Driver:
         return self.active
 
     def get_server_pid(self):
-        """Expose the native backend independently from captured Reader metadata."""
+        """Expose the synthetic driver identifier for other query fixtures."""
         return self.pid
-
-    async def fetchrow(self, sql):
-        """Model only the real snapshot query, including native identity fields."""
-        assert sql == reads._SNAPSHOT_SQL
-        self.checks += 1
-        snapshot = (*self.modes, self.direct_login, *self.identity[:-1], self.pid)
-        if self.after_check is not None:
-            self.after_check()
-        return snapshot
 
 
 class _Session:
@@ -85,20 +75,25 @@ class _Session:
         self.statements.append(str(statement))
         if str(statement).startswith("SET TRANSACTION"):
             self.driver.modes = ("repeatable read", "on")
+        if str(statement) == reads._SNAPSHOT_SQL:
+            self.driver.checks += 1
+            modes = self.driver.modes
+            if self.driver.after_check is not None:
+                self.driver.after_check()
+            return SimpleNamespace(first=lambda: modes)
 
     async def connection(self):
         """Return the session's original driver wrapper."""
         return self
 
     async def get_raw_connection(self):
-        """Expose driver changes so continuity checks can refuse them."""
+        """Expose the driver used to execute serving queries."""
         return SimpleNamespace(driver_connection=self.driver)
 
 
 @contextmanager
 def _bound_reader(session):
     session.info["api_reader_verified"] = True
-    session.info["api_reader_identity"] = dict(zip(reads._IDENTITY_FIELDS, session.driver.identity, strict=True))
     binding = database._TransactionBinding(id(reads.db), session, asyncio.current_task())
     session_token = database._SESSION.set(session)
     reader_token = database._READER.set(binding)
@@ -115,6 +110,7 @@ async def test_idle_session_owns_fresh_snapshot():
         assert driver is session.driver and driver.active
         assert session.statements == [
             "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+            reads._SNAPSHOT_SQL,
             "SET LOCAL lock_timeout='1s'",
         ]
     assert (session.begins, session.commits, session.rollbacks) == (1, 1, 0)
@@ -126,13 +122,12 @@ async def test_bound_reader_keeps_caller_transaction(modes):
     session = _Session(active=True, modes=modes)
     original = session.transaction
     with _bound_reader(session) as binding:
-        metadata = session.info["api_reader_identity"]
         async with reads.network_serving_read_context(session) as driver:
             assert driver is session.driver and database.current_session() is session
-        assert database._READER.get() is binding and session.info["api_reader_identity"] is metadata
+        assert database._READER.get() is binding and session.info == {"api_reader_verified": True}
     assert session.transaction is original and session.driver.active
     assert (session.begins, session.commits, session.rollbacks) == (0, 0, 0)
-    assert session.statements == ["SET LOCAL lock_timeout='1s'"]
+    assert session.statements == [reads._SNAPSHOT_SQL, "SET LOCAL lock_timeout='1s'", reads._SNAPSHOT_SQL]
 
 
 @pytest.mark.parametrize("modes", [("read committed", "on"), ("repeatable read", "off"), ("serializable", "off")])
@@ -142,14 +137,13 @@ async def test_active_wrong_modes_refuse_untouched(modes):
     with _bound_reader(session), pytest.raises(NetworkServingReadUnavailable):
         async with reads.network_serving_read_context(session):
             pytest.fail("wrong transaction modes reached the reader")
-    assert session.transaction is original and session.driver.active and session.statements == []
+    assert session.transaction is original and session.driver.active and session.statements == [reads._SNAPSHOT_SQL]
     assert (session.begins, session.commits, session.rollbacks) == (0, 0, 0)
 
 
 async def test_unbound_active_flags_confer_no_admission():
     session = _Session(active=True, modes=("repeatable read", "on"))
     session.info["api_reader_verified"] = True
-    session.info["api_reader_identity"] = dict(zip(reads._IDENTITY_FIELDS, session.driver.identity, strict=True))
     with pytest.raises(NetworkServingReadUnavailable):
         async with reads.network_serving_read_context(session):
             pytest.fail("unbound active session was admitted")
@@ -172,20 +166,7 @@ async def test_foreign_session_and_child_task_refuse():
     assert owner.driver.checks == foreign.driver.checks == 0
 
 
-@pytest.mark.parametrize("field", reads._IDENTITY_FIELDS)
-async def test_native_reader_identity_must_match(field):
-    session = _Session(active=True, modes=("repeatable read", "on"))
-    with _bound_reader(session):
-        session.info["api_reader_identity"][field] = "different"
-        with pytest.raises(NetworkServingReadUnavailable):
-            async with reads.network_serving_read_context(session):
-                pytest.fail("captured identity mismatch reached the reader")
-    assert session.statements == [] and session.begins == 0
-
-
-@pytest.mark.parametrize(
-    "damage", ["transaction", "driver", "pid", "native_transaction", "modes", "metadata", "savepoint"]
-)
+@pytest.mark.parametrize("damage", ["transaction", "modes", "savepoint", "binding"])
 async def test_successful_exit_checks_original_snapshot(damage):
     session = _Session(active=True, modes=("repeatable read", "on"))
     original = session.transaction
@@ -193,16 +174,10 @@ async def test_successful_exit_checks_original_snapshot(damage):
         async with reads.network_serving_read_context(session):
             if damage == "transaction":
                 session.transaction = object()
-            if damage == "driver":
-                session.driver = _Driver(active=True, modes=("repeatable read", "on"))
-            if damage == "pid":
-                session.driver.pid += 1
-            if damage == "native_transaction":
-                session.driver.active = False
             if damage == "modes":
                 session.driver.modes = ("repeatable read", "off")
-            if damage == "metadata":
-                session.info["api_reader_identity"] = dict(session.info["api_reader_identity"])
+            if damage == "binding":
+                session.info["api_reader_verified"] = False
             if damage == "savepoint":
                 session.nested = object()
     assert (session.begins, session.commits, session.rollbacks) == (0, 0, 0)
@@ -215,23 +190,22 @@ async def test_mode_check_cannot_replace_transaction():
     with _bound_reader(session), pytest.raises(NetworkServingReadUnavailable):
         async with reads.network_serving_read_context(session):
             pytest.fail("transaction changed during native admission")
-    assert session.statements == []
+    assert session.statements == [reads._SNAPSHOT_SQL]
 
 
-@pytest.mark.parametrize("damage", ["metadata", "login", "savepoint"])
+@pytest.mark.parametrize("damage", ["binding", "savepoint"])
 async def test_reader_admission_refuses_context_drift(damage):
     session = _Session(active=True, modes=("repeatable read", "on"))
     with _bound_reader(session):
-        if damage == "metadata":
-            session.driver.after_check = lambda: session.info["api_reader_identity"].update(role_oid=99)
-        if damage == "login":
-            session.driver.direct_login = False
+        if damage == "binding":
+            session.driver.after_check = lambda: session.info.update(api_reader_verified=False)
         if damage == "savepoint":
             session.nested = object()
         with pytest.raises(NetworkServingReadUnavailable):
             async with reads.network_serving_read_context(session):
                 pytest.fail("changed Reader context was admitted")
-    assert session.statements == [] and session.begins == session.rollbacks == session.commits == 0
+    assert session.statements == ([] if damage == "savepoint" else [reads._SNAPSHOT_SQL])
+    assert session.begins == session.rollbacks == session.commits == 0
 
 
 @pytest.mark.parametrize("active", [False, True])
@@ -245,6 +219,32 @@ async def test_body_failure_preserves_caller_ownership(active, failure):
                 session.driver.after_check = lambda: pytest.fail("body failure triggered exit SQL")
                 raise failure
     assert caught.value is failure
+    assert session.transaction is original and session.driver.active is active
+    assert (session.begins, session.commits, session.rollbacks) == ((0, 0, 0) if active else (1, 0, 1))
+
+
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("stage", ["connection", "modes", "timeout"])
+async def test_setup_sql_failure_preserves_transaction_ownership(active, stage):
+    session = _Session(active=active, modes=("repeatable read", "on"))
+    original = session.transaction
+    failure = SQLAlchemyError("reader setup failed")
+    execute = session.execute
+
+    async def fail_setup(statement):
+        if (stage == "modes" and str(statement) == reads._SNAPSHOT_SQL) or (
+            stage == "timeout" and str(statement).startswith("SET LOCAL")
+        ):
+            raise failure
+        return await execute(statement)
+
+    session.execute = fail_setup
+    if stage == "connection":
+        session.connection = AsyncMock(side_effect=failure)
+    with _bound_reader(session) if active else nullcontext():
+        with pytest.raises(NetworkServingReadUnavailable):
+            async with reads.network_serving_read_context(session):
+                pytest.fail("failed setup yielded a Reader")
     assert session.transaction is original and session.driver.active is active
     assert (session.begins, session.commits, session.rollbacks) == ((0, 0, 0) if active else (1, 0, 1))
 
@@ -272,7 +272,7 @@ async def _call_route(session, route, monkeypatch):
         {},
         0,
         "b" * 64,
-        20,
+        CompactAddressRelation("network_candidate_11111111111141118111111111111111", "entity_address_unified"),
     )
     if route == "catalog":
 

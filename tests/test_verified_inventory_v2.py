@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Pure witness-v2 metadata checks; these fixtures grant no native custody or authority."""
 
-import copy
 import hashlib
 from dataclasses import replace
 from uuid import UUID
@@ -14,10 +13,11 @@ from process import registry_source_inventory_summaries as summaries
 from process import registry_verified_office_derivation as codec
 from process.network_fhir_membership_source import fhir_source_witness_binding_v2, with_fhir_successor
 from process.registry_source_contribution_store import _WITNESS_COUNTERS_V2, FACT_ANCHOR_FIELDS, _canonical
+from tests.registry_source_recipe_support import _derivation, _descriptor
 from tests.test_network_fhir_retained_capture import pin, retained
 from tests.test_registry_generic_fhir_facts import _legacy_pin, _recipe
 from tests.test_registry_ptg_office_membership_recipe import _recipe as ptg_recipe
-from tests.test_registry_source_inventory_preparation import _aca_recipe, _derivation, _descriptor
+from tests.test_registry_source_inventory_preparation import _aca_recipe
 from tests.test_verified_office_source_witnesses_v2 import _descriptor as witness_descriptor
 
 
@@ -31,7 +31,6 @@ def context():
             "table_name": "entity_address_unified",
             "generation_id": "b" * 64,
         },
-        "address_identity": {"schema_oid": 11, "table_oid": 12, "owner_oid": 13, "identity_sha256": "c" * 64},
         "origin_manifest_sha256": None,
         "canonicalizer_version": {
             "identity_version": 2,
@@ -72,7 +71,12 @@ def rows(source_pin=None, anchored=False):
     recipe = _recipe(source_pin)
     descriptor = witness_descriptor(source_pin)
     if anchored:
-        descriptor.update(fact_candidate_id=str(UUID(int=9)), fact_table_oid=71, fact_seal_sha256="f" * 64)
+        descriptor.update(
+            fact_candidate_id=str(UUID(int=9)),
+            fact_schema_name="synthetic_original_facts",
+            fact_table_name="network_source_contribution",
+            fact_generation_id="f" * 64,
+        )
     return recipe, descriptor, derivation(recipe, descriptor)
 
 
@@ -120,8 +124,8 @@ def test_prepare_explicit_v2_and_exact_bindings(kind, anchored):
         pytest.param(
             lambda document: document["fact_artifact"].update(transform_version="fhir-source-facts-v1"), id="transform"
         ),
-        pytest.param(lambda document: document["address_identity"].update(table_oid=True), id="oid_bool"),
-        pytest.param(lambda document: document["address_identity"].update(owner_oid=0), id="oid_zero"),
+        pytest.param(lambda document: document["address_source"].update(table_name="invalid-name"), id="address_name"),
+        pytest.param(lambda document: document["address_source"].update(generation_id=""), id="address_generation"),
         pytest.param(lambda document: document["canonicalizer_version"].update(identity_prefix="v1"), id="prefix"),
         pytest.param(
             lambda document: document["canonicalizer_version"].update(ruleset_version=True), id="ruleset_bool"
@@ -162,7 +166,10 @@ def test_preparation_rejects_valid_but_substituted_derivation(field):
         document["fact_artifact"][field] = "f" * 64 if field == "fact_sha256" else 4
     elif field == "anchor":
         document["fact_artifact"].update(
-            fact_candidate_id=str(UUID(int=8)), fact_table_oid=72, fact_seal_sha256="f" * 64
+            fact_candidate_id=str(UUID(int=8)),
+            fact_schema_name="synthetic_other_facts",
+            fact_table_name="network_source_contribution",
+            fact_generation_id="f" * 64,
         )
     elif field == "input_membership_rows":
         document.update(input_membership_rows=0, accepted_membership_rows=0, office_rows=0)
@@ -252,7 +259,6 @@ def test_complete_mixed_inventory_and_both_aggregate_hashes():
         "approved_revision",
         "approved_generation_sha256",
         "address_source",
-        "address_identity",
         "origin_manifest_sha256",
         "canonicalizer_version",
     ],
@@ -264,8 +270,6 @@ def test_office_fold_refuses_another_valid_context_and_poison_is_permanent(field
         document[field] = 8
     elif field == "address_source":
         document[field]["schema_name"] = "another_address"
-    elif field == "address_identity":
-        document[field]["table_oid"] = 99
     elif field == "canonicalizer_version":
         document[field]["pub28_sha256"] = "f" * 64
     else:
@@ -429,3 +433,59 @@ def test_new_summaries_are_closed_and_explicit(kind, mutate):
     mutate(document, kind)
     with pytest.raises(contract.RegistrySourceInventoryError):
         validate(document, root)
+
+
+def test_saved_legacy_context_preserves_raw_checksum_with_opaque_retired_metadata():
+    legacy_by_field = {
+        **context(),
+        "address_identity": {
+            "schema_oid": "old-schema",
+            "table_oid": None,
+            "owner_oid": False,
+            "identity_sha256": "old-recorded-content",
+        },
+    }
+    assert codec.validate_verified_office_context_v2(legacy_by_field) == legacy_by_field
+    assert (
+        codec.verified_office_context_sha256(legacy_by_field)
+        == hashlib.sha256(codec.canonical(legacy_by_field).encode()).hexdigest()
+    )
+    assert "address_identity" not in context()
+    for field in ("schema_name", "table_name", "generation_id"):
+        changed_by_field = {
+            **legacy_by_field,
+            "address_source": {
+                **legacy_by_field["address_source"],
+                field: "" if field == "generation_id" else "invalid-name",
+            },
+        }
+        with pytest.raises(ValueError):
+            codec.validate_verified_office_context_v2(changed_by_field)
+
+
+def test_saved_legacy_derivation_retains_content_bytes_without_interpreting_retired_fields():
+    _, _, document = rows(anchored=True)
+    legacy_by_field = {
+        **document,
+        "address_identity": {
+            "schema_oid": None,
+            "table_oid": "retired",
+            "owner_oid": False,
+            "identity_sha256": "saved-content",
+        },
+    }
+    artifact_by_field = {
+        key: value for key, value in document["fact_artifact"].items() if key not in FACT_ANCHOR_FIELDS
+    }
+    legacy_by_field["fact_artifact"] = {
+        **artifact_by_field,
+        "fact_candidate_id": document["fact_artifact"]["fact_candidate_id"],
+        "fact_table_oid": "retired",
+        "fact_seal_sha256": None,
+    }
+    assert codec.validate_verified_office_derivation_v2(legacy_by_field) == legacy_by_field
+    assert codec.canonical(codec.validate_verified_office_derivation_v2(legacy_by_field)) == codec.canonical(
+        legacy_by_field
+    )
+    with pytest.raises(ValueError):
+        codec.validate_verified_office_derivation_v2({**legacy_by_field, "unexpected": True})

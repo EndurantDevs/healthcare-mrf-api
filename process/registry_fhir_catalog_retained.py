@@ -10,7 +10,6 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource, fhir_physical_source
-from process.network_fhir_retained_capture import pin_retained_fhir_read, require_retained_fhir_capture
 from process.network_fhir_retained_capture_contract import PRODUCER, canonical, is_sha256, text
 from process.network_serving_read import PinnedNetworkServingManifest, resolve_network_serving_manifest
 from process.registry_fhir_catalog_sources import FHIRCatalogSourceDisposition, FHIRCatalogSourceReadProfile
@@ -58,25 +57,25 @@ def _manifest_document(manifest):
     }
 
 
-def _descriptor(recipe, manifest, database_oid, source_uri):
+def _descriptor(recipe, manifest, source_uri):
     source_pin = recipe.source_pin
     _require(type(source_pin) is PinnedFHIRMembershipSource and source_pin.retained_capture is not None)
     capture = source_pin.retained_capture
+    selected = fhir_physical_source(source_pin).retained_capture
+    _require(selected is not None)
     _require(
         recipe.binding_coordinates.producer_id == PRODUCER
         and recipe.binding_coordinates.edition_id == capture.capture_id
     )
-    # Flat metadata stays on the approval anchor; the recipe separately binds physical reads.
-    oid_by_table = dict(capture.relation_oids)
     return {
         "coordinates": asdict(recipe.binding_coordinates),
         "profile": "retained_normalized",
         "endpoint_id": source_pin.endpoint_id,
         "dataset_sha256": source_pin.dataset_sha256,
-        "resource_table_oid": oid_by_table["provider_directory_dataset_resource"],
-        "resource_leaf_oids": [oid_by_table["provider_directory_dataset_resource"]],
-        "header_table_oid": oid_by_table["provider_directory_endpoint_dataset"],
-        "database_oid": database_oid,
+        "tables": {
+            "header": dict(selected.tables["provider_directory_endpoint_dataset"]),
+            "resource": dict(selected.tables["provider_directory_dataset_resource"]),
+        },
         "source_uri": normalize_fhir_catalog_retained_source_uri(source_uri),
         "accepted_receipt_id": capture.release_id,
         "accepted_receipt_sha256": capture.capture_sha256,
@@ -84,10 +83,7 @@ def _descriptor(recipe, manifest, database_oid, source_uri):
         "complete": True,
         "previous_dataset_id": None,
         "source_aliases": [source_pin.source_id],
-        "native_read_profile": FHIRCatalogSourceReadProfile(
-            capture.schema_name, capture.owner_role, capture.runtime_roles
-        ).document(),
-        "native_catalog_sha256": capture.catalog_sha256,
+        "native_read_profile": FHIRCatalogSourceReadProfile(selected.schema_name).document(),
         "admission": None,
         "capture_sha256": capture.capture_sha256,
         "retained_recipe": json.loads(canonical_registry_source_recipes((recipe,))),
@@ -116,33 +112,40 @@ def retained_fhir_catalog_recipe(descriptor):
             and is_sha256(manifest["source_recipes_sha256"])
         )
     )
-    database_oid = descriptor.get("database_oid")
-    _require(type(database_oid) is int and 0 < database_oid < 2**32)
-    expected = _descriptor(recipe, manifest, database_oid, descriptor.get("source_uri"))
-    _require(canonical(descriptor) == canonical(expected))
+    expected = _descriptor(recipe, manifest, descriptor.get("source_uri"))
+    physical_fields = {
+        "resource_table_oid",
+        "resource_leaf_oids",
+        "header_table_oid",
+        "database_oid",
+        "native_catalog_sha256",
+    }
+    if set(descriptor) == set(expected) - {"tables"} | physical_fields:
+        descriptor_by_field = {
+            key: field_value for key, field_value in descriptor.items() if key not in physical_fields
+        }
+        descriptor_by_field.update(
+            tables=expected["tables"],
+            native_read_profile=expected["native_read_profile"],
+            retained_recipe=expected["retained_recipe"],
+        )
+    else:
+        descriptor_by_field = descriptor
+    _require(canonical(descriptor_by_field) == canonical(expected))
     return recipe
 
 
 def validate_retained_fhir_catalog_descriptor(descriptor):
-    """Check closed linkage; publication and native read checks confer authority."""
-    retained_fhir_catalog_recipe(descriptor)
-    return json.loads(canonical(descriptor))
+    """Validate the closed logical source, named tables and retained recipe linkage."""
+    recipe = retained_fhir_catalog_recipe(descriptor)
+    return _descriptor(recipe, descriptor.get("retained_manifest"), descriptor.get("source_uri"))
 
 
 def retained_fhir_catalog_read_source(descriptor):
-    """Derive the physical read tuple without changing the original approval anchor."""
+    """Resolve named retained data while preserving the original approval scope."""
     source = fhir_physical_source(retained_fhir_catalog_recipe(descriptor).source_pin)
     _require(source.retained_capture is not None)
     return source
-
-
-async def _require_recipe_captures(connection, recipe):
-    original = recipe.source_pin.retained_capture
-    physical = fhir_physical_source(recipe.source_pin).retained_capture
-    _require(original is not None and physical is not None)
-    await require_retained_fhir_capture(connection, original, verify_content=False)
-    if physical != original:
-        await require_retained_fhir_capture(connection, physical, verify_content=False)
 
 
 async def resolve_fhir_catalog_retained_sources(connection, manifest, *, control_schema, source_uris=None):
@@ -151,14 +154,13 @@ async def resolve_fhir_catalog_retained_sources(connection, manifest, *, control
     manifest_document = _manifest_document(manifest)
     source_uris = {} if source_uris is None else source_uris
     _require(type(source_uris) is dict)
-    database_oid = await connection.fetchval("SELECT oid::bigint FROM pg_database WHERE datname=current_database()")
     accepted_at = datetime.now(timezone.utc)
     dispositions = []
     for recipe in recipes:
         source = recipe.source_pin
         if type(source) is not PinnedFHIRMembershipSource or source.retained_capture is None:
             continue
-        descriptor = _descriptor(recipe, manifest_document, database_oid, source_uris.get(source.endpoint_id))
+        descriptor = _descriptor(recipe, manifest_document, source_uris.get(source.endpoint_id))
         validate_retained_fhir_catalog_descriptor(descriptor)
         dispositions.append(
             FHIRCatalogSourceDisposition(
@@ -174,15 +176,13 @@ async def resolve_granted_fhir_catalog_sources(connection, recipes, *, source_ur
         return ()
     source_uris = {} if source_uris is None else source_uris
     _require(type(source_uris) is dict)
-    database_oid = await connection.fetchval("SELECT oid::bigint FROM pg_database WHERE datname=current_database()")
     accepted_at = datetime.now(timezone.utc)
     dispositions = []
     for recipe in recipes:
         _require(type(recipe.source_pin) is PinnedFHIRMembershipSource)
         capture = recipe.source_pin.retained_capture
         _require(capture is not None)
-        await _require_recipe_captures(connection, recipe)
-        descriptor = _descriptor(recipe, None, database_oid, source_uris.get(recipe.source_pin.endpoint_id))
+        descriptor = _descriptor(recipe, None, source_uris.get(recipe.source_pin.endpoint_id))
         validate_retained_fhir_catalog_descriptor(descriptor)
         dispositions.append(
             FHIRCatalogSourceDisposition(
@@ -200,14 +200,13 @@ async def resolve_granted_fhir_catalog_sources(connection, recipes, *, source_ur
 
 
 async def has_verified_retained_fhir_catalog_sources(connection, descriptors, *, control_schema):
-    """Recheck exact capture custody and any declared publication without writes."""
+    """Validate logical capture editions and their selected published recipe manifest."""
     _require(type(descriptors) is tuple and 0 < len(descriptors) <= 1000)
     recipes_by_manifest = {}
     for descriptor in descriptors:
         recipe = retained_fhir_catalog_recipe(descriptor)
         expected = descriptor["retained_manifest"]
         if expected is None:
-            await _require_recipe_captures(connection, recipe)
             continue
         key = canonical(expected)
         if key not in recipes_by_manifest:
@@ -219,18 +218,7 @@ async def has_verified_retained_fhir_catalog_sources(connection, descriptors, *,
                 connection, manifest, control_schema=control_schema
             )
         _require(recipe in recipes_by_manifest[key])
-        if recipe.source_pin.retained_successor is not None:
-            await _require_recipe_captures(connection, recipe)
     return True
 
 
 require_retained_fhir_catalog_sources = has_verified_retained_fhir_catalog_sources
-
-
-async def pin_retained_fhir_catalog_source(connection, descriptor):
-    """Admit the full retained content once for the caller's read-only transaction."""
-    recipe = retained_fhir_catalog_recipe(descriptor)
-    database_oid = await connection.fetchval("SELECT oid::bigint FROM pg_database WHERE datname=current_database()")
-    _require(database_oid == descriptor["database_oid"])
-    await _require_recipe_captures(connection, recipe)
-    return await pin_retained_fhir_read(connection, fhir_physical_source(recipe.source_pin).retained_capture)

@@ -19,18 +19,8 @@ class RegistryPTGAddressCarry:
 
 
 def retained_site_origin_reference(receipt):
-    """Retain native closure coordinates without accumulating selected row payloads."""
-    return tuple(
-        getattr(receipt, name)
-        for name in (
-            "generation_id",
-            "manifest_sha256",
-            "schema_oid",
-            "address_table_oid",
-            "binding_table_oid",
-            "owner_role_oid",
-        )
-    )
+    """Refer to the original logical edition before folding selected data rows."""
+    return receipt.generation_id, receipt.manifest_sha256
 
 
 def _canonical(document):

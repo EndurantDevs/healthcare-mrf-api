@@ -14,9 +14,8 @@ from process import reference_family_archive as archive
 from process import registry_source_inventory_contract as contract
 from process import registry_source_inventory_preparation as preparation
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
-from process.network_fhir_membership_source import PinnedFHIRMembershipSource, fhir_physical_source
+from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.network_legacy_membership_source import PinnedACAMembershipSource
-from process.registry_source_contribution_store import fhir_fact_transform, recipe_contribution_identity
 from process.registry_source_inventory_contract import (
     RegistrySourceInventoryError,
     encode_source_inventory_entry,
@@ -28,12 +27,10 @@ from process.registry_source_recipe_store import (
     canonical_registry_source_recipes,
     registry_source_recipes_sha256,
 )
+from tests.registry_source_recipe_support import _capture_recipe, _derivation, _descriptor, _example
 from tests.test_registry_aca_source_recipe import _DATASET, _metadata
 from tests.test_registry_ptg_office_membership_recipe import _recipe as _ptg_recipe
-from tests.test_registry_source_contributions import _descriptor as _legacy_descriptor
-from tests.test_registry_source_inventory_store_postgres import _capture_recipe
 from tests.test_registry_source_office_summary_v3 import _derivation as _office_example
-from tests.test_registry_source_recipe_store_postgres import _example
 
 
 def _aca_recipe():
@@ -81,50 +78,6 @@ def _aca_recipe():
             **{key: coordinate for key, coordinate in metadata["network_bindings"].items() if key != "source_key_kind"}
         ),
     )
-
-
-def _descriptor(recipe, anchored=False):
-    identity, capture = recipe_contribution_identity(recipe)
-    descriptor = _legacy_descriptor(recipe)
-    descriptor.update(
-        recipe_sha256=identity,
-        capture_sha256=capture,
-        transform_version=fhir_fact_transform(recipe.source_pin),
-        fact_candidate_id=str(UUID(int=7)) if anchored else None,
-        fact_table_oid=71 if anchored else None,
-        fact_seal_sha256="d" * 64 if anchored else None,
-    )
-    descriptor["source_generation"] = hashlib.sha256(
-        json.dumps([capture, descriptor["mapping_sha256"]], sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    return descriptor
-
-
-def _derivation(recipe, descriptor=None, *, facts=False):
-    identity = hashlib.sha256(canonical_registry_source_recipes((recipe,)).encode()).hexdigest()
-    derivation = _office_example(identity, mode="facts" if facts else "raw")
-    physical = (
-        fhir_physical_source(recipe.source_pin)
-        if type(recipe.source_pin) is PinnedFHIRMembershipSource
-        else recipe.source_pin
-    )
-    derivation["physical_source_sha256"] = physical.generation_id
-    if descriptor is not None:
-        derivation["mapping_sha256"] = descriptor["mapping_sha256"]
-    if facts:
-        derivation["fact_artifact"] = {
-            field: descriptor[field]
-            for field in (
-                "fact_candidate_id",
-                "fact_table_oid",
-                "fact_seal_sha256",
-                "capture_sha256",
-                "transform_version",
-                "fact_sha256",
-                "fact_rows",
-            )
-        }
-    return derivation
 
 
 def _metadata_rows(recipes):
@@ -252,10 +205,10 @@ def test_complete_preparation_rejects_missing_or_unpaired_metadata(damage):
         case "orphan_derivation":
             derivations.append(_derivation(_example(99), _descriptor(_example(99))))
         case "rev1":
-            for field in ("fact_candidate_id", "fact_table_oid", "fact_seal_sha256"):
+            for field in ("fact_candidate_id", "fact_schema_name", "fact_table_name", "fact_generation_id"):
                 contributions[0].pop(field)
         case "partial_anchor":
-            contributions[0]["fact_table_oid"] = 71
+            contributions[0]["fact_schema_name"] = "partial_facts"
         case "nonfhir_contribution":
             contributions.append({**contributions[0], "recipe_sha256": derivations[1]["recipe_sha256"]})
         case "nonfhir_facts":
@@ -275,8 +228,9 @@ def test_complete_preparation_rejects_missing_or_unpaired_metadata(damage):
         "mapping_sha256",
         "physical_source_sha256",
         "fact_candidate_id",
-        "fact_table_oid",
-        "fact_seal_sha256",
+        "fact_schema_name",
+        "fact_table_name",
+        "fact_generation_id",
         "capture_sha256",
         "transform_version",
         "fact_sha256",

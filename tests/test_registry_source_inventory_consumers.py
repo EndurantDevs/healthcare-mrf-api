@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Pure consumer wiring checks; native custody/physical locks remain separate proof."""
+"""Pure consumer wiring checks; native Source and publication remain separate proof."""
 
 import copy
 import hashlib
@@ -14,7 +14,6 @@ from uuid import UUID, uuid4
 import pytest
 
 from db.registry_source_inventory_schema import INVENTORY_TABLE
-from process import network_candidate_custody as custody_module
 from process import network_compact_address_carriers as carriers
 from process import registry_aca_address_carry as aca_carry
 from process import registry_ptg_address_carry as ptg_carry
@@ -23,13 +22,14 @@ from process import registry_source_inventory_store as inventory_store
 from process import registry_source_recipe_store as recipes
 from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import ApprovedMembershipSource
+from process.network_compact_layout import CompactAddressRelation
 from process.network_membership_copy import MembershipCopyTarget
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_source_inventory_contract import make_source_inventory_entry, source_inventory_root
 from process.registry_source_inventory_reference import INVENTORY_DIGEST_KEY, SourceInventoryReference
+from tests.registry_source_recipe_support import _example
 from tests.test_registry_ptg_office_membership_recipe import _recipe as _ptg_recipe
 from tests.test_registry_source_inventory_preparation import _aca_recipe
-from tests.test_registry_source_recipe_store_postgres import _example
 
 CONTROL = "synthetic_control"
 APPROVED = ApprovedMembershipSource(3, "b" * 64, 0)
@@ -74,7 +74,7 @@ def _inventory(count=1, *, legacy=False):
         copy.deepcopy(generations_by_source),
         APPROVED.approved_revision,
         "d" * 64,
-        71,
+        CompactAddressRelation(copy_target.schema_name, "entity_address_unified"),
     )
     return SimpleNamespace(
         selected_recipes=selected_recipes,
@@ -103,18 +103,8 @@ def _retained_spies(monkeypatch, fixture):
         events.append("manifest")
         return fixture.manifest
 
-    async def custody(connection, copy_target, *, control_schema, required):
-        assert (
-            events == ["manifest"]
-            and required is True
-            and copy_target == fixture.copy_target
-            and control_schema == CONTROL
-        )
-        events.append("custody")
-        return {"receipt": {"closure": {"relation_oids": {INVENTORY_TABLE: 88}}}}
-
-    async def inventory(connection, copy_target, candidate_by_field, *, expected_table_oid, control_schema):
-        assert events == ["manifest", "custody"] and expected_table_oid == 88
+    async def inventory(connection, copy_target, candidate_by_field, *, control_schema):
+        assert events == ["manifest"]
         assert (
             copy_target == fixture.copy_target
             and candidate_by_field == fixture.candidate_by_field
@@ -123,28 +113,22 @@ def _retained_spies(monkeypatch, fixture):
         events.append("inventory")
         return fixture.reference, fixture.entries
 
-    resolver, seal, loader = (
-        AsyncMock(side_effect=resolve),
-        AsyncMock(side_effect=custody),
-        AsyncMock(side_effect=inventory),
-    )
+    resolver, loader = AsyncMock(side_effect=resolve), AsyncMock(side_effect=inventory)
     monkeypatch.setattr(recipes, "resolve_network_serving_manifest", resolver)
-    monkeypatch.setattr(custody_module, "verify_network_candidate_custody", seal)
-    monkeypatch.setattr(inventory_store, "_load_locked_source_inventory", loader)
-    return connection, resolver, seal, loader, events
+    monkeypatch.setattr(inventory_store, "load_source_inventory", loader)
+    return connection, resolver, loader, events
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("count", [0, 1, 101, 1000])
-async def test_retained_resolver_loads_full_inventory_only_after_required_custody(monkeypatch, full_inventory, count):
+async def test_retained_resolver_loads_full_inventory_after_logical_manifest(monkeypatch, full_inventory, count):
     fixture = full_inventory if count == 1000 else _inventory(count)
-    connection, _, seal, loader, events = _retained_spies(monkeypatch, fixture)
+    connection, _, loader, events = _retained_spies(monkeypatch, fixture)
     result = await recipes.resolve_retained_registry_source_recipes(
         connection, fixture.manifest, control_schema=CONTROL
     )
     assert result == fixture.selected_recipes and len(result) == count
-    assert events == ["manifest", "custody", "inventory"]
-    seal.assert_awaited_once()
+    assert events == ["manifest", "inventory"]
     loader.assert_awaited_once()
     assert connection.fetchval.await_args_list[0].args == ("SHOW transaction_isolation",)
     assert connection.fetchval.await_count == 1
@@ -152,10 +136,10 @@ async def test_retained_resolver_loads_full_inventory_only_after_required_custod
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["manifest", "candidate", "schema", "generation", "state", "seal", "oid", "loader"])
-async def test_retained_scope_or_custody_refusal_never_falls_back_to_raw_recipes(monkeypatch, damage):
+@pytest.mark.parametrize("damage", ["manifest", "candidate", "schema", "generation", "state", "loader"])
+async def test_retained_scope_or_content_refusal_never_falls_back_to_raw_recipes(monkeypatch, damage):
     fixture = _inventory()
-    connection, resolver, seal, loader, events = _retained_spies(monkeypatch, fixture)
+    connection, resolver, loader, events = _retained_spies(monkeypatch, fixture)
     if damage == "manifest":
         resolver.side_effect = None
         resolver.return_value = replace(fixture.manifest, generation_id=8)
@@ -167,27 +151,21 @@ async def test_retained_scope_or_custody_refusal_never_falls_back_to_raw_recipes
         fixture.candidate_by_field["source_generations"]["custom_membership"] = "f" * 64
     if damage == "state":
         fixture.candidate_by_field["state"] = "ready"
-    if damage == "seal":
-        seal.side_effect = ValueError("synthetic custody refusal")
-    if damage == "oid":
-        seal.side_effect = None
-        seal.return_value = {"receipt": {"closure": {"relation_oids": {}}}}
     if damage == "loader":
         loader.side_effect = ValueError("synthetic inventory refusal")
     with pytest.raises(recipes.RegistrySourceRecipeError, match="unavailable"):
         await recipes.resolve_retained_registry_source_recipes(connection, fixture.manifest, control_schema=CONTROL)
-    assert events != ["manifest", "custody", "inventory"]
+    assert events != ["manifest", "inventory"]
 
 
 @pytest.mark.asyncio
 async def test_legacy_retained_bytes_and_hash_caps_are_unchanged(monkeypatch):
     fixture = _inventory(2, legacy=True)
-    connection, _, seal, loader, _ = _retained_spies(monkeypatch, fixture)
+    connection, _, loader, _ = _retained_spies(monkeypatch, fixture)
     assert (
         await recipes.resolve_retained_registry_source_recipes(connection, fixture.manifest, control_schema=CONTROL)
         == fixture.selected_recipes
     )
-    seal.assert_not_awaited()
     loader.assert_not_awaited()
     with pytest.raises(recipes.RegistrySourceRecipeError):
         recipes.canonical_registry_source_recipes(_inventory(101).selected_recipes)
@@ -206,21 +184,14 @@ async def test_carrier_projection_reads_registered_inventory_after_existing_scop
         events.append("scope")
         return candidate_by_field, {"descriptor_sha256": "a" * 64}, physical
 
-    async def oid(query, relation):
-        assert events == ["scope"] and query == "SELECT to_regclass($1)::oid::bigint"
-        assert relation == '"' + fixture.copy_target.schema_name + '".network_source_inventory'
-        events.append("oid")
-        return 88
-
-    async def inventory(connection, copy_target, current, *, expected_table_oid, control_schema):
-        assert events == ["scope", "oid"] and expected_table_oid == 88 and control_schema == CONTROL
+    async def inventory(actual_connection, copy_target, current, *, control_schema):
+        assert actual_connection is connection and events == ["scope"] and control_schema == CONTROL
         assert current == candidate_by_field and copy_target == fixture.copy_target
         events.append("inventory")
         return fixture.reference, fixture.entries
 
     monkeypatch.setattr(carriers, "_scope", scope)
-    connection.fetchval.side_effect = oid
-    monkeypatch.setattr(inventory_store, "_load_locked_source_inventory", inventory)
+    monkeypatch.setattr(inventory_store, "load_source_inventory", inventory)
     monkeypatch.setattr(
         carriers, "canonical_registry_source_recipes", lambda *_: pytest.fail("Whole-array legacy cap reached")
     )
@@ -231,7 +202,8 @@ async def test_carrier_projection_reads_registered_inventory_after_existing_scop
         selected_recipes == fixture.selected_recipes and reference == fixture.reference and actual_physical == physical
     )
     assert receipt["source_recipes_sha256"] == fixture.reference.root.recipes_sha256
-    assert events == ["scope", "oid", "inventory"]
+    assert events == ["scope", "inventory"]
+    connection.fetchval.assert_not_awaited()
 
 
 @pytest.mark.parametrize("damage", ["same", "order", "missing", "substitute"])

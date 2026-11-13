@@ -38,8 +38,8 @@ SEARCH_COLUMNS = (
 _COLUMNS = (*SEARCH_COLUMNS, "geo", "canonical_network_ids")
 _BATCH_ROWS = 2000
 _SCOPE_FIELDS = ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
-_FIELDS = {"contract", "scope", "table_name", "table_oid", "row_count", "sources", "indexes", "sha256"}
-_INDEX_FIELDS = ("index_oid", "table_oid", "definition")
+_FIELDS = {"contract", "scope", "table_name", "row_count", "sources", "indexes", "sha256"}
+_INDEX_FIELDS = ("definition",)
 _GEO = "CASE WHEN a.lat IS NOT NULL AND a.long IS NOT NULL THEN public.Geography(public.ST_MakePoint(a.long::double precision,a.lat::double precision)) END"
 _PREDICATE = "type IN ('primary','secondary','practice','site') AND COALESCE(address_precision,'')<>'city_zip' AND lat IS NOT NULL AND long IS NOT NULL"
 
@@ -67,81 +67,68 @@ def _json(value):
     return json.loads(value) if isinstance(value, str) else value
 
 
-def _is_oid(value):
-    return type(value) is int and 0 < value < 2**32
-
-
 def _descriptor(value):
-    _require(type(value) is dict and set(value) == _FIELDS and value["contract"] == CONTRACT)
+    _require(type(value) is dict and set(value) in (_FIELDS, _FIELDS | {"table_oid"}) and value["contract"] == CONTRACT)
     _require(type(value["scope"]) is dict and set(value["scope"]) == set(_SCOPE_FIELDS))
-    try:
-        target = MembershipCopyTarget(**value["scope"])
-        sources = value["sources"]
-        _require(type(sources) is dict and set(sources) == {"base", "custom", "ref_map", "artifacts"})
-        from process.network_compact_layout import CompactEdgeArtifact
+    target = MembershipCopyTarget(**value["scope"])
+    sources = value["sources"]
+    _require(type(sources) is dict and set(sources) == {"base", "custom", "ref_map", "artifacts"})
+    from process.network_compact_layout import CompactEdgeArtifact
 
-        layout = CompactNetworkLayout(
-            CompactAddressRelation(**sources["ref_map"]),
-            CompactAddressRelation(**sources["base"]),
-            tuple(CompactEdgeArtifact(**entry) for entry in sources["artifacts"]),
-            None if sources["custom"] is None else CompactAddressRelation(**sources["custom"]),
-        )
-    except (TypeError, KeyError, ValueError) as error:
-        raise NetworkGeoSearchError("Network geo search source identity is invalid") from error
+    def relation(document):
+        """Decode a schema-qualified search input without historical physical fields."""
+        return CompactAddressRelation(document["schema_name"], document["table_name"])
+
+    layout = CompactNetworkLayout(
+        relation(sources["ref_map"]),
+        relation(sources["base"]),
+        tuple(CompactEdgeArtifact(entry["candidate_id"], entry["schema_name"]) for entry in sources["artifacts"]),
+        None if sources["custom"] is None else relation(sources["custom"]),
+    )
     _require(layout.ref_map.schema_name == target.schema_name and value["table_name"] == TABLE)
-    _require(_is_oid(value["table_oid"]) and type(value["row_count"]) is int and value["row_count"] >= 0)
+    _require(type(value["row_count"]) is int and value["row_count"] >= 0)
     _require(type(value["indexes"]) is list and len(value["indexes"]) == 2)
-    for index in value["indexes"]:
-        _require(type(index) is dict and set(index) == {"name", *_INDEX_FIELDS})
-        _require(_is_oid(index["index_oid"]) and index["table_oid"] == value["table_oid"])
-        _require(type(index["definition"]) is str and 0 < len(index["definition"]) < 8192)
-    _require({index["name"] for index in value["indexes"]} == {TABLE + "_pkey", TABLE + "_gn"})
-    _require(len({index["index_oid"] for index in value["indexes"]}) == 2)
-    _require(value["sha256"] == _digest({key: entry for key, entry in value.items() if key != "sha256"}))
-    return value
+    indexes = [{field: index[field] for field in ("name", "definition")} for index in value["indexes"]]
+    _require({index["name"] for index in indexes} == {TABLE + "_pkey", TABLE + "_gn"})
+    _require(all(type(index["definition"]) is str and 0 < len(index["definition"]) < 8192 for index in indexes))
+    return {
+        **{key: value[key] for key in _FIELDS},
+        "sources": json.loads(json.dumps(asdict(layout))),
+        "indexes": indexes,
+    }
 
 
 def geo_search_receipt(candidate):
-    """Absent legacy receipts stay absent; present receipts bind the candidate and inputs."""
+    """Read the published search projection's logical scope and qualified inputs."""
     report = _json(candidate.get("validation_json")) or {}
     serving = report.get("serving_readiness") or {}
     if "geo_search" not in serving:
         return None
     descriptor = _descriptor(serving["geo_search"])
     _require(descriptor["scope"] == {field: str(candidate[field]) for field in _SCOPE_FIELDS})
-    sources = descriptor["sources"]
-    canonical = report.get("candidate_readiness", {})
-    _require(sources["ref_map"]["table_oid"] == canonical.get("ref_map_oid"))
-    _require(sources["base"]["table_oid"] == serving.get("address_artifact", {}).get("table", {}).get("oid"))
     expected_artifacts = [
-        {key: entry[key] for key in ("candidate_id", "schema_name", "table_oid")}
-        for entry in serving.get("edge_artifacts", ())
+        {key: entry[key] for key in ("candidate_id", "schema_name")} for entry in serving.get("edge_artifacts", ())
     ]
-    _require(sources["artifacts"] == expected_artifacts)
+    _require(descriptor["sources"]["artifacts"] == expected_artifacts)
     return json.loads(json.dumps(descriptor))
 
 
 def geo_search_relation(candidate):
-    """Return a coordinate only after the candidate writer closure pins its indexes."""
+    """Return the validated published search relation when one is available."""
     descriptor = geo_search_receipt(candidate)
     if descriptor is None:
         return None
-    closure = _json(candidate["validation_json"]).get("writer_closure", {})
-    _require(closure.get("relation_oids", {}).get(TABLE) == descriptor["table_oid"])
-    for index in descriptor["indexes"]:
-        _require(closure.get("index_oids", {}).get(index["name"]) == index["index_oid"])
-        _require(closure.get("index_table_oids", {}).get(index["name"]) == descriptor["table_oid"])
-    return CompactAddressRelation(candidate["schema_name"], TABLE, descriptor["table_oid"])
+    return CompactAddressRelation(candidate["schema_name"], descriptor["table_name"])
 
 
 def require_geo_search_index_records(indexes, descriptor):
-    """Require the same live native indexes from the caller's complete catalog inventory."""
-    _descriptor(descriptor)
+    """Check the required search index definitions before publication."""
+    descriptor = _descriptor(descriptor)
     _require_index_profile(descriptor)
-    by_oid = {index["index_oid"]: index for index in indexes}
+    by_name = {index["name"]: index for index in indexes}
     for expected in descriptor["indexes"]:
-        actual = by_oid.get(expected["index_oid"])
-        _require(actual is not None and all(actual.get(field) == expected[field] for field in _INDEX_FIELDS))
+        actual = by_name.get(expected["name"])
+        _require(actual is not None and actual["definition"] == expected["definition"])
         _require(all(actual.get(flag) is True for flag in ("indisvalid", "indisready", "indislive")))
 
 
@@ -167,46 +154,35 @@ def _require_index_profile(descriptor):
         _require(_normalized_index_definition(index["definition"]) == _normalized_index_definition(expected_definition))
 
 
-async def _index_records(connection, table_oid):
+async def _index_records(connection, relation_name):
     statement = index_catalog_statement(
-        """SELECT c.relname AS name,i.indexrelid::bigint AS index_oid,i.indrelid::bigint AS table_oid,
-        i.indisvalid,i.indisready,i.indislive,pg_get_indexdef(i.indexrelid) AS definition
-        FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid WHERE i.indrelid=$1::oid ORDER BY c.relname""",
+        """SELECT c.relname AS name,i.indisvalid,i.indisready,i.indislive,
+        pg_get_indexdef(i.indexrelid) AS definition
+        FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+        WHERE i.indrelid=to_regclass($1::text) ORDER BY c.relname""",
     )
-    return sorted(_json(await connection.fetchval(statement, table_oid)), key=lambda index: index["name"])
+    return sorted(_json(await connection.fetchval(statement, relation_name)), key=lambda index: index["name"])
 
 
 async def verify_geo_search_indexes(connection, descriptor):
-    """Recheck physical identity under the existing transaction before publication."""
-    _descriptor(descriptor)
-    _require(connection.is_in_transaction())
-    relation = CompactAddressRelation(descriptor["scope"]["schema_name"], TABLE, descriptor["table_oid"])
-    await _pin_relation(connection, relation)
-    require_geo_search_index_records(await _index_records(connection, descriptor["table_oid"]), descriptor)
-
-
-async def _pin_relation(connection, relation):
-    qualified = _qualified(relation)
-    _require(await connection.fetchval("SELECT to_regclass($1)::oid::bigint", qualified) == relation.table_oid)
-    await connection.execute(f"LOCK TABLE ONLY {qualified} IN ACCESS SHARE MODE")
-    _require(await connection.fetchval("SELECT to_regclass($1)::oid::bigint", qualified) == relation.table_oid)
+    """Check index readiness by the selected schema-qualified search table."""
+    descriptor = _descriptor(descriptor)
+    relation = CompactAddressRelation(descriptor["scope"]["schema_name"], descriptor["table_name"])
+    require_geo_search_index_records(await _index_records(connection, _qualified(relation)), descriptor)
 
 
 async def _has_compatible_sources(connection, layout):
-    """Only missing columns mean an old profile; incompatible present types fail closed."""
+    """Check column types needed by the bounded search projection."""
     profiles = []
     for relation in (layout.base, *((layout.custom,) if layout.custom is not None else ())):
-        await _pin_relation(connection, relation)
         attributes = await connection.fetch(
-            """SELECT attname,atttypid,atttypmod,attcollation FROM pg_attribute
-            WHERE attrelid=$1::oid AND attnum>0 AND NOT attisdropped AND attname=ANY($2::text[])""",
-            relation.table_oid,
+            """SELECT attname,format_type(atttypid,atttypmod) AS type_name
+            FROM pg_attribute WHERE attrelid=to_regclass($1::text)
+              AND attnum>0 AND NOT attisdropped AND attname=ANY($2::text[])""",
+            _qualified(relation),
             SEARCH_COLUMNS,
         )
-        columns_by_name = {
-            entry["attname"]: tuple(entry[field] for field in ("atttypid", "atttypmod", "attcollation"))
-            for entry in attributes
-        }
+        columns_by_name = {entry["attname"]: entry["type_name"] for entry in attributes}
         if set(columns_by_name) != set(SEARCH_COLUMNS):
             return False
         profiles.append(columns_by_name)
@@ -305,7 +281,7 @@ async def _build_projection(connection, target, layout):
         f"CREATE INDEX {TABLE}_gn ON {table} USING gist (geo,canonical_network_ids public.gist__intbig_ops) WHERE {_PREDICATE}"
     )
     await connection.execute(f"ANALYZE {table}")
-    return await connection.fetchval("SELECT to_regclass($1)::oid::bigint", table), verified
+    return verified
 
 
 async def prepare_network_geo_search(connection, copy_target, layout):
@@ -314,7 +290,6 @@ async def prepare_network_geo_search(connection, copy_target, layout):
     _require(connection.is_in_transaction() and layout.ref_map.schema_name == copy_target.schema_name)
     if not await _has_compatible_sources(connection, layout):
         return None
-    await _pin_relation(connection, layout.ref_map)
     referenced_artifacts = await connection.fetch(
         f"SELECT DISTINCT artifact_candidate_id::text AS candidate_id FROM ONLY {_qualified(layout.ref_map)}"
     )
@@ -322,22 +297,19 @@ async def prepare_network_geo_search(connection, copy_target, layout):
         {entry["candidate_id"] for entry in referenced_artifacts}
         == {artifact.candidate_id for artifact in layout.artifacts}
     )
-    for artifact in layout.artifacts:
-        await _pin_relation(
-            connection, CompactAddressRelation(artifact.schema_name, "network_office_edge", artifact.table_oid)
-        )
     async with connection.transaction():
-        table_oid, count = await _build_projection(connection, copy_target, layout)
+        count = await _build_projection(connection, copy_target, layout)
         descriptor_by_field = {
             "contract": CONTRACT,
             "scope": {field: getattr(copy_target, field) for field in _SCOPE_FIELDS},
             "table_name": TABLE,
-            "table_oid": table_oid,
             "row_count": count,
             "sources": json.loads(json.dumps(asdict(layout))),
             "indexes": [
                 {field: index_record[field] for field in ("name", *_INDEX_FIELDS)}
-                for index_record in await _index_records(connection, table_oid)
+                for index_record in await _index_records(
+                    connection, compact_identifier(copy_target.schema_name) + "." + TABLE
+                )
             ],
         }
         descriptor_by_field["sha256"] = _digest(descriptor_by_field)

@@ -2,8 +2,8 @@
 """Indexed set validation for a complete sealed membership candidate."""
 
 import json
-import os
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from uuid import UUID
 
 from db.registry_schema import registry_schema
@@ -350,3 +350,218 @@ async def validate_network_membership_candidate(
         connection, copy_target, source, control_schema=control_schema, office_sources=office_sources
     ) as (report, _):
         return report
+
+
+@asynccontextmanager
+async def _preservation_scope(
+    connection, copy_target, candidate, schema, inventory_entries, *, source_witness_runtime=None
+):
+    """Keep exact carry selections alive through final data checks, then drain their temporary tables."""
+    from process.network_sampled_custody import inherit_preserved_sampling
+    from process.registry_fhir_serving_preservation import (
+        cleanup_fhir_serving_preservation,
+        has_fresh_carried_typed_data,
+        rederive_fhir_serving_preservation,
+        verify_fhir_preservation_target_rows,
+    )
+
+    preservation = await rederive_fhir_serving_preservation(
+        connection,
+        copy_target,
+        candidate,
+        control_schema=schema,
+        inventory_entries=inventory_entries,
+        source_witness_runtime=source_witness_runtime,
+    )
+    primary = None
+    try:
+        if preservation is not None:
+            await verify_fhir_preservation_target_rows(
+                connection, copy_target, candidate, preservation, control_schema=schema
+            )
+        freshly_checked = await has_fresh_carried_typed_data(
+            connection, preservation, control_schema=schema, source_witness_runtime=source_witness_runtime
+        )
+        if not freshly_checked:
+            await inherit_preserved_sampling(connection, preservation, source_witness_runtime, schema)
+        yield preservation
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        try:
+            await cleanup_fhir_serving_preservation(connection, preservation, primary=primary)
+        except BaseException as cleanup_error:
+            if primary is None:
+                raise
+            primary.add_note("FHIR preservation cleanup failed; caller rollback remains required.")
+            primary._registry_preservation_cleanup_error = cleanup_error
+
+
+async def _validate_full_candidate_data(connection, copy_target, candidate, schema):
+    """Recheck complete native accounting, address parity and structural serving indexes."""
+    from process.network_membership_serving_indexes import (
+        _index_digest,
+        _matching_inputs,
+        _serving_plan,
+        _source_semantics,
+    )
+
+    report = _json_object(candidate["validation_json"])
+    address_source = PinnedAddressSource(**report["address_source"])
+    validated, scope = await _matching_inputs(connection, candidate, copy_target, address_source, schema)
+    serving = report.get("serving_readiness")
+    if (
+        type(serving) is not dict
+        or serving.get("component") != "unified_address_serving"
+        or type(serving.get("readiness_revision")) is not int
+        or serving["readiness_revision"] != 1
+        or serving.get("ready") is not True
+        or serving.get("index_profile") != "serving"
+        or serving.get("scope") != scope
+    ):
+        raise NetworkMembershipValidationError("Candidate lacks matching full serving readiness")
+    await _source_semantics(
+        connection,
+        f"{_identifier(address_source.schema_name)}.{_identifier(address_source.table_name)}",
+        f"{_identifier(copy_target.schema_name)}.entity_address_unified",
+        replay=True,
+    )
+    current_indexes = await _index_digest(connection, copy_target.schema_name, _serving_plan(copy_target.schema_name))
+    if current_indexes != serving.get("index_definition_sha256"):
+        raise NetworkMembershipValidationError("Candidate serving index definitions changed")
+    return validated
+
+
+async def _final_proof(
+    connection,
+    copy_target,
+    candidate,
+    schema,
+    *,
+    office_authority=None,
+    inventory_entries=None,
+    source_witness_runtime=None,
+):
+    """Reconstruct complete candidate data from named inputs without a control-row publication lock."""
+    from process.network_compact_readiness import is_compact_candidate
+    from process.network_em_provider_inputs import verify_candidate_em_provider_inputs
+    from process.network_source_contribution_custody import verify_independent_source_contributions
+    from process.registry_source_office_custody import verify_independent_initial_source_offices
+
+    source_options_by_name = {"source_witness_runtime": source_witness_runtime}
+    async with _preservation_scope(
+        connection, copy_target, candidate, schema, inventory_entries, **source_options_by_name
+    ) as preservation:
+        await verify_registry_source_retention_rows(connection, copy_target, candidate)
+        source_preservation = await verify_independent_source_contributions(
+            connection,
+            copy_target,
+            candidate,
+            control_schema=schema,
+            office_authority=office_authority,
+            preservation=preservation,
+            **source_options_by_name,
+            **({"inventory_entries": inventory_entries} if inventory_entries is not None else {}),
+        )
+        if inventory_entries is None and source_preservation is None:
+            await verify_independent_initial_source_offices(
+                connection,
+                copy_target,
+                candidate,
+                control_schema=schema,
+                office_authority=office_authority,
+                preservation=preservation,
+            )
+        if is_compact_candidate(candidate):
+            from process.network_compact_validation import verify_compact_final_proof
+
+            validated = await verify_compact_final_proof(
+                connection,
+                copy_target,
+                candidate,
+                control_schema=schema,
+                office_authority=office_authority,
+                **source_options_by_name,
+            )
+        else:
+            validated = await _validate_full_candidate_data(connection, copy_target, candidate, schema)
+        await verify_candidate_em_provider_inputs(connection, candidate)
+        return validated
+
+
+def _candidate_source_runtime(source_witness_runtime, copy_target):
+    """Create this candidate's sampling run from the configured deterministic policy."""
+    from process.network_sampled_custody import SampledValidationRun
+    from process.registry_source_recipe_composition import SourceWitnessRuntime
+
+    if source_witness_runtime is not None:
+        if type(source_witness_runtime) is not SourceWitnessRuntime:
+            raise NetworkMembershipValidationError("Final validation requires configured Source data services")
+        source_witness_runtime.__post_init__()
+        if source_witness_runtime.semantic_policy is not None:
+            source_witness_runtime = replace(
+                source_witness_runtime,
+                semantic_policy=None,
+                semantic_validation=SampledValidationRun(
+                    source_witness_runtime.semantic_policy, copy_target.candidate_id
+                ),
+            )
+    return source_witness_runtime
+
+
+async def validate_network_candidate_final(
+    connection, copy_target, candidate, control_schema, *, office_authority=None, source_witness_runtime=None
+):
+    """Validate named snapshot data completely before the caller's short atomic publication transaction."""
+    from process.registry_source_inventory_reference import verify_source_recipe_metadata
+    from process.registry_source_inventory_store import load_source_inventory
+
+    if (
+        type(copy_target) is not MembershipCopyTarget
+        or not connection.is_in_transaction()
+        or await connection.fetchval("SHOW transaction_isolation") not in {"repeatable read", "serializable"}
+        or candidate["state"] not in {"ready", "published"}
+        or any(
+            str(candidate[field]) != getattr(copy_target, field)
+            for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
+        )
+    ):
+        raise NetworkMembershipValidationError(
+            "Final validation requires the exact ready candidate in a repeatable snapshot"
+        )
+    _identifier(control_schema)
+    metadata = verify_source_recipe_metadata(candidate)
+    entries = None
+    if metadata.inventory is not None:
+        _, entries = await load_source_inventory(connection, copy_target, candidate, control_schema=control_schema)
+    source_witness_runtime = _candidate_source_runtime(source_witness_runtime, copy_target)
+    validated = await _final_proof(
+        connection,
+        copy_target,
+        candidate,
+        control_schema,
+        office_authority=office_authority,
+        inventory_entries=entries,
+        source_witness_runtime=source_witness_runtime,
+    )
+    sampling = None if source_witness_runtime is None else source_witness_runtime.semantic_validation
+    semantic = None if sampling is None else await sampling.finish(connection, copy_target.candidate_id)
+    count_fields = (
+        "membership_rows",
+        "distinct_memberships",
+        "projected_locations",
+        "orphan_bindings",
+        "raw_rows",
+        "batch_rows",
+        "batch_count",
+        "unknown_network_rows",
+    )
+    return {
+        "candidate_id": copy_target.candidate_id,
+        "schema_name": copy_target.schema_name,
+        "complete": True,
+        "source_generations": _validated_sources(candidate),
+        "counts": {field: validated[field] for field in count_fields},
+        "semantic_validation": semantic,
+    }

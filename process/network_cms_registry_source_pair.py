@@ -101,7 +101,6 @@ class RegistryCMSPublicationProof:
             or pin.retained_epoch is not None
             or pin.retained_successor is not None
             or pin.retained_capture is not None
-            or pin.custody_owner_role is not None
         ):
             raise ValueError("registry_cms_publication_proof_invalid")
         RegistrySourceMembershipRecipe(pin, self.binding_coordinates)
@@ -181,8 +180,6 @@ class RegistryCMSRetainedSourcePair:
             or self.address_source.table_name != "entity_address_unified"
             or self.address_source.generation_id != _digest(receipt_payload["address"])
             or str(self.address_ownership.dataset_id) != str(epoch.epoch_id)
-            or self.owner_role != epoch.owner_role
-            or self.runtime_roles != epoch.runtime_roles
             or tuple(receipt_payload["cms"][field] for field in _CMS_FIELDS) != self.proof.cms_authority
             or receipt_payload["selection"]["proof_id"] != self.proof.selection_proof_id
             or not _is_profile_identity(receipt_payload, self.proof)
@@ -443,10 +440,6 @@ async def _retained_source_publication_time(connection, pair, *, api_read=False)
     """Read exact copied metadata; receipt time is not source publication time."""
     pin = pair.recipe.source_pin
     dataset_table = _identifier(pin.read_schema_name) + ".provider_directory_endpoint_dataset"
-    if api_read:
-        backend_pid = await connection.fetchval("SELECT pg_backend_pid()")
-        # The table this name resolves to now; a table replaced during the read is refused below.
-        current_oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", dataset_table)
     metadata_record = await connection.fetchrow(
         f"""SELECT endpoint_id,dataset_hash,acquisition_root_run_id,status,published_at,
         content_proof_admission_sha256,publication_metadata_sha256,
@@ -456,15 +449,6 @@ async def _retained_source_publication_time(connection, pair, *, api_read=False)
         FROM {dataset_table} WHERE dataset_id=$1""",
         pin.dataset_id,
     )
-    if api_read:
-        from process.network_compact_layout import CompactAddressRelation
-        from process.network_read_identity import verify_consumed_network_relations
-
-        await verify_consumed_network_relations(
-            connection,
-            (CompactAddressRelation(pin.read_schema_name, "provider_directory_endpoint_dataset", current_oid),),
-            expected_backend_pid=backend_pid,
-        )
     declaration_by_field = {
         **asdict(pair.proof.binding_coordinates),
         "source_key_kind": "organization_resource_id",

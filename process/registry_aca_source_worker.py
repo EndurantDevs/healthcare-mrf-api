@@ -38,14 +38,14 @@ from process.registry_publication_ptg_runtime import RegistryPublicationSQLLimit
 from process.registry_publication_worker import (
     _BoundedPool,
     _close_pool,
+    _configured_worker_runtime,
     _custody_config_url,
     _initial_sources,
     _pool_options,
+    _preparation_role_profile,
     _ptg_config,
-    _qualified_worker_runtime,
     _sql_limits,
-    _verify_custody_config,
-    _worker_backend_qualification,
+    _validate_legacy_preparation_url,
 )
 
 CONFIG_ENV = "HLTHPRT_REGISTRY_ACA_SOURCE_WORKER"
@@ -68,6 +68,7 @@ class RegistryACASourceWorkerConfig:
     sql_limits: RegistryPublicationSQLLimits = field(default_factory=RegistryPublicationSQLLimits)
     event: dict | None = field(default=None, repr=False)
     custody_url: object | None = field(default=None, repr=False)
+    preparation_roles: dict | None = field(default=None, repr=False)
 
     def __post_init__(self):
         if (
@@ -95,7 +96,8 @@ class RegistryACASourceWorkerConfig:
             _invalid()
         if self.ptg is None or self.ptg.store.control_schema != self.consumer.control_schema:
             _invalid()
-        _verify_custody_config(self)
+        _validate_legacy_preparation_url(self)
+        object.__setattr__(self, "preparation_roles", _preparation_role_profile(self))
         if self.event is not None:
             validate_registry_aca_source_event(self.event)
 
@@ -114,7 +116,7 @@ def parse_registry_aca_source_worker_config(encoded):
         _object(
             document,
             {"execution_dsn", "notification_dsn", "consumer", "notification_store", "reader_role", "ptg"},
-            {"sql_limits", "event", "custody_dsn"},
+            {"sql_limits", "event", "custody_dsn", "preparation_roles"},
         )
         consumer = _consumer_config(document["consumer"])
         store_fields_map = dict(document["notification_store"])
@@ -131,6 +133,7 @@ def parse_registry_aca_source_worker_config(encoded):
             _sql_limits(document["sql_limits"]) if "sql_limits" in document else RegistryPublicationSQLLimits(),
             document.get("event"),
             _custody_config_url(document["custody_dsn"]) if "custody_dsn" in document else None,
+            preparation_roles=document.get("preparation_roles"),
         )
     except ValueError, TypeError, KeyError, AttributeError, UnicodeError, RecursionError, ArgumentError:
         _invalid()
@@ -215,12 +218,7 @@ async def run_registry_aca_source_worker(config, *, event=None):
         reader = await asyncpg.create_pool(**_pool_options(config.notification_url, 1, config.sql_limits))
         stack.push_async_callback(_close_pool, reader)
         reader = _BoundedPool(reader, config.sql_limits.connect_timeout_seconds)
-        async with reader.acquire() as notification:
-            qualification = await _worker_backend_qualification(config, notification, config.reader_role)
-        execution_verifier = qualification.verifier(config.consumer.execution_role)
-        execution = await asyncpg.create_pool(
-            **_pool_options(config.execution_url, 1, config.sql_limits, backend_verifier=execution_verifier)
-        )
+        execution = await asyncpg.create_pool(**_pool_options(config.execution_url, 1, config.sql_limits))
         stack.push_async_callback(_close_pool, execution)
         execution = _BoundedPool(execution, config.sql_limits.connect_timeout_seconds)
         async with execution.acquire() as connection:
@@ -231,7 +229,7 @@ async def run_registry_aca_source_worker(config, *, event=None):
                     _invalid()
                 async with notification.transaction(isolation="repeatable_read", readonly=True):
                     identity = await config.notification_store.qualify(notification, writing=False)
-            consumer = await _qualified_worker_runtime(config, stack, qualification, connection)
+            consumer = await _configured_worker_runtime(config, stack)
             if consumer.seal_candidate is None:
                 _invalid()
             await consumer.composition_runtime.qualify()

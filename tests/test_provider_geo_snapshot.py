@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Fixed geo inventories retain native guards; protocol doubles are not custody proof."""
+"""Geo reads keep their named optional inputs, publication state and cleanup scoped."""
 
 import asyncio
 import json
@@ -9,16 +9,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 from sanic.exceptions import ServiceUnavailable
-from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
-from api import network_read_execution as execution
 from api import provider_collection_network_read as collection
 from api import provider_profile_snapshot as snapshot
 from api.endpoint import npi
 from process.npi_canonical_publication import NPI_CANONICAL_TABLES
 from tests.test_npi_near_snapshot import near_snapshot
 from tests.test_provider_collection_network_read import _query, _read, boundary
-from tests.test_provider_profile_snapshot_read_identity import _Session
 
 _RAW_PARENTS = (
     "provider_directory_dataset_affiliation_organization",
@@ -26,6 +24,22 @@ _RAW_PARENTS = (
     "provider_directory_dataset_network_plan",
     "provider_directory_dataset_resource",
 )
+
+
+def _session(*, installed):
+    events, answers = [], {}
+
+    async def execute(statement, parameters=None):
+        query = str(statement)
+        events.append(query)
+        if parameters is not None:
+            assert parameters["schema"] == "mrf"
+            return SimpleNamespace(all=lambda: [(name, name in installed) for name in parameters["names"]])
+        return SimpleNamespace(
+            scalar=lambda: any(f'"mrf".{name}' in query and value for name, value in answers.items())
+        )
+
+    return SimpleNamespace(info={"api_reader_verified": True}, execute=execute, events=events, answers=answers)
 
 
 def _database(session):
@@ -38,11 +52,8 @@ def _database(session):
     )
 
 
-async def test_geo_inventory_excludes_only_unconsumed_families_and_preserves_full_profile_guard():
-    session = _Session(installed=(*snapshot._GEO_TABLES, *_RAW_PARENTS))
-    session.kinds.update(dict.fromkeys(_RAW_PARENTS, "p"))
-    session.indirect_names.update(_RAW_PARENTS)
-    session.partition_roots.update(_RAW_PARENTS)
+async def test_geo_inventory_excludes_unconsumed_families_and_preserves_full_profile_availability():
+    session = _session(installed=(*snapshot._GEO_TABLES, *_RAW_PARENTS))
     assert set(snapshot._GEO_TABLES) == set(snapshot._COMMON_TABLES) | set(NPI_CANONICAL_TABLES) | {
         "npi_canonical_publication_receipt",
         "npi_canonical_publication_receipt_seal",
@@ -50,42 +61,19 @@ async def test_geo_inventory_excludes_only_unconsumed_families_and_preserves_ful
         "nucc_taxonomy",
     }
     async with snapshot.provider_geo_read_snapshot(_database(session), "mrf") as actual:
-        assert actual is session and execution.has_network_read_inventory()
+        assert actual is session
         assert set(snapshot._SNAPSHOT.get()) == {"mrf." + name for name in snapshot._GEO_TABLES}
         assert snapshot.snapshot_relation_available("mrf.nucc_taxonomy") is True
         assert not any("mrf." + name in snapshot._SNAPSHOT.get() for name in _RAW_PARENTS)
     assert not any(event.startswith("LOCK TABLE") for event in session.events)
     async with snapshot.provider_profile_read_snapshot(_database(session), "mrf", include_detail=True):
         assert all(snapshot.snapshot_relation_available("mrf." + name) for name in _RAW_PARENTS)
-    assert sum(event.startswith("LOCK TABLE") for event in session.events) == 1
-    assert snapshot._SNAPSHOT.get() is None and not execution.has_network_read_inventory()
-
-
-@pytest.mark.parametrize("name", ("npi", "nucc_taxonomy", snapshot._CMS_RECEIPT_TABLE))
-@pytest.mark.parametrize("damage", ("partitioned", "inherited"))
-async def test_geo_snapshot_keeps_consumed_relation_topology_guard(name, damage):
-    session = _Session(installed=snapshot._GEO_TABLES)
-    if damage == "partitioned":
-        session.kinds[name] = "p"
-    else:
-        session.indirect_names.add(name)
-    with pytest.raises(ServiceUnavailable):
-        async with snapshot.provider_geo_read_snapshot(_database(session), "mrf"):
-            pytest.fail("unsupported consumed topology reached geo loader")
-    assert snapshot._SNAPSHOT.get() is None and not execution.has_network_read_inventory()
-
-
-@pytest.mark.parametrize("change", (None, 999))
-async def test_geo_snapshot_keeps_fresh_name_and_oid_recheck(change):
-    session = _Session(installed=snapshot._GEO_TABLES)
-    session.catalog_change = {'"mrf"."npi"': change}
-    with pytest.raises(snapshot._SnapshotSetupChanged):
-        async with snapshot.provider_geo_read_snapshot(_database(session), "mrf"):
-            pytest.fail("stale geo name reached loader")
+    assert not any(event.startswith("LOCK TABLE") for event in session.events)
+    assert snapshot._SNAPSHOT.get() is None
 
 
 async def test_geo_snapshot_preserves_cms_withdrawal_history_requirement(monkeypatch):
-    session = _Session(installed=snapshot._GEO_TABLES)
+    session = _session(installed=snapshot._GEO_TABLES)
     session.answers[snapshot._CMS_RECEIPT_TABLE] = True
     session.answers[snapshot._PROFILE_GENERATION_TABLE] = False
     missing_receipt = AsyncMock(return_value=None)
@@ -94,46 +82,47 @@ async def test_geo_snapshot_preserves_cms_withdrawal_history_requirement(monkeyp
         async with snapshot.provider_geo_read_snapshot(_database(session), "mrf"):
             pytest.fail("withdrawn CMS profile bypassed receipt history")
     missing_receipt.assert_awaited_once_with(session, "mrf")
-    assert snapshot._SNAPSHOT.get() is None and not execution.has_network_read_inventory()
+    assert snapshot._SNAPSHOT.get() is None
 
 
-@pytest.mark.parametrize("drift", (False, True))
-async def test_geo_snapshot_checks_native_address_authority_and_original_names(monkeypatch, drift):
-    session = _Session(installed=snapshot._GEO_TABLES)
+@pytest.mark.parametrize("refused", (False, True))
+async def test_geo_snapshot_preserves_selected_address_generation_and_its_failure(monkeypatch, refused):
+    session = _session(installed=snapshot._GEO_TABLES)
     session.answers[snapshot.address_generation.TABLE_NAME] = True
-    pins = tuple(session.current[f'"mrf"."{name}"'] for name in snapshot.address_generation.RELATION_NAMES)
+    generation, failure = object(), RuntimeError("address generation unavailable")
 
     async def read_authority(actual, *, schema_name):
         assert actual is session and schema_name == "mrf"
-        if drift:
-            session.current['"mrf"."npi"'] = 999
-        return SimpleNamespace(relation_oids=pins)
+        if refused:
+            raise failure
+        return generation
 
     monkeypatch.setattr(snapshot.address_generation, "read_entity_address_result_generation_authority", read_authority)
-    if drift:
-        with pytest.raises(ServiceUnavailable):
+    if refused:
+        with pytest.raises(RuntimeError) as caught:
             async with snapshot.provider_geo_read_snapshot(_database(session), "mrf"):
-                pytest.fail("drifted geo authority reached loader")
+                pytest.fail("failed address generation reached loader")
+        assert caught.value is failure
     else:
         async with snapshot.provider_geo_read_snapshot(_database(session), "mrf"):
-            assert session.info["provider_profile_native_authorities"]["entity-address"].relation_oids == pins
-            await execution.execute_network_read(session, text("SELECT geo_payload"))
+            assert session.info["provider_profile_native_authorities"]["entity-address"] is generation
     assert "provider_profile_native_authorities" not in session.info
 
 
 @pytest.mark.parametrize("failure", (ValueError("loader"), asyncio.CancelledError()))
 async def test_geo_snapshot_restores_context_on_loader_failure(failure):
-    session = _Session(installed=snapshot._GEO_TABLES)
+    session = _session(installed=snapshot._GEO_TABLES)
     with pytest.raises(type(failure)) as caught:
         async with snapshot.provider_geo_read_snapshot(_database(session), "mrf"):
             raise failure
     assert caught.value is failure
-    assert snapshot._SNAPSHOT.get() is None and not execution.has_network_read_inventory()
+    assert snapshot._SNAPSHOT.get() is None
 
 
 @pytest.mark.parametrize("loader_failure", (False, True))
 async def test_geo_snapshot_reuses_setup_retry_without_replaying_loader(monkeypatch, loader_failure):
     opened, closed, loaded = [], [], []
+    original = DBAPIError("synthetic setup", {}, SimpleNamespace(sqlstate="55P03"))
 
     @asynccontextmanager
     async def reader_session():
@@ -148,20 +137,26 @@ async def test_geo_snapshot_reuses_setup_retry_without_replaying_loader(monkeypa
     async def read_scope(session, _schema, *, include_detail, table_names):
         assert include_detail is True and table_names is snapshot._GEO_TABLES
         if len(opened) == 1:
-            raise snapshot._SnapshotSetupChanged("setup")
+            raise original
         yield session
 
     monkeypatch.setattr(snapshot, "_read_snapshot_scope", read_scope)
     database = SimpleNamespace(
         has_reader_session=lambda: False, _transaction_binding=lambda: None, reader_session=reader_session
     )
-    try:
+
+    async def load():
         async with snapshot.provider_geo_read_snapshot(database, "mrf") as session:
             loaded.append(session)
             if loader_failure:
-                raise snapshot._SnapshotSetupChanged("loader")
-    except snapshot._SnapshotSetupChanged:
-        assert loader_failure
+                raise original
+
+    if loader_failure:
+        with pytest.raises(ServiceUnavailable) as caught:
+            await load()
+        assert caught.value.__cause__ is original
+    else:
+        await load()
     assert len(opened) == 2 and opened == closed and loaded == opened[1:]
 
 

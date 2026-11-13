@@ -16,7 +16,7 @@ from uuid import UUID
 from db.plan_release_storage import storage_identifier
 from db.registry_fhir_catalog import SNAPSHOT_COLUMNS
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
-from process.registry_fhir_catalog_custody import verify_fhir_catalog_snapshot
+from process.registry_fhir_catalog_custody import validate_fhir_catalog_snapshot_record
 from process.registry_fhir_catalog_fingerprints import require_fhir_catalog_mapping_revision
 from process.registry_fhir_catalog_observation import CATALOG_OBSERVATION_CONTRACT
 from process.registry_fhir_catalog_publication import (
@@ -24,14 +24,12 @@ from process.registry_fhir_catalog_publication import (
     FHIRCatalogPublicationRuntime,
     validated_fhir_catalog_command,
 )
-from process.registry_fhir_catalog_published_read import fhir_catalog_published_reads
 from process.registry_fhir_catalog_registry_reader import (
     catalog_projection_generations,
     require_retained_fhir_catalog_sources,
 )
 from process.registry_fhir_catalog_retained import (
     normalize_fhir_catalog_retained_source_uri,
-    pin_retained_fhir_catalog_source,
     retained_fhir_catalog_read_source,
     retained_fhir_catalog_recipe,
 )
@@ -42,7 +40,6 @@ from process.registry_fhir_catalog_sources import (
     MAX_PAGE,
     FHIRCatalogSourceReadProfile,
     fhir_catalog_source_generation,
-    is_named_fhir_catalog_descriptor,
     require_current_fhir_catalog_sources,
     validate_fhir_catalog_source_descriptor,
 )
@@ -64,31 +61,6 @@ from process.uhc_flex_practitioner_async_safety import drain_operation
 MAX_CONFIG_BYTES = 1048576
 MAX_CROSSWALKS = 5000
 _CONTEXT = ContextVar("registry_fhir_catalog_grant_source_snapshot", default=None)
-_IDENTITY_SQL = """SELECT pg_catalog.current_database()::text AS database_name,
- (SELECT oid::bigint FROM pg_catalog.pg_database WHERE datname=pg_catalog.current_database()) AS database_oid,
- (pg_catalog.pg_control_system()).system_identifier::text AS system_identifier,
- pg_catalog.pg_postmaster_start_time() AS postmaster_started,pg_catalog.pg_is_in_recovery() AS recovering"""
-_ROLE_SQL = """SELECT r.rolname,r.rolcanlogin,r.rolsuper,r.rolcreatedb,r.rolcreaterole,r.rolreplication,r.rolbypassrls,
- EXISTS(SELECT FROM pg_catalog.pg_roles elevated WHERE
-   (elevated.rolsuper OR elevated.rolcreatedb OR elevated.rolcreaterole OR elevated.rolreplication OR elevated.rolbypassrls
-    OR elevated.rolname IN ('pg_read_all_data','pg_write_all_data','pg_read_server_files','pg_write_server_files',
-       'pg_execute_server_program','pg_signal_backend','pg_checkpoint','pg_create_subscription'))
-   AND pg_catalog.pg_has_role(r.oid,elevated.oid,'MEMBER')) AS elevated_membership
- FROM pg_catalog.pg_roles r WHERE r.rolname=current_user"""
-_PROFILES_SQL = """SELECT p.schema_name,
- CASE WHEN p.published_read_scope IS NULL THEN
-   EXISTS(SELECT FROM pg_catalog.pg_roles allowed WHERE allowed.rolname=ANY(p.runtime_roles)
-     AND pg_catalog.pg_has_role(current_user,allowed.oid,'USAGE'))
- ELSE session_user=current_user AND current_user::text=p.published_read_scope->>'reader_role'
-   AND (SELECT oid::bigint FROM pg_catalog.pg_roles WHERE rolname=current_user)=
-     (p.published_read_scope->>'reader_oid')::bigint END AS admitted_role,
- owner.oid IS NOT NULL AND NOT (pg_catalog.pg_has_role(current_user,owner.oid,'MEMBER')
-   OR pg_catalog.pg_has_role(current_user,owner.oid,'SET')) AS no_owner_path,
- NOT coalesce(pg_catalog.has_schema_privilege(current_user,
-   pg_catalog.to_regnamespace(pg_catalog.format('%I',p.schema_name)),'CREATE'),true)
-   AS no_schema_create
- FROM jsonb_to_recordset($1::jsonb) p(schema_name text,owner_role text,runtime_roles text[],published_read_scope jsonb)
- LEFT JOIN pg_catalog.pg_roles owner ON owner.rolname=p.owner_role"""
 _DESCRIPTORS_SQL = """WITH page AS MATERIALIZED (
  SELECT source_generation,source_id,descriptor_json::text AS document
  FROM {namespace}.registry_fhir_catalog_source
@@ -314,7 +286,6 @@ class _SourceSnapshot:
     grant_sha256: str
     current: tuple[dict, ...]
     retained: tuple[dict, ...] = ()
-    retained_reads: tuple[object, ...] = ()
     authorized: bool = False
 
 
@@ -328,7 +299,7 @@ async def _protected_snapshot(connection, proposed, grant, *, generation=None, p
     )
     if stored is None:
         _fail("snapshot_unavailable")
-    await verify_fhir_catalog_snapshot(connection, stored)
+    await validate_fhir_catalog_snapshot_record(connection, stored)
     if generation is None and (
         stored["schema_name"] != proposed["schema_name"] or metadata_generation(proposed) != selected_generation
     ):
@@ -352,8 +323,19 @@ async def load_fhir_catalog_source_descriptors(connection, snapshot, vector):
             for entry in entries:
                 if entry["document"] is None:
                     _fail("descriptor_bounds")
-                descriptor = validate_fhir_catalog_source_descriptor(json.loads(entry["document"]))
-                generation = fhir_catalog_source_generation(descriptor)
+                stored = json.loads(entry["document"])
+                descriptor = validate_fhir_catalog_source_descriptor(stored)
+                legacy_fields = {
+                    "resource_table_oid",
+                    "resource_leaf_oids",
+                    "header_table_oid",
+                    "database_oid",
+                    "native_catalog_sha256",
+                }
+                is_legacy = set(stored) == set(descriptor) - {"tables"} | legacy_fields
+                if is_legacy:
+                    _digest(entry["source_generation"])
+                generation = entry["source_generation"] if is_legacy else fhir_catalog_source_generation(descriptor)
                 if (
                     generation != entry["source_generation"]
                     or descriptor["coordinates"]["source_id"] != entry["source_id"]
@@ -504,50 +486,6 @@ def _active_context(connection, snapshot, grant, *, required=True):
     return context
 
 
-async def _reader_identity(reader, writer, descriptors):
-    reader_identity_by_field = dict(await reader.fetchrow(_IDENTITY_SQL))
-    writer_identity_by_field = dict(await writer.fetchrow(_IDENTITY_SQL))
-    if reader_identity_by_field != writer_identity_by_field or reader_identity_by_field["recovering"] is not False:
-        _fail("database_changed")
-    if any(descriptor["database_oid"] != reader_identity_by_field["database_oid"] for descriptor in descriptors):
-        _fail("database_changed")
-    role = await reader.fetchrow(_ROLE_SQL)
-    if (
-        role is None
-        or role["rolcanlogin"] is not True
-        or any(
-            role[field] is not False
-            for field in (
-                "rolsuper",
-                "rolcreatedb",
-                "rolcreaterole",
-                "rolreplication",
-                "rolbypassrls",
-                "elevated_membership",
-            )
-        )
-    ):
-        _fail("reader_role_unsafe")
-    profiles_by_document = {
-        canonical_json(descriptor["native_read_profile"]): descriptor["native_read_profile"]
-        for descriptor in descriptors
-    }
-    for descriptor in descriptors:
-        if descriptor["profile"] == "retained_normalized":
-            capture = retained_fhir_catalog_read_source(descriptor).retained_capture
-            profile = FHIRCatalogSourceReadProfile(
-                capture.schema_name, capture.owner_role, capture.runtime_roles
-            ).document()
-            profiles_by_document[canonical_json(profile)] = profile
-    permissions = await reader.fetch(_PROFILES_SQL, canonical_json(list(profiles_by_document.values())))
-    if len(permissions) != len(profiles_by_document) or any(
-        entry[field] is not True
-        for entry in permissions
-        for field in ("admitted_role", "no_owner_path", "no_schema_create")
-    ):
-        _fail("reader_role_unsafe")
-
-
 @asynccontextmanager
 async def _readonly_snapshot(reader):
     transaction = reader.transaction(isolation="repeatable_read", readonly=True)
@@ -555,8 +493,7 @@ async def _readonly_snapshot(reader):
     try:
         await drain_operation(transaction.start(), preserve_cancellation=True)
         await reader.execute("SET LOCAL search_path = pg_catalog, pg_temp, public")
-        with fhir_catalog_published_reads(reader):
-            yield
+        yield
     except BaseException as error:
         original_error = error
         raise
@@ -648,18 +585,11 @@ class _GrantCallbacks:
                 if current:
                     await stack.enter_async_context(fhir_catalog_source_publication_fence(reader, current))
                 async with _readonly_snapshot(reader):
-                    await _reader_identity(reader, connection, current + retained)
-                    reads = tuple(
-                        [
-                            await pin_retained_fhir_catalog_source(reader, retained_descriptor)
-                            for retained_descriptor in retained
-                        ]
-                    )
-                    async with self._brand(connection, reader, stored, current, retained, reads):
+                    async with self._brand(connection, reader, stored, current, retained):
                         yield
 
     @asynccontextmanager
-    async def _brand(self, writer, reader, snapshot, current, retained=(), reads=()):
+    async def _brand(self, writer, reader, snapshot, current, retained=()):
         token = _CONTEXT.set(
             _SourceSnapshot(
                 asyncio.current_task(),
@@ -669,7 +599,6 @@ class _GrantCallbacks:
                 self.grant.sha256,
                 current,
                 retained,
-                reads,
             )
         )
         try:
@@ -693,8 +622,6 @@ class _GrantCallbacks:
             await require_retained_fhir_catalog_sources(
                 connection, context.retained, control_schema=self.grant.control_schema
             )
-            for retained_read in context.retained_reads:
-                await retained_read.verify(context.reader, retained_read.capture)
         return True
 
 
@@ -806,7 +733,7 @@ async def _verify_fresh_observation(reader, connection, snapshot, generation, de
 
 
 async def _verify_observation_replay(connection, snapshot, generation, descriptor, source_rows, expected):
-    """Compare independent replay with the exact sealed facts and source accounting."""
+    """Compare independent replay with complete stored facts and source accounting."""
     stored = await fhir_catalog_observation_digest(
         connection, schema_name=snapshot["schema_name"], source_generation=generation
     )
@@ -889,7 +816,7 @@ def build_fhir_catalog_observation_verifier(
         _fail("source_export_invalid")
 
     async def verify_inputs(*, connection, copy_target, snapshot, standing_grant):
-        """Verify fresh facts or exact prior custody only after candidate writes close."""
+        """Validate fresh facts or matching prior content after candidate writes close."""
         if standing_grant.sha256 != grant.sha256 or copy_target.schema_name != snapshot["schema_name"]:
             _fail("policy_changed")
         vector = snapshot_inputs(snapshot)["source_vector_json"]
@@ -946,7 +873,7 @@ async def _verify_committed_source_history(connection, snapshot, prior, vector, 
 async def _verify_cached_observations(
     connection, snapshot, prior, vector, descriptors, previous, *, source_companies_only
 ):
-    """Verify carried facts against prior custody and return only sources requiring independent replay."""
+    """Validate carried content and return sources requiring independent replay."""
     from process.registry_fhir_plan_tier import needs_plan_tier_refresh
 
     fresh_sources = []
@@ -988,14 +915,6 @@ async def verify_current_fhir_catalog_source_companies(source_export, connection
         async with open_source_owned_catalog_export(source_export, profile, connection) as export:
             for entry in entries:
                 descriptor = descriptors[entry["source_generation"]]
-                if "native_read_profile" in export and not is_named_fhir_catalog_descriptor(descriptor):
-                    _fail("source_not_admitted")
-                if (
-                    not is_named_fhir_catalog_descriptor(descriptor)
-                    and "database_identity" in export
-                    and descriptor["database_oid"] != export["database_identity"]["database_oid"]
-                ):
-                    _fail("database_changed")
                 labels = await collect_fhir_catalog_source_companies(export, descriptor, required=True)
                 if labels != entry["source_companies"]:
                     _fail("source_companies_changed")
@@ -1013,7 +932,7 @@ async def _replay_registered_observations(source_pool, connection, snapshot, gra
         _fail("source_not_admitted")
     exported_sources, native_sources = [], []
     for source in sources:
-        if source_export is not None and "published_read_scope" not in source[1]["native_read_profile"]:
+        if source_export is not None:
             exported_sources.append(source)
         else:
             native_sources.append(source)
@@ -1027,13 +946,12 @@ async def _replay_registered_observations(source_pool, connection, snapshot, gra
         if reader is connection:
             _fail("reader_required")
         async with fhir_catalog_reference_workspace(reader) as workspace, _readonly_snapshot(reader):
-            await _reader_identity(reader, connection, tuple(descriptor for _, descriptor in native_sources))
             for generation, descriptor in native_sources:
                 await _verify_fresh_observation(reader, connection, snapshot, generation, descriptor, workspace)
 
 
 async def _replay_source_owned_observations(source_export, connection, snapshot, sources):
-    """Reopen each admitted profile under Source ownership for independent sealing replay."""
+    """Reopen each configured source profile for independent content replay."""
     sources_by_profile = {}
     for generation, descriptor in sources:
         profile_key = canonical_json(descriptor["native_read_profile"])
@@ -1042,14 +960,6 @@ async def _replay_source_owned_observations(source_export, connection, snapshot,
         profile = source_profile(json.loads(profile_key))
         async with open_source_owned_catalog_export(source_export, profile, connection) as export:
             for generation, descriptor in selected:
-                if "native_read_profile" in export and not is_named_fhir_catalog_descriptor(descriptor):
-                    _fail("source_not_admitted")
-                if (
-                    not is_named_fhir_catalog_descriptor(descriptor)
-                    and "database_identity" in export
-                    and descriptor["database_oid"] != export["database_identity"]["database_oid"]
-                ):
-                    _fail("database_changed")
                 expected = _ObservationReplayDigest()
                 source_rows = await export["replay"](descriptor, expected.collect)
                 if type(source_rows) is not int:

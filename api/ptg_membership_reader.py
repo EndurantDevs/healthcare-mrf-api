@@ -3,7 +3,6 @@
 
 from sqlalchemy import text
 
-from api.network_read_execution import execute_network_read
 from api.ptg2_v4_graph import _charge_v4_taxonomy_projection_work, v4_npi_keys_for_values
 from api.ptg_membership_contract import encoded
 from api.ptg_membership_source import source_identity
@@ -49,8 +48,9 @@ async def _attached_index(session, tables, request, state):
             request.code_system,
             request.code,
             tables=tables,
+            api_read=True,
         )
-        state.membership_index = await locate(session, identity)
+        state.membership_index = await locate(session, identity, api_read=True)
         state.membership_index_checked = True
     return state.membership_index
 
@@ -68,8 +68,7 @@ async def _membership_pairs(session, tables, npis, request, state, ownership, co
     projection_remaining = request.forward_limits.maximum_projection_members - state.indexed_projection_members
     projection_row = (
         (
-            await execute_network_read(
-                session,
+            await session.execute(
                 membership_statement(ownership.schema_name),
                 {
                     "npis": list(npi_keys_by_value),

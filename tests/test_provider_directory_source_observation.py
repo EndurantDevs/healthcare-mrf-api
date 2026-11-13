@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Host transport tests for issued readonly authority; Native proof is separate."""
+"""Named observation routing, logical transaction lifetime and failure cleanup."""
 
 import asyncio
 from contextlib import asynccontextmanager
@@ -19,24 +19,11 @@ from process.provider_directory_generic_source_policy import GenericSourcePolicy
 
 class Driver:
     def __init__(self):
-        self.is_open = True
         self.calls = []
-        self.actor_by_field = dict(
-            session="publisher",
-            current="owner",
-            backend=123,
-            readonly="on",
-            isolation="repeatable read",
-            transaction="7/91",
-        )
-
-    def is_in_transaction(self):
-        return self.is_open
 
     async def fetchrow(self, sql):
-        assert sql == observation._ORIGIN_SQL
         self.calls.append(sql)
-        return dict(self.actor_by_field)
+        raise AssertionError("observation attempted physical identity lookup")
 
 
 class Database:
@@ -62,22 +49,19 @@ class Database:
 class Factory:
     def __init__(self):
         self.policy = GenericSourcePolicy("synthetic", "owner", "publisher", ("reader",), ())
-        self.producer_identity = ("a" * 40, "sha256:" + "b" * 64)
         self.driver = Driver()
-        self.session = SimpleNamespace(driver=self.driver)
+        self.transaction = SimpleNamespace(is_active=False)
+        self.session = SimpleNamespace(driver=self.driver, get_transaction=lambda: self.transaction)
         self.events = []
-        self.policy_checks = []
-
-    def _require_current_policy(self):
-        self.policy_checks.append(True)
 
     @asynccontextmanager
     async def observation_transaction(self, *, isolation):
-        self.driver.actor_by_field["isolation"] = isolation
+        self.transaction.is_active = True
         self.events.append(("enter", isolation))
         try:
             yield self.session
         finally:
+            self.transaction.is_active = False
             self.events.append(("exit", isolation))
 
 
@@ -102,8 +86,8 @@ async def test_genuine_observation_is_bound_and_leaves_no_writer_authority(case)
         issued = observation.current_observation(directory)
         assert issued.session is session is factory.session
         assert issued.connection is factory.driver
-        assert issued.origin == (123, "7/91")
-        assert issued.task is asyncio.current_task() and issued.producer == factory.producer_identity
+        assert issued.policy == factory.policy and issued.isolation == "repeatable read"
+        assert session.get_transaction().is_active
         assert observation.source._PUBLISHER.get() is None and observation.source._OWNER.get() is None
         assert directory.db._transaction_binding().session is session
     assert observation.current_observation(directory) is None
@@ -130,7 +114,7 @@ async def test_named_observation_checks_transaction_lifecycle_without_connection
     factory.session.get_transaction = lambda: transaction
     async with observation.observation_transaction(case.directory, isolation="repeatable read"):
         assert transaction.is_active
-    with pytest.raises(RuntimeError, match="observation_transaction_changed"):
+    with pytest.raises(RuntimeError, match="observation_transaction_required"):
         async with observation.observation_transaction(case.directory, isolation="repeatable read"):
             transaction.is_active = False
     assert factory.driver.calls == []
@@ -150,7 +134,7 @@ async def test_named_observation_cannot_restart_factory_managed_transaction(case
             yield session
 
     factory.observation_transaction = managed_observation
-    with pytest.raises(RuntimeError, match="source_observation_transaction_changed"):
+    with pytest.raises(RuntimeError, match="source_observation_transaction_required"):
         async with observation.observation_transaction(case.directory, isolation="repeatable read"):
             await session.commit()
             with pytest.raises(InvalidRequestError, match="closed transaction inside context manager"):
@@ -172,17 +156,15 @@ async def test_named_observation_accepts_equal_logical_storage_coordinates(case)
     assert factory.driver.calls == []
 
 
-@pytest.mark.parametrize(
-    ("field", "replacement"),
-    [("session", "reader"), ("current", "reader"), ("readonly", "off"), ("backend", 0), ("transaction", None)],
-)
-async def test_native_wrong_actor_or_transaction_refuses_before_body(case, field, replacement):
-    case.factory.driver.actor_by_field[field] = replacement
-    with pytest.raises(RuntimeError, match="actor_changed"):
+@pytest.mark.parametrize("transaction", [None, SimpleNamespace(is_active=False)])
+async def test_inactive_transaction_refuses_before_body(case, transaction):
+    case.factory.session.get_transaction = lambda: transaction
+    with pytest.raises(RuntimeError, match="observation_transaction_required"):
         async with observation.observation_transaction(case.directory, isolation="repeatable read"):
-            pytest.fail("wrong native actor exposed")
+            pytest.fail("inactive transaction exposed")
     assert case.directory.db._transaction_binding() is None
     assert case.factory.events[-1][0] == "exit"
+    assert case.factory.driver.calls == []
 
 
 async def test_read_committed_cannot_satisfy_repeatable_read(case):
@@ -192,55 +174,37 @@ async def test_read_committed_cannot_satisfy_repeatable_read(case):
                 pytest.fail("weaker snapshot exposed")
 
 
-async def test_inherited_task_cannot_use_parent_observation(case):
-    async with observation.observation_transaction(case.directory, isolation="repeatable read"):
-        before = len(case.factory.driver.calls)
-
-        async def child():
-            with pytest.raises(RuntimeError, match="observation_changed"):
-                observation.current_observation(case.directory)
-
-        await asyncio.create_task(child())
-        assert len(case.factory.driver.calls) == before
-
-
-async def test_unissued_or_closed_record_cannot_be_replayed(case):
+async def test_closed_observation_transaction_cannot_be_reused(case):
     async with observation.observation_transaction(case.directory, isolation="repeatable read"):
         issued = observation.current_observation(case.directory)
-        token = observation._ACTIVE.set(replace(issued))
-        try:
-            with pytest.raises(RuntimeError, match="observation_changed"):
-                observation.current_observation(case.directory)
-        finally:
-            observation._ACTIVE.reset(token)
     token = observation._ACTIVE.set(issued)
     try:
-        with pytest.raises(RuntimeError, match="observation_changed"):
-            observation.current_observation(case.directory)
+        with pytest.raises(RuntimeError, match="observation_transaction_required"):
+            async with observation.observation_transaction(case.directory, isolation="repeatable read"):
+                pytest.fail("closed transaction exposed")
     finally:
         observation._ACTIVE.reset(token)
 
 
-@pytest.mark.parametrize("change", ["backend", "transaction", "readonly", "isolation", "driver", "binding", "policy"])
-async def test_postcheck_rejects_replaced_native_or_logical_binding(case, change):
-    with pytest.raises(RuntimeError):
+@pytest.mark.parametrize("change", ["inactive", "missing", "policy"])
+async def test_postcheck_rejects_closed_transaction_or_changed_schema(case, change):
+    with pytest.raises(RuntimeError, match="transaction_required|schema_changed"):
         async with observation.observation_transaction(case.directory, isolation="repeatable read"):
-            if change in {"backend", "transaction", "readonly", "isolation"}:
-                case.factory.driver.actor_by_field[change] = "changed"
-            if change == "driver":
-                case.factory.session.driver = Driver()
-            if change == "binding":
-                case.directory.db.binding.set(None)
-            if change == "policy":
+            if change == "inactive":
+                case.factory.transaction.is_active = False
+            elif change == "missing":
+                case.factory.session.get_transaction = lambda: None
+            else:
                 case.factory.policy = GenericSourcePolicy("other", "owner", "publisher", ("reader",), ())
     assert observation._ACTIVE.get() is None
+    assert case.directory.db._transaction_binding() is None
 
 
 async def test_primary_cancellation_preserved_with_postcheck_failure(case):
     original = asyncio.CancelledError("original")
     with pytest.raises(asyncio.CancelledError) as caught:
         async with observation.observation_transaction(case.directory, isolation="repeatable read"):
-            case.factory.driver.actor_by_field["readonly"] = "off"
+            case.factory.transaction.is_active = False
             raise original
     assert caught.value is original
     assert isinstance(caught.value.__cause__, BaseExceptionGroup)
@@ -248,12 +212,13 @@ async def test_primary_cancellation_preserved_with_postcheck_failure(case):
     assert case.directory.db._transaction_binding() is None
 
 
-async def test_primary_error_preserved_when_observation_stays_valid(case):
-    original = LookupError("original")
-    with pytest.raises(LookupError) as caught:
+@pytest.mark.parametrize("original", [LookupError("original"), PermissionError("read-only transaction")])
+async def test_primary_error_preserved_when_observation_stays_valid(case, original):
+    with pytest.raises(type(original)) as caught:
         async with observation.observation_transaction(case.directory, isolation="repeatable read"):
             raise original
     assert caught.value is original
+    assert case.directory.db._transaction_binding() is None
 
 
 @pytest.mark.parametrize("context_name", ["_PUBLISHER", "_OWNER"])
@@ -278,13 +243,9 @@ async def test_ordinary_bound_transaction_cannot_become_source_observation(case)
 
 
 @pytest.fixture
-def private_case(case, monkeypatch):
+def private_case(case):
     case.factory.policy = replace(case.factory.policy, schema="private_source")
-    case.factory.storage_binding = storage.FHIRSourceStorageBinding(
-        "synthetic", "private_source", 100, 101, 102, 103, 104, "c" * 64
-    )
-    case.verify_coordinates = AsyncMock()
-    monkeypatch.setattr(storage, "verify_isolated_source_storage_coordinates", case.verify_coordinates)
+    case.factory.storage_binding = storage.FHIRSourceStorageBinding("synthetic", "private_source")
     return case
 
 
@@ -294,21 +255,18 @@ async def test_private_observation_keeps_catalog_and_storage_separate(private_ca
     async with observation.observation_transaction(case.directory, isolation="repeatable read"):
         assert observation.current_storage_binding("synthetic") is case.factory.storage_binding
         assert observation.source._PUBLISHER.get() is None and observation.source._OWNER.get() is None
-        case.verify_coordinates.assert_awaited_with(
-            case.factory.driver, case.factory.policy, case.factory.storage_binding
-        )
+        assert case.factory.driver.calls == []
         with pytest.raises(RuntimeError, match="schema_changed"):
             observation.current_storage_binding("private_source")
     assert observation.current_storage_binding("synthetic") is None
 
 
-@pytest.mark.parametrize("change", ["catalog_schema", "storage_schema", "binding", "locator"])
+@pytest.mark.parametrize("change", ["catalog_schema", "storage_schema", "locator"])
 async def test_private_observation_refuses_changed_coordinates(private_case, change):
     case = private_case
     mutation_by_kind = {
         "catalog_schema": (case.directory, "_schema", lambda: "other_catalog"),
         "storage_schema": (case.factory, "policy", replace(case.factory.policy, schema="other_private")),
-        "binding": (case.factory, "storage_binding", replace(case.factory.storage_binding)),
         "locator": (
             case.factory,
             "storage_binding",
@@ -323,28 +281,6 @@ async def test_private_observation_refuses_changed_coordinates(private_case, cha
     assert all(
         isinstance(error, RuntimeError) and "source_observation" in str(error) for error in failures.value.exceptions
     )
-
-
-async def test_private_observation_refuses_native_storage_drift(private_case):
-    case = private_case
-    case.verify_coordinates.side_effect = RuntimeError("native storage changed")
-    with pytest.raises(RuntimeError, match="native storage changed"):
-        async with observation.observation_transaction(case.directory, isolation="repeatable read"):
-            pytest.fail("changed native coordinates exposed")
-    assert observation._ACTIVE.get() is None
-    assert case.directory.db._transaction_binding() is None
-
-
-async def test_private_observation_cannot_be_inherited_by_child(private_case):
-    case = private_case
-    async with observation.observation_transaction(case.directory, isolation="repeatable read"):
-
-        async def child():
-            with pytest.raises(RuntimeError, match="observation_changed"):
-                observation.current_storage_binding("synthetic")
-
-        await asyncio.create_task(child())
-        assert observation.current_storage_binding("synthetic") is case.factory.storage_binding
 
 
 async def test_named_input_capture_uses_issued_reader_with_another_supplied_session(case, monkeypatch):

@@ -1,6 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Bounded predecessor streams preserve commitments and honor every SQL result."""
 
+import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -11,16 +13,33 @@ from tests.rooted_predecessor_component_support import LegacyPages
 from tests.test_provider_directory_rooted_graph_publication_freeze import SCHEMA, _current_bodies
 
 
+def test_metadata_query_preserves_json_literals_after_asyncpg_compilation():
+    from sqlalchemy import text
+    from sqlalchemy.dialects.postgresql.asyncpg import dialect
+
+    query = validation.legacy_metadata_query(freeze.validation_body_sql(freeze.LEGACY, SCHEMA), SCHEMA)
+    statement = text(query).compile(dialect=dialect())
+    compiled = str(statement)
+    literal = re.search(r"reviewed_root_policy_json = '([^']+)'::jsonb", compiled)
+    assert literal is not None
+    assert json.loads(literal.group(1)) == {
+        "policy_version": "provider-directory-reviewed-root-policy-v1",
+        "required_root_count": 1,
+    }
+    assert statement.params == {"dataset_id": None}
+    assert "https://flex.optum.com/fhirpublic/R4" in compiled
+
+
 @pytest.mark.asyncio
 async def test_legacy_streams_cross_pages_without_omissions(monkeypatch):
     database = LegacyPages()
     monkeypatch.setattr(validation, "PAGE_ROWS", 2)
     current = SimpleNamespace(dataset_id="edition", dataset_hash=database.dataset_hash, resource_count=3)
-    digest, count, leaves = await validation.validate_legacy_content(
+    digest, count, _ = await validation.validate_legacy_content(
         database, current, {"candidate_acquisition_id": "acquisition"}
     )
     assert (digest, count) == (current.dataset_hash, 3)
-    assert list(leaves.values()) == [{11}, {12}, {13}, {14}]
+    assert len(database.layout_calls) == 1
     assert len(database.calls) == 9
     assert all(parameters["page_rows"] == 2 and "LIMIT :page_rows" in sql for sql, parameters in database.calls)
     assert [parameters["identity"] for _, parameters in database.calls if "identity" in parameters] == ["B.2", "c3"] * 3
@@ -30,14 +49,13 @@ async def test_legacy_streams_cross_pages_without_omissions(monkeypatch):
 @pytest.mark.asyncio
 async def test_unmatched_raw_row_remains_outside_published_provenance(monkeypatch):
     database = LegacyPages()
-    database.raw.append(dict(leaf=13, npi=1000000099, resource_id="unmatched", work_leaf=None, valid=True))
+    database.raw.append(dict(npi=1000000099, resource_id="unmatched", valid=True))
     current = SimpleNamespace(dataset_id="edition", dataset_hash=database.dataset_hash, resource_count=3)
     monkeypatch.setattr(validation, "PAGE_ROWS", 2)
-    digest, count, leaves = await validation.validate_legacy_content(
+    digest, count, _ = await validation.validate_legacy_content(
         database, current, {"candidate_acquisition_id": "acquisition"}
     )
     assert (digest, count) == (database.dataset_hash, 3)
-    assert leaves["provider_directory_uhc_flex_practitioner_work"] == {14}
 
 
 @pytest.mark.asyncio
@@ -68,6 +86,13 @@ def test_legacy_metadata_keeps_reviewed_predicates():
     assert query.endswith(" AND header.status='published'")
     assert ":dataset_id" in query and "candidate_dataset_id" not in query
     successor = freeze.wrapped_body(freeze.LEGACY, SCHEMA, original)
-    assert validation.legacy_metadata_query(successor, SCHEMA) == query
-    with pytest.raises(RuntimeError, match="predecessor_invalid"):
-        validation.legacy_metadata_query(original.replace("SELECT", "SELECT true OR", 1), SCHEMA)
+    retained = freeze.original_query(successor)
+    assert retained == original
+    assert validation.legacy_metadata_query(retained, SCHEMA) == query
+    for changed in (
+        original.replace(validation._CONTENT_ANCHOR, "", 1),
+        original + validation._CONTENT_ANCHOR,
+        original.replace("candidate_dataset_id", "unbound_dataset_id", 1),
+    ):
+        with pytest.raises(RuntimeError, match="predecessor_invalid"):
+            validation.legacy_metadata_query(changed, SCHEMA)

@@ -20,7 +20,6 @@ from process.registry_approval_store import (
 )
 from process.registry_approved_company_read import MAX_APPROVED_COMPANY_PAGE_SIZE, read_registry_approved_companies
 from process.registry_company_approval_fence import (
-    _source_engine,
     registry_company_approval_transaction,
     require_registry_company_approval_fence,
 )
@@ -38,7 +37,6 @@ from process.registry_membership_refresh_queue import (
 )
 from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
 from process.registry_ptg_scope_engine import RegistryPTGScopeEngineService
-from process.registry_publication_ptg_runtime import _IDENTITY_SQL
 from process.registry_publication_queue import (
     RegistryReactivationCommand,
     _reactivation_actor,
@@ -386,22 +384,9 @@ async def _configured_preview(request, service, command, actor, expected_head, *
         or (service.store.control_schema or control_schema) != control_schema
     ):
         raise RegistryImportedSelectionUnavailable("registry_imported_selection_unavailable")
-    async with request.ctx.sa_session.begin():
-        driver = await _driver(request.ctx.sa_session)
-        expected_by_name = dict(await driver.fetchrow(_IDENTITY_SQL.replace(":schema", "$1"), control_schema))
-    engine = _source_engine(service.reader_sessions)
     async with registry_company_approval_transaction(service.reader_sessions, control_schema=control_schema) as session:
         await require_registry_company_approval_fence(session, control_schema)
         driver = await _driver(session)
-        actual_by_name = dict(await driver.fetchrow(_IDENTITY_SQL.replace(":schema", "$1"), control_schema))
-        if actual_by_name["current_role"] != engine.url.username:
-            raise RegistryImportedSelectionUnavailable("registry_imported_selection_unavailable")
-        original_roles = [
-            identity.pop("session_role") == identity.pop("current_role")
-            for identity in (expected_by_name, actual_by_name)
-        ]
-        if expected_by_name != actual_by_name or actual_by_name["control_oid"] is None or not all(original_roles):
-            raise RegistryImportedSelectionUnavailable("registry_imported_selection_unavailable")
         authority = (session, service.store, RegistryPTGGraphReadBudget(16 * 1024 * 1024))
         if summary_only:
             return await _checked_preview(driver, command, actor, expected_head, authority, summary_only=True)

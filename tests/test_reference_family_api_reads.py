@@ -355,7 +355,7 @@ async def test_native_heap_admission_preserves_overlapping_prior_inventory(monke
 
     session, _proof = _reader(monkeypatch)
     name, oid = session.pairs_by_importer["claims-pricing"][0]
-    pin = CompactAddressRelation("mrf", name, oid)
+    pin = CompactAddressRelation("mrf", name)
     await execution.install_network_read_inventory(session, (pin,), only_relations=(pin,))
     await reads.pin_claims_reader(session, api_read=True)
     installed = execution._installed_read_inventory(session)

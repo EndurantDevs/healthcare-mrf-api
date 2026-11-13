@@ -17,9 +17,10 @@ from process.registry_source_inventory_preparation import SourceInventoryPrepara
 from process.registry_source_inventory_reference import SourceInventoryReference
 from process.registry_source_inventory_summaries import office_summary_v4
 from process.registry_source_recipe_store import RECIPE_DIGEST_KEY, canonical_registry_source_recipes
+from tests.registry_source_recipe_support import _derivation, _descriptor
 from tests.test_registry_ptg_office_membership_recipe import _recipe as _ptg_recipe
-from tests.test_registry_source_contributions import _recipe as _unprotected_recipe
-from tests.test_registry_source_inventory_preparation import _aca_recipe, _derivation, _descriptor
+from tests.test_registry_source_contributions import _recipe as _unretained_recipe
+from tests.test_registry_source_inventory_preparation import _aca_recipe
 
 _APPROVED = SimpleNamespace(approved_revision=7, generation_id="b" * 64)
 _ADDRESS = SimpleNamespace(generation_id="c" * 64)
@@ -36,16 +37,12 @@ def _recipe(index=0):
 
 
 def _cms_recipe():
-    recipe = _unprotected_recipe()
+    recipe = _unretained_recipe()
     return replace(
         recipe,
         source_pin=replace(
             recipe.source_pin,
             source_id="cms-npd",
-            custody_owner_role="synthetic_owner",
-            custody_runtime_roles=("synthetic_reader",),
-            custody_proof_sha256="d" * 64,
-            custody_catalog_sha256="e" * 64,
         ),
         binding_coordinates=replace(recipe.binding_coordinates, source_id="cms-npd"),
     )
@@ -97,10 +94,10 @@ def test_inventory_recipe_bound_preserves_legacy(count):
 
 
 @pytest.mark.parametrize("inventory", [False, True])
-def test_inventory_keeps_exact_pin_custody(inventory):
+def test_inventory_keeps_exact_logical_source_scope(inventory):
     accepted = (_recipe(), _aca_recipe(), _cms_recipe())
     assert len(offices.validate_initial_source_recipes(accepted, inventory=inventory)) == 3
-    for invalid in (list(accepted), (_unprotected_recipe(),), (accepted[0], accepted[0])):
+    for invalid in (list(accepted), (_unretained_recipe(),), (accepted[0], accepted[0])):
         with pytest.raises(offices.RegistryInitialSourceError, match="recipes_invalid"):
             offices.validate_initial_source_recipes(invalid, inventory=inventory)
 

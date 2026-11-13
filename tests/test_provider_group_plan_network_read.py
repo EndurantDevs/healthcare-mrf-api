@@ -15,6 +15,7 @@ from api import plan_release_serving
 from api import provider_group_plan_network_read as managed
 from api.network_address_scope import network_address_read_scope
 from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 from tests.test_pricing_api import (
@@ -30,7 +31,14 @@ from tests.test_pricing_api import (
 def held_scope():
     candidate = str(UUID(int=19))
     manifest = PinnedNetworkServingManifest(
-        17, candidate, "network_candidate_" + UUID(candidate).hex, 1, {}, 23, "b" * 64, 99
+        17,
+        candidate,
+        "network_candidate_" + UUID(candidate).hex,
+        1,
+        {},
+        23,
+        "b" * 64,
+        CompactAddressRelation("network_candidate_" + UUID(candidate).hex, "entity_address_unified"),
     )
     with network_address_read_scope(
         manifest,

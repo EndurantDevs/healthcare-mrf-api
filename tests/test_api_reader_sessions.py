@@ -127,11 +127,10 @@ def test_profile_reader_grants_cover_receipt_function_dependencies(monkeypatch):
 
 
 class ReaderSession(_FakeSession):
-    """Supply the genuine-login query result without a PostgreSQL connection."""
+    """Model configured transaction modes without a PostgreSQL connection."""
 
-    def __init__(self, identity=("reader_test", "reader_test")):
+    def __init__(self):
         super().__init__()
-        self.identity = identity
         self.info = {}
         self.modes = ("repeatable read", "on")
 
@@ -143,10 +142,11 @@ class ReaderSession(_FakeSession):
         ):
             self.executed.append((statement, params))
             return _FakeResult(self.modes)
-        if str(statement).startswith("SELECT session_user, current_user"):
-            self.executed.append((statement, params))
-            return _FakeResult((*self.identity, 12345, 23456, "192.0.2.1", 5432, 34567))
         return await super().execute(statement, params)
+
+    async def connection(self):
+        self._in_tx = True
+        return self
 
     async def commit(self):
         await super().commit()
@@ -356,7 +356,7 @@ async def test_npi_count_caller_keeps_both_queries_on_reader_owner(monkeypatch):
     monkeypatch.setattr(npi, "db", database)
     async with database.reader_session():
         assert await npi._compute_npi_counts() == [42, 42]
-    assert len(session.executed) == 3
+    assert len(session.executed) == 2
 
 
 async def test_ptg_network_caller_opens_independent_genuine_reader(monkeypatch):
@@ -413,13 +413,27 @@ async def test_reader_failure_and_cancellation_close_without_writer(monkeypatch,
     assert not database.has_reader_session()
 
 
-async def test_wrong_login_refuses_before_payload_and_closes(monkeypatch):
-    session = ReaderSession(("reader_test", "writer_test"))
+async def test_reader_starts_configured_transaction_without_setup_queries(monkeypatch):
+    session = ReaderSession()
     database = reader_database(monkeypatch, [session])
-    with pytest.raises(RuntimeError, match="login identity"):
+    async with database.reader_session() as acquired:
+        assert acquired is session and session.in_transaction()
+        assert session.info == {"api_reader_verified": True}
+        assert not session.executed
+    assert session.closed and session.committed and not session.info
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("connection failed"), asyncio.CancelledError()])
+async def test_reader_connection_failure_closes_and_clears_binding(monkeypatch, failure):
+    session = ReaderSession()
+    session.connection = AsyncMock(side_effect=failure)
+    database = reader_database(monkeypatch, [session])
+    with pytest.raises(type(failure)) as caught:
         async with database.reader_session():
-            pytest.fail("unverified Reader reached payload")
-    assert len(session.executed) == 1 and session.closed and session.rolled_back
+            pytest.fail("failed connection yielded a Reader")
+    assert caught.value is failure
+    assert not session.executed and session.closed and not session.info
+    assert not database.has_reader_session()
 
 
 async def test_explicit_background_writer_preserves_parent_reader(monkeypatch):
@@ -499,7 +513,7 @@ async def test_pricing_statistics_queries_stay_on_reader_owner(monkeypatch):
         request = SimpleNamespace(ctx=SimpleNamespace(sa_session=session))
         response = await pricing.pricing_statistics(request)
         assert response.status == 200
-        assert len(session.executed) == 5
+        assert len(session.executed) == 4
 
 
 def _optional_count_read(session, events, failure):
@@ -1041,7 +1055,7 @@ async def test_optional_count_expired_cumulative_budget_never_returns_total(monk
     assert session.execute.await_count == (3 if has_started else 0)
 
 
-async def test_reader_temporary_setup_precedes_identity_and_read_only_verification(monkeypatch):
+async def test_reader_temporary_setup_precedes_read_only_verification(monkeypatch):
     session = ReaderSession()
     database = reader_database(monkeypatch, [session])
 
@@ -1057,10 +1071,6 @@ async def test_reader_temporary_setup_precedes_identity_and_read_only_verificati
             "SET TRANSACTION READ WRITE",
             "CREATE TEMP TABLE prepared(value int) ON COMMIT DROP",
             "SET TRANSACTION READ ONLY",
-            "SELECT session_user, current_user, "
-            "(SELECT oid FROM pg_catalog.pg_roles WHERE rolname=current_user), "
-            "(SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database()), "
-            "host(inet_server_addr()), inet_server_port(), pg_backend_pid()",
             "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')",
         ]
     assert session.committed and session.closed and not session.info and not database.has_reader_session()
@@ -1075,7 +1085,7 @@ async def test_reader_temporary_setup_refuses_reuse_and_allows_explicit_independ
             async with database.reader_session(temporary_setup=setup):
                 pytest.fail("reused Reader accepted setup")
         setup.assert_not_awaited()
-        assert len(parent.executed) == 1
+        assert not parent.executed
         async with database.reader_session(independent=True, temporary_setup=setup) as acquired:
             assert acquired is child and current_session() is child
             setup.assert_awaited_once_with(child)

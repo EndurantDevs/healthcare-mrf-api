@@ -9,7 +9,6 @@ from typing import Any
 
 from sqlalchemy import text
 
-from api.network_read_execution import execute_network_read
 from api.ptg2_billing_associations import (
     _normalized_provider_group_refs,
     _sidecar_state,
@@ -224,8 +223,7 @@ async def resolve_billing_entity_ref_group_scope(
         return None
     if tin_key is None:
         return None
-    group_result = await execute_network_read(
-        session,
+    group_result = await session.execute(
         _billing_ref_groups_query(schema_name),
         {
             "snapshot_key": snapshot_key,
@@ -252,8 +250,7 @@ async def _resolve_billing_entity_ref_tin_key(
     if type(snapshot_key) is not int or not 1 <= snapshot_key < 2**63:
         raise PTG2BillingAssociationDataError("billing association snapshot key is invalid")
     decoded_reference = decode_billing_entity_ref(billing_entity_ref)
-    candidate_result = await execute_network_read(
-        session,
+    candidate_result = await session.execute(
         _billing_ref_candidates_query(schema_name),
         {
             "snapshot_key": snapshot_key,

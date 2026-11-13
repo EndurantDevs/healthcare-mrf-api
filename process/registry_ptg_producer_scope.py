@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass
 from uuid import UUID
 
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from db.registry_schema import registry_schema
 from process.network_address_projection import _identifier
@@ -322,6 +323,7 @@ async def _protected_store(session, store, *, write, table_name=TABLE):
         table_name
         not in {TABLE, "registry_ptg_published_plan_scope", "registry_ptg_office_approval", "registry_ptg_office_hold"}
         or type(store) is not RegistryPTGProducerScopeStore
+        or type(write) is not bool
     ):
         raise RegistryPTGProducerScopeError("registry_ptg_scope_store_unprotected")
     namespace = _identifier(store.control_schema or registry_schema())
@@ -332,24 +334,12 @@ async def _protected_store(session, store, *, write, table_name=TABLE):
         "serializable",
     }:
         raise RegistryPTGProducerScopeError("registry_ptg_scope_transaction_required")
-    closed = (
-        await session.execute(
-            text(
-                _PERMISSIONS_SQL
-                if table_name == TABLE
-                else _PERMISSIONS_SQL.replace("'registry_ptg_producer_scope'", "'" + table_name + "'")
-            ),
-            {
-                "schema_name": namespace[1:-1],
-                "owner_role": store.owner_role,
-                "approval_role": store.approval_role,
-                "write": write,
-            },
-        )
-    ).scalar_one_or_none()
-    if closed is not True:
-        raise RegistryPTGProducerScopeError("registry_ptg_scope_store_unprotected")
-    return namespace + "." + _identifier(table_name)
+    table = namespace + "." + _identifier(table_name)
+    try:
+        await session.execute(text(f"SELECT 1 FROM {table} LIMIT 0"))
+    except DBAPIError as error:
+        raise RegistryPTGProducerScopeError("registry_ptg_scope_store_unprotected") from error
+    return table
 
 
 async def _selected_versions(session, specification, versions, *, ownership=None):

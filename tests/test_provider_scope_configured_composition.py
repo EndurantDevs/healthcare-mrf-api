@@ -12,10 +12,11 @@ from sqlalchemy import text
 from api import provider_geo_sql, provider_list_sql
 from api.endpoint import npi
 from api.network_address_scope import network_address_read_scope, scoped_address_relation_sql
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
 from tests import test_custom_import_provider_geo_sql as geo_fixture
 from tests import test_custom_import_provider_list as list_fixture
-from tests.network_read_execution_support import with_read_identity_receipts
+from tests.network_read_execution_support import with_read_session
 
 _CANDIDATE = "00000000-0000-0000-0000-000000000001"
 _MANIFEST = PinnedNetworkServingManifest(
@@ -26,7 +27,7 @@ _MANIFEST = PinnedNetworkServingManifest(
     {"unified_address": "synthetic-version"},
     0,
     "a" * 64,
-    17,
+    CompactAddressRelation("network_candidate_" + _CANDIDATE.replace("-", ""), "entity_address_unified"),
 )
 
 
@@ -105,7 +106,7 @@ async def test_native_scoped_list_uses_the_existing_request_session(monkeypatch)
         calls.append((statement, parameters))
         return Result()
 
-    session = with_read_identity_receipts(SimpleNamespace(execute=execute))
+    session = with_read_session(SimpleNamespace(execute=execute))
     database = SimpleNamespace(acquire=lambda: (_ for _ in ()).throw(AssertionError("unscoped pool acquired")))
     with network_address_read_scope(_MANIFEST, (42,)):
         async with provider_list_sql._provider_list_connection(database, None, session) as connection:

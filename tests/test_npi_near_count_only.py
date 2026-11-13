@@ -30,7 +30,7 @@ def count_reader(monkeypatch):
         return [SimpleNamespace(_mapping={"total_count": state.total})]
 
     proxy = Mock(return_value=SimpleNamespace(all=query))
-    monkeypatch.setattr(provider_list_sql, "NetworkReadConnectionProxy", proxy)
+    monkeypatch.setattr(provider_list_sql, "ConnectionProxy", proxy)
     monkeypatch.setattr(npi, "db", SimpleNamespace(acquire=Mock(side_effect=AssertionError("unpinned read"))))
     monkeypatch.setattr(npi, "_plan_release_npi_scope", AsyncMock(return_value=(None, {})))
     metadata = AsyncMock(side_effect=AssertionError("count must not hydrate provider metadata"))
@@ -42,7 +42,14 @@ def count_reader(monkeypatch):
 def _pinned_manifest(generation):
     candidate_id = UUID(int=generation)
     return PinnedNetworkServingManifest(
-        generation, str(candidate_id), "network_candidate_" + candidate_id.hex, generation + 10, {}, 0, "c" * 64, 1
+        generation,
+        str(candidate_id),
+        "network_candidate_" + candidate_id.hex,
+        generation + 10,
+        {},
+        0,
+        "c" * 64,
+        CompactAddressRelation("network_candidate_" + candidate_id.hex, "entity_address_unified"),
     )
 
 
@@ -105,11 +112,12 @@ async def test_near_compact_count_keeps_generation_arrays(count_reader, selected
     artifact_id = UUID(int=generation + 100)
     artifact_schema = "network_candidate_" + artifact_id.hex
     layout = CompactNetworkLayout(
-        CompactAddressRelation(manifest.schema_name, "network_slice_ref", 2),
-        CompactAddressRelation("retained_addresses", "entity_address_unified", 1),
-        (CompactEdgeArtifact(str(artifact_id), artifact_schema, 3),),
+        CompactAddressRelation(manifest.schema_name, "network_slice_ref"),
+        CompactAddressRelation("retained_addresses", "entity_address_unified"),
+        (CompactEdgeArtifact(str(artifact_id), artifact_schema),),
     )
     object.__setattr__(manifest, "_compact_layout", layout)
+    object.__setattr__(manifest, "address_relation", manifest.compact_layout.base)
     request = SimpleNamespace(
         args={"lat": "41", "long": "-87", "count_only": "1"},
         ctx=SimpleNamespace(sa_session=count_reader.session),
