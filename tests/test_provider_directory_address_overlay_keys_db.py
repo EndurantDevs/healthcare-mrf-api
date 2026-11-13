@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -51,23 +52,31 @@ async def _seed_affiliation(database, schema_name):
     await database.status(
         f'INSERT INTO "{schema_name}"."provider_directory_organization_affiliation" '
         "VALUES ('cms-npd', 'aff-1', true, 'Organization/org-1', NULL, "
-        "'[\"Location/physical\",\"Location/repeat\"]'::jsonb, '[]'::jsonb, '[]'::jsonb, 'run-current', now())"
+        "'[\"Location/physical\"]'::jsonb, '[]'::jsonb, '[]'::jsonb, 'run-current', now())"
     )
 
 
-async def _seed_repeated_unit_location(database, schema_name):
-    """Add the one shape the native and SQL parsers key differently: a spaced, repeated unit."""
-    await database.status(
-        f'INSERT INTO "{schema_name}"."provider_directory_location" '
-        "(source_id, resource_id, mode, addresses, first_line, second_line, city_name, state_name, postal_code) "
-        "VALUES ('cms-npd', 'repeat', 'instance', CAST(:addresses AS jsonb), "
-        "'100 Main Street Suite 200  A', '200 A', 'Austin', 'TX', '78701')",
-        addresses='[{"use": "work", "type": "physical"}]',
-    )
-    await database.status(
-        f'UPDATE "{schema_name}"."provider_directory_practitioner_role" SET location_refs = '
-        '\'["Location/kind","Location/postal","Location/physical","Location/repeat"]\'::jsonb'
-    )
+async def _seed_repeated_unit_locations(database, schema_name):
+    """Add the shapes the native and SQL parsers key differently: a repeated unit after odd spacing."""
+    for resource_id, first_line in (
+        ("repeat", "100 Main Street Suite 200  A"),
+        ("narrow", "100 Main Street Suite 200\u202f A"),
+    ):
+        await database.status(
+            f'INSERT INTO "{schema_name}"."provider_directory_location" '
+            "(source_id, resource_id, mode, addresses, first_line, second_line, city_name, state_name, postal_code) "
+            "VALUES ('cms-npd', :resource_id, 'instance', CAST(:addresses AS jsonb), "
+            ":first_line, '200 A', 'Austin', 'TX', '78701')",
+            resource_id=resource_id,
+            first_line=first_line,
+            addresses='[{"use": "work", "type": "physical"}]',
+        )
+    location_refs = ["Location/kind", "Location/postal", "Location/physical", "Location/repeat", "Location/narrow"]
+    for table_name in ("provider_directory_practitioner_role", "provider_directory_organization_affiliation"):
+        await database.status(
+            f'UPDATE "{schema_name}"."{table_name}" SET location_refs = CAST(:location_refs AS jsonb)',
+            location_refs=json.dumps(location_refs),
+        )
 
 
 async def _seed_sql_keyed_stage(database, schema_name, components, scope_by_name):
@@ -77,7 +86,7 @@ async def _seed_sql_keyed_stage(database, schema_name, components, scope_by_name
     await database.status(importer.provider_directory_address_overlay_table_sql(schema_name, "batch_stage"))
     await _seed_cms_role_location_rows(database, schema_name)
     await _seed_affiliation(database, schema_name)
-    await _seed_repeated_unit_location(database, schema_name)
+    await _seed_repeated_unit_locations(database, schema_name)
     for component in components:
         await database.status(
             importer._address_overlay_component_insert_sql(
@@ -123,9 +132,9 @@ async def test_batch_keyed_locations_publish_the_same_overlay_rows(monkeypatch):
                 importer, schema_name, "batch_stage", None, ["cms-npd"], scope_by_name, components
             )
 
-        assert inserted_by_component == {"practitioner_role": 2, "organization_affiliation": 2}
-        # The repeated-unit Location has irregular whitespace, so only the other three are batch keyed;
-        # both components still publish it through the SQL key.
+        assert inserted_by_component == {"practitioner_role": 3, "organization_affiliation": 3}
+        # The two repeated-unit Locations have odd spacing, so only the other three are batch keyed;
+        # both components still publish them through the SQL key.
         assert "keyed locations rows=3" in step_messages[0]
         # The control run owns the key table although the build's query scope has no run id.
         assert key_tables[0][0] == "run-control"
@@ -135,7 +144,7 @@ async def test_batch_keyed_locations_publish_the_same_overlay_rows(monkeypatch):
         batch_rows = await database.all(PUBLISHED_ROWS_SQL.format(schema=schema_name, stage="batch_stage"))
         sql_rows = await database.all(PUBLISHED_ROWS_SQL.format(schema=schema_name, stage="sql_stage"))
         assert list(map(tuple, batch_rows)) == list(map(tuple, sql_rows))
-        assert len(batch_rows) == 4 and all(published[1] for published in batch_rows)
+        assert len(batch_rows) == 6 and all(published[1] for published in batch_rows)
         leftover_tables = await database.scalar(
             "SELECT count(*) FROM pg_tables WHERE schemaname = :schema_name AND tablename LIKE :stage_pattern",
             schema_name=schema_name,

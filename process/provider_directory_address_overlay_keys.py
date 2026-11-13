@@ -56,11 +56,9 @@ def _native_location_batch(fhir: Any) -> Any | None:
     return canonicalize if inspect.isbuiltin(canonicalize) else None
 
 
-def _has_regular_whitespace_sql(line_sql: str) -> str:
-    """Match a NULL line or one with single inner spaces, no edge spaces and no non-breaking space."""
-    return (
-        f"COALESCE({line_sql} = regexp_replace(btrim({line_sql}), '\\s+', ' ', 'g') AND {line_sql} !~ U&'\\00A0', TRUE)"
-    )
+def _has_plain_spacing_sql(text_sql: str) -> str:
+    """Match NULL or printable-ASCII words separated by single spaces, whatever the collation."""
+    return f"COALESCE({text_sql} ~ '^[\\x21-\\x7E]+( [\\x21-\\x7E]+)*$', TRUE)"
 
 
 def location_key_page_sql(context: dict[str, str], is_source_scoped: bool) -> str:
@@ -74,10 +72,12 @@ def location_key_page_sql(context: dict[str, str], is_source_scoped: bool) -> st
          WHERE (loc.source_id, loc.resource_id)
                > (CAST(:after_source_id AS varchar), CAST(:after_resource_id AS varchar))
            AND (loc.address_key ~* '{context["uuid_re"]}') IS NOT TRUE
-           -- addr_key_v1 compares a repeated unit before collapsing whitespace, the native parser after;
-           -- lines with irregular whitespace stay unkeyed here, so the SQL function keys them.
-           AND {_has_regular_whitespace_sql("loc.first_line")}
-           AND {_has_regular_whitespace_sql("loc.second_line")}
+           -- addr_key_v1 and the native parser treat whitespace runs and Unicode spaces differently
+           -- around a repeated unit; anything but plain single-spaced ASCII stays unkeyed here, so
+           -- the SQL function keys it.
+           AND {_has_plain_spacing_sql("loc.first_line")}
+           AND {_has_plain_spacing_sql("loc.second_line")}
+           AND {_has_plain_spacing_sql("loc.city_name")}
            {source_scope}
          ORDER BY loc.source_id, loc.resource_id
          LIMIT :page_rows;
