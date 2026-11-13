@@ -69,11 +69,11 @@ from process.mrf_discovery_catalog_manifest import (
 )
 from process.mrf_discovery_checkpoints import (
     DatabaseDiscoveryCheckpointStore,
-    DiscoverySourceBatchIncomplete,
     SourceBatchSummary,
     SourceProcessResult,
     execute_checkpointed_source_batch,
 )
+from process.mrf_discovery_partial_batch import finished_partial_batch
 from process.mrf_discovery_post_resolvers import (
     _resolve_bcbsnc_aso_employer_search,
     post_discovery_text,
@@ -16022,10 +16022,9 @@ async def _execute_discovery_source_work(state: _DiscoveryCommandState, source_r
             state.checkpoint_store,
         )
     except BaseException as exc:
-        if isinstance(exc, DiscoverySourceBatchIncomplete):
-            state.result.source_batch_summary = exc.summary
-        await _record_discovery_command_failure(state, exc)
-        raise
+        source_batch_summary, source_rows = await finished_partial_batch(
+            exc, state, source_rows, _record_discovery_command_failure
+        )
     state.result.source_batch_summary = source_batch_summary
     state.result.urls_checked = source_batch_summary.urls_checked
     state.result.plans = source_batch_summary.plans_discovered
