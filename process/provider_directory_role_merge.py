@@ -107,20 +107,27 @@ def composed_merged_role_sha256(base_hash: str, entry_hashes: list[str]) -> str:
     ).hexdigest()
 
 
-def merged_role_hash_components(payload_by_field: Mapping[str, Any]) -> tuple[str, list[str], str] | None:
-    """Return the base, per-network entry and payload commitments of a merged role, or None for any other payload."""
+def _is_merged_role(payload_by_field: Mapping[str, Any]) -> bool:
+    """Whether a payload is a merged role or a repeat of one: its identity is a content hash it matches."""
 
     role_id = payload_by_field.get("resource_id")
     if type(role_id) is not str or _SHA256_HEX_RE.fullmatch(role_id) is None:
+        return False
+    if payload_by_field.get(_REPEAT) is True:
+        return all(name in _REPEAT_FIELDS for name in payload_by_field if name not in {"resource_id", _REPEAT})
+    return role_id == merged_role_id(payload_by_field)
+
+
+def merged_role_hash_components(payload_by_field: Mapping[str, Any]) -> tuple[str, list[str], str] | None:
+    """Return the base, per-network entry and payload commitments of a merged role, or None for any other payload."""
+
+    if not _is_merged_role(payload_by_field):
         return None
     if payload_by_field.get(_REPEAT) is True:
         names = [name for name in payload_by_field if name not in {"resource_id", _REPEAT}]
-        if not set(names).issubset(_REPEAT_FIELDS):
-            return None
-    elif role_id == merged_role_id(payload_by_field):
-        names = _role_network_fields(payload_by_field)
     else:
-        return None
+        names = _role_network_fields(payload_by_field)
+    role_id = payload_by_field["resource_id"]
     entry_hashes = sorted(
         {
             _entry_sha256(name, entry)
@@ -180,9 +187,7 @@ def _merge_role_payloads(first: Mapping[str, Any], second: Mapping[str, Any]) ->
 
     role_id = second.get("resource_id")
     # Only an identity that is its own content hash is a merged role; any other keeps the conflict rule.
-    if role_id != first.get("resource_id") or any(
-        merged_role_hash_components(observation) is None for observation in (first, second)
-    ):
+    if role_id != first.get("resource_id") or not (_is_merged_role(first) and _is_merged_role(second)):
         return None
     observed_roles = [observation for observation in (first, second) if observation.get(_REPEAT) is not True]
     if observed_roles:

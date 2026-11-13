@@ -428,7 +428,9 @@ async def test_reduced_heap_sample_rejects_invalid_rows():
 
 
 @pytest.mark.asyncio
-async def test_complete_semantic_key_can_cross_many_cursor_and_copy_pages(monkeypatch):
+@pytest.mark.parametrize("chunk_rows", [256, 4])
+async def test_complete_semantic_key_can_cross_many_cursor_and_copy_pages(monkeypatch, chunk_rows):
+    monkeypatch.setattr(completion, "_KEY_CHUNK_ROWS", chunk_rows)
     rows = [_resource("first", values=(str(index),)) for index in range(31)] + [_resource("second")]
     complete = completion._reduced_rows(_stream(rows), dataset_id="dataset", prepare=dict, merge=_merge)
     result_rows = [row async for row in complete]
@@ -447,6 +449,20 @@ async def test_complete_semantic_key_can_cross_many_cursor_and_copy_pages(monkey
         == 2
     )
     assert [row[0] for row in copied_records] == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_each_observation_and_each_merged_result_is_validated_once():
+    prepared_values = []
+
+    def prepare(resource_row):
+        prepared_values.append(resource_row["payload_json"]["values"])
+        return dict(resource_row)
+
+    rows = [_resource("first", values=(str(index),)) for index in range(3)] + [_resource("second")]
+    complete = completion._reduced_rows(_stream(rows), dataset_id="dataset", prepare=prepare, merge=_merge)
+    assert len([row async for row in complete]) == 2
+    assert prepared_values == [["0"], ["1"], ["2"], ["0", "1", "2"], _resource("second")["payload_json"]["values"]]
 
 
 @pytest.mark.asyncio
