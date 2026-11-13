@@ -17,7 +17,7 @@ from db.models.company_registry import CompanyRegistry
 ROOT = Path(__file__).parents[1]
 REVISION = "20261012010000_company_registry_name_origin"
 PREDECESSOR = "20261011010000_company_registry_group_assertions"
-CURRENT_HEAD = "20261111010000_code_sets_publication_idempotency"
+CURRENT_HEAD = "20261113010000_address_canonical_space_normalization"
 _ORIGIN_UPGRADE_REVISIONS = [
     REVISION,
     "20261013010000_registry_custom_history_events",
@@ -70,6 +70,7 @@ _ORIGIN_UPGRADE_REVISIONS = [
     "20261104010000_custom_import_unlogged_landing",
     "20261107010000_custom_import_child_reference_aggregate",
     "20261108010000_custom_import_family_child_reference_aggregate",
+    "20261111010000_code_sets_publication_idempotency",
     CURRENT_HEAD,
 ]
 
@@ -197,10 +198,7 @@ def test_origin_migration_extends_the_sole_existing_head():
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
     assert script.get_heads() == [CURRENT_HEAD]
-    assert (
-        script.get_revision(CURRENT_HEAD).down_revision
-        == "20261108010000_custom_import_family_child_reference_aggregate"
-    )
+    assert script.get_revision(CURRENT_HEAD).down_revision == "20261111010000_code_sets_publication_idempotency"
     assert script.get_revision("20261029010000_registry_source_inventory").down_revision == (
         "20261028020000_registry_membership_refresh"
     )
