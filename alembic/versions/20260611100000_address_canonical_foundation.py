@@ -113,8 +113,7 @@ def _sql_literal(value: str) -> str:
 
 def _case_pairs(mapping: dict[str, str], *, indent: str = "        ") -> str:
     return "\n".join(
-        f"{indent}WHEN {_sql_literal(key)} THEN {_sql_literal(value)}"
-        for key, value in sorted(mapping.items())
+        f"{indent}WHEN {_sql_literal(key)} THEN {_sql_literal(value)}" for key, value in sorted(mapping.items())
     )
 
 
@@ -162,13 +161,16 @@ LANGUAGE sql
 IMMUTABLE
 PARALLEL SAFE
 AS $$
-    SELECT translate(
+    -- Every Unicode space becomes a plain one, runs collapse and the ends are trimmed,
+    -- so line comparisons see the same text as the native canonicalizer.
+    SELECT btrim(regexp_replace(translate(
         COALESCE(value, ''),
         chr(160) || chr(8239) || chr(8201) || chr(8202) || chr(8199) ||
         chr(8198) || chr(8197) || chr(8196) || chr(8195) || chr(8194) ||
-        chr(8193) || chr(8192),
-        '            '
-    )
+        chr(8193) || chr(8192) || chr(5760) || chr(8287) || chr(12288) ||
+        chr(8232) || chr(8233) || chr(133),
+        repeat(' ', 18)
+    ), '\s+', ' ', 'g'))
 $$;
 
 CREATE OR REPLACE FUNCTION {qschema}.addr_zip5_norm_v1(value text)
@@ -1199,9 +1201,7 @@ def downgrade() -> None:
     schema = _schema()
     bind = op.get_bind()
     for table in ADDRESS_KEY_TABLES:
-        bind.exec_driver_sql(
-            f'ALTER TABLE IF EXISTS {_q(schema, table)} DROP COLUMN IF EXISTS "address_key";'
-        )
+        bind.exec_driver_sql(f'ALTER TABLE IF EXISTS {_q(schema, table)} DROP COLUMN IF EXISTS "address_key";')
     bind.exec_driver_sql(f"DROP TABLE IF EXISTS {_q(schema, 'address_checksum_collision')};")
     bind.exec_driver_sql(f"DROP TABLE IF EXISTS {_q(schema, 'address_checksum_map')};")
     bind.exec_driver_sql(f"DROP TABLE IF EXISTS {_q(schema, 'address_archive_v2')};")

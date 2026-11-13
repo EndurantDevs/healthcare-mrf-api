@@ -22,7 +22,7 @@ from tests.test_entity_address_alias_guard_postgres import _admin_url, _owned_gu
 from tests.test_provider_directory_profile_capacity_adoption_postgres import _upgrade_disposable_schema_to_head
 
 _SCHEMA = "migrated_address"
-_HEAD = "20261111010000_code_sets_publication_idempotency"
+_HEAD = "20261113010000_address_canonical_space_normalization"
 _ROLE_SCHEMA_REVISION = "20261019030000_provider_directory_role_schema"
 
 

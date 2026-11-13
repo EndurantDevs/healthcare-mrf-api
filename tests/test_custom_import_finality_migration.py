@@ -105,6 +105,7 @@ _SEALED_APPEND_UPGRADE_TAIL = (
     "20261107010000_custom_import_child_reference_aggregate",
     "20261108010000_custom_import_family_child_reference_aggregate",
     "20261111010000_code_sets_publication_idempotency",
+    "20261113010000_address_canonical_space_normalization",
 )
 
 MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260917130000_custom_import_generation_finality.py"
@@ -281,9 +282,9 @@ def _assert_custom_import_manual_acceptance_lineage(script):
 
 def _assert_finality_migration_chain(script):
     """Keep the exact accepted migration head and predecessor assertions."""
-    assert script.get_heads() == ["20261111010000_code_sets_publication_idempotency"]
-    assert script.get_revision("20261111010000_code_sets_publication_idempotency").down_revision == (
-        "20261108010000_custom_import_family_child_reference_aggregate"
+    assert script.get_heads() == ["20261113010000_address_canonical_space_normalization"]
+    assert script.get_revision("20261113010000_address_canonical_space_normalization").down_revision == (
+        "20261111010000_code_sets_publication_idempotency"
     )
     assert script.get_revision("20261029010000_registry_source_inventory").down_revision == (
         "20261028020000_registry_membership_refresh"
