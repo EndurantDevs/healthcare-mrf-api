@@ -119,6 +119,15 @@ Useful environment knobs for full crawls:
   Ordering uses checked indexes rather than temporary sort files. Exhaustion fails the source
   checkpoint with a diagnostic; raising this trusted worker setting requires enough disk capacity
   for every concurrently admitted target.
+- `HLTHPRT_MRF_DISCOVERY_MAX_FAILED_SOURCE_PERCENT`: share of sources that may be left out of the
+  catalog while the run still succeeds; defaults to 10. A source is left out when its checkpoint
+  failed, or when its shared index page was crawled by a source that failed. Once every source has
+  a succeeded or failed checkpoint, at least one source remains listed and the share left out is
+  within the limit, the run finishes. Sources left out are no longer listed under the run, so
+  catalog consumers page only sources that completed. The run reports `failed_source_count` and
+  `withdrawn_source_count` and omits `discovery_proof_version`, because the frozen source set did
+  not complete. Above the limit the run fails as before; `0` makes any failed source fail the run.
+  A retry still processes only the sources without a successful checkpoint.
 
 ASR Health Benefits does not expose an all-groups catalog. Keep monthly imports constrained to the
 `asr_health_benefits_groups` seed list, and refresh the CSV only through an intentional maintenance
