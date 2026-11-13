@@ -43,6 +43,7 @@ from process import entity_address_rows_native as row_preparation
 from process import entity_address_rows_preparation as prepared_rows
 from process import provider_directory_profile as profile_artifact
 from process import provider_directory_serving_recovery as serving_recovery
+from process import provider_geo_search
 from process.control_lifecycle import mark_control_run
 from process.entity_address_candidate_preparation import (
     _PROVIDER_DIRECTORY_CURRENT_OVERLAY_CTES_TEMPLATE,
@@ -13552,10 +13553,7 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
     published_rows = stage_rows
     started_at = context.get("start")
     if isinstance(started_at, datetime.datetime):
-        context["published_elapsed_seconds"] = round(
-            (datetime.datetime.utcnow() - started_at).total_seconds(),
-            3,
-        )
+        context["published_elapsed_seconds"] = round((datetime.datetime.utcnow() - started_at).total_seconds(), 3)
     post_publish_profile = "none" if is_partial_provider_directory_refresh else _post_publish_index_profile()
     should_build_post_publish_concurrently = _should_build_post_publish_concurrently()
     context["post_publish_index_profile"] = post_publish_profile
@@ -13750,6 +13748,7 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
             preserve_finished_at=True,
             committed_context=context if context.get("control_run_terminal_committed") else None,
         )
+    await provider_geo_search.refresh_after_publication("address", test_mode=bool(context.get("test_mode")))
     print_time_info(context.get("start"))
 
 

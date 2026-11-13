@@ -51,6 +51,23 @@ def clear_ptg2_price_hydration_cache():
 
 
 @pytest.fixture(autouse=True)
+def read_addresses_without_provider_geo_search(request, monkeypatch):
+    # Nearby handlers look up the all-address projection and importers rebuild it after publishing; stubbed
+    # sessions would answer those calls. Tests that exercise the projection opt in with @pytest.mark.provider_geo_search.
+    if request.node.get_closest_marker("provider_geo_search") is not None:
+        return
+
+    from api import provider_geo_search
+    from process import provider_geo_search as provider_geo_search_builder
+
+    async def no_projection(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(provider_geo_search, "current_provider_geo_search", no_projection)
+    monkeypatch.setattr(provider_geo_search_builder, "refresh_after_publication", no_projection)
+
+
+@pytest.fixture(autouse=True)
 def freeze_specialty_resolution_cache():
     # Endpoint handlers lazily refresh the shared specialty cache from the DB;
     # unit tests stub sessions with queued results, so a refresh would consume
