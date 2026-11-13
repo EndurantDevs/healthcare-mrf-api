@@ -51,7 +51,7 @@ async def _seed_affiliation(database, schema_name):
     await database.status(
         f'INSERT INTO "{schema_name}"."provider_directory_organization_affiliation" '
         "VALUES ('cms-npd', 'aff-1', true, 'Organization/org-1', NULL, "
-        "'[\"Location/physical\"]'::jsonb, '[]'::jsonb, '[]'::jsonb, 'run-current', now())"
+        "'[\"Location/physical\",\"Location/repeat\"]'::jsonb, '[]'::jsonb, '[]'::jsonb, 'run-current', now())"
     )
 
 
@@ -123,8 +123,9 @@ async def test_batch_keyed_locations_publish_the_same_overlay_rows(monkeypatch):
                 importer, schema_name, "batch_stage", None, ["cms-npd"], scope_by_name, components
             )
 
-        assert inserted_by_component == {"practitioner_role": 2, "organization_affiliation": 1}
-        # The repeated-unit Location has irregular whitespace, so only the other three are batch keyed.
+        assert inserted_by_component == {"practitioner_role": 2, "organization_affiliation": 2}
+        # The repeated-unit Location has irregular whitespace, so only the other three are batch keyed;
+        # both components still publish it through the SQL key.
         assert "keyed locations rows=3" in step_messages[0]
         # The control run owns the key table although the build's query scope has no run id.
         assert key_tables[0][0] == "run-control"
@@ -134,7 +135,7 @@ async def test_batch_keyed_locations_publish_the_same_overlay_rows(monkeypatch):
         batch_rows = await database.all(PUBLISHED_ROWS_SQL.format(schema=schema_name, stage="batch_stage"))
         sql_rows = await database.all(PUBLISHED_ROWS_SQL.format(schema=schema_name, stage="sql_stage"))
         assert list(map(tuple, batch_rows)) == list(map(tuple, sql_rows))
-        assert len(batch_rows) == 3 and all(published[1] for published in batch_rows)
+        assert len(batch_rows) == 4 and all(published[1] for published in batch_rows)
         leftover_tables = await database.scalar(
             "SELECT count(*) FROM pg_tables WHERE schemaname = :schema_name AND tablename LIKE :stage_pattern",
             schema_name=schema_name,

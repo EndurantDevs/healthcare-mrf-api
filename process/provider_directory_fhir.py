@@ -71793,6 +71793,7 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                   WITH direct_locations AS MATERIALIZED (
                       SELECT
                           location.resource_id::varchar AS resource_id,
+                          -- Without a staged key this is NULL and the enclosing select calls addr_key_v1.
                           CASE WHEN location.address_key ~* '{uuid_re}' THEN location.address_key
                                ELSE keyed.address_key END::varchar AS address_key,
                           location.first_line::varchar AS first_line,
