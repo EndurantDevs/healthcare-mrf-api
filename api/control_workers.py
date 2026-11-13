@@ -855,6 +855,8 @@ def _configured_worker_job_image(spec: WorkerSpec, launch_request: dict[str, Any
         return os.getenv("HLTHPRT_REGISTRY_FHIR_CATALOG_WORKER_IMAGE", "").strip() or generic_image
     if spec.importers == ("mrf-source-discovery",):
         return os.getenv("HLTHPRT_MRF_SOURCE_DISCOVERY_WORKER_IMAGE", "").strip() or generic_image
+    if spec.importers == ("npi",):
+        return os.getenv("HLTHPRT_NPI_WORKER_IMAGE", "").strip() or generic_image
     return generic_image
 
 

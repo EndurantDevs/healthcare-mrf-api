@@ -906,7 +906,7 @@ async def test_name_taxonomy_projection_disabled_skips_startup_catalog(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_name_taxonomy_projection_enabled_requires_sealed_current_gin(monkeypatch):
+async def test_name_taxonomy_projection_enabled_requires_current_gin(monkeypatch):
     scalar = AsyncMock(return_value=False)
     monkeypatch.setattr(
         npi_module,
@@ -923,7 +923,7 @@ async def test_name_taxonomy_projection_enabled_requires_sealed_current_gin(monk
 
     sql = str(scalar.await_args.args[0])
     assert "projection_index.indrelid = 'mrf.npi'::regclass" in sql
-    assert "publication_receipt.npi_table_oid = projection_index.indrelid" in sql
+    assert "publication_receipt" not in sql
     assert "npi_idx_search_taxonomy_codes" in sql
     assert "projection_index_method.amname = 'gin'" in sql
     assert "projection_index.indisvalid" in sql
