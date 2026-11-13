@@ -719,7 +719,7 @@ def _ensure_spec(spec: WorkerSpec, launch_request: dict[str, Any]) -> dict[str, 
         provider_directory_source_publication.require_original_stopped(fhir_launch)
     except ValueError, RuntimeError, _KubernetesApiError:
         return {"status": "failed", "message": "FHIR publication requires the original worker to be stopped"}
-    if spec.worker_class == "process.NPI" and npi_launch is None:
+    if npi_launch is None and npi_source_worker.is_ordinary_launch_refused(spec, launch_request):
         return {"status": "failed", "message": "NPI source worker requires exact admitted job"}
     if (
         spec.worker_class == "process.ProviderDirectoryFHIR"
@@ -1953,9 +1953,11 @@ def _single_job_worker_target(
     spec: WorkerSpec,
     launch_payload: dict[str, Any],
 ) -> str | None:
-    source_job_id = _admitted_source_job_target(
-        spec, launch_payload
-    ) or provider_directory_source_worker.admitted_ordinary_fhir_job(spec, launch_payload)
+    source_job_id = (
+        _admitted_source_job_target(spec, launch_payload)
+        or provider_directory_source_worker.admitted_ordinary_fhir_job(spec, launch_payload)
+        or npi_source_worker.admitted_ordinary_npi_job(spec, launch_payload)
+    )
     if source_job_id is not None:
         return source_job_id
     if plan_pricing_worker_policy.configured_release_worker_image(spec, launch_payload) is not None:

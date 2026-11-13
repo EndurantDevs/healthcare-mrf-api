@@ -18,8 +18,9 @@ python main.py worker process.NPI --burst
 
 Managed launches use `HLTHPRT_NPI_SOURCE_WORKER_IMAGE` when set; its value must
 be an immutable image digest reference. When unset,
-`HLTHPRT_REFERENCE_SOURCE_WORKER_IMAGE` remains the fallback. An explicitly empty
-NPI override is rejected. This override applies only to NPI workers.
+`HLTHPRT_REFERENCE_SOURCE_WORKER_IMAGE` remains the fallback. When neither is
+set, the ordinary worker job image runs the import. An explicitly empty NPI
+override is rejected. This override applies only to NPI workers.
 
 ### Ownership-sealed publication
 

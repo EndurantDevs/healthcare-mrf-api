@@ -56,6 +56,56 @@ def test_specific_image_preserves_reference_fallback_and_other_importers(monkeyp
         source.admit_npi_source_worker_launch(_recorded())
 
 
+def test_unconfigured_source_image_admits_only_the_recorded_ordinary_job(monkeypatch):
+    monkeypatch.delenv(source.IMAGE_ENV, raising=False)
+    monkeypatch.setenv(source.REFERENCE_IMAGE_ENV, "")
+    assert source.admit_npi_source_worker_launch(_recorded()) is None
+    request = workers._AdmittedWorkerRequest(run_id=RUN_ID, importer="npi")
+    assert source.admitted_ordinary_npi_job(SPEC, request) is None
+    assert workers._ensure_spec(SPEC, request)["status"] == "failed"
+    workers._bind_admitted_job(request, _recorded())
+    assert source.authorized_npi_source_worker_launch(SPEC, request) is None
+    assert source.admitted_ordinary_npi_job(SPEC, request) == JOB_ID
+    assert workers._single_job_worker_target(SPEC, request) == JOB_ID
+    assert source.admitted_ordinary_npi_job(SPEC, {"run_id": RUN_ID, "importer": "npi"}) is None
+    request["job_id"] = "npi_start_other"
+    assert source.admitted_ordinary_npi_job(SPEC, request) is None
+    request["job_id"] = JOB_ID
+    monkeypatch.setenv(source.IMAGE_ENV, IMAGE)
+    assert source.admitted_ordinary_npi_job(SPEC, request) is None
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_source_image_creates_the_ordinary_job(monkeypatch):
+    ordinary_image = "example/ordinary@sha256:" + "f" * 64
+    monkeypatch.delenv(source.IMAGE_ENV, raising=False)
+    monkeypatch.delenv(source.REFERENCE_IMAGE_ENV, raising=False)
+    monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", ordinary_image)
+
+    @asynccontextmanager
+    async def connection():
+        yield object()
+
+    monkeypatch.setattr(workers.db, "acquire", connection)
+    monkeypatch.setattr(workers, "acquire_control_run_worker_action_lock", AsyncMock())
+    monkeypatch.setattr(workers, "admit_existing_outer_run_action", AsyncMock(return_value=_recorded()))
+    calls = []
+    monkeypatch.setattr(workers, "_kubernetes_request", lambda *args: calls.append(args) or {})
+    monkeypatch.setattr(
+        workers,
+        "_worker_state",
+        lambda *args: {"running": bool(calls), "job_status": "active" if calls else "missing"},
+    )
+    response = await workers.guarded_ensure_worker({"run_id": RUN_ID, "importer": "npi"})
+    assert response["status"] == "started" and [call[0] for call in calls] == ["POST"]
+    container = calls[0][2]["spec"]["template"]["spec"]["containers"][0]
+    assert container["image"] == ordinary_image
+    assert container["command"][-2:] == ["worker-once", SPEC.worker_class]
+    environment_by_name = {entry["name"]: entry for entry in container["env"]}
+    assert environment_by_name["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"]["value"] == JOB_ID
+
+
 def test_existing_job_refuses_a_new_specific_image(admitted, mounted_job, monkeypatch):
     monkeypatch.setenv(source.IMAGE_ENV, "example/replacement@sha256:" + "e" * 64)
     replacement = source.admit_npi_source_worker_launch(_recorded())
@@ -213,13 +263,15 @@ async def test_locked_ensure_admits_the_actual_registered_job(monkeypatch, with_
 
 
 @pytest.mark.asyncio
-async def test_missing_image_refuses_before_launch(monkeypatch):
+async def test_unconfigured_image_admits_without_a_source_launch(monkeypatch):
     monkeypatch.delenv(source.IMAGE_ENV, raising=False)
     monkeypatch.delenv(source.REFERENCE_IMAGE_ENV, raising=False)
     request = workers._AdmittedWorkerRequest(run_id=RUN_ID, importer="npi")
     workers._bind_admitted_job(request, _recorded())
-    assert (await workers._admit_source_worker_launches(request, _recorded()))["status"] == "failed"
+    assert await workers._admit_source_worker_launches(request, _recorded()) is None
     assert request.npi_source_launch is None
+    monkeypatch.setenv(source.IMAGE_ENV, "")
+    assert (await workers._admit_source_worker_launches(request, _recorded()))["status"] == "failed"
 
 
 def test_source_launch_has_no_local_process_fallback(admitted, monkeypatch):
