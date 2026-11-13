@@ -203,8 +203,7 @@ def _validate_isolated_binding_storage(binding, expected_storage):
     metadata = binding["identity"]["metadata"]
     if binding["contract"] == NAMED_ISOLATED_CONTRACT:
         _validate_named_storage(expected_storage)
-        _require_ordinary_source_metadata(metadata)
-        _require(len(metadata["source_ids"]) == 1, "isolated_kind_unsupported")
+        _require_named_source_identity(binding["identity"])
     _require(binding["storage"] == expected_storage, "storage_binding_changed")
     _require(binding["phase"] != "published" and binding["auxiliary"] is None, "isolated_kind_unsupported")
     if binding["contract"] == CMS_ISOLATED_CONTRACT:
@@ -240,6 +239,38 @@ def _validate_named_storage(document):
         and re.fullmatch(r"sha256:[0-9a-f]{64}", producer[1]),
         "storage_binding_changed",
     )
+
+
+def named_source_resources(source_ids):
+    """Return registered resource contracts used by retained source transitions."""
+    if type(source_ids) not in (list, tuple):
+        return None
+    if tuple(source_ids) == (VSP_SOURCE_ID,):
+        return VSP_RESOURCE_TYPES
+    directory = import_module("process.provider_directory_fhir")
+    registered_source = directory._stable_source_id(directory.anthem.seed_rows()[0])
+    if tuple(source_ids) == (registered_source,):
+        return directory.anthem.RESOURCES
+    return None
+
+
+def _require_named_source_identity(identity):
+    """Keep ordinary singleton scope and complete registered retained resources."""
+    metadata = identity["metadata"]
+    _require_ordinary_source_metadata(metadata)
+    _require(len(metadata["source_ids"]) == 1, "isolated_kind_unsupported")
+    resources = named_source_resources(metadata.get("source_ids"))
+    if resources is not None and metadata["source_ids"] != [VSP_SOURCE_ID]:
+        _require(
+            all(
+                type(metadata.get(field)) is list
+                and len(metadata[field]) == len(resources)
+                and all(type(resource) is str for resource in metadata[field])
+                and set(metadata[field]) == set(resources)
+                for field in ("selected_resources", "expected_resources")
+            ),
+            "isolated_kind_unsupported",
+        )
 
 
 def validate_handoff_document(document, expected_storage):
@@ -950,6 +981,10 @@ async def _locked_transition_candidate(
     )
     has_changed_header_owner = header["import_run_id"] != identity_by_field["failed_run_id"]
     candidate_storage_by_field = candidate_by_field.get("storage")
+    source_ids = stored_identity["metadata"].get("source_ids")
+    is_named_fhir = by_name and source_ids != [VSP_SOURCE_ID] and named_source_resources(source_ids) is not None
+    if is_named_fhir:
+        _require_named_source_identity(stored_identity)
     if by_name and candidate_by_field["contract"] == ISOLATED_CONTRACT:
         _require(type(candidate_storage_by_field) is dict, "transition_candidate_changed")
         candidate_storage_by_field = {key: candidate_storage_by_field.get(key) for key in old_storage}
@@ -969,7 +1004,7 @@ async def _locked_transition_candidate(
         == {name for name in expected_counts if not name.startswith("LU:")}
         == {_resource_family(name) for name in expected_counts}
         and candidate_storage_by_field in (old_storage, new_storage)
-        and (not by_name or is_empty_vsp_failure and metadata.get("error") == OFFICE_DOCTORS_INVALID),
+        and (not by_name or is_named_fhir or is_empty_vsp_failure and metadata.get("error") == OFFICE_DOCTORS_INVALID),
         "transition_candidate_changed",
     )
     if by_name and candidate_by_field["contract"] == ISOLATED_CONTRACT:
@@ -1304,6 +1339,25 @@ async def _verify_bulk_transition_checkpoints(
         )
 
 
+def _require_registered_transition_scope(checkpoints, bulk_checkpoints, source_ids):
+    """Keep the registered Anthem endpoint and one complete checkpoint scope."""
+    if source_ids == [VSP_SOURCE_ID] or named_source_resources(source_ids) is None:
+        return
+    directory = import_module("process.provider_directory_fhir")
+    _require(
+        not bulk_checkpoints
+        and all(
+            checkpoint["canonical_api_base"] == directory.anthem.API_BASE
+            and _json(checkpoint["source_ids"]) == source_ids
+            and type(checkpoint["source_scope_hash"]) is str
+            and re.fullmatch(r"[0-9a-f]{64}", checkpoint["source_scope_hash"])
+            for checkpoint in checkpoints
+        )
+        and len({checkpoint["source_scope_hash"] for checkpoint in checkpoints}) == 1,
+        "transition_checkpoint_changed",
+    )
+
+
 async def _verify_transition_checkpoints(
     connection,
     policy,
@@ -1335,6 +1389,7 @@ async def _verify_transition_checkpoints(
         root_run_id,
         dataset_id,
     )
+    _require_registered_transition_scope(checkpoint_rows, bulk_checkpoints, source_ids)
     if is_empty_vsp_failure:
         _require(not (checkpoint_rows or bulk_checkpoints), "transition_checkpoint_changed")
         return
@@ -1349,6 +1404,11 @@ async def _verify_transition_checkpoints(
 
     if has_verified_partition_checkpoints(checkpoint_rows, identity_by_field, expected_counts, source_ids, run_status):
         return
+    _require_rest_transition_checkpoints(checkpoint_rows, identity_by_field, expected_counts, run_status)
+
+
+def _require_rest_transition_checkpoints(checkpoint_rows, identity_by_field, expected_counts, run_status):
+    """Retain each ordinary scan's existing cursor, owner and exact row census."""
     _require(run_status == "failed", "transition_run_changed")
     _require(
         len(checkpoint_rows) == len(expected_counts)
@@ -1356,8 +1416,8 @@ async def _verify_transition_checkpoints(
         and all(
             _is_resumable_transition_checkpoint(checkpoint_record)
             and checkpoint_record["owner_run_id"] == identity_by_field["failed_run_id"]
-            and checkpoint_record["acquisition_root_run_id"] == root_run_id
-            and checkpoint_record["dataset_id"] == dataset_id
+            and checkpoint_record["acquisition_root_run_id"] == identity_by_field["acquisition_root_run_id"]
+            and checkpoint_record["dataset_id"] == identity_by_field["dataset_id"]
             and checkpoint_record["rows_processed"] == expected_counts[checkpoint_record["resource_type"]]
             and checkpoint_record["pages_processed"] > 0
             for checkpoint_record in checkpoint_rows
@@ -1595,7 +1655,7 @@ def _transition_result(
         )
         receipt_by_field = {
             "dataset_id": candidate_by_field["identity"]["dataset_id"],
-            "rows": 0,
+            "rows": sum(expected_resource_counts.values()),
             "lineage_run_ids": run_evidence_by_field["lineage_run_ids"],
         }
     else:

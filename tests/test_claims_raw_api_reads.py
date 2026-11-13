@@ -2,7 +2,7 @@
 """Raw-consumer protocol tests; synthetic native receipts confer no Source authority."""
 
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -241,6 +241,10 @@ async def test_npi_claims_filters_keep_guarded_reader_without_network_scope(monk
         yield session
 
     monkeypatch.setattr(npi, "db", SimpleNamespace(acquire=acquire))
+    # Snapshot ownership is covered separately; these cases exercise guarded raw SQL.
+    monkeypatch.setattr(
+        "api.provider_profile_snapshot.provider_directory_read_snapshot", lambda *_args, **_kwargs: nullcontext()
+    )
     monkeypatch.setattr(npi, "provider_profile_read_snapshot", snapshot)
     monkeypatch.setattr(npi, "provider_geo_read_snapshot", snapshot)
     if refuse:

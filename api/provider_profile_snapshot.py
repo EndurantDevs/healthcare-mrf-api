@@ -6,6 +6,7 @@ import asyncio
 import re
 from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
+from functools import wraps
 
 from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
@@ -148,6 +149,49 @@ def snapshot_cms_serving_generation(schema):
     if schema != snapshot_schema:
         raise ServiceUnavailable("Provider data is temporarily unavailable.")
     return authority.serving_generation.as_dict() if authority and authority.serving_generation else None
+
+
+@asynccontextmanager
+async def provider_directory_read_snapshot(database, session=None, *, reuse=False):
+    """Own an ordinary read snapshot without changing the caller's Writer session."""
+    from db.connection import has_reader_session
+
+    if reuse:
+        yield session
+        return
+    async with database.session() as read_session:
+        has_reader = has_reader_session(database)
+        async with nullcontext() if has_reader else read_session.begin():
+            if not has_reader:
+                await read_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            yield read_session
+
+
+def provider_directory_snapshot_read(handler):
+    """Keep ordinary provider HTTP loaders on one explicit read session."""
+
+    @wraps(handler)
+    async def snapshot_read(request, *args, session=None, **kwargs):
+        """Borrow existing scopes or close one ordinary snapshot before returning."""
+        if any(
+            kwargs.get(name) is not None
+            for name in ("native_args", "import_context", "native_npis", "native_scope_preparer")
+        ):
+            return await handler(request, *args, session=session, **kwargs)
+        from api.endpoint import npi as provider
+        from db.connection import has_reader_session
+
+        request_session = session if session is not None else provider._request_session(request)
+        should_reuse = (
+            session is not None
+            or request_session is None
+            or has_reader_session(provider.db)
+            or provider.current_network_address_scope() is not None
+        )
+        async with provider_directory_read_snapshot(provider.db, request_session, reuse=should_reuse) as read_session:
+            return await handler(request, *args, session=read_session, **kwargs)
+
+    return snapshot_read
 
 
 @asynccontextmanager

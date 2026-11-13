@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Generator, Iterable, Mapping
 
+from process.provider_directory_generic_source_policy import source_copy_executor
 from process.provider_directory_organization_hash import (
     composed_organization_semantic_sha256,
     organization_label_hashes,
@@ -683,11 +684,14 @@ async def _proof_lineage_for_contract(
     schema: str,
     dataset_id: str,
     expected_resource_hash_contract: str | None,
+    *,
+    publisher: Any = None,
 ) -> tuple[str, str, list[str], list[str] | None, str]:
     """Lock the parent and require the hash contract the rows were built under."""
     from process.provider_directory_source_proof_control import require_proof_executor
 
-    publisher = await require_proof_executor(connection, schema)
+    if publisher is None:
+        publisher = await require_proof_executor(connection, schema)
     (
         endpoint_id,
         root_run_id,
@@ -731,13 +735,19 @@ async def persist_dataset_proof_shard(
     expected_resource_hash_contract: str | None = None,
 ) -> dict[str, Any]:
     """Persist one retry-idempotent resource-family batch proof."""
+    from process.provider_directory_source_proof_control import require_proof_executor
+
+    publisher = await require_proof_executor(connection, schema)
+    connection = source_copy_executor(connection)
     (
         endpoint_id,
         root_run_id,
         source_ids,
         proof_resource_scope,
         resource_hash_contract,
-    ) = await _proof_lineage_for_contract(connection, schema, dataset_id, expected_resource_hash_contract)
+    ) = await _proof_lineage_for_contract(
+        connection, schema, dataset_id, expected_resource_hash_contract, publisher=publisher
+    )
     descriptor_by_field, compressed = build_dataset_proof_shard(
         dataset_rows,
         dataset_id=dataset_id,
@@ -761,8 +771,12 @@ async def persist_built_dataset_proof_shard(
     expected_resource_hash_contract: str | None = None,
 ) -> dict[str, Any]:
     """Persist a shard built off the publisher; its lineage and artifact must match the locked parent."""
+    from process.provider_directory_source_proof_control import require_proof_executor
+
+    publisher = await require_proof_executor(connection, schema)
+    connection = source_copy_executor(connection)
     endpoint_id, root_run_id, source_ids, proof_resource_scope, _ = await _proof_lineage_for_contract(
-        connection, schema, dataset_id, expected_resource_hash_contract
+        connection, schema, dataset_id, expected_resource_hash_contract, publisher=publisher
     )
     lineage_fields = ("dataset_id", "endpoint_id", "acquisition_root_run_id", "source_ids")
     if (
@@ -2221,6 +2235,7 @@ async def delete_dataset_proof_shards(
     from process.provider_directory_source_proof_control import lock_proof_parent, require_proof_executor
 
     publisher = await require_proof_executor(connection, schema)
+    connection = source_copy_executor(connection)
     await lock_proof_parent(publisher, dataset_id, acquiring=False)
 
     await connection.status(
@@ -2239,6 +2254,7 @@ async def delete_dataset_resource_proof_shards(
     from process.provider_directory_source_proof_control import lock_proof_parent, require_proof_executor
 
     publisher = await require_proof_executor(connection, schema)
+    connection = source_copy_executor(connection)
     await lock_proof_parent(publisher, dataset_id, acquiring=False)
 
     await connection.status(

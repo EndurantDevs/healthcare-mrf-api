@@ -57,19 +57,20 @@ PROOF_HOOKS = {
 
 
 async def require_proof_executor(executor, schema):
-    """Refuse absent, inherited or substituted transactions before catalog IO."""
+    """Require the Source task and proof namespace before parent or payload IO."""
     publisher = bound_publisher()
     session = source_copy_session()
-    if isinstance(executor, Database):
-        binding = executor._transaction_binding()
-        is_original = binding is not None and binding.session is session
-    else:
-        is_original = isinstance(executor, ConnectionProxy) and executor._connection is session
     binding = getattr(publisher, "storage_binding", None)
     expected_schema = publisher.policy.schema if binding is None else binding.catalog_schema
-    _require(is_original and schema == expected_schema, "proof_transaction_changed")
+    _require(schema == expected_schema, "proof_transaction_changed")
     if isinstance(binding, NamedFHIRSourceStorage):
         return publisher
+    if isinstance(executor, Database):
+        transaction_binding = executor._transaction_binding()
+        is_original = transaction_binding is not None and transaction_binding.session is session
+    else:
+        is_original = isinstance(executor, ConnectionProxy) and executor._connection is session
+    _require(is_original, "proof_transaction_changed")
     _require(await _copy_driver(session) is publisher.connection, "proof_transaction_changed")
     if binding is None:
         await verify_proof_control(publisher.connection, publisher.policy)

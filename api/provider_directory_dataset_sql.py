@@ -2,7 +2,53 @@
 
 """Dataset-fenced Provider Directory resources and readiness capabilities."""
 
+from sqlalchemy import text
+
 from db.provider_directory_readiness import dataset_relation_ready_predicate
+from process.provider_directory_named_edition import HEADER, source_registration_sql, source_relation_sql
+
+_SOURCE_COLUMNS = {
+    HEADER: (
+        "endpoint_id",
+        "dataset_id",
+        "acquisition_root_run_id",
+        "import_run_id",
+        "status",
+        "is_current",
+        "published_at",
+        "superseded_at",
+        "publication_metadata_json",
+    ),
+    "provider_directory_dataset_resource": ("dataset_id", "resource_type", "resource_id", "payload_json"),
+    "provider_directory_dataset_insurance_plan": ("dataset_id", "resource_id", "payload_json"),
+    "provider_directory_dataset_network_plan": ("dataset_id", "network_resource_id", "insurance_plan_resource_id"),
+    "provider_directory_dataset_affiliation_organization": (
+        "dataset_id",
+        "participating_organization_resource_id",
+        "affiliation_resource_id",
+    ),
+}
+
+
+def named_source_data_sql(query, schema, editions=(), *, plan_scalars=False):
+    """Bind the closed data-relation operands in an existing generated query."""
+    if not editions:
+        return query
+    import re
+
+    for table, columns in _SOURCE_COLUMNS.items():
+        pattern = r"\b(FROM|JOIN)\s+" + re.escape(schema + "." + table) + r"(?=\s)"
+        if re.search(pattern, query) is None:
+            continue
+        if table == "provider_directory_dataset_insurance_plan" and plan_scalars:
+            columns = (*columns, "plan_active", "plan_identifier")
+        relation = source_relation_sql(schema, table, editions, columns=columns)
+        query = re.sub(pattern, lambda match: match[1] + " " + relation, query)
+    pattern = r"\b(FROM|JOIN)\s+" + re.escape(schema + ".provider_directory_source") + r"(?=\s)"
+    registration = source_registration_sql(schema, editions)
+    query = re.sub(pattern, lambda match: match[1] + " " + registration, query)
+    return query
+
 
 PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE = "provider_directory_dataset_insurance_plan"
 PROVIDER_DIRECTORY_DATASET_RELATION_VERSION = "1"
@@ -247,3 +293,208 @@ def legacy_affiliation_candidates_sql(
            {relation_fallback_filter}
     )
     """
+
+
+def directory_current_dataset_ctes_sql(schema: str) -> str:
+    """Select one completely published endpoint dataset for each catalog source."""
+    return f"""
+    current_endpoint_counts AS MATERIALIZED (
+        SELECT dataset.endpoint_id
+          FROM {schema}.provider_directory_endpoint_dataset AS dataset
+         WHERE dataset.is_current IS TRUE
+      GROUP BY dataset.endpoint_id
+        HAVING COUNT(*) = 1
+    ), current_datasets AS MATERIALIZED (
+        SELECT dataset.endpoint_id, dataset.dataset_id,
+               COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar AS run_id
+          FROM {schema}.provider_directory_endpoint_dataset AS dataset
+          JOIN current_endpoint_counts AS current_endpoint
+            ON current_endpoint.endpoint_id = dataset.endpoint_id
+         WHERE dataset.is_current IS TRUE
+           AND dataset.status = 'published'
+           AND dataset.published_at IS NOT NULL
+           AND dataset.superseded_at IS NULL
+           AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) IS NOT NULL
+    )
+    """
+
+
+def directory_location_status_sql(
+    payload_sql: str,
+    *,
+    resource_type_sql: str,
+) -> str:
+    """Classify role activity conservatively from valid effective dates."""
+    role_start = f"{payload_sql} -> 'period' ->> 'start'"
+    role_end = f"{payload_sql} -> 'period' ->> 'end'"
+    role_start_date = f"""
+        CASE
+            WHEN pg_input_is_valid(LEFT(COALESCE({role_start}, ''), 10), 'date')
+            THEN LEFT({role_start}, 10)::date
+            ELSE NULL::date
+        END
+    """
+    role_end_date = f"""
+        CASE
+            WHEN pg_input_is_valid(LEFT(COALESCE({role_end}, ''), 10), 'date')
+            THEN LEFT({role_end}, 10)::date
+            ELSE NULL::date
+        END
+    """
+    role_active = f"""
+        LOWER(COALESCE({payload_sql} ->> 'active', '')) = 'true'
+        AND (
+            COALESCE({role_start}, '') = ''
+            OR ({role_start_date}) <= CURRENT_DATE
+        )
+        AND (
+            COALESCE({role_end}, '') = ''
+            OR ({role_end_date}) >= CURRENT_DATE
+        )
+    """
+    role_inactive = f"""
+        LOWER(COALESCE({payload_sql} ->> 'active', '')) = 'false'
+        OR ({role_start_date}) > CURRENT_DATE
+        OR ({role_end_date}) < CURRENT_DATE
+    """
+    return f"""
+        CASE
+            WHEN BOOL_OR(
+                {resource_type_sql} = 'PractitionerRole'
+                AND ({role_active})
+            ) THEN 'active'
+            WHEN COUNT(*) FILTER (
+                WHERE {resource_type_sql} = 'PractitionerRole'
+            ) > 0
+            AND BOOL_AND(COALESCE(({role_inactive}), FALSE)) FILTER (
+                WHERE {resource_type_sql} = 'PractitionerRole'
+            ) THEN 'inactive'
+            ELSE 'unknown'
+        END::varchar
+    """
+
+
+_LOCATION_STATUS_SQL = """
+        WITH {current_dataset_ctes_sql}, matched_overlays AS MATERIALIZED (
+            SELECT overlay.source_record_id,
+                   overlay.source_id,
+                   overlay.resource_id,
+                   overlay.last_seen_run_id
+              FROM {overlay_table_sql} AS overlay
+             WHERE overlay.source_record_id = ANY(:source_record_ids)
+               AND overlay.resource_type = 'PractitionerRole'
+        ), visible_roles AS NOT MATERIALIZED (
+            SELECT overlay.source_record_id,
+                   CASE
+                       WHEN role.resource_id IS NOT NULL THEN jsonb_build_object(
+                           'active', role.active,
+                           'period', jsonb_build_object(
+                               'start', role.period_start,
+                               'end', role.period_end
+                           )
+                       )
+                       ELSE resource.payload_json::jsonb
+                   END AS payload_json
+              FROM matched_overlays AS overlay
+              JOIN {schema}.provider_directory_source AS source
+                ON source.source_id = overlay.source_id
+              JOIN current_datasets AS dataset
+                ON dataset.endpoint_id = source.endpoint_id
+               AND dataset.run_id = overlay.last_seen_run_id
+         LEFT JOIN {role_table_sql} AS role
+                ON role.source_id = overlay.source_id
+               AND role.resource_id = overlay.resource_id
+               AND role.last_seen_run_id = dataset.run_id
+         LEFT JOIN {resource_table_sql} AS resource
+                ON role.resource_id IS NULL
+               AND resource.dataset_id = dataset.dataset_id
+               AND resource.resource_type = 'PractitionerRole'
+               AND resource.resource_id = overlay.resource_id
+             WHERE role.resource_id IS NOT NULL
+                OR resource.resource_id IS NOT NULL
+        )
+        SELECT visible_role.source_record_id,
+               {location_status_sql} AS location_status
+          FROM visible_roles AS visible_role
+      GROUP BY visible_role.source_record_id;
+        """
+
+
+def location_status_query(schema: str, overlay_table_sql: str, editions=()):
+    """Resolve office status from the selected immutable directory resources."""
+    query = _LOCATION_STATUS_SQL.format(
+        current_dataset_ctes_sql=directory_current_dataset_ctes_sql(schema),
+        overlay_table_sql=overlay_table_sql,
+        schema=schema,
+        role_table_sql=f"{schema}.provider_directory_practitioner_role",
+        resource_table_sql=f"{schema}.provider_directory_dataset_resource",
+        location_status_sql=directory_location_status_sql(
+            "visible_role.payload_json", resource_type_sql="'PractitionerRole'"
+        ),
+    )
+    return text(named_source_data_sql(query, schema, editions, plan_scalars=False))
+
+
+_CURRENT_GEO_EVIDENCE_SQL = """
+        WITH requested_candidates AS MATERIALIZED (
+            SELECT requested.npi, requested.address_key
+              FROM unnest(
+                       CAST(:candidate_npis AS bigint[]),
+                       CAST(:candidate_address_keys AS uuid[])
+                   ) AS requested(npi, address_key)
+        ), current_endpoint_counts AS MATERIALIZED (
+            SELECT dataset.endpoint_id
+              FROM {dataset_table} AS dataset
+             WHERE dataset.is_current IS TRUE
+          GROUP BY dataset.endpoint_id
+            HAVING COUNT(*) = 1
+        ), current_datasets AS MATERIALIZED (
+            SELECT dataset.endpoint_id, dataset.dataset_id,
+                   COALESCE(
+                       dataset.acquisition_root_run_id, dataset.import_run_id
+                   )::varchar AS run_id
+              FROM {dataset_table} AS dataset
+              JOIN current_endpoint_counts AS current_endpoint
+                ON current_endpoint.endpoint_id = dataset.endpoint_id
+             WHERE dataset.is_current IS TRUE
+               AND dataset.status = 'published'
+               AND dataset.published_at IS NOT NULL
+               AND dataset.superseded_at IS NULL
+               AND COALESCE(
+                       dataset.acquisition_root_run_id, dataset.import_run_id
+                   ) IS NOT NULL
+        ), current_provider_directory_runs AS MATERIALIZED (
+            SELECT source.source_id, dataset.dataset_id, dataset.run_id
+              FROM {source_table} AS source
+              JOIN current_datasets AS dataset
+                ON dataset.endpoint_id = source.endpoint_id
+        )
+        SELECT requested.npi, requested.address_key::text AS address_key,
+               ARRAY_AGG(
+                   DISTINCT overlay.source_record_id
+                   ORDER BY overlay.source_record_id
+               ) AS source_record_ids, COUNT(DISTINCT current_run.dataset_id)::integer AS provider_directory_source_count
+          FROM requested_candidates AS requested
+          JOIN {overlay_table} AS overlay
+            ON overlay.npi = requested.npi
+           AND overlay.address_key = requested.address_key
+          JOIN current_provider_directory_runs AS current_run
+            ON current_run.source_id = overlay.source_id
+           AND current_run.run_id = overlay.last_seen_run_id
+          JOIN {dataset_resource_table} AS dataset_resource
+            ON dataset_resource.dataset_id = current_run.dataset_id
+           AND dataset_resource.resource_type = overlay.resource_type
+           AND dataset_resource.resource_id = overlay.resource_id
+         WHERE overlay.source_record_id IS NOT NULL
+      GROUP BY requested.npi, requested.address_key;
+    """
+
+
+def current_geo_evidence_sql(source_table, dataset_table, dataset_resource_table, overlay_table):
+    """Build bounded current-dataset provenance using the caller's scoped relations."""
+    return _CURRENT_GEO_EVIDENCE_SQL.format(
+        source_table=source_table,
+        dataset_table=dataset_table,
+        dataset_resource_table=dataset_resource_table,
+        overlay_table=overlay_table,
+    )

@@ -22,3 +22,5 @@ def checkpoint_unit_scope(monkeypatch):
 
     monkeypatch.setattr(directory, "source_checkpoint_transaction", transaction)
     monkeypatch.setattr(directory, "require_checkpoint_executor", AsyncMock())
+    monkeypatch.setattr(directory, "source_copy_executor", lambda executor: executor)
+    monkeypatch.setattr(directory.bulk_parallel, "source_copy_executor", lambda executor: executor)

@@ -561,7 +561,7 @@ async def _catalog(directory, name):
 async def _resource_pages(directory, model, dataset, enrichment):
     """Seek native resource keys before expanding one bounded typed page."""
     columns = ",".join(directory._q(str(column.name)) for column in model.__table__.columns)
-    projection = directory._artifact_resource_batch_select_sql(model, directory._schema())
+    projection = directory._artifact_resource_batch_select_sql(model, directory._schema(), dataset=dataset)
     statement = f"WITH projected({columns}) AS ({projection}) SELECT * FROM projected"
     params_by_name = dict(
         source_id=dataset.source_id,
@@ -652,7 +652,7 @@ async def _prepare_model(directory, admission, model, name, created_by_relation)
             expected, kind = statement, None
         else:
             if admission.factory is None:
-                statement = directory._provider_directory_artifact_resource_select_sql(model, schema)
+                statement = directory._provider_directory_artifact_resource_select_sql(model, schema, dataset=dataset)
                 params_by_name = dict(
                     source_ids=[dataset.source_id],
                     dataset_ids=[dataset.dataset_id],

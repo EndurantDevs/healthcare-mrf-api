@@ -21,6 +21,23 @@ from process.provider_directory_validated_publication_contract import (
 _ADMISSION_SCHEMA = ProviderDirectoryEndpointDataset.__table__.schema
 
 
+def named_source_dataset_records(records, editions):
+    """Overlay current logical headers while keeping newer validated candidates."""
+    endpoints = {edition.endpoint_id for edition in editions}
+    return [
+        record
+        for record in records
+        if not (record.get("endpoint_id") in endpoints and record.get("is_current") is True)
+    ] + [
+        {
+            **edition.header,
+            "publication_metadata": edition.header["publication_metadata_json"],
+            "current_source_ids": edition.source_ids,
+        }
+        for edition in editions
+    ]
+
+
 def _source_endpoint_id(source_model, *, current_published_only):
     """Keep Profile reads on the serving alias while finding new candidates."""
 
@@ -294,14 +311,16 @@ def _current_dataset_identity_statement(dataset_ids):
     )
 
 
-async def _current_dataset_identities_by_id(dataset_ids):
+async def _current_dataset_identities_by_id(dataset_ids, editions=()):
     """Read exact current identities and recheck their serving state."""
 
     if not dataset_ids:
         return {}
     query_result = await db.execute(_current_dataset_identity_statement(dataset_ids))
     identities_by_id = {}
-    for dataset_record in query_result.mappings().all():
+    for dataset_record in named_source_dataset_records(query_result.mappings().all(), editions):
+        if dataset_record.get("dataset_id") not in dataset_ids:
+            continue
         try:
             identity = ProviderDirectoryDatasetIdentity.from_payload(
                 {

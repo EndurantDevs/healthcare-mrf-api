@@ -11355,6 +11355,15 @@ def _artifact_source_record(
     }
 
 
+@pytest.fixture
+def legacy_artifact_selection(monkeypatch):
+    @asynccontextmanager
+    async def legacy_selection(_directory, _source_ids):
+        yield ()
+
+    monkeypatch.setattr(importer.named_source_editions, "artifact_selection_snapshot", legacy_selection)
+
+
 def _stub_artifact_dataset_hydration(monkeypatch) -> None:
     monkeypatch.setattr(
         importer,
@@ -11408,6 +11417,7 @@ def _stub_artifact_scope_lifecycle(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("legacy_artifact_selection")
 async def test_artifact_dataset_selection_is_current_published_isolates_failed_sources(
     monkeypatch,
 ):
@@ -11460,6 +11470,7 @@ async def test_artifact_dataset_selection_is_current_published_isolates_failed_s
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("legacy_artifact_selection")
 async def test_artifact_dataset_selection_scopes_explicit_and_filters_all_source_publish(
     monkeypatch,
 ):
@@ -11598,6 +11609,7 @@ def test_artifact_dataset_selection_projects_only_bounded_dataset_fields():
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("legacy_artifact_selection")
 async def test_humana_explicit_artifact_selection_rejects_18_alias_expansion(
     monkeypatch,
 ):
@@ -11669,6 +11681,7 @@ def _artifact_selection_row(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("legacy_artifact_selection")
 async def test_full_artifact_selection_prefers_validated_and_falls_back_to_current(
     monkeypatch,
 ):
@@ -11716,6 +11729,7 @@ async def test_full_artifact_selection_prefers_validated_and_falls_back_to_curre
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("legacy_artifact_selection")
 async def test_targeted_artifact_selection_remains_current_only(monkeypatch):
     _stub_artifact_dataset_hydration(monkeypatch)
     lookup = AsyncMock(
@@ -12422,6 +12436,7 @@ async def test_artifact_scope_materialization_cleans_partial_tables(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("legacy_artifact_selection")
 async def test_missing_current_dataset_fails_before_artifact_build(monkeypatch):
     monkeypatch.setattr(
         importer.db,

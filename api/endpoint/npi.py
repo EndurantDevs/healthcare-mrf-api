@@ -54,6 +54,9 @@ from api.npi_detail_cache_identity import (
     NpiDetailCacheIdentity as _NpiDetailCacheIdentity,
 )
 from api.npi_detail_cache_identity import (
+    directory_overlay_cache_identity,
+)
+from api.npi_detail_cache_identity import (
     npi_detail_cache_key as _format_npi_detail_cache_key,
 )
 from api.npi_native_cache_identity import npi_canonical_publication_identity
@@ -63,6 +66,11 @@ from api.provider_directory_dataset_sql import (
     PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE,
     PROVIDER_DIRECTORY_EVIDENCE_CAPABILITY_SQL,
     _provider_directory_current_resource_ctes_sql,
+    current_geo_evidence_sql,
+    directory_current_dataset_ctes_sql,
+    directory_location_status_sql,
+    location_status_query,
+    named_source_data_sql,
 )
 from api.provider_directory_dataset_sql import (
     legacy_affiliation_candidates_sql as _legacy_affiliation_candidates_sql,
@@ -127,6 +135,8 @@ from api.provider_profile import (
     fetch_provider_profile_projection,
 )
 from api.provider_profile_snapshot import (
+    provider_directory_read_snapshot,
+    provider_directory_snapshot_read,
     provider_geo_read_snapshot,
     provider_optional_read,
     provider_profile_read_snapshot,
@@ -211,6 +221,7 @@ from process.ext.contact_canon import canonicalize_one as canonicalize_contact_o
 from process.ext.utils import download_it
 from process.florida_mqa_profile import STANDARD_CATEGORIES
 from process.openaddresses import exact_lookup_sql, fuzzy_lookup_sql, lookup_params_from_address, relaxed_lookup_sql
+from process.provider_directory_named_edition import named_editions_for_session
 from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
 
 _attach_selected_address_source_details = provider_detail_network_metadata.attach_provider_source_details
@@ -934,6 +945,13 @@ def _runtime_db_schema() -> str:
     if _DB_SCHEMA_RE.fullmatch(schema) is None:
         raise RuntimeError("npi_database_schema_invalid")
     return schema
+
+
+async def _named_directory_editions(session, schema, source_ids=None):
+    """Keep generation-scoped network responses on their existing source pin."""
+    if current_network_address_scope() is not None:
+        return ()
+    return await named_editions_for_session(session, schema, source_ids)
 
 
 def _schema_cache_key(table_name: str) -> str:
@@ -2800,6 +2818,22 @@ def _provider_directory_role_evidence_sql(
     )
 
 
+def _named_role_evidence_sql(schema, table_flags, editions=()):
+    """Bind role evidence to the selected logical editions and capabilities."""
+    has_plan_scalars = _has_provider_directory_plan_scalars(table_flags) and not editions
+    query = _provider_directory_role_evidence_sql(
+        schema,
+        table_flags.get("provider_directory_network_catalog", False),
+        table_flags.get("provider_directory_organization_affiliation", False),
+        table_flags.get(PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE, False),
+        table_flags.get(PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE, False),
+        table_flags.get(PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE, False),
+        has_plan_scalars,
+        all(table_flags.get(index_name, False) for _key, index_name in READINESS_INDEXES),
+    )
+    return named_source_data_sql(query, schema, editions, plan_scalars=has_plan_scalars)
+
+
 def _provider_directory_plan_metadata(mapping: Mapping[str, Any]) -> dict[str, Any] | None:
     has_plan_metadata = mapping.get("plan_returned") is not None or mapping.get("catalog_complete") is not None
     if not has_plan_metadata:
@@ -3252,20 +3286,10 @@ async def _fetch_provider_directory_role_evidence_map(
     if table_flags is None:
         return {}
     schema = _runtime_db_schema()
+    editions = await _named_directory_editions(session, schema, [source_id for source_id, _key in bounded_keys])
     await _disable_provider_directory_evidence_jit(session)
     evidence_result = await _execute_stmt(
-        text(
-            _provider_directory_role_evidence_sql(
-                schema,
-                table_flags["provider_directory_network_catalog"],
-                table_flags["provider_directory_organization_affiliation"],
-                table_flags[PROVIDER_DIRECTORY_DATASET_NETWORK_PLAN_TABLE],
-                table_flags[PROVIDER_DIRECTORY_DATASET_AFFILIATION_ORGANIZATION_TABLE],
-                table_flags[PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE],
-                _has_provider_directory_plan_scalars(table_flags),
-                all(table_flags.get(index_name, False) for _key, index_name in READINESS_INDEXES),
-            )
-        ),
+        text(_named_role_evidence_sql(schema, table_flags, editions=editions)),
         session=session,
         params={
             "source_ids": [source_id for source_id, _role_id in bounded_keys],
@@ -3596,8 +3620,10 @@ def _provider_directory_affiliation_evidence_sql(
     has_dataset_insurance_plan: bool = False,
     has_dataset_insurance_plan_scalars: bool = False,
     has_dataset_readiness_indexes: bool = False,
+    editions=(),
 ) -> str:
     """Resolve exact affiliation network and plan evidence from current resources."""
+    has_dataset_insurance_plan_scalars = has_dataset_insurance_plan_scalars and not editions
     current_resource_ctes_sql = _provider_directory_current_resource_ctes_sql(
         schema,
         has_dataset_insurance_plan,
@@ -3616,7 +3642,8 @@ def _provider_directory_affiliation_evidence_sql(
         has_catalog,
     )
     current_typed_resource_ctes_sql = _current_typed_resource_ctes_sql()
-    return f"""
+    return named_source_data_sql(
+        f"""
     WITH {current_resource_ctes_sql}, {current_typed_resource_ctes_sql},
          {affiliation_ctes_sql},
          {plan_resolution_cte_sql}, {plan_cap_ctes_sql}, evidence AS (
@@ -3641,7 +3668,11 @@ def _provider_directory_affiliation_evidence_sql(
   ORDER BY CASE WHEN evidence.evidence_type = 'affiliation' THEN 0 ELSE 1 END,
            evidence.source_id, evidence.affiliation_id, evidence.evidence_type, evidence.resource_id
      LIMIT {MAX_PROVIDER_DIRECTORY_ROLE_EVIDENCE_ROWS};
-    """
+    """,
+        schema,
+        editions,
+        plan_scalars=has_dataset_insurance_plan_scalars,
+    )
 
 
 def _map_provider_directory_affiliation_evidence(
@@ -3727,6 +3758,7 @@ async def _fetch_provider_directory_affiliation_evidence_map(
     if table_flags is None:
         return {}
     schema = _runtime_db_schema()
+    editions = await _named_directory_editions(session, schema, [source_id for source_id, _key in bounded_keys])
     await _disable_provider_directory_evidence_jit(session)
     evidence_result = await _execute_stmt(
         text(
@@ -3737,6 +3769,7 @@ async def _fetch_provider_directory_affiliation_evidence_map(
                 table_flags[PROVIDER_DIRECTORY_DATASET_INSURANCE_PLAN_TABLE],
                 _has_provider_directory_plan_scalars(table_flags),
                 all(table_flags.get(index_name, False) for _key, index_name in READINESS_INDEXES),
+                editions=editions,
             )
         ),
         session=session,
@@ -6549,7 +6582,7 @@ def _taxonomy_scope_tokens(raw_value: Any) -> tuple[tuple[str, ...], tuple[str, 
     return tuple(exact_codes), tuple(prefixes)
 
 
-async def _normalize_match_candidate_params(request) -> dict[str, Any]:
+async def _normalize_match_candidate_params(request, *, request_session=None) -> dict[str, Any]:
     """Validate and normalize provider candidate-match query parameters."""
     args = request.args
     unknown_params = sorted(set(args.keys()) - MATCH_CANDIDATE_QUERY_PARAMS)
@@ -6633,7 +6666,7 @@ async def _normalize_match_candidate_params(request) -> dict[str, Any]:
             "provide at least one locator: address_site_key, address_key, lat+long, or phone"
         )
 
-    request_session = _request_session(request)
+    request_session = request_session if request_session is not None else _request_session(request)
     specialty_filter = None
     if provider_type:
         if request_session is not None:
@@ -6705,63 +6738,12 @@ def _match_candidate_column_sql(address_table_sql: str) -> dict[str, str]:
 
 def _current_provider_directory_geo_evidence_sql() -> str:
     """Return exact current-overlay provenance for bounded geo candidates."""
-    source_table = _schema_cache_key("provider_directory_source")
-    dataset_table = _schema_cache_key("provider_directory_endpoint_dataset")
-    dataset_resource_table = _schema_cache_key("provider_directory_dataset_resource")
-    overlay_table = _schema_cache_key("provider_directory_address_overlay")
-    return f"""
-        WITH requested_candidates AS MATERIALIZED (
-            SELECT requested.npi, requested.address_key
-              FROM unnest(
-                       CAST(:candidate_npis AS bigint[]),
-                       CAST(:candidate_address_keys AS uuid[])
-                   ) AS requested(npi, address_key)
-        ), current_endpoint_counts AS MATERIALIZED (
-            SELECT dataset.endpoint_id
-              FROM {dataset_table} AS dataset
-             WHERE dataset.is_current IS TRUE
-          GROUP BY dataset.endpoint_id
-            HAVING COUNT(*) = 1
-        ), current_datasets AS MATERIALIZED (
-            SELECT dataset.endpoint_id, dataset.dataset_id,
-                   COALESCE(
-                       dataset.acquisition_root_run_id, dataset.import_run_id
-                   )::varchar AS run_id
-              FROM {dataset_table} AS dataset
-              JOIN current_endpoint_counts AS current_endpoint
-                ON current_endpoint.endpoint_id = dataset.endpoint_id
-             WHERE dataset.is_current IS TRUE
-               AND dataset.status = 'published'
-               AND dataset.published_at IS NOT NULL
-               AND dataset.superseded_at IS NULL
-               AND COALESCE(
-                       dataset.acquisition_root_run_id, dataset.import_run_id
-                   ) IS NOT NULL
-        ), current_provider_directory_runs AS MATERIALIZED (
-            SELECT source.source_id, dataset.dataset_id, dataset.run_id
-              FROM {source_table} AS source
-              JOIN current_datasets AS dataset
-                ON dataset.endpoint_id = source.endpoint_id
-        )
-        SELECT requested.npi, requested.address_key::text AS address_key,
-               ARRAY_AGG(
-                   DISTINCT overlay.source_record_id
-                   ORDER BY overlay.source_record_id
-               ) AS source_record_ids, COUNT(DISTINCT current_run.dataset_id)::integer AS provider_directory_source_count
-          FROM requested_candidates AS requested
-          JOIN {overlay_table} AS overlay
-            ON overlay.npi = requested.npi
-           AND overlay.address_key = requested.address_key
-          JOIN current_provider_directory_runs AS current_run
-            ON current_run.source_id = overlay.source_id
-           AND current_run.run_id = overlay.last_seen_run_id
-          JOIN {dataset_resource_table} AS dataset_resource
-            ON dataset_resource.dataset_id = current_run.dataset_id
-           AND dataset_resource.resource_type = overlay.resource_type
-           AND dataset_resource.resource_id = overlay.resource_id
-         WHERE overlay.source_record_id IS NOT NULL
-      GROUP BY requested.npi, requested.address_key;
-    """
+    return current_geo_evidence_sql(
+        _schema_cache_key("provider_directory_source"),
+        _schema_cache_key("provider_directory_endpoint_dataset"),
+        _schema_cache_key("provider_directory_dataset_resource"),
+        _schema_cache_key("provider_directory_address_overlay"),
+    )
 
 
 def _match_candidate_taxonomy_filter_sql(
@@ -6809,7 +6791,7 @@ def _match_candidate_taxonomy_filter_sql(
     """
 
 
-def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tuple[Any, dict[str, Any]]:
+def _match_candidate_query(params: dict[str, Any], address_table_sql: str, editions=()) -> tuple[Any, dict[str, Any]]:
     """Build the bounded provider candidate query and its bound parameters."""
     columns = _match_candidate_column_sql(address_table_sql)
     bound_parameter_map: dict[str, Any] = {
@@ -6860,7 +6842,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str) -> tu
         and _is_unified_address_table(address_table_sql)
         and not is_scoped_address_relation(address_table_sql)
     ):
-        phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
+        phone_candidates_cte = _address_phone_candidates_cte(address_table_sql, editions=editions)
         bound_parameter_map["candidate_limit"] = min(
             max(int(params["limit"]) * 8, 20),
             _MATCH_CANDIDATES_MAX_INTERNAL_ROWS,
@@ -7071,7 +7053,12 @@ async def _fetch_match_candidate_rows(params: dict[str, Any], *, session: Any = 
         "taxonomy_array",
     }
     address_table_sql = await _address_serving_table_sql(required_columns, session=session)
-    query, query_params = _match_candidate_query(params, address_table_sql)
+    editions = (
+        await _named_directory_editions(session, _runtime_db_schema())
+        if params.get("phone_digits") and session is not None
+        else ()
+    )
+    query, query_params = _match_candidate_query(params, address_table_sql, editions)
     try:
         async with asyncio.timeout(max(0.1, _MATCH_CANDIDATES_TIMEOUT_SECONDS)):
             candidate_query_result = await _execute_match_candidate_query(query, query_params, session)
@@ -7658,8 +7645,10 @@ async def _attach_geo_candidate_record_ids(
     candidate_pairs = _geo_candidate_address_pairs(candidate_row_list)
     if not candidate_pairs:
         return
+    schema = _runtime_db_schema()
+    editions = await _named_directory_editions(database_session, schema) if database_session is not None else ()
     evidence_result = await _execute_stmt(
-        text(_current_provider_directory_geo_evidence_sql()),
+        text(named_source_data_sql(_current_provider_directory_geo_evidence_sql(), schema, editions)),
         session=database_session,
         params={
             "candidate_npis": [npi for npi, _address_key in candidate_pairs],
@@ -7779,7 +7768,8 @@ async def _fetch_enriched_match_candidate_rows_bounded(
 
 
 @blueprint.get("/match-candidates")
-async def match_candidates(request):
+@provider_directory_snapshot_read
+async def match_candidates(request, *, session=None):
     """Return bounded provider candidates for an address or identity query."""
     started = time.monotonic()
     request.args.get("address_site_key")
@@ -7798,8 +7788,8 @@ async def match_candidates(request):
     request.args.get("include_sources")
     request.args.get("include_evidence")
     request.args.get("debug")
-    params = await _normalize_match_candidate_params(request)
-    request_session = _request_session(request)
+    params = await _normalize_match_candidate_params(request, request_session=session)
+    request_session = session if session is not None else _request_session(request)
     candidate_rows, enrichment_map = await _fetch_enriched_match_candidate_rows_bounded(
         params,
         started_at=started,
@@ -7924,8 +7914,9 @@ def _append_unique_search_taxonomy(
 
 @blueprint.get("/all")
 @canonical_network_read
+@provider_directory_snapshot_read
 async def list_providers(
-    request, *, native_args=None, import_context=None, native_npis=None, native_scope_preparer=None
+    request, *, native_args=None, import_context=None, native_npis=None, native_scope_preparer=None, session=None
 ):
     """Search, count, or page through public NPI provider records."""
     if (
@@ -7944,7 +7935,7 @@ async def list_providers(
     include_chain_enrichment = _include_chain_provider_enrichment(args.get("show"))
     response_format = args.get("format") or args.get("response_format")
     response_format = str(response_format).strip().lower() if response_format else None
-    request_session = _request_session(request)
+    request_session = session if session is not None else _request_session(request)
     is_ordinary_provider_query = (
         native_args is None
         and import_context is None
@@ -8194,6 +8185,11 @@ async def list_providers(
     zip_code = zip_code or postal_code
 
     phone_digits = _normalize_phone_digits(phone)
+    editions = (
+        await _named_directory_editions(request_session, _runtime_db_schema())
+        if phone_digits and request_session is not None
+        else ()
+    )
     address_key = _normalize_address_key(address_key_raw)
     address_site_key = _normalize_uuid_key(address_site_key_raw, PUBLIC_ADDRESS_SITE_KEY)
     exact_npi = _normalize_exact_npi(npi_raw)
@@ -8502,6 +8498,7 @@ async def list_providers(
             phone_candidates_cte = _address_phone_candidates_cte(
                 address_table_sql,
                 is_bounded=import_context is None and native_npis is None,
+                editions=editions,
             )
             if phone_candidates_cte:
                 phone_candidates_join = _address_phone_candidates_join("c")
@@ -8764,7 +8761,7 @@ async def list_providers(
         if zip_code:
             address_clauses.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
-            phone_candidates_cte = _address_phone_candidates_cte(address_table_sql)
+            phone_candidates_cte = _address_phone_candidates_cte(address_table_sql, editions=editions)
             if phone_candidates_cte:
                 phone_candidates_join = _address_phone_candidates_join("c")
             else:
@@ -8902,7 +8899,7 @@ async def list_providers(
         return await _bounded_provider_list_count(
             _count_rows,
             session=request_session,
-            has_reader=has_reader_session(db),
+            has_reader=has_reader_session(db) or (session is not None and is_ordinary_provider_query),
             timeout=_NPI_ALL_TOTAL_TIMEOUT_SECONDS,
         )
 
@@ -9070,6 +9067,7 @@ async def list_providers(
             phone_candidates_cte = _address_phone_candidates_cte(
                 address_table_sql,
                 is_bounded=page_import_context is None and native_npis is None,
+                editions=editions,
             )
             if phone_candidates_cte:
                 phone_candidates_join = _address_phone_candidates_join("c")
@@ -9430,7 +9428,12 @@ async def list_providers(
             async with _provider_list_connection(
                 db,
                 page_import_context,
-                request_session,
+                request_session
+                if page_import_context is not None
+                or native_npis is not None
+                or current_network_address_scope() is not None
+                or has_reader_session(db)
+                else None,
                 native_npis=native_npis,
             ) as taxonomy_conn:
                 return await taxonomy_conn.all(
@@ -9499,8 +9502,7 @@ async def list_providers(
                 asyncio.create_task(_fetch_search_taxonomy_records()),
                 asyncio.create_task(
                     _apply_location_statuses(
-                        location_candidates,
-                        session=request_session,
+                        location_candidates, session=request_session, use_request_session=session is not None
                     )
                 ),
                 asyncio.create_task(_fetch_search_enrichment_summary()),
@@ -9768,7 +9770,7 @@ async def list_providers(
                 else "native batch provider count is required"
             )
     else:
-        if current_network_address_scope() is not None:
+        if current_network_address_scope() is not None or request_session is not None:
             raw_total = await _count_with_timeout()
             result_payload = await get_results(start, limit, filters_by_name)
         else:
@@ -12061,6 +12063,7 @@ async def read_npi_detail(request, npi, *, native_args=None):
         return address_by_field
 
     async with provider_profile_read_snapshot(db, _runtime_db_schema(), include_detail=True) as request_session:
+        directory_editions = await _named_directory_editions(request_session, _runtime_db_schema())
         profile_record: dict[str, Any] | None = None
         if include_profile:
             from api.provider_profile_network_read import read_detail_directory_profile
@@ -12083,6 +12086,9 @@ async def read_npi_detail(request, npi, *, native_args=None):
                     )
                     address_overlay_serving_identity = await _provider_directory_address_overlay_serving_identity(
                         session=request_session,
+                    )
+                    address_overlay_serving_identity = directory_overlay_cache_identity(
+                        address_overlay_serving_identity, directory_editions
                     )
                 is_response_cache_enabled = canonical_publication_identity is not None
             except sanic.exceptions.ServiceUnavailable:
@@ -13207,26 +13213,7 @@ async def _provider_directory_address_overlay_serving_identity(
 
 
 def _directory_current_dataset_ctes_sql(schema: str) -> str:
-    return f"""
-    current_endpoint_counts AS MATERIALIZED (
-        SELECT dataset.endpoint_id
-          FROM {schema}.provider_directory_endpoint_dataset AS dataset
-         WHERE dataset.is_current IS TRUE
-      GROUP BY dataset.endpoint_id
-        HAVING COUNT(*) = 1
-    ), current_datasets AS MATERIALIZED (
-        SELECT dataset.endpoint_id, dataset.dataset_id,
-               COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)::varchar AS run_id
-          FROM {schema}.provider_directory_endpoint_dataset AS dataset
-          JOIN current_endpoint_counts AS current_endpoint
-            ON current_endpoint.endpoint_id = dataset.endpoint_id
-         WHERE dataset.is_current IS TRUE
-           AND dataset.status = 'published'
-           AND dataset.published_at IS NOT NULL
-           AND dataset.superseded_at IS NULL
-           AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id) IS NOT NULL
-    )
-    """
+    return directory_current_dataset_ctes_sql(schema)
 
 
 def _directory_overlay_resource_ctes_sql(schema: str) -> str:
@@ -13342,78 +13329,34 @@ _PROVIDER_DIRECTORY_OVERLAY_QUERY_TEMPLATE = """
 
 def _provider_directory_overlay_query_sql(
     overlay_columns: set[str],
+    editions=(),
 ) -> str:
     """Build the current-resource provider-directory address overlay query."""
     lat_select, long_select, coordinate_group_by = _overlay_coordinate_sql(overlay_columns)
     premise_select, premise_filter, premise_group_by = _overlay_premise_key_sql(overlay_columns)
     overlay_table_sql = _schema_cache_key(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
     current_resource_ctes_sql = _directory_overlay_resource_ctes_sql(_runtime_db_schema())
-    return _PROVIDER_DIRECTORY_OVERLAY_QUERY_TEMPLATE.format(
-        current_resource_ctes_sql=current_resource_ctes_sql,
-        overlay_table_sql=overlay_table_sql,
-        premise_filter=premise_filter,
-        formatted_address_select=_overlay_formatted_address_sql(overlay_columns),
-        lat_select=lat_select,
-        long_select=long_select,
-        premise_select=premise_select,
-        location_status_select=_overlay_location_status_sql(),
-        coordinate_group_by=coordinate_group_by,
-        premise_group_by=premise_group_by,
+    return named_source_data_sql(
+        _PROVIDER_DIRECTORY_OVERLAY_QUERY_TEMPLATE.format(
+            current_resource_ctes_sql=current_resource_ctes_sql,
+            overlay_table_sql=overlay_table_sql,
+            premise_filter=premise_filter,
+            formatted_address_select=_overlay_formatted_address_sql(overlay_columns),
+            lat_select=lat_select,
+            long_select=long_select,
+            premise_select=premise_select,
+            location_status_select=_overlay_location_status_sql(),
+            coordinate_group_by=coordinate_group_by,
+            premise_group_by=premise_group_by,
+        ),
+        _runtime_db_schema(),
+        editions,
+        plan_scalars=False,
     )
 
 
-def _provider_directory_location_status_sql(
-    payload_sql: str,
-    *,
-    resource_type_sql: str,
-) -> str:
-    role_start = f"{payload_sql} -> 'period' ->> 'start'"
-    role_end = f"{payload_sql} -> 'period' ->> 'end'"
-    role_start_date = f"""
-        CASE
-            WHEN pg_input_is_valid(LEFT(COALESCE({role_start}, ''), 10), 'date')
-            THEN LEFT({role_start}, 10)::date
-            ELSE NULL::date
-        END
-    """
-    role_end_date = f"""
-        CASE
-            WHEN pg_input_is_valid(LEFT(COALESCE({role_end}, ''), 10), 'date')
-            THEN LEFT({role_end}, 10)::date
-            ELSE NULL::date
-        END
-    """
-    role_active = f"""
-        LOWER(COALESCE({payload_sql} ->> 'active', '')) = 'true'
-        AND (
-            COALESCE({role_start}, '') = ''
-            OR ({role_start_date}) <= CURRENT_DATE
-        )
-        AND (
-            COALESCE({role_end}, '') = ''
-            OR ({role_end_date}) >= CURRENT_DATE
-        )
-    """
-    role_inactive = f"""
-        LOWER(COALESCE({payload_sql} ->> 'active', '')) = 'false'
-        OR ({role_start_date}) > CURRENT_DATE
-        OR ({role_end_date}) < CURRENT_DATE
-    """
-    return f"""
-        CASE
-            WHEN BOOL_OR(
-                {resource_type_sql} = 'PractitionerRole'
-                AND ({role_active})
-            ) THEN 'active'
-            WHEN COUNT(*) FILTER (
-                WHERE {resource_type_sql} = 'PractitionerRole'
-            ) > 0
-            AND BOOL_AND(COALESCE(({role_inactive}), FALSE)) FILTER (
-                WHERE {resource_type_sql} = 'PractitionerRole'
-            ) THEN 'inactive'
-            ELSE 'unknown'
-        END::varchar
-    """
+def _provider_directory_location_status_sql(payload_sql: str, *, resource_type_sql: str) -> str:
+    return directory_location_status_sql(payload_sql, resource_type_sql=resource_type_sql)
 
 
 async def _fetch_provider_directory_address_overlay_map(
@@ -13435,9 +13378,11 @@ async def _fetch_provider_directory_address_overlay_map(
     if not all(visibility_table_states):
         return {}
     overlay_columns = await _table_columns(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, session=session)
+    editions = await _named_directory_editions(session, _runtime_db_schema()) if session is not None else ()
     overlay_query = text(
         _provider_directory_overlay_query_sql(
             overlay_columns,
+            editions=editions,
         )
     )
     overlay_result = await _execute_stmt(
@@ -13481,62 +13426,8 @@ async def _fetch_provider_directory_address_overlay(
     ).get(int(npi), [])
 
 
-def _location_status_query(schema: str, overlay_table_sql: str) -> Any:
-    current_dataset_ctes_sql = _directory_current_dataset_ctes_sql(schema)
-    role_table_sql = f"{schema}.{ProviderDirectoryPractitionerRole.__tablename__}"
-    resource_table_sql = f"{schema}.provider_directory_dataset_resource"
-    location_status_sql = _provider_directory_location_status_sql(
-        "visible_role.payload_json",
-        resource_type_sql="'PractitionerRole'",
-    )
-    # Typed rows are mutable; the immutable dataset payload preserves current
-    # publication semantics when a checkpoint run ID differs.
-    return text(
-        f"""
-        WITH {current_dataset_ctes_sql}, matched_overlays AS MATERIALIZED (
-            SELECT overlay.source_record_id,
-                   overlay.source_id,
-                   overlay.resource_id,
-                   overlay.last_seen_run_id
-              FROM {overlay_table_sql} AS overlay
-             WHERE overlay.source_record_id = ANY(:source_record_ids)
-               AND overlay.resource_type = 'PractitionerRole'
-        ), visible_roles AS NOT MATERIALIZED (
-            SELECT overlay.source_record_id,
-                   CASE
-                       WHEN role.resource_id IS NOT NULL THEN jsonb_build_object(
-                           'active', role.active,
-                           'period', jsonb_build_object(
-                               'start', role.period_start,
-                               'end', role.period_end
-                           )
-                       )
-                       ELSE resource.payload_json::jsonb
-                   END AS payload_json
-              FROM matched_overlays AS overlay
-              JOIN {schema}.provider_directory_source AS source
-                ON source.source_id = overlay.source_id
-              JOIN current_datasets AS dataset
-                ON dataset.endpoint_id = source.endpoint_id
-               AND dataset.run_id = overlay.last_seen_run_id
-         LEFT JOIN {role_table_sql} AS role
-                ON role.source_id = overlay.source_id
-               AND role.resource_id = overlay.resource_id
-               AND role.last_seen_run_id = dataset.run_id
-         LEFT JOIN {resource_table_sql} AS resource
-                ON role.resource_id IS NULL
-               AND resource.dataset_id = dataset.dataset_id
-               AND resource.resource_type = 'PractitionerRole'
-               AND resource.resource_id = overlay.resource_id
-             WHERE role.resource_id IS NOT NULL
-                OR resource.resource_id IS NOT NULL
-        )
-        SELECT visible_role.source_record_id,
-               {location_status_sql} AS location_status
-          FROM visible_roles AS visible_role
-      GROUP BY visible_role.source_record_id;
-        """
-    )
+def _location_status_query(schema: str, overlay_table_sql: str, editions=()) -> Any:
+    return location_status_query(schema, overlay_table_sql, editions)
 
 
 def _status_map_from_result(query_result: Any) -> dict[str, str]:
@@ -13568,17 +13459,15 @@ async def _fetch_location_status_by_record_id(
         return {}
     try:
         overlay_table_sql = _schema_cache_key(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
-        status_query = _location_status_query(
-            _runtime_db_schema(),
-            overlay_table_sql,
-        )
         use_passed_session = use_request_session and session is not None
         async with (
-            contextlib.nullcontext(session) if use_passed_session else db.session() as status_session,
+            provider_directory_read_snapshot(db, session, reuse=use_passed_session) as status_session,
             provider_read_savepoint(status_session)
             if use_passed_session or has_network_read_inventory(status_session)
             else contextlib.nullcontext(),
         ):
+            editions = await _named_directory_editions(status_session, _runtime_db_schema())
+            status_query = _location_status_query(_runtime_db_schema(), overlay_table_sql, editions=editions)
             query_result = await _execute_stmt(
                 status_query,
                 session=status_session,

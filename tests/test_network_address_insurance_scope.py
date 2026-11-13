@@ -93,12 +93,33 @@ def _record_insurance_statements(monkeypatch, statements):
         yield connection
 
     monkeypatch.setattr(provider_list_sql, "ConnectionProxy", Mock(return_value=connection))
-    monkeypatch.setattr(npi, "db", SimpleNamespace(acquire=acquire))
     monkeypatch.setattr(npi, "_address_serving_table_sql", AsyncMock(return_value="mrf.entity_address_unified"))
     monkeypatch.setattr(npi, "_plan_release_npi_scope", AsyncMock(return_value=(None, {})))
 
-    async def execute(statement, parameters):
-        rows = await query(statement, **parameters)
+    @asynccontextmanager
+    async def transaction():
+        yield
+
+    async def execute(statement, parameters=None):
+        sql = str(statement)
+        if "AS timeout_text" in sql:
+            settings = SimpleNamespace(
+                timeout_text="0",
+                timeout_milliseconds="0",
+                transaction_isolation="repeatable read",
+                transaction_read_only="on",
+            )
+            return SimpleNamespace(one_or_none=lambda: settings)
+        if sql.startswith("SET TRANSACTION") or "set_config(" in sql:
+            return None
+        rows = await query(statement, **(parameters or {}))
         return SimpleNamespace(all=lambda: rows)
 
-    return with_read_identity_receipts(SimpleNamespace(execute=execute))
+    session = with_read_identity_receipts(SimpleNamespace(execute=execute, begin=transaction, begin_nested=transaction))
+
+    @asynccontextmanager
+    async def session_scope():
+        yield session
+
+    monkeypatch.setattr(npi, "db", SimpleNamespace(acquire=acquire, session=session_scope))
+    return session

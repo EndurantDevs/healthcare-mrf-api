@@ -4,11 +4,14 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from db.connection import Database
 from process import provider_directory_profile as profile_artifact
 from process import provider_directory_profile_selection_snapshot as snapshot
 from tests.test_provider_directory_profile_selection_attestation import _catalog
@@ -16,6 +19,32 @@ from tests.test_provider_directory_profile_selection_coverage import (
     _dataset_row,
     _source_row,
 )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_reuses_real_owned_transaction_for_nested_selection(monkeypatch):
+    sessions = []
+
+    def session_factory():
+        session = AsyncSession()
+        sessions.append(session)
+        return session
+
+    database = Database(session_factory=session_factory)
+    monkeypatch.setattr(snapshot, "db", database)
+    from process import provider_directory_named_edition
+
+    resolve = AsyncMock(return_value=())
+    monkeypatch.setattr(provider_directory_named_edition, "named_editions_for_session", resolve)
+    monkeypatch.setattr(snapshot, "load_profile_selection_dataset_rows", AsyncMock(return_value=[]))
+    async with database.transaction() as owned_session:
+        async with snapshot.profile_selection_snapshot() as selected_session:
+            async with snapshot.profile_selection_snapshot() as nested_session:
+                assert selected_session is nested_session is owned_session
+        assert owned_session.in_transaction()
+        assert await snapshot._selection_dataset_rows() == []
+        resolve.assert_awaited_once_with(owned_session, snapshot._schema())
+        assert sessions == [owned_session]
 
 
 @pytest.mark.asyncio
@@ -29,15 +58,23 @@ async def test_snapshot_database_queries_lock_all_selection_relations(monkeypatc
     )
     monkeypatch.setattr(snapshot.db, "status", status)
     monkeypatch.setattr(snapshot.db, "all", all_rows)
+    from process import provider_directory_named_edition
+
+    @asynccontextmanager
+    async def transaction():
+        yield object()
+
+    monkeypatch.setattr(snapshot.db, "transaction", transaction)
+    monkeypatch.setattr(provider_directory_named_edition, "named_editions_for_session", AsyncMock(return_value=()))
 
     await snapshot._lock_profile_selection_tables()
     assert await snapshot._selection_source_rows() == [{"source_id": "a"}]
     assert await snapshot._selection_dataset_rows() == [{"dataset_id": "d"}]
-    assert status.await_count == 4
+    assert status.await_count == 5
     advisory_call = status.await_args_list[0]
     assert "pg_advisory_xact_lock" in advisory_call.args[0]
     assert advisory_call.kwargs["lock_identity"].endswith("pdfhir_1ceb7c0986c320b7eb924881")
-    relation_lock_sql = status.await_args_list[-1].args[0]
+    relation_lock_sql = status.await_args_list[-2].args[0]
     assert (
         relation_lock_sql.index("provider_directory_dataset_insurance_plan")
         < relation_lock_sql.index("provider_directory_dataset_network_plan")
@@ -55,7 +92,13 @@ async def test_snapshot_current_selection_honors_optional_lock(monkeypatch):
         "_selection_source_rows",
         AsyncMock(return_value=[_source_row(), *_variant_registry_rows()]),
     )
-    dataset_rows = AsyncMock(return_value=[_dataset_row()])
+
+    async def read_datasets(*, exact_readiness, has_selection_locks):
+        if has_selection_locks:
+            assert lock.await_count == 1
+        return [_dataset_row()]
+
+    dataset_rows = AsyncMock(side_effect=read_datasets)
     monkeypatch.setattr(snapshot, "_selection_dataset_rows", dataset_rows)
     unlocked = await snapshot._compute_current_selection(
         _catalog(),
@@ -78,9 +121,9 @@ async def test_snapshot_current_selection_honors_optional_lock(monkeypatch):
     assert unlocked.identity_payload["selection_fingerprint"] == proposal.identity_payload["selection_fingerprint"]
     lock.assert_awaited_once_with()
     assert [await_call.kwargs for await_call in dataset_rows.await_args_list] == [
-        {"exact_readiness": True},
-        {"exact_readiness": True},
-        {"exact_readiness": False},
+        {"exact_readiness": True, "has_selection_locks": False},
+        {"exact_readiness": True, "has_selection_locks": True},
+        {"exact_readiness": False, "has_selection_locks": False},
     ]
 
 

@@ -93,6 +93,7 @@ from process import provider_directory_fhir_response as fhir_response
 from process import provider_directory_leaf_census as leaf_census
 from process import provider_directory_molina as molina
 from process import provider_directory_mvp as mvp
+from process import provider_directory_named_edition as named_source_editions
 from process import provider_directory_owned_wal_transaction as profile_owned_wal
 from process import provider_directory_pacificsource as pacificsource
 from process import provider_directory_profile as profile_artifact
@@ -291,7 +292,13 @@ from process.provider_directory_fhir_subset_identity import (
     subset_activation_source_contract_payload,
 )
 from process.provider_directory_generic_source_adapters import resource_scan_types
-from process.provider_directory_generic_source_policy import is_source_storage_required
+from process.provider_directory_generic_source_policy import (
+    is_source_storage_required,
+    source_copy_executor,
+)
+from process.provider_directory_generic_source_policy import (
+    source_native_executor as _require_source_native_connection,
+)
 from process.provider_directory_identifier_policy import (
     CMS_NPD_PSEUDO_EIN_SYSTEM,
     CMS_NPD_SOURCE_ID,
@@ -13135,6 +13142,8 @@ class ProviderDirectoryArtifactDataset:
     operation_key: str | None = None
     published_at: str | None = None
 
+    storage_schema: str | None = None
+
     @property
     def artifact_resources(self) -> tuple[str, ...]:
         """Return every proven family available to serving artifacts."""
@@ -13155,6 +13164,7 @@ class _ProviderDirectoryArtifactScopeBatchProjection:
     last_resource_id: str | None
     projected_rows: int
     projected_logical_bytes: int
+    storage_schema: str | None = None
 
     def canonical_payload(self) -> dict[str, Any]:
         """Return this batch coordinate in deterministic hash form."""
@@ -13168,6 +13178,7 @@ class _ProviderDirectoryArtifactScopeBatchProjection:
             "last_resource_id": self.last_resource_id,
             "projected_rows": self.projected_rows,
             "projected_logical_bytes": self.projected_logical_bytes,
+            **({"storage_schema": self.storage_schema} if self.storage_schema is not None else {}),
         }
 
 
@@ -13362,12 +13373,13 @@ def _provider_directory_artifact_dataset_selection_sql(
     *,
     should_select_validated_candidates: bool = False,
     allow_published_replacement: bool = False,
+    named_editions: tuple[Any, ...] = (),
 ) -> str:
     """Select one immutable dataset per endpoint with explicit fallback rules."""
     if allow_published_replacement and (not source_ids or len(source_ids) != 1 or should_select_validated_candidates):
         raise ValueError("provider_directory_published_replacement_scope_invalid")
     source_ref = _qt(_schema(), ProviderDirectorySource.__tablename__)
-    dataset_ref = _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)
+    dataset_ref = _artifact_dataset_relation(_schema(), named_editions)
     is_explicit_selection = source_ids is not None
     preselect_candidates = is_explicit_selection and should_select_validated_candidates
     options_sql = _artifact_dataset_options_cte(
@@ -17221,6 +17233,7 @@ def _provider_directory_artifact_dataset_from_row(
         dataset_id=dataset_id,
         evidence_run_id=value_by_name["evidence_run_id"] or "",
         serving_endpoint_id=serving_endpoint_id,
+        storage_schema=_clean_text(dataset_row_map.get("storage_schema")),
         selected_resources=selected_resources,
         retained_resources=retained_resources,
         expected_resources=expected_resources,
@@ -18086,6 +18099,7 @@ def _artifact_endpoint_selection_identity(
         dataset.admission_id,
         dataset.operation_key,
         dataset.published_at,
+        dataset.storage_schema,
     )
 
 
@@ -18111,44 +18125,33 @@ async def _hydrate_legacy_artifact_dataset_rows(
     return [dict(_pagination_checkpoint_row_mapping(dataset_row)) for dataset_row in dataset_rows]
 
 
+def _artifact_dataset_relation(schema: str, named_editions: tuple[Any, ...] = ()) -> str:
+    """Select current immutable headers with explicit historical column shape."""
+    return named_source_editions.artifact_dataset_relation(sys.modules[__name__], schema, named_editions)
+
+
+def _artifact_payload_relation(schema: str, model: Any, datasets=()) -> str:
+    """Overlay exact selected editions without consulting the later current pointer."""
+    return named_source_editions.artifact_payload_relation(sys.modules[__name__], schema, model, datasets)
+
+
+def _artifact_selection_snapshot(source_ids=None):
+    """Resolve named pointers and selected headers in the caller's one snapshot."""
+    return named_source_editions.artifact_selection_snapshot(sys.modules[__name__], source_ids)
+
+
 async def _resolve_provider_directory_artifact_datasets(
     source_ids: list[str] | tuple[str, ...] | None,
     *,
     should_select_validated_candidates: bool = False,
     allow_published_replacement: bool = False,
 ) -> ProviderDirectoryArtifactDatasetFence:
-    is_explicit_selection = source_ids is not None
-    cleaned_source_ids = _clean_source_id_list(source_ids)
-    if is_explicit_selection and not cleaned_source_ids:
-        raise RuntimeError("provider_directory_artifact_source_ids_empty")
-    dataset_rows = await db.all(
-        _provider_directory_artifact_dataset_selection_sql(
-            cleaned_source_ids if is_explicit_selection else None,
-            should_select_validated_candidates=(should_select_validated_candidates),
-            allow_published_replacement=allow_published_replacement,
-        ),
-        published_status=ENDPOINT_DATASET_PUBLISHED,
-        validated_status=ENDPOINT_DATASET_VALIDATED,
-        select_validated_candidates=should_select_validated_candidates,
-        **({"source_ids": cleaned_source_ids} if is_explicit_selection else {}),
-    )
-    dataset_rows = await _hydrate_legacy_artifact_dataset_rows(dataset_rows)
-    dataset_rows = await annotate_uhc_flex_profile_dataset_readiness(
-        dataset_rows,
-        database=db,
-        row_mapping=_pagination_checkpoint_row_mapping,
-    )
-    fence = _validate_provider_directory_artifact_datasets(
-        dataset_rows,
-        cleaned_source_ids,
+    return await named_source_editions.resolve_artifact_datasets(
+        sys.modules[__name__],
+        source_ids,
         should_select_validated_candidates=should_select_validated_candidates,
+        allow_published_replacement=allow_published_replacement,
     )
-    fence = await _expand_reviewed_artifact_promotion_aliases(fence)
-    if allow_published_replacement:
-        from process.provider_directory_published_source_replacement import mark_for_preparation
-
-        return mark_for_preparation(sys.modules[__name__], fence)
-    return fence
 
 
 async def ensure_provider_directory_published_source_alias(
@@ -19125,7 +19128,7 @@ def _provider_directory_artifact_resource_select_sql(
         )
         SELECT {selected_columns}
           FROM selected
-          JOIN {_qt(schema, ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
+          JOIN {_artifact_resource_header_relation(schema, dataset)} AS dataset
             ON dataset.dataset_id = selected.dataset_id
           JOIN {_artifact_resource_input_relation(schema, dataset)} AS resource
             ON resource.dataset_id = selected.dataset_id
@@ -19151,13 +19154,13 @@ def _provider_directory_artifact_resource_insert_sql(
 
 
 def _artifact_resource_input_relation(schema: str, dataset: Any) -> str:
-    """Use the issued retained physical child for a selected SOURCE dataset."""
-    from process.provider_directory_generic_source_policy import is_source_storage_required
-    from process.provider_directory_profile_source_inputs import resource_relation
+    """Use the explicit immutable edition or the existing retained SOURCE input."""
+    return named_source_editions.artifact_resource_input_relation(sys.modules[__name__], schema, dataset)
 
-    if dataset is not None and is_source_storage_required():
-        return _unscoped_qt(schema, resource_relation(sys.modules[__name__], dataset))
-    return _qt(schema, ProviderDirectoryDatasetResource.__tablename__)
+
+def _artifact_resource_header_relation(schema: str, dataset: Any) -> str:
+    """Read the same explicit edition as the selected immutable resource rows."""
+    return named_source_editions.artifact_resource_header_relation(sys.modules[__name__], schema, dataset)
 
 
 def _artifact_resource_batch_select_sql(
@@ -19194,7 +19197,7 @@ def _artifact_resource_batch_select_sql(
         )
         SELECT {selected_columns}
           FROM selected
-          JOIN {_qt(schema, ProviderDirectoryEndpointDataset.__tablename__)}
+          JOIN {_artifact_resource_header_relation(schema, dataset)}
                AS dataset
             ON dataset.dataset_id = selected.dataset_id
           JOIN resource_batch AS resource
@@ -19341,6 +19344,7 @@ async def _artifact_resource_projection_batch(
         last_resource_id=next_resource_id,
         projected_rows=batch_rows,
         projected_logical_bytes=batch_logical_bytes,
+        storage_schema=dataset.storage_schema,
     )
 
 
@@ -19749,6 +19753,7 @@ def _validate_artifact_resource_batch_coordinate(
         or expected_batch.source_id != dataset.source_id
         or expected_batch.dataset_id != dataset.dataset_id
         or expected_batch.evidence_run_id != dataset.evidence_run_id
+        or expected_batch.storage_schema != dataset.storage_schema
         or expected_batch.resource_type != resource_type
         or expected_batch.after_resource_id != state.after_resource_id
     ):
@@ -20510,11 +20515,13 @@ def _artifact_fence_dataset_projection_sql(
          ORDER BY dataset.dataset_id;"""
 
 
-def _artifact_fence_dataset_rows_sql(*, for_update: bool) -> str:
+def _artifact_fence_dataset_rows_sql(
+    *, for_update: bool, dataset_schema: str | None = None, lock_rows: bool = True
+) -> str:
     """Return the exact dataset identity projection used by both fences."""
 
     dataset_ref = _unscoped_qt(
-        _schema(),
+        dataset_schema or _schema(),
         ProviderDirectoryEndpointDataset.__tablename__,
     )
     source_ref = _unscoped_qt(
@@ -20525,6 +20532,8 @@ def _artifact_fence_dataset_rows_sql(*, for_update: bool) -> str:
         dataset_ref,
         for_update=for_update,
     )
+    if not lock_rows:
+        lock_sql = ""
     safe_metadata = _artifact_safe_publication_metadata_sql()
     receipt = "dataset.artifact_selection_receipt_json"
     receipt_mode = f"""
@@ -20739,10 +20748,15 @@ async def _artifact_fence_dataset_rows(
         )
     else:
         query_params_by_name["endpoint_ids"] = fence.endpoint_ids
-    return await executor.all(
-        _artifact_fence_dataset_rows_sql(for_update=for_update),
-        **query_params_by_name,
-    )
+    if any(dataset.storage_schema is not None for dataset in selected_datasets):
+        return await named_source_editions.artifact_fence_dataset_rows(
+            sys.modules[__name__],
+            executor,
+            selected_datasets,
+            query_params_by_name,
+            for_update=for_update,
+        )
+    return await executor.all(_artifact_fence_dataset_rows_sql(for_update=for_update), **query_params_by_name)
 
 
 async def _artifact_eligible_validated_ids(
@@ -22993,27 +23007,8 @@ def _artifact_dataset_source_summary_source_ids(
     return normalized_source_ids
 
 
-def _artifact_source_summary_candidate_sql() -> str:
-    dataset_ref = _unscoped_qt(
-        _schema(),
-        ProviderDirectoryEndpointDataset.__tablename__,
-    )
-    return f"""
-        SELECT dataset.acquisition_root_run_id,
-               {_artifact_safe_publication_metadata_sql("dataset")}
-                   AS publication_metadata_json
-          FROM {dataset_ref} AS dataset
-         WHERE dataset.dataset_id = :dataset_id
-           AND dataset.endpoint_id = :endpoint_id
-           AND COALESCE(dataset.acquisition_root_run_id, dataset.import_run_id)
-               IS NOT DISTINCT FROM :evidence_run_id
-           AND dataset.previous_dataset_id
-               IS NOT DISTINCT FROM :previous_dataset_id
-           AND dataset.dataset_hash IS NOT DISTINCT FROM :dataset_hash
-           AND dataset.is_current = :is_current
-           AND dataset.status = :expected_status
-           AND dataset.superseded_at IS NULL;
-    """
+def _artifact_source_summary_candidate_sql(dataset: ProviderDirectoryArtifactDataset | None = None) -> str:
+    return named_source_editions.artifact_source_summary_candidate_sql(sys.modules[__name__], dataset)
 
 
 async def _current_artifact_dataset_source_summary_candidate(
@@ -23023,7 +23018,7 @@ async def _current_artifact_dataset_source_summary_candidate(
 ) -> tuple[EndpointDatasetCandidate, dict[str, Any]]:
     """Load one exact locked dataset binding for retained summary work."""
     metadata_record = await executor.first(
-        _artifact_source_summary_candidate_sql(),
+        _artifact_source_summary_candidate_sql(dataset),
         dataset_id=dataset.dataset_id,
         endpoint_id=dataset.endpoint_id,
         evidence_run_id=dataset.evidence_run_id,
@@ -23467,6 +23462,15 @@ async def _rebuild_one_current_dataset_artifacts(
     should_rebuild_source_summary: bool,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any] | None]:
     """Rebuild one dataset's proofs in a single stable transaction."""
+    if dataset.storage_schema is not None:
+        return await named_source_editions.reuse_artifact_relations(
+            sys.modules[__name__],
+            dataset,
+            dataset_fence,
+            network_plan=should_rebuild_network_plan,
+            affiliation_organization=should_rebuild_affiliation_organization,
+            source_summary=should_rebuild_source_summary,
+        )
     async with db.transaction():
         if should_rebuild_source_summary:
             await db.status("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
@@ -23770,33 +23774,8 @@ def _provider_directory_dataset_followup(
 
 
 async def _current_profile_dataset_map(source_id: str) -> dict[str, Any]:
-    database_row = await db.first(
-        f"""
-        SELECT dataset.dataset_id,
-               dataset.endpoint_id,
-               dataset.acquisition_root_run_id,
-               dataset.dataset_hash,
-               dataset.status,
-               dataset.is_current,
-               dataset.superseded_at,
-               {_artifact_safe_publication_metadata_sql("dataset")}
-                   AS publication_metadata_json
-          FROM {_qt(_schema(), ProviderDirectorySource.__tablename__)} AS source
-          JOIN {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)} AS dataset
-            ON dataset.endpoint_id = source.endpoint_id
-         WHERE source.source_id = :source_id
-           AND dataset.status = :published_status
-           AND dataset.is_current = true
-           AND dataset.superseded_at IS NULL
-         ORDER BY dataset.published_at DESC, dataset.dataset_id DESC
-         LIMIT 2;
-        """,
-        source_id=source_id,
-        published_status=ENDPOINT_DATASET_PUBLISHED,
-    )
-    if database_row is None:
-        return {}
-    return dict(_pagination_checkpoint_row_mapping(database_row))
+    """Read the current logical dataset within one repeatable selection snapshot."""
+    return await named_source_editions.current_profile_dataset_map(sys.modules[__name__], source_id)
 
 
 async def _source_local_dataset_followup_if_current(
@@ -24883,6 +24862,7 @@ class _ProviderDirectoryProfileBuild:
     capacity_geometry_status: str = "legacy_unavailable"
     capacity_geometry_hash: str | None = None
     capacity_geometry_json: str | None = None
+    named_datasets: tuple[ProviderDirectoryArtifactDataset, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -28726,7 +28706,6 @@ async def _provider_directory_profile_capacity_transaction(
 
     binding = db._transaction_binding(borrowed_only=True) if reuse_borrowed else None
     if binding is not None:
-        db._validate_existing_session_database(binding.session)
         db._require_active_borrowed_transaction(binding.session)
     transaction = contextlib.nullcontext() if binding is not None else db.transaction()
     admission = _provider_directory_profile_capacity_admission()
@@ -30641,7 +30620,10 @@ def _canonical_profile_datasets(
 ) -> list[dict[str, Any]]:
     """Return full dataset records in deterministic identity order."""
     return sorted(
-        (asdict(dataset) for dataset in datasets),
+        (
+            {key: value for key, value in asdict(dataset).items() if key != "storage_schema" or value is not None}
+            for dataset in datasets
+        ),
         key=_stable_identity_json,
     )
 
@@ -31407,6 +31389,10 @@ async def _resolve_provider_directory_profile_build(
         run_id,
         identity,
         coordinates,
+    )
+    candidate_build = replace(
+        candidate_build,
+        named_datasets=tuple(dataset for dataset in dataset_fence.datasets if dataset.storage_schema is not None),
     )
     is_checkpoint_lineage_matching = _is_profile_build_checkpoint_lineage_matching(
         checkpoint_map,
@@ -34668,9 +34654,10 @@ async def _populate_provider_directory_profile_evidence_stage(
             build.schema,
             ProviderDirectoryOrganizationAffiliation.__tablename__,
         ),
-        "affiliation_organization_ref": _qt(
+        "affiliation_organization_ref": _artifact_payload_relation(
             build.schema,
-            ProviderDirectoryDatasetAffiliationOrganization.__tablename__,
+            ProviderDirectoryDatasetAffiliationOrganization,
+            build.named_datasets,
         ),
         "service_ref": _qt(
             build.schema,
@@ -34680,9 +34667,10 @@ async def _populate_provider_directory_profile_evidence_stage(
             build.schema,
             ProviderDirectoryEndpoint.__tablename__,
         ),
-        "dataset_resource_ref": _qt(
+        "dataset_resource_ref": _artifact_payload_relation(
             build.schema,
-            ProviderDirectoryDatasetResource.__tablename__,
+            ProviderDirectoryDatasetResource,
+            build.named_datasets,
         ),
     }
     if not bounded:
@@ -37876,17 +37864,6 @@ async def _lock_mutable_endpoint_dataset_resource_parents(
     return selected_dataset_ids
 
 
-async def _require_source_native_connection(connection):
-    """An explicit retained/checkpoint executor cannot select a second connection."""
-    from process.provider_directory_generic_source_policy import bound_publisher
-    from process.provider_directory_projection_stage import _copy_driver
-
-    publisher = bound_publisher()
-    underlying = connection._connection if isinstance(connection, ConnectionProxy) else connection
-    if await _copy_driver(underlying) is not publisher.connection:
-        raise RuntimeError("provider_directory_generic_source_physical_transaction_changed")
-
-
 @contextlib.asynccontextmanager
 async def _mutable_endpoint_dataset_resource_mutation(
     dataset_ids: Iterable[str],
@@ -37899,7 +37876,7 @@ async def _mutable_endpoint_dataset_resource_mutation(
     async with source_transaction(db):
         selected_dataset_ids = _normalized_endpoint_dataset_ids(dataset_ids)
         if database_connection is not None:
-            await _require_source_native_connection(database_connection)
+            database_connection = await _require_source_native_connection(database_connection)
             await _lock_mutable_endpoint_dataset_resource_parents(
                 database_connection,
                 selected_dataset_ids,
@@ -44941,6 +44918,7 @@ async def _persist_bulk_manifest_outputs(
     manifest: BulkExportManifest,
 ) -> None:
     await require_checkpoint_executor(connection, bulk_identity=identity)
+    connection = source_copy_executor(connection)
     for manifest_output in manifest.outputs:
         await connection.status(
             f"""
@@ -45687,6 +45665,7 @@ async def _persist_refreshed_bulk_output(
     validator: BulkExportOutputValidator,
 ) -> None:
     await require_checkpoint_executor(connection, bulk_identity=identity)
+    connection = source_copy_executor(connection)
     is_complete = output_checkpoint.get("state") == BULK_EXPORT_OUTPUT_COMPLETE
     output_count = await connection.status(
         _bulk_capability_output_update_sql(),
@@ -45719,6 +45698,7 @@ async def _persist_refreshed_bulk_manifest(
     manifest_audit_json: str,
 ) -> None:
     await require_checkpoint_executor(connection, bulk_identity=identity)
+    connection = source_copy_executor(connection)
     parent_count = await connection.status(
         _bulk_capability_parent_update_sql(),
         checkpoint_id=identity.checkpoint_id,
@@ -49232,6 +49212,7 @@ async def _update_last_updated_partition_checkpoint(
     checkpoint_by_field: dict[str, Any],
 ) -> Any:
     await require_checkpoint_executor(database_executor)
+    database_executor = source_copy_executor(database_executor)
     return await database_executor.status(
         f"""
         UPDATE {_pagination_checkpoint_table_ref()}
@@ -50233,7 +50214,7 @@ async def _upsert_dataset_resource_rows_on_connection(
     """Append a retained/partition batch through the same isolated native COPY."""
     from process.provider_directory_generic_source_adapters import persist_source_rows
 
-    await _require_source_native_connection(connection)
+    connection = await _require_source_native_connection(connection)
     if not resource_rows:
         return
     if resource_hash_contract is None:
@@ -61639,7 +61620,7 @@ async def _clear_checkpoint_dataset_resource_type(
         if not context.dataset_id:
             return
         if database_connection is not None:
-            await _require_source_native_connection(database_connection)
+            database_connection = await _require_source_native_connection(database_connection)
         candidate = await resolve_existing_source_candidate(db, sys.modules[__name__], context.dataset_id)
         if candidate.identity["acquisition_root_run_id"] != context.acquisition_root_run_id:
             raise RuntimeError("provider_directory_endpoint_dataset_cleanup_parent_changed")

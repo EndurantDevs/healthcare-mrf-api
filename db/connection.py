@@ -396,15 +396,6 @@ class Database:
             raise RuntimeError("bind_existing_session requires an active caller transaction")
         if session.in_nested_transaction():
             raise RuntimeError("bind_existing_session rejects a nested caller transaction")
-        self._validate_existing_session_database(session)
-
-    def _validate_existing_session_database(self, session: AsyncSession) -> None:
-        """Reject a mismatched database when the SQLAlchemy bind names one."""
-
-        expected_database_name = self._requested_database_name()
-        bound_database_name = self._session_database_name(session)
-        if bound_database_name is not None and expected_database_name and bound_database_name != expected_database_name:
-            raise RuntimeError("bind_existing_session database identity does not match")
 
     @staticmethod
     def _require_active_borrowed_transaction(session: AsyncSession) -> None:

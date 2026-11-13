@@ -143,7 +143,7 @@ async def test_near_count_keeps_snapshot_and_skips_page(near_snapshot, include_t
         )
     )
     assert json.loads(reply.body) == {"rows": 37}
-    assert near_snapshot.reads == ["address", "plan", "acquire", "count", "encode"]
+    assert near_snapshot.reads == ["address", "plan", "count", "encode"]
     assert near_snapshot.entered == near_snapshot.exited == 1 and not near_snapshot.active
 
 

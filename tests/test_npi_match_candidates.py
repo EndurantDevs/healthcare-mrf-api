@@ -56,28 +56,32 @@ async def test_match_candidate_params_reject_entity_conflict():
         )
 
 
+async def _ensure_test_specialty_cache(session):
+    assert session == "test-session"
+
+
+def _resolved_test_specialty_filter(args):
+    assert args == {"specialty": "hospital", "include_subspecialties": False}
+    return types.SimpleNamespace(
+        taxonomy_codes=("282N00000X",),
+        classification=None,
+        unresolved_specialty=False,
+        suggested_specialties=(),
+    )
+
+
 @pytest.mark.asyncio
 async def test_match_candidate_params_accept_every_public_filter(monkeypatch):
     """Verify match candidate params accept every public filter."""
-    async def fake_ensure_specialty_resolution_cache(session):
-        assert session == "test-session"
-    def fake_resolve_provider_specialty_filter(args):
-        assert args == {"specialty": "hospital", "include_subspecialties": False}
-        return types.SimpleNamespace(
-            taxonomy_codes=("282N00000X",),
-            classification=None,
-            unresolved_specialty=False,
-            suggested_specialties=(),
-        )
     monkeypatch.setattr(
         npi_module,
         "ensure_specialty_resolution_cache",
-        fake_ensure_specialty_resolution_cache,
+        _ensure_test_specialty_cache,
     )
     monkeypatch.setattr(
         npi_module,
         "resolve_provider_specialty_filter",
-        fake_resolve_provider_specialty_filter,
+        _resolved_test_specialty_filter,
     )
     request = types.SimpleNamespace(
         args={
@@ -121,9 +125,7 @@ async def test_match_candidate_params_accept_every_public_filter(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_match_candidate_params_geo_defaults_radius():
-    params = await npi_module._normalize_match_candidate_params(
-        _request({"lat": "40.0", "long": "-75.0"})
-    )
+    params = await npi_module._normalize_match_candidate_params(_request({"lat": "40.0", "long": "-75.0"}))
 
     assert params["radius_miles"] == 1.0
     assert params["limit"] == 5
@@ -138,9 +140,7 @@ async def test_match_candidate_params_reject_lat_without_long():
 @pytest.mark.asyncio
 async def test_match_candidate_params_reject_limit_above_maximum():
     with pytest.raises(sanic.exceptions.InvalidUsage):
-        await npi_module._normalize_match_candidate_params(
-            _request({"phone": "5550100000", "limit": "51"})
-        )
+        await npi_module._normalize_match_candidate_params(_request({"phone": "5550100000", "limit": "51"}))
 
 
 def test_taxonomy_scope_tokens_accept_exact_and_prefix():
@@ -303,7 +303,9 @@ def test_match_candidate_output_scores_and_hides_internal_fields():
         "primary_provider_type_code": "12",
     }
 
-    candidate = npi_module._match_candidate_output(candidate_row_map, match_query_params_by_name, enrichment_summary_map)
+    candidate = npi_module._match_candidate_output(
+        candidate_row_map, match_query_params_by_name, enrichment_summary_map
+    )
 
     assert candidate["npi"] == 1234567890
     assert candidate["address_site_key"] == "22222222-2222-2222-2222-222222222222"
@@ -362,28 +364,36 @@ def test_match_candidate_sort_key_orders_ties():
     def top_npi(candidates):
         return sorted(candidates, key=npi_module._match_candidate_sort_key)[0]["npi"]
 
-    assert top_npi(
-        [
-            {"npi": 1306486022, "match_score": 0.65, "sources": {"fhir": {"source_count": 1}}},
-            {"npi": 1730166224, "match_score": 0.65, "sources": {"fhir": {"source_count": 2}}},
-        ]
-    ) == 1730166224
-    assert top_npi(
-        [
-            {
-                "npi": 1306486022,
-                "match_score": 1.0,
-                "match_signals": {"taxonomy": {"matched": True}},
-                "sources": {"fhir": {"source_count": 3}},
-            },
-            {
-                "npi": 1730166224,
-                "match_score": 1.0,
-                "match_signals": {"taxonomy": {"provider_type_matched": True}},
-                "sources": {"fhir": {"source_count": 1}},
-            },
-        ]
-    ) == 1730166224
+    assert (
+        top_npi(
+            [
+                {"npi": 1306486022, "match_score": 0.65, "sources": {"fhir": {"source_count": 1}}},
+                {"npi": 1730166224, "match_score": 0.65, "sources": {"fhir": {"source_count": 2}}},
+            ]
+        )
+        == 1730166224
+    )
+    assert (
+        top_npi(
+            [
+                {
+                    "npi": 1306486022,
+                    "match_score": 1.0,
+                    "match_signals": {"taxonomy": {"matched": True}},
+                    "sources": {"fhir": {"source_count": 3}},
+                },
+                {
+                    "npi": 1730166224,
+                    "match_score": 1.0,
+                    "match_signals": {"taxonomy": {"provider_type_matched": True}},
+                    "sources": {"fhir": {"source_count": 1}},
+                },
+            ]
+        )
+        == 1730166224
+    )
+
+
 @pytest.mark.asyncio
 async def test_match_candidates_route_shapes_payload(monkeypatch):
     async def fake_rows(params, *, session=None):
@@ -430,9 +440,7 @@ async def test_match_candidates_route_returns_503_on_timeout(monkeypatch):
     monkeypatch.setattr(npi_module, "_fetch_match_candidate_rows", fake_rows)
 
     with pytest.raises(sanic.exceptions.ServiceUnavailable):
-        await npi_module.match_candidates(
-            _request({"address_key": "11111111-1111-1111-1111-111111111111"})
-        )
+        await npi_module.match_candidates(_request({"address_key": "11111111-1111-1111-1111-111111111111"}))
 
 
 @pytest.mark.asyncio
@@ -447,7 +455,7 @@ async def test_fetch_match_candidate_rows_rolls_back_session_after_timeout(monke
     async def fake_address_table(required_columns, *, session=None):
         return "mrf.entity_address_unified"
 
-    def fake_query(params, address_table_sql):
+    def fake_query(params, address_table_sql, editions=()):
         return object(), {}
 
     async def fake_execute(stmt, *, session=None, params=None):
@@ -477,7 +485,7 @@ async def test_fetch_match_candidate_rows_rolls_back_session_after_cancellation(
     async def fake_address_table(required_columns, *, session=None):
         return "mrf.entity_address_unified"
 
-    def fake_query(params, address_table_sql):
+    def fake_query(params, address_table_sql, editions=()):
         return object(), {}
 
     async def fake_execute(stmt, *, session=None, params=None):

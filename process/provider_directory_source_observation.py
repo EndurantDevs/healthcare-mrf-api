@@ -10,6 +10,7 @@ from weakref import WeakKeyDictionary
 from process import provider_directory_generic_source_policy as source
 from process.provider_directory_output_snapshot_catalog import require_output
 from process.provider_directory_projection_stage import _copy_driver
+from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage
 
 _ACTIVE = ContextVar("provider_directory_source_observation", default=None)
 _ISSUED = WeakKeyDictionary()
@@ -43,7 +44,12 @@ class _Observation:
 
 
 def _fields(observation):
-    return tuple(getattr(observation, name) for name in observation.__dataclass_fields__)
+    excluded = (
+        {"database", "session", "connection", "origin"}
+        if isinstance(observation.storage_binding, NamedFHIRSourceStorage)
+        else set()
+    )
+    return tuple(getattr(observation, name) for name in observation.__dataclass_fields__ if name not in excluded)
 
 
 def _storage_binding(directory, factory):
@@ -68,18 +74,23 @@ def current_observation(directory):
         return None
     require_output(type(observation) is _Observation, "source_observation_required")
     binding = directory.db._transaction_binding()
+    by_name = isinstance(observation.storage_binding, NamedFHIRSourceStorage)
     require_output(
         _ISSUED.get(observation) == _fields(observation)
         and observation.directory is directory
-        and observation.database is directory.db
+        and (by_name or observation.database is directory.db)
         and observation.task is asyncio.current_task()
         and not observation.task.done()
         and source._FACTORY.get() is observation.factory
         and observation.factory.policy is observation.policy
         and source.source_producer_identity() == observation.producer
-        and _storage_binding(directory, observation.factory) is observation.storage_binding
+        and (
+            _storage_binding(directory, observation.factory) == observation.storage_binding
+            if by_name
+            else _storage_binding(directory, observation.factory) is observation.storage_binding
+        )
         and binding is not None
-        and binding.session is observation.session
+        and (by_name or binding.session is observation.session)
         and binding.borrowed is True
         and binding.owner_task is observation.task
         and source._PUBLISHER.get() is None
@@ -107,7 +118,7 @@ async def _native_origin(directory, factory, session, connection, isolation):
     if isinstance(storage_binding, NamedFHIRSourceStorage):
         transaction = session.get_transaction()
         require_output(transaction is not None and transaction.is_active, "source_observation_transaction_changed")
-        return (transaction,)
+        return ()
     require_output(
         source._FACTORY.get() is factory
         and await _copy_driver(session) is connection
@@ -149,7 +160,9 @@ async def capture_fhir_input(directory, session, schema):
     """Attest protected FHIR inputs on the issued readonly transaction."""
     observation = current_observation(directory)
     require_output(
-        observation is not None and observation.session is session and observation.policy.schema == schema,
+        observation is not None
+        and (isinstance(observation.storage_binding, NamedFHIRSourceStorage) or observation.session is session)
+        and observation.policy.schema == schema,
         "source_observation_connection_changed",
     )
     await _verify(directory, observation)

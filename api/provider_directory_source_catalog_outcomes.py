@@ -30,6 +30,7 @@ from api.provider_directory_source_dataset_selection import (
     _current_dataset_identities_by_id,
     _dataset_identity,
     _source_local_current_published_dataset_statement,
+    named_source_dataset_records,
 )
 from api.provider_directory_sources import RUNNABLE_CLASSIFICATIONS
 from db.models import db
@@ -80,6 +81,7 @@ def _profile_current_dataset_from_row(
 
 async def _profile_current_dataset_by_source_ids(
     source_id_groups: set[tuple[str, ...]],
+    editions=(),
 ) -> dict[tuple[str, ...], outcomes._CurrentPublishedDataset]:
     """Read exact current published identities using Profile state semantics."""
 
@@ -90,7 +92,7 @@ async def _profile_current_dataset_by_source_ids(
         tuple[str, ...],
         outcomes._CurrentPublishedDataset,
     ] = {}
-    for dataset_record in query_result.mappings().all():
+    for dataset_record in named_source_dataset_records(query_result.mappings().all(), editions):
         candidate = _profile_current_dataset_from_row(
             dataset_record,
             source_id_groups,
@@ -192,6 +194,7 @@ async def _legacy_current_identities_by_source_ids(
     dataset_by_source_ids: Mapping[tuple[str, ...], outcomes._CurrentPublishedDataset],
     current_dataset_by_source_ids: Mapping[tuple[str, ...], outcomes._CurrentPublishedDataset],
     canonical_dataset_by_source_id: Mapping[str, Any],
+    editions=(),
 ) -> dict[tuple[str, ...], ProviderDirectoryDatasetIdentity]:
     """Bind sealed candidates to scalar identities of endpoint-local incumbents."""
 
@@ -207,7 +210,8 @@ async def _legacy_current_identities_by_source_ids(
         )
     }
     identities_by_id = await _current_dataset_identities_by_id(
-        {dataset.previous_dataset_id for dataset in candidates_by_source_ids.values()}
+        {dataset.previous_dataset_id for dataset in candidates_by_source_ids.values()},
+        editions=editions,
     )
     return {
         source_ids: identity
@@ -344,6 +348,7 @@ def _enriched_catalog_entry(
 
 async def enrich_provider_directory_source_catalog(
     catalog: Mapping[str, Any],
+    editions=(),
 ) -> dict[str, Any]:
     """Attach latest sealed and current published source outcome summaries."""
 
@@ -355,8 +360,8 @@ async def enrich_provider_directory_source_catalog(
     has_rooted_fhir_entry = any(is_rooted_fhir_catalog_entry(catalog_entry) for catalog_entry in catalog_items)
     if has_rooted_fhir_entry:
         source_id_groups.add(ROOTED_FHIR_SOURCE_ID_GROUP)
-    dataset_by_source_ids = await outcomes._current_published_dataset_by_source_ids(source_id_groups)
-    current_dataset_by_source_ids = await _profile_current_dataset_by_source_ids(source_id_groups)
+    dataset_by_source_ids = await outcomes._current_published_dataset_by_source_ids(source_id_groups, editions=editions)
+    current_dataset_by_source_ids = await _profile_current_dataset_by_source_ids(source_id_groups, editions=editions)
     automatic_source_ids = _automatic_publication_source_ids(
         catalog_items,
         dataset_by_source_ids,
@@ -366,6 +371,7 @@ async def enrich_provider_directory_source_catalog(
         dataset_by_source_ids,
         current_dataset_by_source_ids,
         canonical_dataset_by_source_id,
+        editions=editions,
     )
     rooted_summary = await _rooted_summary_for_catalog(current_dataset_by_source_ids) if has_rooted_fhir_entry else None
 

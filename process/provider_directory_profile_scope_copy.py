@@ -11,6 +11,7 @@ from process import provider_directory_generic_source_policy as source_policy
 from process import provider_directory_profile_native_copy as native_copy
 from process import provider_directory_profile_source_inputs as source_inputs
 from process.provider_directory_dataset_rehydrate_pages import projected_pages
+from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
 _SCOPE = ContextVar("provider_directory_profile_scope_copy", default=None)
@@ -65,12 +66,18 @@ async def source_read_transaction(fhir):
     elif source_policy._PUBLISHER.get() is not None:
         publisher = source_policy.bound_publisher()
         binding = fhir.db._transaction_binding()
-        _require(binding is not None and binding.session is source_policy.source_copy_session())
+        by_name = isinstance(getattr(publisher, "storage_binding", None), NamedFHIRSourceStorage)
+        _require(binding is not None and (by_name or binding.session is source_policy.source_copy_session()))
         yield
         _require(
             source_policy.bound_publisher() is publisher
-            and fhir.db._transaction_binding() is binding
-            and source_policy.source_copy_session() is binding.session
+            and fhir.db._transaction_binding() is not None
+            and (
+                by_name
+                or (
+                    fhir.db._transaction_binding() is binding and source_policy.source_copy_session() is binding.session
+                )
+            )
         )
     else:
         async with source_policy.source_transaction(fhir.db, isolation="repeatable read"):

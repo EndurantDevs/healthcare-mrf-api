@@ -93,12 +93,22 @@ async def iter_source_owned_catalog_legacy_bindings(source_export, descriptor, o
 
 @asynccontextmanager
 async def open_source_owned_catalog_export(factory, profile, registry_connection):
-    """Keep source-owned validation and cleanup around an identity-matched export."""
+    """Keep source-owned validation and cleanup around a profile-scoped export."""
     if type(profile) is not FHIRCatalogSourceReadProfile or profile.published_read_scope is not None:
         raise ValueError("registry_fhir_catalog_source_export_profile_invalid")
     if not callable(factory):
         raise ValueError("registry_fhir_catalog_source_export_factory_invalid")
     async with factory(source_profile=profile) as export:
+        if type(export) is dict and "native_read_profile" in export:
+            required = _OPERATIONS | {"native_read_profile"}
+            if (
+                set(export) not in (required, required | {"source_companies"})
+                or export["native_read_profile"] != profile.document()
+                or any(not callable(callback) for name, callback in export.items() if name != "native_read_profile")
+            ):
+                raise ValueError("registry_fhir_catalog_source_export_invalid")
+            yield export
+            return
         required = _OPERATIONS | {"database_identity"}
         if type(export) is not dict or set(export) not in (required, required | {"source_companies"}):
             raise ValueError("registry_fhir_catalog_source_export_invalid")

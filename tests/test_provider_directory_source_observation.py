@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy.exc import InvalidRequestError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from process import provider_directory_source_observation as observation
 from process import provider_directory_source_storage_binding as storage
@@ -120,15 +122,53 @@ async def test_nested_read_reuses_exact_session_and_stronger_isolation(case):
     assert len(case.factory.events) == 2
 
 
-async def test_named_observation_rejects_an_application_transaction_replacement(case):
+async def test_named_observation_checks_transaction_lifecycle_without_connection_identity(case):
     factory = case.factory
     factory.storage_binding = storage.NamedFHIRSourceStorage("catalog", factory.policy.schema)
     case.directory._schema = lambda: "catalog"
     transaction = SimpleNamespace(is_active=True)
     factory.session.get_transaction = lambda: transaction
+    async with observation.observation_transaction(case.directory, isolation="repeatable read"):
+        assert transaction.is_active
     with pytest.raises(RuntimeError, match="observation_transaction_changed"):
         async with observation.observation_transaction(case.directory, isolation="repeatable read"):
-            transaction = SimpleNamespace(is_active=True, replacement=True)
+            transaction.is_active = False
+    assert factory.driver.calls == []
+
+
+async def test_named_observation_cannot_restart_factory_managed_transaction(case):
+    factory = case.factory
+    factory.storage_binding = storage.NamedFHIRSourceStorage("catalog", factory.policy.schema)
+    case.directory._schema = lambda: "catalog"
+    session = AsyncSession()
+    session.driver = factory.driver
+
+    @asynccontextmanager
+    async def managed_observation(*, isolation):
+        assert isolation == "repeatable read"
+        async with session, session.begin():
+            yield session
+
+    factory.observation_transaction = managed_observation
+    with pytest.raises(RuntimeError, match="source_observation_transaction_changed"):
+        async with observation.observation_transaction(case.directory, isolation="repeatable read"):
+            await session.commit()
+            with pytest.raises(InvalidRequestError, match="closed transaction inside context manager"):
+                async with session.begin():
+                    pytest.fail("replacement transaction exposed")
+    assert observation.current_observation(case.directory) is None
+    assert case.directory.db._transaction_binding() is None
+    assert factory.driver.calls == []
+
+
+async def test_named_observation_accepts_equal_logical_storage_coordinates(case):
+    factory = case.factory
+    factory.storage_binding = storage.NamedFHIRSourceStorage("catalog", factory.policy.schema)
+    factory.session.get_transaction = lambda: SimpleNamespace(is_active=True)
+    case.directory._schema = lambda: "catalog"
+    async with observation.observation_transaction(case.directory, isolation="repeatable read"):
+        factory.storage_binding = replace(factory.storage_binding)
+        assert observation.current_observation(case.directory).storage_binding == factory.storage_binding
     assert factory.driver.calls == []
 
 
@@ -305,3 +345,21 @@ async def test_private_observation_cannot_be_inherited_by_child(private_case):
 
         await asyncio.create_task(child())
         assert observation.current_storage_binding("synthetic") is case.factory.storage_binding
+
+
+async def test_named_input_capture_uses_issued_reader_with_another_supplied_session(case, monkeypatch):
+    from process import provider_directory_generic_source_provision as provision
+
+    factory = case.factory
+    factory.storage_binding = storage.NamedFHIRSourceStorage("catalog", factory.policy.schema)
+    case.directory._schema = lambda: "catalog"
+    factory.session.get_transaction = lambda: SimpleNamespace(is_active=True)
+    factory.observe_source_callable_capability = AsyncMock(return_value=())
+    proof_by_field = {"data": "verified"}
+    capture = AsyncMock(return_value=proof_by_field)
+    monkeypatch.setattr(provision, "capture_protected_fhir_input", capture)
+    async with observation.observation_transaction(case.directory, isolation="repeatable read"):
+        assert await observation.capture_fhir_input(case.directory, object(), factory.policy.schema) is proof_by_field
+    capture.assert_awaited_once_with(factory.driver, source_policy=factory.policy)
+    factory.observe_source_callable_capability.assert_awaited_once_with(factory.driver, factory.policy)
+    assert factory.driver.calls == []

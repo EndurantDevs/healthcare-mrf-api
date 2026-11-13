@@ -7,6 +7,7 @@ from dataclasses import replace
 from functools import partial
 
 from process.provider_directory_fhir_response import AdaptiveRequestSlots
+from process.provider_directory_generic_source_policy import source_copy_executor
 
 _TRANSIENT_STREAM_ERRORS = frozenset(
     "bulk_export_transport_" + name
@@ -456,6 +457,7 @@ async def begin_capability_refresh(
 async def reserve_refresh_attempts(directory, connection, identity, attempt_limit, incomplete_count):
     """Reserve the existing incomplete-output counters within the fenced transaction."""
     await directory.require_checkpoint_executor(connection, bulk_identity=identity)
+    connection = source_copy_executor(connection)
     output_count = await connection.status(
         f"""
         UPDATE {directory._bulk_output_checkpoint_table_ref()}

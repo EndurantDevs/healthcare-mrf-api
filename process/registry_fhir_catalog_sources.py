@@ -84,6 +84,21 @@ _DESCRIPTOR_FIELDS = {
     "native_catalog_sha256",
     "admission",
 }
+_PHYSICAL_DESCRIPTOR_FIELDS = {
+    "resource_table_oid",
+    "resource_leaf_oids",
+    "header_table_oid",
+    "database_oid",
+    "native_catalog_sha256",
+}
+_NAMED_DESCRIPTOR_FIELDS = (_DESCRIPTOR_FIELDS - _PHYSICAL_DESCRIPTOR_FIELDS) | {"catalog_schema"}
+
+
+def is_named_fhir_catalog_descriptor(descriptor):
+    """Recognize the existing normalized descriptor's schema-qualified representation."""
+    return type(descriptor) is dict and "catalog_schema" in descriptor
+
+
 _ADMISSION_FIELDS = {
     "version",
     "kind",
@@ -265,6 +280,34 @@ def parse_fhir_catalog_source_profile(document):
 _profile = parse_fhir_catalog_source_profile
 
 
+def _canonical_source_descriptor(descriptor):
+    """Discard historical physical fields before validating or hashing named inputs."""
+    is_named = is_named_fhir_catalog_descriptor(descriptor)
+    if type(descriptor) is not dict:
+        _fail()
+    descriptor_by_field = {
+        key: field_value
+        for key, field_value in descriptor.items()
+        if not is_named or key not in _PHYSICAL_DESCRIPTOR_FIELDS
+    }
+    expected_fields = _NAMED_DESCRIPTOR_FIELDS if is_named else _DESCRIPTOR_FIELDS
+    if set(descriptor_by_field) != expected_fields:
+        _fail()
+    return descriptor_by_field, is_named
+
+
+def _validate_legacy_source_storage(descriptor_by_field):
+    """Preserve the historical physical representation for unrelated legacy sources."""
+    _digest(descriptor_by_field["native_catalog_sha256"])
+    for field in ("resource_table_oid", "header_table_oid", "database_oid"):
+        _positive(descriptor_by_field[field])
+    leaves = descriptor_by_field["resource_leaf_oids"]
+    if type(leaves) is not list or not leaves or len(leaves) > MAX_PAGE or sorted(set(leaves)) != leaves:
+        _fail()
+    for oid in leaves:
+        _positive(oid)
+
+
 def validate_fhir_catalog_source_descriptor(descriptor):
     """Validate linkage only; native recapture and the standing grant confer authority."""
     if type(descriptor) is dict and descriptor.get("profile") == "retained_normalized":
@@ -274,51 +317,54 @@ def validate_fhir_catalog_source_descriptor(descriptor):
             return validate_retained_fhir_catalog_descriptor(descriptor)
         except ValueError, TypeError, KeyError:
             _fail("retained_invalid")
-    if type(descriptor) is not dict or set(descriptor) != _DESCRIPTOR_FIELDS:
-        _fail()
-    coordinates = descriptor["coordinates"]
+    descriptor_by_field, is_named = _canonical_source_descriptor(descriptor)
+    coordinates = descriptor_by_field["coordinates"]
     if type(coordinates) is not dict:
         _fail()
     coordinates = RegistryNetworkSourceCoordinates(**coordinates)
-    profile = _profile(descriptor["native_read_profile"])
-    aliases = _strings(descriptor["source_aliases"], 64)
+    profile = _profile(descriptor_by_field["native_read_profile"])
+    aliases = _strings(descriptor_by_field["source_aliases"], 64)
     if coordinates.source_system != "fhir" or coordinates.producer_id != PRODUCER:
         _fail()
-    if descriptor["profile"] != "published_normalized" or coordinates.dataset_schema != profile.schema_name:
+    if descriptor_by_field["profile"] != "published_normalized":
+        _fail()
+    if is_named:
+        _identifier(descriptor_by_field["catalog_schema"])
+        if descriptor_by_field["catalog_schema"] != profile.catalog_schema or profile.published_read_scope is not None:
+            _fail()
+    elif coordinates.dataset_schema != profile.schema_name:
         _fail()
     if coordinates.source_id != aliases[0] or coordinates.edition_id != coordinates.dataset_id:
         _fail()
-    _bounded_text(descriptor["endpoint_id"], 64)
-    if descriptor["source_uri"] is None:
+    _bounded_text(descriptor_by_field["endpoint_id"], 64)
+    if descriptor_by_field["source_uri"] is None:
         _fail()
-    fhir_source_uri(descriptor["source_uri"])
-    for field in ("dataset_sha256", "accepted_receipt_sha256", "native_catalog_sha256"):
-        _digest(descriptor[field])
-    for field in ("resource_table_oid", "header_table_oid", "database_oid"):
-        _positive(descriptor[field])
-    leaves = descriptor["resource_leaf_oids"]
-    if type(leaves) is not list or not leaves or len(leaves) > MAX_PAGE or sorted(set(leaves)) != leaves:
-        _fail()
-    for oid in leaves:
-        _positive(oid)
+    fhir_source_uri(descriptor_by_field["source_uri"])
+    for field in ("dataset_sha256", "accepted_receipt_sha256"):
+        _digest(descriptor_by_field[field])
+    if not is_named:
+        _validate_legacy_source_storage(descriptor_by_field)
     has_observation_receipt = (
-        type(descriptor["admission"]) is dict and descriptor["admission"].get("kind") == "catalog_observation"
+        type(descriptor_by_field["admission"]) is dict
+        and descriptor_by_field["admission"].get("kind") == "catalog_observation"
     )
+    if is_named and not has_observation_receipt:
+        _fail("observation_invalid")
     expected_receipt = (
-        CATALOG_OBSERVATION_CONTRACT + ":" + descriptor["accepted_receipt_sha256"]
+        CATALOG_OBSERVATION_CONTRACT + ":" + descriptor_by_field["accepted_receipt_sha256"]
         if has_observation_receipt
         else ADMISSION_SEAL_CONTRACT + ":" + coordinates.dataset_id
     )
-    if descriptor["accepted_receipt_id"] != expected_receipt:
+    if descriptor_by_field["accepted_receipt_id"] != expected_receipt:
         _fail()
-    if type(descriptor["complete"]) is not bool:
+    if type(descriptor_by_field["complete"]) is not bool:
         _fail()
-    if descriptor["previous_dataset_id"] is not None:
-        _bounded_text(descriptor["previous_dataset_id"], 96)
-    _validate_admission_descriptor(descriptor["admission"], descriptor)
+    if descriptor_by_field["previous_dataset_id"] is not None:
+        _bounded_text(descriptor_by_field["previous_dataset_id"], 96)
+    _validate_admission_descriptor(descriptor_by_field["admission"], descriptor_by_field)
     if profile.published_read_scope is not None:
-        validate_fhir_catalog_published_descriptor(profile, descriptor)
-    return json.loads(fhir_catalog_json_bytes(descriptor))
+        validate_fhir_catalog_published_descriptor(profile, descriptor_by_field)
+    return json.loads(fhir_catalog_json_bytes(descriptor_by_field))
 
 
 def _validate_admission_descriptor(admission, descriptor):

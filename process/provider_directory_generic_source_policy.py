@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 
-from db.connection import Database
+from db.connection import ConnectionProxy, Database
 from db.plan_release_storage import storage_identifier
 from process.plan_release_storage_custody import storage_profile, storage_roles
 from process.provider_directory_generic_candidate import GenericCandidateError
@@ -353,6 +353,26 @@ def source_copy_session():
     owner = _OWNER.get()
     _require(owner is not None and owner[0] is publisher, "owner_transaction_required")
     return owner[1]
+
+
+def source_copy_executor(executor):
+    """Route named-source SQL through the current batch session."""
+    if isinstance(getattr(bound_publisher(), "storage_binding", None), NamedFHIRSourceStorage):
+        return ConnectionProxy(None, source_copy_session(), None)
+    return executor
+
+
+async def source_native_executor(executor):
+    """Use the named batch session and preserve legacy explicit-executor validation."""
+    from process.provider_directory_projection_stage import _copy_driver
+
+    publisher = bound_publisher()
+    if isinstance(getattr(publisher, "storage_binding", None), NamedFHIRSourceStorage):
+        return source_copy_executor(executor)
+    underlying = executor._connection if isinstance(executor, ConnectionProxy) else executor
+    if await _copy_driver(underlying) is not publisher.connection:
+        raise RuntimeError("provider_directory_generic_source_physical_transaction_changed")
+    return executor
 
 
 async def _publication_origin(database):

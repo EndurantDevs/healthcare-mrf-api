@@ -111,6 +111,12 @@ async def test_readiness_index_path_requires_both_capabilities(affiliation, avai
             return self.rows
 
     class EvidenceSession:
+        copy_to_table = True
+
+        async def fetchval(self, query, *_args):
+            assert query == "SELECT to_regclass($1)::text"
+            return None
+
         async def execute(self, statement, params=None):
             statements.append(str(statement))
             if params and "table_names" in params:

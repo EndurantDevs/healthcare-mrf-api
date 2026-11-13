@@ -130,6 +130,28 @@ async def test_retained_connection_proxy_must_match_the_original_physical_publis
 
 
 @pytest.mark.asyncio
+async def test_named_retained_executor_uses_issued_copy_session_without_driver_identity_check(monkeypatch):
+    from db.connection import ConnectionProxy
+    from process import provider_directory_projection_stage as projection
+    from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage
+
+    directory = import_module("process.provider_directory_fhir")
+    session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(rowcount=1)))
+    native = object()
+    publisher = SimpleNamespace(connection=native, storage_binding=NamedFHIRSourceStorage("catalog", "candidate"))
+    monkeypatch.setattr(policy, "bound_publisher", lambda: publisher)
+    monkeypatch.setattr(policy, "source_copy_session", lambda: session)
+    driver_lookup = AsyncMock(side_effect=AssertionError("connection identity lookup"))
+    monkeypatch.setattr(projection, "_copy_driver", driver_lookup)
+    unrelated = ConnectionProxy(None, object(), object())
+    executor = await directory._require_source_native_connection(unrelated)
+    assert await executor.status("UPDATE synthetic_candidate SET value=:value", value="kept") == 1
+    session.execute.assert_awaited_once()
+    assert executor._connection is session
+    driver_lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("resource_type", ["Organization", "Location", "InsurancePlan", "PractitionerRole"])
 async def test_identity_batches_reuse_the_original_owner_transaction_without_new_begin(resource_type):
     from contextlib import asynccontextmanager

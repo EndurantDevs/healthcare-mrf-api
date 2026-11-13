@@ -189,11 +189,28 @@ async def plan_tier_projection(connection, descriptor, context, pairs, *, revisi
 
 async def replace_plan_tier_bindings(connection, relations, descriptor, keys):
     """Replace only the same typed source identities in the isolated candidate."""
-    selection = (
-        f"SELECT binding_id FROM {relations['binding']} WHERE document_json->'source_scope'->>'kind'='uhc_plan_tier_v1' "
-        "AND document_json->>'source_id'=$1 AND document_json->>'dataset_schema'=$2 "
-        "AND document_json->>'source_key'=ANY($3::text[])"
+    from process.registry_fhir_catalog_observed_source import catalog_replacement_scope, catalog_replacement_scope_sql
+
+    is_named = "catalog_schema" in descriptor
+    source_join = (
+        f" JOIN {relations['source']} source ON "
+        "binding.document_json->'source_scope'->>'source_generation'=source.source_generation"
+        if is_named
+        else ""
     )
-    arguments = (descriptor["coordinates"]["source_id"], descriptor["coordinates"]["dataset_schema"], keys)
+    scope = (
+        catalog_replacement_scope_sql("source.descriptor_json")
+        if is_named
+        else "binding.document_json->>'dataset_schema'"
+    )
+    source_identity = "source.descriptor_json->>'endpoint_id'" if is_named else "binding.document_json->>'source_id'"
+    selection = (
+        f"SELECT binding.binding_id FROM {relations['binding']} binding{source_join} "
+        "WHERE binding.document_json->'source_scope'->>'kind'='uhc_plan_tier_v1' "
+        f"AND {source_identity}=$1 AND {scope}=$2 "
+        "AND binding.document_json->>'source_key'=ANY($3::text[])"
+    )
+    source_id = descriptor["endpoint_id"] if is_named else descriptor["coordinates"]["source_id"]
+    arguments = (source_id, catalog_replacement_scope(descriptor), keys)
     await connection.execute(f"DELETE FROM {relations['relationship']} WHERE binding_id IN ({selection})", *arguments)
     await connection.execute(f"DELETE FROM {relations['binding']} WHERE binding_id IN ({selection})", *arguments)

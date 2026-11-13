@@ -1,7 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Synthetic handler protocols; optional fallbacks never swallow identity refusals."""
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -72,7 +72,8 @@ async def test_location_status_identity_refusal_escapes_optional_mode(monkeypatc
     failure = ServiceUnavailable("guard refused")
     query = AsyncMock(side_effect=failure)
     monkeypatch.setattr(npi, "_execute_stmt", query)
-    monkeypatch.setattr(npi.db, "session", lambda: _optional_scope(None))
+    status_session = SimpleNamespace(begin=lambda: _optional_scope(None), execute=AsyncMock())
+    monkeypatch.setattr(npi.db, "session", lambda: nullcontext(status_session))
     with pytest.raises(ServiceUnavailable) as caught:
         await npi._fetch_location_status_by_record_id(
             ["provider_directory_fhir:practitioner_role:example:role"], fail_closed=fail_closed

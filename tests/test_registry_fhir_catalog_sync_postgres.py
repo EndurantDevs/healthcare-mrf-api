@@ -45,6 +45,91 @@ from tests.test_registry_fhir_catalog_sources import descriptor, read_profile
 ACCEPTED_AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
+async def _named_replacement_rows(fixture, *, is_typed):
+    """Stage predecessor bindings from distinct logical scopes in one isolated candidate."""
+    schema = "catalog_replacement_" + uuid4().hex
+    fixture.schemas.append(schema)
+    namespace = '"' + schema + '"'
+    relation_by_kind = {
+        kind: namespace + ".registry_fhir_catalog_" + kind for kind in ("binding", "relationship", "source")
+    }
+    await fixture.connection.execute(
+        f"CREATE SCHEMA {namespace}; CREATE TABLE {relation_by_kind['source']} (source_generation text,descriptor_json jsonb);"
+        f"CREATE TABLE {relation_by_kind['binding']} (binding_id uuid PRIMARY KEY,document_json jsonb);"
+        f"CREATE TABLE {relation_by_kind['relationship']} (binding_id uuid)"
+    )
+    replacement_key = "UHCPlanTier/key" if is_typed else "network"
+    source_specs = (
+        ("named-old", "catalog-a", "endpoint", "edition-old", replacement_key),
+        ("legacy-old", None, "endpoint", "catalog-a", replacement_key),
+        ("other-endpoint", "catalog-a", "other", "edition-old", replacement_key),
+        ("other-scope", "catalog-b", "endpoint", "edition-old", replacement_key),
+        ("absent", "catalog-a", "endpoint", "edition-old", "not-replaced"),
+    )
+    binding_id_by_generation = {}
+    for generation, catalog, endpoint, payload_schema, source_key in source_specs:
+        previous_descriptor_by_field = {"endpoint_id": endpoint, "coordinates": {"dataset_schema": payload_schema}}
+        if catalog is not None:
+            previous_descriptor_by_field["catalog_schema"] = catalog
+        binding_id = uuid4()
+        binding_id_by_generation[generation] = binding_id
+        binding_by_field = {
+            "source_id": "previous-alias",
+            "source_key": source_key,
+            "dataset_schema": payload_schema,
+            "evidence_id": generation + ":Organization/" + source_key,
+            "source_scope": {"kind": "uhc_plan_tier_v1", "source_generation": generation},
+        }
+        await fixture.connection.execute(
+            f"INSERT INTO {relation_by_kind['source']} VALUES($1,$2::jsonb)",
+            generation,
+            json.dumps(previous_descriptor_by_field),
+        )
+        await fixture.connection.execute(
+            f"INSERT INTO {relation_by_kind['binding']} VALUES($1,$2::jsonb)", binding_id, json.dumps(binding_by_field)
+        )
+        await fixture.connection.execute(f"INSERT INTO {relation_by_kind['relationship']} VALUES($1)", binding_id)
+    return schema, relation_by_kind, replacement_key, binding_id_by_generation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["observed", "independent", "typed"])
+async def test_named_successor_retires_bindings_across_payload_schemas(metadata_custody, path):
+    from process.registry_fhir_catalog_projection_validation import _ProjectionReplay
+    from process.registry_fhir_plan_tier_catalog import replace_plan_tier_bindings
+    from tests.test_registry_fhir_catalog_grant import snapshot, standing_grant
+
+    fixture = metadata_custody
+    schema, relation_by_kind, replacement_key, binding_id_by_generation = await _named_replacement_rows(
+        fixture, is_typed=path == "typed"
+    )
+    successor_descriptor_by_field = {
+        "endpoint_id": "endpoint",
+        "catalog_schema": "catalog-a",
+        "coordinates": {"source_id": "new-alias", "dataset_schema": "edition-new"},
+    }
+    if path == "typed":
+        await replace_plan_tier_bindings(
+            fixture.connection, relation_by_kind, successor_descriptor_by_field, [replacement_key]
+        )
+    elif path == "observed":
+        await sync._replace_observed_bindings(
+            fixture.connection, '"' + schema + '"', successor_descriptor_by_field, [replacement_key]
+        )
+    else:
+        grant = standing_grant()
+        selected_snapshot_by_field = {**snapshot(grant), "schema_name": schema}
+        replay = _ProjectionReplay(fixture.connection, selected_snapshot_by_field, grant, None)
+        replay.targets.update(relation_by_kind)
+        await replay.replace_bindings(successor_descriptor_by_field, [replacement_key])
+    retained_binding_ids = {binding_id_by_generation[name] for name in ("other-endpoint", "other-scope", "absent")}
+    for kind in ("binding", "relationship"):
+        binding_rows = await fixture.connection.fetch(f"SELECT binding_id FROM {relation_by_kind[kind]}")
+        assert {binding_row["binding_id"] for binding_row in binding_rows} == retained_binding_ids
+    assert await fixture.connection.fetchval(f"SELECT count(*) FROM {relation_by_kind['source']}") == 5
+    assert successor_descriptor_by_field["coordinates"]["dataset_schema"] == "edition-new"
+
+
 async def _registry(fixture):
     connection, namespace = fixture.connection, '"' + fixture.control_schema + '"'
     await connection.execute(f"DROP TABLE {namespace}.network_registry_identity")

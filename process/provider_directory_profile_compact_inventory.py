@@ -123,7 +123,7 @@ def _child_ctes(fhir, schema, fence):
     """Read raw resources and affiliation edges only from issued immutable children."""
     resources, edges, parameters = [], [], {}
     for number, dataset in enumerate(fence.datasets):
-        captured = inputs.binding(fhir, dataset)
+        captured = inputs.binding(fhir, dataset) if dataset.storage_schema is None else None
         parameter = "compact_dataset_" + str(number)
         parameters[parameter] = dataset.dataset_id
         for statements, model in (
@@ -131,7 +131,11 @@ def _child_ctes(fhir, schema, fence):
             (edges, fhir.ProviderDirectoryDatasetAffiliationOrganization),
         ):
             root = model.__tablename__
-            reference = fhir._unscoped_qt(schema, captured["tables"][root]["name"])
+            reference = (
+                fhir._unscoped_qt(dataset.storage_schema, root)
+                if dataset.storage_schema is not None
+                else fhir._unscoped_qt(schema, captured["tables"][root]["name"])
+            )
             columns = ",".join(profile.quote_identifier(column.name) for column in model.__table__.columns)
             statements.append("SELECT " + columns + " FROM " + reference + " WHERE dataset_id=:" + parameter)
     _require(bool(resources) and bool(edges))
