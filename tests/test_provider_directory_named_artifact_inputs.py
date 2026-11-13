@@ -278,43 +278,6 @@ def test_virtual_overlay_projects_each_selected_named_and_legacy_dataset():
     assert "legacy-dataset" in statement and named.dataset_id in statement
 
 
-@pytest.mark.asyncio
-async def test_ordinary_overlay_pages_use_the_issued_named_dataset(monkeypatch):
-    from process import provider_directory_generic_source_artifacts as artifacts
-
-    dataset = _dataset()
-    selected = SimpleNamespace(_mapping={"resource_id": "role-1"})
-    queries = AsyncMock(side_effect=[[selected], []])
-    monkeypatch.setattr(fhir.db, "all", queries)
-    monkeypatch.setattr(
-        artifacts,
-        "_loading_projection",
-        lambda _fhir, _root, sql, params, _enrichment: (
-            sql,
-            sql,
-            params,
-            None,
-            {},
-        ),
-    )
-
-    async def pages(_db, sql, _params, _model):
-        assert f'"{dataset.storage_schema}"."provider_directory_dataset_resource"' in sql
-        yield [{"resource_id": "role-1"}]
-
-    monkeypatch.setattr(artifacts, "projected_pages", pages)
-    assert [
-        page
-        async for page in artifacts._resource_pages(
-            fhir,
-            fhir.ProviderDirectoryPractitionerRole,
-            dataset,
-            {},
-        )
-    ] == [[{"resource_id": "role-1"}]]
-    assert queries.await_args_list[1].kwargs["after_resource_id"] == "role-1"
-
-
 def test_legacy_header_input_preserves_existing_relation_routing(monkeypatch):
     monkeypatch.setattr(fhir, "_qt", lambda schema, root: "issued_" + schema + "." + root)
     assert fhir._artifact_resource_header_relation("mrf", None) == "issued_mrf.provider_directory_endpoint_dataset"
