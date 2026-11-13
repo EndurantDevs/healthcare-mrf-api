@@ -30,6 +30,9 @@ def admit_npi_source_worker_launch(admitted_run):
     """Require the configured immutable source image and original queued identity."""
     if admitted_run.get("importer") != _IMPORTER:
         return None
+    if not _is_source_image_configured():
+        # No source image is configured: the ordinary worker job runs the import.
+        return None
     metrics = admitted_run.get("metrics")
     image = os.environ.get(IMAGE_ENV, os.getenv(REFERENCE_IMAGE_ENV, ""))
     if (
@@ -44,6 +47,36 @@ def admit_npi_source_worker_launch(admitted_run):
     ):
         raise ValueError("npi_source_worker_admission_unavailable")
     return NPISourceWorkerLaunch(admitted_run["run_id"], metrics["job_id"], image)
+
+
+def _is_source_image_configured():
+    return IMAGE_ENV in os.environ or bool(os.getenv(REFERENCE_IMAGE_ENV))
+
+
+def admitted_ordinary_npi_job(spec, launch_request):
+    """Return the recorded job of a server-admitted NPI run when no source image is configured."""
+    from api.control_workers import _AdmittedWorkerRequest
+
+    if type(launch_request) is not _AdmittedWorkerRequest or _is_source_image_configured():
+        return None
+    identity = launch_request.admitted_job
+    if (
+        launch_request.npi_source_launch is not None
+        or type(identity) is not tuple
+        or len(identity) != 5
+        or identity[1:4] != (_IMPORTER, _QUEUE, _FUNCTION)
+        or identity[4] != "npi_start_" + identity[0]
+        or (spec.worker_class, spec.queue, spec.importers, spec.role) != (_WORKER_CLASS, _QUEUE, (_IMPORTER,), "start")
+        or launch_request.get("run_id") != identity[0]
+        or launch_request.get("job_id") not in (None, "", identity[4])
+    ):
+        return None
+    return identity[4]
+
+
+def is_ordinary_launch_refused(spec, launch_request):
+    """An NPI worker without a source launch starts only for the recorded ordinary job."""
+    return spec.worker_class == _WORKER_CLASS and admitted_ordinary_npi_job(spec, launch_request) is None
 
 
 def authorized_npi_source_worker_launch(spec, launch_request):
