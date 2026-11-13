@@ -992,6 +992,28 @@ async def test_published_request_serves_a_copied_candidate_table_by_name(indexed
     assert await _api_rows(held, None) == expected
 
 
+async def test_published_request_keeps_the_retained_heap_when_its_name_is_reused(indexed_api_db):
+    """Rotation gives the recorded name to a replacement; the published generation keeps its own rows."""
+    held = indexed_api_db
+    reader, base = held.fixture.roles["reader"], held.current.compact_layout.base
+    live = f'"{base.schema_name}"."{base.table_name}"'
+    retained = f"{base.table_name}_retained_{base.table_oid:x}"
+    expected = await _api_rows(held, None)
+    await held.fixture.connection.execute(
+        f'ALTER TABLE {live} RENAME TO "{retained}"; '
+        f'CREATE TABLE {live} (LIKE "{base.schema_name}"."{retained}"); '
+        f'GRANT SELECT ON {live} TO "{reader}"'
+    )
+    try:
+        manifest, address_rows = await _api_rows(held, None)
+        assert address_rows == expected[1] and manifest.compact_layout.base.table_name == retained
+    finally:
+        await held.fixture.connection.execute(
+            f'DROP TABLE {live}; ALTER TABLE "{base.schema_name}"."{retained}" RENAME TO "{base.table_name}"'
+        )
+    assert await _api_rows(held, None) == expected
+
+
 @pytest.mark.parametrize("failure", ["permission", "missing_edge"])
 async def test_published_request_reports_native_access_and_missing_table_errors(indexed_api_db, failure):
     from sanic.exceptions import ServiceUnavailable
