@@ -24,9 +24,9 @@ def test_landing_migration_extends_the_unique_current_head():
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["20261111010000_code_sets_publication_idempotency"]
-    assert script.get_revision("20261111010000_code_sets_publication_idempotency").down_revision == (
-        "20261108010000_custom_import_family_child_reference_aggregate"
+    assert script.get_heads() == ["20261113010000_address_canonical_space_normalization"]
+    assert script.get_revision("20261113010000_address_canonical_space_normalization").down_revision == (
+        "20261111010000_code_sets_publication_idempotency"
     )
     assert (
         script.get_revision("20261107010000_custom_import_child_reference_aggregate").down_revision
