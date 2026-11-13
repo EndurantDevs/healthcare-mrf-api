@@ -180,7 +180,7 @@ def native_geo_entity_scope():
 
 
 def _native_eligible_geo_cte(nearby: NearbySqlQuery) -> str:
-    taxonomy_from, taxonomy_where = _taxonomy_filter_parts(nearby)
+    taxonomy_where = _taxonomy_filter_where(nearby)
     address_key_columns = ",\n           ".join(
         f"a.{column} AS _geo_address_{column}" for column in _address_row_key_columns(nearby.address_table_sql)
     )
@@ -193,7 +193,7 @@ def _native_eligible_geo_cte(nearby: NearbySqlQuery) -> str:
                AS cursor_distance_meters,
            {address_key_columns}
       FROM {nearby.search_table_sql or nearby.address_table_sql} AS a
-      JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
+      JOIN mrf.npi AS d ON d.npi = a.npi
      WHERE ST_DWithin(
                {_nearby_geography(nearby)},
                Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision))),
@@ -262,33 +262,23 @@ def _selected_geo_cte(import_context: ProviderImportQuery) -> str:
     )
 
 
-def _taxonomy_filter_parts(
-    nearby: NearbySqlQuery,
-    *,
-    filter_alias: str = "taxonomy_filter",
-) -> tuple[str, str]:
+def _taxonomy_filter_where(nearby: NearbySqlQuery) -> str:
     if not nearby.use_taxonomy_filter:
-        return "", ""
-    taxonomy_from = (
-        "\n      CROSS JOIN (\n"
-        "            SELECT ARRAY_AGG(code) AS taxonomy_codes,\n"
-        "                   ARRAY_AGG(int_code) AS codes\n"
-        "              FROM mrf.nucc_taxonomy\n"
-        f"             WHERE {nearby.taxonomy_conditions}\n"
-        f"      ) AS {filter_alias}"
-    )
-    taxonomy_where = f"\n       AND a.taxonomy_array && {filter_alias}.codes"
+        return ""
+    # Uncorrelated subqueries run once as init plans, so the geo/taxonomy index can stop after one page.
+    taxonomy_int_codes = f"(SELECT ARRAY_AGG(int_code) FROM mrf.nucc_taxonomy WHERE {nearby.taxonomy_conditions})"
+    taxonomy_where = f"\n       AND a.taxonomy_array && {taxonomy_int_codes}"
     if nearby.primary_only:
         taxonomy_where += (
             "\n       AND EXISTS ("
             "SELECT 1 FROM mrf.npi_taxonomy AS provider_taxonomy "
             "WHERE provider_taxonomy.npi = a.npi "
             "AND provider_taxonomy.healthcare_provider_taxonomy_code "
-            f"= ANY({filter_alias}.taxonomy_codes) "
+            f"IN (SELECT code FROM mrf.nucc_taxonomy WHERE {nearby.taxonomy_conditions}) "
             "AND UPPER(COALESCE("
             "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y')"
         )
-    return taxonomy_from, taxonomy_where
+    return taxonomy_where
 
 
 def _membership_clause(import_context: ProviderImportQuery) -> str:
@@ -371,7 +361,7 @@ WITH sub_s AS (
            a.*,
            d.*
       FROM {address_table_sql} AS a
-      JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
+      JOIN mrf.npi AS d ON d.npi = a.npi
      WHERE ST_DWithin(
                Geography(
                    ST_MakePoint(
@@ -439,7 +429,7 @@ SELECT sub_s.*, taxonomy.*, nucc.display_name AS taxonomy_display
 _NATIVE_NEARBY_COUNT_SQL_TEMPLATE = """
 SELECT COUNT(DISTINCT (a.npi, a.address_key)) AS total_count
   FROM {address_table_sql} AS a
-  JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
+  JOIN mrf.npi AS d ON d.npi = a.npi
  WHERE ST_DWithin(
            Geography(
                ST_MakePoint(
@@ -499,12 +489,8 @@ SELECT hydrated_geo.*, taxonomy.*, nucc.display_name AS taxonomy_display
           hydrated_geo.npi_code ASC,
           hydrated_geo.address_key ASC"""
 
-    taxonomy_from, taxonomy_where = _taxonomy_filter_parts(
-        nearby,
-        filter_alias="g",
-    )
+    taxonomy_where = _taxonomy_filter_where(nearby)
     return _NATIVE_NEARBY_SQL_TEMPLATE.format(
-        taxonomy_from=taxonomy_from,
         taxonomy_where=taxonomy_where,
         geo_precision_clause=nearby.geo_precision_clause,
         geo_type_clause=nearby.geo_type_clause,
@@ -527,18 +513,14 @@ def build_native_nearby_count_sql(
 ) -> str:
     """Build the exact native nearby count query from normalized fragments."""
 
-    taxonomy_from, taxonomy_where = _taxonomy_filter_parts(
-        nearby,
-        filter_alias="g",
-    )
+    taxonomy_where = _taxonomy_filter_where(nearby)
     if nearby.search_table_sql:
         return f"""SELECT COUNT(DISTINCT (a.npi, a.address_key)) AS total_count
   FROM {nearby.search_table_sql} AS a
-  JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
+  JOIN mrf.npi AS d ON d.npi = a.npi
  WHERE {_search_geo_predicates(nearby, taxonomy_where)}
    {bbox_clause};"""
     return _NATIVE_NEARBY_COUNT_SQL_TEMPLATE.format(
-        taxonomy_from=taxonomy_from,
         taxonomy_where=taxonomy_where,
         geo_precision_clause=nearby.geo_precision_clause,
         geo_type_clause=nearby.geo_type_clause,
@@ -564,13 +546,13 @@ def _search_geo_predicates(nearby: NearbySqlQuery, taxonomy_where: str) -> str:
 
 def _native_search_page(nearby: NearbySqlQuery) -> str:
     """Limit physical search rows before hydrating wide provider/address records."""
-    taxonomy_from, taxonomy_where = _taxonomy_filter_parts(nearby, filter_alias="g")
+    taxonomy_where = _taxonomy_filter_where(nearby)
     return f"""WITH page_geo AS MATERIALIZED (
     SELECT d.npi AS npi_code, a.address_key, a.location_key AS _geo_address_location_key,
            a.geo <-> Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision)))
                AS cursor_distance_meters
       FROM {nearby.search_table_sql} AS a
-      JOIN mrf.npi AS d ON d.npi = a.npi{taxonomy_from}
+      JOIN mrf.npi AS d ON d.npi = a.npi
      WHERE {_search_geo_predicates(nearby, taxonomy_where)}
      ORDER BY a.geo <-> Geography(ST_MakePoint(CAST(:in_long AS double precision), CAST(:in_lat AS double precision))),
               a.npi, a.address_key,

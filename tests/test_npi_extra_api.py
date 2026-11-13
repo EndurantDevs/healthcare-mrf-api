@@ -8,8 +8,8 @@ import pytest
 from api.endpoint import npi as npi_module
 from api.endpoint.npi import (
     active_pharmacists,
-    pharmacists_per_pharmacy,
     pharmacists_in_pharmacies,
+    pharmacists_per_pharmacy,
 )
 
 
@@ -68,16 +68,14 @@ def test_nearby_count_sql_matches_page_filters_and_identity():
         use_taxonomy_filter=True,
         address_table_sql="mrf.entity_address_unified",
         geo_precision_clause="AND COALESCE(a.address_precision, '') <> 'city_zip'",
-        bbox_clause=(
-            "AND a.lat BETWEEN :min_lat AND :max_lat "
-            "AND a.long BETWEEN :min_long AND :max_long"
-        ),
+        bbox_clause=("AND a.lat BETWEEN :min_lat AND :max_lat AND a.long BETWEEN :min_long AND :max_long"),
     )
 
     assert "COUNT(DISTINCT (a.npi, a.address_key))" in sql
     assert "a.address_key IS NOT NULL" in sql
     assert "classification = :classification" in sql
-    assert "a.taxonomy_array && g.codes" in sql
+    assert "a.taxonomy_array && (SELECT ARRAY_AGG(int_code) FROM mrf.nucc_taxonomy" in sql
+    assert "CROSS JOIN" not in sql
     assert "a.plans_network_array && :plan_network_array" in sql
     assert "d.provider_organization_name ILIKE :q" in sql
     assert "a.lat BETWEEN :min_lat AND :max_lat" in sql
@@ -207,27 +205,29 @@ async def test_pharmacists_per_pharmacy_state_and_name(monkeypatch):
         async def all(self, sql, **params):
             # first call histogram, second detail
             if "pharmacist_group" in str(sql):
-                captured_by_field['sql'] = sql
-                captured_by_field['params'] = params
+                captured_by_field["sql"] = sql
+                captured_by_field["params"] = params
                 return [("1", 2)]
             return [("201", "Clinic", 2)]
 
         async def first(self, *_args, **_kwargs):
             return None
 
-    monkeypatch.setattr(npi_module.db, 'acquire', lambda: FakeAcquire(RecordingConnection()))
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(RecordingConnection()))
 
-    request = types.SimpleNamespace(args={'state': 'ny', 'name_like': 'clinic'})
+    request = types.SimpleNamespace(args={"state": "ny", "name_like": "clinic"})
     response = await pharmacists_per_pharmacy(request)
     pharmacists_per_pharmacy_payload = json.loads(response.body)
 
-    assert pharmacists_per_pharmacy_payload["histogram"][0]['pharmacist_group'] == '1'
+    assert pharmacists_per_pharmacy_payload["histogram"][0]["pharmacist_group"] == "1"
     # name params now use indexed placeholders
-    assert captured_by_field['params']['state'] == 'NY'
-    assert any(field_value == '%clinic%' for k, field_value in captured_by_field['params'].items() if k.startswith('name_like'))
-    sql_text = str(captured_by_field['sql'])
-    assert 'ph.state_name = :state' in sql_text
-    assert 'LIKE :name_like_0' in sql_text
+    assert captured_by_field["params"]["state"] == "NY"
+    assert any(
+        field_value == "%clinic%" for k, field_value in captured_by_field["params"].items() if k.startswith("name_like")
+    )
+    sql_text = str(captured_by_field["sql"])
+    assert "ph.state_name = :state" in sql_text
+    assert "LIKE :name_like_0" in sql_text
 
 
 @pytest.mark.asyncio
@@ -253,13 +253,13 @@ async def test_pharmacists_per_pharmacy_uses_unified_address_table_when_compatib
 
     monkeypatch.setenv("HLTHPRT_ADDRESS_SERVING_SOURCE", "entity_address_unified")
     monkeypatch.setattr(npi_module, "_table_columns", fake_table_columns)
-    monkeypatch.setattr(npi_module.db, 'acquire', lambda: FakeAcquire(RecordingConnection()))
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(RecordingConnection()))
 
-    request = types.SimpleNamespace(args={'state': 'ny'})
+    request = types.SimpleNamespace(args={"state": "ny"})
     response = await pharmacists_per_pharmacy(request)
     response_payload_by_field = json.loads(response.body)
 
-    assert response_payload_by_field["histogram"][0]['pharmacist_group'] == '1'
+    assert response_payload_by_field["histogram"][0]["pharmacist_group"] == "1"
     sql_text = captured_by_field["sql"]
     assert "FROM mrf.entity_address_unified AS a" in sql_text
     assert "FROM mrf.npi_address AS a" not in sql_text
@@ -267,15 +267,30 @@ async def test_pharmacists_per_pharmacy_uses_unified_address_table_when_compatib
 
 @pytest.mark.asyncio
 async def test_pharmacists_per_pharmacy_full_groups(monkeypatch):
-    expected_groups = ['25+'] + [str(i) for i in range(25, 0, -1)]
+    expected_groups = ["25+"] + [str(i) for i in range(25, 0, -1)]
     fake_rows = [(group, idx) for idx, group in enumerate(expected_groups, start=1)]
 
     fake_conn = FakeConnection(all_result=[fake_rows, [("999", "Any", 1)]])
-    monkeypatch.setattr(npi_module.db, 'acquire', lambda: FakeAcquire(fake_conn))
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(fake_conn))
 
     request = types.SimpleNamespace(args={})
     response = await pharmacists_per_pharmacy(request)
     payload = json.loads(response.body)
 
-    assert [entry['pharmacist_group'] for entry in payload["histogram"]] == expected_groups
-    assert [entry['pharmacy_count'] for entry in payload["histogram"]] == list(range(1, len(expected_groups) + 1))
+    assert [entry["pharmacist_group"] for entry in payload["histogram"]] == expected_groups
+    assert [entry["pharmacy_count"] for entry in payload["histogram"]] == list(range(1, len(expected_groups) + 1))
+
+
+def test_taxonomy_filter_is_an_init_plan_not_a_join():
+    sql = npi_module._build_nearby_sql(
+        "classification = :classification",
+        "",
+        "",
+        use_taxonomy_filter=True,
+        primary_only=True,
+        address_table_sql="mrf.entity_address_unified",
+    )
+    assert "CROSS JOIN" not in sql
+    taxonomy_codes = "(SELECT ARRAY_AGG(int_code) FROM mrf.nucc_taxonomy WHERE classification = :classification)"
+    assert f"a.taxonomy_array && {taxonomy_codes}" in sql
+    assert "IN (SELECT code FROM mrf.nucc_taxonomy WHERE classification = :classification)" in sql
