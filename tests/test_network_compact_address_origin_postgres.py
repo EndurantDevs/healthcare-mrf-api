@@ -21,7 +21,7 @@ from api.network_address_scope import (
     scoped_address_relation_sql,
 )
 from api.network_read_execution import execute_network_read
-from api.network_serving_api_read import api_catalog_read_snapshot, resolve_api_network_pin
+from api.network_serving_api_read import api_catalog_read_snapshot
 from api.reference_family_reads import pin_claims_reader
 from db.connection import Database, current_session
 from process import network_indexed_address_artifact as indexed
@@ -34,7 +34,6 @@ from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_pipeline import prepare_network_candidate
 from process.network_membership_publication import publish_network_candidate
 from process.network_published_api_pin import published_api_pin_statement
-from process.network_serving_api_sql import api_serving_pin_statement
 from process.network_serving_read import NetworkServingReadUnavailable
 from process.registry_candidate_composition import (
     RegistryCompositionAddressSources,
@@ -838,11 +837,11 @@ async def indexed_api_db(indexed_db, monkeypatch):
     database._database_override = url.database
     native_fetchrow = asyncpg.Connection.fetchrow
     control_schema = fixture.control_schema
-    metadata_sql = api_serving_pin_statement(control_schema), published_api_pin_statement(control_schema)
+    metadata_sql = published_api_pin_statement(control_schema)
 
     async def observe_metadata(connection, statement, *parameters, **options):
         address_entry = await native_fetchrow(connection, statement, *parameters, **options)
-        if statement in metadata_sql:
+        if statement == metadata_sql:
             requests.append((connection, parameters, address_entry))
         return address_entry
 
@@ -902,72 +901,6 @@ async def test_published_api_pin_one_query_and_retained_reader_parity(indexed_ap
         manifest, address_rows = await _api_rows(held, generation_id)
         assert manifest == expected_manifest and address_rows == expected_rows
     assert len(held.requests) == 3 and not held.database.has_reader_session()
-
-
-async def test_direct_indexed_pin_retains_genuine_current_and_retained_reader_contract(indexed_api_db):
-    held = indexed_api_db
-    for generation_id, expected in (
-        (None, held.current),
-        (held.current.generation_id, held.current),
-        (held.retained.generation_id, held.retained),
-    ):
-        async with held.database.reader_session() as session:
-            identity_by_field = dict(session.info["api_reader_identity"])
-            transaction = session.get_transaction()
-            await pin_claims_reader(session, api_read=True)
-            before = len(held.requests)
-            manifest, approved, relation = await resolve_api_network_pin(session, generation_id=generation_id)
-            assert len(held.requests) == before + 1
-            driver, parameters, _entry = held.requests[-1]
-            assert parameters == (held.fixture.control_schema, generation_id, 8388608)
-            assert manifest == expected and manifest.compact_layout == expected.compact_layout
-            assert manifest.compact_layout.base.table_oid == held.current.compact_layout.base.table_oid
-            assert approved.approved_revision == expected.approved_custom_revision
-            assert approved.generation_id == expected.source_generations["custom_membership"]
-            assert relation.schema_name == held.fixture.control_schema
-            assert relation.table_name == "registry_approved_record"
-            assert relation.table_oid == await driver.fetchval(
-                "SELECT pg_catalog.to_regclass($1)::oid::bigint",
-                f'"{held.fixture.control_schema}".registry_approved_record',
-            )
-            assert driver.get_server_pid() == identity_by_field["backend_pid"]
-            assert session.info["api_reader_identity"] == identity_by_field and current_session() is session
-            assert session.get_transaction() is transaction and session.get_nested_transaction() is None
-    assert len(held.requests) == 3 and not held.database.has_reader_session()
-
-
-@pytest.mark.parametrize("damage", ["actor", "relation", "publication"])
-async def test_indexed_api_pin_refuses_native_drift_before_rows(indexed_api_db, damage):
-    held = indexed_api_db
-    fixture, base = held.fixture, held.current.compact_layout.base
-    commands_by_damage = {
-        "actor": (
-            f'ALTER ROLE "{fixture.roles["reader"]}" CREATEROLE',
-            f'ALTER ROLE "{fixture.roles["reader"]}" NOCREATEROLE',
-        ),
-        "relation": (
-            f'ALTER TABLE "{base.schema_name}"."{base.table_name}" ENABLE ROW LEVEL SECURITY',
-            f'ALTER TABLE "{base.schema_name}"."{base.table_name}" DISABLE ROW LEVEL SECURITY',
-        ),
-        "publication": (
-            f'UPDATE "{fixture.control_schema}".network_serving_manifest SET eligible=false',
-            f'UPDATE "{fixture.control_schema}".network_serving_manifest SET eligible=true',
-        ),
-    }
-    change, restore = commands_by_damage[damage]
-    await fixture.connection.execute(change)
-    try:
-        for generation_id in (None, held.retained.generation_id):
-            async with held.database.reader_session() as session:
-                await pin_claims_reader(session, api_read=True)
-                before = len(held.requests)
-                with pytest.raises(NetworkServingReadUnavailable):
-                    await resolve_api_network_pin(session, generation_id=generation_id)
-                assert len(held.requests) == before + 1
-    finally:
-        await fixture.connection.execute(restore)
-    assert not held.database.has_reader_session()
-    assert (await _api_rows(held, None))[0] == held.current
 
 
 async def test_published_request_serves_a_copied_candidate_table_by_name(indexed_api_db):

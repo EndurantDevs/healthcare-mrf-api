@@ -961,14 +961,16 @@ def trusted_recipe(monkeypatch):
     """Mock only the existing manifest/map authorities; source admission and scope SQL remain real."""
     state_by_field = {"dataset": "synthetic-dataset"}
 
-    async def manifest(driver, *, generation_id=None):
+    async def manifest(driver, *, generation_id=None, api_read=False):
+        assert api_read is True
         if generation_id not in (None, 9):
             raise ValueError("unavailable exact canonical pin")
         return PinnedNetworkServingManifest(
             9, "00000000-0000-0000-0000-000000000001", os.environ["HLTHPRT_DB_SCHEMA"], 1, {}, 7, "c" * 64, 1
         )
 
-    async def recipes(driver, manifest):
+    async def recipes(driver, manifest, *, api_read=False):
+        assert api_read is True
         schema = os.environ["HLTHPRT_DB_SCHEMA"]
         oid = await driver.fetchval("SELECT to_regclass($1)::oid", schema + ".provider_directory_dataset_resource")
         source = PinnedFHIRMembershipSource(

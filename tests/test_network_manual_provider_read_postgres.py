@@ -316,6 +316,8 @@ def _assert_fixed_guarded_queries(logged_queries):
     """Pin constant metadata/data/identity reads, including first-use driver codec discovery."""
     application_prefixes = (
         "SELECT current_setting('transaction_isolation')",
+        # The published routing probe precedes the legacy candidate lookup.
+        "SELECT to_jsonb(candidate)::text AS candidate_json",
         "SELECT to_jsonb(candidate)::text AS candidate_json",
         "SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only')",
         "SELECT to_regclass($1)::oid",
@@ -332,12 +334,12 @@ def _assert_fixed_guarded_queries(logged_queries):
     for query in logged_queries:
         statement = " ".join(query.query.split())
         (codec_queries if statement.startswith(codec_prefixes) else application_queries).append(statement)
-    assert len(application_queries) == len(application_prefixes) == 7
+    assert len(application_queries) == len(application_prefixes) == 8
     assert all(
         statement.startswith(prefix)
         for statement, prefix in zip(application_queries, application_prefixes, strict=True)
     )
-    assert len(codec_queries) in (0, 3) and len(logged_queries) in (7, 10)
+    assert len(codec_queries) in (0, 3) and len(logged_queries) in (8, 11)
     assert all(statement.startswith(prefix) for statement, prefix in zip(codec_queries, codec_prefixes))
     assert all(query.query.lstrip().startswith(("SELECT", "WITH")) for query in logged_queries)
     assert sum("network_candidate_custody" in query.query for query in logged_queries) == 1

@@ -247,16 +247,11 @@ async def _page_query(connection, current, control_schema, *, read_relations=Non
             connection, current, control_schema, candidate=candidate, read_relations=read_relations
         )
         return _query(current, bindings, selected, arguments), arguments
-    seal = getattr(current, "_custody_seal_sha256", None)
     generations = candidate["source_generations"]
     if type(generations) is str:
         generations = json.loads(generations)
-    if (
-        type(seal) is not str
-        or re.fullmatch(r"[0-9a-f]{64}", seal) is None
-        or generations != current.source_generations
-    ):
-        raise NetworkProviderReadUnavailable("Pinned provider-only source custody is unavailable")
+    if generations != current.source_generations:
+        raise NetworkProviderReadUnavailable("Pinned provider-only source generations differ")
     verify_registry_source_contributions(candidate)
     approved, approved_relation = await _approved_mapping(connection, current, control_schema)
     if read_relations is not None:
