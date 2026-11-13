@@ -259,7 +259,9 @@ async def _pin_registration_catalog(connection, profile):
 async def _header(connection, profile, endpoint_id, dataset_id, require_current, families):
     relation = storage_relation(profile.schema_name, _HEADER)
     headers = await connection.fetch(
-        f"SELECT tableoid::oid::bigint AS oid,dataset_id,endpoint_id,left(dataset_hash,65) AS dataset_hash,status,is_current,"
+        "SELECT "
+        + ("tableoid::oid::bigint AS oid," if families is not None else "")
+        + "dataset_id,endpoint_id,left(dataset_hash,65) AS dataset_hash,status,is_current,"
         "published_at,resource_count,left(previous_dataset_id,97) AS previous_dataset_id,"
         "left(acquisition_root_run_id,65) AS root_run_id,"
         "json_typeof((publication_metadata_json->'resource_hash_contract')::json) AS hash_contract_type,"
@@ -277,7 +279,7 @@ async def _header(connection, profile, endpoint_id, dataset_id, require_current,
         _fail("publication_unavailable")
     header = headers[0]
     if (
-        header["oid"] not in families[_HEADER]
+        (families is not None and header["oid"] not in families[_HEADER])
         or header["endpoint_id"] != endpoint_id
         or header["dataset_id"] != dataset_id
         or header["status"] not in {"published", "superseded"}
@@ -300,13 +302,17 @@ async def _header(connection, profile, endpoint_id, dataset_id, require_current,
 
 async def _registration(connection, profile, endpoint_id, families):
     endpoints = await connection.fetch(
-        "SELECT tableoid::oid::bigint AS oid,endpoint_id,left(canonical_api_base,2049) AS source_uri FROM "
+        "SELECT "
+        + ("tableoid::oid::bigint AS oid," if families is not None else "")
+        + "endpoint_id,left(canonical_api_base,2049) AS source_uri FROM "
         + storage_relation(profile.catalog_schema, _ENDPOINT)
         + " WHERE endpoint_id=$1 LIMIT 2",
         endpoint_id,
     )
     aliases = await connection.fetch(
-        "SELECT tableoid::oid::bigint AS oid,endpoint_id,left(source_id,65) AS source_id FROM "
+        "SELECT "
+        + ("tableoid::oid::bigint AS oid," if families is not None else "")
+        + "endpoint_id,left(source_id,65) AS source_id FROM "
         + storage_relation(profile.catalog_schema, _SOURCE)
         + ' WHERE endpoint_id=$1 ORDER BY source_id COLLATE "C" LIMIT 1001',
         endpoint_id,
@@ -314,9 +320,12 @@ async def _registration(connection, profile, endpoint_id, families):
     if (
         len(endpoints) != 1
         or not 1 <= len(aliases) <= _MAX_CATALOG_ROWS
-        or endpoints[0]["oid"] not in families[_ENDPOINT]
+        or (families is not None and endpoints[0]["oid"] not in families[_ENDPOINT])
         or endpoints[0]["endpoint_id"] != endpoint_id
-        or any(alias["oid"] not in families[_SOURCE] or alias["endpoint_id"] != endpoint_id for alias in aliases)
+        or any(
+            (families is not None and alias["oid"] not in families[_SOURCE]) or alias["endpoint_id"] != endpoint_id
+            for alias in aliases
+        )
     ):
         _fail("registration_unavailable")
     source_aliases = [alias["source_id"] for alias in aliases]
@@ -340,13 +349,14 @@ async def _facts(connection, profile, dataset_id, native, source_uri, *, publish
         await published_read.verify(connection, schema_name=profile.schema_name, dataset_id=dataset_id)
         resource_relation = "(" + published_read.resource_sql() + ") AS catalog_resources"
         table_oid = "source_table_oid::oid"
+    physical_match = f"bool_and({table_oid}=ANY($3::oid[]))" if native is not None else "true"
     counts = await connection.fetch(
-        f"SELECT resource_type,count(*) AS rows,bool_and({table_oid}=ANY($3::oid[])) AS physical_match FROM "
+        f"SELECT resource_type,count(*) AS rows,{physical_match} AS physical_match FROM "
         + resource_relation
         + ' WHERE dataset_id=$1 AND resource_type=ANY($2::text[]) GROUP BY resource_type ORDER BY resource_type COLLATE "C"',
         dataset_id,
         RESOURCE_TYPES,
-        native["resource_leaf_oids"],
+        *([native["resource_leaf_oids"]] if native is not None else []),
     )
     digests = FHIRCatalogObservationDigests()
     async for page in iter_fhir_catalog_raw_pages(
@@ -461,7 +471,17 @@ def _receipt(header, families):
     )
 
 
-def _descriptor(profile, header, native, registration, families):
+def catalog_replacement_scope(descriptor):
+    """Keep replacement stable while named editions retain their payload coordinates."""
+    return descriptor.get("catalog_schema", descriptor["coordinates"]["dataset_schema"])
+
+
+def catalog_replacement_scope_sql(descriptor_sql):
+    """Use the same logical scope for stored named and legacy descriptors."""
+    return f"COALESCE({descriptor_sql}->>'catalog_schema',{descriptor_sql}->'coordinates'->>'dataset_schema')"
+
+
+def _descriptor(profile, header, native, registration, families, *, storage_schema=None):
     from process.registry_fhir_catalog_sources import PRODUCER
 
     source_uri, aliases = registration
@@ -470,7 +490,7 @@ def _descriptor(profile, header, native, registration, families):
         "coordinates": {
             "source_system": "fhir",
             "source_id": aliases[0],
-            "dataset_schema": profile.schema_name,
+            "dataset_schema": storage_schema or profile.schema_name,
             "dataset_id": dataset_id,
             "producer_id": PRODUCER,
             "edition_id": dataset_id,
@@ -484,7 +504,7 @@ def _descriptor(profile, header, native, registration, families):
         "source_aliases": aliases,
         "native_read_profile": profile.document(),
         "admission": _receipt(header, families),
-        **native,
+        **(native if native is not None else {"catalog_schema": profile.catalog_schema}),
     }
     digest = catalog_observation_descriptor_digest(descriptor_by_field)
     descriptor_by_field.update(

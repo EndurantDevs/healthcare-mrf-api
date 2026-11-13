@@ -30,6 +30,27 @@ def _install_catalog_snapshot(monkeypatch, session, driver, resolve):
     monkeypatch.setattr("api.network_serving_api_read.api_catalog_read_snapshot", snapshot)
 
 
+def _install_existing_snapshot(monkeypatch, session):
+    @asynccontextmanager
+    async def existing_snapshot(_database, request_session=None, *, reuse=False):
+        assert request_session is session
+        yield session
+
+    monkeypatch.setattr("api.provider_profile_snapshot.provider_directory_read_snapshot", existing_snapshot)
+
+
+def _batch_http_app(session):
+    app = Sanic("native_network_batch_" + uuid4().hex)
+
+    @app.middleware("request")
+    async def bind_session(request):
+        """Reuse the one synthetic request session throughout the real route."""
+        request.ctx.sa_session = session
+
+    app.add_route(npi.get_npi_batch, "/npi/id/batch", methods=["POST"])
+    return app
+
+
 @pytest.fixture
 def native_network_batch(monkeypatch):
     """Pin real HTTP scope/auth around synthetic retained and live office reads."""
@@ -39,6 +60,8 @@ def native_network_batch(monkeypatch):
         12, str(candidate_id), "network_candidate_" + candidate_id.hex, 1, {}, 0, "c" * 64, 1
     )
     session = with_read_identity_receipts(SimpleNamespace(execute=AsyncMock()))
+
+    _install_existing_snapshot(monkeypatch, session)
     driver = session.connection.return_value.get_raw_connection.return_value.driver_connection
     mock_approved_control_metadata(monkeypatch)
     bind_reader = AsyncMock(return_value=session)
@@ -71,14 +94,7 @@ def native_network_batch(monkeypatch):
     monkeypatch.setattr(npi, "_apply_location_statuses", AsyncMock())
     monkeypatch.setattr(npi, "_fetch_other_names_map", AsyncMock(return_value={}))
     monkeypatch.setattr(npi, "_fetch_provider_enrichment_summary_map", AsyncMock(return_value={}))
-    app = Sanic("native_network_batch_" + uuid4().hex)
-
-    @app.middleware("request")
-    async def bind_session(request):
-        """Reuse the one synthetic request session throughout the real route."""
-        request.ctx.sa_session = session
-
-    app.add_route(npi.get_npi_batch, "/npi/id/batch", methods=["POST"])
+    app = _batch_http_app(session)
     return SimpleNamespace(
         app=app,
         member=member,

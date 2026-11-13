@@ -342,7 +342,7 @@ class _ProjectionReplay:
             if not carried:
                 await replace_plan_tier_bindings(
                     self.connection,
-                    self.targets,
+                    {**self.targets, "source": self.namespace + ".registry_fhir_catalog_source"},
                     descriptor,
                     [json.loads(binding_row[4])["source_key"] for binding_row in projection.binding_rows],
                 )
@@ -352,14 +352,19 @@ class _ProjectionReplay:
 
     async def replace_bindings(self, descriptor, identities):
         """Replace the same observed Organizations while preserving absent historical ones."""
+        from process.registry_fhir_catalog_observed_source import (
+            catalog_replacement_scope,
+            catalog_replacement_scope_sql,
+        )
+
         selection = (
             f"SELECT b.binding_id FROM {self.targets['binding']} b "
             f"JOIN {self.namespace}.registry_fhir_catalog_source s ON b.document_json->>'evidence_id'="
             "s.source_generation||':Organization/'||(b.document_json->>'source_key') "
             "WHERE b.document_json->>'source_key'=ANY($1::text[]) AND s.descriptor_json->>'endpoint_id'=$2 "
-            "AND s.descriptor_json->'coordinates'->>'dataset_schema'=$3"
+            f"AND {catalog_replacement_scope_sql('s.descriptor_json')}=$3"
         )
-        parameters = (identities, descriptor["endpoint_id"], descriptor["coordinates"]["dataset_schema"])
+        parameters = (identities, descriptor["endpoint_id"], catalog_replacement_scope(descriptor))
         await self.connection.execute(
             f"DELETE FROM {self.targets['relationship']} WHERE binding_id IN ({selection})", *parameters
         )

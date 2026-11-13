@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import json
 import os
 
 import pytest
@@ -7,6 +8,7 @@ from sqlalchemy import text
 
 from api.endpoint import npi as npi_module
 from db.models import db
+from tests.provider_profile_snapshot_postgres_support import grant_profile_reader, snapshot_database
 from tests.test_npi_provider_directory_role_evidence_db import (
     _insert_dataset_rows,
     _insert_endpoint_rows,
@@ -14,7 +16,6 @@ from tests.test_npi_provider_directory_role_evidence_db import (
     _insert_source_rows,
     _publish_dataset_rows,
 )
-
 
 LOCATION_STATUS_ENDPOINT_ID = "pd-location-status"
 LOCATION_STATUS_SOURCE_ID = "pdfhir_location_status_test"
@@ -80,14 +81,8 @@ def _geo_membership_fixture() -> dict[str, object]:
         "run_id": "run_geo_membership_test",
         "npi": 1003968710,
         "address_key": "47ab23c8-74f7-41eb-8ffb-e8b9f6214594",
-        "included_record_id": (
-            "provider_directory_fhir:organization_address:"
-            f"{source_id}:organization-included:0"
-        ),
-        "excluded_record_id": (
-            "provider_directory_fhir:practitioner_role_address:"
-            f"{source_id}:role-excluded:0"
-        ),
+        "included_record_id": (f"provider_directory_fhir:organization_address:{source_id}:organization-included:0"),
+        "excluded_record_id": (f"provider_directory_fhir:practitioner_role_address:{source_id}:role-excluded:0"),
     }
 
 
@@ -290,15 +285,12 @@ async def test_location_status_query_uses_current_typed_row_and_dataset_fallback
                 ),
                 {
                     "source_record_ids": [
-                        role_record["source_record_id"]
-                        for role_record in LOCATION_STATUS_ROLE_RECORDS
+                        role_record["source_record_id"] for role_record in LOCATION_STATUS_ROLE_RECORDS
                     ]
                 },
             )
             status_by_record_id = {
-                status_row._mapping["source_record_id"]: status_row._mapping[
-                    "location_status"
-                ]
+                status_row._mapping["source_record_id"]: status_row._mapping["location_status"]
                 for status_row in query_result.all()
             }
 
@@ -309,3 +301,167 @@ async def test_location_status_query_uses_current_typed_row_and_dataset_fallback
             }
         finally:
             await fixture_savepoint.rollback()
+
+
+async def _create_named_geo_catalog(database, schema, edition_schemas):
+    """Use fixture-owned names and the closed header/resource reader shape."""
+    columns_by_table = {
+        "provider_directory_endpoint_dataset": (
+            "endpoint_id text,dataset_id text PRIMARY KEY,acquisition_root_run_id text,import_run_id text,"
+            "status text,is_current boolean,published_at timestamptz,superseded_at timestamptz,"
+            "publication_metadata_json jsonb,dataset_hash text,resource_count bigint"
+        ),
+        "provider_directory_dataset_resource": (
+            "dataset_id text,resource_type text,resource_id text,payload_json jsonb,"
+            "PRIMARY KEY(dataset_id,resource_type,resource_id)"
+        ),
+    }
+    async with database.engine.begin() as connection:
+        for namespace in (schema, *edition_schemas):
+            if namespace != schema:
+                await connection.execute(text(f'CREATE SCHEMA "{namespace}"'))
+            for table_name, columns in columns_by_table.items():
+                await connection.execute(text(f'CREATE TABLE "{namespace}".{table_name} ({columns})'))
+        await connection.execute(
+            text(f'CREATE TABLE "{schema}".provider_directory_source (source_id text PRIMARY KEY,endpoint_id text)')
+        )
+        await connection.execute(
+            text(
+                f'CREATE TABLE "{schema}".current_edition '
+                "(catalog_schema text,endpoint_id text,dataset_id text,schema_name text,"
+                "previous_dataset_id text,previous_schema_name text,"
+                "PRIMARY KEY(catalog_schema,endpoint_id))"
+            )
+        )
+        await connection.execute(
+            text(
+                f'CREATE TABLE "{schema}".provider_directory_address_overlay '
+                "(source_record_id text PRIMARY KEY,source_id text,last_seen_run_id text,"
+                "resource_type text,resource_id text,npi bigint,address_key uuid)"
+            )
+        )
+        for namespace in edition_schemas:
+            role = database._reader_database._reader_login[0]
+            await connection.execute(text(f'GRANT USAGE ON SCHEMA "{namespace}" TO "{role}"'))
+    for namespace in (schema, *edition_schemas):
+        await grant_profile_reader(database, namespace, columns_by_table)
+    await grant_profile_reader(
+        database, schema, ("provider_directory_source", "current_edition", "provider_directory_address_overlay")
+    )
+
+
+async def _seed_named_geo_editions(database, schema, edition_schemas, fixture_by_field):
+    """Leave stale catalog A present while the logical pointer selects immutable A or B."""
+    async with database.engine.begin() as connection:
+        await connection.execute(
+            text(f'INSERT INTO "{schema}".provider_directory_source VALUES (:source_id,:endpoint_id)'), fixture_by_field
+        )
+        for namespace, dataset_id, generation in (
+            (schema, "legacy-a", "a"),
+            (edition_schemas[0], "named-a", "a"),
+            (edition_schemas[1], "named-b", "b"),
+        ):
+            parameters_by_name = {
+                **fixture_by_field,
+                "dataset_id": dataset_id,
+                "run_id": "run-" + generation,
+                "resource_id": "organization-" + generation,
+                "dataset_hash": generation * 64,
+                "metadata": json.dumps({"source_ids": [fixture_by_field["source_id"]]}),
+            }
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{namespace}".provider_directory_endpoint_dataset '
+                    "(endpoint_id,dataset_id,acquisition_root_run_id,status,is_current,published_at,"
+                    "publication_metadata_json,dataset_hash,resource_count) "
+                    "VALUES (:endpoint_id,:dataset_id,:run_id,'published',true,now(),CAST(:metadata AS jsonb),:dataset_hash,1)"
+                ),
+                parameters_by_name,
+            )
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{namespace}".provider_directory_dataset_resource '
+                    "VALUES (:dataset_id,'Organization',:resource_id,'{}'::jsonb)"
+                ),
+                parameters_by_name,
+            )
+        for generation in ("a", "b"):
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{schema}".provider_directory_address_overlay '
+                    "VALUES (:record_id,:source_id,:run_id,'Organization',:resource_id,:npi,CAST(:address_key AS uuid))"
+                ),
+                {
+                    **fixture_by_field,
+                    "record_id": f"provider_directory_fhir:organization_address:{fixture_by_field['source_id']}:{generation}:0",
+                    "run_id": "run-" + generation,
+                    "resource_id": "organization-" + generation,
+                },
+            )
+        await connection.execute(
+            text(
+                f"INSERT INTO \"{schema}\".current_edition VALUES (:catalog,:endpoint_id,'named-a',:edition,NULL,NULL)"
+            ),
+            {
+                "catalog": schema,
+                "endpoint_id": fixture_by_field["endpoint_id"],
+                "edition": edition_schemas[0],
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_geo_named_switch_preserves_old_reader_and_fresh_evidence(monkeypatch):
+    """A pinned A read and fresh B read must ignore the same stale catalog A."""
+    from process import provider_directory_named_edition as named
+
+    async with snapshot_database(monkeypatch, populated=False) as (database, schema):
+        edition_schemas = (schema + "_a", schema + "_b")
+        fixture_by_field = {**_geo_membership_fixture(), "source_id": "geo-named-source", "endpoint_id": "geo-named"}
+        monkeypatch.setattr(named, "POINTER_SCHEMA", schema)
+        try:
+            await _create_named_geo_catalog(database, schema, edition_schemas)
+            await _seed_named_geo_editions(database, schema, edition_schemas, fixture_by_field)
+
+            async def evidence(session):
+                candidate_by_field = {
+                    "npi": fixture_by_field["npi"],
+                    "address_key": fixture_by_field["address_key"],
+                    "source_record_ids": ["provider_directory_fhir:stale"],
+                    "address_sources": ["nppes", "provider_directory_fhir"],
+                }
+                await npi_module._attach_geo_candidate_record_ids(
+                    [candidate_by_field], {"lat": 41, "long": -101}, database_session=session
+                )
+                assert (
+                    candidate_by_field["provider_directory_source_count"] == 1
+                    and candidate_by_field["source_count"] == 2
+                )
+                return candidate_by_field["source_record_ids"]
+
+            async with database.reader_session() as old_reader:
+                old_records = await evidence(old_reader)
+                assert old_records == [
+                    f"provider_directory_fhir:organization_address:{fixture_by_field['source_id']}:a:0"
+                ]
+                async with database.engine.begin() as writer:
+                    await writer.execute(
+                        text(
+                            f'UPDATE "{schema}".current_edition '
+                            "SET dataset_id='named-b',schema_name=:schema_b,"
+                            "previous_dataset_id='named-a',previous_schema_name=:schema_a"
+                        ),
+                        {
+                            "schema_a": edition_schemas[0],
+                            "schema_b": edition_schemas[1],
+                        },
+                    )
+                assert await evidence(old_reader) == old_records
+            async with database.reader_session() as fresh_reader:
+                assert await evidence(fresh_reader) == [
+                    f"provider_directory_fhir:organization_address:{fixture_by_field['source_id']}:b:0"
+                ]
+        finally:
+            async with database.engine.begin() as connection:
+                for namespace in reversed(edition_schemas):
+                    await connection.execute(text(f'DROP SCHEMA IF EXISTS "{namespace}" CASCADE'))

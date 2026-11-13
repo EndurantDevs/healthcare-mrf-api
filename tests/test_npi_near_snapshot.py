@@ -35,6 +35,11 @@ def _install_near_connection(monkeypatch, check, state):
         check("acquire")
         yield Connection()
 
+    async def execute(statement, parameters=None):
+        query_rows = await Connection().all(statement, **(parameters or {}))
+        return SimpleNamespace(all=lambda: query_rows, first=lambda: query_rows[0] if query_rows else None)
+
+    state.session = SimpleNamespace(execute=execute)
     monkeypatch.setattr(npi, "db", SimpleNamespace(acquire=acquire))
 
 

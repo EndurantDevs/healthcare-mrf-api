@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 
@@ -26,6 +27,17 @@ class NpiDetailCacheIdentity:
     address_key: str | None = None
     address_site_key: str | None = None
     address_grouping: str = "flat"
+
+
+def directory_overlay_cache_identity(overlay_identity, editions=()):
+    """Keep responses from different immutable directory editions distinct."""
+    if not editions:
+        return overlay_identity
+    return (
+        overlay_identity
+        + "|directory:"
+        + json.dumps([(edition.schema_name, edition.dataset_id) for edition in editions], separators=(",", ":"))
+    )
 
 
 def npi_detail_cache_key(

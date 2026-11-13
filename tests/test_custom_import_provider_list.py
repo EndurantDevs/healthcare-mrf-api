@@ -8,6 +8,7 @@ import json
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from sanic.exceptions import InvalidUsage
@@ -151,6 +152,7 @@ def _configure_imported_page_dependencies(monkeypatch) -> None:
     )
     monkeypatch.setattr(npi_module, "_address_serving_table_sql", _legacy_address_table)
     monkeypatch.setattr(npi_module, "_plan_release_npi_scope", _empty_plan_scope)
+    monkeypatch.setattr(npi_module, "_named_directory_editions", AsyncMock(return_value=()))
     monkeypatch.setattr(npi_module, "_apply_location_statuses", _mark_active_statuses)
     monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", _empty_enrichment)
     monkeypatch.setattr(

@@ -4819,6 +4819,13 @@ def test_uhc_catalog_reports_supported_resources_without_enabling_import():
 @pytest.mark.asyncio
 async def test_control_provider_directory_sources_endpoint(monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "secret")
+    session = types.SimpleNamespace(copy_to_table=True, execute=AsyncMock(), fetchval=AsyncMock(return_value=None))
+
+    @asynccontextmanager
+    async def transaction():
+        yield session
+
+    monkeypatch.setattr(control.db, "transaction", transaction)
     enriched_catalog_map = {
         "catalog_digest": "a" * 64,
         "items": [{"entry_id": "example", "outcome_summary": {}}],
@@ -4832,7 +4839,8 @@ async def test_control_provider_directory_sources_endpoint(monkeypatch):
     response = await control.control_provider_directory_sources(authed_request())
 
     assert json.loads(response.body) == enriched_catalog_map
-    catalog_reader.assert_awaited_once_with()
+    catalog_reader.assert_awaited_once_with(editions=())
+    assert str(session.execute.await_args.args[0]) == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
 
 
 @pytest.mark.asyncio

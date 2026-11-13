@@ -17,23 +17,22 @@ from process import provider_directory_profile_selection as selection
 from process import provider_directory_profile_selection_snapshot as snapshot
 from tests.provider_directory_profile_uhc_flex_test_support import (
     _catalog as _uhc_catalog,
+)
+from tests.provider_directory_profile_uhc_flex_test_support import (
     _dataset_rows as _uhc_dataset_rows,
+)
+from tests.provider_directory_profile_uhc_flex_test_support import (
     _source_rows as _uhc_source_rows,
 )
 
 
 def _profile_selection_request() -> dict[str, object]:
     return {
-        "contract_id": (
-            "healthporta.provider-directory-profile-selection-"
-            "attestation-request.v1"
-        ),
+        "contract_id": ("healthporta.provider-directory-profile-selection-attestation-request.v1"),
         "node_id": "dev-node",
         "catalog_digest": "a" * 64,
         "selection_fingerprint": "b" * 64,
-        "datasets": [
-            {"source_id": "dataset-scoped", "dataset_id": "dataset-current"}
-        ],
+        "datasets": [{"source_id": "dataset-scoped", "dataset_id": "dataset-current"}],
     }
 
 
@@ -82,9 +81,7 @@ async def test_control_catalog_falls_back_on_optional_database_failures(
         control_catalog,
         "current_profile_selection_request",
         AsyncMock(
-            side_effect=RuntimeError("unavailable")
-            if failed_operation == "selection"
-            else None,
+            side_effect=RuntimeError("unavailable") if failed_operation == "selection" else None,
             return_value=selection_payload,
         ),
     )
@@ -92,9 +89,7 @@ async def test_control_catalog_falls_back_on_optional_database_failures(
         control_catalog,
         "enrich_provider_directory_source_catalog",
         AsyncMock(
-            side_effect=RuntimeError("unavailable")
-            if failed_operation == "outcomes"
-            else None,
+            side_effect=RuntimeError("unavailable") if failed_operation == "outcomes" else None,
             return_value=enriched_map,
         ),
     )
@@ -233,12 +228,8 @@ async def test_current_selection_request_uses_repeatable_unlocked_snapshot(
     monkeypatch.setattr(selection, "_compute_current_selection", selection_reader)
 
     catalog_map = {"catalog_digest": "a" * 64, "items": []}
-    assert await selection.current_profile_selection_request(
-        catalog_map
-    ) == selection_payload
-    transaction_status.assert_awaited_once_with(
-        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;"
-    )
+    assert await selection.current_profile_selection_request(catalog_map) == selection_payload
+    transaction_status.assert_awaited_once_with("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
     selection_reader.assert_awaited_once_with(
         catalog_map,
         node_id="dev-node",
@@ -282,10 +273,7 @@ async def test_attestation_rejects_stale_header_proposal(monkeypatch):
     register.assert_not_awaited()
     assert transaction_status.await_count == 2
     assert "REPEATABLE READ" in transaction_status.await_args_list[0].args[0]
-    assert (
-        "provider_directory_profile_selection_proof"
-        in transaction_status.await_args_list[1].args[0]
-    )
+    assert "provider_directory_profile_selection_proof" in transaction_status.await_args_list[1].args[0]
     assert "SHARE ROW EXCLUSIVE" in transaction_status.await_args_list[1].args[0]
 
 

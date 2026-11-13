@@ -49,6 +49,11 @@ def desired_fence_hash(fence: Any) -> str:
             {
                 **{name: getattr(dataset, name, None) for name in fields},
                 "artifact_resources": sorted(dataset.artifact_resources),
+                **(
+                    {"storage_schema": dataset.storage_schema}
+                    if getattr(dataset, "storage_schema", None) is not None
+                    else {}
+                ),
             }
             for dataset in sorted(fence.datasets, key=lambda item: item.source_id)
         ]

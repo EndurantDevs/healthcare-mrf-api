@@ -1,17 +1,153 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Complete proof-batch custody replaces only the retired control hooks."""
 
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from db.connection import ConnectionProxy
+from db.connection import ConnectionProxy, Database
 from process import provider_directory_proof_store as store
 from process import provider_directory_source_proof_control as control
 from process.provider_directory_generic_candidate import GenericCandidateError
 from tests.test_provider_directory_generic_source_storage import _case
+
+
+def _named_proof_parent(factory):
+    """Create a logical loading candidate with ordinary source and lineage metadata."""
+    metadata = {"source_ids": ["source-a"], "selected_resources": ["Organization"]}
+    identity_by_field = {
+        "dataset_id": "dataset-proof",
+        "endpoint_id": "endpoint-proof",
+        "acquisition_root_run_id": "root-proof",
+        "metadata": metadata,
+    }
+    binding_by_field = {
+        "contract": "generic-source-detached-by-name-v1",
+        "identity": identity_by_field,
+        "phase": "loading",
+        "ordinal": 0,
+        "resets": {},
+        "auxiliary": None,
+        "relationship_sha256": None,
+        "tables": {
+            kind: {"name": "pdgs_" + "a" * 32 + suffix}
+            for kind, suffix in (("resource_input", "_ri"), ("witness_input", "_wi"))
+        },
+        "storage": {
+            "catalog_schema": "catalog_schema",
+            "storage_schema": "source_schema",
+            "producer": list(factory.producer_identity),
+        },
+        "admission": None,
+    }
+    return {
+        **identity_by_field,
+        "status": "acquiring",
+        "is_current": False,
+        "publication_metadata_json": metadata,
+        "candidate_storage_json": binding_by_field,
+    }
+
+
+@pytest.fixture
+def named_proof_scope(monkeypatch):
+    """Use the genuine Source task and logical candidate checks with in-memory SQL results."""
+    from process import provider_directory_generic_source_policy as policy
+    from tests.test_provider_directory_generic_source_policy import _connection, _named_factory
+    from tests.test_provider_directory_proof_store import _MemoryProofConnection
+
+    factory = _named_factory()
+    native, _ = _connection()
+    memory = _MemoryProofConnection()
+    parent_by_field = _named_proof_parent(factory)
+    native.fetchrow = AsyncMock(side_effect=lambda *arguments: deepcopy(parent_by_field))
+
+    async def execute(statement, parameters):
+        query = str(statement).lstrip()
+        if query.startswith("DELETE"):
+            memory.shards.clear()
+        elif query.startswith("INSERT"):
+            await memory.status(statement, **parameters)
+        row = await memory.first(statement, **parameters) if query.startswith("SELECT") else None
+        return SimpleNamespace(rowcount=1, first=lambda: row)
+
+    session = SimpleNamespace(execute=AsyncMock(side_effect=execute), info={})
+    driver_lookup = AsyncMock(side_effect=AssertionError("named proof identity lookup"))
+    monkeypatch.setattr(control, "_copy_driver", driver_lookup)
+
+    @asynccontextmanager
+    async def scope():
+        async with policy.bind_generic_source_transaction_factory(factory):
+            async with policy.bind_generic_source_publisher(
+                native, factory.policy, verify_role_profile=AsyncMock(), transaction_isolation="repeatable read"
+            ) as publisher:
+                token = policy._OWNER.set((publisher, session))
+                try:
+                    yield SimpleNamespace(session=session, native=native, memory=memory, parent=parent_by_field)
+                finally:
+                    policy._OWNER.reset(token)
+        driver_lookup.assert_not_awaited()
+
+    return scope
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["persist", "built", "delete", "delete_resource"])
+async def test_named_proof_writers_route_unrelated_executor_to_source_session(named_proof_scope, operation):
+    from tests.test_provider_directory_proof_store import _dataset_resource
+
+    resource_rows = [_dataset_resource("Organization", "organization", {"npi": "123"})]
+    unrelated = ConnectionProxy(None, object(), None)
+    unrelated.status = AsyncMock(side_effect=AssertionError("unrelated proof writer used"))
+    unrelated.first = AsyncMock(side_effect=AssertionError("unrelated proof reader used"))
+    async with named_proof_scope() as case:
+        if operation == "built":
+            descriptor, compressed = store.build_dataset_proof_shard(
+                resource_rows,
+                dataset_id="dataset-proof",
+                endpoint_id="endpoint-proof",
+                acquisition_root_run_id="root-proof",
+                source_ids=["source-a"],
+            )
+            await store.persist_built_dataset_proof_shard(
+                unrelated, "catalog_schema", descriptor, compressed, dataset_id="dataset-proof"
+            )
+        else:
+            await store.persist_dataset_proof_shard(
+                unrelated, "catalog_schema", resource_rows, dataset_id="dataset-proof"
+            )
+            if operation == "delete":
+                await store.delete_dataset_proof_shards(unrelated, "catalog_schema", "dataset-proof")
+            elif operation == "delete_resource":
+                await store.delete_dataset_resource_proof_shards(
+                    unrelated, "catalog_schema", "dataset-proof", "Organization"
+                )
+        assert bool(case.memory.shards) == (operation in {"persist", "built"})
+        assert case.session.execute.await_count >= 2
+        assert '"source_schema"."provider_directory_endpoint_dataset"' in case.native.fetchrow.await_args.args[0]
+        assert "FOR SHARE" in case.native.fetchrow.await_args.args[0]
+        unrelated.status.assert_not_awaited()
+        unrelated.first.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_named_proof_routing_keeps_parent_lineage_before_any_write(named_proof_scope):
+    from tests.test_provider_directory_proof_store import _dataset_resource
+
+    async with named_proof_scope() as case:
+        case.parent["endpoint_id"] = "changed-endpoint"
+        with pytest.raises(GenericCandidateError, match="proof_identity_changed"):
+            await store.persist_dataset_proof_shard(
+                object(),
+                "catalog_schema",
+                [_dataset_resource("Organization", "organization", {})],
+                dataset_id="dataset-proof",
+            )
+        case.session.execute.assert_not_awaited()
+        assert case.memory.shards == {}
 
 
 @pytest.mark.asyncio
@@ -35,7 +171,8 @@ async def test_every_proof_writer_refuses_ambient_executor_before_any_target_io(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", [None, "session", "driver", "schema", "executor"])
-async def test_proof_executor_is_original_same_task_owner_before_native_custody(monkeypatch, change):
+@pytest.mark.parametrize("executor_kind", ["proxy", "database"])
+async def test_proof_executor_is_original_same_task_owner_before_native_custody(monkeypatch, change, executor_kind):
     session, native = object(), object()
     publisher = SimpleNamespace(connection=native, policy=SimpleNamespace(schema="source_schema"))
     monkeypatch.setattr(control, "bound_publisher", lambda: publisher)
@@ -44,7 +181,12 @@ async def test_proof_executor_is_original_same_task_owner_before_native_custody(
     monkeypatch.setattr(control, "_copy_driver", driver)
     custody = AsyncMock()
     monkeypatch.setattr(control, "verify_proof_control", custody)
-    executor = ConnectionProxy(None, object() if change == "session" else session, None)
+    supplied_session = object() if change == "session" else session
+    if executor_kind == "database":
+        executor = Database()
+        monkeypatch.setattr(executor, "_transaction_binding", lambda: SimpleNamespace(session=supplied_session))
+    else:
+        executor = ConnectionProxy(None, supplied_session, None)
     if change == "executor":
         executor = SimpleNamespace(_connection=session)
     if change is None:

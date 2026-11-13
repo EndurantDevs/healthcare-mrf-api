@@ -59,15 +59,32 @@ def _resource_cte(fhir, schema, fence, resource_type):
     """Project exactly the retained resource families materialized by the full artifact scope."""
     model = fhir.RESOURCE_MODELS_BY_TYPE[resource_type]
     datasets = [dataset for dataset in fence.datasets if resource_type in dataset.artifact_resources]
-    query = _literal_query(
-        fhir._provider_directory_artifact_resource_select_sql(model, schema),
-        {
-            "source_ids": [dataset.source_id for dataset in datasets],
-            "dataset_ids": [dataset.dataset_id for dataset in datasets],
-            "evidence_run_ids": [dataset.evidence_run_id for dataset in datasets],
-            "resource_type": resource_type,
-        },
-    )
+    if any(getattr(dataset, "storage_schema", None) is not None for dataset in datasets):
+        queries = [
+            "("
+            + _literal_query(
+                fhir._provider_directory_artifact_resource_select_sql(model, schema, dataset=dataset),
+                {
+                    "source_ids": [dataset.source_id],
+                    "dataset_ids": [dataset.dataset_id],
+                    "evidence_run_ids": [dataset.evidence_run_id],
+                    "resource_type": resource_type,
+                },
+            )
+            + ")"
+            for dataset in datasets
+        ]
+        query = " UNION ALL ".join(queries)
+    else:
+        query = _literal_query(
+            fhir._provider_directory_artifact_resource_select_sql(model, schema),
+            {
+                "source_ids": [dataset.source_id for dataset in datasets],
+                "dataset_ids": [dataset.dataset_id for dataset in datasets],
+                "evidence_run_ids": [dataset.evidence_run_id for dataset in datasets],
+                "resource_type": resource_type,
+            },
+        )
     name = fhir._q("desired_overlay_" + model.__tablename__)
     columns = ", ".join(fhir._q(column.name) for column in model.__table__.columns)
     return name, f"{name} ({columns}) AS MATERIALIZED ({query})"

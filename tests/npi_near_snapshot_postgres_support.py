@@ -14,7 +14,8 @@ from sqlalchemy.sql.elements import TextClause
 
 from api import provider_profile_snapshot as snapshot
 from api.endpoint import npi
-from db.connection import ConnectionProxy, current_session
+from api.network_read_execution import NetworkReadConnectionProxy
+from db.connection import current_session
 from db.models import EntityAddressUnified, NPIData, NPIDataTaxonomy, NUCCTaxonomy
 from tests.provider_profile_snapshot_postgres_support import grant_profile_reader, snapshot_database
 
@@ -137,7 +138,7 @@ def _observe_near_reads(database, schema, monkeypatch):
         publication=None,
     )
     original_all, original_metadata, original_json = (
-        ConnectionProxy.all,
+        NetworkReadConnectionProxy.all,
         npi._project_provider_network_metadata,
         npi.response.json,
     )
@@ -171,7 +172,7 @@ def _observe_near_reads(database, schema, monkeypatch):
             assert not state.publication.done()
         return original_json(*args, **kwargs)
 
-    monkeypatch.setattr(ConnectionProxy, "all", observed_all)
+    monkeypatch.setattr(NetworkReadConnectionProxy, "all", observed_all)
     monkeypatch.setattr(npi, "_project_provider_network_metadata", observed_metadata)
     monkeypatch.setattr(npi.response, "json", observed_json)
     return state

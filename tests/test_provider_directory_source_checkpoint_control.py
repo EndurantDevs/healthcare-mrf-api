@@ -2,6 +2,7 @@
 """Batch fences retain both parent coordinates and the original transaction."""
 
 import ast
+import asyncio
 import importlib
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -454,6 +455,7 @@ async def test_shared_refresh_child_requires_original_executor_before_write(monk
     connection = SimpleNamespace(status=AsyncMock(return_value=1))
     require = AsyncMock(side_effect=GenericCandidateError("synthetic_executor_refused") if reject else None)
     monkeypatch.setattr(directory, "require_checkpoint_executor", require)
+    monkeypatch.setattr(directory.bulk_parallel, "source_copy_executor", lambda executor: executor)
     operation = directory.bulk_parallel.reserve_refresh_attempts(directory, connection, identity, 1, 1)
     if reject:
         with pytest.raises(GenericCandidateError, match="synthetic_executor_refused"):
@@ -488,6 +490,143 @@ async def test_checkpoint_transaction_passes_batch_loading_to_its_source_transac
         async with control.source_checkpoint_transaction(object()):
             pytest.fail("the transaction body must not run")
     assert opened_options == [{}]
+
+
+@pytest.fixture
+def named_writer(monkeypatch):
+    """Keep Source task/parent authorization while exposing its actual SQLAlchemy executor."""
+    factory = _named_factory()
+    native, _ = _connection()
+    directory = importlib.import_module("process.provider_directory_fhir")
+    monkeypatch.setattr(directory, "_schema", lambda: factory.storage_binding.catalog_schema)
+    native.fetchrow = AsyncMock(return_value=dict(_IDENTITY))
+    session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(rowcount=1)))
+    driver_lookup = AsyncMock(side_effect=AssertionError("named SQL needs no connection identity probe"))
+    monkeypatch.setattr(control, "_copy_driver", driver_lookup)
+
+    @asynccontextmanager
+    async def transaction():
+        """Issue task-scoped authority inside the requesting test's task."""
+        async with control.source.bind_generic_source_transaction_factory(factory):
+            async with control.source.bind_generic_source_publisher(
+                native, factory.policy, verify_role_profile=AsyncMock(), transaction_isolation="repeatable read"
+            ) as publisher:
+                owner_token = control.source._OWNER.set((publisher, session))
+                bulk_token = control._BULK_IDENTITY.set(dict(_IDENTITY))
+                try:
+                    yield SimpleNamespace(
+                        session=session,
+                        native=native,
+                        publisher=publisher,
+                        identity=SimpleNamespace(**_IDENTITY, owner_run_id="owner-run"),
+                    )
+                finally:
+                    control._BULK_IDENTITY.reset(bulk_token)
+                    control.source._OWNER.reset(owner_token)
+        driver_lookup.assert_not_awaited()
+
+    return transaction
+
+
+def _unrelated_executor(kind):
+    """Expose supported executor shapes whose SQL must remain untouched."""
+    if kind == "database":
+        executor = control.Database()
+        executor._transaction_binding = lambda: SimpleNamespace(session=object())
+    else:
+        executor = control.ConnectionProxy(None, object(), object())
+    executor.status = AsyncMock(side_effect=AssertionError("unrelated executor received a Source write"))
+    return executor
+
+
+async def _bulk_child(directory, name, executor, identity):
+    """Invoke each existing bulk child through its normal parameters."""
+    output = SimpleNamespace(
+        output_index=0,
+        resource_type="Organization",
+        url="https://example.org/output",
+        url_hash="c" * 64,
+        identity_hash="d" * 64,
+    )
+    manifest = SimpleNamespace(outputs=[output], identity_hash="e" * 64, payload={}, status_url=None)
+    if name == "manifest":
+        await directory._persist_bulk_manifest_outputs(executor, identity, manifest)
+    elif name == "output":
+        validator = SimpleNamespace(etag=None, output_expires_at=None, content_length_bytes=42, etag_hash=None)
+        await directory._persist_refreshed_bulk_output(executor, identity, output, {"output_id": "output"}, validator)
+    elif name == "refresh":
+        await directory._persist_refreshed_bulk_manifest(executor, identity, {}, manifest, "{}")
+    else:
+        await directory.bulk_parallel.reserve_refresh_attempts(directory, executor, identity, 1, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("executor_kind", ["database", "proxy"])
+@pytest.mark.parametrize("child_name", ["manifest", "output", "refresh", "attempts"])
+async def test_named_bulk_children_route_wrong_executor_to_copy_and_checkpoint_session(
+    named_writer,
+    monkeypatch,
+    executor_kind,
+    child_name,
+):
+    directory = importlib.import_module("process.provider_directory_fhir")
+    monkeypatch.setattr(directory, "_encrypt_bulk_capability", lambda value: "synthetic-ciphertext")
+    executor = _unrelated_executor(executor_kind)
+    async with named_writer() as writer:
+        await _bulk_child(directory, child_name, executor, writer.identity)
+        executor.status.assert_not_awaited()
+        writer.session.execute.assert_awaited_once()
+        statement, parameters = writer.session.execute.await_args.args
+        table = (
+            "provider_directory_bulk_acquisition_checkpoint"
+            if child_name == "refresh"
+            else "provider_directory_bulk_output_checkpoint"
+        )
+        assert f'"source_schema"."{table}"' in str(statement)
+        assert parameters["checkpoint_id"] == _IDENTITY["checkpoint_id"]
+        assert "FOR SHARE" in writer.native.fetchrow.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_named_checkpoint_routing_preserves_original_task_and_cursor_scope(named_writer):
+    executor = _unrelated_executor("proxy")
+    async with named_writer() as writer:
+        with pytest.raises(GenericCandidateError, match="publisher_connection_required"):
+            await asyncio.create_task(control.require_checkpoint_executor(executor, bulk_identity=writer.identity))
+        token = control._BULK_IDENTITY.set({**_IDENTITY, "dataset_id": "different"})
+        try:
+            with pytest.raises(GenericCandidateError, match="checkpoint_identity_scope_changed"):
+                await control.require_checkpoint_executor(executor, bulk_identity=writer.identity)
+        finally:
+            control._BULK_IDENTITY.reset(token)
+        writer.session.execute.assert_not_awaited()
+        executor.status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_named_retained_copy_and_proof_share_the_issued_session(named_writer, monkeypatch):
+    from process import provider_directory_generic_source_adapters as adapters
+
+    directory = importlib.import_module("process.provider_directory_fhir")
+    executor = _unrelated_executor("proxy")
+    resource_rows = [{"dataset_id": "dataset", "resource_type": "Organization", "resource_id": "organization"}]
+    async with named_writer() as writer:
+
+        async def copy_rows(_directory, rows, **options):
+            assert rows == resource_rows and control.source_copy_session() is writer.session
+            await writer.session.execute("COPY synthetic_resource", {})
+
+        async def proof_rows(routed, _schema, rows, **options):
+            assert rows == resource_rows
+            await routed.status("INSERT INTO synthetic_proof VALUES (:value)", value="proof")
+
+        monkeypatch.setattr(adapters, "persist_source_rows", copy_rows)
+        monkeypatch.setattr(directory, "persist_dataset_proof_shard", proof_rows)
+        await directory._upsert_dataset_resource_rows_on_connection(
+            executor, resource_rows, persist_content_proof=True, resource_hash_contract="transport_neutral_v2"
+        )
+        assert writer.session.execute.await_count == 2
+        executor.status.assert_not_awaited()
 
 
 @asynccontextmanager

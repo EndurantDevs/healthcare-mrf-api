@@ -16,6 +16,7 @@ from sqlalchemy import String, column, select, values
 from api.endpoint import npi
 from api.endpoint.pagination import parse_pagination
 from api.network_read_execution import execute_network_read
+from api.provider_profile_snapshot import provider_directory_snapshot_read
 from process.custom_import.read_contracts import CustomImportReadUnavailableError
 
 _PAGE_KEYS = {"page", "page_size", "limit", "start", "offset"}
@@ -143,7 +144,7 @@ async def _prepare_native_batch(npis, native_args, session, *, import_context=No
         return _NativeBatchState(
             details,
             await npi._rank_npi_batch_addresses(
-                npis, session=session, use_request_session=has_import_context, fail_closed=has_import_context
+                npis, session=session, use_request_session=session is not None, fail_closed=has_import_context
             ),
         )
     base = await npi._fetch_npi_location_candidates_map(npis, session=session)
@@ -155,7 +156,7 @@ async def _prepare_native_batch(npis, native_args, session, *, import_context=No
     await npi._apply_location_statuses(
         [address for identity in npis for address in base.get(identity, ())],
         session=session,
-        use_request_session=has_import_context,
+        use_request_session=session is not None,
         fail_closed=has_import_context,
     )
     addresses_by_npi = {
@@ -215,6 +216,7 @@ async def _batch_eligible_npis(
             import_context=import_context,
             native_npis=tuple(requested),
             native_scope_preparer=native_scope_preparer,
+            session=session,
         )
         if reply.status != 200:
             raise CustomImportReadUnavailableError("native batch eligibility is unavailable")
@@ -425,7 +427,9 @@ async def build_native_batch_payload(
     """Assemble ordered provider summaries with set-based database reads."""
     npis = list(batch_params["npis"])
     detail_by_npi = await npi._build_npi_identity_details_map(npis, session=session)
-    ranked_addresses_by_npi = await npi._rank_npi_batch_addresses(npis, session=session)
+    ranked_addresses_by_npi = await npi._rank_npi_batch_addresses(
+        npis, session=session, use_request_session=session is not None
+    )
     selected_addresses_by_npi = await npi._hydrate_npi_batch_addresses(
         npis,
         ranked_addresses_by_npi,
@@ -460,7 +464,8 @@ async def build_native_batch_payload(
     }
 
 
-async def serve_native_batch(request):
+@provider_directory_snapshot_read
+async def serve_native_batch(request, *, session=None):
     """Return up to 100 provider summaries from one bounded database pipeline."""
     started = time.monotonic()
     request_body = request.json
@@ -473,11 +478,11 @@ async def serve_native_batch(request):
             request,
             batch_params,
             native_args=parse_native_batch_query(native_query),
-            session=npi._request_session(request),
+            session=session,
         )
     else:
         batch_params = npi._normalize_npi_batch_request(request_body)
-        payload = await npi._build_npi_batch_payload(batch_params, session=npi._request_session(request))
+        payload = await npi._build_npi_batch_payload(batch_params, session=session)
     payload["meta"] = {
         "elapsed_ms": round((time.monotonic() - started) * 1000.0, 2),
         "max_batch_size": npi.NPI_BATCH_MAX_SIZE,

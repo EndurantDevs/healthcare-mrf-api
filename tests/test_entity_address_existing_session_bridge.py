@@ -200,7 +200,7 @@ async def _expect_bridge_rejected(database: Database, session, match: str) -> No
         await bridge.__aenter__()
 
 
-async def _assert_inactive_and_identity_rejections(database: Database) -> None:
+async def _assert_borrowed_session_contract(database: Database) -> None:
     assert database.session_factory is not None
     inactive_session = database.session_factory()
     try:
@@ -219,10 +219,11 @@ async def _assert_inactive_and_identity_rejections(database: Database) -> None:
                 )
             assert unconnected_database.engine is None
 
-            wrong_database = Database()
-            wrong_database._database_override = "different_test_database"
-            await _expect_bridge_rejected(wrong_database, caller_session, "database identity")
-            assert wrong_database.engine is None
+            borrower = Database()
+            borrower._database_override = "different_test_database"
+            async with borrower.bind_existing_session(caller_session):
+                assert await borrower.scalar("SELECT current_database()") == os.environ["HLTHPRT_DB_DATABASE"]
+            assert borrower.engine is None
     finally:
         await caller_session.close()
 
@@ -281,5 +282,5 @@ async def test_borrowed_session_keeps_native_cutover_and_outer_rollback_atomic(m
 @pytest.mark.asyncio
 async def test_existing_session_bridge_rejects_ambiguous_or_unowned_contexts():
     async with _temporary_schema() as (database, _schema):
-        await _assert_inactive_and_identity_rejections(database)
+        await _assert_borrowed_session_contract(database)
         await _assert_existing_binding_rejections(database)

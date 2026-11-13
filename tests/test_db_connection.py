@@ -218,20 +218,15 @@ async def test_session_and_native_acquire_reuse_bound_session_without_ending_it(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("connection_bound", [False, True])
 @pytest.mark.parametrize("database_matches", [False, True])
-async def test_session_metadata_checks_engine_and_connection_database_identity(connection_bound, database_matches):
+async def test_bridge_uses_explicit_session_database(database_matches):
     engine = create_async_engine("postgresql+asyncpg://tester@localhost/synthetic")
-    session = SimpleNamespace(bind=engine.connect() if connection_bound else engine)
     db = Database()
     db._database_override = "synthetic" if database_matches else "other"
     try:
-        assert db._session_database_name(session) == "synthetic"
-        if database_matches:
-            db._validate_existing_session_database(session)
-        else:
-            with pytest.raises(RuntimeError, match="database identity does not match"):
-                db._validate_existing_session_database(session)
+        async with AsyncSession(bind=engine) as session, session.begin(), db.bind_existing_session(session):
+            assert db._transaction_binding().session is session
+            assert session.in_transaction() and not session.in_nested_transaction()
         assert engine.pool.checkedout() == 0
     finally:
         await engine.dispose()

@@ -42,6 +42,7 @@ from process.registry_fhir_catalog_sources import (
     MAX_PAGE,
     FHIRCatalogSourceReadProfile,
     fhir_catalog_source_generation,
+    is_named_fhir_catalog_descriptor,
     require_current_fhir_catalog_sources,
     validate_fhir_catalog_source_descriptor,
 )
@@ -987,7 +988,13 @@ async def verify_current_fhir_catalog_source_companies(source_export, connection
         async with open_source_owned_catalog_export(source_export, profile, connection) as export:
             for entry in entries:
                 descriptor = descriptors[entry["source_generation"]]
-                if descriptor["database_oid"] != export["database_identity"]["database_oid"]:
+                if "native_read_profile" in export and not is_named_fhir_catalog_descriptor(descriptor):
+                    _fail("source_not_admitted")
+                if (
+                    not is_named_fhir_catalog_descriptor(descriptor)
+                    and "database_identity" in export
+                    and descriptor["database_oid"] != export["database_identity"]["database_oid"]
+                ):
                     _fail("database_changed")
                 labels = await collect_fhir_catalog_source_companies(export, descriptor, required=True)
                 if labels != entry["source_companies"]:
@@ -1035,7 +1042,13 @@ async def _replay_source_owned_observations(source_export, connection, snapshot,
         profile = source_profile(json.loads(profile_key))
         async with open_source_owned_catalog_export(source_export, profile, connection) as export:
             for generation, descriptor in selected:
-                if descriptor["database_oid"] != export["database_identity"]["database_oid"]:
+                if "native_read_profile" in export and not is_named_fhir_catalog_descriptor(descriptor):
+                    _fail("source_not_admitted")
+                if (
+                    not is_named_fhir_catalog_descriptor(descriptor)
+                    and "database_identity" in export
+                    and descriptor["database_oid"] != export["database_identity"]["database_oid"]
+                ):
                     _fail("database_changed")
                 expected = _ObservationReplayDigest()
                 source_rows = await export["replay"](descriptor, expected.collect)

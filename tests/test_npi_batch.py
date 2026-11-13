@@ -166,6 +166,7 @@ def test_batch_list_shape_is_closed_and_preserves_original_grouping_constraints(
 
 @pytest.mark.asyncio
 async def test_native_batch_endpoint_reuses_extended_shared_path_only_when_requested(monkeypatch):
+    monkeypatch.setattr("db.connection.has_reader_session", lambda _database: True)
     params_by_field = {"npis": [9000000000], "native_query": {"q": "Synthetic", "view": "full"}}
     shared = AsyncMock(
         return_value={"items": [], "requested": 1, "found": 0, "not_found": 1, "pagination": {"total": 0}}
@@ -228,7 +229,7 @@ async def test_batch_status_lookup_uses_the_pinned_import_session(monkeypatch, e
         [identity], args, session, import_context=object() if imported else None
     )
 
-    statuses.assert_awaited_once_with([role_id], session=session, use_request_session=imported, fail_closed=imported)
+    statuses.assert_awaited_once_with([role_id], session=session, use_request_session=True, fail_closed=imported)
     assert state.addresses[identity][0]["location_status"] == "active"
 
 
@@ -676,6 +677,7 @@ async def test_batch_overlay_map_groups_npis_and_passes_shared_filters(monkeypat
     execute_stmt = AsyncMock(return_value=overlay_result)
     monkeypatch.setattr(npi_module, "_execute_stmt", execute_stmt)
     session = object()
+    monkeypatch.setattr(npi_module, "_named_directory_editions", AsyncMock(return_value=()))
 
     overlay_map = await npi_module._fetch_provider_directory_address_overlay_map(
         [first_npi, second_npi, first_npi],

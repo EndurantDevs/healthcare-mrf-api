@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from process import provider_directory_proof_store as proof_store
 from process import provider_directory_source_proof_control as control
 
 
@@ -25,3 +26,4 @@ def proof_memory_authority(monkeypatch):
 
     monkeypatch.setattr(control, "require_proof_executor", memory_executor)
     monkeypatch.setattr(control, "lock_proof_parent", memory_parent)
+    monkeypatch.setattr(proof_store, "source_copy_executor", lambda executor: executor)

@@ -22,7 +22,7 @@ _SELECTION_PROJECTION_TIMEOUT_SECONDS = 5.0
 _CMS_CANDIDATE_TIMEOUT_SECONDS = 5.0
 
 
-async def provider_directory_control_catalog() -> dict[str, Any]:
+async def provider_directory_control_catalog(editions=()) -> dict[str, Any]:
     """Return optional outcomes and the exact current Profile request."""
 
     static_map = provider_directory_source_catalog()
@@ -37,7 +37,7 @@ async def provider_directory_control_catalog() -> dict[str, Any]:
         )
     try:
         async with asyncio.timeout(_OUTCOME_ENRICHMENT_TIMEOUT_SECONDS):
-            catalog_map = await enrich_provider_directory_source_catalog(static_map)
+            catalog_map = await enrich_provider_directory_source_catalog(static_map, editions=editions)
     except Exception:
         logging.getLogger(__name__).warning(
             "Provider Directory outcome enrichment failed; returning static catalog",

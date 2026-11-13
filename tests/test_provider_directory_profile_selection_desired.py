@@ -250,7 +250,13 @@ async def test_ordinary_dated_read_preserves_current_readiness_and_locks(monkeyp
     desired = _ordinary_desired()
     catalog, sources, rows, _candidate = _selection_rows(desired)
     lock = AsyncMock()
-    dataset_read = AsyncMock(return_value=rows)
+
+    async def read_datasets(*, exact_readiness, has_selection_locks):
+        if has_selection_locks:
+            assert lock.await_count == 1
+        return rows
+
+    dataset_read = AsyncMock(side_effect=read_datasets)
     cms_read = AsyncMock(side_effect=AssertionError("ordinary selection must not read a CMS candidate"))
     monkeypatch.setattr(snapshot, "_lock_profile_selection_tables", lock)
     monkeypatch.setattr(snapshot, "_selection_source_rows", AsyncMock(return_value=sources))
@@ -265,7 +271,7 @@ async def test_ordinary_dated_read_preserves_current_readiness_and_locks(monkeyp
         exact_readiness=exact_readiness,
     )
     assert result.request_projection == _computed(desired).request_projection
-    dataset_read.assert_awaited_once_with(exact_readiness=exact_readiness)
+    dataset_read.assert_awaited_once_with(exact_readiness=exact_readiness, has_selection_locks=exact_readiness)
     assert lock.await_count == int(exact_readiness)
     cms_read.assert_not_awaited()
 

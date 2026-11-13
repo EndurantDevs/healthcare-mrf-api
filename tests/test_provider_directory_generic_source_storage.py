@@ -703,7 +703,9 @@ async def test_new_partition_candidate_reaches_real_reset_while_retained_candida
     monkeypatch.setattr(directory, "source_checkpoint_transaction", transaction)
     monkeypatch.setattr(directory, "_mutable_endpoint_dataset_resource_mutation", transaction)
     monkeypatch.setattr(policy, "source_transaction", transaction)
-    monkeypatch.setattr(directory, "_require_source_native_connection", AsyncMock())
+    monkeypatch.setattr(
+        directory, "_require_source_native_connection", AsyncMock(side_effect=lambda executor: executor)
+    )
     monkeypatch.setattr(directory, "_lock_endpoint_dataset_resource_family", AsyncMock())
     monkeypatch.setattr(storage, "resolve_existing_source_candidate", AsyncMock(return_value=candidate))
     monkeypatch.setattr(directory, "delete_dataset_proof_shards", AsyncMock())

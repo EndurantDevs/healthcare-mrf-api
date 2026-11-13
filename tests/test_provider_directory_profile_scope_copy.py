@@ -15,6 +15,26 @@ from process import provider_directory_profile_scope_copy as copy_scope
 fhir = importlib.import_module("process.provider_directory_fhir")
 
 
+@pytest.mark.asyncio
+async def test_named_source_read_reuses_issued_owner_without_session_identity_comparisons(monkeypatch):
+    from process import provider_directory_source_observation as observation
+    from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage
+
+    publisher = SimpleNamespace(storage_binding=NamedFHIRSourceStorage("catalog", "candidate"))
+    owner = object()
+    monkeypatch.setattr(copy_scope.source_policy, "is_source_storage_required", lambda: True)
+    monkeypatch.setattr(copy_scope.source_policy, "bound_publisher", lambda: publisher)
+    monkeypatch.setattr(copy_scope.source_policy, "source_copy_session", lambda: owner)
+    monkeypatch.setattr(observation, "current_observation", lambda directory: None)
+    monkeypatch.setattr(fhir.db, "_transaction_binding", lambda: SimpleNamespace(session=object()))
+    token = copy_scope.source_policy._PUBLISHER.set(publisher)
+    try:
+        async with copy_scope.source_read_transaction(fhir):
+            assert copy_scope.source_policy.source_copy_session() is owner
+    finally:
+        copy_scope.source_policy._PUBLISHER.reset(token)
+
+
 def _batch():
     return fhir._ProviderDirectoryArtifactScopeBatchProjection(
         batch_number=1,

@@ -1,14 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-from contextlib import asynccontextmanager
-from datetime import UTC, date, datetime
 import json
 import types
+from contextlib import asynccontextmanager
+from datetime import UTC, date, datetime
 from unittest.mock import AsyncMock
 
 import pytest
-
-from tests.provider_profile_snapshot_test_support import stub_provider_profile_snapshot as stub_provider_profile_snapshot
 
 from api.endpoint import npi as npi_module
 from tests.npi_location_hydration_support import (
@@ -17,6 +15,9 @@ from tests.npi_location_hydration_support import (
     install_location_only_detail_mocks,
     large_base_locations,
     unified_location_mapping,
+)
+from tests.provider_profile_snapshot_test_support import (
+    stub_provider_profile_snapshot as stub_provider_profile_snapshot,
 )
 from tests.test_npi_location_paging import (
     ADDRESS_A,
@@ -108,9 +109,7 @@ async def test_profile_only_provider_continues_through_location_pipeline(
         "total": 3,
         "has_more": False,
     }
-    assert response_map["provider_directory_profile"]["generation_id"] == (
-        "synthetic-generation"
-    )
+    assert response_map["provider_directory_profile"]["generation_id"] == ("synthetic-generation")
 
 
 def test_overlay_query_derives_status_without_graph_metadata_parsing():
@@ -158,9 +157,7 @@ async def test_unified_candidate_and_address_only_hydrator_share_location_identi
     assert identity == "location:synthetic-location-1"
     assert hydrated_locations[0]["_base_row_identities"] == [identity]
     assert hydrated_locations[0]["address_sources"] == ["synthetic_directory"]
-    assert hydrated_locations[0]["source_record_ids"] == location_mapping[
-        "source_record_ids"
-    ]
+    assert hydrated_locations[0]["source_record_ids"] == location_mapping["source_record_ids"]
     assert hydrated_locations[0]["aca_plan_array"] == ["synthetic-plan"]
     assert hydrated_locations[0]["address_site_key"] == SITE_A
     assert execute_stmt.await_count == 2
@@ -215,9 +212,7 @@ def test_unkeyed_candidate_order_is_stable_across_input_order():
     forward = npi_module._rank_provider_locations([first, second])
     reverse = npi_module._rank_provider_locations([second, first])
 
-    assert [row["first_line"] for row in forward] == [
-        row["first_line"] for row in reverse
-    ]
+    assert [row["first_line"] for row in forward] == [row["first_line"] for row in reverse]
 
 
 def test_address_datetime_types_and_naive_freshness_are_normalized():
@@ -225,15 +220,9 @@ def test_address_datetime_types_and_naive_freshness_are_normalized():
     date_value = date(2026, 8, 10)
 
     assert npi_module._parse_address_datetime(aware_value) is aware_value
-    assert npi_module._parse_address_datetime(date_value) == datetime(
-        2026, 8, 10, tzinfo=UTC
-    )
-    assert npi_module._address_freshness_timestamp(
-        {"updated_at": "2026-08-10T12:30:00"}
-    ) == aware_value.timestamp()
-    assert npi_module._address_freshness_timestamp(
-        {"updated_at": aware_value}
-    ) == aware_value.timestamp()
+    assert npi_module._parse_address_datetime(date_value) == datetime(2026, 8, 10, tzinfo=UTC)
+    assert npi_module._address_freshness_timestamp({"updated_at": "2026-08-10T12:30:00"}) == aware_value.timestamp()
+    assert npi_module._address_freshness_timestamp({"updated_at": aware_value}) == aware_value.timestamp()
 
 
 def _assert_location_status_sql_contract(status_sql: str) -> None:
@@ -262,12 +251,8 @@ def _assert_location_status_sql_contract(status_sql: str) -> None:
 
 @pytest.mark.asyncio
 async def test_location_status_lookup_normalizes_rows_and_empty_input(monkeypatch):
-    role_a = (
-        "provider_directory_fhir:practitioner_role:source-a:role-a:location-a"
-    )
-    role_b = (
-        "provider_directory_fhir:practitioner_role:source-b:role-b:location-b"
-    )
+    role_a = "provider_directory_fhir:practitioner_role:source-a:role-a:location-a"
+    role_b = "provider_directory_fhir:practitioner_role:source-b:role-b:location-b"
     query_result = _ResultRows(
         [
             types.SimpleNamespace(
@@ -281,7 +266,11 @@ async def test_location_status_lookup_normalizes_rows_and_empty_input(monkeypatc
         ]
     )
     request_session = object()
-    status_session = object()
+    status_session = types.SimpleNamespace(begin=lambda: owned_transaction(), execute=AsyncMock())
+
+    @asynccontextmanager
+    async def owned_transaction():
+        yield
 
     @asynccontextmanager
     async def owned_status_session():
@@ -289,6 +278,7 @@ async def test_location_status_lookup_normalizes_rows_and_empty_input(monkeypatc
 
     execute_stmt = AsyncMock(return_value=query_result)
     monkeypatch.setattr(npi_module.db, "session", owned_status_session)
+    monkeypatch.setattr(npi_module, "_named_directory_editions", AsyncMock(return_value=()))
     monkeypatch.setattr(npi_module, "_execute_stmt", execute_stmt)
 
     assert await npi_module._fetch_location_status_by_record_id(["", None]) == {}
@@ -310,9 +300,7 @@ async def test_location_status_lookup_normalizes_rows_and_empty_input(monkeypatc
     status_call = execute_stmt.await_args
     assert status_call.kwargs["session"] is status_session
     assert status_call.kwargs["session"] is not request_session
-    assert status_call.kwargs["params"] == {
-        "source_record_ids": [role_a, role_b]
-    }
+    assert status_call.kwargs["params"] == {"source_record_ids": [role_a, role_b]}
     _assert_location_status_sql_contract(str(status_call.args[0]))
 
 
@@ -321,7 +309,12 @@ async def test_location_status_lookup_missing_relation_uses_owned_transaction(
     monkeypatch,
 ):
     request_session = AsyncMock()
-    status_session = object()
+    status_session = types.SimpleNamespace(begin=lambda: owned_transaction(), execute=AsyncMock())
+
+    @asynccontextmanager
+    async def owned_transaction():
+        yield
+
     transaction_events = []
 
     @asynccontextmanager
@@ -337,12 +330,11 @@ async def test_location_status_lookup_missing_relation_uses_owned_transaction(
 
     execute_stmt = AsyncMock(side_effect=RuntimeError("missing relation"))
     monkeypatch.setattr(npi_module.db, "session", owned_status_session)
+    monkeypatch.setattr(npi_module, "_named_directory_editions", AsyncMock(return_value=()))
     monkeypatch.setattr(npi_module, "_execute_stmt", execute_stmt)
 
     status_map = await npi_module._fetch_location_status_by_record_id(
-        [
-            "provider_directory_fhir:practitioner_role:source-a:role-a:location-a"
-        ],
+        ["provider_directory_fhir:practitioner_role:source-a:role-a:location-a"],
         session=request_session,
     )
 
@@ -357,9 +349,7 @@ async def test_location_status_lookup_missing_relation_uses_owned_transaction(
 async def test_legacy_location_queries_use_fallback_columns_and_address_key(
     monkeypatch,
 ):
-    legacy_mapping = {
-        column.key: None for column in npi_module.NPIAddress.__table__.columns
-    }
+    legacy_mapping = {column.key: None for column in npi_module.NPIAddress.__table__.columns}
     legacy_mapping.update(
         npi=1234567890,
         type="primary",
@@ -407,9 +397,7 @@ def test_legacy_identity_filter_and_hydrator_reject_unselected_row():
         address_table.c.type,
         address_table.c.checksum,
     ]
-    query_result = _ResultRows(
-        [{"npi": 1234567890, "type": "primary", "checksum": 77}]
-    )
+    query_result = _ResultRows([{"npi": 1234567890, "type": "primary", "checksum": 77}])
     hydrated = npi_module._hydrate_address_query_rows(
         query_result,
         selected_columns,
@@ -450,6 +438,4 @@ def test_identity_only_address_dedupes_deterministically():
         "first_line": "100 Example Avenue",
         "_base_row_identities": ["legacy:1234567890:primary:77"],
     }
-    assert npi_module._dedupe_addresses_by_key([identity_only_location_map]) == [
-        identity_only_location_map
-    ]
+    assert npi_module._dedupe_addresses_by_key([identity_only_location_map]) == [identity_only_location_map]

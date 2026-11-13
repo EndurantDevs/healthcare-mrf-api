@@ -22,6 +22,7 @@ from api.network_address_scope import (
     scoped_address_parameters,
 )
 from api.network_read_execution import NetworkReadConnectionProxy
+from api.provider_directory_dataset_sql import named_source_data_sql
 from api.provider_profile_snapshot import provider_read_savepoint
 from db.connection import ConnectionProxy
 from db.models import EntityAddressUnified, NPIAddress
@@ -187,6 +188,7 @@ def _address_phone_candidates_cte(
     address_table_sql: str,
     *,
     is_bounded: bool = True,
+    editions=(),
 ) -> str | None:
     """Return indexed phone candidates, including current directory evidence."""
 
@@ -200,12 +202,16 @@ def _address_phone_candidates_cte(
         direct_phone=direct_phone,
     )
     candidate_limit_clause = "LIMIT :candidate_limit" if is_bounded else ""
-    return ",\n".join(
-        (
-            _CURRENT_PROVIDER_DIRECTORY_PHONE_CTES.strip(),
-            phone_candidate_rows_cte.strip(),
-            _RANKED_PHONE_CANDIDATE_CTES.format(candidate_limit_clause=candidate_limit_clause).strip(),
-        )
+    return named_source_data_sql(
+        ",\n".join(
+            (
+                _CURRENT_PROVIDER_DIRECTORY_PHONE_CTES.strip(),
+                phone_candidate_rows_cte.strip(),
+                _RANKED_PHONE_CANDIDATE_CTES.format(candidate_limit_clause=candidate_limit_clause).strip(),
+            )
+        ),
+        "mrf",
+        editions,
     )
 
 
@@ -282,9 +288,14 @@ async def _provider_list_connection(
     *,
     native_npis=None,
 ):
-    """Reuse the request transaction for imported or scoped provider reads."""
+    """Reuse an explicit request snapshot, keeping unscoped compatibility reads independent."""
 
-    if import_context is None and native_npis is None and current_network_address_scope() is None:
+    if (
+        request_session is None
+        and import_context is None
+        and native_npis is None
+        and current_network_address_scope() is None
+    ):
         async with database.acquire() as connection:
             yield connection
         return

@@ -169,16 +169,16 @@ def _coordinates(values, limit):
 
 
 async def require_checkpoint_executor(executor, *, bulk_identity=None):
-    """Connection-taking children must borrow the exact physical writer session."""
+    """Require the current batch and its immutable checkpoint scope."""
     publisher = bound_publisher()
     session = source_copy_session()
-    if isinstance(executor, Database):
-        binding = executor._transaction_binding()
-        is_original = binding is not None and binding.session is session
-    else:
-        is_original = isinstance(executor, ConnectionProxy) and executor._connection is session
-    _require(is_original, "checkpoint_transaction_changed")
     if not isinstance(getattr(publisher, "storage_binding", None), NamedFHIRSourceStorage):
+        if isinstance(executor, Database):
+            binding = executor._transaction_binding()
+            is_original = binding is not None and binding.session is session
+        else:
+            is_original = isinstance(executor, ConnectionProxy) and executor._connection is session
+        _require(is_original, "checkpoint_transaction_changed")
         _require(await _copy_driver(session) is publisher.connection, "checkpoint_transaction_changed")
     if bulk_identity is not None:
         _require(_BULK_IDENTITY.get() == _bulk_identity(bulk_identity), "checkpoint_identity_scope_changed")

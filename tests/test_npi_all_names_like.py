@@ -4,12 +4,13 @@ import asyncio
 import json
 import re
 import types
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
 import sanic.exceptions
 
-from api import provider_search_sql
+from api import provider_profile_snapshot, provider_search_sql
 from api.endpoint import npi as npi_module
 from api.endpoint.npi import get_all
 
@@ -944,9 +945,15 @@ def _name_taxonomy_provider_record(provider_npi):
     )
 
 
+@asynccontextmanager
+async def _existing_snapshot(_database, session=None, *, reuse=False):
+    yield session
+
+
 @pytest.mark.asyncio
 async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypatch):
     """Keep taxonomy, status, and enrichment reads concurrent after paging."""
+    monkeypatch.setattr(provider_profile_snapshot, "provider_directory_read_snapshot", _existing_snapshot)
     provider_npi = 1000000049
     request_session = object()
     provider_record = _name_taxonomy_provider_record(provider_npi)
@@ -954,7 +961,7 @@ async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypat
     enrichment_started = asyncio.Event()
     taxonomy_started = asyncio.Event()
 
-    async def fake_apply_location_statuses(locations, *, session=None):
+    async def fake_apply_location_statuses(locations, *, session=None, use_request_session=False):
         assert session is request_session
         status_started.set()
         await asyncio.wait_for(asyncio.gather(enrichment_started.wait(), taxonomy_started.wait()), timeout=1)
@@ -981,6 +988,7 @@ async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypat
     monkeypatch.setattr(npi_module, "_apply_location_statuses", fake_apply_location_statuses)
     monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", fake_fetch_enrichment)
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    monkeypatch.setattr(npi_module, "_provider_list_connection", lambda *_args, **_kwargs: FakeAcquire(conn))
 
     response = await get_all(
         types.SimpleNamespace(
@@ -1006,6 +1014,7 @@ async def test_get_all_name_taxonomy_page_reuses_match_for_exact_total(monkeypat
 @pytest.mark.asyncio
 async def test_get_all_name_taxonomy_cancels_sibling_reads_on_failure(monkeypatch):
     """Finish sibling cancellation before propagating a taxonomy read failure."""
+    monkeypatch.setattr(provider_profile_snapshot, "provider_directory_read_snapshot", _existing_snapshot)
     provider_npi = 1000000049
     request_session = object()
     provider_record = _name_taxonomy_provider_record(provider_npi)
@@ -1022,7 +1031,7 @@ async def test_get_all_name_taxonomy_cancels_sibling_reads_on_failure(monkeypatc
             cancelled_reads.add(name)
             raise
 
-    async def fake_status(_locations, *, session=None):
+    async def fake_status(_locations, *, session=None, use_request_session=False):
         assert session is request_session
         await block_read("status", status_started)
 
@@ -1041,6 +1050,7 @@ async def test_get_all_name_taxonomy_cancels_sibling_reads_on_failure(monkeypatc
     monkeypatch.setattr(npi_module, "_apply_location_statuses", fake_status)
     monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_summary_map", fake_enrichment)
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    monkeypatch.setattr(npi_module, "_provider_list_connection", lambda *_args, **_kwargs: FakeAcquire(conn))
 
     with pytest.raises(RuntimeError, match="taxonomy read failed"):
         await get_all(

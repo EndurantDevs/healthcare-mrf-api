@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -151,17 +152,66 @@ async def _selection_source_rows() -> list[Mapping[str, Any]]:
     return [_row_mapping(database_row) for database_row in database_rows]
 
 
+@asynccontextmanager
+async def profile_selection_snapshot():
+    """Own a repeatable snapshot or reuse the caller's publication transaction."""
+    if db.has_reader_session():
+        async with db.session() as session:
+            yield session
+        return
+    binding = db._transaction_binding()
+    if binding is not None:
+        yield binding.session
+        return
+    async with db.transaction() as session:
+        await db.status("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        yield session
+
+
 async def _selection_dataset_rows(
     *,
     exact_readiness: bool = True,
+    has_selection_locks: bool = False,
 ) -> list[Mapping[str, Any]]:
-    return await load_profile_selection_dataset_rows(
-        database=db,
-        endpoint_dataset_ref=_table_ref(ProviderDirectoryEndpointDataset),
-        schema_ref=_quote_identifier(_schema()),
-        row_mapping=_row_mapping,
-        exact_readiness=exact_readiness,
-    )
+    from process.provider_directory_named_edition import named_editions_for_session, source_relation_sql
+
+    async with profile_selection_snapshot() as session:
+        editions = await named_editions_for_session(session, _schema())
+        # Publication updates source aliases, so the existing SHARE locks also keep named pointers stable.
+        if (
+            editions
+            and not has_selection_locks
+            and await db.scalar("SELECT current_setting('transaction_isolation')")
+            not in {
+                "repeatable read",
+                "serializable",
+            }
+        ):
+            raise RuntimeError("provider_directory_profile_selection_snapshot_required")
+        dataset_rows = await load_profile_selection_dataset_rows(
+            database=db,
+            endpoint_dataset_ref=source_relation_sql(
+                _schema(),
+                ProviderDirectoryEndpointDataset.__tablename__,
+                editions,
+                columns=tuple(column.name for column in ProviderDirectoryEndpointDataset.__table__.columns),
+            ),
+            schema_ref=_quote_identifier(_schema()),
+            row_mapping=_row_mapping,
+            exact_readiness=exact_readiness,
+        )
+    schema_by_dataset = {edition.dataset_id: edition.schema_name for edition in editions}
+    return [
+        {
+            **dataset_row,
+            **(
+                {"storage_schema": schema_by_dataset[dataset_row["dataset_id"]]}
+                if dataset_row["dataset_id"] in schema_by_dataset
+                else {}
+            ),
+        }
+        for dataset_row in dataset_rows
+    ]
 
 
 def _canonical_scalar(scalar_value: Any) -> str | None:
@@ -263,6 +313,7 @@ def _profile_input(
     return {
         **pair_map,
         **scoped_fields,
+        **({"storage_schema": dataset_row["storage_schema"]} if dataset_row.get("storage_schema") is not None else {}),
         "resource_count": int(dataset_row.get("resource_count") or 0),
         "validated_at": _canonical_scalar(dataset_row.get("validated_at")),
         "published_at": _canonical_scalar(dataset_row.get("published_at")),
@@ -439,6 +490,7 @@ async def _compute_current_selection(
         source_rows=await _selection_source_rows(),
         dataset_rows=await _selection_dataset_rows(
             exact_readiness=exact_readiness,
+            has_selection_locks=lock_selection,
         ),
         include_input_proof=exact_readiness,
     )
@@ -516,7 +568,7 @@ async def _compute_desired_selection(
             f"FROM {_table_ref(ProviderDirectoryEndpointDataset)} WHERE dataset_id=:dataset_id;",
             dataset_id=desired["dataset_id"],
         )
-    current_rows = await _selection_dataset_rows(exact_readiness=exact_readiness)
+    current_rows = await _selection_dataset_rows(exact_readiness=exact_readiness, has_selection_locks=lock_selection)
     if desired is not None:
         incumbent_rows = await db.all(
             "SELECT endpoint_id, dataset_id, acquisition_root_run_id, dataset_hash, "

@@ -12,6 +12,9 @@ from typing import Any
 from api.provider_directory_source_dataset_selection import (
     _source_local_dataset_statement as _current_published_dataset_statement,
 )
+from api.provider_directory_source_dataset_selection import (
+    named_source_dataset_records,
+)
 from api.provider_directory_source_summary_outcome import source_summary_outcome_counts
 from db.models import db
 from process.import_status_events import isoformat_utc
@@ -22,17 +25,30 @@ _VALIDATED_DATASET_STATUS = "validated"
 _OUTCOME_RESOURCE_COUNTS_METADATA_KEY = "outcome_resource_counts_v1"
 _TWIN_ROOT_VERIFICATION_METADATA_KEY = "twin_root_verification_v1"
 _INTERNAL_RESOURCE_TYPE_PREFIX = "LU:"
-_SUPPORTED_RESOURCE_TYPES = frozenset({
-    "Endpoint", "HealthcareService", "InsurancePlan", "Location",
-    "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole",
-})
+_SUPPORTED_RESOURCE_TYPES = frozenset(
+    {
+        "Endpoint",
+        "HealthcareService",
+        "InsurancePlan",
+        "Location",
+        "Organization",
+        "OrganizationAffiliation",
+        "Practitioner",
+        "PractitionerRole",
+    }
+)
 
 _RELATION_COUNT_FIELDS = (
-    ("dataset_network_plan", "InsurancePlan",
-     "insurance_plan_resource_count", "network_plan_links"),
-    ("dataset_affiliation_organization", "OrganizationAffiliation",
-     "affiliation_resource_count", "organization_affiliation_links"),
+    ("dataset_network_plan", "InsurancePlan", "insurance_plan_resource_count", "network_plan_links"),
+    (
+        "dataset_affiliation_organization",
+        "OrganizationAffiliation",
+        "affiliation_resource_count",
+        "organization_affiliation_links",
+    ),
 )
+
+
 @dataclass(frozen=True)
 class _CurrentPublishedDataset:
     source_ids: tuple[str, ...]
@@ -63,11 +79,7 @@ def _utc_datetime(value: Any) -> dt.datetime | None:
         if not raw_value:
             return None
         try:
-            value = dt.datetime.fromisoformat(
-                raw_value[:-1] + "+00:00"
-                if raw_value.endswith("Z")
-                else raw_value
-            )
+            value = dt.datetime.fromisoformat(raw_value[:-1] + "+00:00" if raw_value.endswith("Z") else raw_value)
         except ValueError:
             return None
     if not isinstance(value, dt.datetime):
@@ -96,10 +108,7 @@ def _normalized_text_tuple(
         if (
             normalized_value is None
             or normalized_value in normalized_values
-            or (
-                reject_internal_resources
-                and normalized_value.startswith(_INTERNAL_RESOURCE_TYPE_PREFIX)
-            )
+            or (reject_internal_resources and normalized_value.startswith(_INTERNAL_RESOURCE_TYPE_PREFIX))
         ):
             return None
         normalized_values.append(normalized_value)
@@ -115,7 +124,8 @@ def _sealed_dataset_state(
     superseded_at = _utc_datetime(dataset_record.get("superseded_at"))
     dataset_state = {
         _VALIDATED_DATASET_STATUS: (False, validated_at)
-        if published_at is None and superseded_at is None else (False, None),
+        if published_at is None and superseded_at is None
+        else (False, None),
         _PUBLISHED_DATASET_STATUS: (
             True,
             published_at if superseded_at is None else None,
@@ -125,11 +135,7 @@ def _sealed_dataset_state(
             published_at if superseded_at is not None else None,
         ),
     }.get(status or "")
-    if (
-        dataset_state is None
-        or dataset_record.get("is_current") is not dataset_state[0]
-        or dataset_state[1] is None
-    ):
+    if dataset_state is None or dataset_record.get("is_current") is not dataset_state[0] or dataset_state[1] is None:
         return None
     return status, dataset_state[0], dataset_state[1], validated_at, published_at
 
@@ -147,9 +153,7 @@ def _current_dataset_from_row(
     state = _sealed_dataset_state(dataset_record)
     endpoint_id = _clean_text(dataset_record.get("endpoint_id"))
     dataset_id = _clean_text(dataset_record.get("dataset_id"))
-    resource_count = _valid_nonnegative_count(
-        dataset_record.get("resource_count")
-    )
+    resource_count = _valid_nonnegative_count(dataset_record.get("resource_count"))
     if (
         source_ids not in expected_source_id_groups
         or state is None
@@ -157,11 +161,7 @@ def _current_dataset_from_row(
         or dataset_id is None
         or resource_count is None
         or not isinstance(publication_metadata, Mapping)
-        or (
-            current_source_ids := _normalized_text_tuple(
-                dataset_record.get("current_source_ids")
-            )
-        ) is None
+        or (current_source_ids := _normalized_text_tuple(dataset_record.get("current_source_ids"))) is None
         or not set(source_ids).issubset(current_source_ids)
     ):
         return None
@@ -169,12 +169,8 @@ def _current_dataset_from_row(
         source_ids=source_ids,
         endpoint_id=endpoint_id,
         dataset_id=dataset_id,
-        acquisition_root_run_id=_clean_text(
-            dataset_record.get("acquisition_root_run_id")
-        ),
-        previous_dataset_id=_clean_text(
-            dataset_record.get("previous_dataset_id")
-        ),
+        acquisition_root_run_id=_clean_text(dataset_record.get("acquisition_root_run_id")),
+        previous_dataset_id=_clean_text(dataset_record.get("previous_dataset_id")),
         dataset_hash=_clean_text(dataset_record.get("dataset_hash")),
         status=state[0],
         is_current=state[1],
@@ -194,17 +190,16 @@ def _dataset_order_key(
 
 async def _current_published_dataset_by_source_ids(
     source_id_groups: set[tuple[str, ...]],
+    editions=(),
 ) -> dict[tuple[str, ...], _CurrentPublishedDataset]:
     if not source_id_groups:
         return {}
-    query_result = await db.execute(
-        _current_published_dataset_statement(source_id_groups)
-    )
+    query_result = await db.execute(_current_published_dataset_statement(source_id_groups))
     selected_by_source_ids: dict[
         tuple[str, ...],
         _CurrentPublishedDataset,
     ] = {}
-    for dataset_record in query_result.mappings().all():
+    for dataset_record in named_source_dataset_records(query_result.mappings().all(), editions):
         candidate = _current_dataset_from_row(
             dataset_record,
             source_id_groups,
@@ -212,9 +207,7 @@ async def _current_published_dataset_by_source_ids(
         if candidate is None:
             continue
         selected = selected_by_source_ids.get(candidate.source_ids)
-        if selected is None or _dataset_order_key(candidate) > _dataset_order_key(
-            selected
-        ):
+        if selected is None or _dataset_order_key(candidate) > _dataset_order_key(selected):
             selected_by_source_ids[candidate.source_ids] = candidate
     return selected_by_source_ids
 
@@ -257,9 +250,7 @@ def _validated_resource_counts(
         if allow_extra_resources
         else selected_resource_types == actual_resource_types
     )
-    if not has_expected_resource_types or sum(
-        resource_count_by_type.values()
-    ) != expected_total:
+    if not has_expected_resource_types or sum(resource_count_by_type.values()) != expected_total:
         return None
     return dict(sorted(resource_count_by_type.items()))
 
@@ -276,18 +267,15 @@ def _is_proof_bound_to_dataset(
     return bool(
         dataset.dataset_hash is not None
         and proof.get("endpoint_id") == dataset.endpoint_id
-        and _clean_text(proof.get("acquisition_root_run_id"))
-        == dataset.acquisition_root_run_id
+        and _clean_text(proof.get("acquisition_root_run_id")) == dataset.acquisition_root_run_id
         and proof.get("dataset_hash") == dataset.dataset_hash
-        and _normalized_text_tuple(proof.get("source_ids"))
-        == dataset.source_ids
+        and _normalized_text_tuple(proof.get("source_ids")) == dataset.source_ids
         and _normalized_text_tuple(
             proof.get("selected_resources"),
             reject_internal_resources=True,
         )
         == selected_resources
-        and _valid_nonnegative_count(proof.get("resource_count"))
-        == dataset.resource_count
+        and _valid_nonnegative_count(proof.get("resource_count")) == dataset.resource_count
     )
 
 
@@ -295,9 +283,7 @@ def _versioned_outcome_resource_counts(
     dataset: _CurrentPublishedDataset,
     selected_resources: tuple[str, ...],
 ) -> dict[str, int] | None:
-    proof = dataset.publication_metadata.get(
-        _OUTCOME_RESOURCE_COUNTS_METADATA_KEY
-    )
+    proof = dataset.publication_metadata.get(_OUTCOME_RESOURCE_COUNTS_METADATA_KEY)
     if (
         not isinstance(proof, Mapping)
         or proof.get("complete") is not True
@@ -322,14 +308,8 @@ def _matched_twin_resource_counts(
     dataset: _CurrentPublishedDataset,
     selected_resources: tuple[str, ...],
 ) -> dict[str, int] | None:
-    verification = dataset.publication_metadata.get(
-        _TWIN_ROOT_VERIFICATION_METADATA_KEY
-    )
-    proof = (
-        verification.get("proof")
-        if isinstance(verification, Mapping)
-        else None
-    )
+    verification = dataset.publication_metadata.get(_TWIN_ROOT_VERIFICATION_METADATA_KEY)
+    proof = verification.get("proof") if isinstance(verification, Mapping) else None
     if (
         not isinstance(verification, Mapping)
         or verification.get("result") != "matched"
@@ -369,9 +349,7 @@ def _diagnostic_resource_counts(
             or diagnostic.get("next_url_remaining") not in (None, False)
         ):
             return None
-        rows_fetched = _valid_nonnegative_count(
-            diagnostic.get("rows_fetched")
-        )
+        rows_fetched = _valid_nonnegative_count(diagnostic.get("rows_fetched"))
         if rows_fetched is None:
             return None
         raw_count_by_resource[resource_type] = rows_fetched
@@ -420,18 +398,12 @@ def _precomputed_relation_counts(
             or proof.get("complete") is not True
             or not _is_version_one(proof.get("version"))
             or proof.get("dataset_id") != dataset.dataset_id
-            or _clean_text(proof.get("acquisition_root_run_id"))
-            != dataset.acquisition_root_run_id
+            or _clean_text(proof.get("acquisition_root_run_id")) != dataset.acquisition_root_run_id
         ):
             continue
-        proof_source_count = _valid_nonnegative_count(
-            proof.get(source_count_field)
-        )
+        proof_source_count = _valid_nonnegative_count(proof.get(source_count_field))
         edge_count = _valid_nonnegative_count(proof.get("edge_count"))
-        if (
-            proof_source_count != resource_counts.get(source_resource_type, 0)
-            or edge_count is None
-        ):
+        if proof_source_count != resource_counts.get(source_resource_type, 0) or edge_count is None:
             continue
         summary_count_by_field[output_field] = edge_count
     return summary_count_by_field
@@ -464,6 +436,7 @@ def _outcome_summary(dataset: _CurrentPublishedDataset) -> dict[str, Any]:
 
 async def enrich_provider_directory_source_catalog(
     catalog: Mapping[str, Any],
+    editions=(),
 ) -> dict[str, Any]:
     """Attach latest sealed and current published source outcomes."""
 
@@ -471,4 +444,4 @@ async def enrich_provider_directory_source_catalog(
         enrich_provider_directory_source_catalog as enrich_catalog,
     )
 
-    return await enrich_catalog(catalog)
+    return await enrich_catalog(catalog, editions=editions)

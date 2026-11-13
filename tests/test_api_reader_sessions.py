@@ -538,6 +538,18 @@ def _optional_count_read(session, events, failure):
     return read
 
 
+def _bind_optional_count_queries(monkeypatch, session, connection):
+    execute = session.execute
+
+    async def execute_query(statement, parameters=None):
+        if str(statement).startswith(("SELECT session_user, current_user", "SELECT current_setting(")):
+            return await execute(statement, parameters)
+        query_rows = await connection.all(statement, **(parameters or {}))
+        return SimpleNamespace(all=lambda: query_rows)
+
+    monkeypatch.setattr(session, "execute", execute_query)
+
+
 def _optional_count_reader(monkeypatch, failure, *, unfiltered=False):
     """Bind the real provider caller to a Reader and record its savepoint boundary."""
     from api import provider_list_sql
@@ -578,6 +590,7 @@ def _optional_count_reader(monkeypatch, failure, *, unfiltered=False):
 
     monkeypatch.setattr(session, "begin_nested", savepoint)
     monkeypatch.setattr(connection, "all", _optional_count_read(session, events, failure))
+    _bind_optional_count_queries(monkeypatch, session, connection)
     return database, session, events
 
 
@@ -780,7 +793,11 @@ async def test_npi_count_metadata_statements_consume_one_phase_budget(monkeypatc
         ceilings.append(timeout_ms)
         yield
 
-    async def metadata_execute(_statement, _parameters=None):
+    execute = session.execute
+
+    async def metadata_execute(statement, parameters=None):
+        if str(statement) not in {"SELECT first_metadata", "SELECT second_metadata"}:
+            return await execute(statement, parameters)
         allowed = budget.milliseconds / 1000
         clock.value += min(0.08, allowed)
         if allowed < 0.08:

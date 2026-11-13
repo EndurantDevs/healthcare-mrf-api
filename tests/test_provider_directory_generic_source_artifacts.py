@@ -293,11 +293,17 @@ async def test_prepared_npi_metrics_require_original_native_stages_and_selector(
 
 
 @pytest.mark.asyncio
-async def test_ordinary_preparation_reuses_repair_copy_and_full_tuple_parity(monkeypatch):
+@pytest.mark.parametrize("storage_schema", [None, "published_edition"])
+async def test_ordinary_preparation_reuses_repair_copy_and_full_tuple_parity(monkeypatch, storage_schema):
     import importlib
 
     directory = importlib.import_module("process.provider_directory_fhir")
-    dataset = SimpleNamespace(source_id="source_a", dataset_id="dataset_a", evidence_run_id="root_a")
+    dataset = SimpleNamespace(
+        source_id="source_a",
+        dataset_id="dataset_a",
+        evidence_run_id="root_a",
+        storage_schema=storage_schema,
+    )
     admission = SimpleNamespace(
         factory=None,
         fence=SimpleNamespace(datasets=(dataset,)),
@@ -326,6 +332,9 @@ async def test_ordinary_preparation_reuses_repair_copy_and_full_tuple_parity(mon
     assert created_by_relation == {"private_stage": (1, 2, "r", "u")}
     statement, params = copy.await_args.args[-2:]
     assert "provider_directory_dataset_resource" in statement and "repair_eligible" in statement
+    if storage_schema is not None:
+        assert '"published_edition"."provider_directory_dataset_resource"' in statement
+        assert '"published_edition"."provider_directory_endpoint_dataset"' in statement
     assert copy.await_args.kwargs == dict(admission=admission, kind="npi")
     assert params["source_ids"] == ["source_a"] and params["dataset_ids"] == ["dataset_a"]
     assert params["evidence_run_ids"] == ["root_a"] and params["resource_type"] == "Practitioner"

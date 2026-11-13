@@ -264,14 +264,26 @@ def test_directory_role_acceptance_alias_is_bidirectional():
 
 async def test_location_status_failure_is_visible_when_fail_closed(monkeypatch):
     """Required location-status queries must propagate storage failures."""
-    session = SimpleNamespace(execute=AsyncMock(side_effect=RuntimeError("query unavailable")))
-    monkeypatch.setattr(npi_module, "db", SimpleNamespace(session=lambda: FakeAcquire(session)))
+    original = RuntimeError("query unavailable")
+    status_query = npi_module._location_status_query("mrf", "mrf.provider_directory_address_overlay")
+    reached_status_queries = []
 
-    with pytest.raises(RuntimeError, match="query unavailable"):
+    async def execute(statement, _params=None):
+        if str(statement) == str(status_query):
+            reached_status_queries.append(statement)
+            raise original
+        assert str(statement) == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+
+    session = SimpleNamespace(execute=AsyncMock(side_effect=execute), begin=lambda: FakeAcquire(None))
+    monkeypatch.setattr(npi_module, "db", SimpleNamespace(session=lambda: FakeAcquire(session)))
+    monkeypatch.setattr(npi_module, "_named_directory_editions", AsyncMock(return_value=()))
+
+    with pytest.raises(RuntimeError, match="query unavailable") as caught:
         await npi_module._fetch_location_status_by_record_id(
             ["provider_directory_fhir:practitioner_role:example:role"], fail_closed=True
         )
-    session.execute.assert_awaited_once()
+    assert caught.value is original and len(reached_status_queries) == 1
+    assert session.execute.await_count == 2
 
 
 async def test_missing_overlay_identity_cannot_be_cached(monkeypatch):
@@ -866,6 +878,44 @@ def _install_query_connection(monkeypatch, query_rows=()):
     )
     monkeypatch.setattr(npi_module, "db", SimpleNamespace(acquire=lambda: FakeAcquire(connection)))
     return connection
+
+
+@pytest.mark.parametrize("has_session", [False, True])
+async def test_ordinary_list_serializes_reads_on_a_request_session(monkeypatch, has_session):
+    """One explicit session must never execute count and page in child tasks."""
+    read_tasks, read_stages = [], []
+    owner = asyncio.current_task()
+    session = object() if has_session else None
+
+    async def query(statement, **_parameters):
+        is_count = "COUNT(DISTINCT" in str(statement)
+        read_tasks.append(asyncio.current_task())
+        read_stages.append("count" if is_count else "page")
+        await asyncio.sleep(0)
+        return [(4,)] if is_count else []
+
+    async def count_in_context(count, **_options):
+        return await count()
+
+    connection = SimpleNamespace(all=query)
+    proxy = Mock(return_value=connection)
+    monkeypatch.setattr(provider_list_sql, "NetworkReadConnectionProxy", proxy)
+    monkeypatch.setattr(npi_module, "db", SimpleNamespace(acquire=lambda: FakeAcquire(connection)))
+    monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.npi_address"))
+    monkeypatch.setattr(npi_module, "_plan_release_npi_scope", AsyncMock(return_value=(None, {})))
+    monkeypatch.setattr(npi_module, "_bounded_provider_list_count", count_in_context)
+    request = SimpleNamespace(args={"classification": "Pharmacy", "limit": "1", "include_total": "1"})
+
+    document = json.loads((await npi_module.list_providers(request, session=session)).body)
+
+    assert document["total"] == 4 and document["rows"] == []
+    assert read_stages == ["count", "page"]
+    if has_session:
+        assert read_tasks == [owner, owner]
+        assert all(call.args[1] is session for call in proxy.call_args_list)
+    else:
+        assert len(set(read_tasks)) == 2 and owner not in read_tasks
+        proxy.assert_not_called()
 
 
 @pytest.mark.parametrize("count_only", (True, False))

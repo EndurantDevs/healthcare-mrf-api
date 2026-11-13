@@ -3,6 +3,7 @@
 """Keep loader-mocked route tests independent of a running database."""
 
 from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -19,3 +20,4 @@ def stub_provider_profile_snapshot(monkeypatch):
 
     monkeypatch.setattr(npi, "provider_profile_read_snapshot", snapshot)
     monkeypatch.setattr(npi, "provider_geo_read_snapshot", snapshot)
+    monkeypatch.setattr(npi, "_named_directory_editions", AsyncMock(return_value=()))

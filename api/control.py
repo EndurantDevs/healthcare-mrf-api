@@ -6,6 +6,7 @@ import logging
 
 from sanic import Blueprint, response
 from sanic.exceptions import BadRequest, NotFound, SanicException
+from sqlalchemy import text
 
 from api.control_auth import require_control_auth as _require_control_auth
 from api.control_frozen_rate_files import (
@@ -54,6 +55,8 @@ from api.provider_directory_profile_selection_attestation import (
     register_profile_selection_route,
 )
 from api.uhc_provider_file_catalog import register_uhc_provider_file_catalog_routes
+from db.models import ProviderDirectorySource, db
+from process.provider_directory_named_edition import named_editions_for_session
 from process.ptg_parts.ptg2_candidate_attestation import record_candidate_audit_attestation
 from process.ptg_parts.source_snapshot_control import (
     SourceSnapshotConflict,
@@ -105,7 +108,10 @@ async def control_importers(request):
 async def control_provider_directory_sources(request):
     """List reviewed FHIR sources from the deployed acquisition contract."""
     _require_control_auth(request)
-    return response.json(await provider_directory_control_catalog())
+    async with db.transaction() as session:
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        editions = await named_editions_for_session(session, str(ProviderDirectorySource.__table__.schema))
+        return response.json(await provider_directory_control_catalog(editions=editions))
 
 
 @blueprint.post("/provider-directory/rooted-graph-operation")

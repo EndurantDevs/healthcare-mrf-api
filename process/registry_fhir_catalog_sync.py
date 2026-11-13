@@ -1438,7 +1438,9 @@ async def _project_plan_tier_source(connection, copy_target, disposition, snapsh
             allocate=True,
             as_of=snapshot["as_of"],
         )
-        relations_by_kind = {kind: namespace + ".registry_fhir_catalog_" + kind for kind in ("binding", "relationship")}
+        relations_by_kind = {
+            kind: namespace + ".registry_fhir_catalog_" + kind for kind in ("binding", "relationship", "source")
+        }
         await replace_plan_tier_bindings(
             connection,
             relations_by_kind,
@@ -1773,13 +1775,15 @@ async def _merge_legacy_identity_inputs(loader, descriptor, source_bindings, con
 
 async def _replace_observed_bindings(connection, namespace, descriptor, organization_ids):
     """Replace this source's observed networks only; missing networks keep old rows."""
-    arguments = (organization_ids, descriptor["endpoint_id"], descriptor["coordinates"]["dataset_schema"])
+    from process.registry_fhir_catalog_observed_source import catalog_replacement_scope, catalog_replacement_scope_sql
+
+    arguments = (organization_ids, descriptor["endpoint_id"], catalog_replacement_scope(descriptor))
     selection = (
         f"SELECT b.binding_id FROM {namespace}.registry_fhir_catalog_binding b "
         f"JOIN {namespace}.registry_fhir_catalog_source s ON "
         "b.document_json->>'evidence_id'=s.source_generation||':Organization/'||(b.document_json->>'source_key') "
         "WHERE b.document_json->>'source_key'=ANY($1::text[]) AND s.descriptor_json->>'endpoint_id'=$2 "
-        "AND s.descriptor_json->'coordinates'->>'dataset_schema'=$3"
+        f"AND {catalog_replacement_scope_sql('s.descriptor_json')}=$3"
     )
     await connection.execute(
         f"DELETE FROM {namespace}.registry_fhir_catalog_relationship WHERE binding_id IN ({selection})", *arguments

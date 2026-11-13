@@ -2,26 +2,18 @@
 
 import asyncio
 import types
+from unittest.mock import AsyncMock
 
 import pytest
 import sanic.exceptions
 
 from api.endpoint import npi as npi_module
 
-
 SOURCE_ID = "pdfhir_nebraska"
-SOURCE_RECORD_ID = (
-    "provider_directory_fhir:organization_address:"
-    f"{SOURCE_ID}:organization-1:0"
-)
+SOURCE_RECORD_ID = f"provider_directory_fhir:organization_address:{SOURCE_ID}:organization-1:0"
 ALIAS_SOURCE_ID = "pdfhir_nebraska_alias"
-ALIAS_SOURCE_RECORD_ID = (
-    "provider_directory_fhir:organization_affiliation:"
-    f"{ALIAS_SOURCE_ID}:affiliation-1:0"
-)
-STALE_SOURCE_RECORD_ID = (
-    "provider_directory_fhir:organization_address:pdfhir_stale:organization-1:0"
-)
+ALIAS_SOURCE_RECORD_ID = f"provider_directory_fhir:organization_affiliation:{ALIAS_SOURCE_ID}:affiliation-1:0"
+STALE_SOURCE_RECORD_ID = "provider_directory_fhir:organization_address:pdfhir_stale:organization-1:0"
 ADDRESS_KEY = "47ab23c8-74f7-41eb-8ffb-e8b9f6214594"
 
 
@@ -126,6 +118,7 @@ def geo_evidence_fakes(monkeypatch):
         }
 
     monkeypatch.setattr(npi_module, "_execute_stmt", fake_execute)
+    monkeypatch.setattr(npi_module, "_named_directory_editions", AsyncMock(return_value=()))
     monkeypatch.setattr(
         npi_module,
         "_fetch_provider_directory_source_detail_map",
@@ -164,9 +157,7 @@ async def test_geo_candidate_attaches_current_overlay_provenance(geo_evidence_fa
         "candidate_npis": [1003968710],
         "candidate_address_keys": [ADDRESS_KEY],
     }
-    assert "current_provider_directory_runs AS MATERIALIZED" in geo_evidence_fakes[
-        "sql"
-    ]
+    assert "current_provider_directory_runs AS MATERIALIZED" in geo_evidence_fakes["sql"]
     assert candidate_row_list[0]["source_record_ids"] == [
         "nppes:1003968710:practice",
         SOURCE_RECORD_ID,
@@ -186,8 +177,39 @@ async def test_geo_candidate_attaches_current_overlay_provenance(geo_evidence_fa
 
 
 @pytest.mark.asyncio
+async def test_geo_evidence_uses_the_named_request_edition(monkeypatch):
+    """The exact corroboration query must use the same request's selected edition."""
+    edition = types.SimpleNamespace(
+        catalog_schema="mrf",
+        schema_name="directory_selected",
+        dataset_id="selected-dataset",
+        endpoint_id="selected-endpoint",
+        source_ids=(SOURCE_ID,),
+    )
+    session = object()
+    resolve = AsyncMock(return_value=(edition,))
+    execute = AsyncMock(return_value=types.SimpleNamespace(all=list))
+    monkeypatch.setattr(npi_module, "_named_directory_editions", resolve)
+    monkeypatch.setattr(npi_module, "_execute_stmt", execute)
+    candidate_by_field = {"npi": 1003968710, "address_key": ADDRESS_KEY}
+
+    await npi_module._attach_geo_candidate_record_ids(
+        [candidate_by_field], _geo_candidate_params(), database_session=session
+    )
+
+    resolve.assert_awaited_once_with(session, "mrf")
+    assert execute.await_args.kwargs["session"] is session
+    query = str(execute.await_args.args[0])
+    assert '"directory_selected"."provider_directory_endpoint_dataset"' in query
+    assert '"directory_selected"."provider_directory_dataset_resource"' in query
+    assert "dataset_id='selected-dataset'" in query
+    assert "source_id IN ('" + SOURCE_ID + "')" in query
+
+
+@pytest.mark.asyncio
 async def test_geo_candidate_rejects_stale_serving_evidence(monkeypatch):
     """No exact current membership means no FHIR match from serving residue."""
+
     async def fake_execute(*_args, **_kwargs):
         return types.SimpleNamespace(all=list)
 
@@ -224,9 +246,7 @@ async def test_geo_candidate_rejects_stale_serving_evidence(monkeypatch):
         None,
     )
 
-    assert candidate_row_by_name["source_record_ids"] == [
-        "nppes:1003968710:practice"
-    ]
+    assert candidate_row_by_name["source_record_ids"] == ["nppes:1003968710:practice"]
     assert candidate_row_by_name["address_sources"] == ["nppes"]
     assert candidate_row_by_name["source_count"] == 1
     assert candidate_row_by_name["independent_source_count"] == 1
@@ -240,6 +260,7 @@ async def test_geo_candidate_rejects_stale_serving_evidence(monkeypatch):
 @pytest.mark.asyncio
 async def test_geo_candidate_ranking_uses_current_source_count(monkeypatch):
     """Only exact current corroboration contributes to the final FHIR rank."""
+
     async def fake_execute(*_args, **_kwargs):
         current_evidence_map = {
             "npi": 1003968711,
@@ -284,13 +305,8 @@ async def test_geo_candidate_ranking_uses_current_source_count(monkeypatch):
         {},
     )
 
-    assert [
-        candidate_row["source_count"] for candidate_row in candidate_rows
-    ] == [0, 1]
-    assert [
-        candidate_row["provider_directory_source_count"]
-        for candidate_row in candidate_rows
-    ] == [0, 1]
+    assert [candidate_row["source_count"] for candidate_row in candidate_rows] == [0, 1]
+    assert [candidate_row["provider_directory_source_count"] for candidate_row in candidate_rows] == [0, 1]
     assert ranked_candidates[0]["npi"] == 1003968711
     assert ranked_candidates[0]["sources"]["fhir"]["source_count"] == 1
     assert ranked_candidates[1]["sources"]["fhir"]["source_count"] == 0
@@ -311,9 +327,7 @@ async def test_geo_evidence_query_caps_candidate_pairs(monkeypatch):
             "npi": 1000000000 + candidate_index,
             "address_key": f"00000000-0000-0000-0000-{candidate_index:012d}",
         }
-        for candidate_index in range(
-            npi_module._MATCH_CANDIDATES_MAX_INTERNAL_ROWS + 1
-        )
+        for candidate_index in range(npi_module._MATCH_CANDIDATES_MAX_INTERNAL_ROWS + 1)
     ]
 
     await npi_module._attach_geo_candidate_record_ids(
@@ -337,6 +351,7 @@ async def _no_candidate_sources(*_args, **_kwargs):
 @pytest.mark.asyncio
 async def test_match_candidates_returns_503_on_source_lookup_timeout(monkeypatch):
     """The added lookup cannot exceed the endpoint timeout budget."""
+
     async def slow_source_lookup(*_args, **_kwargs):
         await asyncio.sleep(1)
 
@@ -360,6 +375,7 @@ async def test_match_candidates_returns_503_on_source_lookup_timeout(monkeypatch
 @pytest.mark.asyncio
 async def test_match_candidates_returns_503_on_source_lookup_db_failure(monkeypatch):
     """A corroboration DB error fails closed instead of serving stale evidence."""
+
     async def failing_source_lookup(*_args, **_kwargs):
         raise RuntimeError("database unavailable")
 
@@ -379,6 +395,7 @@ async def test_match_candidates_returns_503_on_source_lookup_db_failure(monkeypa
 @pytest.mark.asyncio
 async def test_match_candidates_enrichment_uses_remaining_deadline(monkeypatch):
     """Later enrichment receives the original endpoint deadline, not a reset."""
+
     async def slow_candidate_lookup(*_args, **_kwargs):
         await asyncio.sleep(0.12)
         return await _one_geo_candidate({}, session=None)
@@ -408,14 +425,13 @@ async def test_match_candidates_enrichment_uses_remaining_deadline(monkeypatch):
         sanic.exceptions.ServiceUnavailable,
         match="enrichment lookup exceeded",
     ):
-        await npi_module.match_candidates(
-            _request({"lat": "41.09967", "long": "-101.67646"})
-        )
+        await npi_module.match_candidates(_request({"lat": "41.09967", "long": "-101.67646"}))
 
 
 @pytest.mark.asyncio
 async def test_match_candidates_returns_503_on_enrichment_timeout(monkeypatch):
     """A slow enrichment query cannot outlive the endpoint deadline."""
+
     async def slow_enrichment(*_args, **_kwargs):
         await asyncio.sleep(1)
 
@@ -436,14 +452,13 @@ async def test_match_candidates_returns_503_on_enrichment_timeout(monkeypatch):
         sanic.exceptions.ServiceUnavailable,
         match="enrichment lookup exceeded",
     ):
-        await npi_module.match_candidates(
-            _request({"lat": "41.09967", "long": "-101.67646"})
-        )
+        await npi_module.match_candidates(_request({"lat": "41.09967", "long": "-101.67646"}))
 
 
 @pytest.mark.asyncio
 async def test_match_candidates_returns_503_on_enrichment_db_failure(monkeypatch):
     """An enrichment DB failure is translated without exposing raw details."""
+
     async def failing_enrichment(*_args, **_kwargs):
         raise RuntimeError("database connection secret")
 
@@ -460,9 +475,7 @@ async def test_match_candidates_returns_503_on_enrichment_db_failure(monkeypatch
     )
 
     with pytest.raises(sanic.exceptions.ServiceUnavailable) as exc_info:
-        await npi_module.match_candidates(
-            _request({"lat": "41.09967", "long": "-101.67646"})
-        )
+        await npi_module.match_candidates(_request({"lat": "41.09967", "long": "-101.67646"}))
 
     assert "enrichment lookup is temporarily unavailable" in str(exc_info.value)
     assert "database connection secret" not in str(exc_info.value)
