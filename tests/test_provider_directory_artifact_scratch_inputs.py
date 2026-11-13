@@ -55,7 +55,7 @@ def test_all_eight_typed_encoders_use_only_selected_physical_child(root):
     assert "INSERT " not in sql and "UPDATE " not in sql and "DELETE " not in sql
     assert '"' + binding["tables"][scratch.source_storage.RESOURCE]["name"] + '"' in sql
     assert '"provider_directory_dataset_resource"' not in sql
-    assert "CAST(resource.payload_json::jsonb ->>" in sql
+    assert "CAST(parsed.payload_jsonb ->>" in sql and sql.count("payload_json::jsonb") == 1
     assert (
         "selected.evidence_run_id" in sql
         and "COALESCE(dataset.published_at, dataset.validated_at, dataset.created_at)" in sql
