@@ -388,10 +388,10 @@ async def _network_request_snapshot(session):
 
 
 def _request_snapshot_app(monkeypatch, observations, entered):
-    """Observe each real catalog pin before its full manifest checks and native hydration."""
-    from process import registry_network_catalog_read as catalog
+    """Observe each request's published pin before native hydration."""
+    from api import network_serving_api_read as serving_read
 
-    original = catalog.catalog_pin
+    original = serving_read.read_published_api_pin
 
     async def pin(driver, *arguments, **options):
         snapshot = await _network_request_snapshot(current_session())
@@ -399,7 +399,7 @@ def _request_snapshot_app(monkeypatch, observations, entered):
         observations.append(snapshot)
         return await original(driver, *arguments, **options)
 
-    monkeypatch.setattr(catalog, "catalog_pin", pin)
+    monkeypatch.setattr(serving_read, "read_published_api_pin", pin)
     app = RequestLifecycleSanic("network-request-snapshot-" + uuid4().hex)
     db.init_app(app)
 

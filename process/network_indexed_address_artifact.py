@@ -97,7 +97,7 @@ def _descriptor(binding):
     return json.loads(artifact._json(binding))
 
 
-async def _native_identity(connection, address_source, runtime_roles, *, origin_oid, expected_oid=None, api_read=False):
+async def _native_identity(connection, address_source, runtime_roles, *, origin_oid, expected_oid=None):
     from process.entity_address_native_publication import _catalog_evidence
     from process.entity_address_unified import _required_geo_taxonomy_stage_index_sql
     from process.mrf_address_publication import require_native_read_catalog_subjects
@@ -106,14 +106,11 @@ async def _native_identity(connection, address_source, runtime_roles, *, origin_
     from process.network_membership_serving_indexes import _index_digest, _serving_plan
     from process.network_membership_writer_closure import _protected_owner
 
-    await artifact._require_api_read_context(connection, api_read)
     await artifact._require_capture_snapshot(connection)
     qualified = _identifier(address_source.schema_name) + ".entity_address_unified"
     oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", qualified)
     artifact._require(type(oid) is int and (expected_oid is None or oid == expected_oid), "indexed_table_changed")
-    physical = await (artifact._read_table if api_read else artifact._locked_table)(
-        connection, address_source.schema_name, oid
-    )
+    physical = await artifact._locked_table(connection, address_source.schema_name, oid)
     owner = await connection.fetchrow("SELECT * FROM pg_roles WHERE oid=$1::oid", physical["owner_oid"])
     artifact._require(
         _protected_owner(owner)
@@ -205,14 +202,12 @@ async def capture_indexed_address_artifact(connection, address_source, *, runtim
     return _descriptor(descriptor_by_field)
 
 
-async def verify_indexed_address_artifact(connection, descriptor, *, runtime_roles, api_read=False):
+async def verify_indexed_address_artifact(connection, descriptor, *, runtime_roles):
     """Authenticate an independently sealed descriptor without rereading legacy writer reports."""
     descriptor = _descriptor(descriptor)
     roles = artifact._roles(runtime_roles)
     artifact._require(descriptor["runtime_roles"] == list(roles), "roles_changed")
-    await bootstrap.verify_bootstrap_address_artifact(
-        connection, descriptor["origin_artifact"], runtime_roles=roles, api_read=api_read
-    )
+    await bootstrap.verify_bootstrap_address_artifact(connection, descriptor["origin_artifact"], runtime_roles=roles)
     address_source = PinnedAddressSource(
         descriptor["namespace"]["name"], "entity_address_unified", descriptor["generation_id"]
     )
@@ -222,7 +217,6 @@ async def verify_indexed_address_artifact(connection, descriptor, *, runtime_rol
         roles,
         origin_oid=descriptor["origin_artifact"]["table"]["oid"],
         expected_oid=descriptor["table"]["oid"],
-        api_read=api_read,
     )
     artifact._require(
         descriptor["database"] == await artifact._database(connection)

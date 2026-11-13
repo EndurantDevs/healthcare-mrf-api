@@ -90,18 +90,15 @@ def _api_spies(monkeypatch, fixture, *, failing_guard=None):
         if connection.events.count("guard") == failing_guard:
             raise NetworkReadIdentityError("synthetic mismatched consumed relation")
 
-    # The published inventory is found by name; no seal is read.
-    metadata_spy = AsyncMock(side_effect=AssertionError("API inventory read verified a seal"))
     consumed_spy = AsyncMock(side_effect=verify)
-    monkeypatch.setattr(custody, "verify_network_candidate_read_metadata", metadata_spy)
     monkeypatch.setattr(store, "verify_consumed_network_relations", consumed_spy)
-    return connection, metadata_spy, consumed_spy
+    return connection, consumed_spy
 
 
 @pytest.mark.parametrize("count", [0, 1, 101, 1000])
 async def test_api_loader_preserves_complete_root(monkeypatch, count):
     fixture = _inventory(count)
-    connection, metadata, guards = _api_spies(monkeypatch, fixture)
+    connection, guards = _api_spies(monkeypatch, fixture)
     inventory, entries = await store.load_source_inventory_for_api(
         connection, fixture.copy_target, fixture.candidate_by_field, control_schema=CONTROL
     )
@@ -114,14 +111,13 @@ async def test_api_loader_preserves_complete_root(monkeypatch, count):
     )
     assert guards.await_count == 1 + connection.events.count("preflight") + connection.events.count("payload")
     assert "payload" in connection.events if count else "payload" not in connection.events
-    metadata.assert_not_awaited()
     connection.execute.assert_not_awaited()
 
 
 @pytest.mark.parametrize("failing_guard", [1, 2, 3])
 async def test_guard_failure_precedes_payload_decode(monkeypatch, failing_guard):
     fixture = _inventory()
-    connection, _, _ = _api_spies(monkeypatch, fixture, failing_guard=failing_guard)
+    connection, _ = _api_spies(monkeypatch, fixture, failing_guard=failing_guard)
     decoder = Mock(side_effect=AssertionError("unverified payload decoded"))
     monkeypatch.setattr(store, "source_inventory_entry", decoder)
     with pytest.raises(store.RegistrySourceInventoryError, match="physical_identity_invalid"):
@@ -134,7 +130,7 @@ async def test_guard_failure_precedes_payload_decode(monkeypatch, failing_guard)
 
 async def test_empty_preflight_is_guarded(monkeypatch):
     fixture = _inventory(0)
-    connection, _, _ = _api_spies(monkeypatch, fixture, failing_guard=2)
+    connection, _ = _api_spies(monkeypatch, fixture, failing_guard=2)
     with pytest.raises(store.RegistrySourceInventoryError):
         await store.load_source_inventory_for_api(
             connection, fixture.copy_target, fixture.candidate_by_field, control_schema=CONTROL
@@ -144,7 +140,7 @@ async def test_empty_preflight_is_guarded(monkeypatch):
 
 async def test_no_complete_inventory_escapes_root_mismatch(monkeypatch):
     fixture = _inventory()
-    connection, _, _ = _api_spies(monkeypatch, fixture)
+    connection, _ = _api_spies(monkeypatch, fixture)
     replacement = _inventory(2).entries[1]
     fixture.entries = (replace(replacement, ordinal=1),)
     connection.rows = [dict(zip(store._COLUMNS, store.source_inventory_record(fixture.entries[0]), strict=True))]
@@ -158,7 +154,7 @@ async def test_no_complete_inventory_escapes_root_mismatch(monkeypatch):
 @pytest.mark.parametrize("damage", ["mode", "missing", "scope", "root"])
 async def test_metadata_refusal_precedes_inventory_data(monkeypatch, damage):
     fixture = _inventory()
-    connection, metadata, guards = _api_spies(monkeypatch, fixture)
+    connection, guards = _api_spies(monkeypatch, fixture)
     if damage == "mode":
         connection.modes = ("repeatable read", "off")
     elif damage == "missing":

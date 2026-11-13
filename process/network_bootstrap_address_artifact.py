@@ -138,16 +138,13 @@ async def _physical_heaps(connection, receipt):
     return heaps_by_name
 
 
-async def _captured_descriptor(connection, receipt, runtime_roles, *, api_read):
-    await artifact._require_api_read_context(connection, api_read)
+async def _captured_descriptor(connection, receipt, runtime_roles):
     await bootstrap._transaction(connection)
     runtime_roles = artifact._roles(runtime_roles)
     caller = await connection.fetchrow("SELECT current_user::text AS name,current_user::regrole::oid::bigint AS oid")
     subjects = tuple(sorted(set((*runtime_roles, caller["name"]))))
     # Output actors need safe reach, not an invented grant to read both inputs.
-    await access.bootstrap_pin_read_roles(
-        connection, receipt.address_source, (), runtime_actors=subjects, api_read=api_read
-    )
+    await access.bootstrap_pin_read_roles(connection, receipt.address_source, (), runtime_actors=subjects)
     await require_native_read_catalog_subjects(
         artifact._CatalogSession(connection), [oid for _, oid in receipt.relation_oids], subjects
     )
@@ -158,7 +155,7 @@ async def _captured_descriptor(connection, receipt, runtime_roles, *, api_read):
     document["dormant_sequence"] = dormant
     sequence_oid = int(dormant["sequence"][0]) if dormant is not None else None
     # The protected receipt already proved copied content; reuse retains current custody and worker locks.
-    await bootstrap._verify_capture(connection, receipt, verify_content=False, api_read=api_read)
+    await bootstrap._verify_capture(connection, receipt, verify_content=False)
     heaps_by_name = await _physical_heaps(connection, receipt)
     dependencies = {oid for _, oid in (*receipt.relation_oids, *receipt.index_oids)}
     if sequence_oid is not None:
@@ -200,14 +197,14 @@ async def capture_bootstrap_address_artifact(connection, source, *, runtime_role
         )
     )
     artifact._require(source == receipt.address_source, "source_generation_changed")
-    return await _captured_descriptor(connection, receipt, runtime_roles, api_read=False)
+    return await _captured_descriptor(connection, receipt, runtime_roles)
 
 
-async def verify_bootstrap_address_artifact(connection, descriptor, *, runtime_roles, api_read=False):
+async def verify_bootstrap_address_artifact(connection, descriptor, *, runtime_roles):
     """Revalidate a sealed descriptor without binding it to a renewable access proof."""
     descriptor = _descriptor(descriptor)
     artifact._require(descriptor["runtime_roles"] == list(artifact._roles(runtime_roles)), "roles_changed")
     receipt = bootstrap._decode(artifact._json(descriptor["bootstrap_receipt"]))
-    current = await _captured_descriptor(connection, receipt, runtime_roles, api_read=api_read)
+    current = await _captured_descriptor(connection, receipt, runtime_roles)
     artifact._require(current == descriptor, "bootstrap_artifact_changed")
     return CompactAddressRelation(descriptor["namespace"]["name"], "entity_address_unified", descriptor["table"]["oid"])

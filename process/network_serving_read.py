@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import dataclass
 from uuid import UUID
@@ -301,16 +300,12 @@ async def resolve_network_serving_manifest(
             from process.network_published_api_pin import read_published_api_pin
 
             published = await read_published_api_pin(connection, generation_id, namespace[1:-1], approved=False)
-            if published is not None:
-                return published[0]
-        # Generations published before the indexed address contract have no published routing metadata.
+            return published[0]
         entry = await _read_manifest(connection, namespace, generation_id)
         if entry is None:
             raise NetworkServingReadUnavailable("Network serving manifest is unavailable")
         candidate = json.loads(entry["candidate_json"])
-        custody = await _candidate_custody(
-            connection, candidate, namespace[1:-1], **({"api_read": True} if api_read else {})
-        )
+        custody = await _candidate_custody(connection, candidate, namespace[1:-1])
         return _pinned_manifest(entry, custody=custody)
     except (ValueError, TypeError, KeyError, asyncpg.PostgresError) as error:
         if isinstance(error, NetworkServingReadUnavailable):

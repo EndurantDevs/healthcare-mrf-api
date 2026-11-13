@@ -7,13 +7,15 @@ from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_compact_custom_preparation import compact_carrier_receipt, compact_custom_receipt
 from process.network_compact_layout import CompactAddressRelation, CompactEdgeArtifact, CompactNetworkLayout
-from process.network_indexed_address_artifact import CONTRACT as INDEXED_CONTRACT
+from process.network_compact_readiness import is_compact_candidate
 from process.network_serving_read import NetworkServingReadUnavailable, _pinned_manifest
 
 _PUBLISHED_SQL = """SELECT to_jsonb(candidate)::text AS candidate_json,
  to_jsonb(manifest)::text AS manifest_json,
  physical.relname AS base_name,space.nspname AS base_schema,
  (physical.relrowsecurity OR physical.relforcerowsecurity) AS base_rls,
+ (SELECT own.relrowsecurity OR own.relforcerowsecurity FROM pg_catalog.pg_class own WHERE own.oid=
+   pg_catalog.to_regclass(pg_catalog.format('%I.entity_address_unified',candidate.schema_name))) AS own_rls,
  to_regclass('{control}.registry_approved_record')::oid::bigint AS approved_oid,
  {approved_rows} AS approved_rows
  FROM {control}.network_serving_manifest manifest
@@ -76,14 +78,10 @@ def _custom_address_relation(candidate, descriptor):
     return None
 
 
-def _decode_published_pin(entry, schema, *, approved=True):
-    if entry is None:
-        raise NetworkServingReadUnavailable("Published network generation is unavailable")
-    candidate = json.loads(entry["candidate_json"])
+def _published_layout(entry, candidate):
+    """Name the retained dependencies of a compact generation from its own validation report."""
     report = candidate["validation_json"]
-    descriptor = report["serving_readiness"].get("address_artifact")
-    if type(descriptor) is not dict or descriptor.get("contract") != INDEXED_CONTRACT:
-        return None
+    descriptor = report["serving_readiness"]["address_artifact"]
     if entry["base_rls"] is not False:
         raise NetworkServingReadUnavailable("Published network address rows are unavailable")
     canonical = report["candidate_readiness"]
@@ -98,7 +96,20 @@ def _decode_published_pin(entry, schema, *, approved=True):
     )
     from process.network_compact_layout import bind_compact_geo_search_candidate
 
-    layout = bind_compact_geo_search_candidate(layout, candidate)
+    return bind_compact_geo_search_candidate(layout, candidate)
+
+
+def _decode_published_pin(entry, schema, *, approved=True):
+    if entry is None:
+        raise NetworkServingReadUnavailable("Published network generation is unavailable")
+    candidate = json.loads(entry["candidate_json"])
+    report = candidate["validation_json"]
+    layout = None
+    if is_compact_candidate(candidate):
+        layout = _published_layout(entry, candidate)
+    elif entry["own_rls"] is not False:
+        # Without a compact layout the generation serves its own address table; row filtering would hide rows.
+        raise NetworkServingReadUnavailable("Published network address rows are unavailable")
     manifest = _pinned_manifest(
         entry,
         custody={

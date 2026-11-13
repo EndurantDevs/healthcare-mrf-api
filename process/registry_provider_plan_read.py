@@ -299,7 +299,9 @@ async def read_registry_provider_plans(
         identity = _identifier(str(NPIData.__table__.schema)) + "." + _identifier(str(NPIData.__table__.name))
         if not await connection.fetchval(f"SELECT EXISTS(SELECT 1 FROM {identity} WHERE npi=$1)", int(query.npi)):
             raise RegistryNetworkCatalogError("registry_network_catalog_detail_denied")
-        recipes = await resolve_retained_registry_source_recipes(connection, manifest, control_schema=control_schema)
+        recipes = await resolve_retained_registry_source_recipes(
+            connection, manifest, control_schema=control_schema, api_read=True
+        )
         approved = _api_approved_source(connection, manifest, control_schema)
         if approved is None:
             approved = await pin_retained_approved_membership_source(

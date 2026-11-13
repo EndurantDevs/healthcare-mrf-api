@@ -15,17 +15,13 @@ from tests.test_registry_network_catalog_read import batch_boundary, legacy_sele
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("api_read", [False, True])
-async def test_sealed_catalog_pin_preserves_reader_mode_and_default(batch_boundary, monkeypatch, api_read):
+async def test_sealed_catalog_pin_resolves_the_published_metadata(batch_boundary, monkeypatch):
     connection, manifest, _ = batch_boundary
     object.__setattr__(manifest, "_custody_seal_sha256", "c" * 64)
     resolve = AsyncMock(return_value=manifest)
     monkeypatch.setattr(catalog, "resolve_network_serving_manifest", resolve)
-    assert await catalog.catalog_pin(connection, 9, "sample_control", api_read=api_read) is manifest
-    pin_by_option = {"generation_id": 9, "control_schema": "sample_control"}
-    if api_read:
-        pin_by_option["api_read"] = True
-    resolve.assert_awaited_once_with(connection, **pin_by_option)
+    assert await catalog.catalog_pin(connection, 9, "sample_control") is manifest
+    resolve.assert_awaited_once_with(connection, generation_id=9, control_schema="sample_control", api_read=True)
     assert not any(sql.startswith("LOCK TABLE") for sql, _ in connection.calls)
 
 
@@ -51,18 +47,10 @@ async def test_legacy_reuses_active_verified_manifest_once(batch_boundary, monke
         assert page["generation"] == "9" and page["items"][0]["network_id"] == 7
     assert revisions == [4]
     assert resolve.await_args_list == [
-        call(connection, generation_id=None, control_schema="sample_control"),
-        call(connection, generation_id=9, control_schema="sample_control"),
+        call(connection, generation_id=None, control_schema="sample_control", api_read=True)
     ]
     assert sum("transaction_isolation" in sql for sql, _ in connection.calls) == 1
-    assert connection.calls.count(("SELECT current_setting('search_path')", ())) == 1
-    assert connection.calls.count(("SET LOCAL search_path TO pg_catalog,public", ())) == 1
-    assert connection.calls.count(("SELECT set_config('search_path',$1,true)", ("sample_path",))) == 1
-    locks = [sql for sql, _ in connection.calls if sql.startswith("LOCK TABLE")]
-    assert locks == [
-        'LOCK TABLE "candidate_sample".network_membership,"candidate_sample".provider_location_binding,'
-        '"candidate_sample".entity_address_unified IN ACCESS SHARE MODE'
-    ]
+    assert not any(sql.startswith("LOCK TABLE") for sql, _ in connection.calls)
     with pytest.raises(catalog.RegistryNetworkCatalogError, match="source_changed"):
         catalog._reuse_manifest(connection, manifest, 9, "sample_control")
 

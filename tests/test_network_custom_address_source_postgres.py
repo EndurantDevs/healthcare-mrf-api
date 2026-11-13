@@ -1889,9 +1889,9 @@ async def test_bootstrap_access_exact_successor_preserves_receipt_and_old_reader
     original_native = bootstrap_access._native
     native_receipts = []
 
-    async def observe_native(connection, receipt, reader_oid, *, api_read=False):
+    async def observe_native(connection, receipt, reader_oid):
         native_receipts.append(receipt)
-        return await original_native(connection, receipt, reader_oid, api_read=api_read)
+        return await original_native(connection, receipt, reader_oid)
 
     monkeypatch.setattr(bootstrap_access, "_native", observe_native)
     original = await connection.fetchval("SELECT obj_description($1::oid,'pg_namespace')", receipt.schema_oid)
@@ -2107,42 +2107,8 @@ async def test_bootstrap_access_renewal_retains_exact_raw_predecessor(bootstrap_
     )
 
 
-async def test_bootstrap_access_api_mode_is_metadata_only_and_requires_readonly_snapshot(bootstrap_access_fixture):
-    fixture = bootstrap_access_fixture
-    proof = await _change_bootstrap_access(fixture)
-
-    class MetadataOnly:
-        def __init__(self, connection):
-            self.connection = connection
-
-        def __getattr__(self, name):
-            return getattr(self.connection, name)
-
-        async def execute(self, query, *arguments):
-            assert not query.lstrip().upper().startswith("LOCK ")
-            assert fixture.receipt.address_source.schema_name not in query
-            return await self.connection.execute(query, *arguments)
-
-    async with _bootstrap_access_login(fixture.reader, fixture.password) as connection:
-        with pytest.raises(ValueError, match="transaction_required"):
-            await bootstrap_access.bootstrap_read_roles(connection, fixture.receipt, api_read=True)
-        async with connection.transaction(isolation="repeatable_read"):
-            with pytest.raises(ValueError, match="read_snapshot_required"):
-                await bootstrap_access.bootstrap_read_roles(connection, fixture.receipt, api_read=True)
-        async with connection.transaction(isolation="repeatable_read", readonly=True):
-            roles = await bootstrap_access.bootstrap_pin_read_roles(
-                MetadataOnly(connection),
-                fixture.receipt.address_source,
-                (),
-                runtime_actors=(fixture.stranger,),
-                api_read=True,
-            )
-            assert roles == tuple(sorted((*fixture.receipt.runtime_roles, proof["reader"])))
-
-
 @pytest.mark.parametrize("bootstrap_access_fixture", ["serial"], indirect=True)
-@pytest.mark.parametrize("api_read", [False, True])
-async def test_bootstrap_access_api_mode_checks_output_actor_dormant_sequence(bootstrap_access_fixture, api_read):
+async def test_bootstrap_access_checks_output_actor_dormant_sequence(bootstrap_access_fixture):
     fixture = bootstrap_access_fixture
     connection, receipt = fixture.fixture.connection, fixture.receipt
     proof = await _change_bootstrap_access(fixture)
@@ -2153,28 +2119,12 @@ async def test_bootstrap_access_api_mode_checks_output_actor_dormant_sequence(bo
     assert not await connection.fetchval(
         "SELECT has_table_privilege($1::name,$2::oid,'SELECT')", fixture.stranger, receipt.relation_oids[0][1]
     )
-    if api_read:
-        await connection.execute(
-            f'GRANT "{fixture.fixture.roles["reader"]}" TO "{fixture.stranger}" '
-            "WITH ADMIN FALSE, INHERIT TRUE, SET FALSE"
-        )
-        async with (
-            _bootstrap_access_login(fixture.stranger, fixture.password) as caller,
-            caller.transaction(isolation="repeatable_read", readonly=True),
-        ):
-            assert await bootstrap_access.bootstrap_pin_read_roles(caller, receipt.address_source, (), api_read=True)
     await connection.execute(f'GRANT SELECT,USAGE,UPDATE ON SEQUENCE {sequence} TO "{fixture.stranger}"')
     async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
         async with reader.transaction(isolation="repeatable_read", readonly=True):
             assert await bootstrap_access.bootstrap_pin_read_roles(
-                reader, receipt.address_source, (), runtime_actors=(fixture.stranger,), api_read=api_read
+                reader, receipt.address_source, (), runtime_actors=(fixture.stranger,)
             ) == tuple(sorted((*receipt.runtime_roles, fixture.reader)))
-    if api_read:
-        async with (
-            _bootstrap_access_login(fixture.stranger, fixture.password) as caller,
-            caller.transaction(isolation="repeatable_read", readonly=True),
-        ):
-            assert await bootstrap_access.bootstrap_pin_read_roles(caller, receipt.address_source, (), api_read=True)
     assert await _verify_bootstrap_access(fixture) == receipt
     assert await bootstrap_access._proof(connection, receipt) == proof
     assert await connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}") == before

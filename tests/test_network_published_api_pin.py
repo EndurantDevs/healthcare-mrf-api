@@ -51,9 +51,9 @@ async def test_invalid_generation_never_runs_metadata_sql(generation):
     connection.fetchrow.assert_not_awaited()
 
 
-def _published_entry(descriptor, *, base_rls=False):
-    candidate_json = json.dumps({"validation_json": {"serving_readiness": {"address_artifact": descriptor}}})
-    return {"candidate_json": candidate_json, "base_rls": base_rls}
+def _published_entry(serving_readiness, *, base_rls=False, own_rls=False):
+    candidate_json = json.dumps({"validation_json": {"serving_readiness": serving_readiness, "writer_closure": {}}})
+    return {"candidate_json": candidate_json, "base_rls": base_rls, "own_rls": own_rls}
 
 
 @pytest.mark.asyncio
@@ -66,16 +66,31 @@ async def test_missing_published_generation_is_unavailable():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("descriptor", [None, {"contract": "other.address.artifact"}])
-async def test_generation_without_an_indexed_address_artifact_has_no_published_pin(descriptor):
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=_published_entry(descriptor)))
-    assert await published.read_published_api_pin(connection, None, "example_control") is None
+async def test_generation_without_a_compact_layout_resolves_from_its_validation_report(monkeypatch):
+    """A generation published before the compact layout needs neither a ledger row nor a base heap."""
+    entry = _published_entry({"index_definition_sha256": "d" * 64}, base_rls=None)
+    manifest, proofs = SimpleNamespace(), []
+    monkeypatch.setattr(published, "_pinned_manifest", lambda _entry, custody: proofs.append(custody) or manifest)
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=entry))
+    resolved = await published.read_published_api_pin(connection, None, "example_control", approved=False)
+    assert resolved == (manifest, None, None)
+    assert proofs[0]["compact_layout"] is None and proofs[0]["seal_sha256"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("own_rls", [True, None], ids=["row security", "no address table"])
+async def test_generation_without_a_compact_layout_refuses_a_row_filtered_address_table(own_rls):
+    entry = _published_entry({"index_definition_sha256": "d" * 64}, base_rls=None, own_rls=own_rls)
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=entry))
+    with pytest.raises(published.NetworkServingReadUnavailable, match="address rows are unavailable"):
+        await published.read_published_api_pin(connection, None, "example_control", approved=False)
+    assert "AS own_rls" in connection.fetchrow.await_args.args[0]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("base_rls", [True, None], ids=["row security", "no heap under either name"])
 async def test_unreadable_published_address_heap_is_unavailable(base_rls):
-    entry = _published_entry({"contract": published.INDEXED_CONTRACT}, base_rls=base_rls)
+    entry = _published_entry({"component": "compact_network_serving", "address_artifact": {}}, base_rls=base_rls)
     connection = SimpleNamespace(fetchrow=AsyncMock(return_value=entry))
     with pytest.raises(published.NetworkServingReadUnavailable, match="address rows are unavailable"):
         await published.read_published_api_pin(connection, None, "example_control")
@@ -88,7 +103,9 @@ async def test_manifest_only_read_touches_no_approved_records(monkeypatch):
 
     report_by_field = {
         "serving_readiness": {
-            "address_artifact": {"contract": published.INDEXED_CONTRACT, "table": {"oid": 11}},
+            "component": "compact_network_serving",
+            # The address contract does not matter: every compact generation is named by its report.
+            "address_artifact": {"contract": "network_address_artifact.postgres.v1", "table": {"oid": 11}},
             "edge_artifacts": [],
             "index_definition_sha256": "d" * 64,
         },
@@ -115,6 +132,9 @@ async def test_manifest_only_read_touches_no_approved_records(monkeypatch):
     assert "NULL::bigint AS approved_rows" in statement and approved_records not in statement
     # The candidate's own validation report supplies the relation names; the ledger is never read.
     assert "network_candidate_custody" not in statement and proofs[0]["seal_sha256"] is None
+    assert proofs[0]["compact_layout"].base == layouts.CompactAddressRelation(
+        "example_addresses", "entity_address_unified", 11
+    )
     assert proofs[0]["receipt"] == {
         "closure": {},
         "control": {},

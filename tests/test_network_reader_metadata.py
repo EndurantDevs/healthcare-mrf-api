@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Metadata-only API verification; mocks do not establish physical consumption authority."""
+"""Address artifact and compact dependency verification on a synthetic connection."""
 
-import copy
 from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -70,10 +69,9 @@ def _physical(oid, name):
 
 
 class Connection:
-    def __init__(self, *, retained=False, modes=("repeatable read", "on")):
-        self.modes, self.active, self.calls = modes, True, []
-        name = "entity_address_unified_retained_29" if retained else "entity_address_unified"
-        self.physical = {41: _physical(41, name), 80: _physical(80, artifact._AUTHORITY)}
+    def __init__(self):
+        self.calls = []
+        self.physical = {41: _physical(41, "entity_address_unified"), 80: _physical(80, artifact._AUTHORITY)}
         self.owner = {
             "oid": 100,
             **dict.fromkeys(
@@ -84,12 +82,10 @@ class Connection:
         self.candidate_by_name = None
 
     def is_in_transaction(self):
-        return self.active
+        return True
 
     async def fetchrow(self, statement, *arguments):
         self.calls.append((statement, arguments))
-        if statement.startswith("SELECT current_setting('transaction_isolation')"):
-            return self.modes
         if statement.startswith("SELECT oid::bigint AS oid,datname"):
             return self.database
         if statement.startswith("SELECT c.oid::bigint,c.relname"):
@@ -128,39 +124,11 @@ def _catalog_spies(monkeypatch, descriptor):
     return mutation, subjects, catalog, alias
 
 
-@pytest.mark.parametrize("retained", [False, True])
-@pytest.mark.parametrize("modes", [("repeatable read", "on"), ("serializable", "on")])
-async def test_api_address_metadata_preserves_custody_checks_without_target_locks(monkeypatch, retained, modes):
+async def test_address_verification_keeps_both_explicit_locks(monkeypatch):
     descriptor = _descriptor()
-    connection = Connection(retained=retained, modes=modes)
-    mutation, subjects, catalog, alias = _catalog_spies(monkeypatch, descriptor)
-    relation = await artifact.verify_network_address_artifact(
-        connection, descriptor, runtime_roles=ROLES, api_read=True
-    )
-    assert relation == CompactAddressRelation(SCHEMA, connection.physical[41]["relname"], 41)
-    mutation.assert_awaited_once()
-    assert mutation.await_args.args[1:] == ([41, 80], 100)
-    subjects.assert_awaited_once()
-    assert subjects.await_args.args[1:] == ([41, 80], ("api_user", *ROLES))
-    catalog.assert_awaited_once()
-    alias.assert_awaited_once()
-    statements = [sql for sql, arguments in connection.calls]
-    assert all(sql.startswith("SELECT ") for sql in statements)
-    assert not any("advisory" in sql.lower() or "to_regclass" in sql for sql in statements)
-    assert [
-        arguments[0] for sql, arguments in connection.calls if sql.startswith("SELECT c.oid::bigint,c.relname")
-    ] == [41, 80, 80]
-
-
-@pytest.mark.parametrize("explicit", [False, True])
-async def test_default_writer_address_verification_keeps_both_explicit_locks(monkeypatch, explicit):
-    descriptor = _descriptor()
-    connection = Connection(modes=("read committed", "off"))
+    connection = Connection()
     _catalog_spies(monkeypatch, descriptor)
-    options = {"api_read": False} if explicit else {}
-    assert (
-        await artifact.verify_network_address_artifact(connection, descriptor, runtime_roles=ROLES, **options)
-    ).table_oid == 41
+    assert (await artifact.verify_network_address_artifact(connection, descriptor, runtime_roles=ROLES)).table_oid == 41
     statements = [sql for sql, arguments in connection.calls]
     assert [sql for sql in statements if sql.startswith("LOCK TABLE")] == [
         f'LOCK TABLE ONLY "{SCHEMA}"."entity_address_unified" IN ACCESS SHARE MODE NOWAIT',
@@ -200,7 +168,7 @@ async def test_default_writer_address_verification_keeps_both_explicit_locks(mon
         "digest",
     ],
 )
-async def test_api_address_metadata_keeps_every_existing_refusal(monkeypatch, damage):
+async def test_address_verification_keeps_every_refusal(monkeypatch, damage):
     descriptor, connection = _descriptor(), Connection()
     mutation, subjects, catalog, alias = _catalog_spies(monkeypatch, descriptor)
     changes_by_fault = {
@@ -252,8 +220,7 @@ async def test_api_address_metadata_keeps_every_existing_refusal(monkeypatch, da
             {key: field for key, field in descriptor.items() if key != "descriptor_sha256"}
         )
     with pytest.raises((ValueError, RuntimeError)):
-        await artifact.verify_network_address_artifact(connection, descriptor, runtime_roles=ROLES, api_read=True)
-    assert not any(sql.startswith("LOCK TABLE") for sql, arguments in connection.calls)
+        await artifact.verify_network_address_artifact(connection, descriptor, runtime_roles=ROLES)
 
 
 def _candidate():
@@ -314,35 +281,31 @@ def _edge_spies(monkeypatch, connection, expected_by_field):
         assert target.candidate_id == RETAINED and target.schema_name == expected_by_field["schema_name"]
         return seal_by_field
 
-    metadata, writer = AsyncMock(side_effect=verified), AsyncMock(side_effect=verified)
-    monkeypatch.setattr(custody, "verify_network_candidate_read_metadata", metadata)
+    writer = AsyncMock(side_effect=verified)
     monkeypatch.setattr(custody, "verify_network_candidate_custody", writer)
-    return metadata, writer, seal_by_field
+    return writer, seal_by_field
 
 
-@pytest.mark.parametrize("api_read", [False, True])
-async def test_compact_dependency_flag_reaches_address_and_retained_seal_verifiers(monkeypatch, api_read):
+async def test_compact_dependencies_reach_address_and_retained_seal_verifiers(monkeypatch):
     candidate_by_name, retained, expected_by_field = _candidate()
     connection = Connection()
     connection.candidate_by_name = retained
-    metadata, writer, _ = _edge_spies(monkeypatch, connection, expected_by_field)
+    writer, _ = _edge_spies(monkeypatch, connection, expected_by_field)
     address = AsyncMock(return_value=CompactAddressRelation(SCHEMA, "entity_address_unified", 41))
     monkeypatch.setattr(artifact, "verify_network_address_artifact", address)
-    layout = await dependencies.verify_compact_dependencies(
-        connection, candidate_by_name, control_schema=CONTROL, **({"api_read": True} if api_read else {})
-    )
+    layout = await dependencies.verify_compact_dependencies(connection, candidate_by_name, control_schema=CONTROL)
     assert layout.ref_map.table_oid == 51 and layout.base.table_oid == 41
     assert [edge.table_oid for edge in layout.artifacts] == [52, 53]
-    assert address.await_args.kwargs == {"runtime_roles": ROLES, **({"api_read": True} if api_read else {})}
-    assert metadata.await_count == int(api_read) and writer.await_count == int(not api_read)
+    assert address.await_args.kwargs == {"runtime_roles": ROLES}
+    writer.assert_awaited_once()
 
 
 @pytest.mark.parametrize("damage", ["seal", "oid", "revision", "custody"])
-async def test_api_retained_edge_cannot_bypass_exact_independent_seal(monkeypatch, damage):
+async def test_retained_edge_cannot_bypass_exact_independent_seal(monkeypatch, damage):
     candidate_by_name, retained, expected_by_field = _candidate()
     connection = Connection()
     connection.candidate_by_name = retained
-    metadata, writer, seal_by_field = _edge_spies(monkeypatch, connection, expected_by_field)
+    writer, seal_by_field = _edge_spies(monkeypatch, connection, expected_by_field)
     if damage == "seal":
         seal_by_field["seal_sha256"] = "d" * 64
     if damage == "oid":
@@ -350,78 +313,15 @@ async def test_api_retained_edge_cannot_bypass_exact_independent_seal(monkeypatc
     if damage == "revision":
         seal_by_field["receipt"]["revision"] = 3
     if damage == "custody":
-        metadata.side_effect = ValueError("genuine metadata custody refused")
+        writer.side_effect = ValueError("genuine custody refused")
     with pytest.raises(ValueError):
         await dependencies._verified_layout(
-            connection,
-            candidate_by_name,
-            CompactAddressRelation(SCHEMA, "entity_address_unified", 41),
-            CONTROL,
-            api_read=True,
+            connection, candidate_by_name, CompactAddressRelation(SCHEMA, "entity_address_unified", 41), CONTROL
         )
-    writer.assert_not_awaited()
-
-
-@pytest.mark.parametrize("entry", ["address", "dependencies", "layout", "edge"])
-@pytest.mark.parametrize("modes", [("repeatable read", "off"), ("read committed", "on"), ("serializable", "off")])
-async def test_api_entrypoints_require_genuine_read_only_repeatable_context(monkeypatch, entry, modes):
-    candidate_by_name, retained, expected_by_field = _candidate()
-    connection = Connection(modes=modes)
-    connection.candidate_by_name = retained
-    metadata, writer, _ = _edge_spies(monkeypatch, connection, expected_by_field)
-    with pytest.raises(ValueError, match="read_snapshot_required"):
-        if entry == "address":
-            await artifact.verify_network_address_artifact(
-                connection, _descriptor(), runtime_roles=ROLES, api_read=True
-            )
-        if entry == "dependencies":
-            await dependencies.verify_compact_dependencies(
-                connection, candidate_by_name, control_schema=CONTROL, api_read=True
-            )
-        if entry == "layout":
-            await dependencies._verified_layout(
-                connection,
-                candidate_by_name,
-                CompactAddressRelation(SCHEMA, "entity_address_unified", 41),
-                CONTROL,
-                api_read=True,
-            )
-        if entry == "edge":
-            await dependencies._retained_edge(connection, RETAINED, CONTROL, api_read=True)
-    assert len(connection.calls) == 1
-    metadata.assert_not_awaited()
-    writer.assert_not_awaited()
-
-
-@pytest.mark.parametrize("entry", ["address", "dependencies", "layout", "edge"])
-@pytest.mark.parametrize("invalid", [0, 1, None, "true"])
-async def test_read_mode_never_accepts_bool_like_markers(entry, invalid):
-    candidate_by_name, _, _ = _candidate()
-    connection = Connection()
-    with pytest.raises(ValueError, match="read_mode_invalid"):
-        if entry == "address":
-            await artifact.verify_network_address_artifact(
-                connection, _descriptor(), runtime_roles=ROLES, api_read=invalid
-            )
-        if entry == "dependencies":
-            await dependencies.verify_compact_dependencies(
-                connection, candidate_by_name, control_schema=CONTROL, api_read=invalid
-            )
-        if entry == "layout":
-            await dependencies._verified_layout(
-                connection,
-                candidate_by_name,
-                CompactAddressRelation(SCHEMA, "entity_address_unified", 41),
-                CONTROL,
-                api_read=invalid,
-            )
-        if entry == "edge":
-            await dependencies._retained_edge(connection, RETAINED, CONTROL, api_read=invalid)
-    assert not connection.calls
 
 
 @pytest.mark.parametrize("damage", [None, "binding", "carrier", "heap", "base_oid", "own_edge"])
-async def test_api_layout_preserves_custom_carrier_and_owned_edge_checks(monkeypatch, damage):
+async def test_layout_preserves_custom_carrier_and_owned_edge_checks(monkeypatch, damage):
     candidate_by_name, retained, expected_by_field = _candidate()
     connection = Connection()
     connection.candidate_by_name = retained
@@ -450,35 +350,8 @@ async def test_api_layout_preserves_custom_carrier_and_owned_edge_checks(monkeyp
     monkeypatch.setattr(custom, "compact_carrier_receipt", lambda candidate_by_name: carriers)
     base = CompactAddressRelation(SCHEMA, "entity_address_unified", 41)
     if damage is None:
-        layout = await dependencies._verified_layout(connection, candidate_by_name, base, CONTROL, api_read=True)
+        layout = await dependencies._verified_layout(connection, candidate_by_name, base, CONTROL)
         assert layout.custom == CompactAddressRelation(candidate_by_name["schema_name"], "entity_address_unified", 54)
     else:
         with pytest.raises(ValueError):
-            await dependencies._verified_layout(connection, candidate_by_name, base, CONTROL, api_read=True)
-
-
-@pytest.mark.parametrize("entry", ["address", "dependencies", "layout", "edge"])
-async def test_api_metadata_cannot_use_a_transaction_marker_without_native_transaction(entry):
-    candidate_by_name, _, _ = _candidate()
-    connection = Connection()
-    connection.active = False
-    with pytest.raises(ValueError, match="transaction_required"):
-        if entry == "address":
-            await artifact.verify_network_address_artifact(
-                connection, _descriptor(), runtime_roles=ROLES, api_read=True
-            )
-        if entry == "dependencies":
-            await dependencies.verify_compact_dependencies(
-                connection, candidate_by_name, control_schema=CONTROL, api_read=True
-            )
-        if entry == "layout":
-            await dependencies._verified_layout(
-                connection,
-                candidate_by_name,
-                CompactAddressRelation(SCHEMA, "entity_address_unified", 41),
-                CONTROL,
-                api_read=True,
-            )
-        if entry == "edge":
-            await dependencies._retained_edge(connection, RETAINED, CONTROL, api_read=True)
-    assert not connection.calls
+            await dependencies._verified_layout(connection, candidate_by_name, base, CONTROL)

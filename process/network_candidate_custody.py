@@ -664,9 +664,8 @@ async def _candidate_index_digest(connection, candidate):
     return await _index_digest(connection, candidate["schema_name"], _serving_plan(candidate["schema_name"]))
 
 
-async def _verify(connection, copy_target, schema, control, candidate, seal, *, operator=False, api_read=False):
-    """Verify sealed metadata; API metadata checks defer physical pins to actual data reads."""
-    _require(type(api_read) is bool and not (api_read and operator))
+async def _verify(connection, copy_target, schema, control, candidate, seal, *, operator=False):
+    """Verify sealed metadata and hold shared locks on the candidate's objects."""
     _require(candidate["state"] in ("ready", "published") and seal is not None)
     receipt = _sealed_receipt(seal)
     from process.network_compact_readiness import is_compact_candidate
@@ -697,46 +696,13 @@ async def _verify(connection, copy_target, schema, control, candidate, seal, *, 
     _require(set(closure["reader_roles"]) <= set(runtime_roles))
     roles = _final_roles(control["rolname"], tuple(closure["reader_roles"]))
     _require(closure["owner_role"] == control["rolname"] and closure["loader_roles"] == [])
-    if api_read:
-        catalog = await _catalog(connection, copy_target, candidate)
-        await _heap_guards(connection, catalog)
-    else:
-        catalog = await _lock_objects(connection, copy_target, candidate, exclusive=False, assume_owner=operator)
+    catalog = await _lock_objects(connection, copy_target, candidate, exclusive=False, assume_owner=operator)
     _require(_receipt(copy_target, roles, catalog) == closure)
     await _check_closed(connection, roles, catalog)
     await _census_closed(connection, control, catalog, runtime_roles)
     await _address_runtime_closure(connection, candidate, runtime_roles)
     _require(await _candidate_index_digest(connection, candidate) == receipt["index_definition_sha256"])
     return {"seal_sha256": seal["seal_sha256"], "receipt": receipt}
-
-
-async def verify_network_candidate_read_metadata(connection, copy_target, *, control_schema, required=True):
-    """Authenticate API metadata without acquiring locks on candidate data tables.
-
-    This does not authorize exposing data. Every consuming query must verify its
-    actual physical identities on this same backend/transaction before rows reach
-    application code or a cache. Producers and custodians use the locking verifier.
-    """
-    _require(connection.is_in_transaction() and type(copy_target) is MembershipCopyTarget and type(required) is bool)
-    _identifier(control_schema)
-    modes = await connection.fetchrow(
-        "SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only')"
-    )
-    _require(tuple(modes) in (("repeatable read", "on"), ("serializable", "on")))
-    if not required:
-        exists = await connection.fetchval(
-            "SELECT to_regclass($1)::oid", f"{_identifier(control_schema)}.network_candidate_custody"
-        )
-        if exists is None:
-            return None
-    seal = await _seal(connection, copy_target, control_schema)
-    if seal is None and not required:
-        return None
-    control = await _control(connection, control_schema)
-    candidate = await _candidate(connection, copy_target, control_schema)
-    result = await _verify(connection, copy_target, control_schema, control, candidate, seal, api_read=True)
-    _require(await _control(connection, control_schema) == control)
-    return result
 
 
 async def verify_network_candidate_custody(connection, copy_target, *, control_schema, required=True):

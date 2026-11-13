@@ -129,13 +129,6 @@ async def _require_api_read_context(connection, api_read):
         _require(tuple(modes) in (("repeatable read", "on"), ("serializable", "on")), "read_snapshot_required")
 
 
-async def _read_table(connection, schema_name, oid):
-    physical = await _physical(connection, oid)
-    _require(physical is not None and physical["schema_name"] == schema_name, "table_absent")
-    _require(physical["relname"] in {_TABLE, f"{_TABLE}_retained_{oid:x}"}, "table_name_invalid")
-    return physical
-
-
 async def _owner(connection):
     role = await connection.fetchrow(
         "SELECT r.oid::bigint,r.rolcanlogin,r.rolsuper,r.rolcreatedb,r.rolcreaterole,r.rolreplication,r.rolbypassrls "
@@ -403,33 +396,26 @@ async def _captured_descriptor(connection, session, physical, authority_oid, ori
     return _descriptor(descriptor_by_field)
 
 
-async def verify_network_address_artifact(connection, descriptor, *, runtime_roles, api_read=False):
+async def verify_network_address_artifact(connection, descriptor, *, runtime_roles):
     """Verify only a descriptor extracted from an independently sealed candidate.
 
     The caller must authenticate candidate custody before calling this function.
     A descriptor's self-digest checks formatting; external JSON grants no authority.
     Current singleton/alias generations may advance after that independent seal.
-    API mode checks metadata only; consuming queries must independently verify their physical identities.
     """
     from process import network_bootstrap_address_artifact as bootstrap
     from process import network_indexed_address_artifact as indexed
 
-    await _require_api_read_context(connection, api_read)
     descriptor = _descriptor(descriptor)
     if descriptor["contract"] == bootstrap.CONTRACT:
-        return await bootstrap.verify_bootstrap_address_artifact(
-            connection, descriptor, runtime_roles=runtime_roles, api_read=api_read
-        )
+        return await bootstrap.verify_bootstrap_address_artifact(connection, descriptor, runtime_roles=runtime_roles)
     if descriptor["contract"] == indexed.CONTRACT:
-        return await indexed.verify_indexed_address_artifact(
-            connection, descriptor, runtime_roles=runtime_roles, api_read=api_read
-        )
+        return await indexed.verify_indexed_address_artifact(connection, descriptor, runtime_roles=runtime_roles)
     runtime_roles = _roles(runtime_roles)
     _require(connection.is_in_transaction(), "transaction_required")
     _require(descriptor["runtime_roles"] == list(runtime_roles), "roles_changed")
     _require(descriptor["database"] == await _database(connection), "database_changed")
-    resolve_table = _read_table if api_read else _locked_table
-    physical = await resolve_table(connection, descriptor["namespace"]["name"], descriptor["table"]["oid"])
+    physical = await _locked_table(connection, descriptor["namespace"]["name"], descriptor["table"]["oid"])
     _require(
         physical["schema_oid"] == descriptor["namespace"]["oid"]
         and physical["schema_owner_oid"] == descriptor["namespace"]["owner_oid"]
@@ -437,8 +423,7 @@ async def verify_network_address_artifact(connection, descriptor, *, runtime_rol
         "physical_identity_changed",
     )
     authority_name = f'{_identifier(physical["schema_name"])}."{_AUTHORITY}"'
-    if not api_read:
-        await connection.execute(f"LOCK TABLE ONLY {authority_name} IN ACCESS SHARE MODE NOWAIT")
+    await connection.execute(f"LOCK TABLE ONLY {authority_name} IN ACCESS SHARE MODE NOWAIT")
     session = _CatalogSession(connection)
     owner_oid = await _custody(connection, session, physical, descriptor["authority_table_oid"], runtime_roles)
     _require(owner_oid == descriptor["protected_owner_oid"], "protected_owner_changed")

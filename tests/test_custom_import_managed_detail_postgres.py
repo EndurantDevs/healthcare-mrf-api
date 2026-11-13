@@ -419,9 +419,9 @@ async def signed_collection_transport(signed_collection_coordinates, managed_imp
     """Observe genuine import calls and preserve the route's original request session."""
     from sqlalchemy import MetaData
 
+    from api import network_serving_api_read as serving_read
     from api.network_address_scope import current_network_address_scope
     from db.models import NUCCTaxonomy
-    from process import registry_network_catalog_read as catalog
     from process.custom_import.read_core import CustomImportReadService
 
     fixture = managed_import_transport
@@ -430,17 +430,12 @@ async def signed_collection_transport(signed_collection_coordinates, managed_imp
     async with context.fixture.engine.begin() as connection:
         await connection.run_sync(model_table.create)
         await connection.execute(text(f'GRANT SELECT ON mrf.nucc_taxonomy TO "{context.role}"'))
-    observed = SimpleNamespace(fixture=fixture, pins=[], custody=[], import_reads=[], requests=[])
-    original_pin, original_custody = catalog._pin, catalog.resolve_network_serving_manifest
+    observed = SimpleNamespace(fixture=fixture, pins=[], import_reads=[], requests=[])
+    original_pin = serving_read.read_published_api_pin
 
     async def observe_pin(*args, **kwargs):
         observed.pins.append(args)
         return await original_pin(*args, **kwargs)
-
-    async def observe_custody(*args, **kwargs):
-        manifest = await original_custody(*args, **kwargs)
-        observed.custody.append((args, kwargs, manifest))
-        return manifest
 
     def observe_import_method(name):
         original = getattr(CustomImportReadService, name)
@@ -454,9 +449,7 @@ async def signed_collection_transport(signed_collection_coordinates, managed_imp
 
         monkeypatch.setattr(CustomImportReadService, name, observe)
 
-    monkeypatch.setattr(catalog, "_pin", observe_pin)
-    monkeypatch.setattr(catalog, "catalog_pin", observe_pin)
-    monkeypatch.setattr(catalog, "resolve_network_serving_manifest", observe_custody)
+    monkeypatch.setattr(serving_read, "read_published_api_pin", observe_pin)
     for name in ("prepare_npi_entity_relation", "scope_npi_entity_relation", "hydrate_npi_page"):
         observe_import_method(name)
 
@@ -527,7 +520,6 @@ async def _signed_collection_post(case, kind, document, *, invalid_signature=Fal
     context.statements.clear()
     context.transactions.clear()
     case.pins.clear()
-    case.custody.clear()
     case.import_reads.clear()
     _, reply = await context.app.asgi_client.post(path, data=body, headers=headers)
     assert reply.headers["Cache-Control"] == "private, no-store"
@@ -536,18 +528,12 @@ async def _signed_collection_post(case, kind, document, *, invalid_signature=Fal
     return reply
 
 
-def _assert_collection_custody(case):
-    """Require the original single native resolution and its exact authenticated manifest."""
+def _assert_collection_pin(case):
+    """Require the single published pin on the request's own Reader connection."""
     context = case.fixture.context
-    assert len(case.pins) == len(case.custody) == 1
-    arguments, options_by_name, manifest = case.custody[0]
-    assert len(arguments) == 1 and arguments[0] is case.pins[0][0]
+    assert len(case.pins) == 1
     assert case.pins[0][1:] == (context.manifest.generation_id, context.fixture.control_schema)
-    assert options_by_name == {"generation_id": case.pins[0][1], "control_schema": case.pins[0][2], "api_read": True}
-    assert arguments[0].get_server_pid() == context.statements[0][1][4]
-    assert manifest == context.manifest
-    seal = getattr(manifest, "_custody_seal_sha256", None)
-    assert type(seal) is str and re.fullmatch(r"[0-9a-f]{64}", seal)
+    assert case.pins[0][0].get_server_pid() == context.statements[0][1][4]
 
 
 def _signed_collection_success(case, reply, document, *, include_filter, has_rows=True):
@@ -565,7 +551,7 @@ def _signed_collection_success(case, reply, document, *, include_filter, has_row
     assert reply.headers["X-Network-Generation"] == str(context.manifest.generation_id)
     assert reply.headers["X-Network-Access-Scope"] == document["managed_collection"]["access_scope_sha256"]
     _assert_collection_reader(context)
-    _assert_collection_custody(case)
+    _assert_collection_pin(case)
     names = [name for name, _ in case.import_reads]
     assert "prepare_npi_entity_relation" in names and "scope_npi_entity_relation" in names
     assert len({session for _, session in case.import_reads}) == 1
@@ -590,7 +576,7 @@ async def test_signed_collection_http_same_reader_policy_and_imports(signed_coll
         case, kind, _signed_collection_document(case, kind, "default", True), invalid_signature=True
     )
     assert invalid.status == 404 and "managed_collection" not in invalid.json
-    assert not case.fixture.context.statements and not case.pins and not case.custody and not case.import_reads
+    assert not case.fixture.context.statements and not case.pins and not case.import_reads
     for policy in ("default", "selected", "excluded"):
         for include_filter in (True, False):
             document = _signed_collection_document(case, kind, policy, include_filter)
@@ -685,7 +671,7 @@ def _observe_service_failures(case, monkeypatch):
 async def service_claims_transport(signed_collection_transport, monkeypatch):
     """Observe original native service, real pins and their actual Reader connection."""
     from api import custom_import_provider_service_http as service_http
-    from process import registry_network_catalog_read as catalog
+    from api import network_serving_api_read as serving_read
 
     case = signed_collection_transport
     context = case.fixture.context
@@ -698,7 +684,7 @@ async def service_claims_transport(signed_collection_transport, monkeypatch):
         context.manifest.approved_custom_revision,
     )
     case.networks = [entry["identity"] for entry in networks]
-    original_pin, original_page = catalog._pin, service_http._service_page
+    original_pin, original_page = serving_read.read_published_api_pin, service_http._service_page
 
     async def pin(*args, **kwargs):
         driver = args[0]
@@ -727,8 +713,7 @@ async def service_claims_transport(signed_collection_transport, monkeypatch):
             assert len(case.claim_sql) < 100
             case.claim_sql.append(statement)
 
-    monkeypatch.setattr(catalog, "_pin", pin)
-    monkeypatch.setattr(catalog, "catalog_pin", pin)
+    monkeypatch.setattr(serving_read, "read_published_api_pin", pin)
     monkeypatch.setattr(service_http, "_service_page", page)
     context.writer_statements.clear()
     yield case
@@ -782,7 +767,6 @@ async def _service_http_post(case, document, *, signed, invalid=False, headers=N
         context.statements,
         context.transactions,
         case.pins,
-        case.custody,
         case.import_reads,
         case.driver_proofs,
         case.native_reads,
@@ -801,7 +785,7 @@ def _service_http_success(case, reply, document, *, signed, include_filter=False
     assert reply.status == 200, json.dumps({"response": reply.json, "failures": case.failures})
     _assert_collection_reader(context)
     assert len(case.driver_proofs) == len(case.native_reads) == 1
-    _assert_collection_custody(case)
+    _assert_collection_pin(case)
     proof = case.driver_proofs[0]
     assert proof[:4] == (context.role, context.role, "on", "repeatable read")
     assert proof[4] == context.statements[0][1][4] and proof[5] == context.transactions[0]
@@ -883,7 +867,7 @@ async def _assert_service_optional_metric_refusal(case):
     assert refused.status == 400
     assert case.failures == [("CustomImportReadRequestError", "metric predicates require imported membership")]
     _assert_collection_reader(case.fixture.context)
-    _assert_collection_custody(case)
+    _assert_collection_pin(case)
     assert not case.native_reads
 
 

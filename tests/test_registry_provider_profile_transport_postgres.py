@@ -496,21 +496,15 @@ async def _source_reviewed_payer(held):
         )
 
 
-def _observe_catalog_pin(monkeypatch, catalog, observer):
-    """Observe each catalog entry while retaining its genuine verification."""
-    monkeypatch.setattr(catalog, "_pin", observer)
-    monkeypatch.setattr(catalog, "catalog_pin", observer)
-
-
 @pytest.fixture
 async def source_transport(source_preparation, profile_transport, published_profile_source, monkeypatch):
-    """Observe delegated real pins and bind the actual request's prior session."""
+    """Observe each request's published pin and bind the actual request's prior session."""
     import base64
     from contextlib import contextmanager
 
+    from api import network_serving_api_read as serving_read
     from api import provider_directory_managed_read as managed
     from api.provider_directory_entities_contract import CURSOR_KEY_ENV
-    from process import registry_network_catalog_read as catalog
 
     held = profile_transport
     held.source_pin = published_profile_source[2].recipe.source_pin
@@ -518,13 +512,12 @@ async def source_transport(source_preparation, profile_transport, published_prof
     held.writer_statements.clear()
     held.calls, held.requests, held.source_sql, held.driver_proofs = [], [], [], []
     held.prior = object()
-    original_pin, original_custody = catalog._pin, catalog.resolve_network_serving_manifest
+    original_pin = serving_read.read_published_api_pin
     original_reader = managed._request_reader
 
     async def pin(*args, **kwargs):
         held.calls.append("pin")
         driver = args[0]
-        held.active_driver = driver
         proof = await driver.fetchrow(
             "SELECT session_user,current_user,current_setting('transaction_read_only'),"
             "current_setting('transaction_isolation'),pg_backend_pid(),"
@@ -534,11 +527,6 @@ async def source_transport(source_preparation, profile_transport, published_prof
         )
         held.driver_proofs.append(tuple(proof))
         return await original_pin(*args, **kwargs)
-
-    async def custody(*args, **kwargs):
-        held.calls.append("custody")
-        assert args[0] is held.active_driver
-        return await original_custody(*args, **kwargs)
 
     @contextmanager
     def request_reader(request, session):
@@ -558,8 +546,7 @@ async def source_transport(source_preparation, profile_transport, published_prof
         if len(held.source_sql) < 5000:
             held.source_sql.append(statement)
 
-    _observe_catalog_pin(monkeypatch, catalog, pin)
-    monkeypatch.setattr(catalog, "resolve_network_serving_manifest", custody)
+    monkeypatch.setattr(serving_read, "read_published_api_pin", pin)
     monkeypatch.setattr(managed, "_request_reader", request_reader)
     monkeypatch.setenv(CURSOR_KEY_ENV, base64.urlsafe_b64encode(_SOURCE_KEY).decode().rstrip("="))
     yield held
@@ -581,7 +568,7 @@ async def _source_post(held, document, *, status=200, headers=None):
     if status == 403:
         assert not observed and not held.calls[calls:]
     else:
-        assert held.calls[calls:] == ["pin", "custody"]
+        assert held.calls[calls:] == ["pin"]
         identities = [identity for _statement, identity in observed]
         assert identities and len({identity[4] for identity in identities}) == 1
         assert all(identity[:4] == (held.role, held.role, "on", "repeatable read") for identity in identities)
@@ -891,24 +878,19 @@ async def test_native_reader_prepares_plan_temporary_tables_before_verified_snap
     import asyncio
 
     from api import custom_import_plan_sql as plan
-    from process import registry_network_catalog_read as catalog
+    from api import network_serving_api_read as serving_read
 
     held = profile_transport
     database = Database()
     database._database_override = held.fixture.engine.url.database
     calls = []
-    original_pin, original_custody = catalog._pin, catalog.resolve_network_serving_manifest
+    original_pin = serving_read.read_published_api_pin
 
     async def pin(*args, **options):
         calls.append("pin")
         return await original_pin(*args, **options)
 
-    async def custody(*args, **options):
-        calls.append("custody")
-        return await original_custody(*args, **options)
-
-    _observe_catalog_pin(monkeypatch, catalog, pin)
-    monkeypatch.setattr(catalog, "resolve_network_serving_manifest", custody)
+    monkeypatch.setattr(serving_read, "read_published_api_pin", pin)
     names = [plan.IMPORTED, plan.CANDIDATES, plan.MEMBERSHIPS, plan.OCCURRENCES, plan.PRICES, plan.SELECTED]
     held.writer_statements.clear()
     try:
@@ -931,7 +913,7 @@ async def test_native_reader_prepares_plan_temporary_tables_before_verified_snap
                     )
                     == 0
                 )
-        assert calls == ["pin", "custody"] * 3
+        assert calls == ["pin"] * 3
         assert database.engine is None and not held.writer_statements
     finally:
         await database.disconnect()

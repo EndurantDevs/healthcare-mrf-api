@@ -474,7 +474,7 @@ async def test_worker_selected_indexed_base_requires_exact_retained_generation(i
     assert current == fixture.previous and rows == fixture.previous_rows
 
 
-async def test_indexed_dependency_verifies_read_snapshot_native_identity_and_role_closure(indexed_db):
+async def test_indexed_dependency_verifies_native_identity_and_role_closure(indexed_db):
     from process.registry_publication_execution import _source_rollback_address_sources
 
     fixture = indexed_db
@@ -490,12 +490,12 @@ async def test_indexed_dependency_verifies_read_snapshot_native_identity_and_rol
     descriptor = await _address_descriptor(fixture, candidate)
     async with fixture.execution_connection.transaction(isolation="repeatable_read", readonly=True):
         relation = await verify_network_address_artifact(
-            fixture.execution_connection, descriptor, runtime_roles=tuple(descriptor["runtime_roles"]), api_read=True
+            fixture.execution_connection, descriptor, runtime_roles=tuple(descriptor["runtime_roles"])
         )
         assert relation.table_oid == descriptor["table"]["oid"]
-    with pytest.raises(NetworkAddressArtifactError, match="transaction_required"):
+    with pytest.raises(ValueError, match="repeatable-read transaction"):
         await verify_network_address_artifact(
-            fixture.execution_connection, descriptor, runtime_roles=tuple(descriptor["runtime_roles"]), api_read=True
+            fixture.execution_connection, descriptor, runtime_roles=tuple(descriptor["runtime_roles"])
         )
     await fixture.connection.execute(
         f'GRANT UPDATE ON "{fixture.legacy.schema_name}".entity_address_unified TO "{fixture.roles["reader"]}"'
@@ -507,7 +507,6 @@ async def test_indexed_dependency_verifies_read_snapshot_native_identity_and_rol
                     fixture.execution_connection,
                     descriptor,
                     runtime_roles=tuple(descriptor["runtime_roles"]),
-                    api_read=True,
                 )
     finally:
         await fixture.connection.execute(
@@ -515,7 +514,7 @@ async def test_indexed_dependency_verifies_read_snapshot_native_identity_and_rol
         )
     async with fixture.execution_connection.transaction(isolation="repeatable_read", readonly=True):
         relation = await verify_network_address_artifact(
-            fixture.execution_connection, descriptor, runtime_roles=tuple(descriptor["runtime_roles"]), api_read=True
+            fixture.execution_connection, descriptor, runtime_roles=tuple(descriptor["runtime_roles"])
         )
         assert relation.table_oid == descriptor["table"]["oid"]
 
@@ -551,7 +550,7 @@ async def test_indexed_reader_digest_is_independent_of_public_schema_visibility(
         )
         assert await connection.fetchval("SELECT has_schema_privilege(current_user,'public','USAGE')") is public_usage
         async with connection.transaction(isolation="repeatable_read", readonly=True):
-            physical = await indexed.artifact._read_table(connection, fixture.schema, oid)
+            physical = await indexed.artifact._physical(connection, oid)
             catalog = await _catalog_evidence(indexed.artifact._CatalogSession(connection), handoff_by_field)
             canonical = await _index_digest(connection, fixture.schema, plan, qualified_definitions=True)
             legacy = await _index_digest(connection, fixture.schema, plan)
@@ -571,7 +570,7 @@ async def test_indexed_reader_digest_is_independent_of_public_schema_visibility(
         f'ALTER INDEX "{fixture.schema}".entity_address_unified_idx_geo_idx SET (fillfactor=80)'
     )
     async with fixture.reader.transaction(isolation="repeatable_read", readonly=True):
-        assert await indexed.artifact._read_table(fixture.reader, fixture.schema, oid) == reader[0]
+        assert await indexed.artifact._physical(fixture.reader, oid) == reader[0]
         assert await _catalog_evidence(indexed.artifact._CatalogSession(fixture.reader), handoff_by_field) == reader[1]
         assert await _index_digest(fixture.reader, fixture.schema, plan, qualified_definitions=True) != reader[2]
         assert await _index_digest(fixture.reader, fixture.schema, plan) != reader[3]
@@ -604,7 +603,6 @@ async def test_changed_index_cannot_satisfy_sealed_native_identity(indexed_db, d
                 fixture.execution_connection,
                 descriptor,
                 runtime_roles=tuple(descriptor["runtime_roles"]),
-                api_read=True,
             )
 
 

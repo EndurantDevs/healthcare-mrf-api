@@ -81,17 +81,17 @@ resumes it. A refused request is marked rejected and is not resumed. The
 entry's class, constant code, SQLSTATE and location before deciding whether to
 resume the request or fix the cause first.
 
-API reads of a generation published with an indexed address artifact resolve its
-published routing metadata and locate its tables, its source inventory and its
-anchored source artifacts by schema-qualified name, so a copy of that published
-snapshot in another database serves those reads with its recorded metadata
-unchanged. Other reads can still require the original custody proof: generations
-published under an older address contract verify the recorded physical
-identities, and CMS network-scoped entity reads verify their retained source
-capture against the publishing database and can return 503 on a copy. After an
-address table rotation an indexed generation keeps reading its own table under
-the retained name `<table>_retained_<oid hex>`; the recorded name then belongs
-to the replacement. Callers outside API reads keep the strict check.
+API reads of every published generation resolve its published routing metadata
+and locate its tables, its source inventory and its anchored source artifacts by
+schema-qualified name, so a copy of a published snapshot in another database
+serves those reads with its recorded metadata unchanged. This holds for every
+address contract and for generations published before the compact layout. One
+read can still require the original custody proof: CMS network-scoped entity
+reads verify their retained source capture against the publishing database and
+can return 503 on a copy. After an address table rotation a generation keeps
+reading its own table under the retained name `<table>_retained_<oid hex>`; the
+recorded name then belongs to the replacement. Callers outside API reads keep
+the strict check.
 
 Directory inventory alone does not establish pricing availability or nationwide
 network coverage.

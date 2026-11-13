@@ -132,17 +132,14 @@ def test_projection_refuses_internal_archive_columns():
 @pytest.fixture
 def provider_boundary(batch_boundary, monkeypatch):
     connection, manifest, pinned_revisions = batch_boundary
-    native_fetchval = connection.fetchval
     connection.provider_exists = AsyncMock(return_value=True)
 
     async def fetchval(sql, *arguments):
-        if sql == "SELECT current_setting('search_path')":
-            return await native_fetchval(sql, *arguments)
         identity = provider_reader.NPIData.__table__
         assert sql == f'SELECT EXISTS(SELECT 1 FROM "{identity.schema}"."{identity.name}" WHERE npi=$1)'
         return await connection.provider_exists(sql, *arguments)
 
-    monkeypatch.setattr(connection, "fetchval", fetchval)
+    monkeypatch.setattr(connection, "fetchval", fetchval, raising=False)
     monkeypatch.setattr(provider_reader, "resolve_retained_registry_source_recipes", AsyncMock(return_value=()))
     monkeypatch.setattr(
         provider_reader, "pin_retained_approved_membership_source", AsyncMock(return_value=SimpleNamespace())
@@ -169,8 +166,7 @@ async def test_supplied_manifest_uses_exact_generation_and_retained_source_check
         manifest=manifest,
     )
     assert resolver.await_args_list == [
-        call(connection, generation_id=9, control_schema="sample_control"),
-        call(connection, generation_id=9, control_schema="sample_control"),
+        call(connection, generation_id=9, control_schema="sample_control", api_read=True),
     ]
     assert response == {
         "generation": "9",
@@ -181,24 +177,14 @@ async def test_supplied_manifest_uses_exact_generation_and_retained_source_check
     }
     assert pinned_revisions == [4]
     provider_reader.resolve_retained_registry_source_recipes.assert_awaited_once_with(
-        connection, manifest, control_schema="sample_control"
+        connection, manifest, control_schema="sample_control", api_read=True
     )
     provider_reader.pin_retained_approved_membership_source.assert_awaited_once_with(
         connection, approved_revision=4, control_schema="sample_control"
     )
     provider_reader._retained_memberships.assert_awaited_once_with(connection, manifest, "sample_control")
-    assert len(connection.calls) == 6
-    assert "transaction_isolation" in connection.calls[0][0]
-    assert connection.calls[1][0] == (
-        'LOCK TABLE "candidate_sample".network_membership,"candidate_sample".provider_location_binding,'
-        '"candidate_sample".entity_address_unified IN ACCESS SHARE MODE'
-    )
-    assert "validation_json::text" in connection.calls[2][0]
-    assert connection.calls[3:] == [
-        ("SELECT current_setting('search_path')", ()),
-        ("SET LOCAL search_path TO pg_catalog,public", ()),
-        ("SELECT set_config('search_path',$1,true)", ("sample_path",)),
-    ]
+    # The pin checks only the transaction mode: no lock, no validation report, no index digest.
+    assert len(connection.calls) == 1 and "transaction_isolation" in connection.calls[0][0]
     connection.provider_exists.assert_awaited_once()
 
 
@@ -211,8 +197,7 @@ async def test_unsupplied_manifest_preserves_current_head_selection(provider_bou
         connection, RegistryProviderPlansQuery("1000000491"), excluded_network_ids=(), control_schema="sample_control"
     )
     assert resolver.await_args_list == [
-        call(connection, generation_id=None, control_schema="sample_control"),
-        call(connection, generation_id=9, control_schema="sample_control"),
+        call(connection, generation_id=None, control_schema="sample_control", api_read=True),
     ]
 
 
@@ -297,24 +282,10 @@ async def test_supplied_manifest_does_not_bypass_transaction_checks(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("corruption", ["native_indexes", "index_digest", "readiness_receipt", "source"])
-async def test_supplied_manifest_does_not_bypass_live_readiness_checks(provider_boundary, corruption):
+async def test_supplied_manifest_does_not_bypass_the_approved_source_check(provider_boundary):
     connection, manifest, _ = provider_boundary
-    if corruption == "native_indexes":
-        connection.native_ready = False
-    elif corruption == "index_digest":
-        connection.index_digest = "e" * 64
-    elif corruption == "readiness_receipt":
-        connection.report.pop("serving_readiness")
-    else:
-        manifest.source_generations["custom_membership"] = "c" * 64
-    expected_code = {
-        "native_indexes": "source_unavailable",
-        "index_digest": "directory_unavailable",
-        "readiness_receipt": "directory_unavailable",
-        "source": "source_changed",
-    }[corruption]
-    with pytest.raises(RegistryNetworkCatalogError, match=expected_code):
+    manifest.source_generations["custom_membership"] = "c" * 64
+    with pytest.raises(RegistryNetworkCatalogError, match="source_changed"):
         await provider_reader.read_registry_provider_plans(
             connection,
             RegistryProviderPlansQuery("1000000491"),

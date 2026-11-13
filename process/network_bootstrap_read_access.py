@@ -257,17 +257,14 @@ async def _reader(connection, receipt, reader):
     return row["oid"], _digest(component)
 
 
-async def _base_catalog(connection, receipt, *, api_read=False):
-    from process.network_address_artifact import _require_api_read_context
+async def _base_catalog(connection, receipt):
     from process.network_bootstrap_sources import _catalog, _decode, _schema_name
 
-    await _require_api_read_context(connection, api_read)
     schema_name = _schema_name(receipt.specification)
     stored = await connection.fetchval("SELECT obj_description($1::oid,'pg_namespace')", receipt.schema_oid)
     _require(_decode(stored) == receipt)
     tables = ",".join(f"{_identifier(schema_name)}.{_identifier(name)}" for name, _ in receipt.relation_oids)
-    if not api_read:
-        await connection.execute(f"LOCK TABLE {tables} IN ACCESS SHARE MODE NOWAIT")
+    await connection.execute(f"LOCK TABLE {tables} IN ACCESS SHARE MODE NOWAIT")
     catalog = await _catalog(connection, schema_name)
     _require(catalog["namespace"] == {"oid": receipt.schema_oid, "nspowner": receipt.owner_oid})
     _require(tuple(sorted(catalog["heaps"].items())) == receipt.relation_oids)
@@ -279,10 +276,10 @@ async def _base_catalog(connection, receipt, *, api_read=False):
     return schema_name
 
 
-async def _native(connection, receipt, reader_oid, *, api_read=False):
+async def _native(connection, receipt, reader_oid):
     from process.network_registry_cms_prepared_address import _require_prepared_copy_key
 
-    schema_name = await _base_catalog(connection, receipt, api_read=api_read)
+    schema_name = await _base_catalog(connection, receipt)
     for name, oid in receipt.relation_oids:
         await _require_prepared_copy_key(
             connection,
@@ -330,27 +327,27 @@ def _extended_acl(receipt, before, reader_oid):
     return sorted(before + additions)
 
 
-async def bootstrap_read_roles(connection, receipt, *, api_read=False):
+async def bootstrap_read_roles(connection, receipt):
     """Accept only the original ACLs or the single native-bound read successor."""
     from process.network_custom_address_source import NetworkCustomAddressSourceError, _closed
 
-    await _base_catalog(connection, receipt, api_read=api_read)
+    await _base_catalog(connection, receipt)
     try:
         await _closed(connection, receipt.schema_oid, receipt.owner_oid, receipt.runtime_roles, None)
     except NetworkCustomAddressSourceError:
         proof = await _proof(connection, receipt)
         _require(proof is not None)
-        return await _successor_roles(connection, receipt, proof, api_read=api_read)
+        return await _successor_roles(connection, receipt, proof)
     # Restored original authority never depends on a retired successor actor.
     return receipt.runtime_roles
 
 
-async def _successor_roles(connection, receipt, proof, *, allow_original=False, api_read=False):
+async def _successor_roles(connection, receipt, proof, *, allow_original=False):
     from process.network_custom_address_source import _closed
 
     reader_oid, roles_sha256 = await _reader(connection, receipt, proof["reader"])
     _require((reader_oid, roles_sha256) == (proof["reader_oid"], proof["roles_sha256"]))
-    _require(await _native(connection, receipt, reader_oid, api_read=api_read) == proof["native_sha256"])
+    _require(await _native(connection, receipt, reader_oid) == proof["native_sha256"])
     _require(proof["after"] == _extended_acl(receipt, proof["before"], reader_oid))
     current = await _acl(connection, receipt)
     _require(current == proof["after"] or (allow_original and current == proof["before"]))
@@ -363,7 +360,7 @@ async def _successor_roles(connection, receipt, proof, *, allow_original=False, 
     return roles
 
 
-async def bootstrap_pin_read_roles(connection, pin, required_roles, *, runtime_actors=(), api_read=False):
+async def bootstrap_pin_read_roles(connection, pin, required_roles, *, runtime_actors=()):
     """Preserve authenticated readers and reject unsafe input reach by output actors."""
     from process.network_bootstrap_sources import _decode
     from process.network_custom_address_source import NetworkCustomAddressSourceError
@@ -375,14 +372,12 @@ async def bootstrap_pin_read_roles(connection, pin, required_roles, *, runtime_a
             )
         )
         _require(pin in (receipt.address_source, receipt.npi_source))
-        roles = await bootstrap_read_roles(connection, receipt, api_read=api_read)
+        roles = await bootstrap_read_roles(connection, receipt)
         _require(set(required_roles) <= set(roles))
         actors = sorted(set(runtime_actors))
-        if actors or api_read:
+        if actors:
             caller = await connection.fetchval("SELECT current_user::text")
             caller_oid = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", caller)
-            if api_read:
-                actors = sorted(set((*actors, caller)))
             native = await _native_catalog(connection, receipt, tuple(actors))
             await _dormant_sequence(connection, receipt, json.loads(native["document"]), caller_oid, roles=())
         for actor in actors:
