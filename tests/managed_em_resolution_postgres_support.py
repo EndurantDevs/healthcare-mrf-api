@@ -132,7 +132,7 @@ async def test_published_provider_resolver(custom_db, monkeypatch):
                 driver, generation_id=manifest.generation_id, control_schema=fixture.control_schema, api_read=True
             )
             assert api_manifest == manifest
-            assert api_manifest.custody_control is None and api_manifest.compact_layout is None
+            assert not api_manifest.custody_control and api_manifest.compact_layout is None
             assert (
                 await resolve_em_provider_inputs(driver, api_manifest, fixture.control_schema, api_read=True) == inputs
             )

@@ -178,26 +178,18 @@ async def test_indexed_bootstrap_refuses_untrusted_native_execution(bootstrap_db
         await transaction.rollback()
 
 
-@pytest.mark.parametrize("api_read", [False, True])
-async def test_bootstrap_control_caller_is_not_an_implicit_runtime_actor(bootstrap_db, api_read):
+async def test_bootstrap_control_caller_is_not_an_implicit_runtime_actor(bootstrap_db):
     fixture = bootstrap_db
     receipt = await _bootstrap_prepare(fixture, await _bootstrap_specification(fixture))
     connection = fixture.connection
     assert await connection.fetchval("SELECT rolsuper FROM pg_roles WHERE rolname=current_user")
-    async with connection.transaction(isolation="repeatable_read", readonly=api_read):
-        arguments_by_name = dict(runtime_actors=(fixture.roles["reader"],), api_read=api_read)
-        if api_read:
-            # An API reader must not own the executable native index dependencies.
-            with pytest.raises(NetworkCustomAddressSourceError, match="bootstrap read access differs") as refused:
-                await access.bootstrap_pin_read_roles(connection, receipt.address_source, (), **arguments_by_name)
-            assert isinstance(refused.value.__cause__, access.BootstrapReadAccessError)
-            assert isinstance(refused.value.__cause__.__cause__, RuntimeError)
-            assert str(refused.value.__cause__.__cause__) == "canonical source executable ownership is unsupported"
-        else:
-            assert (
-                await access.bootstrap_pin_read_roles(connection, receipt.address_source, (), **arguments_by_name)
-                == receipt.runtime_roles
+    async with connection.transaction(isolation="repeatable_read"):
+        assert (
+            await access.bootstrap_pin_read_roles(
+                connection, receipt.address_source, (), runtime_actors=(fixture.roles["reader"],)
             )
+            == receipt.runtime_roles
+        )
 
 
 @pytest.mark.parametrize("mutation", ["missing", "native_owner"])

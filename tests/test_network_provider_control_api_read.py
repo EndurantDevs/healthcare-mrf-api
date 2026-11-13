@@ -65,7 +65,6 @@ async def test_current_control_profiles_are_read_by_name(monkeypatch):
     assert [pin.table_oid for pin in pins] == [11, 12, 13]
     assert all(pin.schema_name == CONTROL for pin in pins)
     assert connection.fetch.await_args.args[1] == f'"{CONTROL}"'
-    native.assert_not_awaited()
     connection.execute.assert_not_awaited()
 
 
@@ -95,7 +94,6 @@ async def test_control_selection_is_closed(monkeypatch, names):
     connection, _, native = _control_fixture(monkeypatch)
     with pytest.raises(custody.NetworkCandidateCustodyError):
         await custody.read_network_control_relation_pins(connection, names, control_schema=CONTROL)
-    native.assert_not_awaited()
 
 
 async def test_read_write_control_context_refuses(monkeypatch):
@@ -105,7 +103,6 @@ async def test_read_write_control_context_refuses(monkeypatch):
         await custody.read_network_control_relation_pins(
             connection, ("registry_approved_record",), control_schema=CONTROL
         )
-    native.assert_not_awaited()
 
 
 async def test_approved_helper_reauthenticates_caller_manifest(monkeypatch):
@@ -188,11 +185,9 @@ async def test_fact_owner_api_preserves_required_authentication(monkeypatch, leg
         CompactAddressRelation(CONTROL, "network_membership_candidate", 11),
         CompactAddressRelation(CONTROL, "network_serving_manifest", 12),
     )
-    native = AsyncMock(side_effect=AssertionError("API read verified a seal"))
     loader = AsyncMock(return_value=(owner.reference, owner.entries))
     locked = AsyncMock(side_effect=AssertionError("API selected locking owner verification"))
     monkeypatch.setattr(custody, "read_network_control_relation_pins", AsyncMock(return_value=pins))
-    monkeypatch.setattr(custody, "verify_network_candidate_read_metadata", native)
     monkeypatch.setattr(artifacts, "verify_network_candidate_custody", locked)
     monkeypatch.setattr(inventory, "load_source_inventory_for_api", loader)
     guard = AsyncMock()
@@ -202,7 +197,6 @@ async def test_fact_owner_api_preserves_required_authentication(monkeypatch, leg
         connection, selected, control_schema=CONTROL, api_read=True
     )
     assert len(resolved) == 1 and resolved[selected[0]["recipe_sha256"]].reference.fact_table_oid == 42
-    native.assert_not_awaited()
     assert loader.await_count == int(not legacy)
     assert guard.await_args.args[1] == pins
     locked.assert_not_awaited()

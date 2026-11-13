@@ -16,14 +16,9 @@ from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_validation import _json_object
 
 
-async def _retained_edge(connection, candidate_id, control_schema, *, api_read=False):
-    from process.network_address_artifact import _require_api_read_context
-    from process.network_candidate_custody import (
-        verify_network_candidate_custody,
-        verify_network_candidate_read_metadata,
-    )
+async def _retained_edge(connection, candidate_id, control_schema):
+    from process.network_candidate_custody import verify_network_candidate_custody
 
-    await _require_api_read_context(connection, api_read)
     candidate = await connection.fetchrow(
         f"SELECT * FROM {_identifier(control_schema)}.network_membership_candidate WHERE candidate_id=$1",
         UUID(candidate_id),
@@ -32,8 +27,7 @@ async def _retained_edge(connection, candidate_id, control_schema, *, api_read=F
     target = MembershipCopyTarget(
         *(str(candidate[field]) for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name"))
     )
-    verifier = verify_network_candidate_read_metadata if api_read else verify_network_candidate_custody
-    seal = await verifier(connection, target, control_schema=control_schema)
+    seal = await verify_network_candidate_custody(connection, target, control_schema=control_schema)
     _require(seal["receipt"]["revision"] in (4, 5))
     return {
         "candidate_id": target.candidate_id,
@@ -64,20 +58,16 @@ async def capture_compact_edge_artifacts(connection, target, *, control_schema):
     return artifacts
 
 
-async def verify_compact_dependencies(connection, candidate, *, control_schema, api_read=False):
-    """Resolve authenticated dependency metadata; API data consumption needs its separate physical guard."""
-    from process.network_address_artifact import _require_api_read_context, verify_network_address_artifact
+async def verify_compact_dependencies(connection, candidate, *, control_schema):
+    """Resolve authenticated dependency metadata for producers and custodians."""
+    from process.network_address_artifact import verify_network_address_artifact
 
-    await _require_api_read_context(connection, api_read)
     report = _json_object(candidate["validation_json"])
     serving = report["serving_readiness"]
     closure = report["writer_closure"]
     runtime_roles = tuple(sorted(set(closure["loader_roles"] + closure["reader_roles"])))
-    read_options = {"api_read": True} if api_read else {}
-    base = await verify_network_address_artifact(
-        connection, serving["address_artifact"], runtime_roles=runtime_roles, **read_options
-    )
-    return await _verified_layout(connection, candidate, base, control_schema, **read_options)
+    base = await verify_network_address_artifact(connection, serving["address_artifact"], runtime_roles=runtime_roles)
+    return await _verified_layout(connection, candidate, base, control_schema)
 
 
 async def capture_compact_dependencies(connection, candidate, *, control_schema):
@@ -95,12 +85,10 @@ async def capture_compact_dependencies(connection, candidate, *, control_schema)
     return await _verified_layout(connection, candidate, base, control_schema)
 
 
-async def _verified_layout(connection, candidate, base, control_schema, *, api_read=False):
+async def _verified_layout(connection, candidate, base, control_schema):
     """Bind every layout coordinate to verified metadata without authorizing data consumption."""
-    from process.network_address_artifact import _require_api_read_context
     from process.network_compact_custom_preparation import compact_carrier_receipt, compact_custom_receipt
 
-    await _require_api_read_context(connection, api_read)
     report = _json_object(candidate["validation_json"])
     serving, canonical = report["serving_readiness"], report["candidate_readiness"]
     closure = report["writer_closure"]
@@ -122,9 +110,7 @@ async def _verified_layout(connection, candidate, base, control_schema, *, api_r
                 and artifact.table_oid == canonical["edge_heap_oid"]
             )
         else:
-            _require(
-                await _retained_edge(connection, artifact.candidate_id, control_schema, api_read=api_read) == expected
-            )
+            _require(await _retained_edge(connection, artifact.candidate_id, control_schema) == expected)
         artifacts.append(artifact)
     custom = compact_custom_receipt(candidate)
     carriers = compact_carrier_receipt(candidate)

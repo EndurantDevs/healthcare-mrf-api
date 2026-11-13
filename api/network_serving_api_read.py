@@ -8,7 +8,6 @@ from api.network_serving_read_context import _entry_snapshot, _require_reader_ow
 from api.provider_profile_snapshot import provider_read_savepoint
 from db.registry_schema import registry_schema
 from process.network_published_api_pin import read_published_api_pin
-from process.network_read_identity import NetworkReadIdentityError, verify_bound_network_names
 from process.network_serving_read import NetworkServingReadUnavailable
 
 
@@ -37,18 +36,6 @@ async def _same_reader(session, transaction, reader, driver, backend_pid):
         raise _unavailable()
 
 
-async def _legacy_pin(driver, generation_id, schema):
-    """Retain full historical verification; an indexed missing seal never becomes legacy."""
-    from process.network_approved_membership_source import _pin_verified_api_approved_source
-    from process.registry_network_catalog_read import catalog_pin
-
-    manifest = await catalog_pin(driver, generation_id, schema, api_read=True)
-    if manifest.supports_location_lookup:
-        raise _unavailable()
-    approved, relation = await _pin_verified_api_approved_source(driver, manifest, control_schema=schema)
-    return manifest, approved, relation
-
-
 @asynccontextmanager
 async def api_catalog_read_snapshot(session, generation_id=None, control_schema=None):
     """Guard control reads; address consumers retain their separate bound data scope."""
@@ -58,11 +45,8 @@ async def api_catalog_read_snapshot(session, generation_id=None, control_schema=
     transaction, reader = _reader_entry(session)
     driver, backend_pid = await _original_read_driver(session)
     async with provider_read_savepoint(session):
-        resolved = await read_published_api_pin(driver, generation_id, schema)
-    if resolved is None:
-        resolved = await _legacy_pin(driver, generation_id, schema)
+        manifest, approved, relation = await read_published_api_pin(driver, generation_id, schema)
     await _same_reader(session, transaction, reader, driver, backend_pid)
-    manifest, approved, relation = resolved
     object.__setattr__(manifest, "_api_request_session", session)
     object.__setattr__(manifest, "_api_request_transaction", transaction)
     controls = (relation,)
@@ -71,11 +55,6 @@ async def api_catalog_read_snapshot(session, generation_id=None, control_schema=
     try:
         with network_read_name_inventory(driver, controls):
             yield manifest, relation
-            if getattr(manifest, "_published_api_request", False) is not True:
-                try:
-                    await verify_bound_network_names(driver, controls, expected_backend_pid=backend_pid)
-                except NetworkReadIdentityError as error:
-                    raise _unavailable() from error
             await _same_reader(session, transaction, reader, driver, backend_pid)
     finally:
         _PINNED_READ.reset(token)

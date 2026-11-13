@@ -26,7 +26,6 @@ from api.network_provider_read import NetworkOfficeSelection, NetworkProviderRea
 from api.network_read_execution import execute_network_read
 from db.connection import db
 from process.network_address_projection import _identifier
-from process.network_candidate_custody import verify_network_candidate_read_metadata
 from process.network_membership_pipeline import prepare_and_publish_network_candidate, prepare_network_candidate
 from process.network_membership_publication import NetworkPublicationError, publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
@@ -355,9 +354,6 @@ async def _canonical_request(context, manifest, copy_target, monkeypatch):
                 api_read=True,
             )
             assert api_manifest == manifest
-            metadata = await verify_network_candidate_read_metadata(
-                driver, copy_target, control_schema=context.fixture.control_schema
-            )
             candidate_by_field = await _candidate(context, copy_target)
             inventory, entries = await load_source_inventory_for_api(
                 driver, copy_target, candidate_by_field, control_schema=context.fixture.control_schema
@@ -365,7 +361,6 @@ async def _canonical_request(context, manifest, copy_target, monkeypatch):
             assert inventory.root == source_inventory_root(entries) and len(entries) == 1
             await _assert_canonical_locations(session, manifest, network_id)
             await asyncio.sleep(0)
-        assert metadata["seal_sha256"] == manifest._custody_seal_sha256
         assert not any(_requests_lock(query_event.query) for query_event in statements)
         request = SimpleNamespace(
             query_string=f"network_ids={network_id}",

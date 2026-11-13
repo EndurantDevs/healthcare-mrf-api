@@ -3,7 +3,6 @@
 
 import hashlib
 import json
-import os
 import re
 from uuid import UUID
 
@@ -252,25 +251,15 @@ async def _verify_provider_custody(connection, candidate, closure):
     return await verify_candidate_em_provider_inputs(connection, candidate, runtime_roles=runtime_roles)
 
 
-async def _candidate_custody(connection, candidate, control_schema, *, api_read=False, allow_unsealed=False):
+async def _candidate_custody(connection, candidate, control_schema, *, allow_unsealed=False):
     from process.registry_source_inventory_reference import source_inventory_heaps
 
     copy_target = MembershipCopyTarget(
         *(str(candidate[field]) for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name"))
     )
-    if (
-        type(api_read) is not bool
-        or type(allow_unsealed) is not bool
-        or allow_unsealed
-        and (api_read or candidate["state"] != "ready")
-    ):
+    if type(allow_unsealed) is not bool or allow_unsealed and candidate["state"] != "ready":
         raise NetworkPublicationError("Candidate read verification mode is invalid")
-    verifier = verify_network_candidate_custody
-    if api_read:
-        from process.network_candidate_custody import verify_network_candidate_read_metadata
-
-        verifier = verify_network_candidate_read_metadata
-    custody = await verifier(
+    custody = await verify_network_candidate_custody(
         connection,
         copy_target,
         control_schema=control_schema,
@@ -281,9 +270,7 @@ async def _candidate_custody(connection, candidate, control_schema, *, api_read=
     if custody is not None and is_compact_candidate(candidate):
         from process.network_compact_dependencies import verify_compact_dependencies
 
-        layout = await verify_compact_dependencies(
-            connection, candidate, control_schema=control_schema, **({"api_read": True} if api_read else {})
-        )
+        layout = await verify_compact_dependencies(connection, candidate, control_schema=control_schema)
         return {**custody, "compact_layout": layout}
     return custody
 

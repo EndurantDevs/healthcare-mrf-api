@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""API reads resolve the published routing metadata before any other verification."""
+"""API reads resolve only the published routing metadata; other readers never use it."""
 
 import json
 
@@ -50,20 +50,19 @@ async def test_api_read_serves_the_published_pin_without_other_verification(monk
 @pytest.mark.parametrize(
     ("failure", "message"),
     [
-        (None, "verification failed"),
         (serving.NetworkServingReadUnavailable("missing"), "missing"),
         (KeyError("candidate"), "verification failed"),
     ],
 )
-async def test_api_read_refuses_without_a_published_pin(monkeypatch, unverifiable, failure, message):
-    """A generation without published routing metadata keeps its original verification."""
-
+async def test_api_read_has_no_verification_besides_the_published_pin(monkeypatch, failure, message):
     async def read_published(_connection, _generation_id, _schema, *, approved):
-        if failure is not None:
-            raise failure
-        return None
+        raise failure
+
+    async def unexpected(*_arguments, **_options):
+        raise AssertionError("an API read never falls back to the sealed manifest")
 
     monkeypatch.setattr(published_pin, "read_published_api_pin", read_published)
+    monkeypatch.setattr(serving, "_read_manifest", unexpected)
     with pytest.raises(serving.NetworkServingReadUnavailable, match=message):
         await serving.resolve_network_serving_manifest(_Connection(), control_schema="registry", api_read=True)
 

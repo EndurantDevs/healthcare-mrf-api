@@ -100,7 +100,7 @@ async def _require_legacy_manifest(context, recipe):
         assert await resolve_retained_registry_source_recipes(
             reader, manifest, control_schema=schema, api_read=True
         ) == (recipe,)
-        assert manifest.candidate_relation_pins and not hasattr(manifest, "_custody_seal_sha256")
+        assert manifest.candidate_relation_pins
         return manifest
 
 
@@ -177,7 +177,7 @@ async def _assert_publication_readers(context, first, source_inputs):
         reader.transaction(isolation="repeatable_read", readonly=True),
     ):
         current = await publication.resolve_network_serving_manifest(reader, control_schema=schema, api_read=True)
-        assert current == second and hasattr(current, "_custody_seal_sha256")
+        assert current == second
         assert await _office_memberships(reader, second) == original_rows
     return second
 

@@ -3,8 +3,7 @@
 
 import asyncio
 import copy
-import json
-from dataclasses import asdict, replace
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -18,7 +17,6 @@ from process import network_candidate_custody as custody
 from process import network_em_provider_inputs as inputs
 from process import network_published_api_pin as published_pin
 from process import network_read_identity as identity
-from process import network_serving_read as serving
 from process.network_compact_layout import CompactAddressRelation
 from tests import test_network_em_provider_inputs as input_fixture
 from tests import test_plan_pricing_em_attribution as rate_fixture
@@ -155,89 +153,6 @@ async def test_input_cancellation_is_not_converted_to_metadata_unavailability(mo
     resolver.side_effect = asyncio.CancelledError()
     with pytest.raises(asyncio.CancelledError):
         await inputs.resolve_em_provider_inputs(driver, supplied, "control", api_read=True)
-
-
-async def _legacy_input_reader(monkeypatch):
-    driver, supplied, _actual, _resolver, sealed_pins = await _input_reader(monkeypatch)
-    candidate_by_field = {
-        "schema_name": supplied.schema_name,
-        "source_generations": supplied.source_generations,
-        "source_recipes_json": [],
-        "validation_json": {},
-    }
-    entry_by_field = {"candidate_json": json.dumps(candidate_by_field), "manifest_json": "{}", "catalog_json": "{}"}
-    readiness = (None, None, None, {"relation_oids": {"entity_address_unified": supplied.address_table_oid}})
-    monkeypatch.setattr(serving, "_publication_readiness", lambda _candidate: readiness)
-    monkeypatch.setattr(serving, "_retained_manifest", lambda *_args, **_kwargs: asdict(supplied))
-    monkeypatch.setattr(serving, "_verified_writer_closure", lambda *_args: supplied.address_table_oid)
-    read = AsyncMock(return_value=entry_by_field)
-    custody_proof = AsyncMock(return_value=None)
-    monkeypatch.setattr(serving, "_read_manifest", read)
-    monkeypatch.setattr(serving, "_candidate_custody", custody_proof)
-    # A legacy generation has no published routing metadata.
-    monkeypatch.setattr(published_pin, "read_published_api_pin", AsyncMock(return_value=None))
-    resolver = AsyncMock(wraps=serving.resolve_network_serving_manifest)
-    monkeypatch.setattr(inputs, "resolve_network_serving_manifest", resolver)
-    return driver, supplied, candidate_by_field, entry_by_field, resolver, read, custody_proof, sealed_pins
-
-
-async def test_legacy_api_checks_manifest_control_and_nine_receipt(monkeypatch):
-    driver, supplied, _candidate, _entry, resolver, read, custody_proof, sealed_pins = await _legacy_input_reader(
-        monkeypatch
-    )
-    session = _RatesSession(driver)
-    assert await inputs.resolve_em_provider_inputs_in_session(session, supplied, "control") == input_fixture.family()
-    resolver.assert_awaited_once_with(
-        driver, generation_id=supplied.generation_id, control_schema="control", api_read=True
-    )
-    read.assert_awaited_once_with(driver, '"control"', supplied.generation_id)
-    assert custody_proof.await_args.kwargs == {"api_read": True}
-    sealed_pins.assert_awaited_once_with(driver, ("network_membership_candidate",), control_schema="control")
-    assert driver.events == ["header-read", "header-guard", "native-catalog"]
-    assert len(execution._installed_read_inventory(session).relations) == 9
-
-
-@pytest.mark.parametrize("damage", ["manifest", "compact", "inventory", "contribution"])
-async def test_legacy_branch_cannot_infer_acceptance_from_supplied_manifest_json(monkeypatch, damage):
-    driver, supplied, candidate, entry, resolver, _read, _custody, sealed_pins = await _legacy_input_reader(monkeypatch)
-    if damage == "manifest":
-        supplied = replace(supplied, manifest_sha256="f" * 64)
-    elif damage == "compact":
-        candidate["validation_json"] = {"serving_readiness": {"component": "compact_network_serving"}}
-    elif damage == "inventory":
-        from process.registry_source_inventory_contract import source_inventory_root
-        from process.registry_source_inventory_reference import INVENTORY_DIGEST_KEY, SourceInventoryReference
-
-        reference = SourceInventoryReference(source_inventory_root(()))
-        candidate["source_recipes_json"] = reference.as_dict()
-        candidate["source_generations"] = {INVENTORY_DIGEST_KEY: reference.root.entries_sha256}
-    else:
-        from process.registry_source_contribution_store import registry_source_contribution_sha256
-
-        receipt_by_field = {
-            "component": "registry_source_contributions",
-            "revision": 1,
-            "table_name": "network_source_contribution",
-            "sources": [],
-        }
-        candidate["source_generations"] = {
-            "registry_source_contributions": registry_source_contribution_sha256(receipt_by_field)
-        }
-        candidate["validation_json"] = {"registry_source_contributions": receipt_by_field}
-    entry["candidate_json"] = json.dumps(candidate)
-    with pytest.raises(PlanPricingProjectionUnavailable):
-        await inputs.resolve_em_provider_inputs(driver, supplied, "control", api_read=True)
-    assert resolver.await_args.kwargs["api_read"] is True
-    assert driver.events == []
-    sealed_pins.assert_not_awaited()
-
-
-async def test_legacy_header_oid_swap_is_refused_before_fields_or_receipt(monkeypatch):
-    driver, supplied, *_rest = await _legacy_input_reader(monkeypatch)
-    driver.current_control_oid = 801
-    with pytest.raises(PlanPricingProjectionUnavailable):
-        await inputs.resolve_em_provider_inputs(driver, supplied, "control", api_read=True)
-    assert driver.events == ["header-read", "header-guard"]
 
 
 class _RatesResult:

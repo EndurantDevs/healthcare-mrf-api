@@ -72,18 +72,13 @@ async def test_ready_inventory_without_seal_revalidates_before_custody(monkeypat
     assert closure.await_count == final_proof.await_count == 1
 
 
-@pytest.mark.parametrize(
-    "state,api_read,allow_unsealed",
-    [("published", False, True), ("sealed", False, True), ("ready", True, True), ("ready", False, 1)],
-)
-async def test_optional_inventory_seal_is_preparation_only(monkeypatch, state, api_read, allow_unsealed):
+@pytest.mark.parametrize("state,allow_unsealed", [("published", True), ("sealed", True), ("ready", 1)])
+async def test_optional_inventory_seal_is_preparation_only(monkeypatch, state, allow_unsealed):
     candidate_by_name = {**_registered(1), "state": state}
     verify = AsyncMock()
     monkeypatch.setattr(publication, "verify_network_candidate_custody", verify)
     with pytest.raises(publication.NetworkPublicationError, match="verification mode"):
-        await publication._candidate_custody(
-            object(), candidate_by_name, "fixture", api_read=api_read, allow_unsealed=allow_unsealed
-        )
+        await publication._candidate_custody(object(), candidate_by_name, "fixture", allow_unsealed=allow_unsealed)
     verify.assert_not_awaited()
 
 

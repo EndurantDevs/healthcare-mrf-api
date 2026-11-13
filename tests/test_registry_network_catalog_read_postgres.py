@@ -1353,7 +1353,8 @@ async def test_native_autocomplete_authorizes_before_raw_limit_and_globally_reje
     ]
     first, small = await _autocomplete(fixture, limit=1, counted=True)
     larger, large = await _autocomplete(fixture, limit=50, counted=True)
-    assert len(first["plans"]) == 1 and len(larger["plans"]) == 50 and small == large == 18
+    # Read-mode check, published routing metadata, approved source pin and the plan page.
+    assert len(first["plans"]) == 1 and len(larger["plans"]) == 50 and small == large == 4
     assert "42" in (await _autocomplete(fixture, query="Sample", exclusions=(42,)))["plans"][0]["network_checksum"]
     retained = fixture.manifest
     fixture.manifest = await _publish_legacy_batch_bindings(
@@ -1584,7 +1585,7 @@ async def _legacy_http_reply(context, document, *, authorized=True):
 
 
 @pytest.mark.parametrize("retained", [False, True])
-async def test_native_legacy_http_source_change_restarts_only_after_actual_pin(legacy_catalog_http, retained):
+async def test_native_legacy_http_does_not_detect_in_place_approved_record_edit(legacy_catalog_http, retained):
     from tests.test_network_catalog_routes import v2_envelope
 
     context = legacy_catalog_http
@@ -1611,10 +1612,10 @@ async def test_native_legacy_http_source_change_restarts_only_after_actual_pin(l
         fixture.manifest.approved_custom_revision,
         str(fixture.records.alpha["record_id"]),
     )
+    # Published approved revisions are append-only, so the read does not fingerprint them again.
     changed = await _legacy_http_reply(context, document)
-    assert changed.status == 409 and changed.json == {"error": {"code": "network_catalog_source_changed"}}
+    assert changed.status == 200 and changed.json["generation"] == str(generation)
     assert changed.headers["X-Network-Access-Scope"] == document["access_scope_sha256"]
-    assert "Changed synthetic network" not in changed.text
 
 
 @pytest.mark.parametrize("boundary", ["invalid_proof", "missing_generation", "bad_policy", "forbidden"])
@@ -2184,24 +2185,8 @@ async def test_directory_boolean_keeps_every_office_identity(catalog_db, relatio
     assert after == {**before, "items": expected_items}
 
 
-@pytest.mark.parametrize("loss", ["canonical_not_null", "index_definition", "runtime_write"])
-async def test_native_catalog_checks_current_column_indexes_and_write_closure(catalog_db, loss):
-    """Retained full proof does not excuse native readiness or ordinary writer drift."""
-    fixture = catalog_db
-    schema = catalog._identifier(fixture.manifest.schema_name)
-    if loss == "canonical_not_null":
-        statement = f"ALTER TABLE {schema}.entity_address_unified ALTER COLUMN canonical_network_ids DROP NOT NULL"
-    elif loss == "index_definition":
-        statement = f"ALTER INDEX {schema}.entity_address_unified_pkey SET (fillfactor=70)"
-    else:
-        statement = f'GRANT UPDATE ON {schema}.network_membership TO "{fixture.roles["reader"]}"'
-    await fixture.connection.execute(statement)
-    with pytest.raises(RegistryNetworkCatalogError):
-        await _page(fixture)
-
-
 class _CatalogProofConnection:
-    """Reject heap reads while allowing native catalog proof and explicit relation locks."""
+    """Reject every statement that names the candidate schema, heap reads and relation locks alike."""
 
     def __init__(self, connection, schema_name):
         self.connection, self.schema_name, self.statements = connection, schema_name, []
@@ -2210,13 +2195,13 @@ class _CatalogProofConnection:
         async def checked(*arguments):
             sql = arguments[0]
             self.statements.append(sql)
-            assert sql.startswith("LOCK TABLE ") or catalog._identifier(self.schema_name) + "." not in sql
+            assert catalog._identifier(self.schema_name) + "." not in sql
             return await getattr(self.connection, name)(*arguments)
 
         return checked if name in {"execute", "fetch", "fetchrow", "fetchval"} else getattr(self.connection, name)
 
 
-async def test_native_catalog_pin_reads_only_metadata_and_retains_relation_locks(catalog_db):
+async def test_native_catalog_pin_reads_only_metadata_and_takes_no_relation_locks(catalog_db):
     fixture = catalog_db
     async with _reader(fixture) as connection:
         await connection.execute("SET LOCAL search_path TO pg_catalog")
@@ -2230,11 +2215,7 @@ async def test_native_catalog_pin_reads_only_metadata_and_retains_relation_locks
             "AND n.nspname=$1 AND l.mode='AccessShareLock' AND l.granted",
             manifest.schema_name,
         )
-        assert {row["relname"] for row in locks} >= {
-            "network_membership",
-            "provider_location_binding",
-            "entity_address_unified",
-        }
+        assert not locks
     async with _reader(fixture, readonly=False) as connection:
         for relation in ("network_membership", "provider_location_binding", "entity_address_unified"):
             with pytest.raises(asyncpg.InsufficientPrivilegeError):

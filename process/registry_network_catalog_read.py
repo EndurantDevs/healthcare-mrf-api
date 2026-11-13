@@ -23,8 +23,6 @@ from process.network_approved_membership_source import (
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_fhir_retained_capture_contract import PRODUCER as RETAINED_FHIR_PRODUCER
 from process.network_fhir_retained_capture_contract import is_sha256
-from process.network_membership_candidate_indexes import _catalog_readiness
-from process.network_membership_serving_indexes import _index_digest, _serving_plan
 from process.network_read_identity import NetworkReadIdentityError, verify_consumed_network_relations
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_catalog_policy import RegistryOrganizationVisibility
@@ -474,8 +472,8 @@ async def catalog_directory_fetchrow(connection, sql, parameters, relations):
     return entry
 
 
-async def catalog_pin(connection, generation_id, control_schema, *, api_read=False):
-    """Pin a verified catalog generation and approved membership in the caller-owned read-only snapshot."""
+async def catalog_pin(connection, generation_id, control_schema):
+    """Pin a published catalog generation and approved membership in the caller-owned read-only snapshot."""
     if not connection.is_in_transaction():
         raise RegistryNetworkCatalogError("registry_network_catalog_transaction_required")
     transaction = await connection.fetchrow(
@@ -484,59 +482,15 @@ async def catalog_pin(connection, generation_id, control_schema, *, api_read=Fal
     )
     if transaction["isolation"] not in ("repeatable read", "serializable") or transaction["read_only"] != "on":
         raise RegistryNetworkCatalogError("registry_network_catalog_transaction_required")
-    pin_by_option = {"generation_id": generation_id, "control_schema": control_schema}
-    if api_read:
-        pin_by_option["api_read"] = True
-    manifest = await resolve_network_serving_manifest(connection, **pin_by_option)
+    # Every catalog read runs in a read-only snapshot, so it resolves the published routing metadata.
+    manifest = await resolve_network_serving_manifest(
+        connection, generation_id=generation_id, control_schema=control_schema, api_read=True
+    )
     approved = await pin_retained_approved_membership_source(
         connection, approved_revision=manifest.approved_custom_revision, control_schema=control_schema
     )
     if manifest.source_generations.get("custom_membership") != approved.generation_id:
         raise RegistryNetworkCatalogError("registry_network_catalog_source_changed")
-    seal_sha256 = getattr(manifest, "_custody_seal_sha256", None)
-    if seal_sha256 is not None:
-        if type(seal_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", seal_sha256) is None:
-            raise RegistryNetworkCatalogError("registry_network_catalog_directory_unavailable")
-        return manifest
-    return await _verified_directory(connection, manifest, control_schema)
-
-
-async def _directory_index_digest(connection, schema_name):
-    """Match the publisher's index deparsing context without changing the caller."""
-    original_search_path = await connection.fetchval("SELECT current_setting('search_path')")
-    await connection.execute("SET LOCAL search_path TO pg_catalog,public")
-    try:
-        await _catalog_readiness(connection, schema_name)
-        return await _index_digest(connection, schema_name, _serving_plan(schema_name))
-    finally:
-        await connection.execute("SELECT set_config('search_path',$1,true)", original_search_path)
-
-
-async def _verified_directory(connection, manifest, control_schema):
-    """Read immutable publication proof; full row parity stays in publication validation."""
-    candidate = _identifier(manifest.schema_name)
-    await connection.execute(
-        f"LOCK TABLE {candidate}.network_membership,{candidate}.provider_location_binding,"
-        f"{candidate}.entity_address_unified IN ACCESS SHARE MODE"
-    )
-    # Keep native identity checks under the same relation locks as the following page.
-    locked_manifest = await resolve_network_serving_manifest(
-        connection, generation_id=manifest.generation_id, control_schema=control_schema
-    )
-    if locked_manifest != manifest:
-        raise RegistryNetworkCatalogError("registry_network_catalog_source_changed")
-    expected = await connection.fetchrow(
-        f"SELECT validation_json::text AS validation_json FROM {_identifier(control_schema)}.network_membership_candidate "
-        "WHERE candidate_id=$1::uuid AND state='published'",
-        UUID(manifest.candidate_id),
-    )
-    report = _closed_json(expected["validation_json"].encode(), MAX_RESPONSE_BYTES) if expected else None
-    if type(report) is not dict or type(report.get("serving_readiness")) is not dict:
-        raise RegistryNetworkCatalogError("registry_network_catalog_directory_unavailable")
-    digest = await _directory_index_digest(connection, manifest.schema_name)
-    if digest != report["serving_readiness"].get("index_definition_sha256"):
-        raise RegistryNetworkCatalogError("registry_network_catalog_directory_unavailable")
-    # shortcut: trusted owner/admin DML requires explicit full validation, not a catalog read.
     return manifest
 
 

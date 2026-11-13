@@ -33,23 +33,6 @@ from tests.test_network_custom_address_source_postgres import (
 pytestmark = pytest.mark.asyncio
 
 
-class _ObservedConnection:
-    def __init__(self, connection):
-        self.connection = connection
-        self.statements = []
-
-    def __getattr__(self, name):
-        method = getattr(self.connection, name)
-        if name not in {"execute", "fetch", "fetchrow", "fetchval"}:
-            return method
-
-        async def observed(statement, *arguments, **kwargs):
-            self.statements.append(statement)
-            return await method(statement, *arguments, **kwargs)
-
-        return observed
-
-
 async def _capture(fixture, connection, *, roles=None):
     async with connection.transaction(isolation="repeatable_read"):
         return await artifact.capture_network_address_artifact(
@@ -59,17 +42,15 @@ async def _capture(fixture, connection, *, roles=None):
         )
 
 
-async def _verify(fixture, connection, descriptor, *, api_read=True):
-    async with connection.transaction(isolation="repeatable_read", readonly=api_read):
+async def _verify(fixture, connection, descriptor):
+    async with connection.transaction(isolation="repeatable_read"):
         return await artifact.verify_network_address_artifact(
-            connection, descriptor, runtime_roles=tuple(descriptor["runtime_roles"]), api_read=api_read
+            connection, descriptor, runtime_roles=tuple(descriptor["runtime_roles"])
         )
 
 
 @pytest.mark.parametrize("bootstrap_access_fixture", ["constant", "serial"], indirect=True)
-async def test_genuine_bootstrap_artifact_reuses_closed_content_for_worker_and_api(
-    bootstrap_access_fixture, monkeypatch
-):
+async def test_genuine_bootstrap_artifact_reuses_closed_content_for_worker(bootstrap_access_fixture, monkeypatch):
     fixture, receipt = bootstrap_access_fixture, bootstrap_access_fixture.receipt
     await _change_bootstrap_access(fixture)
 
@@ -91,15 +72,8 @@ async def test_genuine_bootstrap_artifact_reuses_closed_content_for_worker_and_a
         if sequence_oid is not None:
             expected_oids.add(sequence_oid)
         assert descriptor["dependency_oids"] == sorted(expected_oids)
-        assert await _verify(fixture, reader, descriptor, api_read=False)
-
-        observed = _ObservedConnection(reader)
-        resolved = await _verify(fixture, observed, descriptor)
+        resolved = await _verify(fixture, reader, descriptor)
         assert resolved.table_oid == dict(receipt.relation_oids)["entity_address_unified"]
-        assert all(
-            statement.lstrip().upper().startswith(("SELECT", "WITH", "SHOW")) for statement in observed.statements
-        )
-        assert not any("LOCK TABLE" in statement or "pg_try_advisory" in statement for statement in observed.statements)
 
 
 @pytest.mark.parametrize("changed", ["receipt", "filenode", "native"])
@@ -122,7 +96,7 @@ async def test_rehashed_descriptor_requires_current_protected_evidence(bootstrap
         )
         assert bootstrap_artifact._descriptor(descriptor) == descriptor
         with pytest.raises(ValueError, match="[Bb]ootstrap"):
-            await _verify(fixture, reader, descriptor, api_read=False)
+            await _verify(fixture, reader, descriptor)
 
 
 @pytest.mark.parametrize("drift", ["acl", "native", "receipt"])
@@ -146,7 +120,7 @@ async def test_worker_reuse_refuses_changed_native_custody(bootstrap_access_fixt
         with pytest.raises(ValueError, match="[Bb]ootstrap"):
             await _capture(fixture, connection)
         with pytest.raises(ValueError, match="[Bb]ootstrap"):
-            await _verify(fixture, connection, descriptor, api_read=False)
+            await _verify(fixture, connection, descriptor)
     finally:
         await transaction.rollback()
 
@@ -160,7 +134,7 @@ async def test_worker_reuse_keeps_both_heap_locks_until_transaction_end(bootstra
     async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
         async with reader.transaction(isolation="repeatable_read"):
             descriptor = await _capture(fixture, reader)
-            assert await _verify(fixture, reader, descriptor, api_read=False)
+            assert await _verify(fixture, reader, descriptor)
             locked = await reader.fetch(
                 "SELECT relation::bigint FROM pg_locks WHERE pid=pg_backend_pid() AND mode='AccessShareLock' "
                 "AND granted AND relation=ANY($1::oid[]) ORDER BY relation",
@@ -302,7 +276,7 @@ async def _assert_cascade_refusal(fixture, reader, sequence_owner, sequence, des
     receipt = fixture.receipt
     npi_oid = dict(receipt.relation_oids)["npi"]
     async with reader.transaction(isolation="repeatable_read"):
-        assert await _verify(fixture, reader, descriptor, api_read=False)
+        assert await _verify(fixture, reader, descriptor)
         original_shape = await bootstrap._shape(reader, npi_oid)
         original_content = await bootstrap._content(reader, receipt.address_source.schema_name, "npi")
         await _assert_sequence_drop_blocked(fixture, reader, sequence_owner, sequence)
@@ -313,9 +287,8 @@ async def _assert_cascade_refusal(fixture, reader, sequence_owner, sequence, des
         assert await bootstrap._shape(reader, npi_oid) != original_shape
         with pytest.raises(bootstrap.NetworkBootstrapSourceError):
             await bootstrap.verify_network_bootstrap_sources(reader, receipt)
-    for api_read in (True, False):
-        with pytest.raises(NetworkCustomAddressSourceError, match="[Bb]ootstrap"):
-            await _verify(fixture, reader, descriptor, api_read=api_read)
+    with pytest.raises(NetworkCustomAddressSourceError, match="[Bb]ootstrap"):
+        await _verify(fixture, reader, descriptor)
 
 
 @pytest.mark.parametrize("bootstrap_access_fixture", ["serial"], indirect=True)
@@ -341,7 +314,6 @@ async def test_sequence_ownership_keeps_read_boundary(bootstrap_access_fixture):
             assert await administrator.fetchval(f"SELECT last_value FROM {sequence}") == 7654321 + ordinal
             assert await _copy_retained_npi(fixture, reader) == original_content
             assert await _verify(fixture, reader, descriptor)
-            assert await _verify(fixture, reader, descriptor, api_read=False)
             assert await _capture(fixture, reader) == descriptor
         async with reader.transaction(isolation="repeatable_read"):
             with pytest.raises(artifact.NetworkAddressArtifactError, match="source_generation_changed"):
