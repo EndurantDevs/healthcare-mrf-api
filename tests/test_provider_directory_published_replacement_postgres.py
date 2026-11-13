@@ -13,7 +13,6 @@ from sqlalchemy import event, text
 from db.connection import Database
 from process import provider_directory_generic_source_artifacts as artifacts
 from process import provider_directory_published_source_replacement as replacement
-from process.provider_directory_dataset_rehydrate_types import DatasetRehydrationError
 from tests import provider_directory_generic_artifact_pages_support as page_copy
 from tests.provider_directory_dataset_artifact_pg_support import seal_validated_dataset
 from tests.provider_directory_serving_recovery_postgres_support import ordinary_serving_case
@@ -405,23 +404,15 @@ async def test_native_prepared_admission_cannot_cross_incumbent_scopes(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_native_copy_keeps_exact_origin_type_order_and_repaired_tuple_parity(monkeypatch):
-    """Bounded pages preserve origin, resource type, NPI repair and complete tuples."""
+async def test_database_insert_keeps_exact_origin_type_order_and_repaired_tuple_parity(monkeypatch):
+    """One database insert preserves origin, resource type, NPI repair and complete tuples."""
     async with page_copy.native_case(monkeypatch) as case:
         prepared = page_copy.enrichment()
         statement, expected, params, kind, _counts = page_copy.copy_inputs(case, prepared)
         async with case.connection.begin():
-            copied = await artifacts._copy(
-                case.directory,
-                case.driver,
-                page_copy.MODEL,
-                "new_stage",
-                statement,
-                params,
-                admission=page_copy.copy_admission(prepared),
-                kind=kind,
+            await artifacts._insert_projection(
+                case.directory, page_copy.MODEL, "new_stage", statement, expected, params, kind, prepared
             )
-            assert copied == 1030
             await artifacts._verify_set_parity(case.connection, expected, '"mrf"."new_stage"', params)
             rows = (
                 await case.connection.execute(
@@ -432,78 +423,50 @@ async def test_native_copy_keeps_exact_origin_type_order_and_repaired_tuple_pari
                 ("source_a", str(1000000000 + row_number), 1000000000 + row_number) for row_number in range(1, 1031)
             ]
             assert all(row.names == [{"family": "dataset_a"}] for row in rows)
+            assert prepared["metrics"]["resource_id_npis_backfilled"]["Practitioner"] == 1030
 
 
 @pytest.mark.asyncio
-async def test_filtered_whole_native_page_advances_before_later_valid_rows(monkeypatch):
-    """An empty filtered window cannot hide valid rows beyond its native frontier."""
-    original = artifacts._loading_projection
-
-    def filtered(*args):
-        statement, expected, params, kind, counts = original(*args)
-        return f"SELECT * FROM ({statement}) p WHERE p.resource_id>'1000000512'", expected, params, kind, counts
-
-    monkeypatch.setattr(artifacts, "_loading_projection", filtered)
-    async with page_copy.native_case(monkeypatch) as case:
+async def test_database_insert_stores_explicit_json_null_as_sql_null(monkeypatch):
+    """Readers expand JSON columns as arrays, so a JSON null scalar must not reach them."""
+    async with page_copy.native_case(monkeypatch, rows=2) as case:
+        prepared = page_copy.enrichment()
+        statement, expected, params, kind, _counts = page_copy.copy_inputs(case, prepared)
         async with case.connection.begin():
-            rows = [
-                row
-                async for page in artifacts._resource_pages(
-                    case.directory, page_copy.MODEL, page_copy.DATASET, page_copy.enrichment()
+            await case.connection.execute(
+                text(
+                    "UPDATE mrf.provider_directory_dataset_resource "
+                    "SET payload_json=(payload_json::jsonb || jsonb_build_object('telecom', NULL))::json "
+                    "WHERE dataset_id='dataset_a' AND resource_type='Practitioner' AND resource_id='1000000001'"
                 )
-                for row in page
-            ]
-            assert [row["resource_id"] for row in rows] == [
-                str(1000000000 + row_number) for row_number in range(513, 1031)
-            ]
+            )
+            await artifacts._insert_projection(
+                case.directory, page_copy.MODEL, "new_stage", statement, expected, params, kind, prepared
+            )
+            stored = await case.connection.execute(
+                text(
+                    "SELECT count(*) FILTER (WHERE telecom IS NULL), count(*) FILTER (WHERE names IS NULL), "
+                    "count(*) FILTER (WHERE jsonb_typeof(telecom::jsonb) = 'null') FROM mrf.new_stage"
+                )
+            )
+            assert tuple(stored.one()) == (2, 0, 0)
 
 
 @pytest.mark.asyncio
-async def test_oversized_native_record_refuses_without_partial_output(monkeypatch):
-    """Expanded JSON still refuses oversize before any output can survive rollback."""
-    async with page_copy.native_case(monkeypatch, rows=1, payload_bytes=17 * 1024**2) as case:
-        prepared = page_copy.enrichment()
-        statement, _expected, params, kind, _counts = page_copy.copy_inputs(case, prepared)
-        with pytest.raises(DatasetRehydrationError, match="read_record_too_large"):
-            async with case.connection.begin():
-                await artifacts._copy(
-                    case.directory,
-                    case.driver,
-                    page_copy.MODEL,
-                    "new_stage",
-                    statement,
-                    params,
-                    admission=page_copy.copy_admission(prepared),
-                    kind=kind,
-                )
-        assert (await case.connection.execute(text("SELECT count(*) FROM mrf.new_stage"))).scalar_one() == 0
-
-
-@pytest.mark.asyncio
-async def test_late_reader_failure_rolls_back_completed_copy_pages(monkeypatch):
-    """A failed later read leaves no previously copied candidate rows committed."""
+async def test_failed_database_insert_leaves_no_candidate_rows(monkeypatch):
+    """A failure after the insert leaves no candidate rows committed."""
     async with page_copy.native_case(monkeypatch) as case:
-        original = case.directory.db.all
 
-        async def fail_next_native_page(statement, **params):
-            if params.get("after_resource_id") == "1000000512":
-                raise RuntimeError("fixture_page_interrupted")
-            return await original(statement, **params)
+        async def fail_repair_count(_statement, **_params):
+            raise RuntimeError("fixture_count_interrupted")
 
-        case.directory.db.all = fail_next_native_page
+        case.directory.db.scalar = fail_repair_count
         prepared = page_copy.enrichment()
-        statement, _expected, params, kind, _counts = page_copy.copy_inputs(case, prepared)
-        with pytest.raises(RuntimeError, match="fixture_page_interrupted"):
+        statement, expected, params, kind, _counts = page_copy.copy_inputs(case, prepared)
+        with pytest.raises(RuntimeError, match="fixture_count_interrupted"):
             async with case.connection.begin():
-                await artifacts._copy(
-                    case.directory,
-                    case.driver,
-                    page_copy.MODEL,
-                    "new_stage",
-                    statement,
-                    params,
-                    admission=page_copy.copy_admission(prepared),
-                    kind=kind,
+                await artifacts._insert_projection(
+                    case.directory, page_copy.MODEL, "new_stage", statement, expected, params, kind, prepared
                 )
         assert (await case.connection.execute(text("SELECT count(*) FROM mrf.new_stage"))).scalar_one() == 0
 
