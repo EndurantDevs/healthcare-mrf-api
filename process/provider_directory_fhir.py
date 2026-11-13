@@ -46466,7 +46466,7 @@ class _BulkOutputStreamState:
         pending_rows = list(self.pending_rows)
         rows_written = self.rows_written
         committed_bytes = self.committed_bytes
-        scope = source_checkpoint_transaction(db, schema=_schema()) if progress_handler else contextlib.nullcontext()
+        scope = bulk_parallel.batch_transaction(sys.modules[__name__], progress_handler)
         async with bulk_parallel.write_slot(sys.modules[__name__], self.context.source_record), scope:
             if handler and pending_rows:
                 rows_written += await handler(self.context.model, pending_rows)

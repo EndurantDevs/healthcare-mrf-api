@@ -258,3 +258,18 @@ async def test_timeout_preserves_primary_error_and_releases_transfer_slot():
             pytest.fail("timed out transport returned a response")
     assert parallel.state(directory, source_by_field)["requests"].active == 0
     assert parallel.state(directory, source_by_field)["requests"].limit == 4
+
+
+def test_only_a_bulk_batch_with_progress_opens_the_batch_loading_transaction():
+    calls = []
+    directory = SimpleNamespace(
+        db=object(),
+        _schema=lambda: "source_schema",
+        source_checkpoint_transaction=lambda database, **options: calls.append((database, options)) or "scope",
+    )
+
+    assert parallel.batch_transaction(directory, object()) == "scope"
+    assert calls == [(directory.db, {"schema": "source_schema", "is_batch_loading": True})]
+    # Without a progress handler there is no owner transaction to open at all.
+    with parallel.batch_transaction(directory, None):
+        assert len(calls) == 1

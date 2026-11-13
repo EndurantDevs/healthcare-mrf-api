@@ -464,3 +464,27 @@ async def test_shared_refresh_child_requires_original_executor_before_write(monk
         connection.status.assert_awaited_once()
         assert connection.status.await_args.kwargs["checkpoint_id"] == identity.checkpoint_id
     require.assert_awaited_once_with(connection, bulk_identity=identity)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_batch_loading", [True, False])
+async def test_checkpoint_transaction_passes_batch_loading_to_its_source_transaction(monkeypatch, is_batch_loading):
+    opened_options = []
+
+    @asynccontextmanager
+    async def source_transaction(database, **options):
+        opened_options.append(options)
+        raise RuntimeError("opened")
+        yield
+
+    monkeypatch.setattr(control, "source_transaction", source_transaction)
+    with pytest.raises(RuntimeError, match="opened"):
+        async with control.source_checkpoint_transaction(object(), is_batch_loading=is_batch_loading):
+            pytest.fail("the transaction body must not run")
+    assert opened_options == [{"is_batch_loading": True}] if is_batch_loading else [{}]
+
+    opened_options.clear()
+    with pytest.raises(RuntimeError, match="opened"):
+        async with control.source_checkpoint_transaction(object()):
+            pytest.fail("the transaction body must not run")
+    assert opened_options == [{}]

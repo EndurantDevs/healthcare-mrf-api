@@ -3,7 +3,7 @@
 
 import asyncio
 import json
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -1840,3 +1840,183 @@ async def test_checkpoint_guard_refuses_proxy_before_factory():
             async with policy.source_checkpoint_guard(SimpleNamespace(_transaction_binding=lambda: None)):
                 pytest.fail("proxy admitted")
     factory.checkpoint_guard.assert_not_called()
+
+
+async def _capture_custody(connection, configured):
+    return await isolated.capture_isolated_source_storage_custody(
+        connection,
+        configured,
+        catalog_schema="catalog_schema",
+        migration_role="migration",
+        namespace_owner_role="namespace_owner",
+        publication={"owner_role": "source_owner", "publisher_role": "source_publisher"},
+    )
+
+
+def _loading_connection(factory, *, replication_role="origin", session="source_publisher"):
+    connection, native_by_field, _ = _isolated_connection(factory)
+    actor_by_field = {"session": session, "current": session, "administrator": False}
+    connection.fetchrow = AsyncMock(
+        side_effect=lambda query, *args: native_by_field if query.startswith("SELECT d.oid") else actor_by_field
+    )
+    connection.fetchval = AsyncMock(
+        side_effect=lambda query, *args: replication_role if "session_replication_role" in query else "repeatable read"
+    )
+    return connection
+
+
+@contextmanager
+def _batch_loading(is_batch_loading=True):
+    token = policy._BATCH_LOADING.set(is_batch_loading)
+    try:
+        yield
+    finally:
+        policy._BATCH_LOADING.reset(token)
+
+
+@pytest.fixture
+def storage_capture(monkeypatch):
+    clock = Mock(return_value=1000.0)
+    capture = AsyncMock(side_effect=lambda *_, **__: {"version": 1, "captured_at": clock.return_value})
+    monkeypatch.setattr(isolated.time, "monotonic", clock)
+    monkeypatch.setattr(isolated, "_capture_isolated_source_storage_custody", capture)
+    monkeypatch.setattr(isolated, "_LOADING_CUSTODY", [])
+    return SimpleNamespace(capture=capture, clock=clock)
+
+
+async def _open_transaction(factory, connection, *, is_batch_loading):
+    """Open one transaction the way the issued factory does: both verifications capture the storage."""
+
+    async def verify_role_profile(driver, schema, **roles):
+        await _capture_custody(driver, factory.policy)
+
+    async def source_storage_binding(driver, configured):
+        await verify_role_profile(driver, configured.schema)
+        return factory.storage_binding
+
+    factory.source_storage_binding = source_storage_binding
+    with _batch_loading(is_batch_loading):
+        async with policy.bind_generic_source_transaction_factory(factory):
+            async with policy.bind_generic_source_publisher(
+                connection,
+                factory.policy,
+                verify_role_profile=verify_role_profile,
+                transaction_isolation="repeatable read",
+            ):
+                assert policy.loading_verification_factory() is None
+
+
+@pytest.mark.asyncio
+async def test_batch_transactions_reuse_one_storage_capture_per_interval(custody, storage_capture):
+    factory = _isolated_factory()
+    connection = _loading_connection(factory)
+
+    await _open_transaction(factory, connection, is_batch_loading=True)
+    storage_capture.clock.return_value += isolated._LOADING_CUSTODY_SECONDS - 1
+    await _open_transaction(factory, connection, is_batch_loading=True)
+    # Two batches, each verified at the publisher binding and at the storage binding: one capture.
+    assert storage_capture.capture.await_count == 1
+
+    storage_capture.clock.return_value += 1
+    await _open_transaction(factory, connection, is_batch_loading=True)
+    assert storage_capture.capture.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_completion_right_after_a_batch_captures_storage_afresh(custody, storage_capture):
+    factory = _isolated_factory()
+    connection = _loading_connection(factory)
+    await _open_transaction(factory, connection, is_batch_loading=True)
+    assert storage_capture.capture.await_count == 1
+
+    # Completion, handoff and every other transaction do not opt in: both verifications capture anew.
+    await _open_transaction(factory, connection, is_batch_loading=False)
+    assert storage_capture.capture.await_count == 3
+    # Those captures never replace the one a batch may reuse.
+    await _open_transaction(factory, connection, is_batch_loading=True)
+    assert storage_capture.capture.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_storage_capture_is_reused_only_by_its_loading_factory(custody, storage_capture):
+    factory, other_factory = _isolated_factory(), _isolated_factory()
+    connection = _loading_connection(factory)
+
+    async def capture_while_loading(issued, configured):
+        async with policy.bind_generic_source_transaction_factory(issued):
+            with _batch_loading(), policy._loading_verification():
+                return await _capture_custody(connection, configured)
+
+    first = await capture_while_loading(factory, factory.policy)
+    second = await capture_while_loading(factory, factory.policy)
+    assert storage_capture.capture.await_count == 1 and first == second and first is not second
+    # Inside a batch transaction but outside its two verifications, a capture is new.
+    async with policy.bind_generic_source_transaction_factory(factory):
+        with _batch_loading():
+            await _capture_custody(connection, factory.policy)
+    assert storage_capture.capture.await_count == 2
+    # Another storage or another issued factory is never served from the first one's capture.
+    other_policy = policy.GenericSourcePolicy("other_schema", "source_owner", "source_publisher", ("source_reader",))
+    await capture_while_loading(factory, other_policy)
+    await capture_while_loading(other_factory, other_policy)
+    assert storage_capture.capture.await_count == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("changes", "code"),
+    [({"replication_role": "replica"}, "replication_role"), ({"session": "other_login"}, "genuine_publisher_required")],
+)
+async def test_reused_storage_capture_still_checks_the_current_connection(custody, storage_capture, changes, code):
+    factory = _isolated_factory()
+    async with policy.bind_generic_source_transaction_factory(factory):
+        with _batch_loading(), policy._loading_verification():
+            await _capture_custody(_loading_connection(factory), factory.policy)
+            with pytest.raises(GenericCandidateError, match=code):
+                await _capture_custody(_loading_connection(factory, **changes), factory.policy)
+    assert storage_capture.capture.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_or_bounded_storage_capture_is_never_reused(custody, storage_capture):
+    factory = _isolated_factory()
+    connection = _loading_connection(factory)
+    storage_capture.capture.side_effect = GenericCandidateError("provider_directory_source_storage_transaction_changed")
+    async with policy.bind_generic_source_transaction_factory(factory):
+        with _batch_loading(), policy._loading_verification():
+            for _ in range(2):
+                with pytest.raises(GenericCandidateError, match="transaction_changed"):
+                    await _capture_custody(connection, factory.policy)
+            storage_capture.capture.side_effect = None
+            storage_capture.capture.return_value = {"version": 1}
+            for _ in range(2):
+                await isolated.capture_isolated_source_storage_custody(
+                    connection,
+                    factory.policy,
+                    catalog_schema="catalog_schema",
+                    migration_role="migration",
+                    namespace_owner_role="namespace_owner",
+                    publication={},
+                    expected_history_bounds={"bounded": True},
+                )
+    assert storage_capture.capture.await_count == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_batch_loading", [True, False])
+async def test_only_a_batch_transaction_opts_in_while_it_is_opened(is_batch_loading):
+    opened_flags = []
+
+    @asynccontextmanager
+    async def transaction(database, *, isolation):
+        opened_flags.append(policy._BATCH_LOADING.get())
+        raise RuntimeError("opened")
+        yield
+
+    factory = SimpleNamespace(transaction=transaction)
+    async with policy.bind_generic_source_transaction_factory(factory):
+        with pytest.raises(RuntimeError, match="opened"):
+            async with policy.source_transaction(object(), is_batch_loading=is_batch_loading):
+                pytest.fail("the transaction body must not run")
+        assert policy._BATCH_LOADING.get() is False
+    assert opened_flags == [is_batch_loading]
