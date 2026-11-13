@@ -375,14 +375,8 @@ async def _pin_verified_api_approved_source(connection, current, *, control_sche
     from process.network_candidate_custody import read_network_control_relation_pins
 
     namespace = _control_namespace(control_schema)
-    control = current.custody_control
-    if control is not None and type(control) is not dict:
-        raise ApprovedMembershipSourceError("Approved API control metadata differs")
     (relation,) = await read_network_control_relation_pins(
-        connection,
-        ("registry_approved_record",),
-        control_schema=namespace[1:-1],
-        expected_candidate_table_oid=None if control is None else control["candidate_table_oid"],
+        connection, ("registry_approved_record",), control_schema=namespace[1:-1]
     )
     pid = connection.get_server_pid()
     approved = await _scope(

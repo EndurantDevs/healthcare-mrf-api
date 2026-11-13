@@ -170,13 +170,7 @@ def _artifact_copy_target(candidate):
     )
 
 
-async def _verify_artifact_owner(connection, candidate, control_schema, *, api_read=False):
-    if api_read:
-        from process.network_candidate_custody import verify_network_candidate_read_metadata
-
-        return await verify_network_candidate_read_metadata(
-            connection, _artifact_copy_target(candidate), control_schema=control_schema, required=True
-        )
+async def _verify_artifact_owner(connection, candidate, control_schema):
     return await verify_network_candidate_custody(
         connection, _artifact_copy_target(candidate), control_schema=control_schema, required=True
     )
@@ -199,9 +193,6 @@ async def _owner_sources(connection, candidate, custody, control_schema, *, api_
 
     try:
         expected = verify_source_recipe_metadata(candidate).inventory
-        inventory_oid = custody["receipt"]["closure"]["relation_oids"][INVENTORY_TABLE]
-        if expected is None or type(inventory_oid) is not int or not 0 < inventory_oid < 2**32:
-            raise ValueError
         if api_read:
             from process.registry_source_inventory_store import load_source_inventory_for_api
 
@@ -209,6 +200,9 @@ async def _owner_sources(connection, candidate, custody, control_schema, *, api_
                 connection, _artifact_copy_target(candidate), candidate, control_schema=control_schema
             )
         else:
+            inventory_oid = custody["receipt"]["closure"]["relation_oids"][INVENTORY_TABLE]
+            if type(inventory_oid) is not int or not 0 < inventory_oid < 2**32:
+                raise ValueError
             reference, entries = await _load_locked_source_inventory(
                 connection,
                 _artifact_copy_target(candidate),
@@ -258,22 +252,42 @@ def _selected_by_owner(descriptors):
 
 
 def _authenticate_owned_source(owner, custody, descriptor, reference, *, sources=None):
-    if (
-        custody["seal_sha256"] != reference.fact_seal_sha256
-        or custody["receipt"]["closure"]["relation_oids"].get(CONTRIBUTION_TABLE) != reference.fact_table_oid
-        or owner["schema_name"] != "network_candidate_" + UUID(reference.fact_candidate_id).hex
+    # API reads pass no custody: a published owner is identified by its schema name.
+    if owner["schema_name"] != "network_candidate_" + UUID(reference.fact_candidate_id).hex or (
+        custody is not None
+        and (
+            custody["seal_sha256"] != reference.fact_seal_sha256
+            or custody["receipt"]["closure"]["relation_oids"].get(CONTRIBUTION_TABLE) != reference.fact_table_oid
+        )
     ):
         raise RegistrySourceContributionError("registry_source_artifact_physical_identity_changed")
     owning = _owning_descriptor(owner, descriptor, sources=sources)
     return ResolvedSourceFactArtifact(reference, owner["schema_name"], dict(owning))
 
 
+_UNFILTERED_FACT_HEAP_SQL = """SELECT c.relkind='r' AND c.relpersistence='p'
+ AND c.relam=(SELECT oid FROM pg_catalog.pg_am WHERE amname='heap')
+ AND NOT (c.relrowsecurity OR c.relforcerowsecurity OR c.relispartition)
+ AND NOT EXISTS(SELECT FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)
+ AND NOT EXISTS(SELECT FROM pg_catalog.pg_rewrite WHERE ev_class=c.oid)
+ FROM pg_catalog.pg_class c WHERE c.oid=pg_catalog.to_regclass($1)"""
+
+
+async def _require_unfiltered_fact_heap(connection, schema_name):
+    """API reads consume anchored facts directly; row filtering would return a silent partial page."""
+    relation = f"{_identifier(schema_name)}.{CONTRIBUTION_TABLE}"
+    if await connection.fetchval(_UNFILTERED_FACT_HEAP_SQL, relation) is not True:
+        raise RegistrySourceContributionError("registry_source_artifact_physical_identity_changed")
+
+
 async def _resolve_owner_page(connection, owners_by_identity, selected_by_owner, control_schema, *, api_read=False):
     resolved_by_recipe = {}
     for identity, candidate in owners_by_identity.items():
-        custody = await _verify_artifact_owner(
-            connection, candidate, control_schema, **({"api_read": True} if api_read else {})
-        )
+        custody = None
+        if api_read:
+            await _require_unfiltered_fact_heap(connection, candidate["schema_name"])
+        else:
+            custody = await _verify_artifact_owner(connection, candidate, control_schema)
         sources = await _owner_sources(
             connection, candidate, custody, control_schema, **({"api_read": True} if api_read else {})
         )

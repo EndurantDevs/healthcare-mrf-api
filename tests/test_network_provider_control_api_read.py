@@ -25,12 +25,10 @@ _PID = 77
 
 
 def _control_fixture(monkeypatch):
-    control_by_field = {"schema_oid": 10, "schema_owner_oid": 501, "candidate_table_oid": 11, "owner_oid": 500}
     table_records = [
         dict(
             relname=name,
             oid=oid,
-            relowner=501,
             relkind="r",
             relpersistence="p",
             heap=True,
@@ -47,7 +45,8 @@ def _control_fixture(monkeypatch):
             ("registry_approved_record", 13),
         )
     ]
-    native = AsyncMock(return_value=control_by_field)
+    # Control pins are read by name; the ledger's physical profile is never consulted.
+    native = AsyncMock(side_effect=AssertionError("control custody was read"))
     monkeypatch.setattr(custody, "_control", native)
     connection = SimpleNamespace(
         is_in_transaction=lambda: True,
@@ -55,36 +54,34 @@ def _control_fixture(monkeypatch):
         fetch=AsyncMock(return_value=table_records),
         execute=AsyncMock(),
     )
-    return connection, control_by_field, table_records, native
+    return connection, table_records, native
 
 
-async def test_current_control_profiles_use_actual_owner(monkeypatch):
-    connection, control, rows, native = _control_fixture(monkeypatch)
+async def test_current_control_profiles_are_read_by_name(monkeypatch):
+    connection, rows, native = _control_fixture(monkeypatch)
     pins = await custody.read_network_control_relation_pins(
-        connection, tuple(row["relname"] for row in rows), control_schema=CONTROL, expected_candidate_table_oid=11
+        connection, tuple(row["relname"] for row in rows), control_schema=CONTROL
     )
     assert [pin.table_oid for pin in pins] == [11, 12, 13]
     assert all(pin.schema_name == CONTROL for pin in pins)
-    assert connection.fetch.await_args.args[1] == control["schema_oid"]
-    assert native.await_count == 2
+    assert connection.fetch.await_args.args[1] == f'"{CONTROL}"'
+    native.assert_not_awaited()
     connection.execute.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("relowner", 500),
         ("relkind", "v"),
         ("heap", False),
         ("relrowsecurity", True),
         ("rules", True),
         ("inherited", True),
         ("columns", ["wrong"]),
-        ("oid", 99),
     ],
 )
 async def test_changed_control_profile_refuses(monkeypatch, field, value):
-    connection, _, rows, _ = _control_fixture(monkeypatch)
+    connection, rows, _ = _control_fixture(monkeypatch)
     rows[0][field] = value
     with pytest.raises(custody.NetworkCandidateCustodyError):
         await custody.read_network_control_relation_pins(
@@ -95,14 +92,14 @@ async def test_changed_control_profile_refuses(monkeypatch, field, value):
 
 @pytest.mark.parametrize("names", [(), [], ("other_table",), ("registry_approved_record",) * 2])
 async def test_control_selection_is_closed(monkeypatch, names):
-    connection, _, _, native = _control_fixture(monkeypatch)
+    connection, _, native = _control_fixture(monkeypatch)
     with pytest.raises(custody.NetworkCandidateCustodyError):
         await custody.read_network_control_relation_pins(connection, names, control_schema=CONTROL)
     native.assert_not_awaited()
 
 
 async def test_read_write_control_context_refuses(monkeypatch):
-    connection, _, _, native = _control_fixture(monkeypatch)
+    connection, _, native = _control_fixture(monkeypatch)
     connection.fetchrow.return_value = ("repeatable read", "off")
     with pytest.raises(custody.NetworkCandidateCustodyError):
         await custody.read_network_control_relation_pins(
@@ -114,9 +111,7 @@ async def test_read_write_control_context_refuses(monkeypatch):
 async def test_approved_helper_reauthenticates_caller_manifest(monkeypatch):
     manifest = _manifest()
     manifest.source_generations["custom_membership"] = "b" * 64
-    object.__setattr__(manifest, "_custody_control", {"candidate_table_oid": 11})
     caller = replace(manifest)
-    object.__setattr__(caller, "_custody_control", {"candidate_table_oid": 999})
     pin = CompactAddressRelation(CONTROL, "registry_approved_record", 13)
     resolver = AsyncMock(return_value=manifest)
     native = AsyncMock(return_value=(pin,))
@@ -130,7 +125,7 @@ async def test_approved_helper_reauthenticates_caller_manifest(monkeypatch):
     )
     assert result.generation_id == "b" * 64 and relation == pin
     assert resolver.await_args.kwargs["api_read"] is True
-    assert native.await_args.kwargs["expected_candidate_table_oid"] == 11
+    native.assert_awaited_once_with(connection, ("registry_approved_record",), control_schema=CONTROL)
     assert scope.await_args.kwargs["read_identity"] == (pin, _PID)
 
 
@@ -186,14 +181,14 @@ async def test_fact_owner_api_preserves_required_authentication(monkeypatch, leg
     connection = SimpleNamespace(
         is_in_transaction=lambda: True,
         get_server_pid=lambda: _PID,
-        fetchval=AsyncMock(side_effect=["repeatable read", "on"]),
+        fetchval=AsyncMock(side_effect=["repeatable read", "on", True]),
         fetch=AsyncMock(return_value=[owner.candidate]),
     )
     pins = (
         CompactAddressRelation(CONTROL, "network_membership_candidate", 11),
         CompactAddressRelation(CONTROL, "network_serving_manifest", 12),
     )
-    native = AsyncMock(return_value=owner.custody)
+    native = AsyncMock(side_effect=AssertionError("API read verified a seal"))
     loader = AsyncMock(return_value=(owner.reference, owner.entries))
     locked = AsyncMock(side_effect=AssertionError("API selected locking owner verification"))
     monkeypatch.setattr(custody, "read_network_control_relation_pins", AsyncMock(return_value=pins))
@@ -207,10 +202,36 @@ async def test_fact_owner_api_preserves_required_authentication(monkeypatch, leg
         connection, selected, control_schema=CONTROL, api_read=True
     )
     assert len(resolved) == 1 and resolved[selected[0]["recipe_sha256"]].reference.fact_table_oid == 42
-    assert native.await_args.kwargs["required"] is True
+    native.assert_not_awaited()
     assert loader.await_count == int(not legacy)
     assert guard.await_args.args[1] == pins
     locked.assert_not_awaited()
+    fact_heap_check = connection.fetchval.await_args_list[-1].args
+    assert "relrowsecurity" in fact_heap_check[0]
+    assert fact_heap_check[1] == f'"{owner.candidate["schema_name"]}".network_source_contribution'
+
+
+@pytest.mark.parametrize("unfiltered", [False, None])
+async def test_fact_owner_api_refuses_a_row_filtered_fact_table(monkeypatch, unfiltered):
+    owner = _owner(2)
+    connection = SimpleNamespace(
+        is_in_transaction=lambda: True,
+        get_server_pid=lambda: _PID,
+        fetchval=AsyncMock(side_effect=["repeatable read", "on", unfiltered]),
+        fetch=AsyncMock(return_value=[owner.candidate]),
+    )
+    pins = (
+        CompactAddressRelation(CONTROL, "network_membership_candidate", 11),
+        CompactAddressRelation(CONTROL, "network_serving_manifest", 12),
+    )
+    loader = AsyncMock(side_effect=AssertionError("a filtered fact table must refuse before its inventory is read"))
+    monkeypatch.setattr(custody, "read_network_control_relation_pins", AsyncMock(return_value=pins))
+    monkeypatch.setattr(inventory, "load_source_inventory_for_api", loader)
+    monkeypatch.setattr(artifacts, "verify_consumed_network_relations", AsyncMock())
+    with pytest.raises(artifacts.RegistrySourceContributionError, match="physical_identity_changed"):
+        await artifacts.authenticate_anchored_source_fact_metadata(
+            connection, _selected(owner, owner.sources[:1]), control_schema=CONTROL, api_read=True
+        )
 
 
 async def test_empty_fact_metadata_api_still_requires_readonly():

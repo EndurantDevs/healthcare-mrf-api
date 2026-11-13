@@ -25,6 +25,7 @@ class _NativeRow(dict):
 class _InventoryConnection:
     def __init__(self, fixture):
         self.fixture, self.events = fixture, []
+        self.oid, self.modes = _OID, ("repeatable read", "on")
         self.execute = AsyncMock()
         self.rows = [
             dict(zip(store._COLUMNS, store.source_inventory_record(entry), strict=True)) for entry in fixture.entries
@@ -33,12 +34,18 @@ class _InventoryConnection:
     def is_in_transaction(self):
         return True
 
-    async def fetchval(self, query):
+    async def fetchval(self, query, *arguments):
+        if query == "SELECT to_regclass($1)::oid::bigint":
+            assert arguments == (store._relation(self.fixture.copy_target),)
+            self.events.append("name")
+            return self.oid
         assert query == "SELECT pg_backend_pid()"
         self.events.append("pid")
         return _PID
 
     async def fetchrow(self, query, *arguments):
+        if "transaction_isolation" in query:
+            return self.modes
         if "SELECT dataset_id" in query:
             return {key: value for key, value in asdict(self.fixture.copy_target).items()}
         if "JOIN pg_namespace n" in query:
@@ -76,12 +83,6 @@ def _api_spies(monkeypatch, fixture, *, failing_guard=None):
     connection = _InventoryConnection(fixture)
     expected_relation = store.CompactAddressRelation(fixture.copy_target.schema_name, store.INVENTORY_TABLE, _OID)
 
-    async def metadata(actual, target, *, control_schema):
-        assert actual is connection and target == fixture.copy_target and control_schema == CONTROL
-        assert connection.events == []
-        connection.events.append("custody")
-        return {"receipt": {"closure": {"relation_oids": {store.INVENTORY_TABLE: _OID}}}}
-
     async def verify(actual, relations, *, expected_backend_pid):
         assert actual is connection and relations == (expected_relation,) and expected_backend_pid == _PID
         assert "pid" in connection.events and connection.events[-1] in {"count", "preflight", "payload"}
@@ -89,7 +90,9 @@ def _api_spies(monkeypatch, fixture, *, failing_guard=None):
         if connection.events.count("guard") == failing_guard:
             raise NetworkReadIdentityError("synthetic mismatched consumed relation")
 
-    metadata_spy, consumed_spy = AsyncMock(side_effect=metadata), AsyncMock(side_effect=verify)
+    # The published inventory is found by name; no seal is read.
+    metadata_spy = AsyncMock(side_effect=AssertionError("API inventory read verified a seal"))
+    consumed_spy = AsyncMock(side_effect=verify)
     monkeypatch.setattr(custody, "verify_network_candidate_read_metadata", metadata_spy)
     monkeypatch.setattr(store, "verify_consumed_network_relations", consumed_spy)
     return connection, metadata_spy, consumed_spy
@@ -103,7 +106,7 @@ async def test_api_loader_preserves_complete_root(monkeypatch, count):
         connection, fixture.copy_target, fixture.candidate_by_field, control_schema=CONTROL
     )
     assert inventory == fixture.reference and entries == fixture.entries
-    assert connection.events[:3] == ["custody", "pid", "count"]
+    assert connection.events[:3] == ["name", "pid", "count"]
     assert all(
         connection.events[index + 1] == "guard"
         for index, event in enumerate(connection.events)
@@ -111,7 +114,7 @@ async def test_api_loader_preserves_complete_root(monkeypatch, count):
     )
     assert guards.await_count == 1 + connection.events.count("preflight") + connection.events.count("payload")
     assert "payload" in connection.events if count else "payload" not in connection.events
-    metadata.assert_awaited_once()
+    metadata.assert_not_awaited()
     connection.execute.assert_not_awaited()
 
 
@@ -136,7 +139,7 @@ async def test_empty_preflight_is_guarded(monkeypatch):
         await store.load_source_inventory_for_api(
             connection, fixture.copy_target, fixture.candidate_by_field, control_schema=CONTROL
         )
-    assert connection.events == ["custody", "pid", "count", "guard", "preflight", "guard"]
+    assert connection.events == ["name", "pid", "count", "guard", "preflight", "guard"]
 
 
 async def test_no_complete_inventory_escapes_root_mismatch(monkeypatch):
@@ -152,15 +155,14 @@ async def test_no_complete_inventory_escapes_root_mismatch(monkeypatch):
     assert connection.events[-1] == "guard" and connection.events.count("guard") >= 3
 
 
-@pytest.mark.parametrize("damage", ["seal", "oid", "scope", "root"])
+@pytest.mark.parametrize("damage", ["mode", "missing", "scope", "root"])
 async def test_metadata_refusal_precedes_inventory_data(monkeypatch, damage):
     fixture = _inventory()
     connection, metadata, guards = _api_spies(monkeypatch, fixture)
-    if damage == "seal":
-        metadata.side_effect = store.RegistrySourceInventoryError("synthetic sealed metadata refusal")
-    elif damage == "oid":
-        metadata.side_effect = None
-        metadata.return_value = {"receipt": {"closure": {"relation_oids": {store.INVENTORY_TABLE: _OID + 1}}}}
+    if damage == "mode":
+        connection.modes = ("repeatable read", "off")
+    elif damage == "missing":
+        connection.oid = None
     elif damage == "scope":
         fixture.candidate_by_field["dataset_id"] = "00000000-0000-0000-0000-000000000001"
     else:

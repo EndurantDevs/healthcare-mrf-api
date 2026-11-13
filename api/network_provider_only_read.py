@@ -99,14 +99,8 @@ async def _source_candidate(connection, current, control_schema):
     from process.network_candidate_custody import read_network_control_relation_pins
 
     namespace = _control_namespace(control_schema)
-    control = current.custody_control
-    if type(control) is not dict:
-        raise NetworkProviderReadUnavailable("Pinned provider-only source custody is unavailable")
     relations = await read_network_control_relation_pins(
-        connection,
-        ("network_membership_candidate",),
-        control_schema=namespace[1:-1],
-        expected_candidate_table_oid=control["candidate_table_oid"],
+        connection, ("network_membership_candidate",), control_schema=namespace[1:-1]
     )
     pid = connection.get_server_pid()
     candidate = await connection.fetchrow(

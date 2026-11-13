@@ -12,7 +12,6 @@ from process.network_serving_read import NetworkServingReadUnavailable, _pinned_
 
 _PUBLISHED_SQL = """SELECT to_jsonb(candidate)::text AS candidate_json,
  to_jsonb(manifest)::text AS manifest_json,
- to_regclass('{control}.network_membership_candidate')::oid::bigint AS candidate_table_oid,
  physical.relname AS base_name,space.nspname AS base_schema,
  (physical.relrowsecurity OR physical.relforcerowsecurity) AS base_rls,
  to_regclass('{control}.registry_approved_record')::oid::bigint AS approved_oid,
@@ -106,7 +105,7 @@ def _decode_published_pin(entry, schema, *, approved=True):
             # The validation report names the candidate's relations; no ledger row is read.
             "receipt": {
                 "closure": report["writer_closure"],
-                "control": {"candidate_table_oid": entry["candidate_table_oid"]},
+                "control": {},
                 "index_definition_sha256": report["serving_readiness"]["index_definition_sha256"],
             },
             "seal_sha256": None,
