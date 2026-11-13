@@ -3,11 +3,11 @@
 
 import json
 
-from process.network_address_projection import _identifier
+from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_approved_membership_source import ApprovedMembershipSource
+from process.network_compact_custom_preparation import compact_carrier_receipt, compact_custom_receipt
 from process.network_compact_layout import CompactAddressRelation, CompactEdgeArtifact, CompactNetworkLayout
 from process.network_indexed_address_artifact import CONTRACT as INDEXED_CONTRACT
-from process.network_serving_api_validation import _custom_address_relation
 from process.network_serving_read import NetworkServingReadUnavailable, _pinned_manifest
 
 _PUBLISHED_SQL = """SELECT to_jsonb(candidate)::text AS candidate_json,
@@ -43,6 +43,36 @@ _PUBLISHED_SQL = """SELECT to_jsonb(candidate)::text AS candidate_json,
 def published_api_pin_statement(control_schema):
     """Select the published pointer, never an uncommitted maximum generation."""
     return _PUBLISHED_SQL.format(control=_identifier(control_schema))
+
+
+def _require(condition):
+    if condition is not True:
+        raise NetworkServingReadUnavailable("Protected API serving metadata is unavailable")
+
+
+def _custom_address_relation(candidate, descriptor):
+    report = candidate["validation_json"]
+    closure = report["writer_closure"]
+    custom, carrier = compact_custom_receipt(candidate), compact_carrier_receipt(candidate)
+    if custom is None:
+        return None
+    _require(custom.base_source == PinnedAddressSource(**report["address_source"]))
+    _require(custom.base_artifact_sha256 == descriptor["descriptor_sha256"])
+    _require(custom.binding_table_oid == closure["relation_oids"].get("provider_location_binding"))
+    _require(custom.runtime_roles == tuple(sorted(set(closure["loader_roles"] + closure["reader_roles"]))))
+    address_oid = custom.address_table_oid
+    if carrier is not None:
+        _require(carrier.base_source == custom.base_source and carrier.runtime_roles == custom.runtime_roles)
+        _require(
+            carrier.base_artifact_sha256 == custom.base_artifact_sha256
+            and carrier.binding_table_oid == custom.binding_table_oid
+        )
+        _require(not custom.custom_pair_count or address_oid == carrier.address_table_oid)
+        address_oid = carrier.address_table_oid
+    if custom.custom_pair_count or carrier is not None and carrier.materialized_address_rows:
+        _require(address_oid == closure["relation_oids"].get("entity_address_unified"))
+        return CompactAddressRelation(candidate["schema_name"], "entity_address_unified", address_oid)
+    return None
 
 
 def _decode_published_pin(entry, schema):
