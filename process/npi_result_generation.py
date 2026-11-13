@@ -602,6 +602,52 @@ async def install_npi_stage_mutation_guards(
     )
 
 
+async def _live_relation_oids(connection: Any, schema: str) -> tuple[int, ...]:
+    live_oids = await connection.fetchrow(
+        "SELECT "
+        + ", ".join(
+            f"to_regclass($1 || '.{table_name}')::oid::bigint AS relation_{ordinal}"
+            for ordinal, table_name in enumerate(RELATION_NAMES, 1)
+        ),
+        schema,
+    )
+    if live_oids is None:
+        raise RuntimeError("NPI serving relations are unavailable")
+    return _relation_oids(tuple(live_oids[f"relation_{ordinal}"] for ordinal in range(1, 7)))
+
+
+async def publish_unreceipted_npi_result_generation(
+    connection: Any,
+    *,
+    schema_name: str,
+) -> NpiResultGenerationAuthority:
+    """Advance and bind the result revision when publication carries no evidence receipt."""
+
+    schema = _schema_name(schema_name)
+    current_row = await connection.fetchrow(_state_projection(schema, lock=True))
+    if current_row is None:
+        raise RuntimeError("NPI result generation authority is unavailable")
+    current = validate_npi_result_generation_authority(current_row)
+    if current.local_generation >= _MAX_GENERATION:
+        raise RuntimeError("NPI local result generation is exhausted")
+    relation_oids = await _live_relation_oids(connection, schema)
+    updated = await connection.fetchrow(
+        f"UPDATE {_quoted(schema)}.{_quoted(TABLE_NAME)} SET "
+        "local_generation=$1, origin_lineage_id=local_lineage_id, "
+        "origin_generation=$1, published_at=transaction_timestamp(), relation_oids=$2::bigint[], "
+        "canonical_publication_ref=NULL, canonical_publication_generation=NULL, "
+        "canonical_chain_ref=NULL, canonical_import_date=NULL WHERE singleton IS TRUE "
+        "RETURNING singleton, local_lineage_id, local_generation, origin_lineage_id, "
+        "origin_generation, published_at, relation_oids, canonical_publication_ref, "
+        "canonical_publication_generation, canonical_chain_ref, canonical_import_date",
+        current.local_generation + 1,
+        list(relation_oids),
+    )
+    if updated is None:
+        raise RuntimeError("NPI result generation authority is unavailable")
+    return validate_npi_result_generation_authority(updated)
+
+
 async def publish_local_npi_result_generation(
     connection: Any,
     *,
@@ -618,17 +664,7 @@ async def publish_local_npi_result_generation(
     current = validate_npi_result_generation_authority(current_row)
     if current.local_generation >= _MAX_GENERATION:
         raise RuntimeError("NPI local result generation is exhausted")
-    live_oids = await connection.fetchrow(
-        "SELECT "
-        + ", ".join(
-            f"to_regclass($1 || '.{table_name}')::oid::bigint AS relation_{ordinal}"
-            for ordinal, table_name in enumerate(RELATION_NAMES, 1)
-        ),
-        schema,
-    )
-    if live_oids is None:
-        raise RuntimeError("NPI serving relations are unavailable")
-    relation_oids = _relation_oids(tuple(live_oids[f"relation_{ordinal}"] for ordinal in range(1, 7)))
+    relation_oids = await _live_relation_oids(connection, schema)
     if relation_oids != fixed_receipt.relation_oids:
         raise RuntimeError("NPI publication relation identity differs")
     provenance = _provenance(fixed_receipt)
@@ -756,6 +792,7 @@ __all__ = [
     "install_npi_stage_mutation_guards",
     "publish_adopted_npi_result_generation",
     "publish_local_npi_result_generation",
+    "publish_unreceipted_npi_result_generation",
     "read_npi_result_generation_authority",
     "require_npi_automatic_generation_order",
     "validate_npi_canonical_provenance",

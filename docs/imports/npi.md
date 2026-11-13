@@ -21,6 +21,8 @@ be an immutable image digest reference. When unset,
 `HLTHPRT_REFERENCE_SOURCE_WORKER_IMAGE` remains the fallback. When neither is
 set, the ordinary worker job image runs the import. An explicitly empty NPI
 override is rejected. This override applies only to NPI workers.
+`HLTHPRT_NPI_WORKER_IMAGE` selects the ordinary worker job image for NPI alone;
+when unset, `HLTHPRT_WORKER_JOB_IMAGE` is used.
 
 ### Ownership-sealed publication
 
@@ -37,8 +39,17 @@ generation, all six current relation OIDs and canonical publication provenance.
 This mode uses its protected native publication record; the legacy seal proof below
 applies to ordinary publication.
 
-## Required Evidence Configuration
-Every controlled NPI run fails closed unless all four settings are present:
+## Evidence Configuration
+`HLTHPRT_NPPES_PUBLIC_EVIDENCE_MODE` is `off` by default. In that mode a
+controlled run downloads every listed dissemination archive, validates and
+indexes the staged tables as usual, rotates them into place, and marks the run
+succeeded without a publication receipt. The result generation record is bound
+to the new tables, so API caches keep a stable key. When
+`HLTHPRT_NPPES_PUBLIC_EVIDENCE_SCRATCH_ROOT` is set, archives still unpack
+there rather than in pod ephemeral storage.
+
+With `HLTHPRT_NPPES_PUBLIC_EVIDENCE_MODE=required`, a run fails closed unless
+all four settings are present:
 
 - `HLTHPRT_NPPES_PUBLIC_EVIDENCE_MODE=required`
 - `HLTHPRT_NPPES_RIGHTS_PROOF_SHA256` equals the SHA-256 of the shipped

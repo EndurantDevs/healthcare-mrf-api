@@ -686,10 +686,6 @@ SELECT EXISTS (
         ON projection_column.attrelid = projection_index.indrelid
        AND projection_column.attname = 'search_taxonomy_codes'
        AND NOT projection_column.attisdropped
-      JOIN mrf.npi_canonical_publication_receipt AS publication_receipt
-        ON publication_receipt.npi_table_oid = projection_index.indrelid
-      JOIN mrf.npi_canonical_publication_receipt_seal AS publication_seal
-        USING (publication_ref)
      WHERE projection_index.indrelid = 'mrf.npi'::regclass
        AND projection_index_relation.relname = 'npi_idx_search_taxonomy_codes'
        AND projection_index_method.amname = 'gin'

@@ -26,6 +26,7 @@ _WEEKLY_RE = re.compile(
     flags=re.ASCII,
 )
 _MAX_LISTING_BYTES = 4 * 1024 * 1024
+_LISTED_ARCHIVE_RE = re.compile(r"NPPES_Data_Dissemination[A-Za-z0-9_]*_V2\.zip", flags=re.ASCII)
 
 
 class _HrefParser(HTMLParser):
@@ -41,6 +42,16 @@ class _HrefParser(HTMLParser):
         for name, value in attrs:
             if name.lower() == "href" and type(value) is str:
                 self.hrefs.append(value)
+
+
+def listed_nppes_archive_names(listing_html: str) -> list[str]:
+    """Return each linked dissemination archive name once, in document order."""
+
+    parser = _HrefParser()
+    parser.feed(listing_html)
+    parser.close()
+    linked_names = (href.rsplit("/", 1)[-1] for href in parser.hrefs)
+    return list(dict.fromkeys(name for name in linked_names if _LISTED_ARCHIVE_RE.fullmatch(name)))
 
 
 def _official_archive_url(archive_name: str) -> str:
@@ -199,6 +210,7 @@ __all__ = (
     "NPPES_LISTING_URL",
     "NppesArchiveCandidate",
     "_candidate_from_url",
+    "listed_nppes_archive_names",
     "parse_official_nppes_listing",
     "select_nppes_release_chain",
     "validate_nppes_archive_candidate",

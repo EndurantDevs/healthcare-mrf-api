@@ -31,9 +31,16 @@ async def npi_native_cache_identity(execute, schema, *, session=None):
     if len(rows) != 1:
         return None
     authority = validate_npi_result_generation_authority(rows[0])
-    if authority.serving_generation is None or authority.canonical_provenance is None:
+    if authority.serving_generation is None:
         return None
-    return f"native:{authority.local_lineage_id}:{authority.local_generation}:{authority.canonical_provenance.publication_ref}"
+    provenance, serving = authority.canonical_provenance, authority.serving_generation
+    # An adopted generation can keep the local counter, so an unreceipted key carries its origin identity.
+    publication = (
+        f"unreceipted:{serving.origin_lineage_id}:{serving.origin_generation}"
+        if provenance is None
+        else provenance.publication_ref
+    )
+    return f"native:{authority.local_lineage_id}:{authority.local_generation}:{publication}"
 
 
 async def npi_publication_cache_identity(identity_rows, execute, schema, logger, *, session=None):

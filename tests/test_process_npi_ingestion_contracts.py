@@ -571,6 +571,54 @@ async def test_publication_transaction_reconciles_only_an_exact_commit(
 
 
 @pytest.mark.asyncio
+async def test_unreceipted_commit_converges_after_an_ambiguous_exit(monkeypatch, npi_module):
+    finished_at = "2026-08-09T02:03:04.000000+00:00"
+    commit = npi_module.NpiCanonicalPublicationCommit(None, finished_at, finished_at)
+    attempt = ("run_synthetic", "run_synthetic:attempt", finished_at)
+    state_by_name = {
+        "commit": commit,
+        "progress": {"phase": "npi published"},
+        "metrics": {"nppes_public_evidence": {"mode": "off"}},
+        "attempt": attempt,
+    }
+
+    @asynccontextmanager
+    async def settled_transaction():
+        yield
+
+    @asynccontextmanager
+    async def settled_connection():
+        yield SimpleNamespace(transaction=settled_transaction, execute=AsyncMock())
+
+    monkeypatch.setattr(npi_module.db, "acquire_driver", settled_connection)
+    settled = AsyncMock(return_value=True)
+    monkeypatch.setattr(npi_module, "has_settled_npi_publication", settled)
+    reload_commit = AsyncMock(return_value=commit)
+    monkeypatch.setattr(npi_module, "load_unreceipted_npi_commit", reload_commit)
+    committed_context_by_name = {}
+    lease = npi_module._NpiImportLease(object(), _AmbiguousPublicationConnection(), 731)
+    async with npi_module._npi_publication_transaction(
+        lease=lease,
+        schema="testschema",
+        context=committed_context_by_name,
+        publication_state_by_name=state_by_name,
+    ):
+        state_by_name["body_entered"] = True
+    assert committed_context_by_name["control_run_terminal_committed"] is True
+    assert settled.await_args.kwargs["run_id"] == "run_synthetic"
+    assert reload_commit.await_args.kwargs["attempt"] == attempt
+    reload_commit.return_value = None
+    with pytest.raises(RuntimeError, match="npi_canonical_publication_invalid"):
+        async with npi_module._npi_publication_transaction(
+            lease=lease,
+            schema="testschema",
+            context={},
+            publication_state_by_name=state_by_name,
+        ):
+            state_by_name["second_body_entered"] = True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure_count,error_type",
     [

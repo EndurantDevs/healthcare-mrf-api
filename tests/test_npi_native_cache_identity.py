@@ -57,7 +57,7 @@ async def test_absent_or_multiple_native_revisions_cannot_key_cache(rows):
 
 
 @pytest.mark.asyncio
-async def test_generation_without_canonical_provenance_cannot_key_cache():
+async def test_tracked_generation_without_a_receipt_still_keys_cache():
     row = revision_row()
     for field in (
         "canonical_publication_ref",
@@ -66,7 +66,12 @@ async def test_generation_without_canonical_provenance_cannot_key_cache():
         "canonical_import_date",
     ):
         row[field] = None
-    assert await npi_native_cache_identity(AsyncMock(return_value=native_rows([row])), "mrf") is None
+    expected = f"native:{row['local_lineage_id']}:4:unreceipted:{row['origin_lineage_id']}:4"
+    assert await npi_native_cache_identity(AsyncMock(return_value=native_rows([row])), "mrf") == expected
+    # A later adoption keeps the local counter and rebinds every table.
+    adopted_by_field = {**row, "origin_generation": 5, "relation_oids": [20, 21, 22, 23, 24, 25]}
+    later = await npi_native_cache_identity(AsyncMock(return_value=native_rows([adopted_by_field])), "mrf")
+    assert later == f"native:{row['local_lineage_id']}:4:unreceipted:{row['origin_lineage_id']}:5"
 
 
 @pytest.mark.asyncio

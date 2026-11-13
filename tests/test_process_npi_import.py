@@ -3,9 +3,9 @@
 import csv
 import hashlib
 import importlib
-from pathlib import Path
 import shutil
 import zipfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -199,10 +199,16 @@ def _install_test_mode_dependencies(
     zip_path: Path,
     captured_payloads: list[dict[str, object]],
 ) -> AsyncMock:
-    async def fake_download(_url):
-        return '<a href="NPPES_Data_Dissemination_20260301_20260331_V2.zip">current</a>'
+    downloaded_urls = []
 
-    async def fake_download_and_save(_url, target, **_kwargs):
+    async def fake_download(_url):
+        return (
+            '<a href="NPPES_Data_Dissemination_20260301_20260331_V2.zip">current</a> '
+            '<a href="NPPES_Data_Dissemination_20260401_20260407_V2.zip">next</a>'
+        )
+
+    async def fake_download_and_save(url, target, **_kwargs):
+        downloaded_urls.append(url)
         shutil.copyfile(zip_path, target)
 
     async def fake_unzip(source, target, **_kwargs):
@@ -231,6 +237,7 @@ def _install_test_mode_dependencies(
         AsyncMock(return_value={}),
     )
     staging_reset = AsyncMock()
+    staging_reset.downloaded_urls = downloaded_urls
     monkeypatch.setattr(npi_module, "_prepare_npi_staging", staging_reset)
     monkeypatch.setattr(npi_module, "save_npi_data", fake_save)
     return staging_reset
@@ -257,6 +264,7 @@ async def test_process_data_test_mode_imports_nppes_zip(monkeypatch, tmp_path, n
     }
     await npi_module.process_data(worker_context_map, {"test_mode": True})
     staging_reset.assert_awaited_once_with("20260331", "mrf")
+    assert staging_reset.downloaded_urls == ["https://example.com/NPPES_Data_Dissemination_20260301_20260331_V2.zip"]
     assert worker_context_map["context"]["run"] == 1
     assert worker_context_map["context"]["test_mode"] is True
     npi_payload = next(

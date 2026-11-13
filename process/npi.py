@@ -83,6 +83,7 @@ from process.npi_result_generation import (
     install_npi_result_revision_guards,
     publish_local_npi_result_generation,
 )
+from process.npi_unreceipted_publication import commit_unreceipted_npi_publication, load_unreceipted_npi_commit
 from process.nppes_public_evidence_chain_rows import (
     CHAIN_ARCHIVE_COLUMNS,
     build_nppes_chain_storage_rows,
@@ -97,6 +98,7 @@ from process.nppes_public_evidence_import import (
     resolve_nppes_evidence_runtime_config,
     validate_nppes_public_evidence_chain_receipt,
 )
+from process.nppes_public_evidence_listing import listed_nppes_archive_names
 from process.nppes_public_evidence_scratch import (
     assert_nppes_scratch_capacity,
     resolve_nppes_scratch_root,
@@ -1287,9 +1289,9 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
     evidence_config = _nppes_evidence_runtime_config(context)
     if test_mode and evidence_config.required:
         raise NPIPrerequisiteError("NPI test mode cannot admit immutable public evidence")
-    if run_id and not evidence_config.required:
-        raise NPIPrerequisiteError("Controlled NPI publication requires NPPES public evidence")
-    scratch_root = resolve_nppes_scratch_root() if evidence_config.required else None
+    # Without evidence the archives still unpack on the configured work volume, not pod storage.
+    has_scratch_root = evidence_config.required or bool(os.getenv("HLTHPRT_NPPES_PUBLIC_EVIDENCE_SCRATCH_ROOT"))
+    scratch_root = resolve_nppes_scratch_root() if has_scratch_root else None
     canonical_addresses_enabled = source_enabled("nppes")
     if scope is not None and not canonical_addresses_enabled:
         raise NPIPrerequisiteError("Isolated NPI preparation requires canonical address output")
@@ -1352,7 +1354,7 @@ async def execute_npi_import_attempt(ctx, task=None):  # pragma: no cover
         listing_url = os.environ["HLTHPRT_NPPES_DOWNLOAD_URL_DIR"] + os.environ["HLTHPRT_NPPES_DOWNLOAD_URL_FILE"]
         print(listing_url)
         html_source = await download_it(listing_url)
-        source_files = re.findall(r"(NPPES_Data_Dissemination.*_V2.zip)", html_source)
+        source_files = listed_nppes_archive_names(html_source)
         file_limit = TEST_NPI_MAX_FILES if test_mode else None
         selected_sources = source_files[:file_limit] if file_limit else source_files
     if not selected_sources:
@@ -2325,8 +2327,9 @@ async def _load_npi_commit_on_fresh_connection(
     commit: NpiCanonicalPublicationCommit,
     progress_by_name: dict[str, object],
     metrics_by_name: dict[str, object],
+    attempt: tuple[str, str, str] | None = None,
 ) -> NpiCanonicalPublicationCommit | None:
-    """Read one exact sealed commit without reusing an uncertain connection."""
+    """Read one exact commit without reusing an uncertain connection."""
 
     try:
         async with db.acquire_driver() as connection:
@@ -2336,10 +2339,18 @@ async def _load_npi_commit_on_fresh_connection(
                 is_settled = await has_settled_npi_publication(
                     connection,
                     schema=schema,
-                    run_id=commit.receipt.run_id,
+                    run_id=attempt[0] if commit.receipt is None else commit.receipt.run_id,
                 )
                 if not is_settled:
                     return None
+                if commit.receipt is None:
+                    return await load_unreceipted_npi_commit(
+                        connection,
+                        schema=schema,
+                        attempt=attempt,
+                        progress_by_name=progress_by_name,
+                        metrics_by_name=metrics_by_name,
+                    )
                 return await load_committed_npi_publication(
                     connection,
                     schema=schema,
@@ -2357,6 +2368,7 @@ async def _reconcile_npi_commit_after_error(
     commit: NpiCanonicalPublicationCommit,
     progress_by_name: dict[str, object],
     metrics_by_name: dict[str, object],
+    attempt: tuple[str, str, str] | None = None,
 ) -> NpiCanonicalPublicationCommit | None:
     """Shield one fresh read while the publishing task may be canceled."""
 
@@ -2366,6 +2378,7 @@ async def _reconcile_npi_commit_after_error(
             commit=commit,
             progress_by_name=progress_by_name,
             metrics_by_name=metrics_by_name,
+            attempt=attempt,
         )
     )
     while True:
@@ -2424,6 +2437,7 @@ async def _npi_publication_transaction(
             commit=commit,
             progress_by_name=progress,
             metrics_by_name=metrics,
+            attempt=publication_state_by_name.get("attempt"),
         )
         if reconciled is None:
             if isinstance(transaction_error, asyncio.CancelledError):
@@ -2492,10 +2506,8 @@ async def finalize_npi_import_attempt(ctx):  # pragma: no cover
     if context.get("test_mode"):
         raise NPIPrerequisiteError("NPI test mode cannot publish live tables")
     evidence_config = _nppes_evidence_runtime_config(context)
-    if not evidence_config.required:
-        raise NPIPrerequisiteError("Controlled NPI publication requires NPPES public evidence")
-    evidence_receipt = _required_nppes_evidence_receipt(context)
-    evidence_metrics = _nppes_evidence_metrics(evidence_receipt)
+    evidence_receipt = _required_nppes_evidence_receipt(context) if evidence_config.required else None
+    evidence_metrics = {"mode": "off"} if evidence_receipt is None else _nppes_evidence_metrics(evidence_receipt)
     await ensure_database(bool(context.get("test_mode")))
 
     db_schema = _runtime_db_schema()
@@ -3059,38 +3071,44 @@ WHERE
                             index_suffixes=index_suffixes,
                         ),
                     )
-                relation_oids = await canonical_relation_oids(
-                    lease.connection,
-                    schema=schema,
-                )
-                publication_receipt = await insert_npi_publication_receipt(
-                    lease.connection,
-                    schema=schema,
-                    publication_input=NpiCanonicalPublicationInput(
-                        run_id,
-                        attempt_id,
-                        attempt_started_at,
-                        evidence_receipt.chain_ref,
-                        publication_import_date,
-                        relation_oids,
-                        publication_row_counts,
-                    ),
-                )
-                await publish_local_npi_result_generation(
-                    lease.connection,
-                    schema_name=schema,
-                    receipt=publication_receipt,
-                )
-                terminal_metrics_by_name["npi_canonical_publication"] = npi_publication_metrics(publication_receipt)
                 publication_state_by_name["progress"] = terminal_progress_by_name
                 publication_state_by_name["metrics"] = terminal_metrics_by_name
-                publication_state_by_name["commit"] = await mark_npi_publication_succeeded(
-                    lease.connection,
-                    schema=schema,
-                    receipt=publication_receipt,
-                    progress_by_name=terminal_progress_by_name,
-                    metrics_by_name=terminal_metrics_by_name,
-                )
+                if evidence_receipt is None:
+                    publication_state_by_name["attempt"] = (run_id, attempt_id, attempt_started_at)
+                    publication_state_by_name["commit"] = await commit_unreceipted_npi_publication(
+                        lease.connection,
+                        schema=schema,
+                        attempt=(run_id, attempt_id, attempt_started_at),
+                        progress_by_name=terminal_progress_by_name,
+                        metrics_by_name=terminal_metrics_by_name,
+                    )
+                else:
+                    publication_receipt = await insert_npi_publication_receipt(
+                        lease.connection,
+                        schema=schema,
+                        publication_input=NpiCanonicalPublicationInput(
+                            run_id,
+                            attempt_id,
+                            attempt_started_at,
+                            evidence_receipt.chain_ref,
+                            publication_import_date,
+                            await canonical_relation_oids(lease.connection, schema=schema),
+                            publication_row_counts,
+                        ),
+                    )
+                    await publish_local_npi_result_generation(
+                        lease.connection,
+                        schema_name=schema,
+                        receipt=publication_receipt,
+                    )
+                    terminal_metrics_by_name["npi_canonical_publication"] = npi_publication_metrics(publication_receipt)
+                    publication_state_by_name["commit"] = await mark_npi_publication_succeeded(
+                        lease.connection,
+                        schema=schema,
+                        receipt=publication_receipt,
+                        progress_by_name=terminal_progress_by_name,
+                        metrics_by_name=terminal_metrics_by_name,
+                    )
 
             break
         except Exception as error:

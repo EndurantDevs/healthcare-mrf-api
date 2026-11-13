@@ -106,6 +106,20 @@ async def test_unconfigured_source_image_creates_the_ordinary_job(monkeypatch):
     assert environment_by_name["HLTHPRT_WORKER_ONCE_TARGET_JOB_ID"]["value"] == JOB_ID
 
 
+@pytest.mark.parametrize("override", [None, " ", "example/npi@sha256:" + "1" * 64])
+def test_ordinary_worker_image_can_be_set_for_npi_alone(monkeypatch, override):
+    generic_image = "example/ordinary@sha256:" + "f" * 64
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", generic_image)
+    monkeypatch.delenv("HLTHPRT_NPI_WORKER_IMAGE", raising=False)
+    if override is not None:
+        monkeypatch.setenv("HLTHPRT_NPI_WORKER_IMAGE", override)
+    expected = override if override and override.strip() else generic_image
+    assert workers._configured_worker_job_image(SPEC) == expected
+    other = workers._BY_IMPORTER_ROLE[("mrf-source-discovery", "start")]
+    monkeypatch.delenv("HLTHPRT_MRF_SOURCE_DISCOVERY_WORKER_IMAGE", raising=False)
+    assert workers._configured_worker_job_image(other) == generic_image
+
+
 def test_existing_job_refuses_a_new_specific_image(admitted, mounted_job, monkeypatch):
     monkeypatch.setenv(source.IMAGE_ENV, "example/replacement@sha256:" + "e" * 64)
     replacement = source.admit_npi_source_worker_launch(_recorded())
