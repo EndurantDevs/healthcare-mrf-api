@@ -61,3 +61,36 @@ async def test_other_reads_never_use_published_evidence(monkeypatch, unverifiabl
     monkeypatch.setattr(published_pin, "read_published_api_pin", read_published)
     with pytest.raises(serving.NetworkServingReadUnavailable, match="verification failed"):
         await serving.resolve_network_serving_manifest(_Connection(), control_schema="registry")
+
+
+async def test_missing_generation_is_refused_without_reading_published_evidence(monkeypatch):
+    async def read_manifest(_connection, _namespace, _generation_id):
+        return None
+
+    async def read_published(*_arguments):
+        raise AssertionError("a missing generation has no publication evidence")
+
+    monkeypatch.setattr(serving, "_read_manifest", read_manifest)
+    monkeypatch.setattr(published_pin, "read_published_api_pin", read_published)
+    with pytest.raises(serving.NetworkServingReadUnavailable, match="manifest is unavailable"):
+        await serving.resolve_network_serving_manifest(_Connection(), control_schema="registry", api_read=True)
+
+
+@pytest.mark.parametrize(
+    ("selector", "message"),
+    [
+        ({"api_read": 1}, "verification mode is invalid"),
+        ({"generation_id": 0}, "generation is invalid"),
+        ({"generation_id": True}, "generation is invalid"),
+        ({"generation_id": 2**63}, "generation is invalid"),
+    ],
+)
+async def test_invalid_selector_is_refused_before_the_connection_is_used(selector, message):
+    with pytest.raises(serving.NetworkServingReadUnavailable, match=message):
+        await serving.resolve_network_serving_manifest(object(), control_schema="registry", **selector)
+
+
+async def test_read_outside_a_transaction_is_refused(monkeypatch):
+    monkeypatch.setattr(_Connection, "is_in_transaction", lambda _connection: False)
+    with pytest.raises(serving.NetworkServingReadUnavailable, match="caller-owned transaction"):
+        await serving.resolve_network_serving_manifest(_Connection(), control_schema="registry", api_read=True)

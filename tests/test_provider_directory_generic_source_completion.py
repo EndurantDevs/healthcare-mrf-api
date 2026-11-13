@@ -512,14 +512,14 @@ async def test_real_organization_v4_union_matches_the_existing_canonical_contrac
     )
 
 
-def _witness():
-    raw_by_field = {"resourceType": "Organization", "id": "example"}
+def _witness(resource_id="example"):
+    raw_by_field = {"resourceType": "Organization", "id": resource_id}
     return dict(
         dataset_id="dataset",
         source_id="cms-npd",
         release_id="a" * 64,
         resource_type="Organization",
-        resource_id="example",
+        resource_id=resource_id,
         raw_payload_sha256=hashlib.sha256(completion.storage._encoded(raw_by_field).encode()).hexdigest(),
         normalized_payload_hash="b" * 64,
         raw_payload_json=raw_by_field,
@@ -549,6 +549,22 @@ async def test_closed_candidate_acquired_digest_markers_use_one_set_check(mismat
     assert '"source_schema"."private_resource"' in statement
     assert "completion_proof_required_version=3" in statement
     assert "IS DISTINCT FROM (r.acquired_resource_sha256 IS NOT NULL)" in statement
+
+
+async def _reduced_witness_rows(rows):
+    return [value async for value in completion._reduced_witnesses(_stream(rows), "dataset", "a" * 64)]
+
+
+@pytest.mark.asyncio
+async def test_witnesses_of_several_resources_reduce_in_order_and_refuse_disorder():
+    first, second = _witness("first"), _witness("second")
+    assert await _reduced_witness_rows([first, first, second]) == [first, second]
+    with pytest.raises(GenericCandidateError, match="witness_order_changed"):
+        await _reduced_witness_rows([second, first])
+    assert await _reduced_witness_rows([]) == []
+    # A reduction without rows copies nothing and never touches the connection.
+    no_rows = completion._reduced_rows(_stream([]), dataset_id="dataset", prepare=dict, merge=_merge)
+    assert await completion._copy_rows(object(), object(), "heap", completion.RESOURCE_COLUMNS, no_rows) == 0
 
 
 @pytest.mark.asyncio
