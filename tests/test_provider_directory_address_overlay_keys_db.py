@@ -55,39 +55,64 @@ async def _seed_affiliation(database, schema_name):
     )
 
 
+async def _seed_repeated_unit_location(database, schema_name):
+    """Add the one shape the native and SQL parsers key differently: a spaced, repeated unit."""
+    await database.status(
+        f'INSERT INTO "{schema_name}"."provider_directory_location" '
+        "(source_id, resource_id, mode, addresses, first_line, second_line, city_name, state_name, postal_code) "
+        "VALUES ('cms-npd', 'repeat', 'instance', CAST(:addresses AS jsonb), "
+        "'100 Main Street Suite 200  A', '200 A', 'Austin', 'TX', '78701')",
+        addresses='[{"use": "work", "type": "physical"}]',
+    )
+    await database.status(
+        f'UPDATE "{schema_name}"."provider_directory_practitioner_role" SET location_refs = '
+        '\'["Location/kind","Location/postal","Location/physical","Location/repeat"]\'::jsonb'
+    )
+
+
+async def _seed_sql_keyed_stage(database, schema_name, components, scope_by_name):
+    """Seed the fixture and publish it once with the SQL key expression."""
+    await _install_canonical_functions(database, schema_name)
+    await _create_fixture_tables(database, schema_name, "sql_stage")
+    await database.status(importer.provider_directory_address_overlay_table_sql(schema_name, "batch_stage"))
+    await _seed_cms_role_location_rows(database, schema_name)
+    await _seed_affiliation(database, schema_name)
+    await _seed_repeated_unit_location(database, schema_name)
+    for component in components:
+        await database.status(
+            importer._address_overlay_component_insert_sql(
+                schema_name, "sql_stage", component=component, source_ids=["cms-npd"]
+            ),
+            **scope_by_name,
+        )
+
+
+def _recorded_batch_key_tables(monkeypatch, database):
+    """Batch-key on this database in two-row pages and record each key table's owner."""
+    native_batch = overlay_keys._native_location_batch(importer)
+    key_tables = []
+    stage_table_name = importer._address_overlay_stage_table_name
+
+    def owned_key_table(run_id):
+        key_tables.append((run_id, stage_table_name(run_id)))
+        return key_tables[-1][1]
+
+    monkeypatch.setattr(importer, "_address_overlay_stage_table_name", owned_key_table)
+    monkeypatch.setattr(importer, "db", database)
+    monkeypatch.setattr(overlay_keys, "_native_location_batch", lambda _fhir: native_batch or _python_location_batch)
+    monkeypatch.setattr(overlay_keys, "LOCATION_KEY_PAGE_ROWS", 2)
+    return key_tables
+
+
 @pytest.mark.asyncio
 async def test_batch_keyed_locations_publish_the_same_overlay_rows(monkeypatch):
     """Keying Locations once in batches must not change one published row."""
 
     async with _temporary_schema(monkeypatch) as (database, schema_name):
-        await _install_canonical_functions(database, schema_name)
-        await _create_fixture_tables(database, schema_name, "sql_stage")
-        await database.status(importer.provider_directory_address_overlay_table_sql(schema_name, "batch_stage"))
-        await _seed_cms_role_location_rows(database, schema_name)
-        await _seed_affiliation(database, schema_name)
         components = ("practitioner_role", "organization_affiliation")
         scope_by_name = {"source_ids": ["cms-npd"]}
-        for component in components:
-            await database.status(
-                importer._address_overlay_component_insert_sql(
-                    schema_name, "sql_stage", component=component, source_ids=["cms-npd"]
-                ),
-                **scope_by_name,
-            )
-        native_batch = overlay_keys._native_location_batch(importer)
-        key_tables = []
-        stage_table_name = importer._address_overlay_stage_table_name
-
-        def owned_key_table(run_id):
-            key_tables.append((run_id, stage_table_name(run_id)))
-            return key_tables[-1][1]
-
-        monkeypatch.setattr(importer, "_address_overlay_stage_table_name", owned_key_table)
-        monkeypatch.setattr(importer, "db", database)
-        monkeypatch.setattr(
-            overlay_keys, "_native_location_batch", lambda _fhir: native_batch or _python_location_batch
-        )
-        monkeypatch.setattr(overlay_keys, "LOCATION_KEY_PAGE_ROWS", 2)
+        await _seed_sql_keyed_stage(database, schema_name, components, scope_by_name)
+        key_tables = _recorded_batch_key_tables(monkeypatch, database)
         step_messages = []
 
         async def record_step(*, message):
@@ -98,7 +123,8 @@ async def test_batch_keyed_locations_publish_the_same_overlay_rows(monkeypatch):
                 importer, schema_name, "batch_stage", None, ["cms-npd"], scope_by_name, components
             )
 
-        assert inserted_by_component == {"practitioner_role": 1, "organization_affiliation": 1}
+        assert inserted_by_component == {"practitioner_role": 2, "organization_affiliation": 1}
+        # The repeated-unit Location has irregular whitespace, so only the other three are batch keyed.
         assert "keyed locations rows=3" in step_messages[0]
         # The control run owns the key table although the build's query scope has no run id.
         assert key_tables[0][0] == "run-control"
@@ -108,7 +134,7 @@ async def test_batch_keyed_locations_publish_the_same_overlay_rows(monkeypatch):
         batch_rows = await database.all(PUBLISHED_ROWS_SQL.format(schema=schema_name, stage="batch_stage"))
         sql_rows = await database.all(PUBLISHED_ROWS_SQL.format(schema=schema_name, stage="sql_stage"))
         assert list(map(tuple, batch_rows)) == list(map(tuple, sql_rows))
-        assert len(batch_rows) == 2 and all(published[1] for published in batch_rows)
+        assert len(batch_rows) == 3 and all(published[1] for published in batch_rows)
         leftover_tables = await database.scalar(
             "SELECT count(*) FROM pg_tables WHERE schemaname = :schema_name AND tablename LIKE :stage_pattern",
             schema_name=schema_name,
