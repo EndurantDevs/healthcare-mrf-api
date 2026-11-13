@@ -6,7 +6,7 @@ import copy
 import json
 from dataclasses import asdict, replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sanic.exceptions import ServiceUnavailable
@@ -16,6 +16,7 @@ from api import plan_pricing_em_attribution as attribution
 from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
 from process import network_candidate_custody as custody
 from process import network_em_provider_inputs as inputs
+from process import network_published_api_pin as published_pin
 from process import network_read_identity as identity
 from process import network_serving_read as serving
 from process.network_compact_layout import CompactAddressRelation
@@ -134,6 +135,15 @@ async def test_input_header_uses_the_genuine_resolved_control_pin_before_decode(
     assert driver.events == ["header-read", "header-guard", "native-catalog"]
 
 
+async def test_input_header_reuses_the_published_pin_of_the_request(monkeypatch):
+    driver, supplied, actual, resolver, _pins = await _input_reader(monkeypatch)
+    reuse = Mock(return_value=actual)
+    monkeypatch.setattr(published_pin, "active_published_api_pin", reuse)
+    assert await inputs.resolve_em_provider_inputs(driver, supplied, "control", api_read=True) == input_fixture.family()
+    reuse.assert_called_once_with(driver, supplied, control_schema="control")
+    resolver.assert_not_awaited()
+
+
 @pytest.mark.parametrize("damage", ["manifest", "control", "guard", "missing", "sources", "receipt", "native", "pid"])
 async def test_api_inputs_preserve_full_manifest_receipt_native_and_consumption_checks(monkeypatch, damage):
     driver, supplied, actual, resolver, pins = await _input_reader(monkeypatch)
@@ -191,6 +201,8 @@ async def _legacy_input_reader(monkeypatch):
     custody_proof = AsyncMock(return_value=None)
     monkeypatch.setattr(serving, "_read_manifest", read)
     monkeypatch.setattr(serving, "_candidate_custody", custody_proof)
+    # A legacy generation has no published routing metadata.
+    monkeypatch.setattr(published_pin, "read_published_api_pin", AsyncMock(return_value=None))
     resolver = AsyncMock(wraps=serving.resolve_network_serving_manifest)
     monkeypatch.setattr(inputs, "resolve_network_serving_manifest", resolver)
     return driver, supplied, candidate_by_field, entry_by_field, resolver, read, custody_proof, sealed_pins

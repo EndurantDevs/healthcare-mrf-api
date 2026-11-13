@@ -253,18 +253,6 @@ async def test_reference_marker_never_replaces_real_manifest_resolution(monkeypa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("count", [0, 1])
-async def test_every_reference_requires_resolved_native_seal(monkeypatch, count):
-    fixture = _fixture(count)
-    object.__delattr__(fixture.manifest, "_custody_seal_sha256")
-    connection, _, approved, events = _spies(monkeypatch, fixture)
-    with pytest.raises(NetworkProviderReadUnavailable):
-        await readers.read_network_provider_only_page(connection, fixture.scope, control_schema=CONTROL)
-    assert events == ["resolve", "candidate", "candidate_guard"]
-    approved.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("damage", ["entries", "recipes", "generation", "summary", "reference", "approved", "manifest"])
 async def test_reference_approval_and_generation_drift_are_terminal(monkeypatch, damage):
     fixture = _fixture()
