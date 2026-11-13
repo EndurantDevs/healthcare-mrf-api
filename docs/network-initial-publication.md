@@ -81,5 +81,13 @@ resumes it. A refused request is marked rejected and is not resumed. The
 entry's class, constant code, SQLSTATE and location before deciding whether to
 resume the request or fix the cause first.
 
+API reads locate a published generation's tables by schema-qualified name, so a
+published snapshot copied to another database serves there with its recorded
+metadata unchanged. After an address table rotation the generation keeps reading
+its own table under the retained name `<table>_retained_<oid hex>`; the recorded
+name then belongs to the replacement. When custody cannot be re-proved for an
+API read, the read uses the stored publication evidence; other callers keep the
+strict check.
+
 Directory inventory alone does not establish pricing availability or nationwide
 network coverage.
