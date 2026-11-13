@@ -12,6 +12,7 @@ import pytest
 
 from process import provider_directory_source_checkpoint_control as control
 from process.provider_directory_generic_candidate import GenericCandidateError
+from tests.test_provider_directory_generic_source_policy import _connection, _named_factory
 
 _IDENTITY = {
     "checkpoint_id": "checkpoint",
@@ -78,6 +79,46 @@ async def test_concurrent_same_identity_insert_remains_replayable():
 def test_parent_coordinate_shape_and_bounded_size_refuse(values):
     with pytest.raises(GenericCandidateError, match="checkpoint_coordinates_invalid"):
         control._coordinates(values, 64)
+
+
+@pytest.mark.asyncio
+async def test_named_checkpoint_transaction_fences_parent_in_private_schema(monkeypatch):
+    factory = _named_factory()
+    binding = factory.storage_binding
+    connection, _ = _connection()
+    connection.fetch = AsyncMock(
+        return_value=[{"dataset_id": "dataset", "status": "acquiring", "acquisition_root_run_id": "root"}]
+    )
+    database, session = object(), object()
+
+    @asynccontextmanager
+    async def transaction(executor):
+        assert executor is database
+        yield
+
+    monkeypatch.setattr(control, "source_transaction", transaction)
+    monkeypatch.setattr(
+        control, "require_checkpoint_executor", AsyncMock(side_effect=lambda _: control.bound_publisher())
+    )
+    monkeypatch.setattr(control, "source_copy_session", lambda: session)
+    capture = AsyncMock()
+    monkeypatch.setattr(control, "capture_checkpoint_controls", capture)
+    async with control.source.bind_generic_source_transaction_factory(factory):
+        async with control.source.bind_generic_source_publisher(
+            connection, factory.policy, verify_role_profile=AsyncMock(), transaction_isolation="repeatable read"
+        ):
+            with pytest.raises(GenericCandidateError, match="checkpoint_namespace_changed"):
+                async with control.source_checkpoint_transaction(database, schema=binding.storage_schema):
+                    pytest.fail("private schema used as the catalog locator")
+            connection.fetch.assert_not_awaited()
+            async with control.source_checkpoint_transaction(
+                database, schema=binding.catalog_schema, dataset_ids=["dataset"], root_run_ids=["root"]
+            ) as executor:
+                assert executor is session
+    query, datasets, roots = connection.fetch.await_args.args
+    assert '"source_schema"."provider_directory_endpoint_dataset"' in query
+    assert "FOR KEY SHARE" in query and datasets == ["dataset"] and roots == ["root"]
+    capture.assert_not_awaited()
 
 
 @pytest.mark.asyncio

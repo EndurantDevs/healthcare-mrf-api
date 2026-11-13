@@ -57,11 +57,12 @@ async def test_proof_executor_is_original_same_task_owner_before_native_custody(
 
 
 @pytest.mark.asyncio
-async def test_private_proof_executor_uses_issued_storage_with_the_original_catalog_locator(monkeypatch):
+@pytest.mark.parametrize("named", [False, True])
+async def test_private_proof_executor_uses_issued_storage_with_the_original_catalog_locator(monkeypatch, named):
     from process import provider_directory_generic_source_policy as policy
-    from tests.test_provider_directory_generic_source_policy import _isolated_factory
+    from tests.test_provider_directory_generic_source_policy import _isolated_factory, _named_factory
 
-    factory = _isolated_factory()
+    factory = _named_factory() if named else _isolated_factory()
     session, native = object(), object()
     publisher = SimpleNamespace(connection=native, policy=factory.policy, storage_binding=factory.storage_binding)
     monkeypatch.setattr(control, "bound_publisher", lambda: publisher)
@@ -72,10 +73,13 @@ async def test_private_proof_executor_uses_issued_storage_with_the_original_cata
     monkeypatch.setattr(control, "verify_proof_control", custody)
     executor = ConnectionProxy(None, session, None)
     assert await control.require_proof_executor(executor, "catalog_schema") is publisher
-    custody.assert_awaited_once_with(native, factory.policy, storage_binding=factory.storage_binding)
     with pytest.raises(GenericCandidateError, match="proof_transaction_changed"):
         await control.require_proof_executor(executor, "source_schema")
-    assert custody.await_count == 1
+    if named:
+        control._copy_driver.assert_not_awaited()
+        custody.assert_not_awaited()
+    else:
+        custody.assert_awaited_once_with(native, factory.policy, storage_binding=factory.storage_binding)
 
 
 @pytest.mark.asyncio
