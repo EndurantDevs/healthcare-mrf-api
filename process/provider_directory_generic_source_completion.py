@@ -246,23 +246,33 @@ async def _reduce_payloads_sql(connection, policy, previous, candidate, director
     await connection.execute(f"SET LOCAL work_mem='{previous_work_mem}'")
 
 
+# One key's observations are reduced together, so each is validated once and so is the merged result.
+# The chunk bounds memory for a key observed any number of times.
+_KEY_CHUNK_ROWS = 256
+
+
 async def _reduced_rows(rows, *, dataset_id, prepare, merge):
-    previous_key, accumulated = None, None
+    def reduced(key_rows):
+        """Validate and merge rows of one key with the same identity/hash and pure semantic contracts."""
+        return next(reduce_sorted_resources(key_rows, dataset_id, prepare_row=prepare, merge_rows=merge))
+
+    def complete(key_rows):
+        """Reduce the last rows of one key and validate a merged result like an observation."""
+        return reduced([reduced(key_rows)]) if len(key_rows) > 1 else reduced(key_rows)
+
+    previous_key, pending_rows = None, []
     async for row in rows:
         key = (row["resource_type"], row["resource_id"])
         storage._require(previous_key is None or key >= previous_key, "resource_order_changed")
-        # Reuse the same complete-key identity/hash and pure semantic contracts.
-        if key == previous_key:
-            accumulated = next(
-                reduce_sorted_resources((accumulated, row), dataset_id, prepare_row=prepare, merge_rows=merge)
-            )
-        else:
-            if accumulated is not None:
-                yield accumulated
-            accumulated = next(reduce_sorted_resources((row,), dataset_id, prepare_row=prepare, merge_rows=merge))
-            previous_key = key
-    if accumulated is not None:
-        yield accumulated
+        if pending_rows and key != previous_key:
+            yield complete(pending_rows)
+            pending_rows = []
+        elif len(pending_rows) == _KEY_CHUNK_ROWS:
+            pending_rows = [reduced(pending_rows)]
+        pending_rows.append(row)
+        previous_key = key
+    if pending_rows:
+        yield complete(pending_rows)
 
 
 async def _reduced_witnesses(rows, dataset_id, release_id):
