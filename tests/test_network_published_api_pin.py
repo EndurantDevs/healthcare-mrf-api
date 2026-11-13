@@ -90,6 +90,7 @@ async def test_manifest_only_read_touches_no_approved_records(monkeypatch):
         "serving_readiness": {
             "address_artifact": {"contract": published.INDEXED_CONTRACT, "table": {"oid": 11}},
             "edge_artifacts": [],
+            "index_definition_sha256": "d" * 64,
         },
         "candidate_readiness": {"ref_map_oid": 12},
         "writer_closure": {},
@@ -101,11 +102,11 @@ async def test_manifest_only_read_touches_no_approved_records(monkeypatch):
         "base_rls": False,
         "base_schema": "example_addresses",
         "base_name": "entity_address_unified",
-        "receipt_json": "{}",
-        "seal_sha256": None,
+        "candidate_table_oid": 41,
     }
     manifest = SimpleNamespace(approved_custom_revision=4, source_generations={"custom_membership": "c" * 64})
-    monkeypatch.setattr(published, "_pinned_manifest", lambda _entry, custody: manifest)
+    evidence = []
+    monkeypatch.setattr(published, "_pinned_manifest", lambda _entry, custody: evidence.append(custody) or manifest)
     monkeypatch.setattr(layouts, "bind_compact_geo_search_candidate", lambda layout, _candidate: layout)
     connection = SimpleNamespace(fetchrow=AsyncMock(return_value=entry_by_field))
     resolved = await published.read_published_api_pin(connection, 3, "example_control", approved=False)
@@ -113,6 +114,13 @@ async def test_manifest_only_read_touches_no_approved_records(monkeypatch):
     approved_records = 'FROM "example_control".registry_approved_record'
     statement = connection.fetchrow.await_args.args[0]
     assert "NULL::bigint AS approved_rows" in statement and approved_records not in statement
+    # The candidate's own validation report supplies the relation names; the ledger is never read.
+    assert "network_candidate_custody" not in statement and evidence[0]["seal_sha256"] is None
+    assert evidence[0]["receipt"] == {
+        "closure": {},
+        "control": {"candidate_table_oid": 41},
+        "index_definition_sha256": "d" * 64,
+    }
 
     entry_by_field.update(approved_oid=31, approved_rows=5)
     pinned, approved, relation = await published.read_published_api_pin(connection, 3, "example_control")

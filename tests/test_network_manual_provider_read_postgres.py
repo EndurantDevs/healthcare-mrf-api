@@ -342,8 +342,7 @@ def _assert_fixed_guarded_queries(logged_queries):
     assert len(codec_queries) in (0, 3) and len(logged_queries) in (8, 11)
     assert all(statement.startswith(prefix) for statement, prefix in zip(codec_queries, codec_prefixes))
     assert all(query.query.lstrip().startswith(("SELECT", "WITH")) for query in logged_queries)
-    # The routing probe joins the ledger and the legacy lookup reads its row.
-    assert sum("network_candidate_custody" in query.query for query in logged_queries) == 2
+    assert sum("network_candidate_custody" in query.query for query in logged_queries) == 1
 
 
 async def test_draft_edits_and_new_head_preserve_retained_approved_identity(manual_read_db):

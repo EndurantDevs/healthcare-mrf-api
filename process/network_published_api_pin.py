@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Read published routing metadata; publication owns the expensive custody audits."""
+"""Read published routing metadata from the candidate's own validation report."""
 
 import json
 
@@ -12,17 +12,13 @@ from process.network_serving_read import NetworkServingReadUnavailable, _pinned_
 
 _PUBLISHED_SQL = """SELECT to_jsonb(candidate)::text AS candidate_json,
  to_jsonb(manifest)::text AS manifest_json,
- jsonb_build_object('closure',seal.receipt_json->'closure','control',(seal.receipt_json->'control')
-   ||jsonb_build_object('candidate_table_oid',
-     to_regclass('{control}.network_membership_candidate')::oid::bigint),
-   'index_definition_sha256',seal.receipt_json->'index_definition_sha256')::text AS receipt_json,
- seal.seal_sha256,physical.relname AS base_name,space.nspname AS base_schema,
+ to_regclass('{control}.network_membership_candidate')::oid::bigint AS candidate_table_oid,
+ physical.relname AS base_name,space.nspname AS base_schema,
  (physical.relrowsecurity OR physical.relforcerowsecurity) AS base_rls,
  to_regclass('{control}.registry_approved_record')::oid::bigint AS approved_oid,
  {approved_rows} AS approved_rows
  FROM {control}.network_serving_manifest manifest
  JOIN {control}.network_membership_candidate candidate USING(candidate_id)
- LEFT JOIN {control}.network_candidate_custody seal USING(candidate_id)
  LEFT JOIN pg_catalog.pg_class physical ON physical.oid=(
   -- Rotation keeps a published heap under its retained name and gives the recorded name to the replacement.
   SELECT named.oid FROM pg_catalog.pg_class named
@@ -107,8 +103,13 @@ def _decode_published_pin(entry, schema, *, approved=True):
     manifest = _pinned_manifest(
         entry,
         custody={
-            "receipt": json.loads(entry["receipt_json"]),
-            "seal_sha256": entry["seal_sha256"],
+            # The validation report names the candidate's relations; no ledger row is read.
+            "receipt": {
+                "closure": report["writer_closure"],
+                "control": {"candidate_table_oid": entry["candidate_table_oid"]},
+                "index_definition_sha256": report["serving_readiness"]["index_definition_sha256"],
+            },
+            "seal_sha256": None,
             "compact_layout": layout,
         },
     )
