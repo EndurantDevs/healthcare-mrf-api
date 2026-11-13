@@ -488,3 +488,18 @@ def test_ensure_worker_starts_entity_address_unified_shared_worker(monkeypatch, 
     assert result["items"][0]["worker_class"] == "process.EntityAddressUnified"
     assert captured_by_field["cmd"][-2:] == ["process.EntityAddressUnified", "--burst"]
     assert captured_by_field["env"]["HLTHPRT_ACTIVE_WORKER_QUEUE"] == "arq:EntityAddressUnified"
+
+
+@pytest.mark.asyncio
+async def test_nucc_ensure_selecting_a_second_worker_is_refused():
+    selected_specs = [control_workers._BY_IMPORTER_ROLE[(importer, "start")] for importer in ("nucc", "npi")]
+
+    refused = await control_workers._admit_importer_worker_ensure(
+        {"run_id": "run_nucc_queued", "importer": "nucc"},
+        run_id="run_nucc_queued",
+        importer="nucc",
+        selected_specs=selected_specs,
+    )
+
+    assert refused["status"] == "failed"
+    assert refused["message"] == "NUCC worker selector conflicts with importer"

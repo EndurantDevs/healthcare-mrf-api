@@ -302,3 +302,14 @@ async def test_composition_keeps_custody_and_column_shape_separate(
     else:
         base_shape.assert_awaited_once_with(connection, receipt.source_oids[1], address=True)
         output.assert_awaited_once_with(connection, receipt.address_source, receipt.runtime_roles, address=True)
+
+
+@pytest.mark.asyncio
+async def test_retained_address_source_without_its_manifest_is_unavailable(monkeypatch):
+    connection = SimpleNamespace(is_in_transaction=lambda: True, fetchval=AsyncMock(return_value=7))
+    custody = AsyncMock()
+    monkeypatch.setattr(serving, "_read_manifest", AsyncMock(return_value=None))
+    monkeypatch.setattr(serving, "_candidate_custody", custody)
+    with pytest.raises(serving.NetworkServingReadUnavailable, match="address manifest is unavailable"):
+        await serving.resolve_retained_network_address_source(connection, source(), control_schema="registry")
+    custody.assert_not_awaited()

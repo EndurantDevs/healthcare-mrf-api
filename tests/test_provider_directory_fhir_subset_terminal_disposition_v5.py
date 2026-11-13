@@ -220,6 +220,29 @@ def test_v5_marker_rejects_top_level_tamper(field_name, field_value):
         validated_direct_v5_terminal_marker(marker_by_field)
 
 
+@pytest.mark.parametrize(
+    "resource_type,field_name,field_value",
+    (
+        (None, "resource_dispositions", []),
+        (None, "source_import_sha256", "not-a-digest"),
+        ("Location", "checkpoint_pages", -1),
+        ("Location", "checkpoint_state", "active"),
+        ("Location", "diagnostic_sha256", "not-a-digest"),
+        ("Location", "disposition", TERMINAL_HTTP_410_DISPOSITION),
+        ("HealthcareService", "checkpoint_state", "complete"),
+        ("HealthcareService", "unreviewed_field", 1),
+    ),
+)
+def test_v5_marker_rejects_resource_and_digest_tamper(resource_type, field_name, field_value):
+    marker_by_field = deepcopy(_synthetic_marker())
+    target_by_field = marker_by_field["resource_dispositions"][resource_type] if resource_type else marker_by_field
+    assert target_by_field.get(field_name) != field_value
+    target_by_field[field_name] = field_value
+
+    with pytest.raises(ReviewedSubsetTerminalDispositionError):
+        validated_direct_v5_terminal_marker(marker_by_field)
+
+
 @pytest.mark.asyncio
 async def test_duplicate_v5_candidate_fails_closed():
     database = DirectV5TerminalDatabase()

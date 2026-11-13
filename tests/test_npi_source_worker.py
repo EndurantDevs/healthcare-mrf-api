@@ -4,7 +4,7 @@
 import json
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -180,6 +180,58 @@ def test_admission_requires_immutable_image(monkeypatch, image):
     with pytest.raises(ValueError, match="npi_source_worker_admission_unavailable"):
         source.admit_npi_source_worker_launch(_recorded())
     assert source.admit_npi_source_worker_launch({"importer": "nucc"}) is None
+
+
+def test_job_without_shared_volumes_runs_as_the_fixed_actor(admitted, monkeypatch):
+    for name in ("HLTHPRT_WORKER_JOB_PVC_NAME", "HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON"):
+        monkeypatch.delenv(name, raising=False)
+    job = workers._worker_job_manifest(SPEC, admitted, "example/ordinary:latest")
+    security = job["spec"]["template"]["spec"]["securityContext"]
+    assert "fsGroup" not in security and security["runAsUser"] == security["runAsGroup"] == 10001
+    assert source.is_npi_source_job_matching(job, admitted.npi_source_launch)
+
+
+def test_existing_job_refuses_a_serialized_launch_or_missing_containers(admitted, mounted_job):
+    launch = admitted.npi_source_launch
+    assert not source.is_npi_source_job_matching(mounted_job, asdict(launch))
+    del mounted_job["spec"]["template"]["spec"]["containers"]
+    assert not source.is_npi_source_job_matching(mounted_job, launch)
+
+
+def test_source_secret_is_selected_only_for_the_npi_worker_class(admitted):
+    selector_by_field = {"purposes": [source.PURPOSE], "importers": ["npi"], "workerClasses": [SPEC.worker_class]}
+    assert source.is_npi_source_secret_selected(selector_by_field, SPEC.worker_class, admitted)
+    assert not source.is_npi_source_secret_selected(selector_by_field, "process.NUCC", admitted)
+
+
+@pytest.mark.parametrize(
+    ("worker", "admit", "message"),
+    [
+        (workers.reference_source_worker, "admit_reference_source_worker_launch", "Reference source worker"),
+        (workers.registry_aca_source_worker, "admit_aca_source_worker_launch", "ACA source worker"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_failed_admission_of_a_later_source_worker_refuses_the_request(monkeypatch, worker, admit, message):
+    monkeypatch.setenv(source.IMAGE_ENV, IMAGE)
+    monkeypatch.setattr(worker, admit, Mock(side_effect=ValueError("admission_unavailable")))
+    request = workers._AdmittedWorkerRequest(run_id=RUN_ID, importer="npi")
+    workers._bind_admitted_job(request, _recorded())
+    refused = await workers._admit_source_worker_launches(request, _recorded())
+    assert refused["status"] == "failed" and refused["message"] == message + " admission is unavailable"
+    assert request.npi_source_launch == source.NPISourceWorkerLaunch(RUN_ID, JOB_ID, IMAGE)
+
+
+def test_process_launcher_has_no_kubernetes_jobs_to_find_or_delete(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "process")
+    request_by_field = {"run_id": RUN_ID, "importer": "npi"}
+    with pytest.raises(RuntimeError, match="Kubernetes worker lookup is unavailable"):
+        workers.exact_worker_presence(request_by_field)
+    assert workers.delete_kubernetes_worker_jobs(request_by_field) == {
+        "enabled": False,
+        "launcher": "process",
+        "deleted": 0,
+    }
 
 
 @pytest.mark.parametrize("index", range(5))

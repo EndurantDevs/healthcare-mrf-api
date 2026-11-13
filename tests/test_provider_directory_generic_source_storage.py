@@ -12,6 +12,7 @@ import pytest
 from process import provider_directory_generic_source_storage as storage
 from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
+from process.provider_directory_role_merge import MERGED_ROLE_SOURCES_ENV, role_order_index_sql
 
 
 @pytest.mark.parametrize("root", [storage.HEADER, "provider_directory_pagination_checkpoint"])
@@ -205,28 +206,37 @@ async def test_isolated_copy_uses_only_the_issued_storage_coordinates(harness, m
     assert not any('"catalog_schema".' in statement for statement in harness.sql)
 
 
-@pytest.mark.asyncio
-async def test_isolated_prepare_and_complete_share_the_existing_candidate_binding(harness, monkeypatch):
+def _without_candidate_storage(harness, monkeypatch, found=()):
+    """Start from an unprepared candidate; `found` marks the existence checks that find a row."""
     from process import provider_directory_generic_source_completion as completion
 
-    async with _isolated_harness(harness, monkeypatch) as publisher:
-        harness.header["candidate_storage_json"] = None
-        harness.connection.fetch = AsyncMock(return_value=[])
-        harness.connection.fetchval = AsyncMock(
-            side_effect=lambda query, *args: "private_ordinal_sequence" if "pg_get_serial_sequence" in query else False
+    harness.header["candidate_storage_json"] = None
+    harness.candidate.source_release = None
+    harness.connection.fetch = AsyncMock(return_value=[])
+    harness.connection.fetchval = AsyncMock(
+        side_effect=lambda query, *args: (
+            "private_ordinal_sequence" if "pg_get_serial_sequence" in query else any(mark in query for mark in found)
         )
-        proof_by_name = {}
+    )
+    proof_by_name = {}
 
-        async def capture(connection, policy, names, **options):
-            assert connection is harness.connection and policy is harness.policy
-            for name in names:
-                proof_by_name.setdefault(
-                    name, dict(name=name, oid=1000 + len(proof_by_name), owner=100, layout_sha256="e" * 64)
-                )
-            return {name: proof_by_name[name] for name in names}
+    async def capture(connection, policy, names, **options):
+        assert connection is harness.connection and policy is harness.policy
+        for name in names:
+            proof_by_name.setdefault(
+                name, dict(name=name, oid=1000 + len(proof_by_name), owner=100, layout_sha256="e" * 64)
+            )
+        return {name: proof_by_name[name] for name in names}
 
-        monkeypatch.setattr(storage, "_capture", capture)
-        monkeypatch.setattr(completion, "source_owner_transaction", storage.source_owner_transaction)
+    monkeypatch.setattr(storage, "_capture", capture)
+    monkeypatch.setattr(completion, "source_owner_transaction", storage.source_owner_transaction)
+    return completion
+
+
+@pytest.mark.asyncio
+async def test_isolated_prepare_and_complete_share_the_existing_candidate_binding(harness, monkeypatch):
+    async with _isolated_harness(harness, monkeypatch) as publisher:
+        completion = _without_candidate_storage(harness, monkeypatch)
         reduction = AsyncMock()
         monkeypatch.setattr(completion, "_complete_payloads", reduction)
         loading = await storage.prepare_generic_source_candidate(object(), harness.directory, harness.candidate)
@@ -251,6 +261,62 @@ async def test_isolated_prepare_and_complete_share_the_existing_candidate_bindin
         and "LOCK TABLE" not in statement
         for statement in harness.sql
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("merged_role_sources", "found", "reducer"),
+    [
+        ("example-source", (), "_reduce_payloads_python"),
+        ("", ("count(DISTINCT (payload_hash",), "_reduce_payloads_python"),
+        ("", (), "_reduce_payloads_sql"),
+    ],
+    ids=["merged roles", "differing observations", "identical observations"],
+)
+async def test_isolated_merged_role_source_orders_its_input_and_reduction(
+    harness, monkeypatch, merged_role_sources, found, reducer
+):
+    monkeypatch.setenv(MERGED_ROLE_SOURCES_ENV, merged_role_sources)
+    async with _isolated_harness(harness, monkeypatch):
+        completion = _without_candidate_storage(harness, monkeypatch, found)
+        reduction_by_name = {name: AsyncMock() for name in ("_reduce_payloads_python", "_reduce_payloads_sql")}
+        for name, reduction in reduction_by_name.items():
+            monkeypatch.setattr(completion, name, reduction)
+        loading = await storage.prepare_generic_source_candidate(object(), harness.directory, harness.candidate)
+        loading_statements = list(harness.sql)
+        prepared = await completion.complete_generic_source_candidate(object(), harness.directory, harness.candidate)
+    assert prepared["phase"] == "prepared"
+    assert [name for name, reduction in reduction_by_name.items() if reduction.await_count] == [reducer]
+    is_merged_role_source = bool(merged_role_sources)
+    # Only a source that retains merged roles pays for the lookup index while it loads.
+    order_index = role_order_index_sql(harness.policy.schema, loading["tables"]["resource_input"]["name"])
+    assert (order_index in loading_statements) is is_merged_role_source
+    checks = [call.args[0] for call in harness.connection.fetchval.await_args_list]
+    assert any("native_role" in check for check in checks) is is_merged_role_source
+    assert any("? 'merged_role_repeat'" in check for check in checks) is is_merged_role_source
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("found", "error", "reductions"),
+    [
+        ("count(DISTINCT (source_id", "witness_replay_conflict", 0),
+        ("native_role", "provider_directory_resource_payload_conflict", 0),
+        ("? 'merged_role_repeat'", "provider_directory_merged_role_observation_missing", 1),
+    ],
+    ids=["witness replay", "source role with two contents", "repeat without its role"],
+)
+async def test_isolated_completion_refusal_keeps_the_loading_binding(harness, monkeypatch, found, error, reductions):
+    monkeypatch.setenv(MERGED_ROLE_SOURCES_ENV, "example-source")
+    async with _isolated_harness(harness, monkeypatch):
+        completion = _without_candidate_storage(harness, monkeypatch, (found,))
+        reduction = AsyncMock()
+        monkeypatch.setattr(completion, "_reduce_payloads_python", reduction)
+        loading = await storage.prepare_generic_source_candidate(object(), harness.directory, harness.candidate)
+        with pytest.raises(ValueError, match=error):
+            await completion.complete_generic_source_candidate(object(), harness.directory, harness.candidate)
+        assert harness.header["candidate_storage_json"] == loading
+    assert reduction.await_count == reductions
 
 
 @pytest.mark.asyncio
@@ -315,6 +381,21 @@ async def test_witness_failure_rolls_back_resources_and_header_ordinal(harness):
         )
     assert harness_case.header == original
     assert len(harness_case.sql) == 1 and "pg_advisory_xact_lock" in harness_case.sql[0]
+
+
+@pytest.mark.asyncio
+async def test_interrupted_copy_is_closed_and_retires_its_owner(harness, monkeypatch):
+    original = deepcopy(harness.header)
+    close, invalidate = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(storage, "close_interrupted_copy", close)
+    monkeypatch.setattr(storage, "invalidate_copy_owner", invalidate)
+    monkeypatch.setattr(storage, "source_copy_session", lambda: "copy-session")
+    harness.connection.copy_records_to_table.side_effect = TimeoutError("copy timed out")
+    with pytest.raises(TimeoutError, match="copy timed out"):
+        await storage.append_generic_source_batch(object(), harness.directory, harness.candidate, _rows(1))
+    close.assert_awaited_once_with(harness.connection)
+    invalidate.assert_awaited_once_with("copy-session", harness.connection)
+    assert harness.header == original
 
 
 @pytest.mark.asyncio
