@@ -81,15 +81,19 @@ resumes it. A refused request is marked rejected and is not resumed. The
 entry's class, constant code, SQLSTATE and location before deciding whether to
 resume the request or fix the cause first.
 
-API reads of a generation published with an indexed address artifact locate its
-tables by schema-qualified name, so a copy of that published snapshot in another
-database serves there with its recorded metadata unchanged. Generations
-published under an older address contract still verify the recorded physical
-identities and are not served from a copy. After an address table rotation an
-indexed generation keeps reading its own table under the retained name
-`<table>_retained_<oid hex>`; the recorded name then belongs to the replacement.
-When custody cannot be re-proved for such an API read, the read uses the stored
-publication evidence; other callers keep the strict check.
+API reads that consume the published request pin locate the tables of a
+generation published with an indexed address artifact by schema-qualified name,
+so a copy of that published snapshot in another database serves those reads with
+its recorded metadata unchanged. Other reads can still require the original
+custody proof: generations published under an older address contract verify the
+recorded physical identities, and reads outside the published pin, such as CMS
+network-scoped entity reads, verify the retained source recipes against the
+publishing database and can return 503 on a copy. After an address table
+rotation an indexed generation keeps reading its own table under the retained
+name `<table>_retained_<oid hex>`; the recorded name then belongs to the
+replacement. An API read through the serving resolver whose custody cannot be
+re-proved uses the same stored publication evidence; callers outside API reads
+keep the strict check.
 
 Directory inventory alone does not establish pricing availability or nationwide
 network coverage.
