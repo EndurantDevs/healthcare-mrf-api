@@ -158,6 +158,10 @@ from process.provider_directory_admission_seal import (
     ProviderDirectoryAdmissionSeal,
     admission_seal_from_validated_metadata,
 )
+from process.provider_directory_artifact_scope_projection import PARSED_PAYLOAD_JOIN, PARSED_PAYLOAD_SQL
+from process.provider_directory_artifact_scope_projection import (
+    payload_column_sql as _provider_directory_artifact_payload_column_sql,
+)
 from process.provider_directory_backend_wal_diagnostic import BackendWalDiagnosticResult
 from process.provider_directory_cms_npd_recovery import candidate_available_sql
 from process.provider_directory_dataset_rehydrate import (
@@ -19018,24 +19022,6 @@ async def _create_provider_directory_artifact_scope_layout(
     )
 
 
-def _provider_directory_artifact_payload_column_sql(column: Any) -> str:
-    column_name = column.name
-    if column_name == "source_id":
-        return "selected.source_id"
-    if column_name == "resource_id":
-        return "resource.resource_id"
-    if column_name == "last_seen_run_id":
-        return "selected.evidence_run_id"
-    if column_name in {"observed_at", "updated_at"}:
-        return "COALESCE(dataset.published_at, dataset.validated_at, dataset.created_at)"
-    json_key = _sql_string_literal(column_name)
-    payload_expr = f"resource.payload_json::jsonb -> {json_key}"
-    if isinstance(column.type, SQLAlchemyJSON):
-        return f"CAST({payload_expr} AS json)"
-    column_type = column.type.compile(dialect=postgresql.dialect())
-    return f"CAST(resource.payload_json::jsonb ->> {json_key} AS {column_type})"
-
-
 def _provider_directory_artifact_source_select_sql(
     model: Any,
     schema: str,
@@ -19112,7 +19098,8 @@ def _provider_directory_artifact_resource_select_sql(
 
     columns = list(model.__table__.columns)
     selected_columns = ",\n            ".join(
-        _provider_directory_artifact_payload_column_sql(column) + " AS " + _q(str(column.name)) for column in columns
+        _provider_directory_artifact_payload_column_sql(column, PARSED_PAYLOAD_SQL) + " AS " + _q(str(column.name))
+        for column in columns
     )
     return f"""
         WITH selected(source_id, dataset_id, evidence_run_id) AS (
@@ -19130,6 +19117,7 @@ def _provider_directory_artifact_resource_select_sql(
           JOIN {_artifact_resource_input_relation(schema, dataset)} AS resource
             ON resource.dataset_id = selected.dataset_id
            AND resource.resource_type = :resource_type
+          {PARSED_PAYLOAD_JOIN}
     """.strip()
 
 
@@ -19169,7 +19157,7 @@ def _artifact_resource_batch_select_sql(
 
     columns = list(model.__table__.columns)
     selected_columns = ",\n            ".join(
-        _provider_directory_artifact_payload_column_sql(column) for column in columns
+        _provider_directory_artifact_payload_column_sql(column, PARSED_PAYLOAD_SQL) for column in columns
     )
     return f"""
         WITH selected(source_id, dataset_id, evidence_run_id) AS (
@@ -19199,6 +19187,7 @@ def _artifact_resource_batch_select_sql(
             ON dataset.dataset_id = selected.dataset_id
           JOIN resource_batch AS resource
             ON resource.dataset_id = selected.dataset_id
+          {PARSED_PAYLOAD_JOIN}
          ORDER BY resource.resource_id
     """.strip()
 
