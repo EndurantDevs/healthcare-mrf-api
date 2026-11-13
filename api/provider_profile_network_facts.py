@@ -15,7 +15,6 @@ from db.registry_schema import registry_schema
 from process.network_address_projection import _identifier
 from process.network_approved_source_bindings import APPROVED_NETWORK_BINDINGS_SQL
 from process.network_cms_registry_source_pair import resolve_committed_registry_cms_source_pair
-from process.network_compact_layout import CompactAddressRelation
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource, _source_witness_fields
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_network_catalog_read import _exclusions
@@ -160,8 +159,10 @@ async def pin_cms_profile_scope(
     if len(matches) != 1 or matches[0].source_pin.retained_epoch is None:
         raise DirectoryReadError(503)
     recipe = matches[0]
-    await resolve_committed_registry_cms_source_pair(session, recipe, api_read=True)
     pin = recipe.source_pin
+    # Admission checks the source tables for row filtering before the first source row is read.
+    read_relations = await _profile_read_relations(driver, manifest, pin)
+    await resolve_committed_registry_cms_source_pair(session, recipe, api_read=True)
     parameters_by_name = dict(
         zip(
             (f"scope_{index}" for index in range(1, 8)),
@@ -179,42 +180,27 @@ async def pin_cms_profile_scope(
         profile_max_facts=MAX_FACTS,
         profile_max_bytes=MAX_BYTES,
     )
-    scope = CMSNetworkScope(
+    bindings_sql = APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_identifier(registry_schema()))
+    return CMSNetworkScope(
         manifest,
-        APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_identifier(registry_schema())),
+        re.sub(r"\$(\d+)", lambda match: ":scope_" + match[1], bindings_sql),
         parameters_by_name,
         _identifier(pin.read_schema_name),
         pin,
         {},
         excluded_network_ids,
-        await _profile_read_relations(driver, manifest, pin),
+        read_relations,
     )
-    scope_sql = re.sub(r"\$(\d+)", lambda match: ":scope_" + match[1], scope.bindings_sql)
-    scope = CMSNetworkScope(
-        manifest,
-        scope_sql,
-        parameters_by_name,
-        scope.source_schema,
-        pin,
-        {},
-        excluded_network_ids,
-        scope.read_relations,
-    )
-    return scope
 
 
 async def _profile_read_relations(driver, manifest, pin):
-    """Bind only independently authenticated source, candidate and approved control names."""
+    """Bind the source tables found by name with the candidate and approved control names."""
     from process.network_approved_membership_source import pin_api_retained_approved_membership_source
     from process.network_fhir_membership_source import _require_pinned_source
 
-    epoch = await _require_pinned_source(driver, pin, api_read=True)
+    source_relations = await _require_pinned_source(driver, pin, api_read=True)
     _approved, approved_relation = await pin_api_retained_approved_membership_source(driver, manifest)
-    return (
-        *(CompactAddressRelation(epoch.schema_name, name, oid) for name, oid in epoch.relation_oids),
-        *manifest.candidate_relation_pins,
-        approved_relation,
-    )
+    return (*source_relations, *manifest.candidate_relation_pins, approved_relation)
 
 
 async def execute_cms_profile_read(session, scope, statement, parameters):

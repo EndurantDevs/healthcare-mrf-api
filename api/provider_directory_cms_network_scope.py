@@ -20,6 +20,7 @@ from process.network_fhir_membership_source import (
     _reviewed_descriptor,
     _source_witness_fields,
 )
+from process.network_read_identity import NetworkReadIdentityError
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_network_catalog_read import RegistryNetworkCatalogError, _catalog_manifest
 from process.registry_source_recipe_store import resolve_retained_registry_source_recipes
@@ -266,13 +267,17 @@ async def pin_cms_network_scope(session, schema, query, generation):
             raise ValueError
         recipe = matching_recipes[0]
         source_pin = recipe.source_pin
-        generation = await _scope_source_generation(session, schema, source_pin, recipe)
         approved = await pin_retained_approved_membership_source(
             driver, approved_revision=manifest.approved_custom_revision
         )
+        # Admission checks the source tables for row filtering before the first source row is read.
         await _require_pinned_source(
-            driver, source_pin, _reviewed_descriptor(source_pin, approved, recipe.binding_coordinates, True)
+            driver,
+            source_pin,
+            _reviewed_descriptor(source_pin, approved, recipe.binding_coordinates, True),
+            api_read=True,
         )
+        generation = await _scope_source_generation(session, schema, source_pin, recipe)
         parameters_by_name = dict(
             zip(
                 (f"scope_{index}" for index in range(1, 8)),
@@ -302,7 +307,7 @@ async def pin_cms_network_scope(session, schema, query, generation):
         return scope
     except RegistryNetworkCatalogError:
         raise
-    except ValueError, asyncpg.PostgresError:
+    except ValueError, asyncpg.PostgresError, NetworkReadIdentityError:
         raise DirectoryReadError(503) from None
 
 
@@ -332,7 +337,7 @@ async def _validate_selected_cms_scope(session, scope, query):
 async def _scope_source_generation(session, schema, source_pin, recipe):
     """Choose exact committed historical publication or the unchanged current selector."""
     if source_pin.retained_epoch is not None:
-        retained = await resolve_committed_registry_cms_source_pair(session, recipe)
+        retained = await resolve_committed_registry_cms_source_pair(session, recipe, api_read=True)
         generation_by_field = {
             "endpoint_id": source_pin.endpoint_id,
             "dataset_id": source_pin.dataset_id,

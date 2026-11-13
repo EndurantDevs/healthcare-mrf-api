@@ -4,9 +4,11 @@
 import asyncio
 import json
 import os
+from contextlib import nullcontext
 from dataclasses import asdict, replace
-from uuid import UUID
+from uuid import UUID, uuid4
 
+import asyncpg
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
@@ -972,7 +974,7 @@ def trusted_recipe(monkeypatch):
     async def recipes(driver, manifest, *, api_read=False):
         assert api_read is True
         schema = os.environ["HLTHPRT_DB_SCHEMA"]
-        oid = await driver.fetchval("SELECT to_regclass($1)::oid", schema + ".provider_directory_dataset_resource")
+        # The recorded table identifier is from another database, as on a copy; the read uses the name.
         source = PinnedFHIRMembershipSource(
             schema,
             "cms-npd",
@@ -980,7 +982,7 @@ def trusted_recipe(monkeypatch):
             state_by_field["dataset"],
             "b" * 64,
             "a" * 64,
-            oid,
+            1,
             "synthetic-alias",
             "2026-01-01",
         )
@@ -1066,6 +1068,63 @@ async def test_scoped_redirect_cannot_expose_an_unselected_target(monkeypatch, t
 async def test_unproved_scoped_records_are_excluded(monkeypatch, trusted_recipe, kind):
     async with cms_database(monkeypatch, prepare=_prepare) as sessions:
         assert (await read(sessions, _query(kind)))["items"] == []
+
+
+async def _assert_row_security_blocked(sessions, retained_schema):
+    """The admitted read holds its share lock, so another session cannot enable row security now."""
+    async with sessions() as other:
+        other_driver = (await (await other.connection()).get_raw_connection()).driver_connection
+        await other_driver.execute("SET lock_timeout = '500ms'")
+        with pytest.raises(asyncpg.LockNotAvailableError):
+            await other_driver.execute(
+                f'ALTER TABLE "{retained_schema}".provider_directory_entity_source_binding ENABLE ROW LEVEL SECURITY'
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("row_security", [False, True])
+async def test_api_admission_names_copied_epoch_tables_and_refuses_row_security(monkeypatch, row_security):
+    from process.network_fhir_membership_source import FHIRMembershipSourceError, _require_pinned_source
+    from process.network_fhir_source_epoch import _TABLES, RetainedCMSFHIRSourceEpoch
+
+    epoch_id = uuid4()
+    retained_schema = "registry_cms_epoch_" + epoch_id.hex
+    origin = ("mrf", "cms-npd", "synthetic-endpoint", "synthetic-dataset", "b" * 64, "a" * 64, 1, "synthetic-alias")
+    # Recorded identifiers come from the publishing database; none names a table in this one.
+    recorded_oids = tuple((name, 3 + ordinal) for ordinal, name in enumerate(sorted(_TABLES)))
+    digests = ("c" * 64, "d" * 64, "e" * 64, "f" * 64)
+    retained = RetainedCMSFHIRSourceEpoch(
+        (*origin, "2026-01-01"), epoch_id, retained_schema, 2, recorded_oids, "owner", ("reader",), *digests
+    )
+    pin = PinnedFHIRMembershipSource(*origin, "2026-01-01", retained_epoch=retained)
+
+    async def prepare(session):
+        await session.execute(text(f'CREATE SCHEMA "{retained_schema}"'))
+        for name in _TABLES:
+            shape = "AS TABLE provider_directory_endpoint_dataset" if name.endswith("_dataset") else "(id integer)"
+            await session.execute(text(f'CREATE TABLE "{retained_schema}"."{name}" {shape}'))
+        if row_security:
+            filtered = f'"{retained_schema}".provider_directory_entity_source_binding'
+            await session.execute(text(f"ALTER TABLE {filtered} ENABLE ROW LEVEL SECURITY"))
+
+    async with cms_database(monkeypatch, prepare=prepare) as sessions:
+        try:
+            async with sessions() as session, session.begin():
+                await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+                driver = (await (await session.connection()).get_raw_connection()).driver_connection
+                with pytest.raises(FHIRMembershipSourceError) if row_security else nullcontext():
+                    relations = await _require_pinned_source(driver, pin, api_read=True)
+                if not row_security:
+                    await _assert_row_security_blocked(sessions, retained_schema)
+                current_rows = await driver.fetch(
+                    "SELECT relname::text,oid::bigint FROM pg_class WHERE relnamespace=to_regnamespace($1)::oid",
+                    f'"{retained_schema}"',
+                )
+        finally:
+            await change(sessions, f'DROP SCHEMA "{retained_schema}" CASCADE')
+    if not row_security:
+        assert {(relation.table_name, relation.table_oid) for relation in relations} == set(map(tuple, current_rows))
+        assert len(relations) == len(_TABLES)
 
 
 @pytest.mark.asyncio

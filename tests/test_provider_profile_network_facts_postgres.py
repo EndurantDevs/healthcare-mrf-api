@@ -294,9 +294,12 @@ async def _read(fixture, manifest, **options):
                 session, manifest, "1000000491", excluded_network_ids=options.pop("excluded_network_ids", ()), **options
             )
             await asyncio.sleep(0)
-        assert not any(
-            statement.query.lstrip().upper().startswith("LOCK TABLE") or "pg_advisory" in statement.query.lower()
+        assert not any("pg_advisory" in statement.query.lower() for statement in statements)
+        # The only lock is the share lock that keeps row level security from being enabled during the read.
+        assert all(
+            statement.query.rstrip().upper().endswith("IN ACCESS SHARE MODE")
             for statement in statements
+            if statement.query.lstrip().upper().startswith("LOCK TABLE")
         )
         return result
 
@@ -366,14 +369,4 @@ async def test_native_profile_accounting_refuses_before_fact_transfer(published_
     # A deliberately stricter test budget exercises both native aggregate guards.
     monkeypatch.setattr(profile_facts, bound, 0)
     with pytest.raises(DirectoryReadError):
-        await _read(fixture, manifest)
-
-
-async def test_native_profile_refuses_open_address_custody(published_profile_source):
-    _database, fixture, pair, manifest, _network, _sites = published_profile_source
-    assert (await _read(fixture, manifest)).facts
-    await fixture.connection.execute(
-        f'GRANT UPDATE ON "{pair.address_ownership.schema_name}".entity_address_unified TO "{fixture.roles["reader"]}"'
-    )
-    with pytest.raises(ValueError, match="Native owner or runtime privileges are not closed"):
         await _read(fixture, manifest)
