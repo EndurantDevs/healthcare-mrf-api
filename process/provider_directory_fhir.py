@@ -45280,11 +45280,10 @@ async def _probe_and_persist_bulk_output_validator(
 ) -> str | None:
     try:
         stored_validator = _stored_bulk_output_validator(output_checkpoint)
-        if (
-            stored_validator is not None
-            and stored_validator.output_expires_at is not None
-            and stored_validator.output_expires_at <= _bulk_export_now_utc()
-        ):
+        if bulk_parallel.holds_copy(source_record, identity.checkpoint_id, output_checkpoint, stored_validator):
+            return None  # the saved copy holds the validated bytes; its link may have expired
+        expires_at = stored_validator.output_expires_at if stored_validator is not None else None
+        if expires_at is not None and expires_at <= _bulk_export_now_utc():
             return "bulk_export_output_url_expired"
         status_code, headers_by_name, request_error = await _bulk_http_probe_output(
             session,
