@@ -2233,17 +2233,23 @@ in [Provider-directory and formulary source acceptance](provider-directory-formu
 
 [BCBS Minnesota’s official Provider Directory](https://fhir-developer.bluecrossmn.com/provider-directory)
 uses anonymous Plan-Net searches at `https://api.bluecrossmn.com/fhir/provider`
-for Medicare and Medicaid providers, pharmacies and dentists. The shared source
-catalog records seven documented collections and excludes `Endpoint`. Acquisition
-remains disabled: requests for 1,000 records return 500 in sampled larger
-collections without next links, and
-`Bundle.total` follows the requested count rather than an authoritative directory
-total. Count-only queries still return resources, and the missing-timestamp
-predicate returns dated records. The advertised capability has no history,
-export or versioned-write contract, so timestamp partitioning cannot establish
-complete coverage. Keep this source probe-only until a complete traversal is
-verified. Existing sources using `/fhir/provider-directory/` retain their separate
-identities; endpoint and product equivalence are not assumed.
+for Medicare and Medicaid providers, pharmacies and dentists. The shared importer
+covers seven collections and excludes `Endpoint`. Practitioner, PractitionerRole,
+Organization and OrganizationAffiliation use adaptive timestamp partitions with
+`_count=0&_summary=count&_total=accurate` censuses. Unfiltered and ranged counts
+must match before and after acquisition; every disjoint leaf must match its count
+and both content-verification passes. Valid resource timestamp offsets are
+normalized to UTC for comparison while checkpoint boundaries remain strictly UTC.
+
+InsurancePlan, Location and HealthcareService start with the native zero-count
+search response, retain its server-issued cache handle, then download bounded
+500-row cached pages. Full pages advance even when the gateway omits next links;
+malformed continuation decorations cannot change the retained cache or offset.
+Expired caches fail without resetting retained progress. The existing COPY,
+candidate validation and atomic publication path remains shared. Configured
+support is separate from terminal import, publication and serving verification.
+Historical `/fhir/provider-directory/` aliases retain separate identities; endpoint
+and product equivalence are not assumed.
 
 Florida Blue's official Provider Directory OAS
 (`https://developer.bcbsfl.com/interop/interop-developer-portal/product/758/api/749`)
