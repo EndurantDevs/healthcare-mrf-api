@@ -3,7 +3,6 @@
 
 from sqlalchemy import text
 
-from api.ptg2_code_scope import source_read_relation
 from api.ptg2_tables import snapshot_serving_tables
 from api.ptg2_v4_graph import load_v4_graph_root
 from api.ptg_membership_contract import identity, physical_identity
@@ -36,9 +35,7 @@ async def _finalizer_identity(session, schema, key):
         "target_identity_digest": None,
     }
     if packed:
-        root_relation = source_read_relation(
-            session, schema, "ptg2_v4_finalizer_map_root", default=f'"{schema}".ptg2_v4_finalizer_map_root'
-        )
+        root_relation = f'"{schema}".ptg2_v4_finalizer_map_root'
         finalizer_row = (
             (
                 await session.execute(
@@ -87,12 +84,7 @@ async def _source_storage(session, schema, snapshot_id):
     )
     if not storage_rows or not required_relations.issubset({storage_row["relname"] for storage_row in storage_rows}):
         raise PTG2ManifestArtifactError("membership source relation inventory is incomplete")
-    attestation_relation = source_read_relation(
-        session,
-        serving.PTG2_SCHEMA,
-        "ptg2_v3_candidate_audit_attestation",
-        default=f'"{serving.PTG2_SCHEMA}".ptg2_v3_candidate_audit_attestation',
-    )
+    attestation_relation = f'"{serving.PTG2_SCHEMA}".ptg2_v3_candidate_audit_attestation'
     attestation_digest = await session.scalar(
         text(
             f"SELECT encode(attestation_digest,'hex') FROM {attestation_relation} "
@@ -110,12 +102,10 @@ async def _source_storage(session, schema, snapshot_id):
     }
 
 
-async def source_identity(session, source_key, snapshot_id, code_system, code, *, tables=None, api_read=False):
+async def source_identity(session, source_key, snapshot_id, code_system, code, *, tables=None):
     """Resolve fresh audited source custody and its immutable physical/code identity."""
     expected = tables
-    if type(api_read) is not bool:
-        raise ValueError("membership Source API mode is invalid")
-    tables = await snapshot_serving_tables(session, snapshot_id, **({"api_read": True} if api_read else {}))
+    tables = await snapshot_serving_tables(session, snapshot_id)
     key, schema = _require_source_custody(tables, expected, source_key, snapshot_id)
     root = await load_v4_graph_root(session, key, schema_name=schema, refresh=True)
     finalizer_by_field = await _finalizer_identity(session, schema, key)
