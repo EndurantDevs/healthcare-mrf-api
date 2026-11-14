@@ -222,7 +222,9 @@ async def test_native_target_membership_remains_required(monkeypatch, phase):
             snapshot = await inputs.capture(case.directory, fence)
             await case.database.status(
                 f"UPDATE {case.schema}.provider_directory_endpoint_dataset SET publication_metadata_json="
-                "jsonb_set(publication_metadata_json::jsonb,'{source_ids}','[]')::json WHERE dataset_id='dataset_shared'"
+                "jsonb_set(publication_metadata_json::jsonb,'{source_ids}','[]')::json,"
+                "publication_metadata_summary_json=jsonb_set(publication_metadata_summary_json,'{source_ids}','[]') "
+                "WHERE dataset_id='dataset_shared'"
             )
             operation = (
                 inputs.capture(case.directory, fence)
@@ -240,6 +242,13 @@ async def test_native_peer_metadata_is_not_new_publication_authority(monkeypatch
         async with replacement.preparation_scope(case.directory, _markers()) as fence:
             snapshot = await inputs.capture(case.directory, fence)
         assert "publication_metadata_json" not in inputs._selection_sql(case.directory)[2]
+        # The sealed target's membership comes from its bounded summary, never from the raw document.
+        target_selection = inputs._selection_sql(case.directory, is_publication=True)[2]
+        assert "dataset.publication_metadata_summary_json->'source_ids'" in target_selection
+        assert "publication_metadata_json" not in target_selection
+        assert "COALESCE(dataset.publication_metadata_summary_json -> 'source_ids'," in (
+            address._desired_datasets_sql(case.schema)
+        )
         assert "raw_metadata_sha256" not in replacement._HEADER_FIELDS
         await _unrelated_peer_metadata(case)
         async with case.database.transaction():

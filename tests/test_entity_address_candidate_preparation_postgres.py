@@ -111,7 +111,7 @@ async def _candidate_tables(database, schema):
         "CREATE TABLE {schema}.provider_directory_endpoint_dataset (dataset_id varchar, endpoint_id varchar, "
         "dataset_hash varchar, acquisition_root_run_id varchar, import_run_id varchar, status varchar, "
         "is_current boolean, validated_at timestamp, published_at timestamp, superseded_at timestamp, "
-        "publication_metadata_json text)",
+        "publication_metadata_json json, publication_metadata_summary_json jsonb)",
         "CREATE TABLE {schema}.provider_directory_dataset_resource (dataset_id varchar, resource_type varchar, resource_id varchar)",
         "INSERT INTO {schema}.provider_directory_dataset_resource VALUES "
         "('incumbent','Location','old'), ('candidate','Location','new'), ('retained','Location','other')",
@@ -139,17 +139,19 @@ async def _candidate_datasets(database, schema):
         ("candidate", "endpoint", "directory", "b" * 64, "new-run", "validated", False),
         ("retained", "other-endpoint", "other", "c" * 64, "other-run", "published", True),
     ):
+        # Only the candidate is sealed with a summary; the other datasets answer from their raw document.
         await database.status(
             f"INSERT INTO {schema}.provider_directory_endpoint_dataset VALUES "
             "(:dataset,:endpoint,:digest,:root,:root,:status,:current,now(),"
-            "CASE WHEN :current THEN now() ELSE NULL END,NULL,:metadata)",
+            "CASE WHEN :current THEN now() ELSE NULL END,NULL,CAST(:metadata AS json),CAST(:summary AS jsonb))",
             dataset=dataset_id,
             endpoint=endpoint,
             digest=digest,
             root=root_run,
             status=status,
             current=current,
-            metadata='{"source_ids":["' + source_id + '"]}',
+            metadata=(metadata := '{"source_ids":["' + source_id + '"]}'),
+            summary=metadata if dataset_id == "candidate" else None,
         )
 
 
@@ -185,6 +187,31 @@ async def test_candidate_reads_remain_noncurrent_and_detect_pin_drift(monkeypatc
         finally:
             preparation._PREPARATION.reset(token)
         assert await _overlay_datasets(database, schema) == ["incumbent"]
+
+
+@pytest.mark.parametrize(
+    ("dataset_id", "column", "cast"),
+    [
+        ("candidate", "publication_metadata_summary_json", "jsonb"),
+        ("retained", "publication_metadata_json", "json"),
+    ],
+)
+async def test_pin_membership_reads_summary_then_falls_back_to_raw_document(monkeypatch, dataset_id, column, cast):
+    async with _temporary_schema() as (database, schema):
+        monkeypatch.setattr(native, "db", database)
+        inputs = await _candidate_tables(database, schema)
+        token = preparation._PREPARATION.set(inputs)
+        try:
+            await preparation.assert_dataset_pins(schema, inputs)
+            await database.status(
+                f"UPDATE {schema}.provider_directory_endpoint_dataset "
+                f"SET {column}=CAST('{{\"source_ids\":[]}}' AS {cast}) WHERE dataset_id=:dataset",
+                dataset=dataset_id,
+            )
+            with pytest.raises(RuntimeError, match="pins changed"):
+                await preparation.assert_dataset_pins(schema, inputs)
+        finally:
+            preparation._PREPARATION.reset(token)
 
 
 async def test_empty_desired_vector_prepares_withdrawal_without_changing_current(monkeypatch):
