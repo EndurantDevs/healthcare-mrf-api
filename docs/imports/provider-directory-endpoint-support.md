@@ -22,9 +22,9 @@ Live catalog confirmation is not recorded in this public artifact. Configured so
 | --- | ---: |
 | Acquisition-configured | 36 |
 | Externally supported | 0 |
-| Probe-only | 13 |
+| Probe-only | 14 |
 | Known not importable | 3 |
-| Total tracked | 52 |
+| Total tracked | 53 |
 
 ### Credentialed Or Registered Access
 
@@ -90,6 +90,7 @@ Live catalog confirmation is not recorded in this public artifact. Configured so
 | VSP Vision Care Provider Directory (`vsp-provider-directory`) | Acquisition-configured | None | Official JSON directory | InsurancePlan, Location, Organization, OrganizationAffiliation, Practitioner, PractitionerRole | https://api.vspglobal.com | pdfhir_a0a2c01a0a227491677825bb | Not required | 2026-11-08 | 2026-12-23 | Explicit selection captures the publisher’s public directory for the Choice, Signature and Advantage networks. The normalized output contains network organizations, practitioners, locations and roles. No insurance products, organization affiliations or prices are supplied by this projection. A completed capture, independent network counts and publication are required before treating the directory as available for searches. |
 | Kaiser Permanente (`kaiser`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation | https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc | pdfhir_67f47e3af69543ce63cfbf6d | Not required | 2026-10-11 | 2026-11-25 | The reviewed public R4 source remains manual-only and excluded from automatic scheduling. Its server-issued traversal subset requires replay and reviewed one-root activation evidence. The root-neutral subset proof records advertised, returned, and deficit counts; documented terminal-window bounds remain applicable, and absence under the subset remains unknown. Downstream unified/API runtime verification requires separate proof. |
 | Blue Cross and Blue Shield of Alabama (`bcbs-alabama`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint | https://api-bcbsal-prd.safhir.io/v1/api/provider-directory | pdfhir_e0153166e75593bd07cb0525 | Not required | 2026-11-13 | 2026-12-28 | The carrier-native public directory supports eight anonymous collections with server-issued ct continuations. Seven nonempty collections and an empty Endpoint collection were observed in bounded reads. Requests are paced above the reported one-per-second limit; the configured page size is bounded to 100 and the vendor maximum is unknown. Native commercial POS/EPO/PPO, Federal Employee Program and Blue Advantage plans were observed; Blue Secure equivalence, complete product membership, terminal acquisition, publication and search readiness remain unverified. This directory is independent of the Alabama HIE. The provider-directory route does not require the patient authorization flow. |
+| BCBS Minnesota Provider Directory (`bcbs-minnesota`) | Probe-only | None | Probe | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation | https://api.bluecrossmn.com/fhir/provider | pdfhir_69fc4cc6c4ce23447dc03058 | Not required | 2026-11-14 | 2026-12-29 | The official anonymous Plan-Net API documents Medicare and Medicaid providers, pharmacies and dentists, excluding Endpoint. Requests for 1,000 records return 500 in sampled larger collections without continuation links; Bundle.total changes with _count instead of reporting the complete result set. _summary=count and _total=accurate still return records, and _lastUpdated:missing=true returns dated records. Metadata advertises no history, export or versioned-write contract. A complete traversal is unverified, so acquisition and Profile publication remain disabled. Historical provider-directory aliases retain their separate identities. |
 
 ## Current Published Dataset Audit
 
@@ -164,5 +165,6 @@ Verification environment: `not recorded`. Campaign: `provider-directory-canonica
 | VSP Vision Care Provider Directory (`vsp-provider-directory`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 | Kaiser Permanente (`kaiser`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 | Blue Cross and Blue Shield of Alabama (`bcbs-alabama`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| BCBS Minnesota Provider Directory (`bcbs-minnesota`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 
 Generated by `scripts/generate_provider_directory_support_docs.py`; do not edit this file directly.

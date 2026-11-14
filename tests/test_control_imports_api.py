@@ -4744,14 +4744,14 @@ def test_provider_directory_source_catalog_exposes_all_reviewed_sources():
         catalog["entry_count"],
         catalog["runnable_count"],
         catalog["profile_source_count"],
-    ) == (49, 35, 36)
+    ) == (50, 35, 36)
     assert len(catalog["catalog_digest"]) == 64
     assert len(runnable_items) == 35
     assert {entry["entry_id"] for entry in runnable_items if not entry["profile_enabled"]} == {"vsp-provider-directory"}
     assert all(entry["supported_resources"] == entry["resources"] for entry in runnable_items)
-    assert len(nonrunnable_items) == 14
+    assert len(nonrunnable_items) == 15
     probe_items = [entry for entry in nonrunnable_items if entry["classification"] == "probe_only"]
-    assert len(probe_items) == 13
+    assert len(probe_items) == 14
     probe_by_id = {entry["entry_id"]: entry for entry in probe_items}
     runnable_by_id = {entry["entry_id"]: entry for entry in runnable_items}
     assert runnable_by_id["anthem-provider-directory"]["resources"] == _FULL_PROVIDER_DIRECTORY_RESOURCE_SURFACE[:-1]

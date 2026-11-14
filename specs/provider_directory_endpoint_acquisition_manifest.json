@@ -16,6 +16,7 @@
     "verification_snapshot": "specs/provider_directory_endpoint_verification.json",
     "blocker_registry": "specs/provider_directory_blocker_registry.json",
     "entry_support": {
+      "bcbs-minnesota": {"support_level": "probe-only", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-11-14", "method": "probe", "documented_resources": ["InsurancePlan", "PractitionerRole", "Practitioner", "Organization", "Location", "HealthcareService", "OrganizationAffiliation"], "limitation": "The official anonymous Plan-Net API documents Medicare and Medicaid providers, pharmacies and dentists, excluding Endpoint. Requests for 1,000 records return 500 in sampled larger collections without continuation links; Bundle.total changes with _count instead of reporting the complete result set. _summary=count and _total=accurate still return records, and _lastUpdated:missing=true returns dated records. Metadata advertises no history, export or versioned-write contract. A complete traversal is unverified, so acquisition and Profile publication remain disabled. Historical provider-directory aliases retain their separate identities."},
       "vsp-provider-directory": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-11-08", "method": "official-json", "limitation": "Explicit selection captures the publisher’s public directory for the Choice, Signature and Advantage networks. The normalized output contains network organizations, practitioners, locations and roles. No insurance products, organization affiliations or prices are supplied by this projection. A completed capture, independent network counts and publication are required before treating the directory as available for searches."},
       "anthem-provider-directory": {"support_level": "acquisition-configured", "access_requirement": "oauth2-client-credentials", "requires_registration": true, "reviewed_at": "2026-11-03", "method": "rest", "limitation": "The registered production endpoint supports seven directory collections through OAuth2 client credentials and server-issued next links. Explicit source-ID selection is required; broad scheduled imports exclude the endpoint. Bounded searches and issued continuations returned distinct sampled IDs for each collection; 100-row InsurancePlan and PractitionerRole pages succeeded, but no reliable totals were observed. Endpoint is not advertised. Specimen is advertised, but both Specimen and Endpoint reads returned HTTP 400 and are excluded. No Bulk Data export is advertised. Product, geographic and affiliate coverage must be established from native InsurancePlan, role and affiliation evidence; the endpoint path does not prove Medicaid-only or enterprise-wide coverage. Bounded access does not establish complete acquisition, publication or API readiness."},
       "bcbs-alabama": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-11-13", "method": "rest", "limitation": "The carrier-native public directory supports eight anonymous collections with server-issued ct continuations. Seven nonempty collections and an empty Endpoint collection were observed in bounded reads. Requests are paced above the reported one-per-second limit; the configured page size is bounded to 100 and the vendor maximum is unknown. Native commercial POS/EPO/PPO, Federal Employee Program and Blue Advantage plans were observed; Blue Secure equivalence, complete product membership, terminal acquisition, publication and search readiness remain unverified. This directory is independent of the Alabama HIE. The provider-directory route does not require the patient authorization flow."},
@@ -767,6 +768,19 @@
         "OrganizationAffiliation",
         "Endpoint"
       ]
+    },
+    {
+      "entry_id": "bcbs-minnesota",
+      "display_name": "BCBS Minnesota Provider Directory",
+      "owner_id": "bcbs-minnesota",
+      "source_ids": [
+        "pdfhir_69fc4cc6c4ce23447dc03058"
+      ],
+      "canonical_base": "https://api.bluecrossmn.com/fhir/provider",
+      "classification": "probe_only",
+      "launch_mode": "create",
+      "resource_profile": "NONE",
+      "resources": []
     }
   ]
 }

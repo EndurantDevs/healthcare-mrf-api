@@ -139,5 +139,45 @@
       "provider_directory_coverage_mode": "full",
       "provider_directory_acquisition_enabled": true
     }
+  },
+  {
+    "id": "bcbs-minnesota-provider-directory",
+    "org_name": "Blue Cross and Blue Shield of Minnesota",
+    "plan_name": null,
+    "api_base": "https://api.bluecrossmn.com/fhir/provider",
+    "auth_type": "none",
+    "requires_registration": false,
+    "fhir_version": "4.0.1",
+    "source": "bcbs-minnesota-provider-directory",
+    "source_detail": "official public Provider Directory FHIR API",
+    "source_url": "https://fhir-developer.bluecrossmn.com/provider-directory",
+    "metadata_json": {
+      "provider_directory_confirmed_base": "https://api.bluecrossmn.com/fhir/provider",
+      "provider_directory_confirmed_metadata_url": "https://api.bluecrossmn.com/fhir/provider/metadata",
+      "provider_directory_supported_resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation"
+      ],
+      "provider_directory_fully_enumerable_resources": [],
+      "provider_directory_resource_page_count_caps": {
+        "InsurancePlan": 500,
+        "PractitionerRole": 500,
+        "Practitioner": 500,
+        "Organization": 500,
+        "Location": 500,
+        "HealthcareService": 500,
+        "OrganizationAffiliation": 500
+      },
+      "provider_directory_request_interval_seconds": 0.1,
+      "provider_directory_coverage_mode": "probe_only",
+      "provider_directory_acquisition_enabled": false,
+      "provider_directory_acquisition_blocked_reason": "search_results_truncated_without_continuation",
+      "provider_directory_probe_resource": "Practitioner"
+    }
   }
 ]
