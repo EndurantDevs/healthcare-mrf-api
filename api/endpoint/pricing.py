@@ -56,6 +56,11 @@ from api.custom_import_provider_service_sql import (
 from api.endpoint.pagination import PaginationParams, parse_pagination
 from api.network_address_scope import canonical_network_read
 from api.network_read_execution import direct_heap_relation_sql, execute_network_read, has_network_read_inventory
+from api.plan_pricing_distance_page import (
+    bind_distance_continuation,
+    is_distance_continuation_query,
+    is_distance_order,
+)
 from api.plan_pricing_em_distance import (
     _request_code_index as _em_distance_request_code_index,
 )
@@ -70,6 +75,7 @@ from api.plan_pricing_projection import (
 )
 from api.plan_pricing_state_scan import (
     PlanPricingStateScanBudgetExceeded,
+    is_plan_pricing_scan_transport,
     is_plan_pricing_state_scan,
     search_plan_pricing_state_scan,
     validate_state_scan_transport,
@@ -138,6 +144,7 @@ from api.provider_specialty_filters import (
     ORTHOPAEDIC_SURGERY_TAXONOMY_CODES,
     PRIMARY_CARE_TAXONOMY_CODES,
     DynamicSpecialtyResolutionError,
+    _normalize_taxonomy_codes,
     provider_specialty_taxonomy_exists_sql,
     resolve_provider_specialty_filter,
     resolve_ptg_provider_specialty_filter,
@@ -176,7 +183,13 @@ from api.ptg2_geo_policy import (
     provider_address_location_filter_sql,
 )
 from api.ptg2_online_work import PTG2OnlineWorkBudgetExceeded
-from api.ptg2_response import _normalize_filter_string_list
+from api.ptg2_response import (
+    _annotate_ptg2_query_payload,
+    _has_ptg2_location_filter,
+    _normalize_filter_string_list,
+    _ptg2_empty_result_state,
+    _request_value_or_none,
+)
 from api.ptg2_serving import (
     PTG2LocationScopeError,
     PTG2ProviderFilterScopeError,
@@ -945,12 +958,6 @@ def _parse_float(raw: Any, param: str, minimum: float | None = None) -> float | 
     return value
 
 
-def _request_value_or_none(value: Any) -> Any:
-    """Preserve explicit numeric zero while normalizing request null sentinels."""
-
-    return None if value in (None, "", "null") else value
-
-
 def _normalize_zip5(raw: Any) -> str | None:
     text = str(raw or "").strip()
     if not text:
@@ -1350,7 +1357,7 @@ def _has_provider_expansion_location(
 
 
 def _reject_broad_group_plan_provider_expansion(
-    args: Mapping[str, Any], context: Mapping[str, Any], *, specialty_filter=None
+    args: Mapping[str, Any], context: Mapping[str, Any], *, specialty_filter=None, defer_unresolved=False
 ) -> None:
     """Reject unsafe broad group-plan office-visit provider expansion."""
 
@@ -1385,7 +1392,7 @@ def _reject_broad_group_plan_provider_expansion(
     has_location = _has_provider_expansion_location(args, context)
     if _parse_int(npi, "npi", minimum=1) is not None:
         return
-    if specialty_filter.unresolved_specialty:
+    if specialty_filter.unresolved_specialty and not defer_unresolved:
         _raise_unresolved_specialty(specialty_filter)
     if not has_location:
         if has_taxonomy_scope:
@@ -1409,12 +1416,12 @@ def _raise_unresolved_specialty(specialty_filter) -> None:
     )
 
 
-async def _resolve_ptg_specialty_or_raise(session, args: Mapping[str, Any]):
+async def _resolve_ptg_specialty_or_raise(session, args: Mapping[str, Any], *, defer_unresolved=False):
     try:
         specialty_filter = await resolve_ptg_provider_specialty_filter(session, args)
     except DynamicSpecialtyResolutionError as exc:
         raise InvalidUsage(str(exc)) from exc
-    if specialty_filter.unresolved_specialty:
+    if specialty_filter.unresolved_specialty and not defer_unresolved:
         _raise_unresolved_specialty(specialty_filter)
     return specialty_filter
 
@@ -5771,56 +5778,6 @@ async def _current_source_snapshot_pairs_for_plan(session, plan_fields: dict[str
         return []
     source_key = str(plan_fields.get("source_key") or "").strip().lower()
     return [(source_key, str(snapshot_id))]
-
-
-def _annotate_ptg2_query_payload(
-    ptg2_payload: object,
-    *,
-    plan_id_type: str,
-    year: int | None,
-    has_plan_scope: bool,
-) -> None:
-    if not isinstance(ptg2_payload, dict):
-        return
-    query_payload = ptg2_payload.setdefault("query", {})
-    if not isinstance(query_payload, dict):
-        return
-    if plan_id_type:
-        query_payload.setdefault("plan_id_type", plan_id_type)
-    if year is None or not has_plan_scope:
-        return
-    ignored_params = query_payload.setdefault("ignored_params", [])
-    if isinstance(ignored_params, list) and "year" not in ignored_params:
-        ignored_params.append("year")
-    query_payload.setdefault(
-        "year_semantics",
-        "ignored_for_plan_scoped_ptg_rates",
-    )
-
-
-def _has_ptg2_location_filter(args: object) -> bool:
-    getter = getattr(args, "get", None)
-    if not callable(getter):
-        return False
-    return bool(
-        getter("state")
-        or getter("city")
-        or getter("zip5")
-        or getter("zip")
-        or getter("lat") is not None
-        or getter("long") is not None
-        or getter("radius") is not None
-        or getter("radius_miles") is not None
-        or getter("npi") is not None
-    )
-
-
-def _ptg2_empty_result_state(status: str, *, has_location_filter: bool) -> str:
-    if status == "no_route":
-        return "no_snapshot_for_plan"
-    if has_location_filter:
-        return "no_match_in_radius"
-    return "no_matching_rates"
 
 
 _ALLOWED_AMOUNT_DETAIL_LIMIT = 25
@@ -11632,7 +11589,9 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
     _reject_resolver_only_procedure_search_params(args)
     begin_capacity_evidence(request)
     session = _get_session(request)
-    is_state_scan = is_plan_pricing_state_scan(args)
+    is_distance_ordered = is_distance_order(args)
+    distance_cursor = _request_value_or_none(args.get("cursor")) if is_distance_ordered else None
+    is_state_scan = not (is_distance_ordered and distance_cursor is not None) and is_plan_pricing_state_scan(args)
     if import_context is not None and is_state_scan:
         raise InvalidUsage("custom-import provider-service queries require the claims lane")
     if is_state_scan:
@@ -11750,12 +11709,16 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
         # Plan-scoped searches filter via taxonomy codes; an unresolvable
         # specialty would otherwise silently return every specialty as if
         # filtered. Claims mode keeps its own LIKE/terminology fallback.
-        specialty_probe = await _resolve_ptg_specialty_or_raise(session, args)
+        specialty_args_by_name = args
+        if is_distance_ordered:
+            specialty_args_by_name = {key: args.get(key) for key in args}
+            specialty_args_by_name["taxonomy_codes"] = _normalize_taxonomy_codes(args.get("taxonomy_codes")) or (
+                _normalize_taxonomy_codes(args.get("taxonomy_code"))
+            )
+        specialty_probe = await _resolve_ptg_specialty_or_raise(
+            session, specialty_args_by_name, defer_unresolved=distance_cursor is not None
+        )
         ptg_specialty_filter = specialty_probe
-        if specialty_probe.unresolved_specialty and not (
-            args.get("taxonomy_code") or args.get("taxonomy_classification")
-        ):
-            _raise_unresolved_specialty(specialty_probe)
     broad_expansion_market_type = plan_market_type
     release_selection = None
     guard_release_selection = None
@@ -11870,6 +11833,7 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
                     "provider_sex_code": provider_sex_code,
                 },
                 specialty_filter=ptg_specialty_filter,
+                defer_unresolved=distance_cursor is not None,
             )
     except InvalidUsage:
         if guard_release_selection is None or office_visit_retry_by_field is None:
@@ -11904,6 +11868,8 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
             projection_only=projected_result_type is not None,
         )
         release_selection_args_by_name = _release_selection_args_by_name(release_selection)
+    if distance_cursor is not None and not plan_release_id:
+        raise InvalidUsage("A distance cursor requires a canonical plan release")
     if plan_id or plan_external_id or source_key or snapshot_id or plan_release_id:
         ptg_order_by = order_by
         if (
@@ -11981,6 +11947,32 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
             "view": raw_view,
             "npi": npi,
         }
+        if is_distance_ordered and not _normalize_taxonomy_codes(ptg_args_by_name["taxonomy_codes"]):
+            ptg_args_by_name["taxonomy_codes"] = (
+                _normalize_taxonomy_codes(args.get("taxonomy_code")) or specialty_probe.taxonomy_codes or None
+            )
+        supports_distance_continuation = (
+            is_distance_ordered
+            and projected_result_type is None
+            and import_context is None
+            and is_plan_pricing_scan_transport(request, native_args)
+            and is_distance_continuation_query(
+                ptg_args_by_name,
+                pagination,
+                include_allowed_amounts=include_allowed_amounts,
+                include_providers=_parse_bool(args.get("include_providers"), "include_providers", default=True),
+            )
+        )
+        if supports_distance_continuation and (ptg_latitude is None or ptg_longitude is None):
+            if distance_cursor is not None:
+                return _state_scan_generation_expired_response(request)
+            supports_distance_continuation = False
+        if distance_cursor is not None and not supports_distance_continuation:
+            raise InvalidUsage("Distance continuation requires the same ascending full geographic pricing query")
+        if supports_distance_continuation:
+            if distance_cursor is not None and release_selection is None:
+                return _state_scan_generation_expired_response(request)
+            bind_distance_continuation(ptg_args_by_name, args, distance_cursor, (latitude, longitude), specialty_probe)
         route_name = str(getattr(getattr(request, "route", None), "name", ""))
         if route_name.endswith("pricing.providers.audit_search_by_procedure"):
             attach_candidate_audit_access(request, ptg_args_by_name)
@@ -11993,6 +11985,12 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
                 pagination,
                 **release_selection_args_by_name,
             )
+        except BillingSearchCursorGenerationExpired:
+            return _state_scan_generation_expired_response(request)
+        except BillingSearchCursorError as exc:
+            raise InvalidUsage(str(exc)) from exc
+        except BillingSearchCursorKeyringError as exc:
+            raise sanic.exceptions.ServiceUnavailable("The pricing continuation keyring is unavailable.") from exc
         except PTG2ProviderFilterUnsupportedError as exc:
             return _ptg_json_response(
                 request,
@@ -12072,6 +12070,8 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
         ):
             include_allowed_amounts = legacy_include_allowed_amounts
         if ptg2_payload is None:
+            if distance_cursor is not None:
+                return _state_scan_generation_expired_response(request)
             if include_allowed_amounts and import_context is None:
                 allowed_amount_payload = await _search_ptg_allowed_amount_evidence(
                     session,
