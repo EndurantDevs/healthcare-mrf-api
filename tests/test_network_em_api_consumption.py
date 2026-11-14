@@ -65,7 +65,7 @@ async def test_session_inputs_keep_complete_native_recipe_before_install(monkeyp
     assert installed.relations == tuple(
         CompactAddressRelation(item.schema_name, item.table_name, item.relation_oid) for item in actual.relations
     )
-    assert session.driver.events == ["header-read", "header-guard", "native-catalog", "names-guard"]
+    assert session.driver.events == ["header-read", "header-guard", "lock", "heaps", "names-guard"]
 
 
 async def test_session_inputs_pin_transaction_before_initial_driver_acquisition(monkeypatch):

@@ -91,7 +91,11 @@ locate their retained source capture and committed pair by name, so they serve
 on a copy that holds the control, candidate, source capture and address copy
 schemas, the address copy schema comment and the origin serving receipt. They
 return 503 when a source capture table has row level security, inheritance,
-partitions or rewrite rules. After an address table rotation a generation keeps
+partitions or rewrite rules. Managed E&M pricing reads locate the attribution
+rates table and the nine retained provider input tables by name without
+comparing recorded identifiers, and refuse them as unavailable under the same
+conditions or when a table lacks a column or type the read uses; a retained
+TIGER input may inherit only its canonical parent. After an address table rotation a generation keeps
 reading its own table under the retained name `<table>_retained_<oid hex>`; the
 recorded name then belongs to the replacement. Callers outside API reads keep
 the strict check.

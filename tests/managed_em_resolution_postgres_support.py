@@ -13,6 +13,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from api.network_read_execution import _installed_read_inventory, execute_network_read
+from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_em_provider_inputs import resolve_em_provider_inputs, resolve_em_provider_inputs_in_session
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
@@ -74,6 +75,63 @@ async def _publish_fixture(fixture, schema, copy_targets, created_schema_oids_by
     return inputs, candidate
 
 
+async def _api_inputs(reader_engine, manifest, control_schema, *settings):
+    async with AsyncSession(reader_engine) as session, session.begin():
+        await session.execute(text("SET TRANSACTION READ ONLY"))
+        for setting in settings:
+            await session.execute(text(setting))
+        driver = (await (await session.connection()).get_raw_connection()).driver_connection
+        return await resolve_em_provider_inputs(driver, manifest, control_schema, api_read=True)
+
+
+async def _assert_api_inputs_by_name(fixture, reader_engine, manifest, inputs):
+    """Admit inputs by name under a share lock; row security, a missing column or a lock wait refuse the read."""
+    connection, owner, npi = fixture.connection, fixture.roles["owner"], inputs.relation("npi")
+    async with AsyncSession(reader_engine) as session, session.begin():
+        await session.execute(text("SET TRANSACTION READ ONLY"))
+        driver = (await (await session.connection()).get_raw_connection()).driver_connection
+        assert await resolve_em_provider_inputs(driver, manifest, fixture.control_schema, api_read=True) == inputs
+        # The admitting read holds its share lock, so enabling row level security waits until the read ends.
+        with pytest.raises(asyncpg.LockNotAvailableError):
+            async with connection.transaction():
+                await connection.execute(
+                    f"SET LOCAL lock_timeout = '200ms'; SET LOCAL ROLE \"{owner}\"; "
+                    f"ALTER TABLE {npi} ENABLE ROW LEVEL SECURITY"
+                )
+    # Under repeatable read pg_class is read through a snapshot that can predate the lock; a row filter committed
+    # after that snapshot is still refused.
+    try:
+        async with AsyncSession(reader_engine) as session:
+            with pytest.raises(PlanPricingProjectionUnavailable):
+                async with session.begin():
+                    await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
+                    await session.execute(text("SELECT 1"))
+                    await connection.execute(
+                        f'SET ROLE "{owner}"; ALTER TABLE {npi} ENABLE ROW LEVEL SECURITY; RESET ROLE'
+                    )
+                    driver = (await (await session.connection()).get_raw_connection()).driver_connection
+                    await resolve_em_provider_inputs(driver, manifest, fixture.control_schema, api_read=True)
+    finally:
+        await connection.execute(f'SET ROLE "{owner}"; ALTER TABLE {npi} DISABLE ROW LEVEL SECURITY; RESET ROLE')
+    srid = "ALTER COLUMN the_geom TYPE geometry(MultiPolygon,{0}) USING ST_SetSRID(the_geom,{0})"
+    for table, change, restore in (
+        (npi, "ENABLE ROW LEVEL SECURITY", "DISABLE ROW LEVEL SECURITY"),
+        (npi, "RENAME COLUMN entity_type_code TO entity_type", "RENAME COLUMN entity_type TO entity_type_code"),
+        # The held ZCTA leaf inherits this column; the managed query compares it with SRID 4269 points.
+        ("tiger.zcta5", srid.format(4326), srid.format(4269)),
+    ):
+        await connection.execute(f'SET ROLE "{owner}"; ALTER TABLE {table} {change}; RESET ROLE')
+        try:
+            with pytest.raises(PlanPricingProjectionUnavailable):
+                await _api_inputs(reader_engine, manifest, fixture.control_schema)
+        finally:
+            await connection.execute(f'SET ROLE "{owner}"; ALTER TABLE {table} {restore}; RESET ROLE')
+    async with connection.transaction():
+        await connection.execute(f'SET LOCAL ROLE "{owner}"; LOCK TABLE {npi} IN ACCESS EXCLUSIVE MODE')
+        with pytest.raises(PlanPricingProjectionUnavailable):
+            await _api_inputs(reader_engine, manifest, fixture.control_schema, "SET LOCAL lock_timeout = '200ms'")
+
+
 def _write_resolver_evidence(manifest):
     """Write only the established native resolver scope when explicitly requested."""
     if evidence := os.getenv("MANAGED_EM_NATIVE_EVIDENCE"):
@@ -133,9 +191,6 @@ async def test_published_provider_resolver(custom_db, monkeypatch):
             )
             assert api_manifest == manifest
             assert not api_manifest.custody_control and api_manifest.compact_layout is None
-            assert (
-                await resolve_em_provider_inputs(driver, api_manifest, fixture.control_schema, api_read=True) == inputs
-            )
             assert await resolve_em_provider_inputs_in_session(session, api_manifest, fixture.control_schema) == inputs
             inventory = _installed_read_inventory(session)
             assert inventory.connection is driver and len(inventory.relations) == 9
@@ -148,6 +203,7 @@ async def test_published_provider_resolver(custom_db, monkeypatch):
                 "current_setting('transaction_isolation'),(SELECT rolsuper FROM pg_roles WHERE rolname=current_user)"
             )
             assert tuple(api_identity) == tuple(identity)
+        await _assert_api_inputs_by_name(fixture, reader_engine, api_manifest, inputs)
         _write_resolver_evidence(manifest)
     finally:
         if reader_engine is not None:

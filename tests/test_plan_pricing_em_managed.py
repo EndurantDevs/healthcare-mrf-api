@@ -76,8 +76,8 @@ def _mock_authority_resolvers(state, monkeypatch):
         state.events.append("admission")
         return state.admitted
 
-    async def artifact(actual_session, actual, *, api_read=False):
-        assert actual_session is state.session and actual is state.selection and api_read is True
+    async def artifact(actual_session, actual):
+        assert actual_session is state.session and actual is state.selection
         state.events.append("artifact")
         await install_network_read_inventory(actual_session, (CompactAddressRelation("held_rates", "rate", 100),))
         return SimpleNamespace(rates_relation='"held_rates"."rate"')

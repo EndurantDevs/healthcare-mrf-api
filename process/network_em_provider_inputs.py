@@ -6,7 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from uuid import UUID
 
 import asyncpg
@@ -183,6 +183,11 @@ def _required_columns(role):
     )
 
 
+_INHERITANCE = dict(
+    zcta_inheritance=_held_inheritance_sql("tiger.zcta5"),
+    zip_inheritance=_held_inheritance_sql("tiger.zip_state"),
+    ordinary_inheritance=_held_inheritance_sql("npi"),
+)
 _CATALOG_SQL = """SELECT requested.role,namespace.oid::bigint AS schema_oid,
  held.oid::bigint AS relation_oid,pg_relation_filenode(held.oid)::bigint AS relfilenode,
  owner.oid::bigint AS owner_oid,owner.rolname AS owner_role,
@@ -218,11 +223,43 @@ _CATALOG_SQL = """SELECT requested.role,namespace.oid::bigint AS schema_oid,
  LEFT JOIN pg_namespace namespace ON namespace.nspname=requested.schema_name
  LEFT JOIN pg_class held ON held.relnamespace=namespace.oid AND held.relname=requested.table_name
  LEFT JOIN pg_roles owner ON owner.oid=held.relowner ORDER BY requested.role COLLATE "C"
-""".format(
-    zcta_inheritance=_held_inheritance_sql("tiger.zcta5"),
-    zip_inheritance=_held_inheritance_sql("tiger.zip_state"),
-    ordinary_inheritance=_held_inheritance_sql("npi"),
-)
+""".format(**_INHERITANCE)
+_API_HEAPS_SQL = """SELECT requested.role,held.oid::bigint AS relation_oid,
+ pg_relation_filenode(held.oid)::bigint AS relfilenode
+ FROM jsonb_to_recordset($1::jsonb) requested(role text,schema_name text,table_name text,columns jsonb)
+ JOIN pg_catalog.pg_namespace namespace ON namespace.nspname=requested.schema_name
+ JOIN pg_catalog.pg_class held ON held.relnamespace=namespace.oid AND held.relname=requested.table_name
+ WHERE held.relkind='r' AND held.relpersistence='p'
+ AND held.relam=(SELECT oid FROM pg_catalog.pg_am WHERE amname='heap')
+ AND NOT (held.relrowsecurity OR held.relforcerowsecurity OR held.relispartition)
+ AND NOT pg_catalog.row_security_active(held.oid)
+ AND NOT EXISTS(SELECT FROM pg_catalog.pg_rewrite WHERE ev_class=held.oid)
+ AND NOT EXISTS(SELECT FROM jsonb_each_text(requested.columns) required WHERE NOT EXISTS(
+  SELECT FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t ON t.oid=a.atttypid WHERE a.attrelid=held.oid
+  AND a.attname=required.key AND a.attnum>0 AND NOT a.attisdropped AND t.typname=required.value
+  AND CASE WHEN t.typname='geometry' THEN t.oid=to_regtype('geometry') AND postgis_typmod_srid(a.atttypmod)=4269
+  AND postgis_typmod_type(a.atttypmod) IN ('Polygon','MultiPolygon') ELSE true END))
+ AND CASE requested.role WHEN 'tiger.zcta5' THEN {zcta_inheritance}
+ WHEN 'tiger.zip_state' THEN {zip_inheritance} ELSE {ordinary_inheritance} END ORDER BY requested.role COLLATE "C"
+""".format(**_INHERITANCE)
+
+
+def _rotating_names():
+    """Live tables are replaced under their own names (cutover renames, <table>_old swaps), so a name binds no generation."""
+    live_names = {(model.__table__.schema, model.__table__.name) for model in _MODELS.values()}
+    swapped_names = {(schema, name + "_old") for schema, name in live_names}
+    return live_names | swapped_names | {("tiger", "zcta5"), ("tiger", "zip_state")}
+
+
+async def _locked_plain_heaps(connection, relations):
+    """Share-lock tables by name; return their current rows if none filters rows and each has its read columns."""
+    locked = ",".join(f"{_identifier(held['schema_name'])}.{_identifier(held['table_name'])}" for held in relations)
+    # The share lock lasts until the read ends, so row level security cannot be enabled meanwhile.
+    await connection.execute(f"LOCK TABLE {locked} IN ACCESS SHARE MODE")
+    held_rows = await connection.fetch(_API_HEAPS_SQL, json.dumps(relations))
+    if [held["role"] for held in held_rows] != [held["role"] for held in relations]:
+        _fail()
+    return held_rows
 
 
 def _shape(role, catalog_row):
@@ -392,7 +429,7 @@ async def record_em_provider_inputs(connection, copy_target, receipt, control_sc
 
 
 async def _resolve_em_provider_inputs_api(connection, manifest, control_schema=None):
-    """Guard the accepted sealed or legacy candidate header before reading its retained recipe."""
+    """Decode the published recipe and return its nine inputs as the tables their names resolve to now."""
     from process.network_candidate_custody import read_network_control_relation_pins
     from process.network_read_identity import verify_consumed_network_relations
 
@@ -427,10 +464,16 @@ async def _resolve_em_provider_inputs_api(connection, manifest, control_schema=N
         inputs = _receipt(receipt)
         if manifest.source_generations.get("em_provider_inputs") != receipt["receipt_sha256"]:
             _fail()
-        current = await prepare_em_provider_inputs(connection, inputs, runtime_roles=tuple(receipt["runtime_roles"]))
-        if current != receipt:
+        if any((relation.schema_name, relation.table_name) in _rotating_names() for relation in inputs.relations):
             _fail()
-        return inputs
+        relations = [{**asdict(relation), "columns": _required_columns(relation.role)} for relation in inputs.relations]
+        held_rows = await _locked_plain_heaps(connection, relations)
+        return EMProviderInputs(
+            tuple(
+                replace(relation, relation_oid=held["relation_oid"], relfilenode=held["relfilenode"])
+                for relation, held in zip(inputs.relations, held_rows, strict=True)
+            )
+        )
     except Exception:
         raise PlanPricingProjectionUnavailable("Managed provider inputs are unavailable") from None
 
@@ -504,14 +547,6 @@ async def resolve_em_provider_inputs_in_session(session, manifest, control_schem
                 for relation in inputs.relations
             ),
         )
-        current_driver, current_pid = await _original_read_driver(session)
-        if (
-            current_driver is not connection
-            or current_pid != backend_pid
-            or session.get_transaction() is not transaction
-            or connection.is_in_transaction() is not True
-        ):
-            _fail()
         return inputs
     except Exception:
         raise PlanPricingProjectionUnavailable("Managed provider inputs are unavailable") from None

@@ -393,10 +393,23 @@ async def _bind_native_pricing_read(session, held, control_schema, reader):
     """Bind actual prepared receipts to the original Reader before guarded native completion."""
     driver = (await (await session.connection()).get_raw_connection()).driver_connection
     assert await provider_inputs.prepare_em_provider_inputs(driver, held.inputs, runtime_roles=(reader,)) == held.proof
-    assert (
-        await attribution._verify(driver, held.rates, attribution._identity(held.selection)[0], api_read=True)
-        == held.rates
+    rates_by_field = {"role": "rates", "schema_name": held.rates.schema_name, "table_name": "rates"}
+    (rates,) = await provider_inputs._locked_plain_heaps(
+        driver, [{**rates_by_field, "columns": attribution._RATE_COLUMNS}]
     )
+    assert rates["relation_oid"] == held.rates.table_oid
+    npi = held.inputs.relations[provider_inputs._ROLES.index("npi")]
+    for lacking_by_field in (
+        {**rates_by_field, "columns": {**attribution._RATE_COLUMNS, "code_index": "int4"}},
+        {
+            **rates_by_field,
+            "schema_name": npi.schema_name,
+            "table_name": npi.table_name,
+            "columns": attribution._RATE_COLUMNS,
+        },
+    ):
+        with pytest.raises(ValueError):
+            await provider_inputs._locked_plain_heaps(driver, [lacking_by_field])
     approved_oid = await driver.fetchval(
         "SELECT to_regclass($1)::oid::bigint", f'"{control_schema}".registry_approved_record'
     )
