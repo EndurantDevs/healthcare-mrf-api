@@ -5,7 +5,7 @@ import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -189,6 +189,33 @@ async def test_source_catalog_authentication_precedes_named_reads(monkeypatch):
     with pytest.raises(PermissionError):
         await control.control_provider_directory_sources(SimpleNamespace())
     reader.assert_not_called()
+
+
+async def test_source_catalog_named_lookup_failure_does_not_fall_back(monkeypatch):
+    rollback_events = []
+
+    @asynccontextmanager
+    async def transaction():
+        try:
+            yield SimpleNamespace(execute=AsyncMock())
+        except RuntimeError:
+            rollback_events.append(True)
+            raise
+
+    monkeypatch.setattr(control, "_require_control_auth", lambda _request: None)
+    monkeypatch.setattr(control.db, "transaction", transaction)
+    monkeypatch.setattr(
+        control, "named_editions_for_session", AsyncMock(side_effect=RuntimeError("invalid named header"))
+    )
+    projection = AsyncMock(side_effect=AssertionError("projection after failed named lookup"))
+    fallback = Mock(side_effect=AssertionError("fallback after failed named lookup"))
+    monkeypatch.setattr(control, "provider_directory_control_catalog", projection)
+    monkeypatch.setattr(control, "provider_directory_source_catalog", fallback)
+    with pytest.raises(RuntimeError, match="invalid named header"):
+        await control.control_provider_directory_sources(SimpleNamespace())
+    assert rollback_events == [True]
+    projection.assert_not_awaited()
+    fallback.assert_not_called()
 
 
 async def test_payload_phone_and_overlay_queries_use_the_same_named_edition():
