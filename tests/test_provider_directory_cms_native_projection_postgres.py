@@ -52,10 +52,12 @@ async def _seed_sources(database, schema):
     await database.status(f"""CREATE TABLE {schema}.provider_directory_endpoint_dataset (
         endpoint_id text,dataset_id text,dataset_hash text,acquisition_root_run_id text,
         validated_at timestamptz,published_at timestamptz,superseded_at timestamptz,
-        status text,is_current bool,publication_metadata_json jsonb)""")
+        status text,is_current bool,publication_metadata_json jsonb,publication_metadata_summary_json jsonb)""")
     await database.status(
-        f"""INSERT INTO {schema}.provider_directory_endpoint_dataset VALUES
-        ('cms-endpoint','desired-dataset',:hash,'desired-root',now(),NULL,NULL,'validated',false,
+        f"""INSERT INTO {schema}.provider_directory_endpoint_dataset
+        (endpoint_id,dataset_id,dataset_hash,acquisition_root_run_id,validated_at,published_at,superseded_at,
+         status,is_current,publication_metadata_json)
+        VALUES ('cms-endpoint','desired-dataset',:hash,'desired-root',now(),NULL,NULL,'validated',false,
          '{{"source_ids":["synthetic-source"]}}')""",
         hash="a" * 64,
     )

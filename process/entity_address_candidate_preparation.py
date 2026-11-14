@@ -331,13 +331,17 @@ def _ordinary_serving_peers_sql(db_schema, pins):
 
 
 def _desired_datasets_sql(db_schema: str, ordinary_serving_peer_pins=()) -> str:
-    membership = "(dataset.publication_metadata_json::jsonb -> 'source_ids') @> jsonb_build_array(pin.source_id)"
+    # The bounded summary of a sealed dataset lists the same sources as its much larger raw document.
+    membership = (
+        "COALESCE(dataset.publication_metadata_summary_json -> 'source_ids', "
+        "(dataset.publication_metadata_json -> 'source_ids')::jsonb) @> jsonb_build_array(pin.source_id)"
+    )
     dataset_relation = f"{db_schema}.provider_directory_endpoint_dataset"
     if ordinary_serving_peer_pins:
         dataset_relation = "ONLY " + dataset_relation
         membership = (
             f"CASE WHEN {_ordinary_serving_peers_sql(db_schema, ordinary_serving_peer_pins)} THEN true "
-            "ELSE (dataset.publication_metadata_json -> 'source_ids')::jsonb @> jsonb_build_array(pin.source_id) END"
+            f"ELSE {membership} END"
         )
     return f"""SELECT pin.source_id, dataset.endpoint_id, dataset.dataset_id,
         dataset.acquisition_root_run_id AS run_id,

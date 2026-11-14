@@ -51,7 +51,9 @@ def _selection_sql(directory, *, is_publication=False):
     source, datasets = replacement._tables(directory)
     fields = ",".join("dataset." + name for name in _HEADER_FIELDS)
     if is_publication:
-        members = "(dataset.publication_metadata_json->'source_ids')::jsonb"
+        # A replacement target is always sealed, so its bounded summary lists its sources. The raw document
+        # can be hundreds of megabytes; reading it does not fit the one-second statements of the final cut.
+        members = "dataset.publication_metadata_summary_json->'source_ids'"
         fields += (
             f",COALESCE(jsonb_typeof({members})='array' "
             f"AND {members} @> jsonb_build_array(source.source_id),false) AS source_member"
