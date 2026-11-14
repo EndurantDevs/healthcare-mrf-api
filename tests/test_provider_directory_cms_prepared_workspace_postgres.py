@@ -135,6 +135,38 @@ async def assert_payload_snapshot_bounds(current):
         )
 
 
+async def test_native_identity_lookup_indexes_exist_during_loading_and_survive_finish(native_workspace):
+    """Replay and alias lookups use the final indexes while the maps are mutable."""
+    case = native_workspace
+    async with publisher(case) as (session, driver), observe(case, session, driver) as inputs:
+        async with scope(case, session, driver, inputs) as current:
+            before = current.receipts
+            early_names = [
+                before[root]["name"] + "_i" + str(index)
+                for root in workspace.storage.AUXILIARY_ROOTS
+                for index in range(len(workspace._SECONDARY.get(root, (("source_id", "resource_type", "entity_id"),))))
+            ]
+            early_indexes = dict(
+                await driver.fetch(
+                    "SELECT c.relname,i.indexrelid::bigint FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid "
+                    "WHERE i.indrelid=ANY($1::oid[]) AND c.relname=ANY($2::text[]) AND i.indisvalid AND i.indisready",
+                    [before[root]["oid"] for root in workspace.storage.AUXILIARY_ROOTS],
+                    early_names,
+                )
+            )
+            assert set(early_indexes) == set(early_names)
+            await current.finish_indexes()
+            assert (
+                dict(
+                    await driver.fetch(
+                        "SELECT relname,oid::bigint FROM pg_class WHERE oid=ANY($1::oid[])",
+                        list(early_indexes.values()),
+                    )
+                )
+                == early_indexes
+            )
+
+
 async def test_native_fixed_outputs_copy_and_indexes_keep_publisher_and_source_binding(native_workspace):
     case = native_workspace
     ambient = (source._FACTORY.get(), source._PUBLISHER.get(), source._OWNER.get())

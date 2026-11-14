@@ -215,8 +215,9 @@ async def test_scope_recheck_and_failures_never_commit_or_reopen(monkeypatch, ow
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outer_seconds", [0.05, 15])
+@pytest.mark.parametrize("with_commands", [False, True])
 async def test_admin_clock_caps_first_exclusive_lock_and_caller_commit(
-    monkeypatch, owner_case, structure_case, outer_seconds
+    monkeypatch, owner_case, structure_case, outer_seconds, with_commands
 ):
     from process import provider_directory_cms_owner_role_rights as role_rights
 
@@ -227,7 +228,8 @@ async def test_admin_clock_caps_first_exclusive_lock_and_caller_commit(
     monkeypatch.setattr(execution, "_family", AsyncMock(return_value=[]))
     monkeypatch.setattr(role_rights, "expected_cms_owner_roles", AsyncMock(return_value={}))
     monkeypatch.setattr(execution, "_expanded_acls", AsyncMock(return_value=[]))
-    monkeypatch.setattr(execution, "_table_statements", lambda *arguments: [])
+    commands = ["ALTER TABLE fixture_entry OWNER TO fixture_owner"] if with_commands else []
+    monkeypatch.setattr(execution, "_table_statements", lambda *arguments: commands)
     monkeypatch.setattr(execution, "_routine_statements", AsyncMock(return_value=[]))
     loop = asyncio.get_running_loop()
     original_deadline = loop.time() + outer_seconds
@@ -235,7 +237,7 @@ async def test_admin_clock_caps_first_exclusive_lock_and_caller_commit(
         async with asyncio.timeout_at(original_deadline) as commit_clock:
 
             async def acquire(query):
-                assert query.endswith("IN ACCESS EXCLUSIVE MODE NOWAIT")
+                assert query.endswith("IN ACCESS EXCLUSIVE MODE NOWAIT") or query == commands[0] + ";"
                 assert loop.time() < commit_clock.when() <= min(original_deadline, loop.time() + 3)
 
             connection = SimpleNamespace(execute=AsyncMock(side_effect=acquire))
@@ -246,10 +248,10 @@ async def test_admin_clock_caps_first_exclusive_lock_and_caller_commit(
                 case.policy,
                 case.profile,
                 plan,
-                min(original_deadline, loop.time() + 3),
+                original_deadline,
                 commit_clock=commit_clock,
             )
-            connection.execute.assert_awaited_once()
+            assert connection.execute.await_count == 1 + bool(commands)
             # Model a stalled caller COMMIT after the helper has already returned.
             await asyncio.Future()
     assert commit_clock.expired()

@@ -160,6 +160,77 @@ def _context(case, **changes):
     return reverse.cms_reverse_hook_custody(case.connection, **arguments_by_name)
 
 
+async def test_metadata_uses_entered_clock_before_short_exclusive_window(reverse_case):
+    case = reverse_case
+    loop = asyncio.get_running_loop()
+    async with asyncio.timeout(15) as commit_clock:
+        async with _context(case, deadline=commit_clock) as recheck:
+            await asyncio.sleep(3.05)
+            commit_clock.reschedule(loop.time() + 3)
+            await recheck()
+            assert not commit_clock.expired()
+    assert not commit_clock.expired()
+
+
+async def _refuse_clock(case, commit_clock):
+    with pytest.raises(ValueError, match="deadline_required"):
+        async with _context(case, deadline=commit_clock):
+            pytest.fail("invalid clock entered custody")
+    case.connection.fetchrow.assert_not_awaited()
+    case.connection.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize("fault", ["unentered", "exited", "expired"])
+async def test_administrative_clock_must_be_active_and_same_task_before_sql(reverse_case, fault):
+    case = reverse_case
+    deadline = asyncio.get_running_loop().time() + 10
+    if fault == "unentered":
+        commit_clock = asyncio.timeout_at(deadline)
+    elif fault == "exited":
+        async with asyncio.timeout_at(deadline) as commit_clock:
+            assert not commit_clock.expired()
+    else:
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0) as commit_clock:
+                await asyncio.sleep(0)
+    await _refuse_clock(case, commit_clock)
+
+
+async def test_disabled_administrative_clock_refuses_before_sql(reverse_case):
+    async with asyncio.timeout(None) as commit_clock:
+        await _refuse_clock(reverse_case, commit_clock)
+
+
+async def test_foreign_task_administrative_clock_refuses_before_sql(reverse_case):
+    ready, release = asyncio.get_running_loop().create_future(), asyncio.Event()
+
+    async def foreign():
+        async with asyncio.timeout(10) as clock:
+            ready.set_result(clock)
+            await release.wait()
+
+    task = asyncio.create_task(foreign())
+    try:
+        await _refuse_clock(reverse_case, await ready)
+    finally:
+        release.set()
+        await task
+
+
+async def test_recheck_keeps_shortened_clock_ceiling(reverse_case):
+    case = reverse_case
+    loop = asyncio.get_running_loop()
+    async with asyncio.timeout(15) as commit_clock:
+        async with _context(case, deadline=commit_clock) as recheck:
+            commit_clock.reschedule(loop.time() + 1)
+            await recheck()
+            count = case.connection.fetchrow.await_count
+            commit_clock.reschedule(loop.time() + 2)
+            with pytest.raises(ValueError, match="deadline_required"):
+                await recheck()
+            assert case.connection.fetchrow.await_count == count
+
+
 @pytest.mark.parametrize("fault", [None, "lock", "native", "profile", "recheck"])
 async def test_history_projection_keeps_actual_hooks_and_requires_live_bound_pins(reverse_case, monkeypatch, fault):
     from process import provider_directory_cms_history_bounds as bounds
