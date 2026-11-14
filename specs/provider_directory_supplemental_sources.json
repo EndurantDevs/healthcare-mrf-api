@@ -39,13 +39,13 @@
         "HealthcareService"
       ],
       "provider_directory_resource_page_count_caps": {
-        "InsurancePlan": 100,
-        "PractitionerRole": 100,
-        "Practitioner": 100,
-        "Organization": 100,
-        "Location": 100,
-        "HealthcareService": 100,
-        "OrganizationAffiliation": 100
+        "InsurancePlan": 200,
+        "PractitionerRole": 200,
+        "Practitioner": 200,
+        "Organization": 200,
+        "Location": 200,
+        "HealthcareService": 200,
+        "OrganizationAffiliation": 200
       },
       "provider_directory_resource_fetch_order": [
         "PractitionerRole",
