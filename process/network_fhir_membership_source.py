@@ -517,6 +517,7 @@ _API_EPOCH_TABLES_SQL = """SELECT c.relname::text,c.oid::bigint FROM pg_catalog.
  AND c.relkind='r' AND c.relpersistence='p'
  AND c.relam=(SELECT oid FROM pg_catalog.pg_am WHERE amname='heap')
  AND NOT (c.relrowsecurity OR c.relforcerowsecurity OR c.relispartition)
+ AND NOT pg_catalog.row_security_active(c.oid)
  AND NOT EXISTS(SELECT FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)
  AND NOT EXISTS(SELECT FROM pg_catalog.pg_rewrite WHERE ev_class=c.oid) ORDER BY c.relname"""
 

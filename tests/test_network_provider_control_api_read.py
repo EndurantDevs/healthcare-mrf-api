@@ -5,6 +5,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import asyncpg
 import pytest
 
 from process import network_approved_membership_source as approved
@@ -178,6 +179,7 @@ async def test_fact_owner_api_preserves_required_authentication(monkeypatch, leg
     connection = SimpleNamespace(
         is_in_transaction=lambda: True,
         get_server_pid=lambda: _PID,
+        execute=AsyncMock(),
         fetchval=AsyncMock(side_effect=["repeatable read", "on", True]),
         fetch=AsyncMock(return_value=[owner.candidate]),
     )
@@ -200,20 +202,25 @@ async def test_fact_owner_api_preserves_required_authentication(monkeypatch, leg
     assert loader.await_count == int(not legacy)
     assert guard.await_args.args[1] == pins
     locked.assert_not_awaited()
+    fact_table = f'"{owner.candidate["schema_name"]}".network_source_contribution'
+    connection.execute.assert_awaited_once_with(f"LOCK TABLE {fact_table} IN ACCESS SHARE MODE")
     fact_heap_check = connection.fetchval.await_args_list[-1].args
-    assert "relrowsecurity" in fact_heap_check[0]
-    assert fact_heap_check[1] == f'"{owner.candidate["schema_name"]}".network_source_contribution'
+    assert "relrowsecurity" in fact_heap_check[0] and "row_security_active(c.oid)" in fact_heap_check[0]
+    assert fact_heap_check[1] == fact_table
 
 
-@pytest.mark.parametrize("unfiltered", [False, None])
+@pytest.mark.parametrize("unfiltered", [False, None, "lock"])
 async def test_fact_owner_api_refuses_a_row_filtered_fact_table(monkeypatch, unfiltered):
     owner = _owner(2)
     connection = SimpleNamespace(
         is_in_transaction=lambda: True,
         get_server_pid=lambda: _PID,
+        execute=AsyncMock(),
         fetchval=AsyncMock(side_effect=["repeatable read", "on", unfiltered]),
         fetch=AsyncMock(return_value=[owner.candidate]),
     )
+    if unfiltered == "lock":
+        connection.execute.side_effect = asyncpg.LockNotAvailableError("canceling statement due to lock timeout")
     pins = (
         CompactAddressRelation(CONTROL, "network_membership_candidate", 11),
         CompactAddressRelation(CONTROL, "network_serving_manifest", 12),

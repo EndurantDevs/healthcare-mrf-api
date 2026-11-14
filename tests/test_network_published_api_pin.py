@@ -97,6 +97,44 @@ async def test_unreadable_published_address_heap_is_unavailable(base_rls):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("own_rls", [True, None, False], ids=["row security", "no own table", "unfiltered"])
+async def test_compact_custom_addresses_require_an_unfiltered_own_table(monkeypatch, own_rls):
+    from process import network_compact_layout as layouts
+
+    report_by_field = {
+        "serving_readiness": {
+            "component": "compact_network_serving",
+            "address_artifact": {"table": {"oid": 11}},
+            "edge_artifacts": [],
+            "index_definition_sha256": "d" * 64,
+        },
+        "candidate_readiness": {"ref_map_oid": 12},
+        "writer_closure": {},
+    }
+    schema = "network_candidate_" + "a" * 32
+    entry_by_field = {
+        "candidate_json": json.dumps({"schema_name": schema, "validation_json": report_by_field}),
+        "base_rls": False,
+        "own_rls": own_rls,
+        "base_schema": "example_addresses",
+        "base_name": "entity_address_unified",
+    }
+    custom = layouts.CompactAddressRelation(schema, "entity_address_unified", 13)
+    monkeypatch.setattr(published, "_custom_address_relation", lambda _candidate, _descriptor: custom)
+    monkeypatch.setattr(layouts, "bind_compact_geo_search_candidate", lambda layout, _candidate: layout)
+    proofs = []
+    monkeypatch.setattr(published, "_pinned_manifest", lambda _entry, custody: proofs.append(custody) or object())
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=entry_by_field))
+    if own_rls is not False:
+        with pytest.raises(published.NetworkServingReadUnavailable, match="address rows are unavailable"):
+            await published.read_published_api_pin(connection, 3, "example_control", approved=False)
+        assert proofs == []
+    else:
+        await published.read_published_api_pin(connection, 3, "example_control", approved=False)
+        assert proofs[0]["compact_layout"].custom == custom
+
+
+@pytest.mark.asyncio
 async def test_manifest_only_read_touches_no_approved_records(monkeypatch):
     """A reader without access to approved records still resolves the published manifest."""
     from process import network_compact_layout as layouts
@@ -117,6 +155,8 @@ async def test_manifest_only_read_touches_no_approved_records(monkeypatch):
             {"schema_name": "network_candidate_" + "a" * 32, "validation_json": report_by_field}
         ),
         "base_rls": False,
+        # A base-only layout never reads the candidate's own address table, so its row filter does not matter.
+        "own_rls": True,
         "base_schema": "example_addresses",
         "base_name": "entity_address_unified",
     }
