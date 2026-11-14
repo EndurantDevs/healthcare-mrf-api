@@ -29,6 +29,9 @@ from tests.custom_import_build_scratch_postgres import (
 from tests.custom_import_build_scratch_postgres import (
     test_cleanup_refuses_unverified_and_manual_accepted_scratch as test_cleanup_refuses_unverified_and_manual_accepted_scratch,
 )
+from tests.custom_import_build_scratch_postgres import (
+    test_retention_sweep_trims_kept_sealed_scratch_and_replays as test_retention_sweep_trims_kept_sealed_scratch_and_replays,
+)
 from tests.custom_import_postgres_support import (
     _migration,
     isolated_publication_case,

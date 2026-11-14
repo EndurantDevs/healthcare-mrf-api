@@ -926,16 +926,25 @@ async def test_retention_sweep_dry_run_keeps_storage_and_execute_retires_it():
         _, family_id = await _replaced_fence(case)
         namespace = retirement.snapshot_schema(family_id)
 
-        dry_run = await retention_sweep.sweep(case.sessions, retire, refusals, execute=False, emit=lambda line: None)
-        assert [(record["state"], record["family_id"]) for record in dry_run] == [("would_retire", family_id)]
+        dry_run = await retention_sweep.sweep(
+            case.sessions, retire, refusals, engine_id="synthetic", execute=False, emit=lambda line: None
+        )
+        assert [(outcome["state"], outcome["family_id"]) for outcome in dry_run] == [("would_retire", family_id)]
         async with case.sessions() as session, session.begin():
             assert await session.scalar(text("SELECT to_regnamespace(:n)"), {"n": namespace}) is not None
             assert await session.get(CustomImportSnapshotRetirement, family_id) is None
 
-        executed = await retention_sweep.sweep(case.sessions, retire, refusals, execute=True, emit=lambda line: None)
-        assert [(record["state"], record["reason"]) for record in executed] == [("retired", "replaced_fence")]
+        executed = await retention_sweep.sweep(
+            case.sessions, retire, refusals, engine_id="synthetic", execute=True, emit=lambda line: None
+        )
+        assert [(outcome["state"], outcome["reason"]) for outcome in executed] == [("retired", "replaced_fence")]
         async with case.sessions() as session, session.begin():
             assert await session.scalar(text("SELECT to_regnamespace(:n)"), {"n": namespace}) is None
             assert await session.get(CustomImportSnapshotRetirement, family_id) is not None
 
-        assert await retention_sweep.sweep(case.sessions, retire, refusals, execute=True, emit=lambda line: None) == []
+        assert (
+            await retention_sweep.sweep(
+                case.sessions, retire, refusals, engine_id="synthetic", execute=True, emit=lambda line: None
+            )
+            == []
+        )

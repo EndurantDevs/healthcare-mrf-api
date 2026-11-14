@@ -252,6 +252,59 @@ async def test_cleanup_is_atomic_pin_safe_and_preserves_retained_base_continuati
         await _continue_trimmed_base(case, request, sealed, before_read, monkeypatch)
 
 
+async def test_retention_sweep_trims_kept_sealed_scratch_and_replays():
+    """The scheduled sweep keeps the current family, dry-runs, empties and then replays its scratch."""
+    from process.custom_import import retention_sweep, retirement
+    from tests.custom_import_retirement_postgres import _external_fixture_check
+
+    async def retire(session, family_id):
+        return await retirement.retire_snapshot_family(
+            session, family_id, engine_id="synthetic_engine", assert_external_unreferenced=_external_fixture_check
+        )
+
+    async def sweep(*, execute):
+        outcomes = await retention_sweep.sweep(
+            case.sessions,
+            retire,
+            (retirement.SnapshotRetirementRefused,),
+            engine_id="synthetic_engine",
+            execute=execute,
+            emit=lambda line: None,
+        )
+        return [(outcome["operation"], outcome["state"], outcome["family_id"]) for outcome in outcomes], outcomes[-1]
+
+    async with _source_case() as case:
+        async with case.engine.begin() as connection:
+            await connection.run_sync(install_cleanup_migration, case.schema_name)
+            await connection.run_sync(install_current_verification, case.schema_name)
+        request = await fixture._request_for(case, fixture._records(2, 3), page_rows=16)
+        _build_id, sealed = await fixture._complete(case, request)
+        await fixture._activate(case, request, sealed.generation_id)
+        family_id = await _family(case, request)
+        physical_before, counts_before = await _physical(case, family_id)
+        assert all(counts_before[name] > 0 for name in cleanup.SCRATCH_RELATIONS[:-1])
+        before_read = await _read(case, request, sealed.generation_id)
+
+        states, outcome = await sweep(execute=False)
+        assert states == [("retire", "deferred", family_id), ("trim", "would_trim", family_id)]
+        assert not outcome["replayed"] and outcome["retained_bytes"] > outcome["remaining_bytes"]
+        assert await _physical(case, family_id) == (physical_before, counts_before)
+        async with case.sessions() as session:
+            assert await session.get(CustomImportBuildScratchCleanup, family_id) is None
+
+        states, outcome = await sweep(execute=True)
+        assert states == [("retire", "deferred", family_id), ("trim", "trimmed", family_id)]
+        assert not outcome["replayed"]
+        physical_after, counts_after = await _physical(case, family_id)
+        assert physical_after == physical_before and set(counts_after.values()) == {0}
+        assert await _read(case, request, sealed.generation_id) == before_read
+
+        states, replayed_outcome = await sweep(execute=True)
+        assert states == [("retire", "deferred", family_id), ("trim", "trimmed", family_id)]
+        assert replayed_outcome == {**outcome, "replayed": True}
+        assert await _physical(case, family_id) == (physical_after, counts_after)
+
+
 async def test_cleanup_refuses_phase_index_rebound_to_a_serving_table():
     async with _source_case() as case:
         async with case.engine.begin() as connection:
