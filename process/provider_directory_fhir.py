@@ -86,6 +86,7 @@ from db.models import (
 from db.plan_release_storage import storage_relation
 from process import provider_directory_address_overlay_keys as overlay_keys
 from process import provider_directory_anthem as anthem
+from process import provider_directory_bcbs_minnesota as bcbs_minnesota
 from process import provider_directory_bulk_parallel as bulk_parallel
 from process import provider_directory_capped_partition as capped_partition
 from process import provider_directory_christus as christus
@@ -120,6 +121,7 @@ from process import provider_directory_resource_retry as rest_retry
 from process import provider_directory_serving_recovery as serving_recovery
 from process import provider_directory_source_proxy as source_proxy
 from process import provider_directory_source_selection as source_selection
+from process import provider_directory_time_partition as time_partition
 from process import vsp_directory_integration as vsp_directory
 from process.control_cancel import ImportCancelledError, raise_if_cancelled
 from process.control_lifecycle import (
@@ -42554,7 +42556,9 @@ def _synthetic_position_page_identity(
     """Return a stable page identity for synthetic skip/offset pagination."""
 
     api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
-    if api_base not in (FHIR_SYNTHETIC_SKIP_PAGINATION_BASES | FHIR_SYNTHETIC_OFFSET_PAGINATION_BASES):
+    if api_base not in (
+        FHIR_SYNTHETIC_SKIP_PAGINATION_BASES | FHIR_SYNTHETIC_OFFSET_PAGINATION_BASES | {bcbs_minnesota.API_BASE}
+    ):
         return None
     resource_identities: list[str] = []
     for entry in bundle_entries:
@@ -42614,7 +42618,9 @@ def _synthetic_position_resume_guard_error(
     resume_state: PaginationResumeState | None,
 ) -> str | None:
     api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
-    if api_base not in (FHIR_SYNTHETIC_SKIP_PAGINATION_BASES | FHIR_SYNTHETIC_OFFSET_PAGINATION_BASES):
+    if api_base not in (
+        FHIR_SYNTHETIC_SKIP_PAGINATION_BASES | FHIR_SYNTHETIC_OFFSET_PAGINATION_BASES | {bcbs_minnesota.API_BASE}
+    ):
         return None
     if (
         resume_state is None
@@ -42840,6 +42846,9 @@ def _resolved_fhir_next_url(
         return anthem.next_url(current_url, next_link, collection, page_count_cap, page_entry_count)
     if api_base == MOLINA_PROVIDER_DIRECTORY_BASE and resource_type == "HealthcareService":
         return molina.healthcare_service_next_url(current_url, next_link, page_entry_count)
+    if api_base == bcbs_minnesota.API_BASE and resource_type in bcbs_minnesota.CACHED_RESOURCES:
+        page_count = _source_resource_page_count(source_record, resource_type, _max_page_count())
+        return bcbs_minnesota.next_url(current_url, next_link, resource_type, page_count, page_entry_count)
     if not next_link:
         return None
     census_page_url = _resolved_current_version_census_page_url(
@@ -48432,6 +48441,7 @@ def _should_restart_expired_pagination_checkpoint(
     return bool(
         allow_retained_pagination_reset
         and not _is_url_within_api_base(request_url, anthem.API_BASE)
+        and not _is_url_within_api_base(request_url, bcbs_minnesota.API_BASE)
         and (not is_current_version_census or allow_current_version_census_restart)
         and resume_state
         and resume_state.resumed
@@ -49283,98 +49293,16 @@ def _last_updated_partition_monotonic() -> float:
     return time.monotonic()
 
 
-def _last_updated_partition_url(
-    start_url: str,
-    window: TimeWindow,
-    *,
-    page_count: int,
-    count_only: bool,
-) -> str:
-    parsed = urllib.parse.urlsplit(start_url)
-    replaced_names = {
-        "_count",
-        "_lastUpdated",
-        "_sort",
-        "_summary",
-        "_total",
-    }
-    query_items = [
-        (key, query_value)
-        for key, query_value in urllib.parse.parse_qsl(
-            parsed.query,
-            keep_blank_values=True,
-        )
-        if key not in replaced_names
-    ]
-    query_items.extend(
-        (
-            (
-                "_lastUpdated",
-                f"ge{_format_last_updated_partition_instant(window.start)}",
-            ),
-            (
-                "_lastUpdated",
-                f"lt{_format_last_updated_partition_instant(window.end)}",
-            ),
-        )
-    )
-    if count_only:
-        query_items.extend(
-            (
-                ("_summary", "count"),
-                ("_total", "accurate"),
-            )
-        )
-    else:
-        query_items.extend(
-            (
-                ("_sort", "_lastUpdated,_id"),
-                ("_count", str(page_count)),
-            )
-        )
-    return urllib.parse.urlunsplit(
-        (
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            urllib.parse.urlencode(query_items, doseq=True),
-            parsed.fragment,
-        )
+def _last_updated_partition_url(start_url: str, window: TimeWindow, *, page_count: int, count_only: bool) -> str:
+    """Keep shared URL construction compatible with retained checkpoints."""
+    return time_partition.last_updated_partition_url(
+        sys.modules[__name__], start_url, window, page_count=page_count, count_only=count_only
     )
 
 
 def _last_updated_partition_unfiltered_count_url(start_url: str) -> str:
-    parsed = urllib.parse.urlsplit(start_url)
-    replaced_names = {
-        "_count",
-        "_lastUpdated",
-        "_sort",
-        "_summary",
-        "_total",
-    }
-    query_items = [
-        (key, query_value)
-        for key, query_value in urllib.parse.parse_qsl(
-            parsed.query,
-            keep_blank_values=True,
-        )
-        if key not in replaced_names
-    ]
-    query_items.extend(
-        (
-            ("_summary", "count"),
-            ("_total", "accurate"),
-        )
-    )
-    return urllib.parse.urlunsplit(
-        (
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            urllib.parse.urlencode(query_items, doseq=True),
-            parsed.fragment,
-        )
-    )
+    """Build the full-collection count request before recording its identity."""
+    return time_partition.last_updated_partition_unfiltered_count_url(sys.modules[__name__], start_url)
 
 
 def _is_fhir_searchset_bundle(payload: Any) -> bool:
@@ -49474,9 +49402,14 @@ def _last_updated_partition_resource_window_error(
     if not isinstance(metadata, dict):
         return "resource_meta_missing"
     last_updated_text = metadata.get("lastUpdated")
+    if not isinstance(last_updated_text, str):
+        return "resource_last_updated_invalid"
     try:
-        last_updated = parse_utc_instant(last_updated_text)
-    except PartitionPlanError, TypeError, ValueError:
+        last_updated = datetime.datetime.fromisoformat(last_updated_text.replace("Z", "+00:00"))
+        if last_updated.utcoffset() is None:
+            return "resource_last_updated_invalid"
+        last_updated = last_updated.astimezone(datetime.UTC)
+    except ValueError, OverflowError:
         return "resource_last_updated_invalid"
     if last_updated < window.start or last_updated >= window.end:
         return "resource_last_updated_outside_window"
@@ -53797,6 +53730,11 @@ async def _fetch_resource_rows(
                     )
                 except ValueError as exc:
                     error_message = str(exc)
+                    has_next_url = True
+                    break
+            if source_api_base == bcbs_minnesota.API_BASE and resource_type in bcbs_minnesota.CACHED_RESOURCES:
+                error_message = bcbs_minnesota.page_error(response_payload, resource_type, url)
+                if error_message:
                     has_next_url = True
                     break
             entries = _bundle_entries(response_payload)
@@ -58229,6 +58167,8 @@ def _pagination_checkpoint_strategy_version(
     is_opaque_cursor_census: bool = False,
 ) -> str:
     """Select the checkpoint compatibility contract for one endpoint."""
+    if canonical_api_base == bcbs_minnesota.API_BASE:
+        return bcbs_minnesota.STRATEGY_VERSION
     if canonical_api_base == CARESOURCE_PROVIDER_DIRECTORY_BASE or is_opaque_cursor_census:
         return CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION
     if last_updated_partition_config:

@@ -49,6 +49,8 @@ class CensusRequestDeferred(Exception):
 def pagination_start_url(directory, source, url):
     """Apply position pagination only to the configured collection starts."""
     api_base = directory._canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    if api_base == directory.bcbs_minnesota.API_BASE:
+        return directory.bcbs_minnesota.start_url(directory, url)
     position_pagination_bases = (
         directory.FHIR_OFFSET_PAGINATION_BASES
         | directory.FHIR_SYNTHETIC_SKIP_PAGINATION_BASES

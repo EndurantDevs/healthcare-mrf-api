@@ -163,7 +163,15 @@
         "HealthcareService",
         "OrganizationAffiliation"
       ],
-      "provider_directory_fully_enumerable_resources": [],
+      "provider_directory_fully_enumerable_resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation"
+      ],
       "provider_directory_resource_page_count_caps": {
         "InsurancePlan": 500,
         "PractitionerRole": 500,
@@ -174,10 +182,60 @@
         "OrganizationAffiliation": 500
       },
       "provider_directory_request_interval_seconds": 0.1,
-      "provider_directory_coverage_mode": "probe_only",
-      "provider_directory_acquisition_enabled": false,
-      "provider_directory_acquisition_blocked_reason": "search_results_truncated_without_continuation",
-      "provider_directory_probe_resource": "Practitioner"
+      "provider_directory_coverage_mode": "carrier_directory",
+      "provider_directory_acquisition_enabled": true,
+      "provider_directory_probe_resource": "Practitioner",
+      "provider_directory_expected_nonempty_resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation"
+      ],
+      "provider_directory_resource_scan_concurrency": 8,
+      "provider_directory_last_updated_partition_acquisition": {
+        "enabled": true,
+        "resources": {
+          "Practitioner": {
+            "start": "1900-01-01T00:00:00Z",
+            "end": "resolved_now",
+            "ceiling": 499,
+            "minimum_width_seconds": 1,
+            "boundary_precision_seconds": 1,
+            "page_count": 499,
+            "volatile_metadata_paths": []
+          },
+          "PractitionerRole": {
+            "start": "1900-01-01T00:00:00Z",
+            "end": "resolved_now",
+            "ceiling": 499,
+            "minimum_width_seconds": 1,
+            "boundary_precision_seconds": 1,
+            "page_count": 499,
+            "volatile_metadata_paths": []
+          },
+          "Organization": {
+            "start": "1900-01-01T00:00:00Z",
+            "end": "resolved_now",
+            "ceiling": 499,
+            "minimum_width_seconds": 1,
+            "boundary_precision_seconds": 1,
+            "page_count": 499,
+            "volatile_metadata_paths": []
+          },
+          "OrganizationAffiliation": {
+            "start": "1900-01-01T00:00:00Z",
+            "end": "resolved_now",
+            "ceiling": 499,
+            "minimum_width_seconds": 1,
+            "boundary_precision_seconds": 1,
+            "page_count": 499,
+            "volatile_metadata_paths": []
+          }
+        }
+      }
     }
   },
   {
