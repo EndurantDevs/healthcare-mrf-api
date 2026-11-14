@@ -555,13 +555,12 @@ async def test_actual_ptg_worker_refuses_before_publication(ptg_worker_db, monke
     assert status["state"] == "rejected" and await _retained_pin(native) == fixture.original
     if fault == "authority":
         assert len(calls) == 5
-        assert (
-            await native.custom.connection.fetchval(
-                f'SELECT state FROM "{native.custom.control_schema}".network_membership_candidate WHERE dataset_id=$1',
-                uuid5(UUID(queued["request_id"]), "dataset"),
-            )
-            == "ready"
+        candidate = await native.custom.connection.fetchrow(
+            "SELECT state,to_regnamespace(schema_name) IS NULL AS dropped "
+            f'FROM "{native.custom.control_schema}".network_membership_candidate WHERE dataset_id=$1',
+            uuid5(UUID(queued["request_id"]), "dataset"),
         )
+        assert dict(candidate) == {"state": "rejected", "dropped": True}
 
 
 @asynccontextmanager
