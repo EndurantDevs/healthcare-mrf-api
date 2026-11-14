@@ -19,11 +19,12 @@ jobs:
       with:
         persist-credentials: false
     - name: Install pinned uv
-      run: "#!/usr/bin/env bash\nset -euo pipefail\n\nuv_directory=$(mktemp -d \"$RUNNER_TEMP/uv-0.12.17.XXXXXX\")\ncleanup()\
-        \ {\n  local status=$?\n  rm -f -- \"$uv_directory/archive.tar.gz\"\n  if [ \"$status\" -ne 0 ]; then rm -rf -- \"\
-        $uv_directory\"; fi\n  exit \"$status\"\n}\ntrap cleanup EXIT\ncurl_options=(--fail --location --retry 1 --retry-delay\
-        \ 1 --retry-max-time 61\n  --connect-timeout 10 --max-time 30 --output \"$uv_directory/archive.tar.gz\")\nif ! curl\
-        \ \"${curl_options[@]}\" \\\n  https://releases.astral.sh/github/uv/releases/download/0.12.17/uv-x86_64-unknown-linux-gnu.tar.gz;\
+      run: "#!/usr/bin/env bash\nset -euo pipefail\n\n# An optional fresh fixed directory keeps PATH identical across runs\
+        \ that reuse results.\nif [ -n \"${1-}\" ]; then\n  uv_directory=$1\n  mkdir -- \"$uv_directory\"\nelse\n  uv_directory=$(mktemp\
+        \ -d \"$RUNNER_TEMP/uv-0.12.17.XXXXXX\")\nfi\ncleanup() {\n  local status=$?\n  rm -f -- \"$uv_directory/archive.tar.gz\"\
+        \n  if [ \"$status\" -ne 0 ]; then rm -rf -- \"$uv_directory\"; fi\n  exit \"$status\"\n}\ntrap cleanup EXIT\ncurl_options=(--fail\
+        \ --location --retry 1 --retry-delay 1 --retry-max-time 61\n  --connect-timeout 10 --max-time 30 --output \"$uv_directory/archive.tar.gz\"\
+        )\nif ! curl \"${curl_options[@]}\" \\\n  https://releases.astral.sh/github/uv/releases/download/0.12.17/uv-x86_64-unknown-linux-gnu.tar.gz;\
         \ then\n  rm -f -- \"$uv_directory/archive.tar.gz\"\n  curl \"${curl_options[@]}\" \\\n    https://github.com/astral-sh/uv/releases/download/0.12.17/uv-x86_64-unknown-linux-gnu.tar.gz\n\
         fi\nprintf '%s  %s\\n' \\\n  fa82fd8dde8e8eefdecada6aa0889666556cfceb690d06e0c3bca49eb3070a63 \\\n  \"$uv_directory/archive.tar.gz\"\
         \ | sha256sum --check --strict\ntar -xzf \"$uv_directory/archive.tar.gz\" -C \"$uv_directory\" --strip-components=1\
@@ -31,13 +32,14 @@ jobs:
         \ awk '{print $2}')\" = 0.12.17\nprintf '%s\\n' \"$uv_directory\" >> \"$GITHUB_PATH\"\n"
     - name: Install uv-managed Python
       run: "#!/usr/bin/env bash\nset -euo pipefail\n\ntest \"$(uv --no-config --version | awk '{print $2}')\" = 0.12.17\n\
-        python_directory=$(mktemp -d \"$RUNNER_TEMP/uv-python.XXXXXX\")\ncleanup() {\n  local status=$?\n  if [ \"$status\"\
-        \ -ne 0 ]; then rm -rf -- \"$python_directory\"; fi\n  exit \"$status\"\n}\ntrap cleanup EXIT\nuv --no-config venv\
-        \ --managed-python --python 3.14.7 \"$python_directory/venv\"\npython_library=$(\"$python_directory/venv/bin/python\"\
-        \ -c 'import sysconfig; print(sysconfig.get_config_var(\"LIBDIR\"))')\ntest -d \"$python_library\"\nprintf '%s\\n'\
-        \ \"$python_directory/venv/bin\" >> \"$GITHUB_PATH\"\nprintf 'VIRTUAL_ENV=%s\\nUV_PYTHON_PREFERENCE=only-managed\\\
-        n' \"$python_directory/venv\" >> \"$GITHUB_ENV\"\nprintf 'LD_LIBRARY_PATH=%s%s\\n' \"$python_library\" \"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\"\
-        \ >> \"$GITHUB_ENV\"\n"
+        # An optional fresh fixed directory keeps installed launchers identical across runs.\nif [ -n \"${1-}\" ]; then\n\
+        \  python_directory=$1\n  mkdir -- \"$python_directory\"\nelse\n  python_directory=$(mktemp -d \"$RUNNER_TEMP/uv-python.XXXXXX\"\
+        )\nfi\ncleanup() {\n  local status=$?\n  if [ \"$status\" -ne 0 ]; then rm -rf -- \"$python_directory\"; fi\n  exit\
+        \ \"$status\"\n}\ntrap cleanup EXIT\nuv --no-config venv --managed-python --python 3.14.7 \"$python_directory/venv\"\
+        \npython_library=$(\"$python_directory/venv/bin/python\" -c 'import sysconfig; print(sysconfig.get_config_var(\"LIBDIR\"\
+        ))')\ntest -d \"$python_library\"\nprintf '%s\\n' \"$python_directory/venv/bin\" >> \"$GITHUB_PATH\"\nprintf 'VIRTUAL_ENV=%s\\\
+        nUV_PYTHON_PREFERENCE=only-managed\\n' \"$python_directory/venv\" >> \"$GITHUB_ENV\"\nprintf 'LD_LIBRARY_PATH=%s%s\\\
+        n' \"$python_library\" \"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\" >> \"$GITHUB_ENV\"\n"
     - name: Create isolated Python environment
       run: uv venv --python 3.14.7 --no-python-downloads .venv
     - name: Check public repository hygiene
@@ -71,7 +73,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 1d872b230644f82398eeb903a7797a7cc723414d
+        ref: 299748f7704606791db0ffb6809eba85b9f4e1e2
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -140,7 +142,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 1d872b230644f82398eeb903a7797a7cc723414d
+        ref: 299748f7704606791db0ffb6809eba85b9f4e1e2
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -163,7 +165,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 1d872b230644f82398eeb903a7797a7cc723414d
+        ref: 299748f7704606791db0ffb6809eba85b9f4e1e2
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -200,7 +202,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 1d872b230644f82398eeb903a7797a7cc723414d
+        ref: 299748f7704606791db0ffb6809eba85b9f4e1e2
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -314,7 +316,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 1d872b230644f82398eeb903a7797a7cc723414d
+        ref: 299748f7704606791db0ffb6809eba85b9f4e1e2
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -373,7 +375,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 1d872b230644f82398eeb903a7797a7cc723414d
+        ref: 299748f7704606791db0ffb6809eba85b9f4e1e2
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -405,7 +407,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 1d872b230644f82398eeb903a7797a7cc723414d
+        ref: 299748f7704606791db0ffb6809eba85b9f4e1e2
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -458,7 +460,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 1d872b230644f82398eeb903a7797a7cc723414d
+        ref: 299748f7704606791db0ffb6809eba85b9f4e1e2
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -505,7 +507,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 1d872b230644f82398eeb903a7797a7cc723414d
+        ref: 299748f7704606791db0ffb6809eba85b9f4e1e2
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -543,7 +545,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 1d872b230644f82398eeb903a7797a7cc723414d
+        ref: 299748f7704606791db0ffb6809eba85b9f4e1e2
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -600,15 +602,36 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 1d872b230644f82398eeb903a7797a7cc723414d
+        ref: 299748f7704606791db0ffb6809eba85b9f4e1e2
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
       uses: ./ci/scripts/healthcare/setup
       with:
         postgres-schema-cache: 'true'
+    - name: Resolve PostgreSQL client cache key
+      id: postgres-client-key
+      env:
+        INSTALLER_HASH: ${{ hashFiles('ci/scripts/install_postgres_client') }}
+      run: ". /etc/os-release\nprintf 'key=postgres-client-18-%s-%s-%s-%s\\n' \"$VERSION_CODENAME\" \"$(dpkg --print-architecture)\"\
+        \ \\\n  \"$(date -u +%G-W%V)\" \"$INSTALLER_HASH\" >> \"$GITHUB_OUTPUT\"\n"
+    - name: Restore PostgreSQL client packages
+      id: postgres-client-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: ${{ runner.temp }}/postgres-client-cache
+        key: ${{ steps.postgres-client-key.outputs.key }}
     - name: Install PostgreSQL client
+      id: postgres-client
+      env:
+        POSTGRES_CLIENT_CACHE: ${{ runner.temp }}/postgres-client-cache
       run: bash "$CI_ROOT/scripts/install_postgres_client"
+    - name: Save PostgreSQL client packages
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: ${{ runner.temp }}/postgres-client-cache
+        key: ${{ steps.postgres-client-key.outputs.key }}
+      if: steps.postgres-client-cache.outputs.cache-hit != 'true' && steps.postgres-client.outputs.cache-ready == 'true'
     - name: Download exact-source Rust test binaries
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
@@ -941,7 +964,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 1d872b230644f82398eeb903a7797a7cc723414d
+        ref: 299748f7704606791db0ffb6809eba85b9f4e1e2
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -949,9 +972,33 @@ jobs:
     - name: Check catalog integration capability
       id: catalog-capability
       run: bash "$CI_ROOT/scripts/healthcare/check" fhir-catalog-capability >> "$GITHUB_OUTPUT"
+    - name: Resolve PostgreSQL client cache key
+      id: postgres-client-key
+      env:
+        INSTALLER_HASH: ${{ hashFiles('ci/scripts/install_postgres_client') }}
+      run: ". /etc/os-release\nprintf 'key=postgres-client-18-%s-%s-%s-%s\\n' \"$VERSION_CODENAME\" \"$(dpkg --print-architecture)\"\
+        \ \\\n  \"$(date -u +%G-W%V)\" \"$INSTALLER_HASH\" >> \"$GITHUB_OUTPUT\"\n"
+      if: steps.catalog-capability.outputs.present == 'true'
+    - name: Restore PostgreSQL client packages
+      id: postgres-client-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: ${{ runner.temp }}/postgres-client-cache
+        key: ${{ steps.postgres-client-key.outputs.key }}
+      if: steps.catalog-capability.outputs.present == 'true'
     - name: Install PostgreSQL client
+      id: postgres-client
+      env:
+        POSTGRES_CLIENT_CACHE: ${{ runner.temp }}/postgres-client-cache
       run: bash "$CI_ROOT/scripts/install_postgres_client"
       if: steps.catalog-capability.outputs.present == 'true'
+    - name: Save PostgreSQL client packages
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: ${{ runner.temp }}/postgres-client-cache
+        key: ${{ steps.postgres-client-key.outputs.key }}
+      if: steps.catalog-capability.outputs.present == 'true' && steps.postgres-client-cache.outputs.cache-hit != 'true' &&
+        steps.postgres-client.outputs.cache-ready == 'true'
     - name: Download exact-source Rust test binaries
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
@@ -1020,7 +1067,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 1d872b230644f82398eeb903a7797a7cc723414d
+        ref: 299748f7704606791db0ffb6809eba85b9f4e1e2
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -1146,7 +1193,7 @@ jobs:
       actions: write
       packages: write
     env:
-      CI_REVISION: 1d872b230644f82398eeb903a7797a7cc723414d
+      CI_REVISION: 299748f7704606791db0ffb6809eba85b9f4e1e2
       PYTHONDONTWRITEBYTECODE: '1'
       IMAGE_ARTIFACT_ID: ${{ needs.container-package.outputs.image_artifact_id }}
       MEASUREMENT_ARTIFACT_ID: ${{ needs.measurement.outputs.measurement_artifact_id }}
@@ -1155,7 +1202,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 1d872b230644f82398eeb903a7797a7cc723414d
+        ref: 299748f7704606791db0ffb6809eba85b9f4e1e2
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -1236,7 +1283,7 @@ jobs:
     - dev
 env:
   CI_ROOT: ${{ github.workspace }}/ci
-  CI_REVISION: 1d872b230644f82398eeb903a7797a7cc723414d
+  CI_REVISION: 299748f7704606791db0ffb6809eba85b9f4e1e2
   SOURCE_ROOT: ${{ github.workspace }}/source
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: '1'
