@@ -2217,6 +2217,20 @@ an employer product or nationwide network equivalence.
 The official-file, Flex-cohort, formulary, and release boundaries are recorded
 in [Provider-directory and formulary source acceptance](provider-directory-formulary-source-acceptance.md).
 
+[BCBS Minnesota’s official Provider Directory](https://fhir-developer.bluecrossmn.com/provider-directory)
+uses anonymous Plan-Net searches at `https://api.bluecrossmn.com/fhir/provider`
+for Medicare and Medicaid providers, pharmacies and dentists. The shared source
+catalog records seven documented collections and excludes `Endpoint`. Acquisition
+remains disabled: requests for 1,000 records return 500 in sampled larger
+collections without next links, and
+`Bundle.total` follows the requested count rather than an authoritative directory
+total. Count-only queries still return resources, and the missing-timestamp
+predicate returns dated records. The advertised capability has no history,
+export or versioned-write contract, so timestamp partitioning cannot establish
+complete coverage. Keep this source probe-only until a complete traversal is
+verified. Existing sources using `/fhir/provider-directory/` retain their separate
+identities; endpoint and product equivalence are not assumed.
+
 Florida Blue's official Provider Directory OAS
 (`https://developer.bcbsfl.com/interop/interop-developer-portal/product/758/api/749`)
 declares anonymous access to seven collections at
