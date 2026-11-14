@@ -437,7 +437,7 @@ async def test_saturated_tile_splits_until_source_offices_account_for_the_census
     queries = [TILE, *children[:2]]
     results = [
         {"totalCounts": 51, "locations": first_offices},
-        {"totalCounts": 0, "locations": []},
+        {"totalCounts": 0, "offset": 1, "limit": 50, "hasGAPDr": False},
         {"totalCounts": 1, "locations": [missing]},
     ]
 

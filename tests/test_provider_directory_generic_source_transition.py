@@ -434,7 +434,8 @@ async def test_vsp_retry_converts_empty_legacy_intake_to_names(case, vsp_retry_c
 
 
 @pytest.mark.asyncio
-async def test_named_vsp_successor_retains_an_empty_failed_retry(case, vsp_retry_candidate):
+@pytest.mark.parametrize("error", [storage.OFFICE_DOCTORS_INVALID, storage.SEARCH_RESPONSE_INVALID])
+async def test_named_vsp_successor_retains_an_empty_failed_retry(case, vsp_retry_candidate, error):
     _retain_original_root(case, "failed")
     case.runs[0].update(source_ids=[SOURCE_ID], error_message=storage.OFFICE_DOCTORS_INVALID)
     case.header.update(status="failed", resource_count=0)
@@ -448,6 +449,8 @@ async def test_named_vsp_successor_retains_an_empty_failed_retry(case, vsp_retry
     case.new = {**case.old, "producer": ["d" * 40, "sha256:" + "e" * 64]}
     case.runs.insert(0, {**case.runs[0], "run_id": FAILED, "retry_of_run_id": ROOT, "root_run_id": ROOT})
     case.header["import_run_id"] = FAILED
+    case.header["publication_metadata_json"]["error"] = error
+    case.runs[0]["error_message"] = error
     receipt = await _transition(case, counts)
     assert receipt["rows"] == 0
     assert receipt["lineage_run_ids"] == sorted([ROOT, FAILED])

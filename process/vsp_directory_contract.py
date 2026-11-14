@@ -15,6 +15,7 @@ ENDPOINT_SCOPE = API_BASE.rstrip("/")
 SEARCH_URL = API_BASE + "fadbusiness-api/publiclocationsummarybusextensions"
 PROFILE_PATH = "/provider-web/publicdoctorprofile"
 OFFICE_DOCTORS_INVALID = "vsp_office_doctors_invalid"
+SEARCH_RESPONSE_INVALID = "vsp_search_response_invalid"
 ADAPTER_ID = "vsp-directory-json-v1"
 TRANSPORT = "official_directory_json"
 RESOURCE_TYPES = (
@@ -134,14 +135,16 @@ def search_result(payload):
     """Reject HTTP-200 source errors, clamped pages and ambiguous office counts."""
     require(type(payload) is dict and not payload.get("errors"), "vsp_search_source_error")
     total, locations = payload.get("totalCounts"), payload.get("locations")
-    require(type(total) is int and total >= 0 and type(locations) is list, "vsp_search_response_invalid")
+    if type(total) is int and total == 0 and "locations" not in payload:
+        return 0, []
+    require(type(total) is int and total >= 0 and type(locations) is list, SEARCH_RESPONSE_INVALID)
     identifiers = [public_id(x.get("pid")) for x in locations if type(x) is dict]
     require(
         len(identifiers) == len(locations)
         and len(set(identifiers)) == len(identifiers)
         and len(locations) <= MAX_LOCATIONS
         and len(locations) <= total,
-        "vsp_search_response_invalid",
+        SEARCH_RESPONSE_INVALID,
     )
     require(len(locations) == min(total, MAX_LOCATIONS), "vsp_search_response_incomplete")
     validated_offices = []
