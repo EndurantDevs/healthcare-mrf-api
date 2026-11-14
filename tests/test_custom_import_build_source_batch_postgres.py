@@ -47,20 +47,7 @@ def _synthetic_npi(index):
     return next(prefix + str(digit) for digit in range(10) if _is_valid_npi(prefix + str(digit)))
 
 
-async def test_owner_selection_uses_current_user_without_granting_authority():
-    async with _source_case() as case:
-        request = await _request_for(case, _records(1), page_rows=2)
-        build_id, _ = await staging._begin_build(case.sessions, request)
-        async with staging._page_session(case.sessions, request, build_id) as (session, _):
-            assert await admission._has_admission_owner(session) is True
-            await session.execute(text("SET LOCAL ROLE pg_read_all_data"))
-            try:
-                assert await admission._has_admission_owner(session) is False
-            finally:
-                await session.execute(text("RESET ROLE"))
-
-
-async def test_staging_routes_the_existing_owner_through_ordinary_admission(monkeypatch):
+async def test_staging_routes_cursor_writer_through_ordinary_admission(monkeypatch):
     async with _source_case() as case:
         request = await _request_for(case, _records(3), page_rows=2)
         admitted = AsyncMock(wraps=admission._admit_locked)
@@ -147,20 +134,25 @@ async def _root_page(case, records):
     return context, page
 
 
-async def test_source_owner_selection_uses_current_user_without_granting_authority():
+async def test_cursor_write_routing_tracks_native_permission_without_grants():
     async with _source_case() as case:
         context, _ = await _root_page(case, [_root()])
         async with staging._page_session(case.sessions, context.request, context.build_id) as (session, _):
-            assert await staging._is_source_writer_owner(session) is True
-            await session.execute(text("SET LOCAL ROLE pg_read_all_data"))
+            assert await staging._can_update_build_cursor(session) is True
+            await session.execute(text("SET LOCAL ROLE pg_write_all_data"))
             try:
-                assert await staging._is_source_writer_owner(session) is False
+                assert await staging._can_update_build_cursor(session) is True
             finally:
                 await session.execute(text("RESET ROLE"))
-            assert await staging._is_source_writer_owner(session) is True
+            await session.execute(text("SET LOCAL ROLE pg_read_all_data"))
+            try:
+                assert await staging._can_update_build_cursor(session) is False
+            finally:
+                await session.execute(text("RESET ROLE"))
+            assert await staging._can_update_build_cursor(session) is True
 
 
-def _assert_source_route_statements(statements, ordinary, owner_route):
+def _assert_source_route_statements(statements, ordinary, direct_route):
     """Both routes use fixed-count statements, not database work per row."""
 
     source_calls = Counter(
@@ -171,14 +163,14 @@ def _assert_source_route_statements(statements, ordinary, owner_route):
     )
     expected_count_by_name = {
         "source_bulk_authorize": 1,
-        "resolve_custom_import_source_batch_snapshot": 2 if owner_route else 1,
+        "resolve_custom_import_source_batch_snapshot": 2 if direct_route else 1,
+        "source_set_finalize": 1,
     }
-    if owner_route:
+    if direct_route:
         ordinary.assert_awaited_once()
         # Each fixed ordinary statement retains its own fenced timeout preparation.
         assert len(statements) <= 96 + 2 * len(finalizer._load_sql())
     else:
-        expected_count_by_name["source_set_finalize"] = 1
         ordinary.assert_not_awaited()
         assert len(statements) <= 96
         for model in (
@@ -212,9 +204,9 @@ async def _assert_source_page_outcomes(case, context, record_count):
 
 
 @pytest.mark.parametrize("record_count", [1, 32])
-@pytest.mark.parametrize("owner_route", [True, False])
-async def test_source_page_client_statements_are_batched(monkeypatch, record_count, owner_route):
-    """The real owner route and retained dispatcher preserve candidate outcomes."""
+@pytest.mark.parametrize("direct_route", [True, False])
+async def test_source_page_client_statements_are_batched(monkeypatch, record_count, direct_route):
+    """The direct route and retained dispatcher preserve candidate outcomes."""
 
     async with _source_case() as case:
         context, page = await _root_page(case, [_root(_synthetic_npi(index)) for index in range(record_count)])
@@ -223,16 +215,16 @@ async def test_source_page_client_statements_are_batched(monkeypatch, record_cou
         monkeypatch.setattr(staging, "_copy_source_landing", copy_landing)
         ordinary = AsyncMock(wraps=finalizer.finalize_source_batch)
         monkeypatch.setattr(finalizer, "finalize_source_batch", ordinary)
-        owner_checks = []
-        original_gate = staging._is_source_writer_owner
+        route_checks = []
+        original_gate = staging._can_update_build_cursor
 
         async def checked_gate(session):
-            owned = await original_gate(session)
-            owner_checks.append(owned)
-            assert owned, "the fixture must actually own both SOURCE entry points"
-            return owner_route
+            can_update = await original_gate(session)
+            route_checks.append(can_update)
+            assert can_update, "the fixture must have direct cursor UPDATE permission"
+            return direct_route
 
-        monkeypatch.setattr(staging, "_is_source_writer_owner", checked_gate)
+        monkeypatch.setattr(staging, "_can_update_build_cursor", checked_gate)
 
         def count_statement(_connection, _cursor, statement, _parameters, _context, _executemany):
             statements.append(statement)
@@ -244,8 +236,8 @@ async def test_source_page_client_statements_are_batched(monkeypatch, record_cou
             event.remove(case.engine.sync_engine, "before_cursor_execute", count_statement)
         copy_landing.assert_awaited_once()
         assert len(copy_landing.await_args.args[1]) == record_count
-        assert owner_checks == [True]
-        source_calls = _assert_source_route_statements(statements, ordinary, owner_route)
+        assert route_checks == [True]
+        source_calls = _assert_source_route_statements(statements, ordinary, direct_route)
         print(
             json.dumps(
                 dict(
@@ -269,8 +261,8 @@ def _completion_digest(context, page):
     return hashlib.sha256("\n".join(documents).encode("utf-8")).digest()
 
 
-@pytest.mark.parametrize("owner_route", [True, False])
-async def test_completion_digests_match_canonical_scalars(monkeypatch, owner_route):
+@pytest.mark.parametrize("direct_route", [True, False])
+async def test_completion_digests_match_canonical_scalars(monkeypatch, direct_route):
     """Both finalizers preserve ordered scalar bytes, including embedded JSON text."""
 
     records_by_stream = {
@@ -279,14 +271,14 @@ async def test_completion_digests_match_canonical_scalars(monkeypatch, owner_rou
     }
     ordinary = AsyncMock(wraps=finalizer.finalize_source_batch)
     monkeypatch.setattr(finalizer, "finalize_source_batch", ordinary)
-    original_gate = staging._is_source_writer_owner
+    original_gate = staging._can_update_build_cursor
 
     async def checked_gate(session):
-        assert await original_gate(session), "the fixture must actually own both SOURCE entry points"
-        return owner_route
+        assert await original_gate(session), "the fixture must have direct cursor UPDATE permission"
+        return direct_route
 
-    owner_gate = AsyncMock(wraps=checked_gate)
-    monkeypatch.setattr(staging, "_is_source_writer_owner", owner_gate)
+    route_gate = AsyncMock(wraps=checked_gate)
+    monkeypatch.setattr(staging, "_can_update_build_cursor", route_gate)
     async with _source_case() as case:
         request = replace(await _retained_request(case, records_by_stream=records_by_stream), page_row_limit=32)
         build_id, registry = await staging._begin_build(case.sessions, request)
@@ -317,9 +309,11 @@ async def test_completion_digests_match_canonical_scalars(monkeypatch, owner_rou
                 )
             ).all()
         assert [tuple(completion) for completion in completions] == expected_completions
-        assert owner_gate.await_count == 2
-        assert ordinary.await_count == (2 if owner_route else 0)
-        assert sum(call.args[1] == "source_set_finalize" for call in calls.await_args_list) == (0 if owner_route else 2)
+        assert route_gate.await_count == 2
+        assert ordinary.await_count == (2 if direct_route else 0)
+        assert sum(call.args[1] == "source_set_finalize" for call in calls.await_args_list) == (
+            0 if direct_route else 2
+        )
 
 
 async def test_mixed_outcomes_keep_rejection_ordinals_and_retry_prefix():
@@ -353,14 +347,14 @@ async def test_mixed_outcomes_keep_rejection_ordinals_and_retry_prefix():
         assert await staging.stage_segmented_source(case.sessions, context.request) == result
 
 
-@pytest.mark.parametrize("owner_route", [True, False])
-async def test_source_row_validation_failure_rolls_back_entire_page(monkeypatch, owner_route):
-    if not owner_route:
-        monkeypatch.setattr(staging, "_is_source_writer_owner", AsyncMock(return_value=False))
+@pytest.mark.parametrize("direct_route", [True, False])
+async def test_source_row_validation_failure_rolls_back_entire_page(monkeypatch, direct_route):
+    if not direct_route:
+        monkeypatch.setattr(staging, "_can_update_build_cursor", AsyncMock(return_value=False))
     async with _source_case() as case:
         context, page = await _root_page(case, [_root(), _root(score=None), _root(_synthetic_npi(1))])
         forged = replace(page.records[-1], raw_key=(page.records[-1].raw_key[0], bytes(32)))
-        error_type = finalizer.SourceFinalizationError if owner_route else DBAPIError
+        error_type = finalizer.SourceFinalizationError if direct_route else DBAPIError
         with pytest.raises(error_type, match="source_bulk_row_mismatch"):
             await staging._store_single_page(
                 case.sessions, context, replace(page, records=(*page.records[:-1], forged))

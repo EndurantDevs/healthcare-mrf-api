@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Synthetic custody failures and read-only native catalog statement contracts."""
+"""Logical projection layout, portability and native catalog statement contracts."""
 
 import datetime as dt
 from types import SimpleNamespace
@@ -37,12 +37,6 @@ def _manifest(**changes):
             projection_contract=QUERY_PROJECTION_CONTRACT,
             definition_sha256=bytes.fromhex(_DEFINITION.digest),
             capability_sha256=capability_sha256(_DEFINITION),
-            root_table_oid=101,
-            root_table_owner=42,
-            root_columns_sha256=b"r" * 32,
-            child_table_oid=102,
-            child_table_owner=42,
-            child_columns_sha256=b"k" * 32,
             after_entity_binding_id=999,
             root_count=10,
             child_count=20,
@@ -129,15 +123,11 @@ def _catalog(name=_ROOT, **changes):
     ]
     return (
         dict(
-            table_oid=102 if name == _CHILD else 101,
-            table_owner=42,
-            schema_owner=42,
             relkind="r",
             relpersistence="p",
             inherited=False,
             foreign_keys=False,
             triggers=False,
-            columns_sha256=(b"k" if name == _CHILD else b"r") * 32,
             columns=columns,
             primary_key=primary_key_names,
         )
@@ -176,8 +166,7 @@ def _indexes():
         dict(
             flags_by_name,
             index_name=f"{table}_field_{slot}_idx",
-            table_oid=oid,
-            index_owner=42,
+            table_name=table,
             index_kind="i",
             access_method="btree",
             key_names=["selected_value", *child_keys, f"field_{slot}", "entity_binding_id"],
@@ -185,17 +174,16 @@ def _indexes():
             attribute_count=3 + len(child_keys),
             collation_names=[None] * (3 + len(child_keys)),
         )
-        for table, slot, oid, child_keys in (
-            (_ROOT, 1, 101, []),
-            (_CHILD, 2, 102, ["child_key_sha256"]),
-            (_CHILD, 3, 102, ["child_key_sha256"]),
+        for table, slot, child_keys in (
+            (_ROOT, 1, []),
+            (_CHILD, 2, ["child_key_sha256"]),
+            (_CHILD, 3, ["child_key_sha256"]),
         )
     ] + [
         dict(
             flags_by_name,
             index_name=QUERY_PROJECTION_BINDING_INDEX,
-            table_oid=103,
-            index_owner=42,
+            table_name="custom_import_entity_binding",
             index_kind="i",
             access_method="btree",
             key_names=["dataset_id", "adapter_id", "canonical_value", "entity_binding_id"],
@@ -209,31 +197,29 @@ def _indexes():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("name", [_ROOT, _CHILD])
-async def test_native_catalog_identity_validates_the_model_before_returning_custody(name):
+async def test_native_catalog_validates_qualified_model_layout(name):
     row = _catalog(name)
     session = _session(_result(row, mapping=True))
-    assert await binding.projection_table_identity(session, 17, name, _DEFINITION) == (
-        row["table_oid"],
-        row["table_owner"],
-        row["columns_sha256"],
-    )
+    assert await binding.validate_projection_table(session, 17, name, _DEFINITION) is None
     statement, arguments = session.execute.call_args.args
     assert arguments == {"schema_name": "ci_snapshot_17", "table_name": name}
     sql = str(statement.compile(dialect=postgresql.dialect()))
-    assert "ROW(a.attnum,a.attname,a.atttypid,a.atttypmod,a.attnotnull,a.attcollation," in sql
+    assert "pg_catalog.format_type(a.atttypid,a.atttypmod)" in sql
     assert "c.relkind::text AS relkind,c.relpersistence::text AS relpersistence" in sql
-    assert "E'\\\\n' ORDER BY a.attnum),'UTF8'" in sql
+    assert "n.nspname=%(schema_name)s AND c.relname=%(table_name)s" in sql
+    assert "AS columns" in sql and "AS primary_key" in sql
+    assert not any(value in sql for value in ("AS table_oid", "relowner", "columns_sha256"))
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("name", [_ROOT, _CHILD])
-async def test_empty_capabilities_still_have_valid_fixed_context_identity(name):
+async def test_empty_capabilities_still_have_valid_fixed_context_layout(name):
     document = derived_document()
     document["query"].update(filterable_fields=[], sortable_fields=[], order=[])
     parsed = CustomImportDefinition.from_mapping(document)
     row = _catalog(name)
     row["columns"] = row["columns"][: 4 if name == _CHILD else 2]
-    assert await binding.projection_table_identity(_session(_result(row, mapping=True)), 17, name, parsed)
+    assert await binding.validate_projection_table(_session(_result(row, mapping=True)), 17, name, parsed) is None
 
 
 @pytest.mark.asyncio
@@ -242,19 +228,16 @@ async def test_empty_capabilities_still_have_valid_fixed_context_identity(name):
     [
         {"relkind": "v"},
         {"relpersistence": "u"},
-        {"table_owner": 43},
-        {"table_oid": 0},
         {"inherited": True},
         {"foreign_keys": True},
         {"triggers": True},
-        {"columns_sha256": b"short"},
         {"primary_key": ["entity_binding_id"]},
         {"columns": []},
     ],
 )
-async def test_native_identity_rejects_custody_and_shape_changes(changes):
+async def test_native_layout_rejects_shape_changes(changes):
     with pytest.raises(binding.QueryProjectionUnavailable):
-        await binding.projection_table_identity(
+        await binding.validate_projection_table(
             _session(_result(_catalog(**changes), mapping=True)), 17, _ROOT, _DEFINITION
         )
 
@@ -265,7 +248,7 @@ async def test_catalog_shape_rejects_wrong_precision_default_and_child_collation
         row = _catalog(_CHILD)
         row["columns"][position][index] = value
         with pytest.raises(binding.QueryProjectionUnavailable, match="model shape"):
-            await binding.projection_table_identity(_session(_result(row, mapping=True)), 17, _CHILD, _DEFINITION)
+            await binding.validate_projection_table(_session(_result(row, mapping=True)), 17, _CHILD, _DEFINITION)
 
 
 @pytest.mark.asyncio
@@ -273,7 +256,7 @@ async def test_catalog_shape_rejects_wrong_precision_default_and_child_collation
 async def test_relation_names_cannot_select_caller_sql(name):
     session = _session()
     with pytest.raises(binding.QueryProjectionUnavailable, match="relation name"):
-        await binding.projection_table_identity(session, 17, name, _DEFINITION)
+        await binding.validate_projection_table(session, 17, name, _DEFINITION)
     session.execute.assert_not_awaited()
 
 
@@ -287,7 +270,7 @@ async def test_reader_and_incomplete_writer_pin_then_revalidate_without_writing(
         _result(_parents(frozen_at=frozen_at)),
         _result(_catalog(), mapping=True),
         _result(_catalog(_CHILD), mapping=True),
-        *([_result((103, 42)), _result(_indexes(), mapping=True)] if require_complete else []),
+        *([_result(_indexes(), mapping=True)] if require_complete else []),
     )
     manifest = _manifest(
         complete_at=frozen_at,
@@ -311,25 +294,24 @@ async def test_reader_and_incomplete_writer_pin_then_revalidate_without_writing(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["indexes", "complete"])
 async def test_native_index_evidence_is_required_before_and_after_completion(phase):
-    session = _session(_result((103, 42)), _result(_indexes(), mapping=True))
+    session = _session(_result(_indexes(), mapping=True))
     await binding.validate_projection_indexes(session, _manifest(phase=phase), _DEFINITION)
-    custody_query = session.execute.call_args_list[0].args[0]
-    assert "custom_import_snapshot_relation" in str(custody_query)
-    assert custody_query.compile().params == {"family_id_1": 17, "relation_slot_1": 2}
+    assert session.execute.await_count == 1
     query, parameters = session.execute.call_args.args
     assert "i.indisvalid AS valid,i.indisready AS ready" in str(query)
     assert "i.indexprs IS NULL AS plain,i.indpred IS NULL AS complete" in str(query)
     assert parameters["schema_name"] == "ci_snapshot_17" and len(parameters["index_names"]) == 4
     assert "a.atttypid='pg_catalog.varchar'::regtype THEN 'pg_catalog.text'::regtype" in str(query)
     assert "opn.nspname<>'pg_catalog'" in str(query)
+    assert "heap.relname::text AS table_name" in str(query)
+    assert not any(value in str(query) for value in ("custom_import_snapshot_relation", "relowner", "AS table_oid"))
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "name,value",
     [
-        ("table_oid", 999),
-        ("index_owner", 43),
+        ("table_name", _CHILD),
         ("index_kind", "I"),
         ("access_method", "hash"),
         ("key_names", ["field_1"]),
@@ -354,7 +336,7 @@ async def test_changed_or_unusable_serving_index_fails_closed(name, value):
     index_records[0][name] = value
     with pytest.raises(binding.QueryProjectionUnavailable, match="index shape"):
         await binding.validate_projection_indexes(
-            _session(_result((103, 42)), _result(index_records, mapping=True)), _manifest(), _DEFINITION
+            _session(_result(index_records, mapping=True)), _manifest(), _DEFINITION
         )
 
 
@@ -362,16 +344,16 @@ async def test_changed_or_unusable_serving_index_fails_closed(name, value):
 async def test_complete_manifest_cannot_hide_a_missing_serving_index():
     with pytest.raises(binding.QueryProjectionUnavailable, match="index is missing"):
         await binding.validate_projection_indexes(
-            _session(_result((103, 42)), _result(_indexes()[:-1], mapping=True)), _manifest(), _DEFINITION
+            _session(_result(_indexes()[:-1], mapping=True)), _manifest(), _DEFINITION
         )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("custody", [None, (0, 42), (103, True), ("103", 42), (103, 2**63)])
-async def test_binding_index_requires_existing_native_registry_custody(custody):
-    session = _session(_result(custody))
-    with pytest.raises(binding.QueryProjectionUnavailable, match="binding relation custody"):
-        await binding.validate_projection_indexes(session, _manifest(), _DEFINITION)
+@pytest.mark.parametrize("changes", [{"table_oid": 999}, {"index_owner": 43}])
+async def test_native_indexes_remain_valid_after_physical_metadata_changes(changes):
+    indexes = [record | changes for record in _indexes()]
+    session = _session(_result(indexes, mapping=True))
+    await binding.validate_projection_indexes(session, _manifest(), _DEFINITION)
     assert session.execute.await_count == 1
 
 
@@ -379,8 +361,7 @@ async def test_binding_index_requires_existing_native_registry_custody(custody):
 @pytest.mark.parametrize(
     "name,value",
     [
-        ("table_oid", 101),
-        ("index_owner", 43),
+        ("table_name", _ROOT),
         ("collation_names", [None, "pg_catalog.C", "pg_catalog.C", None]),
         ("collation_names", [None, "pg_catalog.default", "pg_catalog.default", None]),
         ("collation_names", [None, "pg_catalog.default", "public.C", None]),
@@ -388,13 +369,11 @@ async def test_binding_index_requires_existing_native_registry_custody(custody):
         ("default_ops", False),
     ],
 )
-async def test_binding_index_requires_registered_identity_and_exact_native_collations(name, value):
+async def test_binding_index_requires_qualified_table_and_exact_native_collations(name, value):
     indexes = _indexes()
     indexes[-1][name] = value
     with pytest.raises(binding.QueryProjectionUnavailable, match="index shape"):
-        await binding.validate_projection_indexes(
-            _session(_result((103, 42)), _result(indexes, mapping=True)), _manifest(), _DEFINITION
-        )
+        await binding.validate_projection_indexes(_session(_result(indexes, mapping=True)), _manifest(), _DEFINITION)
 
 
 @pytest.mark.asyncio
@@ -417,11 +396,9 @@ async def test_empty_capability_needs_no_binding_or_projection_indexes():
         {"projection_contract": "unknown"},
         {"family_id": True},
         {"producing_token_sha256": b"short"},
-        {"root_columns_sha256": None},
         {"capability_sha256": b""},
         {"after_entity_binding_id": -1},
         {"root_count": -1},
-        {"root_table_oid": 102},
         {"complete_at": None},
         {"projection_sha256": None},
         {"phase": "root"},
@@ -468,15 +445,18 @@ async def test_reader_requires_the_exact_frozen_producer(changes):
 @pytest.mark.parametrize(
     "changes", [{"table_oid": 999}, {"columns_sha256": b"x" * 32}, {"table_owner": 43, "schema_owner": 43}]
 )
-async def test_custody_is_compared_against_retained_identity_after_lock(changes):
+async def test_valid_projection_remains_readable_after_physical_metadata_changes(changes):
     session = _session(
         _result(_parents()),
         _result(None),
         _result(_parents()),
         _result(_catalog(**changes), mapping=True),
+        _result(_catalog(_CHILD, **changes), mapping=True),
+        _result(_indexes(), mapping=True),
     )
-    with pytest.raises(binding.QueryProjectionUnavailable, match="retained table identity"):
-        await binding.lock_projection_tables(session, _manifest(), _DEFINITION)
+    tables = await binding.lock_projection_tables(session, _manifest(), _DEFINITION)
+    assert tuple(tables) == (_ROOT, _CHILD)
+    assert session.execute.await_count == 6
 
 
 @pytest.mark.asyncio
@@ -499,7 +479,6 @@ async def test_writer_prepare_callback_precedes_every_native_statement():
         _result(_parents()),
         _result(_catalog(), mapping=True),
         _result(_catalog(_CHILD), mapping=True),
-        _result((103, 42)),
         _result(_indexes(), mapping=True),
     )
     events = []
@@ -515,7 +494,7 @@ async def test_writer_prepare_callback_precedes_every_native_statement():
 
     session.execute = record
     await binding.lock_projection_tables(session, _manifest(), _DEFINITION, prepare=prepare)
-    assert events == ["prepare", "execute"] * 7
+    assert events == ["prepare", "execute"] * 6
 
 
 @pytest.mark.asyncio
@@ -523,7 +502,7 @@ async def test_expired_writer_callback_stops_before_catalog_or_lock():
     session = _session()
     prepare = AsyncMock(side_effect=TimeoutError("expired window"))
     with pytest.raises(TimeoutError, match="expired window"):
-        await binding.projection_table_identity(session, 17, _ROOT, _DEFINITION, prepare=prepare)
+        await binding.validate_projection_table(session, 17, _ROOT, _DEFINITION, prepare=prepare)
     session.execute.assert_not_awaited()
     with pytest.raises(TimeoutError, match="expired window"):
         await binding.lock_projection_tables(session, _manifest(), _DEFINITION, prepare=prepare)

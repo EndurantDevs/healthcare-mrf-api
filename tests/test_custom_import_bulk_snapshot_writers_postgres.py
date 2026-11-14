@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 
@@ -37,7 +37,12 @@ from process.custom_import.definition import CustomImportDefinition
 from process.custom_import.execution import lease_token_sha256
 from process.custom_import.storage_layout import snapshot_models, snapshot_schema
 from tests import test_custom_import_build_output_postgres as output_fixture
-from tests.custom_import_postgres_support import _migration, isolated_publication_case
+from tests import test_custom_import_build_source_postgres as source_fixture
+from tests.custom_import_postgres_support import (
+    _migration,
+    install_source_completion_contract,
+    isolated_publication_case,
+)
 from tests.test_custom_import_build_output_postgres import (
     _assert_sealed_materialization,
     _complete,
@@ -91,6 +96,7 @@ def _install(connection, schema):
         migration._schema = lambda: schema
         migration.op = Operations(MigrationContext.configure(connection))
         migration.upgrade()
+    install_source_completion_contract(connection, schema)
 
 
 async def _grant_default_rights(connection, case, role):
@@ -196,14 +202,281 @@ async def test_native_source_bootstrap_copy_admission_and_committed_prefix_repla
             assert root.canonical_payload == page.records[0].payload
             snapshot = await session.get(CustomImportSnapshotFamily, family_id)
             assert snapshot.generation_id is None and snapshot.frozen_at is None
-            assert (
-                snapshot.landing_table_oid
-                and snapshot.landing_table_owner
-                and len(snapshot.landing_columns_sha256) == 32
+            assert await session.scalar(
+                text("SELECT to_regclass(:table_name) IS NOT NULL"),
+                {"table_name": f"{snapshot_schema(family_id)}.source_bulk_landing"},
             )
             assert (
                 await session.scalar(text(f'SELECT count(*) FROM "{snapshot_schema(family_id)}".source_bulk_landing'))
                 == 0
+            )
+            assert await session.scalar(text(f'SELECT count(*) FROM "{case.schema_name}".source_bulk_completion')) == 1
+
+
+def _install_snapshot_revision(connection, schema, revision):
+    migration = _migration(_PATH.with_name(revision + ".py"), "snapshot_names_bulk_native_" + revision)
+    migration._schema = lambda: schema
+    migration.op = Operations(MigrationContext.configure(connection))
+    migration.upgrade()
+
+
+async def test_native_reader_rollout_defers_new_family_and_resumes_after_cleanup(monkeypatch):
+    """Keep existing builds resumable and new families absent until readers are ready."""
+    async with _bulk_case() as (case, _role):
+        retained_context, _page, retained_family = await _bootstrap(case)
+        async with case.engine.begin() as connection:
+            await connection.run_sync(
+                _install_snapshot_revision, case.schema_name, "20261114010000_custom_import_snapshot_names"
+            )
+        build_id, _registry = await source._begin_build(case.sessions, retained_context.request)
+        assert build_id == retained_context.build_id
+        register = source_fixture.register_definition
+        monkeypatch.setattr(
+            source_fixture,
+            "register_definition",
+            lambda session, key, definition: register(session, key + "_waiting", definition),
+        )
+        request = await _retained_request(case, records_by_stream={"root_source": [[_root()]], "detail_source": [[]]})
+        with pytest.raises(DBAPIError, match="custom_import_snapshot_reader_rollout_required"):
+            await source._begin_build(case.sessions, request)
+        async with case.sessions() as session:
+            assert (await session.scalars(select(CustomImportSnapshotFamily.family_id))).all() == [retained_family]
+            assert (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(CustomImportBuildAttempt)
+                    .where(CustomImportBuildAttempt.execution_id == request.execution_id)
+                )
+                == 0
+            )
+        async with case.engine.begin() as connection:
+            await connection.run_sync(
+                _install_snapshot_revision, case.schema_name, "20261114020000_custom_import_snapshot_metadata"
+            )
+        build_id, _registry = await source._begin_build(case.sessions, request)
+        async with case.sessions() as session:
+            assert await session.get(CustomImportBuildAttempt, build_id) is not None
+            assert await session.scalar(select(func.count()).select_from(CustomImportSnapshotFamily)) == 2
+
+
+@pytest.mark.parametrize("apply_compatibility", [False, True])
+async def test_previous_source_login_predicate_survives_compatibility_revision(monkeypatch, apply_compatibility):
+    """The previous worker's landing predicate accepts newly authorized pages during rollout."""
+    from process.custom_import import source_finalize_sql as finalizer
+
+    async with _bulk_case() as (case, _role):
+        context, page, _family = await _bootstrap(case)
+        if apply_compatibility:
+            async with case.engine.begin() as connection:
+                await connection.run_sync(
+                    _install_snapshot_revision, case.schema_name, "20261114010000_custom_import_snapshot_names"
+                )
+        query_by_name = dict(finalizer._load_sql())
+        query_by_name["landing_owner"] = query_by_name["landing_owner"].replace(
+            "AND authorized.transaction_id=pg_current_xact_id()",
+            "AND authorized.opened_by=session_user AND authorized.transaction_id=pg_current_xact_id()",
+        )
+        monkeypatch.setattr(finalizer, "_load_sql", lambda: query_by_name)
+        assert await source._store_single_page(case.sessions, context, page) == 1
+        await source._compare_committed_page(case.sessions, context, page)
+
+
+async def test_native_names_migration_preserves_registered_and_future_source_batches(monkeypatch):
+    """Keep old readers selectable while registered and future SOURCE batches migrate."""
+    async with _bulk_case() as (case, _role):
+        retained_context, retained_page, retained_family = await _bootstrap(case)
+        async with case.engine.begin() as connection:
+            await connection.run_sync(
+                _install_snapshot_revision, case.schema_name, "20261114010000_custom_import_snapshot_names"
+            )
+            # Existing readers can still select their old columns during rollout.
+            assert (
+                await connection.execute(
+                    text(
+                        f'SELECT table_oid,table_owner,columns_sha256 FROM "{case.schema_name}".custom_import_snapshot_relation LIMIT 1'
+                    )
+                )
+            ).one_or_none() is not None
+        assert await source._store_single_page(case.sessions, retained_context, retained_page) == 1
+
+        async with case.engine.begin() as connection:
+            await connection.run_sync(
+                _install_snapshot_revision, case.schema_name, "20261114020000_custom_import_snapshot_metadata"
+            )
+        register = source_fixture.register_definition
+        monkeypatch.setattr(
+            source_fixture,
+            "register_definition",
+            lambda session, key, definition: register(session, key + "_future", definition),
+        )
+        future_context, future_page, future_family = await _bootstrap(case)
+        assert retained_family != future_family
+        for context, page, family_id in (
+            (retained_context, retained_page, retained_family),
+            (future_context, future_page, future_family),
+        ):
+            if family_id == future_family:
+                assert await source._store_single_page(case.sessions, context, page) == 1
+            await source._compare_committed_page(case.sessions, context, page)
+            outcome = await source.stage_segmented_source(case.sessions, context.request)
+            assert outcome.phase == "graph" and outcome.source_occurrence_count == 1
+            async with case.sessions() as session:
+                model = snapshot_models(family_id)[CustomImportPack]
+                assert await session.scalar(select(func.count()).select_from(model)) == 1
+        async with case.sessions() as session:
+            assert (
+                await session.scalar(
+                    text("""
+                    SELECT count(*) FROM information_schema.columns
+                    WHERE table_schema=:schema AND table_name IN (
+                        'custom_import_snapshot_family','custom_import_snapshot_relation','custom_import_query_projection')
+                      AND (column_name LIKE '%table_oid' OR column_name LIKE '%table_owner'
+                        OR column_name LIKE '%columns_sha256')
+                """),
+                    {"schema": case.schema_name},
+                )
+                == 0
+            )
+
+
+async def _partial_writer_grants(case, role, family_id, stage):
+    async with case.engine.begin() as connection:
+        for schema in (case.schema_name, snapshot_schema(family_id)):
+            await connection.execute(text(f'GRANT USAGE ON SCHEMA "{schema}" TO "{role}"'))
+            for kind in ("TABLES", "SEQUENCES", "FUNCTIONS"):
+                await connection.execute(text(f'GRANT ALL ON ALL {kind} IN SCHEMA "{schema}" TO "{role}"'))
+        privilege, table = (
+            ("TRUNCATE", "source_bulk_landing") if stage == "source" else ("UPDATE", "custom_import_build_occurrence")
+        )
+        await connection.execute(text(f'REVOKE {privilege} ON "{snapshot_schema(family_id)}".{table} FROM "{role}"'))
+
+
+async def _inject_source_completion_fault(session, fault, case, context, page, landing_rows, namespace):
+    """Inject a closure fault inside the page transaction."""
+    if fault in ("count", "transaction", "cursor", "lease"):
+        mutation = {
+            "count": "source_bulk_completion SET attempted_count=attempted_count+1",
+            "transaction": "source_bulk_completion SET transaction_id='1'::xid8",
+            "cursor": "custom_import_build_stream SET next_source_ordinal=next_source_ordinal+1",
+            "lease": "custom_import_lease SET expires_at=clock_timestamp()-interval '1 second'",
+        }[fault]
+        await session.execute(text(f'UPDATE "{case.schema_name}".{mutation}'))
+    elif fault == "landing":
+        connection = await session.connection()
+        raw = await connection.get_raw_connection()
+        await raw.driver_connection.copy_records_to_table(
+            "source_bulk_landing",
+            schema_name=namespace,
+            columns=source._SOURCE_COPY_COLUMNS,
+            records=landing_rows,
+        )
+    elif fault == "other_batch":
+        await _authorize(session, context, page)
+
+
+@pytest.mark.parametrize("fault", [None, "count", "transaction", "cursor", "landing", "lease", "other_batch"])
+async def test_ordinary_source_completion_closes_temporary_copy_grant(monkeypatch, fault):
+    """A permitted non-owner promotes once and cannot COPY after the batch closes."""
+    from process.custom_import import source_finalize_sql as finalizer
+    from tests.custom_import_query_projection_authority_postgres import _role_session
+
+    async with _bulk_case(default_role=True) as (case, role):
+        context, page, family_id = await _bootstrap(case)
+        namespace = snapshot_schema(family_id)
+        async with case.engine.begin() as connection:
+            await connection.run_sync(
+                _install_snapshot_revision, case.schema_name, "20261114010000_custom_import_snapshot_names"
+            )
+        await _partial_writer_grants(case, role, family_id, "source")
+        async with case.engine.begin() as connection:
+            await connection.execute(text(f'GRANT TRUNCATE ON "{namespace}".source_bulk_landing TO "{role}"'))
+            await connection.execute(text(f'REVOKE INSERT ON "{namespace}".source_bulk_landing FROM "{role}"'))
+        original_call = finalizer._call
+
+        async def close(session, name, arguments):
+            if name == "source_set_finalize":
+                await _inject_source_completion_fault(session, fault, case, context, page, landing_rows, namespace)
+            return await original_call(session, name, arguments)
+
+        monkeypatch.setattr(finalizer, "_call", close)
+        error = RuntimeError if fault == "other_batch" else DBAPIError
+        match = "other batch rollback" if fault == "other_batch" else "source_completed_batch|lease"
+        with nullcontext() if fault is None else pytest.raises(error, match=match):
+            async with source._page_session(lambda: _role_session(case, role), context.request, context.build_id) as (
+                session,
+                _build,
+            ):
+                batch_id, landing_rows = await _authorize(session, context, page)
+                await source._copy_source_landing(session, landing_rows)
+                assert await finalizer.finalize_source_batch(session, batch_id, []) == 1
+                if fault == "other_batch":
+                    assert await session.scalar(
+                        text("SELECT has_any_column_privilege(:role,:table,'INSERT')"),
+                        dict(role=role, table=f"{namespace}.source_bulk_landing"),
+                    )
+                    raise RuntimeError("other batch rollback")
+                await _assert_landing_insert_closed(session, role, namespace)
+        async with case.sessions() as session:
+            await _assert_landing_insert_closed(session, role, namespace)
+            for table in ("source_bulk_completion", "source_bulk_authorization"):
+                assert await session.scalar(text(f'SELECT count(*) FROM "{case.schema_name}".{table}')) == int(
+                    fault is None
+                )
+            assert await session.scalar(
+                select(func.count()).select_from(snapshot_models(family_id)[CustomImportPack])
+            ) == int(fault is None)
+            cursor = await session.get(CustomImportBuildStream, (context.build_id, context.stream_slot))
+            assert cursor.next_source_ordinal == int(fault is None)
+        if fault is None:
+            await source._compare_committed_page(case.sessions, context, page)
+
+
+@pytest.mark.parametrize("stage", ["source", "admission"])
+async def test_partial_writer_grants_roll_back_direct_attempt_before_dispatch(monkeypatch, stage):
+    """Native denials leave COPY, cursor and completion changes atomic before fallback."""
+    from tests.custom_import_query_projection_authority_postgres import _role_session
+
+    async with _bulk_case(default_role=True) as (case, role):
+        context, page, family_id = await _bootstrap(case)
+        async with case.engine.begin() as connection:
+            for revision in (
+                "20261114010000_custom_import_snapshot_names",
+                "20261114020000_custom_import_snapshot_metadata",
+            ):
+                await connection.run_sync(_install_snapshot_revision, case.schema_name, revision)
+        if stage == "admission":
+            await source._stage_local_source(case.sessions, context.request, context.build_id, context.registry)
+            await source._prepare_snapshot_indexes(case.sessions, context.request, context.build_id, "admission")
+        await _partial_writer_grants(case, role, family_id, stage)
+        called_names = []
+        original_call = source._call
+
+        async def record_call(session, name, arguments):
+            called_names.append(name)
+            return await original_call(session, name, arguments)
+
+        monkeypatch.setattr(source, "_call", record_call)
+
+        def sessions():
+            return _role_session(case, role)
+
+        async with sessions() as session, session.begin():
+            assert await session.scalar(
+                text("SELECT has_table_privilege(:relation, 'UPDATE')"),
+                {"relation": f'"{case.schema_name}".custom_import_build_attempt'},
+            )
+        if stage == "source":
+            assert await source._store_single_page(sessions, context, page) == 1
+            assert "source_set_finalize" in called_names
+            await source._compare_committed_page(case.sessions, context, page)
+        else:
+            outcome = await source._admit_local_pages(sessions, context.request, context.build_id)
+            assert outcome.phase == "graph" and outcome.source_occurrence_count == 1
+            assert "admit_custom_import_build_page" in called_names
+        async with case.sessions() as session:
+            assert (
+                await session.scalar(select(func.count()).select_from(snapshot_models(family_id)[CustomImportPack]))
+                == 1
             )
             assert await session.scalar(text(f'SELECT count(*) FROM "{case.schema_name}".source_bulk_completion')) == 1
 
@@ -487,7 +760,7 @@ async def _catalog(connection, schema):
             WHERE (n.nspname=:schema AND p.proname='install_custom_import_snapshot_writers')
                 OR (p.proname='append_custom_import_build_source_families_page' AND n.nspname IN (
                     SELECT 'ci_snapshot_'||family_id::text FROM "{schema}".custom_import_snapshot_family
-                    WHERE landing_table_oid IS NOT NULL))
+                    WHERE to_regclass(format('%I.source_bulk_landing','ci_snapshot_'||family_id::text)) IS NOT NULL))
             ORDER BY p.oid
         """),
             dict(schema=schema),
@@ -591,6 +864,8 @@ async def _assert_partial_refresh_rollback(
 async def test_native_refresh_reaches_frozen_writable_and_future_leaves_without_metadata_changes():
     """Refresh every registered leaf and future installer without altering protected metadata."""
     async with isolated_publication_case(migration_through="20261007000000") as case:
+        async with case.engine.begin() as connection:
+            await connection.run_sync(install_source_completion_contract, case.schema_name)
         frozen_request = await _request_for(case, _records(1, 1), page_rows=32)
         _, sealed = await _complete(case, frozen_request)
         writable_request = await _request_for(case, _records(1, 1), page_rows=32)
@@ -790,6 +1065,7 @@ async def test_current_source_pages_reject_exported_scalar_preinsert_and_changed
             await connection.run_sync(_install_cutover, case.schema_name)
             await connection.run_sync(_refresh_rejections, case.schema_name)
             await connection.run_sync(_refresh, case.schema_name)
+            await connection.run_sync(install_source_completion_contract, case.schema_name)
         request = await _request_for(case, _records(1, 1), definition=_null_projection_definition(), page_rows=32)
         staged = await source.stage_segmented_source(case.sessions, request)
         arguments = await _capture_source_arguments(
@@ -928,6 +1204,7 @@ async def test_native_leaf_error_order_rollback_and_restricted_dispatcher_match(
         async with case.engine.begin() as connection:
             await connection.run_sync(_install_cutover, case.schema_name)
             await connection.run_sync(_refresh_rejections, case.schema_name)
+            await connection.run_sync(install_source_completion_contract, case.schema_name)
         request = await _request_for(case, _records(1, 1), page_rows=32)
         staged = await source.stage_segmented_source(case.sessions, request)
         arguments = await _capture_source_arguments(case, request, staged.build_id, monkeypatch, original)

@@ -141,15 +141,6 @@ def control_plane_retire(engine_id, control_module):
 
     async def retire(session, family_id):
         """Retire one family through the control-plane wrapper on this session."""
-        # Identity comes from the live connection: access is PostgreSQL's job, not a pinned value.
-        database, login, system_identifier = (
-            await session.execute(
-                text(
-                    "SELECT pg_catalog.current_database(), session_user::text, system_identifier::text "
-                    "FROM pg_catalog.pg_control_system()"
-                )
-            )
-        ).one()
         return await control.retire_exact_snapshot_family(
             session,
             family_id,
@@ -157,9 +148,6 @@ def control_plane_retire(engine_id, control_module):
             context=control.SnapshotRetirementOwnerContext(
                 engine_id=engine_id,
                 engine_namespace=namespace,
-                expected_database=database,
-                expected_system_identifier=system_identifier,
-                expected_owner=login,
             ),
         )
 

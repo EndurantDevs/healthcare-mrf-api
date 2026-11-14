@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Fail-closed persisted identity checks for custom-import extension reads."""
+"""Logical persisted bindings for custom-import extension reads."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ from process.custom_import.read_contracts import (
 
 
 async def resolve_generation_snapshot(session: AsyncSession, pinned_target: PinnedReadTarget) -> int | None:
-    """Resolve a sealed generation through the protected, OID-checked registry.
+    """Resolve a published generation to its qualified snapshot table family.
 
     Only an explicit NULL permits canonical legacy storage. Missing functions,
     invalid bindings, or SQL errors must never select another storage family.

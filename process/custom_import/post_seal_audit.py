@@ -30,16 +30,82 @@ from process.custom_import.definition import canonical_json
 from process.custom_import.storage_layout import SNAPSHOT_MODELS, snapshot_schema
 
 CONTRACT = "custom-import/post-seal-structure/v1"
+SAMPLED_CONTRACT = "custom-import/post-seal-structure-sampled/v1"
 ROOT_PAGE_ROWS = 16_384
 MAX_STEP_SECONDS = 120
 _ZERO = b"\0" * 32
-_FUNCTIONS = (
-    "resolve_custom_import_snapshot_relations(bigint)",
-    "resolve_custom_import_generation_snapshot(bigint,bigint,bigint,bigint)",
-    "custom_import_snapshot_columns_sha256(bigint)",
-    "verify_custom_import_build_structure(bigint)",
-    "lock_custom_import_writable_snapshot(bigint,bigint,bytea)",
-)
+_CONTROL_FIELDS = {
+    "custom_import_schema_revision": (
+        "schema_revision_id dataset_id revision_number canonical_schema schema_sha256 created_at "
+    ).split(),
+    "custom_import_definition_revision": (
+        "definition_revision_id dataset_id schema_revision_id revision_number contract_version refresh_mode "
+        "canonical_definition definition_sha256 created_at "
+    ).split(),
+    "custom_import_execution": (
+        "execution_id dataset_id definition_revision_id schema_revision_id idempotency_key mechanism state "
+        "capture_bundle_id request_identity_sha256 source_binding_revision_id terminal_reason started_at "
+        "finished_at created_at updated_at "
+    ).split(),
+    "custom_import_capture_bundle": (
+        "capture_bundle_id dataset_id definition_revision_id schema_revision_id snapshot_token "
+        "snapshot_token_sha256 canonical_manifest manifest_sha256 stream_count sealed_at payload_contract "
+        "capture_state producing_execution_id producing_fence producing_token_sha256 request_identity_sha256 "
+        "source_binding_revision_id source_binding_sha256 source_request_sha256 statement_sha256 "
+        "canonical_policy policy_sha256 acquisition_started_at acquisition_deadline_at committed_part_count "
+        "committed_byte_count committed_decoded_byte_count committed_arrow_byte_count committed_record_count "
+        "committed_manifest_byte_count "
+    ).split(),
+    "custom_import_capture": (
+        "capture_bundle_id dataset_id definition_revision_id schema_revision_id stream_slot content_sha256 "
+        "byte_count canonical_manifest manifest_sha256 payload_contract payload_part_count payload_set_sha256 "
+        "sealed_at capture_state eof_at manifest_set_sha256 committed_part_count committed_byte_count "
+        "committed_decoded_byte_count committed_arrow_byte_count committed_record_count "
+        "committed_manifest_byte_count "
+    ).split(),
+    "custom_import_generation": (
+        "generation_id dataset_id definition_revision_id schema_revision_id execution_id capture_bundle_id "
+        "base_generation_id base_dataset_id source_bundle_sha256 candidate_sha256 root_count family_count "
+        "producing_fence producing_token_sha256 created_at "
+    ).split(),
+    "custom_import_generation_seal": (
+        "generation_id dataset_id definition_revision_id schema_revision_id execution_id capture_bundle_id "
+        "seal_contract materialization_contract verification_evidence query_projection_contract "
+        "query_projection_capability_sha256 query_projection_sha256 query_projection_root_count "
+        "query_projection_child_count sealing_fence sealing_token_sha256 root_count family_count "
+        "generation_family_count family_child_count winner_count profile_count root_scalar_count "
+        "child_scalar_count materialization_sha256 effective_output_sha256 sealed_at "
+    ).split(),
+    "custom_import_build_attempt": (
+        "build_id build_contract dataset_id definition_revision_id schema_revision_id execution_id "
+        "capture_bundle_id producing_fence producing_token_sha256 request_identity_sha256 base_generation_id "
+        "base_pointer_version refresh_mode complete_scope phase generation_id page_row_limit page_byte_limit "
+        "statement_timeout_ms build_deadline_at admission_after_occurrence_id plan_stage plan_page_sequence "
+        "plan_after_base_root_record_id plan_after_source_root_record_id plan_complete_at "
+        "output_after_profile_slot output_after_entity_binding_id output_after_context_key_sha256 "
+        "source_occurrence_count candidate_error_count selected_family_count completed_family_count "
+        "candidate_context_count generation_family_count winner_count next_rejection_ordinal source_frozen_at "
+        "graph_frozen_at output_frozen_at verified_at created_at "
+    ).split(),
+    "custom_import_build_verification": (
+        "build_id generation_id verification_contract manual_acceptance verification_state scan_stage "
+        "page_sequence after_capture_stream_slot after_profile_slot after_root_record_id "
+        "current_family_revision_id current_family_expected_child_count current_family_seen_child_count "
+        "after_child_collection_slot after_child_revision_id after_root_scalar_revision_id "
+        "after_root_scalar_field_slot after_child_scalar_revision_id after_child_scalar_field_slot "
+        "after_winner_profile_slot after_winner_entity_binding_id after_winner_context_key_sha256 root_count "
+        "family_count generation_family_count family_child_count winner_count profile_count root_scalar_count "
+        "child_scalar_count source_frozen_at graph_frozen_at output_frozen_at verified_at "
+    ).split(),
+    "custom_import_query_projection": (
+        "family_id generation_id dataset_id definition_revision_id schema_revision_id execution_id "
+        "producing_fence producing_token_sha256 projection_contract definition_sha256 capability_sha256 phase "
+        "after_entity_binding_id after_selected_value after_child_key_sha256 index_count root_count "
+        "child_count verified_root_count verified_child_count digested_root_count digested_child_count "
+        "digest_chain_sha256 digest_after_entity digest_after_selected_value digest_after_child_key "
+        "projection_sha256 complete_at created_at "
+    ).split(),
+}
 _CHECKPOINT_FIELDS = (
     "checkpoint",
     "arm_ordinal",
@@ -68,6 +134,7 @@ class PostSealAuditProgress:
     state: str
     failure_code: str | None
     replayed: bool = False
+    sampling: dict | None = None
 
 
 @dataclass
@@ -123,6 +190,11 @@ def _sql_resource():
     return document, hashlib.sha256(raw).digest()
 
 
+def _logical_row_document(table, alias):
+    fields = _CONTROL_FIELDS[table]
+    return "jsonb_build_object(" + ",".join(f"'{name}',{alias}.{name}" for name in fields) + ")"
+
+
 async def _row_digests(session, quoted, generation, build_id=None):
     keys = (
         ("custom_import_generation", "generation_id", generation.generation_id),
@@ -145,7 +217,7 @@ async def _row_digests(session, quoted, generation, build_id=None):
     branches, parameters = [], {}
     for index, (table, column, identifier) in enumerate(keys):
         branches.append(
-            f"SELECT '{table}' name,encode(sha256(convert_to(to_jsonb(r)::text,'UTF8')),'hex') digest FROM {quoted}.{table} r WHERE {column}=:id_{index}"
+            f"SELECT '{table}' name,encode(sha256(convert_to({_logical_row_document(table, 'r')}::text,'UTF8')),'hex') digest FROM {quoted}.{table} r WHERE {column}=:id_{index}"
         )
         parameters[f"id_{index}"] = identifier
     control_digests = (await session.execute(text(" UNION ALL ".join(branches)), parameters)).all()
@@ -155,7 +227,7 @@ async def _row_digests(session, quoted, generation, build_id=None):
     captures = (
         await session.execute(
             text(f"""SELECT stream_slot,
-        encode(sha256(convert_to(to_jsonb(c)::text,'UTF8')),'hex') digest
+        encode(sha256(convert_to({_logical_row_document("custom_import_capture", "c")}::text,'UTF8')),'hex') digest
         FROM {quoted}.custom_import_capture c WHERE capture_bundle_id=:bundle ORDER BY stream_slot"""),
             {"bundle": generation.capture_bundle_id},
         )
@@ -181,14 +253,11 @@ async def _base_context(session, family, generation):
     return base_family, base
 
 
-def _leaf_tables(family):
+async def _leaf_tables(session, family):
     if family is None:
         return ()
     names = [model.__tablename__ for model in SNAPSHOT_MODELS]
-    if family.landing_table_oid is not None:
-        names.append("source_bulk_landing")
-    if family.origin_table_oid is not None:
-        names.append("legacy_copy_origin")
+    names.extend(await retirement._optional_relation_names(session, family.family_id))
     return tuple(f'"{snapshot_schema(family.family_id)}"."{name}"' for name in names)
 
 
@@ -219,16 +288,16 @@ async def _context(session, family_id, engine_id):
         raise PostSealAuditRefused("post-seal audit storage is retired")
     build, generation, proof, seal = await build_scratch._eligible(session, family, require_automated=False)
     base_family, base = await _base_context(session, family, generation)
-    tables = _leaf_tables(family) + _leaf_tables(base_family)
+    candidate_tables = await _leaf_tables(session, family)
+    base_tables = await _leaf_tables(session, base_family)
+    tables = candidate_tables + base_tables
     tables += await _projection_tables(session, family) + await _projection_tables(session, base_family)
     await session.execute(text("LOCK TABLE " + ",".join(tables) + " IN SHARE MODE NOWAIT"))
-    candidate_manifest = await build_scratch._manifest(session, quoted, family)
-    base_manifest = None if base is None else await build_scratch._manifest(session, quoted, base_family)
     source_digest = await publication._validated_source_bundle_digest(session, generation)
     identity_by_name = {
         "candidate": _plain(build_scratch._affinity(family, build, generation, proof, seal)),
         "candidate_rows": await _row_digests(session, quoted, generation, build.build_id),
-        "candidate_relations": candidate_manifest,
+        "candidate_relations": candidate_tables,
         "source_digest": source_digest.hex(),
         "counts": {name: getattr(proof, name) for name in build_scratch._COUNT_NAMES},
         "base": None
@@ -237,57 +306,26 @@ async def _context(session, family_id, engine_id):
             "family_id": base_family.family_id,
             "source_digest": (await publication._validated_source_bundle_digest(session, base)).hex(),
             "rows": await _row_digests(session, quoted, base),
-            "relations": base_manifest,
+            "relations": base_tables,
         },
     }
     return _AuditContext(family, build, generation, proof, seal, quoted, base_family, identity_by_name, tables)
 
 
-async def _heap_fingerprints(session, tables):
-    await session.execute(text("SELECT pg_catalog.pg_stat_clear_snapshot()"))
-    rows = (
-        (
-            await session.execute(
-                text("""
-        SELECT c.oid::bigint oid,c.relowner::bigint owner,c.reltype::bigint row_type,
-          c.relfilenode::bigint heap_node,c.reltoastrelid::bigint toast_oid,
-          coalesce(t.relfilenode,0)::bigint toast_node,pg_relation_size(c.oid) heap_bytes,
-          CASE WHEN t.oid IS NULL THEN 0 ELSE pg_relation_size(t.oid) END toast_bytes,
-          pg_stat_get_tuples_inserted(c.oid) inserted,pg_stat_get_tuples_updated(c.oid) updated,
-          pg_stat_get_tuples_deleted(c.oid) deleted,
-          EXISTS(SELECT 1 FROM aclexplode(coalesce(c.relacl,acldefault('r',c.relowner))) a
-            WHERE a.grantee<>c.relowner AND a.privilege_type IN ('INSERT','UPDATE','DELETE','TRUNCATE','TRIGGER')) writable,
-          EXISTS(SELECT 1 FROM pg_attribute a,LATERAL aclexplode(a.attacl) acl
-            WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped AND acl.grantee<>c.relowner
-              AND acl.privilege_type IN ('INSERT','UPDATE')) column_writable
-        FROM pg_class c LEFT JOIN pg_class t ON t.oid=c.reltoastrelid
-        WHERE c.oid=ANY(CAST(:relations AS regclass[])) ORDER BY c.oid
-    """),
-                {"relations": list(tables)},
-            )
-        )
-        .mappings()
-        .all()
-    )
-    if len(rows) != len(tables) or any(row["writable"] or row["column_writable"] for row in rows):
-        raise PostSealAuditRefused("post-seal audit leaves have an open direct writer")
-    return {str(row["oid"]): dict(row) for row in rows}
-
-
-async def _index_fingerprints(session, context):
+async def _validate_indexes(session, context):
     indexes = (
         (
             await session.execute(
                 text("""
-        SELECT n.nspname namespace,c.relname name,c.oid::bigint oid,heap.relname table_name,
-          c.relowner=heap.relowner owner_matches,c.relpersistence='p' persistent,am.amname,
+        SELECT n.nspname namespace,c.relname name,heap.relname table_name,
+          c.relpersistence='p' persistent,am.amname,
           i.indisvalid AND i.indisready AND i.indislive live,i.indisunique unique_index,
           ARRAY(SELECT pg_get_indexdef(c.oid,k,false) FROM generate_series(1,i.indnatts) k) keys,
           regexp_replace(coalesce(pg_get_expr(i.indpred,i.indrelid),''),'[()[:space:]]|::text','','g') predicate,
           ARRAY(SELECT unnest(i.indoption::smallint[])) options
         FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_class heap ON heap.oid=i.indrelid
         JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_am am ON am.oid=c.relam
-        WHERE i.indrelid=ANY(CAST(:relations AS regclass[])) ORDER BY c.oid
+        WHERE i.indrelid=ANY(CAST(:relations AS regclass[])) ORDER BY n.nspname,c.relname
     """),
                 {"relations": list(context.tables)},
             )
@@ -311,39 +349,71 @@ async def _index_fingerprints(session, context):
             actual["predicate"] != spec["predicate"]
             or actual["amname"] != "btree"
             or actual["unique_index"]
-            or not all(actual[k] for k in ("live", "owner_matches", "persistent"))
+            or not all(actual[k] for k in ("live", "persistent"))
         ):
             raise PostSealAuditRefused("post-seal phase or serving index is unavailable")
-    return {str(index_record["oid"]): dict(index_record) for index_record in indexes}
 
 
-async def _function_fingerprints(session, quoted):
-    identities = [quoted + "." + signature for signature in _FUNCTIONS]
-    rows = (
-        await session.execute(
-            text("""SELECT oid::bigint oid,
-        encode(sha256(convert_to(to_jsonb(p)::text,'UTF8')),'hex') digest
-        FROM pg_proc p WHERE oid=ANY(ARRAY(SELECT to_regprocedure(signature)
-          FROM unnest(CAST(:identities AS text[])) signature)) ORDER BY oid"""),
-            {"identities": identities},
+def _sampling_plan(identity):
+    # The frozen candidate fixes the draw; restarting cannot choose easier checks.
+    seed = hashlib.sha256(
+        SAMPLED_CONTRACT.encode() + b"\0" + canonical_json(_plain(identity["candidate"])).encode()
+    ).digest()
+    population = (*range(1, 61), 62)  # Arm 61 is inapplicable to these sealed builds.
+    ranked = sorted(population, key=lambda ordinal: hashlib.sha256(seed + ordinal.to_bytes(2, "big")).digest())
+    return {
+        "contract": SAMPLED_CONTRACT,
+        "percent": 20,
+        "population_count": len(population),
+        "seed": seed.hex(),
+        "selected_ordinals": sorted(ranked[: (len(population) + 4) // 5]),
+    }
+
+
+def _selected_ordinals(binding):
+    if "sampling" not in binding:
+        return None
+    plan = binding["sampling"]
+    try:
+        is_valid = type(plan) is dict and canonical_json(plan) == canonical_json(_sampling_plan(binding["identity"]))
+    except ValueError:
+        is_valid = False
+    if not is_valid:
+        raise PostSealAuditRefused("post-seal audit sample plan differs")
+    return frozenset(plan["selected_ordinals"])
+
+
+async def _check_known_failures(session, family_id, binding):
+    selected = _selected_ordinals(binding)
+    if selected is None:
+        return
+    omitted_failure = await session.scalar(
+        select(Checkpoint.arm_ordinal)
+        .join(Audit, Audit.audit_id == Checkpoint.audit_id)
+        .where(
+            Audit.family_id == family_id,
+            Audit.binding["identity"]["candidate"] == binding["identity"]["candidate"],
+            Checkpoint.state == "failed",
+            Checkpoint.arm_ordinal.not_in(selected),
         )
-    ).all()
-    if len(rows) != len(identities):
-        raise PostSealAuditRefused("post-seal authority function identity is incomplete")
-    return {str(row.oid): row.digest for row in rows}
+        .limit(1)
+    )
+    if omitted_failure is not None:
+        raise PostSealAuditRefused("post-seal sampled audit cannot omit a known failed check")
 
 
-async def _binding(session, context):
-    return _plain(
+async def _binding(session, context, *, sample_percent=None):
+    await _validate_indexes(session, context)
+    binding = _plain(
         {
             "contract": CONTRACT,
             "identity": context.identity,
             "root_page_rows": ROOT_PAGE_ROWS,
-            "heaps": await _heap_fingerprints(session, context.tables),
-            "indexes": await _index_fingerprints(session, context),
-            "functions": await _function_fingerprints(session, context.quoted),
         }
     )
+    if sample_percent == 20:
+        binding["sampling"] = _sampling_plan(context.identity)
+    return binding
 
 
 def _checkpoint_digest(audit, values_by_name, previous):
@@ -371,7 +441,7 @@ async def _append(session, audit, previous, **values_by_name):
     return checkpoint
 
 
-def _progress(checkpoint, *, replayed=False):
+def _progress(checkpoint, *, replayed=False, sampling=None):
     return PostSealAuditProgress(
         checkpoint.audit_id,
         checkpoint.checkpoint,
@@ -380,6 +450,7 @@ def _progress(checkpoint, *, replayed=False):
         checkpoint.state,
         checkpoint.failure_code,
         replayed,
+        sampling,
     )
 
 
@@ -396,14 +467,14 @@ async def _latest(session, audit_id):
 async def _current_binding(session, audit, context):
     if bytes(audit.sql_sha256) != _sql_resource()[1]:
         raise PostSealAuditRefused("post-seal audit SQL changed; start a new attempt")
-    binding = await _binding(session, context)
+    selected = _selected_ordinals(audit.binding)
+    binding = await _binding(session, context, sample_percent=20 if selected is not None else None)
     if _digest(binding) != bytes(audit.binding_sha256) or binding != audit.binding:
         raise PostSealAuditRefused("post-seal audit binding changed; start a new attempt")
 
 
-async def _begin(session, family_id, engine_id, restart):
+async def _begin(session, family_id, engine_id, restart, sample_percent):
     context = await _context(session, family_id, engine_id)
-    binding = await _binding(session, context)
     previous = await session.scalar(
         select(Audit)
         .where(Audit.family_id == family_id)
@@ -413,11 +484,17 @@ async def _begin(session, family_id, engine_id, restart):
     if previous is not None and not restart:
         if previous.engine_id != engine_id:
             raise PostSealAuditRefused("post-seal audit engine identity differs")
+        previous_percent = 20 if _selected_ordinals(previous.binding) is not None else 100
+        if sample_percent is not None and sample_percent != previous_percent:
+            raise PostSealAuditRefused("post-seal audit sample changed; start a new attempt")
         await _current_binding(session, previous, context)
+        await _check_known_failures(session, family_id, previous.binding)
         checkpoint = await _latest(session, previous.audit_id)
         if checkpoint is None or checkpoint.state == "failed":
             raise PostSealAuditRefused("post-seal audit failed; start a new attempt explicitly")
-        return _progress(checkpoint, replayed=True)
+        return _progress(checkpoint, replayed=True, sampling=previous.binding.get("sampling"))
+    binding = await _binding(session, context, sample_percent=sample_percent)
+    await _check_known_failures(session, family_id, binding)
     audit = Audit(
         family_id=family_id,
         engine_id=engine_id,
@@ -446,15 +523,17 @@ async def _begin(session, family_id, engine_id, restart):
         failure_code=None,
         counts=None,
     )
-    return _progress(initial)
+    return _progress(initial, sampling=audit.binding.get("sampling"))
 
 
-async def begin_post_seal_audit(session, family_id, *, engine_id, restart=False):
-    """Bind an exact frozen attempt; restart never overwrites an earlier prefix."""
+async def begin_post_seal_audit(session, family_id, *, engine_id, restart=False, sample_percent=None):
+    """Resume its recorded scope; new attempts default to full unless 20% is explicit."""
     if type(restart) is not bool:
         raise PostSealAuditRefused("post-seal restart flag is invalid")
+    if sample_percent is not None and (type(sample_percent) is not int or sample_percent not in (20, 100)):
+        raise PostSealAuditRefused("post-seal audit sample percent is invalid")
     async with asyncio.timeout(MAX_STEP_SECONDS):
-        return await _begin(session, family_id, engine_id, restart)
+        return await _begin(session, family_id, engine_id, restart, sample_percent)
 
 
 def _compiled(sql, context):
@@ -531,10 +610,9 @@ async def _membership_violation(session, context, arm, parameters):
     return violation
 
 
-async def _run_arm(session, context, previous):
-    """Advance exactly one bounded invariant or root page from its retained checkpoint."""
+def _next_checkpoint(previous):
     ordinal = previous.next_ordinal
-    values_by_name = {
+    return {
         "checkpoint": previous.checkpoint + 1,
         "arm_ordinal": ordinal,
         "next_ordinal": ordinal + 1,
@@ -547,6 +625,12 @@ async def _run_arm(session, context, previous):
         "failure_code": None,
         "counts": None,
     }
+
+
+async def _run_arm(session, context, previous):
+    """Advance exactly one bounded invariant or root page from its retained checkpoint."""
+    ordinal = previous.next_ordinal
+    values_by_name = _next_checkpoint(previous)
     resource = _sql_resource()[0]
     if ordinal == 62:
         return await _complete_counts(session, context, values_by_name, resource)
@@ -601,14 +685,20 @@ async def _advance(session, audit_id, engine_id, expected_checkpoint):
         replay = await session.get(Checkpoint, (audit_id, expected_checkpoint + 1))
         if replay is None:
             raise PostSealAuditRefused("post-seal audit replay checkpoint is missing")
-        return _progress(replay, replayed=True)
+        return _progress(replay, replayed=True, sampling=audit.binding.get("sampling"))
     if previous.state == "complete":
-        return _progress(previous, replayed=True)
-    values_by_name = await _run_arm(session, context, previous)
+        return _progress(previous, replayed=True, sampling=audit.binding.get("sampling"))
+    selected = _selected_ordinals(audit.binding)
+    if selected is not None and previous.next_ordinal not in selected:
+        values_by_name = _next_checkpoint(previous) | {"outcome": "not_applicable"}
+        if previous.next_ordinal == 62:
+            values_by_name.update(state="complete", counts={})
+    else:
+        values_by_name = await _run_arm(session, context, previous)
     await _current_binding(session, audit, await _context(session, audit.family_id, engine_id))
     if values_by_name["state"] == "complete":
         await _validate_chain(session, audit, require_complete=False)
-    return _progress(await _append(session, audit, previous, **values_by_name))
+    return _progress(await _append(session, audit, previous, **values_by_name), sampling=audit.binding.get("sampling"))
 
 
 async def advance_post_seal_audit(session, audit_id, *, engine_id, expected_checkpoint):
@@ -623,10 +713,23 @@ async def advance_post_seal_audit(session, audit_id, *, engine_id, expected_chec
         return await _advance(session, audit_id, engine_id, expected_checkpoint)
 
 
-def _validate_transition(previous, checkpoint, page_rows):
+def _validate_transition(previous, checkpoint, page_rows, selected=None):
     expected = 0 if previous is None else previous.next_ordinal
     if checkpoint.arm_ordinal != expected or checkpoint.state == "failed":
         raise PostSealAuditRefused("post-seal audit did not pass every applicable invariant")
+    if selected is not None and expected > 0 and expected not in selected:
+        if (
+            checkpoint.outcome != "not_applicable"
+            or checkpoint.next_ordinal != expected + 1
+            or checkpoint.root_after_id is not None
+            or not checkpoint.root_eof
+            or checkpoint.page_root_count != 0
+            or checkpoint.range_sha256 is not None
+            or checkpoint.state != ("complete" if expected == 62 else "scanning")
+            or checkpoint.counts != ({} if expected == 62 else None)
+        ):
+            raise PostSealAuditRefused("post-seal audit sampled omission differs")
+        return
     if expected in (41, 42):
         if checkpoint.outcome not in {"range_page", "range_eof"}:
             raise PostSealAuditRefused("post-seal range was not checked to EOF")
@@ -646,6 +749,7 @@ def _validate_transition(previous, checkpoint, page_rows):
 
 
 async def _validate_chain(session, audit, *, require_complete=True):
+    selected = _selected_ordinals(audit.binding)
     page_rows = audit.binding.get("root_page_rows")
     if type(page_rows) is not int or not 0 < page_rows <= 16_384:
         raise PostSealAuditRefused("post-seal audit page bound is invalid")
@@ -670,15 +774,17 @@ async def _validate_chain(session, audit, *, require_complete=True):
                 checkpoint.checkpoint_sha256
             ) != _checkpoint_digest(audit, fields_by_name, prior_hash):
                 raise PostSealAuditRefused("post-seal audit checkpoint hash differs")
-            _validate_transition(previous, checkpoint, page_rows)
+            _validate_transition(previous, checkpoint, page_rows, selected)
             previous, expected = checkpoint, expected + 1
         after = checkpoints[-1].checkpoint
     if previous is None or (require_complete and (previous.state != "complete" or previous.next_ordinal != 63)):
         raise PostSealAuditRefused("post-seal audit is incomplete")
-    if previous.state == "complete" and previous.counts != audit.binding["identity"]["counts"]:
-        raise PostSealAuditRefused("post-seal audit counts differ")
-    if previous.state == "complete" and any(type(count) is not int or count < 0 for count in previous.counts.values()):
-        raise PostSealAuditRefused("post-seal audit count types differ")
+    if previous.state == "complete":
+        expected_counts = {} if selected is not None and 62 not in selected else audit.binding["identity"]["counts"]
+        if previous.counts != expected_counts:
+            raise PostSealAuditRefused("post-seal audit counts differ")
+        if any(type(count) is not int or count < 0 for count in previous.counts.values()):
+            raise PostSealAuditRefused("post-seal audit count types differ")
     return previous
 
 
@@ -696,17 +802,20 @@ async def completed_audit_receipt(session, audit_id, *, engine_id, family_id, ex
     if expected_candidate is not None and audit.binding["identity"]["candidate"] != _plain(expected_candidate):
         raise PostSealAuditRefused("post-seal completed candidate identity differs")
     checkpoint = await _validate_chain(session, audit)
-    return {
+    receipt_by_name = {
         "contract": CONTRACT,
         "audit_id": str(audit.audit_id),
         "binding_sha256": bytes(audit.binding_sha256).hex(),
         "sql_sha256": bytes(audit.sql_sha256).hex(),
         "checkpoint_sha256": bytes(checkpoint.checkpoint_sha256).hex(),
     }
+    if "sampling" in audit.binding:
+        receipt_by_name.update(contract=SAMPLED_CONTRACT, sampling=audit.binding["sampling"])
+    return receipt_by_name
 
 
 async def verified_audit_for_trim(session, context, *, engine_id):
-    """Authorize first cleanup only from a current complete all-arm audit."""
+    """Require completion of the recorded full or explicitly sampled audit scope."""
     audit = await session.scalar(
         select(Audit)
         .where(Audit.family_id == context.family.family_id, Audit.engine_id == engine_id)
@@ -714,8 +823,9 @@ async def verified_audit_for_trim(session, context, *, engine_id):
         .limit(1)
     )
     if audit is None:
-        raise PostSealAuditRefused("post-seal full automated audit is required")
+        raise PostSealAuditRefused("post-seal completed automated audit is required")
     await _current_binding(session, audit, context)
+    await _check_known_failures(session, context.family.family_id, audit.binding)
     return await completed_audit_receipt(
         session, audit.audit_id, engine_id=engine_id, family_id=context.family.family_id
     )

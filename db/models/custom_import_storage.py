@@ -83,18 +83,6 @@ class CustomImportSnapshotFamily(_CustomImportModel):
             "producing_fence > 0 AND octet_length(producing_token_sha256) = 32",
             name="custom_import_snapshot_producer_shape",
         ),
-        CheckConstraint(
-            "(landing_table_oid IS NULL AND landing_table_owner IS NULL AND landing_columns_sha256 IS NULL) OR "
-            "(landing_table_oid IS NOT NULL AND landing_table_owner IS NOT NULL AND landing_columns_sha256 IS NOT NULL "
-            "AND landing_table_oid > 0 AND landing_table_owner > 0 AND octet_length(landing_columns_sha256) = 32)",
-            name="custom_import_snapshot_landing_shape",
-        ),
-        CheckConstraint(
-            "(origin_table_oid IS NULL AND origin_table_owner IS NULL AND origin_columns_sha256 IS NULL) OR "
-            "(origin_table_oid IS NOT NULL AND origin_table_owner IS NOT NULL AND origin_columns_sha256 IS NOT NULL "
-            "AND origin_table_oid > 0 AND origin_table_owner > 0 AND octet_length(origin_columns_sha256) = 32)",
-            name="custom_import_snapshot_origin_shape",
-        ),
     )
 
     family_id = Column(BigInteger, primary_key=True, autoincrement=True)
@@ -108,27 +96,15 @@ class CustomImportSnapshotFamily(_CustomImportModel):
     generation_id = Column(BigInteger)
     created_at = _timestamp_column()
     frozen_at = Column(TIMESTAMP(timezone=True))
-    landing_table_oid = Column(BigInteger)
-    landing_table_owner = Column(BigInteger)
-    landing_columns_sha256 = Column(LargeBinary(32))
-    origin_table_oid = Column(BigInteger)
-    origin_table_owner = Column(BigInteger)
-    origin_columns_sha256 = Column(LargeBinary(32))
 
 
 class CustomImportSnapshotRelation(_CustomImportModel):
-    """Exact native OID for one of the fixed fifteen model-defined tables."""
+    """One fixed table name within its snapshot family's schema."""
 
     __tablename__ = "custom_import_snapshot_relation"
     __main_table__ = __tablename__
     __table_args__ = _table_args(
-        UniqueConstraint("table_oid", name="custom_import_snapshot_relation_oid_key"),
-        CheckConstraint(
-            "relation_slot BETWEEN 1 AND 15 AND table_oid > 0", name="custom_import_snapshot_relation_shape"
-        ),
-        CheckConstraint(
-            "table_owner > 0 AND octet_length(columns_sha256) = 32", name="custom_import_snapshot_layout_shape"
-        ),
+        CheckConstraint("relation_slot BETWEEN 1 AND 15", name="custom_import_snapshot_relation_shape"),
     )
 
     family_id = Column(
@@ -137,9 +113,6 @@ class CustomImportSnapshotRelation(_CustomImportModel):
         primary_key=True,
     )
     relation_slot = Column(SmallInteger, primary_key=True)
-    table_oid = Column(BigInteger, nullable=False)
-    table_owner = Column(BigInteger, nullable=False)
-    columns_sha256 = Column(LargeBinary(32), nullable=False)
 
 
 class CustomImportRevisionHome(_CustomImportModel):

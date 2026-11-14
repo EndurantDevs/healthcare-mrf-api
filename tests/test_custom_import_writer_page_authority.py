@@ -171,11 +171,10 @@ async def test_none_preserves_existing_caller_commit(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fixed_locked_query_binds_every_permit_identity_and_owner(monkeypatch):
+async def test_fixed_locked_query_binds_every_permit_identity_without_owner_check(monkeypatch):
     _, verified, _ = _wire()
     session = Session([40])
     monkeypatch.setattr(admission, "_prepare_statement", AsyncMock())
-    monkeypatch.setattr(admission, "_has_admission_owner", AsyncMock(return_value=True))
     await admission._verify_admission_permit(
         session,
         _request(authorization_expires_at=verified.permit.expires_at),
@@ -187,17 +186,16 @@ async def test_fixed_locked_query_binds_every_permit_identity_and_owner(monkeypa
     for name in ("dataset_id", "definition_revision_id", "schema_revision_id", "source_binding_revision_id"):
         assert f"custom_import_source_binding_revision.{name} =" in query
     assert "custom_import_execution.idempotency_key =" in query
-    admission._has_admission_owner.assert_awaited_once_with(session)
+    assert len(session.statements) == 1
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("matched,owner", [(None, True), (99, True), (40, False)])
-async def test_missing_locked_binding_or_actual_owner_fails_before_decision(monkeypatch, matched, owner):
+@pytest.mark.parametrize("matched", [None, 99])
+async def test_missing_locked_binding_fails_before_decision(monkeypatch, matched):
     _, verified, _ = _wire()
     session, _ = _page(monkeypatch)
     session.values = [matched]
     monkeypatch.setattr(admission, "_prepare_statement", AsyncMock())
-    monkeypatch.setattr(admission, "_has_admission_owner", AsyncMock(return_value=owner))
     decision = AsyncMock()
     monkeypatch.setattr(admission, "_admit_locked", decision)
     with pytest.raises(admission.AdmissionError):
@@ -209,6 +207,29 @@ async def test_missing_locked_binding_or_actual_owner_fails_before_decision(monk
             admission_permit=verified.permit,
         )
     decision.assert_not_awaited()
+    assert "rollback" in session.events and not session.durable
+
+
+@pytest.mark.asyncio
+async def test_native_permission_failure_after_signed_scope_check_rolls_back(monkeypatch):
+    _, verified, _ = _wire()
+    session, _ = _page(monkeypatch)
+    session.values = [40]
+    monkeypatch.setattr(admission, "_prepare_statement", AsyncMock())
+    error = DBAPIError(None, None, SimpleNamespace(sqlstate="42501"))
+    decision = AsyncMock(side_effect=error)
+    monkeypatch.setattr(admission, "_admit_locked", decision)
+    with pytest.raises(DBAPIError) as caught:
+        await admission.admit_source_batch(
+            lambda: session,
+            _request(authorization_expires_at=verified.permit.expires_at),
+            51,
+            0,
+            admission_permit=verified.permit,
+        )
+    assert caught.value is error
+    decision.assert_awaited_once()
+    assert len(session.statements) == 1
     assert "rollback" in session.events and not session.durable
 
 
@@ -233,7 +254,7 @@ async def test_request_cannot_substitute_scope_or_extend_signed_expiry(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_timeout_fallback_rechecks_same_permit_owner_request_and_cursor(monkeypatch):
+async def test_timeout_fallback_rechecks_same_permit_request_and_cursor(monkeypatch):
     _, verified, _ = _wire(cursor=9)
     session, _ = _page(monkeypatch)
     request = _request(authorization_expires_at=verified.permit.expires_at)
@@ -253,15 +274,13 @@ async def test_timeout_fallback_rechecks_same_permit_owner_request_and_cursor(mo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("matches,owners", [([40, 40], [True, False]), ([40, None], [True])])
-async def test_fallback_rejects_lost_owner_or_changed_retained_binding(monkeypatch, matches, owners):
+async def test_fallback_rejects_changed_retained_binding(monkeypatch):
     _, verified, _ = _wire()
     session, _ = _page(monkeypatch)
-    session.values = matches
+    session.values = [40, None]
     error = DBAPIError(None, None, SimpleNamespace(sqlstate="57014"))
     error._custom_import_admission_cursor = 0
     monkeypatch.setattr(admission, "_prepare_statement", AsyncMock())
-    monkeypatch.setattr(admission, "_has_admission_owner", AsyncMock(side_effect=owners))
     decision = AsyncMock(side_effect=error)
     monkeypatch.setattr(admission, "_admit_locked", decision)
     with pytest.raises(admission.AdmissionError):
@@ -388,9 +407,7 @@ async def test_uncertain_commit_is_unavailable_without_retry_or_rollback_claim(m
 async def test_wrong_purpose_permit_fails_before_query_even_with_admission_type(monkeypatch, changes):
     _, verified, _ = _wire()
     session = Session()
-    owner = AsyncMock()
     prepare = AsyncMock()
-    monkeypatch.setattr(admission, "_has_admission_owner", owner)
     monkeypatch.setattr(admission, "_prepare_statement", prepare)
     impostor = SourcePermit(**asdict(verified.permit)) if changes is None else replace(verified.permit, **changes)
     with pytest.raises(admission.AdmissionError):
@@ -398,5 +415,4 @@ async def test_wrong_purpose_permit_fails_before_query_even_with_admission_type(
             session, _request(authorization_expires_at=verified.permit.expires_at), impostor
         )
     assert session.statements == []
-    owner.assert_not_awaited()
     prepare.assert_not_awaited()

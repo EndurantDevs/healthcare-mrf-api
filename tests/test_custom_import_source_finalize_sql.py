@@ -58,12 +58,12 @@ async def test_finalization_invalid_batch_fails_before_sql(monkeypatch):
 async def test_finalization_skips_analyze_and_truncate_when_other_batch_rows_remain(monkeypatch):
     original = _row
 
-    def row(name, close_copy, role):
+    def row(name):
         if name == "needs_occurrence_analyze":
             return {"needed": False}
         if name == "landing_empty":
             return {"empty": False}
-        return original(name, close_copy, role)
+        return original(name)
 
     monkeypatch.setattr(__import__(__name__, fromlist=["_row"]), "_row", row)
     session, called = _page(monkeypatch)
@@ -175,11 +175,18 @@ def test_error_predicates_preserve_canonical_provenance_null_positions_and_bound
         "(SELECT count(DISTINCT root_id) FROM __CANDIDATE__.source_bulk_landing WHERE batch_id=p_batch)",
         "(SELECT count(DISTINCT r.root_record_id) FROM __CANDIDATE__.source_bulk_landing l JOIN __CONTROL__.custom_import_root_record r ON r.dataset_id=b.dataset_id AND r.key_contract_sha256=key_contract AND r.logical_key_sha256=l.typed_hash WHERE l.batch_id=p_batch)",
     )
-    checks = _fused_dictionary_checks(_checks(historical))
+    historical = historical.replace(" OR a.opened_by<>session_user", "").replace(
+        "authorized.opened_by=session_user AND ", ""
+    )
+    checks = [
+        (predicate, code)
+        for predicate, code in _fused_dictionary_checks(_checks(historical))
+        if code != "custom_import_source_snapshot_binding_mismatch"
+    ]
     ordinary_checks = [
         re.fullmatch(r"SELECT CASE WHEN ([\s\S]+) THEN '([^']+)' END problem;\s*", _unbound(query)).groups()
         for name, query in finalizer._load_sql().items()
-        if name not in ("fresh_lease",) and " END problem;" in query
+        if name not in ("fresh_lease", "binding") and " END problem;" in query
     ]
     assert [(_compact(predicate), code) for predicate, code in ordinary_checks] == [
         (_compact(predicate), code) for predicate, code in checks[:-1]
@@ -246,9 +253,8 @@ def test_metadata_scope_and_closure_remain_server_derived_and_no_new_routines():
     )
     assert "d.canonical_definition::jsonb#>'{schema,root,logical_key}'" in queries["metadata"]
     assert "d.definition_revision_id=:b_definition_revision_id" in queries["metadata"]
-    assert "a.opened_by=session_user" in queries["copy_closure"]
-    assert "a.transaction_id=pg_current_xact_id() AND a.accepting" in queries["copy_closure"]
-    assert "session_user::text AS role_name" in queries["copy_closure"]
+    assert all("opened_by" not in query for query in queries.values())
+    assert "copy_closure" not in queries
     assert "least(l.expires_at,:b_build_deadline_at)<=clock_timestamp()" in queries["fresh_lease"]
     assert not re.search(
         r"\b(CREATE|DROP|ALTER|FUNCTION|PROCEDURE|TRIGGER|CALL|EXECUTE|GRANT)\b|^\s*DO\b",
@@ -256,6 +262,25 @@ def test_metadata_scope_and_closure_remain_server_derived_and_no_new_routines():
         re.I | re.M,
     )
     assert not re.search(r"snapshot_writers\.sql|plpgsql", Path(finalizer.__file__).read_text(), re.I)
+
+
+def test_source_binding_keeps_named_relations_and_complete_logical_producer_scope():
+    query = finalizer._load_sql()["binding"]
+    assert "r.relation_slot=1" in query and "f.frozen_at IS NULL" in query
+    for relation in ("custom_import_root_record", "source_bulk_landing"):
+        assert f"parse_ident(:{relation}_relation,true)" in query
+        assert f"ARRAY['ci_snapshot_'||f.family_id::text,'{relation}']" in query
+    for field in (
+        "dataset_id",
+        "definition_revision_id",
+        "schema_revision_id",
+        "execution_id",
+        "capture_bundle_id",
+        "producing_fence",
+        "producing_token_sha256",
+    ):
+        assert "f." + field in query and ":b_" + field in query
+    assert all(name not in query for name in ("table_oid", "table_owner", "columns_sha256"))
 
 
 def test_native_scalar_fields_keep_only_batch_helpers():
@@ -288,7 +313,7 @@ async def test_ordinal_record_bounds_match_native_integer_fields_with_bigint_cou
     assert "SELECT ROW(min(landing_ordinal),max(landing_ordinal))" in query
     assert "IS DISTINCT FROM ROW(0,CAST(:n-1 AS integer))" in query
     assert isinstance(finalizer._parameter_type("n"), BigInteger)
-    statements, _, _ = await finalizer._statements(_Session(), 7)
+    statements, _ = await finalizer._statements(_Session(), 7)
     compiled = str(statements["ordinal_bounds"].compile(dialect=asyncpg_dialect()))
     assert re.search(r"ROW\(0,CAST\(\$\d+::BIGINT-1 AS integer\)\)", compiled)
     assert "n" in statements["ordinal_bounds"]._bindparams
@@ -315,15 +340,22 @@ class _Result:
 
 
 class _Transaction:
-    def __init__(self, session):
-        self.session = session
+    def __init__(self, session, *, nested=False):
+        self.session, self.nested = session, nested
 
     async def __aenter__(self):
-        self.session.events.append("begin")
+        self.session.events.append("savepoint" if self.nested else "begin")
         self.session.active = True
         self.original_path = self.session.search_path
+        self.pending_start = len(self.session.pending)
 
     async def __aexit__(self, kind, error, traceback):
+        if self.nested:
+            self.session.events.append("rollback_savepoint" if error else "release_savepoint")
+            if error is not None:
+                del self.session.pending[self.pending_start :]
+                self.session.search_path = self.original_path
+            return
         self.session.events.append("rollback" if error else "commit")
         if error is None:
             self.session.durable.extend(self.session.pending)
@@ -333,11 +365,11 @@ class _Transaction:
 
 
 class _Session:
-    def __init__(self, fail_at=None, error=None, close_copy=True):
-        self.fail_at, self.error, self.close_copy = fail_at, error, close_copy
+    def __init__(self, fail_at=None, error=None):
+        self.fail_at, self.error = fail_at, error
         self.events, self.pending, self.durable, self.executed = [], [], [], []
         self.active, self.search_path = False, '"synthetic_untrusted", pg_catalog'
-        self.schema, self.role = 'synthetic_control"; SELECT 1; --', 'synthetic_role"; SELECT 1; --'
+        self.schema = 'synthetic_control"; SELECT 1; --'
         quote = dialect().identifier_preparer.quote_schema
         self.name_by_sql = {
             query.replace("__CONTROL__", quote(self.schema)).replace("__CANDIDATE__", "ci_snapshot_7"): name
@@ -352,6 +384,9 @@ class _Session:
 
     def begin(self):
         return _Transaction(self)
+
+    def begin_nested(self):
+        return _Transaction(self, nested=True)
 
     def in_transaction(self):
         return self.active
@@ -373,7 +408,7 @@ class _Session:
             self.search_path = "pg_catalog"
             return _Result({"set_config": "pg_catalog"})
         assert self.search_path == "pg_catalog"
-        name = "revoke" if query.startswith("REVOKE") else self.name_by_sql[query]
+        name = self.name_by_sql[query]
         self.events.append(name)
         self.executed.append((name, statement, dict(parameters or {})))
         if name == self.fail_at:
@@ -385,13 +420,12 @@ class _Session:
             "delete_landing",
             "truncate_landing",
             "close_authorization",
-            "revoke",
         ):
             self.pending.append(name)
-        return _Result(_row(name, self.close_copy, self.role))
+        return _Result(_row(name))
 
 
-def _row(name, close_copy, role):
+def _row(name):
     query = finalizer._load_sql().get(name, "")
     if name == "scope":
         row_by_name = {key: 1 for key in re.findall(r" AS ((?:a|b|s|stream)_[a-z0-9_]+)", query)}
@@ -425,12 +459,11 @@ def _row(name, close_copy, role):
         "needs_occurrence_analyze": dict(needed=True),
         "homes": dict(appended=None),
         "landing_empty": dict(empty=True),
-        "copy_closure": dict(close_copy=close_copy, role_name=role),
     }.get(name)
 
 
-def _page(monkeypatch, *, fail_at=None, error=None, close_copy=True, final_error=None):
-    session = _Session(fail_at, error, close_copy)
+def _page(monkeypatch, *, fail_at=None, error=None, final_error=None):
+    session = _Session(fail_at, error)
     build = SimpleNamespace(phase="source")
     for name in ("_prepare_statement", "_flush_page", "lock_execution", "lock_lease"):
         monkeypatch.setattr(staging, name, AsyncMock())
@@ -442,6 +475,9 @@ def _page(monkeypatch, *, fail_at=None, error=None, close_copy=True, final_error
         session.events.append(name)
         if name == fail_at:
             raise error
+        if name == "source_set_finalize":
+            session.pending.append(name)
+            return SimpleNamespace(scalar_one=lambda: 1)
         return _Result()
 
     called = AsyncMock(side_effect=call)
@@ -465,7 +501,7 @@ async def _finalize(session):
 async def test_full_fixed_stage_order_closure_and_outer_fresh_lease(monkeypatch):
     session, called = _page(monkeypatch)
     assert await _finalize(session) == 1
-    assert session.events[-4:] == ["lock_custom_import_build", "verify_before_commit", "commit", "close"]
+    assert session.events[-4:] == ["source_set_finalize", "verify_before_commit", "commit", "close"]
     assert session.events.index("completion") < session.events.index("homes") < session.events.index("delete_landing")
     assert (
         next(parameters for name, _, parameters in session.executed if name == "global_key_collision")[
@@ -477,21 +513,17 @@ async def test_full_fixed_stage_order_closure_and_outer_fresh_lease(monkeypatch)
     assert (
         session.events.index("close_authorization")
         < session.events.index("fresh_lease")
-        < session.events.index("revoke")
+        < session.events.index("source_set_finalize")
     )
     assert session.search_path == '"synthetic_untrusted", pg_catalog' and not session.pending
-    assert "completion" in session.durable and "revoke" in session.durable
-    revoke = next(str(statement) for name, statement, _ in session.executed if name == "revoke")
-    expected_columns = ",".join(dialect().identifier_preparer.quote(column) for column in staging._SOURCE_COPY_COLUMNS)
-    assert (
-        revoke
-        == f'REVOKE INSERT ({expected_columns}) ON TABLE ci_snapshot_7.source_bulk_landing FROM "synthetic_role""; SELECT 1; --"'
-    )
+    assert "completion" in session.durable and "source_set_finalize" in session.durable
+    assert not any(str(statement).startswith("REVOKE") for _, statement, _ in session.executed)
+    assert called.await_args.args[2] == (("uuid", _BATCH), ("integer[]", []))
     assert [invocation.args[1] for invocation in called.await_args_list] == [
         "resolve_custom_import_source_batch_snapshot",
         "verify_custom_import_snapshot_writers",
         "resolve_custom_import_build_base_snapshot",
-        "lock_custom_import_build",
+        "source_set_finalize",
     ]
     assert all(
         not isinstance(parameter.type, type(None))
@@ -500,10 +532,19 @@ async def test_full_fixed_stage_order_closure_and_outer_fresh_lease(monkeypatch)
     )
 
 
-async def test_other_open_authorization_keeps_exact_copy_grant(monkeypatch):
-    session, _ = _page(monkeypatch, close_copy=False)
-    assert await _finalize(session) == 1
-    assert "revoke" not in session.events and session.events[-2:] == ["commit", "close"]
+async def test_completed_count_mismatch_rolls_back_promoted_batch(monkeypatch):
+    session, called = _page(monkeypatch)
+    original = called.side_effect
+
+    async def mismatched_count(session, name, arguments):
+        outcome = await original(session, name, arguments)
+        return SimpleNamespace(scalar_one=lambda: 2) if name == "source_set_finalize" else outcome
+
+    called.side_effect = mismatched_count
+    with pytest.raises(finalizer.SourceFinalizationError, match="completed batch count differs"):
+        await _finalize(session)
+    assert "completion" in session.events and not session.durable
+    assert session.events[-2:] == ["rollback", "close"]
 
 
 @pytest.mark.parametrize(
@@ -518,8 +559,7 @@ async def test_other_open_authorization_keeps_exact_copy_grant(monkeypatch):
         "homes",
         "close_authorization",
         "fresh_lease",
-        "revoke",
-        "lock_custom_import_build",
+        "source_set_finalize",
     ],
 )
 @pytest.mark.parametrize("error", [RuntimeError("synthetic storage error"), asyncio.CancelledError("synthetic cancel")])
@@ -538,8 +578,46 @@ async def test_final_outer_authority_failure_rolls_back_completed_batch_and_clos
     session, _ = _page(monkeypatch, final_error=error)
     with pytest.raises(LeaseAuthorityLost):
         await _finalize(session)
-    assert "completion" in session.events and "revoke" in session.events
+    assert "completion" in session.events and "source_set_finalize" in session.events
     assert session.events[-2:] == ["rollback", "close"] and not session.durable
+
+
+@pytest.mark.parametrize("fail_at", ["scope", "truncate_landing", "source_set_finalize"])
+async def test_source_permission_denial_restores_copied_batch_before_dispatch(monkeypatch, fail_at):
+    error = DBAPIError(None, None, SimpleNamespace(sqlstate="42501"))
+    session, _ = _page(monkeypatch, fail_at=fail_at, error=error)
+    original_path = session.search_path
+    context = _bulk_context()
+    session.scalars = AsyncMock(
+        return_value=SimpleNamespace(
+            one=lambda: SimpleNamespace(
+                next_pack_ordinal=0, next_part_ordinal=1, next_part_row_ordinal=0, next_source_ordinal=0
+            )
+        )
+    )
+    copied = AsyncMock(side_effect=lambda *_: session.pending.append("copy"))
+    monkeypatch.setattr(staging, "_copy_source_landing", copied)
+    monkeypatch.setattr(staging, "_can_update_build_cursor", AsyncMock(return_value=True))
+
+    async def call(page, name, arguments):
+        assert page is session and session.in_transaction()
+        if name == "source_bulk_authorize":
+            session.pending.append("authorization")
+            return SimpleNamespace(scalar_one=lambda: _BATCH)
+        assert name == "source_set_finalize" and arguments == (("uuid", _BATCH), ("integer[]", []))
+        assert session.events[-1] == "rollback_savepoint"
+        assert session.pending == ["authorization", "copy"]
+        assert session.search_path == original_path and not session.durable
+        session.pending.append("dispatcher")
+        return SimpleNamespace(scalar_one=lambda: 1)
+
+    dispatched = AsyncMock(side_effect=call)
+    monkeypatch.setattr(staging, "_call", dispatched)
+    assert await staging._store_pages(lambda: session, context, (_prepared_page(context),)) == 1
+    copied.assert_awaited_once()
+    assert dispatched.await_count == 2
+    assert session.events.count("savepoint") == session.events.count("rollback_savepoint") == 1
+    assert session.durable == ["authorization", "copy", "dispatcher"]
 
 
 async def test_no_transaction_is_not_an_authority_pass_marker(monkeypatch):
@@ -569,13 +647,13 @@ async def test_real_segmented_caller_does_not_terminally_relabel_storage_failure
         )
     )
     monkeypatch.setattr(staging, "_copy_source_landing", copied)
-    monkeypatch.setattr(staging, "_is_source_writer_owner", AsyncMock(return_value=not old))
+    monkeypatch.setattr(staging, "_can_update_build_cursor", AsyncMock(return_value=not old))
 
     async def call(_session, name, arguments):
         if name == "source_bulk_authorize":
             return SimpleNamespace(scalar_one=lambda: _BATCH)
         assert name == "source_set_finalize"
-        assert old, "the owner route must not call the legacy finalizer"
+        assert old, "the direct route must not call the dispatcher"
         raise error
 
     monkeypatch.setattr(staging, "_call", call)

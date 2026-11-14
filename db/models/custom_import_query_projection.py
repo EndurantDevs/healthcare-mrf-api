@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Low-volume custody and completion evidence for derived query cells."""
+"""Logical producer binding and completion data for derived query cells."""
 
 from sqlalchemy import (
     TIMESTAMP,
@@ -47,12 +47,6 @@ class CustomImportQueryProjection(_CustomImportModel):
             "octet_length(definition_sha256) = 32 AND octet_length(capability_sha256) = 32 AND "
             "after_entity_binding_id >= 0 AND root_count >= 0 AND child_count >= 0",
             name="custom_import_query_projection_shape",
-        ),
-        CheckConstraint(
-            "root_table_oid > 0 AND root_table_owner > 0 AND octet_length(root_columns_sha256) = 32 AND "
-            "child_table_oid > 0 AND child_table_owner > 0 AND octet_length(child_columns_sha256) = 32 AND "
-            "root_table_oid <> child_table_oid",
-            name="custom_import_query_projection_custody",
         ),
         CheckConstraint(
             "phase IN ('root','child','indexes','verify_root','verify_child','digest_root','digest_child','complete') AND "
@@ -109,12 +103,6 @@ class CustomImportQueryProjection(_CustomImportModel):
     projection_contract = Column(String(63), nullable=False, server_default=text(f"'{QUERY_PROJECTION_CONTRACT}'"))
     definition_sha256 = Column(LargeBinary(32), nullable=False)
     capability_sha256 = Column(LargeBinary(32), nullable=False)
-    root_table_oid = Column(BigInteger, nullable=False)
-    root_table_owner = Column(BigInteger, nullable=False)
-    root_columns_sha256 = Column(LargeBinary(32), nullable=False)
-    child_table_oid = Column(BigInteger, nullable=False)
-    child_table_owner = Column(BigInteger, nullable=False)
-    child_columns_sha256 = Column(LargeBinary(32), nullable=False)
     phase = Column(String(16), nullable=False, server_default=text("'root'"))
     after_entity_binding_id = Column(BigInteger, nullable=False, server_default=text("0"))
     after_selected_value = Column(BigInteger)

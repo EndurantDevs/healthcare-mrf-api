@@ -13,10 +13,9 @@ import hashlib
 import json
 import re
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
-from sqlalchemy import BigInteger, cast, column, func, literal_column, select, table, text, true
-from sqlalchemy.dialects.postgresql import OID
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import load_only
 
 from db.models.custom_import import CustomImportBuildAttempt as Build
@@ -31,7 +30,7 @@ from process.custom_import.read_identity import verified_definition
 from process.custom_import.runner_codec import digest_text, payload_field_value, root_key_document_from_tuple
 from process.custom_import.runner_registry import load_collection_slots
 from process.custom_import.runner_types import CandidateRunnerError
-from process.custom_import.storage_layout import SNAPSHOT_MODELS, snapshot_schema, snapshot_tables
+from process.custom_import.storage_layout import snapshot_schema, snapshot_tables
 
 MAX_EVENTS = 100
 MAX_PAGE_BYTES = 65_536
@@ -68,7 +67,6 @@ class _Scope:
     producer_fence: int
     producer_digest: bytes = field(repr=False)
     fingerprint: str
-    rejection_oid: int | None = None
 
 
 def _encoded(document):
@@ -274,54 +272,16 @@ async def _lock_snapshot(session, family_id):
         text(f"SELECT {quoted}.lock_custom_import_materialization_storage(CAST(:family_id AS bigint), false)"),
         {"family_id": family_id},
     )
-    return await _verify_relation_locks(session, quoted, family_id)
-
-
-async def _verify_relation_locks(session, quoted_schema, family_id):
-    # Repeatable-read catalog rows can predate a committed name swap; locks cannot.
-    relations = (
-        await session.execute(
-            text(f"""
-                SELECT r.relation_slot, r.table_oid,
-                    pg_catalog.to_regclass(pg_catalog.format('%I.%I', CAST(:namespace AS text),
-                        (CAST(:names AS text[]))[r.relation_slot]))::oid::bigint AS current_oid,
-                    EXISTS (
-                        SELECT 1 FROM pg_catalog.pg_locks held
-                        WHERE held.pid=pg_catalog.pg_backend_pid() AND held.locktype='relation'
-                            AND held.database=(SELECT oid FROM pg_catalog.pg_database
-                                WHERE datname=pg_catalog.current_database())
-                            AND held.relation=r.table_oid::oid
-                            AND held.mode='AccessShareLock' AND held.granted
-                    ) AS is_locked
-                FROM {quoted_schema}.custom_import_snapshot_relation r
-                WHERE r.family_id=:family_id ORDER BY r.relation_slot LIMIT :limit
-                """),
-            {
-                "family_id": family_id,
-                "namespace": snapshot_schema(family_id),
-                "names": [model.__tablename__ for model in SNAPSHOT_MODELS],
-                "limit": len(SNAPSHOT_MODELS) + 1,
-            },
-        )
-    ).all()
-    if [relation.relation_slot for relation in relations] != list(range(1, len(SNAPSHOT_MODELS) + 1)) or any(
-        not _is_positive(relation.table_oid)
-        or relation.current_oid != relation.table_oid
-        or relation.is_locked is not True
-        for relation in relations
-    ):
-        raise RejectionEvidenceUnavailable()
-    return relations[SNAPSHOT_MODELS.index(Rejection)].table_oid
 
 
 async def _resolve_scope(session, dataset_id, execution_id, build_id):
     statement = _scope_statement(dataset_id, execution_id, build_id)
     scope = _checked_scope((await session.execute(statement)).all(), dataset_id, execution_id, build_id)
-    rejection_oid = await _lock_snapshot(session, scope.family_id)
+    await _lock_snapshot(session, scope.family_id)
     checked = _checked_scope((await session.execute(statement)).all(), dataset_id, execution_id, build_id)
     if checked.fingerprint != scope.fingerprint:
         raise RejectionEvidenceUnavailable()
-    return replace(checked, rejection_oid=rejection_oid)
+    return checked
 
 
 def _logical_key(definition, rejection):
@@ -406,46 +366,19 @@ def _predicate(model, scope):
     )
 
 
-def _source_relation_oid(whole_row):
-    types = table("pg_type", column("oid"), column("typrelid"), schema="pg_catalog")
-    return (
-        select(cast(types.c.typrelid, BigInteger))
-        .where(types.c.oid == cast(func.pg_catalog.pg_typeof(whole_row), OID))
-        .correlate_except(types)
-        .scalar_subquery()
-    )
-
-
 async def _page_headers(session, scope, leaf, after, limit):
     model = leaf.c
-    page = (
-        select(
-            leaf.table_valued().label("origin"),
-            model.rejection_ordinal,
-            func.coalesce(func.octet_length(model.canonical_root_key), 0).label("key_bytes"),
-        )
-        .where(*_predicate(model, scope), model.rejection_ordinal > after)
-        .order_by(model.rejection_ordinal)
-        .limit(limit + 1)
-        .lateral("header_page")
-    )
-    singleton = select(literal_column("1").label("anchor")).subquery("singleton")
-    headers = (
+    return (
         await session.execute(
             select(
-                page.c.rejection_ordinal,
-                page.c.key_bytes,
-                _source_relation_oid(page.c.origin).label("source_oid"),
+                model.rejection_ordinal,
+                func.coalesce(func.octet_length(model.canonical_root_key), 0).label("key_bytes"),
             )
-            .select_from(singleton.outerjoin(page, true()))
-            .order_by(page.c.rejection_ordinal)
+            .where(*_predicate(model, scope), model.rejection_ordinal > after)
+            .order_by(model.rejection_ordinal)
+            .limit(limit + 1)
         )
     ).all()
-    # A schema rename can redirect names despite table locks. The actual row
-    # type, including the typed NULL for an empty page, binds this statement.
-    if not headers or any(header.source_oid != scope.rejection_oid for header in headers):
-        raise RejectionEvidenceUnavailable()
-    return [] if len(headers) == 1 and headers[0].rejection_ordinal is None else headers
 
 
 async def _page_rows(session, scope, after, limit, page_bytes=MAX_PAGE_BYTES):
@@ -475,16 +408,13 @@ async def _page_rows(session, scope, after, limit, page_bytes=MAX_PAGE_BYTES):
                 model.source_ordinal,
                 model.canonical_root_key,
                 model.root_key_sha256,
-                _source_relation_oid(leaf.table_valued()).label("source_oid"),
             )
             .where(*_predicate(model, scope), model.rejection_ordinal.in_(ordinals))
             .order_by(model.rejection_ordinal)
             .limit(limit)
         )
     ).all()
-    if [rejection.rejection_ordinal for rejection in rejections] != ordinals or any(
-        rejection.source_oid != scope.rejection_oid for rejection in rejections
-    ):
+    if [rejection.rejection_ordinal for rejection in rejections] != ordinals:
         raise RejectionEvidenceUnavailable()
     return rejections, len(ordinals) == len(headers)
 

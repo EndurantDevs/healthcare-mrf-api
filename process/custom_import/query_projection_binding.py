@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Native catalog custody checks shared by projection writers and pinned reads."""
+"""Logical bindings and native layout checks for projection writers and pinned reads."""
 
 import hmac
 
@@ -8,7 +8,7 @@ from sqlalchemy import BigInteger, LargeBinary, Numeric, Text, select, text
 from sqlalchemy.dialects import postgresql
 
 from db.models.custom_import import CustomImportDefinitionRevision, CustomImportGeneration
-from db.models.custom_import_storage import CustomImportSnapshotFamily, CustomImportSnapshotRelation
+from db.models.custom_import_storage import CustomImportSnapshotFamily
 from process.custom_import.query_projection_sources import capability_sha256
 from process.custom_import.query_projection_storage import (
     QUERY_PROJECTION_BINDING_INDEX,
@@ -22,23 +22,15 @@ from process.custom_import.storage_layout import snapshot_schema
 
 
 class QueryProjectionUnavailable(CandidateRunnerError):
-    """Required projection identity, custody or completion evidence is invalid."""
+    """Required projection binding, layout or completion evidence is invalid."""
 
 
-_CATALOG_IDENTITY = text(
+_CATALOG_LAYOUT = text(
     r"""
-    SELECT c.oid::bigint AS table_oid,c.relowner::bigint AS table_owner,
-        n.nspowner::bigint AS schema_owner,c.relkind::text AS relkind,c.relpersistence::text AS relpersistence,
+    SELECT c.relkind::text AS relkind,c.relpersistence::text AS relpersistence,
         EXISTS(SELECT 1 FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) AS inherited,
         EXISTS(SELECT 1 FROM pg_catalog.pg_constraint WHERE conrelid=c.oid AND contype='f') AS foreign_keys,
         EXISTS(SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal) AS triggers,
-        (SELECT pg_catalog.sha256(pg_catalog.convert_to(pg_catalog.string_agg(
-            ROW(a.attnum,a.attname,a.atttypid,a.atttypmod,a.attnotnull,a.attcollation,
-                a.attidentity,a.attgenerated,pg_catalog.pg_get_expr(d.adbin,d.adrelid))::text,
-            E'\\n' ORDER BY a.attnum),'UTF8'))
-         FROM pg_catalog.pg_attribute a LEFT JOIN pg_catalog.pg_attrdef d
-            ON d.adrelid=a.attrelid AND d.adnum=a.attnum
-         WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped) AS columns_sha256,
         (SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(
             a.attnum,a.attname,pg_catalog.format_type(a.atttypid,a.atttypmod),
             a.attnotnull,a.attidentity,a.attgenerated,pg_catalog.pg_get_expr(d.adbin,d.adrelid),
@@ -59,7 +51,7 @@ _CATALOG_IDENTITY = text(
 )
 _CATALOG_INDEXES = text(
     """
-    SELECT x.relname::text AS index_name,i.indrelid::bigint AS table_oid,x.relowner::bigint AS index_owner,
+    SELECT x.relname::text AS index_name,heap.relname::text AS table_name,
         x.relkind::text AS index_kind,am.amname::text AS access_method,
         i.indisvalid AS valid,i.indisready AS ready,i.indislive AS live,
         i.indisunique AS unique_index,i.indisprimary AS primary_index,i.indisexclusion AS exclusion_index,
@@ -85,6 +77,7 @@ _CATALOG_INDEXES = text(
                 CASE WHEN a.atttypid='pg_catalog.varchar'::regtype THEN 'pg_catalog.text'::regtype
                     ELSE a.atttypid END) AS default_ops
     FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class x ON x.oid=i.indexrelid
+    JOIN pg_catalog.pg_class heap ON heap.oid=i.indrelid
     JOIN pg_catalog.pg_namespace n ON n.oid=x.relnamespace
     JOIN pg_catalog.pg_am am ON am.oid=x.relam
     WHERE n.nspname=:schema_name AND x.relname=ANY(CAST(:index_names AS text[]))
@@ -119,8 +112,8 @@ def _expected_columns(table):
     return [_column_shape(column, ordinal) for ordinal, column in enumerate(table.c, 1)]
 
 
-async def projection_table_identity(session, family_id, name, definition, *, prepare=None):
-    """Reject changed native layout before retaining or trusting a table signature."""
+async def validate_projection_table(session, family_id, name, definition, *, prepare=None):
+    """Require the defined columns and native keys at the qualified table name."""
 
     tables = query_projection_tables(family_id, definition)
     if type(name) is not str or name not in QUERY_PROJECTION_TABLE_NAMES:
@@ -130,7 +123,7 @@ async def projection_table_identity(session, family_id, name, definition, *, pre
     table_identity = (
         (
             await session.execute(
-                _CATALOG_IDENTITY,
+                _CATALOG_LAYOUT,
                 {"schema_name": snapshot_schema(family_id), "table_name": name},
             )
         )
@@ -141,23 +134,13 @@ async def projection_table_identity(session, family_id, name, definition, *, pre
         table_identity is None
         or table_identity["relkind"] != "r"
         or table_identity["relpersistence"] != "p"
-        or type(table_identity["table_oid"]) is not int
-        or table_identity["table_oid"] <= 0
-        or type(table_identity["table_owner"]) is not int
-        or table_identity["table_owner"] <= 0
-        or table_identity["table_owner"] != table_identity["schema_owner"]
         or table_identity["inherited"]
         or table_identity["foreign_keys"]
         or table_identity["triggers"]
         or table_identity["columns"] != _expected_columns(tables[name])
         or table_identity["primary_key"] != list(tables[name].primary_key.columns.keys())
     ):
-        raise QueryProjectionUnavailable("projection relation custody or model shape differs")
-    return (
-        table_identity["table_oid"],
-        table_identity["table_owner"],
-        _digest(table_identity["columns_sha256"], "column signature"),
-    )
+        raise QueryProjectionUnavailable("projection relation model shape differs")
 
 
 def _manifest_shape(manifest, require_complete):
@@ -171,14 +154,10 @@ def _manifest_shape(manifest, require_complete):
         "schema_revision_id",
         "execution_id",
         "producing_fence",
-        "root_table_oid",
-        "root_table_owner",
-        "child_table_oid",
-        "child_table_owner",
     ):
         identifier = getattr(manifest, name)
         if type(identifier) is not int or not 0 < identifier < 2**63:
-            raise QueryProjectionUnavailable("projection owner identity is invalid")
+            raise QueryProjectionUnavailable("projection producer binding is invalid")
     for name in ("after_entity_binding_id", "root_count", "child_count"):
         accounting_count = getattr(manifest, name)
         if type(accounting_count) is not int or not 0 <= accounting_count < 2**63:
@@ -187,12 +166,8 @@ def _manifest_shape(manifest, require_complete):
         "producing_token_sha256",
         "definition_sha256",
         "capability_sha256",
-        "root_columns_sha256",
-        "child_columns_sha256",
     ):
         _digest(getattr(manifest, name), name)
-    if manifest.root_table_oid == manifest.child_table_oid:
-        raise QueryProjectionUnavailable("projection relation identities repeat")
     if type(manifest.index_count) is not int or not 0 <= manifest.index_count <= 33:
         raise QueryProjectionUnavailable("projection index accounting is invalid")
     _proof_shape(manifest)
@@ -252,32 +227,11 @@ def _index_specs(manifest, definition):
         for column in table.c:
             if column.name.startswith("field_"):
                 expected_by_name[f"{table.name}_{column.name}_idx"] = (
-                    getattr(manifest, f"{scope}_table_oid"),
-                    getattr(manifest, f"{scope}_table_owner"),
+                    table.name,
                     [*keys, column.name, "entity_binding_id"],
                     [None] * (len(keys) + 2),
                 )
     return expected_by_name
-
-
-async def _binding_index_spec(session, manifest, prepare):
-    relation = CustomImportSnapshotRelation
-    if prepare is not None:
-        await prepare(session)
-    custody = (
-        await session.execute(
-            select(relation.table_oid, relation.table_owner).where(
-                relation.family_id == manifest.family_id, relation.relation_slot == 2
-            )
-        )
-    ).one_or_none()
-    if custody is None or any(type(value) is not int or not 0 < value < 2**63 for value in custody):
-        raise QueryProjectionUnavailable("projection binding relation custody is missing or invalid")
-    return (
-        *custody,
-        ["dataset_id", "adapter_id", "canonical_value", "entity_binding_id"],
-        [None, "pg_catalog.default", "pg_catalog.C", None],
-    )
 
 
 async def validate_projection_indexes(session, manifest, definition, *, prepare=None):
@@ -289,7 +243,11 @@ async def validate_projection_indexes(session, manifest, definition, *, prepare=
         raise QueryProjectionUnavailable("projection index coverage differs")
     if not expected_by_name:
         return
-    expected_by_name[QUERY_PROJECTION_BINDING_INDEX] = await _binding_index_spec(session, manifest, prepare)
+    expected_by_name[QUERY_PROJECTION_BINDING_INDEX] = (
+        "custom_import_entity_binding",
+        ["dataset_id", "adapter_id", "canonical_value", "entity_binding_id"],
+        [None, "pg_catalog.default", "pg_catalog.C", None],
+    )
     if prepare is not None:
         await prepare(session)
     index_records = (
@@ -314,10 +272,9 @@ async def validate_projection_indexes(session, manifest, definition, *, prepare=
 
 
 def _is_expected_index(index_record, expected):
-    expected_oid, expected_owner, expected_keys, expected_collations = expected
+    expected_table, expected_keys, expected_collations = expected
     return not (
-        index_record["table_oid"] != expected_oid
-        or index_record["index_owner"] != expected_owner
+        index_record["table_name"] != expected_table
         or index_record["index_kind"] != "i"
         or index_record["access_method"] != "btree"
         or index_record["key_names"] != expected_keys
@@ -387,10 +344,10 @@ async def _validate_parent(session, manifest, require_complete, prepare):
 
 
 async def lock_projection_tables(session, manifest, definition, *, require_complete=True, prepare=None):
-    """Pin fixed leaves, then revalidate custody without writing in read transactions."""
+    """Pin qualified leaves and revalidate logical bindings in the same read transaction."""
 
     if not session.in_transaction():
-        raise QueryProjectionUnavailable("projection custody requires an active transaction")
+        raise QueryProjectionUnavailable("projection read pin requires an active transaction")
     _manifest_shape(manifest, require_complete)
     _definition_binding(manifest, definition)
     await _validate_parent(session, manifest, require_complete, prepare)
@@ -401,16 +358,8 @@ async def lock_projection_tables(session, manifest, definition, *, require_compl
         await prepare(session)
     await session.execute(text(f"LOCK TABLE {names} IN ACCESS SHARE MODE"))
     await _validate_parent(session, manifest, require_complete, prepare)
-    for scope, name in zip(("root", "child"), QUERY_PROJECTION_TABLE_NAMES, strict=True):
-        table_oid, owner, signature = await projection_table_identity(
-            session, manifest.family_id, name, definition, prepare=prepare
-        )
-        if (
-            table_oid != getattr(manifest, f"{scope}_table_oid")
-            or owner != getattr(manifest, f"{scope}_table_owner")
-            or not hmac.compare_digest(signature, bytes(getattr(manifest, f"{scope}_columns_sha256")))
-        ):
-            raise QueryProjectionUnavailable("projection retained table identity differs")
+    for name in QUERY_PROJECTION_TABLE_NAMES:
+        await validate_projection_table(session, manifest.family_id, name, definition, prepare=prepare)
     if require_complete or manifest.phase == "complete":
         await validate_projection_indexes(session, manifest, definition, prepare=prepare)
     return tables

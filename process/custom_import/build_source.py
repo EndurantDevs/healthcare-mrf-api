@@ -374,8 +374,8 @@ async def _call(session: AsyncSession, name: str, arguments: tuple[tuple[str, ob
     return await session.execute(text(f"SELECT * FROM {quoted}.{name}({casts})"), parameter_by_name)
 
 
-async def _is_source_writer_owner(session: AsyncSession) -> bool:
-    """Use ordinary SOURCE SQL only as the current owners of both entry points."""
+async def _can_update_build_cursor(session: AsyncSession) -> bool:
+    """Use native UPDATE permission as a hint; other writes may still be denied."""
 
     await _prepare_statement(session)
     connection = await session.connection()
@@ -386,20 +386,26 @@ async def _is_source_writer_owner(session: AsyncSession) -> bool:
         raise CandidateRunnerError("build functions require an explicit model schema")
     quoted = connection.dialect.identifier_preparer.quote_schema(schema)
     result = await session.execute(
-        text(
-            "SELECT pg_catalog.count(*)=2 AND pg_catalog.bool_and(pg_catalog.pg_get_userbyid(p.proowner)=CURRENT_USER) "
-            "FROM pg_catalog.pg_proc p WHERE p.oid IN "
-            "(pg_catalog.to_regprocedure(:authorize),pg_catalog.to_regprocedure(:finalize))"
-        ),
-        {
-            "authorize": (
-                f"{quoted}.source_bulk_authorize("
-                "pg_catalog.int8,pg_catalog.int2,pg_catalog.int8,pg_catalog.bytea,pg_catalog.int4,pg_catalog.int8)"
-            ),
-            "finalize": f"{quoted}.source_set_finalize(pg_catalog.uuid,pg_catalog.int4[])",
-        },
+        text("SELECT pg_catalog.has_table_privilege(:cursor_relation, 'UPDATE')"),
+        {"cursor_relation": f"{quoted}.custom_import_build_attempt"},
     )
     return result.scalar_one() is True
+
+
+async def _try_ordinary_write(session, write, *arguments, **options):
+    """Roll back a denied direct write before using the fenced dispatcher."""
+
+    if not await _can_update_build_cursor(session):
+        return False, None
+    try:
+        # Keep authorization, COPY and page locks in the enclosing transaction.
+        async with session.begin_nested():
+            result = await write(session, *arguments, **options)
+    except DBAPIError as error:
+        if getattr(error.orig, "sqlstate", None) != "42501":
+            raise
+        return False, None
+    return True, result
 
 
 async def _begin_build(session_factory, request):
@@ -689,11 +695,10 @@ async def _store_pages(session_factory, context, pages, *, verified_parts=()):
         ).scalar_one()
         landing_rows = tuple((batch_id, ordinal, *landing[1:]) for ordinal, landing in enumerate(preview.records))
         await _copy_source_landing(session, landing_rows)
-        if await _is_source_writer_owner(session):
-            from process.custom_import.source_finalize_sql import finalize_source_batch
+        from process.custom_import.source_finalize_sql import finalize_source_batch
 
-            completed = await finalize_source_batch(session, batch_id, earlier_parts)
-        else:
+        direct, completed = await _try_ordinary_write(session, finalize_source_batch, batch_id, earlier_parts)
+        if not direct:
             completed = (
                 await _call(session, "source_set_finalize", (("uuid", batch_id), ("integer[]", earlier_parts)))
             ).scalar_one()
@@ -1245,19 +1250,17 @@ async def stage_segmented_source(
         if writer_transports is not None:
             await _stage_source_handoff(session_factory, request, build_id, registry, writer_transports.source)
         else:
-            direct_admission = await _stage_local_source(session_factory, request, build_id, registry)
+            await _stage_local_source(session_factory, request, build_id, registry)
     with failure_phase(FailurePhase.ADMISSION_INDEX):
         await _prepare_snapshot_indexes(session_factory, request, build_id, "admission")
     with failure_phase(FailurePhase.ADMISSION):
         if writer_transports is not None:
             return await _stage_admission_handoff(session_factory, request, build_id, writer_transports.admission)
-        return await _admit_local_pages(session_factory, request, build_id, direct_admission)
+        return await _admit_local_pages(session_factory, request, build_id)
 
 
 async def _stage_local_source(session_factory, request, build_id, registry):
-    """Preserve standalone replay and select only the current connection's writer."""
-
-    from process.custom_import import admission_sql as admission
+    """Preserve standalone replay from the retained capture and stream cursors."""
 
     async with _page_session(session_factory, request, build_id) as (session, build):
         phase, bundle_id = build.phase, build.capture_bundle_id
@@ -1275,14 +1278,12 @@ async def _stage_local_source(session_factory, request, build_id, registry):
                 )
             ).all()
         }
-        direct_admission = await admission._has_admission_owner(session)
     if phase == "source":
         await _replay_source(session_factory, request, registry, build_id, bundle_id, policy, cursor_by_slot)
-    return direct_admission
 
 
-async def _admit_local_pages(session_factory, request, build_id, direct_admission):
-    """Use the current owner's writer or retained dispatcher in fenced page transactions."""
+async def _admit_local_pages(session_factory, request, build_id):
+    """Select ordinary writes or the retained dispatcher in each fenced page."""
 
     from process.custom_import import admission_sql as admission
 
@@ -1299,14 +1300,15 @@ async def _admit_local_pages(session_factory, request, build_id, direct_admissio
                     )
                 if build.phase != "admission":
                     raise CandidateRunnerError("source build is not ready for global admission")
-                if direct_admission:
-                    await admission._admit_locked(session, build, build.admission_after_occurrence_id)
-                else:
-                    # Restricted principals retain their existing fenced dispatcher until authority is migrated.
+                direct, _ = await _try_ordinary_write(
+                    session, admission._admit_locked, build, build.admission_after_occurrence_id
+                )
+                if not direct:
+                    # Restricted connections keep the existing fenced dispatcher.
                     await _call(
                         session,
                         "admit_custom_import_build_page",
                         (("bigint", build_id), ("bigint", build.admission_after_occurrence_id)),
                     )
         except DBAPIError as error:
-            await admission._retry_admission_timeout(session_factory, request, build_id, error)
+            await admission._retry_admission_timeout(session_factory, request, build_id, error, allow_dispatcher=True)

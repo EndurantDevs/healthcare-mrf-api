@@ -14,7 +14,6 @@ from dataclasses import asdict, dataclass, field, replace
 from process.custom_import import capture, execution, https, runner
 from process.custom_import._source_text import validate_snapshot_token
 from process.custom_import.capture import CaptureManifest, SealedCapture
-from process.custom_import.capture_authority import require_raw_capture_authority
 from process.custom_import.capture_limits import CaptureLimits
 from process.custom_import.capture_store import (
     _MAX_PARQUET_BYTES_PER_BUNDLE,
@@ -26,7 +25,11 @@ from process.custom_import.capture_store import (
 )
 from process.custom_import.definition import CustomImportDefinition, canonical_json
 from process.custom_import.family import assemble_root_families, validate_source_snapshot_tokens
-from process.custom_import.raw_capture_store import load_replayable_raw_bundle, register_raw_capture_bundle
+from process.custom_import.raw_capture_store import (
+    load_replayable_raw_bundle,
+    register_raw_capture_bundle,
+    require_raw_capture_write_access,
+)
 from process.custom_import.runner_registry import load_registry
 from process.custom_import.runner_types import (
     CancellationRequested,
@@ -495,7 +498,7 @@ async def _capture_acquisition_deadline(session_factory, request, grant, deadlin
             _remaining_seconds(deadline)
         elif _uses_originals(request):
             async with session_factory() as session, session.begin():
-                await require_raw_capture_authority(session)
+                await require_raw_capture_write_access(session)
     return deadline
 
 

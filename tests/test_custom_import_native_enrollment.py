@@ -32,7 +32,6 @@ def _proof_functions(tree):
 def test_native_support_is_not_collected_by_main(pytestconfig):
     assert set(NATIVE_SUPPORT_ENTRYPOINTS) == {
         "tests.custom_import_retirement_postgres",
-        "tests.custom_import_retirement_inventory_postgres",
         "tests.custom_import_post_seal_audit_postgres",
     }
     assert set(NATIVE_SUPPORT_ENTRYPOINTS.values()) == ENROLLED_ENTRYPOINTS

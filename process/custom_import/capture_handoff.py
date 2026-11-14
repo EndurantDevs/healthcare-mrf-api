@@ -11,10 +11,14 @@ from types import SimpleNamespace
 
 from db.models.custom_import import CustomImportDefinitionRevision
 from process.custom_import import execution, runner_registry
-from process.custom_import.capture_authority import require_raw_capture_authority
+from process.custom_import.capture_store import _require_clean_session, _require_transaction
 from process.custom_import.capture_wire import manifested_content_sha256
 from process.custom_import.definition import CustomImportDefinition
-from process.custom_import.raw_capture_store import load_replayable_raw_bundle, register_raw_capture_bundle
+from process.custom_import.raw_capture_store import (
+    load_replayable_raw_bundle,
+    register_raw_capture_bundle,
+    require_raw_capture_write_access,
+)
 from process.custom_import.runner_types import LeaseAuthorityLost
 
 
@@ -83,7 +87,7 @@ async def _authorized_session(session_factory, verified, *, acquisition):
 
 
 async def preflight_capture(session_factory, verified):
-    """Prove first-acquisition authority and registrar capability before source access."""
+    """Check acquisition authority, registrar access and deadline before source access."""
 
     async with _authorized_session(session_factory, verified, acquisition=True) as (
         session,
@@ -91,7 +95,9 @@ async def preflight_capture(session_factory, verified):
         _definition,
         deadline,
     ):
-        await require_raw_capture_authority(session)
+        _require_transaction(session)
+        _require_clean_session(session)
+        await require_raw_capture_write_access(session)
         return deadline
 
 

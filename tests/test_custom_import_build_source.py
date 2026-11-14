@@ -106,7 +106,7 @@ def _retained_source_page(monkeypatch, phase, *, bundle=None):
 
 
 @pytest.mark.parametrize("corruption", ["canonical", "digest"])
-async def test_retained_policy_refusal_precedes_cursor_owner_and_replay(monkeypatch, corruption):
+async def test_retained_policy_refusal_precedes_cursor_routing_and_replay(monkeypatch, corruption):
     policy = _policy()
     bundle = SimpleNamespace(
         canonical_policy=json.dumps(json.loads(policy.canonical), indent=2)
@@ -115,9 +115,9 @@ async def test_retained_policy_refusal_precedes_cursor_owner_and_replay(monkeypa
         policy_sha256=b"x" * 32 if corruption == "digest" else bytes.fromhex(policy.digest),
     )
     session, sessions, outcomes = _retained_source_page(monkeypatch, "source", bundle=bundle)
-    replay, owner, writer = AsyncMock(), AsyncMock(), AsyncMock()
+    replay, routing, writer = AsyncMock(), AsyncMock(), AsyncMock()
     monkeypatch.setattr(staging, "_replay_source", replay)
-    monkeypatch.setattr(admission_sql, "_has_admission_owner", owner)
+    monkeypatch.setattr(staging, "_can_update_build_cursor", routing)
     monkeypatch.setattr(staging, "_call", writer)
 
     with pytest.raises(CandidateRunnerError, match="sealed capture policy differs from its retained digest"):
@@ -130,13 +130,12 @@ async def test_retained_policy_refusal_precedes_cursor_owner_and_replay(monkeypa
     session.add.assert_not_called()
     session.add_all.assert_not_called()
     replay.assert_not_awaited()
-    owner.assert_not_awaited()
+    routing.assert_not_awaited()
     writer.assert_not_awaited()
     assert sessions.call_count == 1 and outcomes == ["rollback", "close"]
 
 
-@pytest.mark.parametrize("direct_admission", [False, True])
-async def test_admission_refuses_source_phase_without_writer_or_retry(monkeypatch, direct_admission):
+async def test_admission_refuses_source_phase_without_writer_or_retry(monkeypatch):
     session, sessions, outcomes = _retained_source_page(monkeypatch, "source")
     admitted, dispatched, retry = AsyncMock(), AsyncMock(), AsyncMock()
     monkeypatch.setattr(admission_sql, "_admit_locked", admitted)
@@ -144,7 +143,7 @@ async def test_admission_refuses_source_phase_without_writer_or_retry(monkeypatc
     monkeypatch.setattr(staging, "_call", dispatched)
 
     with pytest.raises(CandidateRunnerError, match="source build is not ready for global admission"):
-        await staging._admit_local_pages(sessions, _request(), 5, direct_admission)
+        await staging._admit_local_pages(sessions, _request(), 5)
 
     admitted.assert_not_awaited()
     dispatched.assert_not_awaited()

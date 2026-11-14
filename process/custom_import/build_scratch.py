@@ -21,7 +21,6 @@ from db.models.custom_import import (
     CustomImportLease,
 )
 from db.models.custom_import_build_scratch import CustomImportBuildScratchCleanup
-from db.models.custom_import_storage import CustomImportSnapshotRelation
 from process.custom_import import publication, retirement
 from process.custom_import.build_output import _COUNT_NAMES, _proof_matches
 from process.custom_import.storage_layout import (
@@ -121,37 +120,6 @@ async def _eligible(session, family, *, require_automated=True):
     return build, generation, proof, seal
 
 
-async def _manifest(session, quoted, family):
-    await session.execute(
-        text(f"SELECT {quoted}.resolve_custom_import_snapshot_relations(:family)"), {"family": family.family_id}
-    )
-    rows = (
-        await session.scalars(
-            select(CustomImportSnapshotRelation)
-            .where(CustomImportSnapshotRelation.family_id == family.family_id)
-            .order_by(CustomImportSnapshotRelation.relation_slot)
-            .execution_options(populate_existing=True)
-        )
-    ).all()
-    if [row.relation_slot for row in rows] != list(range(1, 16)) or family.landing_table_oid is None:
-        raise BuildScratchCleanupRefused("build scratch cleanup relation census is incomplete")
-    relations_by_slot = {
-        str(row.relation_slot): [row.table_oid, row.table_owner, bytes(row.columns_sha256).hex()] for row in rows
-    }
-    for prefix in ("landing", "origin"):
-        oid = getattr(family, f"{prefix}_table_oid")
-        relations_by_slot[prefix] = (
-            None
-            if oid is None
-            else [
-                oid,
-                getattr(family, f"{prefix}_table_owner"),
-                bytes(getattr(family, f"{prefix}_columns_sha256")).hex(),
-            ]
-        )
-    return relations_by_slot
-
-
 def _affinity(family, build, generation, proof, seal):
     return {
         **{name: getattr(family, name) for name in _IDENTITY},
@@ -208,7 +176,7 @@ async def _drop_finished_indexes(session, family_id):
             await session.execute(
                 text("""
         SELECT c.relname::text name,heap.relname::text table_name,
-               i.indisunique unique_index,c.relowner=heap.relowner owner_matches,
+               i.indisunique unique_index,
                i.indisvalid AND i.indisready AND i.indislive live
         FROM pg_catalog.pg_class c
         JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
@@ -226,11 +194,10 @@ async def _drop_finished_indexes(session, family_id):
     if any(
         index["table_name"] != table_by_index_name[index["name"]]
         or index["unique_index"] is not False
-        or index["owner_matches"] is not True
         or index["live"] is not True
         for index in indexes
     ):
-        raise BuildScratchCleanupRefused("build scratch phase index custody differs")
+        raise BuildScratchCleanupRefused("build scratch phase index shape differs")
     quote = (await session.connection()).dialect.identifier_preparer.quote_identifier
     for index in indexes:
         await session.execute(text(f"DROP INDEX {quote(namespace)}.{quote(index['name'])}"))
@@ -257,7 +224,7 @@ async def _post_audit(session, family, proof, affinity, engine_id, marker=None):
         return verified
     except audit.PostSealAuditRefused as error:
         raise BuildScratchCleanupRefused(
-            "build scratch cleanup requires full automated post-seal verification"
+            "build scratch cleanup requires completed automated post-seal verification"
         ) from error
 
 
@@ -266,16 +233,15 @@ async def _trim(session, family_id, engine_id):
     snapshot_schema(family_id)
     retirement.lifecycle_lock_key(engine_id, 1)
     try:
-        _schema, quoted = await retirement._owner_schema(session)
+        await retirement._owner_schema(session)
         family, tombstone = await retirement._locked_family(session, family_id, engine_id)
     except retirement.SnapshotRetirementRefused as exc:
         raise BuildScratchCleanupRefused(
-            "build scratch cleanup requires protected owner authority and exact storage"
+            "build scratch cleanup requires an available snapshot and bounded transaction"
         ) from exc
     if family is None or tombstone is not None:
         raise BuildScratchCleanupRefused("build scratch cleanup snapshot is retired")
     build, generation, proof, seal = await _eligible(session, family, require_automated=False)
-    manifest = await _manifest(session, quoted, family)
     namespace = snapshot_schema(family_id)
     tables = tuple(f'"{namespace}"."{name}"' for name in SCRATCH_RELATIONS)
     affinity = _affinity(family, build, generation, proof, seal)
@@ -285,7 +251,7 @@ async def _trim(session, family_id, engine_id):
             getattr(marker, name) != expected_attribute for name, expected_attribute in affinity.items()
         ):
             raise BuildScratchCleanupRefused("build scratch cleanup replay identity differs")
-        if marker.aggregate_evidence.get("relations") != manifest or not await _empty(session, tables):
+        if not await _empty(session, tables):
             raise BuildScratchCleanupRefused("build scratch cleanup replay storage differs")
         await _post_audit(session, family, proof, affinity, engine_id, marker)
         return BuildScratchCleanupReceipt(family_id, marker.retained_bytes, marker.remaining_bytes, True)
@@ -298,12 +264,12 @@ async def _trim(session, family_id, engine_id):
     await session.execute(text("LOCK TABLE " + ",".join(tables) + " IN ACCESS EXCLUSIVE MODE NOWAIT"))
     removed_indexes = await _drop_finished_indexes(session, family_id)
     await _truncate(session, tables)
-    if not await _empty(session, tables) or await _manifest(session, quoted, family) != manifest:
-        raise BuildScratchCleanupRefused("build scratch cleanup changed registered storage identity")
+    if not await _empty(session, tables):
+        raise BuildScratchCleanupRefused("build scratch cleanup left scratch rows")
     after = await _sizes(session, tables)
     evidence_by_name = {
         "contract": CONTRACT,
-        "relations": manifest,
+        "relations": list(tables),
         "build_counters": {name: getattr(build, name) for name in _BUILD_COUNTERS},
         "structural_counts": {name: getattr(proof, name) for name in _COUNT_NAMES},
         "verification_contract": proof.verification_contract,
@@ -336,6 +302,6 @@ async def _record_cleanup(session, affinity, engine_id, evidence_by_name):
 
 
 async def trim_build_scratch(session, family_id, *, engine_id):
-    """Keep exact relation identities; caller commits or rolls back the complete operation."""
+    """Keep the named tables; caller commits or rolls back the complete operation."""
     async with asyncio.timeout(MAX_CLEANUP_SECONDS):
         return await _trim(session, family_id, engine_id)

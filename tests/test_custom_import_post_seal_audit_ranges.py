@@ -84,3 +84,67 @@ async def test_run_arm_refuses_a_repeated_root_before_the_invariant_query():
     with pytest.raises(audit.PostSealAuditRefused, match="root range"):
         await audit._run_arm(session, _range_context(), previous)
     session.execute.assert_not_awaited()
+
+
+def _index_context(physical_seed):
+    namespace = "ci_snapshot_2"
+    rows = []
+    for ordinal, spec in enumerate(audit._sql_resource()[0]["indexes"]):
+        rows.append(
+            {
+                "namespace": namespace,
+                "name": spec["name"],
+                "table_name": spec["table"],
+                "keys": [audit.re.sub(r" DESC$", "", key) for key in spec["keys"]],
+                "options": [3 if key.endswith(" DESC") else 0 for key in spec["keys"]],
+                "predicate": spec["predicate"],
+                "amname": "btree",
+                "unique_index": False,
+                "live": True,
+                "persistent": True,
+                "oid": physical_seed + ordinal,
+                "owner_matches": False,
+            }
+        )
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=Mock(mappings=Mock(return_value=Mock(all=Mock(return_value=rows)))))
+    )
+    context = SimpleNamespace(
+        family=SimpleNamespace(family_id=2),
+        identity={"candidate": {"family_id": 2}, "counts": {"root_count": 3}},
+        tables=('"ci_snapshot_2"."custom_import_root_record"',),
+    )
+    return session, context, rows
+
+
+async def test_audit_resume_uses_logical_content_and_ignores_physical_catalog_identity():
+    original_session, context, _ = _index_context(100)
+    copied_session, _, _ = _index_context(500)
+    binding = await audit._binding(original_session, context)
+    assert await audit._binding(copied_session, context) == binding
+    assert set(binding) == {"contract", "identity", "root_page_rows"}
+    header = SimpleNamespace(
+        sql_sha256=audit._sql_resource()[1], binding=binding, binding_sha256=audit._digest(binding)
+    )
+    await audit._current_binding(copied_session, header, context)
+    context.identity["counts"]["root_count"] += 1
+    with pytest.raises(audit.PostSealAuditRefused, match="binding changed"):
+        await audit._current_binding(copied_session, header, context)
+
+
+async def test_audit_resume_does_not_transfer_an_old_physical_binding():
+    session, context, _ = _index_context(100)
+    binding = await audit._binding(session, context)
+    binding["heaps"] = {"100": {"heap_node": 200}}
+    header = SimpleNamespace(
+        sql_sha256=audit._sql_resource()[1], binding=binding, binding_sha256=audit._digest(binding)
+    )
+    with pytest.raises(audit.PostSealAuditRefused, match="binding changed"):
+        await audit._current_binding(session, header, context)
+
+
+async def test_audit_keeps_native_index_shape_validation():
+    session, context, rows = _index_context(100)
+    rows[0]["keys"] = ["wrong_column"]
+    with pytest.raises(audit.PostSealAuditRefused, match="index differs"):
+        await audit._binding(session, context)

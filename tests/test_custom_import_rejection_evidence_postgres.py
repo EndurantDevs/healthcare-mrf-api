@@ -7,9 +7,12 @@ from __future__ import annotations
 import json
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,13 +23,32 @@ from db.models.custom_import_storage import CustomImportSnapshotFamily
 from process.custom_import import build_source, execution
 from process.custom_import import rejection_evidence as reader
 from process.custom_import.storage_layout import snapshot_models, snapshot_schema
-from tests.custom_import_postgres_support import isolated_publication_case
+from tests.custom_import_postgres_support import _migration, isolated_publication_case
 from tests.test_custom_import_build_source_postgres import _retained_request, _root
 
 
 @asynccontextmanager
 async def _retained_case():
     async with isolated_publication_case() as case:
+
+        def install(connection):
+            path = (
+                Path(__file__).resolve().parents[1] / "alembic/versions/20261114010000_custom_import_snapshot_names.py"
+            )
+            migration = _migration(path, "retained_rejection_snapshot_names")
+            migration._schema = lambda: case.schema_name
+            migration.op = Operations(MigrationContext.configure(connection))
+            migration.upgrade()
+            cleanup = _migration(
+                path.with_name("20261114020000_custom_import_snapshot_metadata.py"),
+                "retained_rejection_snapshot_metadata",
+            )
+            cleanup._schema = lambda: case.schema_name
+            cleanup.op = migration.op
+            cleanup.upgrade()
+
+        async with case.engine.begin() as connection:
+            await connection.run_sync(install)
         request = await _retained_request(
             case,
             records_by_stream={
@@ -193,137 +215,27 @@ async def test_wrong_owner_or_build_never_reads_a_retained_leaf():
             assert [int(event["ordinal"]) for event in page["events"]] == ordinals
 
 
-async def _replacement_leaf(retained):
-    namespace = snapshot_schema(retained.family_id)
-    async with retained.case.engine.begin() as writer:
-        await writer.execute(
-            text(f'CREATE TABLE "{namespace}".replacement (LIKE "{namespace}".custom_import_rejection INCLUDING ALL)')
-        )
-        await writer.execute(
-            text(f'INSERT INTO "{namespace}".replacement SELECT * FROM "{namespace}".custom_import_rejection')
-        )
-        await writer.execute(text(f"UPDATE \"{namespace}\".replacement SET code='replacement_marker'"))
-        return await writer.scalar(
-            text("SELECT to_regclass(:name)::oid::bigint"), {"name": f"{namespace}.custom_import_rejection"}
-        )
-
-
-async def _swap_leaf(retained):
-    namespace = snapshot_schema(retained.family_id)
-    async with retained.case.engine.begin() as writer:
-        await writer.execute(text("SET LOCAL lock_timeout = '1000ms'"))
-        await writer.execute(text(f'ALTER TABLE "{namespace}".custom_import_rejection RENAME TO original_rejection'))
-        await writer.execute(text(f'ALTER TABLE "{namespace}".replacement RENAME TO custom_import_rejection'))
-
-
-async def test_pre_acquisition_replacement_is_not_retained_evidence(monkeypatch):
+async def test_copied_named_leaf_preserves_retained_pages():
     async with _retained_case() as retained:
         await _finish(retained)
-        original_oid = await _replacement_leaf(retained)
-        lock_snapshot = reader._lock_snapshot
-        swaps = []
-
-        async def replace_before_lock(session, family_id):
-            await _swap_leaf(retained)
-            # Explicit catalog reads retain the earlier transaction snapshot.
-            catalog_name = await session.scalar(
-                text("SELECT relname FROM pg_class WHERE oid=:oid"), {"oid": original_oid}
-            )
-            assert catalog_name == "custom_import_rejection"
-            swaps.append(True)
-            return await lock_snapshot(session, family_id)
-
-        monkeypatch.setattr(reader, "_lock_snapshot", replace_before_lock)
         async with retained.case.sessions() as session:
-            with pytest.raises(reader.RejectionEvidenceUnavailable):
-                await reader.read_rejection_page(session, **_pins(retained))
-        assert swaps == [True]
-
-
-@asynccontextmanager
-async def _replacement_namespace(retained, *, empty=False):
-    namespace = snapshot_schema(retained.family_id)
-    alternate = "replacement_" + uuid.uuid4().hex[:16]
-    original = "original_" + uuid.uuid4().hex[:16]
-    is_created = False
-    try:
+            before = await reader.read_rejection_page(session, **_pins(retained))
+        namespace = snapshot_schema(retained.family_id)
         async with retained.case.engine.begin() as writer:
-            await writer.execute(text(f'CREATE SCHEMA "{alternate}"'))
             await writer.execute(
                 text(
-                    f'CREATE TABLE "{alternate}".custom_import_rejection '
-                    f'(LIKE "{namespace}".custom_import_rejection INCLUDING ALL)'
+                    f'CREATE TABLE "{namespace}".replacement (LIKE "{namespace}".custom_import_rejection INCLUDING ALL)'
                 )
             )
-            if not empty:
-                await writer.execute(
-                    text(
-                        f'INSERT INTO "{alternate}".custom_import_rejection '
-                        f'SELECT * FROM "{namespace}".custom_import_rejection'
-                    )
-                )
-                await writer.execute(
-                    text(f"UPDATE \"{alternate}\".custom_import_rejection SET code='replacement_marker'")
-                )
-        is_created = True
-        yield alternate, original
-    finally:
-        if is_created:
-            async with retained.case.engine.begin() as writer:
-                await writer.execute(text(f'DROP SCHEMA IF EXISTS "{original}" CASCADE'))
-                await writer.execute(text(f'DROP SCHEMA IF EXISTS "{alternate}" CASCADE'))
-
-
-async def _swap_namespace(retained, names):
-    alternate, original = names
-    namespace = snapshot_schema(retained.family_id)
-    async with retained.case.engine.begin() as writer:
-        await writer.execute(text("SET LOCAL lock_timeout = '1000ms'"))
-        await writer.execute(text(f'ALTER SCHEMA "{namespace}" RENAME TO "{original}"'))
-        await writer.execute(text(f'ALTER SCHEMA "{alternate}" RENAME TO "{namespace}"'))
-
-
-@pytest.mark.parametrize("empty", [False, True])
-async def test_post_verification_namespace_swap_is_rejected(monkeypatch, empty):
-    async with _retained_case() as retained:
-        await _finish(retained)
-        async with _replacement_namespace(retained, empty=empty) as names:
-            verified = reader._verify_relation_locks
-            swaps = []
-
-            async def swap_after_verification(session, quoted_schema, family_id):
-                result = await verified(session, quoted_schema, family_id)
-                await _swap_namespace(retained, names)
-                swaps.append(True)
-                return result
-
-            monkeypatch.setattr(reader, "_verify_relation_locks", swap_after_verification)
-            async with retained.case.sessions() as session:
-                with pytest.raises(reader.RejectionEvidenceUnavailable):
-                    await reader.read_rejection_page(session, **_pins(retained))
-            assert swaps == [True]
-
-
-@pytest.mark.parametrize("empty", [False, True])
-async def test_namespace_swap_between_headers_and_hydration_is_rejected(monkeypatch, empty):
-    async with _retained_case() as retained:
-        await _finish(retained)
-        async with _replacement_namespace(retained, empty=empty) as names:
-            page_headers = reader._page_headers
-            swaps = []
-
-            async def swap_after_headers(session, scope, leaf, after, limit):
-                headers = await page_headers(session, scope, leaf, after, limit)
-                assert len(headers) == 2
-                await _swap_namespace(retained, names)
-                swaps.append(True)
-                return headers
-
-            monkeypatch.setattr(reader, "_page_headers", swap_after_headers)
-            async with retained.case.sessions() as session:
-                with pytest.raises(reader.RejectionEvidenceUnavailable):
-                    await reader.read_rejection_page(session, **_pins(retained))
-            assert swaps == [True]
+            await writer.execute(
+                text(f'INSERT INTO "{namespace}".replacement SELECT * FROM "{namespace}".custom_import_rejection')
+            )
+            await writer.execute(
+                text(f'ALTER TABLE "{namespace}".custom_import_rejection RENAME TO original_rejection')
+            )
+            await writer.execute(text(f'ALTER TABLE "{namespace}".replacement RENAME TO custom_import_rejection'))
+        async with retained.case.sessions() as session:
+            assert await reader.read_rejection_page(session, **_pins(retained)) == before
 
 
 async def _http_request(retained):

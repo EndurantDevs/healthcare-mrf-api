@@ -159,6 +159,8 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20261111010000_code_sets_publication_idempotency",
     "20261113010000_address_canonical_space_normalization",
     "20261115010000_ms_drg_companion_tables",
+    "20261114010000_custom_import_snapshot_names",
+    "20261114020000_custom_import_snapshot_metadata",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",

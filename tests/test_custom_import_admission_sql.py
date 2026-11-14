@@ -168,7 +168,8 @@ def test_prerequisite_codes_keep_existing_precedence_and_accounting_is_aggregate
     codes = re.findall(r"RAISE EXCEPTION '([^']+)'", _leaf().split("    WITH\n", 1)[0])
     assert re.findall(r"THEN '(custom_import_[^']+)'", admission._queries()[0]) == codes
     guard, decision, apply, advance = admission._queries()
-    assert "f.landing_table_owner IS NOT NULL AND f.landing_columns_sha256 IS NOT NULL" in guard
+    assert "r.relation_slot=1" in guard
+    assert "landing_table_owner" not in guard and "landing_columns_sha256" not in guard
     assert "f.frozen_at IS NULL" in guard and "s.replay_verified_at IS NULL" in guard
     assert "c.capture_state='sealed'" in guard and "p_expected_after_id" not in guard
     assert "byte_boundary boundary WHERE boundary.raw_bytes>:page_byte_limit" in decision
@@ -193,15 +194,22 @@ class _Result:
 
 
 class _Transaction:
-    def __init__(self, session):
-        self.session = session
+    def __init__(self, session, *, nested=False):
+        self.session, self.nested = session, nested
 
     async def __aenter__(self):
-        self.session.events.append("begin")
+        self.session.events.append("savepoint" if self.nested else "begin")
         self.original_search_path = self.session.search_path
+        self.pending_start = len(self.session.pending)
         return self
 
     async def __aexit__(self, kind, error, traceback):
+        if self.nested:
+            self.session.events.append("rollback_savepoint" if error else "release_savepoint")
+            if error is not None:
+                del self.session.pending[self.pending_start :]
+                self.session.search_path = self.original_search_path
+            return
         self.session.events.append("rollback" if error else "commit")
         if error is None:
             self.session.durable.extend(self.session.pending)
@@ -224,6 +232,9 @@ class _Session:
 
     def begin(self):
         return _Transaction(self)
+
+    def begin_nested(self):
+        return _Transaction(self, nested=True)
 
     async def connection(self):
         return SimpleNamespace(
@@ -697,12 +708,12 @@ async def test_request_bounds_fail_before_opening_a_session(build_id, cursor):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("owner_lookup", [True, False])
-async def test_absent_control_schema_fails_closed(monkeypatch, owner_lookup):
+@pytest.mark.parametrize("route_lookup", [True, False])
+async def test_absent_control_schema_fails_closed(monkeypatch, route_lookup):
     session, _ = _page(monkeypatch, schema=None)
     with pytest.raises(CandidateRunnerError, match="explicit model schema"):
-        if owner_lookup:
-            await admission._has_admission_owner(session)
+        if route_lookup:
+            await staging._can_update_build_cursor(session)
         else:
             await admission._statements(session, 7)
 
@@ -716,13 +727,13 @@ def _staging_page(monkeypatch, session, build, direct=True):
     monkeypatch.setattr(staging, "_begin_build", AsyncMock(return_value=(1, SimpleNamespace(stream_slots={}))))
     monkeypatch.setattr(staging, "_prepare_snapshot_indexes", AsyncMock())
     selected = AsyncMock(return_value=direct)
-    monkeypatch.setattr(admission, "_has_admission_owner", selected)
+    monkeypatch.setattr(staging, "_can_update_build_cursor", selected)
     return selected
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("direct", [True, False])
-async def test_staging_admits_inside_its_existing_page_without_a_nested_transaction(monkeypatch, direct):
+async def test_staging_admits_inside_its_existing_page_with_a_direct_write_savepoint(monkeypatch, direct):
     session, build = _page(monkeypatch)
     selected = _staging_page(monkeypatch, session, build, direct)
     original = admission._admit_locked
@@ -746,6 +757,7 @@ async def test_staging_admits_inside_its_existing_page_without_a_nested_transact
     staged = await staging.stage_segmented_source(lambda: session, _request())
     assert staged == staging.SourceBuildResult(1, 4, "rejected", 4, 2)
     assert session.events.count("begin") == session.events.count("commit") == 3
+    assert session.events.count("savepoint") == session.events.count("release_savepoint") == int(direct)
     selected.assert_awaited_once_with(session)
     if direct:
         assert session.durable == ["apply", "advance"]
@@ -774,7 +786,7 @@ async def test_staging_timeout_uses_fresh_page(monkeypatch):
     result = await staging.stage_segmented_source(sessions, _request())
     assert result == staging.SourceBuildResult(1, 4, "rejected", 4, 2)
     assert sessions.call_count == 4
-    selected.assert_awaited_once_with(initial)
+    assert selected.await_args_list == [call(failed), call(retry)]
     assert failed.events[-2:] == ["rollback", "close"] and not failed.durable
     assert retry.events[-3:] == ["verify_before_commit", "commit", "close"]
     assert retry.executed[1][1]["physical_row_cap"] == 256
@@ -783,20 +795,97 @@ async def test_staging_timeout_uses_fresh_page(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("owns_both", [True, False])
-async def test_direct_selection_binds_both_native_signatures_and_exact_current_user(monkeypatch, owns_both):
-    session, _ = _page(monkeypatch, schema='synthetic"control')
-    executed = AsyncMock(return_value=SimpleNamespace(scalar_one=lambda: owns_both))
-    monkeypatch.setattr(session, "execute", executed)
-    assert await admission._has_admission_owner(session) is owns_both
-    statement, parameters = executed.await_args.args
-    assert '"synthetic""control".begin_custom_import_build(' in parameters["begin"]
-    assert "pg_catalog.timestamptz" in parameters["begin"]
-    assert parameters["admit"] == '"synthetic""control".admit_custom_import_build_page(pg_catalog.int8,pg_catalog.int8)'
-    assert "pg_catalog.count(*)=2" in str(statement) and "=CURRENT_USER" in str(statement)
-    assert "session_user" not in str(statement) and "pg_has_role" not in str(statement)
-    assert 'synthetic"control' not in str(statement)
-    assert all(isinstance(parameter.type, admission.String) for parameter in statement._bindparams.values())
+@pytest.mark.parametrize("step", [0, 3])
+async def test_admission_permission_denial_rolls_back_before_dispatching_same_cursor(monkeypatch, step):
+    rows = _rows()
+    rows[step] = _database_error("permission denied", sqlstate="42501")
+    session, build = _page(monkeypatch, rows)
+    original_path = session.search_path
+    selected = _staging_page(monkeypatch, session, build)
+
+    async def dispatch(page, name, arguments):
+        assert page is session and name == "admit_custom_import_build_page"
+        assert arguments == (("bigint", build.build_id), ("bigint", 0))
+        assert build.phase == "admission" and build.admission_after_occurrence_id == 0
+        assert session.events[-1] == "rollback_savepoint"
+        assert session.search_path == original_path
+        assert not session.pending and not session.durable and "expire" not in session.events
+        session.pending.append("dispatcher")
+        build.phase, build.admission_after_occurrence_id = "graph", 999
+
+    dispatched = AsyncMock(side_effect=dispatch)
+    monkeypatch.setattr(staging, "_call", dispatched)
+    result = await staging._admit_local_pages(lambda: session, _request(), build.build_id)
+    assert result.phase == "graph"
+    selected.assert_awaited_once_with(session)
+    dispatched.assert_awaited_once()
+    assert session.durable == ["dispatcher"]
+    assert session.events.count("savepoint") == session.events.count("rollback_savepoint") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("step", [0, 2, 3])
+async def test_staging_timeout_permission_denial_dispatches_original_cursor(monkeypatch, step):
+    failed_rows = _rows()
+    failed_rows[1] = _database_error()
+    failed, build = _page(monkeypatch, failed_rows)
+    retry_rows = _rows()
+    retry_rows[1]["rows_processed"] = retry_rows[3]["rows_processed"] = 256
+    retry_rows[step] = _database_error("permission denied", sqlstate="42501")
+    retry, terminal = _Session(retry_rows), _Session([])
+    selected = _staging_page(monkeypatch, failed, build)
+    complete = SimpleNamespace(**vars(build))
+    complete.phase = "graph"
+    staging._lock_page.side_effect = [build, SimpleNamespace(**vars(build)), complete]
+    sessions = Mock(side_effect=[failed, retry, terminal])
+    original_call = admission._call
+
+    async def dispatch(page, name, arguments):
+        if name == "resolve_custom_import_build_base_snapshot":
+            return await original_call(page, name, arguments)
+        assert page is retry and name == "admit_custom_import_build_page"
+        assert arguments == (("bigint", build.build_id), ("bigint", 0))
+        assert failed.events[-2:] == ["rollback", "close"] and not failed.durable
+        assert retry.events[-1] == "rollback_savepoint" and not retry.pending
+        assert retry.search_path == '"synthetic_untrusted", pg_catalog'
+        assert all(parameters["physical_row_cap"] == 256 for _, parameters in retry.executed)
+        retry.pending.append("dispatcher")
+
+    monkeypatch.setattr(admission, "_call", dispatch)
+    admitted = await staging._admit_local_pages(sessions, _request(), build.build_id)
+    assert admitted.phase == "graph" and sessions.call_count == 3
+    assert selected.await_args_list == [call(failed), call(retry)]
+    assert retry.durable == ["dispatcher"]
+    assert retry.events[-3:] == ["verify_before_commit", "commit", "close"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("routes", [(True, False), (False, True)])
+async def test_each_admission_page_selects_route_without_caching(monkeypatch, routes):
+    session, build = _page(monkeypatch)
+    selected = _staging_page(monkeypatch, session, build)
+    selected.side_effect = routes
+
+    async def advance(page, locked_build, cursor):
+        assert page is session and locked_build is build
+        assert cursor == build.admission_after_occurrence_id
+        build.admission_after_occurrence_id += 1
+        if build.admission_after_occurrence_id == 2:
+            build.phase = "graph"
+
+    admitted = AsyncMock(side_effect=advance)
+    monkeypatch.setattr(admission, "_admit_locked", admitted)
+
+    async def dispatch(page, name, arguments):
+        assert name == "admit_custom_import_build_page"
+        await advance(page, build, arguments[1][1])
+
+    dispatched = AsyncMock(side_effect=dispatch)
+    monkeypatch.setattr(staging, "_call", dispatched)
+    result = await staging._admit_local_pages(lambda: session, _request(), build.build_id)
+    assert result.phase == "graph" and selected.await_count == 2
+    admitted.assert_awaited_once()
+    dispatched.assert_awaited_once()
 
 
 def test_fixed_package_sql_does_not_transport_caller_statements():

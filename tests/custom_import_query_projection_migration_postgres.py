@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Native metadata, custody, typed cells and bounded context qualification."""
+"""Native metadata, table layout, typed cells and bounded context qualification."""
 
 import hashlib
 from decimal import Decimal
@@ -11,7 +11,7 @@ from alembic.operations import Operations
 from sqlalchemy import insert, select, text
 from sqlalchemy.exc import DBAPIError
 
-from process.custom_import.query_projection_binding import QueryProjectionUnavailable, projection_table_identity
+from process.custom_import.query_projection_binding import QueryProjectionUnavailable, validate_projection_table
 from process.custom_import.query_projection_pages import cell_insert_statement, context_key_statement
 from process.custom_import.query_projection_sources import field_slots
 from process.custom_import.query_projection_storage import (
@@ -82,19 +82,12 @@ async def test_projection_migration_lock_failure_rolls_back_and_preserves_strict
             assert await connection.scalar(text("SHOW lock_timeout")) == original_limit
 
 
-async def _check_custody(connection, control_schema, definition):
-    oid, owner, columns_sha = await projection_table_identity(
-        connection, _FAMILY, "custom_import_derived_root", definition
-    )
-    assert oid > 0 and owner > 0
-    native_sha = await connection.scalar(
-        text(f'SELECT "{control_schema}".custom_import_snapshot_columns_sha256(CAST(:oid AS bigint))'), {"oid": oid}
-    )
-    assert columns_sha == native_sha
+async def _check_layout(connection, definition):
+    await validate_projection_table(connection, _FAMILY, "custom_import_derived_root", definition)
     async with connection.begin_nested() as savepoint:
         await connection.execute(text(f"ALTER TABLE {_SCHEMA}.custom_import_derived_root ADD COLUMN unexpected text"))
-        with pytest.raises(QueryProjectionUnavailable, match="custody|shape"):
-            await projection_table_identity(connection, _FAMILY, "custom_import_derived_root", definition)
+        with pytest.raises(QueryProjectionUnavailable, match="shape"):
+            await validate_projection_table(connection, _FAMILY, "custom_import_derived_root", definition)
         await savepoint.rollback()
 
 
@@ -206,7 +199,7 @@ async def _check_seal_marker_constraint(connection, control_schema):
 
 
 @pytest.mark.asyncio
-async def test_projection_migration_custody_numeric_boundaries_and_native_context_pages():
+async def test_projection_migration_layout_numeric_boundaries_and_native_context_pages():
     definition = _definition()
     async with isolated_publication_case() as case:
         async with case.engine.begin() as connection:
@@ -230,7 +223,7 @@ async def test_projection_migration_custody_numeric_boundaries_and_native_contex
             try:
                 for statement in query_projection_load_statements(_FAMILY, definition):
                     await connection.execute(text(statement))
-                await _check_custody(connection, case.schema_name, definition)
+                await _check_layout(connection, definition)
                 await _check_bigint_contexts(connection, definition)
                 for child in (False, True):
                     await _check_context_pages(connection, definition, child=child)

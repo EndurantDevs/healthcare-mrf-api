@@ -43,7 +43,16 @@ def _config(connection=None):
 
 def test_directory_pricing_join_preserves_exact_parents_without_database_work():
     scripts = ScriptDirectory.from_config(_config())
-    assert scripts.get_heads() == ["20261115010000_ms_drg_companion_tables"]
+    assert scripts.get_heads() == ["20261114020000_custom_import_snapshot_metadata"]
+    assert scripts.get_revision("20261114020000_custom_import_snapshot_metadata").down_revision == (
+        "20261114010000_custom_import_snapshot_names"
+    )
+    assert scripts.get_revision("20261114010000_custom_import_snapshot_names").down_revision == (
+        "20261115010000_ms_drg_companion_tables"
+    )
+    assert scripts.get_revision("20261115010000_ms_drg_companion_tables").down_revision == (
+        "20261113010000_address_canonical_space_normalization"
+    )
     assert scripts.get_revision("20261113010000_address_canonical_space_normalization").down_revision == (
         "20261111010000_code_sets_publication_idempotency"
     )

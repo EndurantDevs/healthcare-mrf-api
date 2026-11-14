@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Owner-schema validation accepts real model metadata and leaves authority to PostgreSQL."""
+"""Maintenance resolves quoted schemas and preserves transaction and census bounds."""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import dialect
 from sqlalchemy.sql import quoted_name
 
 from db.models.custom_import_storage import CustomImportSnapshotFamily
+from process.custom_import import retirement
 from process.custom_import.retirement import SnapshotRetirementRefused, _owner_schema
 
 
@@ -38,7 +39,12 @@ async def test_owner_schema_accepts_actual_model_default_without_translation():
     assert actual_schema is schema
     assert quoted == dialect().identifier_preparer.quote_schema(schema)
     session.scalar.assert_awaited_once()
-    assert session.scalar.await_args.args[1] == {"registry": f"{quoted}.custom_import_snapshot_family"}
+    statement = str(session.scalar.await_args.args[0])
+    assert all(
+        name in statement
+        for name in ("transaction_isolation", "transaction_read_only", "statement_timeout", "lock_timeout")
+    )
+    assert all(name not in statement for name in ("current_user", "session_user", "pg_roles", "rolsuper", "registry"))
 
 
 async def test_owner_schema_preserves_translated_identifier_quoting():
@@ -49,7 +55,7 @@ async def test_owner_schema_preserves_translated_identifier_quoting():
 
     assert actual_schema is schema
     assert quoted == '"owner_schema"'
-    assert session.scalar.await_args.args[1] == {"registry": '"owner_schema".custom_import_snapshot_family'}
+    assert len(session.scalar.await_args.args) == 1
 
 
 @pytest.mark.parametrize("schema", ("a" * 63, quoted_name("é" * 31 + "a", quote=None)))
@@ -66,7 +72,7 @@ class _StringLike:
 
 
 @pytest.mark.parametrize("schema", (None, True, 1, _StringLike(), "", "a" * 64, "é" * 32))
-async def test_owner_schema_rejects_invalid_translations_before_authority_query(schema):
+async def test_owner_schema_rejects_invalid_translations_before_transaction_query(schema):
     session = _owner_session(options={"schema_translate_map": {CustomImportSnapshotFamily.__table__.schema: schema}})
 
     with pytest.raises(SnapshotRetirementRefused, match="schema is invalid"):
@@ -76,23 +82,13 @@ async def test_owner_schema_rejects_invalid_translations_before_authority_query(
 
 
 @pytest.mark.parametrize("allowed", (False, None, 1))
-async def test_actual_model_schema_still_requires_direct_bounded_writable_login(allowed):
+async def test_actual_model_schema_requires_writable_bounded_read_committed_transaction(allowed):
     session = _owner_session(allowed=allowed)
 
-    with pytest.raises(SnapshotRetirementRefused, match="direct writable login transaction and finite bounds"):
+    with pytest.raises(SnapshotRetirementRefused, match="writable bounded read-committed transaction"):
         await _owner_schema(session)
 
     session.scalar.assert_awaited_once()
-
-
-async def test_owner_schema_leaves_authority_to_postgresql_ownership():
-    session = _owner_session()
-
-    await _owner_schema(session)
-
-    statement = str(session.scalar.await_args.args[0])
-    assert "rolsuper" not in statement and "pg_roles" not in statement
-    assert "current_user = session_user" in statement
 
 
 @pytest.mark.parametrize("state", ("new", "dirty", "deleted", "no_transaction"))
@@ -108,3 +104,38 @@ async def test_owner_schema_requires_clean_caller_transaction_before_connection(
 
     session.connection.assert_not_awaited()
     session.scalar.assert_not_awaited()
+
+
+@pytest.mark.parametrize("change", (None, "logical_family", "optional_relation"))
+async def test_final_reference_census_uses_logical_family_and_qualified_relation_names(monkeypatch, change):
+    family_values_by_name = {name: 1 for name in retirement._IDENTITY_NAMES}
+    family_values_by_name.update(producing_token_sha256=b"t" * 32, created_at=None, frozen_at=None)
+    family = SimpleNamespace(**family_values_by_name)
+    observed_values_by_name = dict(family_values_by_name)
+    if change == "logical_family":
+        observed_values_by_name["generation_id"] = 2
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=(None, None, SimpleNamespace(all=lambda: [tuple(observed_values_by_name.values())]))
+        ),
+    )
+    optional = ("source_bulk_landing",)
+    names = (*optional, "legacy_copy_origin") if change == "optional_relation" else optional
+    monkeypatch.setattr(retirement, "_optional_relation_names", AsyncMock(return_value=names))
+    for name in ("assert_closed_continuations", "_close_mutable_references", "_revision_references"):
+        monkeypatch.setattr(retirement, name, AsyncMock())
+    dropped = AsyncMock(return_value="retired")
+    monkeypatch.setattr(retirement, "_retire_verified_family", dropped)
+
+    operation = retirement._commit_reference_closure(
+        session, '"control"', family, [family], {1: optional}, "synthetic", "superseded"
+    )
+    if change:
+        with pytest.raises(SnapshotRetirementRefused, match="reference census changed"):
+            await operation
+        dropped.assert_not_awaited()
+        retirement._revision_references.assert_not_awaited()
+    else:
+        assert await operation == "retired"
+        retirement._revision_references.assert_awaited_once_with(session, family, [])
+        dropped.assert_awaited_once_with(session, '"control"', family, "synthetic", "superseded")

@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Ordinary SOURCE finalization for the existing entry-point owners.
+"""Ordinary SOURCE finalization in the authorized candidate transaction.
 
 Staging uses the same _page_session transaction as authorization and native
 COPY; it owns rollback and the final fresh lease check. Other principals retain
@@ -19,7 +19,7 @@ from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 
 from db.models.custom_import import CustomImportBuildAttempt, CustomImportBuildStream, CustomImportSourceStream
-from process.custom_import.build_source import _SOURCE_COPY_COLUMNS, _call, _prepare_statement
+from process.custom_import.build_source import _call, _prepare_statement
 from process.custom_import.storage_layout import snapshot_schema
 
 _MODEL_BY_PREFIX = {"b": CustomImportBuildAttempt, "s": CustomImportBuildStream, "stream": CustomImportSourceStream}
@@ -53,7 +53,7 @@ def _parameter_type(name):
     prefix, _, column = name.partition("_")
     if prefix in _MODEL_BY_PREFIX:
         return _MODEL_BY_PREFIX[prefix].__table__.c[column].type
-    if name in _RELATIONS_BY_NAME or name in ("kind", "label", "a_opened_by", "a_transaction_id"):
+    if name in _RELATIONS_BY_NAME or name in ("kind", "label", "a_transaction_id"):
         return String()
     if name in ("a_token_hash", "key_contract"):
         return LargeBinary()
@@ -72,7 +72,7 @@ def _load_sql():
 
     fragments = Path(__file__).with_name("source_finalize.sql").read_text().split("-- query: ")
     query_by_name = dict(fragment.split("\n", 1) for fragment in fragments[1:])
-    if len(query_by_name) != 60 or len(fragments) != 61:
+    if len(query_by_name) != 59 or len(fragments) != 60:
         raise SourceFinalizationError("source finalization SQL resource is malformed")
     return query_by_name
 
@@ -97,7 +97,7 @@ async def _statements(session, family_id):
     relation_by_name = {
         name: f"{namespace_by_name[namespace]}.{table}" for name, (namespace, table) in _RELATIONS_BY_NAME.items()
     }
-    return statement_by_name, relation_by_name, connection.dialect.identifier_preparer
+    return statement_by_name, relation_by_name
 
 
 async def _execute_stage(session, statements, parameter_by_name, name):
@@ -174,21 +174,20 @@ async def _promote(session, statements, parameter_by_name):
     await _execute_stage(session, statements, parameter_by_name, "completion")
 
 
-async def _complete(session, statements, parameter_by_name, preparer):
+async def _complete(session, statements, parameter_by_name):
     await _execute_stage(session, statements, parameter_by_name, "homes")
     await _execute_stage(session, statements, parameter_by_name, "delete_landing")
     if (await _execute_stage(session, statements, parameter_by_name, "landing_empty"))["empty"]:
         await _execute_stage(session, statements, parameter_by_name, "truncate_landing")
     await _execute_stage(session, statements, parameter_by_name, "close_authorization")
     await _execute_stage(session, statements, parameter_by_name, "fresh_lease")
-    closure = await _execute_stage(session, statements, parameter_by_name, "copy_closure")
-    if closure["close_copy"]:
-        columns = ",".join(preparer.quote(column) for column in _SOURCE_COPY_COLUMNS)
-        relation = parameter_by_name["source_bulk_landing_relation"]
-        role = preparer.quote(closure["role_name"])
-        await _prepare_statement(session)
-        await session.execute(text(f"REVOKE INSERT ({columns}) ON TABLE {relation} FROM {role}"))
-    await _call(session, "lock_custom_import_build", (("bigint", parameter_by_name["b_build_id"]),))
+    closed = await _call(
+        session,
+        "source_set_finalize",
+        (("uuid", parameter_by_name["p_batch"]), ("integer[]", parameter_by_name["p_verified_parts"])),
+    )
+    if closed.scalar_one() != parameter_by_name["n"]:
+        raise SourceFinalizationError("source completed batch count differs")
 
 
 async def finalize_source_batch(session, batch_id: UUID, verified_parts: list[int]) -> int:
@@ -210,12 +209,12 @@ async def finalize_source_batch(session, batch_id: UUID, verified_parts: list[in
     # Positive native registry identity, not a caller-selected namespace.
     snapshot_schema(family_id)
     await _call(session, "verify_custom_import_snapshot_writers", (("bigint", family_id),))
-    statements, relation_by_name, preparer = await _statements(session, family_id)
+    statements, relation_by_name = await _statements(session, family_id)
     parameter_by_name = dict(relation_by_name, p_batch=batch_id, p_verified_parts=verified_parts, family_id=family_id)
     await _execute_stage(session, statements, parameter_by_name, "scope")
     await _call(session, "resolve_custom_import_build_base_snapshot", (("bigint", parameter_by_name["b_build_id"]),))
     await _validate(session, statements, parameter_by_name)
     await _dictionary(session, statements, parameter_by_name)
     await _promote(session, statements, parameter_by_name)
-    await _complete(session, statements, parameter_by_name, preparer)
+    await _complete(session, statements, parameter_by_name)
     return parameter_by_name["n"]

@@ -47,6 +47,18 @@ def _install_snapshot_registry(connection, schema_name):
     migration._schema = lambda: schema_name
     migration.op = Operations(MigrationContext.configure(connection))
     migration.upgrade()
+    current = _migration(
+        path.with_name("20261114010000_custom_import_snapshot_names.py"), "snapshot_names_native_migration"
+    )
+    current.op = migration.op
+    current._refresh_storage(schema_name)
+    current._check_remaining_references(schema_name)
+    cleanup = _migration(
+        path.with_name("20261114020000_custom_import_snapshot_metadata.py"), "snapshot_metadata_native_migration"
+    )
+    cleanup.op = migration.op
+    cleanup._drop_storage_metadata(schema_name)
+    cleanup._enable_family_creation(schema_name)
 
 
 @asynccontextmanager
@@ -263,8 +275,8 @@ async def _sealed_snapshot(case):
     return graph, attempt, family_id
 
 
-async def test_native_frozen_read_binding_pins_leaf_oids_until_request_completion():
-    """The protected resolver holds all fifteen exact leaf OIDs against DDL."""
+async def test_native_frozen_read_binding_locks_named_leaves_until_request_completion():
+    """Native relation locks keep all fifteen named tables stable during a read."""
 
     async with _snapshot_case() as (case, role):
         graph, attempt, family_id = await _sealed_snapshot(case)
@@ -280,7 +292,7 @@ async def test_native_frozen_read_binding_pins_leaf_oids_until_request_completio
                 (
                     await session.execute(
                         text(
-                            f'SELECT table_oid FROM "{case.schema_name}".custom_import_snapshot_relation WHERE family_id=:family'
+                            f'SELECT table_oid FROM "{case.schema_name}".resolve_custom_import_snapshot_relations(:family)'
                         ),
                         dict(family=family_id),
                     )
@@ -327,8 +339,7 @@ async def test_native_write_binding_requires_registration_and_pins_open_leaves()
                 (
                     await writer.execute(
                         text(
-                            f'SELECT table_oid FROM "{case.schema_name}".custom_import_snapshot_relation '
-                            "WHERE family_id=:family"
+                            f'SELECT table_oid FROM "{case.schema_name}".resolve_custom_import_snapshot_relations(:family)'
                         ),
                         dict(family=family_id),
                     )
@@ -372,7 +383,7 @@ async def test_native_freeze_waits_for_writer_and_rejects_later_writes():
                 await _call(session, case, attempt, "lock_custom_import_writable_snapshot")
 
 
-async def test_native_read_binding_denies_unfrozen_producer_and_layout_drift():
+async def test_native_read_binding_denies_unfrozen_producer_and_missing_table():
     """Corrupt fixture states fail closed and their transaction rolls back."""
 
     async with _snapshot_case() as (case, _role):
@@ -390,7 +401,7 @@ async def test_native_read_binding_denies_unfrozen_producer_and_layout_drift():
         with pytest.raises(DBAPIError, match="custom_import_snapshot_relation_mismatch"):
             async with case.sessions() as session, session.begin():
                 await session.execute(
-                    text(f'ALTER TABLE "{namespace}".custom_import_root_record ADD COLUMN synthetic_read_drift integer')
+                    text(f'ALTER TABLE "{namespace}".custom_import_root_record RENAME TO missing_root_record')
                 )
                 await _read_binding(session, case, graph, attempt.generation_id)
         async with case.sessions() as session, session.begin():
@@ -433,7 +444,7 @@ async def test_native_snapshot_wrong_producer_and_failed_creation_leave_no_parti
             assert (await session.get(CustomImportSnapshotFamily, family_id)).generation_id is None
 
 
-async def test_native_snapshot_exact_oids_shape_and_read_only_grants():
+async def test_native_snapshot_qualified_names_and_read_only_grants():
     async with _snapshot_case() as (case, role):
         _graph, attempt = await _attempt(case)
         family_id = await _create_snapshot(case, attempt)
@@ -472,7 +483,7 @@ async def test_native_snapshot_exact_oids_shape_and_read_only_grants():
         with pytest.raises(DBAPIError, match="custom_import_snapshot_relation_mismatch"):
             async with case.sessions() as session, session.begin():
                 await session.execute(
-                    text(f'ALTER TABLE "{namespace}".custom_import_root_record ADD COLUMN synthetic_drift integer')
+                    text(f'ALTER TABLE "{namespace}".custom_import_root_record RENAME TO missing_root_record')
                 )
                 await session.execute(
                     text(f'SELECT * FROM "{case.schema_name}".resolve_custom_import_snapshot_relations(:family)'),
@@ -481,8 +492,40 @@ async def test_native_snapshot_exact_oids_shape_and_read_only_grants():
         assert await _create_snapshot(case, attempt) == family_id
 
 
+async def test_native_sealed_snapshot_accepts_copied_table_at_the_same_qualified_name():
+    """A table copy does not require rewriting immutable snapshot metadata."""
+
+    async with _snapshot_case() as (case, _role):
+        graph, attempt, family_id = await _sealed_snapshot(case)
+        namespace = snapshot_schema(family_id)
+        async with case.sessions() as session, session.begin():
+            before = await session.scalar(
+                text("SELECT to_regclass(:name)::oid"), {"name": f"{namespace}.custom_import_root_record"}
+            )
+            await session.execute(
+                text(f'ALTER TABLE "{namespace}".custom_import_root_record RENAME TO retained_root_record')
+            )
+            await session.execute(
+                text(
+                    f'CREATE TABLE "{namespace}".custom_import_root_record '
+                    f'(LIKE "{namespace}".retained_root_record INCLUDING ALL)'
+                )
+            )
+            await session.execute(
+                text(
+                    f'INSERT INTO "{namespace}".custom_import_root_record '
+                    f'SELECT * FROM "{namespace}".retained_root_record'
+                )
+            )
+            after = await session.scalar(
+                text("SELECT to_regclass(:name)::oid"), {"name": f"{namespace}.custom_import_root_record"}
+            )
+            assert before != after
+            assert await _read_binding(session, case, graph, attempt.generation_id) == family_id
+
+
 async def _fixture_landing(case, attempt, family_id, role):
-    """Register a minimal owner fixture, not proof of the SOURCE factory/codec."""
+    """Create minimal named landing storage for the native freeze boundary."""
 
     namespace = snapshot_schema(family_id)
     async with case.sessions() as session, session.begin():
@@ -491,15 +534,6 @@ async def _fixture_landing(case, attempt, family_id, role):
                 f'CREATE TABLE "{namespace}".source_bulk_landing '
                 "(landing_ordinal bigint PRIMARY KEY,payload text NOT NULL)"
             )
-        )
-        await session.execute(
-            text(
-                f'UPDATE "{case.schema_name}".custom_import_snapshot_family '
-                f"SET landing_table_oid=c.oid::bigint,landing_table_owner=c.relowner::bigint, "
-                f'landing_columns_sha256="{case.schema_name}".custom_import_snapshot_columns_sha256(c.oid::bigint) '
-                "FROM pg_class c WHERE family_id=:family AND c.oid=to_regclass(:table)"
-            ),
-            dict(family=family_id, table=f"{namespace}.source_bulk_landing"),
         )
         await session.execute(
             text(f'GRANT INSERT(landing_ordinal,payload) ON "{namespace}".source_bulk_landing TO "{role}"')

@@ -12,34 +12,30 @@ from db.models.custom_import_query_projection import CustomImportQueryProjection
 from db.models.custom_import_storage import CustomImportSnapshotFamily, CustomImportSnapshotRelation
 from process.custom_import.build_source import _flush_page, _prepare_statement
 from process.custom_import.continuation_runtime import producer_token_sha256
-from process.custom_import.query_projection_binding import lock_projection_tables, projection_table_identity
+from process.custom_import.query_projection_binding import lock_projection_tables, validate_projection_table
 from process.custom_import.query_projection_sources import capability_sha256
 from process.custom_import.query_projection_storage import QUERY_PROJECTION_CONTRACT, query_projection_load_statements
 from process.custom_import.runner_types import CandidateRunnerError
 from process.custom_import.storage_layout import snapshot_schema
 
 _PREPARER = postgresql.dialect().identifier_preparer
-_OWNER = text(
-    """
-    SELECT r.oid::bigint AS current_owner,n.nspowner::bigint AS schema_owner,
-        c.relowner::bigint AS table_owner,c.oid::bigint AS table_oid,
-        c.relkind::text AS relkind,c.relpersistence::text AS relpersistence
-    FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid
-    JOIN pg_catalog.pg_roles r ON r.rolname=current_user
-    WHERE n.nspname=:schema_name AND c.relname='custom_import_root_record'
-    """
+_ROOT_LAYOUT = text(
+    "SELECT c.relkind='r' AND c.relpersistence='p' "
+    "FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
+    "WHERE n.nspname=:schema_name AND c.relname='custom_import_root_record'"
 )
 _RELATIONS = text(
-    "SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
+    "SELECT c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
     "WHERE n.nspname=:schema_name AND c.relname IN ('custom_import_derived_root','custom_import_derived_child')"
 )
 _ACL = text(
     """
     SELECT DISTINCT acl.grantee::bigint AS grantee,r.rolname::text AS role_name
-    FROM pg_catalog.pg_class c,
+    FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace,
         LATERAL pg_catalog.aclexplode(coalesce(c.relacl,pg_catalog.acldefault('r',c.relowner))) acl
     LEFT JOIN pg_catalog.pg_roles r ON r.oid=acl.grantee
-    WHERE c.oid=CAST(:table_oid AS oid) AND acl.grantee<>c.relowner
+    WHERE n.nspname=:schema_name AND c.relname=:table_name
+        AND (:select_only OR acl.grantee<>c.relowner)
         AND (NOT :select_only OR acl.privilege_type='SELECT')
     """
 )
@@ -124,25 +120,6 @@ async def projection_parent(session, definition, expected_by_name, token, *, pre
     return parent, root_relation
 
 
-async def _owner(session, parent, root_relation, *, prepare=None):
-    row = (
-        (await _execute(session, _OWNER, {"schema_name": snapshot_schema(parent.family_id)}, prepare=prepare))
-        .mappings()
-        .one_or_none()
-    )
-    if (
-        row is None
-        or row["current_owner"] != row["schema_owner"]
-        or row["current_owner"] != row["table_owner"]
-        or row["table_oid"] != root_relation.table_oid
-        or row["table_owner"] != root_relation.table_owner
-        or row["relkind"] != "r"
-        or row["relpersistence"] != "p"
-    ):
-        raise CandidateRunnerError("query projection requires the existing snapshot owner")
-    return row["current_owner"]
-
-
 def _grantee(row):
     if row["grantee"] == 0:
         return "PUBLIC"
@@ -151,10 +128,17 @@ def _grantee(row):
     return _PREPARER.quote_identifier(row["role_name"])
 
 
-async def _close_and_copy_acl(session, parent, table_name, table_oid, readers, *, prepare=None):
+async def _close_and_copy_acl(session, parent, table_name, readers, *, prepare=None):
     target = f"{_PREPARER.quote_identifier(snapshot_schema(parent.family_id))}.{_PREPARER.quote_identifier(table_name)}"
     grants = (
-        (await _execute(session, _ACL, {"table_oid": table_oid, "select_only": False}, prepare=prepare))
+        (
+            await _execute(
+                session,
+                _ACL,
+                {"schema_name": snapshot_schema(parent.family_id), "table_name": table_name, "select_only": False},
+                prepare=prepare,
+            )
+        )
         .mappings()
         .all()
     )
@@ -168,46 +152,52 @@ async def _close_and_copy_acl(session, parent, table_name, table_oid, readers, *
 
 
 async def _create_cells(session, parent, root_relation, definition, *, prepare=None):
-    """Close inherited privileges before retaining the two fresh table identities."""
+    """Apply the existing reader permissions to the two fresh qualified tables."""
 
     existing = await _execute(session, _RELATIONS, {"schema_name": snapshot_schema(parent.family_id)}, prepare=prepare)
     if existing.first() is not None:
         raise CandidateRunnerError("query projection refuses unregistered existing cell relations")
     readers = (
-        (await _execute(session, _ACL, {"table_oid": root_relation.table_oid, "select_only": True}, prepare=prepare))
+        (
+            await _execute(
+                session,
+                _ACL,
+                {
+                    "schema_name": snapshot_schema(parent.family_id),
+                    "table_name": "custom_import_root_record",
+                    "select_only": True,
+                },
+                prepare=prepare,
+            )
+        )
         .mappings()
         .all()
     )
     for statement in query_projection_load_statements(parent.family_id, definition):
         await _execute(session, text(statement), prepare=prepare)
-    custody_by_column = {}
     for scope in ("root", "child"):
         name = f"custom_import_derived_{scope}"
         await (prepare or _prepare_statement)(session)
         if prepare is None:
-            oid, owner, signature = await projection_table_identity(session, parent.family_id, name, definition)
+            await validate_projection_table(session, parent.family_id, name, definition)
         else:
-            oid, owner, signature = await projection_table_identity(
-                session, parent.family_id, name, definition, prepare=prepare
-            )
-        await _close_and_copy_acl(session, parent, name, oid, readers, prepare=prepare)
-        custody_by_column.update(
-            {f"{scope}_table_oid": oid, f"{scope}_table_owner": owner, f"{scope}_columns_sha256": signature}
-        )
-    return custody_by_column
+            await validate_projection_table(session, parent.family_id, name, definition, prepare=prepare)
+        await _close_and_copy_acl(session, parent, name, readers, prepare=prepare)
 
 
 async def initialize_projection(session, request, build):
-    """Create only absent cells, or replay exact custody without adopting caller tables."""
+    """Create only absent cells, or replay the existing logical projection binding."""
 
     parent, root_relation = await _parent(session, request, build)
     return await initialize_projection_parent(session, request.definition, parent, root_relation)
 
 
 async def initialize_projection_parent(session, definition, parent, root_relation, *, prepare=None, flush=None):
-    """Share native owner, ACL and manifest setup after exact parent validation."""
+    """Apply native permissions and initialize the manifest after logical parent validation."""
 
-    await _owner(session, parent, root_relation, prepare=prepare)
+    layout = await _execute(session, _ROOT_LAYOUT, {"schema_name": snapshot_schema(parent.family_id)}, prepare=prepare)
+    if layout.scalar_one_or_none() is not True:
+        raise CandidateRunnerError("query projection root relation model shape differs")
     expected_definition = bytes.fromhex(definition.digest)
     expected_capability = capability_sha256(definition)
     manifest = (
@@ -230,7 +220,7 @@ async def initialize_projection_parent(session, definition, parent, root_relatio
         else:
             await lock_projection_tables(session, manifest, definition, require_complete=False, prepare=prepare)
         return manifest
-    custody_by_column = await _create_cells(session, parent, root_relation, definition, prepare=prepare)
+    await _create_cells(session, parent, root_relation, definition, prepare=prepare)
     manifest = CustomImportQueryProjection(
         **{
             name: getattr(parent, name)
@@ -253,7 +243,6 @@ async def initialize_projection_parent(session, definition, parent, root_relatio
         root_count=0,
         child_count=0,
         index_count=0,
-        **custody_by_column,
     )
     session.add(manifest)
     await (flush or _flush_page)(session)

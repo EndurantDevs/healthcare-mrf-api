@@ -57,7 +57,6 @@ def capture_case(request, coordinator, monkeypatch):
         monkeypatch.setattr(https_candidate, name, operation)
         forbidden_operations.append(operation)
     for name in (
-        "require_raw_capture_authority",
         "register_replayable_parquet_bundle",
         "load_replayable_parquet_bundle",
         "bind_execution_capture_bundle",
@@ -234,7 +233,6 @@ async def test_none_handoff_keeps_legacy_registration_and_readback(coordinator):
         coordinator.session_factory, coordinator.request, capture_handoff=None
     )
     assert result.status == "no_change"
-    coordinator.mocks_by_name["require_raw_capture_authority"].assert_not_awaited()
     coordinator.mocks_by_name["register_replayable_parquet_bundle"].assert_awaited_once()
     coordinator.mocks_by_name["bind_execution_capture_bundle"].assert_awaited_once()
     coordinator.mocks_by_name["load_replayable_parquet_bundle"].assert_awaited_once()

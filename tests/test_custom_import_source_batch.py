@@ -263,32 +263,6 @@ async def test_retained_identity_mismatch_fails_before_read_or_copy(monkeypatch,
         await step._load_request(session, 4, 11, 1, request.lease_token, _PERMIT)
 
 
-@pytest.mark.parametrize("is_owner", [True, False])
-async def test_owner_gate_uses_exact_signatures_and_quoted_mapped_schema(monkeypatch, is_owner):
-    monkeypatch.setattr(staging, "_prepare_statement", AsyncMock())
-    connection = SimpleNamespace(
-        dialect=dialect(),
-        sync_connection=SimpleNamespace(
-            get_execution_options=lambda: {
-                "schema_translate_map": {step.CustomImportBuildAttempt.__table__.schema: 'synthetic"control'}
-            }
-        ),
-    )
-    session = SimpleNamespace(
-        connection=AsyncMock(return_value=connection),
-        execute=AsyncMock(return_value=SimpleNamespace(scalar_one=lambda: is_owner)),
-    )
-    if is_owner:
-        await step._require_owner(session)
-    else:
-        with pytest.raises(RuntimeError, match="entry-point owners"):
-            await step._require_owner(session)
-    query, parameters = session.execute.await_args.args
-    assert "=CURRENT_USER" in str(query) and "pg_catalog.count(*)=2" in str(query)
-    assert parameters["authorize"].startswith('"synthetic""control".source_bulk_authorize(')
-    assert parameters["finalize"].endswith("source_set_finalize(pg_catalog.uuid,pg_catalog.int4[])")
-
-
 @pytest.mark.parametrize(
     "attribute,invalid",
     [
@@ -300,31 +274,25 @@ async def test_owner_gate_uses_exact_signatures_and_quoted_mapped_schema(monkeyp
         ("schema_revision_id", 99),
     ],
 )
-async def test_locked_permit_purpose_and_scope_mismatch_never_reaches_owner(monkeypatch, attribute, invalid):
-    owner = AsyncMock()
-    monkeypatch.setattr(step, "_require_owner", owner)
+async def test_locked_permit_purpose_and_scope_mismatch_never_queries(monkeypatch, attribute, invalid):
     session = SimpleNamespace(execute=AsyncMock())
     with pytest.raises(RuntimeError, match="authority_mismatch"):
         await step._verify_source_permit(
             session, _request(authorization_expires_at=_EXPIRY), _permit(**{attribute: invalid})
         )
     session.execute.assert_not_awaited()
-    owner.assert_not_awaited()
 
 
 @pytest.mark.parametrize("matched", [4, None])
 async def test_locked_permit_query_binds_retained_idempotency_and_exact_binding(monkeypatch, matched):
     monkeypatch.setattr(staging, "_prepare_statement", AsyncMock())
-    owner = AsyncMock()
-    monkeypatch.setattr(step, "_require_owner", owner)
     session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: matched)))
     if matched is None:
         with pytest.raises(RuntimeError, match="authority_mismatch"):
             await step._verify_source_permit(session, _request(authorization_expires_at=_EXPIRY), _PERMIT)
-        owner.assert_not_awaited()
     else:
         await step._verify_source_permit(session, _request(authorization_expires_at=_EXPIRY), _PERMIT)
-        owner.assert_awaited_once_with(session)
+    session.execute.assert_awaited_once()
     statement = session.execute.await_args.args[0]
     compiled = statement.compile(dialect=dialect())
     assert "idempotency_key" in str(compiled) and "binding_sha256" in str(compiled)
@@ -334,13 +302,10 @@ async def test_locked_permit_query_binds_retained_idempotency_and_exact_binding(
 
 @pytest.mark.parametrize("expiry", [None, _EXPIRY - dt.timedelta(seconds=1)])
 async def test_permit_expiry_must_be_the_shared_request_budget(monkeypatch, expiry):
-    owner = AsyncMock()
-    monkeypatch.setattr(step, "_require_owner", owner)
     session = SimpleNamespace(execute=AsyncMock())
     with pytest.raises(RuntimeError, match="authority_mismatch"):
         await step._verify_source_permit(session, _request(authorization_expires_at=expiry), _PERMIT)
     session.execute.assert_not_awaited()
-    owner.assert_not_awaited()
 
 
 @pytest.mark.parametrize("operation", ["initial", "renew"])

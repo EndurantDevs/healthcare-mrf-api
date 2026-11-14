@@ -22,6 +22,8 @@ def test_catalog_membership_and_inventory_extend_the_existing_target_head():
         "20261111010000_code_sets_publication_idempotency",
         "20261113010000_address_canonical_space_normalization",
         "20261115010000_ms_drg_companion_tables",
+        "20261114010000_custom_import_snapshot_names",
+        "20261114020000_custom_import_snapshot_metadata",
     )
     assert scripts.get_heads() == [chain[-1]]
     for predecessor, successor in zip(chain, chain[1:]):
