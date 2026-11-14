@@ -1146,6 +1146,45 @@ async def fetch_source_candidate(directory, source_record, candidate_url, *, tim
     return directory._source_fetch_result_with_elapsed(fetch_result, total_elapsed_ms), False, retry_count
 
 
+def baked_seed_rows(directory, *, source_query=None):
+    """Share the static supplemental registry without resolving remote catalogs."""
+    seed_rows = []
+    metrics_by_catalog = {}
+    for name, base, seed_loader in (
+        ("anthem", directory.anthem.API_BASE, directory.anthem.seed_rows),
+        (
+            "health_partners_plans",
+            directory.HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE,
+            directory._health_partners_plans_seed_rows,
+        ),
+        ("pacificsource", directory.pacificsource.API_BASE, directory.pacificsource.seed_rows),
+        (
+            "capital_blue_cross_products",
+            "capital-blue-cross-public-directory",
+            directory._capital_blue_cross_product_seed_rows,
+        ),
+        (
+            "aetna_provider_directorydata",
+            directory.AETNA_PROVIDER_DIRECTORY_DATA_BASE,
+            directory._aetna_provider_directory_data_seed_rows,
+        ),
+        ("christus_health_plan", directory.christus.API_BASE, directory.christus.christus_seed_rows),
+        ("mvp_health_care", directory.mvp.API_BASE, directory.mvp.seed_rows),
+        ("configured_sources", "provider-directory-supplemental-sources", configured_seed_rows),
+        (
+            "provider_directory_blockers",
+            directory.PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE,
+            directory._provider_directory_blocker_seed_rows,
+        ),
+    ):
+        catalog_rows = [
+            seed_row for seed_row in seed_loader() if directory._is_seed_row_query_match(seed_row, source_query)
+        ]
+        seed_rows.extend(catalog_rows)
+        metrics_by_catalog[name] = {"source": base, "rows": len(catalog_rows)}
+    return seed_rows, metrics_by_catalog
+
+
 def configured_seed_rows():
     """Load baked public source metadata through the existing seed pipeline."""
     path = Path(__file__).resolve().parents[1] / "specs/provider_directory_supplemental_sources.json"
