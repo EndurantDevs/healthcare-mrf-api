@@ -186,8 +186,16 @@ def has_network_read_guard(statement):
 
 
 def has_network_read_inventory(session=None):
-    """Inspect fixed-name scope without compiling or inspecting a statement."""
-    return bool(_NAME_INVENTORIES.get() or _SESSION_INVENTORY_KEY in getattr(session, "info", {}))
+    """Inspect fixed-name scope or a verified Reader snapshot without compiling or inspecting a statement.
+
+    Pinned Reader requests install no inventory; their reads still bypass process caches and keep savepoints.
+    """
+    session_info = getattr(session, "info", {})
+    return bool(
+        _NAME_INVENTORIES.get()
+        or _SESSION_INVENTORY_KEY in session_info
+        or session_info.get("api_reader_verified") is True
+    )
 
 
 def _unavailable():

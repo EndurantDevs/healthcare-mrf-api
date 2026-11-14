@@ -175,7 +175,6 @@ from api.provider_specialty_filters import (
     ensure_specialty_resolution_cache,
     resolve_provider_specialty_filter,
 )
-from api.reference_family_reads import _claims_relation_sql
 from db.connection import gather_reader_calls, has_reader_session, run_as_writer
 from db.models import (
     AddressArchive,
@@ -8361,7 +8360,7 @@ async def list_providers(
             parameter_name = f"procedure_code_{idx}"
             parameters_by_name[parameter_name] = int(code)
             array_clause = f"c.procedures_array @> ARRAY[:{parameter_name}]::INTEGER[]"
-            claims_pp_relation = _claims_relation_sql(request_session, "mrf", "pricing_provider_procedure")
+            claims_pp_relation = "mrf.pricing_provider_procedure"
             exists_clause = (
                 "EXISTS ("
                 f"SELECT 1 FROM {claims_pp_relation} AS pp "
@@ -8380,7 +8379,7 @@ async def list_providers(
             parameter_name = f"medication_code_{idx}"
             parameters_by_name[parameter_name] = int(code)
             array_clause = f"c.medications_array @> ARRAY[:{parameter_name}]::INTEGER[]"
-            claims_pr_relation = _claims_relation_sql(request_session, "mrf", "pricing_provider_prescription")
+            claims_pr_relation = "mrf.pricing_provider_prescription"
             exists_clause = (
                 "EXISTS ("
                 f"SELECT 1 FROM {claims_pr_relation} AS pr "

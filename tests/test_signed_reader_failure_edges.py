@@ -25,7 +25,7 @@ async def test_signed_provider_entry_uses_guarded_claims_reader(monkeypatch, res
     async with boundary.signed_request_reader(request, cold_caller()) as reader:
         assert reader is session
         if resource == "providers":
-            reference_family_reads.pin_claims_reader.assert_awaited_once_with(session, api_read=True)
+            reference_family_reads.pin_claims_reader.assert_awaited_once_with(session)
         else:
             reference_family_reads.pin_claims_reader.assert_not_awaited()
     assert session.closed and session.committed

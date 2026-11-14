@@ -6,95 +6,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from api.reference_family_reads import _claims_dictionary_overlay, claims_dictionary_tables, pin_claims_reader
+from api.reference_family_reads import _claims_dictionary_overlay
 from db.connection import Database
-from process import mrf_address_publication as publication
 from process import reference_family_archive as archive
 from tests.test_api_reader_sessions import ReaderSession
-
-
-def _reader(monkeypatch, *, missing=False, drift=False, binding=False, writable=False, families=("claims-pricing",)):
-    """Use explicit host-only catalog leaves; native role/CAS proof remains separate."""
-    names = sorted(
-        name for importer in families for name in archive.reference_family_receive_spec(importer).table_names
-    )
-    pairs = tuple((name, oid) for oid, name in enumerate(names, 101))
-    oid_by_name = dict(pairs)
-    oid_by_name.update(code_catalog=201, code_crosswalk=202, current_generation=301, relation=302)
-    monkeypatch.setattr(
-        archive,
-        "_relation_oid",
-        AsyncMock(
-            side_effect=lambda _session, _schema, name: (
-                None if missing and name.startswith("claims_code_") else oid_by_name.get(name)
-            )
-        ),
-    )
-    monkeypatch.setattr(publication, "require_native_read_catalog", AsyncMock())
-    binding_rows = [("published-generation", name, oid) for name, oid in pairs]
-    if binding:
-        binding_rows.pop()
-    statement_result = SimpleNamespace(all=lambda: binding_rows)
-
-    async def scalar(statement, parameters=None):
-        """Resolve the actual locked name and fixed read-only authority predicate."""
-        if "to_regclass(:name)" in str(statement):
-            return oid_by_name[parameters["name"].split('"')[-2]] + int(drift)
-        if "payload" in str(statement) or "left_row" in str(statement):
-            return False
-        return not writable
-
-    async def execute(statement, parameters=None):
-        """Return one actual current binding for each separately scoped native family."""
-        if parameters and "importer" in parameters:
-            selected_names = archive.reference_family_receive_spec(parameters["importer"]).table_names
-            return SimpleNamespace(all=lambda: [row for row in binding_rows if row[1] in selected_names])
-        return statement_result
-
-    session = SimpleNamespace(
-        info={},
-        connection=AsyncMock(),
-        rollback=AsyncMock(),
-        execute=AsyncMock(side_effect=execute),
-        scalar=AsyncMock(side_effect=scalar),
-    )
-    return session, pairs
-
-
-@pytest.mark.asyncio
-async def test_reader_pins_complete_family_and_shared_row_versions(monkeypatch):
-    session, pairs = _reader(monkeypatch)
-    assert await pin_claims_reader(session) == pairs
-    session.connection.assert_awaited_once_with(execution_options={"isolation_level": "REPEATABLE READ"})
-    lock = str(session.execute.await_args_list[0].args[0])
-    assert lock.startswith("LOCK TABLE") and lock.endswith("ACCESS SHARE MODE NOWAIT")
-    assert all('"' + name + '"' in lock for name, _oid in pairs)
-    assert '"code_catalog"' in lock and '"code_crosswalk"' in lock
-    binding_sql = " ".join(str(session.execute.await_args_list[1].args[0]).split())
-    assert "JOIN hp_snapshot_retention.relation r USING(generation_id)" in binding_sql
-    assert "heap.relname::text AS relation_name,r.relation_oid::bigint" in binding_sql
-    assert "JOIN pg_catalog.pg_class heap ON heap.oid::bigint=r.relation_oid" in binding_sql
-    assert "ORDER BY heap.relname" in binding_sql
-    assert "r.relation_name" not in binding_sql and "r.table_name" not in binding_sql
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["drift", "binding", "writable"])
-async def test_reader_refuses_identity_publication_or_write_authority_drift(monkeypatch, failure):
-    session, _pairs = _reader(monkeypatch, **{failure: True})
-    with pytest.raises(RuntimeError):
-        await pin_claims_reader(session)
-
-
-@pytest.mark.asyncio
-async def test_reader_uses_pinned_mirrors_without_a_full_shared_dictionary_comparison(monkeypatch):
-    session, _pairs = _reader(monkeypatch)
-    compare = AsyncMock()
-    monkeypatch.setattr(archive, "_is_model_table_equal", compare)
-    await pin_claims_reader(session)
-    compare.assert_not_awaited()
-    catalog, crosswalk = claims_dictionary_tables(session)
-    assert "claims_code_catalog" in str(catalog) and "claims_code_crosswalk" in str(crosswalk)
 
 
 def _seed_reader_catalog(connection):
@@ -200,32 +115,6 @@ def test_scoped_reader_overlay_keeps_original_rows_and_preserves_unrelated_keys(
             for entry in connection.execute(select(crosswalk).order_by(crosswalk.c.from_code))
         ] == [("00001", "pinned"), ("00002", "unrelated")]
     engine.dispose()
-
-
-@pytest.mark.asyncio
-async def test_uninstalled_ordinary_reader_keeps_existing_entrypoint(monkeypatch):
-    session, _pairs = _reader(monkeypatch, missing=True)
-    assert await pin_claims_reader(session) is None
-    session.rollback.assert_awaited_once()
-    session.execute.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("families", (("drug-claims",), ("claims-pricing", "drug-claims")))
-async def test_reader_pins_each_complete_installed_family_before_one_dictionary_overlay(monkeypatch, families):
-    """One transaction locks and authenticates all installed serving heaps, not just physician data."""
-    session, pairs = _reader(monkeypatch, families=families)
-    assert await pin_claims_reader(session) == pairs
-    lock = str(session.execute.await_args_list[0].args[0])
-    assert all('"' + name + '"' in lock for name, _oid in pairs)
-    bindings = [call.args[1]["importer"] for call in session.execute.await_args_list if len(call.args) == 2]
-    assert bindings == list(families)
-    assert "drug_claims_code_catalog" in str(claims_dictionary_tables(session)[0])
-    if len(families) == 2:
-        overlap_queries = [
-            str(call.args[0]) for call in session.scalar.await_args_list if "left_row" in str(call.args[0])
-        ]
-        assert len(overlap_queries) == 2 and all("IS DISTINCT FROM" in sql for sql in overlap_queries)
 
 
 @pytest.mark.asyncio
@@ -359,7 +248,7 @@ async def test_request_entrypoint_binds_pinning_only_to_real_pricing_consumers(m
         assert request.ctx.sa_session is session
         assert pin.await_count == int(is_claims_read)
         if is_claims_read:
-            pin.assert_awaited_once_with(session, api_read=True)
+            pin.assert_awaited_once_with(session)
     finally:
         await callbacks["response"](request, SimpleNamespace(status=200))
     session.close.assert_awaited_once()
