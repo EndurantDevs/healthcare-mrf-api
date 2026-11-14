@@ -630,7 +630,8 @@ async def _refuse_actual_retirement_login(case, role, password):
         async with role_sessions() as session, session.begin():
             await _bounded(session)
             assert await session.scalar(text("SELECT current_user = session_user")) is True
-            with pytest.raises(retirement.SnapshotRetirementRefused, match="protected native owner authority"):
+            # Ownership, not a role attribute, protects retirement: the database refuses these logins.
+            with pytest.raises(DBAPIError, match="permission denied"):
                 await retirement.retire_snapshot_family(
                     session,
                     1,

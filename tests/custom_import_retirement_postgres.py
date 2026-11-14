@@ -911,3 +911,31 @@ async def test_retirement_preserves_closed_continuation_history_but_refuses_acti
             assert tuple(getattr(history, column.name) for column in history.__table__.columns) == original_values
             assert await session.get(CustomImportSnapshotFamily, family_id) is not None
             assert await session.get(CustomImportSnapshotRetirement, family_id) is not None
+
+
+async def test_retention_sweep_dry_run_keeps_storage_and_execute_retires_it():
+    from process.custom_import import retention_sweep
+
+    async def retire(session, family_id):
+        return await retirement.retire_snapshot_family(
+            session, family_id, engine_id="synthetic", assert_external_unreferenced=_external_fixture_check
+        )
+
+    refusals = (retirement.SnapshotRetirementRefused,)
+    async with isolated_publication_case() as case:
+        _, family_id = await _replaced_fence(case)
+        namespace = retirement.snapshot_schema(family_id)
+
+        dry_run = await retention_sweep.sweep(case.sessions, retire, refusals, execute=False, emit=lambda line: None)
+        assert [(record["state"], record["family_id"]) for record in dry_run] == [("would_retire", family_id)]
+        async with case.sessions() as session, session.begin():
+            assert await session.scalar(text("SELECT to_regnamespace(:n)"), {"n": namespace}) is not None
+            assert await session.get(CustomImportSnapshotRetirement, family_id) is None
+
+        executed = await retention_sweep.sweep(case.sessions, retire, refusals, execute=True, emit=lambda line: None)
+        assert [(record["state"], record["reason"]) for record in executed] == [("retired", "replaced_fence")]
+        async with case.sessions() as session, session.begin():
+            assert await session.scalar(text("SELECT to_regnamespace(:n)"), {"n": namespace}) is None
+            assert await session.get(CustomImportSnapshotRetirement, family_id) is not None
+
+        assert await retention_sweep.sweep(case.sessions, retire, refusals, execute=True, emit=lambda line: None) == []
