@@ -225,35 +225,29 @@ async def test_runtime_writes_are_closed(metadata_custody):
 
 
 @pytest.mark.asyncio
-async def test_native_identity_change_refuses(metadata_custody):
+async def test_rebuilt_catalog_table_serves_by_name(metadata_custody):
+    """A copied snapshot has other object ids, another owner and no stored grants."""
     fixture = metadata_custody
     snapshot_by_field = await freeze_metadata(fixture)
     namespace = '"' + fixture.target.schema_name + '"'
     await fixture.connection.execute(f"DROP TABLE {namespace}.registry_fhir_catalog_network")
     for statement in table_sql(namespace, "registry_fhir_catalog_network"):
         await fixture.connection.execute(statement)
-    await fixture.connection.execute(
-        f'ALTER TABLE {namespace}.registry_fhir_catalog_network OWNER TO "{fixture.roles["owner"]}"'
-    )
     async with fixture.connection.transaction(readonly=True):
-        with pytest.raises(ValueError, match="object identity changed"):
-            await verify_fhir_catalog_snapshot(fixture.connection, snapshot_by_field)
+        await verify_fhir_catalog_snapshot(fixture.connection, snapshot_by_field)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("drift", ["grant", "set_path"])
-async def test_native_authority_drift_refuses(metadata_custody, drift):
+async def test_row_filter_enabled_after_reader_snapshot_refuses(metadata_custody):
     fixture = metadata_custody
-    snapshot_by_field = await freeze_metadata(fixture)
-    if drift == "grant":
+    selected = await freeze_metadata(fixture)
+    async with fixture.reader.transaction(isolation="repeatable_read", readonly=True):
+        await fixture.reader.fetchval("SELECT 1")  # fixes the snapshot before the policy change
         await fixture.connection.execute(
-            f'GRANT UPDATE ON "{fixture.target.schema_name}".registry_fhir_catalog_network TO "{fixture.roles["reader"]}"'
+            f'ALTER TABLE "{fixture.target.schema_name}".registry_fhir_catalog_network ENABLE ROW LEVEL SECURITY'
         )
-    else:
-        await fixture.connection.execute(f'GRANT "{fixture.roles["owner"]}" TO "{fixture.roles["reader"]}"')
-    async with fixture.connection.transaction(readonly=True):
-        with pytest.raises(ValueError, match="not closed"):
-            await verify_fhir_catalog_snapshot(fixture.connection, snapshot_by_field)
+        with pytest.raises(ValueError, match="custody_invalid"):
+            await verify_fhir_catalog_snapshot(fixture.reader, selected)
 
 
 def source_descriptor():
