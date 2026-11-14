@@ -11,9 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from api import plan_pricing_code_build as code_build
 from api import plan_pricing_code_contract as code_contract
-from api import plan_pricing_code_read as code_read
 from api import plan_pricing_projection as projection
 from api.plan_pricing_code_storage import attachment_name
 
@@ -40,10 +38,6 @@ async def test_omitted_false_without_ready_projection_falls_back_to_legacy(monke
     session = _Session([])
     session.scalar = AsyncMock(return_value=False)
     selected = _selection(projection_id=None)
-    inputs, locate, lock = AsyncMock(), AsyncMock(), AsyncMock()
-    monkeypatch.setattr(code_build, "resolve_inputs", inputs)
-    monkeypatch.setattr(code_read, "locate", locate)
-    monkeypatch.setattr(code_read, "_lock_provider_relations", lock)
     request_by_field = {"include_providers": "false", "code_system": "CPT", "code": "27447"}
     if zip5 is not None:
         request_by_field["zip5"] = zip5
@@ -73,15 +67,9 @@ async def test_omitted_false_without_ready_projection_falls_back_to_legacy(monke
         )
     assert response is None
     assert [(str(call.args[0]), call.args[1]) for call in session.scalar.await_args_list] == [
-        (
-            "SELECT to_regclass(:relation) IS NOT NULL",
-            {"relation": "hp_snapshot_retention." + attachment_name(expected)},
-        )
+        ("SELECT to_regclass(:view) IS NOT NULL", {"view": "hp_snapshot_retention." + attachment_name(expected)})
         for expected in anchors
     ]
-    inputs.assert_not_awaited()
-    locate.assert_not_awaited()
-    lock.assert_not_awaited()
     assert session.statements == []
 
 

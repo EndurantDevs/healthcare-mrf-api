@@ -1397,3 +1397,12 @@ async def test_claims_pin_refuses_a_stage_moved_in_after_its_snapshot():
                 ),
             )
         assert await _pinned_claims_read(sessions, reader) == ("claims-pricing",)
+
+
+@pytest.mark.asyncio
+async def test_code_pricing_family_serves_by_name_in_this_lane(monkeypatch):
+    """Run the code pricing by-name read here: CI provisions this lane's database, so the case never skips."""
+    from tests import test_plan_pricing_code_postgres as code_pricing
+
+    monkeypatch.setattr(code_pricing, "_url", lambda: make_url(_database_url()))
+    await code_pricing.test_copied_family_serves_by_name_and_lock_holds_off_row_security(monkeypatch)

@@ -187,9 +187,11 @@ async def _assert_reader_pages(db, identity, unscoped_identity):
     reader = create_async_engine(db.reader_url)
     try:
         async with async_sessionmaker(reader)() as session, session.begin():
-            scoped_capability = CodePricingCapability(identity, await locate(session, identity))
-            national = CodePricingCapability(unscoped_identity, await locate(session, unscoped_identity))
-            assert receipt(scoped_capability.found)["projection_id"] == identity_digest(identity)
+            schema_name, header = await locate(session, identity, api_read=True)
+            scoped_capability = CodePricingCapability(header["identity"], schema_name)
+            national_schema, national_header = await locate(session, unscoped_identity, api_read=True)
+            national = CodePricingCapability(national_header["identity"], national_schema)
+            assert scoped_capability.projection_id == identity_digest(identity)
             await _assert_all_pages(session, scoped_capability, national)
             from api.endpoint.pagination import PaginationParams
 
@@ -313,7 +315,8 @@ async def test_zip_native_replacement_retains_old_reader_and_exact_retirement(mo
         identity = _scoped_inputs(monkeypatch, identity)
         first = await _prepare(db, identity)
         async with db.sessions() as pinned, pinned.begin():
-            old = CodePricingCapability(copy.deepcopy(identity), await locate(pinned, identity))
+            old_schema, old_header = await locate(pinned, identity, api_read=True)
+            old = CodePricingCapability(old_header["identity"], old_schema)
             async with db.sessions() as session, session.begin():
                 await session.execute(text("INSERT INTO mrf.geo_zip_lookup VALUES ('48106',40.02,-83)"))
             identity["provider_signature"] = "c" * 64
@@ -388,7 +391,7 @@ async def test_zip_native_distinct_contributors_and_cumulative_work(monkeypatch)
             "factor": 14,
         }
         async with db.sessions() as session, session.begin():
-            capability = CodePricingCapability(identity, await locate(session, identity))
+            capability = CodePricingCapability(identity, (await locate(session, identity, api_read=True))[0])
             all_rows, total = await _page(session, capability, offset=0, order="asc")
             subset, subset_total = await _page(session, capability, offset=0, order="asc", aliases=(third,))
             assert total == subset_total == 2
