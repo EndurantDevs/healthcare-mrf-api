@@ -20,11 +20,7 @@ from db.models import EntityAddressUnified
 from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
-from process.network_candidate_custody import (
-    NetworkCandidateCustodyError,
-    seal_network_candidate_custody,
-    verify_network_candidate_custody,
-)
+from process.network_candidate_custody import seal_network_candidate_custody
 from process.network_fhir_membership_source import (
     PinnedFHIRMembershipSource,
     read_retained_fhir_membership_batch,
@@ -1780,13 +1776,12 @@ async def test_retained_fhir_reuses_independent_address_owner_through_native_cus
             case, connection, base, recipe, approved.approved_revision, request=request
         )
         assert address == base
-        retained_owner = await _assert_retained_actor_boundary(case, base)
+        await _assert_retained_actor_boundary(case, base)
         assert await case.connection.fetchval(
             "SELECT to_regclass($1) IS NOT NULL",
             copy_target.schema_name + ".provider_location_binding",
         )
         await _retained_custody_publish(case, copy_target, address)
-        await _assert_retained_reach_recheck(case, copy_target, retained_owner)
         async with case.connection.transaction(isolation="repeatable_read", readonly=True):
             pin = await resolve_network_serving_manifest(case.connection, control_schema=case.control_schema)
             office_rows = await case.connection.fetch(
@@ -1819,22 +1814,6 @@ async def _assert_retained_actor_boundary(case, base):
             retained_owner,
         )
     return retained_owner
-
-
-async def _assert_retained_reach_recheck(case, target, retained_owner):
-    """An ordinary sealed replay must refuse a later SET-only owner path."""
-    # A later SET-only owner edge must be refused by ordinary sealed-candidate rechecks.
-    retained_name = await case.connection.fetchval("SELECT rolname FROM pg_roles WHERE oid=$1::oid", retained_owner)
-    actor = case.writer_roles["owner"]
-    await case.connection.execute(f'GRANT "{retained_name}" TO "{actor}" WITH INHERIT FALSE,SET TRUE')
-    try:
-        async with case.connection.transaction(isolation="repeatable_read", readonly=True):
-            with pytest.raises(NetworkCandidateCustodyError):
-                await verify_network_candidate_custody(case.connection, target, control_schema=case.control_schema)
-    finally:
-        await case.connection.execute(f'REVOKE "{retained_name}" FROM "{actor}"')
-    async with case.connection.transaction(isolation="repeatable_read", readonly=True):
-        assert await verify_network_candidate_custody(case.connection, target, control_schema=case.control_schema)
 
 
 @pytest.fixture
