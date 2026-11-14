@@ -11,6 +11,7 @@ from uuid import UUID
 import asyncpg
 
 from process.network_address_projection import _identifier
+from process.network_membership_publication import NetworkPreparationPending
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_approval_store import RegistryApprovalConflict
 from process.registry_candidate_composition import (
@@ -37,15 +38,14 @@ from process.registry_publication_execution import (
     complete_queued_registry_source_rollback_preview,
     complete_queued_registry_source_rollback_publication,
 )
-from process.registry_publication_permissions import verify_registry_publication_lifecycle_permissions
 from process.registry_publication_ptg_runtime import RegistryPublicationPTGRuntime
 from process.registry_publication_queue import (
     _document,
     claim_registry_publication_request,
     finish_registry_publication_request,
+    release_registry_publication_request,
     renew_registry_publication_lease,
 )
-from process.registry_publication_worker_permissions import verify_registry_publication_worker_permissions
 from process.registry_source_observation_store import _namespace
 
 if TYPE_CHECKING:
@@ -77,6 +77,7 @@ class RegistryPublicationConsumerConfig:
     only_request_id: UUID | None = None
     membership_refresh_runtime: RegistryMembershipRefreshRuntime | None = field(default=None, repr=False)
     membership_refresh_only: bool = False
+    preparation_roles: dict | None = field(default=None, repr=False)
 
     def __post_init__(self):
         if (
@@ -135,40 +136,9 @@ class RegistryPublicationConsumerConfig:
             for name in ("lifecycle_role", "execution_role", "api_role", "queue_owner_role", "physical_owner_role")
         }
 
-    @property
-    def custody_roles(self):
-        """Return the existing publication worker's complete ordinary role census."""
-        roles = set(self.permission_roles.values()) - {self.queue_owner_role}
-        roles.update(self.loader_roles + self.reader_roles)
-        if self.composition_runtime is not None:
-            roles.update((self.composition_runtime.store.owner_role, self.composition_runtime.store.approval_role))
-        return tuple(sorted(roles))
-
-
-async def _verify_lifecycle(connection, config):
-    await verify_registry_publication_lifecycle_permissions(
-        connection,
-        control_schema=config.control_schema,
-        role=config.lifecycle_role,
-        owner_role=config.queue_owner_role,
-        physical_owner_role=config.physical_owner_role,
-    )
-
-
-async def _verify_execution(connection, config):
-    async with connection.transaction(readonly=True):
-        if config.metadata_only:
-            from process.registry_fhir_catalog_permissions import verify_fhir_catalog_publication_permissions
-
-            return await verify_fhir_catalog_publication_permissions(connection, config, role=config.execution_role)
-        await verify_registry_publication_worker_permissions(
-            connection, **config.permission_roles, control_schema=config.control_schema, role=config.execution_role
-        )
-
 
 async def _claim(lifecycle_pool, config):
     async with lifecycle_pool.acquire() as connection, connection.transaction():
-        await _verify_lifecycle(connection, config)
         return await claim_registry_publication_request(
             connection,
             operation_family="publication",
@@ -185,7 +155,6 @@ async def _heartbeat(lifecycle_pool, config, request_record):
     while True:
         await asyncio.sleep(_HEARTBEAT_SECONDS)
         async with lifecycle_pool.acquire() as connection, connection.transaction():
-            await _verify_lifecycle(connection, config)
             await _renew_active_lease(connection, config, request_record)
 
 
@@ -256,6 +225,10 @@ async def _publication_address_sources(connection, expected_head, config, initia
                 replacement_source_recipes=initial_address_sources.replacement_source_recipes,
                 source_recipe_additions=initial_address_sources.source_recipe_additions,
                 source_witness_runtime=initial_address_sources.source_witness_runtime,
+            )
+        elif initial_address_sources is not None and initial_address_sources.source_witness_runtime is not None:
+            address_sources = replace(
+                address_sources, source_witness_runtime=initial_address_sources.source_witness_runtime
             )
     else:
         address_sources = initial_address_sources
@@ -353,7 +326,6 @@ async def _prepared_address_sources(
 
 async def _execute_catalog_request(connection, config, request_record):
     """Keep the catalog owner's frozen operation and authority boundary."""
-    from process.registry_fhir_catalog_publication import complete_queued_fhir_catalog_publication
 
     if config.metadata_runtime is None:
         raise ValueError("registry_fhir_catalog_runtime_unavailable")
@@ -365,6 +337,7 @@ async def _execute_catalog_request(connection, config, request_record):
         verify_sources=config.metadata_runtime.verify_sources,
         control_schema=config.control_schema,
         source_fence=config.metadata_runtime.source_fence,
+        preparation_roles=config.metadata_runtime.preparation_roles,
     )
 
 
@@ -379,10 +352,6 @@ async def _execute_publication_request(
     authorize_commit=None,
 ):
     connection = await cleanup.enter_async_context(execution_pool.acquire())
-    try:
-        await _verify_execution(connection, config)
-    except ValueError:
-        raise RuntimeError("registry_publication_consumer_unavailable") from None
     command_by_name = _document(request_record["command_json"])
     operation = command_by_name.get("operation")
     if operation == "refresh_memberships":
@@ -419,11 +388,14 @@ async def _execute_publication_request(
         options_by_name["writer_roles"] = config.writer_roles
         options_by_name["composition_runtime"] = config.composition_runtime
         options_by_name["seal_candidate"] = config.seal_candidate
+        if initial_address_sources is not None and initial_address_sources.source_witness_runtime is not None:
+            options_by_name["source_witness_runtime"] = initial_address_sources.source_witness_runtime
         if config.prepare_address_sources is not None:
             options_by_name["prepare_address_sources"] = config.prepare_address_sources
     elif operation == "publish_source_rollback":
         complete = complete_queued_registry_source_rollback_publication
         options_by_name["writer_roles"] = config.writer_roles
+        options_by_name["preparation_roles"] = config.preparation_roles
     else:
         raise ValueError("registry_publication_operation_invalid")
     return await complete(connection, request_record["request_id"], request_record["lease_id"], **options_by_name)
@@ -508,7 +480,6 @@ async def _run_with_heartbeat(
 
 async def _reject(lifecycle_pool, config, request_record):
     async with lifecycle_pool.acquire() as connection, connection.transaction():
-        await _verify_lifecycle(connection, config)
         await finish_registry_publication_request(
             connection,
             request_record["request_id"],
@@ -545,8 +516,6 @@ async def consume_registry_publication_once(
         and type(initial_address_sources) is not RegistryCompositionAddressSources
     ):
         raise ValueError("registry_publication_consumer_config_invalid")
-    async with execution_pool.acquire() as connection:
-        await _verify_execution(connection, config)
     request_record = await _claim(lifecycle_pool, config)
     if request_record is None:
         return None
@@ -563,6 +532,19 @@ async def consume_registry_publication_once(
             initial_address_sources,
             plan_metadata_client,
         )
+    except NetworkPreparationPending as pending:
+        async with lifecycle_pool.acquire() as connection, connection.transaction():
+            await release_registry_publication_request(
+                connection,
+                request_record["request_id"],
+                request_record["lease_id"],
+                control_schema=config.control_schema,
+            )
+        return {
+            "request_id": str(request_record["request_id"]),
+            "state": "waiting_admin_freeze",
+            "result": {"candidate_id": pending.candidate_id},
+        }
     except RegistryApprovalConflict as error:
         if str(error) == "registry_queue_lease_conflict":
             raise RegistryApprovalConflict("registry_queue_lease_conflict") from None

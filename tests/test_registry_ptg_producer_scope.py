@@ -12,6 +12,7 @@ from uuid import UUID
 
 import pytest
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import DBAPIError
 
 from process import registry_ptg_producer_scope as scope
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
@@ -248,17 +249,32 @@ async def test_unstable_transaction_is_rejected(isolation):
 
 
 @pytest.mark.asyncio
-async def test_unprotected_store_refuses_before_source_or_write():
-    session = _session(_Result(value="repeatable read"), _Result(value=False))
-    with pytest.raises(scope.RegistryPTGProducerScopeError, match="store_unprotected"):
-        await scope._protected_store(
-            session,
-            store=_store(),
-            write=True,
-        )
+async def test_named_store_native_failure_refuses_before_source_or_write():
+    failure = DBAPIError("SELECT 1", {}, RuntimeError("permission denied"))
+    session = _session()
+    session.execute.side_effect = [_Result(value="repeatable read"), failure]
+    with pytest.raises(scope.RegistryPTGProducerScopeError, match="store_unprotected") as observed:
+        await scope._protected_store(session, store=_store(), write=True)
+    assert observed.value.__cause__ is failure
     assert session.execute.await_count == 2
-    query = str(session.execute.await_args.args[0])
-    assert all(fragment in query for fragment in ("aclexplode(att.attacl)", "relrowsecurity", "TRUNCATE"))
+    assert (
+        str(session.execute.await_args.args[0])
+        == 'SELECT 1 FROM "synthetic_control"."registry_ptg_producer_scope" LIMIT 0'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("write", [False, True])
+async def test_named_store_returns_configured_relation_without_role_or_acl_census(write):
+    session = _session(_Result(value="repeatable read"), _Result())
+    assert (
+        await scope._protected_store(session, store=_store(), write=write)
+        == '"synthetic_control"."registry_ptg_producer_scope"'
+    )
+    assert [str(call.args[0]) for call in session.execute.await_args_list] == [
+        "SHOW transaction_isolation",
+        'SELECT 1 FROM "synthetic_control"."registry_ptg_producer_scope" LIMIT 0',
+    ]
 
 
 @pytest.mark.asyncio

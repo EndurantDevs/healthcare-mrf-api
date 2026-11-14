@@ -9,13 +9,7 @@ from uuid import uuid4
 
 from sqlalchemy import text
 
-from api.network_read_execution import (
-    _SESSION_INVENTORY_KEY,
-    _installed_read_inventory,
-    _original_read_driver,
-    execute_network_read,
-    install_network_read_inventory,
-)
+from api.network_read_execution import _read_driver
 from api.plan_pricing_code_contract import (
     SPEC,
     capability_identity,
@@ -69,7 +63,6 @@ from db.models.plan_pricing_code_projection import (
 )
 from process import reference_family_archive as native
 from process.live_progress import enqueue_live_progress
-from process.network_compact_layout import CompactAddressRelation
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
 MAX_CODE_MEMBER_CELL_WORK_ROWS: int | None = 32_768
@@ -117,16 +110,13 @@ class _CodeAPISetup:
     def source_relation(self, schema_name, table_name):
         """Read only captured plain heaps; partition routing requires separate authority."""
         key = schema_name, table_name
-        relation = self._source_relations.get(key)
-        if relation is not None and relation[1:] == ("r", False):
-            return "ONLY " + native._quoted(schema_name) + "." + native._quoted(table_name)
+        if key in self._source_relations:
+            return native._quoted(schema_name) + "." + native._quoted(table_name)
         raise PlanPricingProjectionUnavailable("Source physical read routing is unavailable")
 
     async def execute(self, statement, parameters=None):
         """Verify buffered setup results before a decoder can inspect them."""
-        if _installed_read_inventory(self._session) is None:
-            raise PlanPricingProjectionUnavailable("code pricing API inventory is unavailable")
-        return await execute_network_read(self._session, statement, parameters)
+        return await self._session.execute(statement, parameters)
 
     async def scalar(self, statement, parameters=None):
         """Decode a scalar after the original session's read guard."""
@@ -154,67 +144,22 @@ async def _api_input_inventory(session, driver, *, allow_legacy=False):
     required_names.update((schema or SCHEMA, name) for schema, name in geo._PROJECTION_DEPENDENCIES)
     source_names = {*_API_SOURCE_NAMES, PTG2_V4_GRAPH_DIAGNOSTIC_TABLE}
     names = tuple(sorted(required_names | {(PTG2_SCHEMA, name) for name in source_names}))
-    transaction, backend_pid = session.get_transaction(), driver.get_server_pid()
     catalog = await driver.fetch(
-        "SELECT expected.schema_name,expected.table_name,c.oid::pg_catalog.int8,c.relkind::pg_catalog.text,"
-        "EXISTS(SELECT FROM pg_catalog.pg_inherits i WHERE i.inhrelid=c.oid OR i.inhparent=c.oid) AS inherited,"
-        "pg_catalog.has_schema_privilege(current_user,n.oid,'USAGE') AND pg_catalog.has_table_privilege(current_user,c.oid,'SELECT') AS readable "
-        "FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.text[]),pg_catalog.unnest($2::pg_catalog.text[])) expected(schema_name,table_name) "
-        "LEFT JOIN pg_catalog.pg_namespace n ON n.nspname=expected.schema_name "
-        "LEFT JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname=expected.table_name "
+        "SELECT expected.schema_name,expected.table_name,"
+        "pg_catalog.to_regclass(pg_catalog.format('%I.%I',expected.schema_name,expected.table_name)) IS NOT NULL AS available "
+        "FROM ROWS FROM (pg_catalog.unnest($1::text[]),pg_catalog.unnest($2::text[])) expected(schema_name,table_name) "
         "ORDER BY expected.schema_name,expected.table_name",
         [schema for schema, _ in names],
         [name for _, name in names],
     )
-    await _same_api_input_session(session, driver, backend_pid, transaction)
-    if tuple((catalog_row["schema_name"], catalog_row["table_name"]) for catalog_row in catalog) != names:
-        raise PlanPricingProjectionUnavailable("code pricing API input inventory differs")
-    relations, absent_names = [], []
-    for catalog_row in catalog:
-        name = catalog_row["schema_name"], catalog_row["table_name"]
-        if name in required_names and (
-            catalog_row["oid"] is None or catalog_row["relkind"] != "r" or catalog_row["readable"] is not True
-        ):
-            _unqualified_api_read("code pricing API provider inputs are unavailable", allow_legacy)
-        if catalog_row["oid"] is None:
-            absent_names.append(name)
-        else:
-            if catalog_row["relkind"] not in {"r", "p"}:
-                _unqualified_api_read("code pricing API Source inputs are unavailable", allow_legacy)
-            relations.append(CompactAddressRelation(*name, catalog_row["oid"]))
-    plain_names = {
-        (catalog_row["schema_name"], catalog_row["table_name"])
-        for catalog_row in catalog
-        if catalog_row["relkind"] == "r" and catalog_row["inherited"] is False
-    }
-    await install_network_read_inventory(
-        session,
-        tuple(relations),
-        absent_names=tuple(absent_names),
-        only_relations=tuple(
-            relation for relation in relations if (relation.schema_name, relation.table_name) in plain_names
-        ),
-    )
-    return {
-        (catalog_row["schema_name"], catalog_row["table_name"]): (
-            catalog_row["oid"],
-            catalog_row["relkind"],
-            catalog_row["inherited"],
-        )
-        for catalog_row in catalog
-        if catalog_row["oid"] is not None
-    }
-
-
-async def _same_api_input_session(session, driver, backend_pid, transaction):
-    current_driver, current_pid = await _original_read_driver(session)
-    if (
-        current_driver is not driver
-        or current_pid != backend_pid
-        or session.get_transaction() is not transaction
-        or driver.is_in_transaction() is not True
+    if [(row["schema_name"], row["table_name"]) for row in catalog] != list(names) or any(
+        type(row["available"]) is not bool for row in catalog
     ):
-        raise PlanPricingProjectionUnavailable("code pricing API read transaction changed")
+        raise PlanPricingProjectionUnavailable("code pricing API named inventory differs")
+    available_names = {(row["schema_name"], row["table_name"]) for row in catalog if row["available"] is True}
+    if not required_names <= available_names:
+        _unqualified_api_read("code pricing API provider inputs are unavailable", allow_legacy)
+    return available_names
 
 
 async def _has_local_api_sources(reader, selection):
@@ -248,50 +193,40 @@ def _unqualified_api_read(reason, allow_legacy):
 
 
 async def can_read_code_api(session, selection):
-    """Select metadata-eligible ZIP routing; full Source custody remains mandatory."""
+    """Select API routing only when the configured inputs are available."""
     if not callable(getattr(session, "get_transaction", None)):
         return False
-    previous_info_by_name = dict(session.info)
     try:
         async with _api_input_reader(session, selection, allow_legacy=True):
             return True
     except _LegacyCodeReadRequired:
         return False
-    finally:
-        _restore_api_inventory(session, previous_info_by_name)
-
-
-def _restore_api_inventory(session, previous_info_by_name):
-    if _SESSION_INVENTORY_KEY in previous_info_by_name:
-        session.info[_SESSION_INVENTORY_KEY] = previous_info_by_name[_SESSION_INVENTORY_KEY]
-    else:
-        session.info.pop(_SESSION_INVENTORY_KEY, None)
 
 
 @asynccontextmanager
 async def _api_input_reader(session, selection, *, allow_legacy=False):
     transaction = session.get_transaction()
-    driver, backend_pid = await _original_read_driver(session)
-    modes = await driver.fetchrow(
-        "SELECT pg_catalog.current_setting('transaction_isolation'),pg_catalog.current_setting('transaction_read_only')"
-    )
-    await _same_api_input_session(session, driver, backend_pid, transaction)
-    if modes is None or tuple(modes) not in (("repeatable read", "on"), ("serializable", "on")):
-        _unqualified_api_read("code pricing API requires a read-only repeatable-read snapshot", allow_legacy)
-    previous_info_by_name = dict(session.info)
+    failure = None
     try:
+        driver = await _read_driver(session)
+        modes = await driver.fetchrow(
+            "SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only')"
+        )
+        if modes is None or tuple(modes) not in (("repeatable read", "on"), ("serializable", "on")):
+            _unqualified_api_read("code pricing API requires a read-only repeatable-read snapshot", allow_legacy)
         source_relations = await _api_input_inventory(session, driver, allow_legacy=allow_legacy)
-        await _same_api_input_session(session, driver, backend_pid, transaction)
-        if any(kind != "r" or inherited for _, kind, inherited in source_relations.values()):
-            _unqualified_api_read("Source physical read routing is unavailable", allow_legacy)
         reader = _CodeAPISetup(session, source_relations)
         if await _has_local_api_sources(reader, selection):
             _unqualified_api_read("selected source is unavailable for code pricing API reads", allow_legacy)
         yield reader
-        await _same_api_input_session(session, driver, backend_pid, transaction)
-    except BaseException:
-        _restore_api_inventory(session, previous_info_by_name)
+    except BaseException as error:
+        failure = error
         raise
+    finally:
+        if session.get_transaction() is not transaction or session.in_transaction() is not True:
+            if failure is None or isinstance(failure, _LegacyCodeReadRequired):
+                raise PlanPricingProjectionUnavailable("code pricing API read transaction changed") from failure
+            failure.add_note("code pricing API read transaction changed")
 
 
 @dataclass

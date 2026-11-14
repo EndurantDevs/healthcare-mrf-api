@@ -314,6 +314,33 @@ async def test_source_observer_opens_after_continuation_response(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_configured_observer_does_not_read_physical_database_identity(monkeypatch):
+    scope = object.__new__(observation._RetainedObservations)
+    scope.verify_transaction = AsyncMock()
+    scope.source_input = SimpleNamespace()
+    session, connection, events = object(), object(), []
+
+    @asynccontextmanager
+    async def read_only_observation(*, isolation):
+        assert isolation == "read committed"
+        events.append("opened")
+        try:
+            yield session
+        finally:
+            events.append("closed")
+
+    scope.factory = SimpleNamespace(observation_transaction=read_only_observation)
+    driver = AsyncMock(return_value=connection)
+    monkeypatch.setattr(observation, "native_driver", driver)
+    async with scope.observers() as readers:
+        assert isinstance(readers, observation._Observers)
+        assert events == ["opened"]
+    assert events == ["opened", "closed"]
+    driver.assert_awaited_once_with(session)
+    assert scope.verify_transaction.await_count == 3
+
+
+@pytest.mark.asyncio
 async def test_aggregate_budget_denial_is_not_skipped_for_routed_observations():
     from process.provider_directory_cms_preparation import NonprofileAdmissionCheck
 

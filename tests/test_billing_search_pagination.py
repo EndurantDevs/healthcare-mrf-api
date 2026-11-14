@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -25,6 +26,8 @@ from api.ptg2_types import PTG2ServingTables
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from tests.billing_search_entity_ref_support import (
     serving_tables as source_serving_tables,
+)
+from tests.billing_search_entity_ref_support import (
     source_pinned_selection,
     source_publication,
 )
@@ -124,17 +127,29 @@ def _selection() -> PlanReleaseServingSelection:
     )
 
 
-def _pin(*, address_relation_oid=1001, address_evidence_relation_oid=1002):
+def _pin(
+    *,
+    address_relation_name="mrf.entity_address_unified",
+    address_evidence_relation_name="mrf.entity_address_evidence",
+    address_generation=1,
+):
+    if type(address_relation_name) is int:
+        address_relation_name = "mrf.entity_address_unified_" + str(address_relation_name)
+    if type(address_evidence_relation_name) is int:
+        address_evidence_relation_name = "mrf.entity_address_evidence_" + str(address_evidence_relation_name)
     snapshot_digest = pagination.billing_search_snapshot_set_sha256(_selection())
     generation_digest = pagination._framed_sha256(
         pagination._GENERATION_BUNDLE_DOMAIN,
         pagination._canonical_json_bytes(
             {
-                "address_relation_oid": address_relation_oid,
-                "address_evidence_relation_oid": address_evidence_relation_oid,
-                "address_selection_contract": (
-                    pagination.BILLING_ADDRESS_SELECTION_CONTRACT
-                ),
+                "address_relation_name": address_relation_name,
+                "address_evidence_relation_name": address_evidence_relation_name,
+                "address_generation": {
+                    "origin_lineage_id": "11111111-1111-4111-8111-111111111111",
+                    "origin_generation": address_generation,
+                },
+                "network_generation": None,
+                "address_selection_contract": (pagination.BILLING_ADDRESS_SELECTION_CONTRACT),
                 "snapshot_set_sha256": snapshot_digest,
             }
         ),
@@ -142,8 +157,8 @@ def _pin(*, address_relation_oid=1001, address_evidence_relation_oid=1002):
     return pagination.BillingSearchGenerationPin(
         snapshot_set_sha256=snapshot_digest,
         generation_bundle_sha256=generation_digest,
-        address_relation_oid=address_relation_oid,
-        address_evidence_relation_oid=address_evidence_relation_oid,
+        address_relation_name=address_relation_name,
+        address_evidence_relation_name=address_evidence_relation_name,
     )
 
 
@@ -191,9 +206,7 @@ def test_cursor_auth_scope_is_stable_across_transport_timestamps(monkeypatch) ->
         trusted_now=NEXT_REQUEST_TIME,
     )
 
-    assert first_binding.authorization_scope_sha256 == (
-        next_binding.authorization_scope_sha256
-    )
+    assert first_binding.authorization_scope_sha256 == (next_binding.authorization_scope_sha256)
     assert pagination.open_billing_search_page_cursor(
         next_request,
         keyring=KEYRING,
@@ -220,9 +233,7 @@ def test_cursor_auth_scope_is_stable_across_transport_timestamps(monkeypatch) ->
 def test_cursor_rejects_cross_scope_authority(monkeypatch, context_overrides) -> None:
     monkeypatch.setattr(cursor.secrets, "token_bytes", lambda size: b"n" * size)
     first_binding = _cursor_binding()
-    sealed_cursor = pagination.seal_billing_search_page_cursor(
-        (1,), keyring=KEYRING, binding=first_binding
-    )
+    sealed_cursor = pagination.seal_billing_search_page_cursor((1,), keyring=KEYRING, binding=first_binding)
     next_request = _request(cursor=_wire_token(sealed_cursor, first_binding))
     next_context = _authorization_context(**context_overrides)
     next_binding = _cursor_binding(next_request, next_context)
@@ -237,14 +248,14 @@ def test_cursor_rejects_cross_scope_authority(monkeypatch, context_overrides) ->
 
 def test_cursor_reports_expired_generation_after_address_swap(monkeypatch) -> None:
     monkeypatch.setattr(cursor.secrets, "token_bytes", lambda size: b"n" * size)
-    first_binding = _cursor_binding(pin=_pin(address_relation_oid=10))
+    first_binding = _cursor_binding(pin=_pin(address_relation_name=10))
     sealed_cursor = pagination.seal_billing_search_page_cursor(
         (1,),
         keyring=KEYRING,
         binding=first_binding,
     )
     next_request = _request(cursor=_wire_token(sealed_cursor, first_binding))
-    next_binding = _cursor_binding(next_request, pin=_pin(address_relation_oid=11))
+    next_binding = _cursor_binding(next_request, pin=_pin(address_relation_name=11))
 
     with pytest.raises(cursor.BillingSearchCursorGenerationExpired):
         pagination.open_billing_search_page_cursor(
@@ -256,7 +267,7 @@ def test_cursor_reports_expired_generation_after_address_swap(monkeypatch) -> No
 
 def test_cursor_reports_expired_generation_after_evidence_swap(monkeypatch) -> None:
     monkeypatch.setattr(cursor.secrets, "token_bytes", lambda size: b"n" * size)
-    first_binding = _cursor_binding(pin=_pin(address_evidence_relation_oid=10))
+    first_binding = _cursor_binding(pin=_pin(address_evidence_relation_name=10))
     sealed_cursor = pagination.seal_billing_search_page_cursor(
         (1,),
         keyring=KEYRING,
@@ -265,7 +276,7 @@ def test_cursor_reports_expired_generation_after_evidence_swap(monkeypatch) -> N
     next_request = _request(cursor=_wire_token(sealed_cursor, first_binding))
     next_binding = _cursor_binding(
         next_request,
-        pin=_pin(address_evidence_relation_oid=11),
+        pin=_pin(address_evidence_relation_name=11),
     )
 
     with pytest.raises(cursor.BillingSearchCursorGenerationExpired):
@@ -277,34 +288,15 @@ def test_cursor_reports_expired_generation_after_evidence_swap(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
-async def test_generation_capture_locks_address_bundle_before_reading_oids() -> None:
-    session = AsyncMock()
-
-    async def relation_oids_after_lock(*_args, **_kwargs):
-        assert session.execute.await_count == 1
-        return 1001, 1002
-
-    session.scalar.side_effect = relation_oids_after_lock
-
-    pin = await pagination.capture_billing_search_generation_pin(
-        session,
-        _selection(),
-    )
-
-    assert pin.address_relation_oid == 1001
-    assert pin.address_evidence_relation_oid == 1002
-    assert len(pin.snapshot_set_sha256) == 64
-    assert len(pin.generation_bundle_sha256) == 64
-    lock_sql = str(session.execute.await_args.args[0])
-    assert lock_sql == (
-        'LOCK TABLE "mrf"."entity_address_evidence", '
-        '"mrf"."entity_address_unified" IN ACCESS SHARE MODE'
-    )
-    assert "to_regclass" in str(session.scalar.await_args.args[0])
-    assert session.scalar.await_args.args[1] == {
-        "address_relation_name": "mrf.entity_address_unified",
-        "evidence_relation_name": "mrf.entity_address_evidence",
-    }
+async def test_generation_capture_uses_names_and_logical_publication():
+    result = SimpleNamespace(one_or_none=lambda: ("11111111-1111-4111-8111-111111111111", 1))
+    session = SimpleNamespace(execute=AsyncMock(return_value=result), get_transaction=lambda: object())
+    pin = await pagination.capture_billing_search_generation_pin(session, _selection())
+    assert pin == _pin()
+    assert session.execute.await_count == 1
+    statement = str(session.execute.await_args.args[0])
+    assert '"mrf".entity_address_result_generation' in statement
+    assert "origin_generation" in statement
 
 
 def test_snapshot_digest_changes_with_any_release_binding_coordinate() -> None:
@@ -322,20 +314,20 @@ def test_snapshot_digest_changes_with_any_release_binding_coordinate() -> None:
     assert pagination.billing_search_snapshot_set_sha256(changed_selection) != baseline
 
 
-def test_generation_contract_rejects_bad_digests_oids_and_timestamps() -> None:
+def test_generation_contract_rejects_bad_digests_names_and_timestamps() -> None:
     with pytest.raises(PTG2ManifestArtifactError):
         pagination.BillingSearchGenerationPin(
             snapshot_set_sha256="0" * 64,
             generation_bundle_sha256="1" * 64,
-            address_relation_oid=1,
-            address_evidence_relation_oid=2,
+            address_relation_name=1,
+            address_evidence_relation_name=2,
         )
     with pytest.raises(PTG2ManifestArtifactError):
         pagination.BillingSearchGenerationPin(
             snapshot_set_sha256="1" * 64,
             generation_bundle_sha256="2" * 64,
-            address_relation_oid=0,
-            address_evidence_relation_oid=2,
+            address_relation_name=0,
+            address_evidence_relation_name=2,
         )
     with pytest.raises(PTG2ManifestArtifactError):
         pagination.BillingSearchCursorBinding(
@@ -379,9 +371,7 @@ def test_snapshot_digest_requires_complete_v4_release_bindings() -> None:
 
 def test_snapshot_digest_pins_source_publication_and_rejects_corruption() -> None:
     source_aware_selection = source_pinned_selection()
-    source_aware_digest = pagination.billing_search_snapshot_set_sha256(
-        source_aware_selection
-    )
+    source_aware_digest = pagination.billing_search_snapshot_set_sha256(source_aware_selection)
     assert len(source_aware_digest) == 64
 
     mismatched_publication = source_publication(source_count=1)
@@ -398,9 +388,10 @@ def test_address_relation_names_reject_untrusted_schema(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_generation_capture_rejects_missing_relation_oids() -> None:
-    session = AsyncMock()
-    session.scalar.return_value = (1001, None)
+async def test_generation_capture_rejects_missing_logical_publication() -> None:
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(one_or_none=lambda: None)), get_transaction=lambda: object()
+    )
 
     with pytest.raises(PTG2ManifestArtifactError):
         await pagination.capture_billing_search_generation_pin(

@@ -5,7 +5,6 @@ This is producer preparation, not custody. The independent custodian must
 rebuild the same SOURCE facts, mappings and globally pruned office relation.
 """
 
-import asyncio
 import hashlib
 import importlib
 import json
@@ -13,7 +12,7 @@ from dataclasses import asdict, dataclass
 from uuid import UUID, uuid4
 
 from process.network_address_projection import _identifier
-from process.network_custom_address_source import _artifact_dependency_identity, _require_transaction
+from process.network_custom_address_source import _require_transaction
 from process.network_fhir_membership_source import (
     PinnedFHIRMembershipSource,
     fhir_normalized_capture,
@@ -27,7 +26,6 @@ from process.network_initial_cms_office_bindings import (
     _OfficeMatches,
     _prune_unmatched_members,
     _stage_verified_member_page,
-    _transaction_identity,
     _verified_member_input,
     _verify_retained_office_read,
     verified_retained_offices,
@@ -89,23 +87,18 @@ async def _policy_context(connection, address_source, runtime_roles, approved, c
         )
     ):
         raise InitialCMSOfficeBindingError("initial_retained_mapping_canonicalizer_differs")
-    identity = await _artifact_dependency_identity(
-        connection, address_source, runtime_roles, address=True, control_schema=control_schema
-    )
+    address_source.__post_init__()
     context = validate_verified_office_context_v2(
         {
             "policy_version": "retained-fhir-verified-office-v2",
             "approved_revision": approved.approved_revision,
             "approved_generation_sha256": approved.generation_id,
             "address_source": asdict(address_source),
-            "address_identity": dict(
-                zip(("schema_oid", "table_oid", "owner_oid", "identity_sha256"), identity, strict=True)
-            ),
             "origin_manifest_sha256": None,
             "canonicalizer_version": version,
         }
     )
-    return context, identity
+    return context
 
 
 async def _stage_source_members(connection, witness_source, read, input_name, source_table, proofs):
@@ -168,7 +161,7 @@ async def _stage_source_members(connection, witness_source, read, input_name, so
     return tuple(keys)
 
 
-async def _bind_matches(connection, address_source, identity, names, scope, proofs):
+async def _bind_matches(connection, address_source, names, scope, proofs):
     input_name, result_name, source_table = names
     await _finish_verified_office_matches(
         connection, input_name, result_name, address_source, proofs, source_aliases=True
@@ -176,11 +169,7 @@ async def _bind_matches(connection, address_source, identity, names, scope, proo
     await _prune_unmatched_members(connection, source_table, result_name, proofs)
     matches = _OfficeMatches(
         result_name,
-        await connection.fetchval("SELECT to_regclass($1)::oid::bigint", "pg_temp." + result_name),
         address_source,
-        identity,
-        await _transaction_identity(connection),
-        asyncio.current_task(),
         proofs,
         *scope,
     )
@@ -318,7 +307,7 @@ async def _map_witness_offices(connection, address_source, runtime_roles, witnes
 
     approved, control_schema, recipes_sha256 = options.approved, options.control_schema, options.recipes_sha256
     await _require_transaction(connection)
-    context, identity = await _policy_context(connection, address_source, runtime_roles, approved, control_schema)
+    context = await _policy_context(connection, address_source, runtime_roles, approved, control_schema)
     input_name, result_name = "witness_office_inputs_" + uuid4().hex, "witness_office_matches_" + uuid4().hex
     await connection.execute(
         f"CREATE TEMP TABLE {_identifier(input_name)}(page_key text NOT NULL,ordinal integer NOT NULL,"
@@ -348,7 +337,6 @@ async def _map_witness_offices(connection, address_source, runtime_roles, witnes
     matches = await _bind_matches(
         connection,
         address_source,
-        identity,
         (input_name, result_name, source_table),
         (recipes_sha256, approved.generation_id),
         proofs,
@@ -365,7 +353,7 @@ async def _map_witness_offices(connection, address_source, runtime_roles, witnes
         )
         for witness_source in selected
     ]
-    actual, _ = await _policy_context(connection, address_source, runtime_roles, approved, control_schema)
+    actual = await _policy_context(connection, address_source, runtime_roles, approved, control_schema)
     if actual != context:
         raise InitialCMSOfficeBindingError("initial_retained_mapping_canonicalizer_differs")
     await drain_operation(

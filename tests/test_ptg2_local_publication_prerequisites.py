@@ -42,31 +42,17 @@ def test_publication_coordinate_projection_matches_actual_historical_guard(table
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("refusal", [None, "prepared", "installed", "controls"])
-async def test_publisher_requires_both_real_views_and_canonical_controls(monkeypatch, refusal):
-    """A missing native prerequisite stops before any candidate or pointer write."""
-    events = []
-
-    async def attest(_session, *, is_prepared):
-        boundary = "prepared" if is_prepared else "installed"
-        events.append(boundary)
-        if refusal == boundary:
-            raise native.PTG2PhysicalBindingError("unavailable")
-
-    async def controls(_session):
-        events.append("controls")
-        if refusal == "controls":
-            raise native.PTG2PhysicalBindingError("unavailable")
-
-    monkeypatch.setattr(native, "require_local_physical_publisher_view", attest)
+@pytest.mark.parametrize("does_refuse", [False, True])
+async def test_publisher_requires_existing_logical_controls(monkeypatch, does_refuse):
+    controls = AsyncMock(side_effect=native.PTG2PhysicalBindingError("unavailable") if does_refuse else None)
     monkeypatch.setattr(validation, "require_local_publication_controls", controls)
-    if refusal:
+    session = object()
+    if does_refuse:
         with pytest.raises(native.PTG2PhysicalBindingError):
-            await native.require_local_binding_publisher(object())
-        assert events[-1] == refusal
+            await native.require_local_binding_publisher(session)
     else:
-        await native.require_local_binding_publisher(object())
-        assert events == ["prepared", "installed", "controls"]
+        await native.require_local_binding_publisher(session)
+    controls.assert_awaited_once_with(session)
 
 
 @pytest.mark.asyncio

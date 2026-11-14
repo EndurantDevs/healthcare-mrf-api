@@ -8,7 +8,6 @@ from typing import Any
 
 from sqlalchemy import text
 
-from api.network_read_execution import execute_network_read
 from api.ptg2_billing_entity_refs import (
     PTG2BillingAssociationDataError,
     encode_billing_entity_ref,
@@ -192,8 +191,7 @@ async def load_provider_group_billing_associations(
     normalized_refs = _normalized_provider_group_refs(provider_group_refs)
     if not normalized_refs:
         return {}
-    query_result = await execute_network_read(
-        session,
+    query_result = await session.execute(
         _billing_association_query(schema_name),
         {
             "snapshot_key": snapshot_key,

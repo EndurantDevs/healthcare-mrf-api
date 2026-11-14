@@ -22,7 +22,7 @@ from process.registry_membership_refresh_execution import RegistryMembershipRefr
 from process.registry_membership_refresh_queue import RegistryMembershipRefreshAddressProfile
 from process.registry_publication_queue import _request_metadata
 from tests.test_registry_membership_refresh_contract import command
-from tests.test_registry_publication_worker import configuration, resources
+from tests.test_registry_publication_worker import _runtime_configuration, configuration, resources
 
 IMPORTER = "registry-publication-worker"
 REQUEST_ID = "d69a5cb2-4333-43eb-bba8-e03b6108599b"
@@ -291,7 +291,7 @@ async def test_actual_runner_checks_exact_native_request_before_consuming(monkey
 
         monkeypatch.setattr(worker, "_require_membership_refresh_request", preclaim)
         monkeypatch.setattr(worker, "consume_registry_publication_once", consume)
-        config = worker.parse_registry_publication_worker_config(json.dumps(configuration()))
+        config = _runtime_configuration()
         if valid_native:
             assert await worker.run_registry_publication_worker(
                 config, membership_refresh_request_id=UUID(REQUEST_ID)

@@ -2,17 +2,30 @@
 """Protected native publication and request-local retention for code capabilities."""
 
 import base64
+import copy
 import re
 from contextlib import nullcontext
 from uuid import UUID
 
 from sqlalchemy import text
 
-from api.network_read_execution import execute_network_read
+from api.network_read_execution import qualified_relation_sql
 from api.plan_pricing_code_contract import CONTRACT, SPEC, ZIP_CONTRACT, identity_digest
-from api.ptg_membership_storage import _api_read_snapshot, _api_storage_read, _read_metadata, protected_owner
+from api.ptg_membership_storage import (
+    _HEX,
+    _api_read_snapshot,
+    _api_storage_read,
+    _attachment_for_digest,
+    _has_named_attachment,
+    _logical_source_identity,
+    _named_family,
+    _named_storage_receipt,
+    _read_metadata,
+    protected_owner,
+)
 from process import reference_family_archive as native
 from process.entity_address_snapshot_preparation import _require_no_untrusted_mutation, _seal_published_relation
+from process.network_compact_layout import CompactAddressRelation
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from process.ptg_parts.ptg2_physical_binding import _require_closed_local_custody
 
@@ -75,23 +88,202 @@ async def source_pins(session, identity, *, create=False):
     return _pins(identity)
 
 
-async def _api_source_pins(session, identity):
+async def _api_source_pins(session, identity, *, projection_id=None):
     """Keep every source retention predicate inside the authenticated API scope."""
     from api.ptg2_serving import PTG2_SCHEMA
 
-    for pin in _pins(identity):
+    pins = (
+        _pins(identity)
+        if projection_id is None
+        else tuple(
+            {"owner_type": identity["contract"], "owner_id": projection_id, "snapshot_id": snapshot}
+            for snapshot in sorted({source["source_identity"]["snapshot_id"] for source in identity["sources"]})
+        )
+    )
+    if any(_HEX.fullmatch(pin["owner_id"] or "") is None for pin in pins):
+        raise PTG2ManifestArtifactError("code pricing source retention edition differs")
+    for pin in pins:
         present = (
-            await execute_network_read(
+            await _read_metadata(
                 session,
                 text(
                     f"SELECT EXISTS(SELECT 1 FROM ONLY {native._quoted(PTG2_SCHEMA)}.ptg2_snapshot_pin WHERE owner_type=:owner_type AND owner_id=:owner_id AND snapshot_id=:snapshot_id)"
                 ),
                 pin,
+                api_read=True,
             )
         ).scalar_one()
         if present is not True:
             raise PTG2ManifestArtifactError("code pricing source retention pin is missing")
-    return _pins(identity)
+    return pins
+
+
+def _named_membership_receipt(document):
+    fields = {"projection_id", "content_digest", "active_attachment", "storage", "coverage_digest"}
+    if type(document) is not dict or set(document) != fields:
+        raise PTG2ManifestArtifactError("code pricing saved membership receipt differs")
+    receipt_by_field = copy.deepcopy(document)
+    if any(
+        type(receipt_by_field[name]) is not str or _HEX.fullmatch(receipt_by_field[name]) is None
+        for name in ("projection_id", "content_digest", "coverage_digest")
+    ):
+        raise PTG2ManifestArtifactError("code pricing membership edition differs")
+    attachment = receipt_by_field["active_attachment"]
+    if (
+        type(attachment) is not dict
+        or set(attachment) not in ({"name", "relation_oid"}, {"name", "schema_name"})
+        or re.fullmatch(r"pm_[a-z2-7]{52}", attachment.get("name") or "") is None
+    ):
+        raise PTG2ManifestArtifactError("code pricing membership attachment differs")
+    if "schema_name" in attachment and attachment["schema_name"] != "hp_snapshot_retention":
+        raise PTG2ManifestArtifactError("code pricing membership attachment differs")
+    if "relation_oid" in attachment and (
+        type(attachment["relation_oid"]) is not int or not 0 < attachment["relation_oid"] < 2**32
+    ):
+        raise PTG2ManifestArtifactError("code pricing saved membership receipt differs")
+    receipt_by_field["active_attachment"] = {"schema_name": "hp_snapshot_retention", "name": attachment["name"]}
+    if attachment["name"] != _attachment_for_digest(receipt_by_field["projection_id"]):
+        raise PTG2ManifestArtifactError("code pricing membership attachment edition differs")
+    storage = receipt_by_field["storage"]
+    old, named = {"dataset_id", "schema_oid", "relation_oids", "owner_oid"}, {"dataset_id", "schema_name", "relations"}
+    if type(storage) is not dict or set(storage) not in (old, named):
+        raise PTG2ManifestArtifactError("code pricing saved membership storage differs")
+    dataset = UUID(storage["dataset_id"])
+    schema = native.reference_family_stage_schema(dataset)
+    if set(storage) == old:
+        if (
+            any(type(storage[key]) is not int or not 0 < storage[key] < 2**32 for key in ("schema_oid", "owner_oid"))
+            or type(storage["relation_oids"]) is not list
+            or any(
+                type(relation_entry) is not list
+                or len(relation_entry) != 2
+                or type(relation_entry[1]) is not int
+                or not 0 < relation_entry[1] < 2**32
+                for relation_entry in storage["relation_oids"]
+            )
+        ):
+            raise PTG2ManifestArtifactError("code pricing saved membership storage differs")
+        relations = [[schema, relation_entry[0]] for relation_entry in storage["relation_oids"]]
+    else:
+        if storage["schema_name"] != schema:
+            raise PTG2ManifestArtifactError("code pricing membership namespace differs")
+        relations = storage["relations"]
+    from api.ptg_membership_contract import SPEC as membership_spec
+
+    expected_relations = [[schema, name] for name in sorted(membership_spec.table_names)]
+    if type(relations) is not list or sorted(relations) != expected_relations:
+        raise PTG2ManifestArtifactError("code pricing membership named inventory differs")
+    receipt_by_field["storage"] = {"dataset_id": str(dataset), "schema_name": schema, "relations": expected_relations}
+    return receipt_by_field
+
+
+def _logical_code_identity(identity, *, reference=None):
+    try:
+        return _decode_code_identity(identity, reference=reference)
+    except (KeyError, TypeError, ValueError) as error:
+        raise PTG2ManifestArtifactError("code pricing saved identity is invalid") from error
+
+
+def _decode_code_identity(identity, *, reference):
+    fields = {
+        "contract",
+        "build_revision",
+        "plan_release_id",
+        "serving_revision_id",
+        "binding_set_digest",
+        "bindings",
+        "provider_signature",
+        "code_system",
+        "code",
+        "sources",
+    }
+    if (
+        type(identity) is not dict
+        or set(identity) not in (fields, fields | {"scope"})
+        or identity["contract"] not in (CONTRACT, ZIP_CONTRACT)
+        or type(identity["sources"]) is not list
+        or not identity["sources"]
+    ):
+        raise PTG2ManifestArtifactError("code pricing read identity differs")
+    identity_by_field = copy.deepcopy(identity)
+    if reference is not None and len(identity["sources"]) != len(reference["sources"]):
+        raise PTG2ManifestArtifactError("code pricing source inventory differs")
+    for index, source_receipt in enumerate(identity_by_field["sources"]):
+        if (
+            type(source_receipt) is not dict
+            or set(source_receipt)
+            != {
+                "binding_ordinal",
+                "materialized_binding_ordinal",
+                "read_identity_digest",
+                "source_identity",
+                "code_rows",
+                "membership",
+            }
+            or type(source_receipt["read_identity_digest"]) is not str
+            or _HEX.fullmatch(source_receipt["read_identity_digest"]) is None
+            or type(source_receipt["membership"]) is not dict
+        ):
+            raise PTG2ManifestArtifactError("code pricing source receipt differs")
+        expected = None if reference is None else reference["sources"][index]
+        old = source_receipt["membership"].get("storage", {})
+        is_legacy = type(old) is dict and set(old) == {"dataset_id", "schema_oid", "relation_oids", "owner_oid"}
+        source_receipt["source_identity"] = _logical_source_identity(
+            source_receipt["source_identity"], reference=None if expected is None else expected["source_identity"]
+        )
+        source_receipt["membership"] = _named_membership_receipt(source_receipt["membership"])
+        if is_legacy and expected is not None:
+            source_receipt["read_identity_digest"] = expected["read_identity_digest"]
+    return identity_by_field
+
+
+async def _locate_named(session, identity, *, allow_stale_provider):
+    identity = _logical_code_identity(identity)
+    name = attachment_name(identity)
+    if not await _has_named_attachment(session, name):
+        return None
+    memberships = tuple(
+        source_receipt["membership"]["active_attachment"]["name"] for source_receipt in identity["sources"]
+    )
+    relation = await _named_family(session, name, SPEC, "plan_pricing_code_manifest", memberships=memberships)
+    header = (
+        (
+            await _read_metadata(
+                session,
+                text(
+                    f"SELECT identity,content_digest,counts FROM ONLY {qualified_relation_sql(relation.schema_name, relation.table_name)} "
+                    "WHERE singleton=1"
+                ),
+                api_read=True,
+            )
+        )
+        .mappings()
+        .one()
+    )
+    if re.fullmatch("[0-9a-f]{64}", header["content_digest"] or "") is None:
+        raise PTG2ManifestArtifactError("code pricing content identity differs")
+    logical = _logical_code_identity(header["identity"], reference=identity)
+    is_stale = False
+    if logical != identity:
+        old, new = copy.deepcopy(logical), copy.deepcopy(identity)
+        if identity["contract"] == ZIP_CONTRACT and old.get("provider_signature") != new.get("provider_signature"):
+            old["scope"].pop("geo_cells", None)
+            new["scope"].pop("geo_cells", None)
+        old.pop("provider_signature", None)
+        new.pop("provider_signature", None)
+        if not allow_stale_provider or old != new:
+            raise PTG2ManifestArtifactError("code pricing logical identity differs")
+        is_stale = True
+    projection = identity_digest(header["identity"])
+    await _api_source_pins(session, logical, projection_id=projection)
+    if is_stale:
+        return None
+    return (
+        relation,
+        {**dict(header), "identity": logical},
+        projection,
+        CompactAddressRelation("hp_snapshot_retention", name),
+    )
 
 
 def _membership_views(identity):
@@ -153,10 +345,13 @@ async def _storage(session, view_oid, owner, identity, *, api_read=False):
 
 
 async def locate(session, identity, *, allow_stale_provider=False, api_read=False):
-    """An exact closed native view, never a comment or caller receipt, authorizes reads."""
+    """Resolve the attachment and its complete data and retention scope."""
     if type(api_read) is not bool:
         raise PTG2ManifestArtifactError("capability API read mode is invalid")
-    driver, transaction, backend_pid = await _api_read_snapshot(session) if api_read else (None, None, None)
+    transaction = await _api_read_snapshot(session) if api_read else None
+    if api_read:
+        async with _api_storage_read(session, transaction):
+            return await _locate_named(session, identity, allow_stale_provider=allow_stale_provider)
     owner = await protected_owner(session)
     if owner is None:
         return None
@@ -175,7 +370,7 @@ async def locate(session, identity, *, allow_stale_provider=False, api_read=Fals
     view_oid = int(attachment_record[0])
     await _require_no_untrusted_mutation(session, [view_oid], owner)
     ownership = await _storage(session, view_oid, owner, identity, **({"api_read": True} if api_read else {}))
-    async with _api_storage_read(session, ownership, driver, transaction, backend_pid) if api_read else nullcontext():
+    async with _api_storage_read(session, transaction) if api_read else nullcontext():
         header = (
             (
                 await _read_metadata(
@@ -249,6 +444,17 @@ async def seal(session, ownership, identity, *, reader_principals):
 def receipt(found):
     """Expose the authenticated ready identity and captured native storage coordinates."""
     ownership, header, owner, oid = found
+    if type(ownership) is CompactAddressRelation:
+        return {
+            "contract": header["identity"]["contract"],
+            "projection_id": owner,
+            "state": "ready",
+            "identity": header["identity"],
+            "content_digest": header["content_digest"],
+            "counts": header["counts"],
+            "active_attachment": {"schema_name": oid.schema_name, "name": oid.table_name},
+            "storage": _named_storage_receipt(ownership, SPEC),
+        }
     return {
         "contract": header["identity"]["contract"],
         "projection_id": identity_digest(header["identity"]),

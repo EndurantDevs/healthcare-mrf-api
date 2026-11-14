@@ -1,10 +1,11 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Physical publisher custody and refusal before source target access."""
+"""Named source routing, configured transactions and batch failure safety."""
 
 import asyncio
 import json
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -27,7 +28,7 @@ async def _callable_binding(factory, connection):
 
 
 @pytest.mark.asyncio
-async def test_callable_capability_preserves_the_original_native_oid_tuple(custody):
+async def test_callable_capability_preserves_the_original_native_oid_tuple():
     factory, (connection, _) = _identity_factory(), _connection()
     capability = (101, 2**32 - 1)
     factory.source_callable_capability = AsyncMock(return_value=capability)
@@ -38,7 +39,7 @@ async def test_callable_capability_preserves_the_original_native_oid_tuple(custo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("changed", ["missing_factory", "wrong_factory", "connection", "policy", "factory_policy"])
-async def test_callable_capability_refuses_substituted_original_authority(custody, changed):
+async def test_callable_capability_refuses_substituted_original_authority(changed):
     factory, (connection, _) = _identity_factory(), _connection()
     capture = factory.source_callable_capability = AsyncMock(return_value=(101,))
     original_policy = factory.policy
@@ -69,7 +70,7 @@ async def test_callable_capability_refuses_substituted_original_authority(custod
 
 
 @pytest.mark.asyncio
-async def test_callable_capability_cannot_adopt_a_factory_after_publisher_binding(custody):
+async def test_callable_capability_cannot_adopt_a_factory_after_publisher_binding():
     factory, (connection, _) = _identity_factory(), _connection()
     capture = factory.source_callable_capability = AsyncMock(return_value=(101,))
     async with policy.bind_generic_source_publisher(
@@ -85,22 +86,8 @@ async def test_callable_capability_cannot_adopt_a_factory_after_publisher_bindin
 
 
 @pytest.mark.asyncio
-async def test_callable_capability_rejects_an_inherited_child_task(custody):
-    factory, (connection, _) = _identity_factory(), _connection()
-    capture = factory.source_callable_capability = AsyncMock(return_value=(101,))
-
-    async def child():
-        with pytest.raises(GenericCandidateError, match="publisher_connection_required"):
-            await policy.source_callable_capability(connection, factory.policy)
-
-    async with _callable_binding(factory, connection):
-        await asyncio.create_task(child())
-    capture.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("capability", [None, [101], (True,), (0,), (-1,), (2**32,), ("101",), (101, 101)])
-async def test_callable_capability_rejects_malformed_or_non_native_oid_results(custody, capability):
+async def test_callable_capability_rejects_malformed_or_non_native_oid_results(capability):
     factory, (connection, _) = _identity_factory(), _connection()
     factory.source_callable_capability = AsyncMock(return_value=capability)
     async with _callable_binding(factory, connection):
@@ -110,7 +97,7 @@ async def test_callable_capability_rejects_malformed_or_non_native_oid_results(c
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("changed", ["factory", "publisher", "policy"])
-async def test_callable_capability_rechecks_original_context_after_await(custody, changed):
+async def test_callable_capability_rechecks_original_context_after_await(changed):
     factory, (connection, _) = _identity_factory(), _connection()
     original_policy = factory.policy
     tokens = []
@@ -162,8 +149,8 @@ def _connection():
     return connection, transitions
 
 
-def _identity_factory():
-    identity, configured = ("a" * 40, "sha256:" + "b" * 64), _policy()
+def _identity_factory(*, schema="source_schema"):
+    identity, configured = ("a" * 40, "sha256:" + "b" * 64), replace(_policy(), schema=schema)
     factory = SimpleNamespace(transaction=lambda: None, policy=configured, producer_identity=identity)
 
     def require_current_policy():
@@ -176,10 +163,7 @@ def _identity_factory():
 
 def _isolated_factory():
     factory = _identity_factory()
-    factory.storage_binding = isolated.FHIRSourceStorageBinding(
-        "catalog_schema", "source_schema", 10, 20, 30, 100, 101, "d" * 64
-    )
-    factory.source_storage_binding = AsyncMock(return_value=factory.storage_binding)
+    factory.storage_binding = isolated.FHIRSourceStorageBinding("catalog_schema", "source_schema")
     return factory
 
 
@@ -285,7 +269,9 @@ async def test_named_startup_uses_the_bound_schema_without_running_legacy_ddl(mo
             with pytest.raises(GenericCandidateError, match="schema_changed"):
                 await adapters.require_generic_source_layout(directory)
     verify_roles.assert_not_awaited()
-    connection.execute.assert_not_awaited()
+    connection.execute.assert_awaited_once_with(
+        'SELECT dataset_id FROM "source_schema"."provider_directory_endpoint_dataset" LIMIT 0'
+    )
 
 
 @pytest.mark.asyncio
@@ -317,12 +303,23 @@ async def test_seen_cleanup_keeps_private_storage_separate(monkeypatch, isolated
 async def test_published_predecessor_uses_the_canonical_catalog(monkeypatch, isolated_storage, dataset):
     from importlib import import_module
 
+    from process import provider_directory_projection_stage as projection
+
     directory = import_module("process.provider_directory_fhir")
     factory = _isolated_factory() if isolated_storage else _identity_factory()
     query = AsyncMock(return_value={"dataset_id": dataset} if dataset else None)
     monkeypatch.setattr(directory, "_schema", lambda: "catalog_schema")
     monkeypatch.setattr(directory.db, "first", query)
     monkeypatch.setattr(directory.db, "_transaction_binding", lambda: None)
+
+    @asynccontextmanager
+    async def transaction():
+        yield object()
+
+    monkeypatch.setattr(directory.db, "transaction", transaction)
+    monkeypatch.setattr(
+        projection, "_copy_driver", AsyncMock(return_value=SimpleNamespace(fetchval=AsyncMock(return_value=None)))
+    )
     async with policy.bind_generic_source_transaction_factory(factory):
         assert await directory._current_endpoint_dataset_id("endpoint", exclude_dataset_id="candidate") == dataset
     assert '"catalog_schema"."provider_directory_endpoint_dataset"' in query.await_args.args[0]
@@ -339,6 +336,8 @@ async def test_published_predecessor_uses_the_canonical_catalog(monkeypatch, iso
 async def test_published_predecessor_refuses_changed_reader_scope(monkeypatch, changed):
     from importlib import import_module
 
+    from process import provider_directory_projection_stage as projection
+
     directory = import_module("process.provider_directory_fhir")
     factory = _isolated_factory()
     query = AsyncMock(return_value={"dataset_id": "synthetic-incumbent"})
@@ -352,6 +351,15 @@ async def test_published_predecessor_refuses_changed_reader_scope(monkeypatch, c
 
     if changed == "producer":
         query.side_effect = changed_producer
+
+    @asynccontextmanager
+    async def transaction():
+        yield object()
+
+    monkeypatch.setattr(directory.db, "transaction", transaction)
+    monkeypatch.setattr(
+        projection, "_copy_driver", AsyncMock(return_value=SimpleNamespace(fetchval=AsyncMock(return_value=None)))
+    )
     async with policy.bind_generic_source_transaction_factory(factory):
         with pytest.raises((RuntimeError, ValueError), match="catalog_reader_required|source_policy_changed"):
             await directory._current_endpoint_dataset_id("endpoint", exclude_dataset_id="candidate")
@@ -384,7 +392,7 @@ async def test_metadata_validators_keep_canonical_function_qualification(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_private_candidate_admission_needs_no_canonical_functions(monkeypatch, custody):
+async def test_private_candidate_admission_needs_no_canonical_functions(monkeypatch):
     from importlib import import_module
 
     from process.provider_directory_generic_source_storage import HEADER
@@ -411,7 +419,7 @@ async def test_private_candidate_admission_needs_no_canonical_functions(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_private_admission_routes_through_original_binding(monkeypatch, custody):
+async def test_private_admission_routes_through_original_binding(monkeypatch):
     """A competing validated private header blocks without canonical callable access."""
     from importlib import import_module
 
@@ -435,207 +443,7 @@ async def test_private_admission_routes_through_original_binding(monkeypatch, cu
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("closed", [False, True])
-@pytest.mark.parametrize("function_owner", [103, 401])
-async def test_private_custody_requires_no_metadata_execution(monkeypatch, closed, function_owner):
-    """Both private principals must lack effective execution; canonical ACLs stay captured."""
-    from copy import deepcopy
-
-    from process import provider_directory_source_callable_custody as callables
-    from tests.test_provider_directory_source_callable_custody import _entry
-
-    signature = "provider_directory_subset_canonical_sha256(jsonb)"
-    function_by_field = _entry(signature, owner=function_owner)
-    function_by_field["signature"] = '"sample".' + signature
-    native_functions = [dict(deepcopy(function_by_field), authority_closed=closed)]
-    monkeypatch.setattr(isolated, "_isolated_metadata_rows", AsyncMock(return_value=native_functions))
-    monkeypatch.setattr(callables, "_body_digest", lambda body, schema: body)
-    configured = _policy()
-    roles_by_name = {
-        name: {"oid": oid}
-        for name, oid in zip(
-            (configured.owner_role, configured.publisher_role, *configured.runtime_roles), (101, 102, 103), strict=True
-        )
-    }
-    connection = SimpleNamespace()
-    if closed:
-        captured = await isolated._isolated_metadata_custody(connection, "sample", 201, roles_by_name, configured)
-        assert captured[signature]["definition"] == function_by_field["definition"]
-        assert captured[signature]["acl"] == function_by_field["acl"]
-        assert captured[signature]["access"] == function_by_field["access"][:3]
-        assert captured[signature]["access"][2][-1] is (function_owner == 103)
-    else:
-        with pytest.raises(GenericCandidateError, match="metadata_authority_changed"):
-            await isolated._isolated_metadata_custody(connection, "sample", 201, roles_by_name, configured)
-    isolated._isolated_metadata_rows.assert_awaited_once_with(
-        connection, "sample", configured.runtime_roles, [101, 102]
-    )
-
-
-@pytest.mark.parametrize("changed", [None, "missing", "layout", "authority", "physical"])
-def test_admission_batch_preserves_scoped_physical_identity(changed):
-    """Private observations cannot replace an authorized catalog table's physical identity."""
-    relations = [
-        dict(
-            scope="admission",
-            oid=101 + ordinal,
-            relname=name,
-            nspname="catalog",
-            relkind="r",
-            relpersistence="p",
-            relrowsecurity=False,
-            relforcerowsecurity=False,
-            columns='[["identifier", "text"]]',
-        )
-        for ordinal, name in enumerate(sorted(isolated._CATALOG_ROOTS))
-    ]
-    evidence_by_field = dict(
-        catalog=[*relations, dict(relations[0], scope="private", oid=999, nspname="private")],
-        physical=[dict(oid=101 + ordinal, relfilenode=201 + ordinal, column_acls="[[1, null]]") for ordinal in range(3)]
-        + [dict(oid=999, relfilenode=999)],
-        admission_rights=[dict(oid=relation["oid"], closed=True) for relation in relations],
-    )
-    if changed == "missing":
-        evidence_by_field["catalog"].pop(0)
-    elif changed == "layout":
-        relations[0]["relkind"] = "p"
-    elif changed == "authority":
-        evidence_by_field["admission_rights"][0]["closed"] = False
-    elif changed == "physical":
-        evidence_by_field["physical"].pop(0)
-    if changed:
-        errors_by_case = dict(
-            missing="admission_missing",
-            layout="admission_layout_changed",
-            authority="admission_authority_changed",
-            physical="protected_fhir_inventory_changed",
-        )
-        with pytest.raises(GenericCandidateError, match=errors_by_case[changed]):
-            isolated._isolated_admission_rights("catalog", evidence_by_field)
-    else:
-        captured = isolated._isolated_admission_rights("catalog", evidence_by_field)
-        assert set(captured) == isolated._CATALOG_ROOTS
-        for ordinal, name in enumerate(sorted(captured)):
-            assert captured[name]["oid"] == 101 + ordinal
-            assert captured[name]["relfilenode"] == 201 + ordinal
-            assert captured[name]["column_acls"] == [[1, None]]
-            assert captured[name]["columns"] == [["identifier", "text"]]
-            assert "scope" not in captured[name]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("change", [None, "missing", "overload", "substituted"])
-async def test_metadata_batch_requires_fixed_census(change):
-    from process.provider_directory_source_control_privileges import METADATA_FUNCTIONS
-
-    native_functions = [
-        dict(proname=signature.split("(")[0], signature=str(501 + ordinal), authority_closed=True)
-        for ordinal, signature in enumerate(METADATA_FUNCTIONS)
-    ]
-    if change == "missing":
-        native_functions.pop()
-    elif change == "overload":
-        native_functions.append(dict(native_functions[0], signature="999"))
-    elif change == "substituted":
-        native_functions[-1] = dict(native_functions[0], signature="999")
-    connection = SimpleNamespace(fetch=AsyncMock(return_value=native_functions))
-    if change is None:
-        captured = await isolated._isolated_metadata_rows(connection, "sample", ("reader",), [101, 102])
-        assert {function["signature"] for function in captured} == {
-            '"sample"."' + signature.split("(")[0] + '"(' + signature.split("(", 1)[1]
-            for signature in METADATA_FUNCTIONS
-        }
-    else:
-        with pytest.raises(GenericCandidateError, match="metadata_missing"):
-            await isolated._isolated_metadata_rows(connection, "sample", ("reader",), [101, 102])
-    query, schema, names, readers, private_oids = connection.fetch.await_args.args
-    assert (schema, set(names), readers, private_oids) == (
-        "sample",
-        {signature.split("(")[0] for signature in METADATA_FUNCTIONS},
-        ["reader"],
-        [101, 102],
-    )
-    assert "pg_has_role(actor.oid,(definition->>'proowner')::oid,'SET')" in query
-    assert "pg_has_role(actor.oid,(definition->>'proowner')::oid,'USAGE')" in query
-    assert "has_function_privilege(actor.oid,(definition->>'oid')::oid,'EXECUTE')" in query
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("encoded", [False, True])
-@pytest.mark.parametrize(
-    "changed", [None, "edges", "forward_only", "owner_closed", "publication_closed", "publication_available"]
-)
-async def test_delegation_batch_preserves_codec_and_refusals(encoded, changed):
-    configured = _policy()
-    role_names = (
-        configured.owner_role,
-        configured.publisher_role,
-        *configured.runtime_roles,
-        "migration",
-        "namespace",
-        "publication_owner",
-        "publication_publisher",
-    )
-    roles_by_name = {
-        name: {"oid": 101 + ordinal, "rolcanlogin": name == "publication_publisher"}
-        for ordinal, name in enumerate(role_names)
-    }
-    delegation_by_field = dict(
-        edges=[[102, False, True, False], [104, True, True, False], [107, True, True, False]],
-        forward_only=True,
-        owner_closed=True,
-        publication_closed=True,
-        publication_available=True,
-    )
-    if changed == "edges":
-        delegation_by_field["edges"].pop()
-    elif changed:
-        delegation_by_field[changed] = False
-    if encoded:
-        delegation_by_field["edges"] = json.dumps(delegation_by_field["edges"])
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=delegation_by_field))
-    arguments = (
-        connection,
-        configured,
-        roles_by_name,
-        "migration",
-        "namespace",
-        dict(owner_role="publication_owner", publisher_role="publication_publisher"),
-    )
-    if changed:
-        errors_by_field = {
-            "publication_closed": "publication_reverse_delegation",
-            "publication_available": "publication_custody_unavailable",
-        }
-        with pytest.raises(GenericCandidateError, match=errors_by_field.get(changed, "source_delegation_changed")):
-            await isolated._isolated_delegation(*arguments)
-    else:
-        await isolated._isolated_delegation(*arguments)
-    connection.fetchrow.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("encoded", [False, True])
-async def test_catalog_batch_preserves_json_codec(encoded):
-    configured = _policy()
-    role_names = (configured.owner_role, configured.publisher_role, *configured.runtime_roles)
-    roles_by_name = {name: {"oid": 101 + ordinal} for ordinal, name in enumerate(role_names)}
-    evidence_by_field = {
-        name: [{"oid": 201, "nested": [None, True, "native"]}]
-        for name in ("catalog", "templates", "physical", "layouts", "admission_rights", "checkpoints")
-    }
-    native_by_field = {name: json.dumps(entries) if encoded else entries for name, entries in evidence_by_field.items()}
-    native_by_field.update(catalog_prefix='"catalog".', readers_closed=True, dependencies_closed=True)
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=native_by_field))
-    captured = await isolated._isolated_catalog_rows(connection, configured, "catalog", roles_by_name)
-    assert captured == dict(
-        evidence_by_field, catalog_prefix='"catalog".', readers_closed=True, dependencies_closed=True
-    )
-    connection.fetchrow.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_cms_dispositions_remain_scoped_to_shared_headers(custody):
+async def test_cms_dispositions_remain_scoped_to_shared_headers():
     from process.provider_directory_cms_npd_recovery import candidate_available_sql
     from process.provider_directory_generic_source_storage import HEADER
 
@@ -661,7 +469,7 @@ async def test_cms_dispositions_remain_scoped_to_shared_headers(custody):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["private", "changed", "whitespace", "immutable", "legacy"])
-async def test_validation_preserves_private_predecessor_and_legacy_current_fence(monkeypatch, custody, case):
+async def test_validation_preserves_private_predecessor_and_legacy_current_fence(monkeypatch, case):
     from importlib import import_module
 
     directory = import_module("process.provider_directory_fhir")
@@ -703,122 +511,143 @@ async def test_validation_preserves_private_predecessor_and_legacy_current_fence
 
 
 def _isolated_connection(factory):
+    """Keep the existing helper shape while supplying only portable names."""
+    from dataclasses import asdict
+
     connection, transitions = _connection()
-    native_by_field = {
-        key: getattr(factory.storage_binding, key)
-        for key in ("database_oid", "catalog_schema_oid", "storage_schema_oid", "owner_oid", "namespace_owner_oid")
-    }
-    connection.fetchrow = AsyncMock(
-        side_effect=lambda query, *args: (
-            native_by_field
-            if query.startswith("SELECT d.oid")
-            else {"session": "source_publisher", "current": "source_publisher"}
-        )
-    )
-    return connection, native_by_field, transitions
+    return connection, asdict(factory.storage_binding), transitions
 
 
 @pytest.mark.asyncio
-async def test_isolated_binding_is_same_original_factory_object_before_routing(custody):
+async def test_named_binding_routes_portable_names_without_catalog_capture():
+    from dataclasses import replace
+
     factory = _isolated_factory()
     connection, _, _ = _isolated_connection(factory)
+    factory.storage_binding = replace(factory.storage_binding)
+    connection.fetch = AsyncMock(side_effect=AssertionError("catalog capture reached"))
     async with _callable_binding(factory, connection):
         publisher = policy.bound_publisher()
-        assert publisher.storage_binding is factory.storage_binding
-        assert isolated.storage_document(publisher)["producer"] == list(factory.producer_identity)
-        factory.source_storage_binding.assert_awaited_once_with(connection, factory.policy)
-        owner_token = policy._OWNER.set((publisher, object()))
-        try:
-            await policy._bind_isolated_storage(publisher)
-        finally:
-            policy._OWNER.reset(owner_token)
-        assert factory.source_storage_binding.await_count == 2
+        assert isolated.storage_document(publisher) == {
+            "catalog_schema": "catalog_schema",
+            "storage_schema": "source_schema",
+        }
+        await policy._bind_isolated_storage(publisher)
+    connection.execute.assert_awaited_once_with(
+        'SELECT dataset_id FROM "source_schema"."provider_directory_endpoint_dataset" LIMIT 0'
+    )
+    connection.fetchrow.assert_not_awaited()
+    connection.fetchval.assert_not_awaited()
+    connection.fetch.assert_not_awaited()
     assert policy._PUBLISHER.get() is None and policy._FACTORY.get() is None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", [None, "canonical_schema", "native_owner"])
-async def test_isolated_startup_recaptures_storage_and_never_issues_legacy_ddl(custody, monkeypatch, changed):
+@pytest.mark.parametrize("failure", [PermissionError("read denied"), asyncio.CancelledError()])
+async def test_named_layout_preserves_access_failure_without_capture_or_fallback(failure):
+    factory = _named_factory()
+    connection, _ = _connection()
+    connection.execute.side_effect = failure
+    factory.source_callable_capability = AsyncMock(side_effect=AssertionError("catalog capture reached"))
+    async with _callable_binding(factory, connection):
+        with pytest.raises(type(failure)) as raised:
+            await policy._bind_isolated_storage(policy.bound_publisher())
+        assert raised.value is failure
+    connection.execute.assert_awaited_once()
+    connection.fetchrow.assert_not_awaited()
+    connection.fetchval.assert_not_awaited()
+    factory.source_callable_capability.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["schema", "missing", "shape"])
+async def test_named_layout_refuses_changed_declared_storage_before_sql(changed):
+    factory = _named_factory()
+    connection, _ = _connection()
+    async with _callable_binding(factory, connection):
+        publisher = SimpleNamespace(**vars(policy.bound_publisher()))
+        if changed == "schema":
+            publisher.policy = policy.GenericSourcePolicy(
+                "other_schema", "source_owner", "source_publisher", ("reader",)
+            )
+        elif changed == "missing":
+            publisher.storage_binding = None
+        else:
+            publisher.storage_binding = SimpleNamespace(**vars(factory.storage_binding))
+        with pytest.raises(GenericCandidateError, match="storage_changed"):
+            await policy._bind_isolated_storage(publisher)
+    connection.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_batch_loading", [True, False])
+async def test_named_batch_and_completion_use_declared_transactions_without_capture(monkeypatch, is_batch_loading):
+    database, factory, opened = _factory_case(monkeypatch)
+    factory.storage_binding = isolated.FHIRSourceStorageBinding("catalog_schema", "source_schema")
+    capture = factory.source_callable_capability = AsyncMock(side_effect=AssertionError("catalog capture reached"))
+    async with policy.bind_generic_source_transaction_factory(factory):
+        async with policy.source_transaction(database, isolation="repeatable read", is_batch_loading=is_batch_loading):
+            publisher = policy.bound_publisher()
+            assert policy.current_source_storage_binding() == factory.storage_binding
+            assert policy.source_copy_session() is opened[-1][0]
+            publisher.connection.fetchrow.assert_not_awaited()
+            publisher.connection.fetchval.assert_not_awaited()
+    capture.assert_not_awaited()
+    assert [isolation for _, isolation in opened] == ["repeatable read"]
+    assert policy._PUBLISHER.get() is policy._OWNER.get() is policy._FACTORY.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["transaction", "policy", "isolation"])
+async def test_publisher_refuses_invalid_transaction_declaration_before_sql(change):
+    connection, _ = _connection()
+    configured, isolation = _policy(), "repeatable read"
+    if change == "transaction":
+        connection.is_in_transaction = lambda: False
+    elif change == "policy":
+        configured = SimpleNamespace(**vars(configured))
+    else:
+        isolation = "unsupported"
+    with pytest.raises(GenericCandidateError, match="transaction_required|explicit_policy_required|isolation_required"):
+        async with policy.bind_generic_source_publisher(connection, configured, transaction_isolation=isolation):
+            pytest.fail("invalid transaction declaration admitted")
+    connection.execute.assert_not_awaited()
+    connection.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [False, True])
+async def test_named_startup_rechecks_catalog_scope_without_legacy_ddl(monkeypatch, changed):
     from importlib import import_module
 
     from process import provider_directory_generic_source_adapters as adapters
 
     directory = import_module("process.provider_directory_fhir")
     factory = _isolated_factory()
-    connection, native_by_field, _ = _isolated_connection(factory)
+    connection, _, _ = _isolated_connection(factory)
 
     @asynccontextmanager
     async def original_transaction(database):
-        assert policy.bound_publisher().connection is connection
+        assert database is directory.db
         yield
 
     monkeypatch.setattr(adapters, "source_transaction", original_transaction)
-    monkeypatch.setattr(
-        directory, "_schema", lambda: "wrong_catalog" if changed == "canonical_schema" else "catalog_schema"
-    )
+    monkeypatch.setattr(directory, "_schema", lambda: "wrong_catalog" if changed else "catalog_schema")
     legacy_probe = AsyncMock(side_effect=AssertionError("legacy schema mutation path reached"))
     monkeypatch.setattr(directory, "_is_table_present", legacy_probe)
     async with _callable_binding(factory, connection):
-        if changed == "native_owner":
-            native_by_field["owner_oid"] += 1
         if changed:
-            with pytest.raises(GenericCandidateError, match="schema_changed|storage_identity_changed"):
+            with pytest.raises(GenericCandidateError, match="schema_changed"):
                 await directory._ensure_provider_directory_tables()
         else:
             await directory._ensure_provider_directory_tables()
-            assert factory.source_storage_binding.await_count == 2
     legacy_probe.assert_not_awaited()
-    connection.execute.assert_not_awaited()
+    assert connection.execute.await_count == (0 if changed else 1)
+    assert all("LIMIT 0" in call.args[0] for call in connection.execute.await_args_list)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "field", ["database_oid", "catalog_schema_oid", "storage_schema_oid", "owner_oid", "namespace_owner_oid"]
-)
-async def test_isolated_coordinate_substitution_refuses_before_body(custody, field):
-    factory = _isolated_factory()
-    connection, native_by_field, _ = _isolated_connection(factory)
-    native_by_field[field] += 1
-    with pytest.raises(GenericCandidateError, match="storage_identity_changed"):
-        async with _callable_binding(factory, connection):
-            pytest.fail("substituted native identity reached the caller")
-    connection.execute.assert_not_awaited()
-    assert policy._PUBLISHER.get() is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["missing", "copy", "factory", "binding"])
-async def test_isolated_binding_requires_original_factory_and_identity_after_await(custody, changed):
-    from dataclasses import replace
-
-    factory = _isolated_factory()
-    connection, _, _ = _isolated_connection(factory)
-    previous_factory = policy._FACTORY.get()
-    issued = factory.storage_binding
-    if changed == "missing":
-        del factory.source_storage_binding
-    else:
-
-        async def capture(*args):
-            if changed == "factory":
-                policy._FACTORY.set(_isolated_factory())
-            if changed == "binding":
-                factory.storage_binding = replace(issued)
-            await asyncio.sleep(0)
-            return replace(issued) if changed == "copy" else issued
-
-        factory.source_storage_binding = capture
-    try:
-        with pytest.raises(GenericCandidateError, match="storage_factory"):
-            async with _callable_binding(factory, connection):
-                pytest.fail("unissued storage reached the caller")
-    finally:
-        policy._FACTORY.set(previous_factory)
-    assert not any(call.args[0].startswith("SELECT d.oid") for call in connection.fetchrow.await_args_list)
-
-
-@pytest.mark.asyncio
-async def test_isolated_relation_routing_preserves_catalog_and_refuses_unverified_overrides(custody):
+async def test_isolated_relation_routing_preserves_catalog_and_refuses_unverified_overrides():
     from importlib import import_module
 
     from process.provider_directory_generic_source_storage import HEADER, RELATIONS
@@ -863,7 +692,7 @@ async def test_isolated_relation_routing_preserves_catalog_and_refuses_unverifie
 
 
 @pytest.mark.asyncio
-async def test_isolated_routing_refuses_unbound_or_inherited_transaction_and_publication(custody):
+async def test_named_routing_requires_transaction_and_uses_separate_publication_route():
     factory = _isolated_factory()
     connection, _, _ = _isolated_connection(factory)
     factory.publication_session_factory = AsyncMock()
@@ -879,16 +708,9 @@ async def test_isolated_routing_refuses_unbound_or_inherited_transaction_and_pub
         with pytest.raises(GenericCandidateError, match="isolated_activation_unavailable"):
             await policy.source_publication_sessions()
         async with policy.bind_generic_source_publisher(
-            connection, factory.policy, verify_role_profile=AsyncMock(), transaction_isolation="repeatable read"
+            connection, factory.policy, transaction_isolation="repeatable read"
         ):
-
-            async def child():
-                with pytest.raises(GenericCandidateError, match="publisher_connection_required"):
-                    policy.current_source_storage_binding()
-
-            await asyncio.create_task(child())
-            with pytest.raises(GenericCandidateError, match="isolated_activation_unavailable"):
-                await policy._publication_origin(object())
+            assert policy.current_source_storage_binding() == factory.storage_binding
     factory.publication_session_factory.assert_not_awaited()
 
 
@@ -897,18 +719,16 @@ async def test_isolated_routing_refuses_unbound_or_inherited_transaction_and_pub
     [
         ("storage_schema", "catalog_schema"),
         ("storage_schema", "pg_private"),
-        ("database_oid", True),
-        ("storage_schema_oid", 20),
-        ("owner_oid", 0),
-        ("namespace_owner_oid", True),
-        ("namespace_owner_oid", 100),
-        ("enrollment_sha256", "x" * 64),
+        ("storage_schema", "public"),
+        ("catalog_schema", "information_schema"),
+        ("catalog_schema", "pg_catalog"),
+        ("storage_schema", "bad-name"),
     ],
 )
-def test_isolated_binding_refuses_ambiguous_or_non_native_coordinates(field, value):
+def test_named_binding_refuses_ambiguous_or_invalid_schemas(field, value):
     from dataclasses import replace
 
-    with pytest.raises(GenericCandidateError):
+    with pytest.raises((GenericCandidateError, ValueError)):
         replace(_isolated_factory().storage_binding, **{field: value})
 
 
@@ -977,7 +797,7 @@ async def test_source_producer_identity_rechecks_factory_freshness(changed):
 
 
 @pytest.mark.asyncio
-async def test_source_producer_identity_matches_original_publisher_factory_policy_and_task(custody):
+async def test_source_producer_identity_rechecks_publisher_policy_and_producer():
     factory = _identity_factory()
     connection, _ = _connection()
     async with policy.bind_generic_source_transaction_factory(factory):
@@ -986,38 +806,21 @@ async def test_source_producer_identity_matches_original_publisher_factory_polic
         ):
             assert policy.source_producer_identity() is factory.producer_identity
             factory.policy = _policy()
-            with pytest.raises(GenericCandidateError, match="source_policy_changed"):
-                policy.source_producer_identity()
-            factory.policy = policy.bound_publisher().policy
+            assert policy.source_producer_identity() == factory.producer_identity
             token = policy._FACTORY.set(_identity_factory())
             try:
-                with pytest.raises(GenericCandidateError, match="source_policy_changed"):
-                    policy.source_producer_identity()
+                assert policy.source_producer_identity() == factory.producer_identity
             finally:
                 policy._FACTORY.reset(token)
 
-            async def child():
-                with pytest.raises(GenericCandidateError, match="publisher_connection_required"):
-                    policy.source_producer_identity()
-
-            await asyncio.create_task(child())
-
-
-@pytest.fixture
-def custody(monkeypatch):
-    native = AsyncMock()
-    monkeypatch.setattr(policy, "storage_roles", native)
-    return native
-
 
 @pytest.mark.asyncio
-async def test_missing_publisher_refuses_before_driver_or_target_sql(monkeypatch):
-    driver = AsyncMock()
-    monkeypatch.setattr(policy, "_copy_driver", driver)
+async def test_missing_publisher_refuses_before_transaction_access():
+    transaction_binding = Mock(side_effect=AssertionError("target access reached"))
     with pytest.raises(GenericCandidateError, match="publisher_connection_required"):
-        async with policy.source_owner_transaction(object()):
+        async with policy.source_owner_transaction(SimpleNamespace(_transaction_binding=transaction_binding)):
             pytest.fail("ordinary session became an owner")
-    driver.assert_not_awaited()
+    transaction_binding.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1031,7 +834,7 @@ async def test_original_publication_requires_trusted_factory_before_io():
 
 @pytest.mark.asyncio
 async def test_original_publication_delegates_same_session_without_owning_lifecycle(monkeypatch):
-    database, session, sessions = object(), object(), object()
+    database, session, sessions = object(), SimpleNamespace(in_transaction=lambda: True), object()
     calls = []
 
     @asynccontextmanager
@@ -1045,11 +848,9 @@ async def test_original_publication_delegates_same_session_without_owning_lifecy
         yield session
 
     monkeypatch.setattr(policy, "source_publication_body", publication_body)
-    factory = SimpleNamespace(
-        transaction=lambda: None,
-        publication_session_factory=AsyncMock(return_value=sessions),
-        bind_existing_transaction=original,
-    )
+    factory = _identity_factory()
+    factory.publication_session_factory = AsyncMock(return_value=sessions)
+    factory.bind_existing_transaction = original
     async with policy.bind_generic_source_transaction_factory(factory):
         assert await policy.source_publication_sessions() is sessions
         async with policy.original_source_publication(database, session) as bound:
@@ -1066,29 +867,10 @@ async def test_intake_only_factory_cannot_supply_final_publication():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "actor", ({"session": "ordinary", "current": "ordinary"}, {"session": "ordinary", "current": "source_publisher"})
-)
-async def test_claimed_or_set_role_publisher_is_not_genuine(custody, actor):
-    connection, _ = _connection()
-    connection.fetchrow.return_value = actor
-    verifier = AsyncMock()
-    with pytest.raises(GenericCandidateError, match="genuine_publisher_required"):
-        async with policy.bind_generic_source_publisher(
-            connection, _policy(), verify_role_profile=verifier, transaction_isolation="repeatable read"
-        ):
-            pytest.fail("false publisher was admitted")
-    custody.assert_not_awaited()
-    verifier.assert_not_awaited()
-    connection.execute.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_original_physical_owner_and_role_are_restored(custody, monkeypatch):
+async def test_configured_owner_role_is_restored_after_candidate_writes(monkeypatch):
     connection, transitions = _connection()
     session = object()
     database = SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=session))
-    monkeypatch.setattr(policy, "_copy_driver", AsyncMock(return_value=connection))
     verifier = AsyncMock()
     async with policy.bind_generic_source_publisher(
         connection, _policy(), verify_role_profile=verifier, transaction_isolation="repeatable read"
@@ -1100,44 +882,13 @@ async def test_original_physical_owner_and_role_are_restored(custody, monkeypatc
         'SET LOCAL ROLE "source_owner"',
         "RESET ROLE",
     ]
-    custody.assert_awaited_once()
-    verifier.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_different_physical_connection_is_refused(custody, monkeypatch):
-    connection, transitions = _connection()
-    monkeypatch.setattr(policy, "_copy_driver", AsyncMock(return_value=object()))
-    database = SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=object()))
-    async with policy.bind_generic_source_publisher(
-        connection, _policy(), verify_role_profile=AsyncMock(), transaction_isolation="repeatable read"
-    ):
-        with pytest.raises(GenericCandidateError, match="physical_transaction_changed"):
-            async with policy.source_owner_transaction(database):
-                pytest.fail("a side connection split the transaction")
-    assert transitions == []
-    connection.execute.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_child_task_cannot_reuse_the_parent_physical_connection(custody):
-    connection, _ = _connection()
-
-    async def child():
-        with pytest.raises(GenericCandidateError, match="publisher_connection_required"):
-            policy.bound_publisher()
-
-    async with policy.bind_generic_source_publisher(
-        connection, _policy(), verify_role_profile=AsyncMock(), transaction_isolation="repeatable read"
-    ):
-        await asyncio.create_task(child())
+    verifier.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", (RuntimeError("rejected"), asyncio.CancelledError()))
-async def test_rejection_and_cancellation_roll_back_original_savepoint(custody, monkeypatch, failure):
+async def test_rejection_and_cancellation_roll_back_original_savepoint(monkeypatch, failure):
     connection, transitions = _connection()
-    monkeypatch.setattr(policy, "_copy_driver", AsyncMock(return_value=connection))
     database = SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=object()))
     async with policy.bind_generic_source_publisher(
         connection, _policy(), verify_role_profile=AsyncMock(), transaction_isolation="repeatable read"
@@ -1150,25 +901,9 @@ async def test_rejection_and_cancellation_roll_back_original_savepoint(custody, 
 
 
 @pytest.mark.asyncio
-async def test_wrong_native_isolation_refuses_before_profile_or_owner(custody):
+async def test_nested_helpers_reuse_only_the_same_original_owner(monkeypatch):
     connection, transitions = _connection()
-    connection.fetchval.return_value = "read committed"
-    verifier = AsyncMock()
-    with pytest.raises(GenericCandidateError, match="isolation_changed"):
-        async with policy.bind_generic_source_publisher(
-            connection, _policy(), verify_role_profile=verifier, transaction_isolation="repeatable read"
-        ):
-            pytest.fail("isolation was only a caller claim")
-    custody.assert_not_awaited()
-    verifier.assert_not_awaited()
-    assert transitions == []
-
-
-@pytest.mark.asyncio
-async def test_nested_helpers_reuse_only_the_same_original_owner(custody, monkeypatch):
-    connection, transitions = _connection()
-    session = object()
-    monkeypatch.setattr(policy, "_copy_driver", AsyncMock(return_value=connection))
+    session = SimpleNamespace(in_transaction=lambda: True)
     database = SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=session))
     async with policy.bind_generic_source_publisher(
         connection, _policy(), verify_role_profile=AsyncMock(), transaction_isolation="repeatable read"
@@ -1187,9 +922,8 @@ async def test_nested_helpers_reuse_only_the_same_original_owner(custody, monkey
 
 
 @pytest.mark.asyncio
-async def test_closed_copy_transport_preserves_cancellation_without_second_rollback(custody, monkeypatch):
+async def test_closed_copy_transport_preserves_cancellation_without_second_rollback(monkeypatch):
     connection, transitions = _connection()
-    monkeypatch.setattr(policy, "_copy_driver", AsyncMock(return_value=connection))
     database = SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=object()))
     async with policy.bind_generic_source_publisher(
         connection, _policy(), verify_role_profile=AsyncMock(), transaction_isolation="repeatable read"
@@ -1205,14 +939,13 @@ def _factory_case(monkeypatch):
     binding = ContextVar("synthetic_source_session", default=None)
     database = SimpleNamespace(_transaction_binding=lambda: binding.get())
     opened_sessions = []
-    monkeypatch.setattr(policy, "_copy_driver", AsyncMock(side_effect=lambda session: session.driver))
 
     @asynccontextmanager
     async def transaction(requested_database, *, isolation):
         assert requested_database is database
         connection, _ = _connection()
         connection.fetchval.return_value = isolation
-        session = SimpleNamespace(driver=connection)
+        session = SimpleNamespace(driver=connection, in_transaction=lambda: True)
         token = binding.set(SimpleNamespace(session=session))
 
         async def execute(statement):
@@ -1230,11 +963,13 @@ def _factory_case(monkeypatch):
         finally:
             binding.reset(token)
 
-    return database, SimpleNamespace(transaction=transaction), opened_sessions
+    factory = _identity_factory()
+    factory.transaction = transaction
+    return database, factory, opened_sessions
 
 
 @pytest.mark.asyncio
-async def test_factory_propagates_to_two_workers_but_each_owns_its_physical_transaction(custody, monkeypatch):
+async def test_factory_opens_separate_transactions_for_concurrent_workers(monkeypatch):
     database, factory, opened = _factory_case(monkeypatch)
     ready = asyncio.Event()
     entered_sessions = []
@@ -1261,7 +996,6 @@ async def test_factory_propagates_to_two_workers_but_each_owns_its_physical_tran
 @pytest.mark.asyncio
 async def test_factory_must_bind_a_genuine_publisher_before_it_can_yield(monkeypatch):
     driver = AsyncMock()
-    monkeypatch.setattr(policy, "_copy_driver", driver)
 
     @asynccontextmanager
     async def transaction(database, *, isolation):
@@ -1275,7 +1009,7 @@ async def test_factory_must_bind_a_genuine_publisher_before_it_can_yield(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_nested_transaction_cannot_upgrade_isolation_after_earlier_queries(custody, monkeypatch):
+async def test_nested_transaction_cannot_upgrade_isolation_after_earlier_queries(monkeypatch):
     database, factory, opened = _factory_case(monkeypatch)
     async with policy.bind_generic_source_transaction_factory(factory):
         async with policy.source_transaction(database):
@@ -1286,7 +1020,7 @@ async def test_nested_transaction_cannot_upgrade_isolation_after_earlier_queries
 
 
 @pytest.mark.asyncio
-async def test_seal_transaction_requests_repeatable_read_before_factory_queries(custody, monkeypatch):
+async def test_seal_transaction_requests_repeatable_read_before_factory_queries(monkeypatch):
     database, factory, opened = _factory_case(monkeypatch)
     async with policy.bind_generic_source_transaction_factory(factory):
         async with policy.source_transaction(database, isolation="repeatable read"):
@@ -1295,27 +1029,11 @@ async def test_seal_transaction_requests_repeatable_read_before_factory_queries(
 
 
 @pytest.mark.asyncio
-async def test_child_cannot_replace_an_inherited_live_session_with_another_factory_transaction(custody, monkeypatch):
-    database, factory, opened = _factory_case(monkeypatch)
-
-    async def child():
-        with pytest.raises(GenericCandidateError, match="publisher_connection_required"):
-            async with policy.source_transaction(database):
-                pytest.fail("inherited physical session was replaced under an active transaction")
-
-    async with policy.bind_generic_source_transaction_factory(factory):
-        async with policy.source_transaction(database):
-            await asyncio.create_task(child())
-    assert len(opened) == 1
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [None, RuntimeError("body refused"), asyncio.CancelledError()])
-async def test_original_publisher_body_restores_owner_without_abort_role_sql(custody, monkeypatch, failure):
+async def test_original_publisher_body_restores_owner_without_abort_role_sql(monkeypatch, failure):
     connection, transitions = _connection()
-    session = object()
+    session = SimpleNamespace(in_transaction=lambda: True)
     database = SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=session))
-    monkeypatch.setattr(policy, "_copy_driver", AsyncMock(return_value=connection))
 
     async def execute(statement):
         actor = "source_owner" if statement.startswith("SET LOCAL ROLE") else "source_publisher"
@@ -1348,34 +1066,9 @@ async def test_original_publisher_body_restores_owner_without_abort_role_sql(cus
         assert statements == ['SET LOCAL ROLE "source_owner"', "RESET ROLE", "RESET ROLE"]
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["session", "driver", "actor"])
-async def test_publisher_body_rejects_changed_original_identity_before_role_sql(custody, monkeypatch, change):
-    connection, transitions = _connection()
-    session = object()
-    monkeypatch.setattr(policy, "_copy_driver", AsyncMock(return_value=connection))
-    database = SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=session))
-    async with policy.bind_generic_source_publisher(
-        connection, _policy(), verify_role_profile=AsyncMock(), transaction_isolation="repeatable read"
-    ):
-        async with policy.source_owner_transaction(database):
-            connection.fetchrow.return_value = {"session": "source_publisher", "current": "source_owner"}
-            if change == "driver":
-                monkeypatch.setattr(policy, "_copy_driver", AsyncMock(return_value=object()))
-            if change == "actor":
-                connection.fetchrow.return_value = {"session": "foreign", "current": "source_owner"}
-            with pytest.raises(
-                GenericCandidateError, match="original_transaction|physical_transaction|owner_transaction"
-            ):
-                async with policy.source_publisher_body(object() if change == "session" else session):
-                    pytest.fail("changed original identity was admitted")
-            assert transitions == ["savepoint"]
-            assert connection.execute.await_count == 1
-
-
 async def _exercise_publisher_body(connection, session, database, failure):
-    async with policy.source_publisher_body(session) as publisher:
-        assert publisher.connection is connection and policy._OWNER.get() is None
+    async with policy.source_publisher_body(session):
+        assert policy.bound_publisher().connection is connection and policy._OWNER.get() is None
         assert (await connection.fetchrow())["current"] == "source_publisher"
         if failure is not None:
             raise failure
@@ -1413,25 +1106,13 @@ def _synthetic_catalog_roles():
 async def synthetic_source_publisher(
     monkeypatch, database, *, isolation="repeatable read", schema="source_schema", binding=None
 ):
-    """Exercise real publisher/Owner/physical guards over explicit unit catalog data."""
-    from process.plan_release_storage_catalog import ROLE_SQL
-
+    """Exercise configured publisher transactions without a catalog-capture double."""
     configured = policy.GenericSourcePolicy(schema, "source_owner", "source_publisher", ("source_reader",))
     connection, transitions = _connection()
     connection.copy_records_to_table = AsyncMock()
-    connection.get_server_pid = lambda: 17
+    connection.fetch = AsyncMock(side_effect=AssertionError("unexpected catalog capture"))
     connection.fetchval.side_effect = lambda query, *args: isolation if query == "SHOW transaction_isolation" else "23"
     connection.status = AsyncMock()
-
-    async def fetch(query, *arguments):
-        assert query == ROLE_SQL
-        assert arguments == (
-            ["source_owner", "source_publisher", "source_reader"],
-            "source_owner",
-            "source_publisher",
-            schema,
-        )
-        return _synthetic_catalog_roles()
 
     async def execute(statement, *arguments):
         if statement.startswith("SET LOCAL ROLE") or statement == "RESET ROLE":
@@ -1442,7 +1123,6 @@ async def synthetic_source_publisher(
     async def verify(_connection, schema, **roles):
         assert _connection is connection and schema == configured.schema and roles == configured.role_arguments()
 
-    connection.fetch = fetch
     connection.execute.side_effect = execute
     token = None
     if binding is None:
@@ -1465,7 +1145,7 @@ async def synthetic_source_publisher(
 
 
 class SyntheticSourceWorkflow:
-    """Opt-in unit dependency adapter; it never attests native candidate custody."""
+    """Unit orchestration with declared source facts and transaction outcome checks."""
 
     def __init__(self, directory, candidate, identity, *, drained=None, before_seal=None):
         from copy import deepcopy
@@ -1553,9 +1233,8 @@ class SyntheticSourceWorkflow:
         from process import provider_directory_generic_source_adapters as adapters
         from process import provider_directory_generic_source_auxiliary as auxiliary
 
-        factory = SimpleNamespace(
-            transaction=lambda database, **options: self._transaction(monkeypatch, database, **options)
-        )
+        factory = _identity_factory(schema=self.schema)
+        factory.transaction = lambda database, **options: self._transaction(monkeypatch, database, **options)
         with monkeypatch.context() as settings:
             settings.setattr(adapters, "completed_source_scope", self.completed)
             settings.setattr(auxiliary, "seal_identity_candidate", self.seal)
@@ -1605,7 +1284,7 @@ async def test_unit_workflow_refuses_changed_source_coordinates(monkeypatch, fie
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", ("candidate", "source", "session", "database"))
-async def test_unit_workflow_refuses_changed_physical_identity(monkeypatch, change):
+async def test_unit_workflow_refuses_changed_source_and_transaction_inputs(monkeypatch, change):
     workflow = _workflow_case()
     with pytest.raises(AssertionError):
         async with workflow.bind(monkeypatch):
@@ -1654,7 +1333,7 @@ async def test_unit_workflow_rejects_conflicting_existing_declaration(field):
 
 @asynccontextmanager
 async def synthetic_source_factory(monkeypatch, database, *, schema="source_schema"):
-    """Opt in to real publisher guards over explicit, task-local unit catalog doubles."""
+    """Open independent unit transactions through the configured publisher API."""
     binding = ContextVar("unit_source_factory_session", default=None)
     monkeypatch.setattr(database, "_transaction_binding", binding.get, raising=False)
 
@@ -1667,14 +1346,15 @@ async def synthetic_source_factory(monkeypatch, database, *, schema="source_sche
             ) as (connection, _transitions):
                 yield connection
 
-    factory = SimpleNamespace(transaction=transaction)
+    factory = _identity_factory(schema=schema)
+    factory.transaction = transaction
     async with policy.bind_generic_source_transaction_factory(factory):
         yield factory
     assert binding.get() is None
 
 
 @pytest.mark.asyncio
-async def test_unit_factory_keeps_each_task_physical_session_separate(monkeypatch):
+async def test_unit_factory_keeps_concurrent_transactions_separate(monkeypatch):
     database = SimpleNamespace()
     entered_sessions = []
     ready = asyncio.Event()
@@ -1698,7 +1378,7 @@ async def test_unit_factory_keeps_each_task_physical_session_separate(monkeypatc
 
 @asynccontextmanager
 async def synthetic_checkpoint_factory(monkeypatch, database, *, schema="mrf"):
-    """Declare native catalog data only; retain real original-session Source guards."""
+    """Supply checkpoint controls while retaining active transaction checks."""
     from process import provider_directory_source_checkpoint_control as checkpoints
 
     async def capture(connection, configured):
@@ -1783,7 +1463,7 @@ async def test_unit_database_facade_keeps_domain_sql_and_current_source_session(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("substitution", ["task", "session", "database"])
+@pytest.mark.parametrize("substitution", ["session", "database"])
 async def test_unit_database_facade_never_waives_source_executor_guards(monkeypatch, substitution):
     from process.provider_directory_source_checkpoint_control import require_checkpoint_executor
 
@@ -1796,12 +1476,10 @@ async def test_unit_database_facade_never_waives_source_executor_guards(monkeypa
             elif substitution == "database":
                 executor = SyntheticSourceDatabase(SimpleNamespace())
             with pytest.raises(
-                GenericCandidateError, match="publisher_connection_required|checkpoint_transaction_changed"
+                GenericCandidateError,
+                match="publisher_connection_required|checkpoint_transaction_changed|transaction_required",
             ):
-                if substitution == "task":
-                    await asyncio.create_task(require_checkpoint_executor(executor))
-                else:
-                    await require_checkpoint_executor(executor)
+                await require_checkpoint_executor(executor)
         domain.first.assert_not_awaited()
 
 
@@ -1814,7 +1492,8 @@ async def test_checkpoint_guard_delegates_without_publisher_or_owner():
         assert supplied is database and policy._PUBLISHER.get() is policy._OWNER.get() is None
         yield connection, transaction
 
-    factory = SimpleNamespace(transaction=lambda: None, checkpoint_guard=guard)
+    factory = _identity_factory()
+    factory.checkpoint_guard = guard
     async with policy.bind_generic_source_transaction_factory(factory):
         async with policy.source_checkpoint_guard(database) as issued:
             assert issued == (connection, transaction)
@@ -1842,181 +1521,161 @@ async def test_checkpoint_guard_refuses_proxy_before_factory():
     factory.checkpoint_guard.assert_not_called()
 
 
-async def _capture_custody(connection, configured):
-    return await isolated.capture_isolated_source_storage_custody(
-        connection,
-        configured,
-        catalog_schema="catalog_schema",
-        migration_role="migration",
-        namespace_owner_role="namespace_owner",
-        publication={"owner_role": "source_owner", "publisher_role": "source_publisher"},
-    )
+@pytest.mark.asyncio
+async def test_equal_logical_publisher_and_factory_wrappers_keep_the_active_copy_scope():
+    factory = _named_factory()
+    connection, _ = _connection()
+    session = SimpleNamespace(in_transaction=lambda: True)
+    database = SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=session))
+    async with _callable_binding(factory, connection), policy.source_owner_transaction(database):
+        original = policy.bound_publisher()
+        wrapper = _named_factory()
+        factory_token = policy._FACTORY.set(wrapper)
+        publisher_token = policy._PUBLISHER.set(
+            replace(
+                original,
+                policy=replace(original.policy),
+                storage_binding=replace(original.storage_binding),
+                factory=wrapper,
+            )
+        )
+        try:
+            assert policy.source_producer_identity() == factory.producer_identity
+            assert policy.source_copy_session() is session
+        finally:
+            policy._PUBLISHER.reset(publisher_token)
+            policy._FACTORY.reset(factory_token)
+    assert policy._OWNER.get() is policy._PUBLISHER.get() is policy._FACTORY.get() is None
 
 
-def _loading_connection(factory, *, replication_role="origin", session="source_publisher"):
-    connection, native_by_field, _ = _isolated_connection(factory)
-    actor_by_field = {"session": session, "current": session, "administrator": False}
-    connection.fetchrow = AsyncMock(
-        side_effect=lambda query, *args: native_by_field if query.startswith("SELECT d.oid") else actor_by_field
-    )
-    connection.fetchval = AsyncMock(
-        side_effect=lambda query, *args: replication_role if "session_replication_role" in query else "repeatable read"
-    )
-    return connection
+@pytest.mark.asyncio
+async def test_child_with_its_own_active_source_scope_uses_equal_logical_configuration():
+    from process.provider_directory_profile_source_inputs import _child_context
 
+    factory = _named_factory()
+    parent_connection, _ = _connection()
+    parent_session = SimpleNamespace(in_transaction=lambda: True)
+    parent_database = SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=parent_session))
 
-@contextmanager
-def _batch_loading(is_batch_loading=True):
-    token = policy._BATCH_LOADING.set(is_batch_loading)
-    try:
-        yield
-    finally:
-        policy._BATCH_LOADING.reset(token)
-
-
-@pytest.fixture
-def storage_capture(monkeypatch):
-    clock = Mock(return_value=1000.0)
-    capture = AsyncMock(side_effect=lambda *_, **__: {"version": 1, "captured_at": clock.return_value})
-    monkeypatch.setattr(isolated.time, "monotonic", clock)
-    monkeypatch.setattr(isolated, "_capture_isolated_source_storage_custody", capture)
-    monkeypatch.setattr(isolated, "_LOADING_CUSTODY", [])
-    return SimpleNamespace(capture=capture, clock=clock)
-
-
-async def _open_transaction(factory, connection, *, is_batch_loading):
-    """Open one transaction the way the issued factory does: both verifications capture the storage."""
-
-    async def verify_role_profile(driver, schema, **roles):
-        await _capture_custody(driver, factory.policy)
-
-    async def source_storage_binding(driver, configured):
-        await verify_role_profile(driver, configured.schema)
-        return factory.storage_binding
-
-    factory.source_storage_binding = source_storage_binding
-    with _batch_loading(is_batch_loading):
-        async with policy.bind_generic_source_transaction_factory(factory):
-            async with policy.bind_generic_source_publisher(
-                connection,
-                factory.policy,
-                verify_role_profile=verify_role_profile,
-                transaction_isolation="repeatable read",
+    async def child():
+        child_connection, _ = _connection()
+        session = SimpleNamespace(in_transaction=lambda: True)
+        database = SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=session))
+        token = policy._FACTORY.set(_named_factory())
+        try:
+            async with (
+                policy.bind_generic_source_publisher(
+                    child_connection, replace(factory.policy), transaction_isolation="repeatable read"
+                ),
+                policy.source_owner_transaction(database),
             ):
-                assert policy.loading_verification_factory() is None
+                assert policy.source_producer_identity() == factory.producer_identity
+                assert policy.source_copy_session() is session
+                assert policy.bound_publisher().connection is child_connection
+        finally:
+            policy._FACTORY.reset(token)
 
-
-@pytest.mark.asyncio
-async def test_batch_transactions_reuse_one_storage_capture_per_interval(custody, storage_capture):
-    factory = _isolated_factory()
-    connection = _loading_connection(factory)
-
-    await _open_transaction(factory, connection, is_batch_loading=True)
-    storage_capture.clock.return_value += isolated._LOADING_CUSTODY_SECONDS - 1
-    await _open_transaction(factory, connection, is_batch_loading=True)
-    # Two batches, each verified at the publisher binding and at the storage binding: one capture.
-    assert storage_capture.capture.await_count == 1
-
-    storage_capture.clock.return_value += 1
-    await _open_transaction(factory, connection, is_batch_loading=True)
-    assert storage_capture.capture.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_completion_right_after_a_batch_captures_storage_afresh(custody, storage_capture):
-    factory = _isolated_factory()
-    connection = _loading_connection(factory)
-    await _open_transaction(factory, connection, is_batch_loading=True)
-    assert storage_capture.capture.await_count == 1
-
-    # Completion, handoff and every other transaction do not opt in: both verifications capture anew.
-    await _open_transaction(factory, connection, is_batch_loading=False)
-    assert storage_capture.capture.await_count == 3
-    # Those captures never replace the one a batch may reuse.
-    await _open_transaction(factory, connection, is_batch_loading=True)
-    assert storage_capture.capture.await_count == 3
-
-
-@pytest.mark.asyncio
-async def test_storage_capture_is_reused_only_by_its_loading_factory(custody, storage_capture):
-    factory, other_factory = _isolated_factory(), _isolated_factory()
-    connection = _loading_connection(factory)
-
-    async def capture_while_loading(issued, configured):
-        async with policy.bind_generic_source_transaction_factory(issued):
-            with _batch_loading(), policy._loading_verification():
-                return await _capture_custody(connection, configured)
-
-    first = await capture_while_loading(factory, factory.policy)
-    second = await capture_while_loading(factory, factory.policy)
-    assert storage_capture.capture.await_count == 1 and first == second and first is not second
-    # Inside a batch transaction but outside its two verifications, a capture is new.
-    async with policy.bind_generic_source_transaction_factory(factory):
-        with _batch_loading():
-            await _capture_custody(connection, factory.policy)
-    assert storage_capture.capture.await_count == 2
-    # Another storage or another issued factory is never served from the first one's capture.
-    other_policy = policy.GenericSourcePolicy("other_schema", "source_owner", "source_publisher", ("source_reader",))
-    await capture_while_loading(factory, other_policy)
-    await capture_while_loading(other_factory, other_policy)
-    assert storage_capture.capture.await_count == 4
+    async with _callable_binding(factory, parent_connection), policy.source_owner_transaction(parent_database):
+        original = policy.bound_publisher()
+        await asyncio.create_task(child(), context=_child_context())
+        assert policy.bound_publisher() is original and policy.source_copy_session() is parent_session
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("changes", "code"),
-    [({"replication_role": "replica"}, "replication_role"), ({"session": "other_login"}, "genuine_publisher_required")],
+    "operation,changed",
+    [
+        (operation, changed)
+        for operation in ("source_copy_session", "source_producer_identity")
+        for changed in ("policy", "catalog", "storage", "producer", "driver", "session")
+        if (operation, changed) != ("source_producer_identity", "session")
+    ],
 )
-async def test_reused_storage_capture_still_checks_the_current_connection(custody, storage_capture, changes, code):
-    factory = _isolated_factory()
-    async with policy.bind_generic_source_transaction_factory(factory):
-        with _batch_loading(), policy._loading_verification():
-            await _capture_custody(_loading_connection(factory), factory.policy)
-            with pytest.raises(GenericCandidateError, match=code):
-                await _capture_custody(_loading_connection(factory, **changes), factory.policy)
-    assert storage_capture.capture.await_count == 1
+async def test_source_scope_refuses_logical_changes_and_inactive_transactions(operation, changed):
+    factory = _named_factory()
+    connection, _ = _connection()
+    session = SimpleNamespace(in_transaction=lambda: True)
+    database = SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=session))
+    async with _callable_binding(factory, connection), policy.source_owner_transaction(database):
+        wrapper = _named_factory()
+        wrapper._require_current_policy = Mock()
+        if changed == "policy":
+            wrapper.policy = replace(wrapper.policy, owner_role="other_owner")
+        if changed in {"catalog", "storage"}:
+            wrapper.storage_binding = replace(wrapper.storage_binding, **{changed + "_schema": "other_schema"})
+        if changed == "producer":
+            wrapper.producer_identity = ("c" * 40, "sha256:" + "d" * 64)
+        if changed == "driver":
+            connection.is_in_transaction = lambda: False
+        if changed == "session":
+            session.in_transaction = lambda: False
+        token = policy._FACTORY.set(wrapper)
+        try:
+            with pytest.raises(GenericCandidateError, match="policy_changed|transaction_required"):
+                getattr(policy, operation)()
+        finally:
+            policy._FACTORY.reset(token)
 
 
 @pytest.mark.asyncio
-async def test_failed_or_bounded_storage_capture_is_never_reused(custody, storage_capture):
-    factory = _isolated_factory()
-    connection = _loading_connection(factory)
-    storage_capture.capture.side_effect = GenericCandidateError("provider_directory_source_storage_transaction_changed")
-    async with policy.bind_generic_source_transaction_factory(factory):
-        with _batch_loading(), policy._loading_verification():
-            for _ in range(2):
-                with pytest.raises(GenericCandidateError, match="transaction_changed"):
-                    await _capture_custody(connection, factory.policy)
-            storage_capture.capture.side_effect = None
-            storage_capture.capture.return_value = {"version": 1}
-            for _ in range(2):
-                await isolated.capture_isolated_source_storage_custody(
-                    connection,
-                    factory.policy,
-                    catalog_schema="catalog_schema",
-                    migration_role="migration",
-                    namespace_owner_role="namespace_owner",
-                    publication={},
-                    expected_history_bounds={"bounded": True},
-                )
-    assert storage_capture.capture.await_count == 4
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("is_batch_loading", [True, False])
-async def test_only_a_batch_transaction_opts_in_while_it_is_opened(is_batch_loading):
-    opened_flags = []
+@pytest.mark.parametrize("changed", [False, True])
+async def test_checkpoint_guard_compares_logical_factory_configuration(changed):
+    database = Database()
+    factory, wrapper = _identity_factory(), _identity_factory()
+    if changed:
+        wrapper = _identity_factory(schema="other_schema")
 
     @asynccontextmanager
-    async def transaction(database, *, isolation):
-        opened_flags.append(policy._BATCH_LOADING.get())
-        raise RuntimeError("opened")
-        yield
+    async def guard(actual):
+        assert actual is database
+        token = policy._FACTORY.set(wrapper)
+        try:
+            yield "connection", "transaction"
+        finally:
+            policy._FACTORY.reset(token)
 
-    factory = SimpleNamespace(transaction=transaction)
+    factory.checkpoint_guard = guard
     async with policy.bind_generic_source_transaction_factory(factory):
-        with pytest.raises(RuntimeError, match="opened"):
-            async with policy.source_transaction(object(), is_batch_loading=is_batch_loading):
-                pytest.fail("the transaction body must not run")
-        assert policy._BATCH_LOADING.get() is False
-    assert opened_flags == [is_batch_loading]
+        if changed:
+            with pytest.raises(GenericCandidateError, match="policy_changed"):
+                async with policy.source_checkpoint_guard(database):
+                    pytest.fail("changed logical scope entered")
+        else:
+            async with policy.source_checkpoint_guard(database) as issued:
+                assert issued == ("connection", "transaction")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [False, True])
+async def test_original_publication_compares_logical_scope_before_the_body(monkeypatch, changed):
+    factory = _identity_factory()
+    wrapper = _identity_factory(schema="other_schema" if changed else "source_schema")
+    session = SimpleNamespace(in_transaction=lambda: True)
+    entered_events = []
+
+    @asynccontextmanager
+    async def bind(database, actual_session, *, isolation):
+        assert actual_session is session and isolation == "read committed"
+        token = policy._FACTORY.set(wrapper)
+        try:
+            yield session
+        finally:
+            policy._FACTORY.reset(token)
+
+    @asynccontextmanager
+    async def body(database):
+        entered_events.append(True)
+        yield session
+
+    factory.bind_existing_transaction = bind
+    factory.publication_session_factory = AsyncMock()
+    monkeypatch.setattr(policy, "source_publication_body", body)
+    async with policy.bind_generic_source_transaction_factory(factory):
+        if changed:
+            with pytest.raises(GenericCandidateError, match="policy_changed"):
+                async with policy.original_source_publication(object(), session):
+                    pytest.fail("changed logical publication scope entered")
+        else:
+            async with policy.original_source_publication(object(), session) as actual:
+                assert actual is session
+    assert entered_events == ([] if changed else [True])

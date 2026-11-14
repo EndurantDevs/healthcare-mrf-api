@@ -13,7 +13,6 @@ from uuid import UUID, uuid5
 import pytest
 
 from db.registry_source_inventory_schema import INVENTORY_TABLE
-from process import network_candidate_custody as custody
 from process import reference_family_archive as archive
 from process import registry_ptg_source_consumer as consumer
 from process import registry_source_inventory_store as inventory_store
@@ -25,10 +24,11 @@ from process.registry_source_inventory_contract import make_source_inventory_ent
 from process.registry_source_inventory_preparation import SourceInventoryPreparation
 from process.registry_source_inventory_reference import INVENTORY_DIGEST_KEY, SourceInventoryReference
 from process.registry_source_recipe_store import RECIPE_DIGEST_KEY, canonical_registry_source_recipes
+from tests.registry_source_recipe_support import _example
 from tests.test_registry_ptg_office_membership_recipe import _recipe as ptg_recipe
 from tests.test_registry_ptg_source_consumer import config as ptg_consumer_config
 from tests.test_registry_source_inventory_preparation import _aca_recipe
-from tests.test_registry_source_recipe_store_postgres import _cms_custody_recipe, _example
+from tests.test_registry_source_recipe_store_postgres import _cms_custody_recipe
 
 CONTROL = "synthetic_control"
 APPROVED = ApprovedMembershipSource(3, "b" * 64, 0)
@@ -257,15 +257,9 @@ def _replay_spies(monkeypatch, fixture):
     connection = ReplayConnection(fixture.candidate)
     events = []
 
-    async def seal(actual, copy_target, *, control_schema, required):
-        assert actual is connection and actual.active and actual.readonly and actual.reads == 2
-        assert copy_target == fixture.target and required is True and control_schema == CONTROL
-        events.append("custody")
-        return {"receipt": {"closure": {"relation_oids": {INVENTORY_TABLE: 88}}}}
-
-    async def inventory(actual, copy_target, candidate, *, expected_table_oid, control_schema):
-        assert actual is connection and actual.active and actual.readonly and events == ["custody"]
-        assert copy_target == fixture.target and expected_table_oid == 88 and control_schema == CONTROL
+    async def inventory(actual, copy_target, candidate, *, control_schema):
+        assert actual is connection and actual.active and actual.readonly and not events
+        assert copy_target == fixture.target and control_schema == CONTROL
         events.append("inventory")
         return fixture.reference, fixture.entries
 
@@ -273,38 +267,28 @@ def _replay_spies(monkeypatch, fixture):
         assert actual is connection and not actual.active and copy_target == fixture.target and address == ADDRESS
         events.append("pipeline")
 
-    seal_spy, loader, publisher = (
-        AsyncMock(side_effect=seal),
-        AsyncMock(side_effect=inventory),
-        AsyncMock(side_effect=publish),
-    )
-    monkeypatch.setattr(custody, "verify_network_candidate_custody", seal_spy)
-    monkeypatch.setattr(inventory_store, "_load_locked_source_inventory", loader)
+    loader, publisher = AsyncMock(side_effect=inventory), AsyncMock(side_effect=publish)
+    monkeypatch.setattr(inventory_store, "load_source_inventory", loader)
     monkeypatch.setattr(consumer, "prepare_and_publish_network_candidate", publisher)
-    return connection, seal_spy, loader, publisher, events
+    return connection, loader, publisher, events
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("count", [1, 101, 1000])
-async def test_new_reference_replay_holds_required_custody_for_membership_and_identity(
-    monkeypatch, full_recipes, count
-):
+async def test_new_reference_replay_reads_complete_named_membership_inventory(monkeypatch, full_recipes, count):
     fixture = _replay_fixture(full_recipes if count == 1000 else _recipes(count))
-    connection, seal, loader, publish, events = _replay_spies(monkeypatch, fixture)
+    connection, loader, publish, events = _replay_spies(monkeypatch, fixture)
     assert await consumer._replay(connection, fixture.event, ptg_recipe(), _config()) == {"state": "replayed"}
-    assert events == ["custody", "inventory", "pipeline"] and connection.reads == 2
-    seal.assert_awaited_once()
+    assert events == ["inventory", "pipeline"] and connection.reads == 2
     loader.assert_awaited_once()
     publish.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "damage", ["checkpoint", "attempt", "membership", "count", "target", "seal", "oid", "snapshot", "format"]
-)
+@pytest.mark.parametrize("damage", ["checkpoint", "attempt", "membership", "count", "target", "snapshot", "format"])
 async def test_new_reference_replay_refuses_drift_before_publication(monkeypatch, damage):
     fixture = _replay_fixture(_recipes(2))
-    connection, seal, loader, publish, _ = _replay_spies(monkeypatch, fixture)
+    connection, loader, publish, _ = _replay_spies(monkeypatch, fixture)
     fresh_by_name = copy.deepcopy(fixture.candidate)
     connection.snapshot_candidate = fresh_by_name
     if damage == "checkpoint":
@@ -322,11 +306,6 @@ async def test_new_reference_replay_refuses_drift_before_publication(monkeypatch
         fixture.entries = ()
     if damage == "target":
         fresh_by_name["expected_head"] = 8
-    if damage == "seal":
-        seal.side_effect = ValueError("synthetic custody refusal")
-    if damage == "oid":
-        seal.side_effect = None
-        seal.return_value = {"receipt": {"closure": {"relation_oids": {}}}}
     if damage == "snapshot":
         fresh_by_name["candidate_id"] = str(UUID(int=78))
     if damage == "format":
@@ -340,10 +319,9 @@ async def test_new_reference_replay_refuses_drift_before_publication(monkeypatch
 @pytest.mark.asyncio
 async def test_legacy_replay_keeps_existing_pipeline_without_inventory_lookup(monkeypatch):
     fixture = _replay_fixture(_recipes(2), legacy=True)
-    connection, seal, loader, publish, events = _replay_spies(monkeypatch, fixture)
+    connection, loader, publish, events = _replay_spies(monkeypatch, fixture)
     assert await consumer._replay(connection, fixture.event, ptg_recipe(), _config()) == {"state": "replayed"}
     assert events == ["pipeline"] and connection.reads == 1
-    seal.assert_not_awaited()
     loader.assert_not_awaited()
     publish.assert_awaited_once()
 

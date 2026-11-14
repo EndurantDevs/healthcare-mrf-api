@@ -80,22 +80,6 @@ async def read_approved_refresh_bindings(driver, approved_source, scopes, *, con
     return tuple(ApprovedRefreshBinding(**binding) for binding in json.loads(native["bindings_json"]))
 
 
-def _database_target(engine):
-    url = engine.url
-    return (
-        url.host,
-        url.port,
-        url.database,
-        tuple(
-            sorted(
-                (key, value)
-                for key, value in url.query.items()
-                if key not in {"user", "username", "password", "passfile", "sslpassword"}
-            )
-        ),
-    )
-
-
 def _read_engine(sessions):
     if type(sessions) is not async_sessionmaker or sessions.class_ is not AsyncSession or sessions.kw.get("binds"):
         raise RegistryRefreshAnchorUnavailable("registry_refresh_reader_unconfigured")
@@ -112,15 +96,14 @@ def _read_engine(sessions):
     return engine
 
 
-async def _native_context(session):
+async def _source_driver(session):
+    """Use the caller's active transaction with the existing metadata SQL limits."""
+    from process.network_cms_registry_address_capture import native_driver
+
+    driver = await native_driver(session)
     await session.execute(text("SET LOCAL statement_timeout='5s'"))
     await session.execute(text("SET LOCAL lock_timeout='1s'"))
-    connection = await session.connection()
-    driver = (await connection.get_raw_connection()).driver_connection
-    identity = await driver.fetchrow(
-        "SELECT current_database() AS name,oid,pg_catalog.pg_postmaster_start_time() AS started FROM pg_catalog.pg_database WHERE datname=current_database()"
-    )
-    return driver, tuple(identity)
+    return driver
 
 
 async def _current_pin(driver, revision, schema):
@@ -154,7 +137,7 @@ class RegistryRefreshAnchorService:
         RegistryPTGGraphReadBudget(*self.read_budget)
         if self.source_reader_sessions is not None:
             child = _read_engine(self.source_reader_sessions)
-            if child is outer or child.pool is outer.pool or _database_target(child) != _database_target(outer):
+            if child.pool is outer.pool:
                 raise RegistryRefreshAnchorUnavailable("registry_refresh_reader_database_mismatch")
 
     async def verify(self, document_by_field):
@@ -172,7 +155,7 @@ class RegistryRefreshAnchorService:
         async with registry_company_approval_transaction(
             self.reader_sessions, control_schema=self.control_schema
         ) as session:
-            driver, identity = await _native_context(session)
+            driver = await _source_driver(session)
             approved = await _current_pin(driver, document_by_field["approved_revision"], self.control_schema)
             scopes = document_by_field["enrolled_scopes"]
             bindings = await read_approved_refresh_bindings(
@@ -195,17 +178,15 @@ class RegistryRefreshAnchorService:
                 )
             native_bindings = tuple(binding for binding in bindings if binding.record_json["source_system"] != "ptg")
             if native_bindings:
-                derived_by_id.update(await self._read_source_anchors(native_bindings, approved, identity, budget))
+                derived_by_id.update(await self._read_source_anchors(native_bindings, approved, budget))
             return _verified_receipt(document_by_field, approved, derived_by_id)
 
-    async def _read_source_anchors(self, bindings, approved, identity, budget):
+    async def _read_source_anchors(self, bindings, approved, budget):
         if self.source_reader_sessions is None:
             raise RegistryRefreshAnchorUnavailable("registry_refresh_source_reader_unconfigured")
         async with self.source_reader_sessions() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-            driver, child_identity = await _native_context(session)
-            if child_identity != identity:
-                raise RegistryRefreshAnchorUnavailable("registry_refresh_reader_database_mismatch")
+            driver = await _source_driver(session)
             child_pin = await _current_pin(driver, approved.approved_revision, self.control_schema)
             if child_pin != approved:
                 raise RegistryRefreshAnchorUnavailable("registry_refresh_approved_fingerprint_mismatch")

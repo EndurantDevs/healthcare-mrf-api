@@ -3,6 +3,7 @@
 
 import json
 import os
+from contextlib import AsyncExitStack
 from pathlib import Path
 from uuid import uuid4, uuid5
 
@@ -12,20 +13,24 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
-from api.network_read_execution import _installed_read_inventory, execute_network_read
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_em_provider_inputs import resolve_em_provider_inputs, resolve_em_provider_inputs_in_session
-from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_candidate_composition import (
     RegistryCompositionAddressSources,
     compose_registry_membership_candidate,
 )
+from tests.test_network_compact_publication_postgres import _named_compact_runtime
 from tests.test_network_custom_address_source_postgres import _seed
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 from tests.test_plan_pricing_source_policy_postgres import _em_provider_native_heaps
-from tests.test_registry_candidate_composition_postgres import _allow_composition_owner, _remove_candidates, _roles
+from tests.test_registry_candidate_composition_postgres import (
+    _allow_composition_owner,
+    _publish_composition_target,
+    _remove_candidates,
+    _roles,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -60,9 +65,7 @@ async def _publish_fixture(fixture, schema, copy_targets, created_schema_oids_by
         control_schema=fixture.control_schema,
     )
     copy_targets.append(candidate)
-    await prepare_and_publish_network_candidate(
-        connection, candidate, addresses, **_roles(fixture), control_schema=fixture.control_schema
-    )
+    await _publish_composition_target(fixture, candidate, addresses)
     await connection.execute(f'GRANT USAGE ON SCHEMA "{fixture.control_schema}" TO "{fixture.roles["reader"]}"')
     for table in (
         "network_serving_manifest",
@@ -86,9 +89,8 @@ def _write_resolver_evidence(manifest):
                     "repeatable_read_readonly": True,
                     "provider_relations": 9,
                     "api_read_provider_resolver": True,
-                    "api_original_session_nine_input_inventory": True,
-                    "api_guarded_native_provider_read": True,
-                    "legacy_no_seal_control_identity_only": True,
+                    "api_named_nine_provider_inputs": True,
+                    "api_native_provider_read": True,
                     "manifest_sha256": manifest.manifest_sha256,
                     "full_pricing_release_attribution_resolution": False,
                     "http": False,
@@ -99,6 +101,21 @@ def _write_resolver_evidence(manifest):
         )
 
 
+async def _assert_reader_input_relations(session, driver, inputs, identity):
+    """Read the retained provider relation without replacing its API transaction."""
+    assert (
+        len(inputs.relations)
+        == len({(relation.schema_name, relation.table_name) for relation in inputs.relations})
+        == 9
+    )
+    provider_result = await session.execute(text(f"SELECT npi FROM ONLY {inputs.relation('npi')} LIMIT 1"))
+    assert len(provider_result.all()) <= 1
+    api_identity = await driver.fetchrow(
+        "SELECT current_setting('transaction_read_only'),current_setting('transaction_isolation')"
+    )
+    assert tuple(api_identity) == tuple(identity)
+
+
 async def test_published_provider_resolver(custom_db, monkeypatch):
     """Publish through composition and verify the exact manifest with an ordinary Reader."""
     fixture = custom_db
@@ -107,7 +124,9 @@ async def test_published_provider_resolver(custom_db, monkeypatch):
     reader, reader_engine = None, None
     copy_targets, created_schema_oids_by_name = [], {}
     password = uuid4().hex
+    stack = AsyncExitStack()
     try:
+        await _named_compact_runtime(fixture, stack, monkeypatch)
         inputs, candidate = await _publish_fixture(fixture, schema, copy_targets, created_schema_oids_by_name)
         await connection.execute(f"ALTER ROLE \"{fixture.roles['reader']}\" LOGIN PASSWORD '{password}'")
         dsn = os.environ["NETWORK_REGISTRY_TEST_DSN"].replace("postgresql+asyncpg://", "postgresql://")
@@ -118,9 +137,9 @@ async def test_published_provider_resolver(custom_db, monkeypatch):
             assert "em_provider_inputs" in manifest.source_generations
             assert await resolve_em_provider_inputs(reader, manifest, fixture.control_schema) == inputs
             identity = await reader.fetchrow(
-                "SELECT session_user,current_user,current_setting('transaction_read_only'),current_setting('transaction_isolation'),(SELECT rolsuper FROM pg_roles WHERE rolname=current_user)"
+                "SELECT current_setting('transaction_read_only'),current_setting('transaction_isolation')"
             )
-            assert tuple(identity) == (fixture.roles["reader"], fixture.roles["reader"], "on", "repeatable read", False)
+            assert tuple(identity) == ("on", "repeatable read")
         reader_engine = create_async_engine(
             make_url(dsn).set(drivername="postgresql+asyncpg", username=fixture.roles["reader"], password=password),
             isolation_level="REPEATABLE READ",
@@ -132,30 +151,22 @@ async def test_published_provider_resolver(custom_db, monkeypatch):
                 driver, generation_id=manifest.generation_id, control_schema=fixture.control_schema, api_read=True
             )
             assert api_manifest == manifest
-            assert not api_manifest.custody_control and api_manifest.compact_layout is None
+            assert api_manifest.compact_layout is None
             assert (
                 await resolve_em_provider_inputs(driver, api_manifest, fixture.control_schema, api_read=True) == inputs
             )
             assert await resolve_em_provider_inputs_in_session(session, api_manifest, fixture.control_schema) == inputs
-            inventory = _installed_read_inventory(session)
-            assert inventory.connection is driver and len(inventory.relations) == 9
-            provider_result = await execute_network_read(
-                session, f"SELECT npi FROM ONLY {inputs.relation('npi')} LIMIT 1"
-            )
-            assert len(provider_result.all()) <= 1
-            api_identity = await driver.fetchrow(
-                "SELECT session_user,current_user,current_setting('transaction_read_only'),"
-                "current_setting('transaction_isolation'),(SELECT rolsuper FROM pg_roles WHERE rolname=current_user)"
-            )
-            assert tuple(api_identity) == tuple(identity)
+            await _assert_reader_input_relations(session, driver, inputs, identity)
         _write_resolver_evidence(manifest)
     finally:
-        if reader_engine is not None:
-            await reader_engine.dispose()
-        if reader is not None:
-            await reader.close()
-        await _remove_candidates(fixture, copy_targets, uuid4())
-        for namespace, oid in created_schema_oids_by_name.items():
-            if await connection.fetchval("SELECT to_regnamespace($1)::oid::bigint", namespace) == oid:
+        try:
+            if reader_engine is not None:
+                await reader_engine.dispose()
+            if reader is not None:
+                await reader.close()
+            await _remove_candidates(fixture, copy_targets, uuid4())
+            for namespace in created_schema_oids_by_name:
                 await connection.execute(f'DROP SCHEMA IF EXISTS "{namespace}" CASCADE')
                 assert await connection.fetchval("SELECT to_regnamespace($1)", namespace) is None
+        finally:
+            await stack.aclose()

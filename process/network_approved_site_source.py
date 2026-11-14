@@ -8,7 +8,11 @@ import json
 
 from process.network_membership_copy import MAX_COPY_BYTES, MAX_INPUT_BYTES, MAX_ROWS
 from process.network_serving_read import NetworkServingReadUnavailable, resolve_network_serving_manifest
-from process.registry_retained_site_adoption import RetainedSiteAdoptionError, resolve_retained_site_adoptions
+from process.registry_retained_site_adoption import (
+    RetainedSiteAdoptionError,
+    resolve_retained_site_adoptions,
+    retained_site_receipt_document,
+)
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
 _SITE_CTE = """WITH active AS MATERIALIZED (
@@ -58,16 +62,15 @@ def _verify_records(binding_records, receipt):
     for binding_record in binding_records:
         identity_values = tuple(binding_record[field] for field in ("provider_system", "provider_id", "location_id"))
         expected_by_name = {**document, "records": [proven_by_key[identity_values]]}
-        if binding_record["source_receipt_json"] != expected_by_name:
+        if retained_site_receipt_document(binding_record["source_receipt_json"]) != expected_by_name:
             raise RetainedSiteAdoptionError("Approved source-site proof differs from retained evidence")
 
 
 async def verify_approved_site_sources(connection, *, approved_revision, control_schema):
     """Return verified sets; never query once per provider or location.
 
-    The approved map supplies exact six-field selections and sealed receipts.
-    Each retained generation is resolved again, and each bounded page uses the
-    native identity validator before returning its physical retained_source coordinates.
+    The approved map supplies exact selections and saved data receipts. Each
+    retained generation is resolved again and its complete selected rows checked.
     """
     from process.network_address_projection import _identifier
 
@@ -133,7 +136,7 @@ async def _address_copy_columns(connection, source_namespace, target_namespace, 
     from process.network_address_projection import _identifier
 
     columns = await connection.fetch(
-        """SELECT relation.position,relation.oid::oid::bigint AS relation_oid,attribute.attname,attribute.atttypid,attribute.atttypmod,
+        """SELECT relation.position,attribute.attname,attribute.atttypid,attribute.atttypmod,
           attribute.attcollation,attribute.attnotnull,
           attribute.attgenerated::text AS attgenerated,attribute.attidentity::text AS attidentity
         FROM unnest(ARRAY[to_regclass($1),to_regclass($2)]) WITH ORDINALITY relation(oid,position)
@@ -158,10 +161,8 @@ async def _address_copy_columns(connection, source_namespace, target_namespace, 
     if source_relation is not None:
         from db.models import EntityAddressUnified
 
-        if set(shapes[0]) != set(EntityAddressUnified.__table__.columns.keys()) or any(
-            column["relation_oid"] != source_relation.table_oid for column in columns if column["position"] == 1
-        ):
-            raise RetainedSiteAdoptionError("Compact retained address physical shape differs")
+        if set(shapes[0]) != set(EntityAddressUnified.__table__.columns.keys()):
+            raise RetainedSiteAdoptionError("Compact retained address columns differ")
     return tuple(_identifier(name) for name in shapes[1])
 
 

@@ -10,14 +10,17 @@ from uuid import UUID, uuid4
 
 from db.migration_rooted_publication_freeze import CONTRACT, immutable_snapshot_sql
 from db.plan_release_storage import storage_relation
-from process.plan_release_storage_catalog import CATALOG_SQL
 from process.provider_directory_generic_source_storage import RELATIONS, RESOURCE, _capture, _require
 from process.provider_directory_rooted_graph_source_contract import PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID
 from process.provider_directory_rooted_graph_terminal import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_AFFILIATION_FILTER_RECIPE_ID,
     rooted_graph_query_filter_validation_sql,
 )
-from process.provider_directory_source_storage_binding import FHIRSourceCandidateHandoff
+from process.provider_directory_source_storage_binding import (
+    FHIRSourceCandidateHandoff,
+    dataset_source_relations,
+    named_source_document,
+)
 
 HEADER = "provider_directory_rooted_graph_dataset"
 PARENT = "provider_directory_endpoint_dataset"
@@ -34,7 +37,7 @@ _FIELDS = frozenset(
         "identity",
         "admission",
         "tables",
-        "catalog",
+        "inputs",
         "dataset_hash",
         "counts",
         "snapshot",
@@ -64,14 +67,29 @@ def validate_rooted_handoff_document(document, expected_storage):
     _require(str(UUID(document["preparation_id"])) == document["preparation_id"], "rooted_preparation_changed")
     _require(document["storage"] == expected_storage, "rooted_storage_changed")
     _require(set(document["tables"]) == set(ROOTS), "rooted_inventory_changed")
-    tables = list(document["tables"].values())
+    coordinates = []
+    for table in document["tables"].values():
+        _require(type(table) is dict and set(table) == {"schema", "name"}, "rooted_inventory_changed")
+        _require(table["schema"] == expected_storage["storage_schema"], "rooted_inventory_changed")
+        storage_relation(table["schema"], table["name"])
+        coordinates.append((table["schema"], table["name"]))
+    _require(len(set(coordinates)) == len(ROOTS), "rooted_inventory_changed")
+    expected_inputs = {
+        "provider_directory_rooted_graph_" + root
+        for root in ("acquisition", "work", "resource", "edge", "twin_attempt", "twin_admission")
+    }
     _require(
-        len({table["oid"] for table in tables}) == len(ROOTS)
-        and len({table["name"] for table in tables}) == len(ROOTS)
-        and all(_PRIVATE_NAME.fullmatch(table["name"]) for table in tables)
-        and all(table["owner"] == expected_storage["owner_oid"] for table in tables),
-        "rooted_inventory_changed",
+        type(document["inputs"]) is dict and set(document["inputs"]) == expected_inputs, "rooted_inventory_changed"
     )
+    for root, table in document["inputs"].items():
+        _require(
+            type(table) is dict
+            and set(table) == {"schema", "name"}
+            and table["name"] == root
+            and table["schema"] in {expected_storage["catalog_schema"], expected_storage["storage_schema"]},
+            "rooted_inventory_changed",
+        )
+        storage_relation(table["schema"], table["name"])
     identity = document["identity"]
     _require(
         type(identity) is dict and re.fullmatch(r"pdrgpd_[0-9a-f]{48}", identity.get("dataset_id", "")),
@@ -113,11 +131,25 @@ async def validate_rooted_query_filter_recipes(connection, schema, admission):
         "rooted_acquisition_changed",
     )
     acquisition_ids = sorted(set(identities))
+    from process.provider_directory_rooted_graph_source_runtime import (
+        current_rooted_graph_runtime,
+        rooted_input_relations,
+    )
+
+    reader = connection
+    if current_rooted_graph_runtime() is not None and hasattr(connection, "fetchval"):
+        from process.provider_directory_generic_source_completion import _FrozenSourceRows
+
+        reader = _FrozenSourceRows(connection)
     for acquisition_id in acquisition_ids:
+        acquisition_schema = schema
+        if current_rooted_graph_runtime() is not None:
+            inputs = await rooted_input_relations(reader, acquisition_id)
+            acquisition_schema = inputs["provider_directory_rooted_graph_work"]["schema"]
         cursor = ""
         while True:
             page = await connection.fetchval(
-                rooted_graph_query_filter_validation_sql(schema), acquisition_id, cursor, 4096
+                rooted_graph_query_filter_validation_sql(acquisition_schema), acquisition_id, cursor, 4096
             )
             page = json.loads(page) if type(page) is str else page
             _require(
@@ -158,12 +190,11 @@ async def retained_rooted_handoff(runtime, connection, dataset_id=None, *, publi
         )
     if encoded is None:
         return None
-    document = json.loads(encoded) if isinstance(encoded, str) else encoded
-    storage_by_field = {
-        **asdict(runtime.manifest.storage_binding),
-        "producer": list(runtime.manifest.producer_identity),
-    }
+    document = named_source_document(json.loads(encoded) if isinstance(encoded, str) else encoded)
+    storage_by_field = asdict(runtime.manifest.storage_binding)
     validate_rooted_handoff_document(document, storage_by_field)
+    _require(dataset_id is None or document["identity"]["dataset_id"] == dataset_id, "rooted_identity_changed")
+    _require(document["operation"] == runtime.operation, "rooted_operation_changed")
     return FHIRSourceCandidateHandoff(candidate_json(document))
 
 
@@ -194,29 +225,8 @@ async def _lineage_snapshot(connection, schema, dataset_id, variant):
 
 
 async def _capture_rooted_tables(connection, policy, relations):
-    """Capture the closed physical generations and their native catalog in one transaction."""
-    tables = await _capture(connection, policy, list(relations.values()))
-    filenode_by_oid = {
-        table_record["oid"]: table_record["relfilenode"]
-        for table_record in await connection.fetch(
-            "SELECT oid::bigint,relfilenode::bigint FROM pg_class WHERE oid=ANY($1::oid[])",
-            [table["oid"] for table in tables.values()],
-        )
-    }
-    catalog_rows = await connection.fetch(
-        CATALOG_SQL,
-        [str(table["oid"]) for table in tables.values()],
-        next(iter(tables.values()))["owner"],
-        [],
-    )
-    catalog_records = []
-    for table_record in catalog_rows:
-        table_by_field = dict(table_record)
-        for key in ("columns", "constraints", "indexes"):
-            if isinstance(table_by_field[key], str):
-                table_by_field[key] = json.loads(table_by_field[key])
-        catalog_records.append(table_by_field)
-    return tables, filenode_by_oid, catalog_records
+    """Resolve each output by schema-qualified name through ordinary SQL."""
+    return await _capture(connection, policy, list(relations.values()))
 
 
 async def _candidate_identity(connection, runtime, identity):
@@ -240,11 +250,17 @@ async def seal_rooted_handoff(
 ):
     """Persist the discoverable builder receipt in the same transaction as its private heaps."""
     connection = transaction.connection
-    await validate_rooted_query_filter_recipes(connection, runtime.catalog_schema, asdict(admission))
-    tables, filenode_by_oid, catalog_records = await _capture_rooted_tables(
-        connection, runtime.candidate_policy, relations
-    )
+    await validate_rooted_query_filter_recipes(connection, runtime.candidate_schema, asdict(admission))
+    tables = await _capture_rooted_tables(connection, runtime.candidate_policy, relations)
     relations_by_root = {root: storage_relation(runtime.candidate_schema, name) for root, name in relations.items()}
+    relations_by_root.update(
+        {
+            "provider_directory_rooted_graph_" + root: storage_relation(
+                runtime.candidate_schema, "provider_directory_rooted_graph_" + root
+            )
+            for root in ("acquisition", "work", "resource", "edge", "twin_attempt", "twin_admission")
+        }
+    )
     snapshot = await connection.fetchval(
         immutable_snapshot_sql(runtime.catalog_schema, "$1", own_relations=relations_by_root), identity.dataset_id
     )
@@ -255,14 +271,17 @@ async def seal_rooted_handoff(
         "operation": runtime.operation,
         "phase": "ready_for_freeze",
         "preparation_id": str(uuid4()),
-        "storage": {**asdict(runtime.manifest.storage_binding), "producer": list(runtime.manifest.producer_identity)},
+        "storage": asdict(runtime.manifest.storage_binding),
         "identity": identity_by_field,
         "admission": asdict(admission),
-        "tables": {
-            root: {**tables[name], "relfilenode": filenode_by_oid[tables[name]["oid"]]}
-            for root, name in relations.items()
+        "tables": {root: tables[name] for root, name in relations.items()},
+        "inputs": {
+            "provider_directory_rooted_graph_" + root: {
+                "schema": runtime.candidate_schema,
+                "name": "provider_directory_rooted_graph_" + root,
+            }
+            for root in ("acquisition", "work", "resource", "edge", "twin_attempt", "twin_admission")
         },
-        "catalog": sorted(catalog_records, key=lambda table: table["oid"]),
         "dataset_hash": dataset_hash,
         "counts": counts,
         "predecessor_proof": {
@@ -276,6 +295,11 @@ async def seal_rooted_handoff(
             connection, runtime.catalog_schema, identity.root_dataset_id, identity.root_dataset_variant
         ),
     }
+    return await _store_rooted_handoff(connection, runtime, identity, relations, document_by_field)
+
+
+async def _store_rooted_handoff(connection, runtime, identity, relations, document_by_field):
+    """Validate and persist the same canonical handoff before creating its discoverable pointer."""
     document_by_field = json.loads(candidate_json(document_by_field))
     document_by_field["admission"]["previous_dataset_id"] = identity.root_dataset_id
     validate_rooted_handoff_document(document_by_field, document_by_field["storage"])
@@ -289,35 +313,65 @@ async def seal_rooted_handoff(
     return FHIRSourceCandidateHandoff(encoded)
 
 
-def _frozen_validation_query(body, schema, document):
+def _frozen_validation_query(body, schema, document, *, predecessor_resource, comparison_inputs=None):
     """Replay every original candidate predicate against the detached output and its pinned root."""
-    from db.migration_rooted_publication_freeze import (
-        LEGACY,
-        ORIGINAL_DIGESTS,
-        ROOTED,
-        body_digest,
-        is_approved_successor,
-        original_query,
-    )
+    from db.migration_rooted_publication_freeze import LEGACY, ROOTED, validation_body_sql
 
-    expected = ORIGINAL_DIGESTS[ROOTED]
-    if body_digest(body, schema) != expected:
-        _require(is_approved_successor(ROOTED, schema, body, expected), "rooted_validator_changed")
-        body = original_query(body)
+    body = validation_body_sql(ROOTED, schema)
     call = re.escape(storage_relation(schema, LEGACY)) + r"\(root_header\.dataset_id(?:::text)?\)"
     body, replacements = re.subn(call, "TRUE", body)
     _require(replacements == 1, "rooted_validator_changed")
-    ctes = []
+    input_ctes = []
+    for root, table in document["inputs"].items():
+        relation = storage_relation(table["schema"], table["name"])
+        previous = comparison_inputs.get(root) if comparison_inputs else None
+        if root == "provider_directory_rooted_graph_acquisition" and previous is not None and previous != table:
+            selected = '"rooted_comparison_inputs"'
+            older = storage_relation(previous["schema"], previous["name"])
+            input_ctes.append(
+                selected + f" AS NOT MATERIALIZED (SELECT * FROM {relation} UNION ALL "
+                f"SELECT * FROM {older} WHERE acquisition_id=$3)"
+            )
+            relation = selected
+        body = body.replace(storage_relation(schema, root), relation)
+    from process.provider_directory_rooted_graph_bulk import acquisition_hash_expression
+
+    hash_names = (
+        "provider_directory_rooted_graph_terminal_set_sha256",
+        "provider_directory_rooted_graph_resource_set_sha256",
+        "provider_directory_rooted_graph_edge_set_sha256",
+        "provider_directory_rooted_graph_sha256",
+    )
+    input_schema = document["inputs"]["provider_directory_rooted_graph_acquisition"]["schema"]
+    for name in hash_names:
+        expression = re.escape(storage_relation(schema, name)) + r"\(([^()]*)\)"
+        body = re.sub(expression, lambda match: acquisition_hash_expression(input_schema, name, match.group(1)), body)
+    coverage = (
+        re.escape(storage_relation(schema, "provider_directory_rooted_graph_request_failure_coverage"))
+        + r"\(([^()]*)\)"
+    )
+    body = re.sub(
+        coverage,
+        lambda match: match.group(1).removesuffix("::text").replace(".acquisition_id", ".request_failure_coverage"),
+        body,
+    )
+    ctes = input_ctes
     for index, root in enumerate(ROOTS):
         name = '"rooted_frozen_' + str(index) + '"'
         canonical = storage_relation(schema, root)
-        private = storage_relation(document["storage"]["storage_schema"], document["tables"][root]["name"])
+        private = storage_relation(document["tables"][root]["schema"], document["tables"][root]["name"])
         body = body.replace(canonical, name)
         selected = f"SELECT * FROM {private}"
         if root in {RESOURCE, HEADER, PARENT}:
-            selected += f" UNION ALL SELECT * FROM {canonical} WHERE dataset_id=$2"
+            predecessor = predecessor_resource if root == RESOURCE else canonical
+            selected += f" UNION ALL SELECT * FROM {predecessor} WHERE dataset_id=$2"
         ctes.append(name + " AS NOT MATERIALIZED (" + selected + ")")
-    return "WITH " + ",".join(ctes) + " " + body.replace("candidate_dataset_id", "$1").rstrip().removesuffix(";")
+    return (
+        "WITH "
+        + ",".join(ctes)
+        + " "
+        + body.replace("candidate_dataset_id", "$1").replace("\\:", ":").rstrip().removesuffix(";")
+    )
 
 
 async def _frozen_resource_hash(connection, document):
@@ -371,22 +425,14 @@ async def _frozen_resource_hash(connection, document):
 
 async def validate_frozen_rooted_handoff(connection, handoff, issued, *, protected_owner_role):
     """Perform complete original content validation only after protected ownership closes writes."""
-    from db.migration_rooted_publication_freeze import ROOTED
     from process.provider_directory_rooted_graph_current_preflight import current_root_proof
     from process.provider_directory_rooted_graph_input_fence import root_input_fence_sql
 
     document = handoff.document
-    storage_by_field = {**asdict(issued.storage_binding), "producer": list(issued.producer_identity)}
+    storage_by_field = asdict(issued.storage_binding)
     validate_rooted_handoff_document(document, storage_by_field)
     _require(connection.is_in_transaction(), "transaction_required")
     await _require_frozen_inventory(connection, document, protected_owner_role)
-    from process.provider_directory_rooted_graph_foreign_guards import capture_parent_foreign_guards
-
-    _require(
-        await capture_parent_foreign_guards(connection, issued.storage_binding.catalog_schema)
-        == document["snapshot"]["foreign_guards"],
-        "rooted_foreign_guard_changed",
-    )
     from process.provider_directory_rooted_graph_header_checks import validate_rooted_header_check
 
     await validate_rooted_header_check(connection, document)
@@ -399,29 +445,24 @@ async def validate_frozen_rooted_handoff(connection, handoff, issued, *, protect
     }
     _require(document["predecessor_proof"] == expected_by_field, "rooted_predecessor_changed")
     schema = issued.storage_binding.catalog_schema
-    await validate_rooted_query_filter_recipes(connection, schema, document["admission"])
+    await validate_rooted_query_filter_recipes(
+        connection, document["inputs"]["provider_directory_rooted_graph_work"]["schema"], document["admission"]
+    )
     fence = await connection.fetchval(
-        root_input_fence_sql(schema, "$1", "$2::jsonb", variant=proof.current.variant),
+        root_input_fence_sql(schema, "$1", variant=proof.current.variant),
         proof.current.dataset_id,
-        candidate_json(expected_by_field["input_fence"].get("roots", {})),
     )
     _require(
         (json.loads(fence) if isinstance(fence, str) else fence) == expected_by_field["input_fence"],
         "rooted_input_changed",
     )
-    body = await connection.fetchval(
-        "SELECT prosrc FROM pg_proc WHERE oid=to_regprocedure($1)", storage_relation(schema, ROOTED) + "(text)"
-    )
-    query = _frozen_validation_query(body, schema, document)
-    _require(
-        await connection.fetchval(query, document["identity"]["dataset_id"], proof.current.dataset_id) is True,
-        "rooted_candidate_invalid",
-    )
+    predecessor = await dataset_source_relations(connection, schema, proof.current.dataset_id, (RESOURCE,))
+    predecessor_resource = storage_relation(predecessor[RESOURCE]["schema"], predecessor[RESOURCE]["name"])
+    await _validate_frozen_rooted_relations(connection, document, proof, schema, predecessor_resource)
     digest, count = await _frozen_resource_hash(connection, document)
     _require(digest == document["dataset_hash"] and count == sum(document["counts"].values()), "rooted_hash_changed")
     await _require_frozen_inventory(connection, document, protected_owner_role)
     return {
-        "handoff_sha256": handoff.document_sha256,
         "dataset_hash": digest,
         "resource_count": count,
         "resource_counts": document["counts"],
@@ -429,24 +470,44 @@ async def validate_frozen_rooted_handoff(connection, handoff, issued, *, protect
     }
 
 
-async def _require_frozen_inventory(connection, document, owner_role):
-    """Authenticate the native seven-table layout after its protected owner transfer."""
-    from process.provider_directory_generic_source_storage import _table_proof
+async def _validate_frozen_rooted_relations(connection, document, proof, schema, predecessor_resource):
+    """Check complete request coverage and the same predecessor/comparison data relations."""
+    from process.provider_directory_generic_source_completion import _FrozenSourceRows
+    from process.provider_directory_rooted_graph_bulk import named_request_coverage
 
-    owner = await connection.fetchval("SELECT oid::bigint FROM pg_roles WHERE rolname=$1", owner_role)
-    names = [
-        storage_relation(document["storage"]["storage_schema"], table["name"]) for table in document["tables"].values()
-    ]
-    await connection.execute("LOCK TABLE " + ",".join(sorted(names)) + " IN ACCESS SHARE MODE NOWAIT")
-    rows = await connection.fetch(CATALOG_SQL, names, owner, [])
-    receipts_by_oid = {table["oid"]: table for table in document["tables"].values()}
-    _require(len(rows) == len(receipts_by_oid) == 7, "rooted_inventory_changed")
-    for row in rows:
-        receipt = receipts_by_oid[row["oid"]]
-        expected_by_field = {key: receipt[key] for key in ("name", "oid", "owner", "layout_sha256")}
-        _require(_table_proof(row, private=True) == {**expected_by_field, "owner": owner}, "rooted_inventory_changed")
-        _require(
-            await connection.fetchval("SELECT relfilenode::bigint FROM pg_class WHERE oid=$1", row["oid"])
-            == receipt["relfilenode"],
-            "rooted_physical_generation_changed",
+    coverage = await named_request_coverage(
+        _FrozenSourceRows(connection), document["admission"]["publication_acquisition_id"]
+    )
+    _require(
+        coverage == document["snapshot"]["acquisition"]["request_failure_coverage"], "rooted_request_coverage_changed"
+    )
+    from process.provider_directory_rooted_graph_source_runtime import rooted_input_relations
+
+    comparison_id = document["admission"].get("comparison_acquisition_id")
+    comparison = await rooted_input_relations(_FrozenSourceRows(connection), comparison_id) if comparison_id else None
+    query = _frozen_validation_query(
+        None, schema, document, predecessor_resource=predecessor_resource, comparison_inputs=comparison
+    )
+    arguments = [document["identity"]["dataset_id"], proof.current.dataset_id]
+    if (
+        comparison is not None
+        and comparison["provider_directory_rooted_graph_acquisition"]
+        != document["inputs"]["provider_directory_rooted_graph_acquisition"]
+    ):
+        arguments.append(comparison_id)
+    _require(
+        await connection.fetchval(query, *arguments) is True,
+        "rooted_candidate_invalid",
+    )
+
+
+async def _require_frozen_inventory(connection, document, owner_role):
+    """Lock named output relations and reject rows outside the candidate dataset."""
+    names = sorted(storage_relation(table["schema"], table["name"]) for table in document["tables"].values())
+    await connection.execute("LOCK TABLE " + ",".join(names) + " IN ACCESS SHARE MODE NOWAIT")
+    for relation in names:
+        invalid = await connection.fetchval(
+            f"SELECT EXISTS(SELECT FROM {relation} WHERE dataset_id IS DISTINCT FROM $1)",
+            document["identity"]["dataset_id"],
         )
+        _require(invalid is False, "rooted_inventory_changed")

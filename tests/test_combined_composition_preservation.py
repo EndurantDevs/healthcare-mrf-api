@@ -13,7 +13,7 @@ from process import registry_composition_resume as resume
 from process import registry_initial_source_composition as offices
 from process import registry_publication_queue as queue
 from process.registry_source_recipe_composition import OFFICE_MAPPING_KEY
-from tests.test_registry_source_recipe_store_postgres import _example
+from tests.registry_source_recipe_support import _example
 from tests.test_verified_inventory_v2 import rows as witness_rows
 
 
@@ -110,7 +110,7 @@ async def test_only_flat_carry_prepares_final_artifact_before_current_office_pru
     async def current(*_args, **options):
         assert events == ([] if compact else ["artifact"])
         assert options["read_context"] == composition.SourceRecipeReadContext(
-            verified_office_inputs=native_offices if compact else (artifact.address_source, artifact.runtime_roles)
+            verified_office_inputs=native_offices if compact else (artifact.address_source, ())
         )
         events.append("current")
         return stage

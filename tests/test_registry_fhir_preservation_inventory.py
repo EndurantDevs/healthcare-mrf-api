@@ -13,14 +13,14 @@ import pytest
 from process import registry_fhir_serving_preservation as preservation
 from process.network_compact_layout import CompactAddressRelation, CompactEdgeArtifact, CompactNetworkLayout
 from process.network_fhir_membership_source import with_fhir_successor
-from process.network_serving_read import PinnedNetworkServingManifest, _attach_manifest_custody
+from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_source_inventory_preparation import SourceInventoryPreparation
 from process.registry_source_recipe_store import RegistrySourceRecipeError
+from tests.registry_source_recipe_support import _example
 from tests.test_network_fhir_retained_capture import pin
 from tests.test_registry_fhir_serving_preservation import receipt
 from tests.test_registry_generic_accepted_capture import semantic_capture
 from tests.test_registry_generic_fhir_facts import _recipe
-from tests.test_registry_source_recipe_store_postgres import _example
 
 
 def _receipt(recipes, *, inventory):
@@ -99,52 +99,37 @@ def test_legacy_receipt_hash_domain_and_bytes_are_unchanged():
     assert legacy["revision"] == 1 and not preservation._ROOT_FIELDS.intersection(legacy)
 
 
-@pytest.mark.parametrize("supplied", [None, "0" * 64, True])
-def test_exact_predecessor_seal_cannot_be_replaced_by_manifest_dto_equality(supplied):
-    actual = SimpleNamespace(_custody_seal_sha256="a" * 64)
-    with pytest.raises(preservation.FHIRServingPreservationError, match="predecessor_changed"):
-        preservation._require_predecessor_seal(actual, SimpleNamespace(_custody_seal_sha256=supplied))
-    with pytest.raises(preservation.FHIRServingPreservationError):
-        preservation._require_predecessor_seal(SimpleNamespace())
-    preservation._require_predecessor_seal(actual, actual)
-
-
 def _legacy_predecessor():
-    manifest = PinnedNetworkServingManifest(
-        2, str(UUID(int=2)), "network_candidate_" + UUID(int=2).hex, 1, {}, 1, "a" * 64, 31
+    return PinnedNetworkServingManifest(
+        2,
+        str(UUID(int=2)),
+        "network_candidate_" + UUID(int=2).hex,
+        1,
+        {},
+        1,
+        "a" * 64,
+        CompactAddressRelation("network_candidate_" + UUID(int=2).hex, "entity_address_unified"),
     )
-    closure_by_field = {"relation_oids": {"entity_address_unified": 31, "network_member_effective": 32}}
-    _attach_manifest_custody(manifest, None, (None, None, None, closure_by_field), False)
-    return manifest
 
 
-@pytest.mark.parametrize(
-    "damage", ["missing", "address_oid", "membership_oid", "schema", "control", "compact", "null_seal"]
-)
-def test_legacy_predecessor_requires_exact_native_relation_pins(damage):
+@pytest.mark.parametrize("damage", ["type", "generation", "manifest", "address", "schema", "sources"])
+def test_predecessor_requires_matching_logical_manifest_and_names(damage):
     actual, supplied = _legacy_predecessor(), _legacy_predecessor()
-    preservation._require_predecessor_seal(actual, supplied)
-    if damage == "missing":
-        supplied = replace(supplied)
-    elif damage in {"address_oid", "membership_oid", "schema"}:
-        pins = list(supplied.candidate_relation_pins)
-        index = 1 if damage == "membership_oid" else 0
-        pins[index] = replace(
-            pins[index],
-            **({"schema_name": "other_schema"} if damage == "schema" else {"table_oid": 99}),
-        )
-        object.__setattr__(supplied, "_candidate_relation_pins", tuple(pins))
-    else:
-        attribute = {"control": "_custody_control", "compact": "_compact_layout", "null_seal": "_custody_seal_sha256"}[
-            damage
-        ]
-        object.__setattr__(supplied, attribute, None if damage == "null_seal" else object())
+    preservation._require_predecessor_manifest(actual, supplied)
+    changes_by_field = {
+        "generation": {"generation_id": 3},
+        "manifest": {"manifest_sha256": "b" * 64},
+        "address": {"address_relation": CompactAddressRelation("other_generation", "entity_address_unified")},
+        "schema": {"schema_name": "other_generation"},
+        "sources": {"source_generations": {"source": "other-edition"}},
+    }
+    supplied = object() if damage == "type" else replace(supplied, **changes_by_field[damage])
     with pytest.raises(preservation.FHIRServingPreservationError, match="predecessor_changed"):
-        preservation._require_predecessor_seal(actual, supplied)
+        preservation._require_predecessor_manifest(actual, supplied)
 
 
 @pytest.mark.parametrize("selection", ["no_fhir", "same_fhir", "removed_fhir"])
-async def test_legacy_publication_derives_obligation_after_exact_native_pin(monkeypatch, selection):
+async def test_legacy_publication_derives_obligation_from_exact_logical_predecessor(monkeypatch, selection):
     actual = _legacy_predecessor()
     previous = () if selection == "no_fhir" else (_example(),)
     current = () if selection == "removed_fhir" else previous
@@ -174,7 +159,7 @@ async def test_legacy_publication_derives_obligation_after_exact_native_pin(monk
     assert recipes.await_count == bool(previous)
 
 
-async def test_legacy_preparation_rechecks_native_pins_before_unchanged_recipe_return(monkeypatch):
+async def test_legacy_preparation_matches_logical_predecessor_before_unchanged_recipe_return(monkeypatch):
     from process import registry_publication_queue as queue
 
     actual, supplied = _legacy_predecessor(), _legacy_predecessor()
@@ -214,27 +199,20 @@ async def test_coverage_reads_authenticated_physical_successor_dataset_with_orig
 
 
 async def test_compact_predecessor_uses_all_logical_addresses_and_native_artifact_arguments():
-    artifact = CompactEdgeArtifact(str(UUID(int=1)), "network_candidate_" + UUID(int=1).hex, 13)
+    artifact = CompactEdgeArtifact(str(UUID(int=1)), "network_candidate_" + UUID(int=1).hex)
     layout = CompactNetworkLayout(
-        CompactAddressRelation("previous", "network_slice_ref", 11),
-        CompactAddressRelation("base", "retained_addresses", 12),
+        CompactAddressRelation("previous", "network_slice_ref"),
+        CompactAddressRelation("base", "retained_addresses"),
         (artifact,),
-        CompactAddressRelation("previous", "entity_address_unified", 14),
+        CompactAddressRelation("previous", "entity_address_unified"),
     )
-    oids_by_relation = {
-        '"previous"."network_slice_ref"': 11,
-        '"base"."retained_addresses"': 12,
-        '"network_candidate_' + UUID(int=1).hex + '"."network_office_edge"': 13,
-        '"previous"."entity_address_unified"': 14,
-    }
-    connection = SimpleNamespace(
-        execute=AsyncMock(), fetchval=AsyncMock(side_effect=lambda _sql, relation: oids_by_relation[relation])
-    )
+    connection = SimpleNamespace(execute=AsyncMock(), fetchval=AsyncMock())
     relation, arguments = await preservation._predecessor_addresses(connection, SimpleNamespace(compact_layout=layout))
     assert arguments == (str(UUID(int=1)),) and "$1" in relation
     assert '"base"."retained_addresses"' in relation and '"previous"."entity_address_unified"' in relation
     assert "OR (TRUE)" in relation and "canonical_network_ids" in relation
-    assert connection.execute.await_count == len(oids_by_relation)
+    connection.execute.assert_not_awaited()
+    connection.fetchval.assert_not_awaited()
     membership, bindings, addresses = preservation._carry_queries(
         SimpleNamespace(schema_name="previous"), "missing", "raw", relation
     )
@@ -320,7 +298,7 @@ async def test_inventory_wrapper_uses_one_independent_current_stage_and_cleans_p
 
 
 def test_inventory_commitment_handles_recipe_bytes_beyond_the_legacy_vector_limit():
-    from tests.test_registry_source_inventory_store_postgres import _capture_recipe
+    from tests.registry_source_recipe_support import _capture_recipe
 
     recipes = []
     for index in range(100):

@@ -193,20 +193,28 @@ async def test_mismatched_reviewed_rollback_context_is_refused(monkeypatch):
 async def test_reviewed_pre_fhir_target_sets_historical_obligation_baseline(monkeypatch):
     """A verified historical target may precede FHIR even when the current head contains it."""
     from process import registry_fhir_serving_preservation as preservation
+    from process.network_compact_layout import CompactAddressRelation
+    from process.network_serving_read import PinnedNetworkServingManifest
 
-    historical = SimpleNamespace(
-        generation_id=1,
-        candidate_id=str(UUID(int=1)),
-        source_generations={},
-        manifest_sha256="a" * 64,
-        _custody_seal_sha256="d" * 64,
+    historical = PinnedNetworkServingManifest(
+        1,
+        str(UUID(int=1)),
+        "historical",
+        1,
+        {},
+        1,
+        "a" * 64,
+        CompactAddressRelation("historical", "entity_address_unified"),
     )
-    current = SimpleNamespace(
-        generation_id=2,
-        candidate_id=str(UUID(int=2)),
-        source_generations={"registry_source_recipes": "b" * 64},
-        manifest_sha256="c" * 64,
-        _custody_seal_sha256="e" * 64,
+    current = PinnedNetworkServingManifest(
+        2,
+        str(UUID(int=2)),
+        "current",
+        1,
+        {"registry_source_recipes": "b" * 64},
+        1,
+        "c" * 64,
+        CompactAddressRelation("current", "entity_address_unified"),
     )
     candidate_by_field = {
         "expected_head": 2,
@@ -236,8 +244,6 @@ async def test_reviewed_pre_fhir_target_sets_historical_obligation_baseline(monk
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["absent", "paired", "mismatch", "null"])
 async def test_mapping_marker_requires_paired_receipt_and_native_final_input(monkeypatch, mode):
-    from process import network_custom_address_source as addresses
-    from process import network_membership_publication as publication
     from process import registry_fhir_serving_preservation as preservation
     from process import registry_initial_source_composition as offices
     from process.network_address_projection import PinnedAddressSource
@@ -261,37 +267,22 @@ async def test_mapping_marker_requires_paired_receipt_and_native_final_input(mon
     }
     summary_by_field = {"correspondence_sha256": "c" * 64 if mode == "mismatch" else "b" * 64}
     monkeypatch.setattr(offices, "verify_initial_source_office_receipt", lambda _: summary_by_field)
-    monkeypatch.setattr(
-        publication,
-        "publication_candidate_readiness",
-        lambda _: (None, None, None, {"loader_roles": ["loader"], "reader_roles": ["reader"]}),
-    )
-    authenticate = AsyncMock()
-    monkeypatch.setattr(addresses, "verify_artifact_dependency_identity", authenticate)
     connection = object()
     if mode in {"mismatch", "null"}:
         with pytest.raises(FHIRServingPreservationError, match="source_changed"):
             await preservation._current_office_inputs(
                 connection, candidate_by_field, recipes, SimpleNamespace(total_rows=0), "control"
             )
-        authenticate.assert_not_awaited()
     else:
         actual = await preservation._current_office_inputs(
             connection, candidate_by_field, recipes, SimpleNamespace(total_rows=0), "control"
         )
-        assert actual == (None if mode == "absent" else (final_source, ("loader", "reader")))
-        if mode == "paired":
-            authenticate.assert_awaited_once_with(
-                connection, final_source, ("loader", "reader"), address=True, control_schema="control"
-            )
-        else:
-            authenticate.assert_not_awaited()
+        assert actual == (None if mode == "absent" else (final_source, ()))
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("damage", ["receipt", "approval", "generation", "unready"])
 async def test_typed_office_receipt_cannot_replace_current_approval_or_publication_readiness(damage):
-    from process.network_membership_publication import NetworkPublicationError
     from process.registry_fhir_serving_preservation import _current_office_inputs
     from process.registry_initial_source_composition import SUMMARY_KEY, verify_initial_source_office_receipt
     from tests.test_registry_typed_source_recipe import _recipe, _registered_typed_resume
@@ -308,9 +299,7 @@ async def test_typed_office_receipt_cannot_replace_current_approval_or_publicati
         approved.generation_id = "0" * 64
     elif damage == "unready":
         candidate["validation_json"].pop("address_source", None)
-    error = NetworkPublicationError if damage == "unready" else FHIRServingPreservationError
-    message = "Candidate lacks a pinned validation report" if damage == "unready" else "source_changed"
-    with pytest.raises(error, match=message):
+    with pytest.raises(FHIRServingPreservationError, match="source_changed"):
         await _current_office_inputs(object(), candidate, (_recipe(),), approved, "control")
 
 
@@ -435,7 +424,7 @@ async def test_preservation_is_recorded_before_current_v5_selected_stage(monkeyp
     assert events == ["preservation", "current_offices"]
 
 
-async def _native_custody_lifecycle_readiness(case):
+async def _native_lifecycle_readiness(case):
     from process.network_approved_membership_source import pin_approved_membership_source
     from process.network_serving_read import resolve_network_serving_manifest
     from process.registry_fhir_catalog_grant import build_fhir_catalog_publication_runtime
@@ -461,14 +450,9 @@ async def _native_custody_lifecycle_readiness(case):
     serving_lifecycle = case.worker.roles_by_kind["lifecycle"]
     metadata_lifecycle = case.config.consumer.lifecycle_role
     assert serving_lifecycle != metadata_lifecycle
-    ledger = f'"{case.fixture.control_schema}".network_candidate_custody'
-    assert await case.fixture.connection.fetchval(
-        "SELECT has_table_privilege($1::name,$2,'SELECT')", serving_lifecycle, ledger
+    runtime = replace(
+        build_fhir_catalog_publication_runtime(case.config.grant, None), preparation_roles=case.config.preparation_roles
     )
-    assert not await case.fixture.connection.fetchval(
-        "SELECT has_table_privilege($1::name,$2,'SELECT')", metadata_lifecycle, ledger
-    )
-    runtime = build_fhir_catalog_publication_runtime(case.config.grant, None)
     consumer = replace(case.config.consumer, metadata_runtime=runtime, metadata_only=True)
     lifecycle_dsn = case.config.lifecycle_url.set(drivername="postgresql").render_as_string(hide_password=False)
     execution_dsn = case.config.execution_url.set(drivername="postgresql").render_as_string(hide_password=False)
@@ -496,7 +480,7 @@ async def test_connected_fixture_has_real_extendable_company_group_history(monke
     from tests.test_registry_approval_store_postgres import _approve, _command, _create, _draft
 
     async with native_catalog_case(monkeypatch, tmp_path, serving_custody=True) as case:
-        await _native_custody_lifecycle_readiness(case)
+        await _native_lifecycle_readiness(case)
         network_record = await _draft(
             case.fixture.engine, case.fixture.control_schema, _create("network"), case.seed.actor
         )
@@ -967,37 +951,29 @@ def test_preservation_inventory_mode_requires_an_explicit_boolean(inventory):
         _recipe_commitment((recipe(),), inventory)
 
 
-@pytest.mark.parametrize("seal", [None, "A" * 64, "short", 1])
-def test_predecessor_custody_seal_cannot_be_missing_or_retyped(seal):
-    from process.registry_fhir_serving_preservation import _require_predecessor_seal
+@pytest.mark.parametrize("generation", [None, "A" * 64, "short", 1])
+def test_predecessor_logical_manifest_generation_is_well_formed(generation):
+    from process.registry_fhir_serving_preservation import _require_predecessor_manifest
+    from tests.test_registry_fhir_preservation_inventory import _legacy_predecessor
 
-    valid = SimpleNamespace(_custody_seal_sha256="a" * 64)
-    _require_predecessor_seal(valid, valid)
+    valid = _legacy_predecessor()
+    _require_predecessor_manifest(valid, valid)
     with pytest.raises(FHIRServingPreservationError, match="predecessor_changed"):
-        _require_predecessor_seal(SimpleNamespace(_custody_seal_sha256=seal))
+        _require_predecessor_manifest(replace(valid, manifest_sha256=generation))
 
 
 @pytest.mark.asyncio
-async def test_predecessor_address_oid_is_rechecked_under_its_read_lock():
+async def test_predecessor_address_uses_recorded_names_without_native_identity_reads():
+    from process.network_compact_layout import CompactAddressRelation
     from process.registry_fhir_serving_preservation import _predecessor_addresses
 
-    predecessor = SimpleNamespace(compact_layout=None, schema_name="prior_snapshot", address_table_oid=101)
-    events = []
-
-    async def lock(statement):
-        events.append(statement)
-
-    async def oid(query, relation):
-        assert events[-1] == 'LOCK TABLE ONLY "prior_snapshot".entity_address_unified IN ACCESS SHARE MODE NOWAIT'
-        return 102
-
-    connection = SimpleNamespace(execute=AsyncMock(side_effect=lock), fetchval=AsyncMock(side_effect=oid))
-    with pytest.raises(FHIRServingPreservationError, match="predecessor_changed"):
-        await _predecessor_addresses(connection, predecessor)
-    connection.execute.assert_awaited_once()
-    connection.fetchval.assert_awaited_once_with(
-        "SELECT to_regclass($1)::oid::bigint", '"prior_snapshot".entity_address_unified'
+    predecessor = SimpleNamespace(
+        compact_layout=None, address_relation=CompactAddressRelation("prior_snapshot", "entity_address_unified")
     )
+    connection = SimpleNamespace(execute=AsyncMock(), fetchval=AsyncMock())
+    assert await _predecessor_addresses(connection, predecessor) == ('"prior_snapshot"."entity_address_unified"', ())
+    connection.execute.assert_not_awaited()
+    connection.fetchval.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1083,6 +1059,7 @@ async def test_carried_target_rows_recheck_current_approved_generation_and_exact
         "invalid_documents": 0,
         "unresolved_rows": 0,
         "command_documents": 0,
+        "edition_valid": True,
     }
     connection = SimpleNamespace(
         is_in_transaction=lambda: True,

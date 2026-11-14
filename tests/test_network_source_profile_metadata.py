@@ -3,7 +3,7 @@
 
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import asyncpg
 import pytest
@@ -12,7 +12,6 @@ from process import network_cms_registry_address_capture as clones
 from process import network_cms_registry_source_pair as pairs
 from process import network_fhir_membership_source as membership
 from process import network_fhir_source_epoch as epoch
-from process import network_read_identity as consumed
 from process.network_compact_layout import CompactAddressRelation
 from tests.test_network_cms_registry_source_pair import _retained_pair, _witness_pair
 
@@ -24,8 +23,7 @@ class Connection:
         self.active, self.modes, self.calls, self.events = True, ("repeatable read", "on"), [], []
         self.comment, self.payload, self.matches = None, None, True
         self.owner_oid = 31
-        # A copied database gives every table an identifier that no pin recorded.
-        self.oid_by_table = {name: 900000 + index for index, name in enumerate(sorted(epoch._TABLES))}
+        self.tables = set(epoch._TABLES)
 
     def is_in_transaction(self):
         return self.active
@@ -33,7 +31,8 @@ class Connection:
     async def fetch(self, query, *arguments):
         self.calls.append((query, arguments))
         assert all(check in query for check in ("relrowsecurity", "relispartition", "pg_inherits", "pg_rewrite"))
-        return [{"relname": name, "oid": oid} for name, oid in self.oid_by_table.items() if name in arguments[1]]
+        assert "SELECT c.relname::text FROM" in query
+        return [{"relname": name} for name in sorted(self.tables) if name in arguments[1]]
 
     async def fetchrow(self, query, *arguments):
         self.calls.append((query, arguments))
@@ -52,14 +51,10 @@ class Connection:
 
     async def fetchval(self, query, *arguments):
         self.calls.append((query, arguments))
-        if query == "SELECT pg_backend_pid()":
-            return 321
         if query == "SHOW transaction_isolation":
             return self.modes[0]
         if query == "SHOW transaction_read_only":
             return self.modes[1]
-        if query.startswith("SELECT to_regclass"):
-            return self.oid_by_table.get(arguments[0].rpartition(".")[2])
         if query.startswith("SELECT obj_description"):
             return self.comment
         if query.startswith("SELECT oid FROM pg_roles"):
@@ -97,48 +92,14 @@ def _relations(pin, owner_oid):
     ]
 
 
-async def test_epoch_catalog_keeps_all_checks_under_its_lock(monkeypatch):
-    retained = _retained_pair().recipe.source_pin.retained_epoch
-    connection = Connection()
-    catalog_rows = _relations(retained, connection.owner_oid)
-    profiles = Mock()
-    monkeypatch.setattr(epoch, "_catalog_relations", AsyncMock(return_value=catalog_rows))
-    monkeypatch.setattr(epoch, "_require_index_profiles", profiles)
-    actual = await epoch._catalog(connection, retained.schema_name, retained.owner_role, retained.runtime_roles)
-    assert actual == (retained.schema_oid, retained.relation_oids, epoch._hash(catalog_rows))
-    profiles.assert_called_once_with(catalog_rows, connection.owner_oid)
-    assert sum(query.startswith("LOCK TABLE") for query, _ in connection.calls) == 1
-    assert any("has_parameter_privilege" in query and "is_grantable" in query for query, _ in connection.calls)
-
-
-async def test_epoch_requirement_preserves_comment_and_catalog_binding(monkeypatch):
-    pair = _retained_pair()
-    retained = pair.recipe.source_pin.retained_epoch
-    connection = Connection()
-    connection.comment = epoch._receipt_comment(retained)
-    catalog = AsyncMock(return_value=(retained.schema_oid, retained.relation_oids, retained.catalog_sha256))
-    content = AsyncMock(side_effect=AssertionError("metadata mode read full content"))
-    monkeypatch.setattr(epoch, "_catalog", catalog)
-    monkeypatch.setattr(epoch, "_content", content)
-    assert (
-        await epoch.require_retained_cms_fhir_source_epoch(
-            connection, pair.proof.source_pin, retained, verify_content=False
-        )
-        == retained
-    )
-    assert catalog.await_args.kwargs == {}
-    content.assert_not_awaited()
-
-
 async def test_clone_metadata_retains_ownership_role_trigger_index_checks(monkeypatch):
     pair, connection = _retained_pair(), Connection()
     catalog_rows = _relations(pair.address_ownership, connection.owner_oid)
-    ownership, triggers, closed = AsyncMock(return_value=pair.address_ownership), AsyncMock(), AsyncMock()
+    ownership, triggers = AsyncMock(return_value=pair.address_ownership), AsyncMock()
     content = AsyncMock(side_effect=AssertionError("metadata mode called content capturer"))
     monkeypatch.setattr(clones, "verify_entity_address_archive_stage_ownership", ownership)
     monkeypatch.setattr(clones, "_catalog_relations", AsyncMock(return_value=catalog_rows))
     monkeypatch.setattr(clones, "_require_native_constraint_triggers", triggers)
-    monkeypatch.setattr(clones, "_closed", closed)
     monkeypatch.setattr(clones, "capture_entity_address_archive_receipt", content)
     actual = await clones.address_clone_identity(
         clones.NativeReceiptSession(connection),
@@ -150,63 +111,22 @@ async def test_clone_metadata_retains_ownership_role_trigger_index_checks(monkey
     assert actual == (None, epoch._hash(catalog_rows))
     ownership.assert_awaited_once()
     triggers.assert_awaited_once_with(connection, pair.address_ownership.schema_oid)
-    closed.assert_awaited_once()
     content.assert_not_awaited()
     assert sum(query.startswith("LOCK TABLE") for query, _ in connection.calls) == 1
 
 
-class GuardedRow(dict):
-    def __init__(self, values, connection):
-        super().__init__(values)
-        self.connection = connection
-
-    def __getitem__(self, key):
-        assert self.connection.events[-1] == "guard"
-        return super().__getitem__(key)
-
-
-class GuardedMatch:
-    def __init__(self, connection):
-        self.connection = connection
-
-    def __bool__(self):
-        assert self.connection.events[-1] == "guard"
-        return True
-
-
-def _consumption_spy(monkeypatch, connection, retained, *, fail=False):
-    async def guard(actual, relations, *, expected_backend_pid):
-        assert actual is connection and expected_backend_pid == 321
-        assert connection.events[-1] == "data"
-        assert relations == (
-            CompactAddressRelation(retained.schema_name, DATASET_TABLE, connection.oid_by_table[DATASET_TABLE]),
-        )
-        if fail:
-            raise consumed.NetworkReadIdentityError("synthetic physical mismatch")
-        connection.events.append("guard")
-
-    checked = AsyncMock(side_effect=guard)
-    monkeypatch.setattr(consumed, "verify_consumed_network_relations", checked)
-    return checked
-
-
 def _recorded_identifiers(pair):
-    retained = pair.recipe.source_pin.retained_epoch
     return {
-        retained.schema_oid,
         pair.address_ownership.schema_oid,
-        pair.recipe.source_pin.resource_table_oid,
-        *(oid for _, oid in retained.relation_oids),
         *(oid for _, oid in pair.address_ownership.relation_oids),
     }
 
 
 def _assert_no_recorded_oid_sent(connection, pair):
     recorded = _recorded_identifiers(pair)
-    assert not recorded & {321, *connection.oid_by_table.values()}
     integers = [argument for _, arguments in connection.calls for argument in arguments if type(argument) is int]
     assert not recorded & set(integers)
-    assert not any("WHERE false" in query for query, _ in connection.calls)
+    assert not any("pg_backend_pid" in query or "to_regclass" in query for query, _ in connection.calls)
     assert all(
         query.endswith(" IN ACCESS SHARE MODE") for query, _ in connection.calls if query.startswith("LOCK TABLE")
     )
@@ -231,38 +151,54 @@ def _publication_row(pair):
     }
 
 
-@pytest.mark.parametrize("fail", [False, True])
-async def test_publication_metadata_dataset_read_is_guarded_before_any_field_use(monkeypatch, fail):
+@pytest.mark.parametrize(
+    "damage",
+    [
+        None,
+        "endpoint_id",
+        "dataset_hash",
+        "acquisition_root_run_id",
+        "status",
+        "content_proof_admission_sha256",
+        "publication_metadata_sha256",
+        "bindings",
+        "semantic_as_of",
+        "missing",
+    ],
+)
+async def test_publication_metadata_keeps_complete_logical_source_checks(damage):
     pair, connection = _retained_pair(), Connection()
-    connection.payload = GuardedRow(_publication_row(pair), connection)
-    checked = _consumption_spy(monkeypatch, connection, pair.recipe.source_pin.retained_epoch, fail=fail)
-    if fail:
-        with pytest.raises(consumed.NetworkReadIdentityError):
+    connection.payload = _publication_row(pair)
+    if damage == "missing":
+        connection.payload = None
+    elif damage == "bindings":
+        connection.payload[damage] = {}
+    elif damage is not None:
+        connection.payload[damage] = "changed"
+    if damage is not None:
+        with pytest.raises(ValueError, match="registry_cms_source_pair_invalid"):
             await pairs._retained_source_publication_time(connection, pair, api_read=True)
     else:
         assert await pairs._retained_source_publication_time(connection, pair, api_read=True) is None
-    checked.assert_awaited_once()
     _assert_no_recorded_oid_sent(connection, pair)
 
 
-@pytest.mark.parametrize("fail", [False, True])
-async def test_api_admission_names_current_epoch_tables_and_guards_before_boolean_use(monkeypatch, fail):
+@pytest.mark.parametrize("matches", [False, True])
+async def test_api_admission_keeps_named_tables_and_dataset_metadata(monkeypatch, matches):
     pair, connection = _retained_pair(), Connection()
     pin = pair.recipe.source_pin
-    connection.matches = GuardedMatch(connection)
+    connection.matches = matches
     custody = AsyncMock(side_effect=AssertionError("API admission compared recorded custody"))
     monkeypatch.setattr(membership, "require_retained_cms_fhir_source_epoch", custody)
-    checked = _consumption_spy(monkeypatch, connection, pin.retained_epoch, fail=fail)
-    if fail:
-        with pytest.raises(consumed.NetworkReadIdentityError):
+    if not matches:
+        with pytest.raises(membership.FHIRMembershipSourceError):
             await membership._require_pinned_source(connection, pin, api_read=True)
     else:
         assert await membership._require_pinned_source(connection, pin, api_read=True) == tuple(
-            CompactAddressRelation(pin.read_schema_name, name, oid) for name, oid in connection.oid_by_table.items()
+            CompactAddressRelation(pin.read_schema_name, name) for name in sorted(connection.tables)
         )
-    checked.assert_awaited_once()
+    custody.assert_not_awaited()
     _assert_no_recorded_oid_sent(connection, pair)
-    # The share lock on every epoch table precedes the row filtering check, so the check cannot go stale.
     queries = [query for query, _ in connection.calls]
     lock = next(index for index, query in enumerate(queries) if query.startswith("LOCK TABLE"))
     assert lock < next(index for index, query in enumerate(queries) if "relrowsecurity" in query)
@@ -276,7 +212,6 @@ async def test_api_admission_refuses_when_the_epoch_tables_cannot_be_locked(monk
         raise asyncpg.LockNotAvailableError("synthetic lock timeout")
 
     connection.execute = unavailable
-    monkeypatch.setattr(consumed, "verify_consumed_network_relations", AsyncMock())
     with pytest.raises(membership.FHIRMembershipSourceError):
         await membership._require_pinned_source(connection, pair.recipe.source_pin, api_read=True)
     assert connection.events == [] and not any("relrowsecurity" in query for query, _ in connection.calls)
@@ -285,26 +220,20 @@ async def test_api_admission_refuses_when_the_epoch_tables_cannot_be_locked(monk
 async def test_api_admission_refuses_absent_or_row_filtered_epoch_table(monkeypatch):
     pair, connection = _retained_pair(), Connection()
     # The catalog query returns only plain permanent tables without row filtering.
-    del connection.oid_by_table["provider_directory_dataset_resource"]
-    checked = AsyncMock()
-    monkeypatch.setattr(consumed, "verify_consumed_network_relations", checked)
+    connection.tables.remove("provider_directory_dataset_resource")
     with pytest.raises(membership.FHIRMembershipSourceError):
         await membership._require_pinned_source(connection, pair.recipe.source_pin, api_read=True)
     assert connection.events == []
-    checked.assert_not_awaited()
 
 
 async def test_api_admission_of_a_live_schema_pin_compares_no_recorded_table(monkeypatch):
     pair, connection = _retained_pair(), Connection()
     pin = pair.proof.source_pin
     connection.fetch = AsyncMock(side_effect=AssertionError("a live schema has no epoch tables"))
-    checked = AsyncMock()
-    monkeypatch.setattr(consumed, "verify_consumed_network_relations", checked)
     assert await membership._require_pinned_source(connection, pin, {"producer_id": "example"}, api_read=True) == ()
     query, arguments = next(call for call in connection.calls if call[0].startswith("SELECT EXISTS"))
     assert "published_at IS NOT NULL" in query and "relkind='r'" in query and "oid=$" not in query
     assert arguments[0] == pin.schema_name and arguments[-1] == '{"producer_id": "example"}'
-    checked.assert_awaited_once_with(connection, (), expected_backend_pid=321)
     _assert_no_recorded_oid_sent(connection, pair)
 
 
@@ -365,14 +294,13 @@ def _pair_resolver_doubles(monkeypatch, pair, connection, *, schema_oid):
     monkeypatch.setattr(pairs, "require_registry_cms_address_copy_witness", doubles.witness)
     monkeypatch.setattr(pairs, "_publication", doubles.publication)
     monkeypatch.setattr(pairs, "_read_committed_pair", AsyncMock(return_value=(pair, schema_oid)))
-    doubles.checked = _consumption_spy(monkeypatch, connection, pair.recipe.source_pin.retained_epoch)
     return doubles
 
 
 @pytest.mark.parametrize("copied", [False, True])
 async def test_api_pair_resolver_reads_by_name_and_compares_no_physical_identity(monkeypatch, copied):
     pair, connection = _witness_pair(), Connection()
-    connection.payload = GuardedRow(_publication_row(pair), connection)
+    connection.payload = _publication_row(pair)
     doubles = _pair_resolver_doubles(
         monkeypatch, pair, connection, schema_oid=pair.address_ownership.schema_oid + (700000 if copied else 0)
     )
@@ -383,7 +311,6 @@ async def test_api_pair_resolver_reads_by_name_and_compares_no_physical_identity
     for custody in (doubles.source, doubles.clone, doubles.witness):
         custody.assert_not_awaited()
     doubles.publication.assert_awaited_once()
-    doubles.checked.assert_awaited_once()
     _assert_no_recorded_oid_sent(connection, pair)
     doubles.publication.return_value = {"another": "receipt"}
     with pytest.raises(ValueError, match="^registry_cms_source_pair_invalid$"):
@@ -408,4 +335,3 @@ async def test_pair_resolver_outside_api_reads_keeps_every_custody_check(monkeyp
     assert (await operation).pair == pair
     assert doubles.source.await_args.kwargs == doubles.clone.await_args.kwargs == {"verify_content": False}
     doubles.witness.assert_awaited_once()
-    doubles.checked.assert_not_awaited()

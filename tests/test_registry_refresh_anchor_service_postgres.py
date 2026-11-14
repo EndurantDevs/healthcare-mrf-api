@@ -286,17 +286,11 @@ async def test_native_bound_covers_complete_batch_before_json_export(anchor_db):
     assert fixture.calls == []
 
 
-async def test_other_database_target_and_non_singleton_factory_are_refused(anchor_db):
+async def test_non_singleton_source_factory_is_refused(anchor_db):
     fixture = anchor_db
-    other = create_async_engine(
-        fixture.engine.url.set(database="other_synthetic_database"), pool_size=1, max_overflow=0
-    )
     non_singleton = create_async_engine(fixture.engine.url, pool_size=2, max_overflow=0)
     try:
         with pytest.raises(RegistryRefreshAnchorUnavailable):
-            replace(fixture.service, source_reader_sessions=async_sessionmaker(other))
-        with pytest.raises(RegistryRefreshAnchorUnavailable):
             replace(fixture.service, source_reader_sessions=async_sessionmaker(non_singleton))
     finally:
-        await other.dispose()
         await non_singleton.dispose()

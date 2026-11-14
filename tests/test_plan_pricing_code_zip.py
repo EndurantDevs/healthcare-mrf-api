@@ -278,18 +278,25 @@ async def test_exact_zip_attachment_is_preferred_and_invalid_storage_never_falls
     from api import plan_pricing_code_read as reader
 
     identity = _zip_identity()
-    session = SimpleNamespace(scalar=AsyncMock(return_value=True))
+    transaction = object()
+    session = SimpleNamespace(
+        scalar=AsyncMock(),
+        execute=AsyncMock(return_value=SimpleNamespace(scalar_one=lambda: True)),
+        get_transaction=lambda: transaction,
+        in_transaction=lambda: True,
+    )
     monkeypatch.setattr(reader, "_lock_provider_relations", AsyncMock())
     monkeypatch.setattr(build, "resolve_inputs", AsyncMock(return_value=(identity, [])))
     locate = AsyncMock(return_value=(SimpleNamespace(schema_name="synthetic"),))
     monkeypatch.setattr(reader, "locate", locate)
     request_by_field = {**_params(expected=False), "view": "card", "include_providers": "false"}
     capability = await reader.resolve_code_pricing(session, _selection(), request_by_field)
-    assert capability.identity == identity and session.scalar.await_count == 1
+    assert capability.identity == identity and session.execute.await_count == 1
     locate.side_effect = PlanPricingProjectionUnavailable("invalid attached storage")
     with pytest.raises(PlanPricingProjectionUnavailable, match="invalid attached"):
         await reader.resolve_code_pricing(session, _selection(), request_by_field)
-    assert session.scalar.await_count == 2
+    assert session.execute.await_count == 2
+    session.scalar.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -16,6 +16,7 @@ import pytest
 
 from process import registry_required_target_coverage as collector
 from process import registry_required_target_coverage_import as coverage_import
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
 
 SNAPSHOT_ID = UUID("34567890-3456-7890-8345-34567890abcd")
@@ -302,7 +303,14 @@ def _collector_values():
     report = _shape()
     return SimpleNamespace(
         manifest=PinnedNetworkServingManifest(
-            7, str(SNAPSHOT_ID), "serving_fixture", 1, {"custom_membership": "b" * 64}, 1, "c" * 64, 1
+            7,
+            str(SNAPSHOT_ID),
+            "serving_fixture",
+            1,
+            {"custom_membership": "b" * 64},
+            1,
+            "c" * 64,
+            CompactAddressRelation("serving_fixture", "entity_address_unified"),
         ),
         approved=SimpleNamespace(generation_id="b" * 64),
         descriptor={

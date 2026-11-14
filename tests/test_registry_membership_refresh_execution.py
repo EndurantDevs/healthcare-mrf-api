@@ -2,13 +2,16 @@
 """Final refresh fences compare complete registered recipes and live leases."""
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
-from uuid import UUID
+from unittest.mock import AsyncMock, Mock
+from uuid import UUID, uuid4
 
+import asyncpg
+import httpx
 import pytest
+from sqlalchemy.engine import make_url
 
 from process import registry_membership_refresh_execution as refresh
 from process import registry_publication_execution as publication
@@ -203,3 +206,218 @@ async def test_changed_locked_request_stops_before_candidate_locks_or_final_gran
     assert events == ["released"]
     controls.assert_not_awaited()
     final_authority.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, ValueError("invalid rows"), asyncio.CancelledError()])
+async def test_refresh_fixture_uses_named_preparation_before_after_seal_hook(failure):
+    from tests.registry_membership_refresh_execution_support import RefreshExecution
+
+    fixture = RefreshExecution(SimpleNamespace(admin=SimpleNamespace(kw={"bind": object()})), (None,) * 5)
+    target = object()
+    fixture.prepare_candidate = AsyncMock(side_effect=failure)
+    fixture.after_seal = AsyncMock()
+    if failure is None:
+        await fixture.seal(target)
+        fixture.after_seal.assert_awaited_once_with(target)
+    else:
+        with pytest.raises(type(failure)) as error:
+            await fixture.seal(target)
+        assert error.value is failure
+        fixture.after_seal.assert_not_awaited()
+    fixture.prepare_candidate.assert_awaited_once_with(target)
+
+
+@pytest.mark.asyncio
+async def test_refresh_fixture_installs_configured_runtime_and_administrator_freeze(monkeypatch):
+    from tests import registry_membership_refresh_execution_support as support
+
+    fixture = support.RefreshExecution(
+        SimpleNamespace(
+            admin=SimpleNamespace(
+                kw={"bind": SimpleNamespace(url=make_url("postgresql+asyncpg://admin@localhost/test"))}
+            ),
+            names=SimpleNamespace(reader="source_reader"),
+        ),
+        (None, None, "registry_control", None, []),
+    )
+    fixture.roles_by_kind = {
+        name: "refresh_" + name
+        for name in ("queue", "physical", "custody", "api", "lifecycle", "execution", "custodian")
+    }
+    fixture.password = "test"
+    connect = AsyncMock(side_effect=lambda *_args, **_kwargs: SimpleNamespace(close=AsyncMock()))
+    pools = AsyncMock(side_effect=lambda **_kwargs: SimpleNamespace(close=AsyncMock()))
+    monkeypatch.setattr(support.asyncpg, "connect", connect)
+    monkeypatch.setattr(support.asyncpg, "create_pool", pools)
+    monkeypatch.setattr(support.RegistryPublicationSQLLimits, "verify", AsyncMock())
+    installed, callback = SimpleNamespace(preparation_roles=object()), AsyncMock()
+    configure = AsyncMock(return_value=installed)
+    freeze = Mock(return_value=callback)
+    monkeypatch.setattr(support, "_configured_worker_runtime", configure)
+    monkeypatch.setattr(support, "administrative_freeze_callback", freeze)
+    async with AsyncExitStack() as stack:
+        await support._connect_workers(fixture, stack)
+        settings, actual_stack = configure.await_args.args
+        assert actual_stack is stack
+        assert {**settings.consumer.permission_roles, "control_schema": settings.consumer.control_schema} == (
+            fixture.permission_roles
+        )
+        assert settings.consumer.reader_roles == ("source_reader",)
+        assert settings.execution_url.username == fixture.roles_by_kind["execution"]
+        assert settings.preparation_roles == {
+            "namespace_owner_role": "refresh_custody",
+            "publisher_role": "refresh_execution",
+            "application_roles": sorted({"source_reader", *fixture.roles_by_kind.values()} - {"refresh_custody"}),
+        }
+        assert fixture.preparation_roles is installed.preparation_roles
+        assert fixture.prepare_candidate is callback
+        freeze.assert_called_once_with(fixture, installed)
+    assert connect.await_count == pools.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("write_allowed", [False, True])
+async def test_refresh_published_write_probe_refuses_an_application_write_grant(monkeypatch, write_allowed):
+    from tests import registry_membership_refresh_execution_support as support
+
+    statements = []
+
+    class Connection:
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+        async def execute(self, statement):
+            statements.append(statement)
+            if not write_allowed:
+                raise asyncpg.InsufficientPrivilegeError("published generation is read only")
+
+    connection = Connection()
+
+    @asynccontextmanager
+    async def acquire():
+        yield connection
+
+    fixture = support.RefreshExecution(SimpleNamespace(admin=SimpleNamespace(kw={"bind": object()})), (None,) * 5)
+    fixture.connection = fixture.api = fixture.custodian = connection
+    fixture.execution_pool = fixture.lifecycle_pool = SimpleNamespace(acquire=acquire)
+    handoff_by_field = {
+        "tables": [
+            {"schema": "named_snapshot", "name": name} for name in ("network_membership", "provider_location_binding")
+        ]
+    }
+    loader = AsyncMock(return_value=handoff_by_field)
+    monkeypatch.setattr(support, "load_named_network_preparation", loader)
+    candidate_id = str(uuid4())
+    if write_allowed:
+        with pytest.raises(pytest.fail.Exception, match="DID NOT RAISE"):
+            await fixture.assert_published_readonly(candidate_id)
+        assert len(statements) == 1
+    else:
+        await fixture.assert_published_readonly(candidate_id)
+        assert len(statements) == 28
+        assert {statement.split()[0] for statement in statements} == {"UPDATE", "DELETE", "INSERT", "TRUNCATE"}
+    loader.assert_awaited_once_with(connection, candidate_id, control_schema=fixture.control_schema)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["allow", "deny", "cancel"])
+async def test_refresh_commit_http_does_not_require_source_locks(outcome):
+    from tests import registry_membership_refresh_execution_support as support
+    from tests.test_registry_membership_refresh_authority import envelope
+
+    fixture = support.RefreshExecution(SimpleNamespace(admin=SimpleNamespace(kw={"bind": object()})), (None,) * 5)
+    fixture._assert_source_fenced = AsyncMock()
+    fixture.denied_commit, fixture.cancel_commit = outcome == "deny", outcome == "cancel"
+    request = httpx.Request(
+        "POST",
+        "https://authority.example.invalid" + support.COMMIT_AUTHORITY_PATH,
+        headers={"Authorization": "Bearer synthetic-refresh-only"},
+        json=envelope(),
+    )
+    if outcome == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await fixture.http(request)
+    else:
+        reply = await fixture.http(request)
+        assert reply.status_code == (403 if outcome == "deny" else 200)
+    fixture._assert_source_fenced.assert_not_awaited()
+    assert fixture.calls == [support.COMMIT_AUTHORITY_PATH]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, RuntimeError("final CAS refused"), asyncio.CancelledError()])
+async def test_refresh_source_probe_runs_only_inside_original_pin_and_releases(failure):
+    from tests import registry_membership_refresh_execution_support as support
+
+    fixture = support.RefreshExecution(SimpleNamespace(admin=SimpleNamespace(kw={"bind": object()})), (None,) * 5)
+    connection, envelope, source_pin, final_sources = object(), object(), object(), object()
+    events, state = [], SimpleNamespace(is_pinned=False)
+
+    @asynccontextmanager
+    async def pin(*args):
+        assert args == (connection, envelope, source_pin)
+        events.append("pin")
+        state.is_pinned = True
+        try:
+            yield final_sources
+        finally:
+            state.is_pinned = False
+            events.append("release")
+
+    async def prove():
+        assert state.is_pinned
+        events.append("writer_refused")
+
+    fixture.bundle = SimpleNamespace(runtime=SimpleNamespace(pin_sources=pin))
+    fixture._assert_source_fenced = prove
+
+    async def finish():
+        async with fixture._pinned_sources(connection, envelope, source_pin) as sources:
+            assert sources is final_sources and state.is_pinned
+            events.append("final_CAS")
+            if failure is not None:
+                raise failure
+
+    if failure is None:
+        await finish()
+    else:
+        with pytest.raises(type(failure)) as caught:
+            await finish()
+        assert caught.value is failure
+    assert events == ["pin", "writer_refused", "final_CAS"] + (
+        ["writer_refused", "release"] if failure is None else ["release"]
+    )
+    assert state.is_pinned is False
+
+
+@pytest.mark.asyncio
+async def test_refresh_consumer_wraps_final_pins_without_changing_server_runtime(monkeypatch):
+    from tests import registry_membership_refresh_execution_support as support
+    from tests.test_registry_membership_refresh_authority import client
+
+    async with client(lambda _request: pytest.fail("configuration attempted HTTP")) as authorize:
+        original = _runtime(authorize)
+        fixture = support.RefreshExecution(
+            SimpleNamespace(
+                admin=SimpleNamespace(kw={"bind": object()}), names=SimpleNamespace(reader="source_reader")
+            ),
+            (None, None, "registry_control", None, []),
+        )
+        fixture.roles_by_kind = {
+            name: "refresh_" + name
+            for name in ("queue", "physical", "custody", "api", "lifecycle", "execution", "custodian")
+        }
+        fixture.preparation_roles = object()
+        fixture.bundle = SimpleNamespace(runtime=original)
+        fixture.lifecycle_pool, fixture.execution_pool = object(), object()
+        consume = AsyncMock(return_value=None)
+        monkeypatch.setattr(support, "consume_registry_publication_once", consume)
+        assert await fixture.consume(str(uuid4())) is None
+        selected = consume.await_args.kwargs["config"]
+        assert selected.membership_refresh_runtime.pin_sources == fixture._pinned_sources
+        assert selected.membership_refresh_runtime.authorize is original.authorize
+        assert selected.membership_refresh_runtime.resolve_sources is original.resolve_sources
+        assert selected.preparation_roles is fixture.preparation_roles
+        assert fixture.bundle.runtime is original and original.pin_sources is not fixture._pinned_sources

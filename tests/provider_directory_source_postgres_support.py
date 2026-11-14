@@ -502,7 +502,7 @@ async def _native_observation_identity(session, driver, policy):
     return actor_by_field
 
 
-async def _create_native_roles(engine, policy, roles, created, retention_owner, retained_publisher):
+async def _create_native_roles(engine, policy, roles, created, retention_owner, retained_publisher, created_namespaces):
     async with engine.begin() as connection:
         password_sql = await connection.scalar(
             text("SELECT quote_literal(CAST(:password AS text))"), {"password": engine.url.password}
@@ -524,8 +524,8 @@ async def _create_native_roles(engine, policy, roles, created, retention_owner, 
         await connection.execute(
             text(f'GRANT "{policy.owner_role}" TO "{retained_publisher}" WITH INHERIT TRUE, SET FALSE, ADMIN FALSE')
         )
+        created_namespaces.append("hp_snapshot_retention")
         await connection.execute(text(f'CREATE SCHEMA hp_snapshot_retention AUTHORIZATION "{retention_owner}"'))
-        retention_oid = await connection.scalar(text("SELECT 'hp_snapshot_retention'::regnamespace::oid"))
         await connection.execute(text(f'ALTER SCHEMA "{policy.schema}" OWNER TO "{policy.owner_role}"'))
         for role in (policy.publisher_role, *policy.runtime_roles):
             await connection.execute(text(f'GRANT USAGE ON SCHEMA "{policy.schema}" TO "{role}"'))
@@ -543,7 +543,6 @@ async def _create_native_roles(engine, policy, roles, created, retention_owner, 
         dbname = await connection.scalar(text("SELECT current_database()"))
         await connection.execute(text(f'GRANT CREATE ON DATABASE "{dbname}" TO "{policy.publisher_role}"'))
         await connection.execute(text(f'GRANT CREATE ON DATABASE "{dbname}" TO "{retained_publisher}"'))
-    return retention_oid
 
 
 async def _drop_native_source_roles(connection, created, admin):
@@ -561,7 +560,7 @@ WHERE datname=current_database() AND backend_type='autovacuum worker'
 AND pg_has_role(current_user,to_regrole('pg_signal_autovacuum_worker'),'USAGE')"""
 
 
-async def _cleanup_native_source_component(engine, database, is_owned_reader, retention_oid, created, admin):
+async def _cleanup_native_source_component(engine, database, is_owned_reader, created_namespaces, created, admin):
     """Retry only whole rolled-back ownership cleanup when native autovacuum deadlocks."""
     if database is not None:
         if not is_owned_reader:
@@ -573,12 +572,8 @@ async def _cleanup_native_source_component(engine, database, is_owned_reader, re
                 # Fast bulk loads leave autovacuum mid-flight on this disposable database; its catalog
                 # updates deadlock with REASSIGN OWNED, so stop the workers first when allowed to.
                 await connection.execute(text(_CANCEL_AUTOVACUUM_SQL))
-                if retention_oid is not None:
-                    assert (
-                        await connection.scalar(text("SELECT to_regnamespace('hp_snapshot_retention')::oid"))
-                        == retention_oid
-                    )
-                    await connection.execute(text("DROP SCHEMA hp_snapshot_retention RESTRICT"))
+                if "hp_snapshot_retention" in created_namespaces:
+                    await connection.execute(text("DROP SCHEMA IF EXISTS hp_snapshot_retention RESTRICT"))
                 await _drop_native_source_roles(connection, created, admin)
             return
         except DBAPIError as error:
@@ -664,14 +659,16 @@ async def native_source_component(
     retention_owner, retained_publisher = "retention_owner_" + token, "retained_publisher_" + token
     roles = (owner, publisher, *((reader,) if is_owned_reader else ()), *builder, retention_owner, retained_publisher)
     policy = source.GenericSourcePolicy(schema, owner, publisher, (reader, *builder), builder)
-    created, retention_oid, database = [], None, None
+    created, created_namespaces, database = [], [], None
     async with engine.connect() as connection:
         admin = await connection.scalar(text("SELECT session_user"))
         assert _is_component_test_database(await connection.scalar(text("SELECT current_database()")))
         assert await connection.scalar(text("SELECT to_regnamespace('hp_snapshot_retention')")) is None
         await connection.rollback()
     try:
-        retention_oid = await _create_native_roles(engine, policy, roles, created, retention_owner, retained_publisher)
+        await _create_native_roles(
+            engine, policy, roles, created, retention_owner, retained_publisher, created_namespaces
+        )
         publisher_engine = _source_publisher_engine(engine.url, publisher, monkeypatch, pool_size=publisher_pool_size)
         database = Database(
             engine=publisher_engine, session_factory=async_sessionmaker(publisher_engine, expire_on_commit=False)
@@ -696,9 +693,10 @@ async def native_source_component(
                 builder=builder[0] if builder else None,
                 retention_owner=retention_owner,
                 retained_publisher=retained_publisher,
+                created_control_namespaces=created_namespaces,
             )
     finally:
-        await _cleanup_native_source_component(engine, database, is_owned_reader, retention_oid, created, admin)
+        await _cleanup_native_source_component(engine, database, is_owned_reader, created_namespaces, created, admin)
 
 
 def source_component_migrations():

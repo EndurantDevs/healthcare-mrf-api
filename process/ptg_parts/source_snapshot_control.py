@@ -124,7 +124,6 @@ async def promote_ptg2_source_snapshot(
         PTG2SourcePointerConflict,
     ) as exc:
         raise SourceSnapshotConflict(str(exc)) from exc
-    _clear_ptg2_snapshot_cache()
     return promotion_by_field
 
 
@@ -334,7 +333,6 @@ async def retire_ptg2_source_snapshot(
             source_key=source_key,
         )
         after = await _current_references(schema, snapshot_id)
-    _clear_ptg2_snapshot_cache()
     return {
         "snapshot_id": snapshot_id,
         "source_key": source_key or manifest_source_key,
@@ -472,11 +470,3 @@ async def _artifact_manifest_ids(schema: str, snapshot_id: str) -> list[str]:
         snapshot_id=snapshot_id,
     )
     return [str(_row_mapping(row).get("artifact_id")) for row in rows]
-
-
-def _clear_ptg2_snapshot_cache() -> None:
-    try:
-        from api.ptg2_snapshot import _PTG2_SNAPSHOT_RESOLVE_CACHE
-    except Exception:
-        return
-    _PTG2_SNAPSHOT_RESOLVE_CACHE.clear()

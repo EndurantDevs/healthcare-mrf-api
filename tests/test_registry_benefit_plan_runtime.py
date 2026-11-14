@@ -11,7 +11,7 @@ from process import registry_benefit_plan_runtime as runtime
 from process import registry_publication_worker as worker
 from process.registry_benefit_plan_metadata import ORIGIN_CONFIG, TOKEN_CONFIG
 from tests.test_registry_benefit_plan_metadata import _client, _document, _reply
-from tests.test_registry_publication_worker import configuration, resources
+from tests.test_registry_publication_worker import _runtime_configuration, resources
 
 
 def _app(config):
@@ -70,7 +70,7 @@ async def test_actual_worker_passes_its_owned_client_and_closes_on_every_exit(mo
         return None
 
     monkeypatch.setattr(worker, "consume_registry_publication_once", consume)
-    configured = worker.parse_registry_publication_worker_config(json.dumps(configuration()))
+    configured = _runtime_configuration()
     if failure:
         with pytest.raises(RuntimeError):
             await worker.run_registry_publication_worker(configured)

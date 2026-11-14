@@ -18,6 +18,7 @@ from api.provider_directory_cms_entities import read_cms_entities
 from api.provider_directory_entities_contract import CURSOR_KEY_ENV, DirectoryRead, DirectoryReadError
 from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+from process.network_compact_layout import CompactAddressRelation
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.provider_directory_resource_identity import bind_resource_identity_batch, source_resource_uuid
@@ -809,7 +810,7 @@ async def test_identity_history_remains_immutable(monkeypatch):
 async def test_identity_binder_requires_candidate_scope():
     from process.provider_directory_generic_candidate import GenericCandidateError
 
-    with pytest.raises(GenericCandidateError, match="physical_session_required"):
+    with pytest.raises(GenericCandidateError, match="candidate_scope_required"):
         await bind_resource_identity_batch(
             object(), source_id="cms-npd", resource_type="InsurancePlan", resource_ids=["fresh-plan"]
         )
@@ -968,7 +969,14 @@ def trusted_recipe(monkeypatch):
         if generation_id not in (None, 9):
             raise ValueError("unavailable exact canonical pin")
         return PinnedNetworkServingManifest(
-            9, "00000000-0000-0000-0000-000000000001", os.environ["HLTHPRT_DB_SCHEMA"], 1, {}, 7, "c" * 64, 1
+            9,
+            "00000000-0000-0000-0000-000000000001",
+            os.environ["HLTHPRT_DB_SCHEMA"],
+            1,
+            {},
+            7,
+            "c" * 64,
+            CompactAddressRelation(os.environ["HLTHPRT_DB_SCHEMA"], "entity_address_unified"),
         )
 
     async def recipes(driver, manifest, *, api_read=False):
@@ -1090,11 +1098,8 @@ async def test_api_admission_names_copied_epoch_tables_and_refuses_row_security(
     epoch_id = uuid4()
     retained_schema = "registry_cms_epoch_" + epoch_id.hex
     origin = ("mrf", "cms-npd", "synthetic-endpoint", "synthetic-dataset", "b" * 64, "a" * 64, 1, "synthetic-alias")
-    # Recorded identifiers come from the publishing database; none names a table in this one.
-    recorded_oids = tuple((name, 3 + ordinal) for ordinal, name in enumerate(sorted(_TABLES)))
-    digests = ("c" * 64, "d" * 64, "e" * 64, "f" * 64)
     retained = RetainedCMSFHIRSourceEpoch(
-        (*origin, "2026-01-01"), epoch_id, retained_schema, 2, recorded_oids, "owner", ("reader",), *digests
+        (*origin, "2026-01-01"), epoch_id, retained_schema, "c" * 64, "d" * 64, "e" * 64
     )
     pin = PinnedFHIRMembershipSource(*origin, "2026-01-01", retained_epoch=retained)
 

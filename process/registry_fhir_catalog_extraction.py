@@ -578,58 +578,17 @@ def _selected_resource_types(resource_types):
         _fail()
 
 
-async def verify_fhir_catalog_retained_read(connection, *, schema_name, dataset_id, retained_read):
-    """Require this operation's retained read and its exact physical resource heap."""
-    from process.network_fhir_retained_capture import RetainedFHIRRead
+def fhir_catalog_resource_relation(*, schema_name, resource_relation=None):
+    """Quote configured named storage for a logical dataset read."""
+    from db.plan_release_storage import storage_relation
 
-    if (
-        type(retained_read) is not RetainedFHIRRead
-        or schema_name != retained_read.capture.schema_name
-        or dataset_id != retained_read.capture.origin.dataset_id
-    ):
-        _fail("retained_read_changed")
-    await retained_read.verify(connection, retained_read.capture)
-    resource_oid = await connection.fetchval(
-        "SELECT to_regclass($1)::oid::bigint", schema_name + ".provider_directory_dataset_resource"
-    )
-    if resource_oid != dict(retained_read.capture.relation_oids)["provider_directory_dataset_resource"]:
-        _fail("retained_read_changed")
-
-
-async def fhir_catalog_resource_relation(connection, *, schema_name, dataset_id, source_read):
-    """Return only the exact native-verified source relation for this dataset."""
-    if type(schema_name) is not str or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", schema_name) is None:
-        _fail()
-    resources = '"' + schema_name + '".provider_directory_dataset_resource'
-    if source_read is None:
-        return resources
-    from process.network_fhir_retained_capture import RetainedFHIRRead
-    from process.registry_fhir_catalog_published_read import FHIRCatalogPublishedRead
-
-    if type(source_read) is RetainedFHIRRead:
-        await verify_fhir_catalog_retained_read(
-            connection, schema_name=schema_name, dataset_id=dataset_id, retained_read=source_read
-        )
-        return resources
-    if type(source_read) is not FHIRCatalogPublishedRead:
-        _fail("source_read_invalid")
-    await source_read.verify(connection, schema_name=schema_name, dataset_id=dataset_id)
-    return "(" + source_read.resource_sql() + ") AS catalog_resources"
-
-
-async def verify_fhir_catalog_source_read(connection, source_read, *, schema_name=None, dataset_id=None):
-    """Recheck the original native read before each source or staged page."""
-    if source_read is None:
-        return
-    from process.network_fhir_retained_capture import RetainedFHIRRead
-    from process.registry_fhir_catalog_published_read import FHIRCatalogPublishedRead
-
-    if type(source_read) is RetainedFHIRRead:
-        await source_read.verify(connection, source_read.capture)
-    elif type(source_read) is FHIRCatalogPublishedRead:
-        await source_read.verify(connection, schema_name=schema_name, dataset_id=dataset_id)
-    else:
-        _fail("source_read_invalid")
+    if resource_relation is None:
+        return storage_relation(schema_name, "provider_directory_dataset_resource")
+    if type(resource_relation) is not dict or set(resource_relation) != {"schema", "name"}:
+        _fail("resource_relation_invalid")
+    if resource_relation["schema"] != schema_name:
+        _fail("resource_relation_invalid")
+    return storage_relation(resource_relation["schema"], resource_relation["name"])
 
 
 def _validate_fhir_catalog_page_scope(schema_name, dataset_id, after_resource, resource_types):
@@ -657,7 +616,7 @@ async def iter_fhir_catalog_raw_pages(
     page_rows=MAX_ROWS,
     page_bytes=DEFAULT_BYTES,
     resource_types=RESOURCE_TYPES,
-    source_read=None,
+    resource_relation=None,
 ):
     """Read admitted immutable data in a caller-owned repeatable snapshot; never commit."""
     _bound(page_rows, MAX_ROWS)
@@ -669,13 +628,12 @@ async def iter_fhir_catalog_raw_pages(
     isolation = await connection.fetchval("SELECT current_setting('transaction_isolation')")
     if isolation not in {"repeatable read", "serializable"}:
         _fail("transaction_required")
-    resources = await fhir_catalog_resource_relation(
-        connection, schema_name=schema_name, dataset_id=dataset_id, source_read=source_read
-    )
+    resources = fhir_catalog_resource_relation(schema_name=schema_name, resource_relation=resource_relation)
     cursor = after_resource or ("", "")
     query = _PAGE_SQL.format(resources=resources)
     while True:
-        await verify_fhir_catalog_source_read(connection, source_read, schema_name=schema_name, dataset_id=dataset_id)
+        if not connection.is_in_transaction():
+            _fail("transaction_required")
         source_records = await connection.fetch(query, dataset_id, resource_types, *cursor, page_rows, page_bytes)
         if not source_records:
             return
@@ -719,7 +677,7 @@ async def iter_fhir_catalog_pages(
     page_rows=MAX_ROWS,
     page_bytes=DEFAULT_BYTES,
     resource_types=RESOURCE_TYPES,
-    source_read=None,
+    resource_relation=None,
 ):
     """Decode admitted immutable pages without changing their snapshot or bounds."""
     async for source_records in iter_fhir_catalog_raw_pages(
@@ -730,6 +688,6 @@ async def iter_fhir_catalog_pages(
         page_rows=page_rows,
         page_bytes=page_bytes,
         resource_types=resource_types,
-        source_read=source_read,
+        resource_relation=resource_relation,
     ):
         yield _decode_fhir_catalog_page(source_records, page_bytes)

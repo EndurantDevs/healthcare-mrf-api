@@ -2,13 +2,10 @@
 """Native owned pools and current protected EAU observation; App paging is a transport double."""
 
 from contextlib import AsyncExitStack
-from types import SimpleNamespace
 
 import httpx
 import pytest
 
-from db import models
-from process import network_address_artifact as address
 from process import registry_membership_refresh_runtime as runtime
 from tests.test_network_address_artifact_postgres import address_db as address_db
 from tests.test_registry_membership_refresh_queue_postgres import refresh_queue_db as refresh_queue_db
@@ -49,13 +46,6 @@ async def test_native_api_bundle_owns_distinct_pools_and_observes_address_author
         "source_profiles": {},
     }
 
-    async def api_rows(statement, **parameters):
-        return [
-            tuple(row.values())
-            for row in await address._CatalogSession(address_fixture.reader).execute(statement, parameters)
-        ]
-
-    monkeypatch.setattr(models, "db", SimpleNamespace(all=api_rows))
     async with AsyncExitStack() as cleanup:
         bundle = await runtime.build_registry_membership_refresh_runtime(configured_by_field, cleanup)
         resources = bundle.inputs_service.resources

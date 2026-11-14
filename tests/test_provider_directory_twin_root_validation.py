@@ -132,6 +132,7 @@ class _ValidationHarness:
         self.saved_params = None
         self.statements = []
         self.is_committed = False
+        self.scalar = AsyncMock(return_value=True)
 
     async def __aenter__(self):
         return self
@@ -225,6 +226,9 @@ async def _validate(
         async with source_transaction(database, isolation="repeatable read"), harness as connection:
             validation = await importer._persist_endpoint_dataset_validation(connection, candidate, _diagnostics())
             summary = importer._endpoint_dataset_validation_summary(candidate, *validation)
+    harness.scalar.assert_awaited_once()
+    assert "pg_try_advisory_xact_lock" in harness.scalar.await_args.args[0]
+    assert harness.scalar.await_args.kwargs == {"admission_scope": candidate.endpoint_id}
     return summary, harness, relations
 
 

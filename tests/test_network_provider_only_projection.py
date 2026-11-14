@@ -22,10 +22,10 @@ from process.network_membership_copy import MembershipCopyTarget
 from process.registry_source_contribution_store import _COUNTERS, locally_owned_source_descriptor
 from process.registry_source_recipe_composition import RegistrySourceRecipeStage
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
+from tests.registry_source_recipe_support import _example
 from tests.test_network_fhir_retained_capture import pin, retained
 from tests.test_registry_ptg_office_membership_recipe import _recipe as ptg_recipe
 from tests.test_registry_source_contributions import _descriptor, _fact, _recipe
-from tests.test_registry_source_recipe_store_postgres import _example
 
 
 def _target():

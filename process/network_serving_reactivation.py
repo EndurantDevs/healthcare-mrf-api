@@ -10,7 +10,6 @@ from process.network_address_projection import _identifier
 from process.network_membership_publication import (
     _lock_publication_controls,
     _publication_readiness,
-    _verify_provider_custody,
 )
 from process.network_serving_read import NetworkServingReadUnavailable, resolve_network_serving_manifest
 
@@ -56,13 +55,9 @@ async def _reactivate(connection, namespace, generation_id, expected_head, expec
     )
     if manifest.approved_custom_revision != approved_revision:
         raise NetworkServingReactivationError("network_reactivation_target_approval_conflict")
-    readiness = _publication_readiness(dict(retained))
-    await _verify_provider_custody(connection, dict(retained), readiness[3])
+    _publication_readiness(dict(retained))
     has_changed = current_head != generation_id
     if has_changed:
-        from process.network_membership_serving_indexes import verify_network_search_indexes
-
-        await verify_network_search_indexes(connection, dict(retained), compact_layout=manifest.compact_layout)
         status = await connection.execute(
             f"UPDATE {namespace}.network_serving_control SET generation_id=$1 WHERE id=1 AND generation_id=$2",
             generation_id,

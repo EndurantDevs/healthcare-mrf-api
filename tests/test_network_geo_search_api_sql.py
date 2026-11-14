@@ -22,7 +22,7 @@ from api.network_address_scope import (
     scoped_geo_search_relation_sql,
 )
 from api.network_compact_address import compact_address_parameters, compact_address_relation_sql
-from api.network_read_execution import network_read_relations
+from api.network_read_execution import qualified_relation_sql
 from api.provider_geo_sql import (
     build_imported_geo_statements,
     build_native_nearby_count_sql,
@@ -32,50 +32,36 @@ from db.models import EntityAddressUnified
 from process.network_compact_layout import (
     CompactAddressRelation,
     bind_compact_geo_search,
-    verify_compact_layout_catalog,
 )
 from process.network_geo_search import SEARCH_COLUMNS, prepare_network_geo_search
 from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_publication import _manifest_digest
 from tests import test_custom_import_provider_geo_sql as geo_fixture
+from tests.network_compact_address_postgres_support import _layout, _lookup_manifest, _manifest
+from tests.network_compact_address_postgres_support import compact_db as compact_db
 from tests.test_custom_import_provider_geo_sql import _context, _imported_geo_query
-from tests.test_network_compact_address_lookup import _layout
-from tests.test_network_compact_address_postgres import _lookup_manifest, _manifest
-from tests.test_network_compact_address_postgres import compact_db as compact_db
 from tests.test_network_membership_slices_postgres import slice_db as slice_db
 
 
 def _search_layout():
     layout = _layout()
-    projection = CompactAddressRelation(layout.ref_map.schema_name, "network_geo_search", 6)
+    projection = CompactAddressRelation(layout.ref_map.schema_name, "network_geo_search")
     return bind_compact_geo_search(layout, projection), projection
 
 
 def _search_manifest(layout, projection):
-    manifest = _lookup_manifest(layout)
-    object.__setattr__(manifest, "_candidate_relation_pins", (*manifest.candidate_relation_pins, projection))
-    return manifest
+    assert layout.geo_search == projection
+    return _lookup_manifest(layout)
 
 
-def test_search_pin_keeps_historical_serialization_and_requires_fresh_exact_oid():
+def test_search_binding_keeps_the_named_layout_serialization():
     layout = _layout()
     original = asdict(layout)
-    projection = CompactAddressRelation(layout.ref_map.schema_name, "network_geo_search", 6)
+    projection = CompactAddressRelation(layout.ref_map.schema_name, "network_geo_search")
     bind_compact_geo_search(layout, projection)
     assert asdict(layout) == original
-    relations = [layout.ref_map, layout.base, layout.custom, projection]
-    relations += [
-        CompactAddressRelation(artifact.schema_name, "network_office_edge", artifact.table_oid)
-        for artifact in layout.artifacts
-    ]
-    oid_by_qualified_name = {(relation.schema_name, relation.table_name): relation.table_oid for relation in relations}
-    assert verify_compact_layout_catalog(layout, oid_by_qualified_name) is layout
-    for observed_oid in (None, 7):
-        damaged_oid_by_qualified_name = oid_by_qualified_name | {
-            (projection.schema_name, projection.table_name): observed_oid
-        }
-        with pytest.raises(ValueError, match="differs from its pin"):
-            verify_compact_layout_catalog(layout, damaged_oid_by_qualified_name)
+    assert layout.geo_search == projection
+    assert projection in _search_manifest(layout, projection).candidate_relation_pins
 
 
 @pytest.mark.parametrize("mode", ["old-layout", "visible-policy", "legacy", "flat"])
@@ -85,8 +71,10 @@ def test_search_falls_back_for_existing_or_incompatible_scope(mode):
         layout = _layout()
     manifest = _lookup_manifest(layout)
     if mode == "flat":
-        manifest = _manifest(layout)
-        object.__setattr__(manifest, "_compact_layout", None)
+        manifest = replace(
+            _manifest(layout),
+            address_relation=CompactAddressRelation(layout.ref_map.schema_name, "entity_address_unified"),
+        )
     network_ids = None if mode == "visible-policy" else (42,)
     scope_options_by_name = (
         {"excluded_network_ids": (7,), "access_scope_sha256": "a" * 64}
@@ -113,7 +101,7 @@ def test_search_requires_the_original_scoped_relation_and_supported_fields():
             predicate = alias.format(sorted(unsupported_columns)[0]) + " IS NOT NULL"
             assert scoped_geo_search_relation_sql(relation, predicate) is None
         search = scoped_geo_search_relation_sql(relation, "a.npi=:npi AND a.state_name=:state")
-        assert network_read_relations(search) == (projection,)
+        assert qualified_relation_sql(projection.schema_name, projection.table_name) in search
         assert "FROM ONLY" in search
         assert "canonical_network_ids && CAST(:_canonical_network_ids AS INTEGER[])" in search
         assert scoped_address_parameters({})["_canonical_network_ids"] == [7, 42]
@@ -139,12 +127,12 @@ def test_native_search_preserves_knn_page_and_filters_counts_and_cursors(monkeyp
         count = build_native_nearby_count_sql(nearby)
         assert page == build_native_nearby_sql(replace(nearby, search_table_sql=None))
         assert relation in page and relation not in count
-        assert network_read_relations(count) == (projection,)
-        assert network_read_relations(page) == network_read_relations(relation)
+        projection_sql = qualified_relation_sql(projection.schema_name, projection.table_name)
+        assert projection_sql in count
         search_page = build_native_nearby_sql(nearby, use_search_page=True)
         assert "a.geo <->" in search_page
         assert search_page.index("LIMIT :limit") < search_page.index("hydrated_geo AS MATERIALIZED")
-        assert projection in network_read_relations(search_page)
+        assert projection_sql in search_page
         assert "a.state_name = :state" in page and "a.state_name = :state" in count
         assert "healthcare_provider_primary_taxonomy_switch" in page
         assert "COUNT(DISTINCT (a.npi, a.address_key))" in count
@@ -178,7 +166,7 @@ def test_imported_search_keeps_eligible_scope_before_score_filter_and_order(monk
         assert "LIMIT" not in eligible
         assert sql.index("LIMIT") < sql.index("hydrated_geo AS MATERIALIZED")
         assert relation in remainder
-        assert projection in network_read_relations(sql)
+        assert qualified_relation_sql(projection.schema_name, projection.table_name) in sql
         assert ("WHERE imported.entity_value = native_eligible_geo.npi_code::text" in sql) is required
         assert ("LEFT JOIN custom_import_provider_relation AS imported" in sql) is (direction is not None)
 
@@ -186,24 +174,21 @@ def test_imported_search_keeps_eligible_scope_before_score_filter_and_order(monk
 def test_search_binding_is_idempotent_and_cannot_be_replaced_or_cleared():
     layout, projection = _search_layout()
     assert bind_compact_geo_search(layout, projection) is layout
-    for changed in (None, replace(projection, table_oid=7)):
+    for changed in (None, replace(projection, table_name="other_search")):
         with pytest.raises(ValueError, match="already bound"):
             bind_compact_geo_search(layout, changed)
     assert layout.geo_search == projection
 
 
-def test_search_pin_must_belong_to_the_authenticated_manifest_inventory():
-    layout, projection = _search_layout()
-    manifest = _lookup_manifest(layout)
-    for pins in ((), (replace(projection, table_oid=7),)):
-        object.__setattr__(manifest, "_candidate_relation_pins", pins)
-        with network_address_read_scope(manifest, (42,)):
-            relation = scoped_address_relation_sql("mrf.entity_address_unified", location_lookup=True)
-            with pytest.raises(ValueError, match="network_geo_search_pin_invalid"):
-                scoped_geo_search_relation_sql(relation, "a.npi=:npi")
+@pytest.mark.parametrize("field,changed", [("schema_name", "other_generation"), ("table_name", "other_search")])
+def test_search_relation_must_match_its_published_candidate(field, changed):
+    layout = _layout()
+    projection = CompactAddressRelation(layout.ref_map.schema_name, "network_geo_search")
+    with pytest.raises(ValueError, match="differs from its candidate"):
+        bind_compact_geo_search(layout, replace(projection, **{field: changed}))
 
 
-def test_changed_search_descriptor_changes_manifest_cache_and_native_cursor_scope():
+def test_changed_search_generation_changes_cache_and_native_cursor_scope():
     layout, projection = _search_layout()
     scope_report_by_field = {
         "candidate_id": "00000000-0000-0000-0000-000000000002",
@@ -212,12 +197,14 @@ def test_changed_search_descriptor_changes_manifest_cache_and_native_cursor_scop
         "approved_custom_revision": 7,
     }
     digests = [
-        _manifest_digest(2, scope_report_by_field, {}, serving, closure)
-        for serving, closure in (
-            ({}, {}),
-            ({"geo_search": {"descriptor_sha256": "a" * 64}}, {"relation_oids": {"network_geo_search": 6}}),
-            ({"geo_search": {"descriptor_sha256": "b" * 64}}, {"relation_oids": {"network_geo_search": 7}}),
+        _manifest_digest(
+            generation,
+            scope_report_by_field,
+            {"membership_rows": 1, "distinct_memberships": 1, "projected_locations": 1},
+            {"index_profile": "network_geo_search"},
+            {"schema_name": layout.ref_map.schema_name, "tables": [asdict(projection)]},
         )
+        for generation in (1, 2, 3)
     ]
     assert len(set(digests)) == 3
     cache_keys, cursor_scopes = [], []
@@ -231,7 +218,7 @@ def test_changed_search_descriptor_changes_manifest_cache_and_native_cursor_scop
 
 
 def _install_api_boundary(case, session, monkeypatch):
-    monkeypatch.setattr(provider_list_sql, "NetworkReadConnectionProxy", geo_fixture._PostgresGeoProxy)
+    monkeypatch.setattr(provider_list_sql, "ConnectionProxy", geo_fixture._PostgresGeoProxy)
     monkeypatch.setattr(npi, "_plan_release_npi_scope", geo_fixture._empty_plan_scope)
     monkeypatch.setattr(npi, "_should_include_geo_service_locations", lambda: True)
 
@@ -397,7 +384,7 @@ async def test_postgres_search_projection_preserves_routes_and_unselected_fallba
     async with case.connection.transaction():
         descriptor = await prepare_network_geo_search(case.connection, copy_target, layout)
     assert descriptor is not None and descriptor["row_count"] > 0
-    projection = CompactAddressRelation(copy_target.schema_name, "network_geo_search", descriptor["table_oid"])
+    projection = CompactAddressRelation(copy_target.schema_name, "network_geo_search")
     bind_compact_geo_search(layout, projection)
     projected_manifest = _search_manifest(layout, projection)
     case.api_session.info["geo_calls"] = []

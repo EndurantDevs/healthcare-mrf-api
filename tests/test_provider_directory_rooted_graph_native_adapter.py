@@ -28,14 +28,13 @@ from tests.provider_directory_rooted_graph_publication_test_support import (
 
 
 class _Runtime:
-    """Record physical transaction boundaries without supplying private authority."""
+    """Record transaction boundaries for the configured synthetic runtime."""
 
     def __init__(self):
         self.connection = SimpleNamespace(fetchval=AsyncMock(return_value=None))
         self.session = object()
         self.candidate_schema = "private_candidate"
         self.catalog_schema = "catalog"
-        self.require_bound_factory = Mock()
         self.relation_coordinates = Mock(return_value=("private_candidate", "resource_heap"))
         self.transactions = []
         self.exits = []
@@ -82,26 +81,24 @@ def test_unissued_and_generic_factories_do_not_override_relations(factory):
 def test_issued_adapter_forwards_original_factory_database_and_relation_scope(issued_scope):
     scope = issued_scope
     assert adapter.current_rooted_graph_runtime(scope.database) is scope.runtime
-    scope.runtime.require_bound_factory.assert_called_once_with(scope.factory, scope.database)
+    assert adapter.current_rooted_graph_runtime() is scope.runtime
+    scope.runtime.relation_coordinates.assert_not_called()
     assert adapter.rooted_graph_relation_coordinates("mrf", "resource", "resource_scoped") == (
         "private_candidate",
         "resource_heap",
     )
-    scope.runtime.require_bound_factory.assert_called_with(scope.factory, None)
     scope.runtime.relation_coordinates.assert_called_once_with("mrf", "resource", "resource_scoped")
 
 
 def test_binding_rejection_prevents_relation_override_and_propagates(issued_scope):
-    error = RuntimeError("synthetic issued factory rejected")
-    issued_scope.runtime.require_bound_factory.side_effect = error
+    """Propagate relation validation refusal from the configured runtime."""
+    error = RuntimeError("synthetic relation rejected")
+    issued_scope.runtime.relation_coordinates.side_effect = error
     with pytest.raises(RuntimeError) as rejected:
         adapter.rooted_graph_relation_coordinates("mrf", "resource", "resource_scoped")
     assert rejected.value is error
-    issued_scope.runtime.relation_coordinates.assert_not_called()
-    with pytest.raises(RuntimeError) as rejected:
-        adapter.current_rooted_graph_runtime(issued_scope.database)
-    assert rejected.value is error
-    issued_scope.runtime.require_bound_factory.assert_called_with(issued_scope.factory, issued_scope.database)
+    issued_scope.runtime.relation_coordinates.assert_called_once_with("mrf", "resource", "resource_scoped")
+    assert adapter.current_rooted_graph_runtime(issued_scope.database) is issued_scope.runtime
 
 
 @pytest.mark.asyncio
@@ -164,7 +161,11 @@ async def test_retained_preparation_reuse_distinguishes_frozen_and_committed(pre
     assert result is scope.handoff
     scope.prepare.assert_not_awaited()
     assert scope.validate.await_count == int(not published)
-    assert scope.runtime.exits == [None]
+    assert scope.runtime.exits == [None, None]
+    assert scope.runtime.transactions == [
+        (scope.database, {"readonly": True}),
+        (scope.database, {"readonly": True, "publication": True}),
+    ]
     assert scope.runtime.connection.fetchval.await_args.args[1] == scope.handoff.document["preparation_id"]
 
 
@@ -179,7 +180,11 @@ async def test_frozen_resume_propagates_failed_current_fence_without_rebuilding(
         await store.prepare_admitted_rooted_graph_dataset("synthetic-acquisition", database=scope.database)
     assert rejected.value is error
     scope.prepare.assert_not_awaited()
-    assert scope.runtime.exits == [None]
+    assert scope.runtime.exits == [None, None]
+    assert scope.runtime.transactions == [
+        (scope.database, {"readonly": True}),
+        (scope.database, {"readonly": True, "publication": True}),
+    ]
 
 
 @pytest.mark.asyncio
@@ -220,8 +225,10 @@ def materialization(issued_scope, monkeypatch):
     scope.relations = {"provider_directory_dataset_resource": "resource_heap"}
     scope.retained = AsyncMock(return_value=None)
     scope.seal = AsyncMock(return_value=object())
+    scope.query_recipes = AsyncMock()
     monkeypatch.setattr(candidate, "retained_rooted_handoff", scope.retained)
     monkeypatch.setattr(candidate, "seal_rooted_handoff", scope.seal)
+    monkeypatch.setattr(candidate, "validate_rooted_query_filter_recipes", scope.query_recipes)
     monkeypatch.setattr(
         store, "require_provider_directory_rooted_graph_admission", AsyncMock(return_value=scope.admission)
     )
@@ -236,6 +243,7 @@ def materialization(issued_scope, monkeypatch):
     monkeypatch.setattr(store, "_dataset_hash", AsyncMock(return_value="a" * 64))
     scope.calls = Mock()
     for name, callback in (
+        ("recipes", scope.query_recipes),
         ("lock", scope.database.scalar),
         ("retained", scope.retained),
         ("counts", store._preflight_counts),
@@ -274,6 +282,7 @@ async def test_detached_candidate_materializes_finishes_hashes_then_seals(materi
     assert sealed_handoff is scope.seal.return_value
     assert scope.runtime.transactions == [(scope.database, {"isolation": "repeatable read"})]
     assert [call[0] for call in scope.calls.mock_calls] == [
+        "recipes",
         "lock",
         "retained",
         "counts",
@@ -290,6 +299,9 @@ async def test_detached_candidate_materializes_finishes_hashes_then_seals(materi
         "candidate_exit",
         "transaction_exit",
     ]
+    scope.query_recipes.assert_awaited_once_with(
+        scope.runtime.connection, scope.runtime.catalog_schema, asdict(scope.admission)
+    )
     store._insert_headers.assert_awaited_once_with(scope.database, scope.identity, scope.admission, scope.counts)
     store.materialize_provider_directory_rooted_graph_dataset.assert_awaited_once_with(
         scope.database, scope.identity, publication_run_id=scope.admission.publication_run_id, batch_size=7
@@ -320,6 +332,7 @@ async def test_candidate_rechecks_retained_identity_inside_its_lock(materializat
     retained = object()
     scope.retained.return_value = retained
     assert await _materialize(scope) is retained
+    assert [call[0] for call in scope.calls.mock_calls] == ["recipes", "lock", "retained"]
     scope.database.scalar.assert_awaited_once()
     assert scope.database.scalar.await_args.kwargs == {"identity": "rooted_candidate:" + scope.identity.dataset_id}
     store._preflight_counts.assert_not_awaited()
@@ -348,6 +361,7 @@ async def test_failed_candidate_does_not_escape_transaction_or_seal_partial_data
     with pytest.raises(expected) as rejected:
         await _materialize(scope)
     assert scope.runtime.exits == [rejected.value]
+    assert scope.query_recipes.await_count == int(failure != "foreign_current")
     if failure != "seal":
         scope.seal.assert_not_awaited()
     if failure in {"foreign_current", "lock", "counts", "cancel"}:
@@ -355,6 +369,27 @@ async def test_failed_candidate_does_not_escape_transaction_or_seal_partial_data
         store.build_provider_directory_dataset_serving_relations.assert_not_awaited()
     if failure in {"foreign_current", "lock"}:
         store._insert_headers.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error", [ProviderDirectoryRootedGraphPublicationError("rooted_query_recipe_changed"), asyncio.CancelledError()]
+)
+async def test_query_recipe_refusal_propagates_before_candidate_lock(materialization, error):
+    scope = materialization
+    scope.query_recipes.side_effect = error
+    with pytest.raises(type(error)) as rejected:
+        await _materialize(scope)
+    assert rejected.value is error
+    assert scope.runtime.exits == [error]
+    assert [call[0] for call in scope.calls.mock_calls] == ["recipes"]
+    scope.query_recipes.assert_awaited_once_with(
+        scope.runtime.connection, scope.runtime.catalog_schema, asdict(scope.admission)
+    )
+    scope.database.scalar.assert_not_awaited()
+    scope.retained.assert_not_awaited()
+    store.materialize_provider_directory_rooted_graph_dataset.assert_not_awaited()
+    scope.seal.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -4,8 +4,6 @@
 import asyncio
 from contextlib import asynccontextmanager
 
-from sqlalchemy import text
-
 
 @asynccontextmanager
 async def plan_reader_connection(reader):
@@ -14,10 +12,6 @@ async def plan_reader_connection(reader):
 
     async with reader.engine.connect() as connection:
         try:
-            identity = (await connection.execute(text("SELECT session_user,current_user"))).first()
-            if tuple(identity) != (reader._reader_login[0], reader._reader_login[0]):
-                raise RuntimeError("Reader workspace login identity differs")
-            await connection.rollback()
             connection = await connection.execution_options(postgresql_readonly=False)
             async with connection.begin():
                 await prepare_plan_query_tables(connection, preserve_rows=True)

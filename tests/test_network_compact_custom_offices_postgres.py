@@ -14,7 +14,8 @@ from process import network_address_artifact as artifact
 from process import network_compact_custom_offices as custom
 from process import network_custom_address_source as composition
 from process.network_address_projection import PinnedAddressSource
-from process.network_custom_address_source import NetworkCustomAddressSourceError, _source_identity
+from process.network_compact_layout import CompactAddressRelation
+from process.network_custom_address_source import NetworkCustomAddressSourceError
 from tests.test_network_address_artifact_postgres import address_db
 from tests.test_network_custom_address_source_postgres import _draft, _seed
 from tests.test_network_custom_office_rows_postgres import _candidate, _NoCopyConnection
@@ -108,10 +109,9 @@ async def _merge(fixture, receipt):
         f"INSERT INTO {namespace}.provider_location_binding SELECT * FROM {namespace}.custom_provider_location_binding"
     )
     await fixture.publisher.execute(f"DROP TABLE {namespace}.custom_provider_location_binding")
-    oid = await fixture.publisher.fetchval(
-        "SELECT to_regclass($1)::oid::bigint", receipt.target.schema_name + ".provider_location_binding"
+    return replace(
+        receipt, binding_relation=CompactAddressRelation(receipt.target.schema_name, "provider_location_binding")
     )
-    return replace(receipt, binding_table_oid=oid)
 
 
 @asynccontextmanager
@@ -147,19 +147,14 @@ async def _check_full_native_composition(fixture, publisher, arguments_by_name, 
         descriptor = await artifact.capture_network_address_artifact(
             publisher, fixture.base, runtime_roles=arguments_by_name["runtime_roles"]
         )
-        shape = await composition._source_shape(publisher, descriptor["table"]["oid"], address=True)
-        assert descriptor["descriptor_sha256"] != shape
+        shape = await composition._source_columns(publisher, fixture.base, address=True)
+        assert descriptor["table"] == {"schema_name": fixture.base.schema_name, "table_name": fixture.base.table_name}
         receipt = await composition.prepare_custom_address_source(publisher, fixture.base, **arguments_by_name)
-        assert receipt.source_oids == (
-            descriptor["namespace"]["oid"],
-            descriptor["table"]["oid"],
-            descriptor["protected_owner_oid"],
-            descriptor["descriptor_sha256"],
-        )
+        assert receipt.base_source == fixture.base
     async with publisher.transaction(isolation="repeatable_read", readonly=True):
         assert await composition.verify_custom_address_source(publisher, receipt) == receipt
         assert await composition.prepare_custom_address_source(publisher, fixture.base, **arguments_by_name) == receipt
-        assert await composition._source_shape(publisher, receipt.address_table_oid, address=True) == shape
+        assert await composition._source_columns(publisher, receipt.address_source, address=True) == shape
         assert await publisher.fetch(f"SELECT * FROM {source_table} ORDER BY location_key") == before
         addresses = await publisher.fetch(f"SELECT * FROM {namespace}.entity_address_unified")
         assert len(addresses) == len(before) + receipt.custom_pair_count == len(before) + 1
@@ -212,7 +207,7 @@ async def test_ready_custom_rows_can_be_verified_without_control_update_privileg
             control_schema=fixture.control_schema,
             binding_table="provider_location_binding",
         )
-    assert relation.table_oid == receipt.address_table_oid
+    assert relation == receipt.address_relation
 
 
 async def test_genuine_mixed_owner_eau_open_candidate_has_only_current_manual_rows(compact_custom_db):
@@ -220,13 +215,11 @@ async def test_genuine_mixed_owner_eau_open_candidate_has_only_current_manual_ro
     seed = await _seed(fixture)
     target = await _target(fixture, seed.revision)
     async with fixture.publisher.transaction(isolation="repeatable_read"):
-        identity = await _source_identity(fixture.publisher, fixture.base, (fixture.roles["reader"],), address=True)
-        assert identity[1] == await fixture.publisher.fetchval(
-            "SELECT to_regclass($1)::oid::bigint", fixture.base.schema_name + ".entity_address_unified"
-        )
+        descriptor = await artifact.capture_network_address_artifact(fixture.publisher, fixture.base)
+        assert descriptor["table"] == {"schema_name": fixture.base.schema_name, "table_name": fixture.base.table_name}
     receipt = await _prepare(fixture, target, seed.revision)
     assert custom.parse_compact_custom_office_receipt(receipt.as_dict()) == receipt
-    assert receipt.custom_pair_count == 1 and receipt.npi_source is None and receipt.npi_identity is None
+    assert receipt.custom_pair_count == 1 and receipt.npi_source is None
     async with fixture.publisher.transaction(isolation="repeatable_read"):
         base = await artifact.capture_network_address_artifact(
             fixture.publisher, fixture.base, runtime_roles=(fixture.roles["reader"],)
@@ -235,7 +228,7 @@ async def test_genuine_mixed_owner_eau_open_candidate_has_only_current_manual_ro
     rows = await fixture.publisher.fetch(f'SELECT * FROM "{target.schema_name}".entity_address_unified')
     assert len(rows) == 1 and rows[0]["entity_type"] == "manual" and rows[0]["npi"] is None
     assert rows[0]["entity_id"] == seed.provider["record_id"] and rows[0]["row_origin"] == "network_custom"
-    assert (await _verify(fixture, receipt)).table_oid == receipt.address_table_oid
+    assert (await _verify(fixture, receipt)) == receipt.address_relation
     assert not await fixture.publisher.fetchval(
         "SELECT EXISTS(SELECT FROM pg_class WHERE relnamespace=pg_my_temp_schema() AND relname LIKE 'custom_expected_%')"
     )
@@ -245,7 +238,7 @@ async def test_empty_revision_creates_no_custom_heap_and_final_subset_stays_empt
     fixture = compact_custom_db
     target = await _target(fixture, 0)
     receipt = await _prepare(fixture, target, 0)
-    assert receipt.custom_pair_count == 0 and receipt.address_table_oid is None and receipt.binding_table_oid is None
+    assert receipt.custom_pair_count == 0 and receipt.address_relation is None and receipt.binding_relation is None
     assert await _verify(fixture, receipt) is None
     await fixture.publisher.execute(
         f'CREATE TABLE "{target.schema_name}".provider_location_binding(provider_system text,provider_id text,location_id uuid,location_key text,entity_type text,entity_id text)'
@@ -254,11 +247,12 @@ async def test_empty_revision_creates_no_custom_heap_and_final_subset_stays_empt
         f"INSERT INTO \"{target.schema_name}\".provider_location_binding VALUES('npi','1000000491',$1,'public-key','npi','1000000491')",
         uuid4(),
     )
-    oid = await fixture.publisher.fetchval(
-        "SELECT to_regclass($1)::oid::bigint", target.schema_name + ".provider_location_binding"
-    )
     assert (
-        await _verify(fixture, replace(receipt, binding_table_oid=oid), binding_table="provider_location_binding")
+        await _verify(
+            fixture,
+            replace(receipt, binding_relation=CompactAddressRelation(target.schema_name, "provider_location_binding")),
+            binding_table="provider_location_binding",
+        )
         is None
     )
     assert (
@@ -279,9 +273,7 @@ async def test_final_binding_subset_allows_public_rows_and_refuses_extra_custom_
         f"INSERT INTO {namespace}.provider_location_binding VALUES('provider_directory','public-provider',$1,'public-key','provider_directory','public-provider')",
         uuid4(),
     )
-    assert (
-        await _verify(fixture, receipt, binding_table="provider_location_binding")
-    ).table_oid == receipt.address_table_oid
+    assert (await _verify(fixture, receipt, binding_table="provider_location_binding")) == receipt.address_relation
     await fixture.publisher.execute(
         f"UPDATE {namespace}.provider_location_binding SET entity_id='conflict' WHERE provider_system='manual'"
     )
@@ -301,7 +293,8 @@ async def test_final_binding_subset_allows_public_rows_and_refuses_extra_custom_
 
 
 @pytest.mark.parametrize(
-    "damage", ["row", "binding", "fingerprint", "base_digest", "binding_oid", "address_oid", "target", "revision"]
+    "damage",
+    ["row", "binding", "fingerprint", "base_digest", "binding_relation", "address_relation", "target", "revision"],
 )
 async def test_independent_verifier_refuses_producer_rows_or_forged_receipt(compact_custom_db, damage):
     fixture = compact_custom_db
@@ -321,10 +314,14 @@ async def test_independent_verifier_refuses_producer_rows_or_forged_receipt(comp
             receipt = replace(receipt, approved_records_sha256="b" * 64)
         case "base_digest":
             receipt = replace(receipt, base_artifact_sha256="b" * 64)
-        case "binding_oid":
-            receipt = replace(receipt, binding_table_oid=receipt.binding_table_oid + 1)
-        case "address_oid":
-            receipt = replace(receipt, address_table_oid=receipt.address_table_oid + 1)
+        case "binding_relation":
+            receipt = replace(
+                receipt, binding_relation=CompactAddressRelation(receipt.target.schema_name, "different_binding")
+            )
+        case "address_relation":
+            receipt = replace(
+                receipt, address_relation=CompactAddressRelation("different_schema", "entity_address_unified")
+            )
         case "target":
             receipt = replace(receipt, target=replace(receipt.target, producer_id=str(uuid4())))
         case _:
@@ -336,21 +333,21 @@ async def test_independent_verifier_refuses_producer_rows_or_forged_receipt(comp
     )
 
 
-async def test_receipt_fields_and_native_identity_types_are_closed(compact_custom_db):
+async def test_receipt_fields_and_named_relations_are_closed(compact_custom_db):
     fixture = compact_custom_db
     seed = await _seed(fixture)
     receipt = await _prepare(fixture, await _target(fixture, seed.revision), seed.revision)
     original = receipt.as_dict()
     for name, value in [
         ("revision", True),
-        ("revision", 2),
+        ("revision", 3),
         ("approved_revision", -1),
         ("custom_pair_count", True),
         ("custom_pair_count", 0),
-        ("address_table_oid", 0),
-        ("binding_table_oid", None),
+        ("address_relation", {"schema_name": "different_schema", "table_name": "entity_address_unified"}),
+        ("binding_relation", None),
         ("base_artifact_sha256", "A" * 64),
-        ("runtime_roles", [fixture.roles["reader"]] * 2),
+        ("unknown_roles", [fixture.roles["reader"]]),
         ("control_schema", "bad.schema"),
         ("extra", True),
         ("approved_records_sha256", "x" * (256 * 1024)),
@@ -389,7 +386,7 @@ async def test_current_revision_removal_drops_direct_contribution_without_base_c
     )
     revision = approval["approved_revision"]
     new = await _prepare(fixture, await _target(fixture, revision), revision)
-    assert new.custom_pair_count == 0 and new.address_table_oid is None
+    assert new.custom_pair_count == 0 and new.address_relation is None
     with pytest.raises(NetworkCustomAddressSourceError, match="Approved revision differs"):
         await _verify(fixture, old)
 
@@ -417,7 +414,7 @@ async def test_retained_site_pair_requires_separate_carrier(compact_custom_db):
         f'SELECT provider_system,provider_id FROM "{receipt.target.schema_name}".custom_provider_location_binding'
     )
     assert [tuple(binding) for binding in bindings] == [("manual", seed.provider["record_id"])]
-    assert (await _verify(fixture, receipt)).table_oid == receipt.address_table_oid
+    assert (await _verify(fixture, receipt)) == receipt.address_relation
     await fixture.publisher.execute(
         f'INSERT INTO "{receipt.target.schema_name}".custom_provider_location_binding '
         "VALUES('provider_directory','source-provider',$1,'retained-key','provider_directory','source-provider')",
@@ -440,9 +437,9 @@ async def test_explicit_protected_npi_source_is_pinned_and_presence_is_rederived
         await fixture.connection.execute(f'INSERT INTO "{schema}".npi VALUES(1000000004)')
         source = PinnedAddressSource(schema, "npi", "npi_edition_1")
         receipt = await _prepare(fixture, await _target(fixture, seed.revision), seed.revision, npi_source=source)
-        assert receipt.npi_source == source and receipt.npi_identity[1] > 0
+        assert receipt.npi_source == source
         assert custom.parse_compact_custom_office_receipt(receipt.as_dict()) == receipt
-        assert (await _verify(fixture, receipt)).table_oid == receipt.address_table_oid
+        assert (await _verify(fixture, receipt)) == receipt.address_relation
         await fixture.connection.execute(f'DELETE FROM "{schema}".npi')
         with pytest.raises(NetworkCustomAddressSourceError, match="NPI identity is unresolved"):
             await _verify(fixture, receipt)
@@ -460,9 +457,10 @@ async def test_native_npi_family_is_used_and_never_falls_back_to_legacy(compact_
             fixture.publisher, npi_db.schema, runtime_roles=(fixture.roles["reader"],)
         )
     receipt = await _prepare(fixture, await _target(fixture, seed.revision), seed.revision, npi_source=source)
-    assert (receipt.npi_source, receipt.npi_identity) == (source, identity)
+    assert receipt.npi_source == source
+    assert identity["generation_id"] == source.generation_id
     assert source.generation_id != fixture.base.generation_id
-    assert (await _verify(fixture, receipt)).table_oid == receipt.address_table_oid
+    assert (await _verify(fixture, receipt)) == receipt.address_relation
     with pytest.raises(NetworkCustomAddressSourceError, match="npi_generation_changed"):
         await _prepare(
             fixture,
@@ -475,16 +473,15 @@ async def test_native_npi_family_is_used_and_never_falls_back_to_legacy(compact_
         await _verify(fixture, receipt)
 
 
-async def test_mixed_owner_npi_requires_a_separate_verified_family_capability(compact_custom_db):
+async def test_named_npi_requires_actual_provider_presence(compact_custom_db):
     fixture = compact_custom_db
     seed = await _seed(fixture, system="npi")
-    target = await _target(fixture, seed.revision)
-    with pytest.raises(NetworkCustomAddressSourceError, match="unprotected"):
-        await _prepare(fixture, target, seed.revision)
-    assert (
-        await fixture.publisher.fetchval("SELECT to_regclass($1)", target.schema_name + ".entity_address_unified")
-        is None
-    )
+    receipt = await _prepare(fixture, await _target(fixture, seed.revision), seed.revision)
+    assert receipt.npi_source == PinnedAddressSource(fixture.source_schema, "npi", fixture.base.generation_id)
+    assert await _verify(fixture, receipt) == receipt.address_relation
+    await fixture.connection.execute(f'DELETE FROM "{fixture.source_schema}".npi')
+    with pytest.raises(NetworkCustomAddressSourceError, match="NPI identity is unresolved"):
+        await _verify(fixture, receipt)
 
 
 async def test_public_collision_rolls_back_the_small_contribution(compact_custom_db):

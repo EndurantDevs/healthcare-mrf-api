@@ -3,8 +3,6 @@
 
 import hashlib
 import json
-import re
-import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
@@ -23,46 +21,7 @@ def _require(condition, code):
 
 @dataclass(frozen=True)
 class FHIRSourceStorageBinding:
-    """Native coordinates pinned by the original issued manifest, not a locator."""
-
-    catalog_schema: str
-    storage_schema: str
-    database_oid: int
-    catalog_schema_oid: int
-    storage_schema_oid: int
-    owner_oid: int
-    namespace_owner_oid: int
-    enrollment_sha256: str
-
-    def __post_init__(self):
-        for schema in (self.catalog_schema, self.storage_schema):
-            storage_identifier(schema)
-            _require(schema not in {"public", "information_schema"} and not schema.startswith("pg_"), "schema_invalid")
-        _require(self.catalog_schema != self.storage_schema, "isolated_schema_required")
-        _require(self.catalog_schema_oid != self.storage_schema_oid, "isolated_schema_required")
-        _require(
-            all(
-                type(oid) is int and 0 < oid < 2**32
-                for oid in (
-                    self.database_oid,
-                    self.catalog_schema_oid,
-                    self.storage_schema_oid,
-                    self.owner_oid,
-                    self.namespace_owner_oid,
-                )
-            ),
-            "storage_identity_invalid",
-        )
-        _require(self.owner_oid != self.namespace_owner_oid, "protected_namespace_required")
-        _require(
-            type(self.enrollment_sha256) is str and re.fullmatch(r"[0-9a-f]{64}", self.enrollment_sha256),
-            "storage_identity_invalid",
-        )
-
-
-@dataclass(frozen=True)
-class NamedFHIRSourceStorage:
-    """Schema locators supplied by Source orchestration."""
+    """Schema-qualified storage supplied by import orchestration."""
 
     catalog_schema: str
     storage_schema: str
@@ -72,49 +31,135 @@ class NamedFHIRSourceStorage:
             storage_identifier(schema)
             _require(schema not in {"public", "information_schema"} and not schema.startswith("pg_"), "schema_invalid")
         _require(self.catalog_schema != self.storage_schema, "isolated_schema_required")
+
+
+NamedFHIRSourceStorage = FHIRSourceStorageBinding
 
 
 @dataclass(frozen=True)
 class FHIRSourceCandidateHandoff:
-    """Candidate evidence awaiting protected custody, validation and publication."""
+    """Named candidate data awaiting validation and publication."""
 
     document_json: str
 
     @property
     def document_sha256(self):
         """Hash the complete canonical snapshot document, including its proofs."""
-        return hashlib.sha256(self.document_json.encode()).hexdigest()
+        encoded = json.dumps(self.document, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+        return hashlib.sha256(encoded.encode()).hexdigest()
 
     @property
     def document(self):
         """Return a copy without claiming the underlying tables are immutable."""
-        return json.loads(self.document_json)
+        return named_source_document(json.loads(self.document_json))
+
+
+def named_source_document(document):
+    """Read retained candidates using their recorded names and logical data only."""
+    if not isinstance(document, dict) or not isinstance(document.get("storage"), dict):
+        return document
+    storage = document["storage"]
+    if not {"catalog_schema", "storage_schema"} <= set(storage):
+        return document
+    document_by_field = {
+        **document,
+        "storage": {field: storage[field] for field in ("catalog_schema", "storage_schema")},
+    }
+    if isinstance(document.get("tables"), dict):
+        document_by_field["tables"] = {
+            root: {"schema": table.get("schema", storage["storage_schema"]), "name": table.get("name")}
+            if isinstance(table, dict)
+            else table
+            for root, table in document["tables"].items()
+        }
+    if document.get("contract") == "healthporta.provider-directory.rooted-candidate.v1":
+        document_by_field.pop("catalog", None)
+        has_legacy_coordinates = "catalog" in document or bool(set(storage) - {"catalog_schema", "storage_schema"})
+        if "inputs" not in document and has_legacy_coordinates:
+            document_by_field["inputs"] = {
+                "provider_directory_rooted_graph_" + root: {
+                    "schema": storage["catalog_schema"],
+                    "name": "provider_directory_rooted_graph_" + root,
+                }
+                for root in ("acquisition", "work", "resource", "edge", "twin_attempt", "twin_admission")
+            }
+        document_by_field["snapshot"] = _logical_snapshot(document.get("snapshot"))
+        previous_by_field = document.get("predecessor_proof")
+        if isinstance(previous_by_field, dict) and "snapshot" in previous_by_field:
+            previous_by_field = _project_rooted_predecessor(document, previous_by_field)
+            document_by_field["predecessor_proof"] = previous_by_field
+    elif isinstance(document.get("admission"), dict):
+        document_by_field["admission"] = {
+            key: field_value
+            for key, field_value in document["admission"].items()
+            if key != "content_proof_admission_sha256"
+        }
+    if document.get("contract") in {"generic-source-detached-v1", "generic-source-detached-by-name-v1"}:
+        document_by_field["relationship_sha256"] = None
+    return document_by_field
+
+
+def _project_rooted_predecessor(document, previous_by_field):
+    """Project the stored snapshot and logical fence without changing predecessor identity."""
+    previous_by_field = {**previous_by_field, "snapshot": _logical_snapshot(previous_by_field["snapshot"])}
+    fence = previous_by_field.get("input_fence")
+    snapshot_by_field = previous_by_field["snapshot"]
+    if isinstance(fence, dict) and "catalog" in fence and isinstance(snapshot_by_field, dict):
+        mutable_fields = {
+            "status",
+            "is_current",
+            "created_at",
+            "validated_at",
+            "published_at",
+            "superseded_at",
+            "candidate_storage_json",
+        }
+        if document["identity"]["root_dataset_variant"] == "rooted_combined":
+            snapshot_by_field = {
+                **snapshot_by_field,
+                "header": {**snapshot_by_field["header"], "dataset_hash": previous_by_field["dataset_hash"]},
+                "parent": {**snapshot_by_field["parent"], "dataset_hash": previous_by_field["dataset_hash"]},
+            }
+        previous_by_field["input_fence"] = {
+            "dataset_id": snapshot_by_field["header"]["dataset_id"],
+            "variant": document["identity"]["root_dataset_variant"],
+            "header": {
+                key: field_value
+                for key, field_value in snapshot_by_field["header"].items()
+                if key not in mutable_fields
+            },
+            "parent": {
+                key: field_value
+                for key, field_value in snapshot_by_field["parent"].items()
+                if key not in mutable_fields
+            },
+        }
+    return previous_by_field
+
+
+def _logical_snapshot(snapshot):
+    if not isinstance(snapshot, dict):
+        return snapshot
+    snapshot_by_field = {
+        key: value for key, value in snapshot.items() if key not in {"header_check", "foreign_guards", "validator"}
+    }
+    if isinstance(snapshot_by_field.get("parent"), dict):
+        snapshot_by_field["parent"] = {
+            key: value for key, value in snapshot_by_field["parent"].items() if key != "candidate_storage_json"
+        }
+    return snapshot_by_field
 
 
 async def verify_isolated_source_storage_coordinates(connection, policy, binding):
-    """Check native coordinates only; this is not a complete enrollment verifier.
-
-    The issued manifest must independently verify the fixed header, templates,
-    checkpoint/proof controls and canonical admission authority before issuance.
-    """
+    """Resolve configured schema names through ordinary SQL access."""
     _require(type(binding) is FHIRSourceStorageBinding and policy.schema == binding.storage_schema, "storage_changed")
-    _require(connection.is_in_transaction() is True, "transaction_required")
-    actual = await connection.fetchrow(
-        "SELECT d.oid::bigint AS database_oid,c.oid::bigint AS catalog_schema_oid,"
-        "s.oid::bigint AS storage_schema_oid,r.oid::bigint AS owner_oid,"
-        "s.nspowner::bigint AS namespace_owner_oid "
-        "FROM pg_database d,pg_namespace c,pg_namespace s,pg_roles r "
-        "WHERE d.datname=current_database() AND c.nspname=$1 AND s.nspname=$2 "
-        "AND r.rolname=$3",
-        binding.catalog_schema,
-        binding.storage_schema,
-        policy.owner_role,
+    from db.plan_release_storage import storage_relation
+
+    await connection.execute(
+        "SELECT dataset_id FROM "
+        + storage_relation(binding.storage_schema, "provider_directory_endpoint_dataset")
+        + " LIMIT 0"
     )
-    expected_by_field = {
-        field: getattr(binding, field)
-        for field in ("database_oid", "catalog_schema_oid", "storage_schema_oid", "owner_oid", "namespace_owner_oid")
-    }
-    _require(actual is not None and dict(actual) == expected_by_field, "storage_identity_changed")
 
 
 def require_storage_schema(publisher, catalog_schema):
@@ -134,16 +179,14 @@ def require_storage_schema(publisher, catalog_schema):
 
 
 def storage_document(publisher):
-    """Bind stored candidates to the immutable enrollment and exact producer."""
-    from process.provider_directory_generic_source_policy import bound_publisher, source_producer_identity
-
-    _require(bound_publisher() is publisher and publisher.storage_binding is not None, "isolated_storage_required")
-    return {**asdict(publisher.storage_binding), "producer": list(source_producer_identity())}
+    """Return the two configured schema names without local database identities."""
+    _require(type(publisher.storage_binding) is FHIRSourceStorageBinding, "isolated_storage_required")
+    return asdict(publisher.storage_binding)
 
 
 @contextmanager
 def isolated_source_relation_scope(publisher, tables_by_root):
-    """Accept only the native-verified candidate mapping from the owner scope."""
+    """Route the closed logical output group within the selected candidate schema."""
     from process.provider_directory_generic_source_policy import bound_publisher
     from process.provider_directory_generic_source_storage import RELATIONS
 
@@ -173,7 +216,6 @@ def source_relation_coordinates(schema, root, scoped_name):
         factory = source._FACTORY.get()
         binding = getattr(factory, "storage_binding", None)
         if binding is not None:
-            factory._require_current_policy()
             _require(schema == binding.catalog_schema, "schema_changed")
             _require(scoped_name == root, "catalog_override_forbidden")
         return schema, scoped_name
@@ -748,12 +790,6 @@ async def _require_isolated_bound_proof(connection, catalog_schema, expected, ow
         )
 
 
-# At most one entry: an issued factory's latest capture made while verifying a loading transaction,
-# as (factory, subject, time, JSON).
-_LOADING_CUSTODY_SECONDS = 60.0
-_LOADING_CUSTODY = []
-
-
 async def capture_isolated_source_storage_custody(
     connection,
     policy,
@@ -763,55 +799,6 @@ async def capture_isolated_source_storage_custody(
     namespace_owner_role,
     publication,
     expected_history_bounds=None,
-):
-    """Attest the fixed private storage and canonical rights; never grant activation.
-
-    A batch-loading transaction is verified twice and this capture costs several times the write it guards.
-    For that verification alone, a capture of the same storage by the same issued factory is returned again
-    while it is less than a minute old, after the checks of the current connection. The caller still compares
-    it with its issued document on every transaction, and every other verification captures anew.
-    """
-    from process.provider_directory_generic_source_policy import loading_verification_factory
-
-    factory = loading_verification_factory() if expected_history_bounds is None else None
-    subject = (policy, catalog_schema, migration_role, namespace_owner_role, json.dumps(publication, sort_keys=True))
-    recent = _LOADING_CUSTODY[0] if _LOADING_CUSTODY else None
-    if (
-        factory is not None
-        and recent is not None
-        and recent[0] is factory
-        and recent[1] == subject
-        and time.monotonic() - recent[2] < _LOADING_CUSTODY_SECONDS
-    ):
-        # The capture describes catalog state; these describe this connection and are never reused.
-        _require(connection.is_in_transaction() is True, "transaction_required")
-        await _require_source_storage_publisher(connection, policy, publication)
-        _require(await connection.fetchval("SHOW session_replication_role") == "origin", "replication_role")
-        return json.loads(recent[3])
-    captured_at = time.monotonic()
-    custody_by_field = await _capture_isolated_source_storage_custody(
-        connection,
-        policy,
-        catalog_schema=catalog_schema,
-        migration_role=migration_role,
-        namespace_owner_role=namespace_owner_role,
-        publication=publication,
-        expected_history_bounds=expected_history_bounds,
-    )
-    if factory is not None:
-        _LOADING_CUSTODY[:] = [(factory, subject, captured_at, json.dumps(custody_by_field, sort_keys=True))]
-    return custody_by_field
-
-
-async def _capture_isolated_source_storage_custody(
-    connection,
-    policy,
-    *,
-    catalog_schema,
-    migration_role,
-    namespace_owner_role,
-    publication,
-    expected_history_bounds,
 ):
     """Read the private storage, roles and canonical authority from the catalog in the caller's transaction."""
     import asyncio
@@ -859,3 +846,44 @@ async def _capture_isolated_source_storage_custody(
         "transaction_changed",
     )
     return json.loads(json.dumps(custody_by_field, sort_keys=True))
+
+
+async def dataset_source_relations(database, catalog_schema, dataset_id, roots, *, canonical_roots=()):
+    """Resolve one logical dataset's recorded relation names once for a bounded operation."""
+    from db.plan_release_storage import storage_relation
+
+    _require(type(dataset_id) is str and 1 <= len(dataset_id) <= 96, "dataset_invalid")
+    parent = storage_relation(catalog_schema, "provider_directory_endpoint_dataset")
+    if hasattr(database, "fetchrow"):
+        dataset_record = await database.fetchrow(
+            f"SELECT candidate_storage_json FROM {parent} WHERE dataset_id=$1", dataset_id
+        )
+    else:
+        dataset_record = await database.first(
+            f"SELECT candidate_storage_json FROM {parent} WHERE dataset_id=:dataset_id", dataset_id=dataset_id
+        )
+    _require(dataset_record is not None, "dataset_missing")
+    encoded = dataset_record["candidate_storage_json"] if hasattr(dataset_record, "keys") else dataset_record[0]
+    document = named_source_document(json.loads(encoded) if isinstance(encoded, str) else encoded)
+    if document is None:
+        return {root: {"schema": catalog_schema, "name": root} for root in roots}
+    _require(type(document) is dict and type(document.get("tables")) is dict, "tables_changed")
+    _require(document.get("identity", {}).get("dataset_id") == dataset_id, "dataset_changed")
+    storage_schema = document.get("storage", {}).get("storage_schema", catalog_schema)
+    relations_by_root = {}
+    for root in roots:
+        table = document["tables"].get(root)
+        input_table = document.get("inputs", {}).get(root)
+        if table is None and input_table is not None:
+            table = input_table
+            _require(type(table) is dict and table.get("schema") in {catalog_schema, storage_schema}, "schema_changed")
+            relation_by_field = {"schema": table["schema"], "name": table.get("name")}
+        elif table is None and root in canonical_roots:
+            relation_by_field = {"schema": catalog_schema, "name": root}
+        else:
+            _require(type(table) is dict, "tables_changed")
+            relation_by_field = {"schema": table.get("schema", storage_schema), "name": table.get("name")}
+            _require(relation_by_field["schema"] == storage_schema, "schema_changed")
+        storage_relation(relation_by_field["schema"], relation_by_field["name"])
+        relations_by_root[root] = relation_by_field
+    return relations_by_root

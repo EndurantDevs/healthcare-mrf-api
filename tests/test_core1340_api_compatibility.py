@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Semantic compatibility only; native custody remains independently required."""
+"""Signed scope compatibility on maintained named publication read paths."""
 
 import asyncio
 from contextlib import asynccontextmanager
@@ -11,38 +11,58 @@ from uuid import UUID
 import asyncpg
 import pytest
 from sanic.exceptions import Forbidden, ServiceUnavailable
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import dialect
 
 from api import custom_import_provider_network as signed
 from api import network_address_scope as addresses
-from api import network_read_execution as execution
+from api import network_compact_address as compact
 from api import plan_pricing_em_distance as distance
 from api import provider_profile_network_read as profiles
-from api.provider_directory_entities_contract import DirectoryReadError
+from api.network_read_execution import qualified_relation_sql
 from db.models import EntityAddressUnified
 from process.network_compact_layout import CompactAddressRelation, CompactEdgeArtifact, CompactNetworkLayout
-from process.network_read_identity import _CONSUMED_SQL
+from process.network_serving_read import _pinned_manifest
 from process.registry_source_recipe_store import RegistrySourceRecipeError
 from tests.network_read_execution_support import mock_approved_control_metadata
 from tests.test_custom_import_provider_network import _body, _bound_document, _install_manifest, _ScopedSession
 from tests.test_network_fhir_retained_capture import pin, retained
-from tests.test_network_read_execution import _manifest
+
+
+def _named_manifest(*, layout=None):
+    """Decode the selected logical publication with its genuine named routing DTOs."""
+    candidate_id = str(UUID(int=1))
+    schema = "network_candidate_" + UUID(candidate_id).hex
+    manifest_by_field = dict(
+        generation_id=1,
+        candidate_id=candidate_id,
+        schema_name=schema,
+        schema_revision=2 if layout is not None else 1,
+        source_generations={"unified_address": "retained-address-edition"},
+        approved_custom_revision=0,
+        manifest_sha256="a" * 64,
+    )
+    return _pinned_manifest(
+        dict(
+            candidate_json={**manifest_by_field, "validation_json": {"serving_readiness": {}}},
+            manifest_json=manifest_by_field,
+        ),
+        layout=layout,
+    )
 
 
 def _layout_manifest(artifacts, custom):
-    manifest = _manifest(compact=True)
+    schema = "network_candidate_" + UUID(int=1).hex
     layout = CompactNetworkLayout(
-        manifest.compact_layout.ref_map,
-        manifest.compact_layout.base,
+        CompactAddressRelation(schema, "network_slice_ref"),
+        CompactAddressRelation("held_base", "entity_address_unified"),
         tuple(
-            CompactEdgeArtifact(str(UUID(int=index)), "network_candidate_" + UUID(int=index).hex, 30 + index)
+            CompactEdgeArtifact(str(UUID(int=index)), "network_candidate_" + UUID(int=index).hex)
             for index in range(2, 2 + artifacts)
         ),
-        CompactAddressRelation("custom_offices", "entity_address_unified", 90) if custom else None,
+        CompactAddressRelation("custom_offices", "entity_address_unified") if custom else None,
     )
-    object.__setattr__(manifest, "_compact_layout", layout)
-    return manifest
+    return _named_manifest(layout=layout)
 
 
 @pytest.mark.parametrize("artifacts,custom", [(0, False), (1, False), (2, True)])
@@ -58,9 +78,18 @@ def test_compact_legacy_scope_filters_logical_rows_and_preserves_pins(artifacts,
             assert "WHERE FALSE" not in statement
             assert "ref.network_id=ANY" not in statement
             assert "OR (TRUE)" in statement
-        raw_pins = execution.network_read_relations(text("SELECT * FROM " + raw + " office"))
-        assert execution.network_read_relations(typed) == raw_pins
-        assert len(raw_pins) == 1 + bool(custom) + (1 + artifacts if artifacts else 0)
+        layout = manifest.compact_layout
+        expected = (layout.base,) + ((layout.custom,) if custom else ())
+        if artifacts:
+            expected += (layout.ref_map,) + tuple(
+                CompactAddressRelation(artifact.schema_name, "network_office_edge") for artifact in layout.artifacts
+            )
+        assert compact.compact_address_read_relations(layout) == expected
+        for relation in expected:
+            qualified = qualified_relation_sql(relation.schema_name, relation.table_name)
+            unquoted_table = '"' + relation.schema_name + '".' + relation.table_name
+            assert all(qualified in statement or unquoted_table in statement for statement in (raw, sql))
+        assert tuple(typed.selected_columns.keys()) == tuple(EntityAddressUnified.__table__.columns.keys())
         parameters = addresses.scoped_address_parameters({})
         assert parameters["_legacy_network_checksums"] == [-17, 42]
         assert parameters["_canonical_network_ids"] == [42]
@@ -80,7 +109,7 @@ def test_signed_legacy_scope_changes_full_authority_cache_and_read_identity():
     assert subset.access_scope_sha256 != original.access_scope_sha256
     identities = []
     for checksums in ((-17,), (42,)):
-        with addresses.network_address_read_scope(_manifest(compact=True), (42,), legacy_checksums=checksums):
+        with addresses.network_address_read_scope(_layout_manifest(1, False), (42,), legacy_checksums=checksums):
             identities.append(
                 (
                     addresses.scoped_address_cache_key("page"),
@@ -150,7 +179,7 @@ async def test_actual_canonical_scope_enforces_mapping_before_handler(monkeypatc
     @asynccontextmanager
     async def snapshot(actual, generation_id=None, control_schema=None):
         assert actual is session and generation_id == 1 and control_schema is None
-        yield _manifest(), CompactAddressRelation("registry_control", "registry_approved_record", 99)
+        yield _named_manifest(), CompactAddressRelation("registry_control", "registry_approved_record")
 
     monkeypatch.setattr("api.network_serving_api_read.api_catalog_read_snapshot", snapshot)
     mock_approved_control_metadata(monkeypatch)
@@ -173,32 +202,26 @@ async def test_actual_canonical_scope_enforces_mapping_before_handler(monkeypatc
 
 
 def _mapping_driver(events, transaction, failure):
-    """Keep exact native mapping/consumed ordering and injected failure modes."""
+    """Exercise the actual approved legacy map and its native error modes."""
 
     class Mapping:
         def __getitem__(self, key):
             events.append("decode")
             return {"complete": True, "network_ids": [88] if failure == "mapping" else [42]}[key]
 
-    class Driver:
-        def get_server_pid(self):
-            return 42
+    original = asyncpg.InsufficientPrivilegeError("synthetic") if failure == "native" else asyncio.CancelledError()
 
-        def is_in_transaction(self):
-            return True
+    class Driver:
+        original_failure = original
 
         async def fetchrow(self, query, *arguments):
-            if query == _CONSUMED_SQL:
-                events.append("guard")
-                assert arguments[0] == ['"registry_control"."registry_approved_record"']
-                return {"backend_matches": True, "relation_count": 1, "valid": failure != "guard"}
             events.append("mapping")
             assert query.count('JOIN ONLY "registry_control".registry_approved_record') == 2
             assert arguments == (0, ("-17",), "checksum_network", ())
             if failure == "native":
-                raise asyncpg.InsufficientPrivilegeError("synthetic")
+                raise original
             if failure == "cancel":
-                raise asyncio.CancelledError()
+                raise original
             if failure == "transaction":
                 transaction[0] = object()
             return Mapping()
@@ -206,11 +229,11 @@ def _mapping_driver(events, transaction, failure):
     return Driver()
 
 
-@pytest.mark.parametrize("failure", [None, "guard", "transaction", "mapping", "native", "cancel"])
-async def test_actual_mapping_guard_and_original_context_precede_decoding(monkeypatch, failure):
-    """Consume native mapping under the original transaction before exposing decoded fields."""
+@pytest.mark.parametrize("failure", [None, "transaction", "mapping", "native", "cancel"])
+async def test_actual_mapping_and_original_transaction_precede_payload(monkeypatch, failure):
+    """Enforce the signed legacy map before any scoped provider payload is reached."""
     events, transaction = [], [object()]
-    approved = CompactAddressRelation("registry_control", "registry_approved_record", 99)
+    approved = CompactAddressRelation("registry_control", "registry_approved_record")
 
     driver = _mapping_driver(events, transaction, failure)
     session = SimpleNamespace(in_transaction=lambda: True, get_transaction=lambda: transaction[0])
@@ -228,7 +251,7 @@ async def test_actual_mapping_guard_and_original_context_precede_decoding(monkey
     monkeypatch.setattr(
         "process.network_approved_membership_source.pin_api_retained_approved_membership_source", approved_pin
     )
-    scope = addresses.network_address_read_session_scope(session, _manifest(), (42,), legacy_checksums=(-17,))
+    scope = addresses.network_address_read_session_scope(session, _named_manifest(), (42,), legacy_checksums=(-17,))
     if failure:
         expected = (
             addresses._LegacyNetworkScopeMismatch
@@ -242,11 +265,15 @@ async def test_actual_mapping_guard_and_original_context_precede_decoding(monkey
                 pytest.fail("unverified mapping reached the payload")
         if failure != "cancel":
             assert caught.value.headers["Cache-Control"] == "private, no-store"
+        if failure == "native":
+            assert caught.value.__cause__ is driver.original_failure
+        elif failure == "cancel":
+            assert caught.value is driver.original_failure
     else:
         async with scope:
-            assert events == ["approved", "mapping", "guard", "decode", "decode"]
-    if failure in ("guard", "transaction"):
-        assert events == ["approved", "mapping", "guard"]
+            assert events == ["approved", "mapping", "decode", "decode"]
+    if failure == "transaction":
+        assert events == ["approved", "mapping", "decode", "decode"]
     assert addresses.current_network_address_scope() is None
 
 
@@ -270,7 +297,7 @@ async def test_optional_profile_omission_follows_full_api_recipe_authentication(
             )
         )
     )
-    with addresses.network_address_read_scope(_manifest(), (42,)):
+    with addresses.network_address_read_scope(_named_manifest(), (42,)):
         if kind == "retained":
             assert await profiles.read_detail_directory_profile(session, 1000000491, include_evidence=False) is None
         else:

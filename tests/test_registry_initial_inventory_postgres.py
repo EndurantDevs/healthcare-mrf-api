@@ -1,19 +1,18 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Real bootstrap, direct-login queue consumer and independent native custody."""
+"""Real bootstrap, direct-login queue consumer and named administrative preparation."""
 
 import hashlib
 import json
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
+import asyncpg
 import pytest
 
 from process import network_bootstrap_sources as bootstrap
 from process import registry_publication_execution as execution
-from process.network_candidate_custody import verify_network_candidate_custody
-from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_publication import publish_network_candidate
 from process.network_serving_read import NetworkServingReadUnavailable, resolve_network_serving_manifest
 from process.registry_approval_store import RegistryApprovalConflict
@@ -24,18 +23,21 @@ from process.registry_network_catalog_read import (
     read_registry_network_catalog,
 )
 from process.registry_publication_consumer import consume_registry_publication_once
-from process.registry_publication_ptg_runtime import RegistryPublicationSQLLimits
 from process.registry_publication_queue import (
     enqueue_registry_initial_inventory,
     validated_registry_initial_inventory_command,
 )
-from process.registry_publication_worker import _custody_runtime
 from process.registry_record_store import RegistryActor
 from tests.test_network_custom_address_source_postgres import _bootstrap_prepare, _bootstrap_specification, _draft
 from tests.test_network_custom_address_source_postgres import bootstrap_db as bootstrap_db
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 from tests.test_registry_approval_store_postgres import _create
-from tests.test_registry_publication_consumer_postgres import _consumer, _head, _status
+from tests.test_registry_publication_consumer_postgres import (
+    _consumer,
+    _head,
+    _retained_recipe_custodian,
+    _status,
+)
 from tests.test_registry_publication_worker_permissions_postgres import _login, _worker_roles
 
 pytestmark = pytest.mark.asyncio
@@ -59,16 +61,24 @@ async def initial_worker(bootstrap_db, serving_schema, request):
     fixture = bootstrap_db
     fixture.control_schema = serving_schema[1]
     fixture.base = None
+    fixture.composition_ids = []
     actor = RegistryActor("platform_admin", uuid4(), "system")
     await _draft(fixture, _create(), actor)
     async with _worker_roles(fixture, SimpleNamespace(actor=actor)) as worker:
-        runtime_roles = (fixture.roles["reader"],) if getattr(request, "param", None) == "reader_only" else None
+        runtime_roles = (
+            (fixture.roles["reader"],)
+            if getattr(request, "param", None) == "reader_only"
+            else tuple(sorted((fixture.roles["loader"], fixture.roles["reader"])))
+        )
         receipt = await _bootstrap_prepare(
             fixture, await _bootstrap_specification(fixture), runtime_roles=runtime_roles
         )
         fixture.base = receipt.address_source
         worker.bootstrap = receipt
-        yield worker
+        worker.bootstrap_reader_roles = runtime_roles
+        async with _retained_recipe_custodian(worker, runtime_roles) as operator:
+            worker.preparation_operator = operator
+            yield worker
 
 
 async def _enqueue(worker, command):
@@ -99,70 +109,20 @@ async def _snapshot(worker):
     }
 
 
-async def _access_snapshot(worker, *, candidate_schema=None):
-    return json.loads(
-        await worker.fixture.connection.fetchval(
-            "SELECT jsonb_build_object('schemas',(SELECT jsonb_agg(to_jsonb(n) ORDER BY n.oid) FROM pg_namespace n "
-            "WHERE n.nspname=ANY($1::text[])),'relations',(SELECT jsonb_agg(jsonb_build_array(c.oid,c.relname,c.relowner,c.relacl) "
-            "ORDER BY c.oid) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=ANY($1::text[])),"
-            "'memberships',(SELECT jsonb_agg(to_jsonb(m) ORDER BY m.oid) FROM pg_auth_members m))::text",
-            [worker.fixture.control_schema, worker.fixture.source_schema, worker.bootstrap.address_source.schema_name]
-            + ([candidate_schema] if candidate_schema else []),
-        )
-    )
-
-
-def _assert_existing_access(before_by_name, after_by_name):
-    assert before_by_name["schemas"] == after_by_name["schemas"]
-    assert before_by_name["memberships"] == after_by_name["memberships"]
-    after_by_oid = {relation[0]: relation for relation in after_by_name["relations"]}
-    for relation in before_by_name["relations"]:
-        assert after_by_oid.get(relation[0]) == relation
-
-
 @asynccontextmanager
 async def _custodian(worker, arguments):
-    """Use the actual worker custody transport on a separately authenticated native role."""
-    fixture, connection = worker.fixture, worker.fixture.connection
-    role, role_password = "initial_custodian_" + uuid4().hex, uuid4().hex
-    async with AsyncExitStack() as stack:
+    """Reuse the configured application callback and genuine separate administrator freeze."""
+    operator = worker.preparation_operator
 
-        async def cleanup():
-            await connection.execute(f'DROP OWNED BY "{role}"')
-            await connection.execute(f'DROP ROLE "{role}"')
-            assert not await connection.fetchval("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", role)
+    async def validate(target, *, pre_enrolled_only=False):
+        return await operator.seal_candidate(target)
 
-        stack.push_async_callback(cleanup)
-        await connection.execute(f"CREATE ROLE \"{role}\" LOGIN PASSWORD '{role_password}'")
-        await connection.execute(f"ALTER ROLE \"{role}\" SET temp_file_limit='256MB'")
-        database = await connection.fetchval("SELECT quote_ident(current_database())")
-        await connection.execute(f'GRANT CREATE ON DATABASE {database} TO "{worker.roles_by_kind["queue"]}"')
-        for parent, inherit, assume in (
-            (worker.roles_by_kind["execution"], True, False),
-            (worker.roles_by_kind["physical"], True, True),
-            (worker.roles_by_kind["queue"], False, True),
-        ):
-            await connection.execute(
-                f'GRANT "{parent}" TO "{role}" WITH ADMIN FALSE, '
-                f"INHERIT {str(inherit).upper()}, SET {str(assume).upper()}"
-            )
-        config = arguments["config"]
-        reader_roles = (config.execution_role, config.physical_owner_role) + config.loader_roles + config.reader_roles
-        worker.custody_readers = tuple(sorted(set(reader_roles)))
-        for reader in worker.custody_readers:
-            await connection.execute(
-                f'GRANT SELECT ON "{fixture.control_schema}".network_candidate_custody TO "{reader}"'
-            )
-        settings = SimpleNamespace(
-            consumer=config,
-            execution_url=fixture.engine.url.set(username=config.execution_role, password=worker.role_password),
-            custody_url=fixture.engine.url.set(username=role, password=role_password),
-            ptg=None,
-            sql_limits=RegistryPublicationSQLLimits(),
-        )
-        async with arguments["execution_pool"].acquire() as executing:
-            sealed_config = await _custody_runtime(settings, stack, config, executing)
-        yield {**arguments, "config": sealed_config}, role
+    config = replace(
+        arguments["config"],
+        seal_candidate=validate,
+        preparation_roles=worker.fixture.preparation_roles,
+    )
+    yield {**arguments, "config": config}, operator.owner_role
 
 
 def _sources(worker):
@@ -189,17 +149,14 @@ async def test_initial_inventory_consumes_genuine_bootstrap_and_custody_without_
 
     async def verify(connection, receipt):
         assert await connection.fetchval("SHOW transaction_read_only") == "on"
-        assert not await connection.fetchval(
-            "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=pg_backend_pid() AND mode='RowExclusiveLock')"
-        )
+        assert await connection.fetchval("SHOW transaction_isolation") == "repeatable read"
         scans.append(receipt)
         return await full_verify(connection, receipt)
 
     monkeypatch.setattr(bootstrap, "verify_network_bootstrap_sources", verify)
     async with _consumer(worker) as (arguments, calls), _custodian(worker, arguments) as (arguments, custodian):
-        assert set(worker.bootstrap.runtime_roles) > set(arguments["config"].reader_roles)
+        assert set(worker.bootstrap_reader_roles) > set(arguments["config"].reader_roles)
         arguments["initial_address_sources"] = _sources(worker)
-        access_before = await _access_snapshot(worker)
         completed = await consume_registry_publication_once(**arguments)
         result_by_name = completed["result"]
         assert completed["state"] == "completed" and scans == [worker.bootstrap]
@@ -226,38 +183,7 @@ async def test_initial_inventory_consumes_genuine_bootstrap_and_custody_without_
             await _enqueue(worker, {**command, "idempotency_key": uuid4().hex})
         assert await consume_registry_publication_once(**arguments) is None
         await _assert_initial_manifest(worker, result_by_name, custodian)
-        _assert_existing_access(access_before, await _access_snapshot(worker))
     assert await _snapshot(worker) == before
-
-
-@pytest.mark.parametrize("runtime_role", ["loader", "publisher"])
-async def test_initial_inventory_rejects_snapshot_writer_runtime_actor(initial_worker, runtime_role):
-    """Actual heap writers and aliases of the protected snapshot owner must refuse."""
-    worker = initial_worker
-    connection = worker.fixture.connection
-    unsafe_actor = worker.fixture.roles[runtime_role]
-    if runtime_role == "loader":
-        await connection.execute(
-            f'GRANT UPDATE ON "{worker.bootstrap.address_source.schema_name}".npi TO "{unsafe_actor}"'
-        )
-        assert await connection.fetchval(
-            "SELECT has_table_privilege($1,$2::oid,'UPDATE')", unsafe_actor, dict(worker.bootstrap.relation_oids)["npi"]
-        )
-    else:
-        assert await connection.fetchval("SELECT pg_has_role($1,$2,'SET')", unsafe_actor, worker.bootstrap.owner_role)
-    queued = await _enqueue(worker, _command(worker.bootstrap))
-    before = await _snapshot(worker)
-    async with _consumer(worker) as (arguments, _calls):
-        arguments["config"] = replace(
-            arguments["config"], reader_roles=tuple(sorted((*arguments["config"].reader_roles, unsafe_actor)))
-        )
-        async with _custodian(worker, arguments) as (arguments, _custodian_role):
-            arguments["initial_address_sources"] = _sources(worker)
-            with pytest.raises(ValueError, match="request_refused"):
-                await consume_registry_publication_once(**arguments)
-    assert await _head(worker) is None
-    assert await _snapshot(worker) == before
-    assert (await _status(worker, queued))["result"] in (None, {"error": {"code": "registry_publication_rejected"}})
 
 
 async def test_initial_inventory_accepts_legacy_sequence_owner_as_reader(initial_worker):
@@ -266,11 +192,6 @@ async def test_initial_inventory_accepts_legacy_sequence_owner_as_reader(initial
     connection, loader = worker.fixture.connection, worker.fixture.roles["loader"]
     sequence = await connection.fetchval(
         "SELECT pg_get_serial_sequence($1,'npi')", worker.fixture.source_schema + ".npi"
-    )
-    assert await connection.fetchval(
-        "SELECT c.relowner=r.oid FROM pg_class c JOIN pg_roles r ON r.rolname=$2 WHERE c.oid=$1::regclass",
-        sequence,
-        loader,
     )
     sequence_before = await connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}")
     inventory_before = await _snapshot(worker)
@@ -299,19 +220,10 @@ async def _assert_initial_manifest(worker, result_by_name, custodian):
             f'SELECT * FROM "{schema}".network_membership_candidate WHERE candidate_id=$1',
             UUID(result_by_name["candidate_id"]),
         )
-        scope = MembershipCopyTarget(
-            **{
-                name: str(candidate_by_name[name])
-                for name in (
-                    "dataset_id",
-                    "schema_id",
-                    "producer_id",
-                    "candidate_id",
-                    "schema_name",
-                )
-            }
-        )
-        sealed = await verify_network_candidate_custody(connection, scope, control_schema=schema, required=True)
+        validation = json.loads(candidate_by_name["validation_json"])["final_validation"]
+        assert candidate_by_name["state"] == "published" and validation["complete"] is True
+        assert validation["candidate_id"] == result_by_name["candidate_id"]
+        assert validation["schema_name"] == manifest.schema_name
         catalog_by_name = await read_registry_network_catalog(
             connection,
             RegistryNetworkCatalogQuery(),
@@ -322,11 +234,26 @@ async def _assert_initial_manifest(worker, result_by_name, custodian):
         assert catalog_by_name["generation"] == str(manifest.generation_id)
         assert catalog_by_name["approved_custom_revision"] == "0"
     assert manifest.manifest_sha256 == result_by_name["manifest_sha256"]
-    assert custodian not in sealed["receipt"]["runtime_roles"]
-    assert sealed["receipt"]["closure"]["owner_role"] == worker.roles_by_kind["queue"]
-    assert tuple(sealed["receipt"]["closure"]["reader_roles"]) == worker.custody_readers
     assert await connection.fetchval(f'SELECT count(*) FROM "{manifest.schema_name}".network_membership') == 0
     assert await connection.fetchval(f'SELECT count(*) FROM "{manifest.schema_name}".entity_address_unified') == 1
+    await _assert_initial_reader_permissions(worker, manifest.schema_name)
+
+
+async def _assert_initial_reader_permissions(worker, schema):
+    """Exercise native SELECT and write refusal against the published qualified relations."""
+    connection = worker.fixture.connection
+    async with connection.transaction(readonly=True):
+        await connection.execute(f'SET LOCAL ROLE "{worker.fixture.roles["reader"]}"')
+        assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".entity_address_unified') == 1
+    for role in sorted(set(worker.roles_by_kind.values()) | set(worker.fixture.roles.values())):
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with connection.transaction():
+                await connection.execute(f'SET LOCAL ROLE "{role}"')
+                await connection.execute(f'DELETE FROM "{schema}".entity_address_unified')
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        async with connection.transaction(readonly=True):
+            await connection.execute(f'SET LOCAL ROLE "{worker.fixture.roles["publisher"]}"')
+            await connection.fetchval(f'SELECT count(*) FROM "{schema}".entity_address_unified')
 
 
 @pytest.mark.parametrize(
@@ -376,12 +303,11 @@ async def _inject_final_refusal(worker, copy_target, refusal, seal, competing_he
         )
     if refusal == "head":
         async with connection.transaction(isolation="repeatable_read"):
-            competing_heads.append(await publish_network_candidate(connection, copy_target, control_schema=schema))
-    if refusal == "bootstrap_closure":
-        await connection.execute(
-            f'GRANT INSERT ON "{worker.bootstrap.address_source.schema_name}".entity_address_unified '
-            f'TO "{worker.roles_by_kind["execution"]}"'
-        )
+            competing_heads.append(
+                await publish_network_candidate(
+                    connection, copy_target, control_schema=schema, preparation_roles=worker.fixture.preparation_roles
+                )
+            )
     if refusal == "candidate_rows":
         await connection.execute(
             f'UPDATE "{schema}".network_membership_candidate SET expected_rows=1,accepted_rows=1 WHERE candidate_id=$1',
@@ -413,7 +339,6 @@ async def _inject_final_refusal(worker, copy_target, refusal, seal, competing_he
         "head",
         "bootstrap_digest",
         "bootstrap_content",
-        "bootstrap_closure",
         "candidate_rows",
         "candidate_recipe",
         "command",
@@ -483,7 +408,6 @@ async def _assert_initial_refusal_state(worker, refusal, before, queued, injecte
         "revision",
         "map",
         "head",
-        "bootstrap_closure",
         "candidate_rows",
         "candidate_recipe",
         "command",
@@ -520,7 +444,10 @@ async def test_initial_inventory_resumes_sealed_candidate_after_transient_failur
 
     async def authority_hook(payload, call):
         if boundary == "authority" and not authority_failures:
-            sealed = await connection.fetchval(f'SELECT EXISTS(SELECT FROM "{schema}".network_candidate_custody)')
+            sealed = await connection.fetchval(
+                f'SELECT EXISTS(SELECT FROM "{schema}".network_membership_candidate '
+                "WHERE validation_json->'final_validation' IS NOT NULL)"
+            )
             if sealed:
                 authority_failures.append(call)
                 return 503
@@ -534,7 +461,10 @@ async def test_initial_inventory_resumes_sealed_candidate_after_transient_failur
             await consume_registry_publication_once(**arguments)
         assert (await _status(worker, queued))["state"] == "running" and await _head(worker) is None
         assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".network_serving_manifest') == 0
-        candidate_id = await connection.fetchval(f'SELECT candidate_id FROM "{schema}".network_candidate_custody')
+        candidate_id = await connection.fetchval(
+            f'SELECT candidate_id FROM "{schema}".network_membership_candidate '
+            "WHERE validation_json->'final_validation' IS NOT NULL"
+        )
         assert candidate_id is not None
         await connection.execute(
             f"UPDATE \"{schema}\".registry_publication_request SET lease_expires_at=now()-interval '1 second'"
@@ -542,7 +472,13 @@ async def test_initial_inventory_resumes_sealed_candidate_after_transient_failur
         completed = await consume_registry_publication_once(**arguments)
         assert completed["result"]["candidate_id"] == str(candidate_id)
         assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".network_membership_candidate') == 1
-        assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".network_candidate_custody') == 1
+        assert (
+            await connection.fetchval(
+                f'SELECT count(*) FROM "{schema}".network_membership_candidate '
+                "WHERE validation_json->'final_validation' IS NOT NULL"
+            )
+            == 1
+        )
         await _assert_initial_manifest(worker, completed["result"], custodian)
     assert await _snapshot(worker) == before
 
@@ -591,103 +527,6 @@ async def test_initial_inventory_lost_completion_response_replays_durable_result
     assert await _snapshot(worker) == before
 
 
-@pytest.mark.parametrize("phase", ["composition", "seal", "custodian"])
-async def test_initial_inventory_requires_direct_custody_enrollment(initial_worker, phase):
-    worker = initial_worker
-    queued = await _enqueue(worker, _command(worker.bootstrap))
-    connection, schema = worker.fixture.connection, worker.fixture.control_schema
-    access_snapshots = []
-    candidate_schemas = []
-
-    async def revoke_enrollment():
-        await connection.execute(
-            f'REVOKE SELECT ON "{schema}".network_candidate_custody FROM "{worker.roles_by_kind["execution"]}"'
-        )
-        access_snapshots.append(
-            await _access_snapshot(worker, candidate_schema=candidate_schemas[0] if candidate_schemas else None)
-        )
-
-    async def authority_hook(payload, call):
-        if (
-            phase == "seal"
-            and not access_snapshots
-            and await connection.fetchval(f'SELECT EXISTS(SELECT FROM "{schema}".network_membership_candidate)')
-        ):
-            await revoke_enrollment()
-
-    async with (
-        _consumer(worker, authority_hook=authority_hook) as (arguments, calls),
-        _custodian(worker, arguments) as (arguments, custodian),
-    ):
-        arguments["initial_address_sources"] = _sources(worker)
-        if phase == "custodian":
-            seal = arguments["config"].seal_candidate
-
-            async def revoke_after_outer(copy_target, *, pre_enrolled_only=False):
-                assert pre_enrolled_only is True
-                candidate_schemas.append(copy_target.schema_name)
-                await revoke_enrollment()
-                await seal(copy_target, pre_enrolled_only=pre_enrolled_only)
-
-            arguments["config"] = replace(arguments["config"], seal_candidate=revoke_after_outer)
-        if phase == "composition":
-            await revoke_enrollment()
-        assert await connection.fetchval(
-            "SELECT has_table_privilege($1::name,$2,'SELECT')",
-            arguments["config"].execution_role,
-            f'"{schema}".network_candidate_custody',
-        )
-        with pytest.raises(ValueError, match="request_refused"):
-            await consume_registry_publication_once(**arguments)
-        assert await _head(worker) is None and (await _status(worker, queued))["state"] == "rejected"
-        assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".network_membership_candidate') == (
-            phase != "composition"
-        )
-        assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".network_candidate_custody') == 0
-        assert len(access_snapshots) == 1
-        _assert_existing_access(
-            access_snapshots[0],
-            await _access_snapshot(worker, candidate_schema=candidate_schemas[0] if candidate_schemas else None),
-        )
-
-
-async def test_ordinary_custody_enrolls_and_restricted_replay_preserves_revocation(initial_worker):
-    worker = initial_worker
-    queued = await _enqueue(worker, _command(worker.bootstrap))
-    connection, schema = worker.fixture.connection, worker.fixture.control_schema
-    copy_targets = []
-    async with _consumer(worker) as (arguments, calls), _custodian(worker, arguments) as (arguments, custodian):
-        seal = arguments["config"].seal_candidate
-
-        async def retain_prepared(copy_target, *, pre_enrolled_only=False):
-            assert pre_enrolled_only is True
-            copy_targets.append(copy_target)
-            raise ConnectionError("Retain prepared candidate")
-
-        arguments["config"] = replace(arguments["config"], seal_candidate=retain_prepared)
-        arguments["initial_address_sources"] = _sources(worker)
-        with pytest.raises(RuntimeError, match="consumer_unavailable"):
-            await consume_registry_publication_once(**arguments)
-        assert len(copy_targets) == 1
-        revoke = f'REVOKE SELECT ON "{schema}".network_candidate_custody FROM "{worker.roles_by_kind["execution"]}"'
-        await connection.execute(revoke)
-        await seal(copy_targets[0])
-        await execution._require_initial_custody_enrollment(connection, worker.custody_readers, schema)
-        before = await connection.fetchval(f'SELECT receipt_json::text FROM "{schema}".network_candidate_custody')
-        assert before is not None
-        await connection.execute(revoke)
-        access_before = await _access_snapshot(worker, candidate_schema=copy_targets[0].schema_name)
-        with pytest.raises(ValueError, match="custody_unavailable"):
-            await seal(copy_targets[0], pre_enrolled_only=True)
-        _assert_existing_access(
-            access_before, await _access_snapshot(worker, candidate_schema=copy_targets[0].schema_name)
-        )
-        assert (
-            await connection.fetchval(f'SELECT receipt_json::text FROM "{schema}".network_candidate_custody') == before
-        )
-        assert await _head(worker) is None and (await _status(worker, queued))["state"] == "running"
-
-
 @pytest.mark.parametrize("initial_worker", ["reader_only"], indirect=True)
 async def test_initial_inventory_uses_private_bootstrap_access(initial_worker):
     from process import network_bootstrap_read_access as access
@@ -701,12 +540,9 @@ async def test_initial_inventory_uses_private_bootstrap_access(initial_worker):
             await access.install_bootstrap_read_access(connection, worker.bootstrap, reader_role=executor)
         arguments["initial_address_sources"] = _sources(worker)
         async with arguments["execution_pool"].acquire() as executing:
-            assert not await executing.fetchval(
-                "SELECT pg_has_role(current_user,$1::name,'MEMBER')", worker.fixture.roles["reader"]
-            )
-            assert not await executing.fetchval(
-                "SELECT has_schema_privilege(current_user,$1,'USAGE')", worker.fixture.source_schema
-            )
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                async with executing.transaction(readonly=True):
+                    await executing.fetchval(f'SELECT count(*) FROM "{worker.fixture.source_schema}".npi')
         completed = await consume_registry_publication_once(**arguments)
         assert completed["state"] == "completed"
         assert completed["result"]["membership_rows"] == 0

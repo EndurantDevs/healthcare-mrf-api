@@ -92,8 +92,8 @@ def test_serialized_source_row_rejects_identity_drift_and_naive_times(field, val
         ("profile", "unknown"),
         ("complete", 1),
         ("profile", "retained_normalized"),
-        ("resource_table_oid", True),
-        ("resource_table_oid", 2**32),
+        ("tables", {}),
+        ("tables", {"header": {}, "resource": {}}),
         ("source_uri", None),
     ],
 )
@@ -402,12 +402,12 @@ async def test_candidate_rechecks_approval_pins_before_replaying_organization_au
 
 
 @pytest.mark.parametrize("attestation", [None, {}, {"metadata_generation": "a" * 64, "unknown": True}])
-def test_retained_validation_refuses_incomplete_or_unknown_attestation_fields(attestation):
-    with pytest.raises(ValueError, match="registry_fhir_catalog_custody_invalid"):
+def test_retained_validation_refuses_incomplete_or_unknown_content_fields(attestation):
+    with pytest.raises(ValueError, match="registry_fhir_catalog_validation_invalid"):
         validation.verify_fhir_catalog_validation(snapshot(standing_grant()), attestation)
 
 
-def test_retained_attestation_refuses_incomplete_table_accounting():
+def test_retained_validation_refuses_incomplete_table_accounting():
     selected = snapshot(standing_grant())
     selected["accounting_json"] = None
     tables_by_name = {table: {"rows": 0, "sha256": "a" * 64, "batches": 0, "bytes": 0} for table in validation._KEYS}
@@ -419,5 +419,15 @@ def test_retained_attestation_refuses_incomplete_table_accounting():
     }
     validation.verify_fhir_catalog_validation(selected, attestation_by_field)
     del tables_by_name["registry_fhir_catalog_source"]["bytes"]
-    with pytest.raises(ValueError, match="registry_fhir_catalog_custody_invalid"):
+    with pytest.raises(ValueError, match="registry_fhir_catalog_validation_invalid"):
         validation.verify_fhir_catalog_validation(selected, attestation_by_field)
+
+
+@pytest.mark.asyncio
+async def test_candidate_digest_refuses_duplicate_data_keys_within_page(monkeypatch):
+    network_row_by_field = {"metadata_generation": "a" * 64, "network_id": 1, "document": "{}", "row_bytes": 2}
+    connection = SimpleNamespace(fetch=AsyncMock(return_value=[network_row_by_field, dict(network_row_by_field)]))
+    monkeypatch.setattr(validation, "_validate_document", lambda *args: None)
+    with pytest.raises(ValueError, match="validation_order_invalid"):
+        await validation._table_digest(connection, '"catalog_snapshot"', "registry_fhir_catalog_network")
+    connection.fetch.assert_awaited_once()

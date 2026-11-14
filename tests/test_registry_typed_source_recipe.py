@@ -36,58 +36,62 @@ from process.registry_typed_source_metadata import (
     validate_typed_derivation,
     validate_typed_summary,
 )
-from tests.test_network_fhir_source_witness_contract import database_fields, origin_fields
+from tests.registry_source_recipe_support import _example
+from tests.test_network_fhir_source_witness_contract import origin_fields
 from tests.test_registry_fhir_catalog_sources import descriptor as catalog_descriptor
-from tests.test_registry_source_recipe_store_postgres import _example
 
 
 def _recipe():
-    catalog = catalog_descriptor()
+    from process.network_fhir_typed_capture import TABLES
+    from process.registry_fhir_catalog_observation import FHIRCatalogObservationDigests
+    from process.registry_fhir_catalog_observed_source import build_fhir_catalog_observation_descriptor
+    from tests.test_registry_fhir_catalog_sources import published_row, read_profile
+
+    observed = FHIRCatalogObservationDigests()
+    observed.add(
+        {
+            "resource_type": "PractitionerRole",
+            "resource_id": "role-one",
+            "payload_hash": "e" * 64,
+            "payload_json": {"resourceType": "PractitionerRole", "id": "role-one"},
+        }
+    )
+    families = observed.document()
+    catalog = build_fhir_catalog_observation_descriptor(
+        read_profile(),
+        published_row(resource_count=1),
+        catalog_descriptor()["tables"],
+        ("https://directory.example.test/fhir/", ["alias-a", "alias-b"]),
+        families,
+    )
+    counts = tuple(sorted((kind, family["rows"]) for kind, family in families.items()))
     origin = origin_fields() | {
         "schema_name": catalog["coordinates"]["dataset_schema"],
         "source_id": catalog["coordinates"]["source_id"],
         "source_aliases": tuple(catalog["source_aliases"]),
-        "header_oid": catalog["header_table_oid"],
-        "resource_parent_oid": catalog["resource_table_oid"],
-        "resource_leaf_oid": catalog["resource_leaf_oids"][0],
-        "database_oid": catalog["database_oid"],
         "source_uri": catalog["source_uri"],
+        "header_relation": catalog["tables"]["header"],
+        "resource_relation": catalog["tables"]["resource"],
         "semantic_projection_as_of": "2026-10-01",
-        "native_catalog_sha256": catalog["native_catalog_sha256"],
-        "proof_sha256": catalog["admission"]["proof_sha256"],
-        "admission_metadata_sha256": catalog["admission"]["metadata_sha256"],
-        "resource_counts": tuple(sorted(catalog["admission"]["resource_counts"].items())),
-        "resource_hashes": tuple((kind, "e" * 64) for kind in sorted(catalog["admission"]["resource_counts"])),
-        "descriptor_counts": tuple(sorted(catalog["admission"]["resource_counts"].items())),
+        "resource_counts": counts,
+        "resource_hashes": tuple(sorted((kind, family["sha256"]) for kind, family in families.items())),
+        "descriptor_counts": counts,
     }
-    identity = database_fields() | {"database_oid": origin["database_oid"]}
     graph = graph_document(
         origin,
-        identity,
         "2026-10-01",
-        {
-            "source_rows": sum(catalog["admission"]["resource_counts"].values()),
-            "projected_rows": 1,
-            "pair_rows": 1,
-            "reference_rows": 1,
-            "provider_only_roles": 0,
-        },
+        {"source_rows": 1, "projected_rows": 1, "pair_rows": 1, "reference_rows": 1, "provider_only_roles": 0},
     )
     anchor = TypedGraphAnchor(str(UUID(int=5)), "2026-10-01T00:00:00.000000+00:00")
+    schema = PREFIX + UUID(anchor.capture_id).hex
     capture_by_field = {
         "component": "registry_fhir_typed_capture",
-        "descriptor_version": 4,
+        "descriptor_version": 5,
         "capture_id": anchor.capture_id,
         "observed_at": anchor.observed_at,
-        "schema_name": PREFIX + UUID(anchor.capture_id).hex,
-        "owner_role": "typed_owner",
-        "runtime_roles": ["typed_reader"],
-        "catalog": {
-            "schema_oid": 100,
-            "relation_oids": {"cells": 101, "addresses": 102, "pairs": 103},
-            "sha256": "a" * 64,
-        },
-        "content": {name: {"rows": 1, "sha256": "b" * 64} for name in ("cells", "addresses", "pairs")},
+        "schema_name": schema,
+        "tables": {kind: {"schema": schema, "name": name} for kind, name in TABLES.items()},
+        "content": {kind: {"rows": 1, "sha256": "b" * 64} for kind in TABLES},
         "graph": graph,
         "catalog_descriptor": catalog,
     }
@@ -134,7 +138,6 @@ def _metadata(recipe):
                 "table_name": "entity_address_unified",
                 "generation_id": "e" * 64,
             },
-            "address_identity": {"schema_oid": 200, "table_oid": 201, "owner_oid": 202, "identity_sha256": "f" * 64},
             "matched_offices": 1,
             "missing_offices": 0,
         }
@@ -255,7 +258,7 @@ def test_typed_metadata_is_defensive_and_rejects_boolean_versions(section):
 
 
 def test_mixed_inventory_commits_each_protocol_without_coercion():
-    from tests.test_registry_source_inventory_preparation import _derivation, _descriptor
+    from tests.registry_source_recipe_support import _derivation, _descriptor
 
     typed, legacy = _recipe(), _example()
     typed_contribution, typed_derivation = _metadata(typed)
@@ -344,13 +347,13 @@ def test_typed_office_summary_binds_the_registered_approval_and_address():
     [
         ("context", "office_policy", "fhir-direct-network-office-v2"),
         ("context", "canonicalizer_version", True),
-        ("address_identity", "schema_oid", True),
-        ("address_identity", "owner_oid", 0),
-        ("address_identity", "table_oid", 2**32),
+        ("address_source", "schema_name", "bad-name"),
+        ("address_source", "table_name", "bad-name"),
+        ("address_source", "generation_id", ""),
         ("summary", "typed_source_count", 0),
     ],
 )
-def test_typed_office_summary_rejects_changed_policy_or_non_native_identity(section, field, value):
+def test_typed_office_summary_rejects_changed_policy_or_invalid_address_names(section, field, value):
     from process.registry_initial_source_composition import SUMMARY_KEY
     from process.registry_source_inventory_reference import verify_source_recipe_metadata
 
@@ -360,10 +363,12 @@ def test_typed_office_summary_rejects_changed_policy_or_non_native_identity(sect
     assert validate_typed_summary(summary, root, offices=True) == summary
     damaged = deepcopy(summary)
     target = damaged if section == "summary" else damaged["context"]
-    if section == "address_identity":
-        target = target["address_identity"]
+    if section == "address_source":
+        target = target["address_source"]
     target[field] = value
-    with pytest.raises(ValueError, match="registry_typed_metadata_invalid"):
+    with pytest.raises(
+        ValueError, match="(registry_typed_metadata_invalid|identifier is invalid|generation is invalid)"
+    ):
         validate_typed_summary(damaged, root, offices=True)
 
 
@@ -386,7 +391,7 @@ def test_typed_membership_period_requires_real_dates_and_preserves_inclusive_bou
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancelled", [False, True])
-async def test_failed_typed_workspace_invalidates_its_capability_and_terminates_after_failed_rollback(cancelled):
+async def test_failed_typed_workspace_closes_named_stage_and_terminates_after_failed_rollback(cancelled):
     import asyncio
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, Mock
@@ -406,15 +411,14 @@ async def test_failed_typed_workspace_invalidates_its_capability_and_terminates_
     failure = asyncio.CancelledError() if cancelled else ValueError("consumer failed")
     with pytest.raises(type(failure)) as raised:
         async with _workspace(connection) as stage:
-            assert stage.connection is connection and stage.task is asyncio.current_task()
-            assert stage.virtual_xid == "1/2" and stage.oids == {
-                "cells": 101,
-                "addresses": 102,
-                "pairs": 103,
-                "checks": 104,
-            }
+            assert stage.schema_name == "pg_temp" and stage.active
+            assert set(stage.names) == {"cells", "addresses", "pairs", "checks"}
+            assert all(name.startswith("fhir_typed_" + kind + "_") for kind, name in stage.names.items())
             raise failure
     assert raised.value is failure and stage.active is False
+    with pytest.raises(ValueError, match="workspace_closed"):
+        stage.require_ready()
+    connection.fetchval.assert_not_awaited()
     transaction.start.assert_awaited_once()
     transaction.rollback.assert_awaited_once()
     transaction.commit.assert_not_awaited()
@@ -465,11 +469,6 @@ def _registered_typed_resume(state="open"):
             OFFICE_KEY: office,
         },
     }
-    if state != "open":
-        candidate_by_field["validation_json"]["writer_closure"] = {
-            "loader_roles": ["writer"],
-            "reader_roles": ["reader"],
-        }
     if state not in {"open", "sealed"}:
         candidate_by_field["validation_json"]["address_source"] = dict(derivation["address_source"])
     return request, copy_target, candidate_by_field, PinnedAddressSource(**derivation["address_source"])
@@ -478,7 +477,7 @@ def _registered_typed_resume(state="open"):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["open", "sealed", "validated", "ready", "published"])
 async def test_registered_typed_resume_preserves_revision_and_office_pin(state):
-    """Unvalidated registration rederives offices; validated registration retains custody inputs."""
+    """Unvalidated registration rederives offices while validated registration retains its named address."""
     from process import registry_composition_resume as resume
     from tests.test_registry_composition_resume import _connection
 
@@ -486,7 +485,7 @@ async def test_registered_typed_resume_preserves_revision_and_office_pin(state):
     fresh_inputs = (address_source, ("current_reader", "current_writer"))
     expected = fresh_inputs
     if state not in {"open", "sealed"}:
-        expected = (address_source, ("reader", "writer"))
+        expected = (address_source, ())
     connection = _connection([candidate])
     assert await resume.resolve_registered_contribution_resume(
         connection, request, 1, 0
@@ -543,7 +542,7 @@ async def test_unvalidated_typed_resume_refuses_changed_request_identity(state, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["open", "sealed"])
-@pytest.mark.parametrize("damage", ["address_identity", "address_source", "inventory", "contribution", "generation"])
+@pytest.mark.parametrize("damage", ["address_source", "inventory", "contribution", "generation"])
 async def test_unvalidated_typed_resume_refuses_changed_registered_commitments(state, damage):
     from process import registry_composition_resume as resume
     from process.registry_initial_source_composition import SUMMARY_KEY as OFFICE_KEY
@@ -552,8 +551,6 @@ async def test_unvalidated_typed_resume_refuses_changed_registered_commitments(s
 
     request, _target, candidate, address_source = _registered_typed_resume(state)
     match damage:
-        case "address_identity":
-            candidate["validation_json"][OFFICE_KEY]["context"]["address_identity"]["table_oid"] += 1
         case "address_source":
             candidate["validation_json"][OFFICE_KEY]["context"]["address_source"]["generation_id"] = "a" * 64
         case "inventory":
@@ -570,8 +567,8 @@ async def test_unvalidated_typed_resume_refuses_changed_registered_commitments(s
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["validated", "ready", "published"])
-@pytest.mark.parametrize("damage", ["address_source", "writer_closure", "address_changed"])
-async def test_validated_typed_resume_requires_retained_custody(state, damage):
+@pytest.mark.parametrize("damage", ["address_source", "address_changed"])
+async def test_validated_typed_resume_requires_named_office_inputs(state, damage):
     from process import registry_composition_resume as resume
     from tests.test_registry_composition_resume import _connection
 
@@ -692,7 +689,7 @@ async def test_valid_canonical_address_collisions_still_refuse(monkeypatch, coll
 
 def _mixed_typed_summaries():
     """Build both accounting formats through the actual inventory validators."""
-    from tests.test_registry_source_inventory_preparation import _derivation, _descriptor
+    from tests.registry_source_recipe_support import _derivation, _descriptor
 
     typed, legacy = _recipe(), _example()
     contribution, derivation = _metadata(typed)
@@ -767,6 +764,7 @@ def _two_typed_office_derivations():
     capture = deepcopy(first.source_pin.capture)
     capture.pop("capture_sha256")
     capture.update(capture_id=anchor.capture_id, schema_name=PREFIX + UUID(anchor.capture_id).hex)
+    capture["tables"] = {kind: {**table, "schema": capture["schema_name"]} for kind, table in capture["tables"].items()}
     capture["capture_sha256"] = digest(capture)
     second = replace(first, source_pin=replace(first.source_pin, capture=capture, anchor=anchor))
     preparation, documents = SourceInventoryPreparation((first, second)), []
@@ -779,10 +777,8 @@ def _two_typed_office_derivations():
     return reference.root, sorted(documents, key=lambda row: row["recipe_sha256"])
 
 
-@pytest.mark.parametrize(
-    "field", ["approved_revision", "approved_generation_sha256", "address_source", "address_identity"]
-)
-def test_typed_office_inventory_requires_one_current_approval_and_native_address_context(field):
+@pytest.mark.parametrize("field", ["approved_revision", "approved_generation_sha256", "address_source"])
+def test_typed_office_inventory_requires_one_current_approval_and_named_address_context(field):
     root, documents = _two_typed_office_derivations()
     assert typed_office_summary(root, documents)["typed_source_count"] == 2
     second = documents[1]
@@ -792,8 +788,6 @@ def test_typed_office_inventory_requires_one_current_approval_and_native_address
         second[field] = "0" * 64
     elif field == "address_source":
         second[field]["generation_id"] = "0" * 64
-    else:
-        second[field]["table_oid"] += 1
     validate_typed_derivation(second)
     with pytest.raises(ValueError, match="registry_typed_metadata_invalid"):
         typed_office_summary(root, documents)
@@ -853,3 +847,116 @@ async def test_absent_optional_references_and_empty_projection_do_not_invent_row
     connection = SimpleNamespace(execute=AsyncMock())
     await _project_page(connection, object(), [])
     connection.execute.assert_not_awaited()
+
+
+def test_retained_address_metadata_projects_to_named_context():
+    recipe = _recipe()
+    contribution, derivation = _metadata(recipe)
+    legacy_derivation_by_field = {
+        **derivation,
+        "address_identity": {"schema_oid": 999, "table_oid": 123, "owner_oid": 321, "identity_sha256": "f" * 64},
+    }
+    assert validate_typed_derivation(legacy_derivation_by_field) == derivation
+    legacy_derivation_by_field["address_identity"] = {"different_database": True}
+    assert validate_typed_derivation(legacy_derivation_by_field) == derivation
+    preparation = SourceInventoryPreparation((recipe,))
+    preparation.add_contribution(contribution)
+    preparation.add_derivation(derivation)
+    reference, _ = preparation.finish()
+    summary = typed_office_summary(reference.root, [derivation])
+    legacy = deepcopy(summary)
+    legacy["context"]["address_identity"] = legacy_derivation_by_field["address_identity"]
+    assert validate_typed_summary(legacy, reference.root, offices=True) == summary
+
+
+@pytest.mark.asyncio
+async def test_typed_office_readiness_retains_approval_and_child_data_checks():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from process.network_address_projection import PinnedAddressSource
+    from process.registry_typed_source_stage import TypedOfficeMatches, verify_typed_stage_offices
+
+    address = PinnedAddressSource("address_source", "offices", "a" * 64)
+    mapping = SimpleNamespace(require_ready=Mock())
+    matches = TypedOfficeMatches("office_matches", "b" * 64, "c" * 64, address, ("reader",), (mapping,))
+    stage = RegistrySourceRecipeStage("memberships", 1, 0, "d" * 64, contribution_revision=4, office_matches=matches)
+    approved = SimpleNamespace(generation_id="c" * 64)
+    await verify_typed_stage_offices(object(), stage, address, ("reader",), approved, "control")
+    mapping.require_ready.assert_called_once_with()
+    with pytest.raises(ValueError, match="office_context"):
+        await verify_typed_stage_offices(
+            object(), stage, replace(address, generation_id="e" * 64), (), approved, "control"
+        )
+    with pytest.raises(ValueError, match="office_context"):
+        await verify_typed_stage_offices(
+            object(), stage, address, (), SimpleNamespace(generation_id="f" * 64), "control"
+        )
+    mapping.require_ready.side_effect = ValueError("source_incomplete")
+    with pytest.raises(ValueError, match="source_incomplete"):
+        await verify_typed_stage_offices(object(), stage, address, (), approved, "control")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", [None, "address", "approval", "recipe"])
+async def test_mixed_typed_union_checks_logical_office_context_before_copy(monkeypatch, damage):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from process import registry_typed_source_stage as typed_stage
+    from process.network_address_projection import PinnedAddressSource
+    from process.registry_source_recipe_composition import _source_stage_recipes
+
+    typed, legacy = _recipe(), _example()
+    address = PinnedAddressSource("address_source", "offices", "a" * 64)
+    approved = SimpleNamespace(generation_id="b" * 64)
+    matches = typed_stage.TypedOfficeMatches("typed_offices", "c" * 64, approved.generation_id, address, (), ())
+    typed_rows = RegistrySourceRecipeStage(
+        "typed_rows", 2, 1, "d" * 64, contribution_revision=4, office_matches=matches
+    )
+    legacy_matches = SimpleNamespace(
+        address_source=address,
+        approved_generation_id=approved.generation_id,
+        recipe_sha256=_source_stage_recipes((legacy,), True)[1],
+    )
+    if damage == "address":
+        legacy_matches.address_source = replace(address, generation_id="e" * 64)
+    elif damage == "approval":
+        legacy_matches.approved_generation_id = "e" * 64
+    elif damage == "recipe":
+        legacy_matches.recipe_sha256 = "e" * 64
+    legacy_rows = RegistrySourceRecipeStage("legacy_rows", 3, 4, "f" * 64, office_matches=legacy_matches)
+    copy = AsyncMock(return_value="mixed_rows")
+    monkeypatch.setattr(typed_stage, "_copy_combined_stage", copy)
+    arguments_by_name = dict(
+        request_id=UUID(int=9), recipes=(legacy, typed), approved=approved, control_schema="control"
+    )
+    if damage:
+        with pytest.raises(ValueError, match="office_context"):
+            await typed_stage.combine_typed_source_stages(object(), typed_rows, legacy_rows, **arguments_by_name)
+        copy.assert_not_awaited()
+    else:
+        combined = await typed_stage.combine_typed_source_stages(object(), typed_rows, legacy_rows, **arguments_by_name)
+        assert combined.table_name == "mixed_rows" and combined.membership_rows == 5 and combined.omitted_rows == 5
+        assert combined.office_matches.child_stages == (typed_rows, legacy_rows)
+        copy.assert_awaited_once()
+
+
+def test_plain_cms_recipe_keeps_named_data_and_exact_logical_scope():
+    from tests.test_registry_publication_worker import _configured_recipe
+
+    recipe = _configured_recipe()
+    assert validate_initial_source_recipes((recipe,)) == (recipe,)
+    assert recipe.source_pin.resource_relation == {
+        "schema": "source_example",
+        "name": "provider_directory_dataset_resource",
+    }
+    changed = replace(
+        recipe,
+        source_pin=replace(recipe.source_pin, source_id="other-source"),
+        binding_coordinates=replace(recipe.binding_coordinates, source_id="other-source"),
+    )
+    with pytest.raises(ValueError, match="registry_initial_source_recipes_invalid"):
+        validate_initial_source_recipes((changed,))
+    with pytest.raises(ValueError):
+        replace(recipe, binding_coordinates=replace(recipe.binding_coordinates, dataset_id="other-dataset"))

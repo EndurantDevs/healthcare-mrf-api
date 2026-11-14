@@ -586,17 +586,7 @@ async def _em_provider_native_heaps(operator, schema, roles, created_schema_oids
     relations = []
     for role in provider_inputs._ROLES:
         table = "held_" + role.split(".")[1] if role.startswith("tiger.") else role
-        physical = await operator.fetchrow(
-            "SELECT c.oid::bigint,pg_relation_filenode(c.oid)::bigint AS filenode FROM pg_class c "
-            "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=$2",
-            schema,
-            table,
-        )
-        relations.append(
-            provider_inputs.EMProviderInputRelation(
-                role, schema, table, "retained-generation-1", physical["oid"], physical["filenode"]
-            )
-        )
+        relations.append(provider_inputs.EMProviderInputRelation(role, schema, table, "retained-generation-1"))
     return provider_inputs.EMProviderInputs(tuple(relations))
 
 

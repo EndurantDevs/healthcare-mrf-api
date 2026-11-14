@@ -2,7 +2,6 @@
 """One-transaction rooted/UHC candidates using native application-owned DDL."""
 
 from contextlib import asynccontextmanager
-from dataclasses import replace
 from uuid import uuid4
 
 from db.migration_provider_dataset_online import _expected_bulk_relationships
@@ -22,63 +21,17 @@ _PROVENANCE = {
     "practitioner": "provider_directory_uhc_flex_practitioner_dataset_resource",
 }
 
-_ORIGINAL_CHECKS_SQL = """
-SELECT c.oid::bigint,c.relname,n.nspname,c.relkind::text,
-       c.relowner=COALESCE($3::oid,(SELECT oid FROM pg_roles WHERE rolname=current_user)) AS is_owned,
-       to_regclass($2)::oid::bigint AS current_parent,
-       ARRAY(SELECT inhparent::bigint FROM pg_inherits WHERE inhrelid=c.oid ORDER BY inhparent) AS parents,
-       ARRAY(SELECT ARRAY[conname::text,pg_get_expr(conbin,conrelid)]
-             FROM pg_constraint WHERE conrelid=c.oid AND contype='c' ORDER BY oid) AS checks
-  FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=$1
-"""
-
 
 async def _validate_original_checks(connection, policy, relations, dataset_id, *, canonical_schema=None):
-    """Apply the original heap's data checks, retaining SQL CHECK null semantics."""
-    from process.provider_directory_generic_source_provision import _completed_legacy_dataset_plan
-
-    history_policy = replace(policy, schema=canonical_schema) if canonical_schema else policy
-    plan = await _completed_legacy_dataset_plan(connection, history_policy)
-    history_owner = None
-    if canonical_schema:
-        history_owner = await connection.fetchval(
-            "SELECT relowner::bigint FROM pg_class WHERE oid=to_regclass($1)",
-            storage_relation(canonical_schema, RESOURCE),
-        )
-        _require(
-            history_owner is not None
-            and await connection.fetchval("SELECT pg_has_role(session_user,$1::oid,'USAGE')", history_owner),
-            "legacy_history_identity_changed",
-        )
+    """Apply canonical native CHECK predicates to the candidate row set."""
+    schema = canonical_schema or policy.schema
     for root, name in relations.items():
-        identity = plan["tables"].get(root)
-        _require(
-            type(identity) is dict
-            and type(identity.get("original_oid")) is int
-            and type(identity.get("parent_oid")) is int,
-            "legacy_history_identity_changed",
+        checks = await connection.fetch(
+            "SELECT pg_get_expr(conbin,conrelid) AS expression FROM pg_constraint "
+            "WHERE conrelid=to_regclass($1) AND contype='c'",
+            storage_relation(schema, root),
         )
-        keys = identity.get("keys", plan.get("keys"))
-        _require(type(keys) is list, "legacy_history_identity_changed")
-        history = await connection.fetchrow(
-            _ORIGINAL_CHECKS_SQL, identity["original_oid"], storage_relation(history_policy.schema, root), history_owner
-        )
-        _require(
-            history is not None
-            and history["oid"] == identity["original_oid"]
-            and history["relname"] == "pd_dataset_history_" + str(identity["original_oid"])
-            and history["nspname"] == history_policy.schema
-            and history["relkind"] == "r"
-            and history["is_owned"] is True
-            and history["current_parent"] == identity["parent_oid"]
-            and history["parents"] == ([identity["parent_oid"]] if keys else []),
-            "legacy_history_identity_changed",
-        )
-        predicates = [
-            f"NOT ({expression})"
-            for check_name, expression in history["checks"]
-            if check_name != "pd_dataset_history_bound"
-        ]
+        predicates = [f"({check['expression']}) IS FALSE" for check in checks]
         if predicates:
             invalid = await connection.fetchval(
                 f"SELECT EXISTS(SELECT FROM {storage_relation(policy.schema, name)} "
@@ -132,13 +85,19 @@ async def _validate_content(connection, schema, relations, dataset_id, kind):
 
 
 async def _validate_relationships(connection, schema, relations, dataset_id, *, canonical_schema=None):
+    from process.provider_directory_rooted_graph_source_runtime import rooted_graph_relation_coordinates
+
     for source, target, source_columns, target_columns, _ in sorted(_expected_bulk_relationships()):
         if source not in relations:
             continue
         source_ref = storage_relation(schema, relations[source])
-        target_ref = storage_relation(
-            schema if target in relations else canonical_schema or schema, relations.get(target, target)
-        )
+        if target in relations:
+            coordinates = (schema, relations[target])
+        else:
+            coordinates = (canonical_schema or schema, target)
+            if canonical_schema is not None:
+                coordinates = rooted_graph_relation_coordinates(canonical_schema, target, target) or coordinates
+        target_ref = storage_relation(*coordinates)
         predicate = " AND ".join(
             f"s.{storage_identifier(left)}=t.{storage_identifier(right)}"
             for left, right in zip(source_columns, target_columns)
@@ -236,9 +195,6 @@ async def _finish_rooted_runtime_candidate(connection, runtime, relations_by_roo
     literal = "'" + dataset_id.replace("'", "''") + "'"
     for name in relations_by_root.values():
         await connection.execute(f"ALTER TABLE {storage_relation(policy.schema, name)} ADD CHECK(dataset_id={literal})")
-    from process.provider_directory_rooted_graph_candidate_indexes import prepare_rooted_parent_indexes
-
-    await prepare_rooted_parent_indexes(connection, runtime.catalog_schema, policy.schema, output_relations_by_root)
     await _capture(connection, policy, list(relations_by_root.values()))
 
 
@@ -284,6 +240,10 @@ async def native_kind_candidate(database, directory, dataset_id, *, kind, finish
     from process.provider_directory_rooted_graph_source_runtime import current_rooted_graph_runtime
 
     runtime = current_rooted_graph_runtime(database)
+    if kind == "rooted" and runtime is None:
+        raise RuntimeError(
+            "Rooted writes require a configured isolated generation prepared through the Source operator"
+        )
     if kind == "rooted" and runtime is not None:
         _require(detached, "rooted_preparation_required")
         async with _rooted_runtime_candidate(database, directory, dataset_id, runtime, finish) as relations:

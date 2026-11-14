@@ -18,12 +18,7 @@ from process import provider_directory_output_snapshot_journal as journal
 from process import provider_directory_output_snapshot_stage as stages
 from process.ext import address_fast
 from process.provider_directory_dataset_rehydrate_pages import projected_pages
-from process.provider_directory_dataset_rehydrate_pin import (
-    _close_reader,
-    _require_reader,
-    _same_database,
-    _SourceReader,
-)
+from process.provider_directory_dataset_rehydrate_pin import _SourceReader
 from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
 from process.provider_directory_output_snapshot_catalog import output_models, require_output
 from process.uhc_flex_practitioner_async_safety import drain_operation
@@ -298,8 +293,8 @@ async def _pinned_inputs(directory, selector, native, batch_size):
             catalog_by_target = await _capture(owner_session, policy)
             incumbent = custody._native_receipt(policy, catalog_by_target[TARGET], TARGET)
             await _require_geo_fence_rights(owner_session, policy.schema)
-            driver = await _require_reader(session, database, policy)
-            await _same_database(publisher.connection, driver)
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            driver = (await (await session.connection()).get_raw_connection()).driver_connection
             await driver.execute(
                 f"LOCK TABLE ONLY {storage_relation(policy.schema, TARGET)} IN ACCESS SHARE MODE NOWAIT"
             )
@@ -334,7 +329,7 @@ async def _pinned_inputs(directory, selector, native, batch_size):
     finally:
         if reader is not None:
             reader.deactivate()
-        await _close_reader(session)
+        await session.close()
 
 
 async def _verify_candidate(directory, capability, stage, expected_digest, copied, changed):

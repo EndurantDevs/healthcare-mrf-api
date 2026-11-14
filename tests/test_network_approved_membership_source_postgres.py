@@ -14,6 +14,7 @@ from process.network_approved_membership_source import (
     ApprovedMembershipSourceError,
     copy_approved_membership_batch,
     pin_approved_membership_source,
+    pin_retained_approved_membership_source,
     read_approved_membership_batch,
     read_approved_membership_commands,
 )
@@ -83,6 +84,118 @@ async def _candidate(fixture, **changes):
             },
         )
     return target
+
+
+async def _published_edition_metadata(fixture, token="e" * 64):
+    connection, schema, source, *_ = fixture
+    target = await _candidate(fixture, source_generations={"custom_membership": token})
+    await connection.execute(
+        f'UPDATE "{schema}".network_membership_candidate '
+        "SET state='published',index_ready=true,validation_json='{}'::jsonb WHERE candidate_id=$1",
+        UUID(target.candidate_id),
+    )
+    await connection.execute(
+        f'INSERT INTO "{schema}".network_serving_manifest '
+        "(candidate_id,schema_revision,source_generations,approved_custom_revision,manifest_sha256) "
+        "VALUES($1,1,$2::jsonb,$3,$4)",
+        UUID(target.candidate_id),
+        json.dumps({"custom_membership": token}),
+        source.approved_revision,
+        "a" * 64,
+    )
+    return target
+
+
+async def test_unpublished_candidate_does_not_establish_an_approved_edition(approved_source):
+    connection, schema, original, *_ = approved_source
+    await _candidate(approved_source, source_generations={"custom_membership": "e" * 64})
+    async with connection.transaction(isolation="repeatable_read"):
+        current = await pin_approved_membership_source(
+            connection, approved_revision=original.approved_revision, control_schema=schema
+        )
+    assert current == original and current.generation_id != "e" * 64
+
+
+async def test_publication_without_approved_membership_does_not_claim_its_edition(approved_source):
+    connection, schema, original, *_ = approved_source
+    target = await _published_edition_metadata(approved_source)
+    for table in ("network_membership_candidate", "network_serving_manifest"):
+        await connection.execute(
+            f"UPDATE \"{schema}\".{table} SET source_generations=source_generations-'custom_membership' "
+            "WHERE candidate_id=$1",
+            UUID(target.candidate_id),
+        )
+    async with connection.transaction(isolation="repeatable_read"):
+        current = await pin_retained_approved_membership_source(
+            connection, approved_revision=original.approved_revision, control_schema=schema
+        )
+    assert current == original
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "state",
+        "candidate_token",
+        "schema_revision",
+        "manifest_revision",
+        "malformed_token",
+        "missing_manifest",
+        "ambiguous",
+    ],
+)
+async def test_approved_edition_refuses_inconsistent_published_metadata(approved_source, damage):
+    connection, schema, approved_edition, *_ = approved_source
+    copy_target = await _published_edition_metadata(approved_source)
+    if damage == "ambiguous":
+        await _published_edition_metadata(approved_source, "f" * 64)
+    elif damage == "missing_manifest":
+        await connection.execute(
+            f'DELETE FROM "{schema}".network_serving_manifest WHERE candidate_id=$1', UUID(copy_target.candidate_id)
+        )
+    elif damage in {"state", "candidate_token"}:
+        assignment = "state='ready'" if damage == "state" else "source_generations='{}'::jsonb"
+        await connection.execute(
+            f'UPDATE "{schema}".network_membership_candidate SET {assignment} WHERE candidate_id=$1',
+            UUID(copy_target.candidate_id),
+        )
+    else:
+        assignment = {
+            "schema_revision": "schema_revision=2",
+            "manifest_revision": "approved_custom_revision=approved_custom_revision+1",
+            "malformed_token": "source_generations='{}'::jsonb",
+        }[damage]
+        await connection.execute(
+            f'UPDATE "{schema}".network_serving_manifest SET {assignment} WHERE candidate_id=$1',
+            UUID(copy_target.candidate_id),
+        )
+    async with connection.transaction(isolation="repeatable_read"):
+        with pytest.raises(ApprovedMembershipSourceError, match="published edition metadata"):
+            await pin_retained_approved_membership_source(
+                connection, approved_revision=approved_edition.approved_revision, control_schema=schema
+            )
+
+
+async def test_approved_edition_survives_recreated_schema_without_metadata_edits(approved_source):
+    connection, schema, source, *_ = approved_source
+    await _published_edition_metadata(approved_source)
+    archive = "approved_relocation_" + uuid4().hex
+    await connection.execute(f'ALTER SCHEMA "{schema}" RENAME TO "{archive}"')
+    try:
+        await connection.execute(f'CREATE SCHEMA "{schema}"')
+        for name in (
+            "registry_approved_record",
+            "registry_revision_control",
+            "network_membership_candidate",
+            "network_serving_manifest",
+        ):
+            await connection.execute(f'ALTER TABLE "{archive}"."{name}" SET SCHEMA "{schema}"')
+        async with connection.transaction(isolation="repeatable_read"):
+            for pin in (pin_approved_membership_source, pin_retained_approved_membership_source):
+                current = await pin(connection, approved_revision=source.approved_revision, control_schema=schema)
+                assert current == replace(source, generation_id="e" * 64)
+    finally:
+        await connection.execute(f'DROP SCHEMA "{archive}" CASCADE')
 
 
 async def test_exact_location_namespace_and_pending_drafts(approved_source):

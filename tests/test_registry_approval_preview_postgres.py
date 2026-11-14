@@ -867,8 +867,7 @@ async def test_cms_preview_counts_all_source_rows_above_both_native_page_limits(
             sort_keys=True,
         ),
     )
-    assert counted.statements <= 51  # Preserve the existing complete native epoch and custody ceiling.
-    assert counted.statements == 49  # Rollback-only setting scopes remove redundant reads and restores.
+    assert counted.statements <= 51  # Preserve the existing bounded native-read ceiling.
     assert len(counted.office_selection_queries) == 1
     selection_sql, *_parameters, limit = counted.office_selection_queries[0]
     assert "LIMIT $3" in selection_sql and limit == 101
@@ -877,17 +876,24 @@ async def test_cms_preview_counts_all_source_rows_above_both_native_page_limits(
 
 
 @pytest.mark.parametrize("retained_cms_preview", [{"mixed": True}], indirect=True)
-async def test_cms_custody_drift_makes_entire_mixed_preview_unavailable(retained_cms_preview):
-    """A lost protected source owner cannot expose partial ACA counts as complete."""
+async def test_cms_metadata_drift_makes_entire_mixed_preview_unavailable(retained_cms_preview):
+    """A changed retained dataset declaration cannot expose partial mixed-source counts."""
     fixture, reviewed = retained_cms_preview
     command = await _pending_cms_command(fixture, reviewed, "close")
-    owner = reviewed[0][2].retained_epoch.owner_role
+    pin = reviewed[0][2]
+    table = f'"{pin.retained_epoch.schema_name}".provider_directory_endpoint_dataset'
     try:
-        await fixture.connection.execute(f'ALTER ROLE "{owner}" LOGIN')
+        await fixture.connection.execute(
+            f"UPDATE {table} SET publication_metadata_sha256=$2 WHERE dataset_id=$1", pin.dataset_id, "0" * 64
+        )
         preview = await _repeatable_preview(fixture, command)
         assert preview["source_selection"] == {"status": "unavailable"}
     finally:
-        await fixture.connection.execute(f'ALTER ROLE "{owner}" NOLOGIN')
+        await fixture.connection.execute(
+            f"UPDATE {table} SET publication_metadata_sha256=$2 WHERE dataset_id=$1",
+            pin.dataset_id,
+            pin.retained_epoch.metadata_sha256,
+        )
     await _assert_staging_removed(fixture.connection)
 
 

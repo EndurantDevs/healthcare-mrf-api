@@ -9,7 +9,6 @@ import pytest
 from sanic import Sanic
 
 from api import control_registry_ptg_scope as routes
-from process import registry_ptg_office_coordinator as coordinator
 from process import registry_ptg_scope_runtime as runtime
 from process.registry_ptg_office_capture import _digest
 from tests.test_registry_ptg_office_coordinator_postgres import (
@@ -124,14 +123,13 @@ async def _close_native_runtime(app, native):
     return failures
 
 
-async def _verify_parent_cleanup_boundary(native, identities_by_role, native_identity, journal, failures):
+async def _verify_parent_cleanup_boundary(native, identities_by_role, journal, failures):
     """Keep OID/LOGIN evidence and refuse role teardown if identity or sessions drift."""
     role_records = await native.custom.connection.fetch(
         "SELECT rolname::text,oid::bigint,rolcanlogin FROM pg_catalog.pg_roles WHERE rolname=ANY($1::text[]) ORDER BY rolname",
         list(identities_by_role),
     )
     observed_by_role = {role_record["rolname"]: dict(role_record) for role_record in role_records}
-    observed_identity = await coordinator._native_identity(native.custom.connection)
     refusals = []
     sessions = await native.custom.connection.fetchval(
         "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE usename=ANY($1::text[])",
@@ -153,15 +151,13 @@ async def _verify_parent_cleanup_boundary(native, identities_by_role, native_ide
             "phase": "closed_before_parent_cleanup",
             "roles": identities_by_role,
             "observed_roles": observed_by_role,
-            "native_identity": native_identity,
-            "observed_identity": observed_identity,
             "sessions": sessions,
             "captures": captures,
             "close_failures": failures,
             "refusals": refusals,
         },
     )
-    assert observed_by_role == identities_by_role and observed_identity == native_identity
+    assert observed_by_role == identities_by_role
     assert sessions == 0 and not failures and not refusals
 
 
@@ -170,11 +166,8 @@ async def installed_office_runtime(coordinator_db, tmp_path, monkeypatch):
     """Real runtime construction/proofs; no native identity/permission seam is mocked."""
     native = coordinator_db
     identities_by_role = await _role_snapshot(native)
-    native_identity = await coordinator._native_identity(native.custom.connection)
     journal = tmp_path / "office-intent-runtime-cleanup-registration.json"
-    _registered(
-        journal, {"phase": "runtime_registered", "roles": identities_by_role, "native_identity": native_identity}
-    )
+    _registered(journal, {"phase": "runtime_registered", "roles": identities_by_role})
     app = Sanic("native_office_intents_" + uuid4().hex)
     app.blueprint(routes.blueprint, url_prefix=_PREFIX)
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-control")
@@ -184,13 +177,11 @@ async def installed_office_runtime(coordinator_db, tmp_path, monkeypatch):
         service = app.ctx.registry_ptg_office_coordinator
         assert service is not native.service and service.queue_pool is not native.service.queue_pool
         assert service.queue_pool.get_max_size() == 1
-        async with service.queue_pool.acquire() as connection:
-            assert await coordinator._native_identity(connection) == native_identity
         yield SimpleNamespace(app=app, service=service, native=native, journal=journal, roles=identities_by_role)
     finally:
         failures = await _close_native_runtime(app, native)
         try:
-            await _verify_parent_cleanup_boundary(native, identities_by_role, native_identity, journal, failures)
+            await _verify_parent_cleanup_boundary(native, identities_by_role, journal, failures)
         finally:
             Sanic.unregister_app(app)
 
@@ -262,43 +253,6 @@ async def test_native_installed_prepare_list_actor_filter_and_original_audit_rep
     assert len(await _queue_rows(installed)) == 2
     _, wrong_method = await installed.app.asgi_client.get(_PREFIX + "/office-intents")
     assert wrong_method.status_code == 405
-
-
-async def test_native_startup_global_custody_refuses_foreign_audit_writer(installed_office_runtime):
-    installed = installed_office_runtime
-    native, schema = installed.native, installed.native.custom.control_schema
-    role = native.fixture.source.roles[2]
-    relation = f'"{schema}".registry_publication_request'
-    assert not await native.custom.connection.fetchval(
-        "SELECT pg_catalog.has_column_privilege($1,$2,'command_json','UPDATE')",
-        role,
-        relation,
-    )
-    _registered(
-        installed.journal.with_name("office-intent-runtime-mutation.json"),
-        {
-            "phase": "foreign_audit_grant_registered",
-            "roles": installed.roles,
-            "role": role,
-            "relation": relation,
-            "revoke": "UPDATE(command_json)",
-        },
-    )
-    await native.custom.connection.execute(f'GRANT UPDATE(command_json) ON {relation} TO "{role}"')
-    try:
-        with pytest.raises(ValueError, match="queue_permissions"):
-            await runtime._check_office_coordinator(installed.service)
-        with pytest.raises(ValueError, match="queue_permissions"):
-            await installed.service.list(_list_request(native.request))
-        assert not await _queue_rows(installed)
-        async with installed.service.queue_pool.acquire() as queue:
-            assert not await queue.fetchval(
-                "SELECT pg_catalog.has_column_privilege(current_user,$1,'command_json','UPDATE')",
-                relation,
-            )
-    finally:
-        await native.custom.connection.execute(f'REVOKE UPDATE(command_json) ON {relation} FROM "{role}"')
-    await runtime._check_office_coordinator(installed.service)
 
 
 async def test_native_list_denies_revoked_source_read_and_current_upstream_authority(installed_office_runtime):

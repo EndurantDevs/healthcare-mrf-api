@@ -13,10 +13,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process import provider_directory_generic_source_storage as source_storage
-from process.plan_release_storage_catalog import CATALOG_SQL
 from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
 from tests.test_provider_directory_generic_source_policy import synthetic_source_database
-from tests.test_provider_directory_generic_source_storage import _case, _catalog_row, _sequence_row
+from tests.test_provider_directory_generic_source_storage import _case
 from tests.test_provider_directory_organization_partition_v4 import (
     _context,
     _proof_rows,
@@ -108,17 +107,7 @@ def _partition_source_catalog(context):
         acquisition_root_run_id=context.acquisition_root_run_id,
         metadata=metadata,
     )
-    catalog_rows = []
-    for table in binding_by_field["tables"].values():
-        catalog_by_field = _catalog_row() | dict(relname=table["name"], oid=table["oid"], relowner=1, nspname="mrf")
-        table.update(source_storage._layout_proof(catalog_by_field))
-        if table["name"].endswith("_ri"):
-            table["layout_sha256"] = source_storage._input_layout_hash(
-                table["layout_sha256"], _sequence_row(owner=1, schema="mrf")
-            )
-        catalog_rows.append(catalog_by_field)
-
-    return header_by_field, catalog_rows
+    return header_by_field
 
 
 @pytest.mark.asyncio
@@ -130,7 +119,7 @@ async def test_v4_partition_proof_loader_retains_candidate_record(monkeypatch) -
     database_executor = SimpleNamespace(all=AsyncMock(return_value=proof_rows))
 
     context = _context()
-    header_by_field, catalog_rows = _partition_source_catalog(context)
+    header_by_field = _partition_source_catalog(context)
 
     async with synthetic_source_database(monkeypatch, database_executor) as database, source_transaction(database):
         monkeypatch.setattr(importer, "db", database)
@@ -143,15 +132,6 @@ async def test_v4_partition_proof_loader_retains_candidate_record(monkeypatch) -
 
         async def fetch(query, *arguments):
             queries.append(query)
-            if query == source_storage._INPUT_SEQUENCES_SQL:
-                return [_sequence_row(owner=1, schema="mrf")]
-            if query == CATALOG_SQL:
-                assert arguments == (
-                    [f'"mrf"."{catalog_by_field["relname"]}"' for catalog_by_field in catalog_rows],
-                    1,
-                    [],
-                )
-                return copy.deepcopy(catalog_rows)
             if query.startswith("SELECT resource_id,payload_json FROM"):
                 assert arguments == (
                     importer._last_updated_partition_fingerprint_resource_type("Organization", 2),

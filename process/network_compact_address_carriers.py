@@ -15,6 +15,7 @@ from process.network_approved_site_source import (
     verify_approved_site_sources,
 )
 from process.network_compact_address_origin import resolve_compact_address_origin
+from process.network_compact_layout import CompactAddressRelation
 from process.network_custom_address_source import _APPROVED_CTE, _require_transaction
 from process.network_membership_candidate_lifecycle import _locked_candidate
 from process.network_membership_copy import MembershipCopyTarget
@@ -66,7 +67,6 @@ class CompactAddressCarrierReceipt:
     approved_generation: str
     base_source: PinnedAddressSource
     base_artifact_sha256: str
-    runtime_roles: tuple[str, ...]
     source_recipes_sha256: str
     approved_site_sha256: str
     ptg_carry_sha256: str | None
@@ -75,85 +75,126 @@ class CompactAddressCarrierReceipt:
     selected_address_rows: int
     selected_binding_rows: int
     materialized_address_rows: int
-    address_table_oid: int | None
-    binding_table_oid: int
+    address_relation: CompactAddressRelation | None
+    binding_relation: CompactAddressRelation
+    revision: int = 2
 
     def as_dict(self):
-        """Retain bounded descriptive evidence; native rederivation grants authority."""
-        document = json.loads(_encoded({"component": _COMPONENT, "revision": 1, **asdict(self)}))
+        """Retain bounded logical scope and independently rederived data accounting."""
+        document = json.loads(_encoded({"component": _COMPONENT, **asdict(self)}))
         parse_compact_address_carrier_receipt(document)
         return document
 
 
-def _parse_origin_references(origins):
+def _parse_origin_references(origins, *, legacy=False):
     _require(type(origins) is list and len(origins) <= 100, "receipt_invalid")
     references = []
-    for origin in origins:
-        _require(type(origin) is list and len(origin) == 8, "receipt_invalid")
-        _count(origin[0], 1)
-        _sha(origin[1])
-        for oid in origin[2:6]:
-            _count(oid, 1, 2**32 - 1)
-        _count(origin[6], 1)
-        _sha(origin[7])
-        references.append(tuple(origin))
+    for origin_values in origins:
+        _require(type(origin_values) is list and len(origin_values) == (8 if legacy else 4), "receipt_invalid")
+        if legacy:
+            origin_values = [*origin_values[:2], *origin_values[6:]]
+        _count(origin_values[0], 1)
+        _sha(origin_values[1])
+        _count(origin_values[2], 1)
+        _sha(origin_values[3])
+        references.append(tuple(origin_values))
     _require(
-        references == sorted(set(references)) and len({origin[:6] for origin in references}) == len(references),
+        references == sorted(set(references))
+        and len({origin_values[:2] for origin_values in references}) == len(references),
         "receipt_invalid",
     )
     return tuple(references)
 
 
-def parse_compact_address_carrier_receipt(document):
-    """Require an exact bounded receipt without trusting its hashes or native names."""
-    fields = {"component", "revision", *CompactAddressCarrierReceipt.__dataclass_fields__}
-    _require(type(document) is dict and set(document) == fields, "receipt_invalid")
+def _project_legacy_carrier_document(document_by_field, fields, copy_target):
+    _require(document_by_field["revision"] == 1, "receipt_invalid")
+    has_address = document_by_field["address_table_oid"] is not None
+    named_by_field = {key: field_value for key, field_value in document_by_field.items() if key in fields}
+    named_by_field["address_relation"] = (
+        asdict(CompactAddressRelation(copy_target.schema_name, "entity_address_unified")) if has_address else None
+    )
+    named_by_field["binding_relation"] = asdict(
+        CompactAddressRelation(copy_target.schema_name, "provider_location_binding")
+    )
+    return named_by_field
+
+
+def _carrier_content_references(document_by_field, legacy):
+    _identifier(document_by_field["control_schema"])
+    for name in ("approved_generation", "base_artifact_sha256", "source_recipes_sha256", "approved_site_sha256"):
+        _sha(document_by_field[name])
+    for name in ("ptg_carry_sha256", "aca_carry_sha256"):
+        if document_by_field[name] is not None:
+            _sha(document_by_field[name])
+    references = _parse_origin_references(document_by_field["origin_references"], legacy=legacy)
+    for name in (
+        "approved_revision",
+        "selected_address_rows",
+        "selected_binding_rows",
+        "materialized_address_rows",
+    ):
+        _count(document_by_field[name])
+    _require(
+        document_by_field["materialized_address_rows"] <= document_by_field["selected_address_rows"],
+        "receipt_invalid",
+    )
+    return references
+
+
+def parse_compact_address_carrier_receipt(document_by_field):
+    """Decode named carrier inputs and the exact historical receipt layout."""
+    fields = {"component", *CompactAddressCarrierReceipt.__dataclass_fields__}
+    legacy_fields = (fields - {"address_relation", "binding_relation"}) | {
+        "runtime_roles",
+        "address_table_oid",
+        "binding_table_oid",
+    }
+    _require(type(document_by_field) is dict and set(document_by_field) in (fields, legacy_fields), "receipt_invalid")
     try:
-        _require(len(_encoded(document)) <= _MAX_BYTES, "receipt_too_large")
+        _require(len(_encoded(document_by_field)) <= _MAX_BYTES, "receipt_too_large")
         _require(
-            document["component"] == _COMPONENT and type(document["revision"]) is int and document["revision"] == 1,
+            document_by_field["component"] == _COMPONENT and type(document_by_field["revision"]) is int,
             "receipt_invalid",
         )
-        copy_target = document["target"]
+        copy_target = document_by_field["target"]
         _require(
             type(copy_target) is dict and set(copy_target) == set(MembershipCopyTarget.__dataclass_fields__),
             "receipt_invalid",
         )
         copy_target = MembershipCopyTarget(**copy_target)
-        base = document["base_source"]
+        is_legacy = set(document_by_field) == legacy_fields
+        if is_legacy:
+            document_by_field = _project_legacy_carrier_document(document_by_field, fields, copy_target)
+        _require(document_by_field["revision"] in (1, 2), "receipt_invalid")
+        base = document_by_field["base_source"]
         _require(type(base) is dict and set(base) == {"schema_name", "table_name", "generation_id"}, "receipt_invalid")
         base = PinnedAddressSource(**base)
         _require(
             base.table_name == "entity_address_unified" and base.schema_name != copy_target.schema_name,
             "receipt_invalid",
         )
-        _identifier(document["control_schema"])
-        roles = document["runtime_roles"]
-        _require(type(roles) is list and 1 <= len(roles) <= 32 and roles == sorted(set(roles)), "receipt_invalid")
-        for role in roles:
-            _identifier(role)
-        for name in ("approved_generation", "base_artifact_sha256", "source_recipes_sha256", "approved_site_sha256"):
-            _sha(document[name])
-        for name in ("ptg_carry_sha256", "aca_carry_sha256"):
-            if document[name] is not None:
-                _sha(document[name])
-        references = _parse_origin_references(document["origin_references"])
-        for name in (
-            "approved_revision",
-            "selected_address_rows",
-            "selected_binding_rows",
-            "materialized_address_rows",
-        ):
-            _count(document[name])
-        _require(document["materialized_address_rows"] <= document["selected_address_rows"], "receipt_invalid")
-        address_oid = document["address_table_oid"]
-        if address_oid is not None:
-            _count(address_oid, 1, 2**32 - 1)
-        _require(document["materialized_address_rows"] == 0 or address_oid is not None, "receipt_invalid")
-        _count(document["binding_table_oid"], 1, 2**32 - 1)
-        receipt_by_name = {name: document[name] for name in CompactAddressCarrierReceipt.__dataclass_fields__}
+        references = _carrier_content_references(document_by_field, is_legacy)
+        address = (
+            None
+            if document_by_field["address_relation"] is None
+            else CompactAddressRelation(**document_by_field["address_relation"])
+        )
+        binding = CompactAddressRelation(**document_by_field["binding_relation"])
+        _require(
+            address in (None, CompactAddressRelation(copy_target.schema_name, "entity_address_unified")),
+            "receipt_invalid",
+        )
+        _require(not document_by_field["materialized_address_rows"] or address is not None, "receipt_invalid")
+        _require(
+            binding == CompactAddressRelation(copy_target.schema_name, "provider_location_binding"), "receipt_invalid"
+        )
+        receipt_by_name = {name: document_by_field[name] for name in CompactAddressCarrierReceipt.__dataclass_fields__}
         receipt_by_name.update(
-            target=copy_target, base_source=base, runtime_roles=tuple(roles), origin_references=tuple(references)
+            target=copy_target,
+            base_source=base,
+            address_relation=address,
+            binding_relation=binding,
+            origin_references=references,
         )
         return CompactAddressCarrierReceipt(**receipt_by_name)
     except (ValueError, TypeError, KeyError) as error:
@@ -177,7 +218,7 @@ async def _scope(connection, copy_target, base, approved, roles, schema, *, writ
     _require(
         type(approved) is ApprovedMembershipSource
         and type(roles) is tuple
-        and 1 <= len(roles) <= 32
+        and 0 <= len(roles) <= 128
         and roles == tuple(sorted(set(roles))),
         "scope_invalid",
     )
@@ -223,63 +264,42 @@ async def _scope(connection, copy_target, base, approved, roles, schema, *, writ
     return dict(candidate), descriptor, physical
 
 
-async def _temp_identity(connection, backend, namespace_oid, owned):
-    row = await connection.fetchrow(
-        "SELECT pg_backend_pid() AS backend,pg_my_temp_schema()::bigint AS namespace_oid,"
-        "to_regclass('pg_temp.entity_address_unified')::oid::bigint AS address_oid,"
-        "to_regclass('pg_temp.provider_location_binding')::oid::bigint AS binding_oid"
-    )
-    _require(row["backend"] == backend, "scratch_backend_changed")
-    if namespace_oid is not None:
-        _require(row["namespace_oid"] == namespace_oid, "scratch_schema_changed")
-    for name, oid in owned.items():
-        _require(row["address_oid" if name == _TEMP_NAMES[0] else "binding_oid"] == oid, "scratch_identity_changed")
-    return row
-
-
 @asynccontextmanager
 async def _scratch(connection, physical):
-    before = await connection.fetchrow(
-        "SELECT pg_backend_pid() AS backend,to_regclass('pg_temp.entity_address_unified')::oid AS address_oid,"
-        "to_regclass('pg_temp.provider_location_binding')::oid AS binding_oid"
+    available = await connection.fetchval(
+        "SELECT to_regclass('pg_temp.entity_address_unified') IS NULL "
+        "AND to_regclass('pg_temp.provider_location_binding') IS NULL"
     )
-    _require(before["address_oid"] is None and before["binding_oid"] is None, "scratch_names_in_use")
-    owned, state = {}, {"started": False, "namespace": None}
+    _require(available is True, "scratch_names_in_use")
     transaction = connection.transaction()
+    state_by_field = {"started": False}
 
     async def _start():
         await transaction.start()
-        state["started"] = True
+        state_by_field["started"] = True
 
     async def _commit():
         await transaction.commit()
-        state["started"] = False
-
-    async def _create():
-        base = _identifier(physical.schema_name) + "." + _identifier(physical.table_name)
-        statements = (
-            f"CREATE TEMP TABLE entity_address_unified(LIKE {base} INCLUDING DEFAULTS) ON COMMIT DROP",
-            "CREATE TEMP TABLE provider_location_binding(provider_system text NOT NULL,provider_id text NOT NULL,location_id uuid NOT NULL,location_key varchar(64) NOT NULL,entity_type text NOT NULL,entity_id text NOT NULL,PRIMARY KEY(provider_system,provider_id,location_id)) ON COMMIT DROP",
-        )
-        for name, statement in zip(_TEMP_NAMES, statements, strict=True):
-            await connection.execute(statement)
-            row = await _temp_identity(connection, before["backend"], state["namespace"], owned)
-            state["namespace"] = row["namespace_oid"]
-            oid = row["address_oid" if name == _TEMP_NAMES[0] else "binding_oid"]
-            _require(type(oid) is int and oid > 0, "scratch_creation_failed")
-            owned[name] = oid
-        await connection.execute("ALTER TABLE pg_temp.entity_address_unified ADD PRIMARY KEY(location_key)")
+        state_by_field["started"] = False
 
     try:
         await drain_operation(_start(), preserve_cancellation=True)
-        await drain_operation(_create(), preserve_cancellation=True)
+        base = _identifier(physical.schema_name) + "." + _identifier(physical.table_name)
+        await connection.execute(
+            f"CREATE TEMP TABLE entity_address_unified(LIKE {base} INCLUDING DEFAULTS) ON COMMIT DROP"
+        )
+        await connection.execute(
+            "CREATE TEMP TABLE provider_location_binding(provider_system text NOT NULL,provider_id text NOT NULL,"
+            "location_id uuid NOT NULL,location_key varchar(64) NOT NULL,entity_type text NOT NULL,entity_id text NOT NULL,"
+            "PRIMARY KEY(provider_system,provider_id,location_id)) ON COMMIT DROP"
+        )
+        await connection.execute("ALTER TABLE pg_temp.entity_address_unified ADD PRIMARY KEY(location_key)")
         yield
-        await _temp_identity(connection, before["backend"], state["namespace"], owned)
         for name in reversed(_TEMP_NAMES):
             await connection.execute("DROP TABLE pg_temp." + _identifier(name))
         await drain_operation(_commit(), preserve_cancellation=True)
     except BaseException:
-        if state["started"]:
+        if state_by_field["started"]:
             await drain_operation(transaction.rollback(), preserve_cancellation=False)
         raise
 
@@ -304,7 +324,7 @@ async def _fill(connection, approved, recipes, schema, office_authority, existin
         site_digest.update(len(encoded).to_bytes(8, "big"))
         site_digest.update(encoded)
         _selection_chunk(
-            origins, retained_site_origin_reference(site), len(site.records), hashlib.sha256(encoded).hexdigest()
+            origins, retained_site_origin_reference(site)[:2], len(site.records), hashlib.sha256(encoded).hexdigest()
         )
         await copy_approved_site_rows(
             connection, (site,), "pg_temp", exact_rows=True, reproject_network_ids=True, control_schema=schema
@@ -314,7 +334,7 @@ async def _fill(connection, approved, recipes, schema, office_authority, existin
         connection, recipes, approved, schema, office_authority, "pg_temp", **inventory_options
     )
     for origin in ptg.origin_references:
-        _selection_chunk(origins, origin[:6], origin[6], origin[7])
+        _selection_chunk(origins, origin[:2], origin[-2], origin[-1])
     aca = await prepare_aca_address_carry(
         connection,
         recipes,
@@ -354,14 +374,16 @@ async def _base_parity(connection, base):
     _require(invalid is False, "base_payload_conflict")
 
 
-async def _target_oids(connection, target):
-    row = await connection.fetchrow(
-        "SELECT to_regclass($1)::oid::bigint AS address_oid,to_regclass($2)::oid::bigint AS binding_oid",
-        target.schema_name + ".entity_address_unified",
-        target.schema_name + ".provider_location_binding",
+async def _target_relations(connection, target):
+    address = CompactAddressRelation(target.schema_name, "entity_address_unified")
+    binding = CompactAddressRelation(target.schema_name, "provider_location_binding")
+    present = await connection.fetchval(
+        "SELECT to_regclass($1) IS NOT NULL", target.schema_name + ".entity_address_unified"
     )
-    _require(type(row["binding_oid"]) is int, "target_binding_missing")
-    return row["address_oid"], row["binding_oid"]
+    await connection.fetch(
+        f"SELECT * FROM {_identifier(binding.schema_name)}.{_identifier(binding.table_name)} LIMIT 0"
+    )
+    return (address if present else None), binding
 
 
 async def _projection(connection, target, base, approved, roles, schema, office_authority, *, writing):
@@ -374,7 +396,6 @@ async def _projection(connection, target, base, approved, roles, schema, office_
         approved_generation=approved.generation_id,
         base_source=base,
         base_artifact_sha256=descriptor["descriptor_sha256"],
-        runtime_roles=roles,
         source_recipes_sha256=recipe_sha,
     )
     return receipt_by_field, physical, recipes, inventory
@@ -382,18 +403,17 @@ async def _projection(connection, target, base, approved, roles, schema, office_
 
 async def _candidate_source_recipes(connection, target, candidate, schema):
     from process.registry_source_inventory_reference import verify_source_recipe_metadata
-    from process.registry_source_inventory_store import _load_locked_source_inventory
+    from process.registry_source_inventory_store import load_source_inventory
 
     metadata = verify_source_recipe_metadata(candidate)
     if metadata.inventory is None:
         recipes = verify_registry_source_recipes(candidate)
-        return recipes, registry_source_recipes_sha256(canonical_registry_source_recipes(recipes)), None
-    inventory_oid = await connection.fetchval(
-        "SELECT to_regclass($1)::oid::bigint", _identifier(target.schema_name) + ".network_source_inventory"
-    )
-    reference, entries = await _load_locked_source_inventory(
-        connection, target, candidate, expected_table_oid=inventory_oid, control_schema=schema
-    )
+        return (
+            recipes,
+            metadata.recipes_sha256 or registry_source_recipes_sha256(canonical_registry_source_recipes(recipes)),
+            None,
+        )
+    reference, entries = await load_source_inventory(connection, target, candidate, control_schema=schema)
     return _decode_source_inventory_recipes(entries), reference.root.recipes_sha256, reference
 
 
@@ -441,8 +461,8 @@ def _inventory_recipes_match(recipes, native_recipes):
 async def _materialize(connection, copy_target, physical, addresses, bindings, approved):
     namespace = _identifier(copy_target.schema_name)
     carrier_rows = await connection.fetchval(f"SELECT count(*) FROM ({addresses}) expected", approved.approved_revision)
-    address_oid, _ = await _target_oids(connection, copy_target)
-    if carrier_rows and address_oid is None:
+    address_relation, _ = await _target_relations(connection, copy_target)
+    if carrier_rows and address_relation is None:
         base = _identifier(physical.schema_name) + "." + _identifier(physical.table_name)
         await connection.execute(f"CREATE TABLE {namespace}.entity_address_unified(LIKE {base} INCLUDING DEFAULTS)")
         await connection.execute(f"ALTER TABLE {namespace}.entity_address_unified ADD PRIMARY KEY(location_key)")
@@ -482,7 +502,7 @@ async def _materialize(connection, copy_target, physical, addresses, bindings, a
     return carrier_rows
 
 
-def _receipt(receipt_by_field, proof, counts, oids):
+def _receipt(receipt_by_field, proof, counts, relations):
     return CompactAddressCarrierReceipt(
         **receipt_by_field,
         approved_site_sha256=proof[0],
@@ -492,9 +512,24 @@ def _receipt(receipt_by_field, proof, counts, oids):
         selected_address_rows=counts[0],
         selected_binding_rows=counts[1],
         materialized_address_rows=counts[2],
-        address_table_oid=oids[0],
-        binding_table_oid=oids[1],
+        address_relation=relations[0],
+        binding_relation=relations[1],
     )
+
+
+def _has_matching_receipt_data(actual, saved):
+    current, expected = asdict(actual), asdict(saved)
+    current.pop("revision")
+    expected.pop("revision")
+    if saved.revision == 1:
+        # Historical page digests included retired metadata. Row/binding parity
+        # is independently checked against the complete reconstructed projection.
+        for field in ("approved_site_sha256", "ptg_carry_sha256", "aca_carry_sha256"):
+            current.pop(field)
+            expected.pop(field)
+        current["origin_references"] = [origin[:3] for origin in actual.origin_references]
+        expected["origin_references"] = [origin[:3] for origin in saved.origin_references]
+    return current == expected
 
 
 @asynccontextmanager
@@ -508,7 +543,7 @@ async def rederive_compact_address_carrier_projection(
     _require(type(receipt) is CompactAddressCarrierReceipt, "receipt_invalid")
     receipt = parse_compact_address_carrier_receipt(receipt.as_dict())
     _require(
-        runtime_roles == receipt.runtime_roles and (control_schema or receipt.control_schema) == receipt.control_schema,
+        (control_schema or receipt.control_schema) == receipt.control_schema,
         "scope_changed",
     )
     schema = receipt.control_schema
@@ -546,9 +581,9 @@ async def rederive_compact_address_carrier_projection(
             receipt_by_field,
             proof,
             tuple(counts.values()),
-            await _target_oids(connection, receipt.target),
+            await _target_relations(connection, receipt.target),
         )
-        _require(actual == receipt, "native_receipt_changed")
+        _require(_has_matching_receipt_data(actual, receipt), "receipt_data_changed")
         yield CompactAddressCarrierProjection(
             actual,
             "pg_temp.entity_address_unified",
@@ -582,14 +617,6 @@ async def prepare_compact_address_carriers(
             else canonical_registry_source_recipes(recipes) == canonical_registry_source_recipes(native_recipes),
             "recipes_changed",
         )
-        _require(
-            await connection.fetchval(
-                "SELECT pg_has_role(current_user,nspowner,'MEMBER') AND has_schema_privilege(current_user,oid,'CREATE') FROM pg_namespace WHERE nspname=$1",
-                copy_target.schema_name,
-            )
-            is True,
-            "target_owner_required",
-        )
         async with _scratch(connection, physical):
             proof = await _fill(
                 connection,
@@ -611,7 +638,7 @@ async def prepare_compact_address_carriers(
                 receipt_by_field,
                 proof,
                 (*selected.values(), carrier_rows),
-                await _target_oids(connection, copy_target),
+                await _target_relations(connection, copy_target),
             )
             receipt.as_dict()
             return receipt

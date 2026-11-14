@@ -42,12 +42,12 @@ def test_physical_identity_serializes_complete_binding_without_mutating_it():
     document = physical_identity(_tables(physical_binding=binding))
     assert json.loads(json.dumps(document)) == document
     assert document["dataset_id"] == str(binding.dataset_id)
-    assert document["relation_oids"] == [list(pair) for pair in binding.relation_oids]
-    assert document["sequence_oids"] == [list(entry) for entry in binding.sequence_oids]
+    assert document["relations"] == [list(pair) for pair in binding.relations]
+    assert document["sequences"] == [list(entry) for entry in binding.sequences]
     assert document["payload_snapshot_key"] == binding.payload_snapshot_key
     assert document["destination_layout_key"] == binding.destination_layout_key
-    document["relation_oids"][0][1] += 1
-    assert binding.relation_oids == _binding().relation_oids
+    document["relations"][0][1] = "changed"
+    assert binding.relations == _binding().relations
 
 
 @pytest.mark.parametrize(
@@ -65,7 +65,7 @@ def test_source_selectors_and_graph_contract_must_match(monkeypatch, changes):
 def test_supplied_descriptor_cannot_substitute_physical_custody(monkeypatch, kind):
     actual, expected = _tables(), _tables()
     if kind == "physical":
-        expected.physical_binding = replace(_binding(), owner_oid=999)
+        expected.physical_binding = replace(_binding(), payload_snapshot_id="another_payload")
     elif kind == "key":
         expected.shared_snapshot_key = 20
     else:
@@ -116,9 +116,9 @@ async def test_checked_attachment_is_reused_within_one_request_only(monkeypatch)
     first = await reader._attached_index(session, tables, request, state)
     assert await reader._attached_index(session, tables, request, state) is first
     resolve.assert_awaited_once_with(
-        session, PARAMS["source_key"], PARAMS["snapshot_id"], "CPT", "99213", tables=tables
+        session, PARAMS["source_key"], PARAMS["snapshot_id"], "CPT", "99213", tables=tables, api_read=True
     )
-    locate.assert_awaited_once_with(session, PARAMS)
+    locate.assert_awaited_once_with(session, PARAMS, api_read=True)
     await reader._attached_index(session, tables, request, serving._LocalDistanceGraphState())
     assert resolve.await_count == locate.await_count == 2
 

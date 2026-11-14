@@ -1,25 +1,22 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Worker wiring and refusal tests; boundary doubles do not confer native custody."""
+"""Configured Source data services pass through the normal named preparation path."""
 
 import asyncio
-import json
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack
 from dataclasses import replace
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, create_autospec
+from unittest.mock import AsyncMock, Mock
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from process import network_candidate_custody as custody
-from process import registry_ptg_office_membership as offices
+from process import network_membership_publication as publication
 from process import registry_publication_worker as worker
 from process.network_address_projection import PinnedAddressSource
 from process.registry_composition_addresses import RegistryCompositionAddressSources
+from process.registry_fhir_catalog_sources import FHIRCatalogSourceReadProfile
 from process.registry_source_recipe_composition import SourceWitnessRuntime
-from tests.test_network_fhir_source_witness_custody import _profile
-from tests.test_registry_candidate_custody_runtime import WORKERS, _configured, _runtime_custody_case
-from tests.test_registry_publication_worker import configuration
+from tests.test_named_network_preparation import TARGET
+from tests.test_registry_publication_address_preparation import _named_settings, _PreparationPool
+from tests.test_registry_publication_worker import _runtime_configuration, ptg_configuration
 
 _ACTORS = (
     "protected_control_owner",
@@ -36,7 +33,7 @@ _ACTORS = (
 def _runtime(roles=_ACTORS):
     return SourceWitnessRuntime(
         Mock(side_effect=AssertionError("Source must not open in a worker wiring test")),
-        (_profile(),),
+        (FHIRCatalogSourceReadProfile("source_payload", "source_catalog"),),
         "capture_owner",
         tuple(sorted(roles)),
     )
@@ -50,288 +47,61 @@ def _sources(runtime):
     )
 
 
-def _config(runtime, *, session=False):
-    document, _ = _configured(configuration)
-    if session:
-        document["ptg"] = {
-            "owner_role": "protected_control_owner",
-            "approval_role": "office_approver",
-            "read_limits": {"maximum_bytes": 1048576, "maximum_pages": 10, "maximum_coordinates": 100},
-        }
-    return replace(
-        worker.parse_registry_publication_worker_config(json.dumps(document)), initial_address_sources=_sources(runtime)
-    )
-
-
-_PHYSICAL_OWNER = "registry_snapshot_owner"
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize("omitted", tuple(role for role in _ACTORS if role != _PHYSICAL_OWNER))
-async def test_incomplete_source_actor_census_refuses_before_custodian_pool(monkeypatch, omitted):
-    runtime = _runtime(tuple(role for role in _ACTORS if role != omitted))
-    config = _config(runtime)
-    case, create, finalizer, verifier, _ = _runtime_custody_case(monkeypatch, config, "complete", False)
+async def test_preparation_forwards_configured_source_runtime_before_data_refusal(monkeypatch):
+    runtime = _runtime(("source_reader",))
+    sources = _sources(runtime)
+    config = replace(_named_settings(), initial_address_sources=sources)
+    pool = _PreparationPool()
+    monkeypatch.setattr(worker.asyncpg, "create_pool", AsyncMock(return_value=pool))
+    validate = AsyncMock(side_effect=ValueError("unit_source_data_refused"))
+    monkeypatch.setattr(publication, "validate_named_network_preparation", validate)
     async with AsyncExitStack() as stack:
-        with pytest.raises(ValueError, match="registry_source_witness_runtime_census_differs"):
-            await worker._custody_runtime(config, stack, config.consumer, case.execution)
-        assert not stack._exit_callbacks
-    assert case.execution.identity_reads == 1 and case.events == []
-    create.assert_not_awaited()
-    finalizer.assert_not_awaited()
-    verifier.assert_not_awaited()
+        consumer = await worker._configured_worker_runtime(config, stack)
+        with pytest.raises(ValueError, match="unit_source_data_refused"):
+            await consumer.seal_candidate(TARGET)
+        assert validate.await_args.args == (pool.connection, TARGET)
+        assert validate.await_args.kwargs["source_witness_runtime"] is runtime
+        assert sources.source_witness_runtime is runtime
+        assert not pool.active
+    assert pool.closed
     runtime.source_export.assert_not_called()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("proven", [False, True])
-async def test_physical_owner_outside_census_requires_database_proof_before_pool(monkeypatch, proven):
-    from process import registry_source_recipe_composition as composition
-
-    runtime = _runtime(tuple(role for role in _ACTORS if role != _PHYSICAL_OWNER))
-    config = _config(runtime)
-    refusal = composition.RegistrySourceCompositionError("registry_source_witness_runtime_census_differs")
-    proof = AsyncMock(return_value=None) if proven else AsyncMock(side_effect=refusal)
-    monkeypatch.setattr(composition, "require_source_witness_census_outsiders", proof)
-    configured = worker._configured_source_witness_runtime(
-        config, config.consumer, {"custody_owner_role": "protected_control_owner"}
-    )
-    assert configured.census_outsiders == (_PHYSICAL_OWNER,) and configured.runtime_roles == runtime.runtime_roles
-    case, create, finalizer, verifier, _ = _runtime_custody_case(monkeypatch, config, "complete", False)
-    async with AsyncExitStack() as stack:
-        if proven:
-            await worker._custody_runtime(config, stack, config.consumer, case.execution)
-        else:
-            with pytest.raises(ValueError, match="registry_source_witness_runtime_census_differs"):
-                await worker._custody_runtime(config, stack, config.consumer, case.execution)
-            assert not stack._exit_callbacks
-    proof.assert_awaited_once()
-    proven_connection, proven_runtime, proven_outsiders = proof.await_args.args
-    assert proven_connection is case.execution and proven_outsiders == (_PHYSICAL_OWNER,)
-    assert proven_runtime.census_outsiders == (_PHYSICAL_OWNER,)
-    assert proven_runtime.source_export is runtime.source_export
-    if not proven:
-        create.assert_not_awaited()
-        finalizer.assert_not_awaited()
-        verifier.assert_not_awaited()
-    runtime.source_export.assert_not_called()
-
-
-def test_only_physical_owners_may_be_absent_from_the_capture_census():
-    identity_by_name = {"custody_owner_role": "protected_control_owner"}
-    runtime = _runtime(tuple(role for role in _ACTORS if role not in (_PHYSICAL_OWNER, "worker_lifecycle")))
-    config = _config(runtime)
-    with pytest.raises(ValueError, match="registry_source_witness_runtime_census_differs"):
-        worker._configured_source_witness_runtime(config, config.consumer, identity_by_name)
-    complete = _runtime()
-    assert worker._configured_source_witness_runtime(_config(complete), config.consumer, identity_by_name) is complete
-    assert complete.census_outsiders == ()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("omitted", ("registry_queue_owner", "effective_queue", "registry_reader", "effective_reader"))
-async def test_original_and_effective_queue_and_reader_census_precedes_pool(monkeypatch, omitted):
-    roles = set(_ACTORS) | {"effective_queue", "effective_reader"}
-    runtime = _runtime(roles - {omitted})
-    config = _config(runtime)
-    effective = replace(config.consumer, queue_owner_role="effective_queue", reader_roles=("effective_reader",))
-    case, create, finalizer, verifier, _ = _runtime_custody_case(monkeypatch, config, "complete", False)
-    async with AsyncExitStack() as stack:
-        with pytest.raises(ValueError, match="registry_source_witness_runtime_census_differs"):
-            await worker._custody_runtime(config, stack, effective, case.execution)
-    create.assert_not_awaited()
-    finalizer.assert_not_awaited()
-    verifier.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_metadata_owner_that_is_a_reader_cannot_escape_source_census(monkeypatch):
-    runtime = _runtime(set(_ACTORS) - {"registry_reader"})
-    config = _config(runtime)
-    case, create, finalizer, verifier, _ = _runtime_custody_case(monkeypatch, config, "complete", False)
-    case.identity_by_name.update(schema_owner_role="registry_reader", schema_owner_oid=400, candidate_owner_oid=400)
-    async with AsyncExitStack() as stack:
-        with pytest.raises(ValueError, match="registry_source_witness_runtime_census_differs"):
-            await worker._custody_runtime(config, stack, config.consumer, case.execution)
-    create.assert_not_awaited()
-    finalizer.assert_not_awaited()
-    verifier.assert_not_awaited()
-
-
-def test_worker_refuses_a_duck_runtime_before_reading_its_actors():
-    config = _config(_runtime())
-    invalid = SimpleNamespace(
-        **(vars(config) | {"initial_address_sources": SimpleNamespace(source_witness_runtime=object())})
-    )
-    with pytest.raises(ValueError, match="registry_source_witness_runtime_invalid"):
-        worker._configured_source_witness_runtime(invalid, config.consumer, {})
-
-
-def test_worker_refuses_an_unsupported_consumer_with_otherwise_valid_actors():
-    runtime = _runtime()
-    config = _config(runtime)
-    unsupported = SimpleNamespace(**vars(config.consumer))
-    with pytest.raises(ValueError, match="registry_source_witness_worker_unsupported"):
-        worker._configured_source_witness_runtime(
-            config, unsupported, {"custody_owner_role": "protected_control_owner"}
-        )
-    runtime.source_export.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_preparation_forwards_only_the_configured_source_runtime_before_input_refusal(monkeypatch):
-    from process import registry_candidate_composition as preparation
-    from tests.test_registry_publication_address_preparation import _PreparationConnection
-
-    runtime = _runtime()
-    config = _config(runtime)
-    connection = _PreparationConnection()
-    identity_by_name = {"schema_owner_role": "protected_control_owner", "custody_owner_role": "protected_control_owner"}
-    registered = _sources(None)
-
-    @asynccontextmanager
-    async def acquire():
-        yield connection
-
-    verify_inputs = AsyncMock(side_effect=ValueError("unit_native_input_refused"))
-    materialize = AsyncMock(side_effect=AssertionError("refused inputs must not materialize"))
-    monkeypatch.setattr(worker, "_custody_identity", AsyncMock(return_value=identity_by_name))
-    monkeypatch.setattr(custody, "_q_reach_closed", AsyncMock())
-    monkeypatch.setattr(worker, "_registered_address_sources", AsyncMock(return_value=registered))
-    monkeypatch.setattr(worker, "_require_execution_address_reads", verify_inputs)
-    monkeypatch.setattr(preparation, "prepare_registry_composition_address_artifact", materialize)
-    callback = worker._address_preparer(
-        config, config.consumer, SimpleNamespace(acquire=acquire), identity_by_name, config.custody_url.username
-    )
-    with pytest.raises(ValueError, match="unit_native_input_refused"):
-        await callback(
-            request_id="00000000-0000-0000-0000-000000000001",
-            approved_revision=1,
-            source_manifest=None,
-            expected_head=0,
-            address_sources=registered,
-        )
-    assert verify_inputs.await_args.args[1].source_witness_runtime is runtime
-    assert registered.source_witness_runtime is None
-    assert not connection.active and not connection.committed
-    materialize.assert_not_awaited()
-    runtime.source_export.assert_not_called()
-
-
-@pytest.mark.parametrize("parser,factory", WORKERS[1:])
-def test_source_consumer_uses_its_actual_owner_and_notification_actors(parser, factory):
-    parsed = parser(json.dumps(_configured(factory)[0]))
-    roles = {
-        parsed.consumer.execution_role,
-        parsed.consumer.owner_role,
-        parsed.custody_url.username,
-        "protected_control_owner",
-    }
-    if parsed.ptg is None:
-        roles.update((parsed.notification_store.publisher_role, *parsed.notification_store.reader_roles))
-    else:
-        roles.update((parsed.reader_role, parsed.ptg.store.approval_role))
-    runtime = _runtime(roles)
-    config = SimpleNamespace(**vars(parsed), initial_address_sources=_sources(runtime))
-    identity_by_name = {"custody_owner_role": "protected_control_owner"}
-    assert worker._configured_source_witness_runtime(config, parsed.consumer, identity_by_name) is runtime
-    for actor in sorted(roles):
-        config.initial_address_sources = _sources(_runtime(roles - {actor}))
-        with pytest.raises(ValueError, match="registry_source_witness_runtime_census_differs"):
-            worker._configured_source_witness_runtime(config, parsed.consumer, identity_by_name)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("session", (False, True))
-async def test_worker_forwards_source_capability_to_both_independent_sealers(monkeypatch, session):
-    runtime = _runtime(set(_ACTORS) | ({"office_approver"} if session else set()))
-    config = _config(runtime, session=session)
-    case, create, finalizer, verifier, _ = _runtime_custody_case(monkeypatch, config, "complete", False)
-    case.pre_enrolled_only = True
-    original_finalize = finalizer.side_effect
-
-    async def finalize(*arguments, source_witness_runtime, **options):
-        assert source_witness_runtime is runtime
-        return await original_finalize(*arguments, **options)
-
-    finalizer.side_effect = finalize
-    async with AsyncExitStack() as stack:
-        async with case.execution_pool.acquire(timeout=config.sql_limits.connect_timeout_seconds) as connection:
-            consumer = await worker._custody_runtime(config, stack, config.consumer, connection)
-            await consumer.seal_candidate(case.copy_target, pre_enrolled_only=True)
-    assert create.await_count == int(not session)
-    assert finalizer.await_count == verifier.await_count == 1
-    assert case.custody_pool.closes == 1 and not case.custody_pool.active
-    assert case.events.index("q reach") < case.events.index("custody created")
-    runtime.source_export.assert_not_called()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", (None, ValueError("source replay refused"), asyncio.CancelledError()))
-@pytest.mark.parametrize("pre_enrolled_only", (None, False, True))
-async def test_session_sealer_keeps_source_replay_inside_existing_company_fence(
-    monkeypatch, failure, pre_enrolled_only
+@pytest.mark.parametrize("with_snapshot", [False, True])
+@pytest.mark.parametrize("failure", [None, ValueError("Source data refused"), asyncio.CancelledError()])
+async def test_named_preparation_keeps_source_and_approval_services_through_every_exit(
+    monkeypatch, with_snapshot, failure
 ):
-    runtime, authority, events = _runtime(), object(), []
-
-    @asynccontextmanager
-    async def transaction():
-        events.append("begin")
-        try:
-            yield
-        except BaseException:
-            events.append("rollback")
-            raise
-        else:
-            events.append("commit")
-
-    driver = SimpleNamespace(transaction=transaction)
-    raw = SimpleNamespace(get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=driver)))
-    require_authority = AsyncMock(return_value=authority)
-    seal = create_autospec(custody._seal_in_transaction, return_value={"seal_sha256": "a" * 64}, side_effect=failure)
-    monkeypatch.setattr(offices, "require_ptg_office_authority", require_authority)
-    monkeypatch.setattr(custody, "_seal_in_transaction", seal)
-    async with AsyncSession() as session, session.begin():
-        monkeypatch.setattr(session, "connection", AsyncMock(return_value=raw))
-        options_by_name = dict(
-            control_schema="registry",
-            runtime_roles=("reader",),
-            authorize=AsyncMock(),
-            office_store=object(),
-            office_read_budget=object(),
-            source_witness_runtime=runtime,
-        )
-        if pre_enrolled_only is not None:
-            options_by_name["pre_enrolled_only"] = pre_enrolled_only
+    runtime = _runtime()
+    settings = _runtime_configuration(ptg_configuration()) if with_snapshot else _named_settings()
+    config = replace(settings, initial_address_sources=_sources(runtime))
+    pool = _PreparationPool()
+    monkeypatch.setattr(worker.asyncpg, "create_pool", AsyncMock(return_value=pool))
+    marker = object()
+    validate = AsyncMock(return_value=marker, side_effect=failure)
+    monkeypatch.setattr(publication, "validate_named_network_preparation", validate)
+    async with AsyncExitStack() as stack:
+        consumer = await worker._configured_worker_runtime(config, stack)
         if failure is None:
-            assert (
-                await custody.seal_network_candidate_custody_in_session(session, object(), **options_by_name)
-                == seal.return_value
-            )
+            assert await consumer.seal_candidate(TARGET) is marker
         else:
-            with pytest.raises(type(failure)):
-                await custody.seal_network_candidate_custody_in_session(session, object(), **options_by_name)
-    assert seal.await_args.kwargs["source_witness_runtime"] is runtime
-    assert seal.await_args.kwargs["office_authority"] is authority
-    assert seal.await_args.kwargs["pre_enrolled_only"] is (pre_enrolled_only or False)
-    assert require_authority.await_count == (2 if failure is None else 1)
-    assert events == ["begin", "commit" if failure is None else "rollback"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("options_by_name", ({"office_authority": object()}, {"pre_enrolled_only": "true"}))
-async def test_session_sealer_refuses_caller_authority_and_nonboolean_enrollment(monkeypatch, options_by_name):
-    require_authority = AsyncMock(side_effect=AssertionError("invalid seal options must refuse before native reads"))
-    monkeypatch.setattr(offices, "require_ptg_office_authority", require_authority)
-    with pytest.raises(custody.NetworkCandidateCustodyError):
-        await custody.seal_network_candidate_custody_in_session(
-            object(),
-            object(),
-            control_schema="registry",
-            runtime_roles=("reader",),
-            authorize=AsyncMock(),
-            office_store=object(),
-            office_read_budget=object(),
-            **options_by_name,
+            with pytest.raises(type(failure)) as observed:
+                await consumer.seal_candidate(TARGET)
+            assert observed.value is failure
+        assert consumer.prepare_address_sources is None
+        validate.assert_awaited_once_with(
+            pool.connection,
+            TARGET,
+            control_schema=consumer.control_schema,
+            roles=consumer.preparation_roles,
+            source_witness_runtime=runtime,
+            validation_snapshot=consumer.composition_runtime.validation_snapshot if with_snapshot else None,
         )
-    require_authority.assert_not_awaited()
+        if with_snapshot:
+            assert consumer.composition_runtime.store.control_schema == consumer.control_schema
+            assert consumer.composition_runtime.sessions.kw["bind"].pool.checkedout() == 0
+        assert not pool.active and not pool.closed
+    assert pool.closed and pool.timeouts == [config.sql_limits.connect_timeout_seconds]
+    runtime.source_export.assert_not_called()

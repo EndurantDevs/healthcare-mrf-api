@@ -3,11 +3,12 @@
 
 import errno
 import hashlib
+import importlib
+import json
 import os
 import re
 from contextlib import nullcontext
 from copy import deepcopy
-from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -31,33 +32,22 @@ def _candidate_storage_evidence():
     """Build a private, unpublished candidate and two issued storage seals."""
     _, _, header = _case()
     old_storage_by_field = {
-        **asdict(
-            binding.FHIRSourceStorageBinding(
-                "catalog_schema",
-                "source_schema",
-                10,
-                20,
-                30,
-                100,
-                101,
-                "d" * 64,
-            )
-        ),
+        "catalog_schema": "catalog_schema",
+        "storage_schema": "source_schema",
         "producer": ["a" * 40, "sha256:" + "b" * 64],
     }
-    new_storage_by_field = {
-        **old_storage_by_field,
-        "enrollment_sha256": "e" * 64,
-        "producer": ["c" * 40, "sha256:" + "f" * 64],
-    }
+    new_storage_by_field = {**old_storage_by_field, "producer": ["c" * 40, "sha256:" + "f" * 64]}
     document = header["candidate_storage_json"]
-    document.update(contract=storage.ISOLATED_CONTRACT, storage=old_storage_by_field, admission=None)
+    document.update(contract=storage.ISOLATED_CONTRACT, storage=deepcopy(old_storage_by_field), admission=None)
     document["identity"].update(
         dataset_id=DATASET,
         endpoint_id=ENDPOINT,
         acquisition_root_run_id=ROOT,
     )
-    document["identity"]["metadata"].update(expected_resources=["Organization"])
+    directory = importlib.import_module("process.provider_directory_fhir")
+    document["identity"]["metadata"].update(
+        expected_resources=["Organization"], resource_hash_contract=directory.LEGACY_RESOURCE_HASH_CONTRACT
+    )
     header.update(
         dataset_id=DATASET,
         endpoint_id=ENDPOINT,
@@ -108,10 +98,35 @@ def _completed_input_evidence():
 
 
 def _update_test_transition_header(header, args):
-    if storage._json(args[2]) != header["candidate_storage_json"] or args[4] != header["status"]:
+    if json.loads(args[2]) != header["candidate_storage_json"] or args[4] != header["status"]:
         return "UPDATE 0"
-    header.update(candidate_storage_json=storage._json(args[1]), status=args[3])
+    header.update(candidate_storage_json=json.loads(args[1]), status=args[3])
     return "UPDATE 1"
+
+
+def _retained_resource_cursor(input_rows):
+    """Read canonical retained resources through the bounded production cursor seam."""
+
+    async def cursor(sql, *args, prefetch):
+        directory = importlib.import_module("process.provider_directory_fhir")
+        assert prefetch == 4096
+        if "raw_payload_json" in sql:
+            return
+        for group in input_rows:
+            for index in range(group["active"]):
+                payload = {"resourceType": group["resource_type"], "id": str(index)}
+                yield dict(
+                    dataset_id=group["dataset_id"],
+                    resource_type=group["resource_type"],
+                    resource_id=str(index),
+                    payload_json=payload,
+                    acquired_resource_sha256=None,
+                    payload_hash=directory.resource_payload_sha256_for_contract(
+                        payload, directory.LEGACY_RESOURCE_HASH_CONTRACT, resource_type=group["resource_type"]
+                    ),
+                )
+
+    return cursor
 
 
 @pytest.fixture
@@ -122,11 +137,7 @@ def case(monkeypatch):
     run_rows, checkpoint_rows, input_rows = _completed_input_evidence()
     bulk_checkpoints, bulk_outputs = [], []
     writes = []
-
-    async def fetchrow(sql, *args):
-        if sql.startswith("SELECT session_user"):
-            return dict(session="administrator", current="administrator", administrator=True)
-        return deepcopy(header)
+    allowed_tables = {table["name"] for table in header["candidate_storage_json"]["tables"].values()}
 
     async def fetch(sql, *args):
         placeholders = {int(value) for value in re.findall(r"\$(\d+)", sql)}
@@ -142,19 +153,25 @@ def case(monkeypatch):
         return deepcopy(input_rows)
 
     async def execute(sql, *args):
+        if sql.startswith("SELECT 1 FROM "):
+            storage._require(
+                any(sql.endswith('."' + name + '" LIMIT 0') for name in allowed_tables), "table_binding_changed"
+            )
+            return "SELECT 0"
         writes.append((sql, args))
         return _update_test_transition_header(header, args)
 
     connection = SimpleNamespace(
         is_in_transaction=lambda: True,
-        fetchrow=AsyncMock(side_effect=fetchrow),
+        fetchrow=AsyncMock(side_effect=lambda sql, *args: deepcopy(header)),
         fetchval=AsyncMock(
             side_effect=lambda sql, *args: "serializable" if sql == "SHOW transaction_isolation" else True
         ),
         fetch=AsyncMock(side_effect=fetch),
         execute=AsyncMock(side_effect=execute),
+        cursor=_retained_resource_cursor(input_rows),
     )
-    native, tables = AsyncMock(), AsyncMock()
+    native, tables = AsyncMock(), AsyncMock(wraps=storage._verify_tables)
     monkeypatch.setattr(binding, "verify_isolated_source_storage_coordinates", native)
     monkeypatch.setattr(storage, "_verify_tables", tables)
     return SimpleNamespace(
@@ -171,10 +188,11 @@ def case(monkeypatch):
         writes=writes,
         native=native,
         tables=tables,
+        allowed_tables=allowed_tables,
     )
 
 
-async def _transition(case, expected_counts=None, *, stopped_run_id=FAILED):
+async def _transition(case, expected_counts=None, *, stopped_run_id=FAILED, manifest_replay=False):
     return await storage.transition_isolated_loading_candidate_storage(
         case.connection,
         policy=case.policy,
@@ -187,6 +205,7 @@ async def _transition(case, expected_counts=None, *, stopped_run_id=FAILED):
         old_storage=case.old,
         new_storage=case.new,
         expected_resource_counts={"Organization": 3} if expected_counts is None else expected_counts,
+        manifest_replay=manifest_replay,
     )
 
 
@@ -204,7 +223,10 @@ async def test_completed_empty_collection_retains_isolated_candidate(case):
     _include_completed_empty_collection(case)
     result = await _transition(case, {"Organization": 3, "InsurancePlan": 0})
     assert result["rows"] == 3 and result["already_applied"] is False
-    assert case.header["candidate_storage_json"]["storage"] == case.new
+    assert case.header["candidate_storage_json"]["storage"] == {
+        "catalog_schema": "catalog_schema",
+        "storage_schema": "source_schema",
+    }
 
 
 @pytest.mark.asyncio
@@ -233,13 +255,16 @@ async def test_exact_detached_candidate_changes_only_its_storage_binding(case):
     result = await _transition(case)
     assert result["rows"] == 3 and result["already_applied"] is False
     assert result["lineage_run_ids"] == sorted([ROOT, FAILED])
-    assert case.header["candidate_storage_json"] == {**before, "storage": case.new}
+    assert case.header["candidate_storage_json"] == {
+        **binding.named_source_document(before),
+        "contract": storage.NAMED_ISOLATED_CONTRACT,
+    }
     assert len(case.writes) == 1
     assert "candidate_storage_json=$2::jsonb" in case.writes[0][0]
-    case.native.assert_awaited_once()
+    case.native.assert_not_awaited()
     case.tables.assert_awaited_once()
     assert (await _transition(case))["already_applied"] is True
-    assert len(case.writes) == 1
+    assert len(case.writes) == 2
 
 
 @pytest.fixture
@@ -274,6 +299,14 @@ async def test_vsp_capture_retry_proves_empty_storage_under_the_current_producer
     case, monkeypatch, vsp_retry_candidate, retained, error
 ):
     directory, candidate = vsp_retry_candidate
+    document = case.header["candidate_storage_json"]
+    document.update(
+        contract=storage.NAMED_ISOLATED_CONTRACT,
+        storage={"catalog_schema": "catalog_schema", "storage_schema": "source_schema"},
+    )
+    document["tables"] = {
+        kind: {"schema": "source_schema", "name": table["name"]} for kind, table in document["tables"].items()
+    }
     case.header["status"] = "failed"
     if retained != "input":
         case.input_rows.clear()
@@ -282,7 +315,12 @@ async def test_vsp_capture_retry_proves_empty_storage_under_the_current_producer
         case.connection.fetchval.side_effect = None
     monkeypatch.setattr(storage, "_require_candidate_storage", lambda *_args: True)
     monkeypatch.setattr(
-        storage, "storage_document", lambda _publisher: case.new if retained == "producer" else case.old
+        storage,
+        "storage_document",
+        lambda _publisher: {
+            "catalog_schema": "changed_schema" if retained == "producer" else "catalog_schema",
+            "storage_schema": "source_schema",
+        },
     )
     if error:
         with pytest.raises(GenericCandidateError, match=f"^provider_directory_generic_source_{error}$"):
@@ -299,6 +337,9 @@ async def test_vsp_capture_retry_rejects_acquiring_legacy_storage(case, monkeypa
     case.header["status"] = "acquiring"
     binding_document = case.header["candidate_storage_json"]
     binding_document["contract"] = storage.CONTRACT
+    binding_document["tables"] = {
+        kind: {"schema": "source_schema", "name": table["name"]} for kind, table in binding_document["tables"].items()
+    }
     del binding_document["storage"], binding_document["admission"]
     case.input_rows.clear()
     monkeypatch.setattr(storage, "_require_candidate_storage", lambda *_args: None)
@@ -357,9 +398,14 @@ async def test_vsp_pre_capture_failure_transitions_only_an_empty_original_candid
     receipt = await _transition(case, expected_counts, stopped_run_id=ROOT)
     assert receipt["rows"] == 0 and receipt["lineage_run_ids"] == [ROOT]
     assert case.header["status"] == "acquiring"
-    assert case.header["candidate_storage_json"] == {**candidate, "storage": case.new}
-    assert (await _transition(case, expected_counts, stopped_run_id=ROOT))["already_applied"] is True
-    assert len(case.writes) == 1
+    assert case.header["candidate_storage_json"] == {
+        **binding.named_source_document(candidate),
+        "contract": storage.NAMED_ISOLATED_CONTRACT,
+    }
+    assert (await _transition(case, expected_counts, stopped_run_id=ROOT, manifest_replay=True))[
+        "already_applied"
+    ] is True
+    assert len(case.writes) == 2
 
 
 @pytest.mark.asyncio
@@ -397,7 +443,10 @@ async def test_vsp_search_failure_transitions_without_discarding_retained_captur
     receipt = await _transition(case, counts, stopped_run_id=ROOT)
     assert receipt["rows"] == 0 and receipt["lineage_run_ids"] == [ROOT]
     assert case.header["status"] == "failed"
-    assert case.header["candidate_storage_json"]["storage"] == case.new
+    assert case.header["candidate_storage_json"]["storage"] == {
+        "catalog_schema": "catalog_schema",
+        "storage_schema": "source_schema",
+    }
     assert (await _transition(case, counts, stopped_run_id=ROOT))["already_applied"] is True
 
 
@@ -422,15 +471,29 @@ async def test_vsp_retry_converts_empty_legacy_intake_to_names(case, vsp_retry_c
         assert case.writes == []
     else:
         receipt = await _transition(case, counts, stopped_run_id=ROOT)
-        assert receipt == {"dataset_id": DATASET, "rows": 0, "lineage_run_ids": [ROOT], "already_applied": False}
+        assert receipt["dataset_id"] == DATASET and receipt["rows"] == 0
+        assert receipt["lineage_run_ids"] == [ROOT] and receipt["already_applied"] is False
+        assert set(receipt) == {
+            "dataset_id",
+            "rows",
+            "lineage_run_ids",
+            "old_binding_sha256",
+            "new_binding_sha256",
+            "already_applied",
+        }
         actual = case.header["candidate_storage_json"]
         assert actual["contract"] == storage.NAMED_ISOLATED_CONTRACT
-        assert actual["storage"] == case.new and case.header["status"] == "failed"
-        assert actual["tables"] == {kind: {"name": table["name"]} for kind, table in candidate["tables"].items()}
+        assert (
+            actual["storage"] == {"catalog_schema": "catalog_schema", "storage_schema": "source_schema"}
+            and case.header["status"] == "failed"
+        )
+        assert actual["tables"] == {
+            kind: {"schema": "source_schema", "name": table["name"]} for kind, table in candidate["tables"].items()
+        }
         assert (await _transition(case, counts, stopped_run_id=ROOT))["already_applied"] is True
-        assert len(case.writes) == 1
+        assert len(case.writes) == 2
     case.native.assert_not_awaited()
-    case.tables.assert_not_awaited()
+    assert case.tables.await_count == (1 if wrong_table else 2)
 
 
 @pytest.mark.asyncio
@@ -455,7 +518,10 @@ async def test_named_vsp_successor_retains_an_empty_failed_retry(case, vsp_retry
     assert receipt["rows"] == 0
     assert receipt["lineage_run_ids"] == sorted([ROOT, FAILED])
     assert case.header["status"] == "failed"
-    assert case.header["candidate_storage_json"]["storage"] == case.new
+    assert case.header["candidate_storage_json"]["storage"] == {
+        "catalog_schema": "catalog_schema",
+        "storage_schema": "source_schema",
+    }
     assert (await _transition(case, counts))["already_applied"] is True
 
 
@@ -504,9 +570,12 @@ async def test_rearmed_vsp_root_transitions_after_exact_pre_capture_child_failur
     receipt = await _transition(case, counts_by_resource)
     assert receipt["rows"] == 0 and receipt["lineage_run_ids"] == [ROOT, FAILED]
     assert case.header["status"] == "acquiring" and case.header["import_run_id"] == ROOT
-    assert case.header["candidate_storage_json"] == {**candidate, "storage": case.new}
+    assert case.header["candidate_storage_json"] == {
+        **binding.named_source_document(candidate),
+        "contract": storage.NAMED_ISOLATED_CONTRACT,
+    }
     assert (await _transition(case, counts_by_resource))["already_applied"] is True
-    assert len(case.writes) == 1
+    assert len(case.writes) == 2
 
 
 def _empty_vsp_artifact_failure(case):
@@ -571,10 +640,15 @@ async def test_vsp_artifact_failure_rearms_only_the_latest_attached_child_and_re
     assert case.header == {
         **before,
         "status": "acquiring",
-        "candidate_storage_json": {**before["candidate_storage_json"], "storage": case.new},
+        "candidate_storage_json": {
+            **binding.named_source_document(before["candidate_storage_json"]),
+            "contract": storage.NAMED_ISOLATED_CONTRACT,
+        },
     }
-    assert (await _transition(case, counts, stopped_run_id=failed_run_id))["already_applied"] is True
-    assert len(case.writes) == 1 and case.runs == runs
+    assert (await _transition(case, counts, stopped_run_id=failed_run_id, manifest_replay=True))[
+        "already_applied"
+    ] is True
+    assert len(case.writes) == 2 and case.runs == runs
     assert not case.checkpoints and not case.bulk_checkpoints and not case.input_rows
 
 
@@ -726,9 +800,12 @@ async def test_original_root_without_self_reference_transitions_and_replays(requ
     result = await _transition(case, expected_counts_by_resource, stopped_run_id=ROOT)
     assert result["lineage_run_ids"] == [ROOT] and result["rows"] == sum(expected_counts_by_resource.values())
     assert result["already_applied"] is False
-    assert case.header["candidate_storage_json"] == {**before, "storage": case.new}
+    assert case.header["candidate_storage_json"] == {
+        **binding.named_source_document(before),
+        "contract": storage.NAMED_ISOLATED_CONTRACT,
+    }
     assert (await _transition(case, expected_counts_by_resource, stopped_run_id=ROOT))["already_applied"] is True
-    assert len(case.writes) == 1
+    assert len(case.writes) == 2
     assert (case.checkpoints, case.bulk_checkpoints, case.bulk_outputs, case.input_rows, case.runs) == evidence
 
 
@@ -777,9 +854,12 @@ async def test_mixed_checkpoint_transition_and_replay_preserve_all_acquisition_e
     before = deepcopy(case.header["candidate_storage_json"])
     result = await _transition(case, {"Organization": 3, "Location": 2})
     assert result["rows"] == 5 and result["already_applied"] is False
-    assert case.header["candidate_storage_json"] == {**before, "storage": case.new}
+    assert case.header["candidate_storage_json"] == {
+        **binding.named_source_document(before),
+        "contract": storage.NAMED_ISOLATED_CONTRACT,
+    }
     assert (await _transition(case, {"Organization": 3, "Location": 2}))["already_applied"] is True
-    assert len(case.writes) == 1
+    assert len(case.writes) == 2
     assert (case.checkpoints, case.input_rows, case.runs) == (checkpoints, inputs, runs)
 
 
@@ -1014,9 +1094,12 @@ async def test_bulk_transition_preserves_completed_partial_and_unstarted_resourc
     expected_counts_by_resource = {"Organization": 3, "Location": 2, "Endpoint": 0}
     receipt = await _transition(bulk_case, expected_counts_by_resource)
     assert receipt["rows"] == 5 and receipt["already_applied"] is False
-    assert bulk_case.header["candidate_storage_json"] == {**candidate, "storage": bulk_case.new}
+    assert bulk_case.header["candidate_storage_json"] == {
+        **binding.named_source_document(candidate),
+        "contract": storage.NAMED_ISOLATED_CONTRACT,
+    }
     assert (await _transition(bulk_case, expected_counts_by_resource))["already_applied"] is True
-    assert len(bulk_case.writes) == 1
+    assert len(bulk_case.writes) == 2
     assert (bulk_case.bulk_checkpoints, bulk_case.bulk_outputs, bulk_case.input_rows, bulk_case.runs) == before
 
 
@@ -1287,3 +1370,107 @@ async def test_bulk_transition_requires_the_complete_unchanged_census(bulk_case,
     with pytest.raises(GenericCandidateError, match=rf"^provider_directory_generic_source_{expected_error}$"):
         await _transition(bulk_case, expected_counts_by_resource)
     assert bulk_case.writes == []
+
+
+@pytest.mark.asyncio
+async def test_normal_named_nonempty_transition_preserves_all_candidate_bytes_and_raw_cas(case):
+    document = binding.named_source_document(case.header["candidate_storage_json"])
+    document["contract"] = storage.NAMED_ISOLATED_CONTRACT
+    case.header["candidate_storage_json"] = document
+    before = deepcopy(document)
+    result = await _transition(case)
+    assert result["rows"] == 3 and result["lineage_run_ids"] == sorted([ROOT, FAILED])
+    assert case.header["candidate_storage_json"] == before
+    assert json.loads(case.writes[0][1][2]) == before
+    assert (
+        result["old_binding_sha256"]
+        == result["new_binding_sha256"]
+        == hashlib.sha256(storage._encoded(before).encode()).hexdigest()
+    )
+    assert all(set(table) == {"schema", "name"} for table in before["tables"].values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", [None, 1, "false"])
+async def test_manifest_replay_requires_an_explicit_boolean_before_io(case, invalid):
+    with pytest.raises(GenericCandidateError, match="transition_replay_invalid"):
+        await _transition(case, manifest_replay=invalid)
+    case.connection.fetchrow.assert_not_awaited()
+    case.connection.fetchval.assert_not_awaited()
+    assert not case.writes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["hash", "payload", "witness"])
+async def test_retained_payload_and_witness_hashes_are_validated_before_header_cas(case, change):
+    cursor = case.connection.cursor
+
+    async def corrupted(sql, *arguments, prefetch):
+        if change == "witness" and "raw_payload_json" in sql:
+            yield dict(
+                dataset_id=DATASET,
+                source_id="example-source",
+                release_id="a" * 64,
+                resource_type="Organization",
+                resource_id="one",
+                raw_payload_sha256="0" * 64,
+                normalized_payload_hash="b" * 64,
+                raw_payload_json={"resourceType": "Organization", "id": "one"},
+            )
+        async for row in cursor(sql, *arguments, prefetch=prefetch):
+            if change == "hash":
+                row["payload_hash"] = "0" * 64
+            elif change == "payload":
+                row["payload_json"] = {**row["payload_json"], "changed": True}
+            yield row
+
+    case.connection.cursor = corrupted
+    before = deepcopy(case.header)
+    with pytest.raises(GenericCandidateError, match="payload_hash_changed|raw_hash_changed"):
+        await _transition(case)
+    assert not case.writes and case.header == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["table", "storage", "document"])
+async def test_saved_candidate_projection_refuses_unknown_fields(case, field):
+    document = case.header["candidate_storage_json"]
+    target = (
+        document
+        if field == "document"
+        else document["storage"]
+        if field == "storage"
+        else document["tables"]["resource_input"]
+    )
+    target["unknown"] = True
+    with pytest.raises(GenericCandidateError, match="binding_changed|storage_changed"):
+        await _transition(case)
+    assert not case.writes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("manifest_replay", [False, True])
+async def test_named_acquiring_vsp_requires_exact_issuer_replay_and_all_empty_evidence(case, manifest_replay):
+    stopped = _empty_vsp_artifact_failure(case)
+    document = binding.named_source_document(case.header["candidate_storage_json"])
+    document["contract"] = storage.NAMED_ISOLATED_CONTRACT
+    case.header.update(candidate_storage_json=document, status="acquiring")
+    counts = dict.fromkeys(RESOURCE_TYPES, 0)
+    if not manifest_replay:
+        with pytest.raises(GenericCandidateError, match="transition_candidate_changed"):
+            await _transition(case, counts, stopped_run_id=stopped)
+        assert not case.writes
+    else:
+        before = deepcopy(case.header)
+        result = await _transition(case, counts, stopped_run_id=stopped, manifest_replay=True)
+        assert result["rows"] == 0 and result["already_applied"] is True
+        assert case.header == before and not case.checkpoints and not case.input_rows
+
+
+@pytest.mark.asyncio
+async def test_saved_producer_bearing_vsp_does_not_borrow_manifest_replay(case):
+    stopped = _empty_vsp_artifact_failure(case)
+    case.header["status"] = "acquiring"
+    with pytest.raises(GenericCandidateError, match="transition_candidate_changed"):
+        await _transition(case, dict.fromkeys(RESOURCE_TYPES, 0), stopped_run_id=stopped, manifest_replay=True)
+    assert not case.writes

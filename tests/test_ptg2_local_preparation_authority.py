@@ -19,13 +19,17 @@ from tests.test_result_archive_published_identity import _published_row
 
 
 def _ownership(physical_binding):
+    """Build the recorded historical carrier for unchanged archive-writer cases."""
     return archive.ReferenceFamilyStageOwnership(
         native.local_data_family_spec().importer_id,
         physical_binding.dataset_id,
         physical_binding.schema_name,
-        physical_binding.schema_oid,
-        tuple(sorted(physical_binding.relation_oids)),
-        physical_binding.sequence_oids,
+        101,
+        tuple((name, 200 + number) for number, (_schema, name) in enumerate(physical_binding.relations)),
+        tuple(
+            (name, 300 + number, table, column)
+            for number, (_schema, name, table, column) in enumerate(physical_binding.sequences)
+        ),
     )
 
 
@@ -136,7 +140,7 @@ async def test_called_stage_checks_actual_identity_before_metadata_writes(monkey
         },
         "initialized": initialized,
         "audit": audit_by_field,
-        "owner_oid": physical_binding.owner_oid,
+        "owner_oid": 102,
     }
     if drift:
         with pytest.raises(validation.ResultArchiveCandidateValidationError, match="differs"):
@@ -191,9 +195,9 @@ def _protected_preparation_fixture():
         "validation_sha256": native._native_metadata_digest(validation_by_field),
         "inventory_sha256": "e" * 64,
         "state": "validated",
-        "frozen_owner_oid": physical_binding.owner_oid,
+        "frozen_owner_oid": 102,
         "stage_schema": physical_binding.schema_name,
-        "stage_schema_oid": physical_binding.schema_oid,
+        "stage_schema_oid": _ownership(physical_binding).schema_oid,
     }
     return physical_binding, preparation_by_field
 
@@ -231,12 +235,10 @@ async def test_prepared_resolver_locks_complete_family_then_rechecks_catalog(mon
     session = SimpleNamespace(in_transaction=lambda: True, execute=execute)
     if drift:
         with pytest.raises(native.PTG2PhysicalBindingError):
-            await native._prepared_local_header(
-                session, physical_binding.snapshot_id, owner_oid=physical_binding.owner_oid
-            )
+            await native._prepared_local_header(session, physical_binding.snapshot_id, owner_oid=102)
     else:
         _header, _evidence, observed = await native._prepared_local_header(
-            session, physical_binding.snapshot_id, owner_oid=physical_binding.owner_oid
+            session, physical_binding.snapshot_id, owner_oid=102
         )
         assert observed == physical_binding
         assert events[-1] == "post-lock-custody"
@@ -342,13 +344,15 @@ def _published_control_receipt(physical_binding, candidate, published, timestamp
                 "destination_layout_key",
                 "payload_snapshot_id",
                 "payload_snapshot_key",
-                "schema_oid",
-                "owner_oid",
+                "schema_name",
             )
         },
         "dataset_id": str(physical_binding.dataset_id),
-        "relation_oids": [list(pair) for pair in physical_binding.relation_oids],
-        "sequence_oids": [list(entry) for entry in physical_binding.sequence_oids],
+        "relations": [{"schema": schema, "name": name} for schema, name in physical_binding.relations],
+        "sequences": [
+            {"schema": schema, "name": name, "owner_table": table, "owner_column": column}
+            for schema, name, table, column in physical_binding.sequences
+        ],
         "destination_activation": {
             "source_key": "source_a",
             "snapshot_id": physical_binding.snapshot_id,
@@ -435,17 +439,14 @@ def _drift_published_control(candidate, publication_by_field, drift):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "drift", [None, "predecessor", "metadata-key", "coverage", "catalog", "attestation", "preimage"]
+    "drift", [None, "predecessor", "metadata-key", "coverage", "payload", "attestation", "preimage"]
 )
 async def test_retained_control_proof_rejoins_actual_transition_not_current_pointer(monkeypatch, drift):
     """Older retained publications are valid; copied or altered control identities are not."""
     physical_binding, candidate, evidence_by_field, publication_by_field = _published_control_fixture()
     _drift_published_control(candidate, publication_by_field, drift)
-    custody_check = AsyncMock()
-    monkeypatch.setattr(native, "require_closed_local_driver_custody", custody_check)
-    monkeypatch.setattr(
-        native, "local_data_driver_catalog_digest", AsyncMock(return_value="0" * 64 if drift == "catalog" else "c" * 64)
-    )
+    if drift == "payload":
+        publication_by_field["payload_snapshot_key"] += 1
     connection = SimpleNamespace(
         is_in_transaction=lambda: True,
         fetchrow=AsyncMock(return_value=candidate),
@@ -466,7 +467,7 @@ async def test_retained_control_proof_rejoins_actual_transition_not_current_poin
         query = connection.fetchrow.await_args.args[0]
         assert "FOR SHARE OF snapshot,run,binding,scope,layout NOWAIT" in query
         assert physical_binding.schema_name in query and '"ptg2_v4_snapshot_map_root"' in query
-        assert custody_check.await_count == 1
+        assert connection.fetchrow.await_count == connection.fetch.await_count == 1
 
 
 @pytest.mark.asyncio

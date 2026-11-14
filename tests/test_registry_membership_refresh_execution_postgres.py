@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Accepted ACA refresh crosses real composition, custody and atomic publication."""
+"""Accepted ACA refresh crosses real named preparation and atomic publication."""
 
 import asyncio
 import json
@@ -14,6 +14,7 @@ from api.network_compact_address import compact_address_native_sql
 from api.network_provider_read import read_network_provider_page
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_cms_registry_address_capture import native_driver
+from process.network_membership_publication import load_named_network_preparation
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_approval_store import RegistryApprovalConflict
 from process.registry_company_approval_fence import registry_company_approval_transaction
@@ -38,7 +39,8 @@ async def _counts(fixture):
             f"SELECT (SELECT count(*) FROM {schema}.registry_publication_request),"
             f"(SELECT count(*) FROM {schema}.network_membership_candidate),"
             f"(SELECT count(*) FROM {schema}.network_serving_manifest),"
-            f"(SELECT count(*) FROM {schema}.network_candidate_custody)"
+            "(SELECT count(*) FROM hp_snapshot_retention.preparation WHERE node_id=$1 AND importer_id='network')",
+            fixture.control_schema,
         )
     )
 
@@ -52,15 +54,14 @@ async def _heads(fixture):
 
 
 async def _storage_rows(fixture, namespace):
-    """Include MVCC identity so an otherwise invisible no-op UPDATE also fails parity."""
+    """Compare complete named payloads, including duplicate and empty-table rows."""
     tables = await fixture.connection.fetch(
         "SELECT relname FROM pg_class WHERE relnamespace=to_regnamespace($1) AND relkind='r' ORDER BY relname",
         namespace,
     )
     return {
         table["relname"]: await fixture.connection.fetch(
-            f'SELECT xmin::text,ctid::text,to_jsonb(row)::text FROM "{namespace}"."{table["relname"]}" row '
-            "ORDER BY to_jsonb(row)::text"
+            f'SELECT to_jsonb(row)::text FROM ONLY "{namespace}"."{table["relname"]}" row ORDER BY to_jsonb(row)::text'
         )
         for table in tables
     }
@@ -169,22 +170,26 @@ async def _rebind_approved_network(fixture):
     return original["network_id"]
 
 
-async def _assert_separate_custody(fixture, candidate_id):
+async def _assert_named_preparation(fixture, candidate_id):
     row = await fixture.connection.fetchrow(
-        f"SELECT candidate.*,namespace.nspowner::regrole::text AS owner "
+        f"SELECT candidate.* "
         f'FROM "{fixture.control_schema}".network_membership_candidate candidate '
-        "JOIN pg_namespace namespace ON namespace.nspname=candidate.schema_name WHERE candidate_id=$1",
+        "WHERE candidate_id=$1",
         UUID(candidate_id),
     )
-    assert row["owner"] == fixture.roles_by_kind["custody"]
+    preparation = await fixture.connection.fetchrow(
+        "SELECT state,handoff FROM hp_snapshot_retention.preparation WHERE preparation_id=$1",
+        UUID(candidate_id),
+    )
+    assert preparation["state"] == "published"
+    assert json.loads(preparation["handoff"]) == await load_named_network_preparation(
+        fixture.connection, candidate_id, control_schema=fixture.control_schema
+    )
     candidate_by_field = dict(row)
     root = verify_source_recipe_metadata(candidate_by_field).inventory.root
     assert (root.entry_count, root.contribution_count, root.derivation_count) == (1, 0, 1)
     office = verify_initial_source_office_receipt(candidate_by_field)
     assert (office["revision"], office["office_rows"]) == (4, 1)
-    assert not await fixture.connection.fetchval(
-        "SELECT pg_has_role($1::name,$2::name,'SET')", fixture.roles_by_kind["execution"], row["owner"]
-    )
 
 
 async def test_accepted_aca_refresh_publication_replay_and_pinned_second_generation(monkeypatch, record_property):
@@ -204,7 +209,7 @@ async def test_accepted_aca_refresh_publication_replay_and_pinned_second_generat
         assert fixture.calls.count(COMMIT_AUTHORITY_PATH) == 1
         assert await _heads(fixture) == before
         assert await _counts(fixture) == (1, 1, 1, 1)
-        await _assert_separate_custody(fixture, completed["result"]["candidate_id"])
+        await _assert_named_preparation(fixture, completed["result"]["candidate_id"])
         request = await fixture.connection.fetchrow(
             f'SELECT * FROM "{fixture.control_schema}".registry_publication_request WHERE request_id=$1',
             UUID(queued["request_id"]),

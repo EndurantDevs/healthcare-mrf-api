@@ -129,10 +129,8 @@ async def address_db():
         reader = await asyncpg.connect(reader_url.render_as_string(hide_password=False))
         cleanup.push_async_callback(reader.close)
         async with publisher.transaction(isolation="repeatable_read", readonly=True):
-            authority = await artifact.generation.read_entity_address_result_generation_authority(
-                artifact._CatalogSession(publisher), schema_name=schema
-            )
-            generation_id = artifact._digest(artifact._authority_document(authority))
+            authority, _legacy_key = await artifact._current_authority(publisher, schema)
+            generation_id = artifact._digest(authority)
             address_source = PinnedAddressSource(schema, "entity_address_unified", generation_id)
             descriptor = await artifact.capture_network_address_artifact(
                 publisher, address_source, runtime_roles=(role_by_kind["reader"],)

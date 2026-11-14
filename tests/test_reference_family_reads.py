@@ -31,7 +31,7 @@ def _reader(monkeypatch, *, missing=False, drift=False, binding=False, writable=
         ),
     )
     monkeypatch.setattr(publication, "require_native_read_catalog", AsyncMock())
-    binding_rows = [("published-generation", name, oid) for name, oid in pairs]
+    binding_rows = [("published-generation",)]
     if binding:
         binding_rows.pop()
     statement_result = SimpleNamespace(all=lambda: binding_rows)
@@ -45,10 +45,10 @@ def _reader(monkeypatch, *, missing=False, drift=False, binding=False, writable=
         return not writable
 
     async def execute(statement, parameters=None):
-        """Return one actual current binding for each separately scoped native family."""
+        """Return one current logical publication for each separately scoped family."""
         if parameters and "importer" in parameters:
-            selected_names = archive.reference_family_receive_spec(parameters["importer"]).table_names
-            return SimpleNamespace(all=lambda: [row for row in binding_rows if row[1] in selected_names])
+            assert parameters["importer"] in families
+            return SimpleNamespace(all=lambda: binding_rows)
         return statement_result
 
     session = SimpleNamespace(
@@ -71,17 +71,13 @@ async def test_reader_pins_complete_family_and_shared_row_versions(monkeypatch):
     assert all('"' + name + '"' in lock for name, _oid in pairs)
     assert '"code_catalog"' in lock and '"code_crosswalk"' in lock
     binding_sql = " ".join(str(session.execute.await_args_list[1].args[0]).split())
-    assert "JOIN hp_snapshot_retention.relation r USING(generation_id)" in binding_sql
-    assert "heap.relname::text AS relation_name,r.relation_oid::bigint" in binding_sql
-    assert "JOIN pg_catalog.pg_class heap ON heap.oid::bigint=r.relation_oid" in binding_sql
-    assert "ORDER BY heap.relname" in binding_sql
-    assert "r.relation_name" not in binding_sql and "r.table_name" not in binding_sql
+    assert 'SELECT generation_id::text FROM "hp_snapshot_retention"."current_generation"' in binding_sql
+    assert "importer_id=:importer AND dataset_key=:importer" in binding_sql
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["drift", "binding", "writable"])
-async def test_reader_refuses_identity_publication_or_write_authority_drift(monkeypatch, failure):
-    session, _pairs = _reader(monkeypatch, **{failure: True})
+async def test_reader_refuses_a_missing_logical_publication(monkeypatch):
+    session, _pairs = _reader(monkeypatch, binding=True)
     with pytest.raises(RuntimeError):
         await pin_claims_reader(session)
 

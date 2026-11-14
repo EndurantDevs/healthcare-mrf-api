@@ -13,6 +13,7 @@ import pytest
 
 from process import registry_aca_source_consumer as consumer
 from process import registry_aca_source_recipe as producer
+from process.network_address_projection import PinnedAddressSource
 from process.network_membership_publication import NetworkPublicationError
 from process.registry_publication_ptg_runtime import RegistryPublicationPTGRuntime
 from process.registry_source_recipe_store import canonical_registry_source_recipes, registry_source_recipes_sha256
@@ -35,17 +36,6 @@ async def recipe(monkeypatch):
     monkeypatch.setattr(consumer, "_require_archive", AsyncMock())
     prepared, validation = await _prepared(monkeypatch)
     return producer._recipe(prepared, validation, _ROLES)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("omitted", ["source_owner", "source_publisher"])
-async def test_native_seal_omitting_source_authority_is_terminal(monkeypatch, omitted):
-    roles = ("source_owner", "source_publisher", "source_reader")
-    verify = AsyncMock(return_value={"receipt": {"runtime_roles": [role for role in roles if role != omitted]}})
-    monkeypatch.setattr(consumer, "verify_network_candidate_custody", verify)
-    with pytest.raises(ValueError):
-        await consumer._verify_source_custody(object(), object(), config(source_authority_roles=roles))
-    assert verify.await_args.kwargs["required"] is True
 
 
 @pytest.mark.asyncio
@@ -251,8 +241,6 @@ async def _publication_case(monkeypatch):
     monkeypatch.setattr(consumer, "_selection", AsyncMock(return_value=(1, approved, pinned, (accepted_recipe,))))
     monkeypatch.setattr(consumer, "pin_approved_membership_source", AsyncMock(return_value=approved))
     monkeypatch.setattr(consumer, "require_approved_network_source_bindings", AsyncMock())
-    custody = AsyncMock(return_value={"receipt": {"runtime_roles": ["source_owner", "source_publisher"]}})
-    monkeypatch.setattr(consumer, "verify_network_candidate_custody", custody)
     settings = config(
         composition_runtime=runtime,
         seal_candidate=AsyncMock(),
@@ -269,7 +257,6 @@ async def _publication_case(monkeypatch):
         config=settings,
         store=store,
         compose=compose,
-        custody=custody,
     )
 
 
@@ -358,7 +345,7 @@ async def test_completed_or_lost_reply_replays_exact_sealed_candidate_without_re
 
     async def publish(driver, target, **options):
         assert driver is connection and target == case.target and state.active and state.fenced
-        assert options == {"control_schema": "registry_control"}
+        assert options == {"control_schema": "registry_control", "preparation_roles": case.config.preparation_roles}
         state.pending = target
 
     publish_call = AsyncMock(side_effect=publish)
@@ -385,10 +372,6 @@ async def test_completed_or_lost_reply_replays_exact_sealed_candidate_without_re
     case.compose.assert_awaited_once()
     assert case.compose.await_args.kwargs["request_id"] == UUID(json.loads(checkpoint_args[2])["attempt_id"])
     case.config.seal_candidate.assert_awaited_once_with(case.target)
-    assert case.custody.await_count == 2
-    assert all(
-        call.args == (connection, case.target) and call.kwargs["required"] for call in case.custody.await_args_list
-    )
     assert publish_call.await_count == 2 and connection.execute.await_count == 2
     assert sum("pg_advisory_unlock" in call.args[0] for call in connection.fetchval.await_args_list) == 2
 
@@ -458,7 +441,6 @@ async def test_replay_rejects_foreign_checkpoint_or_candidate_before_publication
     with pytest.raises(ValueError):
         await consumer._replay(connection, case.accepted, case.recipe, case.config)
     publish.assert_not_awaited()
-    case.custody.assert_not_awaited()
 
 
 def batch_config(**kwargs):
@@ -478,7 +460,7 @@ async def batch_recipes(monkeypatch):
 
 def batch_addresses():
     return consumer.RegistryCompositionAddressSources(
-        consumer.PinnedAddressSource("retained_addresses", "entity_address_unified", "a" * 64)
+        PinnedAddressSource("retained_addresses", "entity_address_unified", "a" * 64)
     )
 
 

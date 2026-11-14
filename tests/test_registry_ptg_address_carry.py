@@ -16,6 +16,7 @@ from process import registry_ptg_address_carry as carry
 from process import registry_source_recipe_composition as composition
 from process.network_address_projection import PinnedAddressSource
 from process.network_approved_site_source import copy_approved_site_rows
+from process.network_compact_layout import CompactAddressRelation
 from process.registry_retained_site_adoption import (
     RetainedSiteAdoption,
     RetainedSiteAdoptionError,
@@ -28,7 +29,15 @@ from tests.test_registry_ptg_office_membership_recipe import _recipe
 def _receipt():
     adoption = RetainedSiteAdoption("npi", "1234567893", str(UUID(int=8)), "e" * 64, "npi", "1234567893", "f" * 64)
     return RetainedSiteAdoptionReceipt(
-        3, str(UUID(int=9)), "retained_fixture", 1, (("source", "edition"),), 4, "d" * 64, 11, 12, 13, 14, (adoption,)
+        3,
+        str(UUID(int=9)),
+        "retained_fixture",
+        1,
+        (("source", "edition"),),
+        4,
+        "d" * 64,
+        CompactAddressRelation("retained_fixture", "entity_address_unified"),
+        (adoption,),
     )
 
 
@@ -54,50 +63,85 @@ def copy_connection():
     )
 
 
+def _mint(receipt):
+    generation = custom._generation(receipt)
+    return replace(
+        receipt, generation_sha256=generation, address_source=replace(receipt.address_source, generation_id=generation)
+    )
+
+
 def _artifact():
     base = PinnedAddressSource("base_fixture", "entity_address_unified", "edition")
-    return custom.CustomAddressSourceReceipt(
-        str(UUID(int=10)),
+    identity = UUID(int=10)
+    receipt = custom.CustomAddressSourceReceipt(
+        str(identity),
         4,
         "control_fixture",
         base,
         None,
-        (1, 2, 3, "a" * 64),
-        None,
-        "owner_fixture",
-        ("reader_fixture",),
-        11,
-        12,
-        13,
-        14,
-        15,
         0,
         "b" * 64,
-        "c" * 64,
-        base,
+        "",
+        PinnedAddressSource("network_composition_" + identity.hex, "entity_address_unified", "prepared"),
+    )
+    generation = custom._generation(receipt)
+    return replace(
+        receipt, generation_sha256=generation, address_source=replace(receipt.address_source, generation_id=generation)
     )
 
 
-def test_empty_carry_preserves_exact_v2_encoding_and_generation():
+def _legacy_artifact_document(
+    *, ptg=None, aca=None, generation="b862cee9ee1c0ccef4660be2a0cb77666952b18dc1de9d59507ed714ec18f6bc"
+):
+    current = _artifact()
+    document_by_field = {
+        key: value for key, value in current.as_dict().items() if key not in custom._OPTIONAL_RECEIPT_FIELDS
+    }
+    document_by_field.update(
+        source_oids=[1, 2, 3, "a" * 64],
+        npi_oids=None,
+        owner_role="owner_fixture",
+        runtime_roles=["reader_fixture"],
+        schema_oid=11,
+        address_table_oid=12,
+        binding_table_oid=13,
+        office_lookup_index_oid=14,
+        owner_oid=15,
+        revision=4 if aca is not None else 3 if ptg is not None else 2,
+        generation_sha256=generation,
+        address_source={**asdict(current.address_source), "generation_id": generation},
+    )
+    if ptg is not None:
+        document_by_field["ptg_carry_sha256"] = ptg
+    if aca is not None:
+        document_by_field["aca_carry_sha256"] = aca
+    return document_by_field
+
+
+def test_named_receipt_roundtrips_and_binds_complete_logical_recipe():
     receipt = _artifact()
-    old = asdict(receipt)
-    old.pop("ptg_carry_sha256")
-    old.pop("aca_carry_sha256")
-    old.pop("source_aliases")
-    old.pop("fhir_carry_sha256")
-    expected_by_field = {"component": "network_custom_address_source", "revision": 2, **old}
-    assert receipt.as_dict() == expected_by_field
-    assert custom._from_document(json.dumps(expected_by_field)) == receipt
-    expected_by_field.pop("generation_sha256")
-    expected_by_field.pop("address_source")
-    encoded = json.dumps(expected_by_field, sort_keys=True, separators=(",", ":")).encode()
-    assert custom._generation(receipt) == hashlib.sha256(encoded).hexdigest()
+    assert receipt.as_dict()["revision"] == 7
+    assert custom._from_document(json.dumps(receipt.as_dict())) == receipt
+    assert not set(receipt.as_dict()) & custom._LEGACY_PHYSICAL_FIELDS
+    assert custom._generation(receipt) == receipt.generation_sha256
 
 
-def test_v3_binds_carry_and_roundtrips_without_relabeling_v2():
+def test_legacy_record_projects_names_and_keeps_recorded_generation():
+    document = _legacy_artifact_document()
+    receipt = custom._from_document(json.dumps(document))
+    assert receipt.revision == 2 and receipt.generation_sha256 == document["generation_sha256"]
+    assert not set(receipt.as_dict()) & custom._LEGACY_PHYSICAL_FIELDS
+    assert custom._from_document(json.dumps(receipt.as_dict())) == receipt
+
+
+def test_current_carry_changes_logical_generation_and_recipe():
     original = _artifact()
     changed = replace(original, ptg_carry_sha256="f" * 64)
-    assert changed.as_dict()["revision"] == 3
+    generation = custom._generation(changed)
+    changed = replace(
+        changed, generation_sha256=generation, address_source=replace(changed.address_source, generation_id=generation)
+    )
+    assert changed.as_dict()["revision"] == 7
     assert custom._from_document(json.dumps(changed.as_dict())) == changed
     assert custom._generation(original) != custom._generation(changed)
     assert custom._recipe_identity(original) != custom._recipe_identity(changed)
@@ -151,7 +195,7 @@ async def test_exact_recipe_custody_shared_budget_and_selected_rows(monkeypatch)
     assert (result.pages, result.rows) == (1, 1)
     encoded = carry._canonical(_receipt().as_dict())
     selection_sha = hashlib.sha256(len(encoded).to_bytes(8, "big") + encoded).hexdigest()
-    assert result.origin_references == ((3, "d" * 64, 11, 12, 13, 14, 1, selection_sha),)
+    assert result.origin_references == ((3, "d" * 64, 1, selection_sha),)
     from process.registry_source_recipe_store import canonical_registry_source_recipes
 
     legacy_digest = hashlib.sha256(canonical_registry_source_recipes((recipe,)).encode())
@@ -287,7 +331,7 @@ async def test_streaming_copy_and_replay_share_identity_without_retaining_pages(
 
 @pytest.mark.asyncio
 async def test_existing_artifact_replay_rechecks_carry_before_returning(monkeypatch):
-    original = replace(_artifact(), ptg_carry_sha256="a" * 64)
+    original = _mint(replace(_artifact(), ptg_carry_sha256="a" * 64))
     connection = SimpleNamespace(fetchval=AsyncMock(return_value=json.dumps(original.as_dict())))
     monkeypatch.setattr(
         custom, "_ptg_address_carry", AsyncMock(return_value=carry.RegistryPTGAddressCarry("a" * 64, 1, 1))

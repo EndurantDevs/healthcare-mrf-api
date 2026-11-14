@@ -40,10 +40,8 @@ def _case():
     }
     receipts_by_root = {
         root: {
+            "schema": "source_schema",
             "name": "pdgs_" + "b" * 32 + "_" + storage._SUFFIXES[root],
-            "oid": index + 40,
-            "owner": 31,
-            "layout_sha256": "c" * 64,
         }
         for index, root in enumerate(storage.AUXILIARY_ROOTS)
     }
@@ -108,10 +106,10 @@ async def test_failed_index_or_set_check_preserves_loading_binding_before_header
 
 
 @pytest.mark.asyncio
-async def test_seal_updates_native_receipts_only_after_cas(monkeypatch):
+async def test_completion_updates_named_stage_state_only_after_cas(monkeypatch):
     publisher, binding = _case()
     old_receipts = binding["auxiliary"]["tables"]
-    recaptured_by_name = {proof["name"]: {**proof, "layout_sha256": "d" * 64} for proof in old_receipts.values()}
+    recaptured_by_name = {proof["name"]: dict(proof) for proof in old_receipts.values()}
     token = auxiliary._ACTIVE.set((publisher, binding))
 
     @asynccontextmanager
@@ -131,7 +129,8 @@ async def test_seal_updates_native_receipts_only_after_cas(monkeypatch):
 
     async def store(connection, policy, identity, before, after):
         assert binding["auxiliary"]["phase"] == "loading"
-        assert all(proof["layout_sha256"] == "c" * 64 for proof in old_receipts.values())
+        assert all(set(proof) == {"schema", "name"} for proof in old_receipts.values())
+        assert after["auxiliary"]["phase"] == "sealed"
         assert after["auxiliary"]["sealed_sha256"] == auxiliary._seal_digest(identity, after["auxiliary"]["tables"])
 
     monkeypatch.setattr(storage, "_store", AsyncMock(side_effect=store))
@@ -141,7 +140,7 @@ async def test_seal_updates_native_receipts_only_after_cas(monkeypatch):
     finally:
         auxiliary._ACTIVE.reset(token)
     assert binding["auxiliary"]["phase"] == "sealed"
-    assert all(proof["layout_sha256"] == "d" * 64 for proof in old_receipts.values())
+    assert all(proof["schema"] == "source_schema" for proof in old_receipts.values())
     helper.finish_identity_stages.assert_awaited_once()
 
 
@@ -176,7 +175,7 @@ async def test_reference_seal_builds_indexes_once_and_updates_the_protected_rece
     from process import provider_directory_generic_source_completion as completion
 
     publisher, binding = _case()
-    proof_by_field = {"name": "pdgs_" + "b" * 32 + "_rl", "oid": 91, "owner": 31, "layout_sha256": "c" * 64}
+    proof_by_field = {"schema": "source_schema", "name": "pdgs_" + "b" * 32 + "_rl"}
     binding.update(tables={storage.RELATIONSHIP: proof_by_field}, relationship_sha256=None)
     token = auxiliary._ACTIVE.set((publisher, binding))
 
@@ -189,7 +188,7 @@ async def test_reference_seal_builds_indexes_once_and_updates_the_protected_rece
     monkeypatch.setattr(storage, "candidate_identity", lambda *args: binding["identity"])
     monkeypatch.setattr(storage, "_locked", AsyncMock(side_effect=lambda *args, **kw: deepcopy(binding)))
     monkeypatch.setattr(storage, "_verify_tables", AsyncMock())
-    completed_by_field = {**proof_by_field, "layout_sha256": "d" * 64}
+    completed_by_field = dict(proof_by_field)
     monkeypatch.setattr(storage, "_capture", AsyncMock(return_value={proof_by_field["name"]: completed_by_field}))
     store = AsyncMock()
     indexes = AsyncMock()

@@ -22,10 +22,10 @@ from api import provider_geo_sql as geo_sql
 from api import provider_list_sql as provider_list_sql
 from api.custom_import_provider_sql import ProviderImportQuery, compile_npi_entity_relation
 from api.endpoint import npi as npi_module
-from api.network_read_execution import NetworkReadConnectionProxy
+from db.connection import ConnectionProxy
 from process.custom_import.read_core import PreparedNpiEntityRelation, ReadOrderTerm
 from tests.custom_import_postgres_support import transaction_session
-from tests.network_read_execution_support import with_read_identity_receipts
+from tests.network_read_execution_support import with_read_session
 from tests.test_custom_import_provider_list import _scoped_import_context
 
 _FIRST_ADDRESS_KEY = "00000000-0000-0000-0000-000000000001"
@@ -189,7 +189,7 @@ def test_imported_geo_builder_rejects_bad_anchor_and_parameter_collision_without
         _statements(anchor=("1000000003", "not-an-address"))
 
 
-class _RecordingGeoProxy(NetworkReadConnectionProxy):
+class _RecordingGeoProxy(ConnectionProxy):
     def __init__(self, _database, session, raw_connection) -> None:
         assert raw_connection is None
         super().__init__(_database, session, raw_connection)
@@ -197,7 +197,7 @@ class _RecordingGeoProxy(NetworkReadConnectionProxy):
         if not hasattr(session, "execute"):
             session.execute = self._execute
         if not hasattr(session, "connection"):
-            with_read_identity_receipts(session)
+            with_read_session(session)
 
     async def _execute(self, statement, parameters=None):
         rows = self._rows(statement, parameters or {})
@@ -276,7 +276,7 @@ async def test_imported_geo_handler_uses_one_session_and_keeps_private_next_anch
         cursor_calls.append(kwargs)
         return None
 
-    monkeypatch.setattr(provider_list_sql, "NetworkReadConnectionProxy", _RecordingGeoProxy)
+    monkeypatch.setattr(provider_list_sql, "ConnectionProxy", _RecordingGeoProxy)
     monkeypatch.setattr(npi_module, "_address_serving_table_sql", _legacy_address_table)
     monkeypatch.setattr(npi_module, "_plan_release_npi_scope", _empty_plan_scope)
     monkeypatch.setattr(
@@ -333,7 +333,7 @@ async def test_imported_geo_handler_rejects_malformed_page_identity(monkeypatch)
     async def prepare_cursor(**_kwargs):
         return None
 
-    monkeypatch.setattr(provider_list_sql, "NetworkReadConnectionProxy", InvalidPageIdentityProxy)
+    monkeypatch.setattr(provider_list_sql, "ConnectionProxy", InvalidPageIdentityProxy)
     monkeypatch.setattr(npi_module, "_address_serving_table_sql", _legacy_address_table)
     monkeypatch.setattr(npi_module, "_plan_release_npi_scope", _empty_plan_scope)
     monkeypatch.setattr(npi_module.db, "acquire", lambda: (_ for _ in ()).throw(AssertionError("native pool used")))
@@ -362,7 +362,7 @@ async def test_imported_geo_handler_rejects_missing_or_nonunique_cursor_anchor(
     async def prepare_cursor(**_kwargs):
         return "1000000009", _FIRST_ADDRESS_KEY
 
-    monkeypatch.setattr(provider_list_sql, "NetworkReadConnectionProxy", _RecordingGeoProxy)
+    monkeypatch.setattr(provider_list_sql, "ConnectionProxy", _RecordingGeoProxy)
     monkeypatch.setattr(npi_module, "_address_serving_table_sql", _legacy_address_table)
     monkeypatch.setattr(npi_module, "_plan_release_npi_scope", _empty_plan_scope)
     monkeypatch.setattr(
@@ -426,7 +426,7 @@ async def test_imported_geo_normalizes_before_cursor_even_when_code_resolution_i
     assert cursor_state_by_key["was_prepared"] is True
 
 
-class _PostgresGeoProxy(NetworkReadConnectionProxy):
+class _PostgresGeoProxy(ConnectionProxy):
     def __init__(self, _database, session, raw_connection) -> None:
         assert raw_connection is None
         super().__init__(_database, session, raw_connection)
@@ -666,7 +666,7 @@ async def test_postgres_imported_geo_handler_executes_count_page_and_cursor(
         except DBAPIError:
             pytest.skip("PostGIS is unavailable for the native geo execution proof")
         await _seed_geo_tables(session, address_table_sql=address_table_sql)
-        monkeypatch.setattr(provider_list_sql, "NetworkReadConnectionProxy", _PostgresGeoProxy)
+        monkeypatch.setattr(provider_list_sql, "ConnectionProxy", _PostgresGeoProxy)
         monkeypatch.setattr(
             npi_module,
             "_address_serving_table_sql",
@@ -738,7 +738,7 @@ async def test_postgres_required_geo_order_keeps_null_score_and_exact_address_pa
         except DBAPIError:
             pytest.skip("PostGIS is unavailable for the native geo execution proof")
         await _seed_geo_tables(session, address_table_sql=address_table_sql)
-        monkeypatch.setattr(provider_list_sql, "NetworkReadConnectionProxy", _PostgresGeoProxy)
+        monkeypatch.setattr(provider_list_sql, "ConnectionProxy", _PostgresGeoProxy)
         monkeypatch.setattr(
             npi_module,
             "_address_serving_table_sql",

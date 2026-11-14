@@ -7,8 +7,10 @@ import hmac
 import re
 from dataclasses import asdict, dataclass
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from api import ptg2_serving
 from api.billing_search_access_contract import (
@@ -72,20 +74,19 @@ class BillingSearchGenerationPin:
 
     snapshot_set_sha256: str
     generation_bundle_sha256: str
-    address_relation_oid: int
-    address_evidence_relation_oid: int
+    address_relation_name: str
+    address_evidence_relation_name: str
 
     def __post_init__(self) -> None:
         _strict_sha256(self.snapshot_set_sha256)
         _strict_sha256(self.generation_bundle_sha256)
-        if any(
-            type(relation_oid) is not int or relation_oid <= 0
-            for relation_oid in (
-                self.address_relation_oid,
-                self.address_evidence_relation_oid,
-            )
-        ):
-            raise _invalid_generation()
+        for relation_name in (self.address_relation_name, self.address_evidence_relation_name):
+            if (
+                type(relation_name) is not str
+                or len(relation_name.split(".")) != 2
+                or any(_SCHEMA_PATTERN.fullmatch(part) is None for part in relation_name.split("."))
+            ):
+                raise _invalid_generation()
 
     def __repr__(self) -> str:
         return "<billing-search-generation-pin>"
@@ -302,113 +303,34 @@ def _quoted_address_relations() -> tuple[tuple[str, str], ...]:
     )
 
 
-async def _locked_address_relation_oids(session) -> tuple[int, int]:
-    address_relations = _quoted_address_relations()
-    await session.execute(
-        text(
-            "LOCK TABLE "
-            + ", ".join(quoted_name for _qualified_name, quoted_name in address_relations)
-            + " IN ACCESS SHARE MODE"
-        )
-    )
-    relation_oids = await session.scalar(
-        text(
-            "SELECT ARRAY["
-            "to_regclass(:address_relation_name)::oid::bigint, "
-            "to_regclass(:evidence_relation_name)::oid::bigint]"
-        ),
-        {
-            "address_relation_name": address_relations[1][0],
-            "evidence_relation_name": address_relations[0][0],
-        },
-    )
-    if (
-        type(relation_oids) not in {list, tuple}
-        or len(relation_oids) != 2
-        or any(type(relation_oid) is not int or relation_oid <= 0 for relation_oid in relation_oids)
-    ):
-        raise _invalid_generation()
-    return relation_oids[0], relation_oids[1]
-
-
-async def _api_address_relation_oids(session) -> tuple[int, int]:
-    """Inventory the exact live address pair without conferring Source authority."""
-    from api.network_read_execution import _original_read_driver, install_network_read_inventory
-    from process.network_compact_layout import CompactAddressRelation
-
+async def _billing_address_generation(session, schema_name, *, api_read):
+    """Read the logical address generation within the caller's required snapshot."""
+    transaction = session.get_transaction()
     try:
-        address_relations = _quoted_address_relations()
-        schema = address_relations[0][0].split(".", 1)[0]
-        driver, backend_pid = await _original_read_driver(session)
-        transaction = session.get_transaction()
-        if transaction is None or driver.is_in_transaction() is not True:
-            raise _invalid_generation()
-        modes = await driver.fetchrow(
-            "SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only')"
-        )
-        if modes is None or tuple(modes) not in (("repeatable read", "on"), ("serializable", "on")):
-            raise _invalid_generation()
-        catalog_result = await session.execute(
+        if api_read:
+            modes = (
+                await session.execute(
+                    text("SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only')")
+                )
+            ).one()
+            if transaction is None or tuple(modes) not in (("repeatable read", "on"), ("serializable", "on")):
+                raise _invalid_generation()
+        generation_result = await session.execute(
             text(
-                "SELECT c.relname::text,c.oid::bigint FROM pg_catalog.pg_class c "
-                "JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
-                "WHERE n.nspname=:schema AND c.relname=ANY(CAST(:names AS text[])) AND c.relkind='r' "
-                "AND c.relpersistence IN ('p','u') AND NOT c.relispartition "
-                "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_inherits i "
-                "WHERE i.inhrelid=c.oid OR i.inhparent=c.oid)"
-            ),
-            {"schema": schema, "names": list(_ADDRESS_TABLES)},
+                f'SELECT origin_lineage_id::text,origin_generation FROM "{schema_name}".entity_address_result_generation '
+                "WHERE singleton IS TRUE"
+            )
         )
-        catalog_rows = catalog_result.all()
-        oid_by_name = dict(catalog_rows)
-        if (
-            len(catalog_rows) != 2
-            or set(oid_by_name) != set(_ADDRESS_TABLES)
-            or any(type(oid) is not int or oid <= 0 for oid in oid_by_name.values())
-        ):
-            raise _invalid_generation()
-        current_driver, current_pid = await _original_read_driver(session)
-        if current_driver is not driver or current_pid != backend_pid or session.get_transaction() is not transaction:
-            raise _invalid_generation()
-        relations = tuple(CompactAddressRelation(schema, name, oid_by_name[name]) for name in _ADDRESS_TABLES)
-        await install_network_read_inventory(session, relations)
-        current_driver, current_pid = await _original_read_driver(session)
-        if current_driver is not driver or current_pid != backend_pid or session.get_transaction() is not transaction:
-            raise _invalid_generation()
-        return oid_by_name["entity_address_unified"], oid_by_name["entity_address_evidence"]
-    except PTG2ManifestArtifactError:
-        raise
-    except Exception as error:
+        generation = generation_result.one_or_none()
+    except SQLAlchemyError as error:
         raise _invalid_generation() from error
-
-
-async def _capture_billing_search_api_generation_pin(
-    session,
-    selection: PlanReleaseServingSelection,
-    *,
-    contributing_bindings=None,
-) -> BillingSearchGenerationPin:
-    """Keep the original cursor bytes while installing a physical API read inventory."""
-
-    snapshot_set_sha256 = billing_search_snapshot_set_sha256(selection, contributing_bindings=contributing_bindings)
-    address_relation_oid, address_evidence_relation_oid = await _api_address_relation_oids(session)
-    generation_bundle_sha256 = _framed_sha256(
-        _GENERATION_BUNDLE_DOMAIN,
-        _canonical_json_bytes(
-            {
-                "address_relation_oid": address_relation_oid,
-                "address_evidence_relation_oid": address_evidence_relation_oid,
-                "address_selection_contract": BILLING_ADDRESS_SELECTION_CONTRACT,
-                "snapshot_set_sha256": snapshot_set_sha256,
-            }
-        ),
-    )
-    return BillingSearchGenerationPin(
-        snapshot_set_sha256=snapshot_set_sha256,
-        generation_bundle_sha256=generation_bundle_sha256,
-        address_relation_oid=address_relation_oid,
-        address_evidence_relation_oid=address_evidence_relation_oid,
-    )
+    if generation is None or type(generation[1]) is not int or not 0 < generation[1] < 2**63:
+        raise _invalid_generation()
+    try:
+        lineage_id = str(UUID(generation[0]))
+    except (TypeError, ValueError, AttributeError) as error:
+        raise _invalid_generation() from error
+    return transaction, lineage_id, generation[1]
 
 
 async def capture_billing_search_generation_pin(
@@ -418,22 +340,38 @@ async def capture_billing_search_generation_pin(
     contributing_bindings=None,
     api_read=False,
 ) -> BillingSearchGenerationPin:
-    """Lock the address relation and capture the complete serving generation."""
+    """Bind pagination to logical publication generations and qualified relation names."""
     if type(api_read) is not bool:
         raise _invalid_generation()
-    if api_read:
-        return await _capture_billing_search_api_generation_pin(
-            session, selection, contributing_bindings=contributing_bindings
-        )
+    from api.network_address_scope import current_network_address_scope
 
     snapshot_set_sha256 = billing_search_snapshot_set_sha256(selection, contributing_bindings=contributing_bindings)
-    address_relation_oid, address_evidence_relation_oid = await _locked_address_relation_oids(session)
+    address_relations = _quoted_address_relations()
+    schema_name = address_relations[0][0].split(".", 1)[0]
+    transaction, lineage_id, origin_generation = await _billing_address_generation(
+        session, schema_name, api_read=api_read
+    )
+    address_name = address_relations[1][0]
+    evidence_name = address_relations[0][0]
+    scope = current_network_address_scope()
+    network_generation_by_field = None
+    if scope is not None:
+        relation = scope.manifest.address_relation
+        address_name = relation.schema_name + "." + relation.table_name
+        network_generation_by_field = {
+            "generation_id": scope.manifest.generation_id,
+            "manifest_sha256": scope.manifest.manifest_sha256,
+        }
+    if api_read and session.get_transaction() is not transaction:
+        raise _invalid_generation()
     generation_bundle_sha256 = _framed_sha256(
         _GENERATION_BUNDLE_DOMAIN,
         _canonical_json_bytes(
             {
-                "address_relation_oid": address_relation_oid,
-                "address_evidence_relation_oid": address_evidence_relation_oid,
+                "address_relation_name": address_name,
+                "address_evidence_relation_name": evidence_name,
+                "address_generation": {"origin_lineage_id": lineage_id, "origin_generation": origin_generation},
+                "network_generation": network_generation_by_field,
                 "address_selection_contract": BILLING_ADDRESS_SELECTION_CONTRACT,
                 "snapshot_set_sha256": snapshot_set_sha256,
             }
@@ -442,8 +380,8 @@ async def capture_billing_search_generation_pin(
     return BillingSearchGenerationPin(
         snapshot_set_sha256=snapshot_set_sha256,
         generation_bundle_sha256=generation_bundle_sha256,
-        address_relation_oid=address_relation_oid,
-        address_evidence_relation_oid=address_evidence_relation_oid,
+        address_relation_name=address_name,
+        address_evidence_relation_name=evidence_name,
     )
 
 

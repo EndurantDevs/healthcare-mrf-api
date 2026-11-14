@@ -1,16 +1,11 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Private candidate-local inventory storage; raw reads and receipts confer no Source authority.
-
-Native writer closure, custody, root linkage, publication and serving integration
-remain external. This store does not treat a target DTO or a table OID as a capability.
-"""
+"""Bounded candidate-local inventory storage and named snapshot data reads."""
 
 import hashlib
 from dataclasses import dataclass, replace
 from uuid import UUID
 
 from process.network_address_projection import _identifier
-from process.network_compact_layout import CompactAddressRelation
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource, fhir_normalized_capture
 from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
 from process.network_membership_candidate_lifecycle import (
@@ -19,7 +14,6 @@ from process.network_membership_candidate_lifecycle import (
     _require_open,
     _require_transaction,
 )
-from process.network_read_identity import NetworkReadIdentityError, verify_consumed_network_relations
 from process.registry_source_contribution_store import MAX_RECEIPT_BYTES
 from process.registry_source_inventory_contract import (
     MAX_INVENTORY_ENTRIES,
@@ -55,9 +49,10 @@ _NATIVE_PROTOCOL_RESERVE = 1024
 
 @dataclass(frozen=True)
 class SourceInventoryStoreReceipt:
-    """Observed storage identity and commitment; not native custody or admission proof."""
+    """Named inventory storage and its complete content commitment."""
 
-    table_oid: int
+    schema_name: str
+    table_name: str
     root: SourceInventoryRoot
 
 
@@ -184,24 +179,23 @@ async def _inventory_entries(entries):
             yield entry
 
 
-async def _verify_existing_inventory(connection, relation, entries, expected_root, row_limit, byte_limit):
+async def _verify_existing_inventory(connection, copy_target, entries, expected_root, row_limit, byte_limit):
+    relation = _relation(copy_target)
     actual = await connection.fetchrow(
-        "SELECT oid::bigint,relkind::text,relpersistence::text FROM pg_class WHERE oid=to_regclass($1)", relation
+        "SELECT relkind::text,relpersistence::text FROM pg_class WHERE oid=to_regclass($1)", relation
     )
     if actual is None:
         return None
-    if tuple(actual)[1:] != ("r", "p"):
-        raise RegistrySourceInventoryError("registry_source_inventory_physical_identity_invalid")
+    if tuple(actual) != ("r", "p"):
+        raise RegistrySourceInventoryError("registry_source_inventory_relation_invalid")
     await connection.execute(f"LOCK TABLE ONLY {relation} IN ACCESS EXCLUSIVE MODE NOWAIT")
-    if await connection.fetchval("SELECT to_regclass($1)::oid::bigint", relation) != actual["oid"]:
-        raise RegistrySourceInventoryError("registry_source_inventory_physical_identity_invalid")
     accumulator = SourceInventoryAccumulator()
     async for entry in _inventory_entries(entries):
         accumulator.accept(entry)
     if accumulator.finish() != expected_root:
         raise RegistrySourceInventoryError("registry_source_inventory_root_changed")
     await _fold_inventory(connection, relation, expected_root, row_limit, byte_limit)
-    return SourceInventoryStoreReceipt(actual["oid"], expected_root)
+    return SourceInventoryStoreReceipt(copy_target.schema_name, INVENTORY_TABLE, expected_root)
 
 
 def _fitted_metadata(metadata, row_limit, byte_limit):
@@ -224,25 +218,13 @@ def _fitted_metadata(metadata, row_limit, byte_limit):
     return selected
 
 
-async def _verify_api_consumption(connection, read_identity):
-    if read_identity is None:
-        return
-    if type(read_identity) is not tuple or len(read_identity) != 2:
-        raise RegistrySourceInventoryError("registry_source_inventory_physical_identity_invalid")
-    try:
-        await verify_consumed_network_relations(connection, (read_identity[0],), expected_backend_pid=read_identity[1])
-    except NetworkReadIdentityError as error:
-        raise RegistrySourceInventoryError("registry_source_inventory_physical_identity_invalid") from error
-
-
-async def _read_page(connection, relation, after_ordinal, row_limit, byte_limit, *, read_identity=None):
+async def _read_page(connection, relation, after_ordinal, row_limit, byte_limit):
     metadata = await connection.fetch(
         f"SELECT ordinal,({_ENCODED_ENTRY_BYTES_SQL}) AS encoded_bytes,"
         f"({_TRANSFER_BYTES_SQL}) AS transfer_bytes FROM {relation} WHERE ordinal>$1 ORDER BY ordinal LIMIT $2",
         after_ordinal,
         row_limit + 1,
     )
-    await _verify_api_consumption(connection, read_identity)
     if any(
         type(preflight_row["ordinal"]) is not int
         or not 1 <= preflight_row["ordinal"] <= MAX_INVENTORY_ENTRIES
@@ -258,7 +240,6 @@ async def _read_page(connection, relation, after_ordinal, row_limit, byte_limit,
         after_ordinal,
         fitted[-1]["ordinal"],
     )
-    await _verify_api_consumption(connection, read_identity)
     entries = tuple(source_inventory_entry(stored_row) for stored_row in stored_rows)
     if len(entries) != len(fitted) or any(
         len(encode_source_inventory_entry(entry)) != sizes["encoded_bytes"]
@@ -274,14 +255,11 @@ async def _read_page(connection, relation, after_ordinal, row_limit, byte_limit,
     return page
 
 
-async def _fold_inventory(
-    connection, relation, expected_root, row_limit, byte_limit, receive=None, *, read_identity=None
-):
+async def _fold_inventory(connection, relation, expected_root, row_limit, byte_limit, receive=None):
     physical = await connection.fetchrow(
         f"SELECT count(*) AS total,count(*) FILTER(WHERE ordinal IS NULL OR ordinal<1 "
         f"OR ordinal>{MAX_INVENTORY_ENTRIES}) AS invalid FROM {relation}"
     )
-    await _verify_api_consumption(connection, read_identity)
     if physical["total"] != expected_root.entry_count or physical["invalid"] != 0:
         raise RegistrySourceInventoryError("registry_source_inventory_root_changed")
     accumulator, after = SourceInventoryAccumulator(), 0
@@ -292,7 +270,6 @@ async def _fold_inventory(
             after,
             row_limit,
             byte_limit,
-            **({"read_identity": read_identity} if read_identity is not None else {}),
         )
         for entry in page.entries:
             accumulator.accept(entry)
@@ -320,7 +297,7 @@ async def write_source_inventory(
 
     Existing complete-scope/Open control-row authority is mandatory. Any page,
     COPY or verification failure rolls back the whole inventory, including DDL.
-    Successful metadata remains uncommitted; closing writers and custody are external.
+    Successful metadata remains uncommitted. The caller handles snapshot freezing and publication.
     byte_limit bounds the encoded entry list; indexed-column/native transfer has
     a separate fixed ceiling of MAX_INVENTORY_PAGE_BYTES + 4096 bytes.
     entries accepts a sync or async stream of entries; flatten each source page
@@ -337,70 +314,38 @@ async def write_source_inventory(
         if registered.inventory is None or registered.inventory.root != expected_root:
             raise RegistrySourceInventoryError("registry_source_inventory_root_changed")
         relation = _relation(copy_target)
-        existing = await _verify_existing_inventory(connection, relation, entries, expected_root, row_limit, byte_limit)
+        existing = await _verify_existing_inventory(
+            connection, copy_target, entries, expected_root, row_limit, byte_limit
+        )
         if existing is not None:
             return existing
         await _create_inventory(connection, relation)
         await _copy_inventory(connection, copy_target, entries, expected_root, row_limit, byte_limit)
         await _fold_inventory(connection, relation, expected_root, row_limit, byte_limit)
-        table_oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", relation)
-        return SourceInventoryStoreReceipt(table_oid, expected_root)
+        return SourceInventoryStoreReceipt(copy_target.schema_name, INVENTORY_TABLE, expected_root)
 
 
-async def _physical_context(connection, copy_target, expected_table_oid, control_schema, *, api_read=False):
-    _require_transaction(connection, copy_target)
-    if type(api_read) is not bool:
-        raise RegistrySourceInventoryError("registry_source_inventory_physical_identity_invalid")
-    if type(expected_table_oid) is not int or not 0 < expected_table_oid < 2**32:
-        raise RegistrySourceInventoryError("registry_source_inventory_physical_identity_invalid")
-    candidate = await connection.fetchrow(
-        f"SELECT dataset_id,schema_id,producer_id,candidate_id,schema_name "
-        f"FROM {_control_namespace(control_schema)}.network_membership_candidate WHERE candidate_id=$1",
-        UUID(copy_target.candidate_id),
-    )
-    if candidate is None or any(str(candidate[field]) != getattr(copy_target, field) for field in candidate.keys()):
-        raise RegistrySourceInventoryError("registry_source_inventory_scope_invalid")
-    relation = _relation(copy_target)
-    actual = await connection.fetchrow(
-        "SELECT c.oid::bigint,c.relkind::text,c.relpersistence::text FROM pg_class c "
-        "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=$2",
-        copy_target.schema_name,
-        INVENTORY_TABLE,
-    )
-    if actual is None or tuple(actual) != (expected_table_oid, "r", "p"):
-        raise RegistrySourceInventoryError("registry_source_inventory_physical_identity_invalid")
-    if api_read:
-        return relation
-    await connection.execute(f"LOCK TABLE ONLY {relation} IN ACCESS SHARE MODE NOWAIT")
-    pinned = await connection.fetchrow(
-        "SELECT to_regclass($1)::oid::bigint AS current_oid,EXISTS(SELECT FROM pg_locks "
-        "WHERE pid=pg_backend_pid() AND locktype='relation' AND relation=$2::oid "
-        "AND mode='AccessShareLock' AND granted) AS has_lock",
-        relation,
-        expected_table_oid,
-    )
-    if tuple(pinned) != (expected_table_oid, True):
-        raise RegistrySourceInventoryError("registry_source_inventory_physical_identity_invalid")
-    return relation
-
-
-async def _read_context(connection, copy_target, expected_table_oid, control_schema):
+async def _read_context(connection, copy_target, control_schema):
+    """Resolve the inventory name after exact logical candidate scope and repeatable read-only checks."""
     _require_transaction(connection, copy_target)
     settings = await connection.fetchrow(
         "SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only')"
     )
     if tuple(settings) not in (("repeatable read", "on"), ("serializable", "on")):
         raise RegistrySourceInventoryError("registry_source_inventory_snapshot_invalid")
-    return await _physical_context(connection, copy_target, expected_table_oid, control_schema)
+    candidate = await connection.fetchrow(
+        f"SELECT dataset_id,schema_id,producer_id,candidate_id,schema_name "
+        f"FROM {_control_namespace(control_schema)}.network_membership_candidate WHERE candidate_id=$1",
+        UUID(copy_target.candidate_id),
+    )
+    fields = ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
+    if candidate is None or any(str(candidate[field]) != getattr(copy_target, field) for field in fields):
+        raise RegistrySourceInventoryError("registry_source_inventory_scope_invalid")
+    return _relation(copy_target)
 
 
-async def _load_locked_source_inventory(connection, copy_target, candidate, *, expected_table_oid, control_schema=None):
-    """Fold metadata using the orchestrator's locked native OID; this grants no Source custody.
-
-    The custodian supplies its actual locked catalog OID. Retained callers must
-    first verify exact native custody and use the inventory OID in that seal.
-    Keep that transaction and its locks through all subsequent source use.
-    """
+async def load_source_inventory(connection, copy_target, candidate, *, control_schema=None):
+    """Read and validate complete named inventory data in a pinned snapshot."""
     _require_transaction(connection, copy_target)
     if await connection.fetchval("SHOW transaction_isolation") not in {"repeatable read", "serializable"}:
         raise RegistrySourceInventoryError("registry_source_inventory_snapshot_invalid")
@@ -410,85 +355,60 @@ async def _load_locked_source_inventory(connection, copy_target, candidate, *, e
         for field in ("candidate_id", "dataset_id", "schema_id", "producer_id", "schema_name")
     ):
         raise RegistrySourceInventoryError("registry_source_inventory_scope_invalid")
-    relation = await _physical_context(connection, copy_target, expected_table_oid, control_schema)
     actual = await connection.fetchrow(
-        f"SELECT source_recipes_json,source_generations FROM {_control_namespace(control_schema)}.network_membership_candidate WHERE candidate_id=$1",
+        f"SELECT dataset_id,schema_id,producer_id,candidate_id,schema_name,source_recipes_json,source_generations "
+        f"FROM {_control_namespace(control_schema)}.network_membership_candidate WHERE candidate_id=$1",
         UUID(copy_target.candidate_id),
     )
-    if actual is None or verify_source_recipe_metadata(dict(actual)).inventory != inventory:
+    if (
+        actual is None
+        or any(
+            str(actual[field]) != getattr(copy_target, field)
+            for field in ("candidate_id", "dataset_id", "schema_id", "producer_id", "schema_name")
+        )
+        or verify_source_recipe_metadata(dict(actual)).inventory != inventory
+    ):
         raise RegistrySourceInventoryError("registry_source_inventory_root_changed")
     entries = []
-    await _fold_inventory(connection, relation, inventory.root, 100, MAX_INVENTORY_PAGE_BYTES, entries.append)
+    await _fold_inventory(
+        connection, _relation(copy_target), inventory.root, 100, MAX_INVENTORY_PAGE_BYTES, entries.append
+    )
     return inventory, tuple(entries)
 
 
 async def _registered_inventory_entries(connection, copy_target, candidate, *, control_schema=None):
-    """Load producer validation metadata; this current OID never substitutes for sealed custody."""
+    """Load the complete registered inventory with native bounded content checks."""
     candidate_by_field = {**candidate, "source_recipes_json": candidate.get("source_recipes_json", [])}
     if verify_source_recipe_metadata(candidate_by_field).inventory is None:
         return None
-    expected_oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", _relation(copy_target))
-    _inventory, entries = await _load_locked_source_inventory(
-        connection, copy_target, candidate_by_field, expected_table_oid=expected_oid, control_schema=control_schema
-    )
+    _, entries = await load_source_inventory(connection, copy_target, candidate_by_field, control_schema=control_schema)
     return entries
 
 
 async def load_source_inventory_for_api(connection, copy_target, candidate, *, control_schema=None):
-    """Load a complete published inventory by name, without explicit reader locks.
-
-    Actual count, preflight and payload reads are checked before interpretation;
-    the caller retains this original RR/RO transaction through all subsequent use.
-    """
-    _require_transaction(connection, copy_target)
-    settings = await connection.fetchrow(
-        "SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only')"
-    )
-    if tuple(settings) not in (("repeatable read", "on"), ("serializable", "on")):
-        raise RegistrySourceInventoryError("registry_source_inventory_snapshot_invalid")
-    schema = _control_namespace(control_schema)[1:-1]
-    expected_oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", _relation(copy_target))
-    inventory = verify_source_recipe_metadata(candidate).inventory
-    if inventory is None or any(
-        str(candidate[field]) != getattr(copy_target, field)
-        for field in ("candidate_id", "dataset_id", "schema_id", "producer_id", "schema_name")
-    ):
-        raise RegistrySourceInventoryError("registry_source_inventory_scope_invalid")
-    relation = await _physical_context(connection, copy_target, expected_oid, schema, api_read=True)
-    actual = await connection.fetchrow(
-        f"SELECT source_recipes_json,source_generations FROM {_control_namespace(schema)}.network_membership_candidate WHERE candidate_id=$1",
-        UUID(copy_target.candidate_id),
-    )
-    if actual is None or verify_source_recipe_metadata(dict(actual)).inventory != inventory:
-        raise RegistrySourceInventoryError("registry_source_inventory_root_changed")
-    pid = await connection.fetchval("SELECT pg_backend_pid()")
-    read_identity = (CompactAddressRelation(copy_target.schema_name, INVENTORY_TABLE, expected_oid), pid)
-    entries = []
-    await _fold_inventory(
-        connection, relation, inventory.root, 100, MAX_INVENTORY_PAGE_BYTES, entries.append, read_identity=read_identity
-    )
-    return inventory, tuple(entries)
+    """Read the full registered content root in the caller's read-only snapshot."""
+    await _read_context(connection, copy_target, control_schema)
+    return await load_source_inventory(connection, copy_target, candidate, control_schema=control_schema)
 
 
 async def read_source_inventory_page(
     connection,
     copy_target,
     *,
-    expected_table_oid,
     after_ordinal=0,
     row_limit=100,
     byte_limit=MAX_INVENTORY_PAGE_BYTES,
     control_schema=None,
 ):
-    """Read bounded raw metadata under exact scope/OID and RR/RO, without authenticating any Source.
+    """Read bounded metadata under exact logical candidate scope and repeatable read-only isolation.
 
-    A caller must separately establish native custody and authorization. Requery
+    Requery
     from the returned last ordinal; byte/count lookahead is never a continuation iterator.
     byte_limit counts exact encoded-list bytes. Native scalar preflight and each
     payload transfer are separately bounded; indexed fields can shorten a page.
     """
     _page_arguments(after_ordinal, row_limit, byte_limit)
-    relation = await _read_context(connection, copy_target, expected_table_oid, control_schema)
+    relation = await _read_context(connection, copy_target, control_schema)
     return await _read_page(connection, relation, after_ordinal, row_limit, byte_limit)
 
 
@@ -496,7 +416,6 @@ async def verify_source_inventory(
     connection,
     copy_target,
     *,
-    expected_table_oid,
     expected_root,
     control_schema=None,
     row_limit=100,
@@ -504,10 +423,10 @@ async def verify_source_inventory(
 ):
     """Verify every stored row and derived column against a complete independently retained root.
 
-    This raw metadata check neither seals the candidate nor authenticates Source custody.
+    Every row and derived value contributes to the registered content root.
     """
     _page_arguments(0, row_limit, byte_limit)
     if type(expected_root) is not SourceInventoryRoot:
         raise RegistrySourceInventoryError("registry_source_inventory_invalid")
-    relation = await _read_context(connection, copy_target, expected_table_oid, control_schema)
+    relation = await _read_context(connection, copy_target, control_schema)
     return await _fold_inventory(connection, relation, expected_root, row_limit, byte_limit)

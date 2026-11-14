@@ -35,6 +35,7 @@ from process.network_cms_registry_source_pair import (
 )
 from process.network_custom_address_source import _require_transaction
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+from process.network_fhir_source_epoch import _TABLES as _EPOCH_TABLES
 from process.network_registry_cms_prepared_pair import (
     _PREPARED_COMMENT,
     _PREPARED_COMMENT_V2,
@@ -79,22 +80,22 @@ def _closed(document, model):
 
 
 def _request(document):
+    from process.registry_source_recipe_store import _decode_fhir_pin
+
     request_by_field = dict(_closed(document, RegistryCMSRetentionRequest))
-    pin_document = request_by_field.pop("source_pin")
-    pin_fields = {entry.name for entry in fields(PinnedFHIRMembershipSource)} - {
+    pin_by_field = request_by_field.pop("source_pin")
+    nullable_fields = {"retained_epoch", "source_witness_capture", "source_witness_anchor"}
+    expanded_fields = {entry.name for entry in fields(PinnedFHIRMembershipSource)} - {
         "retained_successor",
         "retained_capture",
     }
-    if type(pin_document) is not dict or set(pin_document) != pin_fields:
-        _invalid()
-    pin_by_field = dict(pin_document)
-    if type(pin_by_field["custody_runtime_roles"]) is not list or pin_by_field["retained_epoch"] is not None:
-        _invalid()
-    pin_by_field["custody_runtime_roles"] = tuple(pin_by_field["custody_runtime_roles"])
+    if type(pin_by_field) is dict and set(pin_by_field) == expanded_fields:
+        if any(pin_by_field[field] is not None for field in nullable_fields):
+            _invalid()
+        pin_by_field = {key: value for key, value in pin_by_field.items() if key not in nullable_fields}
+    pin = _decode_fhir_pin(pin_by_field)
     coordinates = _closed(request_by_field.pop("binding_coordinates"), RegistryNetworkSourceCoordinates)
-    return RegistryCMSRetentionRequest(
-        PinnedFHIRMembershipSource(**pin_by_field), RegistryNetworkSourceCoordinates(**coordinates), **request_by_field
-    )
+    return RegistryCMSRetentionRequest(pin, RegistryNetworkSourceCoordinates(**coordinates), **request_by_field)
 
 
 def _stages(entries):
@@ -127,7 +128,6 @@ def _require_pair_scope(pair):
         or pair.recipe.binding_coordinates != pair.request.binding_coordinates
         or pair.address_ownership.dataset_id != epoch.epoch_id
         or not 0 < pair.address_ownership.schema_oid < 2**32
-        or (pair.owner_role, pair.runtime_roles) != (epoch.owner_role, epoch.runtime_roles)
         or pair.request.expected_admission_sha256 != epoch.admission_sha256
         or pair.request.expected_metadata_sha256 != epoch.metadata_sha256
     ):
@@ -140,7 +140,7 @@ def _require_pair_scope(pair):
     ):
         if type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
             _invalid()
-    oids = [oid for _name, oid in epoch.relation_oids + pair.address_ownership.relation_oids]
+    oids = [oid for _name, oid in pair.address_ownership.relation_oids]
     oids += [entry[2] for entry in pair.address_stages]
     if any(type(oid) is not int or not 0 < oid < 2**32 for oid in oids) or len(oids) != len(set(oids)):
         _invalid()
@@ -295,18 +295,19 @@ async def cleanup_prepared_registry_cms_source_pair(session, prepared_pair):
     async with connection.transaction():
         tables = [
             _identifier(schema) + "." + _identifier(name)
-            for schema, relations in (
-                (prepared_pair.address_ownership.schema_name, prepared_pair.address_ownership.relation_oids),
-                (epoch.schema_name, epoch.relation_oids),
+            for schema, names in (
+                (
+                    prepared_pair.address_ownership.schema_name,
+                    tuple(name for name, _ in prepared_pair.address_ownership.relation_oids),
+                ),
+                (epoch.schema_name, _EPOCH_TABLES),
             )
-            for name, _oid in relations
+            for name in names
         ]
         await connection.execute("LOCK TABLE " + ",".join(sorted(tables)) + " IN ACCESS EXCLUSIVE MODE NOWAIT")
         await _require_prepared_pair(session, prepared_pair)
         await cleanup_entity_address_archive_stage(session, owner=prepared_pair.address_ownership)
-        raw_tables = ",".join(
-            _identifier(epoch.schema_name) + "." + _identifier(name) for name, _oid in epoch.relation_oids
-        )
+        raw_tables = ",".join(_identifier(epoch.schema_name) + "." + _identifier(name) for name in _EPOCH_TABLES)
         await connection.execute("DROP TABLE " + raw_tables + " RESTRICT")
         await connection.execute("DROP SCHEMA " + _identifier(epoch.schema_name) + " RESTRICT")
     return "removed"

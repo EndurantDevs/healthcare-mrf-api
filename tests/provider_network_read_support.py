@@ -8,14 +8,11 @@ from sanic import Request
 from sanic.compat import Header
 
 from process.network_compact_layout import CompactAddressRelation
-from process.network_read_identity import _CONSUMED_SQL
 
 
 def provider_reader_double(legacy_documents):
-    """Keep session/backend identity and bounded marker replies stable in route tests."""
-    driver = SimpleNamespace(
-        fetchval=AsyncMock(return_value=1), get_server_pid=lambda: 42, is_in_transaction=lambda: True
-    )
+    """Keep a logical read transaction and bounded query replies in route tests."""
+    driver = SimpleNamespace(fetchval=AsyncMock(return_value=1), is_in_transaction=lambda: True)
     connection = SimpleNamespace(get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=driver)))
     transaction = object()
     session = SimpleNamespace(
@@ -26,8 +23,6 @@ def provider_reader_double(legacy_documents):
     )
 
     async def guarded_read(sql, *parameters):
-        if sql == _CONSUMED_SQL:
-            return {"backend_matches": True, "relation_count": len(parameters[0]), "valid": True}
         return {"complete": True, "network_ids": sorted(document["network_id"] for document in legacy_documents())}
 
     driver.fetchrow = AsyncMock(side_effect=guarded_read)
@@ -36,7 +31,7 @@ def provider_reader_double(legacy_documents):
 
 def approved_record_relation(schema):
     """Return the fixed synthetic approved relation shared by route fixtures."""
-    return CompactAddressRelation(schema, "registry_approved_record", 321)
+    return CompactAddressRelation(schema, "registry_approved_record")
 
 
 def provider_test_request(path):

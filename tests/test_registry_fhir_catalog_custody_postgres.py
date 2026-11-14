@@ -1,13 +1,11 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Authenticated metadata sealing and native runtime privilege denial."""
 
-import asyncio
 import copy
 import hashlib
 import json
 import os
 import re
-from contextlib import suppress
 from dataclasses import asdict
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
@@ -18,18 +16,18 @@ import asyncpg
 import pytest
 from sqlalchemy import MetaData
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.schema import CreateTable
 
 from db.models.registry_approval import RegistryApprovedRecord
 from db.registry_fhir_catalog import PROJECTOR_VERSION, table_sql
 from process import registry_fhir_catalog_validation as validation
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
-from process.network_membership_writer_closure import writer_role_names
 from process.registry_fhir_catalog_custody import (
     PHYSICAL_TABLES,
     FHIRCatalogTarget,
-    freeze_fhir_catalog_snapshot,
-    verify_fhir_catalog_snapshot,
+    validate_fhir_catalog_snapshot_data,
+    validate_fhir_catalog_snapshot_record,
 )
 from process.registry_fhir_catalog_enrichment import FHIRCatalogEnrichmentContext, enrich_fhir_catalog_edges
 from process.registry_fhir_catalog_extraction import extract_fhir_catalog_batch
@@ -43,9 +41,9 @@ from process.registry_fhir_catalog_projection import (
 )
 from process.registry_fhir_catalog_registry_reader import (
     fhir_catalog_registry_reads,
-    verify_fhir_catalog_registry_reads,
 )
 from process.registry_fhir_catalog_validation import canonical_json, metadata_generation
+from tests.fhir_catalog_registry_reader_support import configured_catalog_reader
 from tests.test_registry_fhir_catalog_read import COMPANY, relationship_document
 
 
@@ -83,16 +81,47 @@ async def _create_metadata_roles(fixture, created_roles):
         await connection.execute(f'CREATE ROLE "{name}" ' + credential)
         created_roles.append(name)
     database = await connection.fetchval("SELECT quote_ident(current_database())")
+    await connection.execute(f'GRANT CREATE ON DATABASE {database} TO "{role_by_kind["loader"]}"')
+
+
+async def _prepare_common_catalogs(fixture, monkeypatch):
+    """Prepare real catalog prerequisites under the fixture administrator."""
+    from directory_membership_test_support import prepare_registry_catalog_foundation
+
+    if not await fixture.connection.fetchval("SELECT EXISTS(SELECT FROM pg_extension WHERE extname='pg_trgm')"):
+        fixture.created_extensions.append("pg_trgm")
+    await fixture.connection.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public")
+    await prepare_registry_catalog_foundation(fixture, monkeypatch)
+
+
+async def _create_metadata_controls(fixture):
+    """Create the component ledger and its existing restricted application grants."""
+    connection, role_by_kind, schemas = fixture.connection, fixture.roles, fixture.schemas
+    fixture.control_schema = "fhir_custody_control_" + uuid4().hex
+    schemas.append(fixture.control_schema)
+    await connection.execute(f'CREATE SCHEMA "{fixture.control_schema}"')
     await connection.execute(
-        f'GRANT CREATE ON DATABASE {database} TO "{role_by_kind["owner"]}","{role_by_kind["publisher"]}"'
+        f'CREATE TABLE "{fixture.control_schema}".network_registry_identity(network_id integer PRIMARY KEY)'
     )
+    approved_table = _approved_record_table(fixture.control_schema)
+    await connection.execute(str(CreateTable(approved_table).compile(dialect=postgresql.dialect())))
+    for statement in table_sql('"' + fixture.control_schema + '"', "registry_fhir_catalog_snapshot"):
+        await connection.execute(statement)
+    recipients = ",".join('"' + role_by_kind[kind] + '"' for kind in ("publisher", "reader"))
+    await connection.execute(f'GRANT USAGE ON SCHEMA "{fixture.control_schema}" TO {recipients}')
+    await connection.execute(f'GRANT SELECT ON ALL TABLES IN SCHEMA "{fixture.control_schema}" TO {recipients}')
     await connection.execute(
-        f'GRANT "{role_by_kind["loader"]}","{role_by_kind["owner"]}" TO "{role_by_kind["publisher"]}"'
+        f'GRANT INSERT,UPDATE(custody_json,accounting_json) ON "{fixture.control_schema}".registry_fhir_catalog_snapshot '
+        f'TO "{role_by_kind["publisher"]}"'
     )
+    from process.registry_fhir_catalog_permissions import _grant_named_preparation_control
+
+    async with connection.transaction():
+        await _grant_named_preparation_control(connection, role_by_kind["publisher"])
 
 
 @pytest.fixture
-async def metadata_custody():
+async def metadata_custody(monkeypatch):
     """Keep native metadata roles, control schema and connections under exact cleanup."""
     dsn = os.getenv("NETWORK_REGISTRY_TEST_DSN")
     if not dsn:
@@ -109,39 +138,38 @@ async def metadata_custody():
         schemas=schemas,
         observers=observers,
         dsn=dsn,
+        created_control_namespaces=[],
+        created_extensions=[],
+        engine=create_async_engine(dsn.replace("postgresql://", "postgresql+asyncpg://")),
     )
     try:
+        await _prepare_common_catalogs(fixture, monkeypatch)
         await _create_metadata_roles(fixture, created_roles)
-        await connection.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-        fixture.control_schema = "fhir_custody_control_" + uuid4().hex
-        schemas.append(fixture.control_schema)
-        await connection.execute(f'CREATE SCHEMA "{fixture.control_schema}"')
-        await connection.execute(
-            f'CREATE TABLE "{fixture.control_schema}".network_registry_identity(network_id integer PRIMARY KEY)'
-        )
-        approved_table = _approved_record_table(fixture.control_schema)
-        await connection.execute(str(CreateTable(approved_table).compile(dialect=postgresql.dialect())))
-        await connection.execute(f'GRANT USAGE ON SCHEMA "{fixture.control_schema}" TO "{role_by_kind["publisher"]}"')
-        await connection.execute(
-            f'GRANT SELECT ON ALL TABLES IN SCHEMA "{fixture.control_schema}" TO "{role_by_kind["publisher"]}"'
-        )
+        await _create_metadata_controls(fixture)
         fixture.target = await create_metadata_target(fixture)
         await _connect_metadata_actors(fixture, role_password)
-        yield fixture
+        async with configured_catalog_reader(monkeypatch, dsn, role_by_kind["reader"], role_password):
+            yield fixture
     finally:
         if hasattr(fixture, "sealer_pool"):
             await fixture.sealer_pool.close()
         for observer in observers:
             await observer.close()
+        await cleanup_catalog_preparations(connection, schemas)
         for schema in reversed(schemas):
             await connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
             assert await connection.fetchval("SELECT to_regnamespace($1)", schema) is None
+        for namespace in reversed(fixture.created_control_namespaces):
+            await connection.execute(f'DROP SCHEMA IF EXISTS "{namespace}" CASCADE')
+        for extension in reversed(fixture.created_extensions):
+            await connection.execute(f'DROP EXTENSION IF EXISTS "{extension}"')
         for name in reversed(created_roles):
             await connection.execute(f'DROP OWNED BY "{name}"')
             await connection.execute(f'DROP ROLE "{name}"')
         assert not await connection.fetchval(
             "SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=ANY($1::text[]))", created_roles
         )
+        await fixture.engine.dispose()
         await connection.close()
 
 
@@ -177,21 +205,132 @@ def expected_snapshot(fixture, target=None):
     return snapshot_by_field
 
 
-async def freeze_metadata(fixture, target=None, snapshot=None):
+async def cleanup_catalog_preparations(connection, schemas):
+    """Delete only the genuine preparation records for this fixture's candidate names."""
+    candidates = [
+        UUID(schema.removeprefix("fhir_catalog_"))
+        for schema in schemas
+        if re.fullmatch(r"fhir_catalog_[0-9a-f]{32}", schema)
+    ]
+    if not candidates:
+        return
+    async with connection.transaction():
+        for table in ("preparation_relation", "preparation_claim", "preparation"):
+            await connection.execute(
+                f"DELETE FROM hp_snapshot_retention.{table} WHERE preparation_id=ANY($1::uuid[])", candidates
+            )
+
+
+def metadata_preparation_roles(fixture):
+    """Use the existing separate administrator, publisher and application role names."""
+    return getattr(fixture, "preparation_roles", None) or {
+        "namespace_owner_role": fixture.roles["owner"],
+        "publisher_role": fixture.roles["publisher"],
+        "application_roles": sorted(fixture.roles[kind] for kind in ("loader", "reader", "publisher")),
+    }
+
+
+async def _checkpoint_metadata(fixture, target, snapshot):
+    """Persist loading before handing the actual candidate to the common lifecycle."""
+    from process.registry_fhir_catalog_store import (
+        admit_catalog_preparation,
+        catalog_snapshot_preparation,
+        checkpoint_fhir_catalog_snapshot,
+    )
+
+    async with fixture.publisher.transaction():
+        previous = await fixture.publisher.fetchrow(
+            f'SELECT * FROM "{fixture.control_schema}".registry_fhir_catalog_snapshot WHERE metadata_generation=$1',
+            snapshot["metadata_generation"],
+        )
+        if previous is None:
+            await checkpoint_fhir_catalog_snapshot(
+                fixture.publisher, target, snapshot, None, {}, control_schema=fixture.control_schema
+            )
+        else:
+            assert previous["schema_name"] == target.schema_name
+            snapshot.update(custody_json={"preparation": catalog_snapshot_preparation(previous)}, accounting_json={})
+        store, row, claim = await admit_catalog_preparation(
+            fixture.publisher,
+            snapshot,
+            control_schema=fixture.control_schema,
+            roles=metadata_preparation_roles(fixture),
+        )
+        if claim is not None:
+            await store.yield_named_claim(claim)
+        return row
+
+
+async def _freeze_metadata_generation(fixture, target, snapshot):
+    from directory_catalog_runtime import freeze_registry_generation
+
+    from process.registry_fhir_catalog_store import named_catalog_preparation
+
+    handoff = named_catalog_preparation(snapshot, fixture.control_schema)
+    config_by_field = {
+        **{field: handoff[field] for field in ("kind", "candidate_id", "catalog_schema", "storage_schema")},
+        "preparation_roles": metadata_preparation_roles(fixture),
+    }
+    async with fixture.engine.connect() as administrator:
+        frozen = await freeze_registry_generation(administrator, config_by_field, target.candidate_id)
+    assert frozen["state"] in {"frozen", "validated", "published"}
+
+
+async def freeze_metadata(
+    fixture, target=None, snapshot=None, *, validation_connection=None, standing_grant=None, observation_verifier=None
+):
+    """Checkpoint, administratively close writes, validate data and record the same claim."""
+    from process.registry_fhir_catalog_store import catalog_snapshot_preparation
+
     target = target or fixture.target
     snapshot = snapshot or expected_snapshot(fixture, target)
-    async with fhir_catalog_registry_reads(fixture.publisher), fixture.publisher.transaction():
-        receipt = await freeze_fhir_catalog_snapshot(
-            fixture.publisher,
+    await _checkpoint_metadata(fixture, target, snapshot)
+    await _freeze_metadata_generation(fixture, target, snapshot)
+    connection = validation_connection or fixture.publisher
+    async with fhir_catalog_registry_reads(connection), fixture.publisher.transaction():
+        receipt = await validate_fhir_catalog_snapshot_data(
+            connection,
             target,
-            writer_roles=writer_role_names(
-                fixture.roles["owner"], (fixture.roles["loader"],), (fixture.roles["reader"],)
-            ),
             expected_snapshot=snapshot,
             control_schema=fixture.control_schema,
+            standing_grant=standing_grant,
+            observation_verifier=observation_verifier,
         )
-        await verify_fhir_catalog_registry_reads()
-    return {**snapshot, "custody_json": receipt, "accounting_json": receipt["validation"]["tables"]}
+    snapshot.update(
+        custody_json={**receipt, "preparation": catalog_snapshot_preparation(snapshot)},
+        accounting_json=receipt["tables"],
+    )
+    await _record_metadata_validation(fixture, target, snapshot, receipt)
+    return snapshot
+
+
+async def _record_metadata_validation(fixture, target, snapshot, receipt):
+    """Use the real frozen claim and persist its completed data report together."""
+    from process.registry_fhir_catalog_store import admit_catalog_preparation
+
+    async with fixture.publisher.transaction():
+        store, row, claim = await admit_catalog_preparation(
+            fixture.publisher,
+            snapshot,
+            control_schema=fixture.control_schema,
+            roles=metadata_preparation_roles(fixture),
+        )
+        assert claim is not None and row["state"] in {"frozen", "validated"}
+        await store.validate_named(
+            claim,
+            {
+                "kind": "catalog",
+                "candidate_id": target.candidate_id,
+                "data": {key: receipt[key] for key in ("metadata_generation", "tables", "content_sha256")},
+            },
+        )
+        await fixture.publisher.execute(
+            f'UPDATE "{fixture.control_schema}".registry_fhir_catalog_snapshot SET custody_json=$2::jsonb,accounting_json=$3::jsonb WHERE metadata_generation=$1 AND published_at IS NULL',
+            snapshot["metadata_generation"],
+            canonical_json(snapshot["custody_json"]),
+            canonical_json(snapshot["accounting_json"]),
+        )
+        await store.yield_named_claim(claim)
 
 
 @pytest.mark.asyncio
@@ -199,9 +338,9 @@ async def test_runtime_writes_are_closed(metadata_custody):
     fixture = metadata_custody
     snapshot_by_field = await freeze_metadata(fixture)
     namespace = '"' + fixture.target.schema_name + '"'
-    assert set(snapshot_by_field["custody_json"]["relation_oids"]) == PHYSICAL_TABLES
+    assert set(snapshot_by_field["accounting_json"]) == PHYSICAL_TABLES
     async with fixture.reader.transaction(readonly=True):
-        await verify_fhir_catalog_snapshot(fixture.reader, snapshot_by_field)
+        await validate_fhir_catalog_snapshot_record(fixture.reader, snapshot_by_field)
         assert await fixture.reader.fetchval(f"SELECT count(*) FROM {namespace}.registry_fhir_catalog_network") == 0
     statements = (
         f"INSERT INTO {namespace}.registry_fhir_catalog_network SELECT * FROM {namespace}.registry_fhir_catalog_network",
@@ -212,7 +351,7 @@ async def test_runtime_writes_are_closed(metadata_custody):
         f"ALTER TABLE {namespace}.registry_fhir_catalog_network ADD COLUMN untracked integer",
         f'SET ROLE "{fixture.roles["owner"]}"',
     )
-    for observer in (fixture.loader, fixture.reader):
+    for observer in (fixture.loader, fixture.reader, fixture.publisher):
         for statement in statements:
             with pytest.raises(asyncpg.InsufficientPrivilegeError):
                 await observer.execute(statement)
@@ -222,38 +361,6 @@ async def test_runtime_writes_are_closed(metadata_custody):
                 schema_name=fixture.target.schema_name,
                 records=[("a" * 64, 7, "Example Network", "[]", False, 1, None, "example network")],
             )
-
-
-@pytest.mark.asyncio
-async def test_native_identity_change_refuses(metadata_custody):
-    fixture = metadata_custody
-    snapshot_by_field = await freeze_metadata(fixture)
-    namespace = '"' + fixture.target.schema_name + '"'
-    await fixture.connection.execute(f"DROP TABLE {namespace}.registry_fhir_catalog_network")
-    for statement in table_sql(namespace, "registry_fhir_catalog_network"):
-        await fixture.connection.execute(statement)
-    await fixture.connection.execute(
-        f'ALTER TABLE {namespace}.registry_fhir_catalog_network OWNER TO "{fixture.roles["owner"]}"'
-    )
-    async with fixture.connection.transaction(readonly=True):
-        with pytest.raises(ValueError, match="object identity changed"):
-            await verify_fhir_catalog_snapshot(fixture.connection, snapshot_by_field)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("drift", ["grant", "set_path"])
-async def test_native_authority_drift_refuses(metadata_custody, drift):
-    fixture = metadata_custody
-    snapshot_by_field = await freeze_metadata(fixture)
-    if drift == "grant":
-        await fixture.connection.execute(
-            f'GRANT UPDATE ON "{fixture.target.schema_name}".registry_fhir_catalog_network TO "{fixture.roles["reader"]}"'
-        )
-    else:
-        await fixture.connection.execute(f'GRANT "{fixture.roles["owner"]}" TO "{fixture.roles["reader"]}"')
-    async with fixture.connection.transaction(readonly=True):
-        with pytest.raises(ValueError, match="not closed"):
-            await verify_fhir_catalog_snapshot(fixture.connection, snapshot_by_field)
 
 
 def source_descriptor():
@@ -269,7 +376,10 @@ def source_descriptor():
         "profile": "published_normalized",
         "endpoint_id": "sample-endpoint",
         "dataset_sha256": "e" * 64,
-        "resource_table_oid": 123,
+        "tables": {
+            "header": {"schema": "sample_source", "name": "provider_directory_endpoint_dataset"},
+            "resource": {"schema": "sample_source", "name": "provider_directory_dataset_resource"},
+        },
         "source_uri": "https://example.test/fhir/",
         "accepted_receipt_id": "receipt-one",
         "accepted_receipt_sha256": "f" * 64,
@@ -349,29 +459,20 @@ async def test_validation_batches_and_stable_digest(metadata_custody, monkeypatc
     explained = json.loads(await fixture.connection.fetchval("EXPLAIN (ANALYZE,FORMAT JSON) " + sql, *parameters))
     assert "registry_fhir_catalog_observation_pkey" in json.dumps(explained)
     counted = BatchCounter(fixture.publisher)
-    async with fhir_catalog_registry_reads(counted), fixture.publisher.transaction():
-        receipt = await freeze_fhir_catalog_snapshot(
-            counted,
-            fixture.target,
-            writer_roles=writer_role_names(
-                fixture.roles["owner"], (fixture.roles["loader"],), (fixture.roles["reader"],)
-            ),
-            expected_snapshot=snapshot_by_field,
-            control_schema=fixture.control_schema,
-        )
-        await verify_fhir_catalog_registry_reads()
-    tables = receipt["validation"]["tables"]
+    sealed = await freeze_metadata(fixture, snapshot=snapshot_by_field, validation_connection=counted)
+    receipt = sealed["custody_json"]
+    tables = receipt["tables"]
     assert tables["registry_fhir_catalog_observation"]["rows"] == 1000
     assert tables["registry_fhir_catalog_observation"]["batches"] == 1
     assert tables["registry_fhir_catalog_observation"]["bytes"] > 0
     assert counted.pages == 8
     repeated = await freeze_metadata(fixture, snapshot=snapshot_by_field)
-    assert repeated["custody_json"]["validation"]["content_sha256"] == receipt["validation"]["content_sha256"]
+    assert repeated["custody_json"]["content_sha256"] == receipt["content_sha256"]
     monkeypatch.setattr(
         validation, "_table_digest", AsyncMock(side_effect=AssertionError("retained read rescanned metadata"))
     )
     async with fixture.reader.transaction(readonly=True):
-        await verify_fhir_catalog_snapshot(fixture.reader, repeated)
+        await validate_fhir_catalog_snapshot_record(fixture.reader, repeated)
 
 
 @pytest.mark.asyncio
@@ -389,45 +490,30 @@ async def test_source_count_and_input_tamper_refuse(metadata_custody):
     tampered["metadata_generation"] = metadata_generation(tampered)
     async with fixture.reader.transaction(readonly=True):
         with pytest.raises(ValueError, match="inputs_changed"):
-            await verify_fhir_catalog_snapshot(fixture.reader, tampered)
+            await validate_fhir_catalog_snapshot_record(fixture.reader, tampered)
 
 
 @pytest.mark.asyncio
 async def test_committed_writer_is_validated_after_fence(metadata_custody):
     fixture = metadata_custody
-    snapshot_by_field = expected_snapshot(fixture)
-    pid = await fixture.publisher.fetchval("SELECT pg_backend_pid()")
-    task = None
-    try:
-        async with fixture.loader.transaction():
-            await fixture.loader.execute(
-                f'INSERT INTO "{fixture.target.schema_name}".registry_fhir_catalog_network '
-                "(metadata_generation,network_id,display_name,aliases,archived,revision,benefit_codes,search_name) "
-                "VALUES($1,999,'Raced Network','[]'::jsonb,false,1,NULL,'raced network')",
-                snapshot_by_field["metadata_generation"],
-            )
-            task = asyncio.create_task(freeze_metadata(fixture, snapshot=snapshot_by_field))
-            for _ in range(100):
-                if await fixture.connection.fetchval(
-                    "SELECT wait_event_type='Lock' FROM pg_stat_activity WHERE pid=$1", pid
-                ):
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                raise AssertionError("sealer did not wait on the active metadata writer")
-        with pytest.raises(ValueError, match="set_validation_failed"):
-            await task
-        assert (
-            await fixture.connection.fetchval(
-                "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname=$1", fixture.target.schema_name
-            )
-            == fixture.roles["loader"]
+    snapshot = expected_snapshot(fixture)
+    async with fixture.loader.transaction():
+        await fixture.loader.execute(
+            f'INSERT INTO "{fixture.target.schema_name}".registry_fhir_catalog_network '
+            "(metadata_generation,network_id,display_name,aliases,archived,revision,benefit_codes,search_name) "
+            "VALUES($1,999,'Raced Network','[]'::jsonb,false,1,NULL,'raced network')",
+            snapshot["metadata_generation"],
         )
-    finally:
-        if task is not None and not task.done():
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+        with pytest.raises(asyncpg.LockNotAvailableError):
+            await freeze_metadata(fixture, snapshot=snapshot)
+    with pytest.raises(ValueError, match="set_validation_failed"):
+        await freeze_metadata(fixture, snapshot=snapshot)
+    assert (
+        await fixture.connection.fetchval(
+            f'SELECT count(*) FROM "{fixture.target.schema_name}".registry_fhir_catalog_network'
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -435,7 +521,12 @@ async def test_stale_transaction_cannot_seal(metadata_custody):
     fixture = metadata_custody
     async with fixture.publisher.transaction(isolation="repeatable_read"):
         with pytest.raises(ValueError, match="fresh_snapshot_required"):
-            await freeze_metadata(fixture)
+            await validate_fhir_catalog_snapshot_data(
+                fixture.publisher,
+                fixture.target,
+                expected_snapshot=expected_snapshot(fixture),
+                control_schema=fixture.control_schema,
+            )
 
 
 def _projection_resources(organization_id):
@@ -588,40 +679,28 @@ async def test_manual_uuid_relationship_is_validated(metadata_custody):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("table", sorted(validation._KEYS))
-async def test_digest_accepts_each_expected_native_key_before_paging(table):
-    connection = SimpleNamespace(
-        fetchval=AsyncMock(return_value=canonical_json(validation._KEYS[table])),
-        fetch=AsyncMock(return_value=[]),
-    )
+async def test_digest_reads_empty_declared_tables(table):
+    connection = SimpleNamespace(fetch=AsyncMock(return_value=[]))
     report = await validation._table_digest(connection, '"catalog_fixture"', table)
     assert report == {"rows": 0, "sha256": hashlib.sha256(b"").hexdigest(), "batches": 0, "bytes": 0}
-    connection.fetchval.assert_awaited_once()
-    assert connection.fetchval.await_args.args[1] == '"catalog_fixture".' + table
     connection.fetch.assert_awaited_once()
+    assert f'"catalog_fixture".{table}' in connection.fetch.await_args.args[0]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "native_keys",
-    [
-        None,
-        [],
-        [["metadata_generation", "text"]],
-        [["metadata_generation", "text"], ["display_name", "text"]],
-        [["network_id", "integer"], ["metadata_generation", "text"]],
-        [["metadata_generation", "text"], ["network_id", "text"]],
-        [["metadata_generation", "text"], ["network_id", "integer"], ["display_name", "text"]],
-    ],
-    ids=["missing", "empty", "incomplete", "unrelated", "reordered", "wrong-type", "extra-column"],
-)
-async def test_digest_refuses_missing_or_changed_native_key_without_paging(native_keys):
-    connection = SimpleNamespace(
-        fetchval=AsyncMock(return_value=None if native_keys is None else canonical_json(native_keys)),
-        fetch=AsyncMock(),
+@pytest.mark.parametrize("next_network_id", [7, 6], ids=["duplicate", "decreasing"])
+async def test_digest_refuses_nonincreasing_page_keys(next_network_id):
+    document_by_field = dict(
+        zip(NETWORK_COLUMNS, ("a" * 64, 7, "Example Network", [], False, 1, None, "example network"))
     )
-    with pytest.raises(ValueError, match="registry_fhir_catalog_validation_key_invalid"):
+    encoded = canonical_json(document_by_field)
+    entry_by_field = {"metadata_generation": "a" * 64, "network_id": 7, "document": encoded, "row_bytes": len(encoded)}
+    connection = SimpleNamespace(
+        fetch=AsyncMock(side_effect=[[entry_by_field], [{**entry_by_field, "network_id": next_network_id}]])
+    )
+    with pytest.raises(ValueError, match="registry_fhir_catalog_validation_order_invalid"):
         await validation._table_digest(connection, '"catalog_fixture"', "registry_fhir_catalog_network")
-    connection.fetch.assert_not_awaited()
+    assert connection.fetch.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -647,32 +726,29 @@ async def test_duplicate_paging_keys_refuse_after_writer_closure(metadata_custod
         snapshot_by_field["metadata_generation"],
         validation.PAGE_ROWS + 1,
     )
-    with pytest.raises(ValueError, match="registry_fhir_catalog_validation_key_invalid"):
+    with pytest.raises(ValueError, match="registry_fhir_catalog_validation_order_invalid"):
         await freeze_metadata(fixture, snapshot=snapshot_by_field)
     assert await fixture.connection.fetchval(f"SELECT count(*) FROM {namespace}.registry_fhir_catalog_network") == 1001
-    assert (
-        await fixture.connection.fetchval(
-            "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname=$1", fixture.target.schema_name
-        )
-        == fixture.roles["loader"]
-    )
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        await fixture.loader.execute(f"DELETE FROM {namespace}.registry_fhir_catalog_network")
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["schema_missing", "table_missing", "rls"])
-async def test_sealed_catalog_requires_its_complete_original_unfiltered_heaps(metadata_custody, change):
+@pytest.mark.parametrize("change", ["schema_missing", "table_missing"])
+async def test_named_catalog_requires_declared_tables(metadata_custody, change):
     fixture = metadata_custody
     selected = await freeze_metadata(fixture)
     namespace = '"' + fixture.target.schema_name + '"'
-    statements_by_change = {
-        "schema_missing": f"DROP SCHEMA {namespace} CASCADE",
-        "table_missing": f"DROP TABLE {namespace}.registry_fhir_catalog_network",
-        "rls": f"ALTER TABLE {namespace}.registry_fhir_catalog_network ENABLE ROW LEVEL SECURITY",
-    }
-    await fixture.connection.execute(statements_by_change[change])
-    async with fixture.connection.transaction(readonly=True):
-        with pytest.raises(ValueError, match="custody_invalid"):
-            await verify_fhir_catalog_snapshot(fixture.connection, selected)
+    statement = (
+        f"DROP SCHEMA {namespace} CASCADE"
+        if change == "schema_missing"
+        else f"DROP TABLE {namespace}.registry_fhir_catalog_network"
+    )
+    await fixture.connection.execute(statement)
+    async with fixture.reader.transaction(readonly=True):
+        await validate_fhir_catalog_snapshot_record(fixture.reader, selected)
+        with pytest.raises(asyncpg.UndefinedTableError):
+            await fixture.reader.fetchval(f"SELECT count(*) FROM {namespace}.registry_fhir_catalog_network")
     assert (
         await fixture.connection.fetchval(f'SELECT count(*) FROM "{fixture.control_schema}".network_registry_identity')
         == 0

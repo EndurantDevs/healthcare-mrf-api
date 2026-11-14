@@ -211,7 +211,7 @@ async def test_authenticated_enqueue_reuses_an_existing_or_concurrently_inserted
     connection = Mock(is_in_transaction=Mock(return_value=True), fetchrow=AsyncMock(side_effect=[selected, None]))
     lookup = AsyncMock(side_effect=[None, existing_receipt_by_field] if raced else [existing_receipt_by_field])
     monkeypatch.setattr(publication, "existing_publication_request", lookup)
-    monkeypatch.setattr(publication, "verify_fhir_catalog_snapshot", AsyncMock())
+    monkeypatch.setattr(publication, "validate_fhir_catalog_snapshot_record", AsyncMock())
     authorize = AsyncMock(
         return_value={
             "authorized": True,
@@ -237,7 +237,7 @@ async def test_existing_queue_receipt_does_not_bypass_current_command_authorizat
     connection = Mock(is_in_transaction=Mock(return_value=True), fetchrow=AsyncMock(return_value=selected))
     lookup = AsyncMock(return_value={"state": "completed"})
     monkeypatch.setattr(publication, "existing_publication_request", lookup)
-    monkeypatch.setattr(publication, "verify_fhir_catalog_snapshot", AsyncMock())
+    monkeypatch.setattr(publication, "validate_fhir_catalog_snapshot_record", AsyncMock())
     with pytest.raises(ValueError, match="authority_invalid"):
         await publication.enqueue_fhir_catalog_publication(
             connection,
@@ -359,7 +359,7 @@ async def test_enqueue_refuses_missing_or_changed_closed_snapshot_before_authori
     connection = Mock(is_in_transaction=Mock(return_value=True), fetchrow=AsyncMock(return_value=selected))
     verify = AsyncMock()
     authorize = AsyncMock()
-    monkeypatch.setattr(publication, "verify_fhir_catalog_snapshot", verify)
+    monkeypatch.setattr(publication, "validate_fhir_catalog_snapshot_record", verify)
     with pytest.raises(publication.RegistryApprovalConflict, match="registry_fhir_catalog_snapshot_changed"):
         await publication.enqueue_fhir_catalog_publication(
             connection, command_by_field, authorize_metadata=authorize, control_schema="catalog_control"
@@ -446,3 +446,363 @@ async def test_control_request_refuses_noncanonical_run_identity_before_configur
     with pytest.raises(ValueError, match="registry_fhir_catalog_sync_parameters_invalid"):
         await control.control_start({}, {"run_id": run_id})
     parse_config.assert_not_called()
+
+
+def preparation_case():
+    from process.registry_fhir_catalog_custody import FHIRCatalogTarget
+    from process.registry_fhir_catalog_store import named_catalog_preparation_roles
+    from tests.test_registry_fhir_catalog_grant import snapshot, standing_grant
+
+    grant = standing_grant()
+    candidate = uuid4()
+    target = FHIRCatalogTarget(*(str(uuid4()) for _ in range(3)), str(candidate), "fhir_catalog_" + candidate.hex)
+    selected = snapshot(grant, schema_name=target.schema_name)
+    selected["schema_name"] = target.schema_name
+    roles = named_catalog_preparation_roles(
+        {
+            "namespace_owner_role": "catalog_frozen",
+            "publisher_role": "catalog_validator",
+            "application_roles": ["catalog_execution", "catalog_loader", "catalog_reader", "catalog_validator"],
+        }
+    )
+    return target, selected, SimpleNamespace(grant=grant, preparation_roles=roles)
+
+
+class PreparationConnection:
+    def __init__(self):
+        self.execute = AsyncMock()
+        self.active = False
+
+    def is_in_transaction(self):
+        return self.active
+
+    @asynccontextmanager
+    async def transaction(self, **_options):
+        self.active = True
+        try:
+            yield
+        finally:
+            self.active = False
+
+
+@pytest.mark.parametrize("initial", [{}, {"custody_json": None}])
+def test_fresh_catalog_snapshot_has_no_preparation_checkpoint(initial):
+    from process.registry_fhir_catalog_store import catalog_snapshot_preparation
+
+    assert catalog_snapshot_preparation(initial) is None
+
+
+async def test_catalog_checkpoint_preserves_exact_candidate_and_bounded_resume_data():
+    from process import registry_fhir_catalog_store as store
+
+    target, selected, config = preparation_case()
+    connection = PreparationConnection()
+    accounting_by_phase = {"copied_rows": 7}
+    async with connection.transaction():
+        await store.checkpoint_fhir_catalog_snapshot(
+            connection, target, selected, None, accounting_by_phase, control_schema=config.grant.control_schema
+        )
+    accounting_by_phase["transient_status"] = "waiting"
+    handoff = store.named_catalog_preparation(selected, config.grant.control_schema)
+    assert selected["accounting_json"] == {}
+    assert handoff["candidate_id"] == target.candidate_id
+    assert store.catalog_snapshot_preparation(selected)["accounting"] == {"copied_rows": 7}
+    assert "accounting" not in handoff["snapshot"]
+    assert {table["schema"] for table in handoff["tables"]} == {target.schema_name}
+    assert len(handoff["tables"]) == 5
+    connection.fetchrow = AsyncMock(return_value=selected)
+    assert (
+        await store.load_named_catalog_preparation(
+            connection, target.candidate_id, control_schema=config.grant.control_schema
+        )
+        == handoff
+    )
+    query, name = connection.fetchrow.await_args.args
+    assert "WHERE schema_name=$1" in query and name == target.schema_name
+    assert len(json.dumps(handoff).encode()) < 262144
+
+
+async def test_catalog_admission_reuses_saved_run_scope_and_publication_fence(monkeypatch):
+    from pathlib import Path
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "source"))
+    import directory_catalog_runtime
+
+    from process import registry_fhir_catalog_store as store
+
+    copy_target, selected, config = preparation_case()
+    connection = PreparationConnection()
+    async with connection.transaction():
+        await store.checkpoint_fhir_catalog_snapshot(
+            connection, copy_target, selected, None, {}, control_schema=config.grant.control_schema
+        )
+    named_store = SimpleNamespace(admit_named=AsyncMock(return_value=({"state": "handed_off"}, None)))
+    constructor = Mock(return_value=named_store)
+    monkeypatch.setattr(directory_catalog_runtime, "NamedPreparationStore", constructor)
+    for _ in range(2):
+        await store.admit_catalog_preparation(
+            connection, selected, control_schema=config.grant.control_schema, roles=config.preparation_roles
+        )
+    first, second = named_store.admit_named.await_args_list
+    assert first == second
+    request, handoff = first.args
+    assert request.run_id == request.generation_id == request.publication_fence == copy_target.candidate_id
+    assert request.node_id == config.grant.control_schema
+    assert request.dataset_key == selected["metadata_generation"]
+    assert request.idempotency_key == "catalog:" + selected["metadata_generation"]
+    assert request.request_sha256 == hashlib.sha256(worker.canonical_json(handoff).encode()).hexdigest()
+    assert first.kwargs == {"attempt_id": copy_target.candidate_id}
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+@pytest.mark.parametrize("validation_failure", [None, asyncio.CancelledError])
+async def test_catalog_waits_for_freeze_then_records_only_completed_data_validation(
+    monkeypatch, frozen, validation_failure
+):
+    """Wait for freeze and persist only successful data validation, preserving cancellation."""
+    from process import registry_fhir_catalog_store as store
+
+    copy_target, selected, config = preparation_case()
+    connection = PreparationConnection()
+    await _checkpoint_catalog_candidate(connection, copy_target, selected, config)
+
+    @asynccontextmanager
+    async def acquire():
+        yield connection
+
+    @asynccontextmanager
+    async def workspace(_connection):
+        yield object()
+
+    @asynccontextmanager
+    async def reads(*_connections):
+        yield
+
+    claim = object() if frozen else None
+    preparation_by_field = {"state": "frozen" if frozen else "handed_off"}
+    named_store = SimpleNamespace(validate_named=AsyncMock(), yield_named_claim=AsyncMock())
+    admit = AsyncMock(return_value=(named_store, preparation_by_field, claim))
+    receipt_by_field = {
+        "metadata_generation": selected["metadata_generation"],
+        "inputs": {},
+        "tables": {"registry_fhir_catalog_source": {"rows": 2, "sha256": "b" * 64}},
+        "content_sha256": "c" * 64,
+    }
+    validate = AsyncMock(return_value=receipt_by_field, side_effect=validation_failure)
+    monkeypatch.setattr(worker, "admit_catalog_preparation", admit)
+    monkeypatch.setattr(worker, "fhir_catalog_reference_workspace", workspace)
+    monkeypatch.setattr(worker, "fhir_catalog_registry_reads", reads)
+    monkeypatch.setattr(worker, "build_fhir_catalog_observation_verifier", Mock(return_value=AsyncMock()))
+    monkeypatch.setattr(worker, "validate_fhir_catalog_snapshot_data", validate)
+    if frozen and validation_failure:
+        with pytest.raises(validation_failure):
+            await worker._seal_catalog_snapshot(config, copy_target, selected, SimpleNamespace(acquire=acquire))
+        named_store.validate_named.assert_not_awaited()
+        connection.execute.assert_not_awaited()
+        assert admit.await_count == 1
+    else:
+        state = await worker._seal_catalog_snapshot(config, copy_target, selected, SimpleNamespace(acquire=acquire))
+        assert state == ("validated" if frozen else "handed_off")
+        assert validate.await_count == int(frozen)
+        assert named_store.validate_named.await_count == int(frozen)
+        assert connection.execute.await_count == int(frozen)
+        assert admit.await_count == (2 if frozen else 1)
+        if frozen:
+            assert (
+                named_store.validate_named.await_args.args[1]["data"]["content_sha256"]
+                == receipt_by_field["content_sha256"]
+            )
+            assert store.catalog_snapshot_preparation(selected)["target"]["candidate_id"] == copy_target.candidate_id
+
+
+@pytest.mark.parametrize("failure", [None, RuntimeError])
+async def test_catalog_preparation_publication_shares_the_pointer_transaction(monkeypatch, failure):
+    """Commit the preparation and pointer together, or roll both back on publication failure."""
+    copy_target, selected, config = preparation_case()
+    connection = PreparationConnection()
+    await _checkpoint_catalog_candidate(connection, copy_target, selected, config)
+    _snapshot, command, request_record = service_request()
+    command["metadata_generation"] = selected["metadata_generation"]
+    events = []
+
+    @asynccontextmanager
+    async def locked(*_arguments):
+        events.append("begin")
+        try:
+            yield request_record
+        except BaseException:
+            events.append("rollback")
+            raise
+        else:
+            events.append("commit")
+
+    async def complete(_claim, result):
+        assert len(connection.execute.await_args_list) == 2
+        assert result["data"]["metadata_generation"] == selected["metadata_generation"]
+        events.append("preparation")
+        if failure:
+            raise failure("publication failed")
+
+    named_store = SimpleNamespace(publish_named=AsyncMock(side_effect=complete))
+    monkeypatch.setattr(publication, "locked_publication_request_transaction", locked)
+    monkeypatch.setattr(publication, "_validated_request", Mock(return_value=command))
+    monkeypatch.setattr(publication, "_snapshot", AsyncMock(return_value=selected))
+    monkeypatch.setattr(publication, "_authority", AsyncMock())
+    monkeypatch.setattr(publication, "_compare_head", AsyncMock())
+    monkeypatch.setattr(
+        publication,
+        "admit_catalog_preparation",
+        AsyncMock(
+            return_value=(named_store, {"state": "validated", "publication_fence": copy_target.candidate_id}, object())
+        ),
+    )
+    finish = AsyncMock()
+    monkeypatch.setattr(publication, "finish_registry_publication_request", finish)
+    publication_options_by_name = dict(
+        authorize_metadata=AsyncMock(),
+        verify_sources=AsyncMock(return_value=True),
+        control_schema=config.grant.control_schema,
+        preparation_roles=config.preparation_roles,
+    )
+    if failure:
+        with pytest.raises(failure):
+            await publication._complete_fenced(connection, uuid4(), uuid4(), **publication_options_by_name)
+        finish.assert_not_awaited()
+        assert events == ["begin", "preparation", "rollback"]
+    else:
+        await publication._complete_fenced(connection, uuid4(), uuid4(), **publication_options_by_name)
+        finish.assert_awaited_once()
+        assert events == ["begin", "preparation", "commit"]
+
+
+async def _checkpoint_catalog_candidate(connection, copy_target, selected, config):
+    """Complete and clear the candidate-loading setup before publication assertions."""
+    from process import registry_fhir_catalog_store as store
+
+    async with connection.transaction():
+        await store.checkpoint_fhir_catalog_snapshot(
+            connection, copy_target, selected, None, {}, control_schema=config.grant.control_schema
+        )
+    connection.execute.reset_mock()
+
+
+async def test_catalog_administrative_setup_separates_candidate_ddl_and_validator_control_grants():
+    from dataclasses import replace
+
+    from process.registry_fhir_catalog_permissions import install_fhir_catalog_preparation_permissions
+
+    connection = PreparationConnection()
+    connection.fetchval = AsyncMock(return_value='"example_database"')
+    runtime = FHIRCatalogPublicationRuntime(AsyncMock(), AsyncMock(), AsyncMock())
+    consumer = RegistryPublicationConsumerConfig(
+        "catalog_control",
+        "catalog_lifecycle",
+        "catalog_execution",
+        "catalog_reader",
+        "catalog_queue",
+        "catalog_frozen",
+        loader_roles=("catalog_loader",),
+        reader_roles=("catalog_reader",),
+    )
+    consumer = replace(consumer, metadata_runtime=runtime, metadata_only=True)
+    async with connection.transaction():
+        await install_fhir_catalog_preparation_permissions(
+            connection, consumer, loader_role="catalog_loader", sealer_role="catalog_validator"
+        )
+    statements = [call.args[0] for call in connection.execute.await_args_list]
+    assert 'REVOKE "catalog_loader" FROM "catalog_validator"' in statements
+    assert 'GRANT CREATE ON DATABASE "example_database" TO "catalog_loader"' in statements
+    assert 'REVOKE CREATE ON DATABASE "example_database" FROM "catalog_validator"' in statements
+    assert any(
+        "GRANT UPDATE(custody_json,accounting_json)" in sql and 'TO "catalog_validator"' in sql for sql in statements
+    )
+    control_grants = [
+        sql
+        for sql in statements
+        if sql.startswith("GRANT SELECT,INSERT(") and " ON hp_snapshot_retention.preparation TO " in sql
+    ]
+    assert len(control_grants) == 1
+    assert 'TO "catalog_execution","catalog_validator"' in control_grants[0]
+    assert "frozen_inventory" not in control_grants[0] and "frozen_sha256" not in control_grants[0]
+    assert "INSERT(preparation_id," in control_grants[0] and "UPDATE(state," in control_grants[0]
+    assert any(
+        sql.startswith("REVOKE INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES ON hp_snapshot_retention.preparation")
+        for sql in statements
+    )
+    assert any(
+        sql.startswith("REVOKE INSERT(") and "frozen_inventory,frozen_sha256" in sql and "REFERENCES(" in sql
+        for sql in statements
+    )
+    assert any('REVOKE "catalog_frozen" FROM ' in sql for sql in statements)
+
+
+@pytest.mark.parametrize("checkpointed", [False, True])
+async def test_catalog_cancellation_retains_a_durable_handoff_and_cleans_only_unregistered_candidate(
+    monkeypatch, checkpointed
+):
+    target, _selected, config = preparation_case()
+    config.loader_role = "catalog_loader"
+    connection = PreparationConnection()
+    canceled = asyncio.CancelledError()
+
+    async def prepare(_config, _loader, _source, _sealer, staged, **_options):
+        staged.update(target=target, checkpointed=checkpointed)
+        raise canceled
+
+    discard = AsyncMock()
+    monkeypatch.setattr(worker, "_prepare_fhir_catalog_snapshot", prepare)
+    monkeypatch.setattr(worker, "discard_fhir_catalog_candidate", discard)
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await worker.prepare_fhir_catalog_snapshot(config, connection, None, None)
+    assert caught.value is canceled
+    assert discard.await_count == int(not checkpointed)
+
+
+def test_operator_role_profile_uses_names_without_worker_credentials():
+    from process.registry_fhir_catalog_store import named_catalog_preparation_roles
+    from process.registry_fhir_catalog_worker import parse_fhir_catalog_sync_config
+    from tests.test_registry_fhir_catalog_worker_startup import _configuration
+
+    configured = _configuration(source_reader=True)
+    parsed = parse_fhir_catalog_sync_config(json.dumps(configured))
+    roles = named_catalog_preparation_roles(parsed)
+    roles["application_roles"] = sorted({*roles["application_roles"], "source_loader", "source_runtime"})
+    configured["preparation_roles"] = roles
+    assert parse_fhir_catalog_sync_config(json.dumps(configured)).preparation_roles == roles
+    assert named_catalog_preparation_roles(roles) == roles
+    configured["preparation_roles"] = {**roles, "publisher_role": "another_publisher"}
+    with pytest.raises(ValueError, match="configuration_invalid"):
+        parse_fhir_catalog_sync_config(json.dumps(configured))
+
+
+@pytest.mark.parametrize("changed", [None, "mapping_sha256", "source_vector_json", "previous_generation"])
+async def test_catalog_pending_resume_preserves_original_date_and_compares_build_inputs(changed):
+    from datetime import date
+
+    from process import registry_fhir_catalog_store as store
+
+    copy_target, selected, config = preparation_case()
+    connection = PreparationConnection()
+    async with connection.transaction():
+        await store.checkpoint_fhir_catalog_snapshot(
+            connection, copy_target, selected, None, {"written": 1}, control_schema=config.grant.control_schema
+        )
+    proposed_by_field = {**selected, "as_of": date(2026, 1, 2)}
+    if changed == "mapping_sha256":
+        proposed_by_field[changed] = "f" * 64
+    elif changed == "source_vector_json":
+        proposed_by_field[changed] = [{"source_id": "alias-a", "source_generation": "f" * 64, "status": "current"}]
+    proposed_by_field["metadata_generation"] = worker.metadata_generation(proposed_by_field)
+    connection.fetchrow = AsyncMock(side_effect=[None, selected])
+    retained_snapshot = await worker._reusable_catalog_snapshot(
+        connection,
+        config.grant,
+        proposed_by_field["metadata_generation"],
+        expected_snapshot=proposed_by_field,
+        previous_generation="e" * 64 if changed == "previous_generation" else None,
+    )
+    assert retained_snapshot == (selected if changed is None else None)
+    assert selected["as_of"] == date(2026, 1, 1)
+    assert connection.fetchrow.await_count == 2
+    query, policy = connection.fetchrow.await_args.args
+    assert "LIMIT 1" in query and "published_at IS NULL" in query and policy == config.grant.sha256

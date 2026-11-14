@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Pure approved-source boundaries; native custody remains independently verified."""
+"""Approved revision, bounded data and named snapshot read boundaries."""
 
 import asyncio
 from dataclasses import replace
@@ -51,22 +51,27 @@ async def test_command_seek_refuses_a_changed_approval_snapshot_before_decoding(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "read_identity",
-    [
-        (),
-        (object(), 41),
-        (CompactAddressRelation("other_registry", "registry_approved_record", 42), 41),
-        (CompactAddressRelation("registry", "network_membership", 42), 41),
-    ],
-)
-async def test_retained_pin_cannot_borrow_an_unrelated_consumed_relation(read_identity):
-    connection = SimpleNamespace(is_in_transaction=lambda: True, fetchrow=AsyncMock(return_value=scope_row()))
-    with pytest.raises(approved.ApprovedMembershipSourceError, match="read identity"):
+@pytest.mark.parametrize("fault", ["schema", "revision", "transaction"])
+async def test_retained_pin_rejects_invalid_logical_scope_before_io(fault):
+    connection = SimpleNamespace(is_in_transaction=lambda: fault != "transaction", fetchrow=AsyncMock())
+    with pytest.raises((approved.ApprovedMembershipSourceError, ValueError)):
         await approved.pin_retained_approved_membership_source(
-            connection, approved_revision=4, control_schema="registry", read_identity=read_identity
+            connection,
+            approved_revision=-1 if fault == "revision" else 4,
+            control_schema="invalid.schema" if fault == "schema" else "registry",
         )
-    connection.fetchrow.assert_awaited_once()
+    connection.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("valid", [False, None, 0, "true"])
+async def test_retained_pin_rejects_inconsistent_published_edition_metadata(valid):
+    edition_by_field = {**scope_row(), "edition_valid": valid}
+    connection = SimpleNamespace(is_in_transaction=lambda: True, fetchrow=AsyncMock(return_value=edition_by_field))
+    with pytest.raises(approved.ApprovedMembershipSourceError, match="published edition metadata"):
+        await approved.pin_retained_approved_membership_source(
+            connection, approved_revision=4, control_schema="registry"
+        )
 
 
 @pytest.mark.asyncio
@@ -97,37 +102,41 @@ async def test_api_pin_re_resolves_the_exact_manifest_before_reading_control_poi
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("owned", [False, True])
-@pytest.mark.parametrize("fault", ["physical_pointer", "source_generation"])
-async def test_api_pin_rejects_consumed_heap_or_approved_generation_drift(monkeypatch, fault, owned):
-    from process import network_candidate_custody as custody
+@pytest.mark.parametrize("fault", [None, "source_generation"])
+async def test_api_pin_uses_named_relation_and_exact_approved_generation(monkeypatch, fault, owned):
     from process import network_serving_read as serving
 
     manifest = replace(_manifest(), source_generations={"custom_membership": "a" * 64})
-    relation = CompactAddressRelation("registry", "registry_approved_record", 42)
+    relation = CompactAddressRelation("registry", "registry_approved_record")
     monkeypatch.setattr(serving, "resolve_network_serving_manifest", AsyncMock(return_value=manifest))
-    monkeypatch.setattr(custody, "read_network_control_relation_pins", AsyncMock(return_value=(relation,)))
     connection = SimpleNamespace(
         is_in_transaction=lambda: True,
-        get_server_pid=lambda: 41,
         fetchrow=AsyncMock(
-            side_effect=[
-                scope_row(
-                    revision=manifest.approved_custom_revision,
-                    fingerprint="b" * 64 if fault == "source_generation" else "a" * 64,
-                ),
-                {"backend_matches": True, "relation_count": 1, "valid": fault != "physical_pointer"},
-            ]
+            return_value=scope_row(
+                revision=manifest.approved_custom_revision,
+                fingerprint="b" * 64 if fault == "source_generation" else "a" * 64,
+            )
         ),
     )
-    with pytest.raises(approved.ApprovedMembershipSourceError, match="prerequisites|generation differs"):
+
+    async def pin():
         if owned:
-            await approved.resolve_api_retained_approved_membership_source(
+            return await approved.resolve_api_retained_approved_membership_source(
                 connection, generation_id=manifest.generation_id, control_schema="registry"
             )
-        else:
-            await approved.pin_api_retained_approved_membership_source(connection, manifest, control_schema="registry")
-    assert connection.fetchrow.await_count == 2
-    assert connection.fetchrow.await_args.args[1:4] == (['"registry"."registry_approved_record"'], [42], 41)
+        return await approved.pin_api_retained_approved_membership_source(
+            connection, manifest, control_schema="registry"
+        )
+
+    if fault:
+        with pytest.raises(approved.ApprovedMembershipSourceError, match="generation differs"):
+            await pin()
+    else:
+        pinned = await pin()
+        approved_source, selected_relation = pinned[-2:]
+        assert approved_source == approved.ApprovedMembershipSource(manifest.approved_custom_revision, "a" * 64)
+        assert selected_relation == relation
+    connection.fetchrow.assert_awaited_once()
 
 
 @pytest.mark.asyncio

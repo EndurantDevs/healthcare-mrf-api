@@ -492,3 +492,18 @@ async def test_later_mapping_revision_never_releases_exact_source_checks(field, 
     )
     with pytest.raises(ValueError):
         project(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("intent_state", ["queued", "running", "completed", "rejected"])
+async def test_pending_admin_freeze_projects_only_a_running_intent(intent_state):
+    result = await internal_result(completed=True)
+    result["preparation"]["state"] = "handed_off"
+    result["intent"]["state"] = intent_state
+    if intent_state == "running":
+        actual = project(result)
+        assert actual["preparation"] == result["preparation"]
+        assert actual["intent"]["state"] == "running"
+    else:
+        with pytest.raises(ValueError, match="intent_result_changed"):
+            project(result)

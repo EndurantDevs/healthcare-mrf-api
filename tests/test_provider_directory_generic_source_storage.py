@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Batch authority, immutable native identities and no per-resource SQL."""
+"""Qualified candidate storage, atomic COPY and no per-resource SQL."""
 
 import asyncio
 import importlib
@@ -72,8 +72,8 @@ def _case():
     )
     identity = storage.candidate_identity(directory, candidate)
     tables_by_root = {
-        key: dict(name="pdgs_" + "a" * 32 + suffix, oid=index + 10, owner=100, layout_sha256="c" * 64)
-        for index, (key, suffix) in enumerate((("resource_input", "_ri"), ("witness_input", "_wi")))
+        key: dict(schema="source_schema", name="pdgs_" + "a" * 32 + suffix)
+        for key, suffix in (("resource_input", "_ri"), ("witness_input", "_wi"))
     }
     binding_by_field = dict(
         contract=storage.CONTRACT,
@@ -113,9 +113,16 @@ def harness(monkeypatch):
         copies.append((name, kwargs))
         return f"COPY {len(kwargs['records'])}"
 
+    def fetchval(query, *args):
+        if query.startswith("SELECT candidate_storage_json"):
+            assert args == (candidate.dataset_id,)
+            return deepcopy(header["candidate_storage_json"])
+        assert query.startswith("SELECT nextval(")
+        return header["candidate_storage_json"]["ordinal"] + 1
+
     connection = SimpleNamespace(
         fetchrow=AsyncMock(side_effect=lambda *args: deepcopy(header)),
-        fetchval=AsyncMock(side_effect=lambda *args: header["candidate_storage_json"]["ordinal"] + 1),
+        fetchval=AsyncMock(side_effect=fetchval),
         execute=AsyncMock(side_effect=execute),
         copy_records_to_table=AsyncMock(side_effect=copy),
     )
@@ -131,12 +138,7 @@ def harness(monkeypatch):
             header.update(before)
             raise
 
-    async def capture(conn, configured, names, **kwargs):
-        proofs = header["candidate_storage_json"]["tables"]
-        return {table["name"]: deepcopy(table) for table in proofs.values()}
-
     monkeypatch.setattr(storage, "source_owner_transaction", owner)
-    monkeypatch.setattr(storage, "_capture", AsyncMock(side_effect=capture))
     return SimpleNamespace(
         candidate=candidate,
         directory=directory,
@@ -162,23 +164,13 @@ def _rows(count):
     ]
 
 
-def _isolated_catalog_row(factory):
-    return {
-        field: getattr(factory.storage_binding, field)
-        for field in ("database_oid", "catalog_schema_oid", "storage_schema_oid", "owner_oid", "namespace_owner_oid")
-    }
-
-
-def _set_isolated_candidate(harness, publisher, *, named):
+def _set_isolated_candidate(harness, publisher):
     binding = harness.header["candidate_storage_json"]
     binding.update(
-        contract=storage.NAMED_ISOLATED_CONTRACT if named else storage.ISOLATED_CONTRACT,
+        contract=storage.NAMED_ISOLATED_CONTRACT,
         storage=storage.storage_document(publisher),
         admission=None,
     )
-    if named:
-        for key, suffix in (("resource_input", "ri"), ("witness_input", "wi")):
-            binding["tables"][key] = {"name": "pdgs_" + "a" * 32 + "_" + suffix}
 
 
 @asynccontextmanager
@@ -187,30 +179,13 @@ async def _isolated_harness(harness, monkeypatch, *, named=False):
     from tests.test_provider_directory_generic_source_policy import _isolated_factory, _named_factory
 
     factory = _named_factory() if named else _isolated_factory()
-    native_by_field = {} if named else _isolated_catalog_row(factory)
     harness.policy = factory.policy
     harness.directory._schema = lambda: "catalog_schema"
     metadata = harness.header["candidate_storage_json"]["identity"]["metadata"]
     metadata["source_ids"] = [storage.VSP_SOURCE_ID if named else "example-source"]
     harness.directory._endpoint_dataset_candidate_metadata = lambda _: metadata
-    connection, actor = harness.connection, {"session": "source_publisher", "current": "source_publisher"}
-
-    async def fetchrow(query, *args):
-        if query.startswith("SELECT session_user"):
-            return dict(actor)
-        if query.startswith("SELECT d.oid"):
-            return native_by_field
-        return deepcopy(harness.header)
-
-    connection.fetchrow = AsyncMock(side_effect=fetchrow)
-    original_fetchval = connection.fetchval
-    connection.fetchval = AsyncMock(
-        side_effect=lambda query, *args: (
-            "repeatable read" if query == "SHOW transaction_isolation" else original_fetchval.side_effect(query, *args)
-        )
-    )
+    connection = harness.connection
     connection.is_in_transaction = lambda: True
-    monkeypatch.setattr(policy, "storage_roles", AsyncMock())
 
     @asynccontextmanager
     async def owner(database):
@@ -227,8 +202,7 @@ async def _isolated_harness(harness, monkeypatch, *, named=False):
         async with policy.bind_generic_source_publisher(
             connection, factory.policy, verify_role_profile=AsyncMock(), transaction_isolation="repeatable read"
         ) as publisher:
-            actor["current"] = "source_owner"
-            _set_isolated_candidate(harness, publisher, named=named)
+            _set_isolated_candidate(harness, publisher)
             yield publisher
 
 
@@ -263,12 +237,11 @@ def _named_candidate_context(harness, monkeypatch, factory, source_id):
             else fetchval.side_effect(sql, *args)
         )
     )
-    capture = AsyncMock(side_effect=AssertionError("named storage does not use physical identity"))
+    capture = AsyncMock(side_effect=AssertionError("named bindings already declare their complete relation names"))
     monkeypatch.setattr(storage, "_capture", capture)
 
     session = object()
     database = SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=session))
-    monkeypatch.setattr(policy, "_copy_driver", AsyncMock(return_value=harness.connection))
     monkeypatch.setattr(storage, "source_owner_transaction", policy.source_owner_transaction)
     monkeypatch.setattr(completion, "source_owner_transaction", policy.source_owner_transaction)
     return database, completion, savepoints, capture
@@ -289,12 +262,18 @@ async def _bind_named_publisher(harness, factory, verify_roles):
 
 
 @pytest.mark.asyncio
-async def test_named_candidate_refuses_unsupported_source(harness, monkeypatch):
+@pytest.mark.parametrize("change", ["sources_empty", "sources_many", "resources_empty", "resources_unknown"])
+async def test_named_candidate_refuses_invalid_scope(harness, monkeypatch, change):
     from tests.test_provider_directory_generic_source_policy import _named_factory
 
     factory = _named_factory()
     database, _, savepoints, capture = _named_candidate_context(harness, monkeypatch, factory, "other-source")
-    harness.header["publication_metadata_json"]["source_ids"].append("second-source")
+    metadata = harness.header["publication_metadata_json"]
+    if change == "sources_many":
+        metadata["source_ids"].append("second-source")
+    else:
+        field = "source_ids" if change == "sources_empty" else "selected_resources"
+        metadata[field] = ["UnknownResource"] if change == "resources_unknown" else []
     async with _bind_named_publisher(harness, factory, AsyncMock()):
         with pytest.raises(GenericCandidateError, match="isolated_kind_unsupported"):
             await storage.prepare_generic_source_candidate(database, harness.directory, harness.candidate)
@@ -304,20 +283,19 @@ async def test_named_candidate_refuses_unsupported_source(harness, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_named_candidate_resumes_after_committing_a_batch(harness, monkeypatch):
+@pytest.mark.parametrize("source_id", [storage.VSP_SOURCE_ID, "example-source"])
+async def test_named_candidate_resumes_after_committing_a_batch(harness, monkeypatch, source_id):
     from process import provider_directory_generic_source_policy as policy
     from tests.test_provider_directory_generic_source_policy import _named_factory
 
     factory = _named_factory()
-    database, completion, savepoints, capture = _named_candidate_context(
-        harness, monkeypatch, factory, storage.VSP_SOURCE_ID
-    )
+    database, completion, savepoints, capture = _named_candidate_context(harness, monkeypatch, factory, source_id)
     verify_roles = AsyncMock()
     async with _bind_named_publisher(harness, factory, verify_roles):
         loading = await storage.prepare_generic_source_candidate(database, harness.directory, harness.candidate)
         assert loading["contract"] == storage.NAMED_ISOLATED_CONTRACT
         assert set(loading["tables"]) == {"resource_input", "witness_input"}
-        assert all(set(table) == {"name"} for table in loading["tables"].values())
+        assert all(set(table) == {"schema", "name"} for table in loading["tables"].values())
         assert await storage.append_generic_source_batch(database, harness.directory, harness.candidate, _rows(2)) == 2
     assert policy._PUBLISHER.get() is None
     persisted = deepcopy(harness.header["candidate_storage_json"])
@@ -327,7 +305,11 @@ async def test_named_candidate_resumes_after_committing_a_batch(harness, monkeyp
         async with policy.source_owner_transaction(database):
             previous_statements = list(harness.sql)
             resumed = await storage.prepare_generic_source_candidate(database, harness.directory, harness.candidate)
-            assert resumed == persisted and harness.sql == previous_statements
+            assert resumed == persisted
+            assert all(
+                statement.startswith("SELECT 1 FROM ") and statement.endswith(" LIMIT 0")
+                for statement in harness.sql[len(previous_statements) :]
+            )
             assert (
                 await storage.append_generic_source_batch(database, harness.directory, harness.candidate, _rows(1)) == 1
             )
@@ -336,7 +318,7 @@ async def test_named_candidate_resumes_after_committing_a_batch(harness, monkeyp
         prepared = await completion.complete_generic_source_candidate(database, harness.directory, harness.candidate)
         assert prepared["phase"] == "prepared" and prepared["ordinal"] == 2
         assert set(prepared["tables"]) == {*storage.RELATIONS, "resource_input", "witness_input"}
-        assert all(set(table) == {"name"} for table in prepared["tables"].values())
+        assert all(set(table) == {"schema", "name"} for table in prepared["tables"].values())
         reduce.assert_awaited_once()
 
     assert len(harness.copies) == 2
@@ -356,22 +338,17 @@ def _without_candidate_storage(harness, monkeypatch, found=()):
     harness.header["candidate_storage_json"] = None
     harness.candidate.source_release = None
     harness.connection.fetch = AsyncMock(return_value=[])
-    harness.connection.fetchval = AsyncMock(
-        side_effect=lambda query, *args: (
-            "private_ordinal_sequence" if "pg_get_serial_sequence" in query else any(mark in query for mark in found)
-        )
-    )
-    proof_by_name = {}
 
-    async def capture(connection, policy, names, **options):
-        assert connection is harness.connection and policy is harness.policy
-        for name in names:
-            proof_by_name.setdefault(
-                name, dict(name=name, oid=1000 + len(proof_by_name), owner=100, layout_sha256="e" * 64)
-            )
-        return {name: proof_by_name[name] for name in names}
+    def fetchval(query, *args):
+        if query.startswith("SELECT candidate_storage_json"):
+            assert args == (harness.candidate.dataset_id,)
+            return deepcopy(harness.header["candidate_storage_json"])
+        if "pg_get_serial_sequence" in query:
+            return "private_ordinal_sequence"
+        return any(mark in query for mark in found)
 
-    monkeypatch.setattr(storage, "_capture", capture)
+    harness.connection.fetchval = AsyncMock(side_effect=fetchval)
+    monkeypatch.setattr(storage, "_close_grants", AsyncMock())
     monkeypatch.setattr(completion, "source_owner_transaction", storage.source_owner_transaction)
     return completion
 
@@ -385,7 +362,7 @@ async def test_isolated_prepare_and_complete_share_the_existing_candidate_bindin
         reduction = AsyncMock()
         monkeypatch.setattr(completion, "_complete_payloads", reduction)
         loading = await storage.prepare_generic_source_candidate(object(), harness.directory, harness.candidate)
-        assert loading["contract"] == storage.ISOLATED_CONTRACT
+        assert loading["contract"] == storage.NAMED_ISOLATED_CONTRACT
         assert loading["storage"] == storage.storage_document(publisher)
         indexes = [statement for statement in harness.sql if statement.startswith("CREATE INDEX IF NOT EXISTS")]
         resource_input = loading["tables"]["resource_input"]["name"]
@@ -405,7 +382,10 @@ async def test_isolated_prepare_and_complete_share_the_existing_candidate_bindin
             await completion.complete_generic_source_candidate(object(), harness.directory, harness.candidate)
             == prepared
         )
-        assert harness.sql == pre_replay_statements
+        assert all(
+            statement.startswith("SELECT 1 FROM ") and statement.endswith(" LIMIT 0")
+            for statement in harness.sql[len(pre_replay_statements) :]
+        )
     assert sum(statement.startswith("CREATE TABLE") for statement in harness.sql) == 2 + len(storage.RELATIONS)
     assert all(
         '"catalog_schema".' not in statement
@@ -473,11 +453,14 @@ async def test_isolated_completion_refusal_keeps_the_loading_binding(harness, mo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["storage_schema_oid", "database_oid", "enrollment_sha256", "producer"])
+@pytest.mark.parametrize("changed", ["storage_schema", "catalog_schema", "missing", "type"])
 async def test_isolated_stored_binding_substitution_never_reaches_copy(harness, monkeypatch, changed):
     async with _isolated_harness(harness, monkeypatch):
         document = harness.header["candidate_storage_json"]["storage"]
-        document[changed] = ["c" * 40, "sha256:" + "d" * 64] if changed == "producer" else 999
+        if changed == "missing":
+            document.pop("catalog_schema")
+        else:
+            document["catalog_schema" if changed == "type" else changed] = 999 if changed == "type" else "other_schema"
         with pytest.raises(GenericCandidateError, match="storage_binding_changed"):
             await storage.append_generic_source_batch(object(), harness.directory, harness.candidate, _rows(1))
     harness.connection.copy_records_to_table.assert_not_awaited()
@@ -552,16 +535,14 @@ async def test_interrupted_copy_is_closed_and_retires_its_owner(harness, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_replaced_oid_refuses_before_copy(harness, monkeypatch):
+async def test_duplicate_input_relation_refuses_before_copy(harness):
     h = harness
-    proofs_by_name = {
-        table["name"]: {**table, "oid": 999} for table in h.header["candidate_storage_json"]["tables"].values()
-    }
-    monkeypatch.setattr(storage, "_capture", AsyncMock(return_value=proofs_by_name))
-    with pytest.raises(GenericCandidateError, match="storage_binding_changed"):
+    tables = h.header["candidate_storage_json"]["tables"]
+    tables["witness_input"] = dict(tables["resource_input"])
+    with pytest.raises(GenericCandidateError, match="table_binding_changed"):
         await storage.append_generic_source_batch(object(), h.directory, h.candidate, _rows(1))
     h.connection.copy_records_to_table.assert_not_awaited()
-    assert len(h.sql) == 1 and "pg_advisory_xact_lock" in h.sql[0]
+    assert h.sql == []
 
 
 @pytest.mark.asyncio
@@ -571,7 +552,12 @@ async def test_reset_advances_cutoff_without_payload_update_or_delete(harness):
     await storage.reset_generic_source_family(object(), h.directory, h.candidate, "Organization")
     assert h.header["candidate_storage_json"]["resets"] == {"Organization": 1}
     assert len(h.copies) == 1
-    assert all("pg_advisory_xact_lock" in query or query.startswith("UPDATE") for query in h.sql)
+    reads = {
+        "SELECT 1 FROM " + storage.storage_relation(table["schema"], table["name"]) + " LIMIT 0"
+        for table in h.header["candidate_storage_json"]["tables"].values()
+    }
+    assert reads <= set(h.sql)
+    assert all("pg_advisory_xact_lock" in query or query.startswith("UPDATE") or query in reads for query in h.sql)
 
 
 @pytest.fixture
@@ -607,9 +593,13 @@ async def test_selected_partition_reset_preserves_exact_cutoffs_and_input_identi
     expected_by_field = {**previous, "resets": {**previous["resets"], resource_type: 7}}
     assert harness.header["candidate_storage_json"] == expected_by_field
     assert harness.copies == []
-    assert len(harness.sql) == 2
-    assert "pg_advisory_xact_lock" in harness.sql[0] and harness.sql[1].startswith("UPDATE")
-    assert '"source_schema"."provider_directory_endpoint_dataset"' in harness.sql[1]
+    assert len(harness.sql) == 4
+    assert "pg_advisory_xact_lock" in harness.sql[0] and harness.sql[-1].startswith("UPDATE")
+    assert '"source_schema"."provider_directory_endpoint_dataset"' in harness.sql[-1]
+    assert harness.sql[1:3] == [
+        "SELECT 1 FROM " + storage.storage_relation(table["schema"], table["name"]) + " LIMIT 0"
+        for table in previous["tables"].values()
+    ]
     lock = harness.connection.execute.await_args_list[0]
     lock_family = resource_type if pass_number is None else "Organization"
     assert storage._encoded(["source_schema", "dataset", lock_family]) in lock.args[1]
@@ -742,95 +732,19 @@ async def test_closed_overflow_or_other_namespace_never_reaches_copy(harness, ch
     h.connection.copy_records_to_table.assert_not_awaited()
 
 
-def _catalog_row():
-    return dict(
-        relname="pdgs_" + "a" * 32 + "_ri",
-        oid=1,
-        relowner=100,
-        relkind="r",
-        relpersistence="p",
-        relrowsecurity=False,
-        relforcerowsecurity=False,
-        inert=True,
-        native_checks=True,
-        direct_acl_closed=True,
-        readers_closed=True,
-        relispartition=False,
-        parents=[],
-        columns=[["dataset_id", "character varying(96)", True, None]],
-        constraints=[],
-        indexes=[],
-    )
+def _input_ordinals(harness, ordinals):
+    previous = harness.connection.fetchval.side_effect
+    pending = iter(ordinals)
 
+    def fetchval(query, *arguments):
+        return next(pending) if query.startswith("SELECT nextval(") else previous(query, *arguments)
 
-@pytest.mark.parametrize(
-    "field,value",
-    (
-        ("inert", False),
-        ("direct_acl_closed", False),
-        ("native_checks", False),
-        ("constraints", [{"type": "f", "valid": True}]),
-        ("parents", [2]),
-        ("relispartition", True),
-    ),
-)
-def test_native_private_heap_custody_refuses_hooks_grants_foreign_keys_or_attachment(field, value):
-    with pytest.raises(GenericCandidateError, match="storage_custody_changed"):
-        storage._table_proof(_catalog_row() | {field: value}, private=True)
-
-
-def _sequence_row(*, owner=100, schema="source_schema"):
-    return dict(
-        input_name="pdgs_" + "a" * 32 + "_ri",
-        attname="batch_ordinal",
-        attidentity="d",
-        deptype="i",
-        oid=123,
-        relname="pdgs_" + "a" * 32 + "_ri_batch_ordinal_seq",
-        nspname=schema,
-        relowner=owner,
-        relkind="S",
-        relpersistence="p",
-        seqtypid="bigint",
-        seqstart=1,
-        seqincrement=1,
-        seqmax=2**63 - 1,
-        seqmin=1,
-        seqcache=1,
-        seqcycle=False,
-        acl_closed=True,
-    )
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    (
-        ("attname", "row_ordinal"),
-        ("attidentity", "a"),
-        ("deptype", "a"),
-        ("nspname", "other"),
-        ("relowner", 101),
-        ("relkind", "r"),
-        ("relpersistence", "u"),
-        ("seqtypid", "integer"),
-        ("seqstart", 2),
-        ("seqincrement", 2),
-        ("seqmax", 100),
-        ("seqmin", 0),
-        ("seqcache", 2),
-        ("seqcycle", True),
-        ("acl_closed", False),
-    ),
-)
-def test_input_sequence_requires_exact_native_custody(harness, field, value):
-    with pytest.raises(GenericCandidateError, match="input_sequence_changed"):
-        storage._require_input_sequence(_sequence_row() | {field: value}, harness.policy, 100)
+    harness.connection.fetchval.side_effect = fetchval
 
 
 @pytest.mark.asyncio
 async def test_late_sibling_batch_preserves_higher_ordinal_and_reset(harness):
-    harness.connection.fetchval.return_value = 3
-    harness.connection.fetchval.side_effect = None
+    _input_ordinals(harness, [3])
 
     async def concurrent_copy(name, **options):
         binding = harness.header["candidate_storage_json"]
@@ -845,7 +759,7 @@ async def test_late_sibling_batch_preserves_higher_ordinal_and_reset(harness):
 
 @pytest.mark.asyncio
 async def test_failed_copy_can_resume_after_native_sequence_gap(harness):
-    harness.connection.fetchval.side_effect = [1, 3]
+    _input_ordinals(harness, [1, 3])
     harness.connection.copy_records_to_table.side_effect = RuntimeError("COPY rejected")
     with pytest.raises(RuntimeError, match="COPY rejected"):
         await storage.append_generic_source_batch(object(), harness.directory, harness.candidate, _rows(1))

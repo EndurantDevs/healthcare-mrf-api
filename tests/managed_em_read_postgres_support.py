@@ -19,7 +19,6 @@ from api import network_address_scope as address_scope
 from api import plan_pricing_em_attribution as attribution
 from api import plan_pricing_em_distance as distance
 from api import plan_pricing_em_managed as managed
-from api.network_read_execution import install_network_read_inventory
 from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
 from api.plan_release_serving import PlanReleaseServingSelection, PlanReleaseSnapshotBinding
 from api.ptg2_serving import PTG2LocationScopeError
@@ -69,13 +68,7 @@ async def _held_tables(connection, schema):
             await connection.execute(f'CREATE INDEX ON "{schema}"."{table}" (npi,address_key)')
         if key:
             await connection.execute(f'CREATE UNIQUE INDEX ON "{schema}"."{table}" ({key})')
-        oid, filenode = await connection.fetchrow(
-            "SELECT oid::bigint,pg_relation_filenode(oid)::bigint FROM pg_class WHERE oid=to_regclass($1)",
-            f'"{schema}"."{table}"',
-        )
-        relations.append(
-            provider_inputs.EMProviderInputRelation(role, schema, table, "example_generation", oid, filenode)
-        )
+        relations.append(provider_inputs.EMProviderInputRelation(role, schema, table, "example_generation"))
     return provider_inputs.EMProviderInputs(tuple(relations))
 
 
@@ -219,8 +212,16 @@ async def _prepare(connection, fixture, owner, reader):
     if await connection.fetchval("SELECT to_regnamespace('tiger') IS NOT NULL"):
         await connection.execute(f'GRANT USAGE ON SCHEMA tiger TO "{reader}"')
     proof = await provider_inputs.prepare_em_provider_inputs(connection, inputs, runtime_roles=(reader,))
-    oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", f'"{address_schema}".entity_address_unified')
-    manifest = PinnedNetworkServingManifest(1, str(address_id), address_schema, 1, {}, 0, "b" * 64, oid)
+    manifest = PinnedNetworkServingManifest(
+        1,
+        str(address_id),
+        address_schema,
+        1,
+        {},
+        0,
+        "b" * 64,
+        CompactAddressRelation(address_schema, "entity_address_unified"),
+    )
     await connection.execute(f'ANALYZE "{address_schema}".entity_address_unified')
     return SimpleNamespace(
         inputs=inputs,
@@ -390,30 +391,12 @@ def _observe_windows(held):
 
 
 async def _bind_native_pricing_read(session, held, control_schema, reader):
-    """Bind actual prepared receipts to the original Reader before guarded native completion."""
+    """Validate named provider inputs and the actual selected pricing data before completion."""
     driver = (await (await session.connection()).get_raw_connection()).driver_connection
     assert await provider_inputs.prepare_em_provider_inputs(driver, held.inputs, runtime_roles=(reader,)) == held.proof
     assert (
         await attribution._verify(driver, held.rates, attribution._identity(held.selection)[0], api_read=True)
         == held.rates
-    )
-    approved_oid = await driver.fetchval(
-        "SELECT to_regclass($1)::oid::bigint", f'"{control_schema}".registry_approved_record'
-    )
-    relations = tuple(
-        CompactAddressRelation(relation.schema_name, relation.table_name, relation.relation_oid)
-        for relation in held.inputs.relations
-    )
-    await install_network_read_inventory(
-        session,
-        (
-            *relations,
-            CompactAddressRelation(held.rates.schema_name, "rates", held.rates.table_oid),
-            CompactAddressRelation(
-                held.manifest.schema_name, "entity_address_unified", held.manifest.address_table_oid
-            ),
-            CompactAddressRelation(control_schema, "registry_approved_record", approved_oid),
-        ),
     )
 
 

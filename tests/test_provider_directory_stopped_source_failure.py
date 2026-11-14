@@ -1,7 +1,9 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Stopped recovery changes status while retaining candidate data and serving state."""
 
+import asyncio
 import json
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
@@ -9,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from process import provider_directory_generic_source_storage as storage
 from process import provider_directory_stopped_source_failure as failure
 from process.provider_directory_terminal_root_retirement_contract import (
     RETIREMENT_ENABLED_ENV,
@@ -106,7 +109,12 @@ class Connection:
         self.calls.append((query, arguments))
         assert "FOR UPDATE NOWAIT" in query
         fields = ("dataset_id", "endpoint_id", "import_run_id", "acquisition_root_run_id", "previous_dataset_id")
-        return deepcopy(self.header) if tuple(self.header[field] for field in fields) == arguments else None
+        if tuple(self.header[field] for field in fields) != arguments:
+            return None
+        return {
+            field: deepcopy(self.header[field])
+            for field in query.split(" FROM ", 1)[0].removeprefix("SELECT ").split(",")
+        }
 
     async def execute(self, query, *arguments):
         self.calls.append((query, arguments))
@@ -376,3 +384,94 @@ async def test_non_object_run_metadata_refuses(encoded):
     connection = SimpleNamespace(fetch=AsyncMock(return_value=[{"metrics": encoded}]))
     with pytest.raises(TerminalRootRetirementError):
         await failure._Executor(connection).all("SELECT * FROM synthetic_runs")
+
+
+@pytest.mark.asyncio
+async def test_reused_failed_candidate_still_checks_other_active_endpoint_candidate(monkeypatch):
+    from importlib import import_module
+
+    from process import provider_directory_generic_source_adapters as adapters
+    from process import provider_directory_generic_source_policy as policy
+
+    directory = import_module("process.provider_directory_fhir")
+    candidate_by_field = directory.EndpointDatasetCandidate(
+        endpoint_id="endpoint-synthetic",
+        dataset_id="dataset-failed",
+        acquisition_root_run_id="run-root",
+        import_run_id="run-retry",
+        source_ids=("source-synthetic",),
+        selected_resources=("Organization",),
+        previous_dataset_id=None,
+        reused_from_checkpoint=True,
+    )
+
+    @asynccontextmanager
+    async def transaction(*_args):
+        yield
+
+    monkeypatch.setattr(policy, "source_transaction", transaction)
+    monkeypatch.setattr(adapters, "require_source_transaction", lambda: None)
+    monkeypatch.setattr(adapters, "require_generic_source_layout", AsyncMock())
+    monkeypatch.setattr(directory.db, "acquire", transaction)
+    admission = AsyncMock()
+    monkeypatch.setattr(directory, "_lock_endpoint_dataset_candidate_admission", admission)
+    monkeypatch.setattr(directory, "_has_empty_locked_candidate", AsyncMock(return_value=False))
+    monkeypatch.setattr(directory, "_assert_empty_endpoint_dataset_orphan", AsyncMock())
+    contender = AsyncMock(return_value={"dataset_id": "dataset-active", "status": "acquiring"})
+    monkeypatch.setattr(directory, "_locked_endpoint_verification_state", contender)
+    upsert = AsyncMock()
+    monkeypatch.setattr(directory, "_upsert_endpoint_dataset_candidate", upsert)
+    prepare = AsyncMock()
+    monkeypatch.setattr(storage, "prepare_generic_source_candidate", prepare)
+    with pytest.raises(RuntimeError, match="provider_directory_endpoint_dataset_active_conflict"):
+        await directory._ensure_endpoint_dataset_candidate(candidate_by_field)
+    admission.assert_awaited_once()
+    contender.assert_awaited_once_with(None, candidate_by_field)
+    upsert.assert_not_awaited()
+    prepare.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unsealed_completion_requirement_is_preserved_through_apply_and_replay(case):
+    case.connection.header["completion_proof_required_version"] = 3
+    case.connection.header["publication_metadata_json"]["completion_proof_required_version"] = 3
+    before = deepcopy(case.connection.header)
+    assert await failure.apply_stopped_source_failure(case.request, **case.arguments) == {"changed": True}
+    assert case.connection.header == {**before, "status": "failed"}
+    assert await failure.apply_stopped_source_failure(case.request, **case.arguments) == {"changed": False}
+    assert case.connection.header == {**before, "status": "failed"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["cas", "readback", "cancel"])
+async def test_cas_readback_or_cancellation_failure_rolls_back_caller_transaction(case, stage):
+    before = deepcopy(case.connection.header)
+    original_failure = asyncio.CancelledError("stopped-lineage cancellation")
+    if stage == "cas":
+        case.connection.update_result = "UPDATE 0"
+    elif stage == "readback":
+        fetchrow = case.connection.fetchrow
+
+        async def changed_readback(query, *arguments):
+            row = await fetchrow(query, *arguments)
+            return {**row, "status": "acquiring"} if case.connection.header["status"] == "failed" else row
+
+        case.connection.fetchrow = changed_readback
+    else:
+        case.stopped.side_effect = original_failure
+
+    @asynccontextmanager
+    async def caller_transaction():
+        try:
+            yield
+        except BaseException:
+            case.connection.header = deepcopy(before)
+            raise
+
+    expected = asyncio.CancelledError if stage == "cancel" else TerminalRootRetirementError
+    with pytest.raises(expected) as raised:
+        async with caller_transaction():
+            await failure.apply_stopped_source_failure(case.request, **case.arguments)
+    if stage == "cancel":
+        assert raised.value is original_failure
+    assert case.connection.header == before

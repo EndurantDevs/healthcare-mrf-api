@@ -17,7 +17,9 @@ from tests.test_registry_source_contributions import _descriptor, _recipe
 def _scope():
     recipe = _recipe()
     artifact = ResolvedSourceFactArtifact(
-        SourceFactArtifactReference(str(uuid4()), 42, "a" * 64), "synthetic_fact_owner", _descriptor(recipe)
+        SourceFactArtifactReference(str(uuid4()), "synthetic_fact_owner", "network_source_contribution", "a" * 64),
+        "synthetic_fact_owner",
+        _descriptor(recipe),
     )
     context = offices.FactOfficeContext(SimpleNamespace(approved_revision=7), object(), ("reader",), "control")
     transaction = SimpleNamespace(start=AsyncMock(), commit=AsyncMock(), rollback=AsyncMock())
@@ -103,7 +105,7 @@ def test_pair_pages_enforce_row_and_encoded_byte_bounds(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["bad_seal", "wrong_oid", "changed_fact_hash", "missing_witness"])
+@pytest.mark.parametrize("failure", ["wrong_generation", "wrong_relation", "changed_fact_hash", "missing_source_data"])
 async def test_fact_authentication_failure_never_starts_pair_cursor(monkeypatch, failure):
     recipe, artifact, context, connection, transaction = _scope()
     verify = AsyncMock(side_effect=ValueError(failure))
@@ -128,11 +130,21 @@ async def test_current_mapping_and_full_source_admission_precede_bounded_fact_pa
     monkeypatch.setattr(
         offices,
         "resolve_source_office_origin",
-        AsyncMock(return_value=SimpleNamespace(address_identity=(1, 2, 3, "c" * 64))),
+        AsyncMock(
+            return_value=SimpleNamespace(
+                address_scope=("source_addresses", "entity_address_unified", "edition-one", None)
+            )
+        ),
     )
     pair_by_field = {"provider_system": "npi", "provider_id": "1000000491", "location_id": uuid4()}
     connection.fetch = AsyncMock(side_effect=[[pair_by_field], [pair_by_field], []])
-    matcher = AsyncMock(return_value=([{"selected_office": "d" * 64}], [("npi", "1000000491")], (1, 2, 3, "c" * 64)))
+    matcher = AsyncMock(
+        return_value=(
+            [{"selected_office": "d" * 64}],
+            [("npi", "1000000491")],
+            ("source_addresses", "entity_address_unified", "edition-one", None),
+        )
+    )
     monkeypatch.setattr(offices, "_match_pair_page", matcher)
     sink = AsyncMock()
     context = offices.FactOfficeContext(
@@ -141,7 +153,8 @@ async def test_current_mapping_and_full_source_admission_precede_bounded_fact_pa
     document = await offices.capture_fact_office_pages(connection, recipe, artifact, context)
     assert (document["mode"], document["office_rows"], document["page_count"]) == ("facts", 2, 2)
     assert document["mapping_sha256"] == "b" * 64
-    assert document["fact_artifact"]["fact_table_oid"] == artifact.reference.fact_table_oid
+    assert document["fact_artifact"]["fact_schema_name"] == artifact.reference.fact_schema_name
+    assert document["fact_artifact"]["fact_generation_id"] == artifact.reference.fact_generation_id
     admission.assert_awaited_once()
     mapping.assert_awaited_once()
     assert sink.await_count == matcher.await_count == 2
@@ -231,7 +244,7 @@ async def test_flat_source_without_retained_fact_entitlement_never_reads_owner_r
 @pytest.mark.asyncio
 @pytest.mark.parametrize("successor", [False, True])
 async def test_retained_source_page_refuses_an_unissued_read_before_any_query(successor):
-    from tests.test_registry_source_inventory_store_postgres import _capture_recipe
+    from tests.registry_source_recipe_support import _capture_recipe
 
     _, _, context, connection, _ = _scope()
     recipe = _capture_recipe()

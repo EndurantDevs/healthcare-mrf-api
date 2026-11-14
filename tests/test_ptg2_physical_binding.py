@@ -124,9 +124,12 @@ async def test_native_preparation_inventory_binds_exact_children_and_identity(dr
         local_data_family_spec().importer_id,
         physical.dataset_id,
         physical.schema_name,
-        physical.schema_oid,
-        tuple(sorted(physical.relation_oids)),
-        physical.sequence_oids,
+        101,
+        tuple((name, 200 + number) for number, (_schema, name) in enumerate(physical.relations)),
+        tuple(
+            (name, 300 + number, table, column)
+            for number, (_schema, name, table, column) in enumerate(physical.sequences)
+        ),
     )
     relations = [
         {"ordinal": ordinal, "table_name": name, "relation_oid": oid}
@@ -470,10 +473,19 @@ def _binding():
         "synthetic-source",
         19,
         UUID(int=1),
-        101,
-        102,
-        tuple((name, 200 + ordinal) for ordinal, name in enumerate(local_data_family_spec().table_names)),
-        (("ptg2_v3_snapshot_layout_snapshot_key_seq", 300, "ptg2_v3_snapshot_layout", "snapshot_key"),),
+        "reference_family_archive_" + UUID(int=1).hex,
+        tuple(
+            ("reference_family_archive_" + UUID(int=1).hex, name)
+            for name in sorted(local_data_family_spec().table_names)
+        ),
+        (
+            (
+                "reference_family_archive_" + UUID(int=1).hex,
+                "ptg2_v3_snapshot_layout_snapshot_key_seq",
+                "ptg2_v3_snapshot_layout",
+                "snapshot_key",
+            ),
+        ),
     )
 
 
@@ -525,7 +537,7 @@ def test_binding_keeps_local_metadata_and_payload_coordinates_separate():
     assert binding.snapshot_id != binding.payload_snapshot_id
     assert binding.destination_layout_key != binding.payload_snapshot_key
     assert binding.relation("ptg2_v3_block") == ('"reference_family_archive_' + UUID(int=1).hex + '"."ptg2_v3_block"')
-    assert len(binding.relation_oids) == 42 and len(binding.sequence_oids) == 1
+    assert len(binding.relations) == 42 and len(binding.sequences) == 1
     assert binding.relation("ptg2_source_trace") == (
         '"reference_family_archive_' + UUID(int=1).hex + '"."ptg2_source_trace"'
     )
@@ -541,15 +553,18 @@ def test_binding_keeps_local_metadata_and_payload_coordinates_separate():
         {"payload_snapshot_key": 0},
         {"snapshot_id": " synthetic-destination"},
         {"payload_snapshot_id": "synthetic\nsource"},
-        {"schema_oid": False},
-        {"owner_oid": 0},
+        {"schema_name": "invalid.schema"},
         {"dataset_id": "untrusted-schema"},
-        {"relation_oids": ()},
-        {"sequence_oids": ()},
-        {"sequence_oids": (("unreviewed_sequence", 300, "ptg2_v3_snapshot_layout", "snapshot_key"),)},
+        {"relations": ()},
+        {"sequences": ()},
         {
-            "sequence_oids": (
-                ("ptg2_v3_snapshot_layout_snapshot_key_seq", 200, "ptg2_v3_snapshot_layout", "snapshot_key"),
+            "sequences": (
+                (
+                    "reference_family_archive_" + UUID(int=1).hex,
+                    "unreviewed_sequence",
+                    "ptg2_v3_snapshot_layout",
+                    "snapshot_key",
+                ),
             )
         },
     ),
@@ -559,15 +574,16 @@ def test_binding_rejects_partial_or_malformed_identity(change):
         replace(_binding(), **change)
 
 
-def test_binding_rejects_duplicate_heap_oids_and_reordered_or_arbitrary_model_names():
+def test_binding_rejects_duplicate_missing_or_arbitrary_model_names():
     binding = _binding()
     for inventory in (
-        tuple((name, 300) for name, _oid in binding.relation_oids),
-        tuple(reversed(binding.relation_oids)),
-        (("unreviewed_relation", 300), *binding.relation_oids[1:]),
+        (binding.relations[0], *binding.relations),
+        binding.relations[1:],
+        ((binding.schema_name, "unreviewed_relation"), *binding.relations[1:]),
+        (("different_schema", binding.relations[0][1]), *binding.relations[1:]),
     ):
         with pytest.raises(PTG2PhysicalBindingError, match="inventory"):
-            replace(binding, relation_oids=inventory)
+            replace(binding, relations=inventory)
 
 
 def test_internal_carrier_never_authorizes_serving_or_candidate_resolution():

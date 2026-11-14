@@ -1,9 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Genuine mixed CMS/PTG candidate custody on an independent fenced operator."""
+"""Genuine mixed CMS/PTG preparation, administrative freeze and complete data validation."""
 
 import asyncio
 import json
 from contextlib import AsyncExitStack, aclosing
+from dataclasses import replace
 from types import SimpleNamespace
 from uuid import UUID, uuid4, uuid5
 
@@ -12,26 +13,25 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process.network_address_projection import PinnedAddressSource
-from process.network_candidate_custody import (
-    _address_runtime_closure,
-    _retained_address_runtime_closure,
-    seal_network_candidate_custody,
-    seal_network_candidate_custody_in_session,
-)
 from process.network_custom_address_source import prepare_custom_address_source
-from process.network_membership_pipeline import prepare_network_candidate
-from process.registry_candidate_composition import RegistryCompositionAddressSources
+from process.registry_candidate_composition import (
+    RegistryAddressArtifactCustody,
+    RegistryCompositionAddressSources,
+    prepare_registry_composition_address_artifact,
+)
 from process.registry_company_approval_fence import registry_company_approval_transaction
 from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
 from process.registry_publication_ptg_runtime import RegistryPublicationPTGRuntime
-from process.registry_publication_worker import _custody_runtime, _PTGWorkerConfig
+from process.registry_publication_worker import _configured_worker_runtime, _PTGWorkerConfig
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from process.registry_source_retention import RegistrySourceRetentionError
 from tests import cms_registry_recipe_postgres_support as cms_support
 from tests import test_registry_ptg_office_capture_postgres as office_fixtures
 from tests.cms_registry_recipe_postgres_support import cms_recipe_database as cms_recipe_database
 from tests.cms_registry_recipe_postgres_support import cms_recipe_template as cms_recipe_template
-from tests.registry_candidate_custody_postgres_support import install_candidate_custody
+from tests.registry_candidate_custody_postgres_support import administrative_freeze_callback
+from tests.source_contribution_custody_postgres_support import publish_source_contribution_candidate
+from tests.test_network_compact_publication_postgres import _named_compact_runtime
 from tests.test_network_custom_address_source_postgres import custom_db as _base_custom_db
 from tests.test_registry_ptg_office_coordinator_postgres import coordinator_db as coordinator_db
 from tests.test_registry_ptg_office_coordinator_postgres import office_db as _coordinator_office_db
@@ -65,6 +65,7 @@ async def custom_db(serving_schema):
         database = await connection.fetchval("SELECT quote_ident(current_database())")
         await connection.execute(f'GRANT CREATE ON DATABASE {database} TO "{role}"')
         fixture.retained_address_owner = role
+        fixture.roles["retained_address"] = role
         await connection.execute(f'ALTER SCHEMA "{fixture.source_schema}" OWNER TO "{role}"')
         for table in ("entity_address_unified", "npi"):
             await connection.execute(f'ALTER TABLE "{fixture.source_schema}"."{table}" OWNER TO "{role}"')
@@ -75,7 +76,6 @@ async def custom_db(serving_schema):
 async def office_db(custom_db, tmp_path, monkeypatch, office_publisher):
     """Publish the genuine predecessor under the independent retained owner."""
     original_roles = office_fixtures._roles
-    original_publish = office_fixtures.prepare_and_publish_network_candidate
 
     def retained_roles(fixture):
         roles_by_kind = original_roles(fixture)
@@ -83,18 +83,15 @@ async def office_db(custom_db, tmp_path, monkeypatch, office_publisher):
         return {**roles_by_kind, "owner_role": custom_db.retained_address_owner}
 
     async with AsyncExitStack() as stack:
-        await install_candidate_custody(custom_db, stack)
+        await _named_compact_runtime(custom_db, stack, monkeypatch)
         custom_db.mixed_copy_targets = []
-        await _split_ledger_owner(custom_db, stack, custom_db.mixed_copy_targets)
-        seal = await _predecessor_sealer(custom_db, stack)
+        stack.push_async_callback(_remove_mixed_storage, custom_db, custom_db.mixed_copy_targets)
 
         async def publish(connection, target, address, **options):
-            readers = tuple(sorted(set(options["loader_roles"] + options["reader_roles"])))
-
-            async def seal_candidate(copy_target):
-                return await seal(copy_target, readers)
-
-            return await original_publish(connection, target, address, **options, seal_candidate=seal_candidate)
+            assert options.pop("control_schema") == custom_db.control_schema
+            return await publish_source_contribution_candidate(
+                custom_db, connection, target, address, writer_roles=options
+            )
 
         with monkeypatch.context() as settings:
             settings.setattr(office_fixtures, "_roles", retained_roles)
@@ -105,34 +102,6 @@ async def office_db(custom_db, tmp_path, monkeypatch, office_publisher):
                 yield await anext(generator)
 
 
-async def _predecessor_sealer(fixture, stack):
-    """Use the existing independent login before publication, never the privileged fixture backend."""
-    role = fixture.custody_roles["custodian"]
-    await fixture.connection.execute(
-        f'GRANT "{fixture.retained_address_owner}" TO "{role}" WITH ADMIN FALSE, INHERIT TRUE, SET TRUE'
-    )
-    custodian = await asyncpg.connect(
-        fixture.custody_url.set(drivername="postgresql").render_as_string(hide_password=False)
-    )
-    stack.push_async_callback(custodian.close)
-
-    async def seal(target, runtime_roles):
-        assert role not in runtime_roles
-
-        async def authorize(connection, supplied):
-            return (
-                connection is custodian
-                and supplied == target
-                and await connection.fetchval("SELECT current_user=session_user AND current_user::text=$1", role)
-            )
-
-        return await seal_network_candidate_custody(
-            custodian, target, control_schema=fixture.control_schema, runtime_roles=runtime_roles, authorize=authorize
-        )
-
-    return seal
-
-
 @pytest.fixture
 async def serving_schema(cms_recipe_database, monkeypatch):
     """Keep genuine PTG authority and CMS/registry fixtures in one owned database."""
@@ -141,14 +110,6 @@ async def serving_schema(cms_recipe_database, monkeypatch):
         settings.setenv("HLTHPRT_PTG2_V4_MIGRATION_POSTGRES_DSN", dsn)
         async with aclosing(cms_support.serving_schema.__wrapped__(cms_recipe_database, settings)) as registry_fixture:
             registry = await anext(registry_fixture)
-            identity_sql = "SELECT current_database(),oid FROM pg_database WHERE datname=current_database()"
-            ptg_connection = await asyncpg.connect(dsn)
-            try:
-                assert tuple(await ptg_connection.fetchrow(identity_sql)) == tuple(
-                    await registry[0].fetchrow(identity_sql)
-                )
-            finally:
-                await ptg_connection.close()
             yield registry
 
 
@@ -189,32 +150,6 @@ async def _remove_mixed_storage(fixture, copy_targets):
         schema = "network_composition_" + identity.hex
         await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
         assert await fixture.connection.fetchval("SELECT to_regnamespace($1)", schema) is None
-
-
-async def _split_ledger_owner(fixture, stack, copy_targets):
-    """Keep independent seal authority separate from protected source-store ownership."""
-    role = "ptg_seal_owner_" + uuid4().hex
-    owner, custodian = fixture.roles["owner"], fixture.custody_roles["custodian"]
-    ledger = f'"{fixture.control_schema}".network_candidate_custody'
-    created_roles = []
-
-    async def cleanup():
-        await _remove_mixed_storage(fixture, copy_targets)
-        if created_roles:
-            await fixture.connection.execute(f'ALTER TABLE {ledger} OWNER TO "{owner}"')
-            await fixture.connection.execute(f'DROP OWNED BY "{role}"')
-            await fixture.connection.execute(f'DROP ROLE "{role}"')
-            assert not await fixture.connection.fetchval("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", role)
-
-    stack.push_async_callback(cleanup)
-    await fixture.connection.execute(f'CREATE ROLE "{role}" NOLOGIN')
-    created_roles.append(role)
-    await fixture.connection.execute(f'ALTER TABLE {ledger} OWNER TO "{role}"')
-    await fixture.connection.execute(f'GRANT USAGE ON SCHEMA "{fixture.control_schema}" TO "{role}"')
-    database = await fixture.connection.fetchval("SELECT quote_ident(current_database())")
-    await fixture.connection.execute(f'GRANT CREATE ON DATABASE {database} TO "{role}"')
-    await fixture.connection.execute(f'REVOKE "{owner}" FROM "{custodian}"')
-    await fixture.connection.execute(f'GRANT "{role}" TO "{custodian}" WITH ADMIN FALSE, INHERIT FALSE, SET TRUE')
 
 
 async def _add_declared_cms_office(fixture, source_fixture):
@@ -308,7 +243,7 @@ async def _mixed_execution(native, cms, service, stack):
     engine, _, execution = await _worker(native, execution_role, loading_role, fixture.execution_url.password)
     stack.push_async_callback(engine.dispose)
     stack.push_async_callback(execution.close)
-    for role in cms[0][2].retained_epoch.runtime_roles:
+    for role in cms_support.retained_fixture_roles(cms[0][2])[1:]:
         await fixture.connection.execute(
             f'GRANT "{role}" TO "{execution_role}" WITH ADMIN FALSE, INHERIT TRUE, SET FALSE'
         )
@@ -320,7 +255,7 @@ async def _mixed_execution(native, cms, service, stack):
 
 @pytest.fixture(params=(False, True), ids=("pure-ptg", "cms-ptg"))
 async def mixed_ptg_custody(coordinator_db, reviewed_cms_source, reviewed_ptg_offices, request):
-    """Prepare independent PTG/CMS custody actors and remove only their owned resources."""
+    """Prepare actual PTG/CMS source data and register exact candidate cleanup."""
     cms = reviewed_cms_source
     fixture = coordinator_db.custom
     service, ptg_recipes, _ = reviewed_ptg_offices
@@ -350,18 +285,17 @@ async def mixed_ptg_custody(coordinator_db, reviewed_cms_source, reviewed_ptg_of
             control_schema=fixture.control_schema,
         )
         copy_targets.append(copy_target)
-        await prepare_network_candidate(
-            execution, copy_target, address, **consumer.writer_roles, control_schema=fixture.control_schema
+        await consumer.composition_runtime.prepare(
+            execution, copy_target, address, writer_roles=consumer.writer_roles, control_schema=fixture.control_schema
         )
         await _assert_mixed_source_rows(fixture, copy_target, recipes)
-        custodian_sessions = _mixed_custodian_sessions(config, stack)
         yield SimpleNamespace(
             native=coordinator_db,
             fixture=fixture,
             target=copy_target,
             consumer=consumer,
             config=config,
-            sessions=custodian_sessions,
+            sessions=consumer.composition_runtime.sessions,
             previous=previous,
             producer_sessions=runtime.sessions,
             recipe_count=len(recipes),
@@ -406,31 +340,17 @@ async def _verify_projected_office(case):
         return await _offices(driver, batch, address, None, case.fixture.control_schema)
 
 
-async def test_genuine_mixed_candidate_requires_independent_fenced_session_then_commits(mixed_ptg_custody, monkeypatch):
-    """Reject each incorrect custodian/session and commit only the independently fenced candidate."""
+async def test_genuine_mixed_candidate_validates_data_and_preserves_retained_head(mixed_ptg_custody, monkeypatch):
+    """Check actual source parity, cancellation and validated replay before publication."""
     case = mixed_ptg_custody
-    fixture, copy_target = case.fixture, case.target
-    options_by_name = await _mixed_custody_options(case)
-    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
-        assert await fixture.connection.fetchval(
-            "SELECT has_database_privilege($1,current_database(),'CREATE')", fixture.retained_address_owner
-        )
-        candidate = await fixture.connection.fetchrow(
-            f'SELECT * FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
-            UUID(copy_target.candidate_id),
-        )
-        await _retained_address_runtime_closure(
-            fixture.connection, case.retained_source, options_by_name["runtime_roles"]
-        )
-        await _address_runtime_closure(fixture.connection, candidate, options_by_name["runtime_roles"])
-    await _assert_wrong_custody_sessions(case, options_by_name)
     await _assert_mixed_native_tamper(case)
-    await _assert_cancelled_mixed_seal(case, options_by_name)
-    await _assert_mixed_sealed_replay(case, options_by_name, monkeypatch)
+    await _assert_cancelled_mixed_seal(case, monkeypatch)
+    await _assert_mixed_sealed_replay(case, monkeypatch)
+    await _assert_mixed_reader_permissions(case)
 
 
 async def _mixed_consumer(native, runtime, execution, service, stack):
-    """Configure the original independent custody consumer without changing its actors."""
+    """Configure the existing PTG worker roles and its normal administrative handoff."""
     fixture = native.custom
     execution_role, loading_role = fixture.custody_roles["execution"], fixture.custody_roles["loading"]
     from process.registry_publication_consumer import RegistryPublicationConsumerConfig
@@ -448,12 +368,40 @@ async def _mixed_consumer(native, runtime, execution, service, stack):
     config = SimpleNamespace(
         consumer=consumer,
         execution_url=_socket_url(fixture.execution_url),
-        custody_url=_socket_url(fixture.custody_url),
         ptg=_PTGWorkerConfig(service.store, runtime.read_budget),
         sql_limits=fixture.sql_limits,
+        preparation_roles={
+            **fixture.preparation_roles,
+            "application_roles": sorted(
+                set(fixture.preparation_roles["application_roles"]) | set(native.roles_by_kind.values())
+            ),
+        },
     )
-    consumer = await _custody_runtime(config, stack, consumer, execution)
-    return consumer, config
+    consumer = await _configured_worker_runtime(config, stack)
+    fixture.preparation_roles = consumer.preparation_roles
+    validate = administrative_freeze_callback(fixture, consumer)
+
+    async def validate_candidate(target, **options):
+        if target.candidate_id not in fixture.preparation_ids:
+            fixture.preparation_ids.append(target.candidate_id)
+        return await validate(target, **options)
+
+    async def prepare_addresses(**arguments):
+        return await _mixed_address_artifact(consumer, arguments)
+
+    return replace(consumer, seal_candidate=validate_candidate, prepare_address_sources=prepare_addresses), config
+
+
+async def _mixed_address_artifact(consumer, arguments):
+    """Prepare actual source addresses under the maintained PTG company approval transaction."""
+    selected = arguments["address_sources"]
+    runtime_roles = tuple(sorted({*consumer.reader_roles, consumer.execution_role}))
+    custody = RegistryAddressArtifactCustody(consumer.physical_owner_role, runtime_roles, consumer.control_schema)
+    async with consumer.composition_runtime.validation_snapshot() as (connection, office_authority):
+        artifact = await prepare_registry_composition_address_artifact(
+            connection, custody=custody, office_authority=office_authority, **arguments
+        )
+    return selected if artifact is None else replace(selected, prepared_address_artifact=artifact)
 
 
 async def _assert_mixed_source_rows(fixture, copy_target, recipes):
@@ -464,84 +412,6 @@ async def _assert_mixed_source_rows(fixture, copy_target, recipes):
     assert len(membership_records) == len(recipes) and len(
         {membership_record["network_id"] for membership_record in membership_records}
     ) == len(recipes)
-
-
-def _mixed_custodian_sessions(config, stack):
-    """Register the exact owned custodian engine before returning its session factory."""
-    engine = create_async_engine(config.custody_url, pool_size=1, max_overflow=0)
-    stack.push_async_callback(engine.dispose)
-    return async_sessionmaker(engine)
-
-
-async def _mixed_custody_options(case):
-    """Capture the real independent custodian identity and its complete sealing options."""
-    fixture, copy_target = case.fixture, case.target
-    from process.registry_publication_worker import _custody_identity, _custody_runtime_roles
-
-    async with fixture.execution_connection.transaction():
-        identity = await _custody_identity(
-            fixture.execution_connection, fixture.control_schema, fixture.custody_roles["execution"]
-        )
-
-    async def authorize(driver, supplied):
-        return supplied == copy_target and await driver.fetchval(
-            "SELECT current_user=session_user AND current_user::text=$1", fixture.custody_roles["custodian"]
-        )
-
-    options_by_name = dict(
-        control_schema=fixture.control_schema,
-        runtime_roles=_custody_runtime_roles(case.config, identity, case.consumer),
-        authorize=authorize,
-        office_store=case.config.ptg.store,
-        office_read_budget=case.config.ptg.read_budget,
-    )
-    return options_by_name
-
-
-async def _assert_wrong_custody_sessions(case, options_by_name):
-    """Refuse unfenced, wrong-role, task-transferred and raw direct custody sessions."""
-    fixture, copy_target = case.fixture, case.target
-    with pytest.raises(ValueError, match="custody_unavailable"):
-        await seal_network_candidate_custody_in_session(object(), copy_target, **options_by_name)
-    async with case.sessions() as session, session.begin():
-        with pytest.raises(ValueError, match="company_fence_unavailable"):
-            await seal_network_candidate_custody_in_session(session, copy_target, **options_by_name)
-    async with registry_company_approval_transaction(case.sessions, control_schema=fixture.control_schema) as session:
-        with pytest.raises(ValueError, match="recipe_owner_unavailable"):
-            await seal_network_candidate_custody_in_session(
-                session, copy_target, **(options_by_name | {"office_store": object()})
-            )
-        from process.registry_ptg_office_membership import require_ptg_office_authority
-
-        with pytest.raises(ValueError, match="recipe_owner_unavailable"):
-            await require_ptg_office_authority(
-                fixture.execution_connection,
-                fixture.control_schema,
-                (session, options_by_name["office_store"], options_by_name["office_read_budget"]),
-            )
-        with pytest.raises(ValueError, match="company_fence_unavailable"):
-            await asyncio.create_task(
-                seal_network_candidate_custody_in_session(session, copy_target, **options_by_name)
-            )
-    async with registry_company_approval_transaction(
-        case.producer_sessions, control_schema=fixture.control_schema
-    ) as session:
-
-        async def has_custody_operator_authority(*args):
-            return True
-
-        with pytest.raises(ValueError, match="custody_unavailable"):
-            await seal_network_candidate_custody_in_session(
-                session, copy_target, **(options_by_name | {"authorize": has_custody_operator_authority})
-            )
-    async with case.sessions.kw["bind"].connect() as connection:
-        driver = (await connection.get_raw_connection()).driver_connection
-        with pytest.raises(ValueError, match="custody_unavailable"):
-            await seal_network_candidate_custody(
-                driver,
-                copy_target,
-                **{key: options_by_name[key] for key in ("control_schema", "runtime_roles", "authorize")},
-            )
 
 
 async def _assert_mixed_native_tamper(case):
@@ -590,69 +460,78 @@ async def _assert_mixed_native_tamper(case):
             )
 
 
-async def _assert_cancelled_mixed_seal(case, options_by_name):
-    """Cancellation after the second authority check cannot leave a custody seal."""
-    fixture, copy_target = case.fixture, case.target
-    authorize = options_by_name["authorize"]
+async def _assert_cancelled_mixed_seal(case, monkeypatch):
+    """Cancellation before retaining final validation leaves the prior serving head intact."""
+    from process import network_membership_publication as publication
+
     calls = []
 
-    async def cancel_after_seal(driver, supplied):
-        calls.append(supplied)
-        if len(calls) == 2:
-            raise asyncio.CancelledError
-        return await authorize(driver, supplied)
+    async def cancel_retention(connection, target, validation, control_schema, roles):
+        calls.append(target)
+        raise asyncio.CancelledError
 
-    async with registry_company_approval_transaction(case.sessions, control_schema=fixture.control_schema) as session:
+    with monkeypatch.context() as settings:
+        settings.setattr(publication, "_retain_network_final_validation", cancel_retention)
         with pytest.raises(asyncio.CancelledError):
-            await seal_network_candidate_custody_in_session(
-                session, copy_target, **(options_by_name | {"authorize": cancel_after_seal})
-            )
-    assert calls == [copy_target, copy_target]
+            await case.consumer.seal_candidate(case.target)
+    assert calls == [case.target]
     assert (
-        await fixture.connection.fetchval(
-            f'SELECT count(*) FROM "{fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1',
-            UUID(copy_target.candidate_id),
+        await case.fixture.connection.fetchval(
+            f"SELECT validation_json->'final_validation' FROM \"{case.fixture.control_schema}\".network_membership_candidate "
+            "WHERE candidate_id=$1",
+            UUID(case.target.candidate_id),
         )
-        == 0
+        is None
     )
+    assert await _retained_pin(case.native) == case.previous
 
 
-async def _assert_mixed_sealed_replay(case, options_by_name, monkeypatch):
-    """Reverify one actual seal without reopening source authority or changing old serving."""
-    fixture, copy_target = case.fixture, case.target
-    await case.consumer.seal_candidate(copy_target)
-    await case.consumer.seal_candidate(copy_target, pre_enrolled_only=True)
+async def _assert_mixed_sealed_replay(case, monkeypatch):
+    """Retain one complete data result and replay it without another full source scan."""
+    from process import network_membership_validation as validation
+
+    fixture, target = case.fixture, case.target
+    completed = await case.consumer.seal_candidate(target)
+    assert completed["state"] == "validated" and completed["candidate_id"] == target.candidate_id
+    before = await fixture.connection.fetchval(
+        f'SELECT validation_json::text FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
+        UUID(target.candidate_id),
+    )
 
     async def no_recapture(*args, **kwargs):
-        raise AssertionError("sealed verification must not reopen source authority")
+        raise AssertionError("validated replay must not repeat complete source validation")
 
-    from process import network_source_contribution_custody as independent
-
-    monkeypatch.setattr(independent, "stage_registry_source_recipes", no_recapture)
-    async with case.sessions.kw["bind"].connect() as connection:
-        driver = (await connection.get_raw_connection()).driver_connection
-        sealed = await seal_network_candidate_custody(
-            driver,
-            copy_target,
-            **{key: options_by_name[key] for key in ("control_schema", "runtime_roles", "authorize")},
-        )
-    assert sealed["seal_sha256"] == await fixture.connection.fetchval(
-        f'SELECT seal_sha256 FROM "{fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1',
-        UUID(copy_target.candidate_id),
-    )
-    assert (
-        await fixture.connection.fetchval(
-            f'SELECT count(*) FROM "{fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1',
-            UUID(copy_target.candidate_id),
-        )
-        == 1
-    )
+    with monkeypatch.context() as settings:
+        settings.setattr(validation, "validate_network_candidate_final", no_recapture)
+        assert await case.consumer.seal_candidate(target, pre_enrolled_only=True) == completed
     candidate = await fixture.connection.fetchrow(
-        f'SELECT source_recipes_json::text AS recipes FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
-        UUID(copy_target.candidate_id),
+        f"SELECT validation_json::text AS validation,source_recipes_json::text AS recipes "
+        f'FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
+        UUID(target.candidate_id),
     )
+    assert candidate["validation"] == before
+    final_validation = json.loads(before)["final_validation"]
+    assert final_validation["complete"] is True and final_validation["schema_name"] == target.schema_name
+    assert final_validation["candidate_id"] == target.candidate_id
     assert len(json.loads(candidate["recipes"])) == case.recipe_count
     assert await _retained_pin(case.native) == case.previous
+
+
+async def _assert_mixed_reader_permissions(case):
+    """Use actual PostgreSQL reads and write refusals after the administrative freeze."""
+    connection, schema = case.fixture.connection, case.target.schema_name
+    async with connection.transaction(readonly=True):
+        await connection.execute(f'SET LOCAL ROLE "{case.fixture.roles["reader"]}"')
+        assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".network_membership') > 0
+    for role in (case.consumer.execution_role, case.consumer.physical_owner_role, *case.consumer.reader_roles):
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with connection.transaction():
+                await connection.execute(f'SET LOCAL ROLE "{role}"')
+                await connection.execute(f'DELETE FROM "{schema}".network_membership')
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        async with connection.transaction(readonly=True):
+            await connection.execute(f'SET LOCAL ROLE "{case.fixture.roles["outsider"]}"')
+            await connection.fetchval(f'SELECT count(*) FROM "{schema}".network_membership')
 
 
 def _mixed_address_sources(fixture, previous, retained_address, recipes):

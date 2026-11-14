@@ -45,25 +45,56 @@ async def test_canonicalizer_difference_refuses_before_address_read(monkeypatch,
     monkeypatch.setattr(
         mapping.importlib, "import_module", lambda name: SimpleNamespace(canon_version=lambda: version_by_field)
     )
-    dependency = AsyncMock()
-    monkeypatch.setattr(mapping, "_artifact_dependency_identity", dependency)
+    connection = SimpleNamespace(fetchval=AsyncMock(), fetch=AsyncMock(), execute=AsyncMock())
     with pytest.raises(legacy.InitialCMSOfficeBindingError, match="canonicalizer_differs"):
-        await mapping._policy_context(object(), object(), (), object(), "registry")
-    dependency.assert_not_awaited()
+        await mapping._policy_context(connection, object(), (), object(), "registry")
+    connection.fetchval.assert_not_awaited()
+    connection.fetch.assert_not_awaited()
+    connection.execute.assert_not_awaited()
 
 
 async def test_context_uses_actual_address_and_current_four_field_canonicalizer(monkeypatch):
     version = current_canon_version()
     monkeypatch.setattr(mapping.importlib, "import_module", lambda name: SimpleNamespace(canon_version=lambda: version))
-    identity = (11, 12, 13, "d" * 64)
-    dependency = AsyncMock(return_value=identity)
-    monkeypatch.setattr(mapping, "_artifact_dependency_identity", dependency)
+    connection = SimpleNamespace(fetchval=AsyncMock(), fetch=AsyncMock(), execute=AsyncMock())
     address = PinnedAddressSource("synthetic_addresses", "entity_address_unified", "a" * 64)
     approved = SimpleNamespace(approved_revision=7, generation_id="b" * 64)
-    document, native = await mapping._policy_context(object(), address, ("reader",), approved, "registry")
-    assert native == identity and document["canonicalizer_version"] == version
-    assert document["address_identity"]["table_oid"] == 12 and document["origin_manifest_sha256"] is None
-    assert dependency.await_count == 1
+    document = await mapping._policy_context(connection, address, ("reader",), approved, "registry")
+    assert document["canonicalizer_version"] == version
+    assert document["address_source"] == {
+        "schema_name": address.schema_name,
+        "table_name": address.table_name,
+        "generation_id": address.generation_id,
+    }
+    assert "address_identity" not in document and document["origin_manifest_sha256"] is None
+    connection.fetchval.assert_not_awaited()
+    connection.fetch.assert_not_awaited()
+    connection.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize("damage", [None, "address", "count", "content"])
+async def test_named_matches_compare_complete_data_without_physical_queries(damage):
+    address = PinnedAddressSource("named_addresses", "entity_address_unified", "a" * 64)
+    raw = '[{"location_key":"example"}]'
+    matches = legacy._OfficeMatches(
+        "named_matches", address, {"page": (1, hashlib.sha256(raw.encode()).hexdigest())}, "b" * 64, "c" * 64
+    )
+    actual_address = replace(address, generation_id="d" * 64) if damage == "address" else address
+    connection = SimpleNamespace(
+        is_in_transaction=lambda: True,
+        fetchval=AsyncMock(return_value="repeatable read"),
+        fetchrow=AsyncMock(
+            return_value={"rows": 2 if damage == "count" else 1, "offices_json": "[]" if damage == "content" else raw}
+        ),
+        execute=AsyncMock(),
+    )
+    if damage is None:
+        assert len(await legacy.verified_retained_offices(connection, matches, actual_address, (), "registry")) == 64
+    else:
+        with pytest.raises(legacy.InitialCMSOfficeBindingError):
+            await legacy.verified_retained_offices(connection, matches, actual_address, (), "registry")
+    assert all(call.args[0] == "SHOW transaction_isolation" for call in connection.fetchval.await_args_list)
+    connection.execute.assert_not_awaited()
 
 
 def test_shared_member_policy_keeps_duplicates_and_prunes_only_invalid_npi():
@@ -158,20 +189,27 @@ async def test_derivation_counts_duplicate_members_instead_of_offices(monkeypatc
     expected = hashlib.sha256(("page" + hashlib.sha256(raw.encode()).hexdigest() + "\n").encode()).hexdigest()
     assert document["correspondence_sha256"] == expected
     assert all(
-        document["fact_artifact"][key] is None for key in ("fact_candidate_id", "fact_table_oid", "fact_seal_sha256")
+        document["fact_artifact"][key] is None
+        for key in ("fact_candidate_id", "fact_schema_name", "fact_table_name", "fact_generation_id")
     )
 
 
 async def test_reused_derivation_preserves_exact_anchor_and_full_descriptor_commitment(monkeypatch):
     original = _source()
     descriptor = copy.deepcopy(original.descriptor)
-    descriptor.update(fact_candidate_id=str(UUID(int=9)), fact_table_oid=71, fact_seal_sha256="f" * 64)
+    descriptor.update(
+        fact_candidate_id=str(UUID(int=9)),
+        fact_schema_name="original_facts",
+        fact_table_name="network_source_contribution",
+        fact_generation_id="f" * 64,
+    )
     source = replace(original, descriptor=descriptor)
     connection = SimpleNamespace(fetchval=AsyncMock(return_value=1))
     matches = SimpleNamespace(page_proofs_by_key={})
     result = await mapping._derivation(connection, source, (), matches, "members", context())
     assert result["fact_artifact"]["fact_candidate_id"] == str(UUID(int=9))
-    assert result["fact_artifact"]["fact_table_oid"] == 71
+    assert result["fact_artifact"]["fact_schema_name"] == "original_facts"
+    assert result["fact_artifact"]["fact_generation_id"] == "f" * 64
     assert result["contribution_sha256"] == mapping._digest(descriptor)
 
 
@@ -186,9 +224,8 @@ async def test_all_recipes_share_one_global_pruning_pass(monkeypatch):
         witness_sources.append(mapping.WitnessOfficeSource(recipe, descriptor, "mapped_" + str(index)))
     connection = SimpleNamespace(execute=AsyncMock())
     current_context = context()
-    address_identity_values = tuple(current_context["address_identity"].values())
     monkeypatch.setattr(mapping, "_require_transaction", AsyncMock())
-    monkeypatch.setattr(mapping, "_policy_context", AsyncMock(return_value=(current_context, address_identity_values)))
+    monkeypatch.setattr(mapping, "_policy_context", AsyncMock(return_value=current_context))
     monkeypatch.setattr(composition, "_require_recipe_custody", AsyncMock(return_value=object()))
 
     async def stage(connection, witness_source, read, input_name, source_table, proofs):
@@ -282,3 +319,24 @@ async def test_global_pruning_freezes_all_identities_before_any_page_delete():
     assert "ORDER BY location_key DESC LIMIT 1" in statements[5]
     assert "(other.provider_system,other.provider_id,other.location_id)=" in statements[5]
     assert all("ctid=ANY(ARRAY(" in statement for statement in statements[5:7])
+
+
+@pytest.mark.parametrize("roles", [(), ("reader",)])
+async def test_named_office_capture_uses_snapshot_names_independently_of_role_roster(monkeypatch, roles):
+    address = PinnedAddressSource("named_addresses", "entity_address_unified", "address-edition")
+    source = _source().recipe.source_pin
+    batch = SimpleNamespace(source=source, generation_id="membership-edition", input_sha256="a" * 64)
+    connection = SimpleNamespace(is_in_transaction=lambda: True, fetchval=AsyncMock(return_value="repeatable read"))
+    batch_check = AsyncMock()
+    monkeypatch.setattr(legacy, "_verify_batch", batch_check)
+    monkeypatch.setattr(legacy, "_office_records", AsyncMock(return_value=([], [])))
+    pin, bindings = await legacy._capture_offices(connection, batch, address, roles, None, "control")
+    assert pin.address_source == address and pin.address_scope == (
+        address.schema_name,
+        address.table_name,
+        address.generation_id,
+        None,
+    )
+    assert bindings == [] and pin.office_count == 0
+    batch_check.assert_awaited_once()
+    assert all(call.args[0] == "SHOW transaction_isolation" for call in connection.fetchval.await_args_list)

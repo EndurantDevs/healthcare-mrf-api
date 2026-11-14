@@ -338,16 +338,13 @@ async def _retire_native_guard(session, child, owner, incoming, native_registrat
     )
 
 
-async def _require_adoptable_source(session, source_authority, child):
-    _require(
-        source_authority.relation_oids is None or source_authority.relation_oids == (child["oid"],),
-        "Source relation differs",
-    )
-    # The protected four-ledger projection must be installed by its existing genuine operator first.
-    claims = await session.scalar(
-        text("SELECT count(*) FROM mrf.nucc_retained_relation_claims WHERE relation_oid=:oid"), {"oid": child["oid"]}
-    )
-    _require(claims == 0, "legacy heap has retained claims")
+async def _require_adoptable_source(session, child):
+    from process.nucc_retention_read_view import NuccRetentionReadError, require_unretained_nucc_relations
+
+    try:
+        await require_unretained_nucc_relations(session, schema_name=child["schema"], relation_names=(child["name"],))
+    except NuccRetentionReadError as error:
+        raise native.ReferenceFamilyArchiveError("NUCC protected baseline legacy heap has retained claims") from error
     _require(
         not await session.scalar(
             text(
@@ -370,7 +367,7 @@ async def adopt_nucc_parent(session, *, dataset_id):
         lock=True,
     )
     child, hook = await _old_heap(session)
-    await _require_adoptable_source(session, source_authority, child)
+    await _require_adoptable_source(session, child)
     owner = await _owner(session)
     old_count, old_semantic = await _legacy_contents(session)
     async with session.begin_nested():

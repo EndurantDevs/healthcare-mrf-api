@@ -33,6 +33,43 @@ from process.provider_directory_generic_source_storage import (
 )
 
 
+def named_artifact_input_relation(directory, root, scoped_relation):
+    """Allow an explicit input QName only for the ordinary artifact resource table."""
+    if (
+        type(scoped_relation) is not tuple
+        or len(scoped_relation) != 2
+        or root != directory.ProviderDirectoryDatasetResource.__tablename__
+        or is_source_storage_required()
+    ):
+        raise directory.ProviderDirectoryArtifactBuildStale("provider_directory_artifact_input_relation_invalid")
+    return storage_relation(*scoped_relation)
+
+
+async def lock_endpoint_dataset_candidate_admission(directory, connection, endpoint_id):
+    """Serialize candidate intake within its configured storage scope without waiting."""
+    from process.provider_directory_generic_source_policy import bound_publisher, current_source_storage_binding
+    from process.provider_directory_source_storage_binding import require_storage_schema
+
+    catalog_schema = directory._schema()
+    binding = current_source_storage_binding()
+    scope = endpoint_id
+    if binding is not None:
+        binding = require_storage_schema(bound_publisher(), catalog_schema)
+        scope = f"provider-directory-source-candidate:{binding.catalog_schema}:{binding.storage_schema}:{endpoint_id}"
+    acquired = await connection.scalar(
+        "SELECT pg_catalog.pg_try_advisory_xact_lock(pg_catalog.hashtextextended(:admission_scope, 0));",
+        admission_scope=scope,
+    )
+    if acquired is not True:
+        raise RuntimeError("provider_directory_endpoint_dataset_candidate_admission_busy")
+    relation = directory._qt(catalog_schema, directory.ProviderDirectoryAPIEndpoint.__tablename__)
+    row_lock = " FOR UPDATE NOWAIT" if binding is None else ""
+    return await connection.first(
+        f"SELECT endpoint_id FROM {relation} WHERE endpoint_id = :endpoint_id{row_lock};",
+        endpoint_id=endpoint_id,
+    )
+
+
 def require_source_transaction(*, repeatable_read=False):
     """Refuse before target IO; isolation is established by the trusted broker."""
     publisher = source_transaction_available()
@@ -91,6 +128,7 @@ async def candidate_resource_count(directory, context, resource_type):
     """Count exact active loading identities without exposing or preparing an input heap."""
     if not is_source_storage_required():
         return await _legacy_candidate_count(directory, context, resource_type)
+    from process.provider_directory_generic_source_policy import _publisher_scope, _require_active_source_session
     from process.provider_directory_source_checkpoint_control import require_checkpoint_executor
 
     async with source_transaction(directory.db):
@@ -121,9 +159,11 @@ async def candidate_resource_count(directory, context, resource_type):
             binding["ordinal"],
         )
         _require(type(count) is int and 0 <= count < 2**63, "resource_count_invalid")
-        _require(await require_checkpoint_executor(directory.db) is publisher, "count_transaction_changed")
+        current = await require_checkpoint_executor(directory.db)
+        _require(_publisher_scope(current) == _publisher_scope(publisher), "count_transaction_changed")
+        _require_active_source_session(connection)
         async with source_owner_transaction(directory.db) as current:
-            _require(current is publisher, "count_transaction_changed")
+            _require(_publisher_scope(current) == _publisher_scope(publisher), "count_transaction_changed")
         return count
 
 

@@ -118,13 +118,9 @@ def _recipe(dataset, edition, *, endpoint="endpoint-one", producer="producer"):
         dataset,
         "a" * 64,
         "release",
-        100,
+        {"schema": "source_schema", "name": "provider_directory_dataset_resource"},
         "scope",
         "2026-01-01",
-        custody_owner_role="source_owner",
-        custody_runtime_roles=("source_reader",),
-        custody_proof_sha256="f" * 64,
-        custody_catalog_sha256="e" * 64,
     )
     coordinates = RegistryNetworkSourceCoordinates("fhir", "cms-npd", "source_schema", dataset, producer, edition)
     return RegistrySourceMembershipRecipe(pin, coordinates)

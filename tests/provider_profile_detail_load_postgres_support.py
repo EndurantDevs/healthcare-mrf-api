@@ -16,7 +16,6 @@ from db import models
 from db.connection import Database
 from db.plan_release_storage import storage_identifier
 from process import entity_address_result_generation as address_generation
-from process import npi_result_generation as npi_generation
 from process import nppes_public_evidence_storage as nppes_storage
 from process import provider_directory_generic_source_policy as source
 from process import provider_directory_profile as profile
@@ -62,8 +61,8 @@ async def _install_detail_tables(component, monkeypatch):
     """Add full detail relations before Source provision without replacing existing roots."""
     schema = component.policy.schema
     async with component.admin_engine.begin() as connection:
-        assert await connection.scalar(text("SELECT session_user=current_user")) is True
-        before_by_name = await snapshot._relation_oids(connection, schema, RELATIONS)
+        before_by_name = await snapshot._inventory_relation_names(connection, schema, RELATIONS)
+        before_rows = await _detail_relation_rows(connection, before_by_name)
         later_names = {
             "npi_result_generation",
             "npi_canonical_publication_receipt",
@@ -83,20 +82,35 @@ async def _install_detail_tables(component, monkeypatch):
             if await connection.scalar(text("SELECT to_regclass(:name)"), {"name": f"{schema}.{name}"}) is None:
                 await connection.execute(text(sql))
         await _install_detail_migrations(connection)
-        await npi_generation.install_npi_stage_mutation_guards(
-            connection, schema_name=schema, stage_tables=npi_generation.RELATION_NAMES
-        )
-        await _align_npi_receipt_validator_owner(connection, component.policy)
         await _grant_nppes_fixture_inputs(connection, component.policy)
-        after_by_name = await snapshot._relation_oids(connection, schema, RELATIONS)
+        after_by_name = await snapshot._inventory_relation_names(connection, schema, RELATIONS)
         assert len(after_by_name) == 59
         assert all(
-            oid is not None
-            for name, oid in after_by_name.items()
+            available
+            for name, available in after_by_name.items()
             if not name.endswith((".npi_canonical_publication_receipt", ".npi_canonical_publication_receipt_seal"))
         )
-        assert all(after_by_name[name] == oid for name, oid in before_by_name.items() if oid is not None)
+        assert all(after_by_name[name] for name, available in before_by_name.items() if available)
+        assert (
+            await _detail_relation_rows(connection, {name: after_by_name[name] for name in before_rows}) == before_rows
+        )
         await _grant_detail_reads(connection, component, before_by_name, after_by_name)
+
+
+async def _detail_relation_rows(connection, availability_by_name):
+    """Preserve full rows and duplicate multiplicity in every existing named relation."""
+    rows_by_name = {}
+    for qualified, available in availability_by_name.items():
+        if available:
+            namespace, name = qualified.split(".")
+            relation = f"{storage_identifier(namespace)}.{storage_identifier(name)}"
+            result = await connection.execute(
+                text(
+                    f"SELECT to_jsonb(existing_row)::text FROM {relation} existing_row ORDER BY to_jsonb(existing_row)::text"
+                )
+            )
+            rows_by_name[qualified] = result.scalars().all()
+    return rows_by_name
 
 
 async def _install_detail_migrations(connection):
@@ -131,39 +145,17 @@ async def _grant_nppes_fixture_inputs(connection, policy):
         )
 
 
-async def _align_npi_receipt_validator_owner(connection, policy):
-    """Match the administrator actor used by the original canonical receipt fixture."""
-    migration = receipt_fixture._migration("20260808230000")
-    function = f"{storage_identifier(policy.schema)}.{storage_identifier(migration._VALIDATOR)}()"
-    query = text("""SELECT p.oid::bigint AS oid,p.prosrc,p.prosecdef,p.proconfig,
-        pg_get_userbyid(p.proowner)::text AS owner,current_user::text AS administrator,
-        coalesce((SELECT jsonb_agg(jsonb_build_array(a.grantee::bigint,a.privilege_type,a.is_grantable)
-            ORDER BY a.grantee,a.privilege_type,a.is_grantable)
-            FROM aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a
-            WHERE a.grantee<>p.proowner),'[]'::jsonb) AS explicit_grants
-        FROM pg_proc p WHERE p.oid=to_regprocedure(:function)""")
-    before_by_field = dict((await connection.execute(query, {"function": function})).mappings().one())
-    assert before_by_field["owner"] == policy.control_runtime_roles[0]
-    assert before_by_field["prosecdef"] is True and before_by_field["proconfig"] == ["search_path=pg_catalog"]
-    await connection.execute(text(f"ALTER FUNCTION {function} OWNER TO CURRENT_USER"))
-    after_by_field = dict((await connection.execute(query, {"function": function})).mappings().one())
-    assert after_by_field["owner"] == before_by_field["administrator"]
-    assert {key: value for key, value in before_by_field.items() if key != "owner"} == {
-        key: value for key, value in after_by_field.items() if key != "owner"
-    }
-
-
 async def _grant_detail_reads(connection, component, before_by_name, after_by_name):
     """Keep new supplemental models on the Source owner and expose only Reader SELECT."""
     policy = component.policy
     model_names = {table.name for table in models.db.metadata.tables.values()}
     model_names.update((profile.PROFILE_TABLE, profile.PROFILE_EVIDENCE_TABLE))
-    for qualified, oid in after_by_name.items():
-        if oid is None:
+    for qualified, available in after_by_name.items():
+        if not available:
             continue
         namespace, name = qualified.split(".")
         relation = f"{storage_identifier(namespace)}.{storage_identifier(name)}"
-        if before_by_name[qualified] is None and name in model_names:
+        if not before_by_name[qualified] and name in model_names:
             await connection.execute(text(f"ALTER TABLE {relation} OWNER TO {storage_identifier(policy.owner_role)}"))
         for role in (policy.owner_role, *policy.runtime_roles):
             await connection.execute(text(f"GRANT SELECT ON TABLE {relation} TO {storage_identifier(role)}"))
@@ -466,7 +458,7 @@ async def _detail_source_fixture(monkeypatch):
             _bind_doctors_database(monkeypatch, component.database)
             monkeypatch.setattr(fhir, "db", component.database)
             async with component.admin_engine.begin() as connection:
-                after_by_name = await snapshot._relation_oids(connection, component.policy.schema, RELATIONS)
+                after_by_name = await snapshot._inventory_relation_names(connection, component.policy.schema, RELATIONS)
                 assert len(after_by_name) == 59 and all(after_by_name.values())
                 await _grant_detail_reads(connection, component, after_by_name, after_by_name)
             yield SimpleNamespace(
@@ -511,8 +503,8 @@ async def detail_database(monkeypatch, tmp_path):
         finally:
             await raw.close()
         async with fixture.database.transaction() as session:
-            oids = await snapshot._relation_oids(session, fixture.schema, RELATIONS)
-            assert len(oids) == 59 and all(oids.values())
+            availability = await snapshot._inventory_relation_names(session, fixture.schema, RELATIONS)
+            assert len(availability) == 59 and all(availability.values())
             fixture.npi_identity = await npi_api._npi_canonical_publication_identity(session=session)
             assert fixture.npi_identity is not None
             assert (await npi_api._fetch_provider_enrichment_detail(NPI, session=session))["summary"] is not None

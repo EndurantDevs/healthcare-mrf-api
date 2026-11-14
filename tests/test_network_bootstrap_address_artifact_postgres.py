@@ -1,24 +1,29 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Genuine restricted bootstrap artifact reads on the existing isolated native fixture."""
+"""Named bootstrap artifact reads through genuine restricted PostgreSQL roles."""
 
-import asyncio
 import copy
 import json
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack
 from dataclasses import replace
+from types import SimpleNamespace
+from uuid import uuid4
 
 import asyncpg
 import pytest
+from sqlalchemy import MetaData
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.schema import CreateTable
 
+from db.models import EntityAddressUnified, NPIData
 from process import network_address_artifact as artifact
 from process import network_bootstrap_address_artifact as bootstrap_artifact
-from process import network_bootstrap_read_access as access
 from process import network_bootstrap_sources as bootstrap
-from process.network_custom_address_source import NetworkCustomAddressSourceError
+from process.network_compact_layout import CompactAddressRelation
+from process.provider_directory_generic_source_provision import freeze_fhir_source_snapshot
+from tests.test_network_address_artifact_postgres import _admin_url, _cleanup
 from tests.test_network_custom_address_source_postgres import (
     _bootstrap_access_login,
     _change_bootstrap_access,
-    _renew_bootstrap_access,
 )
 from tests.test_network_custom_address_source_postgres import (
     bootstrap_access_fixture as bootstrap_access_fixture,
@@ -33,99 +38,81 @@ from tests.test_network_custom_address_source_postgres import (
 pytestmark = pytest.mark.asyncio
 
 
-async def _capture(fixture, connection, *, roles=None):
+async def _capture(fixture, connection):
     async with connection.transaction(isolation="repeatable_read"):
-        return await artifact.capture_network_address_artifact(
-            connection,
-            fixture.receipt.address_source,
-            runtime_roles=roles or tuple(sorted((fixture.reader, fixture.stranger))),
-        )
+        return await artifact.capture_network_address_artifact(connection, fixture.receipt.address_source)
 
 
 async def _verify(fixture, connection, descriptor):
     async with connection.transaction(isolation="repeatable_read"):
-        return await artifact.verify_network_address_artifact(
-            connection, descriptor, runtime_roles=tuple(descriptor["runtime_roles"])
-        )
+        return await artifact.verify_network_address_artifact(connection, descriptor)
 
 
 @pytest.mark.parametrize("bootstrap_access_fixture", ["constant", "serial"], indirect=True)
-async def test_genuine_bootstrap_artifact_reuses_closed_content_for_worker(bootstrap_access_fixture, monkeypatch):
+async def test_genuine_bootstrap_artifact_reuses_named_content_for_worker(bootstrap_access_fixture, monkeypatch):
     fixture, receipt = bootstrap_access_fixture, bootstrap_access_fixture.receipt
     await _change_bootstrap_access(fixture)
 
     async def no_content_scan(*_):
-        pytest.fail("Immutable bootstrap artifact reuse must not rescan either heap")
+        pytest.fail("Frozen bootstrap artifact reuse must not rescan either heap")
 
     monkeypatch.setattr(bootstrap, "_content", no_content_scan)
     async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
-        assert not await reader.fetchval(
-            "SELECT has_table_privilege($1,$2::oid,'SELECT')", fixture.stranger, dict(receipt.relation_oids)["npi"]
-        )
         descriptor = await _capture(fixture, reader)
         assert descriptor["contract"] == bootstrap_artifact.CONTRACT
         assert descriptor["bootstrap_receipt"] == json.loads(artifact._json(receipt.as_dict()))
         assert descriptor["generation_id"] == receipt.generation_sha256
-        assert set(descriptor["heaps"]) == {"entity_address_unified", "npi"}
-        expected_oids = {oid for _, oid in (*receipt.relation_oids, *receipt.index_oids)}
-        sequence_oid = descriptor["dormant_sequence_oid"]
-        if sequence_oid is not None:
-            expected_oids.add(sequence_oid)
-        assert descriptor["dependency_oids"] == sorted(expected_oids)
-        resolved = await _verify(fixture, reader, descriptor)
-        assert resolved.table_oid == dict(receipt.relation_oids)["entity_address_unified"]
+        assert descriptor["heaps"] == {
+            name: {"schema_name": receipt.address_source.schema_name, "table_name": name}
+            for name in ("entity_address_unified", "npi")
+        }
+        assert await _verify(fixture, reader, descriptor) == CompactAddressRelation(
+            receipt.address_source.schema_name, "entity_address_unified"
+        )
+        assert not await reader.fetchval(
+            "SELECT has_table_privilege($1,$2,'SELECT')",
+            fixture.stranger,
+            f'"{receipt.address_source.schema_name}".npi',
+        )
 
 
-@pytest.mark.parametrize("changed", ["receipt", "filenode", "native"])
-async def test_rehashed_descriptor_requires_current_protected_evidence(bootstrap_access_fixture, changed):
+@pytest.mark.parametrize("changed", ["edition", "heap", "receipt"])
+async def test_bootstrap_refuses_changed_logical_binding(bootstrap_access_fixture, changed):
     fixture = bootstrap_access_fixture
     await _change_bootstrap_access(fixture)
     async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
         descriptor = copy.deepcopy(await _capture(fixture, reader))
-        if changed == "receipt":
-            receipt = replace(fixture.receipt, capture_snapshot="forged")
-            receipt = replace(receipt, generation_sha256=bootstrap._generation(receipt))
-            descriptor["bootstrap_receipt"] = json.loads(artifact._json(receipt.as_dict()))
-            descriptor["generation_id"] = receipt.generation_sha256
-        elif changed == "filenode":
-            descriptor["heaps"]["npi"]["relfilenode"] += 1
+        if changed == "edition":
+            descriptor["generation_id"] = "f" * 64
+        elif changed == "heap":
+            descriptor["heaps"]["npi"]["table_name"] = "different_npi"
         else:
-            descriptor["native_sha256"] = "f" * 64
+            descriptor["bootstrap_receipt"]["parent_receipts"][0]["row_count"] = -1
         descriptor["descriptor_sha256"] = artifact._digest(
             {key: value for key, value in descriptor.items() if key != "descriptor_sha256"}
         )
-        assert bootstrap_artifact._descriptor(descriptor) == descriptor
-        with pytest.raises(ValueError, match="[Bb]ootstrap"):
+        with pytest.raises(ValueError):
             await _verify(fixture, reader, descriptor)
 
 
-@pytest.mark.parametrize("drift", ["acl", "native", "receipt"])
-async def test_worker_reuse_refuses_changed_native_custody(bootstrap_access_fixture, drift):
-    fixture = bootstrap_access_fixture
+async def test_capture_refuses_changed_stored_edition_and_missing_heap(bootstrap_access_fixture):
+    fixture, receipt = bootstrap_access_fixture, bootstrap_access_fixture.receipt
     await _change_bootstrap_access(fixture)
-    async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
-        descriptor = await _capture(fixture, reader)
-    connection = fixture.fixture.connection
-    namespace = '"' + fixture.receipt.address_source.schema_name + '"'
-    transaction = connection.transaction(isolation="repeatable_read")
-    await transaction.start()
-    try:
-        if drift == "acl":
-            await connection.execute(f'GRANT UPDATE ON {namespace}.npi TO "{fixture.reader}"')
-        elif drift == "native":
-            await connection.execute(f"ALTER TABLE {namespace}.npi ADD COLUMN unexpected integer")
-        else:
-            await connection.execute(f"COMMENT ON SCHEMA {namespace} IS NULL")
-        await connection.execute(f'SET LOCAL ROLE "{fixture.reader}"')
-        with pytest.raises(ValueError, match="[Bb]ootstrap"):
+    connection, schema = fixture.fixture.connection, receipt.address_source.schema_name
+    async with connection.transaction(isolation="repeatable_read"):
+        changed = replace(receipt, captured_at="2026-02-01T00:00:00Z")
+        changed = replace(changed, generation_sha256=bootstrap._generation(changed))
+        document = await connection.fetchval("SELECT quote_literal($1::text)", json.dumps(changed.as_dict()))
+        await connection.execute(f'COMMENT ON SCHEMA "{schema}" IS {document}')
+        with pytest.raises(ValueError):
             await _capture(fixture, connection)
-        with pytest.raises(ValueError, match="[Bb]ootstrap"):
-            await _verify(fixture, connection, descriptor)
-    finally:
-        await transaction.rollback()
+    await connection.execute(f'ALTER TABLE "{schema}".npi RENAME TO previous_npi')
+    async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
+        with pytest.raises(asyncpg.UndefinedTableError):
+            await _capture(fixture, reader)
 
 
-async def test_worker_reuse_keeps_both_heap_locks_until_transaction_end(bootstrap_access_fixture):
+async def test_worker_reuse_keeps_both_named_heap_locks_until_transaction_end(bootstrap_access_fixture):
     fixture = bootstrap_access_fixture
     await _change_bootstrap_access(fixture)
     namespace = '"' + fixture.receipt.address_source.schema_name + '"'
@@ -135,12 +122,6 @@ async def test_worker_reuse_keeps_both_heap_locks_until_transaction_end(bootstra
         async with reader.transaction(isolation="repeatable_read"):
             descriptor = await _capture(fixture, reader)
             assert await _verify(fixture, reader, descriptor)
-            locked = await reader.fetch(
-                "SELECT relation::bigint FROM pg_locks WHERE pid=pg_backend_pid() AND mode='AccessShareLock' "
-                "AND granted AND relation=ANY($1::oid[]) ORDER BY relation",
-                [oid for _, oid in fixture.receipt.relation_oids],
-            )
-            assert {row["relation"] for row in locked} == {oid for _, oid in fixture.receipt.relation_oids}
             with pytest.raises(asyncpg.LockNotAvailableError):
                 async with administrator.transaction():
                     await administrator.execute(f"LOCK TABLE {tables} IN ACCESS EXCLUSIVE MODE NOWAIT")
@@ -148,179 +129,207 @@ async def test_worker_reuse_keeps_both_heap_locks_until_transaction_end(bootstra
             await administrator.execute(f"LOCK TABLE {tables} IN ACCESS EXCLUSIVE MODE NOWAIT")
 
 
-async def test_access_proof_renewal_preserves_existing_bootstrap_descriptor(bootstrap_access_fixture):
-    fixture = bootstrap_access_fixture
-    proof = await _change_bootstrap_access(fixture)
-    async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
-        descriptor = await _capture(fixture, reader)
-        await fixture.fixture.connection.execute(f'GRANT "{fixture.reader}" TO "{fixture.stranger}"')
-        with pytest.raises(NetworkCustomAddressSourceError):
-            await _verify(fixture, reader, descriptor)
-        renewed = await _renew_bootstrap_access(fixture, proof)
-        assert renewed["roles_sha256"] != proof["roles_sha256"]
-        assert await _verify(fixture, reader, descriptor)
-        assert await _capture(fixture, reader) == descriptor
-
-
 @pytest.mark.parametrize("heap", ["entity_address_unified", "npi"])
-async def test_full_verification_rejects_changed_content_in_either_heap(bootstrap_access_fixture, heap):
+@pytest.mark.parametrize("damage", ["content", "shape"])
+async def test_full_verification_rejects_changed_content_or_shape(bootstrap_access_fixture, heap, damage):
     fixture = bootstrap_access_fixture
     await _change_bootstrap_access(fixture)
-    async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
-        await _capture(fixture, reader)
-        qualified = f'"{fixture.receipt.address_source.schema_name}"."{heap}"'
-        field = "first_line" if heap == "entity_address_unified" else "provider_first_name"
-        transaction = fixture.fixture.connection.transaction(isolation="repeatable_read")
-        await transaction.start()
-        try:
-            await fixture.fixture.connection.execute(f"UPDATE {qualified} SET {field}='changed'")
-            # The separate login sees committed state, so verify the changed copy as the reader in this transaction.
-            await fixture.fixture.connection.execute(f'SET LOCAL ROLE "{fixture.reader}"')
-            with pytest.raises(bootstrap.NetworkBootstrapSourceError, match="content or shape"):
-                await bootstrap.verify_network_bootstrap_sources(fixture.fixture.connection, fixture.receipt)
-        finally:
-            await transaction.rollback()
-
-
-@asynccontextmanager
-async def _external_sequence_owner(fixture):
-    administrator = fixture.fixture.connection
-    parent_table = f'"{fixture.fixture.source_schema}".npi'
-    original_owner = fixture.fixture.roles["loader"]
-    sequence = await administrator.fetchval("SELECT pg_get_serial_sequence($1,'npi')", parent_table)
-    try:
-        # Ownership follows the original table; the retained heap stays protected.
-        await administrator.execute(f'ALTER TABLE {parent_table} OWNER TO "{fixture.stranger}"')
-        await administrator.execute(f'GRANT USAGE ON SCHEMA "{fixture.fixture.source_schema}" TO "{fixture.stranger}"')
-        await administrator.execute(
-            f'GRANT "{fixture.stranger}" TO "{fixture.reader}" WITH ADMIN FALSE, INHERIT FALSE, SET TRUE'
-        )
-        assert await administrator.fetchval(
-            "SELECT relowner=$2::regrole FROM pg_class WHERE oid=$1::regclass", sequence, fixture.stranger
-        )
-        await _change_bootstrap_access(fixture)
-        async with _bootstrap_access_login(fixture.stranger, fixture.password) as sequence_owner:
-            yield sequence_owner, sequence
-    finally:
-        await administrator.execute(f'REVOKE "{fixture.stranger}" FROM "{fixture.reader}"')
-        await administrator.execute(f'ALTER TABLE {parent_table} OWNER TO "{original_owner}"')
-        await administrator.execute(
-            f'REVOKE USAGE ON SCHEMA "{fixture.fixture.source_schema}" FROM "{fixture.stranger}"'
-        )
-
-
-async def _copy_retained_npi(fixture, reader):
-    schema_name = fixture.receipt.address_source.schema_name
-    async with reader.transaction(isolation="repeatable_read"):
-        content = await bootstrap._content(reader, schema_name, "npi")
-        await reader.execute(
-            f'CREATE TEMP TABLE copied_npi(LIKE "{schema_name}".npi INCLUDING DEFAULTS) ON COMMIT DROP'
-        )
-        await bootstrap._copy_native_batch(
-            reader, f'SELECT * FROM "{schema_name}".npi', (), "pg_temp", "copied_npi", content[0]
-        )
-        assert await bootstrap._content(reader, "pg_temp", "copied_npi") == content
-        return content
-
-
-async def _change_sequence_state(connection, sequence_oid, state, *, owner=None):
-    try:
-        if owner is not None:
-            assert await connection.fetchval("SELECT pg_has_role(current_user,$1::name,'SET')", owner)
-            assert not await connection.fetchval("SELECT pg_has_role(current_user,$1::name,'USAGE')", owner)
-            assert not await connection.fetchval("SELECT has_sequence_privilege($1::oid,'USAGE,UPDATE')", sequence_oid)
-            await connection.execute(f'SET ROLE "{owner}"')
-            assert await connection.fetchval("SELECT current_user<>session_user AND current_user::text=$1", owner)
-        await connection.fetchval("SELECT nextval($1::oid::regclass)", sequence_oid)
-        assert await connection.fetchval("SELECT setval($1::oid::regclass,$2,true)", sequence_oid, state) == state
-    finally:
-        if owner is not None:
-            await connection.execute("RESET ROLE")
-
-
-async def _drop_sequence(connection, sequence):
-    async with connection.transaction():
-        await connection.execute("SET LOCAL lock_timeout='1000ms'")
-        await connection.execute(f"DROP SEQUENCE {sequence} CASCADE")
-
-
-async def _assert_sequence_drop_blocked(fixture, reader, sequence_owner, sequence):
-    administrator = fixture.fixture.connection
-    reader_pid = await reader.fetchval("SELECT pg_backend_pid()")
-    owner_pid = await sequence_owner.fetchval("SELECT pg_backend_pid()")
-    npi_oid = dict(fixture.receipt.relation_oids)["npi"]
-    drop_task = asyncio.create_task(_drop_sequence(sequence_owner, sequence))
-    try:
-        pending_lock = None
-        for _ in range(50):
-            pending_lock = await administrator.fetchrow(
-                "SELECT mode,pg_blocking_pids(pid) AS blockers FROM pg_locks "
-                "WHERE pid=$1 AND NOT granted AND relation=$2::oid",
-                owner_pid,
-                npi_oid,
-            )
-            if pending_lock:
-                break
-            await asyncio.sleep(0.01)
-        assert pending_lock and pending_lock["mode"] == "AccessExclusiveLock"
-        assert reader_pid in pending_lock["blockers"]
-        with pytest.raises(asyncpg.LockNotAvailableError):
-            await asyncio.wait_for(drop_task, 3)
-    finally:
-        if not drop_task.done():
-            drop_task.cancel()
-        await asyncio.gather(drop_task, return_exceptions=True)
-
-
-async def _assert_cascade_refusal(fixture, reader, sequence_owner, sequence, descriptor):
-    receipt = fixture.receipt
-    npi_oid = dict(receipt.relation_oids)["npi"]
-    async with reader.transaction(isolation="repeatable_read"):
-        assert await _verify(fixture, reader, descriptor)
-        original_shape = await bootstrap._shape(reader, npi_oid)
-        original_content = await bootstrap._content(reader, receipt.address_source.schema_name, "npi")
-        await _assert_sequence_drop_blocked(fixture, reader, sequence_owner, sequence)
-    await _drop_sequence(sequence_owner, sequence)
-    assert await fixture.fixture.connection.fetchval("SELECT to_regclass($1)", sequence) is None
-    async with reader.transaction(isolation="repeatable_read", readonly=True):
-        assert await bootstrap._content(reader, receipt.address_source.schema_name, "npi") == original_content
-        assert await bootstrap._shape(reader, npi_oid) != original_shape
-        with pytest.raises(bootstrap.NetworkBootstrapSourceError):
-            await bootstrap.verify_network_bootstrap_sources(reader, receipt)
-    with pytest.raises(NetworkCustomAddressSourceError, match="[Bb]ootstrap"):
-        await _verify(fixture, reader, descriptor)
+    qualified = f'"{fixture.receipt.address_source.schema_name}"."{heap}"'
+    field = "first_line" if heap == "entity_address_unified" else "provider_first_name"
+    connection = fixture.fixture.connection
+    async with connection.transaction(isolation="repeatable_read"):
+        if damage == "content":
+            await connection.execute(f"UPDATE {qualified} SET {field}='changed'")
+        else:
+            await connection.execute(f"ALTER TABLE {qualified} ADD COLUMN unexpected text")
+        await connection.execute(f'SET LOCAL ROLE "{fixture.reader}"')
+        with pytest.raises(bootstrap.NetworkBootstrapSourceError, match="content|shape"):
+            await bootstrap.verify_network_bootstrap_sources(connection, fixture.receipt)
 
 
 @pytest.mark.parametrize("bootstrap_access_fixture", ["serial"], indirect=True)
-async def test_sequence_ownership_keeps_read_boundary(bootstrap_access_fixture):
+async def test_named_bootstrap_read_and_copy_never_execute_serial_default(bootstrap_access_fixture):
     fixture = bootstrap_access_fixture
-    administrator = fixture.fixture.connection
-    async with (
-        _external_sequence_owner(fixture) as (sequence_owner, sequence),
-        _bootstrap_access_login(fixture.reader, fixture.password) as reader,
-    ):
-        descriptor = await _capture(fixture, reader)
-        sequence_oid = descriptor["dormant_sequence_oid"]
-        assert sequence_oid is not None
-        original_acl = await access._acl(administrator, fixture.receipt)
-        assert not await reader.fetchval(
-            "SELECT has_table_privilege($1,$2::oid,'SELECT')", fixture.stranger, descriptor["heaps"]["npi"]["oid"]
-        )
-        sequence_state = await administrator.fetchrow(f"SELECT last_value,is_called FROM {sequence}")
-        original_content = await _copy_retained_npi(fixture, reader)
-        assert await administrator.fetchrow(f"SELECT last_value,is_called FROM {sequence}") == sequence_state
-        for ordinal, (connection, owner) in enumerate(((sequence_owner, None), (reader, fixture.stranger))):
-            await _change_sequence_state(connection, sequence_oid, 7654321 + ordinal, owner=owner)
-            assert await administrator.fetchval(f"SELECT last_value FROM {sequence}") == 7654321 + ordinal
-            assert await _copy_retained_npi(fixture, reader) == original_content
-            assert await _verify(fixture, reader, descriptor)
-            assert await _capture(fixture, reader) == descriptor
+    await _change_bootstrap_access(fixture)
+    parent = f'"{fixture.fixture.source_schema}".npi'
+    sequence = await fixture.fixture.connection.fetchval("SELECT pg_get_serial_sequence($1,'npi')", parent)
+    before = await fixture.fixture.connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}")
+    async with _bootstrap_access_login(fixture.reader, fixture.password) as reader:
         async with reader.transaction(isolation="repeatable_read"):
-            with pytest.raises(artifact.NetworkAddressArtifactError, match="source_generation_changed"):
-                await artifact.capture_network_address_artifact(
-                    reader,
-                    replace(fixture.receipt.address_source, generation_id="f" * 64),
-                    runtime_roles=(fixture.reader,),
-                )
-        await _assert_cascade_refusal(fixture, reader, sequence_owner, sequence, descriptor)
-        assert await access._acl(administrator, fixture.receipt) == original_acl
+            descriptor = await _capture(fixture, reader)
+            assert await _verify(fixture, reader, descriptor)
+            source = f'"{fixture.receipt.address_source.schema_name}".npi'
+            content = await bootstrap._content(reader, fixture.receipt.address_source.schema_name, "npi")
+            await reader.execute(f"CREATE TEMP TABLE copied_npi(LIKE {source} INCLUDING DEFAULTS)")
+            await bootstrap._copy_native_batch(
+                reader, f"SELECT * FROM {source}", (), "pg_temp", "copied_npi", content[0]
+            )
+            assert await bootstrap._content(reader, "pg_temp", "copied_npi") == content
+    assert await fixture.fixture.connection.fetchrow(f"SELECT last_value,is_called FROM {sequence}") == before
+
+
+def _synthetic_legacy_comment(receipt):
+    """Encode real data accounting in the exact legacy layout; obsolete fields carry no authority."""
+    metadata = receipt.as_dict()
+    document_by_field = {
+        "component": "network_bootstrap_sources",
+        "revision": 1,
+        "specification": {
+            "bootstrap_id": receipt.specification.bootstrap_id,
+            "address_schema": receipt.specification.address_schema,
+            "npi_schema": receipt.specification.npi_schema,
+            "address_table_oid": None,
+            "npi_table_oid": None,
+        },
+        "parent_receipts": [
+            {
+                **parent,
+                **dict.fromkeys(
+                    ("schema_oid", "table_oid", "owner_oid", "authority_table_oid", "authority_json", "shape_sha256")
+                ),
+            }
+            for parent in metadata["parent_receipts"]
+        ],
+        "captured_at": receipt.captured_at,
+        **dict.fromkeys(
+            (
+                "owner_role",
+                "runtime_roles",
+                "capture_snapshot",
+                "schema_oid",
+                "owner_oid",
+                "relation_oids",
+                "index_oids",
+            )
+        ),
+    }
+    document_by_field["generation_sha256"] = artifact._digest(document_by_field)
+    return json.dumps(document_by_field, indent=2) + "\n"
+
+
+async def _restore_bootstrap_copy(fixture, source_reader, target_admin, legacy, raw_comment):
+    """Copy all native columns and freeze the restored schema with the same reader roles."""
+    schema_name = legacy.address_source.schema_name
+    namespace = bootstrap._identifier(schema_name)
+    await target_admin.execute(f"CREATE SCHEMA {namespace}")
+    transfer = SimpleNamespace(
+        transaction=target_admin.transaction,
+        copy_from_query=source_reader.copy_from_query,
+        copy_to_table=target_admin.copy_to_table,
+    )
+    for model, parent in zip((EntityAddressUnified, NPIData), legacy.parent_receipts, strict=True):
+        table = model.__table__.to_metadata(MetaData(), schema=schema_name)
+        await target_admin.execute(str(CreateTable(table).compile(dialect=postgresql.dialect())))
+        columns = ",".join(bootstrap._identifier(str(column.name)) for column in table.columns)
+        await bootstrap._copy_native_batch(
+            transfer,
+            f"SELECT {columns} FROM {namespace}.{bootstrap._identifier(parent.table_name)}",
+            (),
+            schema_name,
+            parent.table_name,
+            parent.row_count,
+        )
+    target_literal = await target_admin.fetchval("SELECT quote_literal($1::text)", raw_comment)
+    await target_admin.execute(f"COMMENT ON SCHEMA {namespace} IS {target_literal}")
+    await freeze_fhir_source_snapshot(
+        target_admin,
+        schema_name,
+        namespace_owner=fixture.fixture.roles["owner"],
+        reader_roles=(fixture.stranger,),
+        application_roles=tuple(
+            sorted(
+                {
+                    fixture.reader,
+                    fixture.stranger,
+                    fixture.fixture.roles["loader"],
+                    fixture.fixture.roles["reader"],
+                }
+            )
+        ),
+    )
+
+
+async def _assert_restored_bootstrap_copy(
+    target_reader, target_admin, legacy, raw_comment, source_descriptor, comment_query
+):
+    """Verify copied data, denied writes and later content corruption without altering the stored comment."""
+    schema_name = legacy.address_source.schema_name
+    namespace = bootstrap._identifier(schema_name)
+    async with target_reader.transaction(isolation="repeatable_read", readonly=True):
+        restored_comment = await target_reader.fetchval(comment_query, schema_name)
+        assert restored_comment.encode() == raw_comment.encode()
+        restored = bootstrap._decode(restored_comment)
+        assert restored == legacy and restored.generation_sha256 == legacy.generation_sha256
+        assert await bootstrap.verify_network_bootstrap_sources(target_reader, restored) == restored
+        descriptor = await artifact.capture_network_address_artifact(target_reader, legacy.address_source)
+        assert descriptor == source_descriptor
+        assert await artifact.verify_network_address_artifact(
+            target_reader, descriptor, api_read=True
+        ) == CompactAddressRelation(schema_name, "entity_address_unified")
+        assert (
+            await target_reader.fetchval(f"SELECT first_line FROM {namespace}.entity_address_unified")
+            == "123 Example Street"
+        )
+        assert await target_reader.fetchval(f"SELECT provider_first_name FROM {namespace}.npi") == "Example"
+
+    for statement in (
+        f"UPDATE {namespace}.npi SET provider_first_name='Forbidden'",
+        f"INSERT INTO {namespace}.npi(npi) VALUES(2000000001)",
+        f"CREATE TABLE {namespace}.unexpected(value int)",
+        f"DROP TABLE {namespace}.npi",
+    ):
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await target_reader.execute(statement)
+
+    await target_admin.execute(f"UPDATE {namespace}.npi SET provider_first_name='Changed'")
+    async with target_reader.transaction(isolation="repeatable_read", readonly=True):
+        with pytest.raises(bootstrap.NetworkBootstrapSourceError, match="content"):
+            await bootstrap.verify_network_bootstrap_sources(target_reader, legacy)
+        assert await target_reader.fetchval(comment_query, schema_name) == raw_comment
+
+
+@pytest.mark.parametrize("bootstrap_access_fixture", ["serial"], indirect=True)
+async def test_legacy_bootstrap_comment_survives_cross_database_copy(bootstrap_access_fixture, record_property):
+    """Synthetic legacy-format compatibility through real COPY; not a historical export."""
+    fixture = bootstrap_access_fixture
+    source_admin = fixture.fixture.connection
+    await _change_bootstrap_access(fixture)
+    raw_comment = _synthetic_legacy_comment(fixture.receipt)
+    legacy = bootstrap._decode(raw_comment)
+    schema_name = legacy.address_source.schema_name
+    namespace = bootstrap._identifier(schema_name)
+    comment_query = "SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=$1"
+    literal = await source_admin.fetchval("SELECT quote_literal($1::text)", raw_comment)
+    await source_admin.execute(f"COMMENT ON SCHEMA {namespace} IS {literal}")
+    assert await source_admin.fetchval(comment_query, schema_name) == raw_comment
+
+    database_name = "bootstrap_copy_" + uuid4().hex
+    created_by_kind = {"database": False}
+    async with AsyncExitStack() as cleanup:
+        cleanup.push_async_callback(_cleanup, source_admin, database_name, [], created_by_kind)
+        assert not await source_admin.fetchval("SELECT EXISTS(SELECT FROM pg_database WHERE datname=$1)", database_name)
+        created_by_kind["database"] = True
+        await source_admin.execute(f'CREATE DATABASE "{database_name}" TEMPLATE template0')
+        target_url = _admin_url().set(database=database_name)
+        target_admin = await asyncpg.connect(target_url.render_as_string(hide_password=False))
+        cleanup.push_async_callback(target_admin.close)
+        source_reader = await cleanup.enter_async_context(_bootstrap_access_login(fixture.reader, fixture.password))
+        async with source_reader.transaction(isolation="repeatable_read", readonly=True):
+            assert await bootstrap.verify_network_bootstrap_sources(source_reader, legacy) == legacy
+            source_descriptor = await artifact.capture_network_address_artifact(source_reader, legacy.address_source)
+            async with target_admin.transaction(isolation="repeatable_read"):
+                await _restore_bootstrap_copy(fixture, source_reader, target_admin, legacy, raw_comment)
+            assert await bootstrap.verify_network_bootstrap_sources(source_reader, legacy) == legacy
+            assert await source_reader.fetchval(comment_query, schema_name) == raw_comment
+
+        target_reader = await asyncpg.connect(
+            target_url.set(username=fixture.stranger, password=fixture.password).render_as_string(hide_password=False)
+        )
+        cleanup.push_async_callback(target_reader.close)
+        await _assert_restored_bootstrap_copy(
+            target_reader, target_admin, legacy, raw_comment, source_descriptor, comment_query
+        )
+
+    record_property("component", "synthetic_legacy_bootstrap_cross_database_copy")
+    record_property("metadata", "raw comment and stored generation preserved")
+    record_property("limits", "Synthetic legacy-format compatibility; not historical export or deployment acceptance")

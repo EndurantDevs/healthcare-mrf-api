@@ -8,18 +8,18 @@ from uuid import UUID, uuid4
 
 from process.network_membership_publication import lock_publication_controls
 from process.registry_approval_store import RegistryApprovalConflict
-from process.registry_fhir_catalog_custody import verify_fhir_catalog_snapshot
+from process.registry_fhir_catalog_custody import validate_fhir_catalog_snapshot_record
 from process.registry_fhir_catalog_fingerprints import (
     require_fhir_catalog_mapping_revision,
     require_fhir_catalog_membership_reuse,
 )
 from process.registry_fhir_catalog_registry_reader import (
     fhir_catalog_registry_reads,
-    verify_fhir_catalog_registry_reads,
 )
 from process.registry_fhir_catalog_registry_reader import (
     resolve_fhir_catalog_network_manifest as resolve_network_serving_manifest,
 )
+from process.registry_fhir_catalog_store import admit_catalog_preparation, catalog_snapshot_preparation
 from process.registry_publication_execution import (
     locked_publication_request_transaction,
     publication_request,
@@ -52,6 +52,7 @@ class FHIRCatalogPublicationRuntime:
     authorize_metadata: object
     verify_sources: object
     source_fence: object
+    preparation_roles: dict | None = None
 
     def __post_init__(self):
         if not all(
@@ -93,9 +94,7 @@ def _metadata(command, *, split_revision=False):
 async def enqueue_fhir_catalog_publication(connection, command, *, authorize_metadata, control_schema=None):
     """Accept only an authenticated standing metadata grant, never browser authority.
 
-    The caller encloses its transaction in ``fhir_catalog_registry_reads(connection)``
-    and verifies that scope before commit. Split-revision validation needs the
-    configured Reader, whose custody must remain held until the writer commits.
+    The caller keeps its configured Reader transaction open through the atomic pointer update.
     """
     if not connection.is_in_transaction():
         raise ValueError("registry_fhir_catalog_transaction_required")
@@ -211,7 +210,7 @@ async def _snapshot(connection, namespace, command):
         )
     ):
         raise RegistryApprovalConflict("registry_fhir_catalog_snapshot_changed")
-    await verify_fhir_catalog_snapshot(connection, row)
+    await validate_fhir_catalog_snapshot_record(connection, row)
     try:
         await require_fhir_catalog_mapping_revision(
             connection, row, command["expected_approved_revision"], control_schema=namespace[1:-1]
@@ -253,6 +252,7 @@ async def complete_queued_fhir_catalog_publication(
     verify_sources,
     source_fence,
     control_schema=None,
+    preparation_roles=None,
 ):
     """Fence source publishers before opening the final repeatable-read snapshot."""
     if connection.is_in_transaction() or not callable(source_fence):
@@ -260,8 +260,8 @@ async def complete_queued_fhir_catalog_publication(
     namespace = source_observation_namespace(control_schema)
     async with fhir_catalog_registry_reads(connection):
         async with connection.transaction(isolation="repeatable_read", readonly=True):
-            record = await publication_request(connection, request_id, lease_id, namespace)
-            command = _validated_request(record)
+            request_record = await publication_request(connection, request_id, lease_id, namespace)
+            command = _validated_request(request_record)
             snapshot = await _snapshot(connection, namespace, command)
             await _authority(authorize_metadata, command, snapshot, connection)
         async with source_fence(snapshot=snapshot, connection=connection):
@@ -272,20 +272,31 @@ async def complete_queued_fhir_catalog_publication(
                 authorize_metadata=authorize_metadata,
                 verify_sources=verify_sources,
                 control_schema=control_schema,
+                preparation_roles=preparation_roles,
             )
 
 
-async def _complete_fenced(connection, request_id, lease_id, *, authorize_metadata, verify_sources, control_schema):
+async def _complete_fenced(
+    connection, request_id, lease_id, *, authorize_metadata, verify_sources, control_schema, preparation_roles=None
+):
     """Publish one closed metadata child and finish its lease in the same transaction."""
     namespace = source_observation_namespace(control_schema)
-    async with locked_publication_request_transaction(connection, request_id, lease_id, namespace) as record:
-        command = _validated_request(record)
+    async with locked_publication_request_transaction(connection, request_id, lease_id, namespace) as request_record:
+        command = _validated_request(request_record)
         snapshot = await _snapshot(connection, namespace, command)
         await _authority(authorize_metadata, command, snapshot, connection)
         await _compare_head(connection, namespace, command, snapshot)
         if not callable(verify_sources) or await verify_sources(snapshot=snapshot, connection=connection) is not True:
             raise RegistryApprovalConflict("registry_fhir_catalog_source_changed")
         await _authority(authorize_metadata, command, snapshot, connection)
+        preparation = catalog_snapshot_preparation(snapshot)
+        store, preparation_record, claim = None, None, None
+        if preparation is not None:
+            store, preparation_record, claim = await admit_catalog_preparation(
+                connection, snapshot, control_schema=namespace[1:-1], roles=preparation_roles
+            )
+            if claim is None or preparation_record["state"] != "validated":
+                raise ValueError("registry_fhir_catalog_preparation_state_invalid")
         await connection.execute(
             f"UPDATE {namespace}.registry_fhir_catalog_snapshot "
             "SET published_at=coalesce(published_at,clock_timestamp()) WHERE metadata_generation=$1",
@@ -295,9 +306,23 @@ async def _complete_fenced(connection, request_id, lease_id, *, authorize_metada
             f"UPDATE {namespace}.network_serving_control SET metadata_generation=$1 WHERE id=1",
             command["metadata_generation"],
         )
-        result = _result(command)
+        publication_result = _result(command)
+        if store is not None:
+            await store.publish_named(
+                claim,
+                {
+                    "kind": "catalog",
+                    "candidate_id": preparation["target"]["candidate_id"],
+                    "fence_token": str(preparation_record["publication_fence"]),
+                    "data": publication_result,
+                },
+            )
         await finish_registry_publication_request(
-            connection, request_id, lease_id, state="completed", result=result, control_schema=control_schema
+            connection,
+            request_id,
+            lease_id,
+            state="completed",
+            result=publication_result,
+            control_schema=control_schema,
         )
-        await verify_fhir_catalog_registry_reads()
-        return result
+        return publication_result

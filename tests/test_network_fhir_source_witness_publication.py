@@ -39,7 +39,6 @@ def _publication_header(origin, summary):
         "proof_sha256": None,
         "semantic_as_of_absent": True,
         "semantic_as_of": None,
-        "oid": origin.header_oid,
         "dataset_id": origin.dataset_id,
         "endpoint_id": origin.endpoint_id,
         "acquisition_root_run_id": origin.root_run_id,
@@ -86,6 +85,7 @@ def _original_publication(proof_key=None):
     async def copy(query, dataset_id, *, output, **options):
         assert dataset_id == origin.dataset_id and options == {"format": "binary"}
         assert query.startswith("SELECT publication_metadata_json::text")
+        assert f'FROM "{origin.header_relation["schema"]}"."{origin.header_relation["name"]}"' in query
         await output(
             b"PGCOPY\n\xff\r\n\x00" + struct.pack("!iihi", 0, 0, 1, len(encoded)) + encoded + struct.pack("!h", -1)
         )

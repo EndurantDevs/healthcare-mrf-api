@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from db.plan_release_storage import storage_relation
 from process import provider_directory_profile_source_inputs as inputs
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 
@@ -30,7 +31,14 @@ class Driver:
         return self.pinned
 
     async def execute(self, statement):
-        assert statement.startswith("LOCK TABLE") and statement.endswith("ACCESS SHARE MODE NOWAIT")
+        relations = {
+            storage_relation(table["schema"], table["name"])
+            for header in self.headers
+            for table in header["candidate_storage_json"]["tables"].values()
+        }
+        assert statement in {"SELECT 1 FROM " + relation + " LIMIT 0" for relation in relations} or (
+            statement.startswith("LOCK TABLE") and statement.endswith("ACCESS SHARE MODE NOWAIT")
+        )
         self.commands.append(statement)
 
 
@@ -65,10 +73,8 @@ def _header(dataset, index):
         relationship_sha256=None,
         tables={
             root: dict(
+                schema="source_schema",
                 name="pdgs_" + str(index) * 32 + "_" + ("r", "ip", "np", "ao", "w", "rl")[number],
-                oid=100 + index * 10 + number,
-                owner=99,
-                layout_sha256="c" * 64,
             )
             for number, root in enumerate(inputs.storage.RELATIONS)
         },
@@ -111,7 +117,6 @@ def case(monkeypatch):
     monkeypatch.setattr(inputs.source, "source_producer_identity", lambda: ("d" * 40, "sha256:" + "e" * 64))
     monkeypatch.setattr(inputs, "_copy_driver", AsyncMock(side_effect=lambda session: session.driver))
     monkeypatch.setattr(inputs, "verify_generic_source_family", AsyncMock())
-    monkeypatch.setattr(inputs.storage, "_verify_tables", AsyncMock())
 
     @asynccontextmanager
     async def transaction(database, *, isolation):
@@ -143,15 +148,16 @@ async def test_scope_pins_full_but_selects_changed_resources(case):
         selected = inputs.resource_relation(case.directory, case.datasets[0])
         assert selected == "pdgs_" + "0" * 32 + "_r"
         captured = inputs.binding(case.directory, case.datasets[0])
-        captured["tables"][inputs.storage.RESOURCE]["oid"] = 999
-        assert inputs.binding(case.directory, case.datasets[0])["tables"][inputs.storage.RESOURCE]["oid"] == 100
+        captured["tables"][inputs.storage.RESOURCE]["name"] = "changed_resource"
+        assert inputs.resource_relation(case.directory, case.datasets[0]) == selected
         source_batch = SimpleNamespace(source_id="retained", dataset_id=None)
         assert inputs.binding(case.directory, source_batch)["identity"]["dataset_id"] == "dataset-retained"
         with pytest.raises((ValueError, RuntimeError), match="dataset_changed"):
             inputs.resource_relation(case.directory, case.datasets[1])
-        assert len(case.pinned.commands) == 1
+        locks = [statement for statement in case.pinned.commands if statement.startswith("LOCK TABLE")]
+        assert len(locks) == 1
         assert all(
-            proof["name"] in case.pinned.commands[0]
+            storage_relation(proof["schema"], proof["name"]) in locks[0]
             for header in case.headers
             for proof in header["candidate_storage_json"]["tables"].values()
         )
@@ -230,10 +236,10 @@ async def test_read_transaction_rechecks_original_factory_and_binding(case, monk
         async with inputs.read_transaction(case.directory):
             assert inputs.resource_relation(case.directory, case.datasets[0]) == "pdgs_" + "0" * 32 + "_r"
         case.reader.headers = copy.deepcopy(case.headers)
-        case.reader.headers[0]["candidate_storage_json"]["tables"][inputs.storage.RESOURCE]["oid"] = 999
+        case.reader.headers[0]["candidate_storage_json"]["tables"][inputs.storage.RESOURCE]["name"] = "changed_resource"
         with pytest.raises((ValueError, RuntimeError), match="binding_changed"):
             async with inputs.read_transaction(case.directory):
-                pytest.fail("changed child OID admitted")
+                pytest.fail("changed source relation admitted")
     assert events[:2] == ["enter", "exit"]
 
 
@@ -253,6 +259,31 @@ def _worker(case, monkeypatch):
         SimpleNamespace(scope_projection=lambda directory: SimpleNamespace(tables=(table,))),
     )
     return model, batch, table, admission
+
+
+async def _wait_event(event, task):
+    ready = asyncio.create_task(event.wait())
+    try:
+        async with asyncio.timeout(5):
+            await asyncio.wait((ready, task), return_when=asyncio.FIRST_COMPLETED)
+            if task.done():
+                await task
+            assert event.is_set()
+    finally:
+        ready.cancel()
+        await asyncio.gather(ready, return_exceptions=True)
+
+
+async def test_event_wait_propagates_early_failure():
+    failure = RuntimeError("setup failed before ready")
+
+    async def operation():
+        raise failure
+
+    pending = asyncio.create_task(operation())
+    with pytest.raises(RuntimeError) as caught:
+        await _wait_event(asyncio.Event(), pending)
+    assert caught.value is failure and pending.done()
 
 
 async def test_materialization_ticket_preserves_context_but_clears_physical_owner(case, monkeypatch):
@@ -304,7 +335,7 @@ async def test_scope_drains_owned_worker_on_body_cancellation(case, monkeypatch)
             task = inputs.create_materialization_task(
                 case.directory, operation(), model=model, relation="typed_model_run", table_projection=table
             )
-            await started.wait()
+            await _wait_event(started, task)
             raise failure
     assert caught.value is failure and stopped.is_set() and task.cancelled()
     assert not inputs._ISSUED
@@ -409,14 +440,20 @@ async def test_repeated_cancellation_drains_before_releasing_pins(case, monkeypa
             await asyncio.Event().wait()
 
     pending = asyncio.create_task(parent())
-    await started.wait()
-    pending.cancel("original cancellation")
-    await closing.wait()
-    assert case.events == [("enter", "repeatable read")]
-    pending.cancel("repeat cancellation")
-    release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await pending
+    try:
+        await _wait_event(started, pending)
+        pending.cancel("original cancellation")
+        await _wait_event(closing, pending)
+        assert case.events == [("enter", "repeatable read")]
+        pending.cancel("repeat cancellation")
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+    finally:
+        release.set()
+        if not pending.done():
+            pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
     assert case.events[-1][0] == "exit" and not inputs._ISSUED
 
 

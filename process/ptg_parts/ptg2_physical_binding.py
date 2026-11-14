@@ -9,10 +9,6 @@ from process.ptg_parts.db_tables import _quote_ident
 
 PHYSICAL_BINDING_CONTRACT = "ptg.snapshot-local-physical-binding.v1"
 SERVING_SCOPE_CONTRACT = "ptg.snapshot-local-serving-scope.v1"
-PREPARED_LOCAL_READ_VIEW_SHA256 = "b5c5a00338fcb6ddcd09dbe1ef24b73a43d759c9f61ab3ca34bd42c93ea0cb26"
-INSTALLED_LOCAL_READ_VIEW_SHA256 = "0525c69ffa3b9815a9e278fe76fab967013fcb0f200c450167ac92e611a76cb3"
-PREPARED_OPERATION_OWNED_READ_VIEW_SHA256 = "dfe5f17dd57fa6670f1ebc3b71b0f98df7a96bcaccdfd81a498958f61fb0f23a"
-INSTALLED_OPERATION_OWNED_READ_VIEW_SHA256 = "33e987d6c5239909fb26b7e3596e331bcab99cc3969fe7fac7e0bbfc05826fe4"
 _SOURCE_FIELDS = (
     "source_key",
     "source_type",
@@ -47,11 +43,6 @@ class PTG2PhysicalBindingError(RuntimeError):
 async def _local_preparation_owner(session):
     """Authenticate the installed control catalog, preserving only initial builder INSERTs."""
     return await _require_local_preparation_catalog(session, lock_tables=True)
-
-
-async def local_preparation_catalog_owner(session):
-    """Authenticate the same protected native owner without granting or reading its tables."""
-    return await _require_local_preparation_catalog(session, lock_tables=False)
 
 
 async def _require_local_preparation_catalog(session, *, lock_tables):
@@ -90,138 +81,32 @@ async def _require_local_preparation_catalog(session, *, lock_tables):
 
 
 def _local_read_view_columns(is_prepared):
-    """The fixed native projections expose no operation lease, request or role configuration."""
+    """Describe the portable named read projection without physical control tokens."""
     names = [
         "contract",
         "destination_snapshot_id",
         "package_id",
         "manifest_sha256",
         "artifact_sha256",
-        "validation_sha256",
-        "inventory_sha256",
-        "owner_oid",
         "native_validation",
         "relation_inventory",
         "sequence_inventory",
     ]
     if not is_prepared:
         names.extend(
-            (
-                "generation_id",
-                "publication_fence",
-                "publication_sha256",
-                "registration_sha256",
-                "generation_inventory",
-                "native_publication",
-            )
+            ("generation_id", "publication_fence", "publication_sha256", "generation_inventory", "native_publication")
         )
     return {
-        name: "bigint"
-        if name == "owner_oid"
-        else "jsonb"
-        if name.endswith("inventory") or name in {"native_validation", "native_publication"}
-        else "text"
+        name: "jsonb" if name.endswith("inventory") or name in {"native_validation", "native_publication"} else "text"
         for name in names
     }
-
-
-async def require_local_physical_read_view(session, *, is_prepared):
-    """Attest and lock a fixed read-only projection; unqualified definitions always refuse."""
-    from sqlalchemy import text
-
-    from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
-
-    _qualified_local_read_view_shas(is_prepared)
-    owner_oid = await local_preparation_catalog_owner(session)
-    ordinary_reader = await session.scalar(
-        text(
-            "SELECT NOT pg_has_role(current_user,CAST(:owner_oid AS oid),'MEMBER') "
-            "AND NOT has_schema_privilege(current_user,to_regnamespace(:schema_name),'CREATE')"
-        ),
-        {"owner_oid": owner_oid, "schema_name": resolve_ptg2_schema()},
-    )
-    if ordinary_reader is not True:
-        raise PTG2PhysicalBindingError("PTG local reader privileges differ")
-    return await _require_local_physical_view_catalog(session, is_prepared=is_prepared, owner_oid=owner_oid)
-
-
-async def require_local_physical_publisher_view(session, *, is_prepared):
-    """Authenticate actual publisher inheritance separately, never by a reader privilege flag."""
-    from sqlalchemy import text
-
-    _qualified_local_read_view_shas(is_prepared)
-    owner_oid = await _local_preparation_owner(session)
-    if (
-        await session.scalar(
-            text("SELECT pg_has_role(current_user,CAST(:owner_oid AS oid),'USAGE')"), {"owner_oid": owner_oid}
-        )
-        is not True
-    ):
-        raise PTG2PhysicalBindingError("PTG local publisher privileges differ")
-    return await _require_local_physical_view_catalog(session, is_prepared=is_prepared, owner_oid=owner_oid)
 
 
 async def require_local_binding_publisher(session):
     """Require installed native controls before the caller-owned LOCAL publication cut."""
     from process.ptg_parts.result_archive_candidate_validation import require_local_publication_controls
 
-    await require_local_physical_publisher_view(session, is_prepared=True)
-    await require_local_physical_publisher_view(session, is_prepared=False)
     await require_local_publication_controls(session)
-
-
-def _qualified_local_read_view_shas(is_prepared):
-    """Native qualification is source-bound, never a caller-supplied digest."""
-    import re
-
-    expected_shas = (
-        (PREPARED_LOCAL_READ_VIEW_SHA256, PREPARED_OPERATION_OWNED_READ_VIEW_SHA256)
-        if is_prepared
-        else (INSTALLED_LOCAL_READ_VIEW_SHA256, INSTALLED_OPERATION_OWNED_READ_VIEW_SHA256)
-    )
-    if any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in expected_shas):
-        raise PTG2PhysicalBindingError("PTG local read interface is not qualified")
-    return expected_shas
-
-
-async def _require_local_physical_view_catalog(session, *, is_prepared, owner_oid):
-    """The two fixed role-specific entrypoints share one exact native catalog proof."""
-    from sqlalchemy import text
-
-    from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
-
-    expected_shas = _qualified_local_read_view_shas(is_prepared)
-    view_name = "ptg2_prepared_physical_binding" if is_prepared else "ptg2_installed_physical_binding"
-    schema_name = resolve_ptg2_schema()
-    query = text(_local_physical_view_catalog_sql())
-    parameters_by_name = {"owner_oid": owner_oid, "schema": schema_name, "view": view_name}
-    first_identity = None
-    for lock_held in (False, True):
-        if lock_held:
-            await session.execute(
-                text(
-                    f"LOCK TABLE ONLY {_quote_ident(schema_name)}.{_quote_ident(view_name)} IN ACCESS SHARE MODE NOWAIT"
-                )
-            )
-        proof = await _local_read_view_proof(session, query, parameters_by_name)
-        first_identity = _validate_local_physical_view_catalog(
-            proof, expected_shas, is_prepared=is_prepared, first_identity=first_identity, lock_held=lock_held
-        )
-    return owner_oid
-
-
-async def _local_read_view_proof(session, query, parameters_by_name):
-    """Use the qualified deparser path only inside the owning transaction, then restore it."""
-    from sqlalchemy import text
-
-    original_path = (await session.execute(text("SELECT pg_catalog.current_setting('search_path')"))).scalar_one()
-    try:
-        await session.execute(text("SELECT pg_catalog.set_config('search_path','pg_catalog, pg_temp',true)"))
-        return (await session.execute(query, parameters_by_name)).mappings().one_or_none()
-    finally:
-        await session.execute(
-            text("SELECT pg_catalog.set_config('search_path',:original_path,true)"), {"original_path": original_path}
-        )
 
 
 async def require_frozen_local_preparation(session, *, operation, ownership):
@@ -426,7 +311,7 @@ def _native_metadata_digest(metadata):
     ).hexdigest()
 
 
-def _prepared_local_binding(evidence, snapshot_id, owner_oid):
+def _prepared_local_binding(evidence, snapshot_id, owner_oid=None):
     """Decode a protected local inventory; decoding itself grants no authority."""
     from process.reference_family_archive import ReferenceFamilyStageOwnership
 
@@ -449,7 +334,6 @@ def _prepared_local_binding(evidence, snapshot_id, owner_oid):
             tuple(tuple(pair) for pair in ownership_by_field["relation_oids"]),
             tuple(tuple(entry) for entry in ownership_by_field["sequence_oids"]),
         )
-        relation_by_name = dict(ownership.relation_oids)
         physical_binding = PTG2PhysicalBinding(
             PHYSICAL_BINDING_CONTRACT,
             snapshot_id,
@@ -457,10 +341,14 @@ def _prepared_local_binding(evidence, snapshot_id, owner_oid):
             evidence["data"]["payload_snapshot_id"],
             evidence["data"]["payload_snapshot_key"],
             ownership.dataset_id,
-            ownership.schema_oid,
-            owner_oid,
-            tuple((name, relation_by_name[name]) for name in local_data_family_spec().table_names),
-            ownership.sequence_oids,
+            ownership.schema_name,
+            tuple((ownership.schema_name, name) for name in sorted(local_data_family_spec().table_names)),
+            tuple(
+                sorted(
+                    (ownership.schema_name, name, table, column)
+                    for name, _oid, table, column in ownership.sequence_oids
+                )
+            ),
         )
         if (
             ownership.importer_id != local_data_family_spec().importer_id
@@ -538,7 +426,7 @@ async def _pin_local_prepared_family(session, preparation_by_field, ownership, p
     await _require_local_preparation_inventory(session, preparation_by_field, ownership)
     # Names select locks only after protected inventory authentication. Recheck
     # names/OIDs/owners/catalog after every exact family heap is fenced.
-    for name, _oid in physical_binding.relation_oids:
+    for _schema, name in physical_binding.relations:
         await session.execute(text(f"LOCK TABLE ONLY {physical_binding.relation(name)} IN ACCESS SHARE MODE NOWAIT"))
     await verify_local_data_family(session, ownership)
     await _require_closed_local_custody(session, ownership, owner_oid)
@@ -613,65 +501,21 @@ async def _local_candidate_control(session, schema_name, physical_binding, *, lo
 
 
 def _local_publication_binding(evidence, publication):
-    """Decode exact inventory identity only; this does not authenticate publication."""
-    expected_fields = {
-        "contract",
-        "destination_snapshot_id",
-        "destination_layout_key",
-        "payload_snapshot_id",
-        "payload_snapshot_key",
-        "dataset_id",
-        "schema_oid",
-        "owner_oid",
-        "relation_oids",
-        "sequence_oids",
-        "destination_activation",
-        "published_control_sha256",
-    }
-    if (
-        not isinstance(publication, dict)
-        or set(publication) != expected_fields
-        or publication["contract"] != PHYSICAL_BINDING_CONTRACT
-    ):
-        raise PTG2PhysicalBindingError("PTG local publication receipt differs")
-    snapshot_id = evidence["initialization"]["destination_snapshot_id"]
-    ownership, physical_binding = _prepared_local_binding(evidence, snapshot_id, publication["owner_oid"])
-    descriptor_by_field = {
-        key: getattr(physical_binding, key)
-        for key in (
-            "destination_layout_key",
-            "payload_snapshot_id",
-            "payload_snapshot_key",
-            "schema_oid",
-            "owner_oid",
-        )
-    }
-    descriptor_by_field.update(
-        destination_snapshot_id=snapshot_id,
-        dataset_id=str(ownership.dataset_id),
-        relation_oids=[list(pair) for pair in physical_binding.relation_oids],
-        sequence_oids=[list(entry) for entry in physical_binding.sequence_oids],
-    )
-    if any(publication[key] != expected for key, expected in descriptor_by_field.items()):
-        raise PTG2PhysicalBindingError("PTG local published inventory differs")
-    return ownership, physical_binding
+    """Decode the logical publication and its complete named payload family."""
+    normalized_by_field = {**evidence, "ownership": _named_local_ownership(evidence["ownership"])}
+    binding = named_local_binding(normalized_by_field, normalized_by_field["initialization"]["destination_snapshot_id"])
+    named_local_publication(publication, binding)
+    return normalized_by_field["ownership"], binding
 
 
 async def require_local_published_control(connection, *, evidence, publication):
-    """Rejoin controls after trusted installed custody checks in this same transaction.
-
-    The caller authenticates the consumed header, installation, package and
-    complete native catalog. Neither argument alone is authority. This binds
-    the exact activation transition without repeating payload scans.
-    """
+    """Rejoin the exact published logical control in the caller's transaction."""
     from process.ptg_parts.ptg2_schema import resolve_ptg2_schema
 
     if not connection.is_in_transaction():
         raise PTG2PhysicalBindingError("PTG local publication verification requires a transaction")
-    ownership, physical_binding = _local_publication_binding(evidence, publication)
-    await require_closed_local_driver_custody(connection, ownership, physical_binding.owner_oid)
-    if await local_data_driver_catalog_digest(connection, ownership) != evidence["catalog_sha256"]:
-        raise PTG2PhysicalBindingError("PTG local published catalog changed")
+    _ownership, physical_binding = _local_publication_binding(evidence, publication)
+    publication = named_local_publication(publication, physical_binding)
     schema_name = resolve_ptg2_schema()
     candidate = await connection.fetchrow(
         _local_candidate_control_query(
@@ -1309,12 +1153,7 @@ def _is_positive_oid(value):
 
 @dataclass(frozen=True)
 class PTG2PhysicalBinding:
-    """Local inventory carrier, not a portable receipt or an admission capability.
-
-    Destination metadata keys must never replace the IDs encoded in retained
-    payloads. A publisher must authenticate this inventory and keep its exact
-    family pinned before any future serving resolution can be admitted.
-    """
+    """Schema-qualified payload locations and logical destination/payload editions."""
 
     contract: str
     snapshot_id: str
@@ -1322,68 +1161,60 @@ class PTG2PhysicalBinding:
     payload_snapshot_id: str
     payload_snapshot_key: int
     dataset_id: UUID
-    schema_oid: int
-    owner_oid: int
-    relation_oids: tuple[tuple[str, int], ...]
-    sequence_oids: tuple[tuple[str, int, str, str], ...]
+    schema_name: str
+    relations: tuple[tuple[str, str], ...]
+    sequences: tuple[tuple[str, str, str, str], ...]
 
     def __post_init__(self):
-        """Reject partial families and malformed local identities before resolution."""
+        import re
+
         if self.contract != PHYSICAL_BINDING_CONTRACT or not isinstance(self.dataset_id, UUID):
-            raise PTG2PhysicalBindingError("PTG physical binding contract or dataset differs")
+            raise PTG2PhysicalBindingError("PTG named binding contract or dataset differs")
         if any(
-            type(snapshot_id) is not str
-            or not snapshot_id
-            or len(snapshot_id) > 96
-            or snapshot_id != snapshot_id.strip()
-            or any(ord(character) < 32 for character in snapshot_id)
-            for snapshot_id in (self.snapshot_id, self.payload_snapshot_id)
+            type(coordinate) is not str
+            or not coordinate
+            or len(coordinate) > 96
+            or coordinate != coordinate.strip()
+            or any(ord(character) < 32 for character in coordinate)
+            for coordinate in (self.snapshot_id, self.payload_snapshot_id)
         ):
-            raise PTG2PhysicalBindingError("PTG physical binding snapshot identity is invalid")
+            raise PTG2PhysicalBindingError("PTG named binding snapshot is invalid")
         if any(
-            type(layout_key) is not int or not 0 < layout_key < 2**63
-            for layout_key in (self.destination_layout_key, self.payload_snapshot_key)
+            type(key) is not int or not 0 < key < 2**63
+            for key in (self.destination_layout_key, self.payload_snapshot_key)
         ):
-            raise PTG2PhysicalBindingError("PTG physical binding layout identity is invalid")
-        if not all(_is_positive_oid(oid) for oid in (self.schema_oid, self.owner_oid)):
-            raise PTG2PhysicalBindingError("PTG physical binding namespace custody is invalid")
+            raise PTG2PhysicalBindingError("PTG named binding edition is invalid")
+        if type(self.schema_name) is not str or re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", self.schema_name) is None:
+            raise PTG2PhysicalBindingError("PTG named binding schema is invalid")
         if (
-            type(self.relation_oids) is not tuple
-            or any(type(pair) is not tuple or len(pair) != 2 for pair in self.relation_oids)
-            or tuple(name for name, _oid in self.relation_oids) != local_data_family_spec().table_names
-            or not all(_is_positive_oid(oid) for _name, oid in self.relation_oids)
-            or len({oid for _name, oid in self.relation_oids}) != len(self.relation_oids)
+            type(self.relations) is not tuple
+            or any(type(pair) is not tuple or len(pair) != 2 for pair in self.relations)
+            or any(type(schema) is not str or type(name) is not str for schema, name in self.relations)
+            or len(self.relations) != len(set(self.relations))
+            or {name for schema, name in self.relations} != set(local_data_family_spec().table_names)
+            or any(schema != self.schema_name for schema, _name in self.relations)
         ):
-            raise PTG2PhysicalBindingError("PTG physical binding complete model inventory differs")
-        expected_sequences = tuple(
-            sorted(
-                (f"{model.__tablename__}_{column.name}_seq", model.__tablename__, column.name)
-                for model in local_data_family_spec().model_types
-                for column in model.__table__.columns
-                if column.identity is not None
-            )
-        )
+            raise PTG2PhysicalBindingError("PTG named binding complete model inventory differs")
+        expected_sequences = {
+            (f"{model.__tablename__}_{column.name}_seq", model.__tablename__, column.name)
+            for model in local_data_family_spec().model_types
+            for column in model.__table__.columns
+            if column.identity is not None
+        }
         if (
-            type(self.sequence_oids) is not tuple
-            or any(type(entry) is not tuple or len(entry) != 4 for entry in self.sequence_oids)
-            or tuple((name, table, column) for name, _oid, table, column in self.sequence_oids) != expected_sequences
-            or not all(_is_positive_oid(oid) for _name, oid, _table, _column in self.sequence_oids)
-            or len({oid for _name, oid, _table, _column in self.sequence_oids}) != len(self.sequence_oids)
-            or {oid for _name, oid, _table, _column in self.sequence_oids} & {oid for _name, oid in self.relation_oids}
+            type(self.sequences) is not tuple
+            or any(type(entry) is not tuple or len(entry) != 4 for entry in self.sequences)
+            or any(any(type(coordinate) is not str for coordinate in entry) for entry in self.sequences)
+            or len(self.sequences) != len(set(self.sequences))
+            or {(name, table, column) for schema, name, table, column in self.sequences} != expected_sequences
+            or any(schema != self.schema_name for schema, _name, _table, _column in self.sequences)
         ):
-            raise PTG2PhysicalBindingError("PTG physical binding identity sequence inventory differs")
-
-    @property
-    def schema_name(self):
-        """Use only the existing locally UUID-derived archive custody namespace."""
-        from process.reference_family_archive import reference_family_stage_schema
-
-        return reference_family_stage_schema(self.dataset_id)
+            raise PTG2PhysicalBindingError("PTG named binding sequence inventory differs")
 
     def relation(self, table):
-        """Derive an internal exact model path without accepting peer relation names."""
+        """Resolve one member of the complete fixed family by its recorded name."""
         if table not in local_data_family_spec().table_names:
-            raise PTG2PhysicalBindingError("PTG physical binding model is outside the complete family")
+            raise PTG2PhysicalBindingError("PTG named binding model is outside the complete family")
         return f"{_quote_ident(self.schema_name)}.{_quote_ident(table)}"
 
 
@@ -1421,35 +1252,285 @@ def _local_preparation_catalog_sql():
     )
 
 
-def _local_physical_view_catalog_sql():
-    """Share the exact existing native catalog predicate across caller types."""
-    return (
-        "SELECT c.oid::bigint AS oid,pg_get_viewdef(c.oid,false) AS definition,"
-        "c.relkind='v' AND c.relpersistence='p' AND c.relowner=:owner_oid "
-        "AND (SELECT array_agg(option ORDER BY option) FROM unnest(c.reloptions) option) "
-        "= ARRAY['security_barrier=true','security_invoker=false']::text[] "
-        "AND has_schema_privilege(current_user,n.oid,'USAGE') AND has_table_privilege(current_user,c.oid,'SELECT') "
-        "AND NOT EXISTS(SELECT 1 FROM aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) a "
-        "WHERE a.grantee<>c.relowner AND (a.grantee=0 OR a.is_grantable OR a.privilege_type<>'SELECT')) "
-        "AND NOT EXISTS(SELECT 1 FROM pg_attribute col,LATERAL aclexplode(col.attacl) a "
-        "WHERE col.attrelid=c.oid AND a.grantee<>c.relowner AND (a.grantee=0 OR a.is_grantable OR a.privilege_type<>'SELECT')) "
-        "AND NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal) AS read_only,"
-        "(SELECT jsonb_object_agg(a.attname,pg_catalog.format_type(a.atttypid,a.atttypmod)) "
-        "FROM pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped) AS columns "
-        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=:schema AND c.relname=:view"
+_LOCAL_AUDIT_IDENTITY_FIELDS = frozenset(
+    {
+        "snapshot_key",
+        "storage_generation",
+        "source_key",
+        "plan_id",
+        "plan_market_type",
+        "coverage_scope_id",
+        "source_set_digest",
+        "ordered_source_ordinal_digest",
+        "source_witness_manifest",
+        "audit_sample_public",
+        "source_witness_digest",
+        "audit_sample_digest",
+        "provider_identifier_quarantine",
+        "provider_identifier_quarantine_evidence",
+    }
+)
+
+
+def named_local_validation(evidence):
+    """Project retained content evidence while discarding historical catalog assertions."""
+    from copy import deepcopy
+
+    fields = {
+        "contract",
+        "metadata_sha256",
+        "ownership",
+        "initialization",
+        "data",
+        "control_sha256",
+        "native_audit",
+        "activation_evidence",
+    }
+    if type(evidence) is not dict or set(evidence) not in (fields, fields | {"catalog_sha256"}):
+        raise PTG2PhysicalBindingError("PTG local validation fields differ")
+    normalized_by_field = {name: deepcopy(evidence[name]) for name in fields}
+    normalized_by_field["ownership"] = _named_local_ownership(evidence["ownership"])
+    audit = normalized_by_field["native_audit"]
+    if (
+        type(audit) is not dict
+        or set(audit)
+        not in ({"contract", "model_sha256", "identity"}, {"contract", "model_sha256", "catalog_sha256", "identity"})
+        or type(audit.get("identity")) is not dict
+        or set(audit["identity"]) != _LOCAL_AUDIT_IDENTITY_FIELDS
+    ):
+        raise PTG2PhysicalBindingError("PTG local source and selection evidence differs")
+    audit.pop("catalog_sha256", None)
+    return normalized_by_field
+
+
+def _named_local_ownership(document):
+    """Retain the existing logical dataset and complete named model family."""
+    fields = {"importer_id", "dataset_id", "schema_name", "relations", "sequences"}
+    legacy_fields = {"importer_id", "dataset_id", "schema_name", "schema_oid", "relation_oids", "sequence_oids"}
+    if type(document) is not dict or set(document) not in (fields, legacy_fields):
+        raise PTG2PhysicalBindingError("PTG local named storage fields differ")
+    if set(document) == fields:
+        return {field: document[field] for field in fields}
+    schema = document["schema_name"]
+    relations, sequences = document["relation_oids"], document["sequence_oids"]
+    if (
+        not isinstance(relations, (list, tuple))
+        or not isinstance(sequences, (list, tuple))
+        or any(not isinstance(pair, (list, tuple)) or len(pair) != 2 for pair in relations)
+        or any(not isinstance(entry, (list, tuple)) or len(entry) != 4 for entry in sequences)
+    ):
+        raise PTG2PhysicalBindingError("PTG local retained model names differ")
+    return {
+        **{field: document[field] for field in ("importer_id", "dataset_id", "schema_name")},
+        "relations": [{"schema": schema, "name": pair[0]} for pair in relations],
+        "sequences": [
+            {"schema": schema, "name": entry[0], "owner_table": entry[2], "owner_column": entry[3]}
+            for entry in sequences
+        ],
+    }
+
+
+def named_local_binding(evidence, snapshot_id):
+    """Decode a complete named payload and its separate destination edition."""
+    ownership = evidence["ownership"]
+    if ownership["importer_id"] != local_data_family_spec().importer_id:
+        raise PTG2PhysicalBindingError("PTG local model family differs")
+    relations, sequences = ownership["relations"], ownership["sequences"]
+    if (
+        not isinstance(relations, list)
+        or not isinstance(sequences, list)
+        or any(type(pair) is not dict or set(pair) != {"schema", "name"} for pair in relations)
+        or any(
+            type(entry) is not dict or set(entry) != {"schema", "name", "owner_table", "owner_column"}
+            for entry in sequences
+        )
+    ):
+        raise PTG2PhysicalBindingError("PTG local complete named family differs")
+    return PTG2PhysicalBinding(
+        PHYSICAL_BINDING_CONTRACT,
+        snapshot_id,
+        evidence["initialization"]["destination_layout_key"],
+        evidence["data"]["payload_snapshot_id"],
+        evidence["data"]["payload_snapshot_key"],
+        UUID(ownership["dataset_id"]),
+        ownership["schema_name"],
+        tuple((pair["schema"], pair["name"]) for pair in sorted(relations, key=lambda pair: pair["name"])),
+        tuple(
+            (entry["schema"], entry["name"], entry["owner_table"], entry["owner_column"])
+            for entry in sorted(sequences, key=lambda entry: entry["name"])
+        ),
     )
 
 
-def _validate_local_physical_view_catalog(proof, expected_shas, *, is_prepared, first_identity, lock_held):
-    """Keep one approved native definition and object identity stable across locking."""
-    import hashlib
-    import json
+def named_local_inventory(relations, sequences, schema):
+    """Accept only complete known name records and known historical projections."""
+    from copy import deepcopy
 
-    definition_sha = hashlib.sha256(proof["definition"].encode()).hexdigest() if proof else None
-    if proof is None or not proof["read_only"] or definition_sha not in expected_shas:
-        raise PTG2PhysicalBindingError("PTG local read interface catalog differs")
-    columns_by_name = json.loads(proof["columns"]) if isinstance(proof["columns"], str) else proof["columns"]
-    identity = (proof["oid"], definition_sha)
-    if columns_by_name != _local_read_view_columns(is_prepared) or (lock_held and identity != first_identity):
-        raise PTG2PhysicalBindingError("PTG local read interface identity differs")
-    return identity
+    if not isinstance(relations, list) or not isinstance(sequences, list):
+        raise PTG2PhysicalBindingError("PTG local ordered model names differ")
+    named_relations, named_sequences = [], []
+    for ordinal, entry_by_field in enumerate(relations):
+        if (
+            type(entry_by_field) is not dict
+            or type(entry_by_field.get("ordinal")) is not int
+            or entry_by_field["ordinal"] != ordinal
+        ):
+            raise PTG2PhysicalBindingError("PTG local relation order differs")
+        if set(entry_by_field) == {"ordinal", "table_name", "relation_oid"}:
+            entry_by_field = {"ordinal": ordinal, "schema_name": schema, "relation_name": entry_by_field["table_name"]}
+        if set(entry_by_field) != {"ordinal", "schema_name", "relation_name"}:
+            raise PTG2PhysicalBindingError("PTG local relation name fields differ")
+        named_relations.append(deepcopy(entry_by_field))
+    for ordinal, entry_by_field in enumerate(sequences):
+        if (
+            type(entry_by_field) is not dict
+            or type(entry_by_field.get("ordinal")) is not int
+            or entry_by_field["ordinal"] != ordinal
+        ):
+            raise PTG2PhysicalBindingError("PTG local sequence order differs")
+        if set(entry_by_field) == {"ordinal", "sequence_name", "sequence_oid", "owner_table", "owner_column"}:
+            entry_by_field = {
+                **{
+                    field: entry_by_field[field]
+                    for field in ("ordinal", "sequence_name", "owner_table", "owner_column")
+                },
+                "schema_name": schema,
+            }
+        if set(entry_by_field) != {"ordinal", "schema_name", "sequence_name", "owner_table", "owner_column"}:
+            raise PTG2PhysicalBindingError("PTG local sequence name fields differ")
+        named_sequences.append(deepcopy(entry_by_field))
+    return named_relations, named_sequences
+
+
+def _named_publication_fields(publication_by_field, binding):
+    """Accept the named receipt or project its exact historical field set."""
+    fields = {
+        "contract",
+        "destination_snapshot_id",
+        "destination_layout_key",
+        "payload_snapshot_id",
+        "payload_snapshot_key",
+        "dataset_id",
+        "schema_name",
+        "relations",
+        "sequences",
+        "destination_activation",
+        "published_control_sha256",
+    }
+    legacy = fields - {"schema_name", "relations", "sequences"} | {
+        "schema_oid",
+        "owner_oid",
+        "relation_oids",
+        "sequence_oids",
+    }
+    if type(publication_by_field) is not dict or set(publication_by_field) not in (fields, legacy):
+        raise PTG2PhysicalBindingError("PTG local publication fields differ")
+    if set(publication_by_field) == legacy:
+        projected = _named_local_ownership(
+            {
+                "importer_id": local_data_family_spec().importer_id,
+                "dataset_id": publication_by_field["dataset_id"],
+                "schema_name": binding.schema_name,
+                "schema_oid": publication_by_field["schema_oid"],
+                "relation_oids": publication_by_field["relation_oids"],
+                "sequence_oids": publication_by_field["sequence_oids"],
+            }
+        )
+        publication_by_field = {
+            **{field: publication_by_field[field] for field in fields - {"schema_name", "relations", "sequences"}},
+            **{field: projected[field] for field in ("schema_name", "relations", "sequences")},
+        }
+    return publication_by_field
+
+
+def named_local_publication(publication_by_field, binding):
+    """Validate a logical publication against its complete named payload family."""
+    publication_by_field = _named_publication_fields(publication_by_field, binding)
+    expected_by_field = {
+        "contract": binding.contract,
+        "destination_snapshot_id": binding.snapshot_id,
+        "destination_layout_key": binding.destination_layout_key,
+        "payload_snapshot_id": binding.payload_snapshot_id,
+        "payload_snapshot_key": binding.payload_snapshot_key,
+        "dataset_id": str(binding.dataset_id),
+        "schema_name": binding.schema_name,
+        "relations": [{"schema": schema, "name": name} for schema, name in binding.relations],
+        "sequences": [
+            {"schema": schema, "name": name, "owner_table": table, "owner_column": column}
+            for schema, name, table, column in binding.sequences
+        ],
+    }
+    for field in ("relations", "sequences"):
+        entries = publication_by_field[field]
+        if not isinstance(entries, list) or any(type(entry) is not dict or "name" not in entry for entry in entries):
+            raise PTG2PhysicalBindingError("PTG local publication model names differ")
+        publication_by_field = {**publication_by_field, field: sorted(entries, key=lambda entry: entry["name"])}
+    activation = publication_by_field["destination_activation"]
+    if type(activation) is not dict or set(activation) != {
+        "source_key",
+        "snapshot_id",
+        "previous_snapshot_id",
+        "activated_at",
+        "audit_report_digest",
+    }:
+        raise PTG2PhysicalBindingError("PTG local activation fields differ")
+    if any(publication_by_field[field] != coordinate for field, coordinate in expected_by_field.items()):
+        raise PTG2PhysicalBindingError("PTG local logical publication differs")
+    return publication_by_field
+
+
+def named_local_read_row(row, *, is_prepared):
+    """Normalize only the maintained named projection or its exact retained predecessor."""
+    from copy import deepcopy
+
+    fields = set(_local_read_view_columns(is_prepared))
+    legacy = fields | {"owner_oid", "validation_sha256", "inventory_sha256"}
+    if not is_prepared:
+        legacy.add("registration_sha256")
+    if type(row) is not dict or set(row) not in (fields, legacy):
+        raise PTG2PhysicalBindingError("PTG local read projection fields differ")
+    normalized_by_field = {field: deepcopy(row[field]) for field in fields}
+    evidence = normalized_by_field["native_validation"] = named_local_validation(row["native_validation"])
+    binding = named_local_binding(evidence, row["destination_snapshot_id"])
+    relations, sequences = named_local_inventory(
+        row["relation_inventory"], row["sequence_inventory"], binding.schema_name
+    )
+    if sorted((entry["schema_name"], entry["relation_name"]) for entry in relations) != list(
+        binding.relations
+    ) or sorted(
+        (entry["schema_name"], entry["sequence_name"], entry["owner_table"], entry["owner_column"])
+        for entry in sequences
+    ) != list(binding.sequences):
+        raise PTG2PhysicalBindingError("PTG local recorded model names differ")
+    normalized_by_field.update(relation_inventory=relations, sequence_inventory=sequences)
+    if not is_prepared:
+        normalized_by_field["generation_inventory"] = _named_generation_inventory(row["generation_inventory"], binding)
+        normalized_by_field["native_publication"] = named_local_publication(row["native_publication"], binding)
+    return normalized_by_field
+
+
+def _named_generation_inventory(document, binding):
+    """Read portable retained names while ignoring known discarded physical fields."""
+    if type(document) is not dict or set(document) not in ({"relations"}, {"database_oid", "relations"}):
+        raise PTG2PhysicalBindingError("PTG local generation names differ")
+    relations = document["relations"]
+    legacy_fields = {
+        "schema_name",
+        "relation_name",
+        "relation_oid",
+        "schema_oid",
+        "schema_owner_oid",
+        "owner_oid",
+        "relfilenode",
+    }
+    if not isinstance(relations, list) or any(
+        type(entry) is not dict
+        or not {"schema_name", "relation_name"} <= set(entry)
+        or set(entry) not in ({"schema_name", "relation_name"}, legacy_fields)
+        for entry in relations
+    ):
+        raise PTG2PhysicalBindingError("PTG local generation name fields differ")
+    names = [(entry["schema_name"], entry["relation_name"]) for entry in relations]
+    if len(names) != len(binding.relations) or set(names) != set(binding.relations):
+        raise PTG2PhysicalBindingError("PTG local generation model family differs")
+    return {"relations": [{"schema_name": schema, "relation_name": name} for schema, name in sorted(names)]}

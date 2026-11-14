@@ -25,6 +25,7 @@ def scope_row(revision=4, fingerprint="a" * 64):
         invalid_documents=0,
         unresolved_rows=0,
         generation_id=fingerprint,
+        edition_valid=True,
         total_rows=0,
     )
 

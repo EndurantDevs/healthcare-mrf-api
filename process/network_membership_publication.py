@@ -3,17 +3,17 @@
 
 import hashlib
 import json
+import os
 import re
+from contextlib import AsyncExitStack
 from uuid import UUID
 
 from db.registry_schema import registry_schema
 from process.network_address_projection import PinnedAddressSource, _identifier
-from process.network_candidate_custody import verify_network_candidate_custody
 from process.network_membership_candidate_indexes import _ready_replay
 from process.network_membership_candidate_lifecycle import _locked_candidate
 from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_validation import _json_object, _scope_report, _validated_replay
-from process.network_membership_writer_closure import _role_names, verify_network_candidate_writer_closure
 
 
 class NetworkPublicationError(ValueError):
@@ -42,7 +42,7 @@ def _publication_readiness(candidate):
 
     if is_compact_candidate(candidate):
         canonical, serving = compact_readiness(candidate, report, scope_report)
-        return scope_report, canonical, serving, _publication_writer_closure(candidate, report)
+        return scope_report, canonical, serving, _publication_snapshot_tables(candidate, report)
     canonical_readiness = _ready_replay(candidate, report, scope_report)
     serving_readiness = report.get("serving_readiness")
     if (
@@ -57,7 +57,7 @@ def _publication_readiness(candidate):
         or re.fullmatch(r"[0-9a-f]{64}", serving_readiness["index_definition_sha256"]) is None
     ):
         raise NetworkPublicationError("Candidate lacks matching full serving readiness")
-    return scope_report, canonical_readiness, serving_readiness, _publication_writer_closure(candidate, report)
+    return scope_report, canonical_readiness, serving_readiness, _publication_snapshot_tables(candidate, report)
 
 
 publication_candidate_readiness = _publication_readiness
@@ -66,55 +66,29 @@ publication_candidate_readiness = _publication_readiness
 _publication_readiness = publication_candidate_readiness
 
 
-def _publication_writer_closure(candidate, report):
-    from process.registry_source_retention import (
-        SOURCE_TABLE,
-        RegistrySourceRetentionError,
-        verify_registry_source_retention,
-    )
-
-    try:
-        retention = verify_registry_source_retention(candidate)
-    except RegistrySourceRetentionError:
-        raise NetworkPublicationError("Candidate source retention differs from its retained digest") from None
-    closure = report.get("writer_closure")
-    expected_scope_dict = {
-        field: str(candidate[field])
-        for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
-    }
-    if (
-        type(closure) is not dict
-        or closure.get("component") != "network_candidate_writer_closure"
-        or type(closure.get("revision")) is not int
-        or closure["revision"] != 1
-        or closure.get("scope") != expected_scope_dict
-        or type(closure.get("loader_roles")) is not list
-        or type(closure.get("reader_roles")) is not list
-    ):
-        raise NetworkPublicationError("Candidate lacks a final matching writer closure")
-    roles_by_group = _role_names(
-        closure.get("owner_role"), tuple(closure["loader_roles"]), tuple(closure["reader_roles"])
-    )
-    if any(closure[role_group] != expected for role_group, expected in roles_by_group.items()):
-        raise NetworkPublicationError("Candidate writer roles differ from their canonical receipt")
+def _publication_snapshot_tables(candidate, report):
+    """Describe the named payload tables required by this complete data generation."""
     from process.network_compact_readiness import compact_serving_heaps, is_compact_candidate
+    from process.registry_source_contribution_store import CONTRIBUTION_TABLE, verify_registry_source_contributions
+    from process.registry_source_inventory_reference import source_inventory_heaps
+    from process.registry_source_retention import SOURCE_TABLE, verify_registry_source_retention
 
-    required_heaps = {"network_membership", "provider_location_binding"}
-    required_heaps.update(
+    schema = candidate["schema_name"]
+    _identifier(schema)
+    required_tables = {"network_membership", "provider_location_binding"}
+    required_tables.update(
         compact_serving_heaps(candidate) if is_compact_candidate(candidate) else {"entity_address_unified"}
     )
-    if retention is not None:
-        required_heaps.add(SOURCE_TABLE)
-    from process.registry_source_contribution_store import CONTRIBUTION_TABLE, verify_registry_source_contributions
-
+    if verify_registry_source_retention(candidate) is not None:
+        required_tables.add(SOURCE_TABLE)
     if verify_registry_source_contributions(candidate) is not None:
-        required_heaps.add(CONTRIBUTION_TABLE)
-    from process.registry_source_inventory_reference import source_inventory_heaps
-
-    required_heaps.update(source_inventory_heaps(candidate))
-    if type(closure.get("relation_oids")) is not dict or set(closure["relation_oids"]) != required_heaps:
-        raise NetworkPublicationError("Candidate writer closure differs from its serving storage")
-    return closure
+        required_tables.add(CONTRIBUTION_TABLE)
+    required_tables.update(source_inventory_heaps(candidate))
+    return {
+        "schema_name": schema,
+        "tables": sorted(required_tables),
+        "validated": report.get("final_validation") is not None,
+    }
 
 
 def _complete_accounting(report):
@@ -155,32 +129,40 @@ def _complete_accounting(report):
         raise NetworkPublicationError("Candidate validation accounting is incomplete")
 
 
-def _manifest_digest(generation_id, scope_report, canonical_readiness, serving_readiness, writer_closure):
+def _manifest_digest(generation_id, scope_report, canonical_readiness, serving_readiness, snapshot_tables):
+    """Identify the named logical edition and its complete data accounting."""
     manifest_by_field = {
         "generation_id": generation_id,
         **{
             field: scope_report[field]
             for field in ("candidate_id", "schema_revision", "source_generations", "approved_custom_revision")
         },
-        "candidate_readiness": canonical_readiness,
-        "serving_readiness": serving_readiness,
-        "writer_closure": writer_closure,
+        "schema_name": snapshot_tables["schema_name"],
+        "tables": snapshot_tables["tables"],
+        "accounting": {
+            field: canonical_readiness[field]
+            for field in ("membership_rows", "distinct_memberships", "projected_locations")
+        },
+        "serving_profile": serving_readiness["index_profile"],
     }
     encoded = json.dumps(manifest_by_field, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _retained_manifest(manifest, readiness, *, replayed):
-    scope_report, canonical_readiness, serving_readiness, writer_closure = readiness
+    scope_report, canonical_readiness, serving_readiness, snapshot_tables = readiness
     sources_by_name = _json_object(manifest["source_generations"])
     if (
         str(manifest["candidate_id"]) != scope_report["candidate_id"]
         or manifest["schema_revision"] != scope_report["schema_revision"]
         or sources_by_name != scope_report["source_generations"]
         or manifest["approved_custom_revision"] != scope_report["approved_custom_revision"]
-        or manifest["manifest_sha256"]
+        or type(manifest["manifest_sha256"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", manifest["manifest_sha256"]) is None
+        or snapshot_tables["validated"]
+        and manifest["manifest_sha256"]
         != _manifest_digest(
-            manifest["generation_id"], scope_report, canonical_readiness, serving_readiness, writer_closure
+            manifest["generation_id"], scope_report, canonical_readiness, serving_readiness, snapshot_tables
         )
     ):
         raise NetworkPublicationError("Retained manifest differs from its immutable candidate")
@@ -198,13 +180,289 @@ def _retained_manifest(manifest, readiness, *, replayed):
     }
 
 
+def named_network_preparation_roles(configured=None):
+    """Use the worker's configured role names for the administrator permission step."""
+    if configured is None:
+        from process.registry_publication_worker import CONFIG_ENV, unique_json_fields
+
+        encoded = os.environ.get(CONFIG_ENV)
+        if type(encoded) is not str or len(encoded.encode()) > 1048576:
+            raise NetworkPublicationError("Snapshot preparation roles are required")
+        document = json.loads(encoded, object_pairs_hook=unique_json_fields)
+        configured = document.get("preparation_roles") if type(document) is dict else None
+    if type(configured) is not dict or set(configured) != {
+        "namespace_owner_role",
+        "publisher_role",
+        "application_roles",
+    }:
+        raise NetworkPublicationError("Snapshot preparation role configuration is invalid")
+    applications = configured["application_roles"]
+    if type(applications) is not list or not 1 <= len(applications) <= 128:
+        raise NetworkPublicationError("Snapshot application roles must be a bounded list")
+    for role in (configured["namespace_owner_role"], configured["publisher_role"], *applications):
+        _identifier(role)
+    if (
+        len(set(applications)) != len(applications)
+        or configured["publisher_role"] not in applications
+        or configured["namespace_owner_role"] in applications
+    ):
+        raise NetworkPublicationError("Snapshot writer and frozen owner roles must be distinct")
+    return {
+        "namespace_owner_role": configured["namespace_owner_role"],
+        "publisher_role": configured["publisher_role"],
+        "application_roles": sorted(applications),
+    }
+
+
+async def load_named_network_preparation(connection, candidate_id, *, control_schema=None):
+    """Load portable resume data for one ready or published named generation."""
+    schema = control_schema if control_schema is not None else registry_schema()
+    namespace = _identifier(schema)
+    identity = UUID(str(candidate_id))
+    candidate_by_field = await connection.fetchrow(
+        f"SELECT * FROM {namespace}.network_membership_candidate WHERE candidate_id=$1", identity
+    )
+    if candidate_by_field is None or candidate_by_field["state"] not in {"ready", "published"}:
+        return None
+    candidate_by_field = dict(candidate_by_field)
+    storage_schema = candidate_by_field["schema_name"]
+    _identifier(storage_schema)
+    if storage_schema == schema:
+        raise NetworkPublicationError("Generation storage must be isolated from publication controls")
+    report = _json_object(candidate_by_field["validation_json"])
+    if type(report) is not dict or type(report.get("address_source")) is not dict:
+        raise NetworkPublicationError("Ready generation lacks named address scope")
+    relations = await connection.fetch(
+        "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE n.nspname=$1 AND c.relkind IN ('r','p') ORDER BY c.relname",
+        storage_schema,
+    )
+    names = [relation["relname"] for relation in relations]
+    if not {"network_membership", "provider_location_binding"} <= set(names):
+        raise NetworkPublicationError("Ready generation storage is incomplete")
+    composition = await _named_address_composition(connection, candidate_by_field, report, schema)
+    tables = [{"schema": storage_schema, "name": name} for name in names]
+    snapshot = _network_preparation_snapshot(candidate_by_field, report)
+    if composition is not None:
+        composition_schema = composition["address_source"]["schema_name"]
+        tables.extend(
+            {"schema": composition_schema, "name": name}
+            for name in ("entity_address_unified", "provider_location_binding")
+        )
+        snapshot["address_composition"] = composition
+    return {
+        "kind": "network",
+        "candidate_id": str(identity),
+        "catalog_schema": schema,
+        "storage_schema": storage_schema,
+        "tables": tables,
+        "snapshot": snapshot,
+    }
+
+
+async def _named_address_composition(connection, candidate_by_field, report_by_field, control_schema):
+    """Include the exact named address artifact in the generation's administrative freeze."""
+    from process.network_custom_address_source import _from_document
+
+    address = PinnedAddressSource(**report_by_field["address_source"])
+    if not address.schema_name.startswith("network_composition_"):
+        return None
+    try:
+        composition = _from_document(
+            await connection.fetchval(
+                "SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=$1",
+                address.schema_name,
+            )
+        )
+    except ValueError, TypeError, KeyError:
+        raise NetworkPublicationError("Address composition scope differs from the candidate") from None
+    if (
+        composition.address_source != address
+        or composition.control_schema != control_schema
+        or composition.approved_revision > candidate_by_field["approved_custom_revision"]
+        or composition.generation_sha256
+        != _json_object(candidate_by_field["source_generations"]).get("unified_address")
+    ):
+        raise NetworkPublicationError("Address composition scope differs from the candidate")
+    relations = await connection.fetch(
+        "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE n.nspname=$1 AND c.relkind IN ('r','p') ORDER BY c.relname",
+        address.schema_name,
+    )
+    if [relation["relname"] for relation in relations] != ["entity_address_unified", "provider_location_binding"]:
+        raise NetworkPublicationError("Address composition tables are incomplete")
+    return composition.as_dict()
+
+
+def _network_preparation_snapshot(candidate, report):
+    address = PinnedAddressSource(**report["address_source"])
+    return {
+        **{field: str(candidate[field]) for field in ("dataset_id", "schema_id", "producer_id")},
+        **{
+            field: candidate[field]
+            for field in (
+                "schema_revision",
+                "expected_head",
+                "approved_custom_revision",
+                "expected_rows",
+                "accepted_rows",
+            )
+        },
+        "source_generations": _json_object(candidate["source_generations"]),
+        "address_source": {
+            "schema_name": address.schema_name,
+            "table_name": address.table_name,
+            "generation_id": address.generation_id,
+        },
+        "accounting": {
+            field: report[field]
+            for field in (
+                "raw_rows",
+                "batch_rows",
+                "batch_count",
+                "membership_rows",
+                "distinct_memberships",
+                "projected_locations",
+                "orphan_bindings",
+                "unknown_network_rows",
+            )
+        },
+    }
+
+
+class NetworkPreparationPending(RuntimeError):
+    """A durable named candidate awaits its existing administrator permission step."""
+
+    def __init__(self, candidate_id):
+        self.candidate_id = str(UUID(str(candidate_id)))
+        super().__init__("network_preparation_waiting_admin_freeze")
+
+
+async def admit_network_preparation(connection, candidate_id, *, control_schema, roles=None):
+    """Admit or resume the existing common lifecycle for this exact named candidate."""
+    from directory_catalog_runtime import NamedPreparationStore, NativePreparationAdmission
+
+    handoff = await load_named_network_preparation(connection, candidate_id, control_schema=control_schema)
+    if handoff is None:
+        raise NetworkPublicationError("Ready network preparation is required")
+    identity = handoff["candidate_id"]
+    request = NativePreparationAdmission(
+        preparation_id=identity,
+        node_id=control_schema,
+        importer_id="network",
+        dataset_key=identity,
+        run_id=identity,
+        generation_id=identity,
+        publication_fence=identity,
+        idempotency_key="network:" + identity,
+        request_sha256=hashlib.sha256(
+            json.dumps(handoff, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        ).hexdigest(),
+    )
+    store = NamedPreparationStore(connection, named_network_preparation_roles(roles), kind="network")
+    row, claim = await store.admit_named(request, handoff, attempt_id=identity)
+    return store, row, claim
+
+
+def _network_validation_reference(validation):
+    """Keep the common lifecycle report bounded while the full data result remains on the candidate."""
+    encoded = json.dumps(validation, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return {
+        "candidate_id": validation["candidate_id"],
+        "schema_name": validation["schema_name"],
+        "validation_sha256": hashlib.sha256(encoded.encode()).hexdigest(),
+    }
+
+
+async def validate_named_network_preparation(
+    connection, copy_target, *, control_schema, roles, source_witness_runtime=None, validation_snapshot=None
+):
+    """Validate frozen payloads without holding publication controls or a preparation claim."""
+    from process.network_membership_validation import validate_network_candidate_final
+
+    if connection.is_in_transaction():
+        raise NetworkPublicationError("Network preparation requires phase-owned transactions")
+    async with connection.transaction():
+        store, preparation_by_field, claim = await admit_network_preparation(
+            connection, copy_target.candidate_id, control_schema=control_schema, roles=roles
+        )
+        if claim is not None:
+            await store.yield_named_claim(claim)
+    if preparation_by_field["state"] == "handed_off":
+        raise NetworkPreparationPending(copy_target.candidate_id)
+    if preparation_by_field["state"] == "published":
+        return {"state": "published", "candidate_id": copy_target.candidate_id}
+    if preparation_by_field["state"] == "validated":
+        candidate_by_field = dict(
+            await connection.fetchrow(
+                f"SELECT * FROM {_identifier(control_schema)}.network_membership_candidate WHERE candidate_id=$1",
+                UUID(copy_target.candidate_id),
+            )
+        )
+        if preparation_by_field["validation"]["evidence"]["data"] != _network_validation_reference(
+            _require_final_validation(candidate_by_field)
+        ):
+            raise NetworkPublicationError("Stored network data validation changed")
+        return {"state": "validated", "candidate_id": copy_target.candidate_id}
+    async with AsyncExitStack() as validation_scope:
+        validation_connection, office_authority = connection, None
+        if validation_snapshot is None:
+            await validation_scope.enter_async_context(connection.transaction(isolation="repeatable_read"))
+        else:
+            validation_connection, office_authority = await validation_scope.enter_async_context(validation_snapshot())
+        candidate_by_field = dict(
+            await validation_connection.fetchrow(
+                f"SELECT * FROM {_identifier(control_schema)}.network_membership_candidate WHERE candidate_id=$1",
+                UUID(copy_target.candidate_id),
+            )
+        )
+        validation = await validate_network_candidate_final(
+            validation_connection,
+            copy_target,
+            candidate_by_field,
+            control_schema,
+            office_authority=office_authority,
+            source_witness_runtime=source_witness_runtime,
+        )
+    return await _retain_network_final_validation(connection, copy_target, validation, control_schema, roles)
+
+
+async def _retain_network_final_validation(connection, copy_target, validation, control_schema, roles):
+    """Record the data result under a fresh short claim after the complete scan."""
+    async with connection.transaction():
+        store, preparation_by_field, claim = await admit_network_preparation(
+            connection, copy_target.candidate_id, control_schema=control_schema, roles=roles
+        )
+        if claim is None or preparation_by_field["state"] not in {"frozen", "validated"}:
+            raise NetworkPublicationError("Frozen network preparation is required")
+        await store.validate_named(
+            claim,
+            {
+                "kind": "network",
+                "candidate_id": copy_target.candidate_id,
+                "data": _network_validation_reference(validation),
+            },
+        )
+        status = await connection.execute(
+            f"UPDATE {_identifier(control_schema)}.network_membership_candidate "
+            "SET validation_json=jsonb_set(validation_json,ARRAY['final_validation'],$2::jsonb) "
+            "WHERE candidate_id=$1 AND state='ready'",
+            UUID(copy_target.candidate_id),
+            json.dumps(validation, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+        )
+        if status != "UPDATE 1":
+            raise NetworkPublicationError("Ready network preparation changed")
+        await store.yield_named_claim(claim)
+    return {"state": "validated", "candidate_id": copy_target.candidate_id}
+
+
 async def lock_publication_controls(connection, namespace):
     """Lock revision and serving singletons in publication order and return their current generations."""
     revision_control = await connection.fetchrow(
-        f"SELECT approved_revision FROM {namespace}.registry_revision_control WHERE id=1 FOR UPDATE"
+        f"SELECT approved_revision FROM {namespace}.registry_revision_control WHERE id=1 FOR UPDATE NOWAIT"
     )
     serving_control = await connection.fetchrow(
-        f"SELECT generation_id FROM {namespace}.network_serving_control WHERE id=1 FOR UPDATE"
+        f"SELECT generation_id FROM {namespace}.network_serving_control WHERE id=1 FOR UPDATE NOWAIT"
     )
     if revision_control is None or serving_control is None:
         raise NetworkPublicationError("Publication singleton controls are missing")
@@ -214,7 +472,16 @@ async def lock_publication_controls(connection, namespace):
 _lock_publication_controls = lock_publication_controls
 
 
-async def _insert_manifest(connection, namespace, candidate, readiness):
+async def _insert_manifest(connection, namespace, candidate, readiness, preparation_roles=None):
+    store, preparation_by_field, claim = await admit_network_preparation(
+        connection, str(candidate["candidate_id"]), control_schema=namespace[1:-1], roles=preparation_roles
+    )
+    if claim is None or preparation_by_field["state"] != "validated":
+        raise NetworkPublicationError("Validated network preparation is required")
+    if preparation_by_field["validation"]["evidence"]["data"] != _network_validation_reference(
+        _require_final_validation(candidate)
+    ):
+        raise NetworkPublicationError("Stored network data validation changed")
     generation_id = await connection.fetchval(
         "SELECT nextval(pg_get_serial_sequence($1,'generation_id'))", namespace + ".network_serving_manifest"
     )
@@ -241,50 +508,55 @@ async def _insert_manifest(connection, namespace, candidate, readiness):
         f"UPDATE {namespace}.network_membership_candidate SET state='published' WHERE candidate_id=$1",
         candidate["candidate_id"],
     )
-    return _retained_manifest(manifest, readiness, replayed=False)
-
-
-async def _verify_provider_custody(connection, candidate, closure):
-    from process.network_em_provider_inputs import verify_candidate_em_provider_inputs
-
-    runtime_roles = tuple(sorted(set(closure["loader_roles"] + closure["reader_roles"])))
-    return await verify_candidate_em_provider_inputs(connection, candidate, runtime_roles=runtime_roles)
-
-
-async def _candidate_custody(connection, candidate, control_schema, *, allow_unsealed=False):
-    from process.registry_source_inventory_reference import source_inventory_heaps
-
-    copy_target = MembershipCopyTarget(
-        *(str(candidate[field]) for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name"))
+    manifest = _retained_manifest(manifest, readiness, replayed=False)
+    await store.publish_named(
+        claim,
+        {
+            "kind": "network",
+            "candidate_id": str(candidate["candidate_id"]),
+            "fence_token": str(preparation_by_field["publication_fence"]),
+            "data": manifest,
+        },
     )
-    if type(allow_unsealed) is not bool or allow_unsealed and candidate["state"] != "ready":
-        raise NetworkPublicationError("Candidate read verification mode is invalid")
-    custody = await verify_network_candidate_custody(
-        connection,
-        copy_target,
-        control_schema=control_schema,
-        required=not allow_unsealed and bool(source_inventory_heaps(candidate)),
+    return manifest
+
+
+def _require_final_validation(candidate):
+    """Require the completed data result for this exact ready logical generation."""
+    report = _json_object(candidate["validation_json"])
+    validation = report.get("final_validation") if type(report) is dict else None
+    if (
+        type(validation) is not dict
+        or validation.get("candidate_id") != str(candidate["candidate_id"])
+        or validation.get("schema_name") != candidate["schema_name"]
+        or validation.get("complete") is not True
+        or validation.get("source_generations") != _json_object(candidate["source_generations"])
+    ):
+        raise NetworkPublicationError("Generation data validation is incomplete")
+    fields = (
+        "raw_rows",
+        "batch_rows",
+        "batch_count",
+        "membership_rows",
+        "distinct_memberships",
+        "projected_locations",
+        "orphan_bindings",
+        "unknown_network_rows",
     )
-    from process.network_compact_readiness import is_compact_candidate
-
-    if custody is not None and is_compact_candidate(candidate):
-        from process.network_compact_dependencies import verify_compact_dependencies
-
-        layout = await verify_compact_dependencies(connection, candidate, control_schema=control_schema)
-        return {**custody, "compact_layout": layout}
-    return custody
+    if validation.get("counts") != {field: report[field] for field in fields}:
+        raise NetworkPublicationError("Generation validation accounting changed")
+    return validation
 
 
-async def _publish_candidate(connection, copy_target, namespace, source_rollback_authority=None):
-    """Publish only the locked ready candidate with exact custody and rollback authority."""
+async def _publish_candidate(
+    connection, copy_target, namespace, source_rollback_authority=None, preparation_roles=None
+):
+    """Switch the verified named generation and its control record atomically."""
     approved_revision, current_head = await _lock_publication_controls(connection, namespace)
     candidate = await _locked_candidate(connection, copy_target, namespace)
     if candidate["state"] not in {"ready", "published"}:
         raise NetworkPublicationError("Candidate must be fully ready before publication")
     readiness = _publication_readiness(candidate)
-    closure = readiness[3]
-    custody = await _require_publication_custody(connection, copy_target, candidate, namespace, closure)
-    await _verify_provider_custody(connection, candidate, closure)
     manifest = await connection.fetchrow(
         f"SELECT * FROM {namespace}.network_serving_manifest WHERE candidate_id=$1", UUID(copy_target.candidate_id)
     )
@@ -294,6 +566,7 @@ async def _publish_candidate(connection, copy_target, namespace, source_rollback
         return _retained_manifest(manifest, readiness, replayed=True)
     if manifest is not None:
         raise NetworkPublicationError("Unpublished candidate already has a retained manifest")
+    _require_final_validation(candidate)
     if approved_revision != candidate["approved_custom_revision"]:
         raise NetworkPublicationError("Approved custom revision changed before publication")
     if current_head != candidate["expected_head"]:
@@ -319,46 +592,18 @@ async def _publish_candidate(connection, copy_target, namespace, source_rollback
         reviewed_source = await require_registry_source_rollback_publication_authority(
             connection, source_rollback_authority, copy_target, candidate, control_schema=namespace[1:-1]
         )
-    predecessor = await fhir_preservation_obligation(
+    await fhir_preservation_obligation(
         connection, candidate, control_schema=namespace[1:-1], reviewed_source_manifest=reviewed_source
     )
-    if predecessor is not None and custody is None:
-        raise NetworkPublicationError("FHIR serving preservation requires independent candidate custody")
-    from process.network_membership_serving_indexes import verify_network_search_indexes
-
-    await verify_network_search_indexes(
-        connection, candidate, compact_layout=custody.get("compact_layout") if custody is not None else None
-    )
-    return await _insert_manifest(connection, namespace, candidate, readiness)
+    return await _insert_manifest(connection, namespace, candidate, readiness, preparation_roles)
 
 
-async def _require_publication_custody(connection, copy_target, candidate, namespace, closure):
-    custody = await _candidate_custody(connection, candidate, namespace[1:-1])
-    if custody is None:
-        from process.network_compact_readiness import is_compact_candidate
+async def publish_network_candidate(
+    connection, copy_target, *, control_schema=None, source_rollback_authority=None, preparation_roles=None
+):
+    """Atomically publish the completed named generation or replay its retained manifest.
 
-        if is_compact_candidate(candidate):
-            raise NetworkPublicationError("Compact publication requires independent physical custody")
-        from process.registry_source_contribution_store import verify_registry_source_contributions
-
-        if verify_registry_source_contributions(candidate) is not None:
-            raise NetworkPublicationError("Source contributions require independent physical custody")
-        await verify_network_candidate_writer_closure(
-            connection,
-            copy_target,
-            owner_role=closure["owner_role"],
-            loader_roles=tuple(closure["loader_roles"]),
-            reader_roles=tuple(closure["reader_roles"]),
-            control_schema=namespace[1:-1],
-        )
-    return custody
-
-
-async def publish_network_candidate(connection, copy_target, *, control_schema=None, source_rollback_authority=None):
-    """Atomically publish trusted readiness, or replay its retained manifest.
-
-    Caller owns commit/rollback. Protected custody or legacy native writer
-    closure is verified before initial publication and every replay.
+    The caller owns the transaction and the final client authorization checks.
     """
     if type(copy_target) is not MembershipCopyTarget:
         raise NetworkPublicationError("Trusted candidate scope is required")
@@ -367,7 +612,9 @@ async def publish_network_candidate(connection, copy_target, *, control_schema=N
     try:
         namespace = _identifier(control_schema if control_schema is not None else registry_schema())
         async with connection.transaction():
-            return await _publish_candidate(connection, copy_target, namespace, source_rollback_authority)
+            return await _publish_candidate(
+                connection, copy_target, namespace, source_rollback_authority, preparation_roles
+            )
     except (ValueError, TypeError) as error:
         if isinstance(error, NetworkPublicationError):
             raise

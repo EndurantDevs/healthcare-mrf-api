@@ -1,280 +1,257 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Read views are qualified native interfaces, never caller-selected authority."""
+"""Named LOCAL readers preserve content and logical publication boundaries."""
 
-import hashlib
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from uuid import UUID
 
 import pytest
 
 from process.ptg_parts import ptg2_physical_binding as native
 from process.ptg_parts import result_archive_candidate_validation as validation
-from tests.test_ptg2_local_preparation_authority import _ownership, _protected_preparation_fixture
+from tests.test_ptg2_local_preparation_authority import (
+    _control_fixture,
+    _ownership,
+    _published_control_fixture,
+    _stage_audit_identity,
+)
 
 
 def _view_fixture():
-    """Preserve the original protected digest independently of the projected evidence."""
-    physical_binding, preparation_by_field = _protected_preparation_fixture()
-    ownership = _ownership(physical_binding)
-    relations = [
+    binding, candidate, _scope, _initialized = _control_fixture()
+    _binding, published, prior, _publication = _published_control_fixture()
+    model_sha = native.local_data_model_digest()
+    audit = _stage_audit_identity(candidate, binding, [{"source_key": 0, "raw_container_sha256": (b"r" * 32).hex()}])
+    evidence_by_field = {
+        "contract": "ptg_result.postgres.v2",
+        "metadata_sha256": "a" * 64,
+        "ownership": {
+            "importer_id": native.local_data_family_spec().importer_id,
+            "dataset_id": str(binding.dataset_id),
+            "schema_name": binding.schema_name,
+            "relations": [{"schema": schema, "name": name} for schema, name in binding.relations],
+            "sequences": [
+                {"schema": schema, "name": name, "owner_table": table, "owner_column": column}
+                for schema, name, table, column in binding.sequences
+            ],
+        },
+        "initialization": {
+            "destination_snapshot_id": binding.snapshot_id,
+            "destination_import_run_id": published["import_run_id"],
+            "destination_layout_key": binding.destination_layout_key,
+        },
+        "data": {
+            "model_sha256": model_sha,
+            "payload_snapshot_id": binding.payload_snapshot_id,
+            "payload_snapshot_key": binding.payload_snapshot_key,
+        },
+        "control_sha256": prior["control_sha256"],
+        "native_audit": {
+            "contract": "ptg-local-data.native-set-audit.v1",
+            "model_sha256": model_sha,
+            "identity": audit["identity"],
+        },
+        "activation_evidence": {**prior["activation_evidence"], "control_sha256": prior["control_sha256"]},
+    }
+    return binding, {
+        "contract": "ptg.prepared-physical-binding-read.v1",
+        "destination_snapshot_id": binding.snapshot_id,
+        "package_id": "a" * 64,
+        "manifest_sha256": "a" * 64,
+        "artifact_sha256": None,
+        "native_validation": evidence_by_field,
+        "relation_inventory": [
+            {"ordinal": ordinal, "schema_name": schema, "relation_name": name}
+            for ordinal, (schema, name) in enumerate(binding.relations)
+        ],
+        "sequence_inventory": [
+            {
+                "ordinal": ordinal,
+                "schema_name": schema,
+                "sequence_name": name,
+                "owner_table": table,
+                "owner_column": column,
+            }
+            for ordinal, (schema, name, table, column) in enumerate(binding.sequences)
+        ],
+    }
+
+
+def _installed_fixture():
+    binding, row = _view_fixture()
+    _binding, control, _evidence, publication = _published_control_fixture()
+    row.update(
+        contract="ptg.installed-physical-binding-read.v1",
+        generation_id=str(UUID(int=3)),
+        publication_fence=str(UUID(int=4)),
+        publication_sha256="d" * 64,
+        generation_inventory={
+            "relations": [{"schema_name": schema, "relation_name": name} for schema, name in binding.relations]
+        },
+        native_publication=publication,
+    )
+    return binding, row, control
+
+
+def _legacy_view_fixture(is_prepared):
+    binding, row_by_field = _view_fixture() if is_prepared else _installed_fixture()[:2]
+    row_by_field = deepcopy(row_by_field)
+    legacy = _ownership(binding)
+    row_by_field.update(owner_oid=102, validation_sha256="b" * 64, inventory_sha256="c" * 64)
+    evidence = row_by_field["native_validation"]
+    evidence["ownership"] = {
+        "importer_id": legacy.importer_id,
+        "dataset_id": str(legacy.dataset_id),
+        "schema_name": legacy.schema_name,
+        "schema_oid": legacy.schema_oid,
+        "relation_oids": [list(pair) for pair in legacy.relation_oids],
+        "sequence_oids": [list(entry) for entry in legacy.sequence_oids],
+    }
+    evidence["catalog_sha256"] = evidence["native_audit"]["catalog_sha256"] = "e" * 64
+    row_by_field["relation_inventory"] = [
         {"ordinal": ordinal, "table_name": name, "relation_oid": oid}
-        for ordinal, (name, oid) in enumerate(ownership.relation_oids)
+        for ordinal, (name, oid) in enumerate(legacy.relation_oids)
     ]
-    sequences = [
+    row_by_field["sequence_inventory"] = [
         {"ordinal": ordinal, "sequence_name": name, "sequence_oid": oid, "owner_table": table, "owner_column": column}
-        for ordinal, (name, oid, table, column) in enumerate(ownership.sequence_oids)
+        for ordinal, (name, oid, table, column) in enumerate(legacy.sequence_oids)
     ]
-    inventory_by_field = {
-        "schema_name": ownership.schema_name,
-        "schema_oid": ownership.schema_oid,
-        "relations": [
-            {key: field_value for key, field_value in relation.items() if key != "ordinal"} for relation in relations
-        ],
-        "sequences": [
-            {key: field_value for key, field_value in sequence.items() if key != "ordinal"} for sequence in sequences
-        ],
-    }
-    evidence = deepcopy(preparation_by_field["validation"]["evidence"])
-    evidence["native_audit"]["identity"] = {}
-    authority_by_field = dict.fromkeys(native._local_read_view_columns(True), "a" * 64)
-    authority_by_field.update(
-        contract="ptg.prepared-physical-binding-read.v1",
-        destination_snapshot_id=physical_binding.snapshot_id,
-        owner_oid=physical_binding.owner_oid,
-        native_validation=evidence,
-        relation_inventory=relations,
-        sequence_inventory=sequences,
-        inventory_sha256=native._native_metadata_digest(inventory_by_field),
-    )
-    return physical_binding, authority_by_field
-
-
-@pytest.mark.asyncio
-async def test_unqualified_view_refuses_before_catalog_or_lock(monkeypatch):
-    monkeypatch.setattr(native, "PREPARED_LOCAL_READ_VIEW_SHA256", None)
-    session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(return_value=True))
-    with pytest.raises(native.PTG2PhysicalBindingError, match="not qualified"):
-        await native.require_local_physical_read_view(session, is_prepared=True)
-    session.execute.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("is_prepared", [True, False])
-@pytest.mark.parametrize("definition", ["SELECT 1;", "SELECT 2;"])
-@pytest.mark.parametrize("drift", [None, "body", "qualified-body", "acl", "oid", "columns"])
-async def test_fixed_read_interface_rechecks_catalog_after_access_share(monkeypatch, is_prepared, definition, drift):
-    """A valid first observation never admits a swapped view or changed privileges."""
-    prefix = "PREPARED" if is_prepared else "INSTALLED"
-    monkeypatch.setattr(native, prefix + "_LOCAL_READ_VIEW_SHA256", hashlib.sha256(b"SELECT 1;").hexdigest())
-    monkeypatch.setattr(
-        native, prefix + "_OPERATION_OWNED_READ_VIEW_SHA256", hashlib.sha256(b"SELECT 2;").hexdigest(), raising=False
-    )
-    monkeypatch.setattr(native, "local_preparation_catalog_owner", AsyncMock(return_value=73))
-    first_by_field = {
-        "oid": 88,
-        "definition": definition,
-        "read_only": True,
-        "columns": native._local_read_view_columns(is_prepared),
-    }
-    second_by_field = deepcopy(first_by_field)
-    mutations_by_name = {
-        "body": ("definition", "SELECT 3;"),
-        "qualified-body": ("definition", "SELECT 2;" if definition == "SELECT 1;" else "SELECT 1;"),
-        "acl": ("read_only", False),
-        "oid": ("oid", 89),
-        "columns": ("columns", {}),
-    }
-    if drift:
-        key, field_value = mutations_by_name[drift]
-        second_by_field[key] = field_value
-    proof = AsyncMock(side_effect=[first_by_field, second_by_field])
-    monkeypatch.setattr(native, "_local_read_view_proof", proof)
-    session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(return_value=True))
-    if drift:
-        with pytest.raises(native.PTG2PhysicalBindingError):
-            await native.require_local_physical_read_view(session, is_prepared=is_prepared)
-    else:
-        assert await native.require_local_physical_read_view(session, is_prepared=is_prepared) == 73
-    assert "ACCESS SHARE MODE NOWAIT" in str(session.execute.await_args.args[0])
-    catalog_sql = str(proof.await_args.args[1])
-    assert "security_invoker=false" in catalog_sql and "a.privilege_type<>'SELECT'" in catalog_sql
-    assert "NOT pg_has_role(current_user,CAST(:owner_oid AS oid),'MEMBER')" in str(session.scalar.await_args.args[0])
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("is_prepared", [True, False])
-async def test_unqualified_successor_refuses_before_catalog_or_lock(monkeypatch, is_prepared):
-    prefix = "PREPARED" if is_prepared else "INSTALLED"
-    monkeypatch.setattr(native, prefix + "_OPERATION_OWNED_READ_VIEW_SHA256", None, raising=False)
-    session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(return_value=True))
-    with pytest.raises(native.PTG2PhysicalBindingError, match="not qualified"):
-        await native.require_local_physical_read_view(session, is_prepared=is_prepared)
-    session.execute.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("does_refuse", [False, True])
-async def test_deparser_path_is_transaction_local_and_restored_on_refusal(does_refuse):
-    """The fixed deparser environment must not escape into the caller's following work."""
-    events = []
-
-    async def execute(query, parameters_by_name=None):
-        sql = str(query)
-        events.append((sql, parameters_by_name))
-        if "current_setting" in sql:
-            return SimpleNamespace(scalar_one=lambda: "public, pg_catalog")
-        if sql == "SELECT native proof":
-            if does_refuse:
-                raise ValueError("proof refused")
-            return SimpleNamespace(mappings=lambda: SimpleNamespace(one_or_none=lambda: {"oid": 88}))
-        return None
-
-    session = SimpleNamespace(execute=execute)
-    if does_refuse:
-        with pytest.raises(ValueError, match="proof refused"):
-            await native._local_read_view_proof(session, "SELECT native proof", {})
-    else:
-        assert await native._local_read_view_proof(session, "SELECT native proof", {}) == {"oid": 88}
-    assert "'pg_catalog, pg_temp',true" in events[1][0]
-    assert events[-1][1] == {"original_path": "public, pg_catalog"}
-    assert ":original_path,true" in events[-1][0]
-
-
-@pytest.mark.parametrize("drift", [None, "contract", "owner", "children", "model", "digest"])
-def test_projected_read_authority_requires_complete_native_inventory(drift):
-    """The original validation SHA is not falsely recomputed from a privacy-safe projection."""
-    physical_binding, authority_by_field = _view_fixture()
-    mutations_by_name = {
-        "contract": lambda: authority_by_field.update(contract="ptg.installed-physical-binding-read.v1"),
-        "owner": lambda: authority_by_field.update(owner_oid=physical_binding.owner_oid + 1),
-        "children": lambda: authority_by_field["relation_inventory"].pop(),
-        "model": lambda: authority_by_field["native_validation"]["data"].update(model_sha256="0" * 64),
-        "digest": lambda: authority_by_field.update(inventory_sha256="0" * 64),
-    }
-    if drift:
-        mutations_by_name[drift]()
-        with pytest.raises(native.PTG2PhysicalBindingError):
-            validation._local_read_authority_binding(
-                authority_by_field, physical_binding.snapshot_id, physical_binding.owner_oid, is_prepared=True
-            )
-    else:
-        assert authority_by_field["validation_sha256"] != native._native_metadata_digest(
-            authority_by_field["native_validation"]
+    if not is_prepared:
+        row_by_field["registration_sha256"] = "f" * 64
+        row_by_field["generation_inventory"] = {
+            "database_oid": 88,
+            "relations": [
+                {
+                    "schema_name": binding.schema_name,
+                    "relation_name": name,
+                    "relation_oid": oid,
+                    "schema_oid": 101,
+                    "schema_owner_oid": 102,
+                    "owner_oid": 102,
+                    "relfilenode": 700 + ordinal,
+                }
+                for ordinal, (name, oid) in enumerate(legacy.relation_oids)
+            ],
+        }
+        publication = row_by_field["native_publication"]
+        for field in ("schema_name", "relations", "sequences"):
+            publication.pop(field)
+        publication.update(
+            schema_oid=101,
+            owner_oid=102,
+            relation_oids=[list(pair) for pair in legacy.relation_oids],
+            sequence_oids=[list(entry) for entry in legacy.sequence_oids],
         )
-        assert (
-            validation._local_read_authority_binding(
-                authority_by_field, physical_binding.snapshot_id, physical_binding.owner_oid, is_prepared=True
-            )[1]
-            == physical_binding
-        )
+    return binding, row_by_field
+
+
+@pytest.mark.parametrize("is_prepared", [False, True])
+def test_known_legacy_read_projection_matches_named_content(is_prepared):
+    binding, legacy = _legacy_view_fixture(is_prepared)
+    expected = (_view_fixture() if is_prepared else _installed_fixture())[1]
+    resolved, normalized = validation._local_read_authority_binding(
+        legacy, binding.snapshot_id, is_prepared=is_prepared
+    )
+    assert resolved == binding
+    assert normalized == expected
+    assert set(normalized["native_validation"]["native_audit"]["identity"]) == native._LOCAL_AUDIT_IDENTITY_FIELDS
+
+
+@pytest.mark.parametrize("is_prepared", [False, True])
+def test_copied_legacy_metadata_ignores_only_retired_physical_values(is_prepared):
+    binding, legacy = _legacy_view_fixture(is_prepared)
+    before = validation._local_read_authority_binding(legacy, binding.snapshot_id, is_prepared=is_prepared)
+    legacy["owner_oid"] = "retired"
+    legacy["validation_sha256"] = legacy["inventory_sha256"] = None
+    evidence = legacy["native_validation"]
+    evidence["ownership"]["schema_oid"] = "different_database"
+    evidence["ownership"]["relation_oids"] = [[name, None] for name, _oid in evidence["ownership"]["relation_oids"]]
+    evidence["catalog_sha256"] = evidence["native_audit"]["catalog_sha256"] = None
+    assert validation._local_read_authority_binding(legacy, binding.snapshot_id, is_prepared=is_prepared) == before
 
 
 @pytest.mark.parametrize(
-    "field,digest,does_refuse",
+    "fault", ["contract", "missing", "duplicate", "schema", "ordinal", "unknown", "model", "selection"]
+)
+def test_named_read_rejects_incomplete_names_or_changed_content(fault):
+    binding, row = _view_fixture()
+    match fault:
+        case "contract":
+            row["contract"] = "unknown"
+        case "missing":
+            row["relation_inventory"].pop()
+        case "duplicate":
+            row["relation_inventory"][-1]["relation_name"] = row["relation_inventory"][0]["relation_name"]
+        case "schema":
+            row["relation_inventory"][0]["schema_name"] = "other"
+        case "ordinal":
+            row["relation_inventory"][0]["ordinal"] = True
+        case "unknown":
+            row["extra"] = None
+        case "model":
+            row["native_validation"]["data"]["model_sha256"] = "0" * 64
+        case "selection":
+            row["native_validation"]["native_audit"]["identity"].pop("provider_identifier_quarantine_evidence")
+    with pytest.raises(native.PTG2PhysicalBindingError):
+        validation._local_read_authority_binding(row, binding.snapshot_id, is_prepared=True)
+
+
+@pytest.mark.parametrize(
+    "field,value,refuses",
     [
         ("artifact_sha256", None, False),
         ("artifact_sha256", "a" * 64, False),
         ("artifact_sha256", "", True),
-        ("artifact_sha256", 42, True),
         ("manifest_sha256", None, True),
-        ("validation_sha256", None, True),
-        ("inventory_sha256", None, True),
+        ("publication_sha256", "g" * 64, True),
     ],
 )
-def test_projected_digest_is_optional_only_for_transport_artifact(field, digest, does_refuse):
-    """A native archive needs no second transport artifact; other binding digests remain mandatory."""
-    physical_binding, authority_by_field = _view_fixture()
-    authority_by_field[field] = digest
-    if does_refuse:
+def test_named_content_checksums_keep_transport_artifact_optional(field, value, refuses):
+    binding, row, _control = _installed_fixture()
+    row[field] = value
+    if refuses:
         with pytest.raises(native.PTG2PhysicalBindingError):
-            validation._local_read_authority_binding(
-                authority_by_field,
-                physical_binding.snapshot_id,
-                physical_binding.owner_oid,
-                is_prepared=True,
-            )
+            validation._local_read_authority_binding(row, binding.snapshot_id, is_prepared=False)
     else:
-        assert (
-            validation._local_read_authority_binding(
-                authority_by_field,
-                physical_binding.snapshot_id,
-                physical_binding.owner_oid,
-                is_prepared=True,
-            )[1]
-            == physical_binding
-        )
+        assert validation._local_read_authority_binding(row, binding.snapshot_id, is_prepared=False)[0] == binding
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("does_refuse", [False, True])
-async def test_called_read_state_fences_all_heaps_before_control_reads(monkeypatch, does_refuse):
-    """Serving evidence remains unread until every exact immutable heap is locked and rechecked."""
-    physical_binding, authority_by_field = _view_fixture()
-    events = []
-    monkeypatch.setattr(native, "PREPARED_LOCAL_READ_VIEW_SHA256", "a" * 64)
-    monkeypatch.setattr(native, "require_local_physical_read_view", AsyncMock(return_value=physical_binding.owner_oid))
-    monkeypatch.setattr(native, "local_preparation_catalog_owner", AsyncMock(return_value=physical_binding.owner_oid))
+async def test_called_read_pins_names_then_checks_logical_postimage(monkeypatch, does_refuse):
+    binding, row_by_field = _view_fixture()
+    statements = []
 
-    async def execute(query, parameters_by_name=None):
+    async def execute(query, parameters=None):
         sql = str(query)
-        events.append(sql)
-        rows = [authority_by_field] if "physical_binding" in sql and sql.startswith("SELECT") else []
+        statements.append(sql)
+        rows = [row_by_field] if sql.startswith("SELECT *") else []
         return SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: rows))
 
-    async def verify(session, ownership):
-        assert len([event for event in events if event.startswith("LOCK TABLE")]) == 42
-        events.append("catalog")
-
-    async def control(session, schema_name, binding, *, lock_controls):
-        assert events[-1] == "catalog" and lock_controls is False
-        events.append("control")
+    async def control(_session, _schema, selected, *, lock_controls):
+        assert len([sql for sql in statements if sql.startswith("LOCK TABLE")]) == len(binding.relations)
+        assert selected == binding and lock_controls is False
         return {"snapshot_id": binding.snapshot_id}
 
-    monkeypatch.setattr(native, "verify_local_data_family", verify)
-    monkeypatch.setattr(native, "_require_closed_local_custody", AsyncMock())
-    monkeypatch.setattr(native, "local_data_catalog_digest", AsyncMock(return_value="c" * 64))
     monkeypatch.setattr(native, "_local_candidate_control", control)
 
-    def postimage(candidate, *args):
-        """Only a successfully rechecked postimage may contribute a cache namespace."""
+    def check(candidate, *_args):
         if does_refuse:
             raise native.PTG2PhysicalBindingError("postimage drift")
         return candidate
 
-    monkeypatch.setattr(native, "_require_local_control_postimage", postimage)
-    session = SimpleNamespace(
-        execute=execute, scalar=AsyncMock(return_value=False), in_transaction=lambda: True, info={}
-    )
+    monkeypatch.setattr(native, "_require_local_control_postimage", check)
+    session = SimpleNamespace(execute=execute, in_transaction=lambda: True, info={})
     if does_refuse:
         with pytest.raises(native.PTG2PhysicalBindingError, match="postimage drift"):
-            await validation.local_data_physical_read_state(session, physical_binding.snapshot_id, is_prepared=True)
+            await validation.local_data_physical_read_state(session, binding.snapshot_id, is_prepared=True)
         assert session.info == {}
     else:
-        state = await validation.local_data_physical_read_state(session, physical_binding.snapshot_id, is_prepared=True)
-        assert state[2] == physical_binding and "control" in events
-        assert session.info["ptg2_local_read_bindings"] == {physical_binding.schema_name: physical_binding}
-        assert session.info["ptg2_local_read_catalog_sha256"] == {physical_binding.schema_name: "c" * 64}
-    assert not any("FOR SHARE" in event or "FOR UPDATE" in event for event in events)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("is_publisher", [False, True])
-async def test_publisher_view_requires_actual_verified_owner_inheritance(monkeypatch, is_publisher):
-    """Caller input cannot promote a reader into the separate native publisher route."""
-    monkeypatch.setattr(native, "PREPARED_LOCAL_READ_VIEW_SHA256", "a" * 64)
-    monkeypatch.setattr(native, "_local_preparation_owner", AsyncMock(return_value=73))
-    attester = AsyncMock(return_value=73)
-    monkeypatch.setattr(native, "_require_local_physical_view_catalog", attester)
-    session = SimpleNamespace(scalar=AsyncMock(return_value=is_publisher))
-    if is_publisher:
-        assert await native.require_local_physical_publisher_view(session, is_prepared=True) == 73
-        attester.assert_awaited_once_with(session, is_prepared=True, owner_oid=73)
-    else:
-        with pytest.raises(native.PTG2PhysicalBindingError, match="publisher privileges"):
-            await native.require_local_physical_publisher_view(session, is_prepared=True)
-        attester.assert_not_awaited()
-    assert "CAST(:owner_oid AS oid),'USAGE'" in str(session.scalar.await_args.args[0])
+        read_state = await validation.local_data_physical_read_state(session, binding.snapshot_id, is_prepared=True)
+        assert read_state[2] == binding
+        assert session.info == {"ptg2_local_read_bindings": {binding.schema_name: binding}}
+    assert all("pg_class" not in sql and "pg_roles" not in sql and "FOR SHARE" not in sql for sql in statements)
 
 
 @pytest.mark.asyncio

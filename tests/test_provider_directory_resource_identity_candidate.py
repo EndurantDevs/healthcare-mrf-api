@@ -66,7 +66,7 @@ class Connection:
 
 
 def _receipt(suffix, ordinal):
-    return {"name": f"pdgs_{'1' * 32}_{suffix}", "oid": ordinal, "owner": 5, "layout_sha256": "b" * 64}
+    return {"schema": "mrf", "name": f"pdgs_{'1' * 32}_{suffix}"}
 
 
 @pytest.fixture
@@ -159,17 +159,29 @@ async def test_invalid_batch_fails_before_database(scope, resource_ids):
 
 
 @pytest.mark.asyncio
-async def test_scope_and_physical_session_are_required(scope):
-    publisher, session, identity, receipt = scope
-    params_by_field = dict(source_id="cms-npd", resource_type="InsurancePlan", resource_ids=["plan"])
-    with pytest.raises(candidate.GenericCandidateError, match="physical_session_required"):
-        await bind_resource_identity_batch(session, **params_by_field)
-    async with candidate.bind_resource_identity_candidate(publisher, identity, receipt):
-        with pytest.raises(candidate.GenericCandidateError, match="physical_session_required"):
-            await bind_resource_identity_batch(object(), **params_by_field)
-        with pytest.raises(candidate.GenericCandidateError, match="physical_session_required"):
-            await asyncio.create_task(bind_resource_identity_batch(session, **params_by_field))
+async def test_logical_candidate_scope_is_required_before_copy(scope):
+    publisher, session, _, _ = scope
+    with pytest.raises(candidate.GenericCandidateError, match="candidate_scope_required"):
+        await bind_resource_identity_batch(
+            session, source_id="cms-npd", resource_type="InsurancePlan", resource_ids=["plan"]
+        )
     assert not publisher.connection.reads and not publisher.connection.copies
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["schema", "name", "extra"])
+async def test_resource_stage_name_is_scoped_before_database(scope, change):
+    publisher, _, identity, receipt = scope
+    if change == "schema":
+        receipt["schema"] = "accepted_catalog"
+    elif change == "name":
+        receipt["name"] = candidate.ROOT
+    else:
+        receipt["unexpected"] = True
+    with pytest.raises(candidate.GenericCandidateError, match="stage_receipt_changed"):
+        async with candidate.bind_resource_identity_candidate(publisher, identity, receipt):
+            pytest.fail("invalid candidate names entered")
+    assert publisher.connection.reads == publisher.connection.copies == []
 
 
 @pytest.mark.asyncio
@@ -194,7 +206,7 @@ async def test_header_is_rechecked_before_copy(scope, change):
         elif change == "extra_stage":
             header["auxiliary"]["tables"]["unknown"] = _receipt("re", 999)
         elif change == "receipt":
-            header["auxiliary"]["tables"][candidate.ROOT]["oid"] += 1
+            header["auxiliary"]["tables"][candidate.ROOT]["schema"] = "different_schema"
         else:
             header["identity"]["endpoint_id"] = "other"
         publisher.connection.binding = header

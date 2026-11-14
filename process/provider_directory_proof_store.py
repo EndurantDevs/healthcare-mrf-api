@@ -571,7 +571,22 @@ async def _insert_dataset_proof_shard(
 ) -> None:
     """Insert one immutable shard, ignoring an exact retry identity."""
 
-    await connection.status(
+    fields = (
+        "dataset_id",
+        "shard_id",
+        "endpoint_id",
+        "acquisition_root_run_id",
+        "source_ids_json",
+        "resource_count",
+        "resource_counts_json",
+        "first_identity_json",
+        "last_identity_json",
+        "input_sha256",
+        "artifact_sha256",
+        "artifact_byte_count",
+        "payload_bytes",
+    )
+    await connection.execute(
         f"""
         INSERT INTO {table_ref} (
             dataset_id, shard_id, endpoint_id, acquisition_root_run_id,
@@ -579,15 +594,11 @@ async def _insert_dataset_proof_shard(
             first_identity_json, last_identity_json, input_sha256,
             artifact_sha256, artifact_byte_count, payload_bytes
         ) VALUES (
-            :dataset_id, :shard_id, :endpoint_id, :acquisition_root_run_id,
-            CAST(:source_ids_json AS jsonb), :resource_count,
-            CAST(:resource_counts_json AS jsonb),
-            CAST(:first_identity_json AS jsonb),
-            CAST(:last_identity_json AS jsonb), :input_sha256,
-            :artifact_sha256, :artifact_byte_count, :payload_bytes
+            $1, $2, $3, $4, $5::jsonb, $6, $7::jsonb,
+            $8::jsonb, $9::jsonb, $10, $11, $12, $13
         ) ON CONFLICT (dataset_id, shard_id) DO NOTHING;
         """,
-        **params_by_name,
+        *(params_by_name[field] for field in fields),
     )
 
 
@@ -599,20 +610,19 @@ async def _persisted_shard_fields(
 ) -> dict[str, Any]:
     """Reload the durable shard fields used for replay verification."""
 
-    return _row_mapping(
-        await connection.first(
-            f"""
+    persisted_row = await connection.fetchrow(
+        f"""
             SELECT endpoint_id, acquisition_root_run_id, source_ids_json,
                    resource_count, resource_counts_json, first_identity_json,
                    last_identity_json, input_sha256, artifact_sha256,
                    artifact_byte_count, payload_bytes
               FROM {table_ref}
-             WHERE dataset_id=:dataset_id AND shard_id=:shard_id;
+             WHERE dataset_id=$1 AND shard_id=$2;
             """,
-            dataset_id=dataset_id,
-            shard_id=shard_id,
-        )
+        dataset_id,
+        shard_id,
     )
+    return dict(persisted_row) if persisted_row is not None else {}
 
 
 def _normalized_persisted_shard_fields(
@@ -684,14 +694,11 @@ async def _proof_lineage_for_contract(
     schema: str,
     dataset_id: str,
     expected_resource_hash_contract: str | None,
-    *,
-    publisher: Any = None,
 ) -> tuple[str, str, list[str], list[str] | None, str]:
     """Lock the parent and require the hash contract the rows were built under."""
     from process.provider_directory_source_proof_control import require_proof_executor
 
-    if publisher is None:
-        publisher = await require_proof_executor(connection, schema)
+    publisher = await require_proof_executor(connection, schema)
     (
         endpoint_id,
         root_run_id,
@@ -713,7 +720,9 @@ async def _store_dataset_proof_shard(
     compressed: bytes,
     proof_resource_scope: list[str] | None,
 ) -> dict[str, Any]:
-    """Insert one shard inside the parent's resource scope and require its exact replay."""
+    """Store one validated batch using the caller's active native transaction."""
+    if connection.is_in_transaction() is not True:
+        raise ProviderDirectoryProofStoreError("provider directory proof transaction required")
     if proof_resource_scope is not None and not set(descriptor_by_field["resource_counts"]).issubset(
         proof_resource_scope
     ):
@@ -724,6 +733,15 @@ async def _store_dataset_proof_shard(
     )
     await _assert_persisted_shard_replay(connection, table_ref, dataset_id, descriptor_by_field, compressed)
     return descriptor_by_field
+
+
+async def _proof_write_connection(publisher):
+    """Use the current batch transport without treating its identity as authority."""
+    from db.connection import ConnectionProxy
+    from process.provider_directory_projection_stage import _copy_driver
+
+    executor = source_copy_executor(publisher.connection)
+    return await _copy_driver(executor._connection) if isinstance(executor, ConnectionProxy) else executor
 
 
 async def persist_dataset_proof_shard(
@@ -737,17 +755,13 @@ async def persist_dataset_proof_shard(
     """Persist one retry-idempotent resource-family batch proof."""
     from process.provider_directory_source_proof_control import require_proof_executor
 
-    publisher = await require_proof_executor(connection, schema)
-    connection = source_copy_executor(connection)
     (
         endpoint_id,
         root_run_id,
         source_ids,
         proof_resource_scope,
         resource_hash_contract,
-    ) = await _proof_lineage_for_contract(
-        connection, schema, dataset_id, expected_resource_hash_contract, publisher=publisher
-    )
+    ) = await _proof_lineage_for_contract(connection, schema, dataset_id, expected_resource_hash_contract)
     descriptor_by_field, compressed = build_dataset_proof_shard(
         dataset_rows,
         dataset_id=dataset_id,
@@ -756,8 +770,14 @@ async def persist_dataset_proof_shard(
         source_ids=source_ids,
         resource_hash_contract=resource_hash_contract,
     )
+    publisher = await require_proof_executor(connection, schema)
     return await _store_dataset_proof_shard(
-        connection, schema, dataset_id, descriptor_by_field, compressed, proof_resource_scope
+        await _proof_write_connection(publisher),
+        schema,
+        dataset_id,
+        descriptor_by_field,
+        compressed,
+        proof_resource_scope,
     )
 
 
@@ -773,10 +793,8 @@ async def persist_built_dataset_proof_shard(
     """Persist a shard built off the publisher; its lineage and artifact must match the locked parent."""
     from process.provider_directory_source_proof_control import require_proof_executor
 
-    publisher = await require_proof_executor(connection, schema)
-    connection = source_copy_executor(connection)
     endpoint_id, root_run_id, source_ids, proof_resource_scope, _ = await _proof_lineage_for_contract(
-        connection, schema, dataset_id, expected_resource_hash_contract, publisher=publisher
+        connection, schema, dataset_id, expected_resource_hash_contract
     )
     lineage_fields = ("dataset_id", "endpoint_id", "acquisition_root_run_id", "source_ids")
     if (
@@ -786,8 +804,14 @@ async def persist_built_dataset_proof_shard(
         or descriptor_by_field.get("artifact_byte_count") != len(compressed)
     ):
         raise ProviderDirectoryProofStoreError("provider directory proof shard lineage changed")
+    publisher = await require_proof_executor(connection, schema)
     return await _store_dataset_proof_shard(
-        connection, schema, dataset_id, descriptor_by_field, compressed, proof_resource_scope
+        await _proof_write_connection(publisher),
+        schema,
+        dataset_id,
+        descriptor_by_field,
+        compressed,
+        proof_resource_scope,
     )
 
 
@@ -2235,12 +2259,12 @@ async def delete_dataset_proof_shards(
     from process.provider_directory_source_proof_control import lock_proof_parent, require_proof_executor
 
     publisher = await require_proof_executor(connection, schema)
-    connection = source_copy_executor(connection)
     await lock_proof_parent(publisher, dataset_id, acquiring=False)
 
-    await connection.status(
-        f"DELETE FROM {_proof_relation(schema)} WHERE dataset_id=:dataset_id;",
-        dataset_id=dataset_id,
+    connection = await _proof_write_connection(publisher)
+    await connection.execute(
+        f"DELETE FROM {_proof_relation(schema)} WHERE dataset_id=$1;",
+        dataset_id,
     )
 
 
@@ -2254,15 +2278,13 @@ async def delete_dataset_resource_proof_shards(
     from process.provider_directory_source_proof_control import lock_proof_parent, require_proof_executor
 
     publisher = await require_proof_executor(connection, schema)
-    connection = source_copy_executor(connection)
     await lock_proof_parent(publisher, dataset_id, acquiring=False)
 
-    await connection.status(
-        f"DELETE FROM {_proof_relation(schema)} "
-        "WHERE dataset_id=:dataset_id "
-        "AND resource_counts_json ? CAST(:resource_type AS text);",
-        dataset_id=dataset_id,
-        resource_type=resource_type,
+    connection = await _proof_write_connection(publisher)
+    await connection.execute(
+        f"DELETE FROM {_proof_relation(schema)} WHERE dataset_id=$1 AND resource_counts_json ? $2::text;",
+        dataset_id,
+        resource_type,
     )
 
 

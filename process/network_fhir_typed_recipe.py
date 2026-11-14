@@ -35,9 +35,8 @@ class PinnedTypedFHIRMembershipSource:
                 coordinates["dataset_id"],
                 catalog["endpoint_id"],
                 catalog["dataset_sha256"],
-                catalog["resource_table_oid"],
-                catalog["header_table_oid"],
-                catalog["database_oid"],
+                catalog["tables"]["resource"],
+                catalog["tables"]["header"],
                 catalog["source_uri"],
                 tuple(catalog["source_aliases"]),
             )
@@ -46,13 +45,11 @@ class PinnedTypedFHIRMembershipSource:
                 origin.dataset_id,
                 origin.endpoint_id,
                 origin.dataset_sha256,
-                origin.resource_parent_oid,
-                origin.header_oid,
-                origin.database_oid,
+                origin.resource_relation,
+                origin.header_relation,
                 origin.source_uri,
                 origin.source_aliases,
             )
-            and origin.resource_leaf_oid in catalog["resource_leaf_oids"]
             and coordinates["source_id"] == origin.source_id,
             "recipe_catalog",
         )
@@ -66,10 +63,10 @@ class PinnedTypedFHIRMembershipSource:
 
     @property
     def catalog_generation(self):
-        """Return the exact sealed catalog generation bound to this recipe."""
-        from process.registry_fhir_catalog_sources import fhir_catalog_source_generation
+        """Return the original logical catalog generation selected by this recipe."""
+        from process.network_fhir_typed_capture import typed_capture_catalog_generation
 
-        return fhir_catalog_source_generation(self.catalog_descriptor)
+        return typed_capture_catalog_generation(self.capture)
 
 
 @dataclass(frozen=True)
@@ -106,8 +103,6 @@ class TypedFHIRRecipeReference:
             expected_anchor=anchor,
             capture_sha256=self.capture_sha256,
             catalog_generation=self.catalog_generation,
-            owner_role=runtime.capture_owner_role,
-            runtime_roles=runtime.runtime_roles,
         )
         pin = PinnedTypedFHIRMembershipSource(capture, anchor, capture["catalog_descriptor"])
         return RegistrySourceMembershipRecipe(

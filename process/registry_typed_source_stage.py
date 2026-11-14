@@ -1,15 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Native typed membership stages and explicit mixed-format office capabilities."""
+"""Typed membership stages with named workspaces and logical office context."""
 
-import asyncio
 import hashlib
 import json
 from dataclasses import dataclass, replace
 from uuid import UUID, uuid4, uuid5
 
 from process.network_address_projection import _identifier
-from process.network_custom_address_source import _artifact_dependency_identity
-from process.network_fhir_source_epoch_pin import _virtual_xid
 from process.network_fhir_source_witness_contract import digest
 from process.network_fhir_typed_contract import require
 from process.network_fhir_typed_mapping import (
@@ -27,83 +24,56 @@ from process.registry_source_recipe_composition import (
 from process.registry_source_recipe_store import canonical_registry_source_recipes
 from process.registry_typed_source_metadata import validate_typed_contribution, validate_typed_derivation
 
-_BRAND = object()
-
 
 @dataclass
 class TypedOfficeMatches:
-    connection: object
-    task: object
-    virtual_xid: str
     table_name: str
-    table_oid: int
     recipe_sha256: str
     approved_generation_id: str
     address_source: object
-    address_identity: tuple
     runtime_roles: tuple
     mappings: tuple
     legacy_stages: tuple = ()
     child_stages: tuple = ()
-    brand: object = None
 
-    async def verify(self, connection, address_source, roles, approved, control_schema):
-        """Recheck task, transaction, approval, native address identity and child mappings."""
+    def require_ready(self, address_source, approved):
+        """Validate the mapped data workspace and its logical approval/address context."""
+        _identifier(self.table_name)
         require(
-            self.brand is _BRAND and self.connection is connection and self.task is asyncio.current_task(),
-            "office_capability",
-        )
-        require(connection.is_in_transaction() and await _virtual_xid(connection) == self.virtual_xid, "office_scope")
-        require(
-            address_source == self.address_source
-            and tuple(roles) == self.runtime_roles
-            and approved.generation_id == self.approved_generation_id,
+            address_source == self.address_source and approved.generation_id == self.approved_generation_id,
             "office_context",
         )
-        require(
-            await connection.fetchval("SELECT to_regclass($1)::oid::bigint", "pg_temp." + self.table_name)
-            == self.table_oid,
-            "office_workspace_changed",
-        )
-        require(
-            tuple(
-                await _artifact_dependency_identity(
-                    connection, address_source, roles, address=True, control_schema=control_schema
-                )
-            )
-            == self.address_identity,
-            "office_native_identity",
-        )
+        from process.network_address_projection import PinnedAddressSource
+
+        require(type(self.address_source) is PinnedAddressSource, "office_context")
+        self.address_source.__post_init__()
         for mapping in self.mappings:
-            await mapping.verify(connection)
-        # Legacy page capabilities are consumed and checked while combine copies them into this union.
-        # They remain attached for provider-only inputs and cleanup, not as capabilities across producer commits.
+            mapping.require_ready()
 
 
 def is_typed_source_stage(stage):
-    """Recognize only a typed stage carrying the original office capability brand."""
+    """Recognize the typed membership and office data representation."""
     return (
         type(stage) is RegistrySourceRecipeStage
         and stage.contribution_revision == 4
         and type(stage.office_matches) is TypedOfficeMatches
-        and stage.office_matches.brand is _BRAND
     )
 
 
 def typed_stage_projection(stage):
-    """Render membership rows only from an authenticated typed stage."""
+    """Render the declared typed membership workspace."""
     require(is_typed_source_stage(stage), "stage_kind")
     return "SELECT " + ",".join(MEMBER_COLUMNS) + " FROM pg_temp." + _identifier(stage.table_name)
 
 
 async def verify_typed_stage_offices(connection, stage, address_source, runtime_roles, approved, control_schema):
-    """Require the typed office capability against the supplied approval and address pins."""
+    """Validate logical approval and the named address snapshot."""
     require(is_typed_source_stage(stage), "stage_kind")
-    await stage.office_matches.verify(connection, address_source, runtime_roles, approved, control_schema)
+    stage.office_matches.require_ready(address_source, approved)
 
 
 async def verify_independent_typed_source_stage(connection, stage):
-    """The publication custodian may consume only a raw-Source-checked stage, never an E load capability."""
+    """Require complete or explicitly sampled Source semantics before publication."""
     from process.network_fhir_sampled_validation import SampledTypedGraphRead
     from process.network_fhir_typed_contract import TypedFHIRGraphStage
 
@@ -117,7 +87,7 @@ async def verify_independent_typed_source_stage(connection, stage):
             or (type(mapping.source_stage) is TypedFHIRGraphStage and mapping.source_stage.checked),
             "independent_source_required",
         )
-        await mapping.source_stage.verify(connection)
+        mapping.source_stage.require_ready()
 
 
 async def _bindings(connection, names):
@@ -146,11 +116,11 @@ async def _bindings(connection, names):
             + source
             + " ON CONFLICT DO NOTHING"
         )
-    return name, await connection.fetchval("SELECT to_regclass($1)::oid::bigint", "pg_temp." + name)
+    return name
 
 
 async def stage_typed_source_recipes(connection, recipes, approved, *, request_id, control_schema, read_context):
-    """Prepare from closed producer inputs; this stage does not assert independent Source verification."""
+    """Build typed memberships from named producer captures."""
     from process.registry_source_recipe_composition import load_typed_source_read
 
     return await _stage_typed_source_recipes(
@@ -167,7 +137,7 @@ async def stage_typed_source_recipes(connection, recipes, approved, *, request_i
 async def stage_verified_typed_source_recipes(
     connection, recipes, approved, *, request_id, control_schema, read_context
 ):
-    """Custodian rebuilds every Source graph through genuine complete EOF before comparison."""
+    """Rebuild Source graphs through complete EOF or explicit semantic sampling."""
     from process.registry_source_recipe_composition import require_typed_source_read
     from process.registry_typed_retained_source import retained_typed_source_proofs
 
@@ -218,7 +188,6 @@ def _typed_mapping_documents(recipe, mapped):
                     "approved_revision",
                     "approved_generation_sha256",
                     "address_source",
-                    "address_identity",
                 )
             },
             **{key: metadata["counters"][key] for key in ("matched_offices", "missing_offices")},
@@ -244,7 +213,7 @@ async def _map_typed_recipes(
                 connection, recipe, approved, control_schema, read_context.source_witness_runtime
             )
             read = RetainedTypedGraphRead(loaded, retained_proofs[recipe_sha256])
-            await read.verify(connection)
+            read.require_ready()
             sampling = getattr(read_context.source_witness_runtime, "semantic_validation", None)
             if sampling is not None:
                 await sampling.record_retained(read.proof, connection)
@@ -259,6 +228,7 @@ async def _map_typed_recipes(
                     approved_source=approved,
                     binding_coordinates=recipe.binding_coordinates,
                     catalog_descriptor=recipe.source_pin.catalog_descriptor,
+                    catalog_generation=recipe.source_pin.catalog_generation,
                 ),
                 None,
             )
@@ -314,27 +284,8 @@ async def _has_retained_sample_coverage(connection, recipe, approved, control_sc
 
 
 async def _typed_office_matches(connection, mappings, recipe_hash, approved, address_source, roles, control_schema):
-    name, oid = await _bindings(connection, [mapping.relation("bindings") for mapping in mappings])
-    address_identity_values = tuple(
-        await _artifact_dependency_identity(
-            connection, address_source, roles, address=True, control_schema=control_schema
-        )
-    )
-    matches = TypedOfficeMatches(
-        connection,
-        asyncio.current_task(),
-        await _virtual_xid(connection),
-        name,
-        oid,
-        recipe_hash,
-        approved.generation_id,
-        address_source,
-        address_identity_values,
-        tuple(roles),
-        tuple(mappings),
-        brand=_BRAND,
-    )
-    return matches
+    name = await _bindings(connection, [mapping.relation("bindings") for mapping in mappings])
+    return TypedOfficeMatches(name, recipe_hash, approved.generation_id, address_source, tuple(roles), tuple(mappings))
 
 
 async def _typed_recipe_stage(connection, recipes, approved, table, recipe_hash, mapped_outputs, matches):
@@ -355,7 +306,6 @@ async def _typed_recipe_stage(connection, recipes, approved, table, recipe_hash,
             "approved_revision",
             "approved_generation_sha256",
             "address_source",
-            "address_identity",
         )
     }
     return RegistrySourceRecipeStage(
@@ -378,7 +328,7 @@ async def _typed_recipe_stage(connection, recipes, approved, table, recipe_hash,
 async def _stage_typed_source_recipes(
     connection, recipes, approved, *, request_id, control_schema, read_context, source_reader, retained_proofs=None
 ):
-    """Stage complete typed recipes and bind their membership, office and accounting proofs."""
+    """Stage complete typed recipes with membership, office and accounting data."""
     require(
         connection.is_in_transaction()
         and type(request_id) is UUID
@@ -442,7 +392,7 @@ async def _copy_combined_stage(connection, typed_stage, legacy_stage, request_id
 async def combine_typed_source_stages(
     connection, typed_stage, legacy_stage, *, request_id, recipes, approved, control_schema
 ):
-    """Union native typed rows with unchanged legacy semantics and retain both proof capabilities."""
+    """Union typed and legacy mapped data while preserving contribution accounting."""
     require(
         is_typed_source_stage(typed_stage)
         and type(legacy_stage) is RegistrySourceRecipeStage
@@ -451,11 +401,16 @@ async def combine_typed_source_stages(
     )
     recipes, recipe_hash = _source_stage_recipes(recipes, True)
     matches = typed_stage.office_matches
-    await matches.verify(connection, matches.address_source, matches.runtime_roles, approved, control_schema)
-    from process.network_initial_cms_office_bindings import verified_retained_offices
-
-    await verified_retained_offices(
-        connection, legacy_stage.office_matches, matches.address_source, matches.runtime_roles, control_schema
+    matches.require_ready(matches.address_source, approved)
+    legacy_recipes = tuple(
+        recipe for recipe in recipes if type(recipe.source_pin) is not PinnedTypedFHIRMembershipSource
+    )
+    _, legacy_recipe_hash = _source_stage_recipes(legacy_recipes, True)
+    require(
+        legacy_stage.office_matches.address_source == matches.address_source
+        and legacy_stage.office_matches.approved_generation_id == approved.generation_id
+        and legacy_stage.office_matches.recipe_sha256 == legacy_recipe_hash,
+        "office_context",
     )
     name = await _copy_combined_stage(connection, typed_stage, legacy_stage, request_id, recipe_hash, approved)
     combined = replace(
@@ -526,7 +481,7 @@ async def _copy_typed_offices(connection, copy_target, stage):
 async def record_typed_source_offices(
     connection, copy_target, recipes, approved, address_source, runtime_roles, stage, *, control_schema=None
 ):
-    """Copy verified office bindings and record their exact candidate inventory summary."""
+    """Copy office bindings and record the complete logical inventory summary."""
     from process.network_membership_candidate_lifecycle import _control_namespace, _locked_candidate, _require_open
     from process.registry_initial_source_composition import SUMMARY_KEY, _is_receipt_match, _report
     from process.registry_source_inventory_preparation import prepare_source_inventory
@@ -558,32 +513,17 @@ async def record_typed_source_offices(
 
 
 async def rebind_typed_producer_stage(connection, stage):
-    """Revalidate sealed inputs when the ordinary producer advances to its copy transaction."""
-    from process.network_fhir_typed_capture import SealedTypedGraphRead, load_typed_graph_capture
+    """Reload declared capture names and compare content in the producer copy transaction."""
+    from process.network_fhir_typed_capture import TypedGraphRead, load_typed_graph_capture
 
     require(is_typed_source_stage(stage), "stage_kind")
-    matches = stage.office_matches
-    require(
-        matches.connection is connection and matches.task is asyncio.current_task() and connection.is_in_transaction(),
-        "office_scope",
-    )
-    require(
-        await connection.fetchval("SELECT to_regclass($1)::oid::bigint", "pg_temp." + matches.table_name)
-        == matches.table_oid,
-        "office_workspace_changed",
-    )
-    for mapping in matches.mappings:
+    require(connection.is_in_transaction(), "transaction_required")
+    for mapping in stage.office_matches.mappings:
         source = mapping.source_stage
-        require(type(source) is SealedTypedGraphRead, "producer_rebind")
-        require(
-            source.stage.connection is connection
-            and source.stage.task is asyncio.current_task()
-            and source.stage.active,
-            "producer_scope",
-        )
+        require(type(source) is TypedGraphRead, "producer_rebind")
+        source.require_ready()
         mapping.source_stage = await load_typed_graph_capture(connection, source.capture, expected_anchor=source.anchor)
-        await mapping.verify(connection)
-    matches.virtual_xid = await _virtual_xid(connection)
+        mapping.require_ready()
 
 
 async def drop_typed_source_stage(connection, stage):

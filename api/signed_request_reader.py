@@ -2,7 +2,6 @@
 """Post-authentication Reader ownership for signed extension transports."""
 
 from contextlib import asynccontextmanager, contextmanager
-from ipaddress import ip_address
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -19,25 +18,6 @@ def is_owned_reader(session):
         and current_session() is session
         and session.info.get("api_reader_verified") is True
     )
-
-
-def _safe_reader_identity(value):
-    """Keep only native scalar identifiers; never fall back to connection settings."""
-    if type(value) is not dict:
-        return None
-    numbers_by_name = {key: value.get(key) for key in ("role_oid", "database_oid", "backend_pid")}
-    if any(type(number) is not int or not 0 < number < 2**32 for number in numbers_by_name.values()):
-        return None
-    address, port = value.get("server_address"), value.get("server_port")
-    if address is None and port is None:
-        return {**numbers_by_name, "server_address": None, "server_port": None}
-    if type(address) is not str or len(address) > 45 or "%" in address or type(port) is not int or not 0 < port < 65536:
-        return None
-    try:
-        address = str(ip_address(address))
-    except ValueError:
-        return None
-    return {**numbers_by_name, "server_address": address, "server_port": port}
 
 
 def _request_uuid(value):
@@ -58,11 +38,7 @@ def _remember_reader_failure(failure, request, session, database, *, boundary, v
     try:
         if boundary not in {"signed_read", "claims_pin"}:
             return
-        identity = None
-        if session is not None and has_reader_session(database) and current_session() is session:
-            if session.info.get("api_reader_verified") is True:
-                identity = _safe_reader_identity(session.info.get("api_reader_identity"))
-        fields_by_name = {"boundary": boundary, "reader": identity}
+        fields_by_name = {"boundary": boundary}
         headers = getattr(request, "headers", {}) or {}
         verified_id = _request_uuid(verified_request_id)
         forwarded_id = _request_uuid(headers.get("X-Request-ID") or headers.get("x-request-id"))

@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import struct
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -22,21 +23,22 @@ import asyncpg
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process import registry_ptg_office_capture as capture
 from process import registry_ptg_scope_engine as scope_engine
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
-from process.network_custom_address_source import NetworkCustomAddressSourceError
 from process.network_membership_candidate_lifecycle import (
     admit_network_membership_batch,
     create_network_candidate,
     seal_network_candidate,
 )
 from process.network_membership_copy import MembershipCopyTarget
-from process.network_membership_pipeline import prepare_and_publish_network_candidate
+from process.network_membership_pipeline import prepare_network_candidate
+from process.network_membership_publication import publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
 from process.ptg_parts.result_archive_source_authority import prepare_ptg_result_archive_source_authority
+from process.registry_ptg_office_custody import RegistryPTGOfficeCustodyProfile, office_preparation_roles
 from process.registry_retained_site_adoption import RetainedSiteAdoptionError
 from tests.test_network_custom_address_source_postgres import _draft
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
@@ -161,6 +163,7 @@ async def _publish_sites(fixture, copy_targets, journal, roles):
     )
     assert await connection.fetchval("SELECT to_regnamespace($1)", copy_target.schema_name) is None
     copy_targets.append(copy_target)
+    fixture.preparation_ids.append(copy_target.candidate_id)
     journal.write_text(
         json.dumps(
             {
@@ -172,13 +175,21 @@ async def _publish_sites(fixture, copy_targets, journal, roles):
         )
     )
     await _seed_retained_membership(fixture, copy_target, source_table, provider_id, network["record_id"])
-    await prepare_and_publish_network_candidate(
+    await prepare_network_candidate(
         connection,
         copy_target,
         fixture.base,
         **_roles(fixture),
         control_schema=fixture.control_schema,
     )
+    await fixture.seal_candidate(copy_target)
+    async with fixture.execution_connection.transaction(isolation="repeatable_read"):
+        await publish_network_candidate(
+            fixture.execution_connection,
+            copy_target,
+            control_schema=fixture.control_schema,
+            preparation_roles=fixture.preparation_roles,
+        )
     async with connection.transaction(isolation="repeatable_read", readonly=True):
         serving = await resolve_network_serving_manifest(connection, control_schema=fixture.control_schema)
         sites = await connection.fetch(
@@ -192,15 +203,31 @@ async def _publish_sites(fixture, copy_targets, journal, roles):
 
 
 async def _publisher_grants(connection, fixture, roles, *, grant):
-    owner = roles[0]
+    from process.registry_ptg_published_provisioning import install_registry_ptg_office_preparation_permissions
+
     publisher = fixture.roles[2]
     database = await connection.fetchval("SELECT quote_ident(current_database())")
     if grant:
-        await connection.execute(f'GRANT CREATE ON DATABASE {database} TO "{publisher}","{owner}"')
-        await connection.execute(f'GRANT "{owner}" TO "{publisher}" WITH INHERIT FALSE, SET TRUE')
+        async with connection.transaction():
+            await install_registry_ptg_office_preparation_permissions(
+                connection,
+                profile=RegistryPTGOfficeCustodyProfile(roles[0], publisher),
+                store=fixture.service.store,
+                reader_roles=(roles[1],),
+            )
     else:
-        await connection.execute(f'REVOKE "{owner}" FROM "{publisher}"')
-        await connection.execute(f'REVOKE CREATE ON DATABASE {database} FROM "{publisher}","{owner}"')
+        await connection.execute(f'REVOKE CREATE ON DATABASE {database} FROM "{publisher}"')
+        recipients = ",".join('"' + role + '"' for role in (publisher, fixture.roles[1], roles[1]))
+        await connection.execute(f"REVOKE ALL ON SCHEMA hp_snapshot_retention FROM {recipients}")
+        await connection.execute(
+            "REVOKE ALL ON hp_snapshot_retention.preparation,hp_snapshot_retention.preparation_claim,"
+            "hp_snapshot_retention.preparation_relation,hp_snapshot_retention.relation FROM " + recipients
+        )
+        columns = await connection.fetchval(
+            "SELECT string_agg(quote_ident(column_name),',' ORDER BY ordinal_position) FROM information_schema.columns "
+            "WHERE table_schema='hp_snapshot_retention' AND table_name='preparation'"
+        )
+        await connection.execute(f"REVOKE ALL ({columns}) ON hp_snapshot_retention.preparation FROM {recipients}")
 
 
 async def _registered_request(fixture, rows, **changes):
@@ -334,7 +361,8 @@ async def _capture_context(scope_fixture, control_schema, roles):
         scope_fixture.service.store,
         control_schema,
         roles[0],
-        (roles[1],),
+        tuple(sorted((roles[1], scope_fixture.roles[1]))),
+        RegistryPTGOfficeCustodyProfile(roles[0], scope_fixture.roles[2]),
     )
     return context, scope_by_field, group
 
@@ -357,16 +385,55 @@ async def _grant_retained_reader(fixture, scope_fixture):
     await fixture.connection.execute(f'GRANT "{retained_reader}" TO "{publisher}"')
 
 
+async def _office_reader_grants(fixture, scope_fixture, roles, *, grant):
+    reader = '"' + roles[1] + '"'
+    verb, preposition = ("GRANT", "TO") if grant else ("REVOKE", "FROM")
+    source = scope_fixture.source.schema
+    control = '"' + scope_fixture.control + '"'
+    for statement in (
+        f"{verb} USAGE ON SCHEMA {source} {preposition} {reader}",
+        f"{verb} SELECT ON ALL TABLES IN SCHEMA {source} {preposition} {reader}",
+        f"{verb} UPDATE ON {source}.ptg2_snapshot {preposition} {reader}",
+        f"{verb} USAGE ON SCHEMA {control} {preposition} {reader}",
+        f"{verb} SELECT ON {control}.registry_ptg_producer_scope {preposition} {reader}",
+        f'{verb} "{fixture.roles["reader"]}" {preposition} {reader}',
+    ):
+        await fixture.connection.execute(statement)
+
+
+async def _cleanup_office_preparations(fixture, schemas):
+    identities = [UUID(schema.removeprefix("registry_ptg_office_")) for schema in schemas]
+    if not identities:
+        return
+    async with fixture.connection.transaction():
+        entries = await fixture.connection.fetch(
+            "SELECT preparation_id,node_id,importer_id FROM hp_snapshot_retention.preparation "
+            "WHERE preparation_id=ANY($1::uuid[]) FOR UPDATE NOWAIT",
+            identities,
+        )
+        assert all(entry["node_id"] == fixture.control_schema and entry["importer_id"] == "office" for entry in entries)
+        for suffix in ("_relation", "_claim", ""):
+            await fixture.connection.execute(
+                "DELETE FROM hp_snapshot_retention.preparation" + suffix + " WHERE preparation_id=ANY($1::uuid[])",
+                identities,
+            )
+
+
 async def _cleanup_office_resources(
     fixture, scope_fixture, roles, schemas, copy_targets, created_roles, is_granted, journal
 ):
+    for name in fixture.office_dependencies:
+        await fixture.connection.execute(f'DROP VIEW IF EXISTS "{fixture.control_schema}"."{name}" RESTRICT')
+    await _cleanup_office_preparations(fixture, schemas)
     for schema in schemas + [candidate.schema_name for candidate in copy_targets]:
         await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
         assert await fixture.connection.fetchval("SELECT to_regnamespace($1)", schema) is None
     if is_granted:
+        await _office_reader_grants(fixture, scope_fixture, roles, grant=False)
         await fixture.connection.execute(f'REVOKE "{fixture.roles["reader"]}" FROM "{scope_fixture.roles[2]}"')
         await _publisher_grants(fixture.connection, scope_fixture, roles, grant=False)
     for role in reversed(created_roles):
+        await fixture.connection.execute(f'DROP OWNED BY "{role}"')
         await fixture.connection.execute(f'DROP ROLE "{role}"')
         assert not await fixture.connection.fetchval("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", role)
     journal.write_text(
@@ -381,6 +448,24 @@ async def _cleanup_office_resources(
     )
 
 
+async def _create_office_roles(connection, roles, created_roles, password):
+    for role in roles:
+        assert not await connection.fetchval("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", role)
+        await connection.execute(
+            f'CREATE ROLE "{role}" ' + ("NOLOGIN" if role == roles[0] else f"LOGIN PASSWORD '{password}'")
+        )
+        created_roles.append(role)
+
+
+def _office_consumer_engine(engine, role, password):
+    return create_async_engine(
+        engine.url.set(username=role, password=password),
+        pool_size=1,
+        max_overflow=0,
+        hide_parameters=True,
+    )
+
+
 @pytest.fixture
 async def office_db(custom_db, tmp_path, monkeypatch, *, complete_graph=False):
     """Register candidate/role cleanup before provisioning native capabilities."""
@@ -388,26 +473,26 @@ async def office_db(custom_db, tmp_path, monkeypatch, *, complete_graph=False):
     roles = ["office_capture_" + kind + "_" + uuid4().hex for kind in ("owner", "consumer")]
     consumer_password = uuid4().hex
     journal = tmp_path / "office-cleanup-registration.json"
-    schemas, copy_targets, created_roles = [], [], []
+    schemas, copy_targets, created_roles, dependencies = [], [], [], []
+    custom_db.office_dependencies = dependencies
     journal.write_text(json.dumps({"phase": "registered", "roles": roles, "schemas": schemas}))
-    async with _native_scope(tmp_path, complete_graph=complete_graph) as scope_fixture:
+    async with AsyncExitStack() as cleanup, _native_scope(tmp_path, complete_graph=complete_graph) as scope_fixture:
+        if not callable(getattr(custom_db, "seal_candidate", None)):
+            from tests.test_network_compact_publication_postgres import _named_compact_runtime
+
+            await _named_compact_runtime(custom_db, cleanup, monkeypatch)
         is_granted = False
+        reader_engine = None
         try:
-            for role in roles:
-                assert not await custom_db.connection.fetchval(
-                    "SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", role
-                )
-                await custom_db.connection.execute(
-                    f'CREATE ROLE "{role}" '
-                    + ("NOLOGIN" if role == roles[0] else f"LOGIN PASSWORD '{consumer_password}'")
-                )
-                created_roles.append(role)
+            await _create_office_roles(custom_db.connection, roles, created_roles, consumer_password)
             serving, sites = await _publish_sites(custom_db, copy_targets, journal, roles)
             is_granted = True
             await _publisher_grants(custom_db.connection, scope_fixture, roles, grant=True)
             await _grant_retained_reader(custom_db, scope_fixture)
+            await _office_reader_grants(custom_db, scope_fixture, roles, grant=True)
             context, scope_by_field, group = await _capture_context(scope_fixture, custom_db.control_schema, roles)
             office_rows = [_office_row(scope_by_field, site, group, ordinal) for ordinal, site in enumerate(sites, 1)]
+            reader_engine = _office_consumer_engine(scope_fixture.engine, roles[1], consumer_password)
             yield SimpleNamespace(
                 source=scope_fixture,
                 connection=custom_db.connection,
@@ -420,11 +505,15 @@ async def office_db(custom_db, tmp_path, monkeypatch, *, complete_graph=False):
                 schemas=schemas,
                 targets=copy_targets,
                 journal=journal,
+                dependencies=dependencies,
                 sessions=scope_fixture.reader,
+                consumer_sessions=async_sessionmaker(reader_engine),
                 native_sessions=async_sessionmaker(custom_db.engine),
                 retained_reader=custom_db.roles["reader"],
             )
         finally:
+            if reader_engine is not None:
+                await reader_engine.dispose()
             await _cleanup_office_resources(
                 custom_db,
                 scope_fixture,
@@ -452,12 +541,69 @@ async def _stream(rows):
         yield capture._canonical([row])
 
 
-async def _prepare(fixture, request, batches):
+async def _prepare(fixture, request, batches, *, before_freeze=None):
     async with fixture.sessions() as session, session.begin():
         await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
-        descriptor = await capture.prepare_registry_ptg_office_capture(session, fixture.context, request, batches)
+        pending = await capture.prepare_registry_ptg_office_capture(session, fixture.context, request, batches)
         assert await session.scalar(text("SELECT current_user")) == fixture.source.roles[2]
-        return descriptor
+        assert pending["state"] == "handed_off" and pending["capture_id"] == str(request.capture_id)
+    if before_freeze is not None:
+        await before_freeze(fixture, request)
+    return await _complete_office_preparation(fixture, request)
+
+
+async def _complete_office_preparation(fixture, request):
+    """Use the real administrator freeze and complete reader witness before recording validation."""
+    from directory_catalog_runtime import freeze_registry_generation
+
+    from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
+    from process.registry_ptg_office_approval import _descriptor
+    from process.registry_ptg_office_preparation import (
+        admit_office_preparation,
+        load_named_office_preparation,
+        office_validation_report,
+    )
+    from process.registry_ptg_office_witness import verify_registry_ptg_office_witness
+
+    candidate_id = str(request.capture_id)
+    handoff = await load_named_office_preparation(
+        fixture.connection,
+        candidate_id,
+        control_schema=fixture.context.control_schema,
+    )
+    assert handoff is not None and handoff["kind"] == "office"
+    config_by_field = {field: handoff[field] for field in ("kind", "candidate_id", "catalog_schema", "storage_schema")}
+    config_by_field["preparation_roles"] = office_preparation_roles(fixture.context)
+    async with fixture.native_sessions.kw["bind"].connect() as administrator:
+        assert await freeze_registry_generation(administrator, config_by_field, candidate_id) == {
+            "preparation_id": candidate_id,
+            "state": "frozen",
+        }
+    async with fixture.consumer_sessions() as reader, reader.begin():
+        await reader.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+        descriptor = await _descriptor(reader, fixture.context, request)
+        witness = await verify_registry_ptg_office_witness(
+            reader,
+            fixture.context,
+            request,
+            descriptor,
+            read_budget=RegistryPTGGraphReadBudget(64 * 1024 * 1024),
+        )
+    async with fixture.sessions() as publisher, publisher.begin():
+        driver = await capture.native_driver(publisher)
+        store, preparation, claim = await admit_office_preparation(driver, request.capture_id, context=fixture.context)
+        assert preparation["state"] == "frozen" and claim is not None
+        validated = await store.validate_named(
+            claim,
+            {
+                "kind": "office",
+                "candidate_id": candidate_id,
+                "data": office_validation_report(descriptor, witness),
+            },
+        )
+        assert validated["state"] == "validated"
+        await store.yield_named_claim(claim)
+    return descriptor
 
 
 def test_compiled_fixture_frames_preserve_whole_input_and_cross_batch_duplicate_grain():
@@ -493,13 +639,18 @@ def test_compiled_fixture_frames_preserve_whole_input_and_cross_batch_duplicate_
 async def test_native_candidate_copy_adopts_exact_sites_and_select_only_consumer(office_db):
     fixture = office_db
     request = await _registered_request(fixture, fixture.rows)
-    descriptor = await _prepare(fixture, request, _stream(fixture.rows))
+    descriptor = await _prepare(
+        fixture,
+        request,
+        _stream(fixture.rows),
+        before_freeze=_assert_preparation_not_forgeable,
+    )
     document = descriptor.as_dict()
     assert document["manifest"]["state"] == "prepared"
     assert document["manifest"]["accounting"]["input_row_count"] == 2
     assert document["manifest"]["accounting"]["canonical_input_sha256"] == request.canonical_input_sha256
     assert document["manifest"]["command"]["retained_generation_id"] == fixture.serving.generation_id
-    assert document["custody"]["owner_role"] == fixture.roles[0] and document["custody"]["heaps"] == 2
+    assert document["storage"] == capture.office_storage(descriptor.schema_name, descriptor.manifest_sha256)
     consumer_url = fixture.source.engine.url.set(
         drivername="postgresql", username=fixture.roles[1], password=fixture.consumer_password
     )
@@ -519,9 +670,185 @@ async def test_native_candidate_copy_adopts_exact_sites_and_select_only_consumer
         )
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
             await consumer.execute(f'DELETE FROM "{descriptor.schema_name}".office_assertion')
-        assert not await consumer.fetchval("SELECT pg_has_role(current_user,$1,'SET')", fixture.roles[0])
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await consumer.execute('SET ROLE "' + fixture.roles[0] + '"')
     finally:
         await consumer.close()
+    await _assert_office_readonly(fixture, descriptor)
+
+
+async def _assert_preparation_not_forgeable(fixture, request):
+    """Exercise protected freeze columns and lifecycle CHECKs on the actual handed-off row."""
+    relation = "hp_snapshot_retention.preparation"
+    url = fixture.sessions.kw["bind"].url.set(drivername="postgresql")
+    publisher = await asyncpg.connect(
+        url.render_as_string(hide_password=False),
+        server_settings={"statement_timeout": "3s", "lock_timeout": "250ms"},
+    )
+    before = await fixture.connection.fetchrow(
+        f"SELECT state,frozen_inventory,frozen_sha256 FROM {relation} WHERE preparation_id=$1",
+        request.capture_id,
+    )
+    assert tuple(before) == ("handed_off", None, None)
+    attempts = (
+        (
+            f"UPDATE {relation} SET frozen_inventory=intake_inventory,frozen_sha256=intake_sha256 WHERE preparation_id=$1",
+            (request.capture_id,),
+            asyncpg.InsufficientPrivilegeError,
+        ),
+        (
+            f"INSERT INTO {relation} SELECT (jsonb_populate_record(NULL::{relation},to_jsonb(preparation)||"
+            "jsonb_build_object('preparation_id',$2::text,'generation_id',$2::text,'run_id',$2::text,"
+            "'dataset_key',$2::text,'state','frozen','frozen_inventory',intake_inventory,'frozen_sha256',intake_sha256))).* "
+            f"FROM {relation} preparation WHERE preparation_id=$1",
+            (request.capture_id, str(uuid4())),
+            asyncpg.InsufficientPrivilegeError,
+        ),
+        (
+            f"UPDATE {relation} SET state='frozen' WHERE preparation_id=$1",
+            (request.capture_id,),
+            (asyncpg.InsufficientPrivilegeError, asyncpg.CheckViolationError),
+        ),
+    )
+    try:
+        for statement, arguments, expected_error in attempts:
+            transaction = publisher.transaction()
+            await transaction.start()
+            try:
+                with pytest.raises(expected_error):
+                    await publisher.execute(statement, *arguments)
+            finally:
+                await transaction.rollback()
+        assert (
+            await fixture.connection.fetchrow(
+                f"SELECT state,frozen_inventory,frozen_sha256 FROM {relation} WHERE preparation_id=$1",
+                request.capture_id,
+            )
+            == before
+        )
+    finally:
+        await publisher.close()
+
+
+async def _assert_office_readonly(fixture, descriptor):
+    namespace = '"' + descriptor.schema_name + '"'
+    statements = (
+        f"INSERT INTO {namespace}.office_assertion SELECT * FROM {namespace}.office_assertion",
+        f"UPDATE {namespace}.office_assertion SET provider_id=provider_id",
+        f"DELETE FROM {namespace}.office_assertion",
+        f"TRUNCATE {namespace}.office_assertion",
+        f"ALTER TABLE {namespace}.office_assertion ADD COLUMN forbidden integer",
+        f"DROP TABLE {namespace}.office_assertion",
+        f"CREATE TABLE {namespace}.forbidden(id integer)",
+        'SET LOCAL ROLE "' + fixture.roles[0] + '"',
+    )
+    for sessions in (fixture.sessions, fixture.consumer_sessions, fixture.source.approver):
+        url = sessions.kw["bind"].url.set(drivername="postgresql")
+        actor = await asyncpg.connect(
+            url.render_as_string(hide_password=False),
+            server_settings={"statement_timeout": "3s", "lock_timeout": "250ms"},
+        )
+        try:
+            assert (
+                await actor.fetchval(f"SELECT count(*) FROM {namespace}.office_assertion")
+                == json.loads(descriptor.manifest_json)["accounting"]["input_row_count"]
+            )
+            for statement in statements:
+                await _deny_office_statement(actor, statement)
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await actor.copy_records_to_table("office_assertion", schema_name=descriptor.schema_name, records=[])
+        finally:
+            await actor.close()
+
+
+async def _deny_office_statement(actor, statement):
+    transaction = actor.transaction()
+    await transaction.start()
+    try:
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await actor.execute(statement)
+    finally:
+        await transaction.rollback()
+
+
+@pytest.mark.asyncio
+async def test_native_frozen_capture_stays_read_only_while_successor_loads(office_db):
+    fixture = office_db
+    first_request = await _registered_request(fixture, fixture.rows)
+    first = await _prepare(fixture, first_request, _stream(fixture.rows))
+    before = await fixture.connection.fetchval(
+        f'SELECT jsonb_agg(to_jsonb(office) ORDER BY ordinal)::text FROM "{first.schema_name}".office_assertion office'
+    )
+    successor_request = await _registered_request(fixture, fixture.rows)
+
+    async def successor_rows():
+        await _assert_office_readonly(fixture, first)
+        async for batch in _stream(fixture.rows):
+            yield batch
+
+    successor = await _prepare(fixture, successor_request, successor_rows())
+    assert successor.capture_id != first.capture_id and successor.schema_name != first.schema_name
+    assert (
+        await fixture.connection.fetchval(
+            f'SELECT jsonb_agg(to_jsonb(office) ORDER BY ordinal)::text FROM "{first.schema_name}".office_assertion office'
+        )
+        == before
+    )
+    await _assert_office_readonly(fixture, first)
+    await _assert_office_readonly(fixture, successor)
+
+
+@pytest.mark.asyncio
+async def test_native_unheld_admin_release_rolls_back_dependency_and_replays_exactly(office_db):
+    from directory_catalog_runtime import release_registry_generation
+
+    fixture = office_db
+    request = await _registered_request(fixture, fixture.rows)
+    descriptor = await _prepare(fixture, request, _stream(fixture.rows))
+    candidate_id = str(request.capture_id)
+    config_by_field = {
+        "kind": "office",
+        "candidate_id": candidate_id,
+        "catalog_schema": fixture.context.control_schema,
+        "storage_schema": descriptor.schema_name,
+        "preparation_roles": office_preparation_roles(fixture.context),
+    }
+    dependency = "office_release_dependency_" + uuid4().hex
+    fixture.dependencies.append(dependency)
+    fixture.journal.write_text(
+        json.dumps({**json.loads(fixture.journal.read_text()), "dependencies": fixture.dependencies})
+    )
+    await fixture.connection.execute(
+        f'CREATE VIEW "{fixture.context.control_schema}"."{dependency}" AS SELECT ordinal FROM "{descriptor.schema_name}".office_assertion'
+    )
+    before = await fixture.connection.fetchrow(
+        "SELECT state,cancellation_requested,claim_token,claim_attempt FROM hp_snapshot_retention.preparation WHERE preparation_id=$1",
+        request.capture_id,
+    )
+    async with fixture.native_sessions.kw["bind"].connect() as administrator:
+        with pytest.raises(asyncpg.DependentObjectsStillExistError):
+            await release_registry_generation(administrator, config_by_field, candidate_id)
+    assert (
+        await fixture.connection.fetchrow(
+            "SELECT state,cancellation_requested,claim_token,claim_attempt FROM hp_snapshot_retention.preparation WHERE preparation_id=$1",
+            request.capture_id,
+        )
+        == before
+    )
+    assert await fixture.connection.fetchval(f'SELECT count(*) FROM "{descriptor.schema_name}".office_assertion') == 2
+    await fixture.connection.execute(f'DROP VIEW "{fixture.context.control_schema}"."{dependency}" RESTRICT')
+    for _ in range(2):
+        async with fixture.native_sessions.kw["bind"].connect() as administrator:
+            assert await release_registry_generation(administrator, config_by_field, candidate_id) == {
+                "preparation_id": candidate_id,
+                "state": "abandoned",
+            }
+    assert await fixture.connection.fetchval("SELECT to_regnamespace($1)", descriptor.schema_name) is None
+    abandoned = await fixture.connection.fetchrow(
+        "SELECT state,cancellation_requested FROM hp_snapshot_retention.preparation WHERE preparation_id=$1",
+        request.capture_id,
+    )
+    assert tuple(abandoned) == ("abandoned", True)
 
 
 async def _binding_batch(fixture, session, descriptor, request, *, limit=1):
@@ -820,7 +1147,7 @@ async def test_native_cancellation_after_first_copy_preserves_outer_savepoint_ow
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("grants", ["table_column", "unsafe_default"])
-async def test_native_grant_closure_revokes_or_refuses_and_rolls_back(office_db, grants):
+async def test_native_admin_freeze_closes_existing_column_and_default_grants(office_db, grants):
     fixture = office_db
     request = await _registered_request(fixture, fixture.rows)
     schema = "registry_ptg_office_" + request.capture_id.hex
@@ -841,30 +1168,17 @@ async def test_native_grant_closure_revokes_or_refuses_and_rolls_back(office_db,
             async for raw in _stream(fixture.rows):
                 yield raw
 
-        if grants == "unsafe_default":
-            with pytest.raises(
-                NetworkCustomAddressSourceError, match="^Native owner or runtime privileges are not closed$"
-            ):
-                await capture.prepare_registry_ptg_office_capture(session, fixture.context, request, batches())
-            assert await driver.fetchval("SELECT to_regnamespace($1)", schema) is None
-        else:
-            descriptor = await capture.prepare_registry_ptg_office_capture(session, fixture.context, request, batches())
-            assert descriptor.schema_name == schema
-            table_oid = json.loads(descriptor.custody_json)["table_oid"]
-            assert not await driver.fetchval(
-                "SELECT has_table_privilege($1,$2::oid,'UPDATE')", fixture.roles[1], table_oid
-            )
-            assert not await driver.fetchval(
-                "SELECT has_any_column_privilege($1,$2::oid,'INSERT,UPDATE,REFERENCES')",
-                fixture.roles[1],
-                table_oid,
-            )
+        pending = await capture.prepare_registry_ptg_office_capture(session, fixture.context, request, batches())
+        assert pending["state"] == "handed_off"
         assert await driver.fetchval("SELECT current_user") == fixture.source.roles[2]
+    descriptor = await _complete_office_preparation(fixture, request)
+    assert descriptor.schema_name == schema
+    await _assert_office_readonly(fixture, descriptor)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["rls", "view", "extra_heap", "column_acl", "column_default", "owner"])
-async def test_native_catalog_substitutions_refuse_and_rollback_restores(office_db, damage):
+@pytest.mark.parametrize("damage", ["view", "column_default"])
+async def test_native_declared_column_shape_refuses_and_rollback_restores(office_db, damage):
     fixture = office_db
     request = await _registered_request(fixture, fixture.rows)
     descriptor = await _prepare(fixture, request, _stream(fixture.rows))
@@ -873,27 +1187,51 @@ async def test_native_catalog_substitutions_refuse_and_rollback_restores(office_
     await transaction.start()
     try:
         statement_by_damage = {
-            "rls": f"ALTER TABLE {namespace}.office_assertion ENABLE ROW LEVEL SECURITY",
             "view": f"ALTER TABLE {namespace}.office_assertion RENAME TO replaced_heap; CREATE VIEW {namespace}.office_assertion AS SELECT * FROM {namespace}.replaced_heap",
-            "extra_heap": f"CREATE TABLE {namespace}.unregistered_fact(id integer)",
-            "column_acl": f'GRANT UPDATE(provider_id) ON {namespace}.office_assertion TO "{fixture.roles[1]}"',
             "column_default": f"ALTER TABLE {namespace}.office_assertion ALTER provider_id SET DEFAULT '1999999901'",
-            "owner": f"ALTER TABLE {namespace}.office_assertion OWNER TO CURRENT_USER",
         }
         await fixture.connection.execute(statement_by_damage[damage])
-        error_type, error_message = (
-            (NetworkCustomAddressSourceError, "^Native owner or runtime privileges are not closed$")
-            if damage == "column_acl"
-            else (capture.RegistryPTGOfficeCaptureError, "^registry_ptg_office_custody_invalid$")
-        )
-        with pytest.raises(error_type, match=error_message):
-            await capture._custody(fixture.connection, descriptor.schema_name, fixture.context)
+        with pytest.raises(capture.RegistryPTGOfficeCaptureError, match="layout_invalid"):
+            await capture._require_office_layout(fixture.connection, descriptor.schema_name, is_published=False)
     finally:
         await transaction.rollback()
-    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
-        assert await capture._custody(fixture.connection, descriptor.schema_name, fixture.context) == json.loads(
-            descriptor.custody_json
+    async with fixture.consumer_sessions() as reader, reader.begin():
+        from process.registry_ptg_office_approval import _descriptor
+
+        assert await _descriptor(reader, fixture.context, request) == descriptor
+
+
+@pytest.mark.asyncio
+async def test_native_hidden_office_rows_refuse_and_restored_data_serves(office_db):
+    from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
+    from process.registry_ptg_office_witness import verify_registry_ptg_office_witness
+
+    fixture = office_db
+    request = await _registered_request(fixture, fixture.rows)
+    descriptor = await _prepare(fixture, request, _stream(fixture.rows))
+    relation = '"' + descriptor.schema_name + '".office_assertion'
+    await fixture.connection.execute(f"ALTER TABLE {relation} ENABLE ROW LEVEL SECURITY")
+    try:
+        async with fixture.consumer_sessions() as reader, reader.begin():
+            with pytest.raises(capture.RegistryPTGOfficeCaptureError, match="accounting_invalid"):
+                await verify_registry_ptg_office_witness(
+                    reader,
+                    fixture.context,
+                    request,
+                    descriptor,
+                    read_budget=RegistryPTGGraphReadBudget(64 * 1024 * 1024),
+                )
+    finally:
+        await fixture.connection.execute(f"ALTER TABLE {relation} DISABLE ROW LEVEL SECURITY")
+    async with fixture.consumer_sessions() as reader, reader.begin():
+        evidence = await verify_registry_ptg_office_witness(
+            reader,
+            fixture.context,
+            request,
+            descriptor,
+            read_budget=RegistryPTGGraphReadBudget(64 * 1024 * 1024),
         )
+        assert evidence.as_dict()["accounting"]["input_row_count"] == request.input_row_count
 
 
 def test_compiled_capture_encoder_has_exact_copy_shape_and_canonical_stream():

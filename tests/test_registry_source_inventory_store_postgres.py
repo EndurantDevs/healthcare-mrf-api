@@ -12,9 +12,6 @@ import asyncpg
 import pytest
 
 from process import registry_source_inventory_store as store
-from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
-from process.network_fhir_membership_source import with_fhir_successor
-from process.network_fhir_retained_capture_contract import SEMANTIC_PROFILE, capture_digest
 from process.network_membership_candidate_lifecycle import (
     MembershipCandidateError,
     create_network_candidate,
@@ -32,35 +29,13 @@ from process.registry_source_inventory_reference import SourceInventoryReference
 from process.registry_source_inventory_summaries import contribution_summary_v3
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe, canonical_registry_source_recipes
 from tests.registry_compact_target_postgres_support import coverage_reader
+from tests.registry_source_recipe_support import _capture_recipe, _example
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
-from tests.test_network_fhir_retained_capture import pin, retained
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 from tests.test_registry_ptg_office_membership_recipe import _recipe as _ptg_recipe
 from tests.test_registry_source_inventory_contract import _entries
 from tests.test_registry_source_inventory_schema_postgres import _migration
-from tests.test_registry_source_recipe_store_postgres import _cms_custody_recipe, _cms_epoch_recipe, _example
-
-
-def _capture_recipe():
-    captures = []
-    for dataset in ("dataset-one", "dataset-two"):
-        capture = retained()
-        origin = replace(
-            capture.origin,
-            dataset_id=dataset,
-            admission_profile=SEMANTIC_PROFILE,
-            original_admission_refusal=None,
-            admission_metadata_sha256="1" * 64,
-            semantic_projection_as_of="2026-01-01",
-            descriptor_counts=capture.origin.resource_counts,
-        )
-        capture = replace(capture, origin=origin)
-        captures.append(replace(capture, capture_sha256=capture_digest(capture)))
-    source = with_fhir_successor(pin(captures[0]), pin(captures[1]))
-    coordinates = RegistryNetworkSourceCoordinates(
-        "fhir", source.source_id, source.schema_name, source.dataset_id, "fixture-producer", captures[0].capture_id
-    )
-    return RegistrySourceMembershipRecipe(source, coordinates)
+from tests.test_registry_source_recipe_store_postgres import _cms_custody_recipe, _cms_epoch_recipe
 
 
 @pytest.mark.parametrize("recipe", [_example(), _cms_epoch_recipe(), _ptg_recipe(), _capture_recipe()])

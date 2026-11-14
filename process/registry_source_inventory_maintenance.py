@@ -1,51 +1,59 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Locked, fresh maintenance reads of independently sealed inventory metadata."""
+"""Fresh maintenance reads of complete named source inventory data."""
 
-from process import network_candidate_custody as custody
+from uuid import UUID
+
+from process.network_membership_candidate_lifecycle import _control_namespace, _require_transaction
+from process.registry_source_inventory_contract import RegistrySourceInventoryError
 from process.registry_source_inventory_reference import verify_source_recipe_metadata
 from process.registry_source_inventory_store import (
     INVENTORY_TABLE,
     MAX_INVENTORY_PAGE_BYTES,
+    SourceInventoryStoreReceipt,
     _fold_inventory,
-    _physical_context,
+    _relation,
 )
+from process.registry_source_recipe_store import _decode_document
 
 
-async def _sealed_snapshot(connection, copy_target, control_schema):
-    control = await custody._control(connection, control_schema)
-    candidate = await custody._candidate(connection, copy_target, control_schema)
-    seal = await custody._seal(connection, copy_target, control_schema)
-    verified = await custody._verify(connection, copy_target, control_schema, control, candidate, seal)
-    return control, candidate, seal, verified
+async def _inventory_snapshot(connection, copy_target, control_schema):
+    candidate = await connection.fetchrow(
+        f"SELECT * FROM {_control_namespace(control_schema)}.network_membership_candidate WHERE candidate_id=$1",
+        UUID(copy_target.candidate_id),
+    )
+    fields = ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
+    if (
+        candidate is None
+        or any(str(candidate[field]) != getattr(copy_target, field) for field in fields)
+        or candidate["state"] not in {"ready", "published"}
+    ):
+        raise RegistrySourceInventoryError("registry_source_inventory_scope_invalid")
+    metadata = verify_source_recipe_metadata(candidate)
+    if metadata.inventory is None:
+        raise RegistrySourceInventoryError("registry_source_inventory_scope_invalid")
+    return dict(candidate), metadata
 
 
 async def read_sealed_source_inventory_for_maintenance(connection, copy_target, *, control_schema):
-    """Fold immutable metadata under maintenance locks in a fresh RC transaction.
+    """Fold complete inventory data in the caller's fresh read-committed transaction.
 
-    Cleanup checks run before and after their exact exclusive target locks, so
-    they must not reuse an older repeatable-read snapshot. Full native custody
-    verifies and locks the independently sealed heaps before this fold. A second
-    full verification checks fresh control, seal and normalized candidate evidence;
-    publication and its matching checkpoint may advance without changing that evidence.
-    The caller keeps the transaction and all locks until its cleanup decision ends.
-    This grants neither Source admission nor API read authority.
+    The named read lock remains held for the caller's cleanup decision. Logical
+    candidate scope and complete inventory metadata must match before and after
+    the bounded fold; publication state and its checkpoint may advance.
     """
-    custody._require(connection.is_in_transaction())
-    custody._require(await connection.fetchval("SHOW transaction_isolation") == "read committed")
-    initial_control, candidate, initial_seal, verified = await _sealed_snapshot(connection, copy_target, control_schema)
-    inventory = verify_source_recipe_metadata(candidate).inventory
-    custody._require(inventory is not None)
-    inventory_oid = verified["receipt"]["closure"]["relation_oids"][INVENTORY_TABLE]
-    relation = await _physical_context(connection, copy_target, inventory_oid, control_schema)
+    _require_transaction(connection, copy_target)
+    if await connection.fetchval("SHOW transaction_isolation") != "read committed":
+        raise RegistrySourceInventoryError("registry_source_inventory_snapshot_invalid")
+    initial_candidate, initial_metadata = await _inventory_snapshot(connection, copy_target, control_schema)
+    inventory = initial_metadata.inventory
+    relation = _relation(copy_target)
+    await connection.execute(f"LOCK TABLE ONLY {relation} IN ACCESS SHARE MODE NOWAIT")
     entries = []
     await _fold_inventory(connection, relation, inventory.root, 100, MAX_INVENTORY_PAGE_BYTES, entries.append)
-    final_control, final_candidate, final_seal, final_verified = await _sealed_snapshot(
-        connection, copy_target, control_schema
-    )
-    custody._require(
-        final_control == initial_control
-        and dict(final_seal) == dict(initial_seal)
-        and final_verified == verified
-        and verify_source_recipe_metadata(final_candidate).inventory == inventory
-    )
-    return final_candidate, final_verified, tuple(entries)
+    final_candidate, final_metadata = await _inventory_snapshot(connection, copy_target, control_schema)
+    if final_metadata != initial_metadata or _decode_document(
+        final_candidate["source_generations"]
+    ) != _decode_document(initial_candidate["source_generations"]):
+        raise RegistrySourceInventoryError("registry_source_inventory_root_changed")
+    receipt = SourceInventoryStoreReceipt(copy_target.schema_name, INVENTORY_TABLE, inventory.root)
+    return final_candidate, receipt, tuple(entries)

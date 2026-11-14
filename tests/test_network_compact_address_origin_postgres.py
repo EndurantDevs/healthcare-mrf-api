@@ -6,7 +6,6 @@ import time
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -17,10 +16,9 @@ from sqlalchemy.pool import NullPool
 
 from api.network_address_scope import (
     network_address_read_session_scope,
-    scoped_address_parameters,
-    scoped_address_relation_sql,
 )
-from api.network_read_execution import execute_network_read
+from api.network_compact_address import compact_address_native_sql
+from api.network_read_execution import bounded_network_read_rows
 from api.network_serving_api_read import api_catalog_read_snapshot
 from api.reference_family_reads import pin_claims_reader
 from db.connection import Database, current_session
@@ -28,13 +26,13 @@ from process import network_indexed_address_artifact as indexed
 from process.entity_address_unified import _location_key_expr
 from process.network_address_artifact import NetworkAddressArtifactError, verify_network_address_artifact
 from process.network_address_projection import PinnedAddressSource
+from process.network_compact_layout import CompactAddressRelation
 from process.network_legacy_membership_source import PinnedACAMembershipSource
 from process.network_membership_candidate_lifecycle import create_network_candidate, seal_network_candidate
 from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_pipeline import prepare_network_candidate
 from process.network_membership_publication import publish_network_candidate
 from process.network_published_api_pin import published_api_pin_statement
-from process.network_serving_read import NetworkServingReadUnavailable
 from process.registry_candidate_composition import (
     RegistryCompositionAddressSources,
     compose_registry_membership_candidate,
@@ -42,10 +40,17 @@ from process.registry_candidate_composition import (
 from process.registry_publication_consumer import _publication_address_sources
 from process.registry_retained_generation import RegistryRetainedGenerationError
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
-from tests.registry_candidate_custody_postgres_support import install_candidate_custody
 from tests.test_network_address_artifact_postgres import _rotate
 from tests.test_network_address_artifact_postgres import address_db as address_db
-from tests.test_network_compact_publication_postgres import _bind_offices, _candidate, _prepare, _publish, _read, _seal
+from tests.test_network_compact_publication_postgres import (
+    _bind_offices,
+    _candidate,
+    _named_compact_runtime,
+    _prepare,
+    _publish,
+    _read,
+    _seal,
+)
 from tests.test_network_compact_publication_postgres import compact_publication_db as compact_publication_db
 from tests.test_network_custom_address_source_postgres import _bootstrap_prepare, _bootstrap_specification, _seed
 from tests.test_network_custom_address_source_postgres import bootstrap_db as bootstrap_db
@@ -129,7 +134,6 @@ async def test_rotated_aca_successor_preserves_selected_office_and_pinned_reads(
         current, actual_rows = await _read(fixture, network_ids=(network_id,))
         assert actual_rows == original_rows
         assert current.compact_layout.base == previous.compact_layout.base
-        assert current.compact_layout.base.table_name.endswith("_retained_" + format(previous.address_table_oid, "x"))
         assert (await _read(fixture, previous.generation_id, network_ids=(network_id,)))[1] == original_rows
         report = json.loads(
             await fixture.connection.fetchval(
@@ -168,11 +172,8 @@ async def test_new_generation_reuses_authenticated_retained_heap_after_rotation(
     await _seal(fixture, second)
     await _publish(fixture, second)
     current, actual = await _read(fixture)
-    assert actual == office_rows and current.address_table_oid == previous.address_table_oid
-    assert current.compact_layout.base.table_name.endswith("_retained_" + format(previous.address_table_oid, "x"))
-    assert current.compact_layout.base.table_oid != await fixture.connection.fetchval(
-        "SELECT to_regclass($1)::oid::bigint", fixture.source.schema_name + ".entity_address_unified"
-    )
+    assert actual == office_rows and current.compact_layout.base == previous.compact_layout.base
+    assert current.compact_layout.base != CompactAddressRelation(fixture.source.schema_name, fixture.source.table_name)
     assert (
         await fixture.connection.fetchval("SELECT to_regclass($1)", second.schema_name + ".entity_address_unified")
         is None
@@ -224,10 +225,10 @@ async def _populate_parent_addresses(connection, parent, row_count):
     )
 
 
-async def _open_fixture_actors(fixture, stack, password):
+async def _open_fixture_actors(fixture, stack, password, monkeypatch):
     """Register and open the existing independent custody and reader fixture actors."""
     connection, control_schema, engine = fixture.connection, fixture.control_schema, fixture.engine
-    await install_candidate_custody(fixture, stack)
+    await _named_compact_runtime(fixture, stack, monkeypatch)
     fixture.runtime_roles = tuple(sorted((fixture.executor_role, fixture.roles["reader"])))
     await connection.execute(f'GRANT USAGE ON SCHEMA "{control_schema}" TO "{fixture.roles["reader"]}"')
     await connection.execute(f'GRANT SELECT ON ALL TABLES IN SCHEMA "{control_schema}" TO "{fixture.roles["reader"]}"')
@@ -253,7 +254,7 @@ async def _open_fixture_actors(fixture, stack, password):
 
 
 async def _publish_unsealed_legacy(fixture):
-    """Publish the indexed predecessor with writer closure and no independent seal."""
+    """Publish the flat predecessor through the normal named freeze and validation."""
     connection, control_schema = fixture.connection, fixture.control_schema
     identity = uuid4()
     fixture.legacy = MembershipCopyTarget(
@@ -284,22 +285,20 @@ async def _publish_unsealed_legacy(fixture):
         reader_roles=(fixture.roles["reader"],),
         control_schema=control_schema,
     )
+    await _seal(fixture, fixture.legacy)
     async with connection.transaction(isolation="repeatable_read"):
         publication_by_field = await publish_network_candidate(
-            connection, fixture.legacy, control_schema=control_schema
+            connection, fixture.legacy, control_schema=control_schema, preparation_roles=fixture.preparation_roles
         )
     fixture.indexed_source = PinnedAddressSource(
         fixture.legacy.schema_name, "entity_address_unified", publication_by_field["manifest_sha256"]
-    )
-    assert not await connection.fetchval(
-        f'SELECT EXISTS(SELECT FROM "{control_schema}".network_candidate_custody WHERE candidate_id=$1)', identity
     )
     return publication_by_field
 
 
 @pytest.fixture
 async def indexed_db(bootstrap_db, serving_schema, request, monkeypatch):
-    """Own an authenticated bootstrap, unsealed indexed predecessor and sealed compact head."""
+    """Own the actual bootstrap, validated flat predecessor and named compact head."""
     parent = bootstrap_db
     connection, control_schema, engine = serving_schema
     password = uuid4().hex
@@ -327,19 +326,14 @@ async def indexed_db(bootstrap_db, serving_schema, request, monkeypatch):
         "a" * 64,
     )
     async with AsyncExitStack() as stack:
-        await _open_fixture_actors(fixture, stack, password)
+        await _open_fixture_actors(fixture, stack, password, monkeypatch)
         publication_by_field = await _publish_unsealed_legacy(fixture)
         fixture.current = await _candidate(
             fixture, (42,), publication_by_field["generation_id"], locations=fixture.locations
         )
         await _prepare(fixture, fixture.current)
         await _seal(fixture, fixture.current)
-        from process import network_membership_serving_indexes
-
-        # Retain the historical unindexed head; every tested successor uses the new gate.
-        with monkeypatch.context() as historical:
-            historical.setattr(network_membership_serving_indexes, "verify_network_search_indexes", AsyncMock())
-            await _publish(fixture, fixture.current)
+        await _publish(fixture, fixture.current)
         fixture.previous, fixture.previous_rows = await _read(fixture)
         yield fixture
 
@@ -403,7 +397,7 @@ async def test_indexed_adoption_ignores_old_arrays_and_preserves_rollback_and_ne
     current, address_rows = await _read(fixture)
     assert current.supports_location_lookup and not fixture.previous.supports_location_lookup
     assert address_rows == fixture.previous_rows
-    assert current.address_table_oid != fixture.previous.address_table_oid
+    assert current.compact_layout.base != fixture.previous.compact_layout.base
     assert current.compact_layout.base.schema_name == fixture.legacy.schema_name
     assert current.source_generations["retained_network_source"] == fixture.previous.manifest_sha256
     previous, previous_rows = await _read(fixture, fixture.previous.generation_id)
@@ -419,12 +413,13 @@ async def test_indexed_adoption_ignores_old_arrays_and_preserves_rollback_and_ne
     )
 
     descriptor = await _address_descriptor(fixture, copy_target)
-    for oid in (descriptor["table"]["oid"], descriptor["catalog"]["indexes"][0]["index_oid"]):
-        async with fixture.connection.transaction(isolation="read_committed"):
-            with pytest.raises(NetworkCompactRetentionError, match="artifact_referenced"):
-                await require_network_compact_artifacts_unreferenced(
-                    fixture.connection, [oid], control_schema=fixture.control_schema
-                )
+    async with fixture.connection.transaction(isolation="read_committed"):
+        with pytest.raises(NetworkCompactRetentionError, match="artifact_referenced"):
+            await require_network_compact_artifacts_unreferenced(
+                fixture.connection,
+                [CompactAddressRelation(**descriptor["table"])],
+                control_schema=fixture.control_schema,
+            )
 
     successor = await _candidate(fixture, (42,), current.generation_id, source_manifest=current)
     await _prepare(fixture, successor)
@@ -459,10 +454,13 @@ async def test_new_independent_seal_rejects_forged_legacy_content_without_advanc
         )
         == fixture.previous.generation_id
     )
-    assert not await fixture.connection.fetchval(
-        f'SELECT EXISTS(SELECT FROM "{fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1)',
-        UUID(target.candidate_id),
+    report = json.loads(
+        await fixture.connection.fetchval(
+            f'SELECT validation_json FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
+            UUID(target.candidate_id),
+        )
     )
+    assert "final_validation" not in report
 
 
 async def test_worker_selected_indexed_base_requires_exact_retained_generation(indexed_db):
@@ -474,7 +472,7 @@ async def test_worker_selected_indexed_base_requires_exact_retained_generation(i
     assert current == fixture.previous and rows == fixture.previous_rows
 
 
-async def test_indexed_dependency_verifies_native_identity_and_role_closure(indexed_db):
+async def test_indexed_dependency_keeps_named_scope_and_snapshot(indexed_db):
     from process.registry_publication_execution import _source_rollback_address_sources
 
     fixture = indexed_db
@@ -489,38 +487,17 @@ async def test_indexed_dependency_verifies_native_identity_and_role_closure(inde
     assert worker_addresses.npi_source == fixture.bootstrap.npi_source
     descriptor = await _address_descriptor(fixture, candidate)
     async with fixture.execution_connection.transaction(isolation="repeatable_read", readonly=True):
-        relation = await verify_network_address_artifact(
-            fixture.execution_connection, descriptor, runtime_roles=tuple(descriptor["runtime_roles"])
-        )
-        assert relation.table_oid == descriptor["table"]["oid"]
-    with pytest.raises(ValueError, match="repeatable-read transaction"):
-        await verify_network_address_artifact(
-            fixture.execution_connection, descriptor, runtime_roles=tuple(descriptor["runtime_roles"])
-        )
-    await fixture.connection.execute(
-        f'GRANT UPDATE ON "{fixture.legacy.schema_name}".entity_address_unified TO "{fixture.roles["reader"]}"'
-    )
-    try:
-        with pytest.raises(NetworkAddressArtifactError, match="runtime_privileges_invalid"):
-            async with fixture.execution_connection.transaction(isolation="repeatable_read", readonly=True):
-                await verify_network_address_artifact(
-                    fixture.execution_connection,
-                    descriptor,
-                    runtime_roles=tuple(descriptor["runtime_roles"]),
-                )
-    finally:
-        await fixture.connection.execute(
-            f'REVOKE UPDATE ON "{fixture.legacy.schema_name}".entity_address_unified FROM "{fixture.roles["reader"]}"'
-        )
+        relation = await verify_network_address_artifact(fixture.execution_connection, descriptor)
+        assert relation == CompactAddressRelation(**descriptor["table"])
+    with pytest.raises(NetworkAddressArtifactError, match="transaction_required"):
+        await verify_network_address_artifact(fixture.execution_connection, descriptor)
     async with fixture.execution_connection.transaction(isolation="repeatable_read", readonly=True):
-        relation = await verify_network_address_artifact(
-            fixture.execution_connection, descriptor, runtime_roles=tuple(descriptor["runtime_roles"])
-        )
-        assert relation.table_oid == descriptor["table"]["oid"]
+        relation = await verify_network_address_artifact(fixture.execution_connection, descriptor)
+        assert relation == CompactAddressRelation(**descriptor["table"])
 
 
 async def test_indexed_reader_digest_is_independent_of_public_schema_visibility(address_db):
-    from process.entity_address_native_publication import _catalog_evidence
+    from process.network_custom_address_source import _source_columns
     from process.network_membership_serving_indexes import (
         _build_serving_indexes,
         _index_digest,
@@ -533,77 +510,47 @@ async def test_indexed_reader_digest_is_independent_of_public_schema_visibility(
     for extension in ("intarray", "btree_gin", "btree_gist"):
         await fixture.admin.execute("CREATE EXTENSION IF NOT EXISTS " + extension)
     await _build_serving_indexes(fixture.admin, fixture.schema, plan)
-    # Schema visibility changes belong only to this fixture's disposable database.
     await fixture.admin.execute("REVOKE USAGE ON SCHEMA public FROM PUBLIC")
     await fixture.admin.execute(f'GRANT USAGE ON SCHEMA public TO "{fixture.roles["reader"]}"')
-    oid = fixture.descriptor["table"]["oid"]
-    handoff_by_field = {
-        "schema_name": fixture.schema,
-        "stage_relations": [
-            {"table_name": "entity_address_unified", "stage_name": "entity_address_unified", "relation_oid": oid}
-        ],
-    }
+    relation = CompactAddressRelation(fixture.schema, "entity_address_unified")
     observations_by_role = {}
-    for name, connection, public_usage in (("publisher", fixture.publisher, False), ("reader", fixture.reader, True)):
-        assert await connection.fetchval(
-            "SELECT current_user=session_user AND current_user::text=$1", fixture.roles[name]
-        )
-        assert await connection.fetchval("SELECT has_schema_privilege(current_user,'public','USAGE')") is public_usage
+    for name, connection in (("publisher", fixture.publisher), ("reader", fixture.reader)):
         async with connection.transaction(isolation="repeatable_read", readonly=True):
-            physical = await indexed.artifact._physical(connection, oid)
-            catalog = await _catalog_evidence(indexed.artifact._CatalogSession(connection), handoff_by_field)
+            columns = await _source_columns(connection, relation, address=True)
             canonical = await _index_digest(connection, fixture.schema, plan, qualified_definitions=True)
             legacy = await _index_digest(connection, fixture.schema, plan)
             definitions = [
                 index_record["index_definition"]
                 for index_record in await _serving_index_records(connection, fixture.schema)
             ]
-            observations_by_role[name] = physical, catalog, canonical, legacy, definitions
+            observations_by_role[name] = columns, canonical, legacy, definitions
     publisher, reader = observations_by_role["publisher"], observations_by_role["reader"]
-    assert publisher[:3] == reader[:3]
-    assert publisher[2] == publisher[3] != reader[3]
-    assert any("public.st_makepoint" in definition for definition in publisher[4])
-    assert any("public.gin__int_ops" in definition for definition in publisher[4])
-    assert all("public.st_makepoint" not in definition for definition in reader[4])
+    assert publisher[:2] == reader[:2]
+    assert publisher[1] == publisher[2] != reader[2]
+    assert any("public.st_makepoint" in definition for definition in publisher[3])
+    assert any("public.gin__int_ops" in definition for definition in publisher[3])
+    assert all("public.st_makepoint" not in definition for definition in reader[3])
 
     await fixture.admin.execute(
         f'ALTER INDEX "{fixture.schema}".entity_address_unified_idx_geo_idx SET (fillfactor=80)'
     )
     async with fixture.reader.transaction(isolation="repeatable_read", readonly=True):
-        assert await indexed.artifact._physical(fixture.reader, oid) == reader[0]
-        assert await _catalog_evidence(indexed.artifact._CatalogSession(fixture.reader), handoff_by_field) == reader[1]
-        assert await _index_digest(fixture.reader, fixture.schema, plan, qualified_definitions=True) != reader[2]
-        assert await _index_digest(fixture.reader, fixture.schema, plan) != reader[3]
+        assert await _source_columns(fixture.reader, relation, address=True) == reader[0]
+        assert await _index_digest(fixture.reader, fixture.schema, plan, qualified_definitions=True) != reader[1]
+        assert await _index_digest(fixture.reader, fixture.schema, plan) != reader[2]
 
 
-@pytest.mark.parametrize("damage", ["oid", "definition"])
-async def test_changed_index_cannot_satisfy_sealed_native_identity(indexed_db, damage):
+async def test_changed_index_definition_refuses_retained_data(indexed_db):
     fixture = indexed_db
     target = await _adopt(fixture)
     await _seal(fixture, target)
     await _publish(fixture, target)
     descriptor = await _address_descriptor(fixture, target)
-    if damage == "oid":
-        index, definition = await fixture.connection.fetchrow(
-            "SELECT quote_ident(n.nspname)||'.'||quote_ident(c.relname),pg_get_indexdef(c.oid) "
-            "FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid "
-            "JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_am a ON a.oid=c.relam "
-            "WHERE i.indrelid=$1::oid AND a.amname='gin' ORDER BY c.oid LIMIT 1",
-            descriptor["table"]["oid"],
-        )
-        await fixture.connection.execute("DROP INDEX " + index)
-        await fixture.connection.execute(definition)
-        assert await fixture.connection.fetchval("SELECT pg_get_indexdef(to_regclass($1))", index) == definition
-    else:
-        index = f'"{fixture.legacy.schema_name}".entity_address_unified_idx_geo_idx'
-        await fixture.connection.execute("ALTER INDEX " + index + " SET (fillfactor=80)")
+    index = f'"{fixture.legacy.schema_name}".entity_address_unified_idx_geo_idx'
+    await fixture.connection.execute("ALTER INDEX " + index + " SET (fillfactor=80)")
     async with fixture.execution_connection.transaction(isolation="repeatable_read", readonly=True):
         with pytest.raises(NetworkAddressArtifactError, match="indexed_artifact_changed"):
-            await verify_network_address_artifact(
-                fixture.execution_connection,
-                descriptor,
-                runtime_roles=tuple(descriptor["runtime_roles"]),
-            )
+            await verify_network_address_artifact(fixture.execution_connection, descriptor)
 
 
 async def test_indexed_custom_npi_input_keeps_authenticated_bootstrap_identity(indexed_db):
@@ -618,7 +565,7 @@ async def test_indexed_custom_npi_input_keeps_authenticated_bootstrap_identity(i
         }
     }
     async with fixture.execution_connection.transaction(isolation="repeatable_read"):
-        summary, _, npi, identity, physical = await _capture_inputs(
+        summary, _, npi, relation = await _capture_inputs(
             fixture.execution_connection,
             fixture.indexed_source,
             approval.revision,
@@ -631,21 +578,19 @@ async def test_indexed_custom_npi_input_keeps_authenticated_bootstrap_identity(i
     assert npi == PinnedAddressSource(
         fixture.bootstrap.address_source.schema_name, "npi", fixture.bootstrap.generation_sha256
     )
-    assert identity[1] == dict(fixture.bootstrap.relation_oids)["npi"]
-    assert physical.schema_name == fixture.indexed_source.schema_name
+    assert relation == CompactAddressRelation(fixture.indexed_source.schema_name, fixture.indexed_source.table_name)
 
 
 @pytest.mark.parametrize("indexed_db", [100001], indirect=True)
 async def test_complete_indexed_content_proof_is_bounded_across_many_ranges(indexed_db, monkeypatch, record_property):
     fixture = indexed_db
     copy_target = await _adopt(fixture)
-    await fixture.custodian.execute("SET work_mem='16MB'")
-    settings = await fixture.custodian.fetchrow("SELECT current_setting('work_mem'),current_setting('temp_file_limit')")
-    assert tuple(settings) == ("16MB", "256MB")
     prove = indexed.prove_indexed_address_equivalence
     observations = []
 
     async def measured_proof(*arguments):
+        settings = await arguments[0].fetchrow("SELECT current_setting('work_mem'),current_setting('temp_file_limit')")
+        assert tuple(settings) == ("16MB", "256MB")
         started = time.perf_counter()
         counts = await prove(*arguments)
         elapsed = time.perf_counter() - started
@@ -668,29 +613,6 @@ async def test_complete_indexed_content_proof_is_bounded_across_many_ranges(inde
     )
 
 
-async def _direct_executor(fixture):
-    """Mirror DEV: the executor reaches neither retained source through the shared reader role."""
-    from process.network_bootstrap_read_access import install_bootstrap_read_access
-
-    connection, executor, reader = fixture.connection, fixture.executor_role, fixture.roles["reader"]
-    if await connection.fetchval("SELECT pg_has_role($1::name,$2::name,'MEMBER')", executor, reader):
-        await connection.execute(f'REVOKE "{reader}" FROM "{executor}"')
-    assert not await connection.fetchval("SELECT pg_has_role($1::name,$2::name,'USAGE')", executor, reader)
-    async with connection.transaction(isolation="repeatable_read"):
-        await install_bootstrap_read_access(connection, fixture.bootstrap, reader_role=executor)
-
-
-async def _legacy_grant(fixture, role, *, revoke=False):
-    connection, schema = fixture.connection, fixture.legacy.schema_name
-    action, direction = ("REVOKE", "FROM") if revoke else ("GRANT", "TO")
-    await connection.execute(f'SET ROLE "{fixture.roles["owner"]}"')
-    try:
-        await connection.execute(f'{action} USAGE ON SCHEMA "{schema}" {direction} "{role}"')
-        await connection.execute(f'{action} SELECT ON ALL TABLES IN SCHEMA "{schema}" {direction} "{role}"')
-    finally:
-        await connection.execute("RESET ROLE")
-
-
 async def _retained_resolves(fixture):
     from process.network_serving_read import resolve_retained_network_address_source
 
@@ -700,44 +622,11 @@ async def _retained_resolves(fixture):
         )
 
 
-async def _retained_access(fixture, *, revoke=False):
-    from process import network_retained_read_access as retained
-
-    operation = retained.revoke_retained_read_access if revoke else retained.install_retained_read_access
-    async with fixture.connection.transaction(isolation="repeatable_read"):
-        return await operation(
-            fixture.connection,
-            fixture.indexed_source,
-            reader_role=fixture.executor_role,
-            control_schema=fixture.control_schema,
-        )
-
-
-async def _executor_reads_legacy(fixture):
-    return await fixture.connection.fetchval(
-        "SELECT has_schema_privilege($1::name,$2::name,'USAGE') AND has_table_privilege($1::name,"
-        "to_regclass(quote_ident($2)||'.entity_address_unified'),'SELECT')",
-        fixture.executor_role,
-        fixture.legacy.schema_name,
-    )
-
-
-async def test_bare_executor_grant_on_the_unsealed_base_is_refused(indexed_db):
-    from process.network_serving_read import NetworkServingReadUnavailable
-
-    fixture = indexed_db
-    await _direct_executor(fixture)
-    await _legacy_grant(fixture, fixture.executor_role)
-    with pytest.raises(NetworkServingReadUnavailable, match="runtime privileges are not protected"):
-        await _adopt(fixture)
-
-
 async def test_retained_successor_admits_direct_executor_adoption(indexed_db):
     fixture = indexed_db
-    await _direct_executor(fixture)
-    proof = await _retained_access(fixture)
-    assert proof["reader"] == fixture.executor_role and proof["after"] != proof["before"]
-    assert await _executor_reads_legacy(fixture)
+    assert await fixture.execution_connection.fetchval(
+        f'SELECT count(*) FROM "{fixture.legacy.schema_name}".entity_address_unified'
+    ) == len(fixture.previous_rows)
     copy_target = await _adopt(fixture)
     await _seal(fixture, copy_target)
     await _publish(fixture, copy_target)
@@ -745,36 +634,6 @@ async def test_retained_successor_admits_direct_executor_adoption(indexed_db):
     assert address_rows == fixture.previous_rows
     assert current.compact_layout.base.schema_name == fixture.legacy.schema_name
     assert (await _retained_resolves(fixture)).schema_name == fixture.legacy.schema_name
-
-
-async def test_retained_successor_refuses_drift_and_re_arms(indexed_db):
-    from process.network_serving_read import NetworkServingReadUnavailable
-
-    fixture = indexed_db
-    await _direct_executor(fixture)
-    await _retained_access(fixture)
-    await _retained_resolves(fixture)
-    stranger = "retained_stranger_" + uuid4().hex[:12]
-    await fixture.connection.execute(f'CREATE ROLE "{stranger}" NOLOGIN')
-    try:
-        await _legacy_grant(fixture, stranger)
-        with pytest.raises(NetworkServingReadUnavailable):
-            await _retained_resolves(fixture)
-        await _legacy_grant(fixture, stranger, revoke=True)
-        await _retained_resolves(fixture)
-        # A changed reader role component invalidates the proof until it is re-armed.
-        await fixture.connection.execute(f'GRANT "{stranger}" TO "{fixture.executor_role}"')
-        with pytest.raises(NetworkServingReadUnavailable):
-            await _retained_resolves(fixture)
-        await _retained_access(fixture, revoke=True)
-        assert not await _executor_reads_legacy(fixture)
-        await _retained_resolves(fixture)
-        re_armed = await _retained_access(fixture)
-        assert re_armed["reader"] == fixture.executor_role
-        await _retained_resolves(fixture)
-    finally:
-        await fixture.connection.execute(f'REVOKE "{stranger}" FROM "{fixture.executor_role}"')
-        await fixture.connection.execute(f'DROP ROLE "{stranger}"')
 
 
 async def _publish_api_candidate(fixture, previous, address_sources):
@@ -860,28 +719,27 @@ async def indexed_api_db(indexed_db, monkeypatch):
 async def _api_rows(held, generation_id):
     async with held.database.reader_session() as session:
         assert session.info["api_reader_verified"] is True and current_session() is session
-        identity_by_field = dict(session.info["api_reader_identity"])
         transaction = session.get_transaction()
         await pin_claims_reader(session, api_read=True)
         before = len(held.requests)
         async with api_catalog_read_snapshot(session, generation_id) as (manifest, approved_relation):
             assert len(held.requests) == before + 1
-            driver, parameters, entry = held.requests[-1]
+            _driver, parameters, entry = held.requests[-1]
             assert parameters == (generation_id,)
             assert manifest._api_approved_relation == approved_relation
-            assert approved_relation.table_oid == entry["approved_oid"]
-            assert not {"families_json", "control_consumed", "indexed_actor_safety_json"}.intersection(entry)
+            assert approved_relation == CompactAddressRelation(held.fixture.control_schema, "registry_approved_record")
+            assert set(entry) == {"candidate_json", "manifest_json", "approved_rows"}
             assert manifest.compact_layout.artifacts == held.current.compact_layout.artifacts
-            async with network_address_read_session_scope(session, manifest, (42,)):
-                relation = scoped_address_relation_sql("mrf.entity_address_unified")
-                address_result = await execute_network_read(
-                    session,
-                    text(f"SELECT location_key,canonical_network_ids FROM {relation} offices ORDER BY location_key"),
-                    scoped_address_parameters({}),
+            async with network_address_read_session_scope(session, manifest, (42,)) as scope:
+                relation, arguments = compact_address_native_sql(
+                    scope.manifest.compact_layout, first_parameter=1, network_ids=scope.network_ids
                 )
-                address_rows = [dict(address_entry) for address_entry in address_result.mappings()]
+                address_rows = await bounded_network_read_rows(
+                    session,
+                    f"SELECT location_key,canonical_network_ids FROM {relation} offices ORDER BY location_key",
+                    *arguments,
+                )
             assert session.get_transaction() is transaction and session.get_nested_transaction() is None
-            assert driver.get_server_pid() == identity_by_field["backend_pid"]
         return manifest, address_rows
 
 
@@ -902,7 +760,7 @@ async def test_published_api_pin_one_query_and_retained_reader_parity(indexed_ap
 
 
 async def test_published_request_serves_a_copied_candidate_table_by_name(indexed_api_db):
-    """A copied published table has another OID; its candidate-schema name identifies it."""
+    """An exact published-table copy serves through the recorded qualified name."""
     held = indexed_api_db
     reader = held.fixture.roles["reader"]
     namespace = '"' + held.current.compact_layout.artifacts[0].schema_name + '"'
@@ -923,34 +781,8 @@ async def test_published_request_serves_a_copied_candidate_table_by_name(indexed
     assert await _api_rows(held, None) == expected
 
 
-async def test_published_request_keeps_the_retained_heap_when_its_name_is_reused(indexed_api_db):
-    """Rotation gives the recorded name to a replacement; the published generation keeps its own rows."""
-    held = indexed_api_db
-    reader, base = held.fixture.roles["reader"], held.current.compact_layout.base
-    live = f'"{base.schema_name}"."{base.table_name}"'
-    retained = f"{base.table_name}_retained_{base.table_oid:x}"
-    expected = await _api_rows(held, None)
-    await held.fixture.connection.execute(
-        f'ALTER TABLE {live} RENAME TO "{retained}"; '
-        f'CREATE TABLE {live} (LIKE "{base.schema_name}"."{retained}"); '
-        f'GRANT SELECT ON {live} TO "{reader}"'
-    )
-    try:
-        manifest, address_rows = await _api_rows(held, None)
-        assert address_rows == expected[1] and manifest.compact_layout.base.table_name == retained
-    finally:
-        await held.fixture.connection.execute(
-            f'DROP TABLE {live}; ALTER TABLE "{base.schema_name}"."{retained}" RENAME TO "{base.table_name}"'
-        )
-    assert await _api_rows(held, None) == expected
-
-
 @pytest.mark.parametrize("failure", ["permission", "missing_edge"])
 async def test_published_request_reports_native_access_and_missing_table_errors(indexed_api_db, failure):
-    from sanic.exceptions import ServiceUnavailable
-
-    from process.entity_address_cutover_contract import postgres_sqlstate
-
     held = indexed_api_db
     fixture, base = held.fixture, held.current.compact_layout.base
     if failure == "permission":
@@ -966,25 +798,23 @@ async def test_published_request_reports_native_access_and_missing_table_errors(
         expected = "42P01"
     await fixture.connection.execute(change)
     try:
-        with pytest.raises(ServiceUnavailable) as error:
+        with pytest.raises(asyncpg.PostgresError) as error:
             await _api_rows(held, None)
-        assert postgres_sqlstate(error.value.original) == expected
+        assert error.value.sqlstate == expected
     finally:
         await fixture.connection.execute(restore)
     assert (await _api_rows(held, None))[0] == held.current
 
 
 @pytest.mark.parametrize("force", [False, True])
-async def test_published_pin_refuses_silent_row_level_filtering(indexed_api_db, force):
+async def test_published_reader_cannot_enable_row_level_filtering(indexed_api_db, force):
     held = indexed_api_db
     base = held.current.compact_layout.base
     table = f'"{base.schema_name}"."{base.table_name}"'
     change = "ENABLE ROW LEVEL SECURITY" if not force else "FORCE ROW LEVEL SECURITY"
-    restore = "DISABLE ROW LEVEL SECURITY" if not force else "NO FORCE ROW LEVEL SECURITY"
-    await held.fixture.connection.execute(f"ALTER TABLE {table} {change}")
-    try:
-        with pytest.raises(NetworkServingReadUnavailable):
-            await _api_rows(held, None)
-    finally:
-        await held.fixture.connection.execute(f"ALTER TABLE {table} {restore}")
-    assert (await _api_rows(held, None))[0] == held.current
+    expected = await _api_rows(held, None)
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        async with held.fixture.reader_engine.connect() as connection, connection.begin():
+            native = (await connection.get_raw_connection()).driver_connection
+            await native.execute(f"ALTER TABLE {table} {change}")
+    assert await _api_rows(held, None) == expected

@@ -11,19 +11,16 @@ from uuid import UUID, uuid4
 import asyncpg
 import pytest
 from sanic import response
-from sqlalchemy import text
 
 from api.network_address_scope import (
     canonical_network_read,
     current_network_address_scope,
     network_address_read_scope,
-    scoped_address_parameters,
-    scoped_address_relation_sql,
 )
 from api.network_compact_address import compact_address_native_sql
 from api.network_provider_only_read import read_network_provider_only_page
 from api.network_provider_read import NetworkOfficeSelection, NetworkProviderReadUnavailable, read_network_provider_page
-from api.network_read_execution import execute_network_read
+from api.network_read_execution import bounded_network_read_rows
 from db.connection import db
 from process.network_address_projection import _identifier
 from process.network_membership_pipeline import prepare_and_publish_network_candidate, prepare_network_candidate
@@ -382,12 +379,16 @@ async def _canonical_request(context, manifest, copy_target, monkeypatch):
 
 async def _maintenance_inventory(context, copy_target):
     async with context.fixture.connection.transaction(isolation="read_committed"):
-        candidate_by_field, seal, entries = await read_sealed_source_inventory_for_maintenance(
+        candidate_by_field, receipt, entries = await read_sealed_source_inventory_for_maintenance(
             context.fixture.connection, copy_target, control_schema=context.fixture.control_schema
         )
         inventory = verify_source_recipe_metadata(candidate_by_field).inventory
         assert candidate_by_field["state"] == "published" and source_inventory_root(entries) == inventory.root
-        assert seal["receipt"]["closure"]["relation_oids"]["network_source_inventory"] > 0
+        assert (receipt.schema_name, receipt.table_name, receipt.root) == (
+            copy_target.schema_name,
+            "network_source_inventory",
+            inventory.root,
+        )
 
 
 def _assert_selected(read_by_kind, network_id):
@@ -515,7 +516,7 @@ async def _pinned_publication(context, original):
         await _prepare(context, second)
         _publication, current = await _publish(context, second)
         assert current.generation_id != original.generation_id
-        assert current.compact_layout.base.table_oid == original.compact_layout.base.table_oid
+        assert current.compact_layout.base == original.compact_layout.base
         assert await _read_scope(connection, pinned, original_network, fixture.control_schema) == expected
         assert (
             await resolve_network_serving_manifest(connection, control_schema=fixture.control_schema)
@@ -557,7 +558,10 @@ async def test_inventory_source_publication_and_pinned_replay(compact_cms_source
     await _no_seal(context, first, None)
     await _refusals(context, first)
     publication, manifest = await _publish(context, first)
-    assert manifest.compact_layout.base.table_oid == context.address.descriptor["table"]["oid"]
+    assert (manifest.compact_layout.base.schema_name, manifest.compact_layout.base.table_name) == (
+        context.source.schema_name,
+        context.source.table_name,
+    )
     assert manifest.compact_layout.custom is None
     await _canonical_request(context, manifest, first, monkeypatch)
     await _maintenance_inventory(context, first)
@@ -569,22 +573,25 @@ async def test_inventory_source_publication_and_pinned_replay(compact_cms_source
         )
         == base_before
     )
-    assert (
-        await context.fixture.connection.fetchval("SELECT to_regclass($1)::oid::bigint", base)
-        == manifest.compact_layout.base.table_oid
+    assert base == (
+        _identifier(manifest.compact_layout.base.schema_name)
+        + "."
+        + _identifier(manifest.compact_layout.base.table_name)
     )
 
 
 async def _assert_canonical_locations(session, manifest, network_id):
     """Consume the same scoped logical office relation under the existing pinned session."""
-    with network_address_read_scope(manifest, (network_id,)):
-        relation = scoped_address_relation_sql("mrf.entity_address_unified")
-        guarded = await execute_network_read(
-            session,
-            text(f"SELECT location_key FROM {relation} office ORDER BY location_key"),
-            scoped_address_parameters({}),
+    with network_address_read_scope(manifest, (network_id,)) as scope:
+        relation, arguments = compact_address_native_sql(
+            scope.manifest.compact_layout, first_parameter=1, network_ids=scope.network_ids
         )
-        assert guarded.scalars().all() == ["a" * 64]
+        guarded = await bounded_network_read_rows(
+            session,
+            f"SELECT location_key FROM {relation} office ORDER BY location_key",
+            *arguments,
+        )
+        assert guarded == [{"location_key": "a" * 64}]
 
 
 def _canonical_address_handler(session, manifest):
@@ -592,13 +599,16 @@ def _canonical_address_handler(session, manifest):
 
     @canonical_network_read
     async def read_addresses(_request):
-        assert current_network_address_scope().manifest == manifest
-        relation = scoped_address_relation_sql("mrf.entity_address_unified")
-        keys = await execute_network_read(
-            session,
-            text(f"SELECT location_key FROM {relation} office ORDER BY location_key"),
-            scoped_address_parameters({}),
+        scope = current_network_address_scope()
+        assert scope.manifest == manifest
+        relation, arguments = compact_address_native_sql(
+            scope.manifest.compact_layout, first_parameter=1, network_ids=scope.network_ids
         )
-        return response.json({"locations": keys.scalars().all()})
+        keys = await bounded_network_read_rows(
+            session,
+            f"SELECT location_key FROM {relation} office ORDER BY location_key",
+            *arguments,
+        )
+        return response.json({"locations": [entry["location_key"] for entry in keys]})
 
     return read_addresses

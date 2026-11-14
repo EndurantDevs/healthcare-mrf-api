@@ -67,9 +67,9 @@ def _fixture_facts():
     """Construct native-shaped transport facts and the real admission dataclass."""
     models = tuple(type("Model" + str(number), (), {"__tablename__": "root_" + str(number)}) for number in range(9))
     policy = GenericSourcePolicy("synthetic", "owner", "publisher", ("reader",), ())
-    factory = SimpleNamespace(policy=policy)
+    factory = SimpleNamespace(policy=policy, _require_current_policy=lambda: None)
     driver = Driver()
-    session = SimpleNamespace(driver=driver)
+    session = SimpleNamespace(driver=driver, in_transaction=driver.is_in_transaction)
     binding = ContextVar("profile_reads_host_binding", default=None)
     lease_checks = []
     fhir = importlib.import_module("process.provider_directory_fhir")

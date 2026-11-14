@@ -4,7 +4,7 @@
 import asyncio
 import json
 import os
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import UUID, uuid4, uuid5
@@ -21,7 +21,6 @@ from process.company_registry_assertion_values import CONTRACT
 from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
-from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.network_membership_serving_indexes import NetworkServingIndexesError, prepare_network_serving_indexes
 from process.network_serving_read import resolve_network_serving_manifest
 from process.network_source_binding_store import (
@@ -29,16 +28,11 @@ from process.network_source_binding_store import (
     apply_network_source_binding_batch,
 )
 from process.registry_candidate_composition import (
-    RegistryAddressArtifactCustody,
     RegistryCompositionAddressSources,
     compose_registry_membership_candidate,
-    prepare_registry_composition_address_artifact,
 )
 from process.registry_catalog_policy import RegistryOrganizationVisibility
-from process.registry_management_permissions import (
-    install_registry_management_permissions,
-    verify_registry_management_permissions,
-)
+from process.registry_management_permissions import install_registry_management_permissions
 from process.registry_network_catalog_read import (
     RegistryNetworkCatalogError,
     RegistryNetworkCatalogLegacyBatchSelector,
@@ -52,21 +46,22 @@ from process.registry_serving_organization_read import (
     RegistryOrganizationCatalogQuery,
     read_registry_serving_organizations,
 )
+from tests.source_contribution_custody_postgres_support import publish_source_contribution_candidate
 from tests.test_company_registry_assertions_postgres import _declared_group, _identifier, _role
+from tests.test_network_compact_publication_postgres import _named_compact_runtime
 from tests.test_network_custom_address_source_postgres import _draft, _seed
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
 from tests.test_network_fhir_retained_capture_postgres import (
     legacy_capture_db as legacy_capture_db,
 )
 from tests.test_network_fhir_retained_capture_postgres import (
-    test_retained_capture_composes_and_publishes_one_exact_office as _publish_retained_capture,
+    retained_capture_publication as _retained_capture_publication,
 )
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 from tests.test_registry_approval_store_postgres import _approve, _command, _CountedConnection, _create
 from tests.test_registry_candidate_composition_postgres import (
     _remove_candidates,
     _roles,
-    _seal_composition_target,
 )
 from tests.test_registry_company_links_postgres import _links
 from tests.test_registry_network_catalog_read import batch_boundary as batch_boundary
@@ -88,25 +83,25 @@ ACA_SCOPE = {
 @pytest.mark.parametrize("legacy_capture_db", ["legacy", "modern"], indirect=True)
 async def test_native_retained_capture_publication_serializes_in_pinned_catalog(legacy_capture_db, serving_schema):
     """Read an actual complete captured publication without inventing a legacy alias."""
-    await _publish_retained_capture(legacy_capture_db, serving_schema)
-    connection, control, _ = serving_schema
-    async with connection.transaction(isolation="repeatable_read", readonly=True):
-        page = await read_registry_network_catalog(
-            connection, RegistryNetworkCatalogQuery(), excluded_network_ids=(), control_schema=control
-        )
-        assert page["total"] == len(page["items"]) == 1
-        binding = page["items"][0]["source_bindings"][0]
-        assert binding["producer_id"] == "registry-retained-normalized-fhir-v1"
-        assert binding["source_scope"]["organization_id"] == "network-one"
-        assert set(binding["source_scope"]) == {"organization_id", "capture_sha256"}
-        detail = await read_registry_network_catalog_detail(
-            connection,
-            page["items"][0]["network_id"],
-            excluded_network_ids=(),
-            generation_id=int(page["generation"]),
-            control_schema=control,
-        )
-        assert json.loads(json.dumps(detail)) == json.loads(json.dumps(page | {"limit": 1}))
+    async with _retained_capture_publication(legacy_capture_db, serving_schema):
+        connection, control, _ = serving_schema
+        async with connection.transaction(isolation="repeatable_read", readonly=True):
+            page = await read_registry_network_catalog(
+                connection, RegistryNetworkCatalogQuery(), excluded_network_ids=(), control_schema=control
+            )
+            assert page["total"] == len(page["items"]) == 1
+            binding = page["items"][0]["source_bindings"][0]
+            assert binding["producer_id"] == "registry-retained-normalized-fhir-v1"
+            assert binding["source_scope"]["organization_id"] == "network-one"
+            assert set(binding["source_scope"]) == {"organization_id", "capture_sha256"}
+            detail = await read_registry_network_catalog_detail(
+                connection,
+                page["items"][0]["network_id"],
+                excluded_network_ids=(),
+                generation_id=int(page["generation"]),
+                control_schema=control,
+            )
+            assert json.loads(json.dumps(detail)) == json.loads(json.dumps(page | {"limit": 1}))
 
 
 def _binding(network_id, coordinates, source_key, scope):
@@ -162,17 +157,8 @@ async def _publish(fixture, approved_revision, expected_head):
     )
     fixture.targets.append(copy_target)
 
-    async def seal_candidate(actual):
-        assert actual == copy_target
-        return await _seal_composition_target(fixture, actual, (fixture.roles["reader"],))
-
-    await prepare_and_publish_network_candidate(
-        fixture.connection,
-        copy_target,
-        address_source,
-        **_roles(fixture),
-        control_schema=fixture.control_schema,
-        seal_candidate=seal_candidate if fixture.seal_initial_candidate else None,
+    await publish_source_contribution_candidate(
+        fixture, fixture.connection, copy_target, address_source, writer_roles=_roles(fixture)
     )
     async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
         manifest = await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
@@ -289,18 +275,20 @@ async def _catalog_permissions(fixture):
 
 
 @pytest.fixture
-async def catalog_db(custom_db, request):
+async def catalog_db(custom_db, request, monkeypatch):
     """Own candidate and reader cleanup from before their first creation."""
     fixture = custom_db
     fixture.seal_initial_candidate = getattr(request, "param", False)
     fixture.requests, fixture.targets, fixture.reader = [], [], None
     # The reused fixtures already register schema/role teardown before their DDL.
     # This finally is established before the additional connection and candidates.
+    stack = AsyncExitStack()
     try:
         assert 180000 <= int(await fixture.connection.fetchval("SHOW server_version_num")) < 190000
         fixture.records = await _catalog_records(fixture)
         approval = await _catalog_approval(fixture)
         await _catalog_permissions(fixture)
+        await _named_compact_runtime(fixture, stack, monkeypatch)
         fixture.manifest = await _publish(fixture, approval["approved_revision"], 0)
         fixture.reader = await asyncpg.connect(
             os.environ["NETWORK_REGISTRY_TEST_DSN"].replace("postgresql+asyncpg://", "postgresql://")
@@ -316,6 +304,7 @@ async def catalog_db(custom_db, request):
                 for request_id in reversed(fixture.requests):
                     await _remove_candidates(fixture, fixture.targets, request_id)
             finally:
+                await stack.aclose()
                 # Protected ownership was installed for this fixture schema;
                 # drop it before original role teardown encounters other-owned
                 # recipe tables. The outer schema drop is idempotent.
@@ -503,16 +492,6 @@ async def test_native_proof_loss_refuses_instead_of_mutable_fallback(catalog_db,
 
 async def test_native_reader_permissions_are_precise_and_outsider_refuses(catalog_db):
     fixture = catalog_db
-    async with fixture.connection.transaction():
-        assert (
-            await verify_registry_management_permissions(
-                fixture.connection,
-                api_role=fixture.roles["reader"],
-                owner_role=fixture.roles["owner"],
-                control_schema=fixture.control_schema,
-            )
-            == fixture.permissions
-        )
     async with _reader(fixture, readonly=False) as connection:
         assert not await connection.fetchval(
             "SELECT has_table_privilege(current_user,$1,'INSERT')",
@@ -1655,12 +1634,9 @@ async def test_native_legacy_http_other_refusals_keep_existing_boundary(legacy_c
         assert reply.headers["X-Network-Access-Scope"] == document["access_scope_sha256"]
 
 
-from process.network_candidate_custody import seal_network_candidate_custody, verify_network_candidate_custody
-from process.network_membership_pipeline import prepare_network_candidate
-from process.network_membership_writer_closure import _acl_rows, _catalog, _default_acl_rows
+async def _prepared_named_candidate(fixture, request_id):
+    from process.network_membership_pipeline import prepare_network_candidate
 
-
-async def _prepared_custody_candidate(fixture, request_id):
     async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
         pin = await pin_approved_membership_source(
             fixture.connection,
@@ -1668,7 +1644,7 @@ async def _prepared_custody_candidate(fixture, request_id):
             control_schema=fixture.control_schema,
         )
     fixture.composition_ids.append(uuid5(request_id, "address:" + pin.generation_id))
-    copy_target, address_source = await compose_registry_membership_candidate(
+    target, address = await compose_registry_membership_candidate(
         fixture.connection,
         request_id=request_id,
         approved_revision=fixture.manifest.approved_custom_revision,
@@ -1677,448 +1653,135 @@ async def _prepared_custody_candidate(fixture, request_id):
         writer_roles=_roles(fixture),
         control_schema=fixture.control_schema,
     )
-    fixture.targets.append(copy_target)
+    fixture.targets.append(target)
     await prepare_network_candidate(
-        fixture.connection, copy_target, address_source, **_roles(fixture), control_schema=fixture.control_schema
+        fixture.connection, target, address, **_roles(fixture), control_schema=fixture.control_schema
     )
-    return copy_target
+    return target, address
 
 
-async def _ensure_custody_ledger(fixture):
-    from sqlalchemy import MetaData
-    from sqlalchemy.dialects import postgresql
-    from sqlalchemy.schema import CreateTable
+async def _assert_unconfigured_reader_denied(fixture, namespace):
+    """Remove the exact temporary role after proving it cannot read the publication."""
+    unconfigured_role = "unconfigured_reader_" + uuid4().hex
+    is_role_created = False
+    try:
+        await fixture.connection.execute(f'CREATE ROLE "{unconfigured_role}" NOLOGIN')
+        is_role_created = True
+        await fixture.reader.execute(f'SET ROLE "{unconfigured_role}"')
+        try:
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await fixture.reader.fetch(f"SELECT * FROM {namespace}.network_membership")
+        finally:
+            await fixture.reader.execute("RESET ROLE")
+    finally:
+        if is_role_created:
+            await fixture.connection.execute(f'DROP ROLE "{unconfigured_role}"')
+            assert not await fixture.connection.fetchval(
+                "SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", unconfigured_role
+            )
 
-    from db.models.network_serving import NetworkCandidateCustody, NetworkMembershipCandidate
 
-    metadata = MetaData()
-    NetworkMembershipCandidate.__table__.to_metadata(metadata, schema=fixture.control_schema)
-    table = NetworkCandidateCustody.__table__.to_metadata(metadata, schema=fixture.control_schema)
-    if (
+async def test_named_publication_preserves_validated_data_pinned_reads_and_native_dml_denial(catalog_db):
+    """Preserve verified data and pinned readers while PostgreSQL denies application writes."""
+    fixture = catalog_db
+    original = fixture.manifest
+    namespace = '"' + original.schema_name + '"'
+    before = await fixture.connection.fetch(
+        f"SELECT to_jsonb(member)::text FROM {namespace}.network_membership member ORDER BY to_jsonb(member)::text"
+    )
+    validation = json.loads(
         await fixture.connection.fetchval(
-            "SELECT to_regclass($1)", f'"{fixture.control_schema}".network_candidate_custody'
+            f'SELECT validation_json::text FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
+            UUID(original.candidate_id),
         )
-        is None
-    ):
-        await fixture.connection.execute(str(CreateTable(table).compile(dialect=postgresql.dialect())))
-        await fixture.connection.execute(
-            f'ALTER TABLE "{fixture.control_schema}".network_candidate_custody OWNER TO "{fixture.roles["owner"]}"'
-        )
-
-
-async def _provision_custody_operators(admin, roles_by_kind, login_fixture, attempted_roles, reader_role, final_owner):
-    for kind, role in roles_by_kind.items():
-        assert not await admin.fetchval("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", role)
-        attempted_roles.append(role)
-        login = "NOLOGIN" if kind == "loading" else f"LOGIN PASSWORD '{login_fixture.role_password}'"
-        await admin.execute(
-            f'CREATE ROLE "{role}" {login} INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS'
-        )
-    database = await admin.fetchval("SELECT quote_ident(current_database())")
-    await admin.execute(f'GRANT CREATE ON DATABASE {database} TO "{roles_by_kind["loading"]}"')
-    await admin.execute(
-        f'GRANT "{roles_by_kind["loading"]}" TO "{roles_by_kind["execution"]}" WITH ADMIN FALSE, INHERIT TRUE, SET TRUE'
-    )
-    await admin.execute(
-        f'GRANT "{reader_role}" TO "{roles_by_kind["execution"]}" WITH ADMIN FALSE, INHERIT TRUE, SET FALSE'
-    )
-    await admin.execute(
-        f'GRANT "{roles_by_kind["execution"]}" TO "{roles_by_kind["custodian"]}" WITH ADMIN FALSE, INHERIT TRUE, SET FALSE'
-    )
-    await admin.execute(
-        f'GRANT "{roles_by_kind["loading"]}" TO "{roles_by_kind["custodian"]}" WITH ADMIN FALSE, INHERIT TRUE, SET TRUE'
-    )
-    await admin.execute(
-        f'GRANT "{final_owner}" TO "{roles_by_kind["custodian"]}" WITH ADMIN FALSE, INHERIT FALSE, SET TRUE'
-    )
-
-
-async def _register_operator_composition(fixture, admin, request_id):
-    async with admin.transaction(isolation="repeatable_read", readonly=True):
-        pin = await pin_approved_membership_source(
-            admin,
-            approved_revision=fixture.manifest.approved_custom_revision,
-            control_schema=fixture.control_schema,
-        )
-    composition_id = uuid5(request_id, "address:" + pin.generation_id)
-    fixture.composition_ids.append(composition_id)
-    return composition_id
-
-
-async def _prepare_operator_candidate(fixture, execution, custodian, request_id, roles_by_kind, runtime_roles):
-    """Prepare from the authenticated serving dependency using independent genuine logins."""
-    namespace = '"' + fixture.control_schema + '"'
-    writer_roles_by_name = {
-        "owner_role": roles_by_kind["loading"],
-        "loader_roles": (),
-        "reader_roles": (fixture.roles["reader"],),
-    }
-    address_sources = RegistryCompositionAddressSources(
-        PinnedAddressSource(fixture.manifest.schema_name, "entity_address_unified", fixture.manifest.manifest_sha256)
-    )
-    async with custodian.transaction(isolation="repeatable_read"):
-        receipt = await prepare_registry_composition_address_artifact(
-            custodian,
-            request_id=request_id,
-            approved_revision=fixture.manifest.approved_custom_revision,
-            expected_head=fixture.manifest.generation_id,
-            source_manifest=fixture.manifest,
-            address_sources=address_sources,
-            custody=RegistryAddressArtifactCustody(
-                fixture.roles["owner"], tuple(sorted(runtime_roles)), fixture.control_schema
-            ),
-        )
-    assert receipt.owner_role != roles_by_kind["loading"] and set(receipt.runtime_roles) == set(runtime_roles)
-    copy_target, address_source = await compose_registry_membership_candidate(
-        execution,
-        request_id=request_id,
-        approved_revision=fixture.manifest.approved_custom_revision,
-        expected_head=fixture.manifest.generation_id,
-        source_manifest=fixture.manifest,
-        address_sources=replace(address_sources, prepared_address_artifact=receipt),
-        writer_roles=writer_roles_by_name,
-        control_schema=fixture.control_schema,
-    )
-    fixture.targets.append(copy_target)
-    await prepare_network_candidate(
-        execution, copy_target, address_source, **writer_roles_by_name, control_schema=fixture.control_schema
-    )
-    candidate_schema = '"' + copy_target.schema_name + '"'
-    candidate_by_name = dict(
-        await execution.fetchrow(
-            f"SELECT * FROM {namespace}.network_membership_candidate WHERE candidate_id=$1",
-            UUID(copy_target.candidate_id),
-        )
-    )
-    assert candidate_by_name["state"] == "ready" and candidate_by_name["expected_rows"] > 0
-
-    return copy_target, candidate_schema, candidate_by_name
-
-
-async def _operator_inventory(admin, copy_target, candidate_by_name, namespace):
-    catalog = await _catalog(admin, copy_target, candidate_by_name)
-    return {
-        "catalog": catalog,
-        "acl": sorted(repr(dict(row)) for row in await _acl_rows(admin, catalog)),
-        "defaults": sorted(repr(dict(row)) for row in await _default_acl_rows(admin, catalog)),
-        "seal_acl": await admin.fetchval(
-            "SELECT relacl::text FROM pg_class WHERE oid=to_regclass($1)",
-            namespace + ".network_candidate_custody",
-        ),
-        "candidate": await admin.fetchval(
-            f"SELECT to_jsonb(c)::text FROM {namespace}.network_membership_candidate c WHERE candidate_id=$1",
-            UUID(copy_target.candidate_id),
-        ),
-        "head": await admin.fetchval(f"SELECT generation_id FROM {namespace}.network_serving_control WHERE id=1"),
-    }
-
-
-async def _qualify_custody_logins(execution, custodian, roles_by_kind, final_owner):
-    for connection, kind in ((execution, "execution"), (custodian, "custodian")):
-        await connection.execute("SET statement_timeout='20s'")
-        await connection.execute("SET lock_timeout='1s'")
-        native = await connection.fetchrow(
-            "SELECT current_user=session_user AS original,current_user::text AS name,rolcanlogin,"
-            "rolsuper,rolcreatedb,rolcreaterole,rolreplication,rolbypassrls FROM pg_roles WHERE rolname=current_user"
-        )
-        assert native["original"] is True and native["name"] == roles_by_kind[kind] and native["rolcanlogin"] is True
-        assert all(
-            native[field] is False
-            for field in ("rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls")
-        )
-    assert await custodian.fetchval("SELECT pg_has_role(current_user,$1::name,'SET')", final_owner)
-    assert not await custodian.fetchval("SELECT pg_has_role(current_user,$1::name,'USAGE')", final_owner)
-    assert not await execution.fetchval("SELECT pg_has_role(current_user,$1::name,'SET')", final_owner)
-
-
-async def _cancel_custody_transfer(custodian, copy_target, fixture, roles_by_kind, runtime_roles, inventory, before):
-    admin = fixture.connection
-    namespace = '"' + fixture.control_schema + '"'
-    authorization_calls = []
-
-    async def can_cancel_after_transfer(connection, supplied):
-        assert connection is custodian and supplied == copy_target
-        assert await connection.fetchval(
-            "SELECT current_user=session_user AND current_user::text=$1", roles_by_kind["custodian"]
-        )
-        authorization_calls.append(None)
-        if len(authorization_calls) == 2:
-            raise asyncio.CancelledError
-        return True
-
-    with pytest.raises(asyncio.CancelledError):
-        await seal_network_candidate_custody(
-            custodian,
-            copy_target,
-            control_schema=fixture.control_schema,
-            runtime_roles=runtime_roles,
-            authorize=can_cancel_after_transfer,
-        )
-    assert len(authorization_calls) == 2 and not custodian.is_in_transaction()
-    assert await inventory() == before
-    assert not await admin.fetchval(
-        f"SELECT EXISTS(SELECT FROM {namespace}.network_candidate_custody WHERE candidate_id=$1)",
-        UUID(copy_target.candidate_id),
-    )
-
-
-async def _seal_operator_candidate(
-    custodian, execution, copy_target, fixture, roles_by_kind, runtime_roles, before, expected_rows
-):
-    admin = fixture.connection
-    namespace = '"' + fixture.control_schema + '"'
-    candidate_schema = '"' + copy_target.schema_name + '"'
-
-    async def is_authorized(connection, supplied):
-        assert connection is custodian and supplied == copy_target
-        assert await connection.fetchval(
-            "SELECT current_user=session_user AND current_user::text=$1", roles_by_kind["custodian"]
-        )
-        return True
-
-    receipt = await seal_network_candidate_custody(
-        custodian,
-        copy_target,
-        control_schema=fixture.control_schema,
-        runtime_roles=runtime_roles,
-        authorize=is_authorized,
-    )
-    assert (
-        await seal_network_candidate_custody(
-            custodian,
-            copy_target,
-            control_schema=fixture.control_schema,
-            runtime_roles=runtime_roles,
-            authorize=is_authorized,
-        )
-        == receipt
-    )
-    assert roles_by_kind["custodian"] not in receipt["receipt"]["runtime_roles"]
-    assert roles_by_kind["execution"] in receipt["receipt"]["closure"]["reader_roles"]
-    assert fixture.roles["outsider"] not in receipt["receipt"]["closure"]["reader_roles"]
-    assert (
-        await admin.fetchval(
-            f"SELECT state FROM {namespace}.network_membership_candidate WHERE candidate_id=$1",
-            UUID(copy_target.candidate_id),
-        )
-        == "ready"
-    )
-    assert (
-        await admin.fetchval(f"SELECT generation_id FROM {namespace}.network_serving_control WHERE id=1")
-        == before["head"]
-    )
-    async with execution.transaction(isolation="repeatable_read", readonly=True):
+    )["final_validation"]
+    assert validation["complete"] is True
+    assert validation["schema_name"] == original.schema_name
+    assert validation["counts"]["membership_rows"] == len(before)
+    async with _reader(fixture) as reader:
+        pinned = await resolve_network_serving_manifest(reader, control_schema=fixture.control_schema)
+        assert pinned == original
+        latest = await _publish(fixture, original.approved_custom_revision, original.generation_id)
+        assert latest.generation_id > original.generation_id
+        assert await resolve_network_serving_manifest(reader, control_schema=fixture.control_schema) == original
         assert (
-            await verify_network_candidate_custody(execution, copy_target, control_schema=fixture.control_schema)
-            == receipt
+            await reader.fetch(
+                f"SELECT to_jsonb(member)::text FROM {namespace}.network_membership member ORDER BY to_jsonb(member)::text"
+            )
+            == before
         )
-        assert await execution.fetchval(f"SELECT count(*) FROM {candidate_schema}.network_membership") == expected_rows
-
-
-async def _refuse_execution_mutations(admin, execution, copy_target, final_owner, roles_by_kind, expected_rows):
-    candidate_schema = '"' + copy_target.schema_name + '"'
-    sample = await admin.fetchrow(
-        f"SELECT network_id,provider_system,provider_id,location_id,evidence_id FROM {candidate_schema}.network_membership LIMIT 1"
-    )
-    statements = (
-        f"UPDATE {candidate_schema}.network_membership SET network_id=network_id",
-        f"DELETE FROM {candidate_schema}.network_membership",
-        f"TRUNCATE {candidate_schema}.network_membership",
-        f"ALTER TABLE {candidate_schema}.network_membership ADD COLUMN unexpected integer",
-        f"DROP TABLE {candidate_schema}.network_membership",
-        f"DROP SCHEMA {candidate_schema} CASCADE",
-        f'SET ROLE "{final_owner}"',
-    )
-    for statement in statements:
-        with pytest.raises(asyncpg.InsufficientPrivilegeError):
-            await execution.execute(statement)
-        assert not execution.is_in_transaction()
-        assert await execution.fetchval(
-            "SELECT current_user=session_user AND current_user::text=$1", roles_by_kind["execution"]
+    assert (
+        await fixture.connection.fetch(
+            f"SELECT to_jsonb(member)::text FROM {namespace}.network_membership member ORDER BY to_jsonb(member)::text"
         )
-    with pytest.raises(asyncpg.InsufficientPrivilegeError):
-        await execution.copy_records_to_table(
-            "network_membership",
-            schema_name=copy_target.schema_name,
-            columns=("network_id", "provider_system", "provider_id", "location_id", "evidence_id"),
-            records=[tuple(sample)],
-        )
-    assert await execution.fetchval(f"SELECT count(*) FROM {candidate_schema}.network_membership") == expected_rows
-
-
-def _record_custody_resources(registration, state, registered_roles, request_id):
-    registration.write_text(json.dumps({"state": state, "roles": registered_roles, "request_id": str(request_id)}))
-
-
-async def _cleanup_custody_operators(
-    fixture, request_id, composition_id, attempted_roles, registered_roles, registration
-):
-    admin = fixture.connection
-    # Every name was registered before creation; no shared fixture role is dropped.
-    await _remove_candidates(fixture, [], request_id)
-    if composition_id is not None:
-        await admin.execute(f'DROP SCHEMA IF EXISTS "network_composition_{composition_id.hex}" CASCADE')
-        assert await admin.fetchval("SELECT to_regnamespace($1)", "network_composition_" + composition_id.hex) is None
-    for role in reversed(attempted_roles):
-        if await admin.fetchval("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", role):
-            await admin.execute(f'DROP OWNED BY "{role}"')
-            await admin.execute(f'DROP ROLE "{role}"')
-    assert not await admin.fetchval(
-        "SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=ANY($1::text[]))", registered_roles
+        == before
     )
-    _record_custody_resources(registration, "cleaned", registered_roles, request_id)
-
-
-async def _assert_custody_reader_locks(fixture, copy_target, receipt):
     await fixture.reader.execute(f'SET ROLE "{fixture.roles["reader"]}"')
     try:
-        async with fixture.reader.transaction(isolation="repeatable_read", readonly=True):
-            assert (
-                await verify_network_candidate_custody(
-                    fixture.reader, copy_target, control_schema=fixture.control_schema
-                )
-                == receipt
-            )
-            assert await fixture.reader.fetchval(
-                "SELECT bool_and(mode='AccessShareLock') FROM pg_locks WHERE pid=pg_backend_pid() "
-                "AND relation=ANY($1::oid[]) AND granted",
-                list(receipt["receipt"]["closure"]["relation_oids"].values()),
-            )
+        for statement in (
+            f"UPDATE {namespace}.network_membership SET network_id=network_id",
+            f"DELETE FROM {namespace}.network_membership",
+            f"TRUNCATE {namespace}.network_membership",
+            f"ALTER TABLE {namespace}.network_membership ADD COLUMN unexpected integer",
+            f"DROP TABLE {namespace}.network_membership",
+        ):
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await fixture.reader.execute(statement)
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
-            await fixture.reader.execute(f'DELETE FROM "{copy_target.schema_name}".network_membership')
+            await fixture.reader.copy_records_to_table(
+                "network_membership",
+                schema_name=original.schema_name,
+                columns=("network_id", "provider_system", "provider_id", "location_id", "evidence_id"),
+                records=[],
+            )
     finally:
         await fixture.reader.execute("RESET ROLE")
+    await _assert_unconfigured_reader_denied(fixture, namespace)
 
 
-async def test_independent_candidate_custody_preserves_logical_proof_and_reader_locks(catalog_db):
-    """Native seal foundation; legacy directory-loss behavior remains separately tested."""
-
-    from process.network_candidate_custody import seal_network_candidate_custody, verify_network_candidate_custody
+async def test_cancelled_named_preparation_keeps_old_head_and_resumes_same_candidate(catalog_db):
     from process.network_membership_publication import publish_network_candidate
 
     fixture = catalog_db
     request_id = uuid4()
     fixture.requests.append(request_id)
-    copy_target = await _prepared_custody_candidate(fixture, request_id)
-    before = await fixture.connection.fetchval(
-        f'SELECT validation_json::text FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
-        UUID(copy_target.candidate_id),
-    )
-    await _ensure_custody_ledger(fixture)
+    copy_target, address = await _prepared_named_candidate(fixture, request_id)
+    before = await _page(fixture)
 
-    async def is_authorized(connection, supplied):
-        assert connection is fixture.connection and supplied == copy_target
-        return True
+    async def cancel_after_validation(selected_target):
+        await fixture.seal_candidate(selected_target)
+        raise asyncio.CancelledError
 
-    assert not await fixture.connection.fetchval(
-        "SELECT has_table_privilege($1::name,$2::regclass,'SELECT')",
-        fixture.roles["outsider"],
-        f'"{copy_target.schema_name}".network_membership',
-    )
-    receipt = await seal_network_candidate_custody(
-        fixture.connection,
-        copy_target,
-        control_schema=fixture.control_schema,
-        runtime_roles=(fixture.roles["reader"], fixture.roles["outsider"]),
-        authorize=is_authorized,
-    )
-    assert receipt["receipt"]["runtime_roles"] == sorted((fixture.roles["reader"], fixture.roles["outsider"]))
-    assert receipt["receipt"]["closure"]["reader_roles"] == [fixture.roles["reader"]]
-    assert not await fixture.connection.fetchval(
-        "SELECT has_table_privilege($1::name,$2::regclass,'SELECT')",
-        fixture.roles["outsider"],
-        f'"{copy_target.schema_name}".network_membership',
-    )
-    assert before == await fixture.connection.fetchval(
-        f'SELECT validation_json::text FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
-        UUID(copy_target.candidate_id),
+    with pytest.raises(asyncio.CancelledError):
+        await publish_source_contribution_candidate(
+            fixture,
+            fixture.connection,
+            copy_target,
+            address,
+            writer_roles=_roles(fixture),
+            seal_candidate=cancel_after_validation,
+        )
+    assert await _page(fixture) == before
+    assert (
+        await fixture.connection.fetchval(
+            f'SELECT generation_id FROM "{fixture.control_schema}".network_serving_control WHERE id=1'
+        )
+        == fixture.manifest.generation_id
     )
     async with fixture.connection.transaction(isolation="repeatable_read"):
-        await publish_network_candidate(fixture.connection, copy_target, control_schema=fixture.control_schema)
-    await _assert_custody_reader_locks(fixture, copy_target, receipt)
-
-
-async def _assert_custody_control_owner(admin, namespace, control_schema):
-    assert await admin.fetchval("SELECT to_regclass($1)", namespace + ".network_candidate_custody") is not None
-    assert (
-        await admin.fetchval(
-            "SELECT n.nspowner=c.relowner FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid "
-            "WHERE n.nspname=$1 AND c.relname='network_candidate_custody'",
-            control_schema,
+        await publish_network_candidate(
+            fixture.connection,
+            copy_target,
+            control_schema=fixture.control_schema,
+            preparation_roles=fixture.preparation_roles,
         )
-        is True
-    )
-
-
-async def _exercise_operator_custody(fixture, login_fixture, request_id, roles_by_kind):
-    """Prove cancellation and sealing on the same genuine execution and independent custody logins."""
-    from tests.test_registry_publication_worker_permissions_postgres import _login
-
-    admin, final_owner = fixture.connection, fixture.roles["owner"]
-    runtime_roles = (
-        roles_by_kind["loading"],
-        roles_by_kind["execution"],
-        fixture.roles["reader"],
-        fixture.roles["outsider"],
-    )
-    async with _login(login_fixture, "execution") as execution, _login(login_fixture, "custodian") as custodian:
-        await _qualify_custody_logins(execution, custodian, roles_by_kind, final_owner)
-        copy_target, candidate_schema, candidate_by_name = await _prepare_operator_candidate(
-            fixture, execution, custodian, request_id, roles_by_kind, runtime_roles
-        )
-
-        async def inventory():
-            return await _operator_inventory(admin, copy_target, candidate_by_name, '"' + fixture.control_schema + '"')
-
-        before = await inventory()
-        expected_rows = await execution.fetchval(f"SELECT count(*) FROM {candidate_schema}.network_membership")
-        assert expected_rows == candidate_by_name["expected_rows"]
-        await _cancel_custody_transfer(custodian, copy_target, fixture, roles_by_kind, runtime_roles, inventory, before)
-        await _seal_operator_candidate(
-            custodian, execution, copy_target, fixture, roles_by_kind, runtime_roles, before, expected_rows
-        )
-        await _refuse_execution_mutations(admin, execution, copy_target, final_owner, roles_by_kind, expected_rows)
-
-
-@pytest.mark.parametrize("catalog_db", [True], indirect=True)
-async def test_safe_operator_custody_cancellation_restores_then_seals_without_execution_owner_reach(
-    catalog_db, tmp_path
-):
-    """Real LOGIN separation, transfer rollback and immutable execution reads."""
-    from process.registry_management_permissions import _catalog as control_catalog
-    from process.registry_publication_worker_permissions import _grant_worker
-
-    fixture = catalog_db
-    admin = fixture.connection
-    token = uuid4().hex
-    roles_by_kind = {kind: "custody_" + kind + "_" + token for kind in ("loading", "execution", "custodian")}
-    login_fixture = SimpleNamespace(roles_by_kind=roles_by_kind, role_password=uuid4().hex)
-    registered_roles = list(roles_by_kind.values())
-    attempted_roles = []
-    request_id = uuid4()
-    fixture.requests.append(request_id)
-    composition_id = None
-    registration = tmp_path / "candidate-custody-resources.json"
-    _record_custody_resources(registration, "registered", registered_roles, request_id)
-    namespace = '"' + fixture.control_schema + '"'
-    final_owner = fixture.roles["owner"]
-    try:
-        await _assert_custody_control_owner(admin, namespace, fixture.control_schema)
-        await _provision_custody_operators(
-            admin, roles_by_kind, login_fixture, attempted_roles, fixture.roles["reader"], final_owner
-        )
-        async with admin.transaction():
-            tables, _ = await control_catalog(
-                admin, await admin.fetchval("SELECT to_regnamespace($1)::oid", fixture.control_schema)
-            )
-            await _grant_worker(admin, fixture.control_schema, tables, roles_by_kind["execution"], execution=True)
-        composition_id = await _register_operator_composition(fixture, admin, request_id)
-        await _exercise_operator_custody(fixture, login_fixture, request_id, roles_by_kind)
-        _record_custody_resources(registration, "checked", registered_roles, request_id)
-    finally:
-        await _cleanup_custody_operators(
-            fixture, request_id, composition_id, attempted_roles, registered_roles, registration
-        )
+    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+        manifest = await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
+    assert manifest.candidate_id == copy_target.candidate_id
+    assert manifest.generation_id > fixture.manifest.generation_id
+    page = await _page(fixture)
+    assert page["generation"] == str(manifest.generation_id)
+    assert page["items"] == before["items"]
 
 
 async def test_native_privileged_directory_corruption_requires_full_validation(catalog_db):

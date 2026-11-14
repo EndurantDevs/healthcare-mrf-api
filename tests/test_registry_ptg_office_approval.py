@@ -14,6 +14,7 @@ from process import registry_ptg_office_approval as approval
 from process import registry_ptg_office_capture as capture
 from process import registry_ptg_published_office_scope as published
 from process import registry_ptg_scope_engine as engine
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_ptg_office_review_contract import validated_office_review_command
 from tests.test_registry_ptg_office_capture import _request
@@ -26,7 +27,14 @@ def _command():
     scope_by_field = published._office_scope(document_by_field, context.graph_identity, [0])
     request = _request()
     serving = PinnedNetworkServingManifest(
-        3, "33333333-3333-4333-8333-333333333333", "synthetic_serving", 1, {}, 3, "d" * 64, 42
+        3,
+        "33333333-3333-4333-8333-333333333333",
+        "synthetic_serving",
+        1,
+        {},
+        3,
+        "d" * 64,
+        CompactAddressRelation("synthetic_serving", "entity_address_unified"),
     )
     accounting_by_field = {
         "canonical_input_sha256": request.canonical_input_sha256,
@@ -94,6 +102,26 @@ def _bind_office_hold(monkeypatch, session, service, events):
     monkeypatch.setattr(retention, "retain_registry_ptg_office_capture", retain_office)
 
 
+def _approval_checks(session, events, physical_error, authority_error):
+    async def physical(actual_session, *args):
+        assert actual_session is session
+        events.append("physical")
+        if physical_error:
+            raise physical_error
+        return SimpleNamespace(manifest_sha256="c" * 64), SimpleNamespace(
+            as_dict=lambda: {"command_sha256": capture._digest(_command())}
+        )
+
+    async def authorize(self, envelope, *, deadline):
+        assert set(envelope) == {"actor", "session_token_sha256", "command"}
+        events.append("authorize")
+        if authority_error:
+            raise authority_error
+        return {"policy_revision": 1}
+
+    return physical, authorize
+
+
 def _boundaries(monkeypatch, *, physical_error=None, authority_error=None, commit_error=None):
     events = []
     service, _ = _service()
@@ -112,21 +140,7 @@ def _boundaries(monkeypatch, *, physical_error=None, authority_error=None, commi
             if commit_error:
                 raise commit_error
 
-    async def physical(actual_session, *args):
-        assert actual_session is session
-        events.append("physical")
-        if physical_error:
-            raise physical_error
-        return SimpleNamespace(manifest_sha256="c" * 64), SimpleNamespace(
-            as_dict=lambda: {"command_sha256": capture._digest(_command())}
-        )
-
-    async def authorize(self, envelope, *, deadline):
-        assert set(envelope) == {"actor", "session_token_sha256", "command"}
-        events.append("authorize")
-        if authority_error:
-            raise authority_error
-        return {"policy_revision": 1}
+    physical, authorize = _approval_checks(session, events, physical_error, authority_error)
 
     async def retain(actual_session, table, document_by_field):
         assert actual_session is session and document_by_field["command"] == _command()
@@ -147,6 +161,15 @@ def _boundaries(monkeypatch, *, physical_error=None, authority_error=None, commi
 
     monkeypatch.setattr(approval, "_pin_source", pin_source)
     _bind_office_hold(monkeypatch, session, service, events)
+
+    async def publication(
+        actual_session, actual_service, descriptor, witness, approval_sha256, hold_sha256, control_schema
+    ):
+        assert actual_session is session and actual_service is service
+        assert approval_sha256 == "a" * 64 and hold_sha256 == "b" * 64
+        assert events[-1] == "office_hold"
+
+    monkeypatch.setattr(approval, "_publish_preparation", publication)
     monkeypatch.setattr(engine.RegistryPTGScopeAuthorityClient, "authorize", authorize)
     return service, session, events
 
@@ -219,7 +242,11 @@ async def test_physical_reader_reuses_complete_witness_and_original_limits(monke
     session = object()
     context = object()
     command_by_field = _command()
-    descriptor = SimpleNamespace(manifest_json=json.dumps({"command": command_by_field}).encode())
+    descriptor = SimpleNamespace(
+        manifest_json=json.dumps(
+            {"command": command_by_field, "command_sha256": capture._digest(command_by_field)}
+        ).encode()
+    )
     reader = AsyncMock(
         return_value=SimpleNamespace(as_dict=lambda: {"command_sha256": capture._digest(command_by_field)})
     )

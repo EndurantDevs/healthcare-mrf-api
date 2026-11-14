@@ -30,10 +30,7 @@ from process.network_legacy_alias_adoption import (
     LegacyNetworkAdoptionRow,
     adopt_legacy_network_aliases,
 )
-from process.registry_management_permissions import (
-    assume_registry_source_owner,
-    verify_registry_management_permissions,
-)
+from process.registry_management_permissions import assume_registry_source_owner
 from process.registry_record_store import RegistryActor, _bounded_text, _validated_actor, _validated_fields
 from process.registry_source_import import _disconnect_database, _error_json, _ReceiptArgumentParser
 
@@ -104,9 +101,6 @@ async def import_network_catalog(session, catalog_rows, actor, source_context, *
     connection = (await (await session.connection()).get_raw_connection()).driver_connection
     try:
         async with session.begin_nested():
-            await verify_registry_management_permissions(
-                connection, api_role=api_role, owner_role=owner_role, control_schema=control_schema
-            )
             await assume_registry_source_owner(connection, owner_role, control_schema=control_schema)
             # Serialize before adoption takes write locks needed by the later catalog validation.
             control = await connection.fetchrow(

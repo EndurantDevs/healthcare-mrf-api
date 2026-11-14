@@ -9,7 +9,7 @@ from sanic.exceptions import NotFound, SanicException
 from sqlalchemy.exc import DBAPIError
 
 from api.network_address_scope import _bound_address_read_session_scope, current_network_address_scope
-from api.network_read_execution import _original_read_driver
+from api.network_read_execution import _read_driver
 from api.network_serving_api_read import api_catalog_read_snapshot
 from api.provider_detail_network_contract import ProviderDetailNetworkQuery, parse_managed_detail_query
 from api.provider_profile_snapshot import provider_profile_read_snapshot
@@ -196,7 +196,7 @@ async def managed_provider_network_read_scope(
         raise RegistryNetworkCatalogError("registry_network_catalog_request_invalid")
     control_schema = registry_schema()
     transaction = session.get_transaction()
-    driver, backend_pid = await _original_read_driver(session)
+    driver = await _read_driver(session)
     async with api_catalog_read_snapshot(session, network_generation, control_schema) as (manifest, approved_relation):
         if network_generation is not None and manifest.generation_id != network_generation:
             raise RegistryNetworkCatalogError("registry_network_catalog_source_changed")
@@ -210,7 +210,6 @@ async def managed_provider_network_read_scope(
             session,
             transaction,
             driver,
-            backend_pid,
             manifest,
             approved_relation,
             network_ids,

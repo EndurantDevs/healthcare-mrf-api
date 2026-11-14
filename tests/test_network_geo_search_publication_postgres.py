@@ -3,11 +3,14 @@
 
 import json
 from dataclasses import asdict, replace
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import asyncpg
 import pytest
 from sqlalchemy import text
+from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.endpoint import npi
@@ -16,31 +19,55 @@ from api.network_address_scope import (
     scoped_address_parameters,
     scoped_address_relation_sql,
 )
-from api.network_read_execution import execute_network_read, network_read_name_inventory, network_read_relations
+from api.network_read_execution import bounded_network_read_rows, qualified_relation_sql
 from api.provider_geo_sql import build_native_nearby_count_sql, build_native_nearby_sql
 from process import network_geo_search
 from process.network_compact_layout import CompactAddressRelation, bind_compact_geo_search
 from process.network_serving_read import resolve_network_serving_manifest
 from tests import test_network_compact_publication_postgres as publication
-from tests.test_network_compact_address_lookup import _layout
+from tests.network_compact_address_postgres_support import _layout
 from tests.test_network_compact_publication_postgres import compact_publication_db as compact_publication_db
+from tests.test_network_read_execution import _session
 
 
-def test_search_sources_allow_only_the_authenticated_base_name_to_rotate():
+def test_search_sources_require_complete_declared_names():
     original = _layout()
     sources = json.loads(json.dumps(asdict(original)))
-    search = CompactAddressRelation(original.ref_map.schema_name, "network_geo_search", 6)
-    rotated_base = replace(original.base, table_name="retained_address_result")
-    rotated = replace(original, base=rotated_base)
-    assert bind_compact_geo_search(rotated, search, sources=sources).geo_search == search
+    search = CompactAddressRelation(original.ref_map.schema_name, "network_geo_search")
+    assert bind_compact_geo_search(original, search, sources=sources).geo_search == search
     for base in (
-        replace(rotated_base, table_oid=7),
-        replace(rotated_base, schema_name="other_schema"),
+        replace(original.base, table_name="retained_address_result"),
+        replace(original.base, schema_name="other_schema"),
     ):
         with pytest.raises(ValueError, match="inputs differ"):
             bind_compact_geo_search(replace(original, base=base), search, sources=sources)
     with pytest.raises(ValueError, match="inputs differ"):
         bind_compact_geo_search(replace(original, custom=None), search, sources=sources)
+
+
+async def _bounded_geo_rows(session, query, parameters):
+    compiled = text(query).params(**parameters).compile(dialect=PGDialect_asyncpg())
+    return await bounded_network_read_rows(
+        session, str(compiled), *(compiled.params[name] for name in compiled.positiontup or ())
+    )
+
+
+async def test_bounded_geo_query_preserves_native_parameters():
+    driver = SimpleNamespace(
+        fetchrow=AsyncMock(
+            return_value={"count": 1, "bytes": 100, "rows_json": json.dumps([{"location_key": "a" * 64}])}
+        )
+    )
+    selected = await _bounded_geo_rows(
+        _session(driver),
+        "SELECT :location AS location_key WHERE :network_id=42",
+        {"location": "a" * 64, "network_id": 42, "unused": "excluded"},
+    )
+    assert selected == [{"location_key": "a" * 64}]
+    query, *arguments = driver.fetchrow.await_args.args
+    assert arguments == ["a" * 64, 42]
+    assert "SELECT $1 AS location_key WHERE $2=42" in query
+    assert "count<=5000 AND bytes<=8388608" in query
 
 
 async def _geo_rows(fixture, generation_id, *, projected):
@@ -59,21 +86,22 @@ async def _geo_rows(fixture, generation_id, *, projected):
         assert (search is not None) is projected
         if projected:
             assert search in manifest.candidate_relation_pins
-        with network_read_name_inventory(native, manifest.candidate_relation_pins):
-            with network_address_read_scope(manifest, (42,)):
-                relation = scoped_address_relation_sql("mrf.entity_address_unified", location_lookup=True)
-                nearby = npi._nearby_sql_query("1=1", "", "", use_taxonomy_filter=False, address_table_sql=relation)
-                page_sql = build_native_nearby_sql(nearby, use_search_page=True)
-                count_sql = build_native_nearby_count_sql(nearby)
-                assert (nearby.search_table_sql is not None) is projected
-                if projected:
-                    assert network_read_relations(count_sql) == (search,)
-                    assert search in network_read_relations(page_sql)
-                parameters = scoped_address_parameters({"in_lat": 40.75, "in_long": -73.5, "radius": 10.0, "limit": 28})
-                count = (await execute_network_read(session, text(count_sql), parameters)).scalar_one()
-                page_rows = (await execute_network_read(session, text(page_sql), parameters)).all()
-                assert count == 1
-                return [page_row._mapping["location_key"] for page_row in page_rows]
+        with network_address_read_scope(manifest, (42,)):
+            relation = scoped_address_relation_sql("mrf.entity_address_unified", location_lookup=True)
+            nearby = npi._nearby_sql_query("1=1", "", "", use_taxonomy_filter=False, address_table_sql=relation)
+            page_sql = build_native_nearby_sql(nearby, use_search_page=True)
+            count_sql = build_native_nearby_count_sql(nearby)
+            assert (nearby.search_table_sql is not None) is projected
+            if projected:
+                search_sql = qualified_relation_sql(search.schema_name, search.table_name)
+                assert search_sql in count_sql and search_sql in page_sql
+                base = manifest.compact_layout.base
+                assert qualified_relation_sql(base.schema_name, base.table_name) not in count_sql
+            parameters = scoped_address_parameters({"in_lat": 40.75, "in_long": -73.5, "radius": 10.0, "limit": 28})
+            (count,) = await _bounded_geo_rows(session, count_sql, parameters)
+            page_rows = await _bounded_geo_rows(session, page_sql, parameters)
+            assert count["total_count"] == 1
+            return [page_row["location_key"] for page_row in page_rows]
 
 
 async def _provider_tables(fixture):
@@ -145,13 +173,14 @@ async def test_geo_search_preparation_custody_publication_and_retained_fallback(
     descriptor = network_geo_search.geo_search_receipt(dict(candidate))
     assert candidate["state"] == "ready" and candidate["index_ready"] is True
     assert descriptor["row_count"] == 2
-    closure = json.loads(candidate["validation_json"])["writer_closure"]
-    assert closure["relation_oids"][network_geo_search.TABLE] == descriptor["table_oid"]
+    assert (descriptor["scope"]["schema_name"], descriptor["table_name"]) == (
+        second.schema_name,
+        network_geo_search.TABLE,
+    )
     async with fixture.connection.transaction():
         await network_geo_search.verify_geo_search_indexes(fixture.connection, descriptor)
-    seal = await publication._seal(fixture, second)
+    await publication._seal(fixture, second)
     assert await fixture.custodian.fetchval("SHOW search_path") == metadata_path
-    assert seal["receipt"]["closure"]["relation_oids"][network_geo_search.TABLE] == descriptor["table_oid"]
     for connection in (fixture.address.reader, fixture.execution_connection):
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
             await connection.execute(f'UPDATE "{second.schema_name}".network_geo_search SET npi=npi')

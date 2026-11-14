@@ -375,7 +375,7 @@ async def publish_local_data_candidate_in_transaction(
     await native.require_local_binding_publisher(session)
     snapshot_id = "snapshot-archive-" + str(UUID(str(operation["operation_id"])))
     _preparation, evidence, physical_binding = await native._prepared_local_header(session, snapshot_id)
-    ownership, _descriptor = native._prepared_local_binding(evidence, snapshot_id, physical_binding.owner_oid)
+    ownership, _descriptor = native._prepared_local_binding(evidence, snapshot_id)
     await native.require_frozen_local_preparation(session, operation=operation, ownership=ownership)
     ready = evidence["activation_evidence"]
     schema_name = resolve_ptg2_schema()
@@ -451,10 +451,12 @@ async def local_data_publication_receipt(session, evidence, physical_binding):
         "payload_snapshot_id": physical_binding.payload_snapshot_id,
         "payload_snapshot_key": physical_binding.payload_snapshot_key,
         "dataset_id": str(physical_binding.dataset_id),
-        "schema_oid": physical_binding.schema_oid,
-        "owner_oid": physical_binding.owner_oid,
-        "relation_oids": [list(pair) for pair in physical_binding.relation_oids],
-        "sequence_oids": [list(entry) for entry in physical_binding.sequence_oids],
+        "schema_name": physical_binding.schema_name,
+        "relations": [{"schema": schema, "name": name} for schema, name in physical_binding.relations],
+        "sequences": [
+            {"schema": schema, "name": name, "owner_table": table, "owner_column": column}
+            for schema, name, table, column in physical_binding.sequences
+        ],
         "destination_activation": {
             "source_key": evidence["activation_evidence"]["source_key"],
             "snapshot_id": physical_binding.snapshot_id,
@@ -1151,40 +1153,22 @@ def _local_audit(candidate, candidate_attributes, source_records, physical_bindi
 
 
 async def local_data_physical_read_state(session, snapshot_id, *, is_prepared):
-    """Resolve one qualified read view and keep exact payload locks in this reader transaction."""
+    """Resolve immutable named payloads and verify their logical control postimage."""
     from process.ptg_parts import ptg2_physical_binding as native
 
-    native._qualified_local_read_view_shas(is_prepared)
     if not callable(getattr(session, "in_transaction", None)) or not session.in_transaction():
         raise native.PTG2PhysicalBindingError("PTG local read requires a caller transaction")
-    is_publisher, owner_oid, authority_by_field = await _local_read_authority(
-        session, snapshot_id, is_prepared=is_prepared
-    )
-    schema_name = resolve_ptg2_schema()
-    ownership, physical_binding = _local_read_authority_binding(
-        authority_by_field, snapshot_id, owner_oid, is_prepared=is_prepared
-    )
-    if is_publisher and is_prepared:
-        header, _evidence, header_binding = await native._prepared_local_header(
-            session, snapshot_id, owner_oid=owner_oid
-        )
-        if header["validation_sha256"] != authority_by_field["validation_sha256"] or header_binding != physical_binding:
-            raise native.PTG2PhysicalBindingError("PTG local publisher read preimage differs")
-    for name, _oid in physical_binding.relation_oids:
-        await session.execute(text(f"LOCK TABLE ONLY {physical_binding.relation(name)} IN ACCESS SHARE MODE NOWAIT"))
-    await native.verify_local_data_family(session, ownership)
-    await native._require_closed_local_custody(session, ownership, owner_oid)
-    evidence = authority_by_field["native_validation"]
-    if await native.local_data_catalog_digest(session, ownership) != evidence["catalog_sha256"]:
-        raise native.PTG2PhysicalBindingError("PTG local read catalog changed")
-    candidate = await native._local_candidate_control(
-        session, schema_name, physical_binding, lock_controls=is_publisher is True
-    )
+    row_by_field = await _local_read_authority(session, snapshot_id, is_prepared=is_prepared)
+    binding, row_by_field = _local_read_authority_binding(row_by_field, snapshot_id, is_prepared=is_prepared)
+    for _schema, name in binding.relations:
+        await session.execute(text(f"LOCK TABLE ONLY {binding.relation(name)} IN ACCESS SHARE MODE NOWAIT"))
+    evidence = row_by_field["native_validation"]
+    candidate = await native._local_candidate_control(session, resolve_ptg2_schema(), binding, lock_controls=False)
     if candidate is None:
         raise native.PTG2PhysicalBindingError("PTG local read control is unavailable")
     plan_result = await session.execute(
         text(
-            f"SELECT plan_id,plan_market_type FROM {_quote_ident(schema_name)}.ptg2_v3_snapshot_plan_scope "
+            f"SELECT plan_id,plan_market_type FROM {_quote_ident(resolve_ptg2_schema())}.ptg2_v3_snapshot_plan_scope "
             "WHERE snapshot_id=:snapshot_id ORDER BY plan_id,plan_market_type"
         ),
         {"snapshot_id": snapshot_id},
@@ -1192,49 +1176,39 @@ async def local_data_physical_read_state(session, snapshot_id, *, is_prepared):
     plans = plan_result.mappings().all()
     if is_prepared:
         candidate = native._require_local_control_postimage(
-            candidate, tuple((plan["plan_id"], plan["plan_market_type"]) for plan in plans), evidence, physical_binding
+            candidate, tuple((plan["plan_id"], plan["plan_market_type"]) for plan in plans), evidence, binding
         )
     else:
         native._require_local_published_postimage(
-            candidate, plans, evidence, authority_by_field["native_publication"], physical_binding
+            candidate, plans, evidence, row_by_field["native_publication"], binding
         )
     info = getattr(session, "info", None)
     if isinstance(info, dict):
-        info.setdefault("ptg2_local_read_bindings", {})[physical_binding.schema_name] = physical_binding
-        info.setdefault("ptg2_local_read_catalog_sha256", {})[physical_binding.schema_name] = evidence["catalog_sha256"]
-    return authority_by_field, evidence, physical_binding, dict(candidate)
+        info.setdefault("ptg2_local_read_bindings", {})[binding.schema_name] = binding
+    return row_by_field, evidence, binding, dict(candidate)
 
 
 async def _local_read_authority(session, snapshot_id, *, is_prepared):
-    """Qualify the actual role and fixed read view before reading its bounded authority."""
+    """Read one fixed named projection under the caller's PostgreSQL privileges."""
     from process.ptg_parts import ptg2_physical_binding as native
 
-    catalog_owner_oid = await native.local_preparation_catalog_owner(session)
-    is_publisher = await session.scalar(
-        text("SELECT pg_has_role(current_user,CAST(:owner_oid AS oid),'USAGE')"), {"owner_oid": catalog_owner_oid}
-    )
-    if is_publisher is True:
-        owner_oid = await native.require_local_physical_publisher_view(session, is_prepared=is_prepared)
-    else:
-        owner_oid = await native.require_local_physical_read_view(session, is_prepared=is_prepared)
     schema_name = resolve_ptg2_schema()
     view_name = "ptg2_prepared_physical_binding" if is_prepared else "ptg2_installed_physical_binding"
-    authority_result = await session.execute(
+    result = await session.execute(
         text(
             f"SELECT * FROM {_quote_ident(schema_name)}.{_quote_ident(view_name)} "
             "WHERE destination_snapshot_id=:snapshot_id LIMIT 2"
         ),
         {"snapshot_id": snapshot_id},
     )
-    authority_rows = authority_result.mappings().all()
-    if len(authority_rows) != 1:
-        raise native.PTG2PhysicalBindingError("PTG local read authority is unavailable")
-    return is_publisher, owner_oid, dict(authority_rows[0])
+    rows = result.mappings().all()
+    if len(rows) != 1:
+        raise native.PTG2PhysicalBindingError("PTG local named read is unavailable")
+    return dict(rows[0])
 
 
 async def local_data_serving_row(session, snapshot_id, row_by_field, *, is_prepared):
     """Supply actual local payload evidence to the existing strict API manifest validators."""
-    from process.ptg_parts import ptg2_physical_binding as native
 
     _authority, _evidence, physical_binding, candidate = await local_data_physical_read_state(
         session, snapshot_id, is_prepared=is_prepared
@@ -1285,60 +1259,47 @@ async def _local_serving_source_identity(session, physical_binding):
     )
 
 
-def _local_read_authority_binding(authority_by_field, snapshot_id, owner_oid, *, is_prepared):
-    """Decode only after the fixed native view body and its owner have been authenticated."""
+def _local_read_authority_binding(authority_by_field, snapshot_id, *, is_prepared):
+    """Decode named tables and preserve the complete logical content validation."""
     from process.ptg_parts import ptg2_physical_binding as native
 
     try:
+        row_by_field = native.named_local_read_row(authority_by_field, is_prepared=is_prepared)
+        evidence = row_by_field["native_validation"]
+        audit = evidence["native_audit"]
         expected_contract = (
             "ptg.prepared-physical-binding-read.v1" if is_prepared else "ptg.installed-physical-binding-read.v1"
         )
-        evidence = authority_by_field["native_validation"]
-        audit = evidence["native_audit"]
-        model_sha256 = native.local_data_model_digest()
         if (
-            set(authority_by_field) != set(native._local_read_view_columns(is_prepared))
-            or authority_by_field["contract"] != expected_contract
-            or authority_by_field["owner_oid"] != owner_oid
-            or authority_by_field["destination_snapshot_id"] != snapshot_id
+            row_by_field["contract"] != expected_contract
+            or row_by_field["destination_snapshot_id"] != snapshot_id
             or evidence["contract"] != "ptg_result.postgres.v2"
+            or set(evidence["initialization"])
+            != {"destination_snapshot_id", "destination_import_run_id", "destination_layout_key"}
             or evidence["initialization"]["destination_snapshot_id"] != snapshot_id
+            or set(evidence["data"]) != {"model_sha256", "payload_snapshot_id", "payload_snapshot_key"}
+            or set(evidence["activation_evidence"]) != {"source_key", "expected_current_snapshot_id", "control_sha256"}
             or audit["contract"] != "ptg-local-data.native-set-audit.v1"
-            or not isinstance(audit["identity"], dict)
-            or audit["model_sha256"] != model_sha256
-            or evidence["data"]["model_sha256"] != model_sha256
-            or audit["catalog_sha256"] != evidence["catalog_sha256"]
+            or audit["model_sha256"] != native.local_data_model_digest()
+            or evidence["data"]["model_sha256"] != audit["model_sha256"]
             or evidence["activation_evidence"]["control_sha256"] != evidence["control_sha256"]
-            or any(
-                not isinstance(authority_by_field[field], str)
-                or re.fullmatch(r"[0-9a-f]{64}", authority_by_field[field]) is None
-                for field in ("manifest_sha256", "validation_sha256", "inventory_sha256")
-            )
-            or (
-                authority_by_field["artifact_sha256"] is not None
-                and (
-                    not isinstance(authority_by_field["artifact_sha256"], str)
-                    or re.fullmatch(r"[0-9a-f]{64}", authority_by_field["artifact_sha256"]) is None
-                )
-            )
         ):
             raise ValueError
-        ownership, physical_binding = native._prepared_local_binding(evidence, snapshot_id, owner_oid)
-        native._require_local_inventory(
-            ownership,
-            authority_by_field["relation_inventory"],
-            authority_by_field["sequence_inventory"],
-            authority_by_field["inventory_sha256"],
-        )
-        if (
-            not is_prepared
-            and native._local_publication_binding(evidence, authority_by_field["native_publication"])[1]
-            != physical_binding
-        ):
+        digests = [row_by_field["manifest_sha256"], evidence["metadata_sha256"], evidence["control_sha256"]]
+        if row_by_field["artifact_sha256"] is not None:
+            digests.append(row_by_field["artifact_sha256"])
+        if not is_prepared:
+            from uuid import UUID
+
+            for field in ("generation_id", "publication_fence"):
+                if str(UUID(row_by_field[field])) != row_by_field[field]:
+                    raise ValueError
+            digests.append(row_by_field["publication_sha256"])
+        if any(type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None for digest in digests):
             raise ValueError
+        return native.named_local_binding(evidence, snapshot_id), row_by_field
     except (KeyError, TypeError, ValueError, AttributeError) as error:
-        raise native.PTG2PhysicalBindingError("PTG local read authority differs") from error
-    return ownership, physical_binding
+        raise native.PTG2PhysicalBindingError("PTG local named read data differs") from error
 
 
 def validate_local_serving_scope(scope_by_field):

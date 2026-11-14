@@ -12,7 +12,6 @@ from uuid import UUID, uuid5
 import pytest
 
 from db.registry_source_inventory_schema import INVENTORY_TABLE
-from process import network_candidate_custody as custody
 from process import reference_family_archive as archive
 from process import registry_aca_source_consumer as aca
 from process import registry_cms_source_consumer as cms
@@ -249,20 +248,9 @@ def _spies(monkeypatch, fixture, module):
     connection = Connection(fixture.candidate)
     events = []
 
-    async def seal(actual, copy_target, *, control_schema, required):
+    async def load(actual, copy_target, candidate, *, control_schema):
         assert actual is connection and actual.active and copy_target == fixture.target
-        assert required is True and control_schema == CONTROL
-        events.append("custody")
-        return {
-            "receipt": {
-                "runtime_roles": ["source_owner", "source_publisher"],
-                "closure": {"relation_oids": {INVENTORY_TABLE: 88}},
-            }
-        }
-
-    async def load(actual, copy_target, candidate, *, expected_table_oid, control_schema):
-        assert actual is connection and actual.active and copy_target == fixture.target
-        assert events[-1] == "custody" and expected_table_oid == 88 and control_schema == CONTROL
+        assert control_schema == CONTROL
         assert actual.readonly is (module is cms)
         events.append("inventory")
         return fixture.reference, fixture.entries
@@ -283,10 +271,8 @@ def _spies(monkeypatch, fixture, module):
         events.append("publish")
         return {"synthetic": "published"}
 
-    sealed, loader, publisher = AsyncMock(side_effect=seal), AsyncMock(side_effect=load), AsyncMock(side_effect=publish)
-    monkeypatch.setattr(custody, "verify_network_candidate_custody", sealed)
-    monkeypatch.setattr(aca, "verify_network_candidate_custody", sealed)
-    monkeypatch.setattr(inventory_store, "_load_locked_source_inventory", loader)
+    loader, publisher = AsyncMock(side_effect=load), AsyncMock(side_effect=publish)
+    monkeypatch.setattr(inventory_store, "load_source_inventory", loader)
     monkeypatch.setattr(cms, "prepare_and_publish_network_candidate", publisher)
     monkeypatch.setattr(aca, "publish_network_candidate", publisher)
     monkeypatch.setattr(aca, "current_aca_source_fence", fence)
@@ -294,22 +280,21 @@ def _spies(monkeypatch, fixture, module):
     selected, archived = AsyncMock(return_value=True), AsyncMock()
     monkeypatch.setattr(aca, "_selected_anchor", selected)
     monkeypatch.setattr(aca, "_require_archive", archived)
-    return connection, sealed, loader, publisher, selected, archived, events
+    return connection, loader, publisher, selected, archived, events
 
 
 @pytest.mark.parametrize("family", ["cms", "aca"])
 @pytest.mark.parametrize("count", [1, 101, 1000])
-async def test_actual_newref_replay_loads_sealed_payload_then_keeps_family_authority(monkeypatch, family, count):
+async def test_actual_newref_replay_loads_named_payload_then_keeps_family_authority(monkeypatch, family, count):
     module = cms if family == "cms" else aca
     fixture = _cms_case(count) if family == "cms" else _aca_case(count)
-    connection, seal, loader, publish, selected, archived, events = _spies(monkeypatch, fixture, module)
+    connection, loader, publish, selected, archived, events = _spies(monkeypatch, fixture, module)
     result = (
         await cms._replay(connection, fixture.event_by_name, fixture.config)
         if module is cms
         else await aca._replay(connection, fixture.event_by_name, fixture.accepted, fixture.config)
     )
-    assert result["state"] == "replayed" and events[:2] == ["custody", "inventory"]
-    seal.assert_awaited_once()
+    assert result["state"] == "replayed" and events[0] == "inventory"
     loader.assert_awaited_once()
     publish.assert_awaited_once()
     if module is aca:
@@ -340,7 +325,7 @@ async def test_small_count_byte_wide_identity_and_actual_replay(monkeypatch, byt
     )
     with pytest.raises(ValueError):
         module._recipe_attempt_commitment(selected_recipes)
-    connection, _, _, publish, *_ = _spies(monkeypatch, fixture, module)
+    connection, _, publish, *_ = _spies(monkeypatch, fixture, module)
     if module is cms:
         assert (await cms._replay(connection, fixture.event_by_name, fixture.config))["state"] == "replayed"
     else:
@@ -357,7 +342,7 @@ async def test_cms_initial_replay_retains_single_recipe_and_no_prior_base_contra
         fixture.candidate["source_generations"]["retained_network_source"] = SOURCE_SHA
     if damage == "head":
         fixture.candidate["expected_head"] = 7
-    connection, _, _, publish, *_ = _spies(monkeypatch, fixture, cms)
+    connection, _, publish, *_ = _spies(monkeypatch, fixture, cms)
     if damage is None:
         assert (await cms._replay(connection, fixture.event_by_name, fixture.config))["state"] == "replayed"
     else:
@@ -368,14 +353,14 @@ async def test_cms_initial_replay_retains_single_recipe_and_no_prior_base_contra
 
 async def test_cms_periodic_newref_recovers_saved_event_before_any_head_lookup(monkeypatch):
     fixture = _cms_case(101)
-    connection, seal, loader, _, *_ = _spies(monkeypatch, fixture, cms)
+    connection, loader, _, *_ = _spies(monkeypatch, fixture, cms)
     cfg, records = await cms._periodic_config(
         connection, fixture.notice, fixture.config, fixture.notice.pair.recipe.source_pin.endpoint_id
     )
     assert cfg == fixture.config and records == [fixture.candidate]
-    assert seal.await_count == loader.await_count == 1
+    assert loader.await_count == 1
     assert (await cms._replay(connection, fixture.event_by_name, cfg, records))["state"] == "replayed"
-    assert seal.await_count == loader.await_count == 2
+    assert loader.await_count == 2
 
 
 async def test_cms_sync_newref_helper_does_not_hydrate_or_claim_authentication():
@@ -385,7 +370,7 @@ async def test_cms_sync_newref_helper_does_not_hydrate_or_claim_authentication()
 
 
 @pytest.mark.parametrize("family", ["cms", "aca"])
-@pytest.mark.parametrize("damage", ["checkpoint", "attempt", "scope", "custody", "oid", "payload"])
+@pytest.mark.parametrize("damage", ["checkpoint", "attempt", "scope", "payload"])
 async def test_newref_replay_refuses_identity_and_payload_drift_before_publish(monkeypatch, family, damage):
     module = cms if family == "cms" else aca
     fixture = _cms_case(2) if module is cms else _aca_case(2)
@@ -395,14 +380,7 @@ async def test_newref_replay_refuses_identity_and_payload_drift_before_publish(m
         fixture.candidate["validation_json"][module._CHECKPOINT]["attempt_id"] = str(UUID(int=98))
     if damage == "scope":
         fixture.candidate["expected_head"] = 8
-    connection, seal, loader, publish, *_ = _spies(monkeypatch, fixture, module)
-    if damage == "custody":
-        seal.side_effect = ValueError("synthetic custody refusal")
-    if damage == "oid":
-        seal.side_effect = None
-        seal.return_value = {
-            "receipt": {"runtime_roles": ["source_owner", "source_publisher"], "closure": {"relation_oids": {}}}
-        }
+    connection, loader, publish, *_ = _spies(monkeypatch, fixture, module)
     if damage == "payload":
         fixture.entries = ()
     with pytest.raises((ValueError, KeyError)):
@@ -410,20 +388,6 @@ async def test_newref_replay_refuses_identity_and_payload_drift_before_publish(m
             await cms._replay(connection, fixture.event_by_name, fixture.config)
         else:
             await aca._replay(connection, fixture.event_by_name, fixture.accepted, fixture.config)
-    publish.assert_not_awaited()
-
-
-async def test_aca_source_authority_census_precedes_inventory_and_archive_reads(monkeypatch):
-    fixture = _aca_case(1)
-    connection, seal, loader, publish, _, archived, _ = _spies(monkeypatch, fixture, aca)
-    seal.side_effect = None
-    seal.return_value = {
-        "receipt": {"runtime_roles": ["source_owner"], "closure": {"relation_oids": {INVENTORY_TABLE: 88}}}
-    }
-    with pytest.raises(ValueError):
-        await aca._replay(connection, fixture.event_by_name, fixture.accepted, fixture.config)
-    loader.assert_not_awaited()
-    archived.assert_not_awaited()
     publish.assert_not_awaited()
 
 
@@ -436,7 +400,7 @@ async def test_aca_successor_must_match_notified_physical_source(monkeypatch):
             ownership=replace(fixture.accepted.source_pin.prepared.ownership, auxiliary_oid=998),
         ),
     )
-    connection, _, _, publish, *_ = _spies(monkeypatch, fixture, aca)
+    connection, _, publish, *_ = _spies(monkeypatch, fixture, aca)
     with pytest.raises(ValueError):
         await aca._replay(
             connection, fixture.event_by_name, replace(fixture.accepted, source_pin=different), fixture.config
@@ -459,7 +423,7 @@ async def test_newref_global_epoch_keeps_all_anchor_and_archive_checks(monkeypat
         global_epoch=True,
         source_authority_roles=("source_owner", "source_publisher"),
     )
-    connection, _, _, publish, selected, archived, _ = _spies(monkeypatch, fixture, aca)
+    connection, _, publish, selected, archived, _ = _spies(monkeypatch, fixture, aca)
     accepted = (
         replace(epoch, prepared=replace(epoch.prepared, ownership=replace(epoch.prepared.ownership, auxiliary_oid=998)))
         if changed
@@ -499,7 +463,7 @@ async def test_cms_actual_wide_attempt_uses_tagged_identity_and_original_checkpo
 
 async def test_aca_actual_wide_attempt_preserves_source_fence_and_selection(monkeypatch):
     fixture = _aca_case(101)
-    connection, _, _, publish, *_ = _spies(monkeypatch, fixture, aca)
+    connection, _, publish, *_ = _spies(monkeypatch, fixture, aca)
     selected_recipes = _recipes(
         101,
         replace(

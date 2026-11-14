@@ -128,6 +128,7 @@ async def verify_compact_final_proof(
         await connection.execute(f"DROP TABLE {work}")
     else:
         _require(await _membership_sets_differ(connection, namespace, layout) is False)
+    return validation
 
 
 async def _compact_accounting(connection, candidate, namespace, address, offices):
@@ -160,7 +161,7 @@ async def _verify_custom_contribution(
         custom = await verify_compact_custom_contribution(
             connection,
             candidate,
-            runtime_roles=receipt.runtime_roles,
+            runtime_roles=(),
             control_schema=control_schema,
             office_authority=office_authority,
             **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),

@@ -111,13 +111,7 @@ def _bounded_page(source_command, approval_sha256, items, limit):
 async def list_registry_ptg_office_prepare_intents(
     connection, actor, source_command, *, scope_approval_sha256, after=None, limit=20, control_schema=None
 ):
-    """Read only in an already authorized, native-profile-verified caller transaction.
-
-    The caller genuinely re-reads the approved source and approval, verifies this
-    connection's native identity/read custody, and checks fresh session authority
-    before and after this call. A hash/actor syntax check supplies none of that.
-    No transaction, privilege, handle, session, physical read or commit is made.
-    """
+    """Read within the caller's authorized source scope and existing transaction."""
     source_command = _list_scope(source_command, scope_approval_sha256, after, limit)
     actor_key = _digest(_reactivation_actor(actor))
     if not connection.is_in_transaction():
@@ -184,12 +178,15 @@ def _prepared_source(prepared, source_command, selector):
 def _prepared_receipt(prepared, receipt):
     _object(prepared, {"capture_id", "state", "command", "command_sha256", "manifest_sha256"})
     selector = receipt["command"]["selector"]
-    if prepared["state"] != "prepared" or prepared["capture_id"] != selector["capture_id"]:
+    if prepared["state"] not in {"prepared", "handed_off"} or prepared["capture_id"] != selector["capture_id"]:
         raise ValueError("registry_ptg_office_intent_result_changed")
     command = _checked_command(prepared["command"], selector)
-    if capture_digest(command) != prepared["command_sha256"] or any(
-        command[name] != selector[name] for name in ("reason", "retained_generation_id")
-    ):
+    from process.registry_ptg_office_review_contract import is_legacy_office_review_command
+
+    if (
+        not is_legacy_office_review_command(prepared["command"])
+        and capture_digest(command) != prepared["command_sha256"]
+    ) or any(command[name] != selector[name] for name in ("reason", "retained_generation_id")):
         raise ValueError("registry_ptg_office_intent_result_changed")
     for name in ("command_sha256", "manifest_sha256"):
         _sha256(prepared[name])
@@ -209,9 +206,10 @@ def project_registry_ptg_office_prepare_result(result, actor, source_command, *,
         if item["state"] not in {"queued", "running"}:
             raise ValueError("registry_ptg_office_intent_result_changed")
     else:
-        if item["state"] != "completed":
-            raise ValueError("registry_ptg_office_intent_result_changed")
         _prepared_receipt(prepared, receipt)
+        expected_state = "running" if prepared["state"] == "handed_off" else "completed"
+        if item["state"] != expected_state:
+            raise ValueError("registry_ptg_office_intent_result_changed")
         _prepared_source(prepared, source_command, item["selector"])
     projected_by_field = {
         "source_command_sha256": capture_digest(source_command),

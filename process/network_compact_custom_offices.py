@@ -8,7 +8,6 @@ from uuid import UUID, uuid4
 import asyncpg
 
 from db.registry_schema import registry_schema
-from process import network_address_artifact as artifact
 from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_compact_layout import CompactAddressRelation
 from process.network_custom_address_source import (
@@ -43,19 +42,18 @@ class CompactCustomOfficeReceipt:
     target: MembershipCopyTarget
     control_schema: str
     approved_revision: int
-    runtime_roles: tuple[str, ...]
     base_source: PinnedAddressSource
     base_artifact_sha256: str
     npi_source: PinnedAddressSource | None
-    npi_identity: tuple[int, int, int, str] | None
     approved_records_sha256: str
     custom_pair_count: int
-    address_table_oid: int | None
-    binding_table_oid: int | None
+    address_relation: CompactAddressRelation | None
+    binding_relation: CompactAddressRelation | None
+    revision: int = 2
 
     def as_dict(self):
-        """Serialize closed preparation evidence; no custody is granted by JSON."""
-        document = json.loads(json.dumps({"component": _COMPONENT, "revision": 1, **asdict(self)}))
+        """Serialize bounded logical inputs and independently checked row accounting."""
+        document = json.loads(json.dumps({"component": _COMPONENT, **asdict(self)}))
         parse_compact_custom_office_receipt(document)
         return document
 
@@ -79,53 +77,69 @@ def _parse_source(document):
     return PinnedAddressSource(**document)
 
 
-def _npi_identity(value):
-    _require(type(value) is list and len(value) == 4, "receipt_invalid")
-    return (*(_integer(oid, 1, 2**32 - 1) for oid in value[:3]), _digest(value[3]))
+def _relation(document, target, allowed):
+    if document is None:
+        return None
+    _closed(document, ("schema_name", "table_name"))
+    relation = CompactAddressRelation(**document)
+    _require(relation.schema_name == target.schema_name and relation.table_name in allowed, "receipt_invalid")
+    return relation
 
 
-def parse_compact_custom_office_receipt(document):
-    """Parse bounded closed evidence without accepting it as native authority."""
-    _closed(document, ("component", "revision", *CompactCustomOfficeReceipt.__dataclass_fields__))
+def parse_compact_custom_office_receipt(document_by_field):
+    """Decode current names and the exact historical receipt layout."""
+    fields = {"component", *CompactCustomOfficeReceipt.__dataclass_fields__}
+    legacy = (fields - {"address_relation", "binding_relation"}) | {
+        "runtime_roles",
+        "npi_identity",
+        "address_table_oid",
+        "binding_table_oid",
+    }
+    _require(type(document_by_field) is dict and set(document_by_field) in (fields, legacy), "receipt_invalid")
     try:
-        _require(len(json.dumps(document, allow_nan=False).encode()) <= _MAX_BYTES, "receipt_too_large")
+        _require(len(json.dumps(document_by_field, allow_nan=False).encode()) <= _MAX_BYTES, "receipt_too_large")
         _require(
-            document["component"] == _COMPONENT and type(document["revision"]) is int and document["revision"] == 1,
+            document_by_field["component"] == _COMPONENT and type(document_by_field["revision"]) is int,
             "receipt_invalid",
         )
-        copy_target = document["target"]
+        copy_target = document_by_field["target"]
         _closed(copy_target, ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name", "table_name"))
         copy_target = MembershipCopyTarget(**copy_target)
-        roles = document["runtime_roles"]
-        _require(type(roles) is list, "receipt_invalid")
-        base = _parse_source(document["base_source"])
-        npi = None if document["npi_source"] is None else _parse_source(document["npi_source"])
-        revision, count = _integer(document["approved_revision"]), _integer(document["custom_pair_count"])
-        _validate_inputs(copy_target, base, revision, tuple(roles), npi)
+        count = _integer(document_by_field["custom_pair_count"])
+        if set(document_by_field) == legacy:
+            _require(document_by_field["revision"] == 1, "receipt_invalid")
+            has_binding = document_by_field["binding_table_oid"] is not None
+            document_by_field = {key: field_value for key, field_value in document_by_field.items() if key in fields}
+            document_by_field["address_relation"] = (
+                asdict(CompactAddressRelation(copy_target.schema_name, "entity_address_unified")) if count else None
+            )
+            document_by_field["binding_relation"] = (
+                asdict(CompactAddressRelation(copy_target.schema_name, "provider_location_binding"))
+                if has_binding
+                else None
+            )
+        _require(document_by_field["revision"] in (1, 2), "receipt_invalid")
+        base = _parse_source(document_by_field["base_source"])
+        npi = None if document_by_field["npi_source"] is None else _parse_source(document_by_field["npi_source"])
+        revision = _integer(document_by_field["approved_revision"])
+        _validate_inputs(copy_target, base, revision, (), npi)
         _require(base.table_name == "entity_address_unified", "current_base_required")
-        _identifier(document["control_schema"])
-        address_oid = document["address_table_oid"]
-        binding_oid = document["binding_table_oid"]
-        _require((address_oid is None) == (count == 0), "receipt_invalid")
-        _require(count == 0 or binding_oid is not None, "receipt_invalid")
-        for oid in (address_oid, binding_oid):
-            if oid is not None:
-                _integer(oid, 1, 2**32 - 1)
-        identity = None if document["npi_identity"] is None else _npi_identity(document["npi_identity"])
-        _require((npi is None) == (identity is None), "receipt_invalid")
+        _identifier(document_by_field["control_schema"])
+        address = _relation(document_by_field["address_relation"], copy_target, {"entity_address_unified"})
+        binding = _relation(document_by_field["binding_relation"], copy_target, _BINDINGS)
+        _require((address is None) == (count == 0) and (count == 0 or binding is not None), "receipt_invalid")
         return CompactCustomOfficeReceipt(
             copy_target,
-            document["control_schema"],
+            document_by_field["control_schema"],
             revision,
-            tuple(roles),
             base,
-            _digest(document["base_artifact_sha256"]),
+            _digest(document_by_field["base_artifact_sha256"]),
             npi,
-            identity,
-            _digest(document["approved_records_sha256"]),
+            _digest(document_by_field["approved_records_sha256"]),
             count,
-            address_oid,
-            binding_oid,
+            address,
+            binding,
+            document_by_field["revision"],
         )
     except (TypeError, ValueError, KeyError) as error:
         raise NetworkCustomAddressSourceError("compact_custom_offices_receipt_invalid") from error
@@ -172,10 +186,12 @@ async def _capture_inputs(connection, base, revision, roles, npi_source, control
     if npi_source is None and base_artifact.get("contract") == indexed.CONTRACT:
         original = indexed.original_address_source(base_artifact)
         npi_source = PinnedAddressSource(original.schema_name, "npi", original.generation_id)
-    effective_npi, npi_identity = (
-        await _capture_npi(connection, base.schema_name, npi_source, roles) if summary["npi_pairs"] else (None, None)
+    effective_npi = (
+        await _capture_npi(connection, base.schema_name, npi_source, roles, base.generation_id)
+        if summary["npi_pairs"]
+        else None
     )
-    return summary, base_artifact["descriptor_sha256"], effective_npi, npi_identity, physical
+    return summary, base_artifact["descriptor_sha256"], effective_npi, physical
 
 
 async def _compact_direct_identity(connection, control, revision):
@@ -188,42 +204,27 @@ async def _compact_direct_identity(connection, control, revision):
     return {**summary_by_field, **dict(direct)}
 
 
-async def _capture_npi(connection, default_schema, source, roles):
+async def _capture_npi(connection, default_schema, source, roles, default_generation):
     from process.network_npi_artifact import capture_network_npi_artifact
     from process.npi_result_generation import TABLE_NAME
 
     schema = default_schema if source is None else source.schema_name
-    native = await connection.fetchval("SELECT to_regclass($1)::oid", _identifier(schema) + "." + TABLE_NAME)
-    if native is not None:
-        captured, identity = await capture_network_npi_artifact(connection, schema, runtime_roles=roles)
-        _require(source is None or source == captured, "npi_generation_changed")
-        return captured, identity
-    # A pre-authority catalog keeps its explicit compatibility pin, never an EAU label.
-    legacy = source or PinnedAddressSource(schema, "npi", "legacy_npi_catalog")
-    identity = await _pin_source(connection, legacy, roles)
-    return source or PinnedAddressSource(schema, "npi", artifact._digest(identity)), identity
-
-
-async def _require_target_owner(connection, target):
-    _require(
-        await connection.fetchval(
-            "SELECT pg_has_role(current_user,nspowner,'MEMBER') AND has_schema_privilege(current_user,oid,'CREATE') "
-            "FROM pg_namespace WHERE nspname=$1",
-            target.schema_name,
+    native = await connection.fetchval("SELECT to_regclass($1) IS NOT NULL", _identifier(schema) + "." + TABLE_NAME)
+    if native:
+        captured, _reference = await capture_network_npi_artifact(
+            connection, schema, runtime_roles=roles, generation_id=None if source is None else source.generation_id
         )
-        is True,
-        "target_owner_required",
-    )
+        _require(source is None or source == captured, "npi_generation_changed")
+        return captured
+    pinned = source or PinnedAddressSource(schema, "npi", default_generation)
+    await _pin_source(connection, pinned, roles)
+    return pinned
 
 
 async def prepare_compact_custom_offices(
     connection, copy_target, base_source, *, approved_revision, runtime_roles, npi_source=None, control_schema=None
 ):
-    """Prepare only approved direct manual/NPI rows; the parent later seals custody.
-
-    Retained-site/PTG/ACA office carriers are separate inputs, never inferred here.
-    Address origins require native current authority or a verified retained seal.
-    """
+    """Prepare approved direct manual and NPI rows from their logical source editions."""
     _validate_inputs(copy_target, base_source, approved_revision, runtime_roles, npi_source)
     await _require_transaction(connection)
     control_schema = control_schema or registry_schema()
@@ -231,12 +232,11 @@ async def prepare_compact_custom_offices(
     try:
         async with connection.transaction():
             candidate = await _candidate(connection, copy_target, base_source, approved_revision, control)
-            await _require_target_owner(connection, copy_target)
-            summary, base_digest, npi, npi_identity, physical = await _capture_inputs(
+            summary, base_digest, npi, physical = await _capture_inputs(
                 connection, base_source, approved_revision, runtime_roles, npi_source, control, candidate
             )
             count = summary["pairs"]
-            address_oid = binding_oid = None
+            address_relation = binding_relation = None
             if count:
                 actual = await _insert_custom_rows(
                     connection,
@@ -247,26 +247,21 @@ async def prepare_compact_custom_offices(
                     approved_revision,
                 )
                 _require(actual == count, "row_accounting_differs")
-                address_oid, binding_oid = await connection.fetchrow(
-                    "SELECT to_regclass($1)::oid::bigint,to_regclass($2)::oid::bigint",
-                    copy_target.schema_name + ".entity_address_unified",
-                    copy_target.schema_name + ".custom_provider_location_binding",
-                )
+                address_relation = CompactAddressRelation(copy_target.schema_name, "entity_address_unified")
+                binding_relation = CompactAddressRelation(copy_target.schema_name, "custom_provider_location_binding")
             else:
                 await _empty_heap(connection, copy_target)
             receipt = CompactCustomOfficeReceipt(
                 copy_target,
                 control_schema,
                 approved_revision,
-                runtime_roles,
                 base_source,
                 base_digest,
                 npi,
-                npi_identity,
                 summary["fingerprint"],
                 count,
-                address_oid,
-                binding_oid,
+                address_relation,
+                binding_relation,
             )
             receipt.as_dict()
             return receipt
@@ -288,12 +283,15 @@ async def _empty_heap(connection, target):
 async def _binding_pin(connection, receipt, binding_table):
     _require(binding_table in _BINDINGS, "binding_table_invalid")
     table = _identifier(receipt.target.schema_name) + "." + _identifier(binding_table)
-    oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", table)
-    if oid is not None:
-        await connection.execute(f"LOCK TABLE ONLY {table} IN ACCESS SHARE MODE NOWAIT")
-        oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", table)
-    _require(oid == receipt.binding_table_oid, "binding_identity_changed")
-    return table if oid is not None else None
+    if receipt.binding_relation is None:
+        _require(receipt.custom_pair_count == 0, "binding_missing")
+        return None
+    _require(
+        receipt.binding_relation == CompactAddressRelation(receipt.target.schema_name, binding_table),
+        "binding_scope_changed",
+    )
+    await connection.fetch(f"SELECT * FROM {table} LIMIT 0")
+    return table
 
 
 async def _expected_rows(connection, receipt, address_table, binding_table, binding_kind, physical, carrier=None):
@@ -381,7 +379,7 @@ async def verify_compact_custom_offices(
     binding_table="custom_provider_location_binding",
     carrier=None,
 ):
-    """Rederive current direct rows independently before parent publication/sealing.
+    """Rederive current direct rows independently before publication.
 
     Final bindings may include unrelated source rows. Every deterministic direct
     custom key and every approved direct pair must match exactly; no hash/count
@@ -392,7 +390,7 @@ async def verify_compact_custom_offices(
     if carrier is not None:
         _require_carrier_scope(receipt, carrier)
     _require(
-        runtime_roles == receipt.runtime_roles and (control_schema or receipt.control_schema) == receipt.control_schema,
+        (control_schema or receipt.control_schema) == receipt.control_schema,
         "scope_changed",
     )
     await _require_transaction(connection)
@@ -411,12 +409,7 @@ async def verify_compact_custom_offices(
             address_table = None
             if receipt.custom_pair_count or carrier is not None and carrier.receipt.materialized_address_rows:
                 address_table = _identifier(receipt.target.schema_name) + ".entity_address_unified"
-                await connection.execute(f"LOCK TABLE ONLY {address_table} IN ACCESS SHARE MODE NOWAIT")
-                _require(
-                    await connection.fetchval("SELECT to_regclass($1)::oid::bigint", address_table)
-                    == (receipt.address_table_oid if carrier is None else carrier.receipt.address_table_oid),
-                    "address_identity_changed",
-                )
+                await connection.fetch(f"SELECT * FROM {address_table} LIMIT 0")
             else:
                 await _empty_heap(connection, receipt.target)
             await _expected_rows(connection, receipt, address_table, bindings, binding_table, physical, carrier)
@@ -426,7 +419,6 @@ async def verify_compact_custom_offices(
                 else CompactAddressRelation(
                     receipt.target.schema_name,
                     "entity_address_unified",
-                    receipt.address_table_oid if carrier is None else carrier.receipt.address_table_oid,
                 )
             )
     except asyncpg.PostgresError as error:
@@ -434,7 +426,7 @@ async def verify_compact_custom_offices(
 
 
 async def _verify_inputs(connection, receipt, runtime_roles, candidate):
-    summary, base_digest, npi, npi_identity, physical = await _capture_inputs(
+    summary, base_digest, npi, physical = await _capture_inputs(
         connection,
         receipt.base_source,
         receipt.approved_revision,
@@ -444,13 +436,12 @@ async def _verify_inputs(connection, receipt, runtime_roles, candidate):
         candidate,
     )
     _require(
-        (summary["fingerprint"], summary["pairs"], base_digest, npi, npi_identity)
+        (summary["fingerprint"], summary["pairs"], base_digest, npi)
         == (
             receipt.approved_records_sha256,
             receipt.custom_pair_count,
             receipt.base_artifact_sha256,
             receipt.npi_source,
-            receipt.npi_identity,
         ),
         "native_inputs_changed",
     )

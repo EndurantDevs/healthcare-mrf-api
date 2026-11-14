@@ -69,20 +69,21 @@ class PinnedFHIRMembershipSource:
     dataset_id: str
     dataset_sha256: str
     release_id: str
-    resource_table_oid: int
+    resource_relation: dict
     alias_scope: str
     as_of: str
-    custody_owner_role: str | None = None
-    custody_runtime_roles: tuple[str, ...] = ()
-    custody_proof_sha256: str | None = None
-    custody_catalog_sha256: str | None = None
     retained_epoch: RetainedCMSFHIRSourceEpoch | None = None
     retained_successor: PinnedFHIRMembershipSource | None = None
     retained_capture: RetainedFHIRCapture | None = None
     source_witness_capture: SourceWitnessCapture | None = None
     source_witness_anchor: SourceWitnessCaptureAnchor | None = None
+    edition_id: str | None = None
 
     def __post_init__(self):
+        if self.edition_id is not None and (
+            type(self.edition_id) is not str or re.fullmatch(r"[0-9a-f]{64}", self.edition_id) is None
+        ):
+            raise FHIRMembershipSourceError("FHIR edition is invalid")
         _identifier(self.schema_name)
         for field_name, maximum in (
             ("source_id", 64),
@@ -101,11 +102,18 @@ class PinnedFHIRMembershipSource:
                 raise FHIRMembershipSourceError("FHIR source coordinates are invalid")
         if type(self.dataset_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", self.dataset_sha256) is None:
             raise FHIRMembershipSourceError("FHIR dataset digest is invalid")
-        if type(self.resource_table_oid) is not int or not 0 < self.resource_table_oid <= 4294967295:
-            raise FHIRMembershipSourceError("FHIR source relation identity is invalid")
+        if type(self.resource_relation) is int:
+            object.__setattr__(
+                self, "resource_relation", {"schema": self.schema_name, "name": "provider_directory_dataset_resource"}
+            )
+        if type(self.resource_relation) is not dict or set(self.resource_relation) != {"schema", "name"}:
+            raise FHIRMembershipSourceError("FHIR source relation is invalid")
+        _identifier(self.resource_relation["schema"])
+        _identifier(self.resource_relation["name"])
+        if self.resource_relation["schema"] != self.schema_name:
+            raise FHIRMembershipSourceError("FHIR source relation is invalid")
         if type(self.as_of) is not str or date.fromisoformat(self.as_of).isoformat() != self.as_of:
             raise FHIRMembershipSourceError("FHIR membership date is invalid")
-        _validate_custody_coordinates(self)
         _validate_epoch_coordinates(self)
         _validate_successor_coordinates(self)
         _validate_retained_capture(self)
@@ -115,10 +123,8 @@ class PinnedFHIRMembershipSource:
     def coordinates(self):
         """Preserve the original nine-coordinate wire for sources without custody."""
         coordinates_by_name = asdict(self)
-        if self.custody_owner_role is None:
-            for name in tuple(coordinates_by_name):
-                if name.startswith("custody_"):
-                    coordinates_by_name.pop(name)
+        if self.edition_id is None:
+            coordinates_by_name.pop("edition_id")
         if self.retained_epoch is None:
             coordinates_by_name.pop("retained_epoch")
         else:
@@ -148,47 +154,23 @@ class PinnedFHIRMembershipSource:
         return physical.retained_epoch.schema_name if physical.retained_epoch is not None else physical.schema_name
 
     @property
-    def read_resource_table_oid(self):
-        """Bind the exact physical resource heap selected by retained custody."""
-        physical = fhir_physical_source(self)
-        capture = fhir_normalized_capture(physical)
+    def read_resource_relation(self):
+        """Resolve the selected retained resource table by its qualified name."""
+        selected = fhir_physical_source(self)
+        capture = fhir_normalized_capture(selected)
         if capture is not None:
-            return dict(capture.relation_oids)["provider_directory_dataset_resource"]
-        if physical.retained_epoch is None:
-            return physical.resource_table_oid
-        return dict(physical.retained_epoch.relation_oids)["provider_directory_dataset_resource"]
+            return dict(capture.tables["provider_directory_dataset_resource"])
+        if selected.retained_epoch is not None:
+            return {"schema": selected.retained_epoch.schema_name, "name": "provider_directory_dataset_resource"}
+        return dict(selected.resource_relation)
 
     @property
     def generation_id(self):
         """Bind every pinned coordinate for the candidate's source generation map."""
-        return hashlib.sha256(json.dumps(self.coordinates, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def _validate_custody_coordinates(source):
-    """Accept either no custody or one complete CMS-only retained receipt."""
-    if (
-        source.custody_owner_role,
-        source.custody_runtime_roles,
-        source.custody_proof_sha256,
-        source.custody_catalog_sha256,
-    ) == (None, (), None, None):
-        return
-    if (
-        source.source_id != "cms-npd"
-        or type(source.custody_owner_role) is not str
-        or type(source.custody_runtime_roles) is not tuple
-        or not 1 <= len(source.custody_runtime_roles) <= 32
-        or any(type(role) is not str for role in source.custody_runtime_roles)
-        or tuple(sorted(set(source.custody_runtime_roles))) != source.custody_runtime_roles
-        or source.custody_owner_role in source.custody_runtime_roles
-        or any(
-            type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None
-            for digest in (source.custody_proof_sha256, source.custody_catalog_sha256)
+        return (
+            self.edition_id
+            or hashlib.sha256(json.dumps(self.coordinates, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         )
-    ):
-        raise FHIRMembershipSourceError("FHIR custody coordinates are invalid")
-    for role in (source.custody_owner_role, *source.custody_runtime_roles):
-        _identifier(role)
 
 
 def _validate_successor_coordinates(source):
@@ -199,13 +181,12 @@ def _validate_successor_coordinates(source):
         type(successor) is not PinnedFHIRMembershipSource
         or successor.retained_successor is not None
         or any(
-            getattr(source, name) != getattr(successor, name)
-            for name in ("schema_name", "source_id", "endpoint_id", "alias_scope")
+            getattr(source, name) != getattr(successor, name) for name in ("source_id", "endpoint_id", "alias_scope")
         )
     ):
         raise FHIRMembershipSourceError("FHIR successor coordinates are invalid")
     if source.source_id == "cms-npd":
-        if successor.retained_epoch is None or (source.retained_epoch is None and source.custody_owner_role is None):
+        if successor.retained_epoch is None or source.schema_name != successor.schema_name:
             raise FHIRMembershipSourceError("FHIR successor coordinates are invalid")
     elif (
         type(source.retained_capture) is not RetainedFHIRCapture
@@ -213,6 +194,9 @@ def _validate_successor_coordinates(source):
         or source.retained_capture.origin.admission_profile != SEMANTIC_PROFILE
         or successor.retained_capture.origin.admission_profile != SEMANTIC_PROFILE
         or successor.as_of != successor.retained_capture.origin.semantic_projection_as_of
+        or source.retained_capture.origin.header_relation != successor.retained_capture.origin.header_relation
+        or source.schema_name != successor.schema_name
+        and successor.retained_capture.origin.schema_name == successor.retained_capture.origin.header_relation["schema"]
     ):
         raise FHIRMembershipSourceError("FHIR successor coordinates are invalid")
 
@@ -243,7 +227,7 @@ def with_fhir_successor(source, successor):
 def _validate_epoch_coordinates(source):
     if source.retained_epoch is None:
         return
-    if source.source_id != "cms-npd" or source.custody_owner_role is not None:
+    if source.source_id != "cms-npd":
         raise FHIRMembershipSourceError("FHIR epoch coordinates are invalid")
     try:
         epoch = validate_retained_cms_fhir_source_epoch(source.retained_epoch)
@@ -256,11 +240,13 @@ def _validate_epoch_coordinates(source):
         source.dataset_id,
         source.dataset_sha256,
         source.release_id,
-        source.resource_table_oid,
         source.alias_scope,
         source.as_of,
     )
-    if type(source.retained_epoch) is not RetainedCMSFHIRSourceEpoch or epoch.origin_coordinates != origin:
+    if (
+        type(source.retained_epoch) is not RetainedCMSFHIRSourceEpoch
+        or (epoch.origin_coordinates[:6] + epoch.origin_coordinates[7:]) != origin
+    ):
         raise FHIRMembershipSourceError("FHIR epoch coordinates are invalid")
 
 
@@ -275,14 +261,13 @@ def _validate_retained_capture(source_pin):
     if (
         source_pin.source_id == "cms-npd"
         or source_pin.retained_epoch is not None
-        or source_pin.custody_owner_role is not None
         or (
             source_pin.schema_name,
             source_pin.source_id,
             source_pin.endpoint_id,
             source_pin.dataset_id,
             source_pin.dataset_sha256,
-            source_pin.resource_table_oid,
+            source_pin.resource_relation,
         )
         != (
             origin.schema_name,
@@ -290,7 +275,7 @@ def _validate_retained_capture(source_pin):
             origin.endpoint_id,
             origin.dataset_id,
             origin.dataset_sha256,
-            origin.resource_parent_oid,
+            origin.resource_relation,
         )
         or source_pin.release_id != capture.release_id
     ):
@@ -307,7 +292,6 @@ def _validate_source_witness(source_pin):
         or type(anchor) is not SourceWitnessCaptureAnchor
         or source_pin.retained_capture is not None
         or source_pin.retained_epoch is not None
-        or source_pin.custody_owner_role is not None
         or source_pin.retained_successor is not None
     ):
         raise FHIRMembershipSourceError("FHIR Source witness coordinates are invalid")
@@ -322,7 +306,7 @@ def _validate_source_witness(source_pin):
         source_pin.endpoint_id,
         source_pin.dataset_id,
         source_pin.dataset_sha256,
-        source_pin.resource_table_oid,
+        source_pin.resource_relation,
         source_pin.release_id,
         source_pin.as_of,
     ) != (
@@ -331,7 +315,7 @@ def _validate_source_witness(source_pin):
         origin.endpoint_id,
         origin.dataset_id,
         origin.dataset_sha256,
-        origin.resource_parent_oid,
+        origin.resource_relation,
         capture.release_id,
         membership_date,
     ):
@@ -512,7 +496,7 @@ async def _successor_descriptor(connection, physical, original):
     return declaration
 
 
-_API_EPOCH_TABLES_SQL = """SELECT c.relname::text,c.oid::bigint FROM pg_catalog.pg_class c
+_API_EPOCH_TABLES_SQL = """SELECT c.relname::text FROM pg_catalog.pg_class c
  WHERE c.relnamespace=pg_catalog.to_regnamespace($1)::oid AND c.relname=ANY($2::text[])
  AND c.relkind='r' AND c.relpersistence='p'
  AND c.relam=(SELECT oid FROM pg_catalog.pg_am WHERE amname='heap')
@@ -535,16 +519,15 @@ async def _api_epoch_relations(connection, schema, namespace):
     tables = await connection.fetch(_API_EPOCH_TABLES_SQL, namespace, list(_TABLES))
     if len(tables) != len(_TABLES):
         raise FHIRMembershipSourceError("Pinned FHIR source is unavailable")
-    return tuple(CompactAddressRelation(schema, table["relname"], table["oid"]) for table in tables)
+    return tuple(CompactAddressRelation(schema, table["relname"]) for table in tables)
 
 
 async def _require_api_pinned_source(connection, source_pin, descriptor, retained_read):
     """Admit a CMS source for an API read by schema-qualified name; no recorded identity is compared.
 
     Row filtering on a retained epoch table would return a silent partial page, so each must be a
-    plain table. Their current relations are returned for the caller's consumed-read checks.
+    plain table. Their qualified names are returned for the caller's fixed query scope.
     """
-    from process.network_read_identity import verify_consumed_network_relations
 
     if (
         fhir_normalized_capture(source_pin) is not None
@@ -565,7 +548,6 @@ async def _require_api_pinned_source(connection, source_pin, descriptor, retaine
     if source_pin.retained_epoch is not None:
         admission = "dataset.status IN ('validated','published','superseded')"
         relations = await _api_epoch_relations(connection, schema, namespace)
-    backend_pid = await connection.fetchval("SELECT pg_backend_pid()")
     is_admitted = await connection.fetchval(
         f"""SELECT EXISTS (SELECT 1 FROM {namespace}.provider_directory_endpoint_dataset dataset
           JOIN pg_namespace ns ON ns.nspname=$1
@@ -582,11 +564,6 @@ async def _require_api_pinned_source(connection, source_pin, descriptor, retaine
         source_pin.source_id,
         json.dumps(descriptor) if descriptor is not None else None,
     )
-    await verify_consumed_network_relations(
-        connection,
-        tuple(relation for relation in relations if relation.table_name == "provider_directory_endpoint_dataset"),
-        expected_backend_pid=backend_pid,
-    )
     if not is_admitted:
         raise FHIRMembershipSourceError("Pinned FHIR source is unavailable")
     return relations
@@ -599,7 +576,7 @@ async def _require_flat_pinned_source(connection, source_pin, descriptor, retain
         if type(retained_read) is not SourceWitnessRead or descriptor is None:
             raise FHIRMembershipSourceError("Pinned FHIR Source witness read is unavailable")
         require_capture_anchor(source_pin.source_witness_capture, source_pin.source_witness_anchor)
-        await retained_read.verify(connection, source_pin.source_witness_capture)
+        retained_read.require_ready(source_pin.source_witness_capture)
         return
     if source_pin.retained_capture is not None:
         from process.network_fhir_retained_capture import RetainedFHIRRead, pin_retained_fhir_read
@@ -608,7 +585,7 @@ async def _require_flat_pinned_source(connection, source_pin, descriptor, retain
             retained_read = await pin_retained_fhir_read(connection, source_pin.retained_capture)
         if type(retained_read) is not RetainedFHIRRead:
             raise FHIRMembershipSourceError("Pinned FHIR source is unavailable")
-        await retained_read.verify(connection, source_pin.retained_capture)
+        retained_read.require_ready(source_pin.retained_capture)
         return
     if source_pin.retained_epoch is not None:
         try:
@@ -624,22 +601,15 @@ async def _require_flat_pinned_source(connection, source_pin, descriptor, retain
         else "dataset.status IN ('published','superseded') AND dataset.published_at IS NOT NULL"
     )
     matches = await connection.fetchval(
-        f"""SELECT EXISTS (SELECT 1 FROM {namespace}.provider_directory_endpoint_dataset dataset
-          JOIN pg_namespace ns ON ns.nspname=$1
-          JOIN pg_class relation ON relation.relnamespace=ns.oid
-            AND relation.relname='provider_directory_dataset_resource' AND relation.relkind='r'
-          WHERE dataset.dataset_id=$2 AND dataset.endpoint_id=$3 AND dataset.dataset_hash=$4
-            AND {admission}
-            AND dataset.publication_metadata_summary_json->'source_ids'=jsonb_build_array($5::text)
-            AND ($7::jsonb IS NULL OR dataset.publication_metadata_summary_json->'network_bindings'=$7::jsonb)
-            AND relation.oid=$6::oid
-            AND NOT EXISTS (SELECT 1 FROM {namespace}.provider_directory_dataset_resource WHERE false))""",
-        source_pin.read_schema_name,
+        f"SELECT EXISTS(SELECT FROM {namespace}.provider_directory_endpoint_dataset dataset "
+        "WHERE dataset.dataset_id=$1 AND dataset.endpoint_id=$2 AND dataset.dataset_hash=$3 "
+        f"AND {admission} "
+        "AND dataset.publication_metadata_summary_json->'source_ids'=jsonb_build_array($4::text) "
+        "AND ($5::jsonb IS NULL OR dataset.publication_metadata_summary_json->'network_bindings'=$5::jsonb))",
         source_pin.dataset_id,
         source_pin.endpoint_id,
         source_pin.dataset_sha256,
         source_pin.source_id,
-        source_pin.read_resource_table_oid,
         json.dumps(descriptor) if descriptor is not None else None,
     )
     if not matches:

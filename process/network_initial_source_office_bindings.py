@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from uuid import UUID, uuid4
 
 from process.network_address_projection import PinnedAddressSource, _identifier
-from process.network_custom_address_source import _artifact_dependency_identity, _require_transaction
+from process.network_custom_address_source import _require_transaction
 from process.network_legacy_membership_source import (
     ACAGlobalEpochReadScope,
     ACAMembershipBatch,
@@ -86,7 +86,7 @@ async def capture_aca_office_address_source(
     pin = PinnedACAOfficeAddressSource(
         address_source,
         batch.source.generation_id,
-        origin.address_identity,
+        origin.address_scope,
         batch.generation_id,
         batch.input_sha256,
         _digest(office_records),
@@ -218,7 +218,7 @@ def _digest(document):
 def _validate_roles(runtime_roles):
     if (
         type(runtime_roles) is not tuple
-        or not 1 <= len(runtime_roles) <= 32
+        or len(runtime_roles) > 32
         or tuple(sorted(set(runtime_roles))) != runtime_roles
     ):
         raise InitialACAOfficeBindingError("initial_aca_office_roles_invalid")
@@ -324,7 +324,7 @@ async def _candidate(connection, target, batch, address_source, control, *, orig
     recipes = candidate.get("source_recipes_json")
     has_inventory = type(recipes) is dict or type(recipes) is str and recipes.lstrip().startswith("{")
     matches = (
-        await _is_inventory_pin_registered(connection, target, candidate, batch, control)
+        await _is_inventory_pin_registered(connection, target, candidate, batch)
         if has_inventory
         else batch.generation_id in generations.values()
     )
@@ -362,17 +362,17 @@ _REGISTERED_PIN_SQL = """SELECT count(*) AS entry_count,max(ordinal) AS ordinal,
    WHERE recipe_sha256=$1 ORDER BY ordinal LIMIT 2) selected"""
 
 
-async def _is_inventory_pin_registered(connection, copy_target, candidate, batch, control):
+async def _is_inventory_pin_registered(connection, copy_target, candidate, batch):
     """Check one raw registration row, never Source authority or membership in the complete root.
 
     The producer folds the complete inventory before office COPY in this locked
     preparation transaction. Selected metadata can still be tampered with while
     OPEN; Source admission/page replay remain mandatory below, and independent
-    complete-root/Source/office custody must succeed before publication.
+    complete-root, Source and office data validation must succeed before publication.
     """
     from process.registry_source_inventory_contract import make_source_inventory_entry
     from process.registry_source_inventory_reference import verify_source_recipe_metadata
-    from process.registry_source_inventory_store import _physical_context, _relation, source_inventory_record
+    from process.registry_source_inventory_store import _relation, source_inventory_record
     from process.registry_source_recipe_store import MAX_SOURCE_RECIPE_BYTES
 
     root = verify_source_recipe_metadata(candidate).inventory.root
@@ -387,10 +387,8 @@ async def _is_inventory_pin_registered(connection, copy_target, candidate, batch
         pin_record[5] != "fhir" and root.contribution_count >= root.entry_count
     ):
         return False
-    oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", _relation(copy_target))
-    relation = await _physical_context(connection, copy_target, oid, control[1:-1])
     selected = await connection.fetchrow(
-        _REGISTERED_PIN_SQL.format(relation=relation),
+        _REGISTERED_PIN_SQL.format(relation=_relation(copy_target)),
         pin_record[4],
         pin_record[1],
         *pin_record[5:],

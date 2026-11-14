@@ -172,7 +172,9 @@ async def _acquire_pinned_root(directory, operation_by_field):
 
 
 async def _ensure_admission(directory, operation_by_field):
-    table = storage_relation(directory._schema(), "provider_directory_rooted_graph_twin_admission")
+    from process.provider_directory_rooted_graph_store_support import table_ref
+
+    table = table_ref("provider_directory_rooted_graph_twin_admission")
     async with source_transaction(directory.db):
         admitted = await directory.db.first(
             f"SELECT acquisition_operation_key,root_dataset_id,root_dataset_hash,root_content_proof_sha256,"

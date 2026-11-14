@@ -4,7 +4,7 @@
 import asyncio
 import hashlib
 import json
-from dataclasses import asdict, replace
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -15,13 +15,12 @@ from process import network_custom_address_source as custom
 from process import network_legacy_membership_source as legacy
 from process import registry_aca_address_carry as carry
 from process import registry_source_recipe_composition as composition
-from process.network_address_artifact import NetworkAddressArtifactError
 from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_compact_layout import CompactAddressRelation
 from process.registry_aca_source_recipe import _recipe
 from tests.test_registry_aca_source_recipe import _ROLES, _prepared
-from tests.test_registry_ptg_address_carry import _artifact
+from tests.test_registry_ptg_address_carry import _artifact, _legacy_artifact_document, _mint
 
 
 @pytest.fixture
@@ -65,28 +64,16 @@ def _pages(monkeypatch, recipe):
     return batch.approved_source, reader, custody, page
 
 
-def test_aca_receipt_preserves_exact_legacy_bytes():
-    original = _artifact()
-    original_fields = asdict(original)
-    original_fields.pop("ptg_carry_sha256")
-    original_fields.pop("aca_carry_sha256")
-    original_fields.pop("source_aliases")
-    original_fields.pop("fhir_carry_sha256")
-    assert original.as_dict() == {"component": "network_custom_address_source", "revision": 2, **original_fields}
+def test_aca_carry_keeps_legacy_generation_and_binds_new_logical_recipe():
     for ptg_digest in (None, "a" * 64):
-        old = replace(original, ptg_carry_sha256=ptg_digest)
-        added = replace(old, aca_carry_sha256="b" * 64)
-        assert added.as_dict()["revision"] == 4
+        original = _mint(replace(_artifact(), ptg_carry_sha256=ptg_digest))
+        added = _mint(replace(original, aca_carry_sha256="b" * 64))
+        assert added.as_dict()["revision"] == 7
         assert custom._from_document(json.dumps(added.as_dict())) == added
-        assert custom._generation(added) != custom._generation(old)
-        expected_by_field = {
-            "component": "network_custom_address_source",
-            "revision": 3 if ptg_digest else 2,
-            **original_fields,
-        }
-        if ptg_digest:
-            expected_by_field["ptg_carry_sha256"] = ptg_digest
-        assert json.dumps(old.as_dict(), sort_keys=True) == json.dumps(expected_by_field, sort_keys=True)
+        assert custom._generation(added) != custom._generation(original)
+        legacy = _legacy_artifact_document(ptg=ptg_digest, aca="b" * 64, generation="e" * 64)
+        parsed = custom._from_document(json.dumps(legacy))
+        assert parsed.generation_sha256 == "e" * 64 and parsed.aca_carry_sha256 == "b" * 64
 
 
 @pytest.mark.parametrize(
@@ -102,9 +89,9 @@ def test_aca_receipt_preserves_exact_legacy_bytes():
     ],
 )
 def test_aca_receipt_rejects_revision_null_digest_and_field_smuggling(changes):
-    receipt = replace(_artifact(), aca_carry_sha256="b" * 64)
+    receipt = _legacy_artifact_document(aca="b" * 64)
     with pytest.raises(custom.NetworkCustomAddressSourceError):
-        custom._from_document(json.dumps({**receipt.as_dict(), **changes}))
+        custom._from_document(json.dumps({**receipt, **changes}))
 
 
 @pytest.mark.asyncio
@@ -252,70 +239,44 @@ async def test_new_rows_are_setwise_and_existing_offices_are_never_overwritten(m
     assert checked.await_args.kwargs == {"writing": False}
 
 
-def _existing_address_connection(table_name, table_oid=123):
-    physical_by_field = {"schema_name": "base_fixture", "relname": table_name, "oid": table_oid}
+def _existing_address_connection():
     return SimpleNamespace(
         is_in_transaction=lambda: True,
-        fetchrow=AsyncMock(side_effect=[physical_by_field, physical_by_field, {"bounded": True, "copied_rows": 1}]),
-        fetchval=AsyncMock(return_value=table_oid),
+        fetchrow=AsyncMock(return_value={"bounded": True, "copied_rows": 1}),
         execute=AsyncMock(),
     )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("retained", [False, True])
-async def test_existing_office_copy_locks_exact_native_origin(recipe, retained):
+async def test_existing_office_copy_preserves_qualified_origin_and_bounded_set_query(recipe, retained):
     table_name = "entity_address_unified_retained_7b" if retained else "entity_address_unified"
-    connection = _existing_address_connection(table_name)
-    origin = CompactAddressRelation("base_fixture", table_name, 123)
+    connection = _existing_address_connection()
+    origin = CompactAddressRelation("base_fixture", table_name)
     await carry._copy_existing_offices(connection, _batch(recipe), "target_fixture", origin)
-    assert connection.execute.await_args.args == (
-        f'LOCK TABLE ONLY "base_fixture"."{table_name}" IN ACCESS SHARE MODE NOWAIT',
-    )
-    assert connection.fetchval.await_args.args == (
-        "SELECT to_regclass($1)::oid::bigint",
-        f'"base_fixture"."{table_name}"',
-    )
     query = connection.fetchrow.await_args.args[0]
     assert f'FROM "base_fixture"."{table_name}" address' in query
     assert "ON CONFLICT(location_key) DO NOTHING" in query
     assert "address.address_key=pairs.location_id" in query
+    assert "count(*)<=5000" in query and "<=8388608" in query
+    connection.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ["logical_pin", "transaction", "name", "oid", "renamed", "bounds"])
-async def test_existing_office_copy_refuses_unverified_or_changed_origin(recipe, fault):
-    origin = CompactAddressRelation("base_fixture", "entity_address_unified_retained_7b", 123)
-    connection = _existing_address_connection(origin.table_name)
-    match fault:
-        case "logical_pin":
-            origin = PinnedAddressSource(origin.schema_name, origin.table_name, "same-label")
-        case "transaction":
-            connection.is_in_transaction = lambda: False
-        case "name":
-            connection = _existing_address_connection("entity_address_unified_retained_7c")
-        case "oid":
-            connection.fetchval.return_value = 124
-        case "renamed":
-            origin = CompactAddressRelation(origin.schema_name, "entity_address_unified", origin.table_oid)
-        case "bounds":
-            physical_by_field = {
-                "schema_name": origin.schema_name,
-                "relname": origin.table_name,
-                "oid": origin.table_oid,
-            }
-            connection.fetchrow.side_effect = [
-                physical_by_field,
-                physical_by_field,
-                {"bounded": False, "copied_rows": 0},
-            ]
-    with pytest.raises((ValueError, NetworkAddressArtifactError)):
-        await carry._copy_existing_offices(connection, _batch(recipe), "target_fixture", origin)
-    if fault in {"logical_pin", "transaction"}:
-        connection.fetchrow.assert_not_awaited()
-        connection.execute.assert_not_awaited()
+@pytest.mark.parametrize("fault", ["logical_pin", "transaction", "bounds"])
+async def test_existing_office_copy_refuses_invalid_scope_or_page_bounds(recipe, fault):
+    origin = CompactAddressRelation("base_fixture", "entity_address_unified_retained_7b")
+    connection = _existing_address_connection()
+    if fault == "logical_pin":
+        origin = PinnedAddressSource(origin.schema_name, origin.table_name, "same-label")
+    elif fault == "transaction":
+        connection.is_in_transaction = lambda: False
     else:
-        assert connection.fetchrow.await_count <= (3 if fault == "bounds" else 2)
+        connection.fetchrow.return_value = {"bounded": False, "copied_rows": 0}
+    with pytest.raises(ValueError):
+        await carry._copy_existing_offices(connection, _batch(recipe), "target_fixture", origin)
+    assert connection.fetchrow.await_count == int(fault == "bounds")
+    connection.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -472,7 +433,7 @@ async def test_full_replay_input_mutation_changes_proof(monkeypatch, recipe, pro
 
 @pytest.mark.asyncio
 async def test_replay_changed_carry_refuses_retained_receipt(monkeypatch):
-    original = replace(_artifact(), aca_carry_sha256="b" * 64)
+    original = _mint(replace(_artifact(), aca_carry_sha256="b" * 64))
     connection = SimpleNamespace(fetchval=AsyncMock(return_value=json.dumps(original.as_dict())))
     monkeypatch.setattr(custom, "_ptg_address_carry", AsyncMock(return_value=SimpleNamespace(sha256=None)))
     monkeypatch.setattr(custom, "_aca_address_carry", AsyncMock(return_value=carry.RegistryACAAddressCarry("c" * 64)))

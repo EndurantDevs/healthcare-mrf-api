@@ -13,13 +13,11 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateTable
 
 from db.models.network_registry import NetworkRegistryAlias, NetworkRegistryIdentity
-from db.registry_fhir_catalog import table_sql
 from process import registry_fhir_catalog_sync as sync
 from process.registry_fhir_catalog_custody import FHIRCatalogTarget
 from process.registry_fhir_catalog_extraction import extract_fhir_catalog_batch
 from process.registry_fhir_catalog_fingerprints import approved_fhir_catalog_fingerprints
 from process.registry_fhir_catalog_grant import FHIRCatalogStandingGrant
-from process.registry_fhir_catalog_projection import SourceCatalogContext
 from process.registry_fhir_catalog_sources import FHIRCatalogSourceDisposition, fhir_catalog_source_generation
 from process.registry_fhir_catalog_store import (
     copy_fhir_catalog_snapshot,
@@ -40,7 +38,8 @@ from tests.test_registry_fhir_catalog_custody_postgres import (
     metadata_custody as metadata_custody,
 )
 from tests.test_registry_fhir_catalog_enrichment import COMPANY, GROUP, context, source_row
-from tests.test_registry_fhir_catalog_sources import descriptor, read_profile
+from tests.test_registry_fhir_catalog_grant import descriptor
+from tests.test_registry_fhir_catalog_sources import read_profile
 
 ACCEPTED_AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -69,7 +68,12 @@ async def _named_replacement_rows(fixture, *, is_typed):
     binding_id_by_generation = {}
     for generation, catalog, endpoint, payload_schema, source_key in source_specs:
         previous_descriptor_by_field = {"endpoint_id": endpoint, "coordinates": {"dataset_schema": payload_schema}}
-        if catalog is not None:
+        if generation == "named-old":
+            previous_descriptor_by_field["tables"] = {
+                "header": {"schema": catalog, "name": "provider_directory_endpoint_dataset"},
+                "resource": {"schema": payload_schema, "name": "provider_directory_dataset_resource"},
+            }
+        elif catalog is not None:
             previous_descriptor_by_field["catalog_schema"] = catalog
         binding_id = uuid4()
         binding_id_by_generation[generation] = binding_id
@@ -105,7 +109,10 @@ async def test_named_successor_retires_bindings_across_payload_schemas(metadata_
     )
     successor_descriptor_by_field = {
         "endpoint_id": "endpoint",
-        "catalog_schema": "catalog-a",
+        "tables": {
+            "header": {"schema": "catalog-a", "name": "provider_directory_endpoint_dataset"},
+            "resource": {"schema": "edition-new", "name": "provider_directory_dataset_resource"},
+        },
         "coordinates": {"source_id": "new-alias", "dataset_schema": "edition-new"},
     }
     if path == "typed":
@@ -136,8 +143,6 @@ async def _registry(fixture):
     for model in (NetworkRegistryIdentity, NetworkRegistryAlias):
         table = model.__table__.to_metadata(MetaData(), schema=fixture.control_schema)
         await connection.execute(str(CreateTable(table).compile(dialect=postgresql.dialect())))
-    for statement in table_sql(namespace, "registry_fhir_catalog_snapshot"):
-        await connection.execute(statement)
     await connection.execute(
         f"INSERT INTO {namespace}.network_registry_identity(network_id,allocation_key) "
         "OVERRIDING SYSTEM VALUE VALUES(7,$1)",

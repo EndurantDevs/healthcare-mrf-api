@@ -16,7 +16,6 @@ from sqlalchemy import MetaData, event, func, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from api import network_serving_read_context as serving_reads
 from api.endpoint import npi, plan
 from api.network_address_scope import (
     _request_selector,
@@ -28,19 +27,19 @@ from api.network_address_scope import (
     scoped_address_relation_sql,
     scoped_address_statement,
 )
-from api.network_read_execution import execute_network_read
 from api.provider_geo_sql import nearby_row_tiebreaker
 from api.provider_list_sql import _is_unified_address_table, _provider_list_connection, _provider_list_parameters
 from api.request_lifecycle import RequestLifecycleSanic
 from db.connection import current_session, db
 from db.models import EntityAddressUnified, Issuer, NPIData, NPIDataTaxonomy, NPIDataTaxonomyGroup, PlanNetworkTierRaw
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
-from tests.test_network_address_projection_postgres import projection_db
+from tests.test_network_address_projection_postgres import projection_db as projection_db
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
-from tests.test_network_membership_serving_indexes_postgres import serving_indexes_db
-from tests.test_network_membership_validation_postgres import validation_db
+from tests.test_network_membership_serving_indexes_postgres import serving_indexes_db as serving_indexes_db
+from tests.test_network_membership_validation_postgres import validation_db as validation_db
 from tests.test_network_provider_routes_postgres import provider_app as provider_app
-from tests.test_network_serving_schema_postgres import serving_schema
+from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 
 
 @pytest.mark.parametrize("checksum", ("", "-1"))
@@ -67,7 +66,7 @@ async def test_canonical_count_keeps_native_batch_bounds_on_the_pinned_session(n
         {},
         0,
         "c" * 64,
-        1,
+        CompactAddressRelation("network_candidate_00000000000000000000000000000001", "entity_address_unified"),
     )
     database = SimpleNamespace(
         acquire=AsyncMock(side_effect=AssertionError("pinned reads cannot acquire another pool"))
@@ -89,9 +88,6 @@ async def test_canonical_count_keeps_native_batch_bounds_on_the_pinned_session(n
 
 
 async def _manifest(fixture):
-    address_oid = await fixture.connection.fetchval(
-        "SELECT to_regclass($1)::oid::bigint", fixture.copy_target.schema_name + ".entity_address_unified"
-    )
     return PinnedNetworkServingManifest(
         1,
         fixture.copy_target.candidate_id,
@@ -100,7 +96,7 @@ async def _manifest(fixture):
         {"unified_address": fixture.address_source.generation_id},
         0,
         "c" * 64,
-        address_oid,
+        CompactAddressRelation(fixture.copy_target.schema_name, "entity_address_unified"),
     )
 
 
@@ -169,7 +165,7 @@ async def _attached_scope_keys(session, manifest, selector, *, inherited=False, 
             if inherited:
                 relation = relation.replace("FROM ONLY ", "FROM ").replace("JOIN ONLY ", "JOIN ")
             statement = text(f"SELECT location_key FROM {relation} addresses")
-        result = await execute_network_read(session, statement, scoped_address_parameters({}))
+        result = await session.execute(statement, scoped_address_parameters({}))
         return sorted(result.scalars().all())
 
 
@@ -201,11 +197,9 @@ async def test_scope_readers_exclude_children_after_native_pin(default_address_d
             baseline = await _attached_scope_keys(session, manifest, selector)
         async with async_sessionmaker(engine)() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-            assert (await session.execute(text("SELECT session_user,current_user"))).one() == (role, role)
-            assert (
-                await session.scalar(text("SELECT to_regclass(:name)::oid::bigint"), {"name": parent})
-                == manifest.address_table_oid
-            )
+            assert session.in_transaction()
+            assert manifest.address_relation == CompactAddressRelation(manifest.schema_name, "entity_address_unified")
+            assert await session.scalar(text("SELECT to_regclass(:name) IS NOT NULL"), {"name": parent}) is True
             await fixture.connection.execute(f"ALTER TABLE {child} INHERIT {parent}")
             assert await _attached_scope_keys(session, manifest, selector, inherited=True) == sorted(
                 [*baseline, ghost_key]
@@ -298,41 +292,17 @@ async def _assert_rejected_selectors(app, headers_by_name, invoked_generations):
         assert rejected.status == 400 and invoked_generations == []
 
 
-@pytest.fixture
-async def protected_provider_app(provider_app):
-    """Protect the fixture's fixed control identities and restore their exact owners and grants."""
-    from tests.test_network_canonical_cutover_postgres import _nearby_control_identity
-
-    fixture = provider_app.fixture
-    connection, schema = fixture.connection, fixture.control_schema
-    namespace, tables = await _nearby_control_identity(connection, schema)
-    try:
-        async with connection.transaction():
-            await connection.execute(f'ALTER SCHEMA "{schema}" OWNER TO "{fixture.roles["owner"]}"')
-            for table in tables:
-                await connection.execute(
-                    f'ALTER TABLE "{schema}"."{table["relname"]}" OWNER TO "{fixture.roles["owner"]}"'
-                )
-        yield provider_app
-    finally:
-        async with connection.transaction():
-            for table in tables:
-                await connection.execute(f'ALTER TABLE "{schema}"."{table["relname"]}" OWNER TO {namespace["owner"]}')
-            await connection.execute(f'ALTER SCHEMA "{schema}" OWNER TO {namespace["owner"]}')
-        assert await _nearby_control_identity(connection, schema) == (namespace, tables)
-
-
 @pytest.mark.asyncio
-async def test_registered_http_wrapper_uses_verified_manifest_and_no_fallback(protected_provider_app, monkeypatch):
+async def test_registered_http_wrapper_uses_verified_manifest_and_no_fallback(provider_app, monkeypatch):
     """Require real frozen publication for every authenticated HTTP address read."""
-    fixture = protected_provider_app.fixture
-    network_id = protected_provider_app.source_network_id
+    fixture = provider_app.fixture
+    network_id = provider_app.source_network_id
     generation_id = await fixture.connection.fetchval(
         f'SELECT generation_id FROM "{fixture.control_schema}".network_serving_control WHERE id=1'
     )
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-network-read-token")
     invoked_generations = []
-    app = _canonical_read_app(protected_provider_app.engine, invoked_generations)
+    app = _canonical_read_app(provider_app.engine, invoked_generations)
     headers_by_name = {"Authorization": "Bearer synthetic-network-read-token"}
     await _assert_rejected_selectors(app, headers_by_name, invoked_generations)
     _, invalid_access = await app.asgi_client.get(
@@ -370,21 +340,20 @@ async def test_registered_http_wrapper_uses_verified_manifest_and_no_fallback(pr
 
 
 @pytest.fixture
-async def request_snapshot_database(protected_provider_app, monkeypatch):
+async def request_snapshot_database(provider_app, monkeypatch):
     """Borrow the provider fixture's exact temporary login and real middleware pools."""
-    yield protected_provider_app
+    yield provider_app
 
 
 async def _network_request_snapshot(session):
-    """Observe native modes and identity without changing the caller's transaction."""
-    driver = (await (await session.connection()).get_raw_connection()).driver_connection
-    identity_values = tuple(
-        await driver.fetchrow(
-            "SELECT current_user,pg_backend_pid(),current_setting('transaction_isolation'),"
+    """Observe the active logical transaction and its read-only snapshot modes."""
+    modes = await session.execute(
+        text(
+            "SELECT transaction_timestamp(),current_setting('transaction_isolation'),"
             "current_setting('transaction_read_only')"
         )
     )
-    return session.get_transaction(), driver, identity_values
+    return session.get_transaction(), tuple(modes.one())
 
 
 def _request_snapshot_app(monkeypatch, observations, entered):
@@ -395,7 +364,7 @@ def _request_snapshot_app(monkeypatch, observations, entered):
 
     async def pin(driver, *arguments, **options):
         snapshot = await _network_request_snapshot(current_session())
-        assert snapshot[1] is driver
+        assert snapshot[0] is not None
         observations.append(snapshot)
         return await original(driver, *arguments, **options)
 
@@ -462,8 +431,7 @@ async def test_http_network_snapshot_uses_real_request_lifecycle(
             request, reply = await app.asgi_client.get(path + "&ending=" + ending, headers=headers_by_name)
             assert reply.status == status, reply.text
             assert len(observations) == resolved_before + 1
-            assert observations[-1][2][2:] == ("repeatable read", "on")
-            assert observations[-1][2][0] == context.fixture.roles["reader"]
+            assert observations[-1][1][1:] == ("repeatable read", "on")
             assert reply.headers["X-Network-Generation"] == str(
                 current_generation := await context.fixture.connection.fetchval(
                     f'SELECT generation_id FROM "{context.fixture.control_schema}".network_serving_control WHERE id=1'
@@ -490,9 +458,9 @@ async def test_http_network_snapshot_uses_real_request_lifecycle(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("read_only", [False, True])
-async def test_network_snapshot_refuses_active_unowned_session(protected_provider_app, read_only):
+async def test_network_snapshot_refuses_active_unowned_session(provider_app, read_only):
     """Active native sessions confer no request Reader ownership, even in read-only mode."""
-    context = protected_provider_app
+    context = provider_app
     async with async_sessionmaker(context.engine)() as session, session.begin():
         await session.execute(
             text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ " + ("READ ONLY" if read_only else "READ WRITE"))
@@ -510,7 +478,7 @@ async def test_network_snapshot_refuses_active_unowned_session(protected_provide
             await canonical_network_read(handler)(request)
         handler.assert_not_awaited()
         assert await _network_request_snapshot(session) == before
-        assert session.in_transaction() and before[1].is_in_transaction()
+        assert session.in_transaction() and await session.scalar(text("SELECT 1")) == 1
 
 
 @pytest.mark.asyncio
@@ -978,7 +946,7 @@ def _default_policy_manifest():
         {},
         8,
         "c" * 64,
-        1,
+        CompactAddressRelation("network_candidate_00000000000000000000000000000001", "entity_address_unified"),
     )
 
 
@@ -994,10 +962,9 @@ def test_default_scope_requires_closed_policy_and_keeps_nested_selected_identity
             scoped_address_relation_sql("mrf.entity_address_unified"),
             scoped_address_cache_key("detail"),
         )
-        assert selected_sql.startswith("(/* network-read:")
         assert (
-            selected_sql.split(" */ ", 1)[1]
-            == 'SELECT * FROM ONLY "network_candidate_00000000000000000000000000000001".entity_address_unified WHERE canonical_network_ids && CAST(:_canonical_network_ids AS INTEGER[]))'
+            selected_sql
+            == '(SELECT * FROM ONLY "network_candidate_00000000000000000000000000000001".entity_address_unified WHERE canonical_network_ids && CAST(:_canonical_network_ids AS INTEGER[]))'
         )
         with network_address_read_scope(manifest, None, excluded_network_ids=(88,), access_scope_sha256="a" * 64):
             assert current_network_address_scope().network_ids is None
@@ -1356,11 +1323,10 @@ def _legacy_header_mapping_records(ambiguous):
 async def test_native_legacy_header_mapping_component_scope(
     serving_indexes_db, serving_schema, monkeypatch, checksums, ids, denied
 ):
-    """Native mapping/consumption only; the existing manifest double supplies no Source authority."""
-    from api.network_address_scope import _network_scope_claim
+    """Require the real signed legacy map; the component manifest supplies no Source authority."""
+    from api.network_address_scope import _LegacyNetworkScopeMismatch, _network_scope_claim, _require_legacy_mapping
     from process.network_address_projection import _identifier
     from process.network_compact_layout import CompactAddressRelation
-    from process.network_read_identity import verify_consumed_network_relations
     from process.registry_network_catalog_read import _LEGACY_BATCH_SQL
 
     fixture = serving_indexes_db
@@ -1389,13 +1355,11 @@ async def test_native_legacy_header_mapping_component_scope(
         )
         transaction = session.get_transaction()
         driver = (await (await session.connection()).get_raw_connection()).driver_connection
-        backend_pid = driver.get_server_pid()
         network_ids, _, actual_checksums, generation = _network_scope_claim(
             request, {"network_ids": ids, "network_generation": "1"}
         )
         assert generation == manifest.generation_id and network_ids == tuple(map(int, ids.split(",")))
         assert actual_checksums == tuple(map(int, checksums.split(",")))
-        oid = await driver.fetchval("SELECT to_regclass($1)::oid::bigint", schema + ".registry_approved_record")
         mapping = await driver.fetchrow(
             _LEGACY_BATCH_SQL.format(control="ONLY " + _identifier(schema)),
             manifest.approved_custom_revision,
@@ -1403,10 +1367,14 @@ async def test_native_legacy_header_mapping_component_scope(
             "checksum_network",
             (),
         )
-        await verify_consumed_network_relations(
-            driver, (CompactAddressRelation(schema, "registry_approved_record", oid),), expected_backend_pid=backend_pid
-        )
+        approved_relation = CompactAddressRelation(schema, "registry_approved_record")
+        if denied:
+            with pytest.raises(_LegacyNetworkScopeMismatch) as refused:
+                await _require_legacy_mapping(driver, approved_relation, manifest, network_ids, actual_checksums)
+            assert refused.value.headers["Cache-Control"] == "private, no-store"
+        else:
+            await _require_legacy_mapping(driver, approved_relation, manifest, network_ids, actual_checksums)
         assert session.get_transaction() is transaction
-        assert (await (await session.connection()).get_raw_connection()).driver_connection is driver
+        assert session.in_transaction()
         assert (mapping["complete"] is True and mapping["network_ids"] == list(network_ids)) is (not denied)
         assert current_network_address_scope() is None

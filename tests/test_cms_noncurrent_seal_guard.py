@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Exact lifecycle successor recognition leaves the ordinary guard intact."""
+"""Historical CMS data predicates and legacy recognizer boundaries."""
 
 import hashlib
 from copy import deepcopy
@@ -35,10 +35,9 @@ def test_successor_changes_only_the_final_lifecycle_rejection(schema):
     assert "pg_catalog.to_jsonb(NEW)-'is_current'" in new
 
 
-@pytest.mark.parametrize("body_index", [0, 1])
-def test_both_exact_bodies_are_recognized_without_changing_default_contract(body_index):
+def test_historical_guard_keeps_default_contract():
     entry = _entry(_KEY)
-    entry["definition"]["prosrc"] = migration.lifecycle_guard_bodies("sample")[body_index]
+    entry["definition"]["prosrc"] = migration.lifecycle_guard_bodies("sample")[0]
     custody._require_definition(entry, custody._CONTRACTS[_KEY], "sample", 201, custody._TYPE_OIDS, "sample")
     assert custody._CONTRACTS[_KEY][-1] == migration.ORIGINAL_SHA256
 
@@ -149,10 +148,10 @@ def _reader_lifecycle_hook(schema, version, hardened_settings=False):
 
 
 @pytest.mark.parametrize("schema", ["snapshot_schema", "Mixed_Catalog23"])
-@pytest.mark.parametrize("version", [0, 1, 2])
+@pytest.mark.parametrize("version", [0, 1])
 @pytest.mark.parametrize("hardened_settings", [False, True])
 @pytest.mark.parametrize("precomputed", [False, True])
-def test_retained_reader_checks_three_exact_lifecycle_variants(schema, version, hardened_settings, precomputed):
+def test_historical_reader_lifecycle_variants(schema, version, hardened_settings, precomputed):
     function = _reader_lifecycle(schema, version, hardened_settings)
     if precomputed:
         body = function.pop("prosrc").replace(reader._identifier(schema) + ".", '"__schema__".')

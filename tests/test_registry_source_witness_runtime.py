@@ -17,15 +17,18 @@ import pytest
 from process import registry_publication_worker as worker
 from process import registry_source_witness_runtime as source_runtime
 from process.network_fhir_sampled_validation import SemanticSamplingPolicy
+from process.registry_fhir_catalog_sources import FHIRCatalogSourceReadProfile
 from process.registry_source_witness_runtime import install_source_witness_runtime, parse_source_witness_config
-from tests.test_network_fhir_source_witness_custody import _profile
-from tests.test_registry_candidate_custody_runtime import _configured
-from tests.test_registry_publication_worker import configuration, resources
+from tests.test_registry_publication_worker import _runtime_configuration, configuration, resources
 from tests.test_registry_source_witness_worker import _ACTORS, _runtime, _sources
 
 
+def _profile():
+    return FHIRCatalogSourceReadProfile("source_payload", "source_catalog")
+
+
 def _document():
-    document, _ = _configured(configuration)
+    document = configuration()
     document["initial_address_sources"] = {
         "base_source": {"schema_name": "address_source", "table_name": "address_rows", "generation_id": "one"},
         "compact": True,
@@ -39,7 +42,7 @@ def _document():
 
 
 def _config():
-    return worker.parse_registry_publication_worker_config(json.dumps(_document()))
+    return _runtime_configuration(_document())
 
 
 def _sampling_document():
@@ -154,9 +157,9 @@ def test_source_settings_reject_unbounded_or_ambiguous_authority(changes_by_fiel
         parse_source_witness_config(document)
 
 
-@pytest.mark.parametrize("missing", ("custody_dsn", "initial_address_sources", "compact"))
+@pytest.mark.parametrize("missing", ("initial_address_sources", "compact"))
 @pytest.mark.parametrize("sampled", (False, True))
-def test_worker_requires_independent_custody_and_compact_inputs(missing, sampled):
+def test_worker_requires_declared_compact_source_inputs(missing, sampled):
     document = _sampling_document() if sampled else _document()
     if missing == "compact":
         document["initial_address_sources"]["compact"] = False
@@ -175,7 +178,7 @@ def test_direct_config_cannot_mix_installed_capability_with_another_server_profi
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("missing", ("custody", "addresses", "compact"))
+@pytest.mark.parametrize("missing", ("addresses", "compact"))
 async def test_installer_rechecks_required_worker_inputs_before_factory(monkeypatch, missing):
     events = []
     exported, factory = _factory(monkeypatch, events)
@@ -183,7 +186,6 @@ async def test_installer_rechecks_required_worker_inputs_before_factory(monkeypa
     addresses = SimpleNamespace(compact=missing != "compact", source_witness_runtime=None)
     config = SimpleNamespace(
         source_witness=configured.source_witness,
-        custody_url=None if missing == "custody" else configured.custody_url,
         initial_address_sources=None if missing == "addresses" else addresses,
     )
     resources = AsyncMock()
@@ -202,7 +204,6 @@ async def test_installer_refuses_conflicting_authority_before_factory(monkeypatc
     exported, factory = _factory(monkeypatch, events)
     configured = _config()
     config = SimpleNamespace(
-        custody_url=configured.custody_url,
         source_witness=_document()["source_witness"] if conflict == "untyped_profile" else configured.source_witness,
         initial_address_sources=_sources(_runtime())
         if conflict == "installed_runtime"
@@ -264,7 +265,7 @@ async def test_installer_forwards_policy_only_for_explicit_server_mode(monkeypat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("missing", ("custody_url", "initial_address_sources", "compact"))
+@pytest.mark.parametrize("missing", ("initial_address_sources", "compact"))
 async def test_installer_rechecks_required_inputs_before_opening_source(monkeypatch, missing):
     events, config = [], _config()
     exported, factory = _factory(monkeypatch, events)
@@ -370,11 +371,13 @@ async def test_actual_worker_keeps_membership_factory_until_owned_pools_close(mo
     )
     installed_runtimes = []
 
-    async def qualified(config, stack, qualification, connection):
+    original_runtime = worker._configured_worker_runtime
+
+    async def configured_runtime(config, stack):
         runtime = config.initial_address_sources.source_witness_runtime
         assert runtime.source_export is exported and config.source_witness is None
         installed_runtimes.append(runtime)
-        return config.consumer
+        return await original_runtime(config, stack)
 
     async def consume(**arguments):
         assert arguments["initial_address_sources"].source_witness_runtime is installed_runtimes[0]
@@ -385,7 +388,7 @@ async def test_actual_worker_keeps_membership_factory_until_owned_pools_close(mo
             raise asyncio.CancelledError
         return None
 
-    monkeypatch.setattr(worker, "_qualified_worker_runtime", qualified)
+    monkeypatch.setattr(worker, "_configured_worker_runtime", configured_runtime)
     monkeypatch.setattr(worker, "consume_registry_publication_once", consume)
     if outcome == "success":
         assert await worker.run_registry_publication_worker(_config()) == {"state": "no_work"}
@@ -405,6 +408,8 @@ async def test_actual_worker_keeps_membership_factory_until_owned_pools_close(mo
         "authority open",
         "lifecycle open",
         "execution open",
+        "preparation open",
+        "preparation close",
         "execution close",
         "lifecycle close",
         "authority close",
@@ -427,34 +432,6 @@ async def test_factory_startup_failure_prevents_worker_startup(monkeypatch, fail
     factory.assert_called_once_with()
     exported.assert_not_called()
     pools.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("omitted", ("registry_queue_owner", "registry_reader", "sealed_operator"))
-async def test_actual_worker_refuses_incomplete_census_before_custody_creation(monkeypatch, omitted):
-    from process import network_candidate_custody
-
-    events, pool_options = resources(monkeypatch)
-    exported, factory = _factory(monkeypatch, events)
-    document = _document()
-    document["source_witness"]["runtime_roles"].remove(omitted)
-    identity = AsyncMock(return_value={"custody_owner_role": "protected_control_owner"})
-    reach = AsyncMock(side_effect=AssertionError("census must refuse before custody reach verification"))
-    consume = AsyncMock(side_effect=AssertionError("incomplete census must not claim work"))
-    monkeypatch.setattr(worker, "_custody_identity", identity)
-    monkeypatch.setattr(network_candidate_custody, "_q_reach_closed", reach)
-    monkeypatch.setattr(worker, "consume_registry_publication_once", consume)
-    with pytest.raises(ValueError, match="registry_source_witness_runtime_census_differs"):
-        await worker.run_registry_publication_worker(
-            worker.parse_registry_publication_worker_config(json.dumps(document))
-        )
-    assert [options["user"] for options in pool_options] == ["worker_lifecycle", "worker_execution"]
-    assert events[-4:] == ["execution close", "lifecycle close", "authority close", "source close"]
-    identity.assert_awaited_once()
-    reach.assert_not_awaited()
-    consume.assert_not_awaited()
-    factory.assert_called_once_with()
-    exported.assert_not_called()
 
 
 @pytest.mark.asyncio

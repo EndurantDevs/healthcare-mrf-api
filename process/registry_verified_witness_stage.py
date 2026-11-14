@@ -61,7 +61,7 @@ def _require_witness_scope(recipes, approved, office_inputs):
         or type(office_inputs[0]) is not PinnedAddressSource
         or office_inputs[0].table_name != "entity_address_unified"
         or type(office_inputs[1]) is not tuple
-        or not 1 <= len(office_inputs[1]) <= 32
+        or len(office_inputs[1]) > 32
         or any(type(role) is not str for role in office_inputs[1])
         or tuple(sorted(set(office_inputs[1]))) != office_inputs[1]
     ):

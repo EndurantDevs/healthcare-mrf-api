@@ -32,8 +32,7 @@ def compact_address_read_relations(layout):
     if layout.artifacts:
         relations.append(layout.ref_map)
         relations.extend(
-            CompactAddressRelation(artifact.schema_name, "network_office_edge", artifact.table_oid)
-            for artifact in layout.artifacts
+            CompactAddressRelation(artifact.schema_name, "network_office_edge") for artifact in layout.artifacts
         )
     return tuple(relations)
 
@@ -113,10 +112,8 @@ def compact_address_relation_sql(layout, *, network_ids=None, visible_membership
     return "(" + _address_query(layout, network_ids, visible_membership_sql, location_lookup) + ")"
 
 
-def _bound_address_query(layout, network_ids, visible_membership_sql, read_statements=None, *, location_lookup=False):
+def _bound_address_query(layout, network_ids, visible_membership_sql, *, location_lookup=False):
     sql = _address_query(layout, network_ids, visible_membership_sql, location_lookup)
-    if read_statements is not None:
-        sql = read_statements.marker(compact_address_read_relations(layout)) + " " + sql
     query = text(sql)
     for name, value in compact_address_parameters(layout).items():
         query = query.bindparams(bindparam(name, value=value, type_=String()))
@@ -125,13 +122,9 @@ def _bound_address_query(layout, network_ids, visible_membership_sql, read_state
     return query
 
 
-def compact_address_selectable(
-    layout, *, network_ids=None, visible_membership_sql=None, read_statements=None, location_lookup=False
-):
+def compact_address_selectable(layout, *, network_ids=None, visible_membership_sql=None, location_lookup=False):
     """Expose model-column parity with raw SQL, including typed reserved binds."""
-    query = _bound_address_query(
-        layout, network_ids, visible_membership_sql, read_statements, location_lookup=location_lookup
-    )
+    query = _bound_address_query(layout, network_ids, visible_membership_sql, location_lookup=location_lookup)
     columns = [column(col.name, col.type) for col in EntityAddressUnified.__table__.columns]
     return query.columns(*columns).subquery("entity_address_unified")
 

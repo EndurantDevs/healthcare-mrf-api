@@ -98,8 +98,8 @@ async def _input_case(native, url, database_name, role_by_kind, password):
     )
 
 
-@pytest_asyncio.fixture
-async def native_case():
+@asynccontextmanager
+async def native_input_resources():
     """Yield isolated native inputs and retire only registered random resources."""
     dsn = os.getenv("HLTHPRT_CMS_CUSTODY_TEST_DSN")
     if not dsn:
@@ -126,7 +126,13 @@ async def native_case():
             url.set(database=database_name).render_as_string(hide_password=False), command_timeout=10
         )
         await _create_input_relations(native, role_by_kind)
-        yield await _input_case(native, url, database_name, role_by_kind, password)
+        yield SimpleNamespace(
+            admin=native,
+            url=url.set(database=database_name),
+            database_name=database_name,
+            roles=role_by_kind,
+            password=password,
+        )
     finally:
         try:
             if native is not None:
@@ -145,6 +151,15 @@ async def native_case():
         finally:
             await admin.close()
             assert admin.is_closed()
+
+
+@pytest_asyncio.fixture
+async def native_case():
+    """Preserve the legacy CMS observation fixture on the shared native resources."""
+    async with native_input_resources() as resources:
+        yield await _input_case(
+            resources.admin, resources.url, resources.database_name, resources.roles, resources.password
+        )
 
 
 @asynccontextmanager

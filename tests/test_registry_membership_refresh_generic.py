@@ -58,6 +58,7 @@ async def test_metadata_observation_and_strict_selection_keep_original_approved_
     recipe = actual[1][0]
     assert recipe.binding_coordinates.edition_id == original.capture_id
     assert recipe.source_pin.retained_capture == original
+    assert recipe.source_pin.resource_relation == original.origin.resource_relation
     assert recipe.source_pin.alias_scope == PRODUCER
     assert fhir_physical_source(recipe.source_pin).retained_capture == current
     assert fhir_physical_source(recipe.source_pin).as_of == "2026-02-01"
@@ -73,6 +74,7 @@ def test_legacy_original_uses_only_exact_explicit_retained_recipe_date():
     with pytest.raises(RegistryRefreshAnchorUnavailable, match="semantic_date_unavailable"):
         generic._original_pin(capture, recipe.binding_coordinates, ())
     assert generic._original_pin(capture, recipe.binding_coordinates, (recipe,)) == recipe.source_pin
+    assert generic._original_pin(capture, recipe.binding_coordinates, (recipe, recipe)) == recipe.source_pin
     conflicting = replace(recipe, source_pin=replace(recipe.source_pin, as_of="2026-02-01"))
     with pytest.raises(RegistryRefreshAnchorUnavailable, match="recipe_ambiguous"):
         generic._original_pin(capture, recipe.binding_coordinates, (recipe, conflicting))
@@ -117,3 +119,28 @@ async def test_missing_current_capture_never_falls_back_to_old_accepted_head(mon
     with pytest.raises(RegistryRefreshAnchorUnavailable, match="legacy_advance_unavailable"):
         await generic._accepted_capture(object(), legacy, RegistryPTGGraphReadBudget(4 * 1024**2))
     assert missing.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_named_refresh_uses_catalog_controls_and_payload_capture_locator(monkeypatch):
+    from tests.test_registry_generic_accepted_capture import named_semantic_capture
+
+    original = named_semantic_capture("payload_one")
+    monkeypatch.setattr(generic, "read_original_generic_capture_metadata", AsyncMock(return_value=original))
+    assert await generic.generic_refresh_endpoints(object(), _bindings(original), object()) == (
+        ("catalog_example", original.origin.source_id, original.origin.endpoint_id),
+    )
+    monkeypatch.setattr(generic, "is_original_generic_capture_current", AsyncMock(return_value=False))
+    head = object()
+    observe = AsyncMock(return_value=head)
+    locate = AsyncMock(return_value=object())
+    monkeypatch.setattr(generic, "read_current_generic_fhir_head", observe)
+    monkeypatch.setattr(generic, "read_accepted_generic_capture_metadata", locate)
+    budget = RegistryPTGGraphReadBudget(4 * 1024**2)
+    await generic._accepted_capture(object(), original, budget)
+    assert observe.await_args.kwargs == {
+        "schema_name": "catalog_example",
+        "source_id": original.origin.source_id,
+        "endpoint_id": original.origin.endpoint_id,
+    }
+    assert locate.await_args.args[1:] == (head, budget)

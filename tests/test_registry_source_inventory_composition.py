@@ -18,9 +18,8 @@ from process.registry_compact_composition import CompactCompositionAddressSource
 from process.registry_source_inventory_preparation import SourceInventoryPreparation
 from process.registry_source_inventory_reference import INVENTORY_DIGEST_KEY, verify_source_recipe_metadata
 from process.registry_source_recipe_store import RegistrySourceRecipeError, canonical_registry_source_recipes
+from tests.registry_source_recipe_support import _derivation, _descriptor, _example
 from tests.test_registry_composition_resume import _connection, _registered
-from tests.test_registry_source_inventory_preparation import _derivation, _descriptor
-from tests.test_registry_source_recipe_store_postgres import _example
 
 
 @asynccontextmanager

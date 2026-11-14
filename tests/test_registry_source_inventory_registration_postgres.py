@@ -13,6 +13,7 @@ from process.network_membership_publication import NetworkPublicationError, _pub
 from process.registry_source_inventory_contract import RegistrySourceInventoryError, source_inventory_root
 from process.registry_source_inventory_reference import SourceInventoryReference, verify_source_recipe_metadata
 from process.registry_source_recipe_store import RECIPE_DIGEST_KEY
+from tests.registry_source_recipe_support import _example
 from tests.test_registry_source_inventory_contract import _entries
 from tests.test_registry_source_inventory_store_postgres import (
     _asynchronous_entries,
@@ -29,7 +30,6 @@ from tests.test_registry_source_inventory_store_postgres import (
 from tests.test_registry_source_inventory_store_postgres import (
     serving_schema as serving_schema,
 )
-from tests.test_registry_source_recipe_store_postgres import _example
 
 
 def _unregistered_target(context):

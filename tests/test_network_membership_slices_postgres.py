@@ -30,8 +30,8 @@ def _pure_slice_inputs():
         str(UUID(int=10)), str(UUID(int=11)), str(UUID(int=12)), str(candidate), "network_candidate_" + candidate.hex
     )
     previous_id = UUID(int=1)
-    previous = PinnedMembershipSlices(str(previous_id), "network_candidate_" + previous_id.hex, 101)
-    affected = AffectedMembershipBuckets(target.schema_name, "affected_buckets", 102)
+    previous = PinnedMembershipSlices(str(previous_id), "network_candidate_" + previous_id.hex)
+    affected = AffectedMembershipBuckets(target.schema_name, "affected_buckets")
     source = PinnedAddressSource("retained_source", "addresses", "address-generation")
     return target, previous, affected, source
 
@@ -43,9 +43,6 @@ def _pure_slice_inputs():
         {"candidate_id": UUID(int=1)},
         {"candidate_id": str(UUID(int=0))},
         {"schema_name": "other_candidate"},
-        {"ref_map_oid": True},
-        {"ref_map_oid": 0},
-        {"ref_map_oid": 2**32},
         {"slice_contract_version": True},
         {"slice_contract_version": 2},
     ],
@@ -56,34 +53,35 @@ def test_pure_slice_pin_requires_exact_candidate_relation_and_contract(changes):
         replace(previous, **changes)
 
 
-@pytest.mark.parametrize("oid", [True, 0, -1, 2**32])
-def test_pure_affected_pin_requires_a_native_oid(oid):
-    with pytest.raises(NetworkMembershipSliceError, match="Affected bucket relation identity"):
-        AffectedMembershipBuckets("candidate", "affected", oid)
+@pytest.mark.parametrize("changes", [{"schema_name": "bad.schema"}, {"table_name": "bad.table"}, {"table_name": 1}])
+def test_pure_affected_pin_requires_qualified_identifiers(changes):
+    with pytest.raises(ValueError):
+        AffectedMembershipBuckets(**({"schema_name": "candidate", "table_name": "affected"} | changes))
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["previous", "affected"])
-@pytest.mark.parametrize("fault", ["before_lock", "after_lock", "invalid_rows"])
-async def test_pure_slice_pins_recheck_identity_under_lock_before_accepting_rows(kind, fault):
+@pytest.mark.parametrize("invalid", [False, True])
+async def test_pure_named_slice_inputs_validate_data_without_extra_locks(kind, invalid):
     target, previous, affected, _ = _pure_slice_inputs()
-    oid = previous.ref_map_oid if kind == "previous" else affected.relation_oid
-    results = {
-        "before_lock": [oid + 1],
-        "after_lock": [oid, oid + 1],
-        "invalid_rows": [oid, oid, True],
-    }[fault]
-    connection = SimpleNamespace(fetchval=AsyncMock(side_effect=results), execute=AsyncMock())
-    with pytest.raises(NetworkMembershipSliceError, match="changed|invalid"):
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=invalid), execute=AsyncMock())
+
+    async def read():
         if kind == "previous":
-            await slices._pin_previous(connection, previous, target)
-        else:
-            await slices._pin_affected(connection, affected, target, previous)
-    assert connection.fetchval.await_count == len(results)
-    assert connection.execute.await_count == (0 if fault == "before_lock" else 1)
-    if fault != "before_lock":
-        expected_mode = "ACCESS SHARE" if kind == "previous" else "SHARE"
-        assert f"IN {expected_mode} MODE" in connection.execute.await_args.args[0]
+            return await slices._pin_previous(connection, previous, target)
+        return await slices._pin_affected(connection, affected, target, previous)
+
+    if invalid:
+        with pytest.raises(NetworkMembershipSliceError, match="invalid"):
+            await read()
+    else:
+        relation = await read()
+        assert relation == (
+            '"' + previous.schema_name + '".network_slice_ref'
+            if kind == "previous"
+            else '"' + affected.schema_name + '"."' + affected.table_name + '"'
+        )
+    assert connection.fetchval.await_count == 1
+    connection.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -93,7 +91,7 @@ async def test_pure_slice_reuse_requires_distinct_history_and_owned_change_set(f
     connection = SimpleNamespace(fetchval=AsyncMock(), execute=AsyncMock())
     with pytest.raises(NetworkMembershipSliceError, match="different immutable candidate|owned relation"):
         if fault in {"self", "untyped_previous"}:
-            prior = PinnedMembershipSlices(target.candidate_id, target.schema_name, 101) if fault == "self" else {}
+            prior = PinnedMembershipSlices(target.candidate_id, target.schema_name) if fault == "self" else {}
             await slices._pin_previous(connection, prior, target)
         else:
             selected = replace(affected, schema_name=previous.schema_name) if fault == "foreign_affected" else affected
@@ -269,7 +267,7 @@ async def _refs(db, target):
 
 
 def _pin(target, receipt):
-    return PinnedMembershipSlices(target.candidate_id, target.schema_name, receipt.ref_map_oid)
+    return PinnedMembershipSlices(target.candidate_id, target.schema_name)
 
 
 @pytest.mark.asyncio
@@ -333,10 +331,8 @@ async def test_reuse_add_remove_move_and_empty_bucket(slice_db):
         )
         == original_edges
     )
-    assert (
-        await db.connection.fetchval("SELECT to_regclass($1)::oid", first.schema_name + ".network_office_edge")
-        == first_receipt.edge_heap_oid
-    )
+    assert first_receipt.edge_heap.schema_name == first.schema_name
+    assert first_receipt.edge_heap.table_name == "network_office_edge"
     third = await _candidate(db, [(42, 0), (7, 1), (99, 3)])
     async with db.connection.transaction():
         third_receipt = await _prepare(db, third, previous=_pin(second, second_receipt))
@@ -370,7 +366,6 @@ async def test_selective_buckets_retain_exact_unexamined_refs(slice_db):
     affected = AffectedMembershipBuckets(
         second.schema_name,
         "changed",
-        await db.connection.fetchval("SELECT to_regclass($1)::oid", second.schema_name + ".changed"),
     )
     async with db.connection.transaction():
         receipt = await _prepare(db, second, previous=_pin(first, first_receipt), affected_buckets=affected)
@@ -412,8 +407,7 @@ async def test_validation_failure_rolls_back_only_local_preparation(slice_db, da
     assert await db.connection.fetchval(f'SELECT count(*) FROM "{target.schema_name}".network_membership') == 1
 
 
-@pytest.mark.asyncio
-async def test_requires_transaction_pinned_generation_and_prior_oid(slice_db):
+async def test_requires_transaction_and_logical_generation(slice_db):
     db = slice_db
     first = await _candidate(db, [(42, 0)])
     with pytest.raises(NetworkMembershipSliceError, match="caller-owned"):
@@ -425,10 +419,16 @@ async def test_requires_transaction_pinned_generation_and_prior_oid(slice_db):
             )
         receipt = await _prepare(db, first)
     second = await _candidate(db, [(42, 0)])
+    schema = '"' + first.schema_name + '"'
+    await db.connection.execute(f"ALTER TABLE {schema}.network_slice_ref RENAME TO previous_slice_refs")
+    await db.connection.execute(
+        f"CREATE TABLE {schema}.network_slice_ref (LIKE {schema}.previous_slice_refs INCLUDING ALL)"
+    )
+    await db.connection.execute(f"INSERT INTO {schema}.network_slice_ref SELECT * FROM {schema}.previous_slice_refs")
+    await db.connection.execute(f"DROP TABLE {schema}.previous_slice_refs")
     async with db.connection.transaction():
-        with pytest.raises(NetworkMembershipSliceError, match="relation changed"):
-            await _prepare(db, second, previous=replace(_pin(first, receipt), ref_map_oid=receipt.edge_heap_oid))
-        assert await db.connection.fetchval("SELECT to_regclass($1)", second.schema_name + ".network_slice_ref") is None
+        successor = await _prepare(db, second, previous=_pin(first, receipt))
+    assert successor.reused_slices == 1 and successor.copied_edge_rows == 0
 
 
 @pytest.mark.asyncio

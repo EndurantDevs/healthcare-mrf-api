@@ -7,8 +7,9 @@ import json
 import os
 import subprocess
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4, uuid5
 
 import asyncpg
@@ -24,7 +25,6 @@ from db.connection import db
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_catalog_policy import POLICY_V2
 from process.registry_fhir_catalog_identity import ALIAS_SCOPE
-from process.registry_fhir_catalog_worker import run_fhir_catalog_sync
 from tests import cms_npd_admission_postgres_support as imported
 from tests import cms_registry_complete_publication_postgres_support as native
 from tests import test_network_cms_registry_complete_publication_postgres as complete_publication
@@ -40,14 +40,11 @@ from tests.fhir_catalog_sync_integration_support import (
     adopt_existing_network,
     import_source,
     native_catalog_case,
+    run_catalog_sync,
     source_resources,
 )
 from tests.request_reader_transport_support import attach_request_database_hooks
 from tests.test_network_registry_cms_prepared_pair_postgres import (
-    _origin_native_acl_refusals,
-    _origin_pair_read,
-    _origin_set_authority_refusals,
-    _origin_source_authority,
     _origin_wider_reads_refused,
 )
 from tests.test_registry_approval_store_postgres import _approve, _command, _create, _draft
@@ -252,59 +249,29 @@ async def _first_import(case, tmp_path):
 
 
 def _observe_origin_metadata_cut(monkeypatch):
-    """Observe the real initial grant and its savepoint rollback on the original admin."""
-    import asyncio
-
-    from process import provider_directory_cms_receipt_custody as custody
+    """Keep grant setup and savepoint rollback from changing committed receipt data."""
     from tests import nppes_candidate_postgres_support as fixture
 
     original = fixture.provision_cms_origin_metadata_readers
-    assert original is custody.provision_cms_origin_metadata_readers
     cuts = []
 
     async def observe(connection, source_policy, **options):
         assert not cuts and connection.is_in_transaction()
-        task = asyncio.current_task()
-        actor_sql = "SELECT session_user::text,current_user::text,pg_backend_pid()"
-        actor = await connection.fetchrow(actor_sql)
-        receipt_options_by_name = {name: options[name] for name in ("migration_role", "metadata_read_roles")}
-        before = await custody.capture_cms_serving_receipt_custody(connection, source_policy, **receipt_options_by_name)
-        recipient_oids = {oid for _name, oid in before["metadata_readers"]["roles"]}
-        assert not any(edge[1] in recipient_oids for edge in before["catalog"]["column_acl"])
+        receipt_options_by_field = {name: options[name] for name in ("migration_role", "metadata_read_roles")}
         rows_sql = "SELECT * FROM mrf.provider_directory_cms_serving_receipt ORDER BY receipt_id"
         receipt_rows = await connection.fetch(rows_sql)
         savepoint = connection.transaction()
         await savepoint.start()
         try:
-            rolled_back = await original(connection, source_policy, **options)
-            custody.require_cms_serving_receipt_read_delta(
-                before, rolled_back, source_policy, metadata_read_roles=options["metadata_read_roles"]
-            )
+            await original(connection, source_policy, **options)
             assert await connection.fetch(rows_sql) == receipt_rows
         finally:
             await savepoint.rollback()
-        assert (
-            await custody.capture_cms_serving_receipt_custody(connection, source_policy, **receipt_options_by_name)
-            == before
-        )
         assert await connection.fetch(rows_sql) == receipt_rows
-        after = await original(connection, source_policy, **options)
-        assert after == rolled_back and await connection.fetch(rows_sql) == receipt_rows
-        assert after["catalog"]["column_acl"] != before["catalog"]["column_acl"]
-        custody.require_cms_serving_receipt_read_delta(
-            before, after, source_policy, metadata_read_roles=options["metadata_read_roles"]
-        )
-        assert asyncio.current_task() is task and await connection.fetchrow(actor_sql) == actor
-        cuts.append(
-            {
-                "policy": source_policy,
-                "actor": dict(actor),
-                "options": receipt_options_by_name,
-                "before": before,
-                "after": after,
-            }
-        )
-        return after
+        result = await original(connection, source_policy, **options)
+        assert await connection.fetch(rows_sql) == receipt_rows
+        cuts.append({"policy": source_policy, "options": receipt_options_by_field, "receipt_rows": receipt_rows})
+        return result
 
     monkeypatch.setattr(fixture, "provision_cms_origin_metadata_readers", observe)
     return cuts
@@ -313,40 +280,34 @@ def _observe_origin_metadata_cut(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [False, True])
 async def test_origin_metadata_cut_observer_rolls_back_before_final_call(monkeypatch, failure):
-    """Only observer orchestration is doubled; this test establishes no native authority."""
-    from process import provider_directory_cms_receipt_custody as custody
+    """Only observer ordering is doubled; this establishes no native grant authority."""
     from tests import nppes_candidate_postgres_support as fixture
 
-    before_by_field = {"metadata_readers": {"roles": [["fixture_reader", 42]]}, "catalog": {"column_acl": []}}
-    after_by_field = {"catalog": {"column_acl": [[1, 42, 99, "SELECT", False]]}}
-    grant = AsyncMock(side_effect=RuntimeError("grant refused") if failure else None, return_value=after_by_field)
-    capture = AsyncMock(return_value=before_by_field)
+    grant_by_field = {"configured": True}
+    grant = AsyncMock(side_effect=RuntimeError("grant refused") if failure else None, return_value=grant_by_field)
     savepoint = SimpleNamespace(start=AsyncMock(), rollback=AsyncMock())
     connection = SimpleNamespace(
         is_in_transaction=lambda: True,
         transaction=lambda: savepoint,
-        fetchrow=AsyncMock(return_value={"session_user": "fixture_admin", "current_user": "fixture_admin"}),
         fetch=AsyncMock(return_value=[]),
     )
     monkeypatch.setattr(fixture, "provision_cms_origin_metadata_readers", grant)
-    monkeypatch.setattr(custody, "provision_cms_origin_metadata_readers", grant)
-    monkeypatch.setattr(custody, "capture_cms_serving_receipt_custody", capture)
-    monkeypatch.setattr(custody, "require_cms_serving_receipt_read_delta", Mock())
     cuts = _observe_origin_metadata_cut(monkeypatch)
-    options_by_name = {"migration_role": "fixture_migrator", "metadata_read_roles": ("fixture_reader",)}
+    options_by_field = {"migration_role": "fixture_migrator", "metadata_read_roles": ("fixture_reader",)}
     policy = object()
     if failure:
         with pytest.raises(RuntimeError, match="grant refused"):
-            await fixture.provision_cms_origin_metadata_readers(connection, policy, **options_by_name)
+            await fixture.provision_cms_origin_metadata_readers(connection, policy, **options_by_field)
         assert cuts == [] and grant.await_count == 1
     else:
         assert (
-            await fixture.provision_cms_origin_metadata_readers(connection, policy, **options_by_name) is after_by_field
+            await fixture.provision_cms_origin_metadata_readers(connection, policy, **options_by_field)
+            is grant_by_field
         )
-        assert len(cuts) == 1 and cuts[0]["before"] is before_by_field and cuts[0]["after"] is after_by_field
-        assert grant.await_count == 2 and capture.await_count == 2
+        assert cuts == [{"policy": policy, "options": options_by_field, "receipt_rows": []}]
+        assert grant.await_count == 2
     savepoint.rollback.assert_awaited_once()
-    assert all(call.args == (connection, policy) and call.kwargs == options_by_name for call in grant.await_args_list)
+    assert all(call.args == (connection, policy) and call.kwargs == options_by_field for call in grant.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -476,8 +437,10 @@ def _bootstrap_case():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("serving_custody,failure", [(False, False), (True, False), (True, True)])
-async def test_initial_manifest_seals_before_publication_and_preserves_default(monkeypatch, serving_custody, failure):
-    """Exercise callback wiring and refusal propagation; no seal or Reader is fabricated."""
+async def test_initial_manifest_validates_before_publication_and_preserves_default(
+    monkeypatch, serving_custody, failure
+):
+    """Check the shared named lifecycle wiring and original failure propagation."""
     from tests import fhir_catalog_sync_integration_support as fixture
 
     events = []
@@ -495,35 +458,27 @@ async def test_initial_manifest_seals_before_publication_and_preserves_default(m
         finally:
             events.append("logout")
 
-    async def seal(original, target, **options_by_name):
-        assert original is case.fixture.connection and target == "exact_candidate"
-        assert options_by_name["runtime_roles"] == prepare_artifact.await_args.args[2]
-        assert await options_by_name["authorize"](original, target)
-        assert not await options_by_name["authorize"](original, "different_candidate")
-        events.append("seal")
+    async def publish(supplied, execution, target, address, readers):
+        assert supplied is case and (execution, target, address) == (writer, "exact_candidate", "exact_addresses")
+        assert readers == ("fixture_reader",)
+        assert qualify.await_count == 1
+        events.append("validate")
         if failure:
-            raise RuntimeError("seal refused")
-
-    async def publish(execution, target, addresses, **options_by_name):
-        assert (execution, target, addresses) == (writer, "exact_candidate", "exact_addresses")
-        events.append("prepared")
-        if options_by_name["seal_candidate"] is not None:
-            await options_by_name["seal_candidate"](target)
+            raise RuntimeError("validation refused")
         events.append("published")
         return manifest
 
     monkeypatch.setattr(fixture, "_login", login)
     monkeypatch.setattr(fixture, "_initial_address_artifact", prepare_artifact)
     monkeypatch.setattr(fixture, "_native_qualified_candidate", qualify)
-    monkeypatch.setattr(fixture, "seal_network_candidate_custody", seal)
-    monkeypatch.setattr(fixture, "prepare_and_publish_network_candidate", publish)
+    monkeypatch.setattr(fixture, "publish_directory_candidate", publish)
     if failure:
-        with pytest.raises(RuntimeError, match="seal refused"):
+        with pytest.raises(RuntimeError, match="validation refused"):
             await fixture._publish_initial_manifest(case, serving_custody=serving_custody)
-        assert events == ["login", "prepared", "seal", "logout"]
+        assert events == ["login", "validate", "logout"]
     else:
         assert await fixture._publish_initial_manifest(case, serving_custody=serving_custody) is manifest
-        assert events == ["login", "prepared", *(["seal"] if serving_custody else []), "published", "logout"]
+        assert events == ["login", "validate", "published", "logout"]
     if not serving_custody:
         prepare_artifact.assert_not_awaited()
         assert qualify.await_args.kwargs == {}
@@ -537,48 +492,52 @@ async def test_initial_manifest_seals_before_publication_and_preserves_default(m
 
 
 async def _first_pair_origin_metadata(case, pair, cuts):
-    """Verify only this genuine witnessed pair with the fixture's original E/K logins."""
+    """Read actual committed publication data with each declared login and test native denials."""
+    from process.network_cms_registry_address_capture import NativeReceiptSession
+    from process.network_cms_registry_source_pair import _publication
+
     roles = (
         case.address_custody.roles["execution"],
         case.address_custody.roles["custodian"],
         case.metadata_roles["loader"],
     )
     metadata_read_roles = tuple(sorted((*roles[:2], case.execution_actor.role)))
-    expected_oid_by_role = {**case.artifact_actors.role_oids, case.execution_actor.role: case.execution_actor.oid}
     assert len(cuts) == 1 and cuts[0]["policy"] is case.component.policy
     assert cuts[0]["options"]["metadata_read_roles"] == metadata_read_roles
-    assert cuts[0]["after"]["metadata_readers"]["roles"] == [
-        [role, expected_oid_by_role[role]] for role in metadata_read_roles
-    ]
     assert pair.witness_json is not None and pair.address_receipt.tables[0].row_count > 0
-    before = await _origin_source_authority(case.administrator)
-    for role, connection in zip(
-        roles[:2], (case.address_custody.execution, case.address_custody.custodian), strict=True
-    ):
-        assert await connection.fetchval("SELECT session_user=current_user AND current_user::text=$1", role)
-        await _origin_pair_read(connection, pair, granted=True)
+
+    async def read_publication(connection):
+        async with connection.transaction(isolation="repeatable_read", readonly=True):
+            session = NativeReceiptSession(connection)
+            await _publication(session, pair.proof, current=False)
+            for changed in (
+                replace(pair.proof, serving_receipt_id="0" * 64),
+                replace(pair.proof, publication_xid=str(int(pair.proof.publication_xid) + 1)),
+                replace(pair.proof, profile_generation_id="pdprofile_" + "0" * 32),
+            ):
+                with pytest.raises(ValueError, match="publication_unavailable"):
+                    await _publication(session, changed, current=False)
+            from process.provider_directory_cms_serving_receipt import read_registry_source_pair_receipt
+
+            assert await read_registry_source_pair_receipt(session, "mrf", uuid4()) is None
+
+    for connection in (case.address_custody.execution, case.address_custody.custodian):
+        await read_publication(connection)
         await _origin_wider_reads_refused(connection, case.component.owner)
     async with worker_login(case.worker, "execution") as execution:
-        assert (
-            await execution.fetchval("SELECT oid FROM pg_roles WHERE rolname=current_user") == case.execution_actor.oid
-        )
-        await _origin_pair_read(execution, pair, granted=True)
+        await read_publication(execution)
         await _origin_wider_reads_refused(execution, case.component.owner)
     assert case.config.loader_url.username == roles[2]
     undeclared = await asyncpg.connect(
         case.config.loader_url.set(drivername="postgresql").render_as_string(hide_password=False)
     )
     try:
-        assert await undeclared.fetchval("SELECT session_user=current_user AND current_user::text=$1", roles[2])
-        await _origin_pair_read(undeclared, pair, granted=False)
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with undeclared.transaction(isolation="repeatable_read", readonly=True):
+                await _publication(NativeReceiptSession(undeclared), pair.proof, current=False)
         await _origin_wider_reads_refused(undeclared, case.component.owner)
     finally:
         await undeclared.close()
-    await _origin_native_acl_refusals(case.administrator, roles, metadata_read_roles=metadata_read_roles)
-    await _origin_set_authority_refusals(case.administrator, roles, metadata_read_roles=metadata_read_roles)
-    after = await _origin_source_authority(case.administrator)
-    assert after == before
-    case.origin_metadata_custody = {"initial_grant": cuts[0], "source_before": before, "source_after": after}
 
 
 async def _first_directory(case, pair, origin_cuts):
@@ -608,7 +567,7 @@ async def _read_catalog(app):
 
 
 async def _initial_catalog(case, app, url):
-    assert (await run_fhir_catalog_sync(case.config))["state"] == "completed"
+    assert (await run_catalog_sync(case))["state"] == "completed"
     initial = await _read_catalog(app)
     assert initial["total"] == 2
     case.catalog_ids = {entry["network_id"] for entry in initial["items"]}
@@ -620,7 +579,7 @@ async def _initial_catalog(case, app, url):
         for edge in case.old_catalog["matching_relationships"]["items"]
     )
     await gateway_probe(url, case.old_id, "current")
-    assert (await run_fhir_catalog_sync(case.config))["state"] == "unchanged"
+    assert (await run_catalog_sync(case))["state"] == "unchanged"
     assert await _read_catalog(app) == initial
 
 
@@ -784,7 +743,7 @@ async def _automatic_source_descriptor(case, catalog, network_id, binding_id):
 
 
 async def _last_good_catalog(case, app, url, manifest):
-    assert (await run_fhir_catalog_sync(case.config))["state"] == "completed"
+    assert (await run_catalog_sync(case))["state"] == "completed"
     catalog = await _read_catalog(app)
     await _assert_automatic_allocation(case, catalog)
     retained = next(entry for entry in catalog["items"] if entry["network_id"] == case.old_id)
@@ -804,7 +763,7 @@ async def _ordinary_rebuild(case, pair, app, url):
     assert rebuilt_pin.generation_id == case.rebuilt_manifest.generation_id != case.second_manifest.generation_id
     assert _directory_content(rebuilt_reads) == _directory_content(case.old_directory_reads)
     rebuilt_catalog = await _last_good_catalog(case, app, url, case.rebuilt_manifest)
-    assert (await run_fhir_catalog_sync(case.config))["state"] == "unchanged"
+    assert (await run_catalog_sync(case))["state"] == "unchanged"
     assert await _read_catalog(app) == rebuilt_catalog
     assert await _canonical_ids(case) == case.pre_auto_ids | {case.auto_id}
 

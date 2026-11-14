@@ -3,6 +3,7 @@
 
 import json
 from dataclasses import dataclass
+from types import SimpleNamespace
 from uuid import UUID
 
 from sqlalchemy import text
@@ -20,11 +21,11 @@ from process.registry_ptg_office_capture import (
     RegistryPTGOfficeCaptureDescriptor,
     RegistryPTGOfficeCaptureRequest,
     _canonical,
-    _custody,
     _digest,
     _office_driver,
+    office_storage,
 )
-from process.registry_ptg_office_review_contract import validated_office_review_command
+from process.registry_ptg_office_review_contract import named_office_review_command, validated_office_review_command
 from process.registry_ptg_office_witness import verify_registry_ptg_office_witness
 from process.registry_ptg_producer_scope import _protected_store
 from process.registry_ptg_published_office_scope import _graph_identity
@@ -117,10 +118,6 @@ async def _context(session, service, command_by_field, control_schema):
         _reader_roles(service),
         profile,
     )
-    from process.registry_ptg_office_capture import _driver
-    from process.registry_ptg_office_custody import verify_registry_ptg_office_custody
-
-    await verify_registry_ptg_office_custody(await _driver(session), context, publisher=False)
     return context
 
 
@@ -143,7 +140,9 @@ async def _descriptor(session, context, request):
     await driver.execute(
         f"LOCK TABLE {namespace}.office_assertion,{namespace}.capture_manifest IN ACCESS SHARE MODE NOWAIT"
     )
-    custody = await _custody(driver, schema_name, context)
+    from process.registry_ptg_office_preparation import require_office_preparation_frozen
+
+    await require_office_preparation_frozen(driver, str(request.capture_id), control_schema=context.control_schema)
     records = await driver.fetch(
         f"SELECT id,manifest_sha256,CASE WHEN octet_length(manifest_json::text)<=8388608 THEN manifest_json::text END AS manifest_json FROM {namespace}.capture_manifest LIMIT 2"
     )
@@ -155,7 +154,7 @@ async def _descriptor(session, context, request):
         schema_name,
         records[0]["manifest_sha256"],
         _canonical(manifest_by_field),
-        _canonical(custody),
+        _canonical(office_storage(schema_name, records[0]["manifest_sha256"])),
     )
 
 
@@ -163,12 +162,13 @@ async def _physical_review(session, service, command_by_field, limits_by_field, 
     context = await _context(session, service, command_by_field, control_schema)
     request = _request(command_by_field)
     descriptor = await _descriptor(session, context, request)
-    if json.loads(descriptor.manifest_json)["command"] != command_by_field:
+    stored_manifest = json.loads(descriptor.manifest_json)
+    if named_office_review_command(stored_manifest["command"]) != command_by_field:
         raise ValueError("registry_ptg_office_command_changed")
     witness = await verify_registry_ptg_office_witness(
         session, context, request, descriptor, read_budget=RegistryPTGGraphReadBudget(**limits_by_field)
     )
-    if witness.as_dict()["command_sha256"] != _digest(command_by_field):
+    if witness.as_dict()["command_sha256"] != stored_manifest["command_sha256"]:
         raise ValueError("registry_ptg_office_command_changed")
     return descriptor, witness
 
@@ -225,6 +225,22 @@ async def _retain(session, table, document_by_field):
     return parameters_by_name["approval_sha256"]
 
 
+async def _publish_preparation(session, service, descriptor, witness, approval_sha256, hold_sha256, control_schema):
+    from process.registry_ptg_office_capture import _driver
+    from process.registry_ptg_office_preparation import publish_office_preparation
+
+    profile = service.office_custody
+    if profile is None:
+        raise ValueError("registry_ptg_office_profile_unavailable")
+    context = SimpleNamespace(
+        control_schema=control_schema,
+        office_custody=profile,
+        owner_role=profile.owner_role,
+        reader_roles=_reader_roles(service),
+    )
+    await publish_office_preparation(await _driver(session), context, descriptor, witness, approval_sha256, hold_sha256)
+
+
 async def approve_offices(service, envelope, deadline, state_by_field):
     """Reverify, freshly authorize and append under one actual fenced transaction.
 
@@ -259,6 +275,7 @@ async def approve_offices(service, envelope, deadline, state_by_field):
         recipe_by_field = approved_office_recipe_receipt(
             envelope["command"], descriptor.manifest_sha256, approval_sha256, hold_sha256
         )
+        await _publish_preparation(session, service, descriptor, witness, approval_sha256, hold_sha256, control_schema)
         await session.execute(
             text("SELECT pg_catalog.set_config('search_path',:original_path,true)"), {"original_path": original_path}
         )

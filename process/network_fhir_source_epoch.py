@@ -15,7 +15,7 @@ import json
 import struct
 import tempfile
 from contextlib import asynccontextmanager, suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,7 +26,6 @@ import asyncpg
 from process.network_address_projection import _identifier
 from process.network_bootstrap_sources import _copy_native_batch, _CopyBatchTooLarge
 from process.network_custom_address_source import _require_transaction
-from process.network_membership_writer_closure import _protected_owner
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
 _TABLES = (
@@ -128,7 +127,7 @@ _ORIGIN_FIELDS = (
     "dataset_id",
     "dataset_sha256",
     "release_id",
-    "resource_table_oid",
+    "resource_relation",
     "alias_scope",
     "as_of",
 )
@@ -160,28 +159,18 @@ def _sha(value):
 
 @dataclass(frozen=True)
 class RetainedCMSFHIRSourceEpoch:
-    """Closed physical custody paired with the unchanged nine origin coordinates."""
+    """A named retained edition with unchanged logical source coordinates."""
 
     origin_coordinates: tuple
     epoch_id: UUID
     schema_name: str
-    schema_oid: int
-    relation_oids: tuple[tuple[str, int], ...]
-    owner_role: str
-    runtime_roles: tuple[str, ...]
     admission_sha256: str
     metadata_sha256: str
     content_sha256: str
-    catalog_sha256: str
 
     def as_dict(self):
-        """Return a bounded closed wire object without a recursive source pin."""
-        document_by_field = asdict(self)
-        document_by_field["epoch_id"] = str(self.epoch_id)
-        document_by_field["origin_coordinates"] = list(self.origin_coordinates)
-        document_by_field["relation_oids"] = [list(pair) for pair in self.relation_oids]
-        document_by_field["runtime_roles"] = list(self.runtime_roles)
-        return document_by_field
+        """Return the bounded named edition document."""
+        return {**asdict(self), "epoch_id": str(self.epoch_id), "origin_coordinates": list(self.origin_coordinates)}
 
 
 def _origin(source_pin):
@@ -190,7 +179,6 @@ def _origin(source_pin):
     if (
         type(source_pin) is not PinnedFHIRMembershipSource
         or source_pin.source_id != "cms-npd"
-        or source_pin.custody_owner_role is not None
         or source_pin.retained_successor is not None
     ):
         _fail()
@@ -198,38 +186,56 @@ def _origin(source_pin):
 
 
 def _decode_epoch(epoch_input):
-    """Decode closed canonical wire arrays without coercing scalar strings."""
-    value = epoch_input
-    if type(value) is dict:
-        if set(value) != set(RetainedCMSFHIRSourceEpoch.__dataclass_fields__):
+    """Project complete legacy documents to their logical named edition."""
+    if type(epoch_input) is RetainedCMSFHIRSourceEpoch:
+        return epoch_input
+    fields = set(RetainedCMSFHIRSourceEpoch.__dataclass_fields__)
+    legacy_fields = {"schema_oid", "relation_oids", "owner_role", "runtime_roles", "catalog_sha256"}
+    if type(epoch_input) is not dict or set(epoch_input) not in (fields, fields | legacy_fields):
+        _fail()
+    try:
+        if len(json.dumps(epoch_input, sort_keys=True, separators=(",", ":")).encode()) > MAX_RECEIPT_BYTES:
             _fail()
+    except TypeError, ValueError, RecursionError:
+        _fail()
+    if set(epoch_input) == fields | legacy_fields:
+        entries, roles = epoch_input["relation_oids"], epoch_input["runtime_roles"]
         if (
-            type(value["epoch_id"]) is not str
-            or type(value["origin_coordinates"]) is not list
-            or type(value["relation_oids"]) is not list
-            or type(value["runtime_roles"]) is not list
-            or any(type(pair) is not list or len(pair) != 2 for pair in value["relation_oids"])
+            type(epoch_input["schema_oid"]) is not int
+            or not 0 < epoch_input["schema_oid"] < 2**32
+            or type(entries) is not list
+            or len(entries) != len(_TABLES)
+            or any(type(entry) is not list or len(entry) != 2 for entry in entries)
+            or [entry[0] for entry in entries] != sorted(_TABLES)
+            or any(type(entry[1]) is not int or not 0 < entry[1] < 2**32 for entry in entries)
+            or type(roles) is not list
+            or not 1 <= len(roles) <= 64
+            or any(type(role) is not str for role in roles)
+            or roles != sorted(set(roles))
+            or epoch_input["owner_role"] in roles
+            or not _sha(epoch_input["catalog_sha256"])
         ):
             _fail()
         try:
-            if str(UUID(value["epoch_id"])) != value["epoch_id"]:
-                _fail()
-            value = RetainedCMSFHIRSourceEpoch(
-                **{
-                    **value,
-                    "epoch_id": UUID(value["epoch_id"]),
-                    "origin_coordinates": tuple(value["origin_coordinates"]),
-                    "relation_oids": tuple(tuple(pair) for pair in value["relation_oids"]),
-                    "runtime_roles": tuple(value["runtime_roles"]),
-                }
-            )
-        except TypeError, ValueError, AttributeError:
+            for role in (epoch_input["owner_role"], *roles):
+                _identifier(role)
+        except TypeError, ValueError:
             _fail()
-    return value
+    epoch_by_field = {name: epoch_input[name] for name in fields}
+    if type(epoch_by_field["origin_coordinates"]) is not list or type(epoch_by_field["epoch_id"]) is not str:
+        _fail()
+    try:
+        if str(UUID(epoch_by_field["epoch_id"])) != epoch_by_field["epoch_id"]:
+            _fail()
+        epoch_by_field["epoch_id"] = UUID(epoch_by_field["epoch_id"])
+        epoch_by_field["origin_coordinates"] = tuple(epoch_by_field["origin_coordinates"])
+        return RetainedCMSFHIRSourceEpoch(**epoch_by_field)
+    except TypeError, ValueError, AttributeError:
+        _fail()
 
 
 def validate_retained_cms_fhir_source_epoch(epoch_input):
-    """Validate exact scalar/tuple fields and canonical namespace identity."""
+    """Validate exact logical coordinates and the canonical candidate namespace."""
     from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 
     epoch = _decode_epoch(epoch_input)
@@ -237,35 +243,18 @@ def validate_retained_cms_fhir_source_epoch(epoch_input):
         type(epoch) is not RetainedCMSFHIRSourceEpoch
         or type(epoch.origin_coordinates) is not tuple
         or len(epoch.origin_coordinates) != 9
-        or type(epoch.runtime_roles) is not tuple
-        or type(epoch.relation_oids) is not tuple
-        or any(type(pair) is not tuple or len(pair) != 2 for pair in epoch.relation_oids)
     ):
         _fail()
     try:
-        _origin(PinnedFHIRMembershipSource(*epoch.origin_coordinates))
-        _identifier(epoch.owner_role)
-        for role in epoch.runtime_roles:
-            _identifier(role)
+        origin = _origin(PinnedFHIRMembershipSource(*epoch.origin_coordinates))
     except TypeError, ValueError:
         _fail()
+    epoch = replace(epoch, origin_coordinates=origin)
     if (
         type(epoch.epoch_id) is not UUID
         or not epoch.epoch_id.int
         or epoch.schema_name != "registry_cms_epoch_" + epoch.epoch_id.hex
-        or type(epoch.schema_oid) is not int
-        or not 0 < epoch.schema_oid <= 4294967295
-        or type(epoch.runtime_roles) is not tuple
-        or not 1 <= len(epoch.runtime_roles) <= 64
-        or tuple(sorted(set(epoch.runtime_roles))) != epoch.runtime_roles
-        or epoch.owner_role in epoch.runtime_roles
-        or type(epoch.relation_oids) is not tuple
-        or tuple(name for name, _ in epoch.relation_oids) != tuple(sorted(_TABLES))
-        or any(type(oid) is not int or not 0 < oid <= 4294967295 for _, oid in epoch.relation_oids)
-        or any(
-            not _sha(getattr(epoch, field))
-            for field in ("admission_sha256", "metadata_sha256", "content_sha256", "catalog_sha256")
-        )
+        or any(not _sha(getattr(epoch, field)) for field in ("admission_sha256", "metadata_sha256", "content_sha256"))
     ):
         _fail()
     if len(json.dumps(epoch.as_dict(), sort_keys=True, separators=(",", ":")).encode()) > MAX_RECEIPT_BYTES:
@@ -437,12 +426,10 @@ async def _admit_origin(connection, source_pin, admission_sha256, metadata_sha25
         or dataset_record["endpoint_id"] != source_pin.endpoint_id
     ):
         _fail()
-    if (
-        await connection.fetchval(
-            "SELECT to_regclass($1)::oid::bigint", namespace + '."provider_directory_dataset_resource"'
-        )
-        != source_pin.resource_table_oid
-    ):
+    if source_pin.resource_relation != {
+        "schema": source_pin.schema_name,
+        "name": "provider_directory_dataset_resource",
+    }:
         _fail()
     seal = await _validated_row_seal(connection, dataset_ref, dataset_record)
     if (seal.proof_sha256, seal.metadata_sha256) != (admission_sha256, metadata_sha256):
@@ -619,67 +606,84 @@ async def _catalog_relations(connection, schema):
         return relations
 
 
-async def _catalog(connection, schema, owner_role, runtime_roles):
-    """Require trigger-free heaps, exact local OIDs and SELECT-only native capabilities."""
-    owner = await connection.fetchrow("SELECT * FROM pg_roles WHERE rolname=$1", owner_role)
-    if not _protected_owner(owner):
-        _fail()
+async def _epoch_catalog_relations(connection, schema):
+    """Read only functional columns, keys and indexes for the named edition."""
+    # Deparsed expressions and operator classes must not depend on the reader's path.
+    async with _borrowed_epoch_settings(connection):
+        await connection.execute("SET LOCAL search_path TO pg_catalog")
+        relations = await connection.fetch(
+            """SELECT c.relname,c.relkind,c.relpersistence,c.relhastriggers,
+      c.relrowsecurity,c.relforcerowsecurity,
+      EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) AS inherited,
+      (SELECT jsonb_agg(jsonb_build_array(a.attname,a.atttypid::bigint,a.atttypmod,a.attnotnull,a.attgenerated,a.attidentity) ORDER BY a.attnum)
+       FROM pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped)::text AS columns,
+      EXISTS(SELECT 1 FROM pg_attrdef d WHERE d.adrelid=c.oid) AS defaults,
+      (SELECT jsonb_agg(jsonb_build_object('name',ix.relname,'method',am.amname,
+        'unique',i.indisunique,'primary',i.indisprimary,'immediate',i.indimmediate,
+        'standard_keys',NOT EXISTS(SELECT 1 FROM unnest(i.indkey::smallint[]) WITH ORDINALITY key(attnum,ordinal)
+          LEFT JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=key.attnum
+          LEFT JOIN pg_opclass op ON op.oid=i.indclass[key.ordinal::int-1]
+          WHERE a.attname IS NULL OR NOT op.opcdefault OR op.opcnamespace<>'pg_catalog'::regnamespace
+            OR op.opcmethod<>ix.relam OR i.indcollation[key.ordinal::int-1]<>a.attcollation),
+        'valid',i.indisvalid,'ready',i.indisready,'live',i.indislive,'key_count',i.indnkeyatts,'attribute_count',i.indnatts,
+        'expressions',i.indexprs IS NOT NULL,'predicate',i.indpred IS NOT NULL,'options',i.indoption::text,
+        'columns',(SELECT jsonb_agg(a.attname ORDER BY key.ordinal) FROM unnest(i.indkey::smallint[]) WITH ORDINALITY key(attnum,ordinal)
+          LEFT JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=key.attnum),
+        'definition',pg_get_indexdef(i.indexrelid)) ORDER BY ix.relname)
+        FROM pg_index i JOIN pg_class ix ON ix.oid=i.indexrelid JOIN pg_am am ON am.oid=ix.relam
+        WHERE i.indrelid=c.oid)::text AS indexes,
+      (SELECT jsonb_agg(jsonb_build_array(k.contype,pg_get_constraintdef(k.oid)) ORDER BY k.conname)
+        FROM pg_constraint k WHERE k.conrelid=c.oid AND k.contype<>'n')::text AS constraints
+      FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid WHERE n.nspname=$1 AND c.relkind IN ('r','p','v','m','f','S') ORDER BY c.relname""",
+            schema,
+        )
+        return relations
+
+
+async def _catalog(connection, schema):
+    """Validate the complete named heap family and its functional keys/indexes."""
     namespace = _identifier(schema)
     await connection.execute(
         "LOCK TABLE "
         + ",".join(namespace + "." + _identifier(name) for name in _TABLES)
         + " IN ACCESS SHARE MODE NOWAIT"
     )
-    relations = await _catalog_relations(connection, schema)
-    if tuple(relation_record["relname"] for relation_record in relations) != tuple(sorted(_TABLES)) or any(
-        relation_record["relkind"] != b"r"
-        or relation_record["relpersistence"] != b"p"
-        or relation_record["relowner"] != owner["oid"]
-        or relation_record["nspowner"] != owner["oid"]
+    relations = await _epoch_catalog_relations(connection, schema)
+    if tuple(row["relname"] for row in relations) != tuple(sorted(_TABLES)) or any(
+        row["relkind"] != b"r"
+        or row["relpersistence"] != b"p"
         or any(
-            relation_record[field]
-            for field in ("relhastriggers", "relrowsecurity", "relforcerowsecurity", "inherited", "defaults")
+            row[field] for field in ("relhastriggers", "relrowsecurity", "relforcerowsecurity", "inherited", "defaults")
         )
-        for relation_record in relations
+        for row in relations
     ):
         _fail()
-    _require_index_profiles(relations, owner["oid"])
-    oids = tuple((relation_record["relname"], relation_record["oid"]) for relation_record in relations)
-    unsafe = await connection.fetchval(
-        """WITH configured AS (SELECT r.* FROM unnest($1::text[]) name LEFT JOIN pg_roles r ON r.rolname=name), acl AS (
-      SELECT a.* FROM pg_namespace n CROSS JOIN LATERAL aclexplode(coalesce(n.nspacl,acldefault('n',n.nspowner))) a WHERE n.oid=$2::oid
-      UNION ALL SELECT a.* FROM pg_class c CROSS JOIN LATERAL aclexplode(coalesce(c.relacl,acldefault('r',c.relowner))) a WHERE c.oid=ANY($4::oid[])
-      UNION ALL SELECT a.* FROM pg_attribute att CROSS JOIN LATERAL aclexplode(att.attacl) a WHERE att.attrelid=ANY($4::oid[])
-    ) SELECT EXISTS(SELECT 1 FROM configured r WHERE r.oid IS NULL OR r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls
-      OR pg_has_role(r.oid,$3::oid,'MEMBER') OR pg_has_role(r.oid,$3::oid,'SET') OR has_parameter_privilege(r.oid,'session_replication_role','SET')
-      OR EXISTS(SELECT 1 FROM pg_roles elevated WHERE (elevated.rolsuper OR elevated.rolcreaterole)
-        AND pg_has_role(r.oid,elevated.oid,'MEMBER')))
-      OR EXISTS(SELECT 1 FROM acl WHERE grantee<>$3::oid AND (is_grantable OR grantee NOT IN (SELECT oid FROM configured) OR privilege_type NOT IN ('USAGE','SELECT')))
-      OR EXISTS(SELECT 1 FROM configured r WHERE NOT has_schema_privilege(r.oid,$2::oid,'USAGE'))
-      OR EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=$5)
-      OR EXISTS(SELECT 1 FROM pg_proc p WHERE p.prosecdef AND p.prorettype NOT IN ('trigger'::regtype,'event_trigger'::regtype)
-        AND EXISTS(SELECT 1 FROM pg_roles definer WHERE definer.oid=p.proowner
-          AND (definer.rolsuper OR definer.rolcreaterole OR pg_has_role(definer.oid,$3::oid,'MEMBER') OR pg_has_role(definer.oid,$3::oid,'SET')))
-        AND EXISTS(SELECT 1 FROM configured r WHERE has_schema_privilege(r.oid,p.pronamespace,'USAGE') AND has_function_privilege(r.oid,p.oid,'EXECUTE')))""",
-        list(runtime_roles),
-        relations[0]["schema_oid"],
-        owner["oid"],
-        [oid for _, oid in oids],
-        schema,
-    )
-    if unsafe:
-        _fail()
-    return relations[0]["schema_oid"], oids, _hash([dict(relation_record) for relation_record in relations])
+    _require_index_profiles(relations)
 
 
-def _require_index_profiles(relations, owner_oid):
-    """Recognize fixed native keys before binding their exact catalog identities."""
+def _require_index_profiles(relations):
+    """Require built-in column types and the fixed native keys and lookup indexes."""
     profiles_by_table = {
         table: [("cms_epoch_pk_" + str(index), keys, True)] for index, (table, keys) in enumerate(_PRIMARY_KEYS)
     }
     for name, table, keys in _LOOKUP_INDEXES:
         profiles_by_table[table].append((name, keys, False))
     for relation_record in relations:
+        columns = json.loads(relation_record["columns"] or "[]")
+        column_by_name = {column[0]: column for column in columns}
+        if (
+            not columns
+            or len(column_by_name) != len(columns)
+            or any(
+                column[1] not in {16, 20, 21, 23, 25, 114, 1015, 1043, 1114, 1184, 2950, 3802} or column[4] or column[5]
+                for column in columns
+            )
+            or any(
+                key not in column_by_name or column_by_name[key][3] is not True
+                for key in dict(_PRIMARY_KEYS)[relation_record["relname"]]
+            )
+        ):
+            _fail()
         indexes = json.loads(relation_record["indexes"] or "[]")
         expected_profiles = sorted(profiles_by_table[relation_record["relname"]])
         if len(indexes) != len(expected_profiles):
@@ -689,9 +693,10 @@ def _require_index_profiles(relations, owner_oid):
                 index_record["name"] != name
                 or tuple(index_record["columns"]) != keys
                 or index_record["method"] != "btree"
-                or index_record["owner_oid"] != owner_oid
                 or index_record["unique"] is not primary
                 or index_record["primary"] is not primary
+                or index_record["immediate"] is not True
+                or index_record["standard_keys"] is not True
                 or any(index_record[field] is not True for field in ("valid", "ready", "live"))
                 or index_record["key_count"] != len(keys)
                 or index_record["attribute_count"] != len(keys)
@@ -701,7 +706,7 @@ def _require_index_profiles(relations, owner_oid):
             ):
                 _fail()
         constraints = json.loads(relation_record["constraints"] or "[]")
-        if len(constraints) != 1 or constraints[0][1] != "p":
+        if len(constraints) != 1 or constraints[0][0] != "p":
             _fail()
 
 
@@ -938,13 +943,12 @@ async def _copy_epoch(
         await _copy_epoch_rows(connection, source_pin, schema, table, oid, copy_admission, source_input)
         await _admit_epoch_copy(copy_admission, "after_insert", schema, table, oid)
     await _create_epoch_indexes(connection, schema, copy_admission, oid_by_table)
-    await connection.execute(f"ALTER SCHEMA {_identifier(schema)} OWNER TO {_identifier(owner_role)}")
-    for table in _TABLES:
-        table_ref = _identifier(schema) + "." + _identifier(table)
-        await connection.execute(f"ALTER TABLE {table_ref} OWNER TO {_identifier(owner_role)}")
-    for role in runtime_roles:
-        await connection.execute(f"GRANT USAGE ON SCHEMA {_identifier(schema)} TO {_identifier(role)}")
-        await connection.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA {_identifier(schema)} TO {_identifier(role)}")
+    from process.provider_directory_generic_source_provision import freeze_fhir_source_snapshot
+
+    await connection.execute("SET LOCAL ROLE NONE")
+    await freeze_fhir_source_snapshot(
+        connection, schema, namespace_owner=owner_role, reader_roles=runtime_roles, application_roles=runtime_roles
+    )
 
 
 def _validate_capture_options(
@@ -1022,7 +1026,7 @@ async def _freeze_epoch(connection, source_pin, options, copy_admission, source_
             else:
                 source_input.require_active()
             await _copy_epoch(connection, source_pin, schema, owner_role, runtime_roles, copy_admission, source_input)
-            schema_oid, oids, catalog = await _catalog(connection, schema, owner_role, runtime_roles)
+            await _catalog(connection, schema)
             content = await _content(connection, schema)
             if source_input is not None and content != await _content(
                 source_input.connection, source_pin.schema_name, source_input
@@ -1033,14 +1037,9 @@ async def _freeze_epoch(connection, source_pin, options, copy_admission, source_
                     origin,
                     epoch_id,
                     schema,
-                    schema_oid,
-                    oids,
-                    owner_role,
-                    runtime_roles,
                     expected_admission_sha256,
                     expected_metadata_sha256,
                     content,
-                    catalog,
                 )
             )
             comment = _receipt_comment(epoch).replace("'", "''")
@@ -1056,30 +1055,53 @@ async def _freeze_epoch(connection, source_pin, options, copy_admission, source_
 
 def _receipt_comment(epoch):
     """Bind the complete independently admitted receipt in protected native metadata."""
-    return "cms-fhir-epoch-v1:" + json.dumps(epoch.as_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return "cms-fhir-epoch-v2:" + json.dumps(epoch.as_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 async def require_retained_cms_fhir_source_epoch(connection, source_pin, epoch, *, verify_content=True):
-    """Revalidate immutable physical custody without consulting a later origin edition."""
+    """Read the named edition and validate its logical source and data declarations."""
     if type(verify_content) is not bool:
         _fail()
     epoch = validate_retained_cms_fhir_source_epoch(epoch)
     if epoch.origin_coordinates != _origin(source_pin):
         _fail()
-    from process.provider_directory_cms_source_runtime import (
-        require_registry_epoch_transaction,
-    )
+    from process.provider_directory_cms_source_runtime import require_registry_epoch_transaction
 
     await require_registry_epoch_transaction(connection, source_pin, epoch)
     try:
-        observed = await _catalog(connection, epoch.schema_name, epoch.owner_role, epoch.runtime_roles)
+        namespace = _identifier(epoch.schema_name)
+        for table in _TABLES:
+            await connection.execute("SELECT 1 FROM " + namespace + "." + _identifier(table) + " LIMIT 0")
+        metadata = await connection.fetchrow(
+            f"""SELECT endpoint_id,dataset_hash,content_proof_admission_sha256,publication_metadata_sha256,
+            publication_metadata_summary_json->'source_ids'=$2::jsonb AS source_matches,
+            publication_metadata_summary_json->'source_release'->>'vector_sha256'=$3 AS release_matches
+            FROM {namespace}.provider_directory_endpoint_dataset WHERE dataset_id=$1
+            AND status IN ('validated','published','superseded')""",
+            source_pin.dataset_id,
+            json.dumps([source_pin.source_id]),
+            source_pin.release_id,
+        )
         if (
-            observed != (epoch.schema_oid, epoch.relation_oids, epoch.catalog_sha256)
-            or await connection.fetchval("SELECT obj_description($1::oid,'pg_namespace')", epoch.schema_oid)
-            != _receipt_comment(epoch)
-            or (verify_content and await _content(connection, epoch.schema_name) != epoch.content_sha256)
+            metadata is None
+            or tuple(
+                metadata[key]
+                for key in (
+                    "endpoint_id",
+                    "dataset_hash",
+                    "content_proof_admission_sha256",
+                    "publication_metadata_sha256",
+                )
+            )
+            != (source_pin.endpoint_id, source_pin.dataset_sha256, epoch.admission_sha256, epoch.metadata_sha256)
+            or metadata["source_matches"] is not True
+            or metadata["release_matches"] is not True
         ):
             _fail()
+        if verify_content:
+            await _catalog(connection, epoch.schema_name)
+            if await _content(connection, epoch.schema_name) != epoch.content_sha256:
+                _fail()
         return epoch
     except FHIRSourceEpochError:
         raise

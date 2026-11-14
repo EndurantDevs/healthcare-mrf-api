@@ -4,7 +4,6 @@
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
-import asyncpg
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
@@ -15,7 +14,6 @@ from process.registry_candidate_custody_preparation import prepare_registry_cand
 from process.registry_management_permissions import (
     RegistryManagementPermissionError,
     install_registry_office_recipe_permissions,
-    verify_registry_management_permissions,
 )
 from tests.test_network_serving_schema_postgres import _candidate
 from tests.test_registry_prepared_migrations_postgres import (
@@ -24,10 +22,6 @@ from tests.test_registry_prepared_migrations_postgres import (
     _arguments,
     _maintenance,
     _upgrade,
-    permissions_db,
-    prepared_db,
-    provider_db,
-    serving_schema,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -84,8 +78,6 @@ async def _incumbents(fixture):
 
 async def test_missing_custody_forward_only_then_adoption_and_narrow_enrollment(custody_db):
     fixture = custody_db
-    with pytest.raises(RegistryManagementPermissionError, match="incomplete"):
-        await verify_registry_management_permissions(fixture.connection, **_arguments(fixture))
     with pytest.raises(RuntimeError, match="preparation is missing"):
         await _upgrade(fixture, REVISION, fixture.roles_by_kind["api"])
     before, grants = await _incumbents(fixture), await _acl(fixture)
@@ -119,8 +111,7 @@ async def test_missing_custody_forward_only_then_adoption_and_narrow_enrollment(
     )
     async with _operator(fixture) as connection:
         driver = (await connection.get_raw_connection()).driver_connection
-        installed = await install_registry_office_recipe_permissions(driver, **_arguments(fixture))
-        assert await verify_registry_management_permissions(driver, **_arguments(fixture)) == installed
+        await install_registry_office_recipe_permissions(driver, **_arguments(fixture))
     after = await _acl(fixture)
     owner_oid, api_oid = await fixture.connection.fetchrow(
         "SELECT (SELECT oid FROM pg_roles WHERE rolname=$1),(SELECT oid FROM pg_roles WHERE rolname=$2)",

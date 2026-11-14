@@ -294,6 +294,7 @@ async def _cleanup_scope(engine, role_engines, control, is_control_created, sour
         for role in reversed(created_roles):
             await connection.exec_driver_sql(f'REVOKE ALL ON ALL TABLES IN SCHEMA "{source_name}" FROM "{role}"')
             await connection.exec_driver_sql(f'REVOKE ALL ON SCHEMA "{source_name}" FROM "{role}"')
+            await connection.exec_driver_sql(f'DROP OWNED BY "{role}"')
             await connection.exec_driver_sql(f'DROP ROLE "{role}"')
             assert not await connection.scalar(
                 text("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=:role)"), {"role": role}

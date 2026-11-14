@@ -223,7 +223,7 @@ async def _one_batch_history(connection, namespace, document, actor, reference, 
 
 
 async def _catalog_map(connection, namespace, document):
-    from process.registry_fhir_catalog_custody import verify_fhir_catalog_snapshot
+    from process.registry_fhir_catalog_custody import validate_fhir_catalog_snapshot_record
 
     snapshot = await connection.fetchrow(
         f"SELECT {','.join(SNAPSHOT_COLUMNS)} FROM {namespace}.registry_fhir_catalog_snapshot "
@@ -231,7 +231,7 @@ async def _catalog_map(connection, namespace, document):
         document["metadata_generation"],
     )
     _require(snapshot is not None)
-    await verify_fhir_catalog_snapshot(connection, snapshot)
+    await validate_fhir_catalog_snapshot_record(connection, snapshot)
     coordinates = document["source_coordinates"]
     relation = _namespace(snapshot["schema_name"]) + ".registry_fhir_catalog_binding"
     rows = await connection.fetch(

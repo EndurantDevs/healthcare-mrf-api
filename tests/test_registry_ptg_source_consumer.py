@@ -12,6 +12,7 @@ import pytest
 
 from process import registry_ptg_source_consumer as consumer
 from process import registry_ptg_source_notifications as notices
+from process.network_compact_layout import CompactAddressRelation
 from process.network_membership_publication import NetworkPublicationError
 from process.registry_publication_ptg_runtime import RegistryPublicationPTGRuntime
 from process.registry_source_recipe_store import canonical_registry_source_recipes, registry_source_recipes_sha256
@@ -417,13 +418,20 @@ def _ptg_publish_outcome(phase_state, sealing):
 
 async def _prepared_ptg_attempt(monkeypatch, changed, sealing):
     """Prepare the selected source, candidate and transactional fake for one retry scenario."""
-    from process.network_address_projection import PinnedAddressSource
-    from process.network_membership_copy import MembershipCopyTarget
     from process.network_serving_read import PinnedNetworkServingManifest
 
     selected = await recipe()
     old = replace(selected, source_pin=replace(selected.source_pin, capture_id=str(UUID(int=3))))
-    pin = PinnedNetworkServingManifest(1, str(UUID(int=2)), "retained", 1, {}, 1, "a" * 64, 5)
+    pin = PinnedNetworkServingManifest(
+        1,
+        str(UUID(int=2)),
+        "retained",
+        1,
+        {},
+        1,
+        "a" * 64,
+        CompactAddressRelation("retained", "entity_address_unified"),
+    )
     approved = SimpleNamespace(approved_revision=1, generation_id="b" * 64)
     monkeypatch.setattr(consumer, "pin_approved_membership_source", AsyncMock(return_value=approved))
     monkeypatch.setattr(consumer, "_selected", AsyncMock(return_value="binding"))
@@ -432,19 +440,7 @@ async def _prepared_ptg_attempt(monkeypatch, changed, sealing):
     monkeypatch.setattr(consumer, "_replacement", AsyncMock(return_value=(selected,)))
     guarded = AsyncMock()
     monkeypatch.setattr(consumer, "require_selected_ptg_office_recipes", guarded)
-    copy_target = MembershipCopyTarget(
-        *(str(UUID(int=i)) for i in (1, 2, 3, 4)), "network_candidate_" + UUID(int=4).hex
-    )
-    address = PinnedAddressSource("addresses", "entity_address_unified", "c" * 64)
-    compose = AsyncMock(return_value=(copy_target, address))
-    runtime = SimpleNamespace(compose=compose)
-    cfg = SimpleNamespace(
-        control_schema="office_control",
-        composition_runtime=runtime,
-        writer_roles={},
-        seal_candidate=None,
-        prepare_address_sources=None,
-    )
+    copy_target, compose, cfg = _ptg_attempt_composition()
     prepare, publish = AsyncMock(), AsyncMock()
     monkeypatch.setattr(consumer, "prepare_registry_candidate_for_context", prepare)
     monkeypatch.setattr(consumer, "publish_network_candidate", publish)
@@ -475,6 +471,27 @@ async def _prepared_ptg_attempt(monkeypatch, changed, sealing):
         copy_target=copy_target,
         selected=selected,
     )
+
+
+def _ptg_attempt_composition():
+    """Build the unchanged candidate/address pair and composition configuration for retry tests."""
+    from process.network_address_projection import PinnedAddressSource
+    from process.network_membership_copy import MembershipCopyTarget
+
+    copy_target = MembershipCopyTarget(
+        *(str(UUID(int=i)) for i in (1, 2, 3, 4)), "network_candidate_" + UUID(int=4).hex
+    )
+    address = PinnedAddressSource("addresses", "entity_address_unified", "c" * 64)
+    compose = AsyncMock(return_value=(copy_target, address))
+    runtime = SimpleNamespace(compose=compose)
+    cfg = SimpleNamespace(
+        control_schema="office_control",
+        composition_runtime=runtime,
+        writer_roles={},
+        seal_candidate=None,
+        prepare_address_sources=None,
+    )
+    return copy_target, compose, cfg
 
 
 @pytest.mark.asyncio

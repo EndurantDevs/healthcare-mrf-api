@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Read-only capabilities retain native custody and guard physical heap reads."""
+"""Named capability reads preserve scope, immutable data and their SQL snapshot."""
 
 import asyncio
 import copy
@@ -7,28 +7,42 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
 
+import asyncpg
 import pytest
-from sanic.exceptions import ServiceUnavailable
 
-from api import network_read_execution as execution
 from api import plan_pricing_code_storage as code
 from api import ptg_membership_storage as membership
 from api.ptg2_serving import PTG2_SCHEMA
-from process.network_compact_layout import CompactAddressRelation
-from process.network_read_identity import NetworkReadIdentityError
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from tests.test_plan_pricing_code_projection import _identity
 from tests.test_ptg_membership_projection import PARAMS
 
 
+def _code_identity():
+    identity = _identity()
+    schema = membership.native.reference_family_stage_schema(UUID(int=3))
+    identity["sources"][0]["membership"] = {
+        "projection_id": "c" * 64,
+        "content_digest": "a" * 64,
+        "coverage_digest": "d" * 64,
+        "active_attachment": {
+            "schema_name": "hp_snapshot_retention",
+            "name": membership._attachment_for_digest("c" * 64),
+        },
+        "storage": {
+            "dataset_id": str(UUID(int=3)),
+            "schema_name": schema,
+            "relations": [[schema, name] for name in sorted(membership.SPEC.table_names)],
+        },
+    }
+    return identity
+
+
 class _Result:
     def __init__(self, session, kind, value):
-        self.session, self.kind, self.value = session, kind, value
-        self.guarded, self.closed = False, False
-        self.requires_guard = execution.has_network_read_inventory()
+        self.session, self.kind, self.value, self.closed = session, kind, value, False
 
     def _decode(self):
-        assert not self.requires_guard or self.guarded
         self.session.events.append(("decode", self.kind))
         return self.value
 
@@ -39,9 +53,6 @@ class _Result:
         return self._decode()
 
     def one(self):
-        return self._decode()
-
-    def one_or_none(self):
         return self._decode()
 
     def all(self):
@@ -59,275 +70,194 @@ class _Result:
 
 class _Session:
     def __init__(self, storage):
-        self.active, self.info, self.events, self.results = True, {}, [], []
+        self.storage, self.active, self.info = storage, True, {}
         self.transaction, self.modes = object(), ("repeatable read", "on")
-        self.control = {
-            "database_oid": 1,
-            "schema_oid": 2,
-            "table_oid": 600,
-            "relkind": "r",
-            "relpersistence": "p",
-            "relrowsecurity": False,
-            "relforcerowsecurity": False,
-            "relispartition": False,
-            "heap": True,
-            "inherited": False,
-            "rules": False,
-            "ordinary_reader": True,
-            "column_updates": [],
-            "immutable_read_lock": False,
-        }
-        self.identity = copy.deepcopy(PARAMS if storage is membership else _identity())
-        self.ownership = storage.native.ReferenceFamilyStageOwnership(
-            storage.SPEC.importer_id,
-            UUID(int=1),
-            "reference_family_archive_" + UUID(int=1).hex,
-            11,
-            tuple((name, 300 + index) for index, name in enumerate(storage.SPEC.table_names)),
-        )
-        self.dependencies = [(oid, 11, self.ownership.schema_name, name) for name, oid in self.ownership.relation_oids]
+        self.events, self.queries, self.results = [], [], []
+        self.identity = copy.deepcopy(PARAMS if storage is membership else _code_identity())
+        self.schema = storage.native.reference_family_stage_schema(UUID(int=1 if storage is membership else 2))
+        self.dependencies = [{"schema_name": self.schema, "table_name": name} for name in storage.SPEC.table_names]
         if storage is code:
             self.dependencies.extend(
-                (oid, 12, "hp_snapshot_retention", name)
-                for name, oid in storage._membership_views(self.identity).items()
+                {
+                    "schema_name": "hp_snapshot_retention",
+                    "table_name": source["membership"]["active_attachment"]["name"],
+                }
+                for source in self.identity["sources"]
             )
-        self.header = {"identity": self.identity, "content_digest": "a" * 64, "counts": {"code_coverage": []}}
-        self.coverage, self.pin_present, self.attachment = [], True, (900, 101, True, True)
-        self.driver = SimpleNamespace(get_server_pid=lambda: 42, is_in_transaction=lambda: self.active)
-        self.connection = AsyncMock(
-            return_value=SimpleNamespace(
-                get_raw_connection=AsyncMock(side_effect=lambda: SimpleNamespace(driver_connection=self.driver))
-            )
-        )
+        self.header = {
+            "identity": copy.deepcopy(self.identity),
+            "content_digest": "a" * 64,
+            "counts": {"code_coverage": []},
+        }
+        self.coverage, self.attachment, self.pin_present = [], True, True
+        self.fault, self.drift, self.selector_present = None, None, True
+        self.commit, self.rollback = AsyncMock(), AsyncMock()
+        self.pin_keys = []
 
     def in_transaction(self):
         return self.active
 
     def get_transaction(self):
-        return self.transaction
+        return self.transaction if self.active else None
 
-    def _response(self, sql):
+    def _response(self, sql, parameters):
         if "current_setting('transaction_isolation')" in sql:
             return "modes", self.modes
-        if "AS ordinary_reader" in sql:
-            return "control", self.control
-        if "SELECT owner.oid" in sql:
-            return "owner", (101, True)
-        if "SELECT c.oid,c.relowner" in sql:
-            return "attachment", self.attachment
-        if "FROM pg_rewrite r" in sql:
+        if "SELECT DISTINCT source.nspname" in sql:
             return "dependencies", self.dependencies
+        if "SELECT pg_catalog.to_regclass" in sql:
+            return "attachment", (
+                self.attachment if type(self.attachment) is bool else parameters["relation"] in self.attachment
+            )
+        if "SELECT owner_id FROM ONLY" in sql:
+            return "editions", [{"owner_id": key} for key in self.pin_keys]
         if "SELECT identity,content_digest,counts" in sql:
             return "header", self.header
+        if "SELECT identity FROM ONLY" in sql:
+            return "selector", {"identity": self.header["identity"]} if self.selector_present else None
         if "SELECT code_key,occurrence_count" in sql:
             return "coverage", self.coverage
-        if "SELECT EXISTS(SELECT 1 FROM" in sql:
+        if "SELECT EXISTS(SELECT 1 FROM ONLY" in sql:
+            expected = (
+                membership.digest(self.header["identity"])
+                if self.storage is membership
+                else code.identity_digest(self.header["identity"])
+            )
+            assert parameters["owner_id"] == expected
+            assert parameters["owner_type"] == (
+                membership.CONTRACT if self.storage is membership else self.identity["contract"]
+            )
+            snapshots = (
+                {self.identity["snapshot_id"]}
+                if self.storage is membership
+                else {source_by_field["source_identity"]["snapshot_id"] for source_by_field in self.identity["sources"]}
+            )
+            assert parameters["snapshot_id"] in snapshots
+            assert membership.native._quoted(PTG2_SCHEMA) + ".ptg2_snapshot_pin" in sql
             return "source-pin", self.pin_present
         raise AssertionError(sql)
 
     async def execute(self, statement, parameters=None):
         sql = str(statement)
-        assert "LOCK TABLE" not in sql and "pg_advisory" not in sql and "LIMIT 0" not in sql
-        assert "SELECT identity FROM hp_snapshot_retention" not in sql
-        kind, value = self._response(sql)
-        result = _Result(self, kind, value)
-        self.events.append(("execute", kind))
-        self.results.append(result)
-        return result
-
-    async def scalar(self, statement, parameters=None):
-        result = await self.execute(statement, parameters)
-        return result.scalar_one()
-
-
-def _custody(monkeypatch, storage, session):
-    lock, capture, closed, view_acl = AsyncMock(), AsyncMock(return_value=session.ownership), AsyncMock(), AsyncMock()
-    monkeypatch.setattr(storage.native, "_lock_family", lock)
-    monkeypatch.setattr(storage.native, "capture_model_family_stage_ownership", capture)
-    monkeypatch.setattr(storage, "_require_closed_local_custody", closed)
-    monkeypatch.setattr(storage, "_require_no_untrusted_mutation", view_acl)
-    return lock, capture, closed, view_acl
-
-
-def _verify(monkeypatch, session, *, refuse=None):
-    async def verify(driver, relations, *, expected_backend_pid, absent_names=()):
-        assert absent_names == ()
-        assert driver is session.driver and expected_backend_pid == 42
-        expected_relations = tuple(
-            CompactAddressRelation(session.ownership.schema_name, name, oid)
-            for name, oid in session.ownership.relation_oids
+        assert all(
+            value not in sql
+            for value in ("LOCK TABLE", "pg_advisory", "pg_roles", "pg_database", "relowner", "pg_has_role")
         )
-        assert relations == (*expected_relations, CompactAddressRelation(PTG2_SCHEMA, "ptg2_snapshot_pin", 600))
-        current = session.results[-1]
-        session.events.append(("guard", current.kind))
-        if current.kind == refuse:
-            raise NetworkReadIdentityError("changed_relation")
-        current.guarded = True
-
-    monkeypatch.setattr(execution, "verify_bound_network_names", verify)
+        kind, value = self._response(sql, parameters)
+        self.queries.append((sql, parameters))
+        self.events.append(("execute", kind))
+        if self.fault is not None and self.fault[0] == kind:
+            raise self.fault[1]
+        result = _Result(self, kind, value)
+        self.results.append(result)
+        if self.drift == kind:
+            self.transaction = object()
+        return result
 
 
 @pytest.mark.parametrize("storage", [membership, code])
 @pytest.mark.parametrize("modes", [("repeatable read", "on"), ("serializable", "on")])
-async def test_api_read_preserves_native_custody_and_installs_real_heap_inventory(monkeypatch, storage, modes):
+async def test_api_read_returns_complete_named_inventory_header_and_existing_retention(storage, modes):
     session = _Session(storage)
     session.modes = modes
-    lock, capture, closed, view_acl = _custody(monkeypatch, storage, session)
-    _verify(monkeypatch, session)
+    original = session.transaction
     found = await storage.locate(session, session.identity, api_read=True)
-    assert found[0] is session.ownership and found[1] == session.header
-    capture.assert_awaited_once_with(session, storage.SPEC, session.ownership.dataset_id)
-    closed.assert_awaited_once_with(session, session.ownership, 101)
-    view_acl.assert_awaited_once_with(session, [900], 101)
-    lock.assert_not_awaited()
-    installed = execution._installed_read_inventory(session)
-    assert installed.connection is session.driver and installed.backend_pid == 42
-    assert {relation.table_oid for relation in installed.relations} == {
-        600,
-        *(oid for _, oid in session.ownership.relation_oids),
-    }
-    assert all(
-        relation.table_name not in {"attachment", storage.attachment_name(session.identity)}
-        for relation in installed.relations
-    )
-    assert session.events.index(("guard", "header")) < session.events.index(("decode", "header"))
-    assert not execution.has_network_read_inventory()
+    assert found[0].schema_name == session.schema
+    assert found[1] == session.header
+    receipt = storage.receipt(found)
+    assert receipt["storage"]["schema_name"] == session.schema
+    assert receipt["storage"]["relations"] == [[session.schema, name] for name in storage.SPEC.table_names]
+    assert set(receipt["active_attachment"]) == {"schema_name", "name"}
+    assert receipt["content_digest"] == session.header["content_digest"]
+    assert session.transaction is original and session.active and session.info == {}
+    session.commit.assert_not_awaited()
+    session.rollback.assert_not_awaited()
 
 
 @pytest.mark.parametrize("storage", [membership, code])
 @pytest.mark.parametrize("modes", [("read committed", "on"), ("repeatable read", "off")])
-async def test_api_requires_native_readonly_snapshot_before_attachment_lookup(monkeypatch, storage, modes):
+async def test_api_requires_readonly_repeatable_snapshot_before_attachment_lookup(storage, modes):
     session = _Session(storage)
     session.modes = modes
-    _custody(monkeypatch, storage, session)
     with pytest.raises(PTG2ManifestArtifactError, match="snapshot"):
         await storage.locate(session, session.identity, api_read=True)
-    assert ("execute", "owner") not in session.events and not session.info
+    assert session.events == [("execute", "modes"), ("decode", "modes")]
 
 
 @pytest.mark.parametrize("storage", [membership, code])
-@pytest.mark.parametrize("refuse", ["header", "source-pin"])
-async def test_guard_failure_closes_buffer_before_decoding_or_capability(monkeypatch, storage, refuse):
+@pytest.mark.parametrize("phase", ["dependencies", "header", "source-pin"])
+async def test_changed_transaction_closes_buffer_before_decode_or_capability(storage, phase):
     session = _Session(storage)
-    _custody(monkeypatch, storage, session)
-    _verify(monkeypatch, session, refuse=refuse)
-    with pytest.raises(PTG2ManifestArtifactError, match="identity changed"):
+    session.drift = phase
+    with pytest.raises(PTG2ManifestArtifactError, match="transaction changed"):
         await storage.locate(session, session.identity, api_read=True)
-    assert ("decode", refuse) not in session.events
-    assert session.results[-1].closed and not session.info
-    assert not execution.has_network_read_inventory()
+    assert ("decode", phase) not in session.events and session.results[-1].closed
+    assert session.info == {}
 
 
-async def test_zero_coverage_rows_are_guarded_before_comparison(monkeypatch):
+@pytest.mark.parametrize("rows", [[], [{"code_key": 1, "occurrence_count": 2, "set_count": 1, "set_digest": "b" * 64}]])
+async def test_membership_coverage_compares_complete_rows_including_empty_results(rows):
     session = _Session(membership)
-    _custody(monkeypatch, membership, session)
-    _verify(monkeypatch, session, refuse="coverage")
-    with pytest.raises(PTG2ManifestArtifactError, match="identity changed"):
-        await membership.locate(session, session.identity, api_read=True)
-    assert ("decode", "coverage") not in session.events and not session.info
+    session.coverage = rows
+    if rows:
+        with pytest.raises(PTG2ManifestArtifactError, match="code coverage"):
+            await membership.locate(session, session.identity, api_read=True)
+    else:
+        assert await membership.locate(session, session.identity, api_read=True) is not None
 
 
 @pytest.mark.parametrize("storage", [membership, code])
-async def test_missing_source_retention_pin_never_returns_or_installs_capability(monkeypatch, storage):
+async def test_missing_source_retention_pin_never_returns_capability(storage):
     session = _Session(storage)
     session.pin_present = False
-    _custody(monkeypatch, storage, session)
-    _verify(monkeypatch, session)
     with pytest.raises(PTG2ManifestArtifactError, match="retention pin"):
         await storage.locate(session, session.identity, api_read=True)
     assert not session.info
 
 
 @pytest.mark.parametrize("storage", [membership, code])
-async def test_installation_refusal_never_returns_verified_header(monkeypatch, storage):
+@pytest.mark.parametrize("fault", ["missing", "extra", "split", "namespace"])
+async def test_named_inventory_refuses_incomplete_or_changed_family(storage, fault):
     session = _Session(storage)
-    _custody(monkeypatch, storage, session)
-    _verify(monkeypatch, session)
-    monkeypatch.setattr(
-        membership, "install_network_read_inventory", AsyncMock(side_effect=ServiceUnavailable("changed"))
-    )
-    with pytest.raises(PTG2ManifestArtifactError, match="identity changed"):
+    if fault == "missing":
+        session.dependencies.pop(0)
+    elif fault == "extra":
+        session.dependencies.append({"schema_name": session.schema, "table_name": "unexpected"})
+    elif fault == "split":
+        session.dependencies[0] = {"schema_name": "other", "table_name": session.dependencies[0]["table_name"]}
+    else:
+        _change_dependency_namespace(session)
+    with pytest.raises(PTG2ManifestArtifactError, match="inventory|namespace"):
         await storage.locate(session, session.identity, api_read=True)
-    assert not session.info
+    assert ("execute", "header") not in session.events
+
+
+def _change_dependency_namespace(session):
+    for dependency_by_field in session.dependencies:
+        if dependency_by_field["schema_name"] == session.schema:
+            dependency_by_field["schema_name"] = "unsupported_archive"
 
 
 @pytest.mark.parametrize("storage", [membership, code])
-async def test_api_capture_drift_refuses_before_payload_or_installation(monkeypatch, storage):
+async def test_absent_attachment_preserves_unindexed_routing_without_ending_snapshot(storage):
     session = _Session(storage)
-    _custody(monkeypatch, storage, session)
-    session.dependencies[0] = (999, 11, session.ownership.schema_name, session.dependencies[0][3])
-    with pytest.raises(PTG2ManifestArtifactError, match="identity changed"):
-        await storage.locate(session, session.identity, api_read=True)
-    assert ("execute", "header") not in session.events and not session.info
-
-
-@pytest.mark.parametrize("storage", [membership, code])
-async def test_absent_attachment_has_no_inventory_but_still_requires_snapshot(monkeypatch, storage):
-    session = _Session(storage)
-    session.attachment = None
-    lock, capture, closed, _view_acl = _custody(monkeypatch, storage, session)
+    session.attachment = False
     assert await storage.locate(session, session.identity, api_read=True) is None
-    lock.assert_not_awaited()
-    capture.assert_not_awaited()
-    closed.assert_not_awaited()
-    assert not session.info
+    assert ("execute", "dependencies") not in session.events and session.active
 
 
 @pytest.mark.parametrize("storage", [membership, code])
-async def test_cancel_propagates_without_installation_or_transaction_end(monkeypatch, storage):
+@pytest.mark.parametrize("phase", ["attachment", "header", "source-pin"])
+@pytest.mark.parametrize("failure", [asyncio.CancelledError(), asyncpg.InsufficientPrivilegeError("read denied")])
+async def test_cancel_and_database_denial_propagate_without_return_or_transaction_end(storage, phase, failure):
     session = _Session(storage)
-    _custody(monkeypatch, storage, session)
-    monkeypatch.setattr(execution, "verify_bound_network_names", AsyncMock(side_effect=asyncio.CancelledError))
-    with pytest.raises(asyncio.CancelledError):
+    original = session.transaction
+    session.fault = phase, failure
+    with pytest.raises(type(failure)) as caught:
         await storage.locate(session, session.identity, api_read=True)
-    assert session.active and not session.info
-    assert not execution.has_network_read_inventory()
-
-
-@pytest.mark.parametrize(
-    "changed",
-    [
-        {"table_oid": None},
-        {"schema_oid": True},
-        {"database_oid": 0},
-        {"table_oid": 2**32},
-        {"relkind": "v"},
-        {"relpersistence": "u"},
-        {"relrowsecurity": True},
-        {"relforcerowsecurity": True},
-        {"relispartition": True},
-        {"heap": False},
-        {"inherited": True},
-        {"rules": True},
-        {"ordinary_reader": False},
-    ],
-)
-async def test_current_control_binding_refuses_unsafe_native_metadata(monkeypatch, changed):
-    session = _Session(membership)
-    session.control.update(changed)
-    _custody(monkeypatch, membership, session)
-    with pytest.raises(PTG2ManifestArtifactError, match="control binding"):
-        await membership.locate(session, session.identity, api_read=True)
-    assert ("execute", "header") not in session.events and not session.info
-
-
-@pytest.mark.parametrize("storage", [membership, code])
-async def test_exact_original_transaction_required_before_capability_return(monkeypatch, storage):
-    session = _Session(storage)
-    _custody(monkeypatch, storage, session)
-    _verify(monkeypatch, session)
-    original = session.execute
-
-    async def changed(statement, parameters=None):
-        result = await original(statement, parameters)
-        if result.kind == "source-pin":
-            session.transaction = object()
-        return result
-
-    session.execute = changed
-    with pytest.raises(PTG2ManifestArtifactError, match="identity changed"):
-        await storage.locate(session, session.identity, api_read=True)
-    assert not session.info
+    assert caught.value is failure and session.transaction is original and session.active
+    session.commit.assert_not_awaited()
+    session.rollback.assert_not_awaited()
 
 
 @pytest.mark.parametrize("storage", [membership, code])
@@ -340,73 +270,157 @@ async def test_api_opt_in_requires_a_server_boolean(storage, invalid_flag):
 
 
 @pytest.mark.parametrize("storage", [membership, code])
-@pytest.mark.parametrize("mutation", ["transaction", "driver", "pid", "inactive"])
-async def test_install_guard_time_identity_change_refuses_before_capability(monkeypatch, storage, mutation):
+@pytest.mark.parametrize("fault", ["identity", "content"])
+async def test_logical_scope_and_content_digest_refuse_before_retention_pin(storage, fault):
     session = _Session(storage)
-    _custody(monkeypatch, storage, session)
-    _verify(monkeypatch, session)
-    original = execution.verify_bound_network_names
-
-    async def changed(*arguments, **keywords):
-        await original(*arguments, **keywords)
-        if "absent_names" not in keywords:
-            return
-        if mutation == "transaction":
-            session.transaction = object()
-        elif mutation == "driver":
-            session.driver = SimpleNamespace(get_server_pid=lambda: 42, is_in_transaction=lambda: True)
-        elif mutation == "pid":
-            session.driver.get_server_pid = lambda: 43
-        else:
-            session.active = False
-
-    monkeypatch.setattr(execution, "verify_bound_network_names", changed)
-    with pytest.raises(PTG2ManifestArtifactError, match="identity changed"):
+    if fault == "identity":
+        session.header["identity"]["code"] = "99214"
+    else:
+        session.header["content_digest"] = "not-a-digest"
+    with pytest.raises(PTG2ManifestArtifactError, match="identity"):
         await storage.locate(session, session.identity, api_read=True)
-    assert not execution.has_network_read_inventory()
+    assert ("execute", "source-pin") not in session.events
 
 
 @pytest.mark.parametrize("storage", [membership, code])
-async def test_initial_backend_pid_is_preserved_through_native_metadata(monkeypatch, storage):
+@pytest.mark.parametrize("inactive", [False, True])
+async def test_api_storage_scope_requires_the_original_active_transaction(storage, inactive):
     session = _Session(storage)
-    _custody(monkeypatch, storage, session)
-    original = session.execute
-
-    async def changed(statement, parameters=None):
-        result = await original(statement, parameters)
-        if result.kind == "dependencies":
-            session.driver.get_server_pid = lambda: 43
-        return result
-
-    session.execute = changed
-    with pytest.raises(PTG2ManifestArtifactError, match="identity changed"):
-        await storage.locate(session, session.identity, api_read=True)
-    assert ("execute", "header") not in session.events and not session.info
+    original = session.transaction
+    with pytest.raises(PTG2ManifestArtifactError, match="transaction changed"):
+        async with membership._api_storage_read(session, original):
+            if inactive:
+                session.active = False
+            else:
+                session.transaction = object()
 
 
-@pytest.mark.parametrize("storage", [membership, code])
-async def test_qualified_immutable_lock_column_update_remains_readable(monkeypatch, storage):
-    session = _Session(storage)
-    session.control.update(column_updates=[membership.LOCK_COLUMN], immutable_read_lock=True)
-    _custody(monkeypatch, storage, session)
-    _verify(monkeypatch, session)
-    assert await storage.locate(session, session.identity, api_read=True) is not None
+async def test_saved_code_receipt_projects_known_metadata_and_recovers_its_exact_pin():
+    session = _Session(code)
+    source = session.header["identity"]["sources"][0]
+    storage = source["membership"]["storage"]
+    source["membership"]["storage"] = {
+        "dataset_id": storage["dataset_id"],
+        "schema_oid": 900,
+        "owner_oid": 901,
+        "relation_oids": [[name, index + 100] for index, (_schema, name) in enumerate(storage["relations"])],
+    }
+    source["membership"]["active_attachment"].pop("schema_name")
+    source["membership"]["active_attachment"]["relation_oid"] = 902
+    source["read_identity_digest"] = "f" * 64
+    expected = code.identity_digest(session.header["identity"])
+    found = await code.locate(session, session.identity, api_read=True)
+    assert code.receipt(found)["projection_id"] == expected
+    from api.plan_pricing_code_read import CodePricingCapability
+
+    assert CodePricingCapability(session.identity, found, api_read=True).projection_id == expected
+    assert "relation_oid" not in code.receipt(found)["identity"]["sources"][0]["membership"]["active_attachment"]
 
 
-@pytest.mark.parametrize(
-    "updates,qualified",
-    [
-        ([membership.LOCK_COLUMN], False),
-        (["owner_id"], True),
-        ([membership.LOCK_COLUMN, "reason"], True),
-        (None, True),
-        ((membership.LOCK_COLUMN,), True),
-    ],
-)
-async def test_only_native_qualified_lock_column_can_have_update_privilege(monkeypatch, updates, qualified):
+@pytest.mark.parametrize("fault", ["unknown", "missing", "wrong_name"])
+async def test_saved_code_receipt_refuses_unknown_or_changed_wire_before_edition_recovery(fault):
+    session = _Session(code)
+    receipt = session.header["identity"]["sources"][0]["membership"]
+    if fault == "unknown":
+        receipt["storage"]["unknown"] = "field"
+    elif fault == "missing":
+        receipt.pop("content_digest")
+    else:
+        receipt["active_attachment"]["name"] = "pm_" + "b" * 52
+    with pytest.raises(PTG2ManifestArtifactError):
+        await code.locate(session, session.identity, api_read=True)
+    assert ("execute", "source-pin") not in session.events
+
+
+async def test_saved_membership_source_metadata_uses_existing_named_alias_and_pin():
     session = _Session(membership)
-    session.control.update(column_updates=updates, immutable_read_lock=qualified)
-    _custody(monkeypatch, membership, session)
-    with pytest.raises(PTG2ManifestArtifactError, match="control binding"):
-        await membership.locate(session, session.identity, api_read=True)
-    assert ("execute", "header") not in session.events and not session.info
+    session.identity.update(
+        contract=membership.CONTRACT,
+        physical_binding=None,
+        graph_root={"map_digest": "d" * 64},
+        finalizer={"state": "legacy_relational"},
+        source_storage={"schema_name": "named_source", "relations": [["named_source", "payload"]]},
+    )
+    session.header["identity"] = copy.deepcopy(session.identity)
+    session.header["identity"]["source_storage"] = {
+        "database_oid": 100,
+        "schema_oid": 101,
+        "relation_oids": [["payload", 102]],
+        "attestation_digest": "e" * 64,
+    }
+    original = membership.digest(session.header["identity"])
+    alias = membership._attachment_for_digest(original)
+    session.pin_keys = [original]
+    session.attachment = {membership.qualified_relation_sql("hp_snapshot_retention", alias)}
+    found = await membership.locate(session, session.identity, api_read=True)
+    result = membership.receipt(found)
+    assert result["projection_id"] == original
+    assert result["source_storage"] == session.identity["source_storage"]
+    assert result["active_attachment"]["name"] == alias
+    assert all("database_oid" not in sql and "owner.oid" not in sql for sql, _parameters in session.queries)
+
+
+async def test_membership_reader_propagates_api_mode_and_reuses_only_its_request_pin(monkeypatch):
+    from api import ptg_membership_reader as reader
+
+    session = object()
+    tables = SimpleNamespace(source_key=PARAMS["source_key"], snapshot_id=PARAMS["snapshot_id"])
+    request = SimpleNamespace(code_system=PARAMS["code_system"], code=PARAMS["code"])
+    state = SimpleNamespace(membership_index_checked=False, membership_index=None)
+    resolve, locate = AsyncMock(return_value=(tables, object(), PARAMS)), AsyncMock(return_value=object())
+    monkeypatch.setattr(reader, "source_identity", resolve)
+    monkeypatch.setattr(reader, "locate", locate)
+    first = await reader._attached_index(session, tables, request, state)
+    assert await reader._attached_index(session, tables, request, state) is first
+    resolve.assert_awaited_once_with(
+        session,
+        PARAMS["source_key"],
+        PARAMS["snapshot_id"],
+        PARAMS["code_system"],
+        PARAMS["code"],
+        tables=tables,
+        api_read=True,
+    )
+    locate.assert_awaited_once_with(session, PARAMS, api_read=True)
+
+
+@pytest.mark.parametrize("api_read", [None, False, True])
+async def test_code_request_propagates_named_mode_and_preserves_explicit_builder_mode(monkeypatch, api_read):
+    from api import plan_pricing_code_read as read
+    from tests.test_plan_pricing_code_projection import _selection
+
+    selected, session = _selection(), object()
+    resolve = AsyncMock(return_value=None)
+    monkeypatch.setattr(read, "_resolve_capability", resolve)
+    assert (
+        await read.resolve_code_pricing(session, selected, {"code_system": "CPT", "code": "27447"}, api_read=api_read)
+        is None
+    )
+    resolve.assert_awaited_once_with(
+        session, selected, ("CPT", "27447"), **({"api_read": True} if api_read is not False else {})
+    )
+
+
+@pytest.mark.parametrize("missing", [False, True])
+async def test_source_api_inventory_reads_qualified_names_without_physical_metadata(missing):
+    from api import ptg_membership_source as source
+
+    async def execute(statement, parameters):
+        sql = str(statement)
+        assert "pg_catalog.to_regclass" in sql and "oid" not in sql and "attestation" not in sql
+        assert parameters["schema"] == "named_source"
+        names = parameters["names"] if not missing else []
+        return SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: [{"relname": name} for name in names]))
+
+    session = SimpleNamespace(execute=AsyncMock(side_effect=execute), scalar=AsyncMock())
+    operation = source._source_storage(session, "named_source", "snapshot", api_read=True)
+    if missing:
+        with pytest.raises(PTG2ManifestArtifactError, match="inventory is incomplete"):
+            await operation
+    else:
+        inventory = await operation
+        assert inventory == {
+            "schema_name": "named_source",
+            "relations": [["named_source", name] for name in session.execute.await_args.args[1]["names"]],
+        }
+    session.scalar.assert_not_awaited()

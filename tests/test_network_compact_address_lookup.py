@@ -2,9 +2,9 @@
 """Bounded office lookups retain the ordinary selector and request identity."""
 
 import json
+import re
 from dataclasses import asdict
 from types import SimpleNamespace
-from uuid import UUID
 
 import pytest
 from sanic.request.parameters import RequestParameters
@@ -21,26 +21,14 @@ from api.network_address_scope import (
     scoped_address_cache_key,
     scoped_address_relation_sql,
 )
-from api.network_read_execution import network_read_relations
+from api.network_read_execution import qualified_relation_sql
 from api.provider_geo_sql import nearby_row_tiebreaker
+from db.models import EntityAddressUnified
 from process import network_bootstrap_address_artifact as bootstrap
 from process import network_indexed_address_artifact as indexed
-from process.network_compact_layout import CompactAddressRelation, CompactEdgeArtifact, CompactNetworkLayout
 from tests import test_custom_import_provider_geo_sql as geo
 from tests import test_network_em_provider_inputs as em_inputs
-from tests.test_network_compact_address_postgres import _lookup_manifest, _manifest
-
-
-def _layout():
-    artifacts = tuple(
-        CompactEdgeArtifact(str(UUID(int=index)), "network_candidate_" + UUID(int=index).hex, index) for index in (1, 2)
-    )
-    return CompactNetworkLayout(
-        CompactAddressRelation(artifacts[-1].schema_name, "network_slice_ref", 3),
-        CompactAddressRelation("held_base", "entity_address_unified", 4),
-        artifacts,
-        CompactAddressRelation("held_custom", "entity_address_unified", 5),
-    )
+from tests.network_compact_address_postgres_support import _layout, _lookup_manifest, _manifest
 
 
 @pytest.mark.parametrize("contract", [None, bootstrap.CONTRACT, "unknown", indexed.CONTRACT])
@@ -102,7 +90,7 @@ def test_lookup_rejects_untyped_switch(lookup):
         scoped_address_relation_sql("mrf.entity_address_unified", location_lookup=lookup)
 
 
-def test_lookup_preserves_binds_and_guard():
+def test_lookup_preserves_binds_columns_and_named_query_scope():
     layout = _layout()
     with network_address_read_scope(_lookup_manifest(layout), (7, 42)) as scope:
         cache_key = scoped_address_cache_key("same-query")
@@ -114,9 +102,7 @@ def test_lookup_preserves_binds_and_guard():
             assert is_scoped_address_relation(relation) and provider_list_sql._is_unified_address_table(relation)
             assert nearby_row_tiebreaker(relation) == "a.location_key ASC"
         assert not is_scoped_address_relation(lookup + " ")
-        typed = compact.compact_address_selectable(
-            layout, network_ids=(7, 42), location_lookup=True, read_statements=scope.read_statements
-        )
+        typed = compact.compact_address_selectable(layout, network_ids=(7, 42), location_lookup=True)
         compiled = typed.element.compile(dialect=PGDialect_asyncpg())
         native, arguments = compact.compact_address_native_sql(
             layout, network_ids=(7, 42), location_lookup=True, first_parameter=3
@@ -124,9 +110,15 @@ def test_lookup_preserves_binds_and_guard():
         assert arguments == tuple(compiled.params[name] for name in compiled.positiontup)
         assert "$1" not in native and "$2" not in native and "$3" in native
         assert all(candidate in arguments for candidate in compact.compact_address_parameters(layout).values())
-        assert (
-            network_read_relations(ordinary) == network_read_relations(lookup) == network_read_relations(select(typed))
-        )
+        assert tuple(typed.c.keys()) == tuple(EntityAddressUnified.__table__.columns.keys())
+        assert native == "(" + re.sub(r"\$(\d+)", lambda match: "$" + str(int(match[1]) + 2), str(compiled)) + ")"
+        typed_sql = str(select(typed).compile(dialect=PGDialect_asyncpg()))
+        expected = compact.compact_address_read_relations(layout)
+        assert len(expected) == 5 and len(set(expected)) == 5
+        for relation in expected:
+            qualified = qualified_relation_sql(relation.schema_name, relation.table_name)
+            unquoted_table = '"' + relation.schema_name + '".' + relation.table_name
+            assert all(qualified in query or unquoted_table in query for query in (ordinary, lookup, typed_sql, native))
         assert scope.address_relation is default_relation and current_network_address_scope() is scope
         assert scoped_address_cache_key("same-query") == cache_key
     assert current_network_address_scope() is None and not is_scoped_address_relation(lookup)
@@ -151,13 +143,16 @@ def test_managed_em_bounds_lookup_source():
         page = managed._page_sql(em_inputs.family(), '"held_rates"."rates"')
         assert f"FROM {lookup} addr" in page and f"FROM {ordinary} addr" not in page
         assert "public.ST_DWithin(" in page and "LIMIT :candidate_limit" in page
-        assert network_read_relations(page) == network_read_relations(ordinary)
+        for relation in compact.compact_address_read_relations(current_network_address_scope().manifest.compact_layout):
+            qualified = qualified_relation_sql(relation.schema_name, relation.table_name)
+            unquoted_table = '"' + relation.schema_name + '".' + relation.table_name
+            assert all(qualified in query or unquoted_table in query for query in (page, ordinary))
 
 
 async def test_custom_geo_uses_local_lookup(monkeypatch):
     session = SimpleNamespace(calls=[])
     context = geo._context()
-    monkeypatch.setattr(provider_list_sql, "NetworkReadConnectionProxy", geo._RecordingGeoProxy)
+    monkeypatch.setattr(provider_list_sql, "ConnectionProxy", geo._RecordingGeoProxy)
     monkeypatch.setattr(geo.npi_module, "_plan_release_npi_scope", geo._empty_plan_scope)
     native_args = RequestParameters({"lat": ["0"], "long": ["0"], "include_total": ["true"], "limit": ["2"]})
 

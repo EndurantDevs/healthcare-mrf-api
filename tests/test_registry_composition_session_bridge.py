@@ -96,24 +96,22 @@ def _bridge_owner(monkeypatch, failure=None):
     async def is_lock_success(connection, statement, parameters):
         operation = "unlock" if "unlock" in str(statement) else "lock"
         events.append(operation)
-        if failure == "driver_changed" and operation == "unlock":
-            pooled.driver_connection = object()
         connection.sync_connection.begin()
         return failure != operation
 
-    async def is_fence_held(session, statement, parameters):
-        assert type(session) is AsyncSession
-        assert "pg_backend_pid()" in str(statement) and "ShareLock" in str(statement)
-        bound = await session.connection()
-        assert (await bound.get_raw_connection()).driver_connection is driver
+    original_fence = fence.require_registry_company_approval_fence
+
+    async def require_fence(session, control_schema, **options):
+        await original_fence(session, control_schema, **options)
         driver.has_transaction = True
-        events.append("native_fence")
-        return failure != "native_fence"
+        events.append("fence")
+        if failure == "fence":
+            raise ValueError("synthetic fence unavailable")
 
     monkeypatch.setattr(AsyncConnection, "start", start)
     monkeypatch.setattr(AsyncConnection, "execution_options", options)
     monkeypatch.setattr(AsyncConnection, "scalar", is_lock_success)
-    monkeypatch.setattr(AsyncSession, "scalar", is_fence_held)
+    monkeypatch.setattr(composition, "require_registry_company_approval_fence", require_fence)
     return async_sessionmaker(engine), driver, events
 
 
@@ -199,7 +197,7 @@ async def test_genuine_factory_prepares_on_fenced_session_then_copies_on_same_dr
     assert actual_address is address and target.candidate_id
     assert events.count("checkout") == 1 and events.count("unlock") == 1
     assert events.index("AUTOCOMMIT") < events.index("lock") < events.index("REPEATABLE READ")
-    assert events.index("native_fence") < events.index("prepare") < events.index("prepare_commit")
+    assert events.index("fence") < events.index("prepare") < events.index("prepare_commit")
     assert events.index("unlock") < events.index("copy") < events.index("close")
     assert "invalidate" not in events
     assert driver.execute.await_args_list == [
@@ -217,16 +215,14 @@ async def test_genuine_factory_prepares_on_fenced_session_then_copies_on_same_dr
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "failure", ["prepare", "prepare_commit", "copy", "cancel", "unlock", "native_fence", "driver_changed"]
-)
+@pytest.mark.parametrize("failure", ["prepare", "prepare_commit", "copy", "cancel", "unlock", "fence"])
 async def test_original_failure_or_cancel_retires_real_owner_without_extra_checkout(monkeypatch, failure):
     sessions, driver, events = _bridge_owner(monkeypatch, failure)
     _preparation(monkeypatch, driver, events, failure)
     with pytest.raises((RuntimeError, ValueError, asyncio.CancelledError)):
         await composition.compose_registry_membership_candidate(sessions, **_arguments())
     assert events.count("checkout") == 1 and events[-1] == "invalidate"
-    if failure in {"prepare", "prepare_commit", "native_fence"}:
+    if failure in {"prepare", "prepare_commit", "fence"}:
         assert "unlock" not in events and "copy" not in events
     if failure == "unlock":
         assert "copy" not in events
@@ -280,17 +276,15 @@ async def test_raw_caller_keeps_original_owned_preparation_and_completion(monkey
         _arguments()["writer_roles"],
     )
     snapshot = AsyncMock(return_value=prepared)
-    seal, verify = AsyncMock(), AsyncMock()
+    seal = AsyncMock()
     monkeypatch.setattr(composition, "_prepare_composition_snapshot", snapshot)
     monkeypatch.setattr(composition, "seal_network_candidate", seal)
-    monkeypatch.setattr(composition, "verify_network_candidate_writer_closure", verify)
     actual = await composition.compose_registry_membership_candidate(driver, **_arguments())
     assert actual == prepared[:2] and events == ["begin", "commit", "begin", "commit"]
     assert snapshot.await_args.args[0] is driver
     seal.assert_awaited_once_with(
         driver, prepared[0], control_schema="synthetic_control", source_stage=prepared[3], command_stage=prepared[4]
     )
-    verify.assert_awaited_once_with(driver, prepared[0], **prepared[-1], control_schema="synthetic_control")
 
 
 @pytest.mark.asyncio
@@ -324,131 +318,71 @@ async def test_factory_subclass_does_not_gain_the_exact_factory_authority():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("state", ["ready", "published"])
-@pytest.mark.parametrize("custody", [None, {"seal_sha256": "a" * 64}, "changed"])
-async def test_terminal_composition_uses_verified_custody_without_resealing(monkeypatch, state, custody):
-    from process import network_candidate_custody
-
-    @asynccontextmanager
-    async def transaction(**options):
-        assert options == {"isolation": "repeatable_read"}
-        yield
-
-    copy_target = _copy_target()
+@pytest.mark.parametrize("state", ["sealed", "validated", "ready", "published"])
+async def test_closed_composition_resumes_without_recopying_terminal_data(monkeypatch, state):
+    target = _copy_target()
     driver = SimpleNamespace(
-        transaction=transaction,
-        fetchrow=AsyncMock(return_value=_candidate_record(copy_target, state)),
+        transaction=_completion_transaction,
+        fetchrow=AsyncMock(return_value=_candidate_record(target, state)),
+        execute=AsyncMock(),
+    )
+    stage = composition.RegistrySourceRecipeStage("source_stage", 0, 0, "c" * 64)
+    commands = SimpleNamespace(add_table="adds", remove_table="removes")
+    prepared = (target, object(), state, stage, commands, _arguments()["writer_roles"])
+    copy, seal = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(composition, "_copy_composition", copy)
+    monkeypatch.setattr(composition, "seal_network_candidate", seal)
+    assert await composition._complete_composition(driver, prepared, None, "control") == prepared[:2]
+    copy.assert_not_awaited()
+    if state in {"sealed", "validated"}:
+        seal.assert_awaited_once_with(
+            driver, target, control_schema="control", source_stage=stage, command_stage=commands
+        )
+    else:
+        seal.assert_not_awaited()
+    driver.fetchrow.assert_awaited_once_with(
+        'SELECT * FROM "control".network_membership_candidate WHERE candidate_id=$1 FOR UPDATE',
+        UUID(target.candidate_id),
+    )
+    assert driver.execute.await_count == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["prepared", "current"])
+async def test_closed_composition_refuses_rejected_logical_state(monkeypatch, stage):
+    target = _copy_target()
+    driver = SimpleNamespace(
+        transaction=_completion_transaction,
+        fetchrow=AsyncMock(return_value=_candidate_record(target, "rejected" if stage == "current" else "ready")),
         execute=AsyncMock(),
     )
     prepared = (
-        copy_target,
+        target,
         object(),
-        state,
+        "rejected" if stage == "prepared" else "ready",
         composition.RegistrySourceRecipeStage("source_stage", 0, 0, "c" * 64),
         SimpleNamespace(add_table="adds", remove_table="removes"),
         _arguments()["writer_roles"],
     )
-    verify = AsyncMock(
-        side_effect=ValueError("custody_changed") if custody == "changed" else None, return_value=custody
-    )
-    monkeypatch.setattr(network_candidate_custody, "verify_network_candidate_custody", verify)
-    seal, legacy = AsyncMock(), AsyncMock()
-    monkeypatch.setattr(composition, "seal_network_candidate", seal)
-    monkeypatch.setattr(composition, "verify_network_candidate_writer_closure", legacy)
-    if custody == "changed":
-        with pytest.raises(ValueError, match="custody_changed"):
-            await composition._complete_composition(driver, prepared, None, "control")
-    else:
-        assert await composition._complete_composition(driver, prepared, None, "control") == prepared[:2]
-    assert seal.await_count == legacy.await_count == int(custody is None)
-    if custody is None:
-        legacy.assert_awaited_once_with(driver, copy_target, **prepared[-1], control_schema="control")
-    verify.assert_awaited_once_with(driver, copy_target, control_schema="control", required=False)
-    driver.fetchrow.assert_awaited_once_with(
-        'SELECT * FROM "control".network_membership_candidate WHERE candidate_id=$1 FOR UPDATE',
-        UUID(copy_target.candidate_id),
-    )
+    copy = AsyncMock()
+    monkeypatch.setattr(composition, "_copy_composition", copy)
+    with pytest.raises(composition.RegistryCompositionError, match="candidate_unavailable"):
+        await composition._complete_composition(driver, prepared, None, "control")
+    copy.assert_not_awaited()
     assert driver.execute.await_count == 3
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("state", ["ready", "published"])
-@pytest.mark.parametrize("missing", ["table", "row"])
-async def test_terminal_legacy_replay_uses_real_missing_custody_boundary(monkeypatch, state, missing):
-    @asynccontextmanager
-    async def transaction(**options):
-        assert options == {"isolation": "repeatable_read"}
-        yield
-
-    copy_target = _copy_target()
-    driver = SimpleNamespace(
-        transaction=transaction,
-        is_in_transaction=lambda: True,
-        fetchval=AsyncMock(return_value=None if missing == "table" else 42),
-        fetchrow=AsyncMock(side_effect=[_candidate_record(copy_target, state), None]),
-        execute=AsyncMock(),
-    )
-    source_stage = composition.RegistrySourceRecipeStage("source_stage", 0, 0, "c" * 64)
-    commands = SimpleNamespace(add_table="adds", remove_table="removes")
-    prepared = (copy_target, object(), state, source_stage, commands, _arguments()["writer_roles"])
-    seal, legacy = AsyncMock(), AsyncMock()
-    monkeypatch.setattr(composition, "seal_network_candidate", seal)
-    monkeypatch.setattr(composition, "verify_network_candidate_writer_closure", legacy)
-
-    assert await composition._complete_composition(driver, prepared, None, "control") == prepared[:2]
-    driver.fetchval.assert_awaited_once_with("SELECT to_regclass($1)::oid", '"control".network_candidate_custody')
-    expected_queries = [
-        (
-            (
-                'SELECT * FROM "control".network_membership_candidate WHERE candidate_id=$1 FOR UPDATE',
-                UUID(copy_target.candidate_id),
-            ),
-            {},
-        )
-    ]
-    if missing == "row":
-        expected_queries.append(
-            (
-                (
-                    'SELECT seal_sha256,receipt_json::text AS receipt_json FROM "control".network_candidate_custody '
-                    "WHERE candidate_id=$1",
-                    UUID(copy_target.candidate_id),
-                ),
-                {},
-            )
-        )
-    assert driver.fetchrow.await_args_list == expected_queries
-    seal.assert_awaited_once_with(
-        driver, copy_target, control_schema="control", source_stage=source_stage, command_stage=commands
-    )
-    legacy.assert_awaited_once_with(driver, copy_target, **prepared[-1], control_schema="control")
-    assert driver.execute.await_count == 3
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "cancel", "preview", "identity", "role"])
+@pytest.mark.parametrize("failure", [None, "cancel", "preview"])
 async def test_configured_api_preview_owns_genuine_fenced_reader_and_closes_on_failure(monkeypatch, failure):
     from api.endpoint import registry_publication as publication
     from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
     from process.registry_ptg_scope_engine import RegistryPTGScopeEngineService
 
     sessions, driver, events = _bridge_owner(monkeypatch)
-    identity_by_name = dict(
-        database_name="synthetic",
-        database_oid=1,
-        server_address=None,
-        server_port=None,
-        server_started="same-start",
-        control_oid=2,
-        current_role="api",
-        session_role="api",
+    monkeypatch.setattr(
+        publication, "require_registry_company_approval_fence", composition.require_registry_company_approval_fence
     )
-    source_identity_by_name = {**identity_by_name, "current_role": "synthetic", "session_role": "synthetic"}
-    if failure == "identity":
-        source_identity_by_name["database_oid"] = 3
-    if failure == "role":
-        source_identity_by_name["current_role"] = "assumed"
-    driver.fetchrow = AsyncMock(side_effect=[identity_by_name, source_identity_by_name])
     service = object.__new__(RegistryPTGScopeEngineService)
     object.__setattr__(service, "reader_sessions", sessions)
     object.__setattr__(service, "store", RegistryPTGProducerScopeStore("owner", "approver", "synthetic_control"))
@@ -463,7 +397,7 @@ async def test_configured_api_preview_owns_genuine_fenced_reader_and_closes_on_f
         assert connection is driver and expected == 7
         assert type(authority[0]) is AsyncSession
         assert authority[0].in_transaction() and authority[1] is service.store
-        assert events.index("lock") < events.index("native_fence")
+        assert events.index("lock") < events.index("fence")
         if failure == "cancel":
             raise asyncio.CancelledError()
         if failure == "preview":
@@ -477,8 +411,6 @@ async def test_configured_api_preview_owns_genuine_fenced_reader_and_closes_on_f
         with pytest.raises((asyncio.CancelledError, RuntimeError)):
             await publication._configured_preview(request, service, object(), object(), 7)
         assert events[-1] == "invalidate"
-        if failure in {"identity", "role"}:
-            observed.assert_not_called()
     else:
         assert await publication._configured_preview(request, service, object(), object(), 7) == {
             "source_selection": {"status": "available"}

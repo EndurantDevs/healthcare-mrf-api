@@ -6,6 +6,7 @@ import hashlib
 import json
 from contextlib import AsyncExitStack, asynccontextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -22,7 +23,8 @@ from api.network_address_scope import (
     scoped_address_statement,
 )
 from db.models import EntityAddressUnified
-from process.network_candidate_custody import seal_network_candidate_custody
+from process.network_address_projection import _identifier
+from process.network_compact_layout import CompactAddressRelation
 from process.network_membership_candidate_lifecycle import (
     admit_network_membership_batch,
     create_network_candidate,
@@ -33,7 +35,7 @@ from process.network_membership_pipeline import prepare_and_publish_network_cand
 from process.network_membership_publication import NetworkPublicationError, publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
 from tests import test_network_address_artifact_postgres as address_tests
-from tests.registry_candidate_custody_postgres_support import install_candidate_custody
+from tests.registry_candidate_custody_postgres_support import administrative_freeze_callback, install_candidate_custody
 from tests.test_network_serving_schema_postgres import serving_schema
 
 
@@ -74,6 +76,58 @@ async def _drop_final_owner(connection, role):
     await connection.execute(f'DROP ROLE "{role}"')
 
 
+async def _cleanup_named_preparations(fixture):
+    from directory_membership_test_support import cleanup_registry_network_preparations
+
+    await cleanup_registry_network_preparations(fixture.connection, fixture.preparation_ids, fixture.control_schema)
+    for namespace in reversed(fixture.created_control_namespaces):
+        await fixture.connection.execute("DROP SCHEMA IF EXISTS " + _identifier(namespace) + " CASCADE")
+
+
+async def _named_compact_runtime(fixture, stack, monkeypatch):
+    """Reuse normal loading roles, preparation controls and the administrator handoff."""
+    from directory_membership_test_support import prepare_registry_catalog_foundation
+
+    from process.registry_publication_consumer import RegistryPublicationConsumerConfig
+    from process.registry_publication_worker import _configured_worker_runtime
+
+    fixture.created_control_namespaces, fixture.preparation_ids = [], []
+    stack.push_async_callback(_cleanup_named_preparations, fixture)
+    for extension in ("intarray", "btree_gin", "btree_gist", "postgis"):
+        await fixture.connection.execute("CREATE EXTENSION IF NOT EXISTS " + extension + " WITH SCHEMA public")
+    await prepare_registry_catalog_foundation(fixture, monkeypatch)
+    await install_candidate_custody(fixture, stack)
+    roles = fixture.custody_roles
+    consumer = RegistryPublicationConsumerConfig(
+        fixture.control_schema,
+        roles["custodian"],
+        fixture.executor_role,
+        fixture.roles["reader"],
+        fixture.roles["owner"],
+        roles["loading"],
+        reader_roles=fixture.writer_roles["reader_roles"],
+    )
+    applications = (
+        set(roles.values())
+        | set(fixture.roles.values())
+        | set(getattr(getattr(fixture, "address", None), "roles", {}).values())
+    )
+    settings = SimpleNamespace(
+        consumer=consumer,
+        execution_url=fixture.execution_url,
+        sql_limits=fixture.sql_limits,
+        ptg=None,
+        preparation_roles={
+            "namespace_owner_role": roles["owner"],
+            "publisher_role": fixture.executor_role,
+            "application_roles": sorted(applications - {roles["owner"]}),
+        },
+    )
+    configured = await _configured_worker_runtime(settings, stack)
+    fixture.preparation_roles = configured.preparation_roles
+    fixture.seal_candidate = administrative_freeze_callback(fixture, configured)
+
+
 @pytest.fixture
 async def compact_publication_db(monkeypatch):
     original_source = address_tests._prepare_source
@@ -102,7 +156,10 @@ async def compact_publication_db(monkeypatch):
             schema_id=str(uuid4()),
             producer_id=str(uuid4()),
         )
-        await install_candidate_custody(fixture, stack)
+        from directory_membership_test_support import retire_empty_registry_catalog_placeholder
+
+        await retire_empty_registry_catalog_placeholder(connection)
+        await _named_compact_runtime(fixture, stack, monkeypatch)
         fixture.runtime_roles = tuple(sorted((fixture.executor_role, address.roles["reader"])))
         await connection.execute(
             f"GRANT INSERT(candidate_id,batch_id,row_count,input_sha256,copy_sha256,input_bytes,copy_bytes) "
@@ -215,25 +272,42 @@ async def _prepare(fixture, target):
 
 
 async def _seal(fixture, target):
-    async def authorize(connection, supplied):
-        assert connection is fixture.custodian and supplied == target
-        return await connection.fetchval(
-            "SELECT current_user=session_user AND current_user::text=$1", fixture.custody_roles["custodian"]
-        )
+    if target.candidate_id not in fixture.preparation_ids:
+        fixture.preparation_ids.append(target.candidate_id)
+    return await fixture.seal_candidate(target)
 
-    return await seal_network_candidate_custody(
-        fixture.custodian,
-        target,
-        control_schema=fixture.control_schema,
-        runtime_roles=fixture.runtime_roles,
-        authorize=authorize,
-    )
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, RuntimeError("validation failed"), asyncio.CancelledError()])
+async def test_compact_callback_registers_cleanup_before_validation(failure):
+    identity = uuid4()
+    target = MembershipCopyTarget(*(str(uuid4()) for _ in range(3)), str(identity), "network_candidate_" + identity.hex)
+    fixture = SimpleNamespace(preparation_ids=[])
+
+    async def validate(supplied):
+        assert supplied == target and fixture.preparation_ids == [target.candidate_id]
+        if failure is not None:
+            raise failure
+        return {"candidate_id": target.candidate_id, "state": "validated"}
+
+    fixture.seal_candidate = AsyncMock(side_effect=validate)
+    if failure is None:
+        assert await _seal(fixture, target) == {"candidate_id": target.candidate_id, "state": "validated"}
+        await _seal(fixture, target)
+        assert fixture.preparation_ids == [target.candidate_id]
+    else:
+        with pytest.raises(type(failure)) as caught:
+            await _seal(fixture, target)
+        assert caught.value is failure
 
 
 async def _publish(fixture, target):
     async with fixture.execution_connection.transaction(isolation="repeatable_read"):
         return await publish_network_candidate(
-            fixture.execution_connection, target, control_schema=fixture.control_schema
+            fixture.execution_connection,
+            target,
+            control_schema=fixture.control_schema,
+            preparation_roles=fixture.preparation_roles,
         )
 
 
@@ -280,7 +354,7 @@ async def _refs(fixture, target):
 @pytest.mark.asyncio
 async def test_connected_compact_custody_publication_and_reuse(compact_publication_db):
     fixture = compact_publication_db
-    source_oid = fixture.address.descriptor["table"]["oid"]
+    source_relation = CompactAddressRelation(fixture.source.schema_name, fixture.source.table_name)
     source_before = await fixture.connection.fetch(
         f'SELECT * FROM "{fixture.address.schema}".entity_address_unified ORDER BY location_key'
     )
@@ -291,7 +365,7 @@ async def test_connected_compact_custody_publication_and_reuse(compact_publicati
         await fixture.connection.fetchval("SELECT to_regclass($1)", first.schema_name + ".entity_address_unified")
         is None
     )
-    with pytest.raises(NetworkPublicationError, match="independent physical custody"):
+    with pytest.raises(NetworkPublicationError, match="Generation data validation is incomplete"):
         await _publish(fixture, first)
     assert (
         await fixture.connection.fetchval(
@@ -299,13 +373,12 @@ async def test_connected_compact_custody_publication_and_reuse(compact_publicati
         )
         is None
     )
-    seal = await _seal(fixture, first)
-    assert seal["receipt"]["revision"] == 4
+    validation = await _seal(fixture, first)
+    assert validation == {"candidate_id": first.candidate_id, "state": "validated"}
     first_publication = await _publish(fixture, first)
     first_pin, first_rows = await _read(fixture)
     assert len(first_rows) == 1 and first_rows[0]["canonical_network_ids"] == [42]
-    assert first_pin.address_table_oid == source_oid
-    assert first_pin.compact_layout.base.table_oid == source_oid
+    assert first_pin.address_relation == first_pin.compact_layout.base == source_relation
     first_refs = await _refs(fixture, first)
     await _assert_sealed_reader(fixture, first)
     await _assert_readonly_replay(fixture, first, first_publication)
@@ -328,12 +401,7 @@ async def test_connected_compact_custody_publication_and_reuse(compact_publicati
         )
         == source_before
     )
-    assert (
-        await fixture.connection.fetchval(
-            "SELECT to_regclass($1)::oid", fixture.source.schema_name + "." + fixture.source.table_name
-        )
-        == source_oid
-    )
+    assert (await _read(fixture))[0].compact_layout.base == source_relation
 
 
 async def _assert_sealed_reader(fixture, target):
@@ -376,7 +444,10 @@ async def _assert_rollback_then_publish(fixture, copy_target, first_pin, first_r
         await transaction.start()
         try:
             provisional = await publish_network_candidate(
-                fixture.execution_connection, copy_target, control_schema=fixture.control_schema
+                fixture.execution_connection,
+                copy_target,
+                control_schema=fixture.control_schema,
+                preparation_roles=fixture.preparation_roles,
             )
             assert provisional["generation_id"] != first_pin.generation_id
         finally:

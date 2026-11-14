@@ -19,6 +19,7 @@ from api.billing_search_cursor import BillingSearchCursorGenerationExpired
 from api.network_address_scope import network_address_read_scope
 from api.plan_release_serving_resolution import PLAN_RELEASE_RESOLUTION_READY, PlanReleaseServingResolution
 from api.ptg2_billing_search_contract import BillingSearchServingUnavailableError
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 from tests.billing_search_entity_ref_support import billing_entity_reference
@@ -32,7 +33,14 @@ from tests.test_ptg2_serving_billing_address_lineage import _location_query
 def _scope(*, exclusions=(), networks=None, legacy_checksums=None):
     candidate = "123e4567-e89b-42d3-a456-426614174000"
     manifest = PinnedNetworkServingManifest(
-        7, candidate, "network_candidate_" + candidate.replace("-", ""), 1, {}, 4, "a" * 64, 17
+        7,
+        candidate,
+        "network_candidate_" + candidate.replace("-", ""),
+        1,
+        {},
+        4,
+        "a" * 64,
+        CompactAddressRelation("network_candidate_" + candidate.replace("-", ""), "entity_address_unified"),
     )
     with network_address_read_scope(
         manifest,
@@ -193,7 +201,10 @@ async def test_signed_adapter_calls_actual_service_with_only_admitted_sources(mo
     )
     monkeypatch.setattr(policy, "admitted_plan_release_bindings", AsyncMock(return_value=release.bindings[1:]))
     pin = pagination.BillingSearchGenerationPin(
-        pagination.billing_search_snapshot_set_sha256(release), "c" * 64, 11, 12
+        pagination.billing_search_snapshot_set_sha256(release),
+        "c" * 64,
+        "mrf.entity_address_unified",
+        "mrf.entity_address_evidence",
     )
     monkeypatch.setattr(pagination, "capture_billing_search_generation_pin", AsyncMock(return_value=pin))
     reader = AsyncMock(return_value=((), False))
@@ -253,12 +264,12 @@ def test_nested_billing_authority_can_be_checked_before_reader(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_exact_retained_lineage_is_one_set_query_on_same_reader():
-    from tests.network_read_execution_support import with_read_identity_receipts
+    from tests.network_read_execution_support import with_read_session
     from tests.ptg2_billing_geo_reader_support import NPI_A, _location_row
     from tests.ptg2_serving_coverage_paydown_support import FakeResult, FakeSession
 
     rows = [{**_location_row(NPI_A), "_geo_evidence_level": "nppes_registry_address", "_geo_evidence_source_id": 1}]
-    session = with_read_identity_receipts(FakeSession([FakeResult([])]))
+    session = with_read_session(FakeSession([FakeResult([])]))
     with _scope(exclusions=(19,)) as manifest:
         await policy._retained_lineage(session, native, rows)
     assert len(session.calls) == 1

@@ -62,8 +62,8 @@ async def test_fresh_typed_facts_use_pinned_compact_office_arms(monkeypatch):
     connection, candidate = object(), {"accepted_rows": 4, "expected_rows": 4}
     offices = CompactOfficeSources(
         PinnedAddressSource("retained_offices", "addresses", "a" * 64),
-        custom=CompactAddressRelation("candidate", "entity_address_unified", 12),
-        physical_base=CompactAddressRelation("retained_offices", "address_heap", 11),
+        custom=CompactAddressRelation("candidate", "entity_address_unified"),
+        physical_base=CompactAddressRelation("retained_offices", "address_heap"),
     )
     work, actual, typed = await slices._slice_facts(
         connection, candidate, ('"candidate"', '"addresses"', "unselected"), None, offices, None

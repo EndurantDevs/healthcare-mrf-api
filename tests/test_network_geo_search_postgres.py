@@ -24,9 +24,9 @@ async def test_search_keyset_reuses_direct_range_shape_after_first_batch():
     candidate_id = str(UUID(int=1))
     namespace = "network_candidate_" + UUID(candidate_id).hex
     layout = CompactNetworkLayout(
-        CompactAddressRelation(namespace, "network_slice_ref", 1),
-        CompactAddressRelation("address_source", "entity_address_unified", 2),
-        (CompactEdgeArtifact(candidate_id, namespace, 3),),
+        CompactAddressRelation(namespace, "network_slice_ref"),
+        CompactAddressRelation("address_source", "entity_address_unified"),
+        (CompactEdgeArtifact(candidate_id, namespace),),
     )
     connection = SimpleNamespace(
         fetchrow=AsyncMock(

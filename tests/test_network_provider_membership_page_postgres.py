@@ -13,13 +13,13 @@ from sqlalchemy.dialects.postgresql import dialect
 from api import network_provider_read as readers
 from db.models import EntityAddressUnified
 from process.network_compact_layout import CompactAddressRelation, CompactEdgeArtifact, CompactNetworkLayout
-from process.network_read_identity import verify_consumed_network_relations
 from process.network_serving_read import PinnedNetworkServingManifest
 
 pytestmark = pytest.mark.asyncio
 
 
 async def _storage(connection, candidate_id):
+    """Create the synthetic named relations consumed by the native paging checks."""
     schema = "network_candidate_" + candidate_id.hex
     namespace = '"' + schema + '"'
     await connection.execute(f"CREATE SCHEMA {namespace}")
@@ -57,15 +57,9 @@ async def _storage(connection, candidate_id):
         "network_slice_ref",
         "network_office_edge",
     ):
-        oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", schema + "." + name)
-        pins_by_table[name] = CompactAddressRelation(schema, name, oid)
+        pins_by_table[name] = CompactAddressRelation(schema, name)
     manifest = PinnedNetworkServingManifest(
-        7, str(candidate_id), schema, 1, {}, 0, "a" * 64, pins_by_table["base_address"].table_oid
-    )
-    object.__setattr__(
-        manifest,
-        "_candidate_relation_pins",
-        (pins_by_table["network_membership"], pins_by_table["provider_location_binding"]),
+        7, str(candidate_id), schema, 1, {}, 0, "a" * 64, CompactAddressRelation(schema, "entity_address_unified")
     )
     object.__setattr__(
         manifest,
@@ -73,10 +67,11 @@ async def _storage(connection, candidate_id):
         CompactNetworkLayout(
             pins_by_table["network_slice_ref"],
             pins_by_table["base_address"],
-            (CompactEdgeArtifact(str(candidate_id), schema, pins_by_table["network_office_edge"].table_oid),),
+            (CompactEdgeArtifact(str(candidate_id), schema),),
             pins_by_table["custom_address"],
         ),
     )
+    object.__setattr__(manifest, "address_relation", manifest.compact_layout.base)
     return SimpleNamespace(connection=connection, manifest=manifest, namespace=namespace)
 
 
@@ -168,6 +163,7 @@ async def _read(case, *, fast, networks=(42,), limit=50, offset=0, maximum_bytes
         namespace=case.namespace, addresses=addresses, address_membership="TRUE"
     )
     async with case.connection.transaction(isolation="repeatable_read", readonly=True):
+        assert await case.connection.fetchval("SHOW transaction_read_only") == "on"
         receipt = await case.connection.fetchrow(
             sql,
             "{" + ",".join(map(str, networks)) + "}",
@@ -183,11 +179,6 @@ async def _read(case, *, fast, networks=(42,), limit=50, offset=0, maximum_bytes
             None,
             None,
             *arguments,
-        )
-        await verify_consumed_network_relations(
-            case.connection,
-            readers._provider_read_relations(case.manifest, membership_page=fast),
-            expected_backend_pid=case.connection.get_server_pid(),
         )
         return readers._result(receipt)
 

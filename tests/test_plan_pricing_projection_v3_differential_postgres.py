@@ -653,32 +653,31 @@ async def attribution_native_roles(migrated_v3_database):
     admin = await asyncpg.connect(dsn)
     suffix = uuid.uuid4().hex[:12]
     roles = SimpleNamespace(
-        owner="em_owner_" + suffix, operator="em_operator_" + suffix, reader="em_reader_" + suffix, schemas=[]
+        owner="em_owner_" + suffix,
+        reader="em_reader_" + suffix,
+        schemas=[],
+        publisher=admin,
+        operator=await admin.fetchval("SELECT current_user"),
     )
     password = uuid.uuid4().hex
-    connections = []
+    consumer = None
     try:
         database = await admin.fetchval("SELECT quote_ident(current_database())")
         await admin.execute(f'CREATE ROLE "{roles.owner}" NOLOGIN')
-        for name in (roles.operator, roles.reader):
-            await admin.execute(
-                f"CREATE ROLE \"{name}\" LOGIN PASSWORD '{password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
-            )
-        await admin.execute(f'GRANT "{roles.owner}" TO "{roles.operator}" WITH INHERIT FALSE, SET TRUE')
-        await admin.execute(f'GRANT CREATE ON DATABASE {database} TO "{roles.owner}","{roles.operator}"')
-        for name in (roles.operator, roles.reader):
-            connections.append(await asyncpg.connect(dsn, user=name, password=password))
-        roles.publisher, roles.consumer = connections
+        await admin.execute(
+            f"""CREATE ROLE "{roles.reader}" LOGIN PASSWORD '{password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"""
+        )
+        await admin.execute(f'GRANT CREATE ON DATABASE {database} TO "{roles.owner}"')
+        consumer = await asyncpg.connect(dsn, user=roles.reader, password=password)
+        roles.consumer = consumer
         yield roles
     finally:
-        for connection in connections:
-            await connection.close()
+        if consumer is not None:
+            await consumer.close()
         for schema in roles.schemas:
             await admin.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-        for name in (roles.operator, roles.reader, roles.owner):
+        for name in (roles.reader, roles.owner):
             await admin.execute(f'REVOKE ALL ON DATABASE {database} FROM "{name}"')
-        await admin.execute(f'REVOKE "{roles.owner}" FROM "{roles.operator}"')
-        for name in (roles.operator, roles.reader, roles.owner):
             await admin.execute(f'DROP ROLE IF EXISTS "{name}"')
         await admin.close()
 
@@ -713,11 +712,10 @@ async def _attribution_publish(roles, selection, **stage_options):
     identity = attribution._identity(selection)
     roles.schemas.append(identity[2])
     async with roles.publisher.transaction(isolation="repeatable_read"):
-        await attribution._check_roles(roles.publisher, attribution._roles(roles.owner, (roles.reader,)))
         await _attribution_stage(roles.publisher, **stage_options)
         receipt = await attribution._publish(roles.publisher, selection, identity, roles.owner, (roles.reader,))
         assert await roles.publisher.fetchval("SELECT current_user") == roles.operator
-        assert await attribution._owner_verify(roles.publisher, receipt, identity[0]) == receipt
+        assert await attribution._verify(roles.publisher, receipt, identity[0]) == receipt
         assert await roles.publisher.fetchval("SELECT current_user") == roles.operator
     return receipt
 
@@ -766,7 +764,7 @@ async def _attribution_candidate_refusals(roles, retained):
                     await attribution._publish(roles.publisher, selection, identity, roles.owner, (roles.reader,))
             assert await roles.publisher.fetchval("SELECT current_user") == roles.operator
             assert await attribution._namespace(roles.publisher, identity[2]) is None
-            assert await attribution._owner_verify(roles.publisher, retained, retained.identity_json) == retained
+            assert await attribution._verify(roles.publisher, retained, retained.identity_json) == retained
         await _attribution_reader_proof(roles, retained, 26)
 
 
@@ -796,46 +794,55 @@ async def _attribution_table_constraint_refusals(roles, receipt):
                 roles.publisher, f"UPDATE {receipt.rates_relation} SET {assignment}"
             )
         await roles.publisher.execute(f'SET LOCAL ROLE "{roles.operator}"')
-        assert await attribution._owner_verify(roles.publisher, receipt, receipt.identity_json) == receipt
+        assert await attribution._verify(roles.publisher, receipt, receipt.identity_json) == receipt
 
 
-async def _attribution_custody_refusals(roles, receipt):
+async def _attribution_named_refusals(roles, receipt):
     from dataclasses import replace
 
     from api import plan_pricing_em_attribution as attribution
 
     async with roles.publisher.transaction(isolation="repeatable_read"):
         for statement in (
-            f'GRANT UPDATE ON {receipt.rates_relation} TO "{roles.reader}"',
             f'ALTER INDEX "{receipt.schema_name}".rates_lookup RENAME TO changed_lookup',
-            f'REINDEX INDEX "{receipt.schema_name}".rates_lookup',
             f"ALTER TABLE {receipt.rates_relation} DROP CONSTRAINT rates_count_ck",
-            f"COMMENT ON SCHEMA \"{receipt.schema_name}\" IS '{{}}'",
         ):
             savepoint = roles.publisher.transaction()
             await savepoint.start()
             try:
-                await roles.publisher.execute(f'SET LOCAL ROLE "{roles.owner}"')
                 await roles.publisher.execute(statement)
-                await roles.publisher.execute(f'SET LOCAL ROLE "{roles.operator}"')
                 with pytest.raises(ValueError):
-                    await attribution._owner_verify(roles.publisher, receipt, receipt.identity_json)
-                assert await roles.publisher.fetchval("SELECT current_user") == roles.operator
+                    await attribution._catalog(roles.publisher, receipt.schema_name)
             finally:
                 await savepoint.rollback()
-            assert await attribution._owner_verify(roles.publisher, receipt, receipt.identity_json) == receipt
-        changed = replace(receipt, table_filenode=receipt.table_filenode + 1)
+        savepoint = roles.publisher.transaction()
+        await savepoint.start()
+        try:
+            await roles.publisher.execute(f'REINDEX INDEX "{receipt.schema_name}".rates_lookup')
+            assert await attribution._verify(roles.publisher, receipt, receipt.identity_json) == receipt
+        finally:
+            await savepoint.rollback()
+        with pytest.raises(ValueError):
+            async with roles.publisher.transaction():
+                await roles.publisher.execute(f"""COMMENT ON SCHEMA "{receipt.schema_name}" IS '{{}}'""")
+                await attribution._verify(roles.publisher, receipt, receipt.identity_json)
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with roles.publisher.transaction():
+                await roles.publisher.execute(f'REVOKE SELECT ON {receipt.rates_relation} FROM "{roles.reader}"')
+                await roles.publisher.execute(f'SET LOCAL ROLE "{roles.reader}"')
+                await attribution._verify(roles.publisher, receipt, receipt.identity_json)
+        assert await roles.publisher.fetchval("SELECT current_user") == roles.operator
+        assert await attribution._verify(roles.publisher, receipt, receipt.identity_json) == receipt
+        changed = replace(receipt, content_sha256="0" * 64)
         changed = replace(changed, receipt_sha256=attribution._receipt_digest(changed))
         with pytest.raises(ValueError):
-            await attribution._owner_verify(roles.publisher, changed, changed.identity_json)
+            await attribution._verify(roles.publisher, changed, changed.identity_json)
         with pytest.raises(ValueError, match="full recipe"):
-            await attribution._owner_verify(
-                roles.publisher, receipt, attribution._identity(_attribution_selection("b"))[0]
-            )
+            await attribution._verify(roles.publisher, receipt, attribution._identity(_attribution_selection("b"))[0])
 
 
 @pytest.mark.asyncio
-async def test_native_em_attribution_publication_custody_replay_and_bigint_bounds(attribution_native_roles):
+async def test_native_em_attribution_named_publication_replay_and_bigint_bounds(attribution_native_roles):
     from api import plan_pricing_em_attribution as attribution
 
     roles = attribution_native_roles
@@ -847,7 +854,7 @@ async def test_native_em_attribution_publication_custody_replay_and_bigint_bound
     await _attribution_reader_proof(roles, boundary, 2**63 - 1)
     await _attribution_candidate_refusals(roles, receipt)
     await _attribution_table_constraint_refusals(roles, receipt)
-    await _attribution_custody_refusals(roles, receipt)
+    await _attribution_named_refusals(roles, receipt)
     await _attribution_reader_proof(roles, receipt, 26)
     async with roles.consumer.transaction(isolation="repeatable_read", readonly=True):
         assert await attribution._content(roles.consumer, receipt.schema_name, "rates") == (18, receipt.content_sha256)

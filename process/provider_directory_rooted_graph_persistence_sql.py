@@ -50,9 +50,9 @@ def _terminal_work_sql(alias: str) -> str:
     )
 
 
-def _root_work_drained_sql() -> str:
+def _root_work_drained_sql(resource_relation=None) -> str:
     work = table_ref(WORK_TABLE)
-    dataset_resource = table_ref(DATASET_RESOURCE_TABLE)
+    dataset_resource = resource_relation or table_ref(DATASET_RESOURCE_TABLE)
     return f"""
         EXISTS (
             SELECT 1 FROM {work} AS root_query
@@ -63,7 +63,7 @@ def _root_work_drained_sql() -> str:
             SELECT 1 FROM {work} AS root_query
              WHERE root_query.acquisition_id = :acquisition_id
                AND root_query.closure_scope = 'root'
-               AND NOT {_terminal_work_sql('root_query')}
+               AND NOT {_terminal_work_sql("root_query")}
         )
         AND NOT EXISTS (
             SELECT member.resource_id
@@ -77,7 +77,7 @@ def _root_work_drained_sql() -> str:
                AND root_query.kind = 'exact_reference_search'
                AND root_query.resource_type = 'PractitionerRole'
                AND root_query.closure_scope = 'root'
-               AND {_terminal_work_sql('root_query')}
+               AND {_terminal_work_sql("root_query")}
         )
         AND NOT EXISTS (
             SELECT root_query.reference_id
@@ -120,7 +120,7 @@ def _direct_reference_closure_sql() -> str:
                       AND target_query.reference_id =
                           reference_edge.target_resource_id
                       AND target_query.closure_scope = 'root'
-                      AND {_terminal_work_sql('target_query')}
+                      AND {_terminal_work_sql("target_query")}
                )
         )
     """
@@ -148,13 +148,13 @@ def _organization_affiliation_closure_sql() -> str:
                           'OrganizationAffiliation'
                       AND affiliation_query.reference_id = organization.resource_id
                       AND affiliation_query.closure_scope = 'root'
-                      AND {_terminal_work_sql('affiliation_query')}
+                      AND {_terminal_work_sql("affiliation_query")}
                )
         )
     """
 
 
-def root_closure_sql() -> str:
+def root_closure_sql(*, resource_relation=None) -> str:
     """Prove known root work drained, not descendants of timed-out queries."""
 
     acquisition = table_ref(ACQUISITION_TABLE)
@@ -164,7 +164,7 @@ def root_closure_sql() -> str:
         SELECT endpoint.canonical_api_base,
                {_root_network_references_sql()} AS root_network_references,
                (
-                   {_root_work_drained_sql()}
+                   {_root_work_drained_sql(resource_relation)}
                    AND {_direct_reference_closure_sql()}
                    AND {_organization_affiliation_closure_sql()}
                ) AS root_frontier_drained,

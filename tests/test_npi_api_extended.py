@@ -1,5 +1,4 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-
 import asyncio
 import json
 import types
@@ -11,6 +10,7 @@ from sqlalchemy import column, table
 
 from api.endpoint import npi as npi_module
 from db.models import AddressArchive, NPIAddress, NPIData, NPIDataOtherIdentifier, NPIDataTaxonomy, NPIDataTaxonomyGroup
+from process.network_compact_layout import CompactAddressRelation
 from tests.provider_profile_snapshot_test_support import (
     stub_provider_profile_snapshot as stub_provider_profile_snapshot,
 )
@@ -2530,7 +2530,14 @@ async def test_canonical_stored_geocode_never_persists(monkeypatch, with_profile
     monkeypatch.setattr(npi_module, "download_it", download)
     candidate_id = uuid4()
     manifest = PinnedNetworkServingManifest(
-        1, str(candidate_id), "network_candidate_" + candidate_id.hex, 1, {}, 0, "a" * 64, 1
+        1,
+        str(candidate_id),
+        "network_candidate_" + candidate_id.hex,
+        1,
+        {},
+        0,
+        "a" * 64,
+        CompactAddressRelation("network_candidate_" + candidate_id.hex, "entity_address_unified"),
     )
     app = _NpiEndpointTestApp({"NPI_API_UPDATE_GEOCODE": True}, close_tasks=True)
     request = types.SimpleNamespace(args={"lookup_stored_geocode": "1"}, app=app)

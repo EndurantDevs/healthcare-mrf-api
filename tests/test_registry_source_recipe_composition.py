@@ -141,14 +141,47 @@ async def test_retained_replay_requires_complete_origin_resource_count(monkeypat
 @pytest.mark.parametrize("cache_kind", ["not-a-dict", "foreign-read"])
 async def test_retained_read_cache_refuses_untrusted_values_without_admission(monkeypatch, cache_kind):
     from process import network_fhir_retained_capture as retained
+    from tests.test_network_fhir_retained_capture import retained as capture_fixture
 
-    capture, connection = object(), object()
-    cache = [] if cache_kind == "not-a-dict" else {capture: object()}
+    capture, connection = capture_fixture(), object()
+    key = capture.schema_name, capture.capture_id, capture.capture_sha256
+    cache = [] if cache_kind == "not-a-dict" else {key: object()}
     pin = AsyncMock()
     monkeypatch.setattr(retained, "pin_retained_fhir_read", pin)
     with pytest.raises(composition.RegistrySourceCompositionError, match="custody_unavailable"):
         await composition._retained_recipe_read(connection, capture, cache)
     pin.assert_not_awaited()
+
+
+async def test_retained_read_cache_reuses_complete_validation_by_named_edition(monkeypatch):
+    from copy import deepcopy
+
+    from process import network_fhir_retained_capture as retained
+    from tests.test_network_fhir_retained_capture import retained as capture_fixture
+
+    capture, connection, cache = capture_fixture(), object(), {}
+    selected = retained.RetainedFHIRRead(capture)
+    pin = AsyncMock(return_value=selected)
+    monkeypatch.setattr(retained, "pin_retained_fhir_read", pin)
+    assert await composition._retained_recipe_read(connection, capture, cache) is selected
+    assert await composition._retained_recipe_read(connection, deepcopy(capture), cache) is selected
+    pin.assert_awaited_once_with(connection, capture)
+    assert list(cache) == [(capture.schema_name, capture.capture_id, capture.capture_sha256)]
+
+
+@pytest.mark.parametrize("available", [False, True])
+async def test_plain_fhir_recipe_checks_named_publication_data(available):
+    from tests.registry_source_recipe_support import _example
+
+    source = _example().source_pin
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=available))
+    if available:
+        await composition._require_fhir_custody(connection, source)
+    else:
+        with pytest.raises(composition.RegistrySourceCompositionError, match="custody_unavailable"):
+            await composition._require_fhir_custody(connection, source)
+    assert "provider_directory_endpoint_dataset" in connection.fetchval.call_args.args[0]
+    assert "pg_roles" not in connection.fetchval.call_args.args[0]
 
 
 @pytest.mark.parametrize("rows,recipes", [(1, [object()]), (0, []), (0, [SimpleNamespace(source_pin=object())])])

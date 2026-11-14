@@ -26,7 +26,7 @@ from process.network_membership_copy import (
     _encode,
     partition_network_membership_commands,
 )
-from process.network_read_identity import NetworkReadIdentityError, verify_consumed_network_relations
+from process.network_read_identity import NetworkReadIdentityError
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
 
@@ -116,11 +116,29 @@ _SCOPE_SQL = (
   FROM selected
 ), bounds AS (
   SELECT coalesce(max(document_bytes),0)<=$2 AND count(*)*64+
-    octet_length(jsonb_build_array($3::text,
-      (SELECT oid FROM pg_namespace WHERE nspname=$3),$1::bigint,'')::text)<=$2 AS is_bounded
+    octet_length(jsonb_build_array($3::text,$1::bigint,'')::text)<=$2 AS is_bounded
   FROM fingerprints
 ), bounded AS (
   SELECT fingerprints.* FROM fingerprints,bounds WHERE bounds.is_bounded
+), published_editions AS (
+  SELECT manifest.source_generations->>'custom_membership' AS token,
+    coalesce(candidate.state='published'
+      AND candidate.schema_revision=manifest.schema_revision
+      AND candidate.approved_custom_revision=$1
+      AND manifest.approved_custom_revision=$1
+      AND candidate.source_generations=manifest.source_generations
+      AND jsonb_typeof(manifest.source_generations->'custom_membership')='string'
+      AND (manifest.source_generations->>'custom_membership') ~ '^[0-9a-f]{{64}}$',false) AS valid
+  FROM {namespace}.network_serving_manifest manifest
+  FULL JOIN {namespace}.network_membership_candidate candidate USING(candidate_id)
+  WHERE (manifest.approved_custom_revision=$1
+    OR (candidate.approved_custom_revision=$1 AND candidate.state='published'))
+    AND (manifest.source_generations ? 'custom_membership'
+      OR candidate.source_generations ? 'custom_membership')
+), published_edition AS (
+  SELECT min(token) AS token,
+    coalesce(bool_and(valid),true) AND count(DISTINCT token)<=1 AS valid
+  FROM published_editions
 ), diagnostics AS (
   SELECT count(*)::bigint AS total_rows,
     count(*) FILTER(WHERE jsonb_typeof(member)<>'object'
@@ -148,16 +166,16 @@ _SCOPE_SQL = (
   ) source_binding ON true
 )
 SELECT current_setting('transaction_isolation') AS isolation,
-  control.approved_revision,diagnostics.*,bounds.is_bounded,
+  control.approved_revision,diagnostics.*,bounds.is_bounded,published_edition.valid AS edition_valid,
   (SELECT count(*) FROM documents WHERE command_mode) AS command_documents,
   (SELECT count(*) FROM active WHERE record_kind='membership'
     AND jsonb_typeof(record_json->'memberships_json') IS DISTINCT FROM 'array') AS invalid_documents,
-  encode(sha256(convert_to(jsonb_build_array($3::text,namespace.oid,$1::bigint,
+  coalesce(published_edition.token,encode(sha256(convert_to(jsonb_build_array($3::text,$1::bigint,
     coalesce((SELECT string_agg(fingerprint,'' ORDER BY record_kind COLLATE "C",record_key COLLATE "C") FROM bounded),''))::text,
-    'UTF8')),'hex') AS generation_id
+    'UTF8')),'hex')) AS generation_id
 FROM {control_source} control
-CROSS JOIN pg_namespace namespace CROSS JOIN diagnostics CROSS JOIN bounds
-WHERE control.id=1 AND namespace.nspname=$3
+CROSS JOIN diagnostics CROSS JOIN bounds CROSS JOIN published_edition
+WHERE control.id=1
 """
 )
 
@@ -262,21 +280,7 @@ async def read_approved_membership_commands(
     )
 
 
-async def _verify_approved_consumption(connection, namespace, read_identity):
-    if read_identity is None:
-        return
-    if (
-        type(read_identity) is not tuple
-        or len(read_identity) != 2
-        or type(read_identity[0]) is not CompactAddressRelation
-        or read_identity[0].schema_name != namespace[1:-1]
-        or read_identity[0].table_name != "registry_approved_record"
-    ):
-        raise ApprovedMembershipSourceError("Approved source read identity is invalid")
-    await verify_consumed_network_relations(connection, (read_identity[0],), expected_backend_pid=read_identity[1])
-
-
-async def _scope(connection, approved_revision, namespace, *, retained=False, legacy=False, read_identity=None):
+async def _scope(connection, approved_revision, namespace, *, retained=False, legacy=False):
     _counter(approved_revision)
     if not connection.is_in_transaction():
         raise ApprovedMembershipSourceError("Approved source requires a caller-owned repeatable-read transaction")
@@ -290,7 +294,6 @@ async def _scope(connection, approved_revision, namespace, *, retained=False, le
             MAX_INPUT_BYTES,
             namespace[1:-1],
         )
-        await _verify_approved_consumption(connection, namespace, read_identity)
     except (asyncpg.PostgresError, NetworkReadIdentityError) as error:
         raise ApprovedMembershipSourceError("Approved source prerequisites are unavailable") from error
     if scope is None or scope["approved_revision"] != approved_revision:
@@ -301,6 +304,8 @@ async def _scope(connection, approved_revision, namespace, *, retained=False, le
         raise ApprovedMembershipSourceError("Approved source document or fingerprint aggregate exceeds 8 MiB")
     if scope["invalid_documents"] or scope["unresolved_rows"]:
         raise ApprovedMembershipSourceError("Approved source has unresolved or malformed membership references")
+    if scope["edition_valid"] is not True:
+        raise ApprovedMembershipSourceError("Approved source has inconsistent published edition metadata")
     if legacy and scope["command_documents"]:
         raise ApprovedMembershipSourceError("Command documents require the separate add/remove reader")
     return ApprovedMembershipSource(approved_revision, scope["generation_id"], scope["total_rows"])
@@ -311,25 +316,18 @@ async def pin_approved_membership_source(connection, *, approved_revision, contr
     return await _scope(connection, approved_revision, _control_namespace(control_schema))
 
 
-async def pin_retained_approved_membership_source(
-    connection, *, approved_revision, control_schema=None, read_identity=None
-):
+async def pin_retained_approved_membership_source(connection, *, approved_revision, control_schema=None):
     """Fingerprint the exact approved revision retained by a verified serving manifest."""
     return await _scope(
         connection,
         approved_revision,
         _control_namespace(control_schema),
         retained=True,
-        **({"read_identity": read_identity} if read_identity is not None else {}),
     )
 
 
 async def pin_api_retained_approved_membership_source(connection, manifest, *, control_schema=None):
-    """Authenticate an approved snapshot and its current physical race pin on this API backend.
-
-    Re-resolve the manifest instead of trusting DTO/private JSON fields. This pin
-    is not a historical seal; Source readers still require their independent seal.
-    """
+    """Resolve the exact approved revision within the selected named serving snapshot."""
     from process.network_published_api_pin import active_published_api_pin
     from process.network_serving_read import PinnedNetworkServingManifest, resolve_network_serving_manifest
 
@@ -372,16 +370,9 @@ async def resolve_api_retained_approved_membership_source(connection, *, generat
 
 async def _pin_verified_api_approved_source(connection, current, *, control_schema):
     """Consume only the immediately resolved manifest; public DTO pins re-resolve first."""
-    from process.network_candidate_custody import read_network_control_relation_pins
-
     namespace = _control_namespace(control_schema)
-    (relation,) = await read_network_control_relation_pins(
-        connection, ("registry_approved_record",), control_schema=namespace[1:-1]
-    )
-    pid = connection.get_server_pid()
-    approved = await _scope(
-        connection, current.approved_custom_revision, namespace, retained=True, read_identity=(relation, pid)
-    )
+    relation = CompactAddressRelation(namespace[1:-1], "registry_approved_record")
+    approved = await _scope(connection, current.approved_custom_revision, namespace, retained=True)
     if approved.generation_id != current.source_generations.get("custom_membership"):
         raise ApprovedMembershipSourceError("Approved API source generation differs")
     return approved, relation

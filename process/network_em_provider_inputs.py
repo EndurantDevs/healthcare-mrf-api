@@ -1,11 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Retain bounded native custody receipts for managed provider dependencies."""
+"""Validate and retain named managed provider dependencies."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import asdict, dataclass
 from uuid import UUID
 
@@ -25,10 +24,9 @@ from db.models import (
     NUCCTaxonomy,
 )
 from process.network_address_projection import _identifier
-from process.network_custom_address_source import _closed, _require_transaction
+from process.network_custom_address_source import _require_transaction
 from process.network_membership_candidate_lifecycle import _control_namespace, _locked_candidate, _require_open
 from process.network_membership_copy import MembershipCopyTarget
-from process.network_membership_writer_closure import _protected_owner
 from process.network_serving_read import PinnedNetworkServingManifest, resolve_network_serving_manifest
 
 _ROLES = (
@@ -50,12 +48,12 @@ _MODELS = dict(
     )
 )
 _MAX_RECEIPT_BYTES = 32768
-_RELATION_FIELDS = {"role", "schema_name", "table_name", "generation_id", "relation_oid", "relfilenode"}
-_CUSTODY_FIELDS = {"schema_oid", "owner_oid", "owner_role", "shape_sha256", "keys_sha256"}
+_RELATION_FIELDS = {"role", "schema_name", "table_name", "generation_id"}
+_LEGACY_FIELDS = {"relation_oid", "relfilenode", "schema_oid", "owner_oid", "owner_role", "shape_sha256", "keys_sha256"}
 
 
 def _fail():
-    raise ValueError("Managed provider input custody is unavailable")
+    raise ValueError("Managed provider input data is unavailable")
 
 
 def _digest(value):
@@ -64,19 +62,12 @@ def _digest(value):
     ).hexdigest()
 
 
-def _oid(value):
-    if type(value) is not int or not 0 < value < 2**32:
-        _fail()
-
-
 @dataclass(frozen=True)
 class EMProviderInputRelation:
     role: str
     schema_name: str
     table_name: str
     generation_id: str
-    relation_oid: int
-    relfilenode: int
 
     def __post_init__(self):
         if type(self.role) is not str or self.role not in _ROLES:
@@ -89,8 +80,17 @@ class EMProviderInputRelation:
             or any(ord(c) < 32 or ord(c) == 127 for c in self.generation_id)
         ):
             _fail()
-        _oid(self.relation_oid)
-        _oid(self.relfilenode)
+
+
+def em_provider_input_relation(document):
+    """Project known retained relation formats to their recorded names and logical version."""
+    if type(document) is not dict or set(document) not in (
+        _RELATION_FIELDS,
+        _RELATION_FIELDS | {"relation_oid", "relfilenode"},
+        _RELATION_FIELDS | _LEGACY_FIELDS,
+    ):
+        _fail()
+    return EMProviderInputRelation(**{key: document[key] for key in _RELATION_FIELDS})
 
 
 @dataclass(frozen=True)
@@ -103,7 +103,6 @@ class EMProviderInputs:
             or len(self.relations) != len(_ROLES)
             or any(type(item) is not EMProviderInputRelation for item in self.relations)
             or tuple(item.role for item in self.relations) != _ROLES
-            or len({item.relation_oid for item in self.relations}) != len(_ROLES)
             or len({(item.schema_name, item.table_name) for item in self.relations}) != len(_ROLES)
         ):
             _fail()
@@ -123,14 +122,12 @@ class EMProviderInputs:
             if item.role in {"npi", "npi_taxonomy", "nucc_taxonomy"}:
                 continue
             canonical = item.role if item.role.startswith("tiger.") else f"{schema_name}.{item.role}"
-            bindings_by_name[canonical] = {
-                key: getattr(item, key) for key in ("schema_name", "table_name", "relation_oid", "relfilenode")
-            }
+            bindings_by_name[canonical] = {key: getattr(item, key) for key in ("schema_name", "table_name")}
         return validate_projection_dependency_bindings(schema_name, bindings_by_name)
 
 
 def em_provider_geo_reads_sql(sql, inputs, schema_name):
-    """Restrict fixed shared geo fragments to the verified native input heaps."""
+    """Restrict fixed shared geo fragments to the named input relations."""
     if type(sql) is not str or type(inputs) is not EMProviderInputs:
         _fail()
     inputs.__post_init__()
@@ -140,18 +137,6 @@ def em_provider_geo_reads_sql(sql, inputs, schema_name):
         sql = sql.replace(f"FROM {relation} ", f"FROM ONLY {relation} ")
         sql = sql.replace(f"JOIN {relation} ", f"JOIN ONLY {relation} ")
     return sql
-
-
-def _runtime_roles(roles):
-    if (
-        type(roles) is not tuple
-        or not 1 <= len(roles) <= 32
-        or any(type(role) is not str for role in roles)
-        or tuple(sorted(set(roles))) != roles
-    ):
-        _fail()
-    for role in roles:
-        _identifier(role)
 
 
 def _native_type(column_type):
@@ -183,41 +168,32 @@ def _required_columns(role):
     )
 
 
-_CATALOG_SQL = """SELECT requested.role,namespace.oid::bigint AS schema_oid,
- held.oid::bigint AS relation_oid,pg_relation_filenode(held.oid)::bigint AS relfilenode,
- owner.oid::bigint AS owner_oid,owner.rolname AS owner_role,
- owner.rolcanlogin,owner.rolsuper,owner.rolcreatedb,owner.rolcreaterole,owner.rolreplication,owner.rolbypassrls,
- namespace.nspowner=held.relowner AS same_owner,held.relkind::text AS relkind,
- held.relpersistence::text AS relpersistence,held.relispartition,held.relrowsecurity,held.relforcerowsecurity,
- EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=held.oid) AS has_triggers,
+_CATALOG_SQL = """SELECT requested.role,held.relkind::text AS relkind,
+ held.relpersistence::text AS relpersistence,held.relispartition,
  CASE requested.role WHEN 'tiger.zcta5' THEN {zcta_inheritance}
  WHEN 'tiger.zip_state' THEN {zip_inheritance} ELSE {ordinary_inheritance} END AS inheritance_ok,
  (SELECT CASE WHEN octet_length(jsonb_agg(to_jsonb(shape) ORDER BY shape.attnum)::text)<=65536
  THEN jsonb_agg(to_jsonb(shape) ORDER BY shape.attnum)::text END FROM (
    SELECT a.attnum,a.attname,t.typname AS type_name,tn.nspname AS type_schema,
-    a.atttypid::bigint AS type_oid,a.atttypmod,a.attnotnull,
-    pg_get_expr(d.adbin,d.adrelid) AS default_expr,
     t.oid=to_regtype('geometry') AS canonical_geometry,
     CASE WHEN t.oid=to_regtype('geometry') THEN postgis_typmod_srid(a.atttypmod) END AS geometry_srid,
     CASE WHEN t.oid=to_regtype('geometry') THEN postgis_typmod_type(a.atttypmod) END AS geometry_type
    FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid
    JOIN pg_namespace tn ON tn.oid=t.typnamespace
-   LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
    WHERE a.attrelid=held.oid AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum LIMIT 257
  ) shape) AS columns_json,
- (SELECT CASE WHEN octet_length(jsonb_agg(to_jsonb(keys) ORDER BY keys.index_oid)::text)<=16384
- THEN jsonb_agg(to_jsonb(keys) ORDER BY keys.index_oid)::text END FROM (
-   SELECT i.indexrelid::bigint AS index_oid,
-    ARRAY(SELECT a.attname FROM unnest(i.indkey::smallint[]) WITH ORDINALITY k(num,ordinal)
+ (SELECT CASE WHEN octet_length(jsonb_agg(to_jsonb(keys))::text)<=16384
+ THEN jsonb_agg(to_jsonb(keys))::text END FROM (
+   SELECT ARRAY(SELECT a.attname FROM unnest(i.indkey::smallint[]) WITH ORDINALITY k(num,ordinal)
      LEFT JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.num
      WHERE k.ordinal<=i.indnkeyatts ORDER BY k.ordinal) AS columns
    FROM pg_index i WHERE i.indrelid=held.oid AND i.indisunique AND i.indisvalid AND i.indisready
-     AND i.indislive AND i.indpred IS NULL AND i.indexprs IS NULL ORDER BY i.indexrelid LIMIT 65
+     AND i.indislive AND i.indpred IS NULL AND i.indexprs IS NULL LIMIT 65
  ) keys) AS keys_json
  FROM jsonb_to_recordset($1::jsonb) requested(role text,schema_name text,table_name text)
  LEFT JOIN pg_namespace namespace ON namespace.nspname=requested.schema_name
  LEFT JOIN pg_class held ON held.relnamespace=namespace.oid AND held.relname=requested.table_name
- LEFT JOIN pg_roles owner ON owner.oid=held.relowner ORDER BY requested.role COLLATE "C"
+ ORDER BY requested.role COLLATE "C"
 """.format(
     zcta_inheritance=_held_inheritance_sql("tiger.zcta5"),
     zip_inheritance=_held_inheritance_sql("tiger.zip_state"),
@@ -259,61 +235,32 @@ def _shape(role, catalog_row):
     }.get(role)
     if required_key and not any(key["columns"] == required_key for key in keys):
         _fail()
-    return _digest(columns), _digest(keys)
 
 
-async def prepare_em_provider_inputs(connection, inputs, *, runtime_roles):
-    """Capture all nine protected heaps in the caller's repeatable-read snapshot."""
+async def prepare_em_provider_inputs(connection, inputs, *, runtime_roles=None):
+    """Validate required columns and native keys on all nine named snapshots in repeatable read."""
     if type(inputs) is not EMProviderInputs:
         _fail()
-    _runtime_roles(runtime_roles)
+    inputs.__post_init__()
     await _require_transaction(connection)
     catalog_rows = await connection.fetch(
         _CATALOG_SQL, json.dumps([asdict(relation_input) for relation_input in inputs.relations])
     )
     if len(catalog_rows) != len(_ROLES) or tuple(catalog_row["role"] for catalog_row in catalog_rows) != _ROLES:
         _fail()
-    relations = []
-    relations_by_owner = {}
     for relation_input, catalog_row in zip(inputs.relations, catalog_rows, strict=True):
         if (
-            catalog_row["relation_oid"] != relation_input.relation_oid
-            or catalog_row["relfilenode"] != relation_input.relfilenode
-            or not _protected_owner(catalog_row)
-            or catalog_row["same_owner"] is not True
-            or catalog_row["relkind"] != "r"
+            catalog_row["relkind"] != "r"
             or catalog_row["relpersistence"] != "p"
             or catalog_row["relispartition"] is not False
-            or catalog_row["relrowsecurity"] is not False
-            or catalog_row["relforcerowsecurity"] is not False
-            or catalog_row["has_triggers"] is not False
             or catalog_row["inheritance_ok"] is not True
         ):
             _fail()
-        _oid(catalog_row["schema_oid"])
-        _oid(catalog_row["owner_oid"])
-        _identifier(catalog_row["owner_role"])
-        shape, keys = _shape(relation_input.role, catalog_row)
-        relations.append(
-            {
-                **asdict(relation_input),
-                "schema_oid": catalog_row["schema_oid"],
-                "owner_oid": catalog_row["owner_oid"],
-                "owner_role": catalog_row["owner_role"],
-                "shape_sha256": shape,
-                "keys_sha256": keys,
-            }
-        )
-        relations_by_owner.setdefault((catalog_row["schema_oid"], catalog_row["owner_oid"]), []).append(
-            relation_input.table_name
-        )
-    for (schema_oid, owner_oid), names in relations_by_owner.items():
-        await _closed(connection, schema_oid, owner_oid, runtime_roles, names)
+        _shape(relation_input.role, catalog_row)
     receipt_by_field = {
         "component": "network_em_provider_inputs",
-        "revision": 1,
-        "runtime_roles": list(runtime_roles),
-        "relations": relations,
+        "revision": 2,
+        "relations": [asdict(relation_input) for relation_input in inputs.relations],
     }
     receipt_by_field["receipt_sha256"] = _digest(receipt_by_field)
     _receipt(receipt_by_field)
@@ -321,38 +268,27 @@ async def prepare_em_provider_inputs(connection, inputs, *, runtime_roles):
 
 
 def _receipt(receipt):
+    """Read logical names from current or retained wire data, ignoring obsolete physical fields."""
+    if type(receipt) is not dict or type(receipt.get("revision")) is not int or receipt["revision"] not in {1, 2}:
+        _fail()
+    is_legacy = receipt["revision"] == 1
+    fields = {"component", "revision", "relations", "receipt_sha256"} | ({"runtime_roles"} if is_legacy else set())
     if (
-        type(receipt) is not dict
-        or set(receipt) != {"component", "revision", "runtime_roles", "relations", "receipt_sha256"}
+        set(receipt) != fields
         or receipt["component"] != "network_em_provider_inputs"
-        or type(receipt["revision"]) is not int
-        or receipt["revision"] != 1
-        or type(receipt["runtime_roles"]) is not list
         or type(receipt["relations"]) is not list
         or len(receipt["relations"]) != len(_ROLES)
-    ):
-        _fail()
-    _runtime_roles(tuple(receipt["runtime_roles"]))
-    inputs = []
-    for entry in receipt["relations"]:
-        if type(entry) is not dict or set(entry) != _RELATION_FIELDS | _CUSTODY_FIELDS:
-            _fail()
-        inputs.append(EMProviderInputRelation(**{key: entry[key] for key in _RELATION_FIELDS}))
-        for key in ("schema_oid", "owner_oid"):
-            _oid(entry[key])
-        _identifier(entry["owner_role"])
-        for key in ("shape_sha256", "keys_sha256"):
-            if type(entry[key]) is not str or re.fullmatch(r"[0-9a-f]{64}", entry[key]) is None:
-                _fail()
-    inputs = EMProviderInputs(tuple(inputs))
-    if (
-        type(receipt["receipt_sha256"]) is not str
-        or receipt["receipt_sha256"]
-        != _digest({key: field_value for key, field_value in receipt.items() if key != "receipt_sha256"})
         or len(json.dumps(receipt).encode()) > _MAX_RECEIPT_BYTES
+        or receipt["receipt_sha256"]
+        != _digest({key: value for key, value in receipt.items() if key != "receipt_sha256"})
     ):
         _fail()
-    return inputs
+    relations = []
+    for entry in receipt["relations"]:
+        if type(entry) is not dict or set(entry) != _RELATION_FIELDS | (_LEGACY_FIELDS if is_legacy else set()):
+            _fail()
+        relations.append(em_provider_input_relation(entry))
+    return EMProviderInputs(tuple(relations))
 
 
 def _object(value):
@@ -392,14 +328,11 @@ async def record_em_provider_inputs(connection, copy_target, receipt, control_sc
 
 
 async def _resolve_em_provider_inputs_api(connection, manifest, control_schema=None):
-    """Guard the accepted sealed or legacy candidate header before reading its retained recipe."""
-    from process.network_candidate_custody import read_network_control_relation_pins
-    from process.network_read_identity import verify_consumed_network_relations
+    """Read the published logical header and its named provider recipe."""
 
     try:
         if type(manifest) is not PinnedNetworkServingManifest:
             _fail()
-        backend_pid = connection.get_server_pid()
         await _require_transaction(connection)
         namespace = _control_namespace(control_schema)
         from process.network_published_api_pin import active_published_api_pin
@@ -411,32 +344,26 @@ async def _resolve_em_provider_inputs_api(connection, manifest, control_schema=N
             )
         if type(retained) is not PinnedNetworkServingManifest or retained != manifest:
             _fail()
-        pins = await read_network_control_relation_pins(
-            connection, ("network_membership_candidate",), control_schema=namespace[1:-1]
-        )
         candidate_header = await connection.fetchrow(
             f"SELECT source_generations,validation_json FROM ONLY {namespace}.network_membership_candidate "
             "WHERE candidate_id=$1 AND schema_name=$2 AND state='published'",
             UUID(manifest.candidate_id),
             manifest.schema_name,
         )
-        await verify_consumed_network_relations(connection, pins, expected_backend_pid=backend_pid)
         if candidate_header is None or _object(candidate_header["source_generations"]) != manifest.source_generations:
             _fail()
         receipt = _object(candidate_header["validation_json"]).get("em_provider_inputs")
         inputs = _receipt(receipt)
         if manifest.source_generations.get("em_provider_inputs") != receipt["receipt_sha256"]:
             _fail()
-        current = await prepare_em_provider_inputs(connection, inputs, runtime_roles=tuple(receipt["runtime_roles"]))
-        if current != receipt:
-            _fail()
+        await prepare_em_provider_inputs(connection, inputs)
         return inputs
     except Exception:
         raise PlanPricingProjectionUnavailable("Managed provider inputs are unavailable") from None
 
 
 async def _resolve_em_provider_inputs_legacy(connection, manifest, control_schema=None):
-    """Revalidate an exact retained manifest and its protected native recipe, read-only."""
+    """Validate an exact retained manifest and named data recipe, read-only."""
     try:
         if type(manifest) is not PinnedNetworkServingManifest:
             _fail()
@@ -458,16 +385,14 @@ async def _resolve_em_provider_inputs_legacy(connection, manifest, control_schem
         inputs = _receipt(receipt)
         if manifest.source_generations.get("em_provider_inputs") != receipt["receipt_sha256"]:
             _fail()
-        current = await prepare_em_provider_inputs(connection, inputs, runtime_roles=tuple(receipt["runtime_roles"]))
-        if current != receipt:
-            _fail()
+        await prepare_em_provider_inputs(connection, inputs)
         return inputs
     except ValueError, TypeError, KeyError, asyncpg.PostgresError:
         raise PlanPricingProjectionUnavailable("Managed provider inputs are unavailable") from None
 
 
 async def resolve_em_provider_inputs(connection, manifest, control_schema=None, *, api_read=False):
-    """Revalidate an exact retained manifest and its protected native recipe, read-only."""
+    """Validate an exact retained manifest and named data recipe, read-only."""
     if type(api_read) is not bool:
         raise PlanPricingProjectionUnavailable("Managed provider inputs are unavailable")
     if api_read:
@@ -476,61 +401,28 @@ async def resolve_em_provider_inputs(connection, manifest, control_schema=None, 
 
 
 async def resolve_em_provider_inputs_in_session(session, manifest, control_schema=None):
-    """Verify the complete retained recipe and bind its nine native inputs to this API transaction."""
-    from api.network_read_execution import _original_read_driver, install_network_read_inventory
-    from process.network_compact_layout import CompactAddressRelation
+    """Resolve retained recipe data within the caller's logical read transaction."""
+    from api.network_read_execution import _read_driver
 
     try:
-        transaction = session.get_transaction()
-        if transaction is None:
-            _fail()
-        connection, backend_pid = await _original_read_driver(session)
-        if session.get_transaction() is not transaction or connection.is_in_transaction() is not True:
-            _fail()
+        connection = await _read_driver(session)
         inputs = await resolve_em_provider_inputs(connection, manifest, control_schema, api_read=True)
-        current_driver, current_pid = await _original_read_driver(session)
-        if (
-            current_driver is not connection
-            or current_pid != backend_pid
-            or session.get_transaction() is not transaction
-            or connection.is_in_transaction() is not True
-            or type(inputs) is not EMProviderInputs
-        ):
-            _fail()
-        await install_network_read_inventory(
-            session,
-            tuple(
-                CompactAddressRelation(relation.schema_name, relation.table_name, relation.relation_oid)
-                for relation in inputs.relations
-            ),
-        )
-        current_driver, current_pid = await _original_read_driver(session)
-        if (
-            current_driver is not connection
-            or current_pid != backend_pid
-            or session.get_transaction() is not transaction
-            or connection.is_in_transaction() is not True
-        ):
+        if type(inputs) is not EMProviderInputs:
             _fail()
         return inputs
     except Exception:
         raise PlanPricingProjectionUnavailable("Managed provider inputs are unavailable") from None
 
 
-async def verify_candidate_em_provider_inputs(connection, candidate, *, runtime_roles):
-    """Verify a declared candidate recipe before any publication or retained replay."""
+async def verify_candidate_em_provider_inputs(connection, candidate, *, runtime_roles=None):
+    """Recheck a declared candidate's actual named provider columns and keys before publication."""
     from process.network_membership_validation import _em_provider_receipt
 
     receipt = _em_provider_receipt(candidate)
     if receipt is None:
         return None
-    _runtime_roles(runtime_roles)
-    if list(runtime_roles) != receipt["runtime_roles"]:
-        _fail()
     try:
-        current = await prepare_em_provider_inputs(connection, _receipt(receipt), runtime_roles=runtime_roles)
+        await prepare_em_provider_inputs(connection, _receipt(receipt))
     except asyncpg.PostgresError as error:
-        raise ValueError("Managed provider input custody is unavailable") from error
-    if current != receipt:
-        _fail()
+        raise ValueError("Managed provider input data is unavailable") from error
     return receipt

@@ -12,83 +12,8 @@ from process import registry_pricing_local_rows as local
 from process import registry_pricing_snapshot_rows as rows
 from process.ptg_parts import ptg2_physical_binding as physical
 from tests.ptg2_manifest_tables_support import strict_snapshot_row, strict_v4_serving_index
-from tests.test_ptg2_local_physical_read_view import _view_fixture
-from tests.test_ptg2_local_preparation_authority import _ownership, _published_control_fixture
+from tests.test_ptg2_local_physical_read_view import _installed_fixture, _legacy_view_fixture, _view_fixture
 from tests.test_registry_pricing_snapshot_rows import SnapshotDriver, metadata
-
-
-def _catalog_fixture():
-    binding, _, _, _ = _published_control_fixture()
-    ownership = _ownership(binding)
-    relations = [
-        {
-            "schema_name": ownership.schema_name,
-            "oid": oid,
-            "relname": name,
-            "relkind": "r",
-            "ordinary": True,
-            "index_table_oid": None,
-        }
-        for name, oid in ownership.relation_oids
-    ]
-    relations += [
-        {
-            "schema_name": ownership.schema_name,
-            "oid": oid,
-            "relname": name,
-            "relkind": "S",
-            "ordinary": True,
-            "index_table_oid": None,
-        }
-        for name, oid, _, _ in ownership.sequence_oids
-    ]
-    sequences = [
-        {"sequence_name": name, "sequence_oid": oid, "table_name": table, "column_name": column}
-        for name, oid, table, column in ownership.sequence_oids
-    ]
-    return ownership, relations, sequences
-
-
-@pytest.mark.parametrize("change", [None, "missing", "oid", "schema", "rls", "unknown", "duplicate", "sequence"])
-def test_complete_native_inventory_requires_every_exact_object(change):
-    ownership, relations, sequences = _catalog_fixture()
-    if change == "missing":
-        relations.pop(0)
-    if change == "oid":
-        relations[0]["oid"] += 10000
-    if change == "schema":
-        relations[0]["schema_name"] = "other"
-    if change == "rls":
-        relations[0]["ordinary"] = False
-    if change == "unknown":
-        relations.append({**relations[0], "relname": "unexpected", "oid": 999999})
-    if change == "duplicate":
-        relations.append(dict(relations[0]))
-    if change == "sequence":
-        sequences[0]["column_name"] = "other"
-    if change is None:
-        local._family_inventory(ownership, relations, sequences)
-    else:
-        with pytest.raises(physical.PTG2PhysicalBindingError):
-            local._family_inventory(ownership, relations, sequences)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, ValueError("view"), asyncio.CancelledError()])
-async def test_deparser_restores_without_replacing_original_failure(failure):
-    driver = SimpleNamespace(
-        fetchval=AsyncMock(return_value="original"), fetchrow=AsyncMock(return_value={"oid": 1}), execute=AsyncMock()
-    )
-    if failure is not None:
-        driver.fetchrow.side_effect = failure
-        driver.execute.side_effect = [None, RuntimeError("restore")]
-        with pytest.raises(type(failure)) as caught:
-            await local._view_proof(driver, "trusted", 1, "mrf", 4096)
-        assert caught.value is failure and "restoration" in failure.__notes__[-1]
-    else:
-        assert await local._view_proof(driver, "trusted", 1, "mrf", 4096) == {"oid": 1}
-    assert driver.execute.await_count == 2
-    assert driver.execute.await_args.args == ("SELECT pg_catalog.set_config('search_path',$1,true)", "original")
 
 
 @pytest.mark.asyncio
@@ -216,72 +141,28 @@ async def test_consumed_local_row_preserves_destination_and_payload_keys(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_native_role_and_fixed_view_refuse_before_header_reads():
-    driver = SimpleNamespace(is_in_transaction=lambda: True, fetch=AsyncMock(return_value=[]))
-    with pytest.raises(physical.PTG2PhysicalBindingError):
-        await local._qualify_installed_view(driver, 4096)
-    assert driver.fetch.await_count == 1
-    query, names, _, columns, cap = driver.fetch.await_args.args
-    assert "requested.table_name" in query and names == [
-        physical._PREPARATION + suffix for suffix in ("", "_relation", "_sequence")
-    ]
-    assert columns == list(physical._INITIAL_PREPARATION_COLUMNS) and cap == 4096
-
-
-def _installed_fixture():
-    binding, authority_by_field = _view_fixture()
-    _, control, evidence, publication = _published_control_fixture()
+@pytest.mark.parametrize("requested_count", [1, 8, 64])
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_complete_named_payload_uses_bounded_set_queries(requested_count, legacy):
+    binding, authority, control = _installed_fixture()
+    if legacy:
+        binding, authority = _legacy_view_fixture(False)
     control.update(
         attested_source_key="source_a",
         attested_coverage_scope_id="a" * 64,
         attested_source_set_digest="b" * 64,
         attested_audit_sample_digest="c" * 64,
     )
-    for field in ("initialization", "data", "native_audit", "activation_evidence"):
-        authority_by_field["native_validation"][field].update(evidence[field])
-    authority_by_field["native_validation"]["control_sha256"] = evidence["control_sha256"]
-    authority_by_field["native_validation"]["activation_evidence"]["control_sha256"] = evidence["control_sha256"]
-    authority_by_field = {**dict.fromkeys(physical._local_read_view_columns(False)), **authority_by_field}
-    authority_by_field.update(contract="ptg.installed-physical-binding-read.v1", native_publication=publication)
-    ownership, relations, sequences = _catalog_fixture()
-    columns = [
-        dict(table_name=name, column_name="key", data_type="bigint", attnotnull=True, attidentity="", attgenerated="")
-        for name, _ in ownership.relation_oids
-    ]
-    objects = [
-        dict(kind="relation", oid=oid, name=name, owner=binding.owner_oid, definition="r:p:0:0")
-        for name, oid in ownership.relation_oids
-    ]
-    digest = physical._local_catalog_digest(ownership, objects, columns)
-    authority_by_field["native_validation"]["catalog_sha256"] = digest
-    authority_by_field["native_validation"]["native_audit"]["catalog_sha256"] = digest
-    return binding, authority_by_field, control, ownership, relations, sequences, objects, columns
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("requested_count", [1, 8, 64])
-async def test_complete_payload_phases_use_fixed_set_queries(monkeypatch, requested_count):
-    """Pure payload proof only: authentic view/role qualification is explicitly stubbed here."""
-    binding, authority_by_field, control, ownership, relations, sequences, objects, columns = _installed_fixture()
     calls = []
-    task = asyncio.current_task()
+    original_task = asyncio.current_task()
 
     async def fetch(query, *parameters):
-        assert asyncio.current_task() is task
+        assert asyncio.current_task() is original_task
         assert "WITH selected AS MATERIALIZED" in query and "byte_count<=" in query
+        assert "pg_class" not in query and "pg_roles" not in query
         calls.append((query, parameters))
         if "SELECT * FROM" in query:
-            return [deepcopy(authority_by_field)]
-        if "AS schema_name" in query:
-            return [dict(selected_by_field, schema_oid=binding.schema_oid) for selected_by_field in relations]
-        if "d.deptype IN ('a','i')" in query:
-            return [dict(selected_by_field, schema_oid=binding.schema_oid) for selected_by_field in sequences]
-        if "custody.*" in query:
-            return [dict(schema_oid=binding.schema_oid, object_count=len(relations), closed=True)]
-        if "AS schema_oid,'relation'" in query:
-            return [dict(selected_by_field, schema_oid=binding.schema_oid) for selected_by_field in objects]
-        if "AS schema_oid,c.relname" in query:
-            return [dict(selected_by_field, schema_oid=binding.schema_oid) for selected_by_field in columns]
+            return [deepcopy(authority)]
         if "AS request_no,snapshot.*" in query:
             return [dict(deepcopy(control), request_no=1)]
         if "SELECT snapshot_id,plan_id" in query:
@@ -291,7 +172,6 @@ async def test_complete_payload_phases_use_fixed_set_queries(monkeypatch, reques
         raise AssertionError(query)
 
     driver = SimpleNamespace(is_in_transaction=lambda: True, fetch=fetch, execute=AsyncMock())
-    monkeypatch.setattr(local, "_qualify_installed_view", AsyncMock(return_value=binding.owner_oid))
     selected = [{"snapshot_id": binding.snapshot_id}] + [
         {"snapshot_id": f"missing-{index}"} for index in range(1, requested_count)
     ]
@@ -299,49 +179,19 @@ async def test_complete_payload_phases_use_fixed_set_queries(monkeypatch, reques
     assert set(resolved) == {binding.snapshot_id}
     assert resolved[binding.snapshot_id][1] == binding
     assert resolved[binding.snapshot_id][0]["bound_snapshot_key"] == binding.destination_layout_key
-    assert len(calls) == 9
+    assert len(calls) == 4
     assert calls[0][1][0] == [selected_by_field["snapshot_id"] for selected_by_field in selected]
     assert driver.execute.await_count == 1
-    assert str(driver.execute.await_args.args[0]).startswith("LOCK TABLE ONLY ")
+    sql = driver.execute.await_args.args[0]
+    assert sql.startswith("LOCK TABLE ONLY ") and "ACCESS SHARE MODE NOWAIT" in sql
+    assert all(binding.relation(name) in sql for _schema, name in binding.relations)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("definition", ["SELECT 1;", "SELECT 2;"])
-@pytest.mark.parametrize("drift", [None, "body", "qualified-body", "acl", "oid", "columns"])
-async def test_ordinary_driver_pins_approved_definition_and_oid(monkeypatch, definition, drift):
-    """The ordinary driver keeps the same definition and object proof as the Session reader."""
-    import hashlib
-
-    monkeypatch.setattr(physical, "INSTALLED_LOCAL_READ_VIEW_SHA256", hashlib.sha256(b"SELECT 1;").hexdigest())
-    monkeypatch.setattr(
-        physical, "INSTALLED_OPERATION_OWNED_READ_VIEW_SHA256", hashlib.sha256(b"SELECT 2;").hexdigest()
-    )
-    monkeypatch.setattr(local, "_installed_owner", AsyncMock(return_value=73))
-    initial_proof_by_field = {
-        "oid": 88,
-        "definition": definition,
-        "read_only": True,
-        "columns": physical._local_read_view_columns(False),
-    }
-    locked_proof_by_field = deepcopy(initial_proof_by_field)
-    mutation_by_kind = {
-        "body": ("definition", "SELECT 3;"),
-        "qualified-body": ("definition", "SELECT 2;" if definition == "SELECT 1;" else "SELECT 1;"),
-        "acl": ("read_only", False),
-        "oid": ("oid", 89),
-        "columns": ("columns", {}),
-    }
-    if drift:
-        field_name, field_value = mutation_by_kind[drift]
-        locked_proof_by_field[field_name] = field_value
-    proof = AsyncMock(side_effect=[initial_proof_by_field, locked_proof_by_field])
-    monkeypatch.setattr(local, "_view_proof", proof)
-    driver = SimpleNamespace(fetchval=AsyncMock(return_value=True), execute=AsyncMock())
-    if drift:
-        with pytest.raises(physical.PTG2PhysicalBindingError):
-            await local._qualify_installed_view(driver, 4096)
-    else:
-        assert await local._qualify_installed_view(driver, 4096) == 73
-    assert proof.await_count == 2
-    assert "ACCESS SHARE MODE NOWAIT" in driver.execute.await_args.args[0]
-    assert "security_invoker=false" in proof.await_args.args[1]
+@pytest.mark.parametrize("fault", ["unknown", "duplicate"])
+async def test_installed_projection_refuses_wrong_or_duplicate_snapshot(fault):
+    binding, authority, _control = _installed_fixture()
+    selected = [authority, authority] if fault == "duplicate" else [{**authority, "destination_snapshot_id": "other"}]
+    driver = SimpleNamespace(is_in_transaction=lambda: True, fetch=AsyncMock(return_value=selected))
+    with pytest.raises(physical.PTG2PhysicalBindingError, match="installed identity"):
+        await local._installed_bindings(driver, (binding.snapshot_id,), 16 * 1024 * 1024)

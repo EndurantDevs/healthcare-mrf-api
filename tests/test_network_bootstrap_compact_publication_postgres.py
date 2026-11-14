@@ -25,11 +25,10 @@ from tests.test_network_fhir_source_witness_publication_postgres import (
     _consumer,
     _manifest,
     _membership_snapshot,
-    _publication_callbacks,
     _publication_case,
 )
 from tests.test_registry_initial_inventory_postgres import _sources as _bootstrap_sources
-from tests.test_registry_publication_consumer_postgres import _enqueue_ordinary, _retained_recipe_custody, _status
+from tests.test_registry_publication_consumer_postgres import _enqueue_ordinary, _status
 from tests.test_registry_publication_worker_permissions_postgres import _login
 
 pytestmark = pytest.mark.asyncio
@@ -109,7 +108,7 @@ async def _published_memberships(connection, manifest):
 async def _assert_compact_generation(context, manifest, bootstrap, retained_network, original):
     assert manifest.compact_layout is not None
     assert manifest.compact_layout.base.schema_name == bootstrap.address_source.schema_name
-    assert manifest.compact_layout.base.table_oid == dict(bootstrap.relation_oids)["entity_address_unified"]
+    assert manifest.compact_layout.base.table_name == bootstrap.address_source.table_name
     async with _login(context.worker, "execution") as reader:
         async with reader.transaction(isolation="repeatable_read", readonly=True):
             memberships, provider_only = await _membership_snapshot(reader, manifest)
@@ -136,7 +135,6 @@ async def test_legacy_bootstrap_head_upgrades_and_reuses_compact_origin(monkeypa
             initial_source_recipes=(retained,),
             source_witness_runtime=context.runtime,
         )
-        context.worker.publication_custody_by_name = _retained_recipe_custody(context.worker, context.operator)
         first = await _queued_publication(context, initial)
         assert first.compact_layout is None
         assert await _candidate_address_pin(context, first) == {
@@ -149,7 +147,6 @@ async def test_legacy_bootstrap_head_upgrades_and_reuses_compact_origin(monkeypa
         replacement = replace(
             initial, compact=True, initial_source_recipes=(), replacement_source_recipes=(retained, context.recipe)
         )
-        context.worker.publication_custody_by_name = _publication_callbacks(context)
         async with _login(context.worker, "execution") as pinned:
             async with pinned.transaction(isolation="repeatable_read", readonly=True):
                 assert (
@@ -178,4 +175,6 @@ async def test_legacy_bootstrap_head_upgrades_and_reuses_compact_origin(monkeypa
         )
         record_property("legacy_pinned_reads", "membership and address results unchanged across publication")
         record_property("ordinary_bootstrap_content_scans", content_scan.await_count)
-        record_property("limits", "local real queue/custody/Source fixture; no deployed import or API timing claim")
+        record_property(
+            "limits", "local real queue/administrator freeze/Source fixture; no deployed import or API timing claim"
+        )

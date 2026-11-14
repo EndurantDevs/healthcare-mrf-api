@@ -257,40 +257,54 @@ def _decode_flat_fhir_pin(document):
 
 def _decode_flat_fhir_pin_values(document):
     all_names = {field.name for field in fields(PinnedFHIRMembershipSource)} - {"retained_successor"}
-    custody_names = all_names - {
+    optional_fields = {
         "retained_epoch",
         "retained_capture",
         "source_witness_capture",
         "source_witness_anchor",
+        "edition_id",
     }
-    legacy_names = {name for name in custody_names if not name.startswith("custody_")}
-    epoch_names = legacy_names | {"retained_epoch"}
-    capture_names = legacy_names | {"retained_capture"}
-    witness_names = legacy_names | {"source_witness_capture", "source_witness_anchor"}
-    if type(document) is not dict or set(document) not in (
-        legacy_names,
-        custody_names,
-        epoch_names,
-        capture_names,
-        witness_names,
-    ):
+    named = all_names - optional_fields
+    legacy = named - {"resource_relation"} | {"resource_table_oid"}
+    retired_fields = {"custody_owner_role", "custody_runtime_roles", "custody_proof_sha256", "custody_catalog_sha256"}
+    groups = (set(), {"retained_epoch"}, {"retained_capture"}, {"source_witness_capture", "source_witness_anchor"})
+    shapes = [
+        base | group | edition for base in (named, legacy) for group in groups for edition in (set(), {"edition_id"})
+    ] + [legacy | retired_fields]
+    if type(document) is not dict or set(document) not in shapes:
         raise RegistrySourceRecipeError("registry_source_recipes_invalid")
-    values_by_name = dict(document)
-    if set(document) == custody_names:
-        if type(document["custody_runtime_roles"]) is not list or document["custody_owner_role"] is None:
+    values_by_name = {
+        key: field_value for key, field_value in document.items() if key not in retired_fields | {"resource_table_oid"}
+    }
+    if (
+        "resource_table_oid" in document
+        or type(document.get("retained_epoch")) is dict
+        and "schema_oid" in document["retained_epoch"]
+    ):
+        # The already published edition remains opaque; only logical names/data are decoded.
+        values_by_name["edition_id"] = hashlib.sha256(
+            json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    if "resource_table_oid" in document:
+        if type(document["resource_table_oid"]) is not int or not 0 < document["resource_table_oid"] < 2**32:
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")
-        values_by_name["custody_runtime_roles"] = tuple(document["custody_runtime_roles"])
-    if set(document) == epoch_names:
+        values_by_name["resource_relation"] = {
+            "schema": document["schema_name"],
+            "name": "provider_directory_dataset_resource",
+        }
+    elif type(values_by_name["resource_relation"]) is not dict:
+        raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+    if "retained_epoch" in document:
         if type(document["retained_epoch"]) is not dict:
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")
         values_by_name["retained_epoch"] = validate_retained_cms_fhir_source_epoch(document["retained_epoch"])
-    if set(document) == capture_names:
+    if "retained_capture" in document:
         from process.network_fhir_retained_capture_contract import validate_capture
 
         if type(document["retained_capture"]) is not dict:
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")
         values_by_name["retained_capture"] = validate_capture(document["retained_capture"])
-    if set(document) == witness_names:
+    if "source_witness_capture" in document:
         if type(document["source_witness_capture"]) is not dict:
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")
         values_by_name["source_witness_capture"] = validate_source_witness_capture(document["source_witness_capture"])
@@ -478,6 +492,30 @@ def decode_registry_source_recipes(value) -> tuple[RegistrySourceMembershipRecip
         raise RegistrySourceRecipeError("registry_source_recipes_invalid") from None
 
 
+def canonical_decoded_registry_source_recipes(document):
+    """Check complete old/new recipe syntax while retaining original canonical transport bytes."""
+    raw = _decode_document(document)
+    decoded = decode_registry_source_recipes(raw)
+    encoded = _canonical_json(raw)
+    if canonical_registry_source_recipes(decoded) != encoded:
+
+        def is_projected_legacy(recipe_document):
+            """Recognize a validated historical pin whose physical fields were projected out."""
+            pin = recipe_document.get("source_pin") if type(recipe_document) is dict else None
+            return type(pin) is dict and (
+                "resource_table_oid" in pin
+                or type(pin.get("retained_epoch")) is dict
+                and "schema_oid" in pin["retained_epoch"]
+            )
+
+        if not any(is_projected_legacy(recipe_document) for recipe_document in raw):
+            raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+        if raw != sorted(raw, key=_canonical_json):
+            raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+        # Every item has already passed its exact closed decoder above.
+    return encoded
+
+
 def registry_source_recipes_sha256(canonical: str) -> str:
     """Hash only the exact canonical representation, never a permissive JSON input."""
     if (
@@ -497,10 +535,11 @@ def verify_registry_source_recipes(candidate: Mapping) -> tuple[RegistrySourceMe
         generations = _decode_document(candidate["source_generations"])
         if type(generations) is not dict:
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")
-        expected = registry_source_recipes_sha256(canonical_registry_source_recipes(recipes)) if recipes else None
-        if (recipes and generations.get(RECIPE_DIGEST_KEY) != expected) or (
-            not recipes and RECIPE_DIGEST_KEY in generations
-        ):
+        raw = _decode_document(candidate["source_recipes_json"])
+        retained_id = generations.get(RECIPE_DIGEST_KEY)
+        canonical = canonical_decoded_registry_source_recipes(raw)
+        expected = hashlib.sha256(canonical.encode()).hexdigest() if recipes else None
+        if (recipes and retained_id != expected) or (not recipes and RECIPE_DIGEST_KEY in generations):
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")
         return recipes
     except ValueError, TypeError, KeyError, UnicodeError, RecursionError:
@@ -529,38 +568,20 @@ def _source_inventory_recipe_digest(recipes):
 
 
 async def _retained_inventory_recipes(connection, candidate, control_schema, *, api_read=False):
-    from db.registry_source_inventory_schema import INVENTORY_TABLE
-    from process.network_candidate_custody import verify_network_candidate_custody
     from process.network_membership_copy import MembershipCopyTarget
-    from process.registry_source_inventory_store import _load_locked_source_inventory
+    from process.registry_source_inventory_store import load_source_inventory
 
     target = MembershipCopyTarget(
         *(str(candidate[field]) for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name"))
     )
     if type(api_read) is not bool:
         raise RegistrySourceRecipeError("registry_source_recipes_unavailable")
-    if api_read:
-        from process.registry_source_inventory_store import load_source_inventory_for_api
-
-        _, entries = await load_source_inventory_for_api(connection, target, candidate, control_schema=control_schema)
-        return _decode_source_inventory_recipes(entries)
-    custody = await verify_network_candidate_custody(connection, target, control_schema=control_schema, required=True)
-    _, entries = await _load_locked_source_inventory(
-        connection,
-        target,
-        candidate,
-        expected_table_oid=custody["receipt"]["closure"]["relation_oids"][INVENTORY_TABLE],
-        control_schema=control_schema,
-    )
+    _, entries = await load_source_inventory(connection, target, candidate, control_schema=control_schema)
     return _decode_source_inventory_recipes(entries)
 
 
 async def resolve_retained_registry_source_recipes(connection, pinned_manifest, *, control_schema=None, api_read=False):
-    """Recheck exact retained manifest and native writer closure without any writes.
-
-    Trusted API callers explicitly select RR/RO metadata and consumed-read checks;
-    producer and maintenance defaults retain their original locking verification.
-    """
+    """Read exact retained manifest and complete inventory data in the pinned transaction."""
     try:
         if (
             type(api_read) is not bool

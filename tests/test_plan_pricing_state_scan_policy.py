@@ -21,6 +21,7 @@ from api.network_address_scope import current_network_address_scope, network_add
 from api.plan_pricing_projection_contract import PROJECTION_CONTRACT, PlanPricingProjectionUnavailable
 from api.plan_release_serving import PlanReleaseSnapshotBinding
 from process.custom_import.read_core import PreparedNpiEntityRelation
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 from tests.test_plan_pricing_state_scan import _args, _keyring, _occurrence, _selection, _Session
@@ -36,7 +37,14 @@ def _pin(**changes):
     candidate = "11111111-1111-4111-8111-111111111111"
     return replace(
         PinnedNetworkServingManifest(
-            17, candidate, "network_candidate_" + candidate.replace("-", ""), 1, {}, 23, "b" * 64, 99
+            17,
+            candidate,
+            "network_candidate_" + candidate.replace("-", ""),
+            1,
+            {},
+            23,
+            "b" * 64,
+            CompactAddressRelation("network_candidate_" + candidate.replace("-", ""), "entity_address_unified"),
         ),
         **changes,
     )

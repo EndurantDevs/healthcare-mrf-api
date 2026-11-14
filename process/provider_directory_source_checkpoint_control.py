@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Original-session authority and bounded parent fences for batch checkpoints."""
+"""Active batch transactions and bounded parent fences for checkpoints."""
 
 import asyncio
 import time
@@ -171,15 +171,17 @@ def _coordinates(values, limit):
 async def require_checkpoint_executor(executor, *, bulk_identity=None):
     """Require the current batch and its immutable checkpoint scope."""
     publisher = bound_publisher()
-    session = source_copy_session()
+    source_copy_session()
     if not isinstance(getattr(publisher, "storage_binding", None), NamedFHIRSourceStorage):
         if isinstance(executor, Database):
             binding = executor._transaction_binding()
-            is_original = binding is not None and binding.session is session
+            batch_session = binding.session if binding is not None else None
         else:
-            is_original = isinstance(executor, ConnectionProxy) and executor._connection is session
-        _require(is_original, "checkpoint_transaction_changed")
-        _require(await _copy_driver(session) is publisher.connection, "checkpoint_transaction_changed")
+            batch_session = executor._connection if isinstance(executor, ConnectionProxy) else None
+        _require(batch_session is not None, "checkpoint_transaction_changed")
+        source._require_active_source_session(batch_session)
+        source._require_active_source_session(await _copy_driver(batch_session))
+        source._require_active_source_session(publisher.connection)
     if bulk_identity is not None:
         _require(_BULK_IDENTITY.get() == _bulk_identity(bulk_identity), "checkpoint_identity_scope_changed")
         if getattr(publisher, "storage_binding", None) is not None:

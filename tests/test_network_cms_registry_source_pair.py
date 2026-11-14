@@ -63,7 +63,7 @@ def test_retained_wire_roundtrip_preserves_original_capture(make_pair):
     assert replay.recipe.source_pin.read_schema_name != replay.proof.source_pin.schema_name
 
 
-@pytest.mark.parametrize("pin_kind", ["foreign-source", "retained", "custody", "untyped"])
+@pytest.mark.parametrize("pin_kind", ["foreign-source", "retained", "untyped"])
 def test_publication_proof_refuses_prebound_or_foreign_source(pin_kind):
     pair = _retained_pair()
     pin = pair.proof.source_pin
@@ -71,14 +71,6 @@ def test_publication_proof_refuses_prebound_or_foreign_source(pin_kind):
         pin = replace(pin, source_id="other-source")
     elif pin_kind == "retained":
         pin = pair.recipe.source_pin
-    elif pin_kind == "custody":
-        pin = replace(
-            pin,
-            custody_owner_role="retained_owner",
-            custody_runtime_roles=("retained_reader",),
-            custody_proof_sha256="1" * 64,
-            custody_catalog_sha256="2" * 64,
-        )
     else:
         pin = pair.proof.source_pin.coordinates
     with pytest.raises(ValueError, match="^registry_cms_publication_proof_invalid$"):

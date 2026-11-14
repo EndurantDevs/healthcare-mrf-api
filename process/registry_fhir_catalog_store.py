@@ -2,7 +2,9 @@
 """Bounded native loading and carry-forward for isolated FHIR metadata candidates."""
 
 import json
+import os
 import re
+from dataclasses import asdict
 from datetime import date, datetime
 from uuid import UUID, uuid4
 
@@ -11,9 +13,10 @@ from db.registry_fhir_catalog import table_sql
 from process.registry_fhir_catalog_custody import (
     PHYSICAL_TABLES,
     FHIRCatalogTarget,
-    verify_fhir_catalog_snapshot,
+    validate_fhir_catalog_snapshot_record,
 )
 from process.registry_fhir_catalog_projection import BINDING_COLUMNS, NETWORK_COLUMNS, RELATIONSHIP_COLUMNS
+from process.registry_fhir_catalog_validation import canonical_json
 
 TABLE_COLUMNS = {
     "registry_fhir_catalog_source": (
@@ -54,6 +57,167 @@ _KEYS = {
 DEFAULT_ROWS = 1000
 DEFAULT_BYTES = 8 * 1024 * 1024
 MAX_BYTES = 34 * 1024 * 1024
+
+
+def named_catalog_preparation_roles(configured=None):
+    """Read configured administrative role names outside portable snapshot metadata."""
+    roles_by_name = configured
+    if roles_by_name is None:
+        from process.registry_fhir_catalog_worker import CONFIG_ENV, _validated_fhir_catalog_sync_config
+
+        roles_by_name = _validated_fhir_catalog_sync_config(os.environ.get(CONFIG_ENV))
+    if type(roles_by_name) is not dict:
+        if getattr(roles_by_name, "preparation_roles", None) is not None:
+            return named_catalog_preparation_roles(roles_by_name.preparation_roles)
+        roles_by_name = {
+            "namespace_owner_role": roles_by_name.consumer.physical_owner_role,
+            "publisher_role": roles_by_name.sealer_url.username,
+            "application_roles": sorted(
+                {
+                    roles_by_name.loader_role,
+                    roles_by_name.sealer_url.username,
+                    roles_by_name.lifecycle_url.username,
+                    roles_by_name.execution_url.username,
+                    *roles_by_name.reader_roles,
+                    *roles_by_name.consumer.loader_roles,
+                    *roles_by_name.consumer.reader_roles,
+                }
+            ),
+        }
+    if set(roles_by_name) != {"namespace_owner_role", "publisher_role", "application_roles"}:
+        _invalid("preparation_roles_invalid")
+    applications = roles_by_name["application_roles"]
+    if (
+        type(applications) not in {list, tuple}
+        or not 1 <= len(applications) <= 128
+        or any(type(role) is not str for role in applications)
+        or list(applications) != sorted(set(applications))
+    ):
+        _invalid("preparation_roles_invalid")
+    owner, publisher = roles_by_name["namespace_owner_role"], roles_by_name["publisher_role"]
+    for role in (owner, publisher, *applications):
+        storage_identifier(role)
+    if owner in applications or owner == publisher or publisher not in applications:
+        _invalid("preparation_roles_invalid")
+    return {"namespace_owner_role": owner, "publisher_role": publisher, "application_roles": list(applications)}
+
+
+def catalog_snapshot_preparation(snapshot):
+    """Decode the bounded logical checkpoint retained with the catalog control row."""
+    record = snapshot.get("custody_json")
+    if type(record) is str:
+        record = json.loads(record)
+    if type(record) is not dict or "preparation" not in record:
+        return None
+    validation_fields = {"metadata_generation", "inputs", "tables", "content_sha256"}
+    if set(record) not in ({"preparation"}, {"preparation"} | validation_fields):
+        _invalid("preparation_invalid")
+    preparation = record["preparation"]
+    if type(preparation) is not dict or set(preparation) != {"target", "previous_metadata_generation", "accounting"}:
+        _invalid("preparation_invalid")
+    if type(preparation["target"]) is not dict or set(preparation["target"]) != set(
+        FHIRCatalogTarget.__dataclass_fields__
+    ):
+        _invalid("preparation_invalid")
+    target = FHIRCatalogTarget(**preparation["target"])
+    if target.schema_name != snapshot["schema_name"]:
+        _invalid("preparation_invalid")
+    previous = preparation["previous_metadata_generation"]
+    if previous is not None:
+        _digest(previous)
+    if type(preparation["accounting"]) is not dict:
+        _invalid("preparation_invalid")
+    if len(canonical_json(preparation).encode()) > DEFAULT_BYTES:
+        _invalid("preparation_bounds")
+    return preparation
+
+
+def named_catalog_preparation(snapshot, control_schema):
+    """Produce the stable common handoff from an actual persisted catalog checkpoint."""
+    preparation = catalog_snapshot_preparation(snapshot)
+    if preparation is None:
+        return None
+    _digest(snapshot["metadata_generation"])
+    target = FHIRCatalogTarget(**preparation["target"])
+    storage_identifier(control_schema)
+    return {
+        "kind": "catalog",
+        "candidate_id": target.candidate_id,
+        "catalog_schema": control_schema,
+        "storage_schema": target.schema_name,
+        "tables": [{"schema": target.schema_name, "name": table} for table in sorted(PHYSICAL_TABLES)],
+        "snapshot": {
+            "metadata_generation": snapshot["metadata_generation"],
+            "target": preparation["target"],
+            "previous_metadata_generation": preparation["previous_metadata_generation"],
+        },
+    }
+
+
+async def load_named_catalog_preparation(connection, candidate_id, *, control_schema=None):
+    """Load one candidate through its indexed qualified storage name."""
+    from process.registry_source_observation_store import source_observation_namespace
+
+    candidate = UUID(str(candidate_id))
+    if not candidate.int or str(candidate) != str(candidate_id):
+        _invalid("preparation_invalid")
+    namespace = source_observation_namespace(control_schema)
+    snapshot = await connection.fetchrow(
+        f"SELECT metadata_generation,schema_name,custody_json FROM {namespace}.registry_fhir_catalog_snapshot "
+        "WHERE schema_name=$1",
+        "fhir_catalog_" + candidate.hex,
+    )
+    return None if snapshot is None else named_catalog_preparation(snapshot, namespace[1:-1])
+
+
+async def checkpoint_fhir_catalog_snapshot(connection, target, snapshot, previous, accounting, *, control_schema):
+    """Persist completed candidate loading before handing its permissions to the operator."""
+    from db.registry_fhir_catalog import SNAPSHOT_COLUMNS
+
+    _transaction(connection)
+    preparation_by_field = {
+        "target": asdict(target),
+        "previous_metadata_generation": None if previous is None else previous["metadata_generation"],
+        "accounting": json.loads(canonical_json(accounting)),
+    }
+    snapshot.update(custody_json={"preparation": preparation_by_field}, accounting_json={})
+    named_catalog_preparation(snapshot, control_schema)
+    columns = tuple(column for column in SNAPSHOT_COLUMNS if column != "published_at")
+    json_columns = {"custody_json", "accounting_json", "source_vector_json"}
+    parameters = ",".join(
+        f"${index}" + ("::jsonb" if column in json_columns else "") for index, column in enumerate(columns, 1)
+    )
+    await connection.execute(
+        f"INSERT INTO {storage_identifier(control_schema)}.registry_fhir_catalog_snapshot"
+        f"({','.join(columns)}) VALUES({parameters})",
+        *(canonical_json(snapshot[column]) if column in json_columns else snapshot[column] for column in columns),
+    )
+
+
+async def admit_catalog_preparation(connection, snapshot, *, control_schema, roles):
+    """Admit or resume the genuine catalog run recorded in the candidate checkpoint."""
+    import hashlib
+
+    from directory_catalog_runtime import NamedPreparationStore, NativePreparationAdmission
+
+    handoff = named_catalog_preparation(snapshot, control_schema)
+    if handoff is None:
+        _invalid("preparation_required")
+    candidate, generation = handoff["candidate_id"], snapshot["metadata_generation"]
+    request = NativePreparationAdmission(
+        preparation_id=candidate,
+        node_id=control_schema,
+        importer_id="catalog",
+        dataset_key=generation,
+        run_id=candidate,
+        generation_id=candidate,
+        publication_fence=candidate,
+        idempotency_key="catalog:" + generation,
+        request_sha256=hashlib.sha256(canonical_json(handoff).encode()).hexdigest(),
+    )
+    store = NamedPreparationStore(connection, named_catalog_preparation_roles(roles), kind="catalog")
+    row, claim = await store.admit_named(request, handoff, attempt_id=candidate)
+    return store, row, claim
 
 
 def _invalid(reason):
@@ -116,25 +280,6 @@ async def _mutable(connection, target, loader_role, control_schema):
     heaps = ",".join(namespace + "." + table for table in sorted(PHYSICAL_TABLES))
     await connection.execute("LOCK TABLE " + heaps + " IN ROW EXCLUSIVE MODE")
     await _unregistered(connection, target, control_schema)
-    native = await connection.fetchrow(
-        "SELECT n.nspowner::bigint,(SELECT oid::bigint FROM pg_roles WHERE rolname=$2) AS loader_oid,"
-        "array_agg(c.relname::text ORDER BY c.relname) FILTER(WHERE c.relkind='r') AS heaps,"
-        "bool_or(c.relkind NOT IN ('r','i') OR c.relpersistence<>'p' OR c.relowner<>n.nspowner "
-        "OR c.relrowsecurity OR c.relforcerowsecurity OR c.relispartition "
-        "OR EXISTS(SELECT FROM pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal) "
-        "OR EXISTS(SELECT FROM pg_rewrite WHERE ev_class=c.oid) "
-        "OR EXISTS(SELECT FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)) AS unsupported "
-        "FROM pg_namespace n LEFT JOIN pg_class c ON c.relnamespace=n.oid WHERE n.nspname=$1 GROUP BY n.oid,n.nspowner",
-        target.schema_name,
-        loader_role,
-    )
-    if (
-        native is None
-        or native["nspowner"] != native["loader_oid"]
-        or set(native["heaps"] or ()) != PHYSICAL_TABLES
-        or native["unsupported"]
-    ):
-        _invalid("owner_invalid")
 
 
 async def create_fhir_catalog_candidate(connection, target, *, loader_role, control_schema):
@@ -144,11 +289,8 @@ async def create_fhir_catalog_candidate(connection, target, *, loader_role, cont
     await _unregistered(connection, target, control_schema)
     async with connection.transaction():
         await connection.execute(f"CREATE SCHEMA {namespace} AUTHORIZATION {role}")
-        own_role = await connection.fetchval("SELECT current_user")
         for table in sorted(PHYSICAL_TABLES):
             await connection.execute(table_sql(namespace, table)[0])
-            if own_role != loader_role:
-                await connection.execute(f"ALTER TABLE {namespace}.{table} OWNER TO {role}")
         await connection.execute(
             f"CREATE INDEX registry_fhir_catalog_binding_evidence_idx ON {namespace}.registry_fhir_catalog_binding "
             "((document_json->>'evidence_id') COLLATE \"C\")"
@@ -158,11 +300,9 @@ async def create_fhir_catalog_candidate(connection, target, *, loader_role, cont
 
 
 async def has_discarded_fhir_catalog_candidate(connection, target, *, loader_role, control_schema):
-    """Remove only an unregistered candidate still owned by its original loader."""
+    """Remove only an unregistered candidate through its configured loader."""
     _transaction(connection)
     namespace = _target(target)
-    if not await connection.fetchval("SELECT current_user=session_user AND current_user::text=$1", loader_role):
-        _invalid("owner_invalid")
     await _unregistered(connection, target, control_schema)
     if not await connection.fetchval("SELECT to_regnamespace($1) IS NOT NULL", target.schema_name):
         return False
@@ -357,7 +497,7 @@ async def copy_fhir_catalog_snapshot(
     max_rows=DEFAULT_ROWS,
     max_bytes=DEFAULT_BYTES,
 ):
-    """Carry all sealed metadata heaps forward without touching old indexes or serving pins."""
+    """Carry validated named metadata tables forward while preserving retained generations."""
     _bounds(max_rows, max_bytes)
     _transaction(connection)
     _digest(metadata_generation)
@@ -365,7 +505,7 @@ async def copy_fhir_catalog_snapshot(
     previous = storage_identifier(previous_snapshot["schema_name"])
     if previous == namespace:
         _invalid("snapshot_immutable")
-    await verify_fhir_catalog_snapshot(connection, previous_snapshot)
+    await validate_fhir_catalog_snapshot_record(connection, previous_snapshot)
     accounting_by_name = {"input_rows": 0, "affected_rows": 0, "batches": 0, "payload_bytes": 0}
     async with connection.transaction():
         await _mutable(connection, copy_target, loader_role, control_schema)

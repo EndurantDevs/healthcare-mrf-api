@@ -1068,23 +1068,16 @@ def _validate_relation_manifest_fields(
 
 
 def _graph_cache_scope(session: Any, schema_name: str) -> str:
-    """Namespace caches by authenticated physical identity, never authorize reads."""
+    """Namespace caches by qualified payload names and logical snapshot editions."""
     info = getattr(session, "info", None)
     info = info if isinstance(info, dict) else {}
     bindings = info.get("ptg_snapshot_candidate_reads", {})
     bound_relations = bindings.get(_quote_ident(schema_name), {})
     physical_binding = info.get("ptg2_local_read_bindings", {}).get(schema_name)
     if physical_binding is not None:
-        catalog_sha256 = info.get("ptg2_local_read_catalog_sha256", {}).get(schema_name)
         if not isinstance(physical_binding, PTG2PhysicalBinding) or physical_binding.schema_name != schema_name:
             raise PTG2SharedBlockError("PTG physical graph cache identity differs")
-        if (
-            not isinstance(catalog_sha256, str)
-            or len(catalog_sha256) != 64
-            or any(character not in "0123456789abcdef" for character in catalog_sha256)
-        ):
-            raise PTG2SharedBlockError("PTG physical graph cache catalog identity is unavailable")
-        return json.dumps((schema_name, bound_relations, repr(physical_binding), catalog_sha256), sort_keys=True)
+        return json.dumps((schema_name, bound_relations, repr(physical_binding)), sort_keys=True)
     return json.dumps((schema_name, bound_relations), sort_keys=True) if bound_relations else str(schema_name)
 
 

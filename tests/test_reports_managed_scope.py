@@ -15,6 +15,7 @@ from api import provider_collection_network_read as collection
 from api.endpoint import reports
 from api.network_address_scope import network_address_read_scope, scoped_address_parameters
 from api.provider_collection_network_contract import parse_managed_collection_query
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
 
 MANIFEST = PinnedNetworkServingManifest(
@@ -25,7 +26,7 @@ MANIFEST = PinnedNetworkServingManifest(
     {},
     8,
     "a" * 64,
-    100,
+    CompactAddressRelation("network_candidate_00000000000000000000000000000001", "entity_address_unified"),
 )
 CASES = [
     ("pharmacy-markets", {}),

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
 
+import asyncpg
 import pytest
 from asyncpg.pgproto.pgproto import UUID as DriverUUID
 from sanic import response
@@ -24,9 +25,8 @@ from api import provider_profile_snapshot as snapshot
 from api.endpoint import npi as provider
 from api.network_address_scope import network_address_read_scope
 from db import connection as db_connection
-from process.network_read_identity import NetworkReadIdentityError
 from process.registry_network_catalog_read import RegistryNetworkCatalogError
-from tests.network_read_execution_support import mock_approved_control_metadata, with_read_identity_receipts
+from tests.network_read_execution_support import mock_approved_control_metadata, with_read_session
 from tests.test_provider_profile_network_read import address_manifest
 
 _NPI = "1000000491"
@@ -65,9 +65,7 @@ def _fact(**changes):
 def _session(facts, *, bounded=True):
     summary_by_field = {"bounded": bounded, "facts_json": json.dumps(facts)}
     query_result = SimpleNamespace(mappings=lambda: SimpleNamespace(one_or_none=lambda: summary_by_field))
-    return with_read_identity_receipts(
-        SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock(return_value=query_result))
-    )
+    return with_read_session(SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock(return_value=query_result)))
 
 
 async def _project(session, detail_by_field, *, selected=None, evidence=False):
@@ -782,7 +780,7 @@ def _geocode_reader_session(outcome):
         state.lookups.append((lookup, state.depth))
         if outcome == lookup + "_error":
             state.aborted = True
-            raise DBAPIError(sql, None, RuntimeError("synthetic optional lookup failure"))
+            raise DBAPIError(sql, None, asyncpg.UndefinedTableError("synthetic optional lookup failure"))
         coordinates = SimpleNamespace(
             long=-87.5,
             lat=41.5,
@@ -890,9 +888,8 @@ async def test_legacy_offices_without_canonical_coverage_keep_facts_without_inve
     ]
 
 
-def _detail_identity_refusal():
+def _detail_read_refusal():
     error = ServiceUnavailable("Synthetic read changed")
-    error.__cause__ = NetworkReadIdentityError("network_read_identity_invalid")
     return error
 
 
@@ -936,21 +933,14 @@ def detail_reconstruction(monkeypatch):
     return state
 
 
-@pytest.mark.parametrize("failures", [1, 2, 3])
-async def test_unselected_detail_reconstructs_only_before_return_with_fresh_owned_reader(
-    detail_reconstruction, failures
-):
+async def test_unselected_detail_refusal_is_returned_without_replaying_the_request(detail_reconstruction):
     state = detail_reconstruction
-    state.failures = [_detail_identity_refusal() for _ in range(failures)]
-    if failures < 3:
-        assert await metadata.read_direct_detail_response(state.request, _NPI) is state.result
-    else:
-        final_error = state.failures[-1]
-        with pytest.raises(ServiceUnavailable) as caught:
-            await metadata.read_direct_detail_response(state.request, _NPI)
-        assert caught.value is final_error
-    assert state.read.await_count == len(state.sessions) == min(failures + 1, 3)
-    assert len(set(state.sessions)) == len(state.sessions) and not state.active
+    failure = _detail_read_refusal()
+    state.failures = [failure]
+    with pytest.raises(ServiceUnavailable) as caught:
+        await metadata.read_direct_detail_response(state.request, _NPI)
+    assert caught.value is failure
+    assert state.read.await_count == len(state.sessions) == 1 and not state.active
 
 
 @pytest.mark.parametrize("cause", [None, ValueError("metadata"), DBAPIError(None, None, ValueError("SQL"))])
@@ -978,7 +968,7 @@ async def test_started_response_cannot_be_reconstructed(detail_reconstruction):
 
     async def started_response(_request, _npi):
         state.request.responded = True
-        raise _detail_identity_refusal()
+        raise _detail_read_refusal()
 
     state.read.side_effect = started_response
     with pytest.raises(ServiceUnavailable):
@@ -987,7 +977,7 @@ async def test_started_response_cannot_be_reconstructed(detail_reconstruction):
 
 
 @pytest.mark.parametrize(
-    "boundary", ["reader", "writer", "request", "inventory", "force", "sync", "primary_env", "alias_env", "updates"]
+    "boundary", ["reader", "writer", "request", "force", "sync", "primary_env", "alias_env", "updates"]
 )
 async def test_unselected_detail_does_not_reconstruct_borrowed_or_effectful_reads(
     detail_reconstruction, monkeypatch, boundary
@@ -999,8 +989,6 @@ async def test_unselected_detail_does_not_reconstruct_borrowed_or_effectful_read
         state.writer = object()
     if boundary == "request":
         state.request.ctx.sa_session = SimpleNamespace(in_transaction=lambda: True)
-    if boundary == "inventory":
-        monkeypatch.setattr(metadata, "has_network_read_inventory", lambda _session: True)
     if boundary in {"force", "sync"}:
         state.request.args[{"force": "force_address_update", "sync": "sync_geocode"}[boundary]] = "yes"
     if boundary.endswith("_env"):
@@ -1008,24 +996,25 @@ async def test_unselected_detail_does_not_reconstruct_borrowed_or_effectful_read
         monkeypatch.setenv(name, "true")
     if boundary == "updates":
         state.request.app.config["NPI_API_UPDATE_GEOCODE"] = True
-    state.failures = [_detail_identity_refusal()]
+    state.failures = [_detail_read_refusal()]
     with pytest.raises(ServiceUnavailable):
         await metadata.read_direct_detail_response(state.request, _NPI)
     assert state.read.await_count == 1 and not state.active
 
 
-async def test_explicit_false_sync_flag_keeps_native_default_precedence(detail_reconstruction, monkeypatch):
+async def test_explicit_false_sync_flag_does_not_replay_a_failed_read(detail_reconstruction, monkeypatch):
     state = detail_reconstruction
     monkeypatch.setenv("HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "true")
     state.request.args["sync_geocode"] = "false"
-    state.failures = [_detail_identity_refusal()]
-    assert await metadata.read_direct_detail_response(state.request, _NPI) is state.result
-    assert state.read.await_count == 2
+    state.failures = [_detail_read_refusal()]
+    with pytest.raises(ServiceUnavailable):
+        await metadata.read_direct_detail_response(state.request, _NPI)
+    assert state.read.await_count == 1
 
 
-async def test_selected_detail_identity_refusal_does_not_reconstruct(direct_detail):
+async def test_selected_detail_read_refusal_does_not_reconstruct(direct_detail):
     boundary = direct_detail
-    error = _detail_identity_refusal()
+    error = _detail_read_refusal()
     boundary.native_read.side_effect = error
     with pytest.raises(ServiceUnavailable) as caught:
         await metadata.read_direct_detail_response(boundary.request, _NPI)

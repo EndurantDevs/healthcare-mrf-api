@@ -38,35 +38,24 @@ def _sql_identifier(value: str, *, field_name: str) -> str:
 
 
 def validate_projection_dependency_bindings(schema_name: str, bindings: object) -> dict:
-    """Copy one closed, native-identity-bound map supplied by a trusted caller."""
-
+    """Copy the closed family of schema-qualified dependency names."""
     schema_name = _sql_identifier(schema_name, field_name="address schema")
     expected_names = {f"{schema or schema_name}.{table}" for schema, table in _PROJECTION_DEPENDENCIES}
-    fields = {"schema_name", "table_name", "relation_oid", "relfilenode"}
+    fields = {"schema_name", "table_name"}
     if not isinstance(bindings, Mapping) or set(bindings) != expected_names:
         raise ValueError("geo projection dependency binding family is invalid")
     bindings_by_name = {}
     for name in sorted(expected_names):
-        supplied_binding = bindings[name]
-        if not isinstance(supplied_binding, Mapping):
+        supplied = bindings[name]
+        if not isinstance(supplied, Mapping) or set(supplied) not in (fields, fields | {"relation_oid", "relfilenode"}):
             raise ValueError("geo projection dependency binding fields are invalid")
-        binding_by_field = dict(supplied_binding)
-        if set(binding_by_field) != fields:
-            raise ValueError("geo projection dependency binding fields are invalid")
-        for field in ("schema_name", "table_name"):
-            if type(binding_by_field[field]) is not str:
-                raise ValueError("geo projection dependency identifier is invalid")
-            _sql_identifier(binding_by_field[field], field_name=field)
-        if any(
-            type(binding_by_field[field]) is not int or not 0 < binding_by_field[field] < 2**32
-            for field in ("relation_oid", "relfilenode")
-        ):
-            raise ValueError("geo projection dependency identity is invalid")
-        bindings_by_name[name] = binding_by_field
-    relation_oids = {binding["relation_oid"] for binding in bindings_by_name.values()}
-    physical_names = {(binding["schema_name"], binding["table_name"]) for binding in bindings_by_name.values()}
-    if len(relation_oids) != len(expected_names) or len(physical_names) != len(expected_names):
-        raise ValueError("geo projection dependency identities are duplicated")
+        named_by_field = {field: supplied[field] for field in fields}
+        for field, value in named_by_field.items():
+            _sql_identifier(value, field_name=field)
+        bindings_by_name[name] = named_by_field
+    qualified_names = {(binding["schema_name"], binding["table_name"]) for binding in bindings_by_name.values()}
+    if len(qualified_names) != len(expected_names):
+        raise ValueError("geo projection dependency names are duplicated")
     return bindings_by_name
 
 
@@ -84,19 +73,15 @@ def projection_dependency_relation_sql(schema_name: str, canonical_name: str, *,
 
 
 def projection_dependency_bindings_match_sql(schema_name: str, dependency_bindings) -> str:
-    """Recapture exact physical identities after the caller locks every held heap."""
-
+    """Check structural relation readiness by name, independently of copied physical storage."""
     bindings_by_name = validate_projection_dependency_bindings(schema_name, dependency_bindings)
     checks = []
-    for name, binding in bindings_by_name.items():
+    for name in bindings_by_name:
         relation = projection_dependency_relation_sql(schema_name, name, dependency_bindings=bindings_by_name)
-        inheritance = _held_inheritance_sql(name)
         checks.append(
             f"EXISTS (SELECT 1 FROM pg_catalog.pg_class held WHERE held.oid=to_regclass('{relation}') "
-            f"AND held.oid={binding['relation_oid']} AND pg_relation_filenode(held.oid)={binding['relfilenode']} "
             "AND held.relkind='r' AND held.relpersistence='p' AND NOT held.relispartition "
-            "AND NOT held.relrowsecurity AND NOT held.relforcerowsecurity "
-            f"AND {inheritance})"
+            f"AND {_held_inheritance_sql(name)})"
         )
     return " AND ".join(checks)
 

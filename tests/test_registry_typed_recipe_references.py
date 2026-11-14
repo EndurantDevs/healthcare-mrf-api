@@ -17,9 +17,24 @@ from process.registry_source_recipe_additions import (
     decode_source_recipe_additions,
     resolve_source_recipe_additions,
 )
+from tests.test_registry_fhir_catalog_sources import read_profile
+from tests.test_registry_publication_worker import configuration
 from tests.test_registry_source_recipe_additions import _configured_additions
-from tests.test_registry_source_witness_runtime import _document
 from tests.test_registry_typed_source_recipe import _recipe
+
+
+def _document():
+    configured = configuration()
+    configured["initial_address_sources"] = {
+        "base_source": {"schema_name": "address_source", "table_name": "address_rows", "generation_id": "one"},
+        "compact": True,
+    }
+    configured["source_witness"] = {
+        "source_profiles": [read_profile().document()],
+        "capture_owner_role": "capture_owner",
+        "runtime_roles": ["source_publisher", "source_reader"],
+    }
+    return configured
 
 
 def _source_recipe(index):
@@ -32,7 +47,6 @@ def _source_recipe(index):
     original = _recipe()
     catalog, capture = deepcopy(original.source_pin.catalog_descriptor), deepcopy(original.source_pin.capture)
     coordinates = catalog["coordinates"]
-    old_dataset = coordinates["dataset_id"]
     coordinates.update(
         source_id=f"alias-a-{index}",
         dataset_id=f"dataset-{index}",
@@ -42,9 +56,15 @@ def _source_recipe(index):
     catalog["native_read_profile"]["schema_name"] = coordinates["dataset_schema"]
     catalog["source_aliases"] = [f"alias-a-{index}", f"alias-b-{index}"]
     catalog["endpoint_id"] = f"endpoint-{index}"
-    catalog["accepted_receipt_id"] = (
-        catalog["accepted_receipt_id"].removesuffix(old_dataset) + coordinates["dataset_id"]
+    from process.registry_fhir_catalog_observation import (
+        CATALOG_OBSERVATION_CONTRACT,
+        catalog_observation_descriptor_digest,
     )
+
+    catalog["tables"]["resource"]["schema"] = coordinates["dataset_schema"]
+    content = catalog_observation_descriptor_digest(catalog)
+    catalog["accepted_receipt_id"] = CATALOG_OBSERVATION_CONTRACT + ":" + content
+    catalog["accepted_receipt_sha256"] = content
     origin = capture["graph"]["origin"]
     origin.update(
         schema_name=coordinates["dataset_schema"],
@@ -52,14 +72,15 @@ def _source_recipe(index):
         dataset_id=coordinates["dataset_id"],
         endpoint_id=catalog["endpoint_id"],
         source_aliases=catalog["source_aliases"],
+        header_relation=catalog["tables"]["header"],
+        resource_relation=catalog["tables"]["resource"],
     )
     anchor = TypedGraphAnchor(str(UUID(int=index)), capture["observed_at"])
     capture.update(
         capture_id=anchor.capture_id,
         schema_name=PREFIX + UUID(anchor.capture_id).hex,
-        owner_role="capture_owner",
-        runtime_roles=_document()["source_witness"]["runtime_roles"],
     )
+    capture["tables"] = {kind: {**table, "schema": capture["schema_name"]} for kind, table in capture["tables"].items()}
     if "catalog_descriptor" in capture:
         capture["catalog_descriptor"] = catalog
     capture["capture_sha256"] = digest(
@@ -184,6 +205,8 @@ def _old_capture_recipe(typed, *, second=False):
     origin = replace(
         capture.origin,
         schema_name=coordinates.dataset_schema,
+        header_relation={**capture.origin.header_relation, "schema": coordinates.dataset_schema},
+        resource_relation={**capture.origin.resource_relation, "schema": coordinates.dataset_schema},
         source_id=coordinates.source_id,
         endpoint_id=typed.source_pin.capture["graph"]["origin"]["endpoint_id"],
         dataset_id="old-dataset-two" if second else "old-dataset-one",
@@ -255,7 +278,7 @@ async def test_replacement_hydrates_complete_vector_preserves_non_fhir_and_remov
 
 
 @pytest.mark.parametrize("damage", ["source", "schema", "endpoint", "dropped", "duplicate"])
-def test_typed_successor_requires_one_exact_physical_source_and_preserves_old_slots(damage):
+def test_typed_successor_preserves_exact_logical_source_scope_and_old_slots(damage):
     from process.registry_fhir_serving_preservation import FHIRServingPreservationError, fhir_vector_succession
 
     typed = _source_recipe(1)
@@ -272,7 +295,13 @@ def test_typed_successor_requires_one_exact_physical_source_and_preserves_old_sl
         from tests.test_network_fhir_retained_capture import pin
 
         field = {"source": "source_id", "schema": "schema_name", "endpoint": "endpoint_id"}[damage]
-        capture = replace(capture, origin=replace(capture.origin, **{field: "different"}))
+        origin_changes_by_field = {field: "different"}
+        if field == "schema_name":
+            origin_changes_by_field.update(
+                header_relation={**capture.origin.header_relation, "schema": "different"},
+                resource_relation={**capture.origin.resource_relation, "schema": "different"},
+            )
+        capture = replace(capture, origin=replace(capture.origin, **origin_changes_by_field))
         capture = replace(capture, capture_sha256=capture_digest(capture))
         source_pin = pin(capture)
         old = replace(

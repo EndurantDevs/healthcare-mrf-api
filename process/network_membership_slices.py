@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 from db.registry_schema import registry_schema
 from process import registry_typed_membership_parity
 from process.network_address_projection import PinnedAddressSource, _identifier, _lock_candidate
+from process.network_compact_layout import CompactAddressRelation
 from process.network_membership_copy import MembershipCopyTarget
 
 SLICE_CONTRACT_VERSION = 1
@@ -26,7 +27,6 @@ class NetworkMembershipSliceError(ValueError):
 class PinnedMembershipSlices:
     candidate_id: str
     schema_name: str
-    ref_map_oid: int
     slice_contract_version: int = SLICE_CONTRACT_VERSION
 
     def __post_init__(self):
@@ -40,8 +40,6 @@ class PinnedMembershipSlices:
             or candidate_id.int == 0
             or str(candidate_id) != self.candidate_id
             or self.schema_name != "network_candidate_" + candidate_id.hex
-            or type(self.ref_map_oid) is not int
-            or not 0 < self.ref_map_oid <= 4294967295
             or type(self.slice_contract_version) is not int
             or self.slice_contract_version != SLICE_CONTRACT_VERSION
         ):
@@ -52,13 +50,10 @@ class PinnedMembershipSlices:
 class AffectedMembershipBuckets:
     schema_name: str
     table_name: str
-    relation_oid: int
 
     def __post_init__(self):
         _identifier(self.schema_name)
         _identifier(self.table_name)
-        if type(self.relation_oid) is not int or not 0 < self.relation_oid <= 4294967295:
-            raise NetworkMembershipSliceError("Affected bucket relation identity is invalid")
 
 
 @dataclass(frozen=True)
@@ -74,8 +69,8 @@ class NetworkMembershipSliceReceipt:
     changed_slices: int
     removed_slices: int
     copied_edge_rows: int
-    ref_map_oid: int
-    edge_heap_oid: int
+    ref_map: CompactAddressRelation
+    edge_heap: CompactAddressRelation
 
 
 async def _pin_previous(connection, previous, copy_target):
@@ -84,11 +79,6 @@ async def _pin_previous(connection, previous, copy_target):
     if type(previous) is not PinnedMembershipSlices or previous.candidate_id == copy_target.candidate_id:
         raise NetworkMembershipSliceError("Prior slices must identify a different immutable candidate")
     table = _identifier(previous.schema_name) + ".network_slice_ref"
-    if await connection.fetchval("SELECT to_regclass($1)::oid", table) != previous.ref_map_oid:
-        raise NetworkMembershipSliceError("Pinned slice reference relation changed")
-    await connection.execute(f"LOCK TABLE {table} IN ACCESS SHARE MODE")
-    if await connection.fetchval("SELECT to_regclass($1)::oid", table) != previous.ref_map_oid:
-        raise NetworkMembershipSliceError("Pinned slice reference relation changed")
     invalid = await connection.fetchval(f"""SELECT EXISTS(
         SELECT 1 FROM {table} WHERE network_id IS NULL OR network_id NOT BETWEEN 1 AND 2147483647
             OR office_bucket IS NULL OR office_bucket NOT BETWEEN 0 AND 63
@@ -112,11 +102,6 @@ async def _pin_affected(connection, affected, copy_target, previous):
     ):
         raise NetworkMembershipSliceError("Affected buckets require an owned relation and a prior generation")
     table = _identifier(affected.schema_name) + "." + _identifier(affected.table_name)
-    if await connection.fetchval("SELECT to_regclass($1)::oid", table) != affected.relation_oid:
-        raise NetworkMembershipSliceError("Affected bucket relation changed")
-    await connection.execute(f"LOCK TABLE {table} IN SHARE MODE")
-    if await connection.fetchval("SELECT to_regclass($1)::oid", table) != affected.relation_oid:
-        raise NetworkMembershipSliceError("Affected bucket relation changed")
     if await connection.fetchval(f"""SELECT EXISTS(
         SELECT 1 FROM {table} WHERE network_id IS NULL OR network_id NOT BETWEEN 1 AND 2147483647
             OR office_bucket IS NULL OR office_bucket NOT BETWEEN 0 AND 63
@@ -339,7 +324,6 @@ async def _finish_slice_relations(connection, copy_target, work_table, *, typed=
     await connection.execute(f"ANALYZE {schema}.network_slice_ref")
     await connection.execute(f"ANALYZE {schema}.network_office_edge")
     await connection.execute(f"DROP TABLE {work_table}")
-    return await _slice_relation_oids(connection, copy_target.schema_name)
 
 
 async def _slice_facts(connection, candidate, relations, affected, office_sources, prepared_work):
@@ -377,7 +361,7 @@ async def _carry_slice_refs(connection, schema, previous_table, affected_table):
 async def _prepare_slices(
     connection, copy_target, address_source, previous, affected, control_schema, office_sources, prepared_work=None
 ):
-    """Prepare one complete immutable slice payload and its physical receipt."""
+    """Prepare one complete immutable slice payload and its named accounting."""
     schema = _identifier(copy_target.schema_name)
     async with connection.transaction():
         candidate = await _lock_candidate(connection, copy_target, address_source, control_schema)
@@ -415,9 +399,7 @@ async def _prepare_slices(
             WHERE NOT EXISTS(SELECT 1 FROM {schema}.network_slice_ref r
                 WHERE r.network_id=p.network_id AND r.office_bucket=p.office_bucket)""")
         )
-        ref_oid, edge_oid = await _finish_slice_relations(
-            connection, copy_target, work_table, **({"typed": True} if is_typed else {})
-        )
+        await _finish_slice_relations(connection, copy_target, work_table, **({"typed": True} if is_typed else {}))
     return NetworkMembershipSliceReceipt(
         copy_target.candidate_id,
         address_source.generation_id,
@@ -430,33 +412,20 @@ async def _prepare_slices(
         total_slices - reused_slices,
         removed_slices,
         copied_rows,
-        ref_oid,
-        edge_oid,
-    )
-
-
-async def _slice_relation_oids(connection, schema_name):
-    return await connection.fetchrow(
-        "SELECT to_regclass($1)::oid,to_regclass($2)::oid",
-        schema_name + ".network_slice_ref",
-        schema_name + ".network_office_edge",
+        CompactAddressRelation(copy_target.schema_name, "network_slice_ref"),
+        CompactAddressRelation(copy_target.schema_name, "network_office_edge"),
     )
 
 
 async def prepare_network_membership_slices(
     connection, copy_target, source, *, previous=None, affected_buckets=None, control_schema=None, office_sources=None
 ):
-    """Prepare compact relations under a caller transaction and a local savepoint.
+    """Prepare compact relations in the candidate using validated named inputs.
 
-    The integrating path must verify closed write authority and custody of the
-    candidate, prior refs/artifacts and pinned addresses before calling. This
-    helper validates facts and physical reference identity, but grants no writer
-    or publication authority. It neither reads old edge heaps nor copies addresses.
-    Bucket version 1 is the first SHA256 UTF-8 location-key byte masked with 63.
-    Content version 1 hashes a domain followed by C-ordered, int32-length-framed
-    UTF-8 keys. Affected buckets are trusted complete change coverage; the caller
-    must validate untouched facts before selective preparation. Matched locations
-    count only examined facts when affected buckets are supplied.
+    Bucket version 1 uses the first SHA256 UTF-8 location-key byte masked with 63.
+    Content version 1 hashes a domain and C-ordered, int32-length-framed UTF-8 keys.
+    Affected buckets require complete change coverage and validated untouched facts.
+    Matched locations count examined facts for selective preparation.
     """
     if type(copy_target) is not MembershipCopyTarget or type(source) is not PinnedAddressSource:
         raise NetworkMembershipSliceError("Trusted candidate and pinned address source are required")

@@ -1,9 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Trusted genuine-session composition adapter for retained exact PTG offices."""
 
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
-
-from sqlalchemy import text
 
 from process.registry_candidate_composition import (
     RegistryCompositionAddressSources,
@@ -18,10 +17,6 @@ from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
 from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
 from process.registry_source_observation_store import _namespace
 
-_IDENTITY_SQL = """SELECT current_database()::text AS database_name,current_user::text AS current_role,
- session_user::text AS session_role,(SELECT oid::bigint FROM pg_database WHERE datname=current_database()) AS database_oid,
- inet_server_addr()::text AS server_address,inet_server_port() AS server_port,
- pg_postmaster_start_time() AS server_started,to_regnamespace(:schema)::oid::bigint AS control_oid"""
 _LIMIT_FIELDS = ("maximum_bytes", "maximum_pages", "maximum_coordinates")
 
 
@@ -32,8 +27,7 @@ _SQL_LIMIT_SQL = """SELECT
  (SELECT setting::bigint FROM pg_settings WHERE name='statement_timeout') AS statement_timeout_ms,
  (SELECT setting::bigint FROM pg_settings WHERE name='lock_timeout') AS lock_timeout_ms,
  current_setting('max_parallel_workers_per_gather')::bigint AS parallel_query,
- current_setting('max_parallel_maintenance_workers')::bigint AS parallel_maintenance,
- current_setting('session_replication_role') AS replication_role"""
+ current_setting('max_parallel_maintenance_workers')::bigint AS parallel_maintenance"""
 
 
 @dataclass(frozen=True)
@@ -85,11 +79,7 @@ class RegistryPublicationSQLLimits:
             value = observed[name]
             if type(value) is not int or not 0 < value <= getattr(self, name):
                 raise RuntimeError("registry_publication_worker_sql_limits_unavailable")
-        if (
-            observed["parallel_query"] != 0
-            or observed["parallel_maintenance"] != 0
-            or observed["replication_role"] != "origin"
-        ):
+        if observed["parallel_query"] != 0 or observed["parallel_maintenance"] != 0:
             raise RuntimeError("registry_publication_worker_sql_limits_unavailable")
 
 
@@ -125,23 +115,15 @@ class RegistryPublicationPTGRuntime:
                 raw = await connection.get_raw_connection()
                 await self.sql_limits.verify(raw.driver_connection)
 
-    async def _same_execution_database(self, connection, control_schema):
-        engine = _source_engine(self.sessions)
-        raw_sql = _IDENTITY_SQL.replace(":schema", "$1")
-        existing_by_name = dict(await connection.fetchrow(raw_sql, control_schema))
-        async with engine.connect() as owned:
-            if self.sql_limits is not None:
-                raw = await owned.get_raw_connection()
-                await self.sql_limits.verify(raw.driver_connection)
-            actual_by_name = dict(
-                (await owned.execute(text(_IDENTITY_SQL), {"schema": control_schema})).mappings().one()
-            )
-        if (
-            existing_by_name != actual_by_name
-            or actual_by_name["current_role"] != actual_by_name["session_role"]
-            or actual_by_name["control_oid"] is None
-        ):
-            raise ValueError("registry_publication_ptg_execution_changed")
+    @asynccontextmanager
+    async def validation_snapshot(self):
+        """Keep the existing company approval fence while checking complete candidate data."""
+        schema = self.store.control_schema
+        async with registry_company_approval_transaction(self.sessions, control_schema=schema) as session:
+            await require_registry_company_approval_fence(session, schema)
+            driver = (await (await session.connection()).get_raw_connection()).driver_connection
+            budget = RegistryPTGGraphReadBudget(**dict(zip(_LIMIT_FIELDS, self._limits, strict=True)))
+            yield driver, (session, self.store, budget)
 
     async def compose(self, connection, **composition_by_name):
         """Use the actual pre-snapshot company fence and retain its driver through sealing."""
@@ -151,7 +133,6 @@ class RegistryPublicationPTGRuntime:
         address_sources = composition_by_name.get("address_sources")
         if type(address_sources) is not RegistryCompositionAddressSources:
             raise ValueError("registry_publication_ptg_runtime_invalid")
-        await self._same_execution_database(connection, control_schema)
         read_budget = RegistryPTGGraphReadBudget(**dict(zip(_LIMIT_FIELDS, self._limits, strict=True)))
         composition_by_name = {
             **composition_by_name,
@@ -164,7 +145,6 @@ class RegistryPublicationPTGRuntime:
     ):
         """Keep native office authority on the actual preparation backend and snapshot."""
         from process.network_membership_pipeline import (
-            _close_raw_phase,
             _compact_selection,
             _inspect_candidate,
             _prepare_phase_snapshot,
@@ -173,7 +153,6 @@ class RegistryPublicationPTGRuntime:
 
         if connection.is_in_transaction() or (self.store.control_schema or control_schema) != control_schema:
             raise ValueError("registry_publication_ptg_runtime_invalid")
-        await self._same_execution_database(connection, control_schema)
         candidate = await _inspect_candidate(connection, copy_target, control_schema)
         if not _compact_selection(candidate, None):
             return await prepare_network_candidate(
@@ -186,7 +165,6 @@ class RegistryPublicationPTGRuntime:
             )
         if candidate["state"] == "published":
             return candidate
-        await _close_raw_phase(connection, copy_target, writer_roles, control_schema)
         async with registry_company_approval_transaction(self.sessions, control_schema=control_schema) as session:
             await require_registry_company_approval_fence(session, control_schema)
             driver = (await (await session.connection()).get_raw_connection()).driver_connection

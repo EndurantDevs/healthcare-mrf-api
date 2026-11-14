@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Authenticated physical table bindings for complete procedure projections."""
+"""Named table bindings for complete procedure projections."""
 
 from dataclasses import dataclass, replace
 
@@ -23,6 +23,7 @@ from api.plan_pricing_projection_contract import (
     projection_code_identity,
 )
 from process import reference_family_archive as native
+from process.network_compact_layout import CompactAddressRelation
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,17 @@ class CodePricingCapability:
     @property
     def projection_id(self):
         """Return the digest of this exact authenticated capability identity."""
+        if self.api_read:
+            from api.ptg_membership_storage import _HEX
+
+            if (
+                len(self.found) != 4
+                or type(self.found[0]) is not CompactAddressRelation
+                or type(self.found[2]) is not str
+                or _HEX.fullmatch(self.found[2]) is None
+            ):
+                raise PlanPricingProjectionUnavailable("code pricing named edition is unavailable")
+            return self.found[2]
         return identity_digest(self.identity)
 
     def relation(self, name):
@@ -116,15 +128,13 @@ async def resolve_code_pricing(session, selection, args, *, api_read=None):
     """Absence preserves ordinary routing; an invalid attached capability fails closed."""
     if api_read is not None and type(api_read) is not bool:
         raise PlanPricingProjectionUnavailable("code pricing API mode is invalid")
-    options = {"api_read": True} if api_read else {}
+    options = {"api_read": True} if api_read is not False else {}
     code_identity = projection_code_identity(args.get("code_system"), args.get("code"))
     if selection is None or code_identity is None:
         return None
     scope = _request_scope(args)
     if scope is not None:
-        capability = await _resolve_capability(
-            session, selection, code_identity, scope=scope, **({"api_read": None} if api_read is None else options)
-        )
+        capability = await _resolve_capability(session, selection, code_identity, scope=scope, **options)
         if capability is not None:
             return capability
     return await _resolve_capability(session, selection, code_identity, **options)
@@ -202,15 +212,12 @@ async def _capability_attached(session, anchor_by_field, api_read):
         )
     ):
         return await session.scalar(statement, parameters_by_name), False
-    from api.network_read_execution import _original_read_driver
-    from api.plan_pricing_code_build import _same_api_input_session
 
     transaction = session.get_transaction()
-    driver, backend_pid = await _original_read_driver(session)
-    await _same_api_input_session(session, driver, backend_pid, transaction)
     buffered = await session.execute(statement, parameters_by_name)
     try:
-        await _same_api_input_session(session, driver, backend_pid, transaction)
+        if session.get_transaction() is not transaction:
+            raise PlanPricingProjectionUnavailable("code pricing API read transaction changed")
         return buffered.scalar_one(), api_read
     except BaseException as error:
         try:

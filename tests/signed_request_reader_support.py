@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock
 from api import signed_request_reader as boundary
 from db.connection import Database
 from tests.test_api_reader_sessions import ReaderSession
-from tests.test_db_connection import _FakeResult
 
 
 def cold_caller():
@@ -21,16 +20,17 @@ def _transport_session(session):
     state_by_field = {"scope": None, "active": False}
     session.info = {}
 
-    async def execute(statement, params=None):
-        if str(statement).startswith("SELECT session_user, current_user"):
+    original_connection = session.connection
+
+    async def connection():
+        if not state_by_field["active"]:
             scope = session.begin()
             await scope.__aenter__()
             state_by_field.update(scope=scope, active=True)
             await original_execute(
                 getattr(session, "snapshot_sql", "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             )
-            return _FakeResult(("reader_test", "reader_test", 12345, 23456, "192.0.2.1", 5432, 34567))
-        return await original_execute(statement) if params is None else await original_execute(statement, params)
+        return await original_connection()
 
     async def finish(failure=None):
         if state_by_field["active"]:
@@ -46,7 +46,7 @@ def _transport_session(session):
     async def close():
         await finish()
 
-    session.execute = execute
+    session.connection = connection
     session.in_transaction = lambda: state_by_field["active"] or original_in_transaction()
     session.commit, session.rollback, session.close = commit, rollback, close
     return session

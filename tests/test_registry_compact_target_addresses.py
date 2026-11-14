@@ -13,18 +13,21 @@ from process.registry_compact_target_addresses import required_target_addresses
 
 
 def _manifest(*, artifacts=2, compact=True, custom=True):
-    manifest = PinnedNetworkServingManifest(7, str(UUID(int=7)), "serving", 1, {}, 0, "a" * 64, 10)
+    manifest = PinnedNetworkServingManifest(
+        7, str(UUID(int=7)), "serving", 1, {}, 0, "a" * 64, CompactAddressRelation("serving", "entity_address_unified")
+    )
     if compact:
         layout = CompactNetworkLayout(
-            CompactAddressRelation("serving", "network_slice_ref", 10),
-            CompactAddressRelation("base", "entity_address_unified", 11),
+            CompactAddressRelation("serving", "network_slice_ref"),
+            CompactAddressRelation("base", "entity_address_unified"),
             tuple(
-                CompactEdgeArtifact(str(UUID(int=index)), "network_candidate_" + UUID(int=index).hex, 20 + index)
+                CompactEdgeArtifact(str(UUID(int=index)), "network_candidate_" + UUID(int=index).hex)
                 for index in range(1, artifacts + 1)
             ),
-            CompactAddressRelation("custom", "entity_address_unified", 12) if custom else None,
+            CompactAddressRelation("custom", "entity_address_unified") if custom else None,
         )
         object.__setattr__(manifest, "_compact_layout", layout)
+        object.__setattr__(manifest, "address_relation", manifest.compact_layout.base)
     return manifest
 
 

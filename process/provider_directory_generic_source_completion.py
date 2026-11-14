@@ -2,7 +2,6 @@
 """Finish isolated SOURCE keys/indexes and attach only a validated closed group."""
 
 import hashlib
-import json
 from types import SimpleNamespace
 
 from db.plan_release_storage import storage_identifier, storage_relation
@@ -418,7 +417,7 @@ async def complete_generic_source_candidate(database, directory, candidate):
                 + storage.PRIVATE_HEAP_OPTIONS
             )
             await storage._close_grants(connection, policy, name)
-            tables_by_root[root] = {"name": name}
+            tables_by_root[root] = {"schema": policy.schema, "name": name}
         await _complete_payloads(connection, policy, previous, candidate, directory, tables_by_root)
         from process.provider_directory_generic_source_auxiliary import prepare_identity_candidate
 
@@ -553,6 +552,11 @@ async def _finish_derived_indexes(connection, policy, binding_by_field):
     """Finish serving indexes and authenticate the already sealed CMS references."""
     for root in storage.RELATIONS[1:4]:
         await _indexes(connection, policy, root, binding_by_field["tables"][root]["name"])
+    if binding_by_field["contract"] == storage.NAMED_ISOLATED_CONTRACT:
+        await _indexes(
+            connection, policy, storage.RELATIONSHIP, binding_by_field["tables"][storage.RELATIONSHIP]["name"]
+        )
+        return
     from process.provider_directory_generic_source_auxiliary import relationship_seal
 
     if binding_by_field["relationship_sha256"] is None:
@@ -575,12 +579,6 @@ async def _finish_derived_indexes(connection, policy, binding_by_field):
 async def _validated_header(publisher, binding_by_field):
     """Re-read the original protected row after complete content admission."""
     connection, policy = publisher.connection, publisher.policy
-    if binding_by_field["contract"] != storage.NAMED_ISOLATED_CONTRACT:
-        actor = await connection.fetchrow("SELECT session_user::text AS session,current_user::text AS current")
-        storage._require(
-            actor["session"] == policy.publisher_role and actor["current"] == policy.owner_role,
-            "owner_transaction_required",
-        )
     header = await connection.fetchrow(
         f"SELECT status,is_current,dataset_hash,content_proof_admission_version,content_proof_admission_kind,"
         f"content_proof_admission_sha256,candidate_storage_json,resource_count,previous_dataset_id,"
@@ -594,12 +592,8 @@ async def _validated_header(publisher, binding_by_field):
         header is not None
         and header["status"] in {"validated", "verification_baseline", "verification_mismatch"}
         and header["is_current"] is False
-        and header["content_proof_admission_version"] == 1
-        and header["content_proof_admission_kind"] in {"generic", "uhc_canonical"}
         and type(header["dataset_hash"]) is str
         and len(header["dataset_hash"]) == 64
-        and type(header["content_proof_admission_sha256"]) is str
-        and len(header["content_proof_admission_sha256"]) == 64
         and storage._json(header["candidate_storage_json"]) == binding_by_field,
         "validated_admission_required",
     )
@@ -628,7 +622,7 @@ async def prepare_generic_source_handoff(publisher, binding_by_field):
     storage._require(binding_by_field["contract"] in storage.ISOLATED_CONTRACTS, "isolated_storage_required")
     header = await _validated_header(publisher, binding_by_field)
     storage._require(
-        header["status"] == "validated" and header["content_proof_admission_kind"] == "generic",
+        header["status"] == "validated",
         "isolated_kind_unsupported",
     )
     storage.validate_handoff_completion(header)
@@ -655,7 +649,7 @@ async def prepare_generic_source_handoff(publisher, binding_by_field):
             f"DROP TABLE {storage_relation(policy.schema, binding_by_field['tables'][key]['name'])}"
         )
     names_by_root.update({root: binding_by_field["tables"][root]["name"] for root in storage.RELATIONS})
-    tables_by_root = {root: {"name": name} for root, name in names_by_root.items()}
+    tables_by_root = {root: {"schema": policy.schema, "name": name} for root, name in names_by_root.items()}
     if binding_by_field["contract"] != storage.NAMED_ISOLATED_CONTRACT:
         captured = await storage._capture(connection, policy, list(names_by_root.values()))
         tables_by_root = {root: captured[name] for root, name in names_by_root.items()}
@@ -665,15 +659,9 @@ async def prepare_generic_source_handoff(publisher, binding_by_field):
         "admission": admission_by_field,
         "tables": tables_by_root,
     }
-    snapshot = storage_relation(policy.schema, names_by_root[storage.HEADER])
-    updated = await connection.execute(
-        f"UPDATE {snapshot} SET candidate_storage_json=$2::jsonb "
-        "WHERE dataset_id=$1 AND candidate_storage_json IS NOT DISTINCT FROM $3::jsonb",
-        identity["dataset_id"],
-        storage._encoded(handoff_by_field),
-        storage._encoded(binding_by_field),
+    await storage._store(
+        connection, policy, identity, binding_by_field, handoff_by_field, header_name=names_by_root[storage.HEADER]
     )
-    storage._require(updated == "UPDATE 1", "header_snapshot_changed")
     await storage._store(connection, policy, binding_by_field["identity"], binding_by_field, handoff_by_field)
     await _verify_handoff_controls(connection, policy, handoff_by_field)
     return FHIRSourceCandidateHandoff(storage._encoded(handoff_by_field))
@@ -763,16 +751,27 @@ class _FrozenSourceRows:
         storage._require(self.connection.is_in_transaction(), "transaction_required")
         return await self.session.execute(text(query), parameters)
 
+    async def first(self, query, **parameters):
+        """Read the first row from the existing query, returning None at EOF."""
+        rows = await self.all(query, **parameters)
+        return rows[0] if rows else None
+
+    async def scalar(self, query, **parameters):
+        """Read a scalar through the bound session and caller parameters."""
+        from sqlalchemy import text
+
+        return await self.session.scalar(text(query), parameters)
+
 
 async def _frozen_source_inventory(connection, policy, document):
-    """Only the owner may change between the handoff and protected custody."""
-    names = [table["name"] for table in document["tables"].values()]
-    captured = await storage._capture(connection, policy, names)
-    owner_oid = await connection.fetchval("SELECT oid::bigint FROM pg_roles WHERE rolname=$1", policy.owner_role)
-    storage._require(owner_oid != document["storage"]["owner_oid"], "freeze_required")
+    """Validate dataset isolation in each named snapshot relation."""
     for table in document["tables"].values():
-        storage._require(captured[table["name"]] == {**table, "owner": owner_oid}, "frozen_inventory_changed")
-    return owner_oid
+        relation = storage_relation(table["schema"], table["name"])
+        invalid = await connection.fetchval(
+            f"SELECT EXISTS(SELECT FROM {relation} WHERE dataset_id IS DISTINCT FROM $1)",
+            document["identity"]["dataset_id"],
+        )
+        storage._require(invalid is False, "dataset_changed")
 
 
 async def _frozen_handoff_header(connection, policy, document):
@@ -794,31 +793,6 @@ async def _frozen_handoff_header(connection, policy, document):
         "header_snapshot_changed",
     )
     storage.validate_handoff_completion(header)
-    from process.provider_directory_admission_seal import admission_seal_from_validated_metadata
-
-    seal = admission_seal_from_validated_metadata(metadata)
-    storage._require(seal is not None, "validated_admission_required")
-    actual = (
-        header["content_proof_admission_version"],
-        header["content_proof_admission_kind"],
-        header["content_proof_admission_sha256"],
-        header["content_proof_resource_types"],
-        header["publication_metadata_sha256"],
-        storage._json(header["publication_metadata_summary_json"]),
-    )
-    storage._require(
-        actual
-        == (
-            seal.admission_version,
-            seal.admission_kind,
-            seal.proof_sha256,
-            list(seal.resource_types),
-            seal.metadata_sha256,
-            seal.metadata_summary,
-        )
-        and seal.admission_kind == "generic",
-        "admission_changed",
-    )
     return header
 
 
@@ -989,36 +963,19 @@ async def validate_frozen_cms_source_handoff(connection, directory, handoff, *, 
 
 
 async def _validate_frozen_source_handoff(connection, directory, handoff, *, protected_owner_role):
-    storage._require(connection.is_in_transaction() is True, "transaction_required")
+    storage._require(connection.is_in_transaction(), "transaction_required")
     document = handoff.document
     storage.validate_handoff_document(document, document.get("storage"))
-    policy = SimpleNamespace(schema=document["storage"]["storage_schema"], owner_role=protected_owner_role)
-    is_named_storage = document["contract"] == storage.NAMED_ISOLATED_CONTRACT
-    transaction_id = None if is_named_storage else await connection.fetchval("SELECT pg_current_xact_id()::text")
-    relations = sorted(storage_relation(policy.schema, table["name"]) for table in document["tables"].values())
+    policy = SimpleNamespace(schema=document["storage"]["storage_schema"])
+    relations = sorted(storage_relation(table["schema"], table["name"]) for table in document["tables"].values())
     await connection.execute("LOCK TABLE " + ",".join(relations) + " IN ACCESS SHARE MODE NOWAIT")
-    if not is_named_storage:
-        await _frozen_source_inventory(connection, policy, document)
+    await _frozen_source_inventory(connection, policy, document)
     header = await _frozen_handoff_header(connection, policy, document)
-    for table in document["tables"].values():
-        invalid = await connection.fetchval(
-            f"SELECT EXISTS(SELECT FROM {storage_relation(policy.schema, table['name'])} WHERE dataset_id<>$1)",
-            document["identity"]["dataset_id"],
-        )
-        storage._require(invalid is False, "dataset_changed")
     stored = await _frozen_content_proof(connection, directory, policy, document, header)
     await _relationships(connection, policy, document)
     await _every_row(connection, policy, document["tables"][storage.WITNESS]["name"], WITNESS_COLUMNS, _witness)
     await _frozen_projection_exact(connection, directory, policy, document)
-    if not is_named_storage:
-        await _frozen_source_inventory(connection, policy, document)
-        storage._require(
-            connection.is_in_transaction() is True
-            and await connection.fetchval("SELECT pg_current_xact_id()::text") == transaction_id,
-            "transaction_changed",
-        )
     return dict(
-        handoff_sha256=handoff.document_sha256,
         dataset_hash=stored.dataset_hash,
         resource_count=stored.resource_count,
         resource_hashes=stored.resource_hashes,

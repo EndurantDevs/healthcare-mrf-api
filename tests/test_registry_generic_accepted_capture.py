@@ -57,12 +57,10 @@ def _published_binding():
         "relationship_sha256": None,
         "tables": {
             root: {
+                "schema": "source_example",
                 "name": "pdgs_" + "a" * 32 + "_" + storage._SUFFIXES[root],
-                "oid": 100 + number,
-                "owner": 17,
-                "layout_sha256": "a" * 64,
             }
-            for number, root in enumerate(storage.RELATIONS)
+            for root in storage.RELATIONS
         },
     }
 
@@ -74,6 +72,7 @@ def _parse_binding(binding, marker=None):
         endpoint_id="endpoint-one",
         root_run_id="run-one",
         source_id="source-one",
+        schema_name="source_example",
     )
 
 
@@ -135,116 +134,16 @@ async def test_metadata_current_capture_accepts_exact_published_binding_without_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "policy_changes,actor_changes,source_authority",
-    [
-        ({}, {}, False),
-        (None, {}, False),
-        ({"schema": "other_schema"}, {}, False),
-        ({"runtime_roles": ("other_reader",)}, {}, False),
-        ({"control_runtime_roles": ("reader_example",)}, {}, False),
-        ({}, {"actor": "source_owner"}, False),
-        ({}, {}, True),
-    ],
-)
-async def test_native_capture_requires_concrete_source_reader_and_independent_writer(
-    policy_changes, actor_changes, source_authority
-):
-    origin = semantic_capture().origin
-    policy = GenericSourcePolicy(origin.schema_name, "source_owner", "source_publisher", (origin.reader_role,))
-    actor_by_field = dict(
-        login=origin.reader_role, actor=origin.reader_role, role="none", readonly="on", isolation="repeatable read"
-    )
-    actor_by_field.update(actor_changes)
-    reader = SimpleNamespace(
-        is_in_transaction=lambda: True,
-        fetchrow=AsyncMock(return_value=actor_by_field),
-        fetch=AsyncMock(return_value=[{"namespace_owner_protected": True}]),
-    )
-    writer = SimpleNamespace(is_in_transaction=lambda: True, fetchval=AsyncMock(return_value=not source_authority))
-    policy = replace(policy, **policy_changes) if policy_changes is not None else None
-    if policy_changes == {} and actor_changes == {} and not source_authority:
-        await snapshot._require_source_actors(reader, writer, origin, policy)
-        assert writer.fetchval.await_args.args[1] == [policy.owner_role, policy.publisher_role]
-    else:
-        with pytest.raises(RetainedFHIRCaptureError):
-            await snapshot._require_source_actors(reader, writer, origin, policy)
-
-
-@pytest.mark.asyncio
-async def test_native_reader_rejects_unprotected_namespace_without_control_roles():
-    origin = semantic_capture().origin
-    policy = GenericSourcePolicy(origin.schema_name, "source_owner", "source_publisher", (origin.reader_role,))
-    reader = SimpleNamespace(
-        is_in_transaction=lambda: True,
-        fetchrow=AsyncMock(
-            return_value=dict(
-                login=origin.reader_role,
-                actor=origin.reader_role,
-                role="none",
-                readonly="on",
-                isolation="repeatable read",
-            )
-        ),
-        fetch=AsyncMock(return_value=[{"namespace_owner_protected": False}]),
-    )
-    writer = SimpleNamespace(is_in_transaction=lambda: True, fetchval=AsyncMock(return_value=True))
-    assert policy.control_runtime_roles == ()
-    with pytest.raises(RetainedFHIRCaptureError):
-        await snapshot._require_source_actors(reader, writer, origin, policy)
-    assert reader.fetch.await_args.args == (
-        snapshot.ROLE_SQL,
-        [origin.reader_role],
-        policy.owner_role,
-        policy.publisher_role,
-        policy.schema,
-    )
-    writer.fetchval.assert_not_awaited()
-
-
-def test_native_child_proof_requires_named_parent_even_with_matching_layout():
-    origin, binding, family = semantic_capture().origin, _published_binding(), []
-    for number, root in enumerate(storage.RELATIONS):
-        family.append({"relname": root, "oid": origin.resource_parent_oid + number * 10})
-        leaf_by_field = dict(
-            relname=binding["tables"][root]["name"],
-            oid=origin.resource_leaf_oid + number * 10,
-            relowner=17,
-            relkind="r",
-            relpersistence="p",
-            relrowsecurity=False,
-            relforcerowsecurity=False,
-            inert=True,
-            native_checks=True,
-            direct_acl_closed=True,
-            readers_closed=True,
-            parents=[origin.resource_parent_oid + number * 10],
-            relispartition=True,
-            columns=[],
-            constraints=[],
-            indexes=[],
-        )
-        family.append(leaf_by_field)
-        binding["tables"][root] = storage._table_proof(leaf_by_field, private=False)
-    snapshot._require_bound_children(family, binding, origin)
-    changed = deepcopy(family)
-    changed[1]["parents"] = [changed[2]["oid"]]
-    binding["tables"][storage.RESOURCE] = storage._table_proof(changed[1], private=False)
-    with pytest.raises(RetainedFHIRCaptureError):
-        snapshot._require_bound_children(changed, binding, origin)
-
-
-@pytest.mark.asyncio
 async def test_native_snapshot_rejects_unmatched_acquisition_metadata():
     import json
 
     binding = _published_binding()
     binding["identity"]["metadata"].update(semantic_projection_as_of="2026-02-01", selected_resources=["Location"])
-    reader = SimpleNamespace(fetchval=AsyncMock(return_value=False))
+    reader = SimpleNamespace(fetchrow=AsyncMock(return_value=None))
     with pytest.raises(RetainedFHIRCaptureError):
         await snapshot._require_header_binding(reader, semantic_capture().origin, binding)
-    query, *arguments = reader.fetchval.await_args.args
-    assert "jsonb_each($7::jsonb)" in query and "publication_metadata_json->acquisition.key" in query
+    query, *arguments = reader.fetchrow.await_args.args
+    assert "jsonb_each($2::jsonb)" in query and "publication_metadata_json->acquisition.key" in query
     assert json.loads(arguments[-1]) == binding["identity"]["metadata"]
 
 
@@ -252,15 +151,8 @@ def test_locator_binds_admission_but_not_reader_role_or_physical_oids():
     origin = semantic_capture().origin
     identity = accepted.generic_fhir_capture_id(origin)
     assert identity.version == 5
-    assert identity == accepted.generic_fhir_capture_id(
-        replace(
-            origin,
-            reader_role="other_reader",
-            header_oid=101,
-            resource_parent_oid=102,
-            resource_leaf_oid=103,
-        )
-    )
+    copied_origin = replace(origin, header_relation={"schema": "copied_catalog", "name": "published_header"})
+    assert identity == accepted.generic_fhir_capture_id(copied_origin)
     for changes in (
         {"dataset_id": "dataset-next"},
         {"admission_metadata_sha256": "5" * 64},
@@ -329,11 +221,8 @@ async def test_current_generic_input_uses_semantic_metadata_budget(metadata_byte
         fetch=AsyncMock(return_value=[header_by_field]),
         fetchrow=AsyncMock(
             return_value={
-                "reader_role": "reader_example",
                 "metadata_bytes": metadata_bytes,
                 "metadata_sha256": "b" * 64,
-                "parent_oid": 11,
-                "leaf_oid": 12,
             }
         ),
     )
@@ -418,7 +307,7 @@ async def test_existing_locator_replay_reauthenticates_complete_capture_without_
     copied = AsyncMock(side_effect=AssertionError("replay copied immutable facts"))
     monkeypatch.setattr(continuation, "require_retained_fhir_capture", full)
     monkeypatch.setattr(continuation, "capture_retained_fhir_source", copied)
-    capture_target = continuation.RegistryGenericCaptureTarget(capture.owner_role, capture.runtime_roles)
+    capture_target = continuation.RegistryGenericCaptureTarget("capture_owner", ("capture_reader",))
     assert (
         await continuation.capture_committed_generic_fhir_source(
             reader,
@@ -458,3 +347,251 @@ def test_head_match_refuses_different_native_admission_even_same_row_counts():
         accepted.require_generic_capture_head(capture, replace(head, proof_sha256="5" * 64))
     with pytest.raises(RetainedFHIRCaptureError):
         accepted.require_generic_capture_head(replace(capture, capture_id=str(UUID(int=1))), head)
+
+
+@pytest.mark.parametrize("old_key", [1, 999999])
+def test_historical_attached_binding_uses_recorded_names_without_physical_matching(old_key):
+    binding = _published_binding()
+    legacy = deepcopy(binding)
+    for table in legacy["tables"].values():
+        table.pop("schema")
+        table.update(oid=old_key, owner=old_key, layout_sha256="f" * 64)
+    assert _parse_binding(legacy) == binding
+    assert all("oid" in table for table in legacy["tables"].values())
+    legacy["tables"][storage.RESOURCE]["unknown"] = True
+    with pytest.raises(GenericCandidateError):
+        _parse_binding(legacy)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", [None, "policy", "missing", "metadata", "resource"])
+async def test_native_snapshot_keeps_logical_source_header_and_relation_scope(fault):
+    origin = semantic_capture().origin
+    binding = _published_binding()
+    policy = GenericSourcePolicy(origin.schema_name, "source_owner", "source_publisher", ("source_reader",))
+    if fault == "policy":
+        policy = replace(policy, schema="other_source")
+    if fault == "resource":
+        origin = replace(origin, resource_relation={"schema": origin.schema_name, "name": "unrelated_rows"})
+    header_by_field = {
+        "candidate_storage_json": binding,
+        "completion_proof_required_version": None,
+        "endpoint_id": origin.endpoint_id,
+        "acquisition_root_run_id": origin.root_run_id,
+        "dataset_hash": origin.dataset_sha256,
+        "status": "published",
+        "published_at": object(),
+        "metadata_matches": fault != "metadata",
+    }
+    reader = SimpleNamespace(
+        is_in_transaction=lambda: True,
+        fetchrow=AsyncMock(return_value=None if fault == "missing" else header_by_field),
+        fetch=AsyncMock(return_value=[]),
+    )
+    writer = SimpleNamespace(is_in_transaction=lambda: True)
+    if fault is not None:
+        with pytest.raises(RetainedFHIRCaptureError):
+            await snapshot.require_native_generic_snapshot(reader, writer, origin, policy, binding)
+        reader.fetch.assert_not_awaited()
+    else:
+        references = await snapshot.require_native_generic_snapshot(reader, writer, origin, policy, binding)
+        assert references == tuple(
+            (root, table["schema"], table["name"]) for root, table in sorted(binding["tables"].items())
+        )
+        assert reader.fetch.await_count == len(storage.RELATIONS)
+        assert all("LIMIT 0" in call.args[0] for call in reader.fetch.await_args_list)
+        assert all("pg_catalog" not in call.args[0] for call in reader.fetch.await_args_list)
+
+
+def named_publication_header():
+    """Pair the real named handoff shape with the canonical published lifecycle."""
+    header = _semantic_admission_header()
+    binding = _published_binding()
+    binding.update(
+        contract=storage.NAMED_ISOLATED_CONTRACT,
+        phase="ready_for_freeze",
+        storage={"catalog_schema": "catalog_example", "storage_schema": "payload_one"},
+        admission={
+            "dataset_hash": header["dataset_hash"],
+            "resource_count": header["resource_count"],
+            "previous_dataset_id": None,
+            "completion_proof_required_version": None,
+            "completion_proof_sha256": None,
+        },
+    )
+    binding["tables"] = {
+        root: {"schema": "payload_one", "name": "pdgs_" + "a" * 32 + "_" + storage._SUFFIXES[root]}
+        for root in (*storage.RELATIONS, *storage.HANDOFF_CONTROL_ROOTS)
+    }
+    return {
+        **header,
+        **binding["admission"],
+        "candidate_storage_json": binding,
+        "status": "published",
+        "published_at": "2026-01-01T00:00:00Z",
+        "is_current": True,
+    }
+
+
+def _parse_named_header(header):
+    return snapshot.published_generic_binding(
+        header,
+        dataset_id=header["dataset_id"],
+        endpoint_id=header["endpoint_id"],
+        root_run_id=header["acquisition_root_run_id"],
+        source_id="source-one",
+        schema_name="catalog_example",
+    )
+
+
+@pytest.mark.parametrize("status,current", [("published", True), ("superseded", False)])
+def test_named_published_binding_preserves_complete_handoff_document(status, current):
+    header = named_publication_header()
+    header.update(status=status, is_current=current)
+    original = deepcopy(header["candidate_storage_json"])
+    assert _parse_named_header(header) == original
+    assert header["candidate_storage_json"] == original
+    assert original["phase"] == "ready_for_freeze"
+
+
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        ("status", "validated"),
+        ("is_current", False),
+        ("published_at", None),
+        ("resource_count", 999),
+        ("dataset_hash", "0" * 64),
+        ("previous_dataset_id", "other"),
+        ("completion_proof_sha256", "0" * 64),
+        ("candidate_storage_json.contract", storage.ISOLATED_CONTRACT),
+        ("candidate_storage_json.contract", "unknown"),
+        ("candidate_storage_json.phase", "prepared"),
+        ("candidate_storage_json.phase", "published"),
+        ("candidate_storage_json.storage.catalog_schema", "payload_one"),
+        ("candidate_storage_json.tables", {}),
+        ("candidate_storage_json.identity.dataset_id", "other"),
+        ("candidate_storage_json.identity.metadata.source_ids", ["other"]),
+        ("candidate_storage_json.identity.metadata.resource_hash_contract", "other"),
+        ("candidate_storage_json.admission.resource_count", True),
+    ],
+)
+def test_named_publication_refuses_incomplete_lifecycle_or_handoff_drift(path, value):
+    header = named_publication_header()
+    keys, selected = path.split("."), header
+    for key in keys[:-1]:
+        selected = selected[key]
+    selected[keys[-1]] = value
+    with pytest.raises((RetainedFHIRCaptureError, GenericCandidateError)):
+        _parse_named_header(header)
+
+
+@pytest.mark.asyncio
+async def test_named_current_input_keeps_payload_identity_and_catalog_controls():
+    header = named_publication_header()
+    driver = SimpleNamespace(
+        is_in_transaction=lambda: True,
+        fetch=AsyncMock(return_value=[header]),
+        fetchrow=AsyncMock(return_value={"metadata_bytes": 100, "metadata_sha256": "b" * 64}),
+    )
+    origin = await accepted.read_current_generic_fhir_input(
+        driver, schema_name="catalog_example", source_id="source-one", endpoint_id="endpoint-one"
+    )
+    assert origin.schema_name == "payload_one"
+    assert origin.header_relation == {"schema": "catalog_example", "name": "provider_directory_endpoint_dataset"}
+    assert origin.resource_relation == header["candidate_storage_json"]["tables"][storage.RESOURCE]
+    assert all(
+        '"catalog_example".provider_directory_endpoint_dataset' in call.args[0] for call in driver.fetch.await_args_list
+    )
+    capture = replace(semantic_capture(), origin=origin)
+    assert await accepted.is_original_generic_capture_current(driver, capture)
+    assert '"catalog_example".provider_directory_endpoint_dataset' in driver.fetch.await_args.args[0]
+    moved_origin = replace(origin, resource_relation={"schema": origin.schema_name, "name": "other_resource"})
+    with pytest.raises(RetainedFHIRCaptureError):
+        await accepted.is_original_generic_capture_current(driver, replace(capture, origin=moved_origin))
+
+
+def named_semantic_capture(payload, dataset="dataset-one", day="2026-01-01"):
+    """Keep one canonical header relation while the immutable payload generation changes."""
+    capture = semantic_capture(dataset, day)
+    origin = replace(
+        capture.origin,
+        schema_name=payload,
+        header_relation={"schema": "catalog_example", "name": "provider_directory_endpoint_dataset"},
+        resource_relation={"schema": payload, "name": "provider_directory_dataset_resource"},
+    )
+    capture = replace(capture, origin=origin)
+    return replace(capture, capture_sha256=capture_digest(capture))
+
+
+def test_named_successor_roundtrip_keeps_original_approval_and_distinct_payloads():
+    original = pin(named_semantic_capture("payload_one"))
+    successor = replace(pin(named_semantic_capture("payload_two", "dataset-next", "2026-02-01")), as_of="2026-02-01")
+    wrapped = fhir.with_fhir_successor(original, successor)
+    recipe = _recipe(wrapped)
+    assert decode_registry_source_recipes(canonical_registry_source_recipes((recipe,))) == (recipe,)
+    assert wrapped.schema_name == "payload_one" and wrapped.retained_successor.schema_name == "payload_two"
+    assert recipe.binding_coordinates.dataset_schema == "payload_one"
+    relocated = replace(successor.retained_capture.origin, header_relation={"schema": "other", "name": "header"})
+    moved_capture = replace(successor.retained_capture, origin=relocated)
+    moved_capture = replace(moved_capture, capture_sha256=capture_digest(moved_capture))
+    with pytest.raises(fhir.FHIRMembershipSourceError, match="successor coordinates"):
+        fhir.with_fhir_successor(original, replace(successor, retained_capture=moved_capture))
+
+
+def test_attached_semantic_original_can_advance_only_to_named_successor():
+    original_capture = semantic_capture()
+    original = pin(original_capture)
+    named = named_semantic_capture("payload_next", "dataset-next", "2026-02-01")
+    named_origin = replace(named.origin, header_relation=original_capture.origin.header_relation)
+    named = replace(named, origin=named_origin)
+    named = replace(named, capture_sha256=capture_digest(named))
+    successor = replace(pin(named), as_of="2026-02-01")
+    wrapped = fhir.with_fhir_successor(original, successor)
+    assert replace(wrapped, retained_successor=None) == original
+    assert wrapped.retained_successor == successor
+    assert decode_registry_source_recipes(canonical_registry_source_recipes((_recipe(wrapped),))) == (_recipe(wrapped),)
+    with pytest.raises(fhir.FHIRMembershipSourceError, match="successor coordinates"):
+        fhir.with_fhir_successor(successor, original)
+    unrelated = pin(semantic_capture("unrelated", "2026-02-01"))
+    unrelated = replace(unrelated, as_of="2026-02-01")
+    with pytest.raises(fhir.FHIRMembershipSourceError, match="successor coordinates"):
+        fhir.with_fhir_successor(successor, unrelated)
+
+
+@pytest.mark.asyncio
+async def test_named_retention_metadata_and_source_registry_use_declared_catalog(monkeypatch):
+    import hashlib
+    import struct
+
+    from process import network_fhir_retained_capture as copying
+
+    metadata = b'{"original":"metadata"}'
+    origin = replace(
+        named_semantic_capture("payload_one").origin,
+        metadata_bytes=len(metadata),
+        metadata_text_sha256=hashlib.sha256(metadata).hexdigest(),
+        header_relation={"schema": "catalog_example", "name": "canonical_header"},
+    )
+    queries = []
+
+    async def export(reader, query, dataset_id, *, output, **options):
+        assert dataset_id == origin.dataset_id and options == {"format": "binary"}
+        queries.append(query)
+        await output(
+            b"PGCOPY\n\xff\r\n\x00" + struct.pack("!iihi", 0, 0, 1, len(metadata)) + metadata + struct.pack("!h", -1)
+        )
+        return "COPY 1"
+
+    monkeypatch.setattr(copying, "_reader_export", export)
+    reader = SimpleNamespace(fetchval=AsyncMock(return_value=origin.endpoint_id))
+    async with copying._publication_metadata_copy(reader, origin) as path:
+        assert path.exists()
+    assert not path.exists()
+    assert '"catalog_example"."canonical_header"' in queries[0] and "payload_one" not in queries[0]
+    await copying._origin_resource(reader, origin)
+    query, source_id = reader.fetchval.await_args.args
+    assert '"catalog_example"."provider_directory_source"' in query and source_id == origin.source_id
+    reader.fetchval.return_value = "other-endpoint"
+    with pytest.raises(RetainedFHIRCaptureError):
+        await copying._origin_resource(reader, origin)

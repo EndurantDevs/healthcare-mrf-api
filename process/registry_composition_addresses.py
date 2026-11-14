@@ -11,9 +11,8 @@ from process.network_approved_membership_source import pin_approved_membership_s
 from process.network_custom_address_source import (
     CustomAddressSourceArguments,
     CustomAddressSourceReceipt,
-    _artifact_dependency_identity,
-    _dependency_actors_closed,
     _require_transaction,
+    _source_columns,
     prepare_recipe_address_source,
     verify_custom_address_source,
 )
@@ -42,10 +41,9 @@ class RegistryCompositionError(ValueError):
 
 @dataclass(frozen=True)
 class RegistryRetainedAddressArtifact:
-    """An independently closed base reused without creating a loading-owner copy."""
+    """The selected immutable base address edition and its logical recipe identity."""
 
     address_source: PinnedAddressSource
-    runtime_roles: tuple[str, ...]
     generation_sha256: str
     original_source: PinnedAddressSource
 
@@ -57,7 +55,7 @@ def _retained_address_artifact(source, runtime_roles):
         generation = hashlib.sha256(
             json.dumps(asdict(source), sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
-    return RegistryRetainedAddressArtifact(replace(source, generation_id=generation), runtime_roles, generation, source)
+    return RegistryRetainedAddressArtifact(replace(source, generation_id=generation), generation, source)
 
 
 def _validated_replacement_recipes(recipes, compact):
@@ -263,7 +261,7 @@ async def _composition_office_summary(
             artifact.address_source,
             retained_fhir_reads=retained_fhir_reads,
             request=OfficeSummaryRequest(
-                runtime_roles=artifact.runtime_roles, control_schema=control_schema, office_authority=office_authority
+                runtime_roles=(), control_schema=control_schema, office_authority=office_authority
             ),
         )
     return summary
@@ -430,7 +428,7 @@ def _address_arguments(request_id, approved, owner_role, runtime_roles, address_
 
 @dataclass(frozen=True)
 class RegistryAddressArtifactCustody:
-    """Fixed owner and runtime census supplied by the qualified independent custodian."""
+    """Existing administrator configuration for address preparation."""
 
     owner_role: str
     runtime_roles: tuple[str, ...]
@@ -440,22 +438,6 @@ class RegistryAddressArtifactCustody:
     def __post_init__(self):
         _identifier(self.owner_role)
         _namespace(self.control_schema)
-        if (
-            type(self.runtime_roles) is not tuple
-            or not 1 <= len(self.runtime_roles) <= 128
-            or any(type(role) is not str for role in self.runtime_roles)
-            or tuple(sorted(set(self.runtime_roles))) != self.runtime_roles
-            or self.owner_role in self.runtime_roles
-        ):
-            raise RegistryCompositionError("registry_composition_address_artifact_roles_differ")
-        for role in self.runtime_roles:
-            _identifier(role)
-        if self.address_reader_roles is not None:
-            from process.network_address_artifact import _roles
-
-            _roles(self.address_reader_roles)
-            if not set(self.address_reader_roles) <= set(self.runtime_roles):
-                raise RegistryCompositionError("registry_composition_address_artifact_roles_differ")
 
 
 def _retained_fhir_only(recipes):
@@ -469,16 +451,10 @@ def _retained_fhir_only(recipes):
 
 
 async def _verify_retained_address_sources(connection, sources, runtime_roles, control_schema):
-    """Keep optional authenticated NPI custody even when no NPI-derived row is constructed."""
-    await _artifact_dependency_identity(
-        connection,
-        sources.base_source,
-        runtime_roles,
-        address=True,
-        control_schema=control_schema,
-    )
+    """Check actual named source columns before reusing their immutable editions."""
+    await _source_columns(connection, sources.base_source, address=True)
     if sources.npi_source is not None:
-        await _artifact_dependency_identity(connection, sources.npi_source, runtime_roles)
+        await _source_columns(connection, sources.npi_source, address=False)
 
 
 async def _prepare_registry_composition_address_artifact(
@@ -492,11 +468,7 @@ async def _prepare_registry_composition_address_artifact(
     office_authority=None,
     select_source_recipes,
 ):
-    """Prepare one sealed artifact in the independent custodian's caller-owned transaction.
-
-    The trusted caller supplies source selection and the runtime census. Execution
-    replays the exact recipe after commit; publication authority is checked separately.
-    """
+    """Prepare complete address data in the caller-owned snapshot transaction."""
     request_id, approved_revision = request_scope
     if (
         type(request_id) is not UUID
@@ -507,7 +479,6 @@ async def _prepare_registry_composition_address_artifact(
     ):
         raise RegistryCompositionError("registry_composition_address_artifact_invalid")
     await _require_transaction(connection)
-    await _require_artifact_custodian(connection)
     _require_source_recipe_phase(address_sources, source_manifest, expected_head)
     address_sources = await _resolve_source_recipe_additions(
         connection, address_sources, source_manifest, expected_head, custody.control_schema
@@ -552,22 +523,13 @@ async def _prepared_address_artifact(
     control_schema,
     office_inputs,
 ):
-    """Read only: require the exact independently sealed recipe and complete executing-role closure."""
-    actor = await connection.fetchval("SELECT session_user::text")
-    required_roles = {
-        actor,
-        writer_roles["owner_role"],
-        *writer_roles["loader_roles"],
-        *writer_roles["reader_roles"],
-    }
-    if not required_roles <= set(receipt.runtime_roles) or receipt.owner_role in required_roles:
-        raise RegistryCompositionError("registry_composition_address_artifact_roles_differ")
+    """Compare the complete recorded logical recipe and freshly checked data."""
     await verify_custom_address_source(connection, receipt)
     arguments = _address_arguments(
         request_id,
         approved,
-        receipt.owner_role,
-        receipt.runtime_roles,
+        writer_roles["owner_role"],
+        tuple(sorted(set(writer_roles["loader_roles"] + writer_roles["reader_roles"]))),
         address_sources,
         control_schema,
     )
@@ -614,7 +576,7 @@ async def _composition_artifact_with_reads(
         address_sources,
         approved,
         artifact,
-        artifact.runtime_roles,
+        (),
         control_schema,
         office_authority,
         source_phase,
@@ -668,29 +630,21 @@ async def _prepare_composition_artifact(
 
 
 async def _verify_compact_preparation_origin(connection, sources, source_manifest, custody):
-    """Authenticate reader intent separately from the complete output-actor closure."""
+    """Resolve exact named address and optional NPI inputs for compact preparation."""
     from process.network_compact_address_origin import resolve_compact_address_origin
 
-    if custody.address_reader_roles is None:
-        raise RegistryCompositionError("registry_composition_address_artifact_roles_differ")
     generations_by_source = {"unified_address": sources.base_source.generation_id}
     if source_manifest is not None:
         generations_by_source["retained_network_source"] = source_manifest.manifest_sha256
     _descriptor, physical = await resolve_compact_address_origin(
         connection,
-        {"source_generations": generations_by_source},
+        {"source_generations": generations_by_source, "validation_json": {}},
         sources.base_source,
-        runtime_roles=custody.address_reader_roles,
+        runtime_roles=(),
         control_schema=custody.control_schema,
     )
-    dependency = replace(
-        sources.base_source,
-        schema_name=physical.schema_name,
-        table_name=physical.table_name,
-    )
-    await _dependency_actors_closed(connection, dependency, custody.runtime_roles)
     if sources.npi_source is not None:
-        await _artifact_dependency_identity(connection, sources.npi_source, custody.runtime_roles)
+        await _source_columns(connection, sources.npi_source, address=False)
 
 
 async def _prepare_preservation(
@@ -732,29 +686,6 @@ def _prepare_source_inventory(recipes, source_stage, office_revision):
                 preparation.add_derivation(derivation)
         office_revision = selected_revision
     return preparation, is_witness_stage, office_revision
-
-
-async def _require_artifact_custodian(connection):
-    actor = await connection.fetchrow(
-        "SELECT session_user::text AS login,current_user::text AS actor,rolcanlogin,rolsuper,rolcreatedb,"
-        "rolcreaterole,rolreplication,rolbypassrls FROM pg_roles WHERE rolname=session_user"
-    )
-    if (
-        not actor
-        or actor["login"] != actor["actor"]
-        or not actor["rolcanlogin"]
-        or any(
-            actor[name]
-            for name in (
-                "rolsuper",
-                "rolcreatedb",
-                "rolcreaterole",
-                "rolreplication",
-                "rolbypassrls",
-            )
-        )
-    ):
-        raise RegistryCompositionError("registry_composition_artifact_custodian_invalid")
 
 
 def _finish_inventory_artifact(preparation, recipes, inputs, artifact, initial_summary, source_stage):
@@ -818,7 +749,7 @@ async def _reuse_composition_artifact(
         address_sources,
         inputs.approved,
         artifact,
-        artifact.runtime_roles,
+        (),
         control_schema,
         inputs.office_context,
         (

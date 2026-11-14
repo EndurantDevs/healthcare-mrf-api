@@ -398,7 +398,7 @@ async def _coverage(
 
 
 async def _typed_coverage(connection, recipe, approved, control_schema, side, inventory, coverage, runtime):
-    """Whole-network absence is derived from independently checked typed Source cells."""
+    """Derive whole-network absence from the retained edition's content-checked cells."""
     from process.registry_source_recipe_composition import load_typed_source_read
 
     stage = await load_typed_source_read(
@@ -419,6 +419,100 @@ async def _typed_coverage(connection, recipe, approved, control_schema, side, in
         side,
         slot,
     )
+
+
+async def _carried_typed_stage(connection, preservation, recipes, candidate, control_schema, runtime):
+    """Rebuild previous typed recipes using their original approved and named address inputs."""
+    from process.network_address_projection import PinnedAddressSource
+    from process.registry_typed_source_stage import stage_verified_typed_source_recipes
+
+    approved = await pin_retained_approved_membership_source(
+        connection,
+        approved_revision=preservation.predecessor.approved_custom_revision,
+        control_schema=control_schema,
+    )
+    report = candidate["validation_json"]
+    report = json.loads(report) if type(report) is str else report
+    address = PinnedAddressSource(**report["address_source"])
+    stage = await stage_verified_typed_source_recipes(
+        connection,
+        recipes,
+        approved,
+        request_id=uuid4(),
+        control_schema=control_schema,
+        read_context=SourceRecipeReadContext(verified_office_inputs=(address, ()), source_witness_runtime=runtime),
+    )
+    return stage, approved
+
+
+async def _carried_typed_mapping_parity(connection, preservation, stage, approved, control_schema):
+    """Compare every carried membership and office field with independently rederived rows."""
+    from process.network_fhir_typed_mapping import BINDING_COLUMNS, MEMBER_COLUMNS
+    from process.registry_typed_membership_parity import has_multiset_difference
+
+    namespace = storage_identifier(preservation.predecessor.schema_name)
+    members = ",".join("m." + field for field in MEMBER_COLUMNS)
+    selected = preservation.network_table
+    expected = (
+        f"SELECT {members} FROM pg_temp.{storage_identifier(stage.table_name)} m JOIN {selected} USING(network_id)"
+    )
+    actual = f"SELECT {members} FROM {namespace}.network_membership_source m JOIN {selected} USING(network_id)"
+    if await has_multiset_difference(connection, actual, expected):
+        _fail("carried_typed_membership_parity")
+    bindings = ",".join("b." + field for field in BINDING_COLUMNS)
+    keys = f"EXISTS(SELECT FROM ({expected}) m WHERE (m.provider_system,m.provider_id,m.location_id)=(b.provider_system,b.provider_id,b.location_id))"
+    mapped = f"SELECT {bindings} FROM pg_temp.{storage_identifier(stage.office_matches.table_name)} b WHERE {keys}"
+    _, expected_bindings = _effective_carry_queries(
+        replace(preservation, binding_query=mapped), (approved.approved_revision, control_schema)
+    )
+    actual_bindings = f"SELECT {bindings} FROM {namespace}.provider_location_binding b WHERE {keys}"
+    if await connection.fetchval(
+        f"WITH expected AS MATERIALIZED ({expected_bindings}), actual AS MATERIALIZED ({actual_bindings}) "
+        "SELECT EXISTS((SELECT * FROM expected EXCEPT ALL SELECT * FROM actual) "
+        "UNION ALL (SELECT * FROM actual EXCEPT ALL SELECT * FROM expected))"
+    ):
+        _fail("carried_typed_office_parity")
+
+
+async def has_fresh_carried_typed_data(connection, preservation, *, control_schema, source_witness_runtime=None):
+    """Freshly validate retained typed data when its published report predates final data evidence."""
+    if preservation is None or not preservation.receipt["carried_rows"]:
+        return False
+    from process.network_source_contribution_custody import _cleanup_independent_source_stage
+    from process.registry_source_contribution_artifacts import (
+        _published_artifact_candidates,
+        load_published_artifact_validation,
+    )
+
+    predecessor = preservation.predecessor
+    candidates = await _published_artifact_candidates(connection, control_schema, {predecessor.candidate_id})
+    candidate = candidates[predecessor.candidate_id]
+    evidence = await load_published_artifact_validation(connection, candidate, control_schema)
+    if evidence["validation"] is not None:
+        return False
+    previous = await resolve_retained_registry_source_recipes(connection, predecessor, control_schema=control_schema)
+    recipes = tuple(recipe for recipe in previous if type(recipe.source_pin) is PinnedTypedFHIRMembershipSource)
+    if not recipes or len(preservation.temporary_tables) != len(_IdentityTables._fields):
+        _fail("carried_source_validation_required")
+    subjects = _IdentityTables(*preservation.temporary_tables).subjects
+    if await connection.fetchval(
+        f"SELECT EXISTS(SELECT FROM {preservation.network_table} ids WHERE NOT EXISTS "
+        f"(SELECT FROM {subjects} s WHERE s.network_id=ids.network_id AND s.supported AND s.slot=ANY($1::text[])))",
+        [_canonical(_slot(recipe)) for recipe in recipes],
+    ):
+        _fail("carried_source_validation_required")
+    stage, approved = await _carried_typed_stage(
+        connection, preservation, recipes, candidate, control_schema, source_witness_runtime
+    )
+    primary = None
+    try:
+        await _carried_typed_mapping_parity(connection, preservation, stage, approved, control_schema)
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        await _cleanup_independent_source_stage(connection, stage, None, primary)
+    return True
 
 
 async def _subjects(connection, inventory, control, revision, destination, side, *, historical=False):
@@ -463,7 +557,7 @@ async def _preservation_baseline(
     )
     if actual != predecessor:
         _fail("predecessor_changed")
-    _require_predecessor_seal(actual, predecessor)
+    _require_predecessor_manifest(actual, predecessor)
     from process.registry_publication_queue import require_registry_source_rollback_composition
 
     operation_sha256 = await require_registry_source_rollback_composition(
@@ -498,45 +592,32 @@ async def _preservation_baseline(
     return previous, old_approved, current_approved, old_receipt, operation_sha256
 
 
-def _require_predecessor_seal(actual, supplied=None):
-    """Match the resolver's authenticated legacy pins or independent custody seal."""
-    if not hasattr(actual, "_custody_seal_sha256"):
-        relation_pins = _legacy_predecessor_pins(actual)
-        if supplied is not None and (actual != supplied or _legacy_predecessor_pins(supplied) != relation_pins):
-            _fail("predecessor_changed")
-        return
-    seal = getattr(actual, "_custody_seal_sha256", None)
-    if type(seal) is not str or re.fullmatch("[0-9a-f]{64}", seal) is None:
-        _fail("predecessor_changed")
-    if supplied is not None and getattr(supplied, "_custody_seal_sha256", None) != seal:
-        _fail("predecessor_changed")
-
-
-def _legacy_predecessor_pins(manifest):
+def _require_predecessor_manifest(actual, supplied=None):
+    """Bind the retained logical generation and qualified address names to the selected predecessor."""
     from process.network_compact_layout import CompactAddressRelation
     from process.network_serving_read import PinnedNetworkServingManifest
 
     if (
-        type(manifest) is not PinnedNetworkServingManifest
-        or manifest.compact_layout is not None
-        or manifest.custody_control is not None
-        or hasattr(manifest, "_custody_seal_sha256")
+        type(actual) is not PinnedNetworkServingManifest
+        or type(actual.generation_id) is not int
+        or actual.generation_id <= 0
+        or type(actual.manifest_sha256) is not str
+        or re.fullmatch("[0-9a-f]{64}", actual.manifest_sha256) is None
+        or type(actual.address_relation) is not CompactAddressRelation
+        or supplied is not None
+        and actual != supplied
     ):
         _fail("predecessor_changed")
-    relation_pins = manifest.candidate_relation_pins
+    if supplied is not None and actual.compact_layout != supplied.compact_layout:
+        _fail("predecessor_changed")
     if (
-        type(relation_pins) is not tuple
-        or not relation_pins
-        or any(
-            type(pin) is not CompactAddressRelation or pin.schema_name != manifest.schema_name for pin in relation_pins
-        )
-        or not any(
-            pin.table_name == "entity_address_unified" and pin.table_oid == manifest.address_table_oid
-            for pin in relation_pins
-        )
+        actual.compact_layout is not None
+        and supplied is not None
+        and actual.compact_layout.geo_search != supplied.compact_layout.geo_search
     ):
         _fail("predecessor_changed")
-    return relation_pins
+    storage_identifier(actual.schema_name)
+    actual.address_relation.__post_init__()
 
 
 async def _create_identity_tables(connection):
@@ -697,28 +778,13 @@ def _carry_queries(predecessor, missing, raw, address_relation=None):
 
 
 async def _predecessor_addresses(connection, predecessor):
-    """Use every sealed logical address, including carriers hidden by ordinary API visibility."""
-    from api.network_compact_address import compact_address_native_sql, compact_address_read_relations
+    """Read every named logical address, including carriers hidden by ordinary API visibility."""
+    from api.network_compact_address import compact_address_native_sql
 
-    layout = predecessor.compact_layout
-    if layout is None:
-        relation = storage_identifier(predecessor.schema_name) + ".entity_address_unified"
-        relations = ((relation, predecessor.address_table_oid),)
-        query, arguments = relation, ()
-    else:
-        query, arguments = compact_address_native_sql(layout, first_parameter=1, visible_membership_sql="TRUE")
-        relations = tuple(
-            (
-                storage_identifier(relation.schema_name) + "." + storage_identifier(relation.table_name),
-                relation.table_oid,
-            )
-            for relation in compact_address_read_relations(layout)
-        )
-    for relation, oid in relations:
-        await connection.execute(f"LOCK TABLE ONLY {relation} IN ACCESS SHARE MODE NOWAIT")
-        if await connection.fetchval("SELECT to_regclass($1)::oid::bigint", relation) != oid:
-            _fail("predecessor_changed")
-    return query, arguments
+    if predecessor.compact_layout is not None:
+        return compact_address_native_sql(predecessor.compact_layout, first_parameter=1, visible_membership_sql="TRUE")
+    relation = predecessor.address_relation
+    return storage_identifier(relation.schema_name) + "." + storage_identifier(relation.table_name), ()
 
 
 async def _coverage_digest(connection, coverage):
@@ -1029,7 +1095,7 @@ async def _obligation_predecessor(connection, candidate, receipt, control_schema
     predecessor = await resolve_network_serving_manifest(
         connection, generation_id=generation, control_schema=control_schema
     )
-    _require_predecessor_seal(predecessor, reviewed_source_manifest)
+    _require_predecessor_manifest(predecessor, reviewed_source_manifest)
     if reviewed_source_manifest is not None and predecessor != reviewed_source_manifest:
         _fail("predecessor_changed")
     if operation is not None:
@@ -1264,10 +1330,8 @@ async def _verify_current_fhir_rows(
 
 
 async def _current_office_inputs(connection, candidate, recipes, approved, control_schema):
-    """Select mapping only from a paired receipt and independently authenticated final office input."""
+    """Select exact logical approval and named address inputs for independent mapping."""
     from process.network_address_projection import PinnedAddressSource
-    from process.network_custom_address_source import verify_artifact_dependency_identity
-    from process.network_membership_publication import publication_candidate_readiness
     from process.registry_initial_source_composition import verify_initial_source_office_receipt
 
     generations_by_name = candidate["source_generations"]
@@ -1284,12 +1348,17 @@ async def _current_office_inputs(connection, candidate, recipes, approved, contr
         ):
             _fail("source_changed")
         address_source = PinnedAddressSource(**context["address_source"])
-        writer_roles = publication_candidate_readiness(candidate)[3]
-        runtime_roles = tuple(sorted(set((*writer_roles["loader_roles"], *writer_roles["reader_roles"]))))
-        await verify_artifact_dependency_identity(
-            connection, address_source, runtime_roles, address=True, control_schema=control_schema
-        )
-        return address_source, runtime_roles
+        report = candidate["validation_json"]
+        report = json.loads(report) if type(report) is str else report
+        if type(report.get("address_source")) is not dict:
+            _fail("source_changed")
+        try:
+            current_address = PinnedAddressSource(**report["address_source"])
+        except TypeError, ValueError:
+            _fail("source_changed")
+        if address_source != current_address:
+            _fail("source_changed")
+        return address_source, ()
     if OFFICE_MAPPING_KEY not in generations_by_name:
         return None
     mapping_sha256 = generations_by_name[OFFICE_MAPPING_KEY]
@@ -1307,13 +1376,13 @@ async def _current_office_inputs(connection, candidate, recipes, approved, contr
         _fail("source_changed")
     report_by_name = candidate["validation_json"]
     report_by_name = json.loads(report_by_name) if type(report_by_name) is str else report_by_name
-    address_source = PinnedAddressSource(**report_by_name["address_source"])
-    writer_roles = publication_candidate_readiness(candidate)[3]
-    runtime_roles = tuple(sorted(set((*writer_roles["loader_roles"], *writer_roles["reader_roles"]))))
-    await verify_artifact_dependency_identity(
-        connection, address_source, runtime_roles, address=True, control_schema=control_schema
-    )
-    return address_source, runtime_roles
+    if type(report_by_name.get("address_source")) is not dict:
+        _fail("source_changed")
+    try:
+        address_source = PinnedAddressSource(**report_by_name["address_source"])
+    except TypeError, ValueError:
+        _fail("source_changed")
+    return address_source, ()
 
 
 async def _verify_current_offices(connection, candidate, recipes, approved, stage, office_inputs, control_schema):

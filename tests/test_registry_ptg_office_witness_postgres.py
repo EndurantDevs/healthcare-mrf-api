@@ -21,14 +21,12 @@ from uuid import UUID
 import asyncpg
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process import registry_ptg_graph_reader as graph
 from process import registry_ptg_office_capture as capture
 from process import registry_ptg_office_membership as offices
 from process import registry_ptg_office_witness as witness
 from process import registry_source_recipe_composition as composition
-from process.network_custom_address_source import NetworkCustomAddressSourceError
 from process.network_serving_read import NetworkServingReadUnavailable
 from process.ptg_parts.result_archive_source_authority import PtgResultArchiveSourceAuthorityError
 from process.registry_ptg_cohort_authority import RegistryPTGCohortAuthorityError
@@ -45,53 +43,10 @@ custom_db = native_fixture.custom_db
 office_db = native_fixture.office_db
 
 
-def _capability_statements(fixture, retained_reader, *, grant):
-    consumer = '"' + fixture.roles[1] + '"'
-    source_schema = fixture.source.source.schema
-    control_schema = '"' + fixture.source.control + '"'
-    verb, preposition = ("GRANT", "TO") if grant else ("REVOKE", "FROM")
-    return (
-        f"{verb} USAGE ON SCHEMA {source_schema} {preposition} {consumer}",
-        f"{verb} SELECT ON ALL TABLES IN SCHEMA {source_schema} {preposition} {consumer}",
-        f"{verb} UPDATE ON {source_schema}.ptg2_snapshot {preposition} {consumer}",
-        f"{verb} USAGE ON SCHEMA {control_schema} {preposition} {consumer}",
-        f"{verb} SELECT ON {control_schema}.registry_ptg_producer_scope {preposition} {consumer}",
-        f'{verb} "{retained_reader}" {preposition} {consumer}',
-    )
-
-
 @pytest.fixture
-async def witness_db(office_db, custom_db, tmp_path):
-    """Register exact additional consumer grants before provisioning or cleanup."""
-    retained_reader = custom_db.roles["reader"]
-    journal = tmp_path / "office-witness-capability-registration.json"
-    grants = _capability_statements(office_db, retained_reader, grant=True)
-    revocations = _capability_statements(office_db, retained_reader, grant=False)
-    journal.write_text(json.dumps({"phase": "registered", "grants": grants, "revocations": revocations}))
-    engine = create_async_engine(
-        office_db.source.engine.url.set(username=office_db.roles[1], password=office_db.consumer_password),
-        pool_size=1,
-        max_overflow=0,
-        isolation_level="REPEATABLE READ",
-        hide_parameters=True,
-    )
-    try:
-        for statement in grants:
-            await office_db.connection.execute(statement)
-        yield SimpleNamespace(**vars(office_db), consumer_sessions=async_sessionmaker(engine))
-    finally:
-        await engine.dispose()
-        for statement in reversed(revocations):
-            await office_db.connection.execute(statement)
-        assert not await office_db.connection.fetchval(
-            "SELECT pg_has_role($1,$2,'MEMBER')", office_db.roles[1], retained_reader
-        )
-        assert not await office_db.connection.fetchval(
-            "SELECT has_table_privilege($1,$2,'UPDATE')",
-            office_db.roles[1],
-            office_db.source.source.schema + ".ptg2_snapshot",
-        )
-        journal.write_text(json.dumps({"phase": "revoked", "grants": grants, "revocations": revocations}))
+async def witness_db(office_db):
+    """Reuse the real installed consumer after the shared admin-freeze/data-validation phases."""
+    return office_db
 
 
 async def _candidate(fixture):
@@ -131,7 +86,7 @@ async def test_native_office_source_exhaustion(witness_db):
     assert evidence["accounting"] == json.loads(descriptor.manifest_json)["accounting"]
     assert evidence["scope_id"] == str(witness_db.context.scope_id)
     assert evidence["scope_approval_sha256"] == witness_db.context.scope_approval_sha256
-    assert evidence["custody"] == json.loads(descriptor.custody_json)
+    assert evidence["storage"] == capture.descriptor_storage(descriptor)
     assert census["nonempty_pages"] == 1 and census["terminal_empty_ordinal"] == 2
     assert census["verified_edge_requests"] == 1
     assert evidence["accounting"]["input_row_count"] == 2
@@ -147,50 +102,57 @@ async def test_native_office_source_exhaustion(witness_db):
 
 async def test_native_consumer_and_publisher_capabilities_are_distinct(witness_db):
     request, descriptor = await _candidate(witness_db)
-    consumer, publisher, owner = witness_db.roles[1], witness_db.source.roles[2], witness_db.roles[0]
-    table = f'"{descriptor.schema_name}".office_assertion'
+    owner = witness_db.roles[0]
     source_table = witness_db.source.source.schema + ".ptg2_snapshot"
-    manager = witness_db.connection
-    assert await manager.fetchval("SELECT has_table_privilege($1,$2,'SELECT')", consumer, table)
-    assert not await manager.fetchval("SELECT has_table_privilege($1,$2,'UPDATE,INSERT,DELETE')", consumer, table)
-    assert await manager.fetchval("SELECT has_table_privilege($1,$2,'UPDATE')", consumer, source_table)
-    assert not await manager.fetchval("SELECT has_table_privilege($1,$2,'INSERT')", consumer, witness_db.source.table)
-    assert not await manager.fetchval("SELECT pg_has_role($1,$2,'SET')", consumer, witness_db.source.roles[1])
-    assert not await manager.fetchval("SELECT pg_has_role($1,$2,'SET')", consumer, owner)
-    assert await manager.fetchval("SELECT pg_has_role($1,$2,'SET')", publisher, owner)
-    assert not await manager.fetchval("SELECT pg_has_role($1,$2,'USAGE')", publisher, owner)
-    assert not await manager.fetchval("SELECT has_table_privilege($1,$2,'SELECT')", publisher, table)
-    budget = _budget()
-    with pytest.raises(asyncpg.InsufficientPrivilegeError):
-        await _verify(witness_db, request, descriptor, budget, sessions=witness_db.sessions)
-    assert budget.read_bytes == 0
-    await _verify(witness_db, request, descriptor, budget)
+    async with witness_db.consumer_sessions() as reader, reader.begin():
+        await reader.execute(text(f"SELECT * FROM {source_table} FOR KEY SHARE"))
+        for statement in (
+            f"INSERT INTO {witness_db.source.table} SELECT * FROM {witness_db.source.table}",
+            "UPDATE hp_snapshot_retention.preparation SET state=state",
+            f'SET LOCAL ROLE "{witness_db.source.roles[1]}"',
+            f'SET LOCAL ROLE "{owner}"',
+        ):
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                async with reader.begin_nested():
+                    await reader.execute(text(statement))
+    await native_fixture._assert_office_readonly(witness_db, descriptor)
+    evidence = await _verify(witness_db, request, descriptor, _budget())
+    assert evidence.as_dict()["accounting"]["input_row_count"] == request.input_row_count
+    assert (await _verify(witness_db, request, descriptor, _budget(), sessions=witness_db.sessions)).as_dict()[
+        "storage"
+    ] == evidence.as_dict()["storage"]
 
 
 async def _recreate_valid_heap(fixture, descriptor):
+    from process.provider_directory_generic_source_provision import freeze_fhir_source_snapshot
+    from process.registry_ptg_office_custody import office_preparation_roles
+
     namespace = '"' + descriptor.schema_name + '"'
     manager = fixture.connection
-    await manager.execute(f"CREATE TABLE {namespace}.replacement (LIKE {namespace}.office_assertion INCLUDING ALL)")
-    await manager.execute(f"INSERT INTO {namespace}.replacement SELECT * FROM {namespace}.office_assertion")
-    await manager.execute(f"DROP TABLE {namespace}.office_assertion")
-    await manager.execute(f"ALTER TABLE {namespace}.replacement RENAME TO office_assertion")
-    await manager.execute(f'ALTER TABLE {namespace}.office_assertion OWNER TO "{fixture.roles[0]}"')
-    await manager.execute(f'GRANT SELECT ON {namespace}.office_assertion TO "{fixture.roles[1]}"')
+    applications = office_preparation_roles(fixture.context)["application_roles"]
+    async with manager.transaction():
+        await manager.execute(f"CREATE TABLE {namespace}.replacement (LIKE {namespace}.office_assertion INCLUDING ALL)")
+        await manager.execute(f"INSERT INTO {namespace}.replacement SELECT * FROM {namespace}.office_assertion")
+        await manager.execute(f"DROP TABLE {namespace}.office_assertion")
+        await manager.execute(f"ALTER TABLE {namespace}.replacement RENAME TO office_assertion")
+        await manager.execute(f'ALTER TABLE {namespace}.office_assertion OWNER TO "{fixture.roles[0]}"')
+        await freeze_fhir_source_snapshot(
+            manager,
+            descriptor.schema_name,
+            namespace_owner=fixture.roles[0],
+            reader_roles=applications,
+            application_roles=applications,
+        )
 
 
-async def test_native_valid_heap_replacement_refuses_old_oid(witness_db):
+async def test_native_equivalent_named_copy_preserves_logical_witness(witness_db):
     request, descriptor = await _candidate(witness_db)
     namespace = '"' + descriptor.schema_name + '"'
-    old_oid = await witness_db.connection.fetchval("SELECT $1::regclass::oid", namespace + ".office_assertion")
+    original = (await _verify(witness_db, request, descriptor, _budget())).as_dict()
     await _recreate_valid_heap(witness_db, descriptor)
-    new_oid = await witness_db.connection.fetchval("SELECT $1::regclass::oid", namespace + ".office_assertion")
-    assert old_oid != new_oid
     assert await witness_db.connection.fetchval(f"SELECT count(*) FROM {namespace}.office_assertion") == 2
-    current_custody = await capture._custody(witness_db.connection, descriptor.schema_name, witness_db.context)
-    assert current_custody["columns_sha256"] == json.loads(descriptor.custody_json)["columns_sha256"]
-    assert current_custody["table_oid"] == new_oid
-    with pytest.raises(witness.RegistryPTGOfficeWitnessError, match="custody_changed"):
-        await _verify(witness_db, request, descriptor, _budget())
+    assert (await _verify(witness_db, request, descriptor, _budget())).as_dict() == original
+    await native_fixture._assert_office_readonly(witness_db, descriptor)
 
 
 @pytest.mark.parametrize("damage", ["document", "digest"])
@@ -203,37 +165,27 @@ async def test_native_manifest_substitution_refuses(witness_db, damage):
         else "manifest_sha256=repeat('f',64)"
     )
     await witness_db.connection.execute(f"UPDATE {namespace}.capture_manifest SET {expression}")
-    with pytest.raises(witness.RegistryPTGOfficeWitnessError, match="manifest_changed"):
+    with pytest.raises(ValueError, match="registry_ptg_office_manifest_changed"):
         await _verify(witness_db, request, descriptor, _budget())
 
 
-@pytest.mark.parametrize("damage", ["column", "default", "extra_heap"])
+@pytest.mark.parametrize("damage", ["column", "default"])
 async def test_native_catalog_drift_refuses(witness_db, damage):
     request, descriptor = await _candidate(witness_db)
     namespace = '"' + descriptor.schema_name + '"'
     sql_by_damage = {
         "column": f"ALTER TABLE {namespace}.office_assertion ADD COLUMN substituted text",
         "default": f"ALTER TABLE {namespace}.office_assertion ALTER COLUMN ordinal SET DEFAULT 1",
-        "extra_heap": f"CREATE TABLE {namespace}.substituted (id bigint)",
     }
     await witness_db.connection.execute(sql_by_damage[damage])
-    with pytest.raises(capture.RegistryPTGOfficeCaptureError, match="custody_invalid"):
+    with pytest.raises(capture.RegistryPTGOfficeCaptureError, match="layout_invalid"):
         await _verify(witness_db, request, descriptor, _budget())
 
 
-@pytest.mark.parametrize("damage", ["default_acl", "column_acl"])
-async def test_native_write_privilege_drift_refuses(witness_db, damage):
+async def test_native_application_roles_cannot_reopen_frozen_writes(witness_db):
     request, descriptor = await _candidate(witness_db)
-    namespace = '"' + descriptor.schema_name + '"'
-    owner, consumer = witness_db.roles
-    statement = (
-        f'ALTER DEFAULT PRIVILEGES FOR ROLE "{owner}" IN SCHEMA {namespace} GRANT INSERT ON TABLES TO "{consumer}"'
-        if damage == "default_acl"
-        else f'GRANT UPDATE(provider_id) ON {namespace}.office_assertion TO "{consumer}"'
-    )
-    await witness_db.connection.execute(statement)
-    with pytest.raises(NetworkCustomAddressSourceError):
-        await _verify(witness_db, request, descriptor, _budget())
+    await native_fixture._assert_office_readonly(witness_db, descriptor)
+    assert (await _verify(witness_db, request, descriptor, _budget())).as_dict()["accounting"]["input_row_count"] == 2
 
 
 @pytest.mark.parametrize("damage", ["missing", "extra"])

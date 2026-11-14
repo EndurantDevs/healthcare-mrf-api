@@ -187,7 +187,7 @@ def _query_observation(observed, statement, parameters=None):
                     "kind": "relation",
                     "oid": oid,
                     "name": name,
-                    "owner": observed.physical.owner_oid,
+                    "owner": 102,
                     "definition": "r:p:1:0",
                 }
                 for name, oid in observed.ownership.relation_oids

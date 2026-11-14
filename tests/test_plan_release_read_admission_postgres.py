@@ -5,7 +5,6 @@ import json
 import os
 import re
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
-from dataclasses import replace
 from hashlib import sha256
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -215,25 +214,17 @@ async def _prepare_local_lock_binding(owner, metadata_schema, reader, monkeypatc
     authority_by_field["native_publication"] = {}
     schema = binding.schema_name
     await owner.execute(f'CREATE SCHEMA "{schema}"')
-    relation_names = [name for name, _oid in binding.relation_oids]
+    relation_names = [name for _schema, name in binding.relations]
     for name in relation_names:
         await owner.execute(f'CREATE TABLE "{schema}"."{name}" (payload text)')
-    relation_records = await owner.fetch(
-        "SELECT relname,oid FROM pg_class WHERE relnamespace=to_regnamespace($1)", schema
-    )
-    oid_by_name = {entry["relname"]: entry["oid"] for entry in relation_records}
-    binding = replace(binding, relation_oids=tuple((name, oid_by_name[name]) for name in relation_names))
     await owner.execute(
         f'GRANT USAGE ON SCHEMA "{schema}" TO "{reader}"; GRANT SELECT ON ALL TABLES IN SCHEMA "{schema}" TO "{reader}"'
     )
     monkeypatch.setattr(validation, "resolve_ptg2_schema", lambda: metadata_schema)
+    monkeypatch.setattr(validation, "_local_read_authority", AsyncMock(return_value=authority_by_field))
     monkeypatch.setattr(
-        validation, "_local_read_authority", AsyncMock(return_value=(False, binding.owner_oid, authority_by_field))
+        validation, "_local_read_authority_binding", lambda *_args, **_kwargs: (binding, authority_by_field)
     )
-    monkeypatch.setattr(validation, "_local_read_authority_binding", lambda *_args, **_kwargs: (None, binding))
-    monkeypatch.setattr(native, "verify_local_data_family", AsyncMock())
-    monkeypatch.setattr(native, "_require_closed_local_custody", AsyncMock())
-    monkeypatch.setattr(native, "local_data_catalog_digest", AsyncMock(return_value="c" * 64))
     monkeypatch.setattr(
         native, "_local_candidate_control", AsyncMock(return_value={"snapshot_id": binding.snapshot_id})
     )

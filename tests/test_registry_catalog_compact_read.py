@@ -32,17 +32,16 @@ _PID = 77
 
 def _compact(manifest):
     artifacts = tuple(
-        CompactEdgeArtifact(str(UUID(int=index)), "network_candidate_" + UUID(int=index).hex, 300 + index)
-        for index in (2, 3)
+        CompactEdgeArtifact(str(UUID(int=index)), "network_candidate_" + UUID(int=index).hex) for index in (2, 3)
     )
     layout = CompactNetworkLayout(
-        CompactAddressRelation(manifest.schema_name, "network_slice_ref", 103),
-        CompactAddressRelation("synthetic_base", "entity_address_unified", 201),
+        CompactAddressRelation(manifest.schema_name, "network_slice_ref"),
+        CompactAddressRelation("synthetic_base", "entity_address_unified"),
         artifacts,
-        CompactAddressRelation("synthetic_custom", "entity_address_unified", 202),
+        CompactAddressRelation("synthetic_custom", "entity_address_unified"),
     )
     pins = tuple(
-        CompactAddressRelation(manifest.schema_name, name, oid)
+        CompactAddressRelation(manifest.schema_name, name)
         for name, oid in (
             ("network_membership", 101),
             ("provider_location_binding", 102),
@@ -50,6 +49,7 @@ def _compact(manifest):
         )
     )
     object.__setattr__(manifest, "_compact_layout", layout)
+    object.__setattr__(manifest, "address_relation", manifest.compact_layout.base)
     object.__setattr__(manifest, "_candidate_relation_pins", pins)
     object.__setattr__(manifest, "_custody_seal_sha256", "c" * 64)
     return manifest
@@ -60,7 +60,14 @@ def _boundary(request, surface, *, empty=False):
         connection, original, snapshot = request.getfixturevalue("page_boundary")
         manifest = _compact(
             PinnedNetworkServingManifest(
-                9, str(UUID(int=1)), original.schema_name, 1, {}, 4, original.manifest_sha256, 123
+                9,
+                str(UUID(int=1)),
+                original.schema_name,
+                1,
+                {},
+                4,
+                original.manifest_sha256,
+                CompactAddressRelation(original.schema_name, "entity_address_unified"),
             )
         )
         fhir.catalog_pin.return_value = manifest
@@ -271,6 +278,7 @@ def test_compact_relation_refuses_missing_or_untyped_native_inputs(batch_boundar
         pins = list(pins)
     if damage == "layout":
         object.__setattr__(manifest, "_compact_layout", object())
+        object.__setattr__(manifest, "address_relation", manifest.compact_layout.base)
     object.__setattr__(manifest, "_candidate_relation_pins", pins)
     with pytest.raises(ValueError):
         catalog.catalog_directory_relation(manifest, first_parameter=11)

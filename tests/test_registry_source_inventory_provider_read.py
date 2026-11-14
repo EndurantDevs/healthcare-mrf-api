@@ -29,14 +29,14 @@ from process.registry_source_inventory_contract import make_source_inventory_ent
 from process.registry_source_inventory_reference import INVENTORY_DIGEST_KEY, SourceInventoryReference
 from process.registry_source_inventory_summaries import contribution_summary_v3
 from process.registry_source_recipe_store import RECIPE_DIGEST_KEY, canonical_registry_source_recipes
+from tests.registry_source_recipe_support import _example
 from tests.test_registry_source_contributions import _descriptor
-from tests.test_registry_source_recipe_store_postgres import _example
 
 CONTROL = "synthetic_control"
 APPROVED = ApprovedMembershipSource(3, "b" * 64, 0)
 _PID = 77
-_CANDIDATE_RELATION = CompactAddressRelation(CONTROL, "network_membership_candidate", 11)
-_APPROVED_RELATION = CompactAddressRelation(CONTROL, "registry_approved_record", 13)
+_CANDIDATE_RELATION = CompactAddressRelation(CONTROL, "network_membership_candidate")
+_APPROVED_RELATION = CompactAddressRelation(CONTROL, "registry_approved_record")
 
 
 def _fixture(count=1, *, legacy=False):
@@ -85,7 +85,7 @@ def _fixture(count=1, *, legacy=False):
         copy.deepcopy(generations_by_name),
         APPROVED.approved_revision,
         "d" * 64,
-        42,
+        CompactAddressRelation("network_candidate_" + identity.replace("-", ""), "entity_address_unified"),
     )
     _pin_provider_fixture_relations(manifest, legacy)
     return SimpleNamespace(
@@ -362,7 +362,7 @@ def _pin_provider_fixture_relations(manifest, legacy):
         manifest,
         "_candidate_relation_pins",
         tuple(
-            CompactAddressRelation(manifest.schema_name, name, oid)
+            CompactAddressRelation(manifest.schema_name, name)
             for name, oid in (
                 (("network_source_contribution", 23),)
                 if legacy

@@ -19,16 +19,10 @@ from tests.test_provider_directory_resource_identity_candidate import scope as r
 
 def _isolate(publisher, monkeypatch):
     publisher.policy.schema = "candidate_storage"
-    publisher.storage_binding = FHIRSourceStorageBinding(
-        database_oid=1,
-        catalog_schema="accepted_catalog",
-        catalog_schema_oid=2,
-        storage_schema="candidate_storage",
-        storage_schema_oid=3,
-        owner_oid=4,
-        namespace_owner_oid=5,
-        enrollment_sha256="a" * 64,
-    )
+    publisher.storage_binding = FHIRSourceStorageBinding("accepted_catalog", "candidate_storage")
+    binding = publisher.connection.binding
+    for table in [*binding["tables"].values(), *binding["auxiliary"]["tables"].values()]:
+        table["schema"] = "candidate_storage"
     monkeypatch.setattr(source, "bound_publisher", lambda: publisher)
 
 

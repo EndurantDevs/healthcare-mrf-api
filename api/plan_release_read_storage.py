@@ -2,16 +2,13 @@
 """Retain authorized legacy reads between structural migration and provisioning."""
 
 import re
-from datetime import datetime
 
 from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.network_read_execution import install_network_read_inventory
 from db.plan_release_storage import BINDING_TABLE, LEGACY_BINDING_TABLE, PIN_TABLE, REVISION_TABLE, storage_relation
 from process.network_compact_layout import CompactAddressRelation
-from process.network_read_identity import NetworkReadIdentityError, verify_bound_network_names
 from process.plan_release_storage_catalog import CATALOG_SQL
 from process.plan_release_storage_custody import _document, _require, _verify_header, _verify_payload
 
@@ -301,10 +298,9 @@ async def _catalog_session_rows(session, statement, parameters):
         raise
 
 
-_API_SNAPSHOT_SQL = """SELECT pg_catalog.pg_backend_pid() AS backend_pid,
- pg_catalog.current_setting('transaction_isolation') AS isolation,
- pg_catalog.current_setting('transaction_read_only') AS read_only,
- pg_catalog.transaction_timestamp() AS started_at"""
+_API_SNAPSHOT_SQL = (
+    "SELECT current_setting('transaction_isolation') AS isolation,current_setting('transaction_read_only') AS read_only"
+)
 _API_AUTHORITY_SQL = (
     "SELECT proof.*,pin.oid::bigint AS pin_oid FROM ("
     + _LEGACY_AUTHORITY_SQL
@@ -312,25 +308,15 @@ _API_AUTHORITY_SQL = (
 )
 
 
-async def _api_native_snapshot(connection, expected=None):
-    """Check caller-owned RRRO; the timestamp detects drift, not unique identity."""
+async def _api_native_snapshot(connection):
+    """Require the caller's read-only repeatable transaction."""
     _require(connection.is_in_transaction() is True, "retained_snapshot_required")
-    backend_pid = connection.get_server_pid()
-    _require(type(backend_pid) is int and 0 < backend_pid <= 2147483647, "retained_backend_invalid")
     snapshot = await connection.fetchrow(_API_SNAPSHOT_SQL)
     _require(
         snapshot is not None
-        and snapshot["backend_pid"] == backend_pid
-        and (snapshot["isolation"], snapshot["read_only"]) in (("repeatable read", "on"), ("serializable", "on"))
-        and type(snapshot["started_at"]) is datetime
-        and snapshot["started_at"].utcoffset() is not None
-        and connection.is_in_transaction() is True
-        and connection.get_server_pid() == backend_pid,
-        "retained_snapshot_changed",
+        and (snapshot["isolation"], snapshot["read_only"]) in (("repeatable read", "on"), ("serializable", "on")),
+        "retained_snapshot_required",
     )
-    identity = backend_pid, snapshot["started_at"]
-    _require(expected is None or identity == expected, "retained_snapshot_changed")
-    return identity
 
 
 def _api_retained_pins(schema, family, authority):
@@ -340,10 +326,8 @@ def _api_retained_pins(schema, family, authority):
     for name in (LEGACY_BINDING_TABLE, REVISION_TABLE):
         relation = by_name[name]
         _require(relation["nspname"] == schema, "retained_namespace_changed")
-        _require(type(relation["oid"]) is int and 0 < relation["oid"] < 2**32, "retained_identity_changed")
-        pins.append(CompactAddressRelation(schema, name, relation["oid"]))
-    _require(type(authority["pin_oid"]) is int and 0 < authority["pin_oid"] < 2**32, "retained_identity_changed")
-    pins.append(CompactAddressRelation(schema, "ptg2_snapshot_pin", authority["pin_oid"]))
+        pins.append(CompactAddressRelation(schema, name))
+    pins.append(CompactAddressRelation(schema, "ptg2_snapshot_pin"))
     return tuple(pins)
 
 
@@ -364,12 +348,12 @@ async def _read_retained_binding_metadata(connection, schema):
     True pins cover ONLY/direct legacy, header and old-pin heaps; they establish
     no mutable routing or Source authority. False is access-only with no pins.
     """
-    snapshot = await _api_native_snapshot(connection)
+    await _api_native_snapshot(connection)
     roots = [storage_relation(schema, name) for name in (BINDING_TABLE, PIN_TABLE)]
     access = await connection.fetch(_ACCESS_SQL, roots)
     _require(len(access) == 2, "read_roots_missing")
     if all(root_access["readable"] is True for root_access in access):
-        await _api_native_snapshot(connection, snapshot)
+        await _api_native_snapshot(connection)
         return False, ()
     _require(
         all(
@@ -405,28 +389,12 @@ async def _read_retained_binding_metadata(connection, schema):
         "retained_legacy_authority_changed",
     )
     pins = _api_retained_pins(schema, family, authority[0])
-    try:
-        await verify_bound_network_names(connection, pins, expected_backend_pid=snapshot[0])
-    except NetworkReadIdentityError as error:
-        raise ValueError("plan_release_storage_retained_identity_changed") from error
-    await _api_native_snapshot(connection, snapshot)
+    await _api_native_snapshot(connection)
     return True, pins
 
 
-async def _api_session_continuity(session, connection, transaction, backend_pid):
-    """Keep metadata and inventory inside the original ORM session and transaction."""
-    try:
-        actual = (await (await session.connection()).get_raw_connection()).driver_connection
-        _require(
-            session.in_transaction() is True
-            and session.get_transaction() is transaction
-            and actual is connection
-            and connection.is_in_transaction() is True
-            and connection.get_server_pid() == backend_pid,
-            "retained_session_changed",
-        )
-    except Exception as error:
-        raise ValueError("plan_release_storage_retained_session_changed") from error
+async def _api_session_continuity(session, transaction):
+    _require(session.in_transaction() is True and session.get_transaction() is transaction, "retained_session_changed")
 
 
 async def _api_retained_session_read(session, schema):
@@ -436,13 +404,8 @@ async def _api_retained_session_read(session, schema):
         transaction = session.get_transaction()
         _require(transaction is not None, "retained_snapshot_required")
         connection = (await (await session.connection()).get_raw_connection()).driver_connection
-        backend_pid = connection.get_server_pid()
-        _require(type(backend_pid) is int and 0 < backend_pid <= 2147483647, "retained_backend_invalid")
         retained, pins = await read_retained_binding_metadata(connection, schema)
-        await _api_session_continuity(session, connection, transaction, backend_pid)
-        if pins:
-            await install_network_read_inventory(session, pins)
-            await _api_session_continuity(session, connection, transaction, backend_pid)
+        await _api_session_continuity(session, transaction)
         return retained
     except ServiceUnavailable as error:
         raise ValueError("plan_release_storage_retained_identity_changed") from error

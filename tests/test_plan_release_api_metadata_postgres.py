@@ -1,19 +1,17 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Genuine retained-family metadata and guarded rows without eager reader locks."""
+"""Retained-family metadata and ordinary session rows without eager reader locks."""
 
 import asyncio
 
 import asyncpg
 import pytest
-from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from api.network_read_execution import bounded_network_read_rows, execute_network_read
+from api.network_read_execution import bounded_network_read_rows
 from api.plan_release_pricing_projection import plan_release_serving_sql
 from api.plan_release_read_storage import is_retained_session_read, read_retained_binding_metadata
-from process.network_read_identity import verify_consumed_network_relations
 from tests.plan_release_storage_postgres_support import NEW_REVISION, OLD_REVISION, RELEASE, _database_config
 from tests.test_plan_release_retained_reads_postgres import retained_case
 
@@ -37,9 +35,7 @@ async def test_native_retained_metadata_and_session_payload_match_original(monke
             with reader.query_logger(statements.append):
                 retained, pins = await read_retained_binding_metadata(reader, case.schema)
                 assert retained and len(pins) == 3
-                backend_pid = reader.get_server_pid()
                 binding_rows = await reader.fetch(native_sql, RELEASE, "plan_release_serving_revision")
-                await verify_consumed_network_relations(reader, pins, expected_backend_pid=backend_pid)
                 assert binding_rows == before
                 await asyncio.sleep(0)
         _assert_no_eager_locks(statements)
@@ -59,8 +55,7 @@ async def test_native_retained_metadata_and_session_payload_match_original(monke
                 statements = []
                 with driver.query_logger(statements.append):
                     assert await is_retained_session_read(session, case.schema, api_read=True)
-                    binding_rows = await execute_network_read(
-                        session,
+                    binding_rows = await session.execute(
                         text(sql),
                         {"plan_release_id": RELEASE, "pin_owner_type": "plan_release_serving_revision"},
                     )
@@ -137,7 +132,6 @@ async def test_retained_metadata_does_not_open_locked_application_relations(monk
                 if locked_relation == "plan_release_snapshot_binding_legacy":
                     await _assert_legacy_payload_waits(reader, legacy)
             assert await reader.fetch(sql, RELEASE, "plan_release_serving_revision") == before
-            await verify_consumed_network_relations(reader, pins, expected_backend_pid=reader.get_server_pid())
 
 
 @pytest.mark.parametrize("damage", ["check", "system_var", "whole_row", "default", "predicate", "bound"])
@@ -182,38 +176,6 @@ async def test_native_metadata_still_refuses_altered_expressions(monkeypatch, da
         async with reader.transaction(isolation="repeatable_read", readonly=True):
             with pytest.raises(ValueError, match="plan_release_storage_"):
                 await read_retained_binding_metadata(reader, case.schema)
-
-
-@pytest.mark.parametrize("adapter", ["buffered", "aggregate"])
-async def test_native_result_guard_rejects_swap_after_metadata_without_eager_locks(monkeypatch, adapter):
-    async with retained_case(monkeypatch) as (case, admin, _reader, _before):
-        url = URL.create(
-            "postgresql+asyncpg",
-            username=case.reader,
-            password=case.role_passwords[case.reader],
-            host=case.config["host"],
-            port=case.config["port"],
-            database=case.config["database"],
-        )
-        engine = create_async_engine(url, isolation_level="REPEATABLE READ")
-        try:
-            async with async_sessionmaker(engine)() as session, session.begin():
-                await session.execute(text("SET TRANSACTION READ ONLY"))
-                assert await is_retained_session_read(session, case.schema, api_read=True)
-                await admin.execute("SET lock_timeout='250ms'")
-                pin = case.relation("ptg2_snapshot_pin")
-                await admin.execute(f"ALTER TABLE {pin} RENAME TO prior_snapshot_pin")
-                await admin.execute(f'CREATE TABLE {pin} (LIKE "{case.schema}".prior_snapshot_pin INCLUDING ALL)')
-                await admin.execute(f'GRANT SELECT ON {pin} TO "{case.reader}"')
-                guarded_read = (
-                    execute_network_read(session, text(f"SELECT owner_id FROM ONLY {pin}"))
-                    if adapter == "buffered"
-                    else bounded_network_read_rows(session, f"SELECT owner_id FROM ONLY {pin}")
-                )
-                with pytest.raises(ServiceUnavailable):
-                    await guarded_read
-        finally:
-            await engine.dispose()
 
 
 @pytest.mark.parametrize("suffix", ["0" * 32, "a" * 32, "", "0" * 31, "g" * 32, "0" * 32 + "_extra"])

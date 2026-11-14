@@ -35,6 +35,7 @@ from process.network_cms_registry_source_pair import (
     require_registry_cms_source_pair,
     require_registry_cms_source_pair_connection,
 )
+from process.network_compact_layout import CompactAddressRelation
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource, read_fhir_membership_batch
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.provider_directory_mrf_payer_binding import (
@@ -847,7 +848,9 @@ def _retained_entity_scope(pair, monkeypatch):
     recipe = pair.recipe
 
     async def manifest(*_args, **_kwargs):
-        return PinnedNetworkServingManifest(9, str(uuid4()), "mrf", 1, {}, 7, "c" * 64, 1)
+        return PinnedNetworkServingManifest(
+            9, str(uuid4()), "mrf", 1, {}, 7, "c" * 64, CompactAddressRelation("mrf", "entity_address_unified")
+        )
 
     async def recipes(*_args, **_kwargs):
         return (recipe,)

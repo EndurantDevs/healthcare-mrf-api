@@ -19,7 +19,7 @@ from api import custom_import_read_http as transport
 from process.custom_import.read_contracts import CustomImportReadRequestError, CustomImportReadUnavailableError
 from process.custom_import.read_core import PreparedNpiEntityRelation, ReadFieldValue
 from tests import test_custom_import_read_http as fixtures
-from tests.network_read_execution_support import _ReceiptDriver, mock_approved_control_metadata
+from tests.network_read_execution_support import _QueryDriver, mock_approved_control_metadata
 
 
 def _body(**changes):
@@ -563,7 +563,7 @@ class _NetworkServiceSession(_Session):
     def __init__(self):
         super().__init__()
         self._transaction = object()
-        self.driver = _ReceiptDriver(self, None)
+        self.driver = _QueryDriver(self, None)
 
     def in_transaction(self):
         return "begin" in self.events and "end" not in self.events
