@@ -10,6 +10,8 @@ import re
 from dataclasses import asdict, dataclass
 from uuid import UUID
 
+import asyncpg
+
 from process.network_address_projection import _identifier
 from process.network_candidate_custody import MAX_RECEIPT_BYTES as CUSTODY_MAX_RECEIPT_BYTES
 from process.network_candidate_custody import verify_network_candidate_custody
@@ -268,6 +270,7 @@ def _authenticate_owned_source(owner, custody, descriptor, reference, *, sources
 _UNFILTERED_FACT_HEAP_SQL = """SELECT c.relkind='r' AND c.relpersistence='p'
  AND c.relam=(SELECT oid FROM pg_catalog.pg_am WHERE amname='heap')
  AND NOT (c.relrowsecurity OR c.relforcerowsecurity OR c.relispartition)
+ AND NOT pg_catalog.row_security_active(c.oid)
  AND NOT EXISTS(SELECT FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)
  AND NOT EXISTS(SELECT FROM pg_catalog.pg_rewrite WHERE ev_class=c.oid)
  FROM pg_catalog.pg_class c WHERE c.oid=pg_catalog.to_regclass($1)"""
@@ -276,6 +279,11 @@ _UNFILTERED_FACT_HEAP_SQL = """SELECT c.relkind='r' AND c.relpersistence='p'
 async def _require_unfiltered_fact_heap(connection, schema_name):
     """API reads consume anchored facts directly; row filtering would return a silent partial page."""
     relation = f"{_identifier(schema_name)}.{CONTRIBUTION_TABLE}"
+    try:
+        # The share lock lasts until the read ends, so row level security cannot be enabled meanwhile.
+        await connection.execute(f"LOCK TABLE {relation} IN ACCESS SHARE MODE")
+    except asyncpg.PostgresError as error:
+        raise RegistrySourceContributionError("registry_source_artifact_physical_identity_changed") from error
     if await connection.fetchval(_UNFILTERED_FACT_HEAP_SQL, relation) is not True:
         raise RegistrySourceContributionError("registry_source_artifact_physical_identity_changed")
 
