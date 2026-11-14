@@ -469,7 +469,7 @@ async def _final_proof(
 ):
     """Reconstruct the complete closed candidate under independent Source and office context."""
     _require(set(source_options) <= {"source_witness_runtime"})
-    from process.network_membership_publication import _publication_readiness, _verify_provider_custody
+    from process.network_membership_publication import _publication_readiness
     from process.network_sampled_custody import inherit_preserved_sampling
 
     readiness = _publication_readiness(candidate)
@@ -523,7 +523,6 @@ async def _final_proof(
                 await _index_digest(connection, copy_target.schema_name, _serving_plan(copy_target.schema_name))
                 == readiness[2]["index_definition_sha256"]
             )
-        await _verify_provider_custody(connection, candidate, readiness[3])
 
 
 async def _original_actor(connection):

@@ -575,7 +575,7 @@ def _mock_final_source_proofs(monkeypatch, calls):
     monkeypatch.setattr(office_custody, "verify_independent_initial_source_offices", offices)
 
 
-@pytest.mark.parametrize("failure", ["relationships", "retention", "provider", "index"])
+@pytest.mark.parametrize("failure", ["relationships", "retention", "index"])
 async def test_final_custodian_uses_full_existing_verification_and_propagates_failure(boundary, monkeypatch, failure):
     boundary.candidate["validation_json"]["address_source"] = {
         "schema_name": "source",
@@ -600,17 +600,11 @@ async def test_final_custodian_uses_full_existing_verification_and_propagates_fa
         if failure == "retention":
             raise RuntimeError("retention refused")
 
-    async def provider(*args):
-        calls.append("provider")
-        if failure == "provider":
-            raise RuntimeError("provider refused")
-
     async def semantics(*args, **kwargs):
         assert kwargs == {"replay": True}
 
     monkeypatch.setattr(custody, "_matching_inputs", matching)
     monkeypatch.setattr(custody, "verify_registry_source_retention_rows", retention)
-    monkeypatch.setattr(network_membership_publication, "_verify_provider_custody", provider)
     monkeypatch.setattr(custody, "_source_semantics", semantics)
     if failure == "index":
         boundary.index = "0" * 64

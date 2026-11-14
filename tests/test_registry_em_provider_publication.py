@@ -69,8 +69,22 @@ def _candidate(state="ready"):
     return candidate_by_field, target, receipt_by_field
 
 
+def _drop_receipt(candidate):
+    """Keep the declared marker and a readable report, without the composition-time receipt."""
+    source = PinnedAddressSource("retained_addresses", "entity_address_unified", "address-edition")
+    candidate["validation_json"] = {"address_source": asdict(source)}
+
+
 def _closure():
     return {"owner_role": "protected_owner", "loader_roles": [], "reader_roles": ["runtime_reader"]}
+
+
+def _held_by_name(_sql, requested):
+    """Resolve every declared input by name to a plain table whose ids differ from the recorded ones."""
+    return [
+        {"role": held["role"], "relation_oid": 900 + index, "relfilenode": 950 + index}
+        for index, held in enumerate(json.loads(requested))
+    ]
 
 
 def _connection():
@@ -80,6 +94,7 @@ def _connection():
 
     return SimpleNamespace(
         transaction=transaction,
+        fetch=AsyncMock(side_effect=_held_by_name),
         fetchrow=AsyncMock(return_value=None),
         fetchval=AsyncMock(),
         execute=AsyncMock(return_value="UPDATE 1"),
@@ -147,31 +162,11 @@ async def test_unpaired_or_malformed_recipe_is_refused_before_validation(damage)
         validation._em_provider_receipt(candidate)
 
 
-async def test_legacy_candidate_does_not_require_provider_receipt_or_native_read(monkeypatch):
+async def test_legacy_candidate_does_not_require_provider_receipt_or_native_read():
     candidate, _, _ = _candidate()
     candidate["source_generations"].pop("em_provider_inputs")
     candidate["validation_json"] = {}
-    prepare_native = AsyncMock()
-    monkeypatch.setattr(provider, "prepare_em_provider_inputs", prepare_native)
-    assert await provider.verify_candidate_em_provider_inputs(object(), candidate, runtime_roles=()) is None
-    prepare_native.assert_not_awaited()
-
-
-@pytest.mark.parametrize("damage", ["native", "changed", "roles"])
-async def test_native_custody_and_writer_runtime_roles_must_match(monkeypatch, damage):
-    candidate, _, receipt = _candidate()
-    current = copy.deepcopy(receipt)
-    if damage == "changed":
-        current["relations"][0]["owner_oid"] += 1
-    native = AsyncMock(return_value=current, side_effect=ValueError("stale") if damage == "native" else None)
-    monkeypatch.setattr(provider, "prepare_em_provider_inputs", native)
-    with pytest.raises(ValueError) as caught:
-        await provider.verify_candidate_em_provider_inputs(
-            object(), candidate, runtime_roles=("other_reader",) if damage == "roles" else ("runtime_reader",)
-        )
-    assert caught.value.__cause__ is None
-    if damage == "roles":
-        native.assert_not_awaited()
+    assert await provider.require_readable_em_provider_inputs(object(), candidate) is None
 
 
 @pytest.mark.parametrize(
@@ -180,46 +175,31 @@ async def test_native_custody_and_writer_runtime_roles_must_match(monkeypatch, d
 )
 async def test_candidate_custody_preserves_actual_prepare_database_cause(failure):
     candidate, _, _ = _candidate()
-    connection = SimpleNamespace(
-        is_in_transaction=lambda: True,
-        fetchval=AsyncMock(return_value="repeatable read"),
-        fetch=AsyncMock(side_effect=failure),
-    )
+    connection = _connection()
+    connection.fetch.side_effect = failure
     with pytest.raises(ValueError, match="^Managed provider input custody is unavailable$") as caught:
-        await provider.verify_candidate_em_provider_inputs(connection, candidate, runtime_roles=("runtime_reader",))
+        await provider.require_readable_em_provider_inputs(connection, candidate)
     assert caught.value.__cause__ is failure
-    connection.fetch.assert_awaited_once()
-
-
-async def test_managed_native_guard_requires_existing_rr_before_catalog_reads():
-    candidate, _, _ = _candidate()
-    conn = SimpleNamespace(
-        is_in_transaction=lambda: True, fetchval=AsyncMock(return_value="read committed"), fetch=AsyncMock()
-    )
-    with pytest.raises(ValueError):
-        await provider.verify_candidate_em_provider_inputs(conn, candidate, runtime_roles=("runtime_reader",))
-    conn.fetch.assert_not_awaited()
+    connection.execute.assert_not_awaited()
 
 
 @pytest.mark.parametrize("state", ["ready", "published"])
 @pytest.mark.parametrize("stale", [False, True])
 async def test_actual_publication_gate_precedes_insert_or_retained_replay(monkeypatch, state, stale, search_index_gate):
-    candidate, copy_target, receipt = _candidate(state)
+    """The stored receipt must be present and well formed; its input tables are not captured again."""
+    candidate, copy_target, _ = _candidate(state)
     conn = _connection()
     events = []
     search_index_gate.side_effect = lambda *args, **kwargs: events.append("search_indexes")
     monkeypatch.setattr(publication, "_lock_publication_controls", AsyncMock(return_value=(2, 16)))
     monkeypatch.setattr(publication, "_locked_candidate", AsyncMock(return_value=candidate))
-    monkeypatch.setattr(publication, "_publication_readiness", lambda _candidate: ({}, {}, {}, _closure()))
+    if stale:
+        _drop_receipt(candidate)
+    else:
+        monkeypatch.setattr(publication, "_publication_readiness", lambda _candidate: ({}, {}, {}, _closure()))
     monkeypatch.setattr(publication, "verify_network_candidate_writer_closure", AsyncMock())
     resolve_predecessor = _predecessor_lookup(monkeypatch, candidate)
-
-    async def native(*args, **kwargs):
-        events.append("custody")
-        if stale:
-            raise ValueError("stale")
-        return receipt
-
+    native = AsyncMock()
     monkeypatch.setattr(provider, "prepare_em_provider_inputs", native)
 
     async def insert(*args):
@@ -232,21 +212,22 @@ async def test_actual_publication_gate_precedes_insert_or_retained_replay(monkey
     )
     conn.fetchrow.return_value = {} if state == "published" else None
     if stale:
-        with pytest.raises(ValueError):
+        with pytest.raises(validation.NetworkMembershipValidationError, match="provider inputs"):
             await publication._publish_candidate(conn, copy_target, '"registry"')
-        assert events == ["custody"]
+        assert events == []
         conn.fetchrow.assert_not_awaited()
     else:
         assert (await publication._publish_candidate(conn, copy_target, '"registry"'))["replayed"] == (
             state == "published"
         )
-        assert events == (["custody", "replay"] if state == "published" else ["custody", "search_indexes", "publish"])
+        assert events == (["replay"] if state == "published" else ["search_indexes", "publish"])
+    native.assert_not_awaited()
     if not stale and state == "ready":
         resolve_predecessor.assert_awaited_once_with(conn, generation_id=16, control_schema="registry")
     else:
         resolve_predecessor.assert_not_awaited()
     conn.execute.assert_not_awaited()
-    assert search_index_gate.await_count == int(not stale and state == "ready")
+    assert conn.fetch.await_count == search_index_gate.await_count == int(not stale and state == "ready")
 
 
 async def test_phase_owned_publication_starts_rr_before_control_locks(monkeypatch):
@@ -277,13 +258,12 @@ async def test_phase_owned_publication_starts_rr_before_control_locks(monkeypatc
 
 async def test_pipeline_retained_replay_checks_custody_before_serving_reads(monkeypatch):
     candidate, target, _ = _candidate("published")
+    _drop_receipt(candidate)
     conn = _connection()
     monkeypatch.setattr(pipeline, "_inspect_candidate", AsyncMock(return_value=candidate))
     monkeypatch.setattr(pipeline, "_scope_report", lambda *args: {})
     monkeypatch.setattr(pipeline, "_validated_replay", lambda *args: None)
-    monkeypatch.setattr(pipeline, "_publication_readiness", lambda *args: ({}, {}, {}, _closure()))
-    monkeypatch.setattr(provider, "prepare_em_provider_inputs", AsyncMock(side_effect=ValueError("stale")))
-    with pytest.raises(ValueError):
+    with pytest.raises(validation.NetworkMembershipValidationError, match="provider inputs"):
         await pipeline._published_replay(conn, target, object(), {}, "registry")
     conn.fetchrow.assert_not_awaited()
     conn.execute.assert_not_awaited()
@@ -292,7 +272,7 @@ async def test_pipeline_retained_replay_checks_custody_before_serving_reads(monk
 @pytest.mark.parametrize("head", [16, 17])
 @pytest.mark.parametrize("stale", [False, True])
 async def test_reactivation_checks_custody_before_cas_even_on_noop(monkeypatch, head, stale, search_index_gate):
-    candidate, _, receipt = _candidate("published")
+    candidate, _, _ = _candidate("published")
     conn = _connection()
     conn.fetchrow.return_value = candidate
     pinned = PinnedNetworkServingManifest(
@@ -300,25 +280,56 @@ async def test_reactivation_checks_custody_before_cas_even_on_noop(monkeypatch, 
     )
     monkeypatch.setattr(reactivation, "_lock_publication_controls", AsyncMock(return_value=(2, head)))
     monkeypatch.setattr(reactivation, "resolve_network_serving_manifest", AsyncMock(return_value=pinned))
-    monkeypatch.setattr(reactivation, "_publication_readiness", lambda *args: ({}, {}, {}, _closure()))
-    native = AsyncMock(return_value=receipt, side_effect=ValueError("stale") if stale else None)
-    monkeypatch.setattr(provider, "prepare_em_provider_inputs", native)
-
-    def before_cas(*args, **kwargs):
-        native.assert_awaited_once()
-        conn.execute.assert_not_awaited()
-
-    search_index_gate.side_effect = before_cas
     if stale:
-        with pytest.raises(ValueError):
+        _drop_receipt(candidate)
+    else:
+        monkeypatch.setattr(reactivation, "_publication_readiness", lambda *args: ({}, {}, {}, _closure()))
+    native = AsyncMock()
+    monkeypatch.setattr(provider, "prepare_em_provider_inputs", native)
+    search_index_gate.side_effect = lambda *args, **kwargs: conn.execute.assert_not_awaited()
+    if stale:
+        with pytest.raises(validation.NetworkMembershipValidationError, match="provider inputs"):
             await reactivation._reactivate(conn, '"registry"', 17, head, 2)
         conn.execute.assert_not_awaited()
     else:
         result = await reactivation._reactivate(conn, '"registry"', 17, head, 2)
         assert result.changed == (head != 17)
-        assert conn.execute.await_count == int(head != 17)
-    native.assert_awaited_once()
+        statements = [call.args[0].split()[0] for call in conn.execute.await_args_list]
+        assert statements == (["UPDATE"] if head != 17 else []) and conn.fetch.await_count == int(head != 17)
+    native.assert_not_awaited()
     assert search_index_gate.await_count == int(not stale and head != 17)
+
+
+@pytest.mark.parametrize("site", ["publication", "reactivation"])
+@pytest.mark.parametrize("absent_role", ["npi", "tiger.zip_state"])
+async def test_head_stays_when_declared_input_is_unreadable(monkeypatch, site, absent_role):
+    """The shared catalog check returns no row for a table that no longer carries its name or lacks a read column."""
+    candidate, copy_target, _ = _candidate("ready" if site == "publication" else "published")
+    conn = _connection()
+    conn.fetch.side_effect = lambda *requested: [
+        held for held in _held_by_name(*requested) if held["role"] != absent_role
+    ]
+    conn.fetchrow.return_value = candidate if site == "reactivation" else None
+    pinned = PinnedNetworkServingManifest(
+        17, candidate["candidate_id"], candidate["schema_name"], 1, candidate["source_generations"], 2, "f" * 64, 100
+    )
+    for module in (publication, reactivation):
+        monkeypatch.setattr(module, "_lock_publication_controls", AsyncMock(return_value=(2, 16)))
+        monkeypatch.setattr(module, "_publication_readiness", lambda *args: ({}, {}, {}, _closure()))
+    monkeypatch.setattr(publication, "_locked_candidate", AsyncMock(return_value=candidate))
+    monkeypatch.setattr(publication, "verify_network_candidate_writer_closure", AsyncMock())
+    insert = AsyncMock()
+    monkeypatch.setattr(publication, "_insert_manifest", insert)
+    _predecessor_lookup(monkeypatch, candidate)
+    monkeypatch.setattr(reactivation, "resolve_network_serving_manifest", AsyncMock(return_value=pinned))
+    with pytest.raises(ValueError, match="^Managed provider input custody is unavailable$") as caught:
+        if site == "publication":
+            await publication._publish_candidate(conn, copy_target, '"registry"')
+        else:
+            await reactivation._reactivate(conn, '"registry"', 17, 16, 2)
+    assert caught.value.__cause__ is None and conn.fetch.await_args.args[0] is provider._API_HEAPS_SQL
+    insert.assert_not_awaited()
+    conn.execute.assert_not_awaited()
 
 
 async def test_trusted_refresh_requires_explicit_family_and_replaces_inherited_pin(monkeypatch):
@@ -351,18 +362,12 @@ async def test_trusted_refresh_requires_explicit_family_and_replaces_inherited_p
 async def test_reactivation_wrapper_preserves_explicit_custody_classification(monkeypatch, is_database_failure):
     from process.registry_publication_consumer import _has_database_cause
 
-    candidate, _, _ = _candidate("published")
     storage_failure = asyncpg.CannotConnectNowError("temporary custody outage")
-    native = SimpleNamespace(
-        is_in_transaction=lambda: True,
-        fetchval=AsyncMock(return_value="repeatable read" if is_database_failure else "read committed"),
-        fetch=AsyncMock(side_effect=storage_failure),
-    )
 
-    async def actual_verifier(*arguments):
-        return await provider.verify_candidate_em_provider_inputs(native, candidate, runtime_roles=("runtime_reader",))
+    async def refused(*arguments):
+        raise ValueError("controls refused") from (storage_failure if is_database_failure else None)
 
-    monkeypatch.setattr(reactivation, "_reactivate", actual_verifier)
+    monkeypatch.setattr(reactivation, "_reactivate", refused)
     connection = _connection()
     connection.is_in_transaction = lambda: True
     with pytest.raises(
@@ -373,11 +378,7 @@ async def test_reactivation_wrapper_preserves_explicit_custody_classification(mo
         )
     assert isinstance(caught.value.__cause__, ValueError)
     assert _has_database_cause(caught.value) is is_database_failure
-    if is_database_failure:
-        assert caught.value.__cause__.__cause__ is storage_failure
-    else:
-        native.fetch.assert_not_awaited()
-        assert caught.value.__cause__.__cause__ is None
+    assert caught.value.__cause__.__cause__ is (storage_failure if is_database_failure else None)
 
 
 def _seal():
@@ -418,8 +419,6 @@ async def test_protected_seal_gates_publication_without_final_owner_assumption(
     resolve_predecessor = _predecessor_lookup(monkeypatch, candidate)
     old_native = AsyncMock(side_effect=AssertionError("sealed candidate must not assume final owner"))
     monkeypatch.setattr(publication, "verify_network_candidate_writer_closure", old_native)
-    custody = AsyncMock()
-    monkeypatch.setattr(publication, "_verify_provider_custody", custody)
     insert = AsyncMock(return_value={"replayed": False})
     monkeypatch.setattr(publication, "_insert_manifest", insert)
     monkeypatch.setattr(publication, "_retained_manifest", lambda *args, **kwargs: {"replayed": True})
@@ -427,13 +426,11 @@ async def test_protected_seal_gates_publication_without_final_owner_assumption(
     if changed:
         with pytest.raises(ValueError, match="changed protected seal"):
             await publication._publish_candidate(conn, copy_target, '"registry"')
-        custody.assert_not_awaited()
         insert.assert_not_awaited()
         conn.fetchrow.assert_not_awaited()
     else:
         published_manifest = await publication._publish_candidate(conn, copy_target, '"registry"')
         assert published_manifest["replayed"] == (state == "published")
-        custody.assert_awaited_once_with(conn, candidate, _closure())
     if not changed and state == "ready":
         resolve_predecessor.assert_awaited_once_with(conn, generation_id=16, control_schema="registry")
     else:
@@ -528,7 +525,6 @@ async def test_replay_retains_legacy_scans_but_sealed_custody_uses_native_proof(
     monkeypatch.setattr(
         publication, "verify_network_candidate_custody", AsyncMock(return_value=_seal() if sealed else None)
     )
-    monkeypatch.setattr(pipeline, "_verify_provider_custody", AsyncMock())
     monkeypatch.setattr(pipeline, "_read_manifest", AsyncMock(return_value={}))
     pinned = Mock()
     monkeypatch.setattr(pipeline, "_pinned_manifest", pinned)

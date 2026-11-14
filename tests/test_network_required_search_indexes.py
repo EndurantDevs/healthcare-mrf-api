@@ -143,7 +143,6 @@ async def test_initial_publication_refuses_before_manifest_sequence(monkeypatch)
     monkeypatch.setattr(publication, "_locked_candidate", AsyncMock(return_value=candidate_by_field))
     monkeypatch.setattr(publication, "_publication_readiness", Mock(return_value=({}, {}, {}, {})))
     monkeypatch.setattr(publication, "_require_publication_custody", AsyncMock(return_value=None))
-    monkeypatch.setattr(publication, "_verify_provider_custody", AsyncMock())
     monkeypatch.setattr(
         registry_fhir_serving_preservation, "fhir_preservation_obligation", AsyncMock(return_value=None)
     )

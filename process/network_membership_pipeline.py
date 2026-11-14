@@ -16,7 +16,6 @@ from process.network_membership_publication import (
     _lock_publication_controls,
     _publication_readiness,
     _retained_manifest,
-    _verify_provider_custody,
     publish_network_candidate,
 )
 from process.network_membership_serving_indexes import (
@@ -195,7 +194,6 @@ async def _published_replay(connection, copy_target, address_source, roles_by_gr
         _validated_replay(candidate, _scope_report(candidate, address_source))
         readiness = _publication_readiness(candidate)
         custody = await _candidate_custody(connection, candidate, control_schema)
-        await _verify_provider_custody(connection, candidate, readiness[3])
         _require_configured_writer_roles(roles_by_group, readiness[3])
         manifest = await connection.fetchrow(
             f"SELECT * FROM {_identifier(control_schema)}.network_serving_manifest WHERE candidate_id=$1",
