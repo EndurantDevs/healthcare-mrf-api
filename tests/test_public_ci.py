@@ -509,12 +509,17 @@ def test_catalog_integration_requires_capability_and_complete_eligible_execution
     assert capability["id"] == "catalog-capability"
     assert capability["run"] == 'bash "$CI_ROOT/scripts/healthcare/check" fhir-catalog-capability >> "$GITHUB_OUTPUT"'
     for name in (
+        "Resolve PostgreSQL client cache key",
+        "Restore PostgreSQL client packages",
         "Install PostgreSQL client",
         "Download exact-source Rust test binaries",
         "Run complete validation stage",
         "Upload exact-source catalog integration evidence",
     ):
         assert steps_by_name[name]["if"] == "steps.catalog-capability.outputs.present == 'true'"
+    assert steps_by_name["Save PostgreSQL client packages"]["if"].startswith(
+        "steps.catalog-capability.outputs.present == 'true' && "
+    )
     assert job["env"]["CI_SHARD"] == "fhir-catalog-integration"
     assert (
         'bash "$CI_ROOT/scripts/healthcare/check" postgres "$CI_SHARD"'
