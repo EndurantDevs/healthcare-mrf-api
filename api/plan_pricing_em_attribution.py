@@ -36,6 +36,8 @@ _COLUMNS = (
     ("maximum_rate", "numeric"),
     ("rate_count", "bigint"),
 )
+# Catalog type names of _COLUMNS; managed pages and their completion read every one of them.
+_RATE_COLUMNS = dict(zip(dict(_COLUMNS), ("int4", "int8", "int2", "numeric", "numeric", "int8"), strict=True))
 _CONSTRAINT_KEYS = {
     "rates_ordinal_ck": ("c", "1"),
     "rates_npi_ck": ("c", "2"),
@@ -406,19 +408,12 @@ def _catalog_digest(catalog):
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
-async def _verify(connection, receipt, identity_json, *, api_read=False):
-    if type(api_read) is not bool:
-        raise ValueError("attribution read mode is invalid")
-    if api_read:
-        from process.network_address_artifact import _require_api_read_context
-
-        await _require_api_read_context(connection, True)
+async def _verify(connection, receipt, identity_json):
     _validate_receipt(receipt)
     if receipt.identity_json != identity_json:
         raise ValueError("attribution full recipe differs")
     relation = receipt.rates_relation
-    if not api_read:
-        await connection.execute(f"LOCK TABLE {relation} IN ACCESS SHARE MODE")
+    await connection.execute(f"LOCK TABLE {relation} IN ACCESS SHARE MODE")
     namespace = await _namespace(connection, receipt.schema_name)
     if namespace is None or _decode(namespace["receipt"]) != receipt:
         raise ValueError("attribution protected publication differs")
@@ -602,11 +597,12 @@ async def prepare_em_attribution_in_session(
         raise PlanPricingProjectionUnavailable("E&M attribution preparation is unavailable") from None
 
 
-async def _resolve_em_attribution_api(session, selection):
-    """Verify unchanged release/custody proof and bind subsequent rates reads to this session."""
+async def resolve_em_attribution(session, selection):
+    """Admit the published rates by schema name and bind the table that name resolves to now to this read."""
     from api.network_read_execution import _original_read_driver, install_network_read_inventory
     from process.network_address_artifact import _require_api_read_context
     from process.network_compact_layout import CompactAddressRelation
+    from process.network_em_provider_inputs import _locked_plain_heaps
 
     try:
         identity = _identity(selection)
@@ -623,16 +619,12 @@ async def _resolve_em_attribution_api(session, selection):
         namespace = await _namespace(connection, identity[2])
         if namespace is None:
             raise ValueError("attribution publication is absent")
-        receipt = await _verify(connection, _decode(namespace["receipt"]), identity[0], api_read=True)
-        current_driver, current_pid = await _original_read_driver(session)
-        if (
-            current_driver is not connection
-            or current_pid != backend_pid
-            or session.get_transaction() is not transaction
-        ):
-            raise ValueError("attribution read transaction changed")
-        await install_network_read_inventory(
-            session, (CompactAddressRelation(receipt.schema_name, "rates", receipt.table_oid),)
+        receipt = _decode(namespace["receipt"])
+        if receipt.identity_json != identity[0]:
+            raise ValueError("attribution full recipe differs")
+        (rates,) = await _locked_plain_heaps(
+            connection,
+            [{"role": "rates", "schema_name": receipt.schema_name, "table_name": "rates", "columns": _RATE_COLUMNS}],
         )
         current_driver, current_pid = await _original_read_driver(session)
         if (
@@ -641,40 +633,11 @@ async def _resolve_em_attribution_api(session, selection):
             or session.get_transaction() is not transaction
         ):
             raise ValueError("attribution read transaction changed")
+        await install_network_read_inventory(
+            session, (CompactAddressRelation(receipt.schema_name, "rates", rates["relation_oid"]),)
+        )
         return receipt
     except Exception:
-        raise PlanPricingProjectionUnavailable("E&M attribution is unavailable") from None
-
-
-async def resolve_em_attribution(session, selection, *, api_read=False):
-    """Verify the full current release recipe and immutable custody without rescanning rates."""
-    if type(api_read) is not bool:
-        raise PlanPricingProjectionUnavailable("E&M attribution is unavailable")
-    if api_read:
-        return await _resolve_em_attribution_api(session, selection)
-    try:
-        identity = _identity(selection)
-        connection = await _driver(session)
-        current = await builder._selected_release(session, selection.plan_release_id, selection.serving_revision_id)
-        if _identity(current) != identity:
-            raise ValueError("attribution selection is stale or filtered")
-        namespace = await _namespace(connection, identity[2])
-        if namespace is None:
-            raise ValueError("attribution publication is absent")
-        return await _verify(connection, _decode(namespace["receipt"]), identity[0])
-    except (
-        asyncpg.PostgresError,
-        SQLAlchemyError,
-        OSError,
-        ValueError,
-        TypeError,
-        KeyError,
-        AttributeError,
-        IndexError,
-        OverflowError,
-        UnicodeError,
-        RecursionError,
-    ):
         raise PlanPricingProjectionUnavailable("E&M attribution is unavailable") from None
 
 

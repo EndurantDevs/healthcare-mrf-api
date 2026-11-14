@@ -169,7 +169,7 @@ async def is_em_distance_projection_ready(
 
         try:
             await admitted_plan_release_bindings(session, selection)
-            await resolve_em_attribution(session, selection, api_read=True)
+            await resolve_em_attribution(session, selection)
             await resolve_em_provider_inputs_in_session(session, scope.manifest)
         except PlanPricingProjectionUnavailable:
             return False

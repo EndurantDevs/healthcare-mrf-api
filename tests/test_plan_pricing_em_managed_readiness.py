@@ -34,9 +34,8 @@ def held(monkeypatch):
         calls.append("admission")
         return ()
 
-    async def attributed(actual_session, actual_selection, *, api_read):
+    async def attributed(actual_session, actual_selection):
         assert actual_session is session and actual_selection is selection
-        assert api_read is True
         calls.append("attribution")
         return object()
 

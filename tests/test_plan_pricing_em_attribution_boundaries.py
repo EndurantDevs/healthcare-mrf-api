@@ -3,19 +3,23 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from api import plan_pricing_em_attribution as attribution
 from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
+from tests.test_network_em_api_metadata import _rates_reader
 from tests.test_plan_pricing_em_attribution import (
     _binding,
     _receipt,
     _relations,
-    _resolver_setup,
     _selection,
 )
+
+
+def _unopened_session():
+    return SimpleNamespace(get_transaction=Mock(side_effect=AssertionError("Invalid identity must not open a read")))
 
 
 @pytest.mark.asyncio
@@ -28,12 +32,11 @@ from tests.test_plan_pricing_em_attribution import (
         {"bindings": ()},
     ],
 )
-async def test_invalid_release_identity_is_refused_before_database_access(monkeypatch, changes):
-    driver = AsyncMock(side_effect=AssertionError("Invalid identity must not acquire a connection"))
-    monkeypatch.setattr(attribution, "_driver", driver)
+async def test_invalid_release_identity_is_refused_before_database_access(changes):
+    session = _unopened_session()
     with pytest.raises(PlanPricingProjectionUnavailable, match="^E&M attribution is unavailable$"):
-        await attribution.resolve_em_attribution(object(), replace(_selection(), **changes))
-    driver.assert_not_awaited()
+        await attribution.resolve_em_attribution(session, replace(_selection(), **changes))
+    session.get_transaction.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -52,13 +55,12 @@ async def test_invalid_release_identity_is_refused_before_database_access(monkey
         {"logical_scope_present": 0},
     ],
 )
-async def test_invalid_source_coordinates_cannot_reach_retained_price_resolution(monkeypatch, changes):
+async def test_invalid_source_coordinates_cannot_reach_retained_price_resolution(changes):
     selection = _selection(_binding(), replace(_binding(17, "source-b"), **changes))
-    driver = AsyncMock(side_effect=AssertionError("Invalid coordinates must not acquire a connection"))
-    monkeypatch.setattr(attribution, "_driver", driver)
+    session = _unopened_session()
     with pytest.raises(PlanPricingProjectionUnavailable, match="^E&M attribution is unavailable$"):
-        await attribution.resolve_em_attribution(object(), selection)
-    driver.assert_not_awaited()
+        await attribution.resolve_em_attribution(session, selection)
+    session.get_transaction.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -78,13 +80,14 @@ async def test_invalid_source_coordinates_cannot_reach_retained_price_resolution
     ],
 )
 async def test_malformed_publication_receipts_fail_before_retained_data_access(monkeypatch, changes):
-    driver, selection, receipt = _resolver_setup(monkeypatch)
+    session, selection, receipt = _rates_reader(monkeypatch)
     document = receipt.as_dict() | changes
     attribution._namespace.return_value = {"receipt": attribution._canonical(document)}
     with pytest.raises(PlanPricingProjectionUnavailable, match="^E&M attribution is unavailable$"):
-        await attribution.resolve_em_attribution(object(), selection)
-    driver.execute.assert_not_awaited()
+        await attribution.resolve_em_attribution(session, selection)
+    session.driver.execute.assert_not_awaited()
     attribution._content.assert_not_awaited()
+    assert session.info == {}
 
 
 @pytest.mark.asyncio
@@ -102,23 +105,12 @@ async def test_malformed_publication_receipts_fail_before_retained_data_access(m
     ],
 )
 async def test_valid_digest_does_not_authorize_invalid_price_accounting(monkeypatch, changes):
-    receipt = _receipt(**changes)
-    driver, selection, _ = _resolver_setup(monkeypatch, receipt=receipt)
+    session, selection, _ = _rates_reader(monkeypatch, receipt=_receipt(**changes))
     with pytest.raises(PlanPricingProjectionUnavailable, match="^E&M attribution is unavailable$"):
-        await attribution.resolve_em_attribution(object(), selection)
-    driver.execute.assert_not_awaited()
+        await attribution.resolve_em_attribution(session, selection)
+    session.driver.execute.assert_not_awaited()
     attribution._content.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("changes", [{"table_oid": 14}, {"table_filenode": 24}])
-async def test_retained_receipt_cannot_substitute_another_physical_price_table(monkeypatch, changes):
-    driver, selection, _ = _resolver_setup(monkeypatch, receipt=_receipt(**changes))
-    with pytest.raises(PlanPricingProjectionUnavailable, match="^E&M attribution is unavailable$"):
-        await attribution.resolve_em_attribution(object(), selection)
-    assert driver.execute.await_count == 1
-    attribution._closed.assert_not_awaited()
-    attribution._content.assert_not_awaited()
+    assert session.info == {}
 
 
 @pytest.mark.asyncio

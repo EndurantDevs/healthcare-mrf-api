@@ -161,7 +161,7 @@ async def search_managed_em_distance(session, selection, args, pagination, zip5,
     if scope is None:
         raise PlanPricingProjectionUnavailable("managed E&M requires a retained network scope")
     admitted = await admitted_plan_release_bindings(session, selection)
-    artifact = await resolve_em_attribution(session, selection, api_read=True)
+    artifact = await resolve_em_attribution(session, selection)
     inputs = await resolve_em_provider_inputs_in_session(session, scope.manifest)
     ordinals = tuple(binding.binding_ordinal for binding in admitted)
     if not ordinals:

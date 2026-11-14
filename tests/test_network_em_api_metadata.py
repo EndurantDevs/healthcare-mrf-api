@@ -3,15 +3,20 @@
 
 import asyncio
 import copy
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import asyncpg
 import pytest
 from sanic.exceptions import ServiceUnavailable
 
+from api import network_address_scope as address_scope
 from api import network_read_execution as execution
 from api import plan_pricing_em_attribution as attribution
+from api import plan_pricing_em_distance as distance
+from api import provider_service_source_policy as source_policy
 from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
 from process import network_candidate_custody as custody
 from process import network_em_provider_inputs as inputs
@@ -43,8 +48,11 @@ class _InputDriver:
                 "validation_json": {"em_provider_inputs": copy.deepcopy(receipt)},
             },
         )
-        self.rows = input_fixture.catalog()
-        self.events = []
+        self.rows = [
+            {"role": held.role, "relation_oid": held.relation_oid, "relfilenode": held.relfilenode}
+            for held in input_fixture.family().relations
+        ]
+        self.events, self.lock_error = [], None
 
     def is_in_transaction(self):
         return True
@@ -55,9 +63,19 @@ class _InputDriver:
     async def fetchval(self, query, *_args):
         return "repeatable read" if query.startswith("SHOW") else True
 
-    async def fetch(self, query, *_args):
-        assert query == inputs._CATALOG_SQL and self.header_guarded
-        self.events.append("native-catalog")
+    async def execute(self, statement):
+        assert self.header_guarded and statement.startswith("LOCK TABLE ") and statement.count('"held_') == 9
+        assert statement.endswith(" IN ACCESS SHARE MODE") and "NOWAIT" not in statement
+        self.events.append("lock")
+        if self.lock_error:
+            raise self.lock_error
+
+    async def fetch(self, query, relations_json):
+        assert query == inputs._API_HEAPS_SQL and self.events[-1] == "lock"
+        requested = json.loads(relations_json)
+        assert [held["table_name"] for held in requested] == [f"held_{i}" for i in range(9)]
+        assert [held["columns"] for held in requested] == [inputs._required_columns(role) for role in inputs._ROLES]
+        self.events.append("heaps")
         return self.rows
 
     async def fetchrow(self, query, *arguments):
@@ -105,7 +123,23 @@ async def test_input_header_uses_the_genuine_resolved_control_pin_before_decode(
         driver, generation_id=supplied.generation_id, control_schema="control", api_read=True
     )
     pins.assert_awaited_once_with(driver, ("network_membership_candidate",), control_schema="control")
-    assert driver.events == ["header-read", "header-guard", "native-catalog"]
+    assert driver.events == ["header-read", "header-guard", "lock", "heaps"]
+
+
+async def test_api_inputs_serve_the_tables_their_names_resolve_to_now(monkeypatch):
+    driver, supplied, *_ = await _input_reader(monkeypatch)
+    for held in driver.rows:
+        held["relation_oid"] += 5000
+        held["relfilenode"] += 5000
+    actual = await inputs.resolve_em_provider_inputs(driver, supplied, "control", api_read=True)
+    assert [held.relation_oid for held in actual.relations] == [5100 + i for i in range(9)]
+    assert [held.relfilenode for held in actual.relations] == [5200 + i for i in range(9)]
+    assert actual == inputs.EMProviderInputs(
+        tuple(
+            replace(held, relation_oid=held.relation_oid + 5000, relfilenode=held.relfilenode + 5000)
+            for held in input_fixture.family().relations
+        )
+    )
 
 
 async def test_input_header_reuses_the_published_pin_of_the_request(monkeypatch):
@@ -117,9 +151,14 @@ async def test_input_header_reuses_the_published_pin_of_the_request(monkeypatch)
     resolver.assert_not_awaited()
 
 
-@pytest.mark.parametrize("damage", ["manifest", "guard", "missing", "sources", "receipt", "native", "pid"])
-async def test_api_inputs_preserve_full_manifest_receipt_native_and_consumption_checks(monkeypatch, damage):
+@pytest.mark.parametrize(
+    "damage", ["manifest", "guard", "missing", "sources", "receipt", "rotating", "row_filter", "lock", "pid"]
+)
+async def test_api_inputs_preserve_manifest_receipt_row_filter_and_consumption_checks(monkeypatch, damage):
     driver, supplied, actual, resolver, pins = await _input_reader(monkeypatch)
+    if damage == "rotating":
+        held = input_fixture.family().relations[1]
+        monkeypatch.setattr(inputs, "_rotating_names", lambda: {(held.schema_name, held.table_name)})
     if damage == "manifest":
         resolver.return_value = replace(actual, address_table_oid=999)
     if damage == "guard":
@@ -130,8 +169,10 @@ async def test_api_inputs_preserve_full_manifest_receipt_native_and_consumption_
         dict.__setitem__(driver.header, "source_generations", {})
     if damage == "receipt":
         dict.__setitem__(driver.header, "validation_json", {})
-    if damage == "native":
-        driver.rows[0]["rolcanlogin"] = True
+    if damage == "row_filter":
+        driver.rows.pop()
+    if damage == "lock":
+        driver.lock_error = asyncpg.LockNotAvailableError("canceling statement due to lock timeout")
 
     async def moved(*_args, **_kwargs):
         driver.pid += 1
@@ -144,8 +185,17 @@ async def test_api_inputs_preserve_full_manifest_receipt_native_and_consumption_
     if damage == "manifest":
         assert driver.events == []
         pins.assert_not_awaited()
-    elif damage != "native":
-        assert "native-catalog" not in driver.events
+    elif damage not in {"row_filter", "lock"}:
+        assert "lock" not in driver.events
+
+
+def test_live_input_names_rotate_and_are_never_served_by_name():
+    schema = inputs._MODELS["npi"].__table__.schema
+    rotating = inputs._rotating_names()
+    for name in ("geo_zip_lookup", "npi", "npi_old", "nucc_taxonomy_old", "npi_address", "mrf_address"):
+        assert (schema, name) in rotating
+    assert {("tiger", "zcta5"), ("tiger", "zip_state")} <= rotating
+    assert not {(held.schema_name, held.table_name) for held in input_fixture.family().relations} & rotating
 
 
 async def test_input_cancellation_is_not_converted_to_metadata_unavailability(monkeypatch):
@@ -172,7 +222,9 @@ class _RatesDriver:
         self.receipt, self.pid, self.guards, self.is_valid = receipt, 42, 0, True
         self.modes = ("repeatable read", "on")
         self.after_guard = None
-        self.execute = AsyncMock(side_effect=AssertionError("API rates proof must not LOCK"))
+        self.current_oid, self.heaps = receipt.table_oid, None
+        self.columns = dict(attribution._RATE_COLUMNS)
+        self.execute = AsyncMock()
 
     def is_in_transaction(self):
         return True
@@ -180,19 +232,35 @@ class _RatesDriver:
     def get_server_pid(self):
         return self.pid
 
+    async def fetch(self, query, relations_json):
+        assert query == inputs._API_HEAPS_SQL
+        self.execute.assert_awaited_once_with(f"LOCK TABLE {self.receipt.rates_relation} IN ACCESS SHARE MODE")
+        (requested,) = json.loads(relations_json)
+        assert requested == {
+            "role": "rates",
+            "schema_name": self.receipt.schema_name,
+            "table_name": "rates",
+            "columns": attribution._RATE_COLUMNS,
+        }
+        if self.heaps is not None:
+            return self.heaps
+        # Like the catalog query, a table without a required column or type returns no row.
+        if any(self.columns.get(name) != kind for name, kind in requested["columns"].items()):
+            return []
+        return [{"role": "rates", "relation_oid": self.current_oid, "relfilenode": 1}]
+
     async def fetchrow(self, query, *arguments):
         if "transaction_isolation" in query:
             return self.modes
         if query == identity._BOUND_NAMES_SQL:
             names, oids, pid = arguments
-            assert names == [f'"{self.receipt.schema_name}"."rates"'] and oids == [self.receipt.table_oid]
+            assert names == [f'"{self.receipt.schema_name}"."rates"'] and oids == [self.current_oid]
             self.guards += 1
             receipt_by_field = {"backend_matches": pid == self.pid, "relation_count": 1, "valid": self.is_valid}
             if self.after_guard:
                 self.after_guard()
             return receipt_by_field
-        assert query == "SELECT * FROM pg_roles WHERE rolname=$1"
-        return rate_fixture._role()
+        raise AssertionError("API rates admission reads no other catalog row")
 
 
 class _RatesSession:
@@ -219,55 +287,65 @@ class _RatesSession:
         return self.result
 
 
-def _rates_reader(monkeypatch):
-    _old_driver, selection, receipt = rate_fixture._resolver_setup(monkeypatch)
+def _rates_reader(monkeypatch, receipt=None):
+    _old_driver, selection, receipt = rate_fixture._resolver_setup(monkeypatch, receipt=receipt)
     driver = _RatesDriver(receipt)
     session = _RatesSession(driver)
     return session, selection, receipt
 
 
 @pytest.mark.parametrize("isolation", ["repeatable read", "serializable"])
-async def test_api_rates_preserve_full_release_and_custody_before_install(monkeypatch, isolation):
+async def test_api_rates_admit_by_name_and_install_the_current_table(monkeypatch, isolation):
     session, selection, receipt = _rates_reader(monkeypatch)
     session.driver.modes = (isolation, "on")
-    assert await attribution.resolve_em_attribution(session, selection, api_read=True) == receipt
+    session.driver.current_oid = receipt.table_oid + 1000
+    assert await attribution.resolve_em_attribution(session, selection) == receipt
     attribution.builder._selected_release.assert_awaited_once_with(
         session, selection.plan_release_id, selection.serving_revision_id
     )
-    attribution._closed.assert_awaited_once_with(
-        session.driver, receipt.schema_oid, receipt.owner_oid, receipt.runtime_roles, None
-    )
+    attribution._catalog.assert_not_awaited()
+    attribution._closed.assert_not_awaited()
     attribution._content.assert_not_awaited()
     installed = execution._installed_read_inventory(session)
-    assert installed.relations == (CompactAddressRelation(receipt.schema_name, "rates", receipt.table_oid),)
+    assert installed.relations == (CompactAddressRelation(receipt.schema_name, "rates", receipt.table_oid + 1000),)
     assert installed.connection is session.driver and installed.backend_pid == 42
-    session.driver.execute.assert_not_awaited()
+    session.driver.execute.assert_awaited_once_with(f"LOCK TABLE {receipt.rates_relation} IN ACCESS SHARE MODE")
 
 
-@pytest.mark.parametrize("damage", ["mode", "selection", "namespace", "catalog", "owner", "closed"])
-async def test_api_rates_do_not_publish_when_an_original_proof_fails(monkeypatch, damage):
+@pytest.mark.parametrize("damage", ["mode", "selection", "filtered", "namespace", "recipe", "row_filter", "lock"])
+async def test_api_rates_do_not_publish_when_admission_fails(monkeypatch, damage):
     session, selection, _receipt = _rates_reader(monkeypatch)
     if damage == "mode":
         session.driver.modes = ("repeatable read", "off")
     if damage == "selection":
         attribution.builder._selected_release.return_value = replace(selection, binding_set_digest="f" * 64)
+    if damage == "filtered":
+        selection = replace(selection, bindings=(selection.bindings[0],))
     if damage == "namespace":
         attribution._namespace.return_value = None
-    if damage == "catalog":
-        changed = rate_fixture._catalog()
-        changed["relations"][0]["filenode"] += 1
-        attribution._catalog.return_value = changed
-    original = session.driver.fetchrow
-
-    async def role(query, *args):
-        return rate_fixture._role(rolcanlogin=True) if "pg_roles" in query else await original(query, *args)
-
-    if damage == "owner":
-        session.driver.fetchrow = role
-    if damage == "closed":
-        attribution._closed.side_effect = ValueError("runtime closure differs")
+    if damage == "recipe":
+        other = rate_fixture._receipt(replace(selection, binding_set_digest="f" * 64))
+        attribution._namespace.return_value = {"receipt": attribution._canonical(other.as_dict())}
+    if damage == "row_filter":
+        session.driver.heaps = []
+    if damage == "lock":
+        session.driver.execute.side_effect = asyncpg.LockNotAvailableError("canceling statement due to lock timeout")
     with pytest.raises(PlanPricingProjectionUnavailable):
-        await attribution.resolve_em_attribution(session, selection, api_read=True)
+        await attribution.resolve_em_attribution(session, selection)
+    assert session.info == {}
+    if damage not in {"row_filter", "lock"}:
+        session.driver.execute.assert_not_awaited()
+
+
+async def test_readiness_advertises_no_retry_when_rates_lack_a_read_column(monkeypatch):
+    session, selection, _receipt = _rates_reader(monkeypatch)
+    del session.driver.columns["code_index"]
+    monkeypatch.setattr(address_scope, "current_network_address_scope", lambda: SimpleNamespace(manifest=object()))
+    monkeypatch.setattr(source_policy, "admitted_plan_release_bindings", AsyncMock(return_value=()))
+    providers = AsyncMock()
+    monkeypatch.setattr(inputs, "resolve_em_provider_inputs_in_session", providers)
+    assert await distance.is_em_distance_projection_ready(session, selection) is False
+    providers.assert_not_awaited()
     assert session.info == {}
 
 
@@ -293,7 +371,7 @@ async def test_rates_resolution_cannot_move_the_original_snapshot(monkeypatch, c
     else:
         session.driver.after_guard = mutate
     with pytest.raises(PlanPricingProjectionUnavailable):
-        await attribution.resolve_em_attribution(session, selection, api_read=True)
+        await attribution.resolve_em_attribution(session, selection)
     if phase == "selection":
         assert session.info == {}
 
@@ -301,7 +379,7 @@ async def test_rates_resolution_cannot_move_the_original_snapshot(monkeypatch, c
 @pytest.mark.parametrize("drift", [False, True])
 async def test_installed_rate_inventory_guards_actual_buffered_rows_before_cache(monkeypatch, drift):
     session, selection, receipt = _rates_reader(monkeypatch)
-    await attribution.resolve_em_attribution(session, selection, api_read=True)
+    await attribution.resolve_em_attribution(session, selection)
     session.drift = drift
     cached_rows = []
     if drift:
@@ -321,7 +399,7 @@ async def test_rates_cancellation_does_not_publish_an_inventory(monkeypatch):
     session, selection, _receipt = _rates_reader(monkeypatch)
     attribution.builder._selected_release.side_effect = asyncio.CancelledError()
     with pytest.raises(asyncio.CancelledError):
-        await attribution.resolve_em_attribution(session, selection, api_read=True)
+        await attribution.resolve_em_attribution(session, selection)
     assert session.info == {}
 
 
@@ -335,14 +413,12 @@ async def test_rates_initial_connection_acquisition_cannot_replace_transaction(m
 
     session.connection = changed_connection
     with pytest.raises(PlanPricingProjectionUnavailable):
-        await attribution.resolve_em_attribution(session, selection, api_read=True)
+        await attribution.resolve_em_attribution(session, selection)
     attribution.builder._selected_release.assert_not_awaited()
     assert session.info == {}
 
 
 @pytest.mark.parametrize("invalid", [None, 0, 1, "true"])
-async def test_both_api_modes_require_boolean_flags(invalid):
+async def test_input_resolution_requires_a_boolean_api_flag(invalid):
     with pytest.raises(PlanPricingProjectionUnavailable):
         await inputs.resolve_em_provider_inputs(object(), object(), api_read=invalid)
-    with pytest.raises(PlanPricingProjectionUnavailable):
-        await attribution.resolve_em_attribution(object(), object(), api_read=invalid)

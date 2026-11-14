@@ -10,7 +10,6 @@ import pytest
 from api import plan_pricing_em_attribution as attribution
 from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
 from api.plan_release_serving import PlanReleaseServingSelection, PlanReleaseSnapshotBinding
-from process.network_custom_address_source import NetworkCustomAddressSourceError
 
 
 def _binding(ordinal=3, source="source-a"):
@@ -224,44 +223,6 @@ def test_native_relation_shapes_are_closed(field, change):
     relations[1][field] = change
     with pytest.raises(ValueError):
         attribution._validate_relations(relations)
-
-
-@pytest.mark.asyncio
-async def test_reader_revalidates_current_full_selection_and_custody(monkeypatch):
-    driver, selection, receipt = _resolver_setup(monkeypatch)
-    session = object()
-    assert await attribution.resolve_em_attribution(session, selection) == receipt
-    assert driver.execute.await_args.args == (f"LOCK TABLE {receipt.rates_relation} IN ACCESS SHARE MODE",)
-    attribution._closed.assert_awaited_once_with(driver, 5, 7, ("artifact_reader",), None)
-    attribution._content.assert_not_awaited()
-    attribution.builder._selected_release.assert_awaited_once_with(
-        session, selection.plan_release_id, selection.serving_revision_id
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "fault", ["absent", "malformed", "stale", "filtered", "filenode", "index", "privilege", "owner"]
-)
-async def test_reader_refuses_missing_stale_or_open_artifacts(monkeypatch, fault):
-    driver, selection, receipt = _resolver_setup(monkeypatch)
-    if fault in {"absent", "malformed"}:
-        attribution._namespace.return_value = None if fault == "absent" else {"receipt": "{}"}
-    if fault == "stale":
-        attribution.builder._selected_release.return_value = replace(selection, binding_set_digest="e" * 64)
-    if fault == "filtered":
-        selection = replace(selection, bindings=(selection.bindings[0],))
-    if fault in {"filenode", "index"}:
-        catalog = _catalog()
-        catalog["relations"][0 if fault == "filenode" else 1]["filenode"] += 1
-        attribution._catalog.return_value = catalog
-    if fault == "privilege":
-        attribution._closed.side_effect = NetworkCustomAddressSourceError("private privilege detail")
-    if fault == "owner":
-        driver.fetchrow.return_value = _role(rolcanlogin=True)
-    with pytest.raises(PlanPricingProjectionUnavailable, match="^E&M attribution is unavailable$"):
-        await attribution.resolve_em_attribution(object(), selection)
-    attribution._content.assert_not_awaited()
 
 
 @pytest.mark.asyncio
