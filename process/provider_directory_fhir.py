@@ -1340,6 +1340,7 @@ REVIEWED_PRACTITIONER_ROLE_PARTITION_RESOURCES = {
 SIMPRA_PROVIDER_DIRECTORY_BASE = "https://data.healthlx.com:8004/SIMPRA"
 CAPITAL_BLUE_CROSS_PROVIDER_DIRECTORY_BASE = "https://providerdirectory-api.capbluecross.com/r4"
 FLORIDA_BLUE_PROVIDER_DIRECTORY_BASE = "https://apigw.bcbsfl.com/interop/interop-developer-portal/emr/api/v1/fhir"
+INDEPENDENCE_PROVIDER_DIRECTORY_BASE = "https://eapics.ibx.com/provider/v1/fhir"
 REVIEWED_PROVIDER_DIRECTORY_CANDIDATE_SOURCE = "healthporta-reviewed-provider-directory-candidate"
 IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE = "https://api-idmedicaid.safhir.io/v1/api/provider-directory"
 IDAHO_MEDICAID_PAGINATION_HOST = "api-ida-prd.safhir.io"
@@ -1525,6 +1526,7 @@ PAGINATION_CHECKPOINT_API_BASES = frozenset(
         "https://api.capitalbluecrossfhir.com/r4/public-ma",
         "https://api.capitalbluecrossfhir.com/r4/public-chip",
         FLORIDA_BLUE_PROVIDER_DIRECTORY_BASE,
+        INDEPENDENCE_PROVIDER_DIRECTORY_BASE,
         HAP_PROVIDER_DIRECTORY_BASE,
         HUMANA_PROVIDER_DIRECTORY_BASE,
         IDAHO_MEDICAID_PROVIDER_DIRECTORY_BASE,
@@ -3761,15 +3763,7 @@ def _url_with_count(url: str, page_count: int) -> str:
 
 
 def _source_pagination_start_url(source: dict[str, Any], url: str) -> str:
-    api_base = _canonical_base(source.get("canonical_api_base") or source.get("api_base"))
-    position_pagination_bases = (
-        FHIR_OFFSET_PAGINATION_BASES | FHIR_SYNTHETIC_SKIP_PAGINATION_BASES | FHIR_SYNTHETIC_OFFSET_PAGINATION_BASES
-    )
-    if api_base not in position_pagination_bases:
-        return url
-    sorted_url = _url_with_replaced_query_item(url, "_sort", "_id")
-    offset_parameter = "_skip" if api_base in FHIR_SYNTHETIC_SKIP_PAGINATION_BASES else "_offset"
-    return _url_with_replaced_query_item(sorted_url, offset_parameter, "0")
+    return source_selection.pagination_start_url(sys.modules[__name__], source, url)
 
 
 def _resource_start_url(source_record: dict[str, Any], resource_type: str, *, page_count: int) -> str | None:
@@ -3777,6 +3771,9 @@ def _resource_start_url(source_record: dict[str, Any], resource_type: str, *, pa
     if supported_resource_types is not None and resource_type not in supported_resource_types:
         return None
     api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    # This collection rejects _count.
+    if api_base == INDEPENDENCE_PROVIDER_DIRECTORY_BASE and resource_type == "Endpoint":
+        return f"{api_base}/Endpoint"
     resource_page_count = _source_resource_page_count(
         source_record,
         resource_type,

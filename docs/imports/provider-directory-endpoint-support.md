@@ -20,11 +20,11 @@ Live catalog confirmation is not recorded in this public artifact. Configured so
 
 | Category | Count |
 | --- | ---: |
-| Acquisition-configured | 36 |
+| Acquisition-configured | 37 |
 | Externally supported | 0 |
 | Probe-only | 14 |
 | Known not importable | 3 |
-| Total tracked | 53 |
+| Total tracked | 54 |
 
 ### Credentialed Or Registered Access
 
@@ -91,6 +91,7 @@ Live catalog confirmation is not recorded in this public artifact. Configured so
 | Kaiser Permanente (`kaiser`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation | https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc | pdfhir_67f47e3af69543ce63cfbf6d | Not required | 2026-10-11 | 2026-11-25 | The reviewed public R4 source remains manual-only and excluded from automatic scheduling. Its server-issued traversal subset requires replay and reviewed one-root activation evidence. The root-neutral subset proof records advertised, returned, and deficit counts; documented terminal-window bounds remain applicable, and absence under the subset remains unknown. Downstream unified/API runtime verification requires separate proof. |
 | Blue Cross and Blue Shield of Alabama (`bcbs-alabama`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint | https://api-bcbsal-prd.safhir.io/v1/api/provider-directory | pdfhir_e0153166e75593bd07cb0525 | Not required | 2026-11-13 | 2026-12-28 | The carrier-native public directory supports eight anonymous collections with server-issued ct continuations. Seven nonempty collections and an empty Endpoint collection were observed in bounded reads. Requests are paced above the reported one-per-second limit; the configured page size is bounded to 100 and the vendor maximum is unknown. Native commercial POS/EPO/PPO, Federal Employee Program and Blue Advantage plans were observed; Blue Secure equivalence, complete product membership, terminal acquisition, publication and search readiness remain unverified. This directory is independent of the Alabama HIE. The provider-directory route does not require the patient authorization flow. |
 | BCBS Minnesota Provider Directory (`bcbs-minnesota`) | Probe-only | None | Probe | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation | https://api.bluecrossmn.com/fhir/provider | pdfhir_69fc4cc6c4ce23447dc03058 | Not required | 2026-11-14 | 2026-12-29 | The official anonymous Plan-Net API documents Medicare and Medicaid providers, pharmacies and dentists, excluding Endpoint. Requests for 1,000 records return 500 in sampled larger collections without continuation links; Bundle.total changes with _count instead of reporting the complete result set. _summary=count and _total=accurate still return records, and _lastUpdated:missing=true returns dated records. Metadata advertises no history, export or versioned-write contract. A complete traversal is unverified, so acquisition and Profile publication remain disabled. Historical provider-directory aliases retain their separate identities. |
+| Independence Blue Cross and Independence Administrators Provider Directory (`independence-provider-directory`) | Acquisition-configured | None | REST | InsurancePlan, PractitionerRole, Practitioner, Organization, Location, HealthcareService, OrganizationAffiliation, Endpoint | https://eapics.ibx.com/provider/v1/fhir | pdfhir_dd4d8d4cf1e5dd3e609ae0b3 | Not required | 2026-11-14 | 2026-12-29 | Eight public collections use the shared REST importer with byte-exact server-issued _page_token continuations, durable checkpoints and bounded parallel resource scans. Search pages are capped at the observed 20 rows. Endpoint rejects _count and uses its bare collection URL. Metadata is unavailable, so admission probes a declared collection. Native plan network labels include Independence Administrators; shared transport does not establish complete product membership or a nine-network count. Counts are omitted and _summary=count does not provide a census. Terminal acquisition, publication and downstream readiness require separate verification. |
 
 ## Current Published Dataset Audit
 
@@ -166,5 +167,6 @@ Verification environment: `not recorded`. Campaign: `provider-directory-canonica
 | Kaiser Permanente (`kaiser`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 | Blue Cross and Blue Shield of Alabama (`bcbs-alabama`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 | BCBS Minnesota Provider Directory (`bcbs-minnesota`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
+| Independence Blue Cross and Independence Administrators Provider Directory (`independence-provider-directory`) | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded | Not recorded |
 
 Generated by `scripts/generate_provider_directory_support_docs.py`; do not edit this file directly.

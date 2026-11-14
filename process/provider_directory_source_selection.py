@@ -46,6 +46,21 @@ class CensusRequestDeferred(Exception):
     """A queued census request must retain its shared cooldown without sending."""
 
 
+def pagination_start_url(directory, source, url):
+    """Apply position pagination only to the configured collection starts."""
+    api_base = directory._canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    position_pagination_bases = (
+        directory.FHIR_OFFSET_PAGINATION_BASES
+        | directory.FHIR_SYNTHETIC_SKIP_PAGINATION_BASES
+        | directory.FHIR_SYNTHETIC_OFFSET_PAGINATION_BASES
+    )
+    if api_base not in position_pagination_bases:
+        return url
+    sorted_url = directory._url_with_replaced_query_item(url, "_sort", "_id")
+    offset_parameter = "_skip" if api_base in directory.FHIR_SYNTHETIC_SKIP_PAGINATION_BASES else "_offset"
+    return directory._url_with_replaced_query_item(sorted_url, offset_parameter, "0")
+
+
 def is_credentialed_rest_source(directory, source_record):
     """Keep authenticated connection reuse limited to the reviewed directory."""
     api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))

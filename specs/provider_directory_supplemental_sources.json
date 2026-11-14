@@ -179,5 +179,65 @@
       "provider_directory_acquisition_blocked_reason": "search_results_truncated_without_continuation",
       "provider_directory_probe_resource": "Practitioner"
     }
+  },
+  {
+    "id": "independence-provider-directory",
+    "org_name": "Independence Blue Cross",
+    "plan_name": "Independence Blue Cross and Independence Administrators Provider Directory",
+    "api_base": "https://eapics.ibx.com/provider/v1/fhir",
+    "auth_type": "none",
+    "requires_registration": false,
+    "fhir_version": "4.0.1",
+    "source": "independence-provider-directory",
+    "source_detail": "official public Provider Directory FHIR API",
+    "source_url": "https://www.ibx.com/scripts/custom/swagger/cmsSwagger.json",
+    "metadata_json": {
+      "provider_directory_confirmed_base": "https://eapics.ibx.com/provider/v1/fhir",
+      "provider_directory_confirmed_catalog_url": "https://www.ibx.com/scripts/custom/swagger/cmsSwagger.json",
+      "provider_directory_supported_resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint"
+      ],
+      "provider_directory_fully_enumerable_resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint"
+      ],
+      "provider_directory_expected_nonempty_resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint"
+      ],
+      "provider_directory_resource_page_count_caps": {
+        "InsurancePlan": 20,
+        "PractitionerRole": 20,
+        "Practitioner": 20,
+        "Organization": 20,
+        "Location": 20,
+        "HealthcareService": 20,
+        "OrganizationAffiliation": 20,
+        "Endpoint": 20
+      },
+      "provider_directory_request_interval_seconds": 0.1,
+      "provider_directory_coverage_mode": "full",
+      "provider_directory_acquisition_enabled": true,
+      "provider_directory_probe_resource": "Practitioner"
+    }
   }
 ]
