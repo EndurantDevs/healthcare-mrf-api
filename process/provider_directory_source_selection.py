@@ -46,6 +46,16 @@ class CensusRequestDeferred(Exception):
     """A queued census request must retain its shared cooldown without sending."""
 
 
+def full_refresh_page_counts(directory):
+    """Keep reviewed source page preferences beside source selection."""
+    return {
+        directory.FLORIDA_BLUE_PROVIDER_DIRECTORY_BASE: 200,
+        directory.anthem.API_BASE: 1000,
+        directory.CARESOURCE_PROVIDER_DIRECTORY_BASE: 1000,
+        directory.HAP_PROVIDER_DIRECTORY_BASE: 1000,
+    }
+
+
 def pagination_start_url(directory, source, url):
     """Apply position pagination only to the configured collection starts."""
     api_base = directory._canonical_base(source.get("canonical_api_base") or source.get("api_base"))

@@ -2250,7 +2250,10 @@ Florida Blue's official Provider Directory OAS
 declares anonymous access to seven collections at
 `https://apigw.bcbsfl.com/interop/interop-developer-portal/emr/api/v1/fhir`.
 The maintained source uses issued opaque next links, durable checkpoints,
-100-row pages and shared pacing below the documented 12 requests per second.
+200-row pages for unbounded full refreshes and shared pacing below the documented
+12 requests per second. Larger requests were clamped to 200 in bounded checks;
+issued continuations retain their own page size. Explicitly bounded requests
+keep their requested count, subject to the source cap.
 Source metadata prioritizes the largest observed collections without changing
 the requested resource set or splitting a cursor chain. `Endpoint` is excluded;
 an explicit zero `OrganizationAffiliation` total is allowed. The separate
