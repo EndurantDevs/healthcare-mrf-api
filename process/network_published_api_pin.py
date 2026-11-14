@@ -13,8 +13,9 @@ from process.network_serving_read import NetworkServingReadUnavailable, _pinned_
 _PUBLISHED_SQL = """SELECT to_jsonb(candidate)::text AS candidate_json,
  to_jsonb(manifest)::text AS manifest_json,
  physical.relname AS base_name,space.nspname AS base_schema,
- (physical.relrowsecurity OR physical.relforcerowsecurity) AS base_rls,
- (SELECT own.relrowsecurity OR own.relforcerowsecurity FROM pg_catalog.pg_class own WHERE own.oid=
+ (physical.relrowsecurity OR physical.relforcerowsecurity OR pg_catalog.row_security_active(physical.oid)) AS base_rls,
+ (SELECT own.relrowsecurity OR own.relforcerowsecurity OR pg_catalog.row_security_active(own.oid)
+   FROM pg_catalog.pg_class own WHERE own.oid=
    pg_catalog.to_regclass(pg_catalog.format('%I.entity_address_unified',candidate.schema_name))) AS own_rls,
  to_regclass('{control}.registry_approved_record')::oid::bigint AS approved_oid,
  {approved_rows} AS approved_rows
@@ -85,6 +86,10 @@ def _published_layout(entry, candidate):
     if entry["base_rls"] is not False:
         raise NetworkServingReadUnavailable("Published network address rows are unavailable")
     canonical = report["candidate_readiness"]
+    custom = _custom_address_relation(candidate, descriptor)
+    if custom is not None and entry["own_rls"] is not False:
+        # Custom and carrier addresses are read from the candidate's own table; a row filter would hide them.
+        raise NetworkServingReadUnavailable("Published network address rows are unavailable")
     layout = CompactNetworkLayout(
         CompactAddressRelation(candidate["schema_name"], "network_slice_ref", canonical["ref_map_oid"]),
         CompactAddressRelation(entry["base_schema"], entry["base_name"], descriptor["table"]["oid"]),
@@ -92,7 +97,7 @@ def _published_layout(entry, candidate):
             CompactEdgeArtifact(artifact["candidate_id"], artifact["schema_name"], artifact["table_oid"])
             for artifact in report["serving_readiness"]["edge_artifacts"]
         ),
-        _custom_address_relation(candidate, descriptor),
+        custom,
     )
     from process.network_compact_layout import bind_compact_geo_search_candidate
 
