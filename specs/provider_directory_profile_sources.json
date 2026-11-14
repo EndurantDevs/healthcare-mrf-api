@@ -11,6 +11,7 @@
     "capital-blue-cross-medicare",
     "capital-blue-cross-chip",
     "bcbs-alabama",
+    "bcbs-minnesota",
     "caresource",
     "christus-health-plan",
     "cigna",
@@ -60,6 +61,7 @@
   "source_ids": [
     "cms-npd",
     "pdfhir_e0153166e75593bd07cb0525",
+    "pdfhir_69fc4cc6c4ce23447dc03058",
     "pdfhir_d68a896335981928bdbbb80e",
     "pdfhir_d09f9fa3d4c8e3ecee8c907b",
     "pdfhir_0f81c146991b27031b1ec366",
@@ -127,6 +129,7 @@
     "sources": [
       {"entry_id": "cms-npd", "source_id": "cms-npd", "resource_profile": "CMS_NPD_R4"},
       {"entry_id": "bcbs-alabama", "source_id": "pdfhir_e0153166e75593bd07cb0525", "resource_profile": "R8"},
+      {"entry_id": "bcbs-minnesota", "source_id": "pdfhir_69fc4cc6c4ce23447dc03058", "resource_profile": "A7"},
       {"entry_id": "aetna-commercial-medicare", "source_id": "pdfhir_d68a896335981928bdbbb80e", "resource_profile": "A7"},
       {"entry_id": "anthem-provider-directory", "source_id": "pdfhir_d09f9fa3d4c8e3ecee8c907b", "resource_profile": "A7"},
       {"entry_id": "alohr", "source_id": "pdfhir_0f81c146991b27031b1ec366", "resource_profile": "ALOHR_GRAPHQL_R4"},

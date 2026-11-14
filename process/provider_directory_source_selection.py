@@ -13,6 +13,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from process import provider_directory_bcbs_minnesota as bcbs_minnesota
 from process import provider_directory_generic_source_policy as source_policy
 from process import vsp_directory_integration as vsp_directory
 
@@ -59,6 +60,8 @@ def full_refresh_page_counts(directory):
 def pagination_start_url(directory, source, url):
     """Apply position pagination only to the configured collection starts."""
     api_base = directory._canonical_base(source.get("canonical_api_base") or source.get("api_base"))
+    if api_base == bcbs_minnesota.API_BASE:
+        return bcbs_minnesota.start_url(directory, url)
     position_pagination_bases = (
         directory.FHIR_OFFSET_PAGINATION_BASES
         | directory.FHIR_SYNTHETIC_SKIP_PAGINATION_BASES
@@ -313,6 +316,8 @@ def requires_verified_session(directory, source_record):
     """Keep strict source transports independent of the ordinary TLS setting."""
     return bool(
         vsp_directory.is_source(source_record)
+        or directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+        == bcbs_minnesota.API_BASE
         or directory.current_version_census_contract(source_record) is not None
         or directory.capped_partition.enabled(directory, source_record)
         or uses_census_retry_policy(directory, source_record)
