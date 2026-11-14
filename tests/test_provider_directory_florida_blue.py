@@ -36,31 +36,44 @@ def test_seed_catalog_scope_and_page_caps(monkeypatch):
     monkeypatch.setattr(directory, "_remote_supplemental_catalogs", lambda **_kwargs: ([], {}))
     seeds, metrics = directory._seed_rows_from_supplemental_catalogs(source_query="Florida Blue")
     assert len(seeds) == metrics["catalogs"]["configured_sources"]["rows"] == 1
-    row = directory._source_row_from_seed(seeds[0])
-    entry = next(item for item in provider_directory_source_catalog()["items"] if item["entry_id"] == "florida-blue")
-    assert row["source_id"] == SOURCE_ID and entry["source_ids"] == [SOURCE_ID]
-    assert row["canonical_api_base"] == entry["canonical_base"] == BASE
+    source_record = directory._source_row_from_seed(seeds[0])
+    entry = next(
+        catalog_entry
+        for catalog_entry in provider_directory_source_catalog()["items"]
+        if catalog_entry["entry_id"] == "florida-blue"
+    )
+    assert source_record["source_id"] == SOURCE_ID and entry["source_ids"] == [SOURCE_ID]
+    assert source_record["canonical_api_base"] == entry["canonical_base"] == BASE
     assert entry["runnable"] and entry["profile_enabled"]
-    assert row["auth_type"] == "none" and not row["requires_registration"]
-    assert not directory.capped_partition.enabled(directory, row)
+    assert source_record["auth_type"] == "none" and not source_record["requires_registration"]
+    assert not directory.capped_partition.enabled(directory, source_record)
     assert set(entry["resources"]) == set(directory.PUBLIC_DIRECTORY_SEVEN_RESOURCES)
-    assert directory._source_resource_fetch_order(row, entry["resources"])[:4] == [
+    assert directory._source_resource_fetch_order(source_record, entry["resources"])[:4] == [
         "PractitionerRole",
         "HealthcareService",
         "Practitioner",
         "Location",
     ]
-    assert directory._source_resource_fetch_order(row, ["Organization", "PractitionerRole"]) == [
+    assert directory._source_resource_fetch_order(source_record, ["Organization", "PractitionerRole"]) == [
         "PractitionerRole",
         "Organization",
     ]
     for resource in entry["resources"]:
-        assert directory._resource_start_url(row, resource, page_count=1000) == f"{BASE}/{resource}?_count=100"
-    assert directory._resource_start_url(row, "Endpoint", page_count=100) is None
-    assert "OrganizationAffiliation" not in row["metadata_json"]["provider_directory_expected_nonempty_resources"]
-    assert directory._source_request_interval_seconds(row) == 0.1
-    assert not directory._has_source_declared_credentialed_access(row)
-    assert directory.source_selection.declared_probe_target(directory, row) == ("Practitioner", BASE)
+        assert (
+            directory._resource_start_url(source_record, resource, page_count=1000) == f"{BASE}/{resource}?_count=200"
+        )
+        assert directory._resource_start_url(source_record, resource, page_count=1) == f"{BASE}/{resource}?_count=1"
+    assert directory._source_full_refresh_page_count(source_record, 100, 0, 0) == 200
+    assert directory._source_full_refresh_page_count(source_record, 25, 10, 0) == 25
+    assert directory._source_full_refresh_page_count(source_record, 25, 0, 1) == 25
+    assert directory._resource_start_url(source_record, "Endpoint", page_count=100) is None
+    assert (
+        "OrganizationAffiliation"
+        not in source_record["metadata_json"]["provider_directory_expected_nonempty_resources"]
+    )
+    assert directory._source_request_interval_seconds(source_record) == 0.1
+    assert not directory._has_source_declared_credentialed_access(source_record)
+    assert directory.source_selection.declared_probe_target(directory, source_record) == ("Practitioner", BASE)
 
 
 @pytest.mark.asyncio
@@ -118,10 +131,14 @@ async def test_stale_isolated_source_uses_declared_collection_without_catalog_wr
     assert directory.source_selection.QUALIFICATION_API_BASE.get() is None
 
 
-def test_opaque_cursor_bytes_and_durable_retry_identity():
+@pytest.mark.parametrize("page_count", [100, 200])
+def test_opaque_cursor_bytes_and_durable_retry_identity(page_count):
     row = source()
-    url = f"{BASE}/Practitioner?_count=100"
-    following = f"{BASE}/?_getpages=synthetic%2Bcursor%3D&_getpagesoffset=100&_count=100&_bundletype=searchset"
+    url = f"{BASE}/Practitioner?_count={page_count}"
+    following = (
+        f"{BASE}/?_getpages=synthetic%2Bcursor%3D&_getpagesoffset={page_count}"
+        f"&_count={page_count}&_bundletype=searchset"
+    )
     assert directory._resolved_fhir_next_url(row, url, following) == following
     assert directory._source_fetch_candidate_urls(following) == [following]
     with pytest.raises(ValueError, match="untrusted_pagination_link"):
