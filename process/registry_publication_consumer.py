@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
-from uuid import UUID
+from uuid import UUID, uuid5
 
 import asyncpg
 
@@ -53,6 +53,23 @@ if TYPE_CHECKING:
 
 _LEASE_SECONDS = 300
 _HEARTBEAT_SECONDS = 30
+# A rejected request is terminal, so its own unpublished candidate can never be resumed or served.
+_REJECT_CANDIDATES_SQL = """UPDATE {control}.network_membership_candidate candidate SET state='rejected'
+WHERE candidate.dataset_id=$1 AND candidate.state<>'published'
+  AND NOT EXISTS(SELECT FROM {control}.network_serving_manifest manifest
+    WHERE manifest.candidate_id=candidate.candidate_id)
+  AND NOT EXISTS(SELECT FROM {control}.network_membership_candidate other
+    WHERE other.candidate_id<>candidate.candidate_id
+      AND strpos(coalesce(other.validation_json::text,''),candidate.schema_name)>0)
+RETURNING candidate.schema_name"""
+_CANDIDATE_TABLES_SQL = """SELECT c.relname FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+WHERE n.nspname=$1 AND c.relkind IN ('r','p') ORDER BY c.relname"""
+_KEPT_CANDIDATE_ERRORS = (
+    asyncpg.InsufficientPrivilegeError,
+    asyncpg.LockNotAvailableError,
+    asyncpg.DependentObjectsStillExistError,
+)
 
 
 @dataclass(frozen=True)
@@ -506,7 +523,7 @@ async def _run_with_heartbeat(
             await asyncio.gather(work, heartbeat, return_exceptions=True)
 
 
-async def _reject(lifecycle_pool, config, request_record):
+async def _reject(lifecycle_pool, execution_pool, config, request_record):
     async with lifecycle_pool.acquire() as connection, connection.transaction():
         await _verify_lifecycle(connection, config)
         await finish_registry_publication_request(
@@ -517,6 +534,41 @@ async def _reject(lifecycle_pool, config, request_record):
             result={"error": {"code": "registry_publication_rejected"}},
             control_schema=config.control_schema,
         )
+    if not config.metadata_only:
+        await _retire_rejected_candidates(execution_pool, config, UUID(str(request_record["request_id"])))
+
+
+async def _retire_rejected_candidates(execution_pool, config, request_id):
+    """Mark the rejected request's own candidate rejected and drop the schema this worker may drop."""
+    # shortcut: best effort after the committed rejection; a failure leaves the schema for a manual drop.
+    with suppress(Exception):
+        async with execution_pool.acquire() as connection:
+            await _verify_execution(connection, config)
+            async with connection.transaction():
+                await _retire_request_candidates(connection, config, request_id)
+
+
+async def _retire_request_candidates(connection, config, request_id):
+    await connection.execute("SET LOCAL lock_timeout='5s'")
+    rejected_rows = await connection.fetch(
+        _REJECT_CANDIDATES_SQL.format(control=_namespace(config.control_schema)),
+        uuid5(request_id, "dataset"),
+    )
+    for record in rejected_rows:
+        # PostgreSQL decides ownership; a schema this login cannot drop keeps only the state change.
+        with suppress(*_KEPT_CANDIDATE_ERRORS):
+            async with connection.transaction():
+                await _drop_candidate_schema(connection, record["schema_name"])
+
+
+async def _drop_candidate_schema(connection, schema_name):
+    schema = _identifier(schema_name)
+    tables = await connection.fetch(_CANDIDATE_TABLES_SQL, schema_name)
+    relations = ",".join(schema + "." + _identifier(record["relname"]) for record in tables)
+    if relations:
+        await connection.execute(f"LOCK TABLE {relations} IN ACCESS EXCLUSIVE MODE NOWAIT")
+        await connection.execute(f"DROP TABLE {relations} RESTRICT")
+    await connection.execute(f"DROP SCHEMA IF EXISTS {schema} RESTRICT")
 
 
 def _has_database_cause(error):
@@ -566,12 +618,12 @@ async def consume_registry_publication_once(
     except RegistryApprovalConflict as error:
         if str(error) == "registry_queue_lease_conflict":
             raise RegistryApprovalConflict("registry_queue_lease_conflict") from None
-        await _reject(lifecycle_pool, config, request_record)
+        await _reject(lifecycle_pool, execution_pool, config, request_record)
         raise ValueError("registry_publication_request_refused") from None
     except (PermissionError, ValueError) as error:
         if _has_database_cause(error):
             raise RuntimeError("registry_publication_consumer_unavailable") from None
-        await _reject(lifecycle_pool, config, request_record)
+        await _reject(lifecycle_pool, execution_pool, config, request_record)
         raise ValueError("registry_publication_request_refused") from None
     except Exception:
         raise RuntimeError("registry_publication_consumer_unavailable") from None

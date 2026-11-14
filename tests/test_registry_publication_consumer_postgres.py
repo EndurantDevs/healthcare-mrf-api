@@ -8,7 +8,7 @@ from contextlib import AsyncExitStack, aclosing, asynccontextmanager
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 import asyncpg
 import httpx
@@ -797,12 +797,67 @@ async def test_final_authority_revocation_refuses_prepared_candidate(worker_perm
             await consume_registry_publication_once(**arguments)
         assert len(calls) == 5 and await _head(fixture) is None
         assert (await _status(fixture, queued))["state"] == "rejected"
-        assert (
-            await fixture.fixture.connection.fetchval(
-                f"SELECT count(*) FROM \"{fixture.fixture.control_schema}\".network_membership_candidate WHERE state='ready'"
-            )
-            == 1
+        candidates = await fixture.fixture.connection.fetch(
+            "SELECT state,to_regnamespace(schema_name) IS NULL AS dropped "
+            f'FROM "{fixture.fixture.control_schema}".network_membership_candidate'
         )
+        assert [dict(candidate) for candidate in candidates] == [{"state": "rejected", "dropped": True}]
+
+
+async def test_rejected_request_retirement_keeps_served_referenced_and_foreign_candidates(worker_permissions):
+    fixture = worker_permissions
+    connection, control = fixture.fixture.connection, fixture.fixture.control_schema
+    execution, lifecycle = fixture.roles_by_kind["execution"], fixture.roles_by_kind["lifecycle"]
+
+    async def candidate(request_id, owner, state="open", validation=None):
+        candidate_id = uuid4()
+        schema = "network_candidate_" + candidate_id.hex
+        await connection.execute(f'CREATE SCHEMA "{schema}" AUTHORIZATION "{owner}"')
+        await connection.execute(f'CREATE TABLE "{schema}".network_membership (npi bigint)')
+        await connection.execute(f'ALTER TABLE "{schema}".network_membership OWNER TO "{owner}"')
+        await connection.execute(
+            f'INSERT INTO "{control}".network_membership_candidate (candidate_id,dataset_id,schema_id,producer_id,'
+            "schema_name,state,source_generations,approved_custom_revision,expected_head,expected_rows,"
+            "validation_json,index_ready) VALUES ($1,$2,$3,$4,$5,$6::text,'{}',0,0,0,$7::jsonb,$6::text='published')",
+            candidate_id,
+            uuid5(request_id, "dataset"),
+            uuid4(),
+            uuid4(),
+            schema,
+            state,
+            None if validation is None and state != "published" else json.dumps(validation or {}),
+        )
+        return candidate_id, schema
+
+    async def outcome(candidate_id):
+        row = await connection.fetchrow(
+            f'SELECT state,to_regnamespace(schema_name) IS NULL AS dropped FROM "{control}".network_membership_candidate '
+            "WHERE candidate_id=$1",
+            candidate_id,
+        )
+        return dict(row)
+
+    requests_by_name = {name: uuid4() for name in ("own", "referenced", "foreign", "manifest", "published")}
+    own, _ = await candidate(requests_by_name["own"], execution)
+    referenced, referenced_schema = await candidate(requests_by_name["referenced"], execution)
+    await candidate(uuid4(), execution, validation={"address_source": {"schema_name": referenced_schema}})
+    foreign, _ = await candidate(requests_by_name["foreign"], lifecycle)
+    manifest, _ = await candidate(requests_by_name["manifest"], execution)
+    await connection.execute(
+        f'INSERT INTO "{control}".network_serving_manifest (candidate_id,schema_revision,source_generations,'
+        "approved_custom_revision,manifest_sha256) VALUES ($1,1,'{}',0,$2)",
+        manifest,
+        "0" * 64,
+    )
+    published, _ = await candidate(requests_by_name["published"], execution, "published")
+    async with _consumer(fixture) as (arguments, _):
+        for request_id in requests_by_name.values():
+            await consumer._retire_rejected_candidates(arguments["execution_pool"], arguments["config"], request_id)
+    assert await outcome(own) == {"state": "rejected", "dropped": True}
+    assert await outcome(referenced) == {"state": "open", "dropped": False}
+    assert await outcome(foreign) == {"state": "rejected", "dropped": False}
+    assert await outcome(manifest) == {"state": "open", "dropped": False}
+    assert await outcome(published) == {"state": "published", "dropped": False}
 
 
 @pytest.mark.parametrize("fault", ["lease", "expiry", "cancel", "renew"])
