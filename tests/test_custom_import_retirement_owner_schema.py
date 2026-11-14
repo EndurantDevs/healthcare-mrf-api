@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Owner-schema validation accepts real model metadata without weakening custody."""
+"""Owner-schema validation accepts real model metadata and leaves authority to PostgreSQL."""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -76,13 +76,23 @@ async def test_owner_schema_rejects_invalid_translations_before_authority_query(
 
 
 @pytest.mark.parametrize("allowed", (False, None, 1))
-async def test_actual_model_schema_still_requires_true_native_owner_authority(allowed):
+async def test_actual_model_schema_still_requires_direct_bounded_writable_login(allowed):
     session = _owner_session(allowed=allowed)
 
-    with pytest.raises(SnapshotRetirementRefused, match="protected native owner authority and finite bounds"):
+    with pytest.raises(SnapshotRetirementRefused, match="direct writable login transaction and finite bounds"):
         await _owner_schema(session)
 
     session.scalar.assert_awaited_once()
+
+
+async def test_owner_schema_leaves_authority_to_postgresql_ownership():
+    session = _owner_session()
+
+    await _owner_schema(session)
+
+    statement = str(session.scalar.await_args.args[0])
+    assert "rolsuper" not in statement and "pg_roles" not in statement
+    assert "current_user = session_user" in statement
 
 
 @pytest.mark.parametrize("state", ("new", "dirty", "deleted", "no_transaction"))
