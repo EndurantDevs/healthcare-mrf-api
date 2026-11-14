@@ -732,7 +732,7 @@ class Database:
         from api.reference_family_reads import pin_claims_reader
 
         try:
-            await pin_claims_reader(session, api_read=True)
+            await pin_claims_reader(session)
         except BaseException:
             await self._close_request_session(request, success=False)
             raise
@@ -984,7 +984,7 @@ class Database:
                 from api.reference_family_reads import pin_claims_reader
 
                 try:
-                    await pin_claims_reader(session, api_read=True)
+                    await pin_claims_reader(session)
                 except (RuntimeError, SQLAlchemyError) as failure:
                     from api.custom_import_read_http import _log_failure
                     from api.signed_request_reader import _remember_reader_failure

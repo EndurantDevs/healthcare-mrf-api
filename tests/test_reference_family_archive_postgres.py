@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
@@ -23,6 +23,7 @@ from sqlalchemy import (
     MetaData,
     Table,
     Text,
+    select,
     text,
 )
 from sqlalchemy.engine import make_url
@@ -1290,3 +1291,109 @@ async def test_scoped_model_invalid_relationships_roll_back_complete_candidate(p
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{stage}" CASCADE'))
         await engine.dispose()
+
+
+@asynccontextmanager
+async def _claims_family_database():
+    """Publish the physician family under its fixed names for a SELECT-only reader role."""
+    from db.models import CodeCatalog, CodeCrosswalk
+
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    reader = "claims_reader_" + uuid4().hex
+    async with sessions.begin() as session:
+        await session.execute(text('CREATE SCHEMA "mrf"'))
+    try:
+        async with sessions.begin() as session:
+            for model in (*archive.reference_family_spec("claims-pricing").model_types, CodeCatalog, CodeCrosswalk):
+                table = model.__table__.to_metadata(MetaData(), schema="mrf")
+                await session.execute(
+                    text(str(archive.CreateTable(table).compile(dialect=archive.postgresql.dialect())))
+                )
+            await session.execute(text(f'CREATE ROLE "{reader}"'))
+            await session.execute(text(f'GRANT USAGE ON SCHEMA "mrf" TO "{reader}"'))
+            await session.execute(text(f'GRANT SELECT ON ALL TABLES IN SCHEMA "mrf" TO "{reader}"'))
+        yield sessions, reader
+    finally:
+        async with sessions.begin() as session:
+            await session.execute(text('DROP SCHEMA IF EXISTS "mrf" CASCADE'))
+            await session.execute(text(f'DROP ROLE IF EXISTS "{reader}"'))
+        await engine.dispose()
+
+
+async def _pinned_claims_read(sessions, reader, after_snapshot=None):
+    """Run the pin as the reader role inside a read-only repeatable-read snapshot."""
+    from api.reference_family_reads import claims_dictionary_tables, pin_claims_reader
+
+    async with sessions() as session:
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        await session.execute(text(f'SET LOCAL ROLE "{reader}"'))
+        await session.execute(text("SELECT 1"))
+        if after_snapshot is not None:
+            async with sessions.begin() as admin:
+                for statement in (after_snapshot,) if isinstance(after_snapshot, str) else after_snapshot:
+                    await admin.execute(text(statement))
+        try:
+            importers = await pin_claims_reader(session)
+            await session.execute(select(claims_dictionary_tables(session)[0]).limit(1))
+            return importers
+        finally:
+            await session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_claims_pin_serves_a_copy_by_name_and_refuses_changed_tables():
+    async with _claims_family_database() as (sessions, reader):
+        assert await _pinned_claims_read(sessions, reader) == ("claims-pricing",)
+        async with sessions.begin() as admin:
+            original_oid = await admin.scalar(text("SELECT to_regclass('mrf.pricing_provider')::oid"))
+            await admin.execute(text("ALTER TABLE mrf.pricing_provider RENAME TO pricing_provider_source"))
+            await admin.execute(text("CREATE TABLE mrf.pricing_provider (LIKE mrf.pricing_provider_source)"))
+            await admin.execute(text("DROP TABLE mrf.pricing_provider_source"))
+            await admin.execute(text(f'GRANT SELECT ON mrf.pricing_provider TO "{reader}"'))
+            assert await admin.scalar(text("SELECT to_regclass('mrf.pricing_provider')::oid")) != original_oid
+        assert await _pinned_claims_read(sessions, reader) == ("claims-pricing",)
+        for change, restore in (
+            (
+                "ALTER TABLE mrf.pricing_provider ENABLE ROW LEVEL SECURITY",
+                "ALTER TABLE mrf.pricing_provider DISABLE ROW LEVEL SECURITY",
+            ),
+            ("ALTER TABLE mrf.claims_code_catalog DROP COLUMN source_release", None),
+        ):
+            async with sessions.begin() as admin:
+                await admin.execute(text(change))
+            with pytest.raises(RuntimeError, match="table is refused"):
+                await _pinned_claims_read(sessions, reader)
+            if restore is not None:
+                async with sessions.begin() as admin:
+                    await admin.execute(text(restore))
+
+
+@pytest.mark.asyncio
+async def test_claims_pin_refuses_row_security_committed_after_its_snapshot():
+    async with _claims_family_database() as (sessions, reader):
+        with pytest.raises(RuntimeError, match="table is refused"):
+            await _pinned_claims_read(
+                sessions,
+                reader,
+                after_snapshot="ALTER TABLE mrf.pricing_provider ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY",
+            )
+
+
+@pytest.mark.asyncio
+async def test_claims_pin_refuses_a_stage_moved_in_after_its_snapshot():
+    """A stage that existed before the snapshot but took the live name after it would read as empty."""
+    async with _claims_family_database() as (sessions, reader):
+        async with sessions.begin() as admin:
+            await admin.execute(text("CREATE TABLE mrf.pricing_provider_stage (LIKE mrf.pricing_provider)"))
+            await admin.execute(text(f'GRANT SELECT ON mrf.pricing_provider_stage TO "{reader}"'))
+        with pytest.raises(RuntimeError, match="table is refused"):
+            await _pinned_claims_read(
+                sessions,
+                reader,
+                after_snapshot=(
+                    "ALTER TABLE mrf.pricing_provider RENAME TO pricing_provider_old",
+                    "ALTER TABLE mrf.pricing_provider_stage RENAME TO pricing_provider",
+                ),
+            )
+        assert await _pinned_claims_read(sessions, reader) == ("claims-pricing",)

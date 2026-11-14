@@ -30,11 +30,12 @@ _NAMES = (
 )
 
 
-async def _session(rows=(), *, installed=True, only_names=_NAMES):
+async def _session(rows=(), *, installed=True, only_names=_NAMES, pinned=False):
     result = FakeResult(rows=list(rows), scalar=2024)
     result.close = Mock()
     session = FakeSession([result])
-    session.info = {}
+    # A pinned request keeps its verified Reader marker; the claims pin installs no inventory.
+    session.info = {"api_reader_verified": True} if pinned else {}
     if installed:
         pins = tuple(CompactAddressRelation("mrf", name, index + 1) for index, name in enumerate(_NAMES))
         await execution.install_network_read_inventory(
@@ -265,15 +266,20 @@ async def test_npi_claims_filters_keep_guarded_reader_without_network_scope(monk
         assert (await operation).status == 200
     (statement, parameters), _ = session.executions[-1]
     sql = str(statement)
-    assert 'FROM ONLY "mrf"."pricing_provider_procedure" AS pp' in sql
-    assert 'FROM ONLY "mrf"."pricing_provider_prescription" AS pr' in sql
+    # List filters name the claims heaps; near keeps ONLY for heaps an installed inventory proved.
+    relation = 'ONLY "mrf"."{}"' if endpoint == "near" else "mrf.{}"
+    assert f"FROM {relation.format('pricing_provider_procedure')} AS pp" in sql
+    assert f"FROM {relation.format('pricing_provider_prescription')} AS pr" in sql
     assert parameters["procedure_code_0"] == 7 and parameters["medication_code_0"] == 8
     assert parameters["filter_year"] == 2024
 
 
+@pytest.mark.parametrize("pinned", [False, True])
 @pytest.mark.parametrize("method", ["_is_table_available", "_table_columns"])
-async def test_guarded_pricing_metadata_ignores_stale_global_hits_and_leaves_cache_unchanged(monkeypatch, method):
-    session, _ = await _session([("year",)])
+async def test_guarded_pricing_metadata_ignores_stale_global_hits_and_leaves_cache_unchanged(
+    monkeypatch, pinned, method
+):
+    session, _ = await _session([("year",)], installed=not pinned, pinned=pinned)
     table_exists_by_key = {"mrf.pricing_provider_procedure": (time.monotonic(), False)}
     table_columns_by_key = {"mrf.pricing_provider_procedure": (time.monotonic(), ("prior_column",))}
     before = (table_exists_by_key.copy(), table_columns_by_key.copy())
@@ -286,9 +292,10 @@ async def test_guarded_pricing_metadata_ignores_stale_global_hits_and_leaves_cac
     assert (table_exists_by_key, table_columns_by_key) == before
 
 
+@pytest.mark.parametrize("pinned", [False, True])
 @pytest.mark.parametrize("method", ["_is_table_available", "_table_columns", "_resolve_npi_filter_capabilities"])
-async def test_guarded_npi_metadata_skips_ordinary_cache_reads_and_writes(monkeypatch, method):
-    session, _ = await _session([("procedures_array",)])
+async def test_guarded_npi_metadata_skips_ordinary_cache_reads_and_writes(monkeypatch, pinned, method):
+    session, _ = await _session([("procedures_array",)], installed=not pinned, pinned=pinned)
     ordinary_get = Mock(return_value={"npi_procedures_array_available": False})
     ordinary_set = Mock(side_effect=AssertionError("request-bound metadata entered process cache"))
     monkeypatch.setattr(npi, "ENABLE_NPI_SCHEMA_CACHE", True)
@@ -330,8 +337,9 @@ async def test_guarded_npi_capabilities_preserve_schema_refusal_without_fallback
     assert capability_cache_by_entry == {"entry": None}
 
 
+@pytest.mark.parametrize("pinned", [False, True])
 @pytest.mark.parametrize("basis", ["quality_signal", "fallback_signal", "quality_feature", "raw"])
-async def test_each_current_taxonomy_evidence_basis_bypasses_the_ordinary_cache(monkeypatch, basis):
+async def test_each_current_taxonomy_evidence_basis_bypasses_the_ordinary_cache(monkeypatch, pinned, basis):
     taxonomy_evidence_by_field = {
         "taxonomy_code": "207Q00000X",
         "distinct_npis": 100000,
@@ -339,7 +347,7 @@ async def test_each_current_taxonomy_evidence_basis_bypasses_the_ordinary_cache(
         "total_beneficiaries": 100000,
         "provider_types": ["Family Medicine"],
     }
-    session, _ = await _session([taxonomy_evidence_by_field])
+    session, _ = await _session([taxonomy_evidence_by_field], installed=not pinned, pinned=pinned)
     if basis == "fallback_signal":
         session._results.insert(0, FakeResult(rows=[]))
     ordinary_get = Mock(return_value=[{"taxonomy_code": "PRIOR"}])

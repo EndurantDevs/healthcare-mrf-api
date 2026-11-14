@@ -862,7 +862,7 @@ async def _api_rows(held, generation_id):
         assert session.info["api_reader_verified"] is True and current_session() is session
         identity_by_field = dict(session.info["api_reader_identity"])
         transaction = session.get_transaction()
-        await pin_claims_reader(session, api_read=True)
+        await pin_claims_reader(session)
         before = len(held.requests)
         async with api_catalog_read_snapshot(session, generation_id) as (manifest, approved_relation):
             assert len(held.requests) == before + 1
