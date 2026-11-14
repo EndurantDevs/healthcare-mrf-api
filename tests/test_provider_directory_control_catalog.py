@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy.exc import PendingRollbackError
 
 from api import provider_directory_control_catalog as control_catalog
 from process import provider_directory_profile_selection as selection
@@ -24,6 +26,85 @@ from tests.provider_directory_profile_uhc_flex_test_support import (
 from tests.provider_directory_profile_uhc_flex_test_support import (
     _source_rows as _uhc_source_rows,
 )
+
+
+@asynccontextmanager
+async def _owned_catalog_transaction(state, events):
+    state.active = True
+    try:
+        yield SimpleNamespace(execute=AsyncMock())
+    except Exception:
+        events.append("rollback")
+        state.poisoned = False
+        raise
+    else:
+        if state.poisoned:
+            raise PendingRollbackError("optional query cancellation invalidated the transaction")
+    finally:
+        state.active = False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_stage", ("selection", "outcomes", "cms"))
+async def test_owned_catalog_timeout_rolls_back_before_static_fallback(monkeypatch, failed_stage):
+    from api import control
+
+    static_map = {"catalog_digest": "a" * 64, "items": []}
+    state = SimpleNamespace(active=False, poisoned=False, failed=False)
+    events = []
+
+    def static_catalog():
+        events.append("static-in-transaction" if state.active else "static-after-rollback")
+        assert not state.poisoned
+        return static_map
+
+    def projection(stage, projection_value):
+        async def read(*_args, **_kwargs):
+            assert not state.poisoned
+            events.append(stage)
+            if stage == failed_stage and not state.failed:
+                state.failed = True
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    state.poisoned = True
+            return projection_value
+
+        return read
+
+    monkeypatch.setattr(control, "_require_control_auth", lambda _request: None)
+    monkeypatch.setattr(control.db, "transaction", lambda: _owned_catalog_transaction(state, events))
+    monkeypatch.setattr(control, "named_editions_for_session", AsyncMock(return_value=("named",)))
+    monkeypatch.setattr(control, "provider_directory_source_catalog", static_catalog)
+    monkeypatch.setattr(control_catalog, "provider_directory_source_catalog", static_catalog)
+    monkeypatch.setattr(
+        control_catalog, "current_profile_selection_request", projection("selection", {"selected": True})
+    )
+    monkeypatch.setattr(
+        control_catalog,
+        "enrich_provider_directory_source_catalog",
+        projection("outcomes", {**static_map, "outcomes": True}),
+    )
+    monkeypatch.setattr(control_catalog, "cms_serving_candidate", projection("cms", {"candidate": True}))
+    for setting in (
+        "_SELECTION_PROJECTION_TIMEOUT_SECONDS",
+        "_OUTCOME_ENRICHMENT_TIMEOUT_SECONDS",
+        "_CMS_CANDIDATE_TIMEOUT_SECONDS",
+    ):
+        monkeypatch.setattr(control_catalog, setting, 0.01)
+
+    catalog_response = await control.control_provider_directory_sources(SimpleNamespace())
+    assert json.loads(catalog_response.body) == static_map
+    assert events[-2:] == ["rollback", "static-after-rollback"]
+    assert events.count("selection") == 1
+    assert not state.active and not state.poisoned
+    catalog_response = await control.control_provider_directory_sources(SimpleNamespace())
+    assert json.loads(catalog_response.body) == {
+        **static_map,
+        "outcomes": True,
+        "profile_selection_request": {"selected": True},
+        "cms_serving_candidate": {"candidate": True},
+    }
 
 
 def _profile_selection_request() -> dict[str, object]:

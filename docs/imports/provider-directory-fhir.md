@@ -1837,14 +1837,15 @@ exact collection by the returned entry count. Saved cursors undergo separate
 scope validation on resume. The importer preserves the issued URL unchanged and refuses
 malformed, unsorted or overlapping resource IDs before staging the page. The
 last sorted ID is committed with each page's existing checkpoint and checked
-again on resume. An existing PractitionerRole checkpoint can upgrade from 500
-to 1,000 entries while retaining its original start hash and exact issued offset.
-Its legacy stored 500-entry cap is upgraded before selecting the start URL;
-lower request counts and other metadata caps retain their limits.
-Only the count changes; the first accepted page commits the count-transition
-proof, sorted boundary, rows and new issued continuation together. Failures
-retain the previous checkpoint. A worker with the older 500-entry cap refuses
-the upgraded cursor. Network-filtered parallel partitions remain unqualified.
+again on resume. Retained PractitionerRole checkpoints keep their issued
+500-entry URL, original start hash and sorted boundary; the current full-refresh
+preference does not resize a saved continuation. Earlier committed transitions
+to 1,000 entries retain their validated transition proof, and native 1,000-entry
+checkpoints resume without creating one. Each accepted page commits its sorted
+boundary, rows and new issued continuation together. Failures retain the previous
+checkpoint. Fresh-start preferences, lower request counts and other metadata
+caps remain unchanged. A worker with the older 500-entry cap refuses a saved
+1,000-entry cursor. Network-filtered parallel partitions remain unqualified.
 Sorted page pairs for all seven collections had strictly
 increasing IDs and retained the issued sort. No reliable collection totals were
 observed. The sampled plans included
