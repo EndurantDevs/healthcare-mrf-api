@@ -869,6 +869,31 @@ async def _scoped_qualification_probe(directory, source_record, *, timeout, run_
         QUALIFICATION_API_BASE.reset(token)
 
 
+def validate_endpoint_scope(
+    directory,
+    source_records: list[dict[str, Any]],
+    requested_scope: str | None,
+) -> str | None:
+    """Require selected source bases to match the requested endpoint scope."""
+    if not requested_scope:
+        return None
+    canonical_scope = directory._canonical_base(requested_scope)
+    if not canonical_scope:
+        raise RuntimeError("provider_directory_endpoint_scope_invalid")
+    resolved_base_values = [
+        directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+        for source_record in source_records
+    ]
+    if not resolved_base_values or any(not value for value in resolved_base_values):
+        raise RuntimeError("provider_directory_endpoint_scope_unresolved_base")
+    resolved_bases = set(resolved_base_values)
+    if len(resolved_bases) != 1:
+        raise RuntimeError("provider_directory_endpoint_scope_multiple_bases")
+    if canonical_scope not in resolved_bases:
+        raise RuntimeError("provider_directory_endpoint_scope_mismatch")
+    return canonical_scope
+
+
 async def qualify_stale_isolated_source(directory, source_rows, task, *, timeout, run_id):
     """Refresh one stale seed verdict with transport reads, without catalog probe writes."""
     if (
