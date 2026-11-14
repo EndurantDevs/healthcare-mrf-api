@@ -40501,24 +40501,9 @@ def _seed_rows_from_supplemental_catalogs(
     )
     supplemental_rows.extend(remote_rows)
     metrics_by_name["catalogs"].update(remote_metrics_by_catalog)
-    for name, base, seed_loader in (
-        ("anthem", anthem.API_BASE, anthem.seed_rows),
-        ("health_partners_plans", HEALTH_PARTNERS_PLANS_PROVIDER_DIRECTORY_BASE, _health_partners_plans_seed_rows),
-        ("pacificsource", pacificsource.API_BASE, pacificsource.seed_rows),
-        ("capital_blue_cross_products", "capital-blue-cross-public-directory", _capital_blue_cross_product_seed_rows),
-        ("aetna_provider_directorydata", AETNA_PROVIDER_DIRECTORY_DATA_BASE, _aetna_provider_directory_data_seed_rows),
-        ("christus_health_plan", christus.API_BASE, christus.christus_seed_rows),
-        ("mvp_health_care", mvp.API_BASE, mvp.seed_rows),
-        ("configured_sources", "provider-directory-supplemental-sources", source_selection.configured_seed_rows),
-        (
-            "provider_directory_blockers",
-            PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE,
-            _provider_directory_blocker_seed_rows,
-        ),
-    ):
-        catalog_rows = [seed_row for seed_row in seed_loader() if _is_seed_row_query_match(seed_row, source_query)]
-        supplemental_rows.extend(catalog_rows)
-        metrics_by_name["catalogs"][name] = {"source": base, "rows": len(catalog_rows)}
+    baked_rows, baked_metrics = source_selection.baked_seed_rows(sys.modules[__name__], source_query=source_query)
+    supplemental_rows.extend(baked_rows)
+    metrics_by_name["catalogs"].update(baked_metrics)
     metrics_by_name["rows"] = len(supplemental_rows)
     return supplemental_rows, metrics_by_name
 

@@ -8,8 +8,76 @@ import importlib
 import io
 import ssl
 import urllib.error
+from unittest.mock import Mock
 
 importer = importlib.import_module("process.provider_directory_fhir")
+
+
+def test_baked_seed_registry_resolves_generated_and_configured_sources_without_remote_io(monkeypatch):
+    unavailable = Mock(side_effect=AssertionError("remote catalog must not resolve baked sources"))
+    monkeypatch.setattr(importer, "_remote_supplemental_catalogs", unavailable)
+    monkeypatch.setattr(importer, "_reviewed_provider_directory_candidate_seed_rows", unavailable)
+    monkeypatch.setattr(importer.urllib.request, "urlopen", unavailable)
+
+    seed_rows, metrics_by_catalog = importer.source_selection.baked_seed_rows(importer)
+    assert (seed_rows, metrics_by_catalog) == importer.source_selection.baked_seed_rows(importer)
+    assert all(seed_row in seed_rows for seed_row in importer.source_selection.configured_seed_rows())
+    assert len(seed_rows) == sum(catalog["rows"] for catalog in metrics_by_catalog.values())
+    assert list(metrics_by_catalog) == [
+        "anthem",
+        "health_partners_plans",
+        "pacificsource",
+        "capital_blue_cross_products",
+        "aetna_provider_directorydata",
+        "christus_health_plan",
+        "mvp_health_care",
+        "configured_sources",
+        "provider_directory_blockers",
+    ]
+    capital_rows, capital_metrics = importer.source_selection.baked_seed_rows(
+        importer, source_query="Capital Blue Cross"
+    )
+    assert capital_rows == importer._capital_blue_cross_product_seed_rows()
+    assert capital_metrics["capital_blue_cross_products"]["rows"] == 2
+    assert sum(catalog["rows"] for catalog in capital_metrics.values()) == 2
+    source_records = [importer._source_row_from_seed(seed_row) for seed_row in capital_rows]
+    assert len({source_record["source_id"] for source_record in source_records}) == 2
+    assert len({source_record["api_base"] for source_record in source_records}) == 2
+    unavailable.assert_not_called()
+
+
+def test_supplemental_catalog_preserves_order_and_metrics_through_baked_registry(monkeypatch):
+    reviewed_seed_by_field = {"id": "reviewed"}
+    remote_seed_by_field = {"id": "remote"}
+    baked_seed_by_field = {"id": "baked"}
+    remote_metrics_by_catalog = {"remote": {"source": "remote", "rows": 1}}
+    baked_metrics_by_catalog = {"baked": {"source": "baked", "rows": 1}}
+    monkeypatch.setattr(
+        importer, "_reviewed_provider_directory_candidate_seed_rows", Mock(return_value=[reviewed_seed_by_field])
+    )
+    monkeypatch.setattr(
+        importer,
+        "_remote_supplemental_catalogs",
+        Mock(return_value=([remote_seed_by_field], remote_metrics_by_catalog)),
+    )
+    resolver = Mock(return_value=([baked_seed_by_field], baked_metrics_by_catalog))
+    monkeypatch.setattr(importer.source_selection, "baked_seed_rows", resolver)
+
+    seed_rows, metrics_by_catalog = importer._seed_rows_from_supplemental_catalogs(source_query="Example")
+
+    assert seed_rows == [reviewed_seed_by_field, remote_seed_by_field, baked_seed_by_field]
+    assert metrics_by_catalog == {
+        "catalogs": {
+            "reviewed_provider_directory_candidates": {
+                "source": importer.REVIEWED_PROVIDER_DIRECTORY_CANDIDATE_SOURCE,
+                "rows": 1,
+            },
+            **remote_metrics_by_catalog,
+            **baked_metrics_by_catalog,
+        },
+        "rows": 3,
+    }
+    resolver.assert_called_once_with(importer, source_query="Example")
 
 
 class _Response:
@@ -50,9 +118,7 @@ def test_seed_deduplication_covers_source_and_anonymous_retest_rows():
         "seed_source": "provider-directory-db-retest",
     }
 
-    assert importer._dedupe_source_rows(
-        [retained_map, duplicate_map, anonymous_map]
-    ) == [retained_map, anonymous_map]
+    assert importer._dedupe_source_rows([retained_map, duplicate_map, anonymous_map]) == [retained_map, anonymous_map]
 
 
 def test_seed_database_resolver_covers_explicit_and_downloaded_paths(
@@ -156,10 +222,7 @@ def test_sync_get_covers_success_http_error_and_transport_error(monkeypatch):
         "urlopen",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("offline")),
     )
-    assert "offline" in (
-        importer._fetch_json_sync("https://example.test/fhir", timeout=1)[2]
-        or ""
-    )
+    assert "offline" in (importer._fetch_json_sync("https://example.test/fhir", timeout=1)[2] or "")
 
 
 def test_sync_post_covers_custom_headers_and_success(monkeypatch):
