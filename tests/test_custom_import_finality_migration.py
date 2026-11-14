@@ -109,6 +109,7 @@ _SEALED_APPEND_UPGRADE_TAIL = (
     "20261115010000_ms_drg_companion_tables",
     "20261114010000_custom_import_snapshot_names",
     "20261114020000_custom_import_snapshot_metadata",
+    "20261114120000_portable_serving_metadata",
 )
 
 MIGRATION_PATH = ROOT / "alembic" / "versions" / "20260917130000_custom_import_generation_finality.py"
@@ -283,9 +284,13 @@ def _assert_custom_import_manual_acceptance_lineage(script):
     )
 
 
-def _assert_finality_migration_chain(script):
-    """Keep the exact accepted migration head and predecessor assertions."""
-    assert script.get_heads() == ["20261114020000_custom_import_snapshot_metadata"]
+def _assert_current_snapshot_migration_chain(script):
+    """Check the current snapshot metadata head and its companion revisions."""
+    assert script.get_heads() == ["20261114120000_portable_serving_metadata"]
+    assert (
+        script.get_revision("20261114120000_portable_serving_metadata").down_revision
+        == "20261114020000_custom_import_snapshot_metadata"
+    )
     assert script.get_revision("20261114020000_custom_import_snapshot_metadata").down_revision == (
         "20261114010000_custom_import_snapshot_names"
     )
@@ -298,6 +303,11 @@ def _assert_finality_migration_chain(script):
     assert script.get_revision("20261113010000_address_canonical_space_normalization").down_revision == (
         "20261111010000_code_sets_publication_idempotency"
     )
+
+
+def _assert_finality_migration_chain(script):
+    """Keep the exact accepted migration head and predecessor assertions."""
+    _assert_current_snapshot_migration_chain(script)
     assert script.get_revision("20261029010000_registry_source_inventory").down_revision == (
         "20261028020000_registry_membership_refresh"
     )

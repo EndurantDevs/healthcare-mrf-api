@@ -530,7 +530,7 @@ def test_prepared_doctors_bind_all_three_sealed_heaps_separately_from_incumbent(
     assert payload["native_input_fence"] == address_build_case[4]
     assert payload["native_dependencies"] == address_build_case[3]
     assert payload["desired_doctors"]["stage_oids"] == [list(stage) for stage in doctors.stage_oids]
-    assert payload["desired_geo_bindings"] == bindings
+    assert payload["desired_geo_bindings"] == address.validate_projection_dependency_bindings("fixture", bindings)
     assert factory.source_relation_overrides == doctors.relation_overrides
     factory.source_relation_overrides.clear()
     assert len(factory.source_relation_overrides) == 3
@@ -546,9 +546,9 @@ def test_prepared_doctors_require_exact_desired_geo_bindings(address_build_case,
     elif change == "incumbent":
         bindings = address_build_case[4]["geo_bindings"]
     elif change == "other-input":
-        bindings["fixture.npi_address"]["relation_oid"] += 100
+        bindings["fixture.npi_address"]["schema_name"] = "other_input"
     else:
-        bindings["fixture.doctor_clinician_address"]["relfilenode"] += 1
+        bindings["fixture.doctor_clinician_address"]["table_name"] = "other_input"
     with pytest.raises(RuntimeError, match="desired_geo_bindings"):
         _factory(address_build_case, doctors=doctors, dependency_bindings=bindings)
 
@@ -614,7 +614,8 @@ async def test_factory_checks_prepared_doctors_before_native_work_and_passes_exa
         address_build_case[2], overrides_by_name, SimpleNamespace(oid=42, relation="overlay"), _admission(factory)
     ):
         kwargs = prepare.call_args.kwargs
-        assert kwargs["doctors"] is doctors and kwargs["dependency_bindings"] == bindings
+        assert kwargs["doctors"] is doctors
+        assert kwargs["dependency_bindings"] == address.validate_projection_dependency_bindings("fixture", bindings)
         assert dict(kwargs["preparation_input"].relation_overrides) == {
             "provider_directory_location": "location_staged",
             "doctor_clinician_address": doctors.stage_oids[0][1],
@@ -662,10 +663,13 @@ def test_captured_tiger_desired_geo_keeps_exact_native_heaps_and_separate_doctor
     doctors, bindings = prepared_doctors_case
     bindings.update(tiger.captured_tiger_bindings(proof))
     expected = address._desired_geo_bindings("fixture", native_fence, doctors, bindings)
-    assert {name: expected[name] for name in ("tiger.zcta5", "tiger.zip_state")} == tiger.captured_tiger_bindings(proof)
+    assert {name: expected[name] for name in ("tiger.zcta5", "tiger.zip_state")} == {
+        name: {field: entry[field] for field in ("schema_name", "table_name")}
+        for name, entry in tiger.captured_tiger_bindings(proof).items()
+    }
     assert expected["fixture.doctor_clinician_address"]["table_name"] == doctors.stage_oids[0][1]
     assert native_fence["geo_bindings"]["fixture.doctor_clinician_address"]["table_name"] == "doctor_clinician_address"
     changed_by_name = {name: dict(binding) for name, binding in bindings.items()}
-    changed_by_name["tiger.zcta5"]["relfilenode"] += 1
+    changed_by_name["tiger.zcta5"]["table_name"] = "another_input"
     with pytest.raises(RuntimeError, match="desired_geo_bindings_changed"):
         address._desired_geo_bindings("fixture", native_fence, doctors, changed_by_name)

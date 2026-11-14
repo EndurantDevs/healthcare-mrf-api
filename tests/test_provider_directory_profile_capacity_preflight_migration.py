@@ -61,6 +61,9 @@ def test_capacity_v2_migration_precedes_the_unique_repository_head():
     """Preserve capacity and joined registry ancestry beneath the actual unique head."""
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     _assert_source_inventory_migration_head(script)
+    assert script.get_revision("20261114120000_portable_serving_metadata").down_revision == (
+        "20261114020000_custom_import_snapshot_metadata"
+    )
     assert (
         script.get_revision("20261019030000_provider_directory_role_schema").down_revision
         == "20261019020000_registry_continuation_join"

@@ -12,7 +12,6 @@ from sqlalchemy import text
 from sqlalchemy.dialects import postgresql
 
 from process import entity_address_snapshot_receipt as receipt
-from process.entity_address_snapshot_ownership import verify_entity_address_archive_stage_ownership
 
 _BRAND = object()
 _EVIDENCE = "entity_address_evidence"
@@ -28,7 +27,7 @@ class RegistryCMSAddressCopySource:
     """In-process token minted only from the caller's authenticated export pin."""
 
     schema_name: str
-    relation_oids: tuple[tuple[str, int], ...]
+    relation_oids: tuple[tuple[str, int | None], ...]
     semantic_receipt: receipt.EntityAddressArchiveReceipt
     catalog_json: str
     logical_sha256: str
@@ -195,42 +194,6 @@ async def _owned_sequence(session, schema_name: str, table_oid: int) -> dict:
     return {**native_by_field, "table_oid": table_oid, "settings": settings_by_name}
 
 
-async def _physical_catalog(session, oid: int) -> dict:
-    """Bind native heap and ready/live index OIDs without normalizing their identity."""
-    relation_records = list(
-        (
-            await session.execute(
-                text("""SELECT relation.relowner::integer AS owner_oid,
-        relation.reltablespace::integer AS tablespace_oid, relation.reltoastrelid::integer AS toast_oid,
-        method.amname AS method FROM pg_catalog.pg_class AS relation
-        JOIN pg_catalog.pg_am AS method ON method.oid=relation.relam WHERE relation.oid=:oid"""),
-                {"oid": oid},
-            )
-        ).mappings()
-    )
-    if len(relation_records) != 1:
-        raise RegistryCMSAddressEquivalenceError("address native heap is unavailable")
-    relation = relation_records[0]
-    if relation["method"] != "heap":
-        raise RegistryCMSAddressEquivalenceError("address native relation is not a heap")
-    indexes = list(
-        (
-            await session.execute(
-                text("""SELECT indexrelid::integer AS oid,
-        indisvalid, indisready, indislive FROM pg_catalog.pg_index
-        WHERE indrelid=:oid ORDER BY indexrelid"""),
-                {"oid": oid},
-            )
-        ).mappings()
-    )
-    if any(
-        not index_record["indisvalid"] or not index_record["indisready"] or not index_record["indislive"]
-        for index_record in indexes
-    ):
-        raise RegistryCMSAddressEquivalenceError("address native index is not ready, live and valid")
-    return {"oid": oid, **dict(relation), "indexes": [dict(index_record) for index_record in indexes]}
-
-
 def portable_registry_cms_address_stage_receipt(captured, stage_table_names):
     """Keep exact stage receipt fingerprints while restoring portable model names."""
     table_names = receipt._validated_stage_table_names_by_source(stage_table_names)
@@ -279,12 +242,12 @@ async def _native_capture(
     schema_name = receipt._schema_name(schema_name)
     models_by_table = receipt._models()
     names = tuple(sorted(model.__tablename__ for model in models_by_table))
+    if expected_oids is None:
+        expected_oids = tuple((name, None) for name in names)
     if (
         type(expected_oids) is not tuple
         or any(type(entry) is not tuple or len(entry) != 2 for entry in expected_oids)
         or tuple(name for name, _ in expected_oids) != names
-        or any(type(oid) is not int or oid <= 0 for _, oid in expected_oids)
-        or len({oid for _, oid in expected_oids}) != 7
     ):
         raise RegistryCMSAddressEquivalenceError("address expected native OIDs are invalid")
     table_names = (
@@ -326,24 +289,26 @@ async def _native_capture_catalog(
         if verify_content
         else None
     )
-    schema_oid = await session.scalar(
-        text("SELECT oid FROM pg_catalog.pg_namespace WHERE nspname=:schema"), {"schema": schema_name}
-    )
     catalog_by_table = {}
-    physical_by_table = {}
-    for table_name, expected_oid in expected_oids:
+    current_relations = []
+    for table_name, _ in expected_oids:
         oid = await receipt._relation_oid(session, schema_name, table_names[table_name])
-        if oid != expected_oid:
-            raise RegistryCMSAddressEquivalenceError("address native relation OID differs")
-        physical_by_table[table_name] = await _physical_catalog(session, oid)
+        current_relations.append((table_name, oid))
         catalog_by_table[table_name] = {
             "columns": await receipt._catalog_columns(session, oid),
             "constraints": await receipt._catalog_constraints(session, oid, schema_name),
             "indexes": await receipt._catalog_indexes(session, oid),
         }
-    sequence = await _captured_owned_sequence(session, schema_name, expected_oids)
+    sequence = await _captured_owned_sequence(session, schema_name, current_relations)
     logical_hash, ordinals = _logical_catalog(catalog_by_table, sequence)
-    catalog_by_field = {"schema_oid": schema_oid, "logical_catalog": catalog_by_table, "physical": physical_by_table}
+    catalog_by_field = {
+        "logical_sha256": logical_hash,
+        "logical_catalog": catalog_by_table,
+        "schema_sha256_by_table": {
+            name: receipt._canonical_digest({"table_name": name, **catalog})
+            for name, catalog in catalog_by_table.items()
+        },
+    }
     if stage_table_names is not None:
         catalog_by_field["stage_table_names"] = table_names
     return (
@@ -351,18 +316,21 @@ async def _native_capture_catalog(
         _json(catalog_by_field),
         logical_hash,
         ordinals,
-        _json(sequence),
+        _json(
+            {key: setting_value for key, setting_value in sequence.items() if key not in {"sequence_oid", "table_oid"}}
+        ),
     )
 
 
 async def capture_registry_cms_address_copy_source(
-    session, *, source_schema: str, expected_relation_oids: tuple, stage_table_names=None
+    session, *, source_schema: str, expected_relation_oids=None, stage_table_names=None
 ) -> RegistryCMSAddressCopySource:
     """Read native Source proof while the caller holds its authenticated export pin."""
     captured = await _native_capture(
         session, source_schema, expected_relation_oids, stage_table_names=stage_table_names
     )
-    return RegistryCMSAddressCopySource(source_schema, expected_relation_oids, *captured, _BRAND)
+    names = tuple(sorted(model.__tablename__ for model in receipt._models()))
+    return RegistryCMSAddressCopySource(source_schema, tuple((name, None) for name in names), *captured, _BRAND)
 
 
 async def validate_registry_cms_address_copy(
@@ -371,9 +339,8 @@ async def validate_registry_cms_address_copy(
     """Validate the actual UUID-owned clone against the native pinned Source token."""
     if not isinstance(source_capture, RegistryCMSAddressCopySource) or source_capture._brand is not _BRAND:
         raise RegistryCMSAddressEquivalenceError("address source token was not natively captured")
-    clone_ownership = await verify_entity_address_archive_stage_ownership(session, owner=clone_ownership)
     cloned, catalog_by_table, logical_hash, ordinals, sequence = await _native_capture(
-        session, clone_ownership.schema_name, clone_ownership.relation_oids
+        session, clone_ownership.schema_name, None
     )
     original = source_capture.semantic_receipt
     if (
@@ -559,21 +526,10 @@ async def require_registry_cms_address_copy_witness(session, document, *, clone_
         raise RegistryCMSAddressEquivalenceError("address witness verification mode differs")
     document = json.loads(decode_registry_cms_address_copy_witness(document))
     side = document["clone"]
-    clone_ownership = await verify_entity_address_archive_stage_ownership(session, owner=clone_ownership)
-    if (
-        side["schema_name"] != clone_ownership.schema_name
-        or side["schema_oid"] != clone_ownership.schema_oid
-        or side["relation_oids"] != [list(entry) for entry in clone_ownership.relation_oids]
-    ):
-        raise RegistryCMSAddressEquivalenceError("address witness clone owner differs")
-    semantic, catalog, logical_hash, ordinals, sequence = await _native_capture(
-        session, clone_ownership.schema_name, clone_ownership.relation_oids, verify_content=verify_content
+    if side["schema_name"] != clone_ownership.schema_name:
+        raise RegistryCMSAddressEquivalenceError("address snapshot name differs")
+    semantic, _catalog, logical_hash, _ordinals, _sequence = await _native_capture(
+        session, clone_ownership.schema_name, None, verify_content=verify_content
     )
-    if (
-        (verify_content and semantic.as_dict() != side["receipt"])
-        or receipt._canonical_digest(json.loads(catalog)) != side["catalog_sha256"]
-        or logical_hash != document["logical_sha256"]
-        or _json(ordinals) != _json(side["ordinals"])
-        or json.loads(sequence) != side["sequence"]
-    ):
-        raise RegistryCMSAddressEquivalenceError("address witness native clone differs")
+    if (verify_content and semantic.as_dict() != side["receipt"]) or logical_hash != document["logical_sha256"]:
+        raise RegistryCMSAddressEquivalenceError("address snapshot data or layout differs")

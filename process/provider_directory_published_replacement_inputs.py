@@ -1,8 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Pin ordinary serving peers without borrowing artifact-candidate eligibility."""
 
+import contextvars
 import importlib
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -11,6 +13,7 @@ from process import provider_directory_serving_recovery_receipts as receipts
 
 _PIN_FIELDS = ("source_id", "endpoint_id", "dataset_id", "dataset_hash", "parent_run_id")
 _HEADER_FIELDS = (*replacement._HEADER_FIELDS, "validated_at")
+_PREFLIGHT = contextvars.ContextVar("provider_directory_publication_preflight", default=None)
 
 
 def _require(condition, suffix):
@@ -76,8 +79,8 @@ async def _serving(directory):
     return sorted((_entry(directory, row) for row in rows), key=lambda entry: entry["source_id"])
 
 
-async def _publication(directory, pin):
-    _source, datasets, selection = _selection_sql(directory, is_publication=True)
+async def _publication_entry(directory, pin, *, is_publication):
+    _source, datasets, selection = _selection_sql(directory, is_publication=is_publication)
     rows = await directory.db.all(
         selection + "dataset.dataset_id=:dataset_id AND dataset.endpoint_id=:endpoint_id "
         "WHERE source.source_id=:source_id AND dataset.is_current AND dataset.status='published' "
@@ -86,7 +89,11 @@ async def _publication(directory, pin):
         **{name: pin[name] for name in ("source_id", "endpoint_id", "dataset_id")},
     )
     _require(len(rows) == 1, "publication_changed")
-    return _entry(directory, rows[0], is_publication=True)
+    return _entry(directory, rows[0], is_publication=is_publication)
+
+
+async def _publication(directory, pin):
+    return await _publication_entry(directory, pin, is_publication=True)
 
 
 def _validate_entry(entry, *, require_provenance, is_publication=False):
@@ -251,16 +258,57 @@ def validate_peer_preparation(inputs):
     )
 
 
+async def _lock_endpoints(directory, snapshot):
+    entries = [*snapshot["serving"], snapshot["publication"]]
+    endpoints = SimpleNamespace(endpoint_ids=sorted({entry["header"]["endpoint_id"] for entry in entries}))
+    await directory._lock_artifact_fence_endpoint_advisories(endpoints, directory.db)
+    await directory._lock_artifact_fence_endpoints(endpoints, directory.db)
+
+
+def _publication_key(directory, entry):
+    return directory._schema(), entry["source_id"], tuple(entry["header"][name] for name in _HEADER_FIELDS)
+
+
+def preflight_pin(db_schema):
+    """Expose only the logical target already validated in the active transaction."""
+    publication = _PREFLIGHT.get()
+    if publication is None or publication[0] != db_schema:
+        return None
+    return _pin({"source_id": publication[1], "header": dict(zip(_HEADER_FIELDS, publication[2], strict=True))})
+
+
+@asynccontextmanager
+async def preflight_publication(directory, snapshot):
+    """Validate raw membership under row locks before the short cutover deadline."""
+    validate(snapshot)
+    async with directory.db.transaction():
+        await _lock_endpoints(directory, snapshot)
+        source, datasets = replacement._tables(directory)
+        for relation, column, value in (
+            (source, "source_id", snapshot["source_id"]),
+            (datasets, "dataset_id", snapshot["publication"]["header"]["dataset_id"]),
+        ):
+            rows = await directory.db.all(
+                f"SELECT {column} FROM ONLY {relation} WHERE {column}=:value FOR SHARE NOWAIT", value=value
+            )
+            _require(len(rows) == 1, "publication_changed")
+        publication = await _publication(directory, _pin(snapshot["publication"]))
+        _require(publication == snapshot["publication"], "publication_changed")
+        # The scoped cutover writes serving pointers, never raw publication metadata.
+        token = _PREFLIGHT.set(_publication_key(directory, publication))
+        try:
+            yield
+        finally:
+            _PREFLIGHT.reset(token)
+
+
 async def lock_and_check(directory, snapshot, *, pointer="incumbent"):
     """Freeze serving-vector phantoms only inside the caller's bounded final transaction."""
     validate(snapshot)
     _require(pointer in {"incumbent", "publication"}, "pointer_invalid")
     await receipts.ordinary(directory.db)
     _require(await directory.db.scalar("SHOW transaction_isolation") == "read committed", "snapshot_changed")
-    entries = [*snapshot["serving"], snapshot["publication"]]
-    endpoints = SimpleNamespace(endpoint_ids=sorted({entry["header"]["endpoint_id"] for entry in entries}))
-    await directory._lock_artifact_fence_endpoint_advisories(endpoints, directory.db)
-    await directory._lock_artifact_fence_endpoints(endpoints, directory.db)
+    await _lock_endpoints(directory, snapshot)
     source, datasets = replacement._tables(directory)
     # Row locks miss new aliases and newly serving endpoints; freeze both sets only for the final cut.
     await directory.db.status(f"LOCK TABLE {datasets},{source} IN SHARE MODE NOWAIT")
@@ -275,6 +323,11 @@ async def lock_and_check(directory, snapshot, *, pointer="incumbent"):
         for entry in snapshot["serving"]
     ]
     _require(await _serving(directory) == expected_entries, "serving_changed")
-    _require(
-        await _publication(directory, _pin(snapshot["publication"])) == snapshot["publication"], "publication_changed"
-    )
+    expected_by_field = snapshot["publication"]
+    pin = _pin(expected_by_field)
+    if _PREFLIGHT.get() == _publication_key(directory, expected_by_field):
+        publication = await _publication_entry(directory, pin, is_publication=False)
+        expected_by_field = {name: expected_by_field[name] for name in ("source_id", "header")}
+    else:
+        publication = await _publication(directory, pin)
+    _require(publication == expected_by_field, "publication_changed")

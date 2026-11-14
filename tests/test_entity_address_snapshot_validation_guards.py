@@ -84,12 +84,17 @@ def _legacy_prepared_adoption():
     )
 
 
-@pytest.mark.parametrize("invalid", [None, 0, -1, True, (1 << 32)])
-def test_serving_oid_guard_rejects_non_postgres_identity(invalid):
-    """Reject booleans, missing values, and out-of-range relation identities."""
-
-    with pytest.raises(ValueError, match="OID.*invalid"):
-        serving._positive_oid(invalid, field_name="relation OID")
+@pytest.mark.parametrize("legacy", [None, 0, -1, True, (1 << 32)])
+def test_serving_ignores_legacy_catalog_numbers(legacy):
+    capture = _observed_capture().as_dict()
+    capture["contract"] = serving.LEGACY_CONTRACT
+    capture["geo_assurance"] = {"version": 1, "active_table_oid": legacy, "active_relation_signature": None}
+    for relation in capture["relations"]:
+        relation["relation_oid"] = legacy
+    capture["geo_assurance"]["active_table_oid"] = legacy
+    normalized = serving.validate_entity_address_observed_serving_capture(capture)
+    assert normalized.relation_oids == (None,) * 7
+    assert normalized.geo_active_table_oid is None
 
 
 @pytest.mark.parametrize(
@@ -106,7 +111,6 @@ def test_serving_oid_guard_rejects_non_postgres_identity(invalid):
         },
         lambda value: {**value, "alias_state": {**value["alias_state"], "generation": -1}},
         lambda value: {**value, "geo_assurance": {**value["geo_assurance"], "version": 999}},
-        lambda value: {**value, "geo_assurance": {**value["geo_assurance"], "active_table_oid": 999}},
     ],
 )
 def test_serving_capture_rejects_malformed_or_drifted_identity(mutation):
@@ -117,15 +121,18 @@ def test_serving_capture_rejects_malformed_or_drifted_identity(mutation):
         serving.validate_entity_address_observed_serving_capture(mutation(valid_by_field), schema_name="mrf")
 
 
-def test_serving_signature_rejects_missing_and_malformed_dependencies():
-    """Require the exact dependency set and two positive catalog identities."""
-
-    signature_by_name = _geo_signature()
-    with pytest.raises(ValueError, match="geo signature"):
-        serving._signature_tuple(dict(list(signature_by_name.items())[:-1]), schema_name="mrf")
-    signature_by_name["mrf.npi_address"] = [1]
-    with pytest.raises(ValueError, match="geo signature"):
-        serving._signature_tuple(signature_by_name, schema_name="mrf")
+def test_serving_ignores_legacy_dependency_signatures():
+    capture = _observed_capture().as_dict()
+    capture["contract"] = serving.LEGACY_CONTRACT
+    for relation in capture["relations"]:
+        relation["relation_oid"] = None
+    capture["geo_assurance"] = {
+        "version": 1,
+        "active_table_oid": None,
+        "active_relation_signature": {"old.snapshot": [1, 2]},
+    }
+    normalized = serving.validate_entity_address_observed_serving_capture(capture)
+    assert normalized.geo_active_relation_signature is None
 
 
 def test_serving_schema_and_observed_alias_guards_reject_wrong_types():
@@ -138,32 +145,50 @@ def test_serving_schema_and_observed_alias_guards_reject_wrong_types():
 
 
 @pytest.mark.asyncio
-async def test_serving_database_guards_reject_missing_state_and_bad_geo_signature():
-    """Reject absent relation/state rows and malformed current assurance evidence."""
+async def test_serving_database_guards_reject_missing_state_and_geo_version():
+    """Keep named-relation and semantic-version checks after legacy IDs are ignored."""
 
     session = SimpleNamespace(execute=AsyncMock(return_value=_mapped_result(row=None)))
     with pytest.raises(RuntimeError, match="relation is unavailable"):
-        await serving._relation_oid(session, "mrf", "entity_address_unified")
+        await serving._relation_name(session, "mrf", "entity_address_unified")
 
     session.execute.return_value = _mapped_result(rows=[])
     with pytest.raises(RuntimeError, match="alias state is invalid"):
         await serving._alias_state(session, "mrf")
     with pytest.raises(RuntimeError, match="geo assurance state is invalid"):
-        await serving._geo_assurance_state(session, schema_name="mrf", live_table_oid=10)
+        await serving._geo_assurance_state(session, schema_name="mrf")
 
     session.execute.return_value = _mapped_result(
         rows=[
             {
                 "singleton": True,
-                "active_geo_assurance_version": serving.geo_projection.GEO_ASSURANCE_VERSION,
+                "active_geo_assurance_version": 999,
                 "active_table_oid": 10,
                 "active_relation_signature": _geo_signature(),
                 "current_relation_signature": {"substitute": [1, 2]},
             }
         ]
     )
-    with pytest.raises(RuntimeError, match="geo assurance state is invalid"):
-        await serving._geo_assurance_state(session, schema_name="mrf", live_table_oid=10)
+    with pytest.raises(RuntimeError, match="geo assurance is not active"):
+        await serving._geo_assurance_state(session, schema_name="mrf")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receiving", (False, True))
+async def test_stale_geo_incumbent_is_replaceable_but_not_source_authority(receiving):
+    state_by_field = {
+        "singleton": True,
+        "active_geo_assurance_version": 1,
+        "npi_generation_matches": receiving,
+    }
+    session = SimpleNamespace(execute=AsyncMock(return_value=_mapped_result(rows=[state_by_field])))
+    if receiving:
+        assert await serving._geo_assurance_state(session, schema_name="mrf", allow_unpublished_geo=True) == 1
+    else:
+        with pytest.raises(RuntimeError, match="geo assurance is not active"):
+            await serving._geo_assurance_state(session, schema_name="mrf")
+    statement = str(session.execute.await_args.args[0])
+    assert ("npi_result_generation" in statement) is not receiving
 
 
 @pytest.mark.asyncio
@@ -319,26 +344,104 @@ async def test_source_cleanup_drains_after_repeated_cancellation():
     cleanup.assert_awaited_once()
 
 
-def test_destination_transaction_geo_and_stage_identity_guards():
-    """Reject missing transaction, malformed geo receipts, and substituted stage OIDs."""
+def test_destination_transaction_and_named_geo_guards():
+    """Reject missing transactions and malformed logical geo receipts."""
 
     with pytest.raises(destination.EntityAddressSnapshotDestinationError, match="caller transaction"):
         destination._require_caller_transaction(SimpleNamespace(in_transaction=lambda: False))
     with pytest.raises(destination.EntityAddressSnapshotDestinationError, match="dependency signature"):
         destination._geo_signature({}, db_schema="mrf")
-    invalid_signature = _geo_signature()
-    invalid_signature["mrf.npi_address"] = [0, 2]
+    signature_by_name = {
+        name: dict(zip(("schema_name", "table_name"), name.split("."), strict=True)) for name in _geo_signature()
+    }
+    generation = ("12345678-1234-5678-1234-567812345678", 1)
+    signature_by_name["mrf.npi_address"]["generation"] = {
+        "origin_lineage_id": generation[0],
+        "origin_generation": generation[1],
+    }
+    invalid_signature_by_name = {
+        **signature_by_name,
+        "mrf.npi_address": {"schema_name": "bad;schema", "table_name": "npi_address"},
+    }
     with pytest.raises(destination.EntityAddressSnapshotDestinationError, match="dependency signature"):
-        destination._geo_signature(invalid_signature, db_schema="mrf")
+        destination._geo_signature(invalid_signature_by_name, db_schema="mrf")
     with pytest.raises(destination.EntityAddressSnapshotDestinationError, match="preparation receipt"):
         destination._validated_geo_preparation({}, db_schema="mrf")
 
-    prepared = SimpleNamespace(stage_cls=SimpleNamespace(__tablename__="entity_address_unified_stage"))
-    with pytest.raises(destination.EntityAddressSnapshotDestinationError, match="stage identity is invalid"):
-        destination._prepared_main_stage_oid({"restored": {"stage_relation_oids": []}}, prepared=prepared)
-    stored_by_field = {"restored": {"stage_relation_oids": [{"table_name": "entity_address_unified_stage", "oid": 0}]}}
-    with pytest.raises(destination.EntityAddressSnapshotDestinationError, match="stage identity is invalid"):
-        destination._prepared_main_stage_oid(stored_by_field, prepared=prepared)
+    stored = destination.EntityAddressGeoAssurancePreparation(
+        None, 0, destination._geo_signature(signature_by_name, db_schema="mrf"), npi_generation=generation
+    ).as_dict()
+    stored["stage_table_oid"] = 999
+    assert destination._validated_geo_preparation(stored, db_schema="mrf").stage_table_oid is None
+
+
+def test_historical_geo_pairs_use_stored_named_context_without_rewriting():
+    signature = _geo_signature()
+    bindings_by_name = {
+        name: {
+            "schema_name": "retained_inputs",
+            "table_name": name.split(".")[1],
+            "relation_oid": 0,
+            "relfilenode": False,
+        }
+        for name in signature
+    }
+    stored_by_field = {
+        "contract": destination.GEO_PREPARATION_CONTRACT,
+        "geo_assurance_version": 1,
+        "stage_table_oid": 777,
+        "projected_rows": 5,
+        "relation_signature": signature,
+    }
+    normalized = destination._validated_geo_preparation(
+        stored_by_field, db_schema="mrf", dependency_bindings=bindings_by_name
+    )
+    assert normalized.stage_table_oid is None and normalized.projected_rows == 5
+    assert all(schema == "retained_inputs" for _name, schema, _table in normalized.relation_signature)
+    assert stored_by_field["relation_signature"] == signature and stored_by_field["stage_table_oid"] == 777
+    with pytest.raises(destination.EntityAddressSnapshotDestinationError, match="dependency signature"):
+        destination._validated_geo_preparation(stored_by_field, db_schema="mrf")
+    stored_by_field["publisher_selected_inputs_sha256"] = "a" * 64
+    with pytest.raises(destination.EntityAddressSnapshotDestinationError, match="legacy selected geo dependencies"):
+        destination._validated_geo_preparation(stored_by_field, db_schema="mrf")
+    assert (
+        destination._validated_geo_preparation(
+            stored_by_field, db_schema="mrf", dependency_bindings=bindings_by_name
+        ).publisher_selected_inputs_sha256
+        == "a" * 64
+    )
+
+
+@pytest.mark.asyncio
+async def test_historical_geo_candidate_compares_named_context_and_row_accounting():
+    bindings_by_name = {
+        name: {"schema_name": "retained_inputs", "table_name": name.split(".")[1]} for name in _geo_signature()
+    }
+    state_by_field = {
+        "candidate_geo_assurance_version": 1,
+        "candidate_table_oid": 777,
+        "candidate_projected_rows": 5,
+        "candidate_relation_signature": _geo_signature(),
+        "current_signature": bindings_by_name,
+        "candidate_dependency_bindings": {
+            name: {**binding, "relation_oid": 0, "relfilenode": False} for name, binding in bindings_by_name.items()
+        },
+        "bindings_match": True,
+    }
+    session = SimpleNamespace(execute=AsyncMock(return_value=_mapped_result(row=state_by_field)))
+    captured = await destination._capture_geo_preparation(
+        session, db_schema="mrf", stage_table_oid=None, projected_rows=5, dependency_bindings=bindings_by_name
+    )
+    assert captured.stage_table_oid is None
+    assert all(schema == "retained_inputs" for _name, schema, _table in captured.relation_signature)
+    for field, changed in (("candidate_projected_rows", 6), ("bindings_match", False)):
+        original = state_by_field[field]
+        state_by_field[field] = changed
+        with pytest.raises(destination.EntityAddressSnapshotDestinationError, match="candidate is stale"):
+            await destination._capture_geo_preparation(
+                session, db_schema="mrf", stage_table_oid=None, projected_rows=5, dependency_bindings=bindings_by_name
+            )
+        state_by_field[field] = original
 
 
 @pytest.mark.asyncio
@@ -444,7 +547,7 @@ def test_destination_metadata_and_remap_receipts_reject_substitution():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("drift", ["alias", "stage_oid", "geo"])
+@pytest.mark.parametrize("drift", ["alias", "geo"])
 async def test_destination_activation_rechecks_alias_stage_and_geo_cas(monkeypatch, drift):
     """Reject each destination-local identity if it changes after preparation."""
 
@@ -473,9 +576,6 @@ async def test_destination_activation_rechecks_alias_stage_and_geo_cas(monkeypat
     )
     monkeypatch.setattr(destination, "_require_prepared_base_versions", AsyncMock())
     monkeypatch.setattr(destination, "_validated_geo_preparation", lambda *_args, **_kwargs: expected_geo)
-    monkeypatch.setattr(
-        destination, "_prepared_main_stage_oid", lambda *_args, **_kwargs: 11 if drift == "stage_oid" else 10
-    )
     actual_geo = replace(expected_geo, projected_rows=1) if drift == "geo" else expected_geo
     monkeypatch.setattr(destination, "_capture_geo_preparation", AsyncMock(return_value=actual_geo))
     monkeypatch.setattr(destination.adoption, "adopt_prepared_entity_address_snapshot", AsyncMock())

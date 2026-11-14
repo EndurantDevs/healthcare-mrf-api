@@ -90,9 +90,7 @@ def assert_fixed_preparation(phases, backend):
         if (statement, readonly, _pid) not in preparation_statements
     )
     last_ddl = max(index for index, phase in enumerate(phases) if phase in preparation_statements)
-    assert [statement for statement, _readonly, _pid in phases[: last_ddl + 1] if statement.startswith("SELECT")] == [
-        "SELECT session_user,current_user"
-    ]
+    assert not any(statement.startswith("SELECT") for statement, _readonly, _pid in phases[: last_ddl + 1])
 
 
 async def legacy_plan_result(case):

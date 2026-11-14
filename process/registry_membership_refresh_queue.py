@@ -61,7 +61,10 @@ async def _require_address(connection, command_by_field, current, profile, contr
         generation = address._digest(address._authority_document(authority))
         source = PinnedAddressSource(profile.schema_name, "entity_address_unified", generation)
         descriptor = await address.capture_network_address_artifact(
-            connection, source, runtime_roles=profile.runtime_roles
+            connection,
+            source,
+            runtime_roles=profile.runtime_roles,
+            expected_artifact_sha256=command_by_field["address_artifact_sha256"],
         )
     except Exception as error:
         raise RegistryMembershipRefreshUnavailable("registry_membership_refresh_address_unavailable") from error

@@ -7989,12 +7989,21 @@ class ProviderDirectoryArtifactBuildStale(RuntimeError):
 
 @dataclass(frozen=True)
 class ProviderDirectoryArtifactBuildFence:
-    """Identity of the live relation from which an artifact stage was built."""
+    """Build inputs retained for existing artifact callers."""
 
     target_oid: int | None
     alias_generation: int | None = None
     dependency_relation: str | None = None
     dependency_relation_oid: int | None = None
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryAliasBuildFence(ProviderDirectoryArtifactBuildFence):
+    """Named publication versions for overlays and their canonical consumers."""
+
+    target_name: str | None = None
+    target_publication: tuple[int, datetime.datetime] | None = None
+    dependency_publication: tuple[int, datetime.datetime] | None = None
 
 
 @dataclass(frozen=True)
@@ -8273,7 +8282,16 @@ async def _provider_directory_artifact_build_guard(
         from process.provider_directory_cms_preparation import active_nonprofile_sql_transaction
 
         async with active_nonprofile_sql_transaction(sys.modules[__name__]):
-            target_oid = await _provider_directory_relation_oid(schema, target_relation)
+            if target_relation == PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE:
+                build_fence = _ProviderDirectoryAliasBuildFence(
+                    target_oid=None,
+                    target_name=_qt(schema, target_relation),
+                    target_publication=await _address_overlay_publication(schema),
+                )
+            else:
+                build_fence = ProviderDirectoryArtifactBuildFence(
+                    target_oid=await _provider_directory_relation_oid(schema, target_relation)
+                )
         from process.provider_directory_profile_control_maintenance import control_maintenance_fence
 
         maintenance = (
@@ -8282,7 +8300,7 @@ async def _provider_directory_artifact_build_guard(
             else contextlib.nullcontext()
         )
         async with maintenance:
-            yield ProviderDirectoryArtifactBuildFence(target_oid=target_oid)
+            yield build_fence
     finally:
         await _release_provider_directory_artifact_build_lock(
             connection, build_lock_key, maintenance_admission=maintenance_admission
@@ -8559,32 +8577,9 @@ async def _acquire_provider_directory_artifact_target_lock(
 async def _assert_provider_directory_artifact_build_fence(
     stage: ProviderDirectoryPreparedArtifactStage,
 ) -> None:
-    if stage.build_fence is None:
-        return
-    current_target_oid = await _provider_directory_relation_oid(
-        stage.schema,
-        stage.target_relation,
-    )
-    if current_target_oid != stage.build_fence.target_oid:
-        raise ProviderDirectoryArtifactBuildStale(stage.target_relation)
-    if stage.build_fence.alias_generation is not None:
-        current_alias_generation = await _address_alias_generation(stage.schema)
-        if current_alias_generation != stage.build_fence.alias_generation:
-            raise ProviderDirectoryArtifactBuildStale(f"{stage.target_relation}:address_alias_generation")
-    if stage.build_fence.dependency_relation is not None:
-        current_dependency_oid = await _provider_directory_relation_oid(
-            stage.schema,
-            stage.build_fence.dependency_relation,
-        )
-        if current_dependency_oid != stage.build_fence.dependency_relation_oid:
-            raise ProviderDirectoryArtifactBuildStale(f"{stage.target_relation}:dependency_relation")
-        if stage.build_fence.dependency_relation == PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE:
-            overlay_generation = await _address_alias_artifact_generation(
-                stage.schema,
-                PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-            )
-            if overlay_generation != stage.build_fence.alias_generation:
-                raise ProviderDirectoryArtifactBuildStale(f"{stage.target_relation}:address_overlay_generation")
+    from process.provider_directory_artifact_bundle_preparation import assert_artifact_build_fence
+
+    await assert_artifact_build_fence(sys.modules[__name__], stage)
 
 
 def _provider_directory_prepared_stage_relations(
@@ -8613,11 +8608,13 @@ async def _install_provider_directory_prepared_stage(
     await db.status(_drop_address_corroboration_sql(schema, old_relation))
     if target_kind in {"r", "p"}:
         await db.status(f"ALTER TABLE {target_ref} RENAME TO {_q(old_relation)};")
+        serving_recovery.receipts.record_rename(schema, stage.target_relation, old_relation)
     elif target_kind in {"v", "m"}:
         await db.status(_drop_address_corroboration_sql(schema, stage.target_relation))
     elif target_kind is not None:
         raise RuntimeError(f"Unsupported Provider Directory artifact target relation kind: {target_kind!r}")
     await db.status(f"ALTER TABLE {stage_ref} RENAME TO {_q(stage.target_relation)};")
+    serving_recovery.receipts.record_rename(schema, stage.stage_table, stage.target_relation)
 
 
 async def _finish_provider_directory_prepared_stage(
@@ -12292,36 +12289,10 @@ async def _capture_address_corroboration_fence(
     source_ids: list[str],
     build_fence: ProviderDirectoryArtifactBuildFence,
 ) -> ProviderDirectoryArtifactBuildFence:
-    """Capture alias generation and overlay identity for corroboration build."""
-    alias_generation = await _address_alias_generation(schema)
-    artifact_generation = await _address_alias_artifact_generation(schema, relation)
-    if artifact_generation != alias_generation and source_ids:
-        raise RuntimeError(
-            "address alias generation changed; a full Provider Directory address corroboration rebuild is required"
-        )
-    dependency_relation = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(
-        PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-        PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-    )
-    dependency_relation_oid = await _provider_directory_relation_oid(
-        schema,
-        dependency_relation,
-    )
-    if dependency_relation_oid is None:
-        raise RuntimeError("Provider Directory address overlay dependency is missing")
-    if dependency_relation == PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE:
-        overlay_generation = await _address_alias_artifact_generation(
-            schema,
-            PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-        )
-        if overlay_generation != alias_generation:
-            raise RuntimeError("Provider Directory address overlay uses a stale address alias generation")
-    return replace(
-        build_fence,
-        alias_generation=alias_generation,
-        dependency_relation=dependency_relation,
-        dependency_relation_oid=dependency_relation_oid,
-    )
+    """Capture alias generation and the overlay publication for corroboration."""
+    from process.provider_directory_artifact_bundle_preparation import capture_address_corroboration_fence
+
+    return await capture_address_corroboration_fence(sys.modules[__name__], schema, relation, source_ids, build_fence)
 
 
 async def _build_address_corroboration_stage(
@@ -70425,6 +70396,22 @@ async def _address_alias_artifact_generation(
     return int(value)
 
 
+async def _address_overlay_publication(schema: str, *, lock=False) -> tuple[int, datetime.datetime] | None:
+    """Read the logical publication, allowing absence only before a target exists."""
+    if not await db.scalar(
+        "SELECT to_regclass(:relation) IS NOT NULL", relation=_qt(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
+    ):
+        return None
+    row = await db.first(
+        f"SELECT generation,updated_at FROM {_qt(schema, address_alias_sql.ADDRESS_ALIAS_ARTIFACT_STATE_TABLE)} "
+        "WHERE artifact_name=:artifact_name" + (" FOR SHARE NOWAIT" if lock else ""),
+        artifact_name=PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+    )
+    if row is None:
+        raise ProviderDirectoryArtifactBuildStale("address_overlay_publication_missing")
+    return int(row[0]), row[1]
+
+
 async def _record_address_alias_artifact_generation(
     stage: ProviderDirectoryPreparedArtifactStage,
 ) -> None:
@@ -70751,6 +70738,7 @@ async def _rename_address_overlay_stage_indexes(schema: str, stage_table: str) -
         if stage_index_name == target_index_name:
             continue
         await db.status(f"ALTER INDEX IF EXISTS {_qt(schema, stage_index_name)} RENAME TO {_q(target_index_name)};")
+        serving_recovery.receipts.record_rename(schema, stage_index_name, target_index_name, index=True)
 
 
 async def _address_overlay_scope_sources(

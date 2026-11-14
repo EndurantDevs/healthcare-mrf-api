@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Bounded source-local serving identity for queued address archive exports."""
+"""Bounded logical serving generations for queued address archive exports."""
 
 from __future__ import annotations
 
@@ -13,55 +13,43 @@ from sqlalchemy import text
 
 from api import ptg2_geo_projection as geo_projection
 from process import entity_address_result_generation as result_generation
-from process.entity_address_dependency_bindings import lock_active_dependencies
 from process.ext import address_alias_sql
 
 entity_address_unified = importlib.import_module("process.entity_address_unified")
-CONTRACT = "entity_address_observed_serving.postgres.v1"
+LEGACY_CONTRACT = "entity_address_observed_serving.postgres.v1"
+CONTRACT = "entity_address_observed_serving.postgres.v2"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_POSTGRES_OID_MAX = (1 << 32) - 1
 _RELATIONS = tuple((model.__name__, model.__tablename__) for model in result_generation.ENTITY_ADDRESS_RESULT_MODELS)
-_LOCAL_GEO_DEPENDENCIES = (
-    "npi_address",
-    "mrf_address",
-    "doctor_clinician_address",
-    "geo_zip_lookup",
-)
-_SHARED_GEO_DEPENDENCIES = ("tiger.zip_state", "tiger.zcta5")
 
 
 @dataclass(frozen=True)
 class EntityAddressObservedServingCapture:
-    """Source-local identity observed after one address family is published."""
+    """Named serving family and its portable generation; legacy ID slots are empty."""
 
     contract: str
     source_schema: str
-    relation_oids: tuple[int, ...]
+    relation_oids: tuple[None, ...]
     alias_schema_version: int
     alias_ruleset_version: int
     alias_generation: int
     geo_assurance_version: int | None
-    geo_active_table_oid: int | None
-    geo_active_relation_signature: tuple[tuple[str, int, int], ...] | None
+    geo_active_table_oid: None
+    geo_active_relation_signature: None
     result_generation: result_generation.EntityAddressServingGeneration | None = None
+    geo_dependency_relations: tuple[tuple[str, str, str], ...] | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        """Return the bounded queue form; every identity remains source-local."""
+        """Write the named snapshot contract without physical identity fields."""
 
         return {
-            "contract": self.contract,
+            "contract": CONTRACT,
             "source_schema": self.source_schema,
             "relations": [
                 {
                     "model_name": model_name,
                     "table_name": table_name,
-                    "relation_oid": relation_oid,
                 }
-                for (model_name, table_name), relation_oid in zip(
-                    _RELATIONS,
-                    self.relation_oids,
-                    strict=True,
-                )
+                for model_name, table_name in _RELATIONS
             ],
             "alias_state": {
                 "schema_version": self.alias_schema_version,
@@ -70,15 +58,12 @@ class EntityAddressObservedServingCapture:
             },
             "geo_assurance": {
                 "version": self.geo_assurance_version,
-                "active_table_oid": self.geo_active_table_oid,
-                "active_relation_signature": (
-                    None
-                    if self.geo_active_relation_signature is None
-                    else {
-                        relation_name: [relation_oid, relation_filenode]
-                        for relation_name, relation_oid, relation_filenode in self.geo_active_relation_signature
-                    }
-                ),
+                "dependencies": {
+                    name: {"schema_name": schema, "table_name": table}
+                    for name, schema, table in (
+                        self.geo_dependency_relations or _dependency_relations(self.source_schema)
+                    )
+                },
             },
             "result_generation": (None if self.result_generation is None else self.result_generation.as_dict()),
         }
@@ -97,49 +82,18 @@ def _quoted(value: str) -> str:
     return f'"{value}"'
 
 
-def _positive_oid(value: object, *, field_name: str) -> int:
-    if type(value) is not int or not 0 < value <= _POSTGRES_OID_MAX:
-        raise ValueError(f"entity-address observed serving {field_name} is invalid")
-    return value
-
-
-def _signature_tuple(value: object, *, schema_name: str) -> tuple[tuple[str, int, int], ...]:
-    expected_names = {
-        *(f"{schema_name}.{table_name}" for table_name in _LOCAL_GEO_DEPENDENCIES),
-        *_SHARED_GEO_DEPENDENCIES,
-    }
-    if not isinstance(value, Mapping) or set(value) != expected_names:
-        raise ValueError("entity-address observed serving geo signature is invalid")
-    entries = []
-    for relation_name, identity in value.items():
-        if (
-            not isinstance(relation_name, str)
-            or len(relation_name.encode("utf-8")) > 127
-            or not isinstance(identity, (list, tuple))
-            or len(identity) != 2
-        ):
-            raise ValueError("entity-address observed serving geo signature is invalid")
-        relation_oid = _positive_oid(identity[0], field_name="geo relation OID")
-        relation_filenode = _positive_oid(identity[1], field_name="geo relation filenode")
-        entries.append((relation_name, relation_oid, relation_filenode))
-    return tuple(sorted(entries))
-
-
-def _validated_relation_oids(relation_entries: object) -> tuple[int, ...]:
+def _validated_relation_names(relation_entries: object, *, legacy: bool) -> None:
+    """Require the fixed logical model names; ignore legacy catalog numbers."""
     if not isinstance(relation_entries, (list, tuple)) or len(relation_entries) != len(_RELATIONS):
-        raise ValueError("entity-address observed serving relation identity is invalid")
-    relation_oids = []
+        raise ValueError("entity-address observed serving relations are invalid")
     for expected_relation, relation_entry in zip(_RELATIONS, relation_entries, strict=True):
         if (
             not isinstance(relation_entry, Mapping)
-            or set(relation_entry) != {"model_name", "table_name", "relation_oid"}
+            or set(relation_entry)
+            != ({"model_name", "table_name", "relation_oid"} if legacy else {"model_name", "table_name"})
             or (relation_entry["model_name"], relation_entry["table_name"]) != expected_relation
         ):
-            raise ValueError("entity-address observed serving relation identity is invalid")
-        relation_oids.append(_positive_oid(relation_entry["relation_oid"], field_name="relation OID"))
-    if len(set(relation_oids)) != len(relation_oids):
-        raise ValueError("entity-address observed serving relation identity is invalid")
-    return tuple(relation_oids)
+            raise ValueError("entity-address observed serving relations are invalid")
 
 
 def _validated_alias_state(alias_state: object) -> tuple[int, int, int]:
@@ -157,32 +111,39 @@ def _validated_alias_state(alias_state: object) -> tuple[int, int, int]:
     return alias_state["schema_version"], alias_state["active_ruleset_version"], alias_state["generation"]
 
 
-def _validated_geo_assurance(
-    geo_assurance: object,
-    *,
-    schema_name: str,
-    live_table_oid: int,
-    allow_unpublished_geo: bool = False,
-) -> tuple[int | None, int | None, tuple[tuple[str, int, int], ...] | None]:
-    fields = {"version", "active_table_oid", "active_relation_signature"}
-    if allow_unpublished_geo and isinstance(geo_assurance, Mapping) and set(geo_assurance) == fields:
-        if all(geo_assurance[field] is None for field in fields):
-            return None, None, None
-    if (
-        not isinstance(geo_assurance, Mapping)
-        or set(geo_assurance) != {"version", "active_table_oid", "active_relation_signature"}
-        or type(geo_assurance["version"]) is not int
-        or geo_assurance["version"] != geo_projection.GEO_ASSURANCE_VERSION
-    ):
+def _dependency_relations(schema, bindings=None):
+    """Normalize the fixed six logical roles, discarding legacy catalog fields."""
+    dependency_names_by_role = {
+        f"{source_schema or schema}.{table}": (source_schema or schema, table)
+        for source_schema, table in geo_projection._PROJECTION_DEPENDENCIES
+    }
+    if bindings is None:
+        return tuple((name, *dependency_names_by_role[name]) for name in sorted(dependency_names_by_role))
+    if not isinstance(bindings, Mapping) or set(bindings) != set(dependency_names_by_role):
+        raise ValueError("entity-address observed serving dependencies are invalid")
+    relations = []
+    for name, binding in sorted(bindings.items()):
+        if not isinstance(binding, Mapping) or set(binding) not in (
+            {"schema_name", "table_name"},
+            {"schema_name", "table_name", "relation_oid", "relfilenode"},
+        ):
+            raise ValueError("entity-address observed serving dependencies are invalid")
+        relations.append((name, _schema_name(binding["schema_name"]), _schema_name(binding["table_name"])))
+    if len({relation[1:] for relation in relations}) != len(dependency_names_by_role):
+        raise ValueError("entity-address observed serving dependencies are invalid")
+    return tuple(relations)
+
+
+def _validated_geo_assurance(geo_assurance: object, *, legacy=False, allow_unpublished_geo=False) -> int | None:
+    fields = {"version", "active_table_oid", "active_relation_signature"} if legacy else {"version", "dependencies"}
+    if not isinstance(geo_assurance, Mapping) or set(geo_assurance) != fields:
         raise ValueError("entity-address observed serving capture is invalid")
-    geo_active_table_oid = _positive_oid(geo_assurance["active_table_oid"], field_name="geo active table OID")
-    if geo_active_table_oid != live_table_oid:
-        raise ValueError("entity-address observed serving geo table identity is invalid")
-    signature = _signature_tuple(
-        geo_assurance["active_relation_signature"],
-        schema_name=schema_name,
-    )
-    return geo_assurance["version"], geo_active_table_oid, signature
+    version = geo_assurance["version"]
+    if allow_unpublished_geo and version is None:
+        return None
+    if type(version) is not int or version != geo_projection.GEO_ASSURANCE_VERSION:
+        raise ValueError("entity-address observed serving capture is invalid")
+    return version
 
 
 def validate_entity_address_observed_serving_capture(
@@ -191,7 +152,7 @@ def validate_entity_address_observed_serving_capture(
     schema_name: str | None = None,
     allow_unpublished_geo: bool = False,
 ) -> EntityAddressObservedServingCapture:
-    """Validate one queued source-local identity without treating it as portable."""
+    """Validate logical queue fields and normalize obsolete physical metadata."""
 
     capture_mapping = (
         capture_value.as_dict() if isinstance(capture_value, EntityAddressObservedServingCapture) else capture_value
@@ -208,17 +169,20 @@ def validate_entity_address_observed_serving_capture(
     }
     if set(capture_mapping) not in (legacy_fields, legacy_fields | {"result_generation"}):
         raise ValueError("entity-address observed serving capture is invalid")
-    if capture_mapping["contract"] != CONTRACT or capture_mapping["source_schema"] != schema:
+    if capture_mapping["contract"] not in {LEGACY_CONTRACT, CONTRACT} or capture_mapping["source_schema"] != schema:
         raise ValueError("entity-address observed serving capture is invalid")
-    relation_oids = _validated_relation_oids(capture_mapping["relations"])
+    is_legacy = capture_mapping["contract"] == LEGACY_CONTRACT
+    _validated_relation_names(capture_mapping["relations"], legacy=is_legacy)
     alias_schema_version, alias_ruleset_version, alias_generation = _validated_alias_state(
         capture_mapping["alias_state"]
     )
-    geo_assurance_version, geo_active_table_oid, geo_signature = _validated_geo_assurance(
+    geo_assurance_version = _validated_geo_assurance(
         capture_mapping["geo_assurance"],
-        schema_name=schema,
-        live_table_oid=relation_oids[0],
+        legacy=is_legacy,
         allow_unpublished_geo=allow_unpublished_geo,
+    )
+    dependencies = _dependency_relations(
+        schema, None if is_legacy else capture_mapping["geo_assurance"]["dependencies"]
     )
     generation_value = capture_mapping.get("result_generation")
     if geo_assurance_version is None and ("result_generation" not in capture_mapping or generation_value is not None):
@@ -231,14 +195,15 @@ def validate_entity_address_observed_serving_capture(
     return EntityAddressObservedServingCapture(
         contract=CONTRACT,
         source_schema=schema,
-        relation_oids=relation_oids,
+        relation_oids=(None,) * len(_RELATIONS),
         alias_schema_version=alias_schema_version,
         alias_ruleset_version=alias_ruleset_version,
         alias_generation=alias_generation,
         geo_assurance_version=geo_assurance_version,
-        geo_active_table_oid=geo_active_table_oid,
-        geo_active_relation_signature=geo_signature,
+        geo_active_table_oid=None,
+        geo_active_relation_signature=None,
         result_generation=serving_generation,
+        geo_dependency_relations=dependencies,
     )
 
 
@@ -255,12 +220,12 @@ def _validated_observed_alias_state(alias_state: Mapping[str, Any]) -> tuple[int
     return alias_state["schema_version"], alias_state["active_ruleset_version"], alias_state["generation"]
 
 
-async def _relation_oid(session, schema_name: str, table_name: str) -> int:
+async def _relation_name(session, schema_name: str, table_name: str) -> str:
     row = (
         (
             await session.execute(
                 text(
-                    "SELECT relation.oid::bigint AS relation_oid, relation.relkind::text AS relkind, "
+                    "SELECT relation.relkind::text AS relkind, "
                     "relation.relpersistence::text AS relpersistence, relation.relrowsecurity, "
                     "relation.relforcerowsecurity FROM pg_catalog.pg_class AS relation "
                     "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace "
@@ -280,7 +245,7 @@ async def _relation_oid(session, schema_name: str, table_name: str) -> int:
         or row["relforcerowsecurity"]
     ):
         raise RuntimeError("entity-address observed serving relation is unavailable")
-    return _positive_oid(row["relation_oid"], field_name="relation OID")
+    return f"{schema_name}.{table_name}"
 
 
 async def _alias_state(session, schema_name: str) -> tuple[int, int, int]:
@@ -303,21 +268,25 @@ async def _alias_state(session, schema_name: str) -> tuple[int, int, int]:
 
 
 async def _geo_assurance_state(
-    session,
-    *,
-    schema_name: str,
-    live_table_oid: int,
-    require_current_dependencies: bool = True,
-    allow_unpublished_geo: bool = False,
-) -> tuple[int | None, int | None, tuple[tuple[str, int, int], ...] | None]:
-    signature, bindings_match = geo_projection.projection_stored_bindings_sql(schema_name, "active_dependency_bindings")
+    session, *, schema_name: str, allow_unpublished_geo=False, dependencies=None
+) -> int | None:
+    """Require fresh source evidence while allowing a stale incumbent to be replaced."""
+    bindings = (
+        None
+        if dependencies is None
+        else {name: {"schema_name": schema, "table_name": table} for name, schema, table in dependencies}
+    )
+    generation_matches = (
+        "TRUE"
+        if allow_unpublished_geo
+        else geo_projection.projection_npi_generation_match_sql(schema_name, "active", dependency_bindings=bindings)
+    )
     geo_state_rows = (
         (
             await session.execute(
                 text(
-                    f"SELECT singleton, active_geo_assurance_version, active_table_oid::bigint, "
-                    f"active_relation_signature, active_dependency_bindings, {signature} AS current_relation_signature, "
-                    f"{bindings_match} AS dependency_bindings_match FROM {_quoted(schema_name)}."
+                    f"SELECT singleton, active_geo_assurance_version, {generation_matches} AS npi_generation_matches "
+                    f"FROM {_quoted(schema_name)}."
                     f"{_quoted(geo_projection.GEO_ASSURANCE_STATE_TABLE)} ORDER BY singleton"
                 )
             )
@@ -327,53 +296,31 @@ async def _geo_assurance_state(
     )
     if len(geo_state_rows) != 1 or geo_state_rows[0]["singleton"] is not True:
         raise RuntimeError("entity-address observed serving geo assurance state is invalid")
-    geo_state = geo_state_rows[0]
-    if allow_unpublished_geo and all(
-        geo_state[field] is None
-        for field in (
-            "active_geo_assurance_version",
-            "active_table_oid",
-            "active_relation_signature",
-            "active_dependency_bindings",
-        )
-    ):
-        return None, None, None
-    try:
-        active_signature = _signature_tuple(geo_state["active_relation_signature"], schema_name=schema_name)
-        current_signature = (
-            _signature_tuple(geo_state["current_relation_signature"], schema_name=schema_name)
-            if require_current_dependencies
-            else active_signature
-        )
-        active_table_oid = _positive_oid(geo_state["active_table_oid"], field_name="geo active table OID")
-    except ValueError as error:
-        raise RuntimeError("entity-address observed serving geo assurance state is invalid") from error
+    version = geo_state_rows[0]["active_geo_assurance_version"]
+    if allow_unpublished_geo and version is None:
+        return None
     if (
-        type(geo_state["active_geo_assurance_version"]) is not int
-        or geo_state["active_geo_assurance_version"] != geo_projection.GEO_ASSURANCE_VERSION
-        or active_table_oid != live_table_oid
-        or (require_current_dependencies and active_signature != current_signature)
-        or (require_current_dependencies and geo_state.get("dependency_bindings_match") is not True)
+        type(version) is not int
+        or version != geo_projection.GEO_ASSURANCE_VERSION
+        or geo_state_rows[0]["npi_generation_matches"] is not True
     ):
         raise RuntimeError("entity-address observed serving geo assurance is not active")
-    return geo_state["active_geo_assurance_version"], active_table_oid, active_signature
+    return version
 
 
 async def _result_generation_state(
     session: Any,
     *,
     schema_name: str,
-    relation_oids: tuple[int, ...],
+    relation_names: tuple[str, ...],
 ) -> result_generation.EntityAddressServingGeneration | None:
+    expected_names = tuple(f"{schema_name}.{name}" for name in result_generation.RELATION_NAMES)
+    if relation_names != expected_names:
+        raise RuntimeError("entity-address result generation serving relations are incomplete")
     authority = await result_generation.read_entity_address_result_generation_authority(
         session,
         schema_name=schema_name,
     )
-    if authority.relation_oids is None:
-        # Migration and legacy/manual adoption deliberately expose no origin.
-        return None
-    if authority.relation_oids != relation_oids or authority.serving_generation is None:
-        raise RuntimeError("entity-address result generation does not identify the serving relations")
     return authority.serving_generation
 
 
@@ -383,7 +330,7 @@ async def observe_entity_address_serving(
     schema_name: str,
     apply_queue_bounds: bool,
 ) -> EntityAddressObservedServingCapture:
-    """Lock in writer order and observe the exact active source-local identity."""
+    """Lock named snapshots in writer order and observe their logical generation."""
 
     if not callable(getattr(session, "in_transaction", None)) or not session.in_transaction():
         raise ValueError("entity-address observed serving requires a caller transaction")
@@ -398,25 +345,37 @@ async def observe_entity_address_serving(
     await session.execute(text(address_alias_sql.alias_advisory_xact_lock_sql()))
     for _model_name, table_name in _RELATIONS:
         await session.execute(text(f"LOCK TABLE {_quoted(schema)}.{_quoted(table_name)} IN SHARE MODE"))
-    await lock_active_dependencies(session, schema)
-    return await _read_observed_serving(session, schema, require_current_dependencies=True)
+    dependencies = await _lock_geo_dependencies(session, schema)
+    return await _read_observed_serving(session, schema, dependencies=dependencies)
 
 
-async def _read_observed_serving(session, schema, *, require_current_dependencies, allow_unpublished_geo=False):
-    """Read the complete native token after the caller selects its locking purpose."""
-    relation_oids = tuple([await _relation_oid(session, schema, table_name) for _, table_name in _RELATIONS])
+async def _lock_geo_dependencies(session, schema):
+    bindings = await session.scalar(
+        text(
+            f"SELECT active_dependency_bindings FROM {_quoted(schema)}."
+            f"{_quoted(geo_projection.GEO_ASSURANCE_STATE_TABLE)} WHERE singleton IS TRUE"
+        )
+    )
+    dependencies = _dependency_relations(schema, bindings)
+    names = ", ".join(
+        ("" if f"{target_schema}.{table}" == role else "ONLY ") + f"{_quoted(target_schema)}.{_quoted(table)}"
+        for role, target_schema, table in dependencies
+    )
+    await session.execute(text(f"LOCK TABLE {names} IN ACCESS SHARE MODE"))
+    return dependencies
+
+
+async def _read_observed_serving(session, schema, *, allow_unpublished_geo=False, dependencies=None):
+    """Read portable generation and semantic state after locking named snapshots."""
+    relation_names = tuple([await _relation_name(session, schema, table_name) for _, table_name in _RELATIONS])
     alias_schema_version, alias_ruleset_version, alias_generation = await _alias_state(session, schema)
-    geo_assurance_version, geo_active_table_oid, geo_active_relation_signature = await _geo_assurance_state(
-        session,
-        schema_name=schema,
-        live_table_oid=relation_oids[0],
-        **({} if require_current_dependencies else {"require_current_dependencies": False}),
-        **({"allow_unpublished_geo": True} if allow_unpublished_geo else {}),
+    geo_assurance_version = await _geo_assurance_state(
+        session, schema_name=schema, allow_unpublished_geo=allow_unpublished_geo, dependencies=dependencies
     )
     serving_generation = await _result_generation_state(
         session,
         schema_name=schema,
-        relation_oids=relation_oids,
+        relation_names=relation_names,
     )
     if geo_assurance_version is None:
         if not allow_unpublished_geo or serving_generation is not None:
@@ -425,25 +384,22 @@ async def _read_observed_serving(session, schema, *, require_current_dependencie
     return EntityAddressObservedServingCapture(
         contract=CONTRACT,
         source_schema=schema,
-        relation_oids=relation_oids,
+        relation_oids=(None,) * len(_RELATIONS),
         alias_schema_version=alias_schema_version,
         alias_ruleset_version=alias_ruleset_version,
         alias_generation=alias_generation,
         geo_assurance_version=geo_assurance_version,
-        geo_active_table_oid=geo_active_table_oid,
-        geo_active_relation_signature=geo_active_relation_signature,
+        geo_active_table_oid=None,
+        geo_active_relation_signature=None,
         result_generation=serving_generation,
+        geo_dependency_relations=dependencies or _dependency_relations(schema),
     )
 
 
 async def _require_empty_receive_bootstrap(session, schema):
     """A receive may observe truly unpublished empty heaps, never cleared legacy data."""
     authority = await result_generation.read_entity_address_result_generation_authority(session, schema_name=schema)
-    if (
-        authority.local_generation != 0
-        or authority.serving_generation is not None
-        or authority.relation_oids is not None
-    ):
+    if authority.local_generation != 0 or authority.serving_generation is not None:
         raise RuntimeError("entity-address unpublished receive generation is invalid")
     populated = " OR ".join(
         f"EXISTS (SELECT 1 FROM {_quoted(schema)}.{_quoted(name)} LIMIT 1)" for _model, name in _RELATIONS
@@ -471,11 +427,8 @@ async def _observe_receive_destination(session, *, schema_name, lock_mode):
     await session.execute(text(address_alias_sql.alias_advisory_xact_lock_sql()))
     for _model_name, table_name in _RELATIONS:
         await session.execute(text(f"LOCK TABLE {_quoted(schema)}.{_quoted(table_name)} IN {lock_mode} MODE"))
-    await lock_active_dependencies(session, schema, receiving=True)
-    # A grouped replacement may already have swapped its dependencies. Its
-    # separate dependency fence selects the new package identities; the exact
-    # stored incumbent signature must still match the queued destination token.
-    return await _read_observed_serving(session, schema, require_current_dependencies=False, allow_unpublished_geo=True)
+    dependencies = await _lock_geo_dependencies(session, schema)
+    return await _read_observed_serving(session, schema, allow_unpublished_geo=True, dependencies=dependencies)
 
 
 async def capture_entity_address_receive_admission(session, *, schema_name: str):

@@ -176,7 +176,7 @@ async def _assert_reader_cannot_mutate(database, schema):
 
 @pytest.mark.asyncio
 async def test_default_projection_retains_inherited_source_compatibility():
-    """Existing NULL bindings keep canonical serving; explicit held roots are refused."""
+    """NULL and explicit canonical bindings keep ordinary geocoder inheritance."""
     from api import ptg2_geo_projection as projection
 
     async with owned_tiger_capture_database() as database:
@@ -204,40 +204,50 @@ async def test_default_projection_retains_inherited_source_compatibility():
         )
         assert await database.admin.fetchval("SELECT " + projection.projection_state_available_sql("mrf"))
         await database.admin.execute(
-            "UPDATE mrf.entity_address_geo_assurance_state SET active_dependency_bindings="
-            "(SELECT jsonb_object_agg(key,jsonb_build_object('schema_name',split_part(key,'.',1),"
-            "'table_name',split_part(key,'.',2),'relation_oid',value->0,'relfilenode',value->1)) "
-            "FROM jsonb_each(active_relation_signature))"
+            "UPDATE mrf.entity_address_geo_assurance_state SET active_dependency_bindings=active_relation_signature"
         )
-        assert not await database.admin.fetchval("SELECT " + projection.projection_state_available_sql("mrf"))
+        assert await database.admin.fetchval("SELECT " + projection.projection_state_available_sql("mrf"))
+        await _assert_canonical_children_locked(database, projection)
         await _assert_received_child_requires_held_bindings(database, projection)
 
 
+async def _assert_canonical_children_locked(database, projection):
+    """Canonical named inputs keep recursive source relation locks."""
+    bindings_by_name = {
+        f"{namespace or 'mrf'}.{name}": {"schema_name": namespace or "mrf", "table_name": name}
+        for namespace, name in projection._PROJECTION_DEPENDENCIES
+    }
+    async with database.sessions["source"]() as session, session.begin():
+        await session.execute(
+            text(projection.projection_dependency_lock_sql("mrf", dependency_bindings=bindings_by_name))
+        )
+        async with database.admin.transaction():
+            await database.admin.execute("SET LOCAL lock_timeout='25ms'")
+            with pytest.raises(asyncpg.LockNotAvailableError):
+                async with database.admin.transaction():
+                    await database.admin.execute("ALTER TABLE tiger_data.zip_state_synthetic RENAME TO changed")
+
+
 async def _assert_received_child_requires_held_bindings(database, projection):
-    """The exact received child shape invalidates NULL, not ordinary source inheritance."""
+    """Retained snapshot names refuse root reads; their isolated held leaves remain usable."""
     schema = archive.reference_family_stage_schema(uuid4())
-    await database.admin.execute(f'CREATE SCHEMA "{schema}" AUTHORIZATION "{database.roles["owner"]}"')
+    await database.admin.execute(f'CREATE SCHEMA "{schema}"')
     for name in ("zip_state", "zcta5"):
         await database.admin.execute(f'CREATE TABLE "{schema}"."{name}" () INHERITS(tiger."{name}")')
     await database.admin.execute("UPDATE mrf.entity_address_geo_assurance_state SET active_dependency_bindings=NULL")
-    # A name alone is not the protected received mode.
-    assert await database.admin.fetchval("SELECT " + projection.projection_state_available_sql("mrf"))
-    for name in ("zip_state", "zcta5"):
-        await database.admin.execute(f'ALTER TABLE "{schema}"."{name}" OWNER TO "{database.roles["owner"]}"')
+    assert not await database.admin.fetchval("SELECT " + projection.projection_state_available_sql("mrf"))
+    await database.admin.execute(
+        "UPDATE mrf.entity_address_geo_assurance_state SET active_dependency_bindings="
+        + projection.projection_relation_signature_sql("mrf")
+    )
     assert not await database.admin.fetchval("SELECT " + projection.projection_state_available_sql("mrf"))
     bindings_by_name = {}
     for namespace, table in projection._PROJECTION_DEPENDENCIES:
         namespace = namespace or "mrf"
         physical = schema if namespace == "tiger" else namespace
-        identity = await database.admin.fetchrow(
-            "SELECT oid::bigint,pg_relation_filenode(oid)::bigint AS filenode FROM pg_class WHERE oid=to_regclass($1)",
-            f'"{physical}"."{table}"',
-        )
         bindings_by_name[f"{namespace}.{table}"] = {
             "schema_name": physical,
             "table_name": table,
-            "relation_oid": identity["oid"],
-            "relfilenode": identity["filenode"],
         }
     import json
 
@@ -248,6 +258,8 @@ async def _assert_received_child_requires_held_bindings(database, projection):
         json.dumps(bindings_by_name),
     )
     assert await database.admin.fetchval("SELECT " + projection.projection_state_available_sql("mrf"))
+    await database.admin.execute(f'CREATE TABLE "{schema}".nested_zcta5 () INHERITS("{schema}".zcta5)')
+    assert not await database.admin.fetchval("SELECT " + projection.projection_state_available_sql("mrf"))
 
 
 @pytest.mark.asyncio

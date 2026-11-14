@@ -56,6 +56,17 @@ async def _create_serving(database, schema):
 
     async with database.engine.begin() as connection:
         await connection.run_sync(apply)
+    path = path.with_name("20261114120000_portable_serving_metadata.py")
+    spec = importlib.util.spec_from_file_location("native_portable_serving_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    await database.status(
+        f'ALTER TABLE "{schema}".entity_address_result_generation '
+        "ADD CONSTRAINT entity_address_result_generation_shape_check "
+        f"CHECK ({migration._generation_check()})"
+    )
+    async with database.engine.begin() as connection:
+        await connection.run_sync(apply)
 
 
 async def _remove_owned_catalog(administrator, ownership):

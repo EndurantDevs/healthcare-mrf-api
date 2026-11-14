@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Strict recognition of the installed common-receipt guards in Profile capacity fingerprints."""
+"""Named contracts for installed common-receipt guards in Profile capacity planning."""
 
 import importlib
 
@@ -42,10 +42,10 @@ async def _tamper_guard(connection, schema, mutation):
         await connection.execute(text(f"DROP TRIGGER {function} ON {table}"))
         await connection.execute(text(f"DROP TRIGGER cms_serving_no_truncate ON {table}"))
         return
-    if mutation == "body":
+    if mutation == "settings":
         await connection.execute(
             text(
-                f"CREATE OR REPLACE FUNCTION {schema}.{function}() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$ BEGIN RETURN NULL; END $$"
+                f"CREATE OR REPLACE FUNCTION {schema}.{function}() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_temp,pg_catalog AS $$ BEGIN RETURN NULL; END $$"
             )
         )
         return
@@ -79,7 +79,7 @@ async def _tamper_guard(connection, schema, mutation):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "mutation", ["body", "disabled", "missing", "extra", "identity", "events", "deferral", "argument"]
+    "mutation", ["settings", "disabled", "missing", "extra", "identity", "events", "deferral", "argument"]
 )
 async def test_serving_receipt_guard_drift_is_rejected(monkeypatch, mutation):
     async with _database(monkeypatch) as (engine, schema):
@@ -99,7 +99,7 @@ async def test_serving_receipt_guard_drift_is_rejected(monkeypatch, mutation):
 
 
 @pytest.mark.asyncio
-async def test_fingerprint_rejects_unsupported_body_in_captured_catalog(monkeypatch):
+async def test_fingerprint_does_not_require_captured_function_identity(monkeypatch):
     async with _database(monkeypatch) as (_engine, schema):
         database = Database()
         await database.connect()
@@ -109,11 +109,12 @@ async def test_fingerprint_rejects_unsupported_body_in_captured_catalog(monkeypa
         async def stale_catalog(relation_oids):
             attributes, indexes, constraints, triggers = await catalog(relation_oids)
             triggers[0]["trigger_function_source"] = "BEGIN RETURN NULL; END"
+            triggers[0]["trigger_function_oid"] += 1000
             return attributes, indexes, constraints, triggers
 
         monkeypatch.setattr(fhir, "_profile_capacity_relation_catalog", stale_catalog)
         try:
-            with pytest.raises(RuntimeError, match="receipt_guard_shape_changed"):
-                await _fingerprint(database, schema)
+            layout = await _fingerprint(database, schema)
+            assert layout.main_index_pages
         finally:
             await database.disconnect()

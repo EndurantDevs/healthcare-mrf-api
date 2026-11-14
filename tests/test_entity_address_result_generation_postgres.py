@@ -24,6 +24,7 @@ _DSN_ENV = "HLTHPRT_ENTITY_ADDRESS_GENERATION_TEST_DSN"
 _DATABASE_PATTERN = re.compile(r"^hc_address_generation_[0-9a-f]{32}$")
 _ROOT = Path(__file__).resolve().parents[1]
 _MIGRATION_PATH = _ROOT / "alembic/versions/20260914100000_entity_address_result_generation.py"
+_PORTABLE_MIGRATION_PATH = _ROOT / "alembic/versions/20261114120000_portable_serving_metadata.py"
 
 
 class _ConnectionDatabase:
@@ -45,15 +46,17 @@ def _database_url():
     if (
         database_url.drivername != "postgresql"
         or database_url.host not in {"127.0.0.1", "localhost"}
-        or database_url.port not in {5432, 5440}
+        or not isinstance(database_url.port, int)
+        or not 1024 <= database_url.port <= 65535
         or not _DATABASE_PATTERN.fullmatch(str(database_url.database or ""))
     ):
         pytest.fail(f"{_DSN_ENV} must identify a UUID-scoped local PostgreSQL test database")
     return database_url.set(drivername="postgresql+asyncpg")
 
 
-def _migration_module():
-    spec = importlib.util.spec_from_file_location("entity_address_result_generation_migration", _MIGRATION_PATH)
+def _migration_module(*, portable=False):
+    path = _PORTABLE_MIGRATION_PATH if portable else _MIGRATION_PATH
+    spec = importlib.util.spec_from_file_location("entity_address_result_generation_migration", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -61,9 +64,22 @@ def _migration_module():
 
 
 async def _run_migration(connection, action: str) -> None:
-    module = _migration_module()
+    modules = [_migration_module(), _migration_module(portable=True)]
+    if action == "downgrade":
+        modules.reverse()
 
     def apply(sync_connection) -> None:
+        for module in modules:
+            module.op = Operations(MigrationContext.configure(sync_connection))
+            getattr(module, action)()
+
+    await connection.run_sync(apply)
+
+
+async def _run_one_migration(connection, *, portable: bool, action: str) -> None:
+    module = _migration_module(portable=portable)
+
+    def apply(sync_connection):
         module.op = Operations(MigrationContext.configure(sync_connection))
         getattr(module, action)()
 
@@ -76,7 +92,7 @@ async def _authority(connection, schema: str = "mrf"):
             await connection.execute(
                 text(
                     f"SELECT singleton, local_lineage_id, local_generation, origin_lineage_id, "
-                    f'origin_generation, published_at, relation_oids FROM "{schema}".'
+                    f'origin_generation, published_at FROM "{schema}".'
                     '"entity_address_result_generation" WHERE singleton IS TRUE'
                 )
             )
@@ -85,17 +101,6 @@ async def _authority(connection, schema: str = "mrf"):
         .one()
     )
     return generation.validate_entity_address_result_generation_authority(row)
-
-
-async def _relation_oids(connection, schema: str = "mrf") -> tuple[int, ...]:
-    values = []
-    for table_name in generation.RELATION_NAMES:
-        value = await connection.scalar(
-            text("SELECT to_regclass(:name)::oid::bigint"),
-            {"name": f"{schema}.{table_name}"},
-        )
-        values.append(int(value))
-    return tuple(values)
 
 
 @pytest.mark.parametrize("schema", ["unsafe-schema", "x" * 64])
@@ -121,26 +126,19 @@ async def _install_generation_authority(engine, schema: str) -> None:
         assert initial.local_generation == 0
         assert initial.serving_generation is None
         assert initial.relation_oids is None
-        for table_name in generation.RELATION_NAMES:
+        for value, table_name in enumerate(generation.RELATION_NAMES, start=1):
             await connection.execute(text(f'CREATE TABLE "{schema}"."{table_name}" (value bigint)'))
+            await connection.execute(text(f'INSERT INTO "{schema}"."{table_name}" VALUES (:value)'), {"value": value})
 
 
 async def _assert_invalid_serving_shapes(engine, schema: str) -> None:
     """Require the database constraint to reject every partial or malformed shape."""
 
     invalid_serving_updates = (
-        "origin_lineage_id=local_lineage_id, origin_generation=1, "
-        "published_at=clock_timestamp(), "
-        "relation_oids=ARRAY[10, 10, 12, 13, 14, 15, 16]::bigint[]",
-        "origin_lineage_id=local_lineage_id, origin_generation=NULL, "
-        "published_at=clock_timestamp(), "
-        "relation_oids=ARRAY[10, 11, 12, 13, 14, 15, 16]::bigint[]",
-        "origin_lineage_id=local_lineage_id, origin_generation=1, "
-        "published_at=clock_timestamp(), "
-        "relation_oids='[0:6]={10,11,12,13,14,15,16}'::bigint[]",
-        "origin_lineage_id=local_lineage_id, origin_generation=1, "
-        "published_at=clock_timestamp(), "
-        "relation_oids=ARRAY[[10, 11, 12, 13, 14, 15, 16]]::bigint[]",
+        "origin_lineage_id=local_lineage_id, origin_generation=NULL, published_at=NULL",
+        "origin_lineage_id=local_lineage_id, origin_generation=NULL, published_at=clock_timestamp()",
+        "origin_lineage_id=local_lineage_id, origin_generation=0, published_at=clock_timestamp()",
+        "local_generation=-1",
     )
     for invalid_update in invalid_serving_updates:
         with pytest.raises(DBAPIError):
@@ -167,8 +165,47 @@ async def _publish_first_local_generation(engine, schema: str):
     assert first_generation.serving_generation.origin_lineage_id == first_generation.local_lineage_id
     assert first_generation.serving_generation.origin_generation == 1
     assert before_publication <= first_generation.serving_generation.published_at <= after_publication
+    assert first_generation.relation_oids is None
     async with engine.connect() as connection:
-        assert first_generation.relation_oids == await _relation_oids(connection, schema)
+        assert await generation._current_relation_names(_ConnectionDatabase(connection), schema) == tuple(
+            f"{schema}.{name}" for name in generation.RELATION_NAMES
+        )
+        assert (await _authority(connection, schema)).as_dict() == first_generation.as_dict()
+
+
+async def _assert_copied_snapshot_keeps_origin(engine, schema: str) -> None:
+    """Read copied tables by destination names without rewriting their generation row."""
+
+    copied_schema = schema + "_copy"
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{copied_schema}"'))
+            for table_name in (generation.TABLE_NAME, *generation.RELATION_NAMES):
+                await connection.execute(
+                    text(
+                        f'CREATE TABLE "{copied_schema}"."{table_name}" (LIKE "{schema}"."{table_name}" INCLUDING ALL)'
+                    )
+                )
+                await connection.execute(
+                    text(f'INSERT INTO "{copied_schema}"."{table_name}" SELECT * FROM "{schema}"."{table_name}"')
+                )
+            original = await generation.read_entity_address_result_generation_authority(connection, schema_name=schema)
+            copied = await generation.read_entity_address_result_generation_authority(
+                connection, schema_name=copied_schema
+            )
+            assert copied.as_dict() == original.as_dict()
+            assert copied.serving_generation is not None
+            assert await generation._current_relation_names(_ConnectionDatabase(connection), copied_schema) == tuple(
+                f"{copied_schema}.{name}" for name in generation.RELATION_NAMES
+            )
+            for expected_value, table_name in enumerate(generation.RELATION_NAMES, start=1):
+                assert (
+                    await connection.scalar(text(f'SELECT value FROM "{copied_schema}"."{table_name}"'))
+                    == expected_value
+                )
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{copied_schema}" CASCADE'))
 
 
 async def _publish_source_and_legacy_adoptions(
@@ -187,6 +224,7 @@ async def _publish_source_and_legacy_adoptions(
         main_table = generation.RELATION_NAMES[0]
         await connection.execute(text(f'ALTER TABLE "{schema}"."{main_table}" RENAME TO "{main_table}_source_old"'))
         await connection.execute(text(f'CREATE TABLE "{schema}"."{main_table}" (value bigint)'))
+        await connection.execute(text(f'INSERT INTO "{schema}"."{main_table}" VALUES (42)'))
         adopted_generation = await generation.publish_adopted_entity_address_generation(
             _ConnectionDatabase(connection),
             schema_name=schema,
@@ -201,7 +239,7 @@ async def _publish_source_and_legacy_adoptions(
     assert adopted_generation.serving_generation.origin_lineage_id == str(source_lineage)
     assert adopted_generation.serving_generation.origin_generation == 27
     assert adopted_generation.serving_generation.published_at == source_published_at
-    assert adopted_generation.relation_oids[0] != second_generation.relation_oids[0]
+    assert adopted_generation.relation_oids is second_generation.relation_oids is None
 
     async with engine.begin() as connection:
         legacy_generation = await generation.publish_adopted_entity_address_generation(
@@ -219,26 +257,28 @@ async def _assert_publication_rollback(engine, schema: str, main_table: str) -> 
     """Require table and authority mutations to roll back together."""
 
     async with engine.connect() as connection:
-        original_oids = await _relation_oids(connection, schema)
+        assert await connection.scalar(text(f'SELECT value FROM "{schema}"."{main_table}"')) == 42
     with pytest.raises(RuntimeError, match="force rollback"):
         async with engine.begin() as connection:
             await connection.execute(
                 text(f'ALTER TABLE "{schema}"."{main_table}" RENAME TO "{main_table}_rollback_old"')
             )
             await connection.execute(text(f'CREATE TABLE "{schema}"."{main_table}" (value bigint)'))
+            await connection.execute(text(f'INSERT INTO "{schema}"."{main_table}" VALUES (99)'))
             advanced_generation = await generation.publish_local_entity_address_generation(
                 _ConnectionDatabase(connection),
                 schema_name=schema,
             )
             assert advanced_generation.local_generation == 3
-            assert advanced_generation.relation_oids[0] != original_oids[0]
+            assert advanced_generation.relation_oids is None
+            assert await connection.scalar(text(f'SELECT value FROM "{schema}"."{main_table}"')) == 99
             raise RuntimeError("force rollback")
 
     async with engine.connect() as connection:
         rolled_back = await _authority(connection, schema)
         assert rolled_back.local_generation == 2
         assert rolled_back.serving_generation is None
-        assert await _relation_oids(connection, schema) == original_oids
+        assert await connection.scalar(text(f'SELECT value FROM "{schema}"."{main_table}"')) == 42
         assert await connection.scalar(
             text("SELECT to_regclass(:name) IS NULL"),
             {"name": f"{schema}.{main_table}_rollback_old"},
@@ -262,6 +302,7 @@ async def test_generation_migration_publication_adoption_and_transaction_rollbac
         await _install_generation_authority(engine, schema)
         await _assert_invalid_serving_shapes(engine, schema)
         await _publish_first_local_generation(engine, schema)
+        await _assert_copied_snapshot_keeps_origin(engine, schema)
         main_table = await _publish_source_and_legacy_adoptions(
             engine,
             schema,
@@ -275,6 +316,82 @@ async def test_generation_migration_publication_adoption_and_transaction_rollbac
                 text("SELECT to_regclass(:name) IS NULL"),
                 {"name": f"{schema}.entity_address_result_generation"},
             )
+    finally:
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        finally:
+            await engine.dispose()
+
+
+async def _install_portable_journal_fixture(engine, schema, journal):
+    """Install both CHECK versions while retaining the existing generation row."""
+    async with engine.begin() as connection:
+        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        await _run_one_migration(connection, portable=False, action="upgrade")
+        await connection.execute(
+            text(
+                f"CREATE TABLE {journal} (document jsonb NOT NULL, "
+                "CONSTRAINT pd_serving_recovery_document CHECK(jsonb_typeof(document)='object' "
+                "AND document->>'version'='1' AND octet_length(document::text)<=2097152))"
+            )
+        )
+        await connection.execute(text(f"INSERT INTO {journal} VALUES (:document)"), {"document": '{"version":1}'})
+        before = (await _authority(connection, schema)).as_dict()
+        await _run_one_migration(connection, portable=True, action="upgrade")
+        assert (await _authority(connection, schema)).as_dict() == before
+        assert await connection.scalar(text(f"SELECT document->>'version' FROM {journal}")) == "1"
+        await connection.execute(text(f"INSERT INTO {journal} VALUES (:document)"), {"document": '{"version":2}'})
+
+
+@pytest.mark.asyncio
+async def test_portable_migration_preserves_rows_and_refuses_incompatible_downgrade(monkeypatch):
+    """Reject incompatible rollback data before changing either native CHECK."""
+    database_url = _database_url()
+    schema = "address_generation_" + uuid4().hex
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    engine = create_async_engine(database_url, poolclass=NullPool)
+    journal = f'"{schema}"."provider_directory_serving_recovery"'
+    authority = f'"{schema}"."entity_address_result_generation"'
+    try:
+        await _install_portable_journal_fixture(engine, schema, journal)
+
+        for document in ('{"version":3}', '{"version":2,"data":"' + "x" * 2097152 + '"}', "[]"):
+            with pytest.raises(DBAPIError):
+                async with engine.begin() as connection:
+                    await connection.execute(
+                        text(f"INSERT INTO {journal} VALUES (CAST(:document AS jsonb))"), {"document": document}
+                    )
+
+        with pytest.raises(RuntimeError, match="v2_journal_prevents_downgrade"):
+            async with engine.begin() as connection:
+                await _run_one_migration(connection, portable=True, action="downgrade")
+
+        async with engine.begin() as connection:
+            await connection.execute(text(f"DELETE FROM {journal} WHERE document->>'version'='2'"))
+            await connection.execute(
+                text(
+                    f"UPDATE {authority} SET origin_lineage_id=local_lineage_id, "
+                    "origin_generation=1,published_at=clock_timestamp(),relation_oids=NULL"
+                )
+            )
+        with pytest.raises(RuntimeError, match="origin_prevents_downgrade"):
+            async with engine.begin() as connection:
+                await _run_one_migration(connection, portable=True, action="downgrade")
+        async with engine.begin() as connection:
+            # A failed generation preflight must not have restored the old journal CHECK first.
+            await connection.execute(text(f"INSERT INTO {journal} VALUES (:document)"), {"document": '{"version":2}'})
+            await connection.execute(text(f"DELETE FROM {journal} WHERE document->>'version'='2'"))
+            await connection.execute(
+                text(f"UPDATE {authority} SET origin_lineage_id=NULL,origin_generation=NULL,published_at=NULL")
+            )
+            await _run_one_migration(connection, portable=True, action="downgrade")
+        with pytest.raises(DBAPIError):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(f"INSERT INTO {journal} VALUES (:document)"), {"document": '{"version":2}'}
+                )
     finally:
         try:
             async with engine.begin() as connection:

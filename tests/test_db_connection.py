@@ -631,22 +631,9 @@ async def test_reader_native_savepoint_preserves_outer_snapshot(monkeypatch, tmp
 
     async with _native_reader_database(monkeypatch, tmp_path) as (database, publisher, schema, role, statements):
         async with database.reader_session() as session:
-            assert len(statements) == 1 and statements[0].startswith("SELECT session_user, current_user,")
-            async with publisher.connect() as connection:
-                expected_identity = (
-                    await connection.execute(
-                        text(
-                            "SELECT (SELECT oid FROM pg_roles WHERE rolname=:role), "
-                            "(SELECT oid FROM pg_database WHERE datname=current_database()), "
-                            "host(inet_server_addr()), inet_server_port()"
-                        ),
-                        {"role": role},
-                    )
-                ).first()
-            identity = session.info["api_reader_identity"]
-            assert tuple(
-                identity[key] for key in ("role_oid", "database_oid", "server_address", "server_port")
-            ) == tuple(expected_identity)
+            assert statements == ["SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"]
+            assert session.in_transaction()
+            assert "api_reader_identity" not in session.info
             await session.execute(text(f'LOCK TABLE ONLY "{schema}".page IN ACCESS SHARE MODE'))
             before = await _native_reader_state(database, schema)
             assert tuple(before[1:5]) == ("repeatable read", "on", role, role) and tuple(before[6:]) == (True, True)

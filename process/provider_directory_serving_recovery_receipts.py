@@ -1,32 +1,120 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Fixed native receipts for ordinary provider serving recovery."""
+"""Portable named snapshots and content validation for serving recovery."""
 
-import asyncio
 import copy
 import re
 import time
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
+from uuid import NAMESPACE_URL, uuid5
 
 from sqlalchemy import text
 
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import entity_address_result_generation as generations
-from process.provider_directory_output_snapshot_catalog import OUTPUT_CATALOG_SQL, decoded, encoded
+from process.provider_directory_output_snapshot_catalog import decoded, encoded
 from process.provider_directory_projection_stage import _copy_driver
 
 ROOTS = ("provider_directory_address_overlay", "entity_address_unified")
 JOURNAL = "provider_directory_serving_recovery"
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 PREPARATION_SECONDS = 2 * 60 * 60
+_VALIDATED = ContextVar("serving_recovery_validated_relations", default=None)
+
+_CATALOG_SQL = """
+SELECT n.nspname AS schema,c.relname,
+ jsonb_build_object('kind',c.relkind,'persistence',c.relpersistence,'partition',c.relispartition,
+ 'rls',c.relrowsecurity,'force_rls',c.relforcerowsecurity,'options',c.reloptions,
+ 'parents',EXISTS(SELECT FROM pg_inherits WHERE inhrelid=c.oid),
+ 'children',EXISTS(SELECT FROM pg_inherits WHERE inhparent=c.oid),
+ 'hooks',(SELECT count(*) FROM pg_trigger WHERE tgrelid=c.oid),
+ 'rules',(SELECT count(*) FROM pg_rewrite WHERE ev_class=c.oid)) AS topology,
+ (SELECT COALESCE(jsonb_agg(jsonb_build_object('number',a.attnum,'name',a.attname,
+ 'type',format_type(a.atttypid,a.atttypmod),'typmod',a.atttypmod,
+ 'native_collation',a.attcollation=t.typcollation,
+ 'required',a.attnotnull,'default',pg_get_expr(d.adbin,d.adrelid),
+ 'identity',a.attidentity,'generated',a.attgenerated) ORDER BY a.attnum),'[]'::jsonb)
+ FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid
+ LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+ WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped) AS columns,
+ (SELECT COALESCE(jsonb_agg(jsonb_build_object('name',k.conname,
+ 'type',k.contype,'keys',k.conkey,'definition',pg_get_constraintdef(k.oid),
+ 'validated',k.convalidated,'deferrable',k.condeferrable,'deferred',k.condeferred)
+ ORDER BY k.conname),'[]'::jsonb) FROM pg_constraint k WHERE k.conrelid=c.oid) AS constraints,
+ (SELECT COALESCE(jsonb_agg(jsonb_build_object('name',idx.relname,
+ 'method',am.amname,'primary',i.indisprimary,'unique',i.indisunique,
+ 'valid',i.indisvalid,'ready',i.indisready,'live',i.indislive,'immediate',i.indimmediate,
+ 'exclusion',i.indisexclusion,'keys_count',i.indnkeyatts,'total_count',i.indnatts,
+ 'predicate',pg_get_expr(i.indpred,i.indrelid),'expression',pg_get_expr(i.indexprs,i.indrelid),
+ 'keys',ARRAY(SELECT a.attname::text FROM unnest(i.indkey::smallint[]) WITH ORDINALITY x(num,pos)
+ LEFT JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum=x.num ORDER BY x.pos),
+ 'options',i.indoption::smallint[],
+ 'native',NOT EXISTS(SELECT FROM unnest(i.indclass::oid[],i.indcollation::oid[],
+ i.indkey::smallint[],i.indoption::smallint[]) x(opclass_oid,collation_oid,num,flags)
+ LEFT JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum=x.num
+ LEFT JOIN pg_opclass op ON op.oid=x.opclass_oid
+ JOIN pg_namespace op_schema ON op_schema.oid=op.opcnamespace
+ WHERE (x.num<>0 AND a.attnum IS NULL) OR x.flags<>0
+ OR x.collation_oid<>COALESCE(a.attcollation,0)
+ OR NOT op.opcdefault OR op_schema.nspname<>'pg_catalog'))
+ ORDER BY idx.relname),'[]'::jsonb)
+ FROM pg_index i JOIN pg_class idx ON idx.oid=i.indexrelid JOIN pg_am am ON am.oid=idx.relam
+ WHERE i.indrelid=c.oid) AS indexes
+FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) ORDER BY c.relname
+"""
+
+_LAYOUT_FIELDS = {
+    "topology": {
+        "kind",
+        "persistence",
+        "partition",
+        "rls",
+        "force_rls",
+        "options",
+        "parents",
+        "children",
+        "hooks",
+        "rules",
+    },
+    "columns": {
+        "number",
+        "name",
+        "type",
+        "typmod",
+        "native_collation",
+        "required",
+        "default",
+        "identity",
+        "generated",
+    },
+    "constraints": {"name", "type", "keys", "definition", "validated", "deferrable", "deferred"},
+    "indexes": {
+        "name",
+        "method",
+        "primary",
+        "unique",
+        "valid",
+        "ready",
+        "live",
+        "immediate",
+        "exclusion",
+        "keys_count",
+        "total_count",
+        "predicate",
+        "expression",
+        "keys",
+        "options",
+        "native",
+    },
+}
 
 
 @dataclass(frozen=True)
 class PreparedRelation:
-    """A content receipt belongs to its actual locked transaction and task."""
+    """Content measured under named locks within the active validation scope."""
 
-    session: object
-    task: object
-    actor_json: str
     schema: str
     receipt_json: str
     elapsed_seconds: float
@@ -46,33 +134,36 @@ def qualified(schema, name):
 
 
 async def ordinary(database):
-    """Use the caller's original ordinary transaction without rebinding it."""
-    from process import provider_directory_generic_source_policy as source
-
+    """Use the caller's SQL transaction; PostgreSQL enforces its access rights."""
     binding = database._transaction_binding()
     require(binding is not None and binding.session.in_transaction(), "ordinary_transaction_required")
-    require(source._PUBLISHER.get() is None and source._OWNER.get() is None, "ordinary_actor_required")
     driver = await _copy_driver(binding.session)
     if not driver.is_in_transaction():
         await binding.session.execute(text("SELECT 1"))
-    require(driver.is_in_transaction(), "physical_transaction_required")
-    actor_by_field = dict(
-        await driver.fetchrow(
-            "SELECT session_user::text AS session,current_user::text AS current,"
-            "current_user::regrole::oid::bigint AS owner,pg_backend_pid() AS backend,"
-            "pg_current_xact_id()::text AS xid,(SELECT oid::bigint FROM pg_database "
-            "WHERE datname=current_database()) AS database_oid"
-        )
-    )
-    require(actor_by_field["session"] == actor_by_field["current"], "ordinary_actor_required")
-    return binding.session, driver, actor_by_field
+    require(driver.is_in_transaction(), "ordinary_transaction_required")
+    return binding.session, driver, {}
 
 
-def _require_heap(native, owner):
+@asynccontextmanager
+async def validation_scope(database):
+    """Keep validated content only while this transaction holds its named locks."""
+    if _VALIDATED.get() is not None:
+        yield
+        return
+    async with database.transaction():
+        validated_by_name = {}
+        token = _VALIDATED.set(validated_by_name)
+        try:
+            yield
+        finally:
+            validated_by_name.clear()
+            _VALIDATED.reset(token)
+
+
+def _require_heap(native):
     topology = native["topology"]
     require(
-        native["relowner"] == owner
-        and topology["kind"] == "r"
+        topology["kind"] == "r"
         and topology["persistence"] == "p"
         and not any(topology[key] for key in ("partition", "rls", "force_rls", "parents", "children", "hooks", "rules"))
         and bool(native["columns"])
@@ -80,36 +171,29 @@ def _require_heap(native, owner):
         and all(constraint["validated"] for constraint in native["constraints"]),
         "native_heap_changed",
     )
-    for grant in native["acl"]["table"]:
-        require(grant[0] == owner or grant[2:] == ["SELECT", False], "native_acl_changed")
-    for grant in native["acl"]["columns"]:
-        require(grant[1] == owner or grant[3:] == ["SELECT", False], "native_acl_changed")
 
 
 async def catalog(database, schema, names):
-    """Capture stable native catalog fields, excluding vacuum and planner statistics."""
+    """Capture logical layout by schema-qualified name without access attestations."""
     from process.entity_address_snapshot_receipt import _normalize_receipt_session
-    from process.mrf_address_publication import require_native_read_catalog
 
-    session, driver, actor = await ordinary(database)
+    session, driver, _actor = await ordinary(database)
     await _normalize_receipt_session(session, schema)
-    rows = await driver.fetch(OUTPUT_CATALOG_SQL, schema, list(names), actor["owner"], [])
+    rows = await driver.fetch(_CATALOG_SQL, schema, list(names))
     require(len(rows) == len(names), "relation_missing")
-    await require_native_read_catalog(session, tuple(row["oid"] for row in rows))
     catalog_by_name = {}
     for row in rows:
         native_by_field = {
-            key: decoded(row[key]) if key in {"topology", "columns", "constraints", "indexes", "acl"} else row[key]
+            key: decoded(row[key]) if key in {"topology", "columns", "constraints", "indexes"} else row[key]
             for key in row.keys()
-            if key not in {"acl_closed", "readers_closed", "readers_select"}
         }
-        _require_heap(native_by_field, actor["owner"])
+        _require_heap(native_by_field)
         catalog_by_name[native_by_field["relname"]] = native_by_field
     return catalog_by_name
 
 
 async def relation(database, schema, name, *, content=True):
-    """Bind a complete canonical row multiset to one real native heap and indexes."""
+    """Measure the complete canonical row multiset of a named snapshot."""
     session, _driver, _actor = await ordinary(database)
     from process.entity_address_snapshot_receipt import _normalize_receipt_session, _row_identity
 
@@ -127,34 +211,21 @@ async def relation(database, schema, name, *, content=True):
     return receipt_by_field
 
 
-async def _require_freeze(driver, oid):
-    require(
-        await driver.fetchval(
-            "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=pg_backend_pid() "
-            "AND relation=$1::oid AND mode IN ('ShareLock','AccessExclusiveLock') AND granted)",
-            oid,
-        ),
-        "preparation_lock_required",
-    )
-
-
 async def prepare_relation(database, schema, name):
     """Hash a frozen heap before any live AccessExclusive cutover starts."""
     started = time.monotonic()
-    session, driver, actor = await ordinary(database)
-    native = (await catalog(database, schema, (name,)))[name]
-    await _require_freeze(driver, native["oid"])
+    validated_by_name = _VALIDATED.get()
+    require(validated_by_name is not None, "preparation_scope_required")
+    _session, driver, _actor = await ordinary(database)
+    await lock(database, schema, (name,), mode="SHARE")
     captured = await relation(database, schema, name)
-    require(captured["native"] == native and (await ordinary(database))[2] == actor, "preparation_changed")
     sizes = await driver.fetchrow(
-        "SELECT pg_catalog.pg_relation_size($1::oid)::bigint AS heap_bytes,"
-        "pg_catalog.pg_total_relation_size($1::oid)::bigint AS total_bytes",
-        native["oid"],
+        "SELECT pg_catalog.pg_relation_size($1::regclass)::bigint AS heap_bytes,"
+        "pg_catalog.pg_total_relation_size($1::regclass)::bigint AS total_bytes",
+        qualified(schema, name),
     )
+    validated_by_name[(schema, name)] = encoded(captured)
     return PreparedRelation(
-        session,
-        asyncio.current_task(),
-        encoded(actor),
         schema,
         encoded(captured),
         time.monotonic() - started,
@@ -173,20 +244,22 @@ def preparation_metrics(proof):
     }
 
 
-async def recheck_prepared(database, proof, name):
-    """Carry content only while original task, native transaction and locks still hold."""
-    session, driver, actor = await ordinary(database)
-    require(
-        type(proof) is PreparedRelation
-        and proof.session is session
-        and proof.task is asyncio.current_task()
-        and proof.actor_json == encoded(actor),
-        "prepared_transaction_changed",
-    )
+async def recheck_prepared(database, proof, name, *, prepare_missing=False):
+    """Reuse content only for its current locked name in this validation scope."""
+    require(type(proof) is PreparedRelation, "prepared_relation_invalid")
+    validated_by_name = _VALIDATED.get()
+    require(validated_by_name is not None, "preparation_scope_required")
+    cached_json = validated_by_name.get((proof.schema, name))
+    if cached_json is None and prepare_missing:
+        await prepare_relation(database, proof.schema, name)
+        cached_json = validated_by_name[(proof.schema, name)]
+    require(cached_json is not None, "prepared_name_changed")
     expected = decoded(proof.receipt_json)
-    await _require_freeze(driver, expected["native"]["oid"])
+    cached = decoded(cached_json)
+    require_relation(expected, cached, renamed=True)
+    await lock(database, proof.schema, (name,), mode="SHARE")
     actual = await relation(database, proof.schema, name, content=False)
-    require_relation(expected, actual, renamed=True, content=False)
+    require_relation(cached, actual, content=False)
     actual.update(rows=expected["rows"], data_sha256=expected["data_sha256"])
     return actual
 
@@ -199,22 +272,61 @@ async def prepared_state(database, schema, proofs_by_root):
     return {"metadata": await metadata(database, schema), "roots": roots_by_name}
 
 
+def _logical_native(native, *, renamed=False):
+    """Read logical layout from current or legacy catalog descriptions."""
+    require(type(native) is dict, "receipt_invalid")
+    layout_by_field = {key: native[key] for key in ("schema", "relname") if key in native}
+    for group, fields in _LAYOUT_FIELDS.items():
+        if group not in native:
+            continue
+        if group == "topology":
+            layout_by_field[group] = {
+                key: copy.deepcopy(value) for key, value in native[group].items() if key in fields
+            }
+            for key in ("parents", "children"):
+                if key in layout_by_field[group]:
+                    layout_by_field[group][key] = bool(layout_by_field[group][key])
+            continue
+        layout_by_field[group] = [
+            {key: copy.deepcopy(value) for key, value in item.items() if key in fields} for item in native[group]
+        ]
+        if renamed and group in {"constraints", "indexes"}:
+            for item in layout_by_field[group]:
+                item.pop("name", None)
+        if group != "columns":
+            layout_by_field[group].sort(key=encoded)
+    if renamed:
+        layout_by_field.pop("relname", None)
+    return layout_by_field
+
+
 def normalized_native(native):
-    """Ignore only OID-derived table/index names changed by the verified rotation."""
-    result = copy.deepcopy(native)
-    result["relname"] = "heap:" + str(native["oid"])
-    for field in ("indexes", "constraints"):
-        for item in result[field]:
-            item["name"] = field + ":" + str(item["oid"])
-    return result
+    """Compare logical layout across table and index renames."""
+    return _logical_native(native, renamed=True)
+
+
+def normalize_relation(receipt, schema):
+    """Discard legacy physical metadata while retaining existing backup names."""
+    require(type(receipt) is dict and type(receipt.get("native")) is dict, "receipt_invalid")
+    original = receipt["native"]
+    native = _logical_native(original)
+    require(native.get("schema", schema) == schema, "relation_changed")
+    native["schema"] = schema
+    if "retained_name" in original or "oid" in original:
+        native["retained_name"] = retained_name(original)
+    originals_by_name = {item["name"]: item for item in original.get("indexes", ())}
+    for index in native.get("indexes", ()):
+        original_index = originals_by_name[index["name"]]
+        if "retained_name" in original_index or "oid" in original_index:
+            index["retained_name"] = retained_name(original_index, index=True)
+    return {"native": native, **{key: receipt[key] for key in ("rows", "data_sha256") if key in receipt}}
 
 
 def require_relation(expected, actual, *, renamed=False, content=True):
-    """Compare every stored catalog field and, when requested, all row contents."""
+    """Compare names, logical layout and, when requested, complete row contents."""
     require(type(expected) is dict and type(actual) is dict, "receipt_invalid")
-    expected_native, actual_native = expected["native"], actual["native"]
-    if renamed:
-        expected_native, actual_native = map(normalized_native, (expected_native, actual_native))
+    expected_native = _logical_native(expected["native"], renamed=renamed)
+    actual_native = _logical_native(actual["native"], renamed=renamed)
     require(expected_native == actual_native, "relation_changed")
     if content:
         require(
@@ -242,17 +354,18 @@ def validate_state(state_by_field):
         require(
             type(receipt) is dict
             and set(receipt) == {"native", "rows", "data_sha256"}
-            and receipt["native"]["relname"] == root,
+            and receipt["native"]["relname"] == root
+            and type(receipt["native"].get("schema")) is str,
             "state_invalid",
         )
+        qualified(receipt["native"]["schema"], root)
         require_relation(receipt, receipt)
     relations = metadata["relations"]
+    schema = state_by_field["roots"][ROOTS[1]]["native"]["schema"]
     require(
         type(relations) is list
-        and len(relations) == 7
-        and len(set(relations)) == 7
-        and all(type(oid) is int and 0 < oid < 2**32 for oid in relations)
-        and relations[0] == state_by_field["roots"][ROOTS[1]]["native"]["oid"],
+        and relations == [f"{schema}.{name}" for name in generations.RELATION_NAMES]
+        and all(receipt["native"]["schema"] == schema for receipt in state_by_field["roots"].values()),
         "state_invalid",
     )
     address = metadata["address"]
@@ -260,12 +373,66 @@ def validate_state(state_by_field):
         type(address) is dict
         and address.get("singleton") is True
         and type(address.get("local_generation")) is int
-        and address["local_generation"] >= 0
-        and (address.get("relation_oids") is None or address["relation_oids"] == relations),
+        and address["local_generation"] >= 0,
         "state_invalid",
     )
     require(type(metadata["alias"]) is dict and type(metadata["alias"].get("generation")) is int, "state_invalid")
     return state_by_field
+
+
+def _logical_metadata(metadata, schema):
+    result = copy.deepcopy(metadata)
+    for family in ("address", "doctors"):
+        if type(result.get(family)) is dict:
+            result[family].pop("relation_oids", None)
+    if type(result.get("profile")) is dict:
+        for field in ("profile_target_oid", "evidence_target_oid"):
+            result["profile"].pop(field, None)
+    relations = result.get("relations")
+    if type(relations) is list and all(type(value) is int for value in relations):
+        result["relations"] = [f"{schema}.{name}" for name in generations.RELATION_NAMES]
+    if result.get("geo") is not None:
+        version = result["geo"].get("version")
+        relation_name = result["geo"].get("relation", f"{schema}.{ROOTS[1]}" if version is not None else None)
+        require(relation_name == (f"{schema}.{ROOTS[1]}" if version is not None else None), "state_invalid")
+        result["geo"] = {"version": version, "relation": relation_name}
+    if result.get("common_receipt") is not None:
+        common = result["common_receipt"]
+        result["common_receipt"] = {
+            "receipt_id": common["receipt_id"],
+            "predecessor_receipt_id": common.get(
+                "predecessor_receipt_id", common.get("payload", {}).get("predecessor_receipt_id")
+            ),
+        }
+    return result
+
+
+def normalize_state(state_by_field, schema):
+    """Read old journal snapshots without rewriting their stored metadata."""
+    require(type(state_by_field) is dict and set(state_by_field) == {"metadata", "roots"}, "state_invalid")
+    state_by_part = {
+        "metadata": _logical_metadata(state_by_field["metadata"], schema),
+        "roots": {root: normalize_relation(receipt, schema) for root, receipt in state_by_field["roots"].items()},
+    }
+    return validate_state(state_by_part)
+
+
+def normalized_state(state_by_field):
+    """Compare serving data without a future retention-name plan."""
+    validate_state(state_by_field)
+    schema = state_by_field["roots"][ROOTS[1]]["native"]["schema"]
+    return {
+        "metadata": _logical_metadata(state_by_field["metadata"], schema),
+        "roots": {
+            root: {**receipt, "native": _logical_native(receipt["native"])}
+            for root, receipt in state_by_field["roots"].items()
+        },
+    }
+
+
+def require_state(expected, actual):
+    """Require the same logical serving generation and validated contents."""
+    require(normalized_state(expected) == normalized_state(actual), "state_changed")
 
 
 async def _optional_json(driver, schema, table, selection, predicate):
@@ -278,7 +445,7 @@ async def _optional_json(driver, schema, table, selection, predicate):
 
 
 async def metadata(database, schema):
-    """Capture serving authorities without treating mutable build candidates as active state."""
+    """Capture logical serving generations and their schema-qualified names."""
     _session, driver, _actor = await ordinary(database)
     selections = (
         ("address", generations.TABLE_NAME, "to_jsonb(state)", "singleton"),
@@ -294,35 +461,30 @@ async def metadata(database, schema):
         (
             "geo",
             "entity_address_geo_assurance_state",
-            "jsonb_build_object('version',active_geo_assurance_version,"
-            "'table_oid',active_table_oid::bigint,'signature',active_relation_signature,'bindings',active_dependency_bindings)",
+            "jsonb_build_object('version',active_geo_assurance_version)",
             "singleton",
         ),
     )
     metadata_by_field = {}
     for key, table, selection, predicate in selections:
         metadata_by_field[key] = await _optional_json(driver, schema, table, selection, predicate)
-    metadata_by_field["relations"] = list(await generations._current_relation_oids(database, schema))
+    metadata_by_field["relations"] = list(await generations._current_relation_names(database, schema))
     table = qualified(schema, "provider_directory_cms_serving_receipt")
     if await driver.fetchval("SELECT to_regclass($1)::oid", table) is None:
         metadata_by_field["common_receipt"] = None
     else:
         receipt_rows = await driver.fetch(
-            f"SELECT receipt_id,payload FROM {table} receipt WHERE NOT EXISTS "
+            f"SELECT receipt_id,predecessor_receipt_id FROM {table} receipt WHERE NOT EXISTS "
             f"(SELECT FROM {table} successor WHERE successor.predecessor_receipt_id=receipt.receipt_id)"
         )
         require(len(receipt_rows) <= 1, "common_history_changed")
-        metadata_by_field["common_receipt"] = (
-            {"receipt_id": receipt_rows[0]["receipt_id"], "payload": decoded(receipt_rows[0]["payload"])}
-            if receipt_rows
-            else None
-        )
+        metadata_by_field["common_receipt"] = dict(receipt_rows[0]) if receipt_rows else None
     require(metadata_by_field["address"] is not None and metadata_by_field["alias"] is not None, "authority_missing")
-    return metadata_by_field
+    return _logical_metadata(metadata_by_field, schema)
 
 
 async def state(database, schema):
-    """Capture complete content and native authority only while readers remain admitted."""
+    """Capture complete contents and logical serving metadata."""
     session, _driver, _actor = await ordinary(database)
     from process.entity_address_snapshot_receipt import _normalize_receipt_session
 
@@ -334,7 +496,7 @@ async def state(database, schema):
 
 
 async def lock_metadata(database, schema):
-    """Pin fixed serving authorities using their existing narrow native writer rights."""
+    """Pin the fixed serving metadata through ordinary SQL locks."""
     _session, driver, _actor = await ordinary(database)
     await driver.execute(
         "LOCK TABLE "
@@ -363,7 +525,7 @@ async def lock_metadata(database, schema):
 
 
 async def lock(database, schema, names, *, mode="ACCESS EXCLUSIVE"):
-    """Lock a fixed or previously authenticated native set in deterministic order."""
+    """Lock a named snapshot set in deterministic order."""
     require(mode in {"SHARE", "ACCESS EXCLUSIVE"}, "lock_mode_invalid")
     _session, driver, _actor = await ordinary(database)
     await driver.execute(
@@ -375,10 +537,59 @@ async def lock(database, schema, names, *, mode="ACCESS EXCLUSIVE"):
     )
 
 
-def retained_name(oid, *, index=False):
-    """Derive collision-free retained names from native object identities."""
-    require(type(oid) is int and 0 < oid < 2**32, "oid_invalid")
-    return ("pdsrv_i_" if index else "pdsrv_r_") + format(oid, "x")
+def retained_name(receipt, *, index=False):
+    """Read an explicit backup name or decode a legacy name without verifying IDs."""
+    native = receipt if type(receipt) is dict else {"oid": receipt}
+    if type(native.get("native")) is dict:
+        native = native["native"]
+    name = native.get("retained_name")
+    if name is None:
+        legacy_number = native.get("oid")
+        require(type(legacy_number) is int and 0 < legacy_number < 2**32, "retained_name_missing")
+        name = ("pdsrv_i_" if index else "pdsrv_r_") + format(legacy_number, "x")
+    storage_identifier(name)
+    require(name.startswith("pdsrv_i_" if index else "pdsrv_r_"), "retained_name_invalid")
+    return name
+
+
+def plan_retention(receipt, generation, phase):
+    """Allocate portable backup names once for this logical publication phase."""
+    result = copy.deepcopy(receipt)
+    native = result["native"]
+    require(type(generation) is str and bool(generation) and type(phase) is str and bool(phase), "retention_invalid")
+    scope = encoded([generation, phase, native["schema"], native["relname"]])
+    native["retained_name"] = "pdsrv_r_" + uuid5(NAMESPACE_URL, scope).hex
+    for index in native["indexes"]:
+        index["retained_name"] = "pdsrv_i_" + uuid5(NAMESPACE_URL, scope + ":" + index["name"]).hex
+    return result
+
+
+def _renamed_index(receipt, original, replacement):
+    if any(item["name"] == original for item in receipt["native"].get("indexes", ())):
+        for group in ("indexes", "constraints"):
+            for item in receipt["native"].get(group, ()):
+                if item["name"] == original:
+                    item["name"] = replacement
+    return encoded(receipt)
+
+
+def record_rename(schema, original, replacement, *, index=False):
+    """Move validated content only after its successful SQL rename."""
+    validated_by_name = _VALIDATED.get()
+    if validated_by_name is None:
+        return
+    if index:
+        for key, receipt_json in tuple(validated_by_name.items()):
+            if key[0] != schema:
+                continue
+            validated_by_name[key] = _renamed_index(decoded(receipt_json), original, replacement)
+        return
+    receipt_json = validated_by_name.pop((schema, original), None)
+    validated_by_name.pop((schema, replacement), None)
+    if receipt_json is not None:
+        receipt = decoded(receipt_json)
+        receipt["native"]["relname"] = replacement
+        validated_by_name[(schema, replacement)] = encoded(receipt)
 
 
 async def rename(database, schema, original, replacement, *, index=False):
@@ -395,32 +606,26 @@ async def rename(database, schema, original, replacement, *, index=False):
         + " RENAME TO "
         + storage_identifier(replacement)
     )
+    record_rename(schema, original, replacement, index=index)
 
 
 async def retain(database, schema, expected):
-    """Preserve a locked original heap and all its native indexes without copying rows."""
+    """Keep the original named snapshot and indexes without copying rows."""
     native = expected["native"]
+    await lock(database, schema, (native["relname"],))
     actual = await relation(database, schema, native["relname"], content=False)
     require_relation(expected, actual, content=False)
-    _session, driver, _actor = await ordinary(database)
-    require(
-        await driver.fetchval(
-            "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=pg_backend_pid() AND relation=$1::oid AND mode='AccessExclusiveLock' AND granted)",
-            native["oid"],
-        ),
-        "original_lock_required",
-    )
     for index in native["indexes"]:
-        await rename(database, schema, index["name"], retained_name(index["oid"], index=True), index=True)
-    await rename(database, schema, native["relname"], retained_name(native["oid"]))
+        await rename(database, schema, index["name"], retained_name(index, index=True), index=True)
+    await rename(database, schema, native["relname"], retained_name(native))
 
 
 async def restore(database, schema, expected, *, prepared):
-    """Restore authenticated original names after the replaced successor is retained."""
+    """Restore original names after retaining the replaced successor."""
     native = expected["native"]
-    retained = retained_name(native["oid"])
+    retained = retained_name(native)
     actual = await recheck_prepared(database, prepared, retained)
     require_relation(expected, actual, renamed=True)
     await rename(database, schema, retained, native["relname"])
     for index in native["indexes"]:
-        await rename(database, schema, retained_name(index["oid"], index=True), index["name"], index=True)
+        await rename(database, schema, retained_name(index, index=True), index["name"], index=True)

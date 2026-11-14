@@ -31,7 +31,11 @@ def _migration(revision=REVISION):
 
 def _assert_source_inventory_migration_head(script):
     """Require the inventory head and its refresh and catalog predecessors."""
-    assert script.get_heads() == ["20261114020000_custom_import_snapshot_metadata"]
+    assert script.get_heads() == ["20261114120000_portable_serving_metadata"]
+    assert (
+        script.get_revision("20261114120000_portable_serving_metadata").down_revision
+        == "20261114020000_custom_import_snapshot_metadata"
+    )
     assert script.get_revision("20261114020000_custom_import_snapshot_metadata").down_revision == (
         "20261114010000_custom_import_snapshot_names"
     )
@@ -323,7 +327,7 @@ def test_native_fixture_head_checks_preserve_history_without_database_work():
     from tests.test_provider_directory_profile_capacity_adoption_postgres import _assert_registry_migration_lineage
 
     script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
-    assert _assert_registry_migration_lineage() == {"20261114020000_custom_import_snapshot_metadata"}
+    assert _assert_registry_migration_lineage() == {"20261114120000_portable_serving_metadata"}
     assert _assert_address_migration_chain(script) is None
 
 

@@ -11,12 +11,19 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tests.ptg2_serving_address_evidence_postgres_support import (
+    _create_cms_address_table,
+    _create_geo_reference_tables,
+    _create_mrf_address_table,
+    _create_npi_address_table,
+)
 from tests.test_entity_address_result_generation_postgres import _run_migration
 from tests.test_entity_address_unified_no_live_mutation import _mock_shutdown_dependencies, _shutdown_context
 from tests.test_entity_address_unified_publication_db import _prepare_live_and_stage, _StageTable, _temporary_schema
 
 native = importlib.import_module("process.entity_address_unified")
 preparation = importlib.import_module("process.entity_address_candidate_preparation")
+receipts = importlib.import_module("process.provider_directory_serving_recovery_receipts")
 
 
 def _inputs(overlay_oid=41):
@@ -127,10 +134,14 @@ async def _candidate_tables(database, schema):
         await database.status(statement.format(schema=schema))
     await _candidate_datasets(database, schema)
     receipt_table = native.address_alias_sql.ADDRESS_ALIAS_ARTIFACT_STATE_TABLE
-    await database.status(f"CREATE TABLE {schema}.{receipt_table} (artifact_name text, generation bigint)")
-    await database.status(f"INSERT INTO {schema}.{receipt_table} VALUES ('provider_directory_address_overlay',0)")
-    overlay_oid = await database.scalar(f"SELECT '{schema}.prepared_overlay'::regclass::oid::bigint")
-    return _inputs(overlay_oid)
+    await database.status(
+        f"CREATE TABLE {schema}.{receipt_table} (artifact_name text, generation bigint, "
+        "updated_at timestamptz NOT NULL DEFAULT now())"
+    )
+    await database.status(
+        f"INSERT INTO {schema}.{receipt_table} (artifact_name,generation) VALUES ('provider_directory_address_overlay',0)"
+    )
+    return _inputs(None)
 
 
 async def _candidate_datasets(database, schema):
@@ -177,8 +188,15 @@ async def test_candidate_reads_remain_noncurrent_and_detect_pin_drift(monkeypatc
             )
             context_by_field = {}
             await native._capture_provider_directory_overlay_alias_fence(schema, [], context_by_field)
-            assert context_by_field["provider_directory_overlay_relation_oid"] == inputs.overlay_relation_oid
-            assert context_by_field["incumbent_provider_directory_overlay_fence"][1] != inputs.overlay_relation_oid
+            assert "provider_directory_overlay_relation_oid" not in context_by_field
+            assert (
+                context_by_field["provider_directory_overlay_relation"]
+                == f"{schema}.provider_directory_address_overlay"
+            )
+            assert context_by_field["incumbent_provider_directory_overlay_fence"] == (
+                0,
+                context_by_field["provider_directory_overlay_publication"],
+            )
             await database.status(
                 f"UPDATE {schema}.provider_directory_endpoint_dataset SET dataset_hash='changed' WHERE dataset_id='candidate'"
             )
@@ -238,13 +256,16 @@ async def _generation_authority(database, schema, monkeypatch):
 
 async def _install_overlay(database, schema):
     await database.status(f"ALTER TABLE {schema}.provider_directory_address_overlay RENAME TO previous_overlay")
+    receipts.record_rename(schema, "provider_directory_address_overlay", "previous_overlay")
     await database.status(f"ALTER TABLE {schema}.prepared_overlay RENAME TO provider_directory_address_overlay")
+    receipts.record_rename(schema, "prepared_overlay", "provider_directory_address_overlay")
 
 
 async def _prepared_fixture(database, schema, monkeypatch):
     monkeypatch.setattr(native, "db", database)
     inputs = await _candidate_tables(database, schema)
     await _prepare_live_and_stage(database, schema)
+    await _prepare_named_geo_inputs(database, schema)
     await _generation_authority(database, schema, monkeypatch)
     context_by_field = {"address_alias_generation": 0, "publish_validation": {}, "staged_rows": 1}
     token = preparation._PREPARATION.set(inputs)
@@ -255,10 +276,48 @@ async def _prepared_fixture(database, schema, monkeypatch):
         preparation._PREPARATION.reset(token)
 
 
+async def _prepare_named_geo_inputs(database, schema):
+    await database.status("CREATE EXTENSION IF NOT EXISTS postgis")
+    for create in (
+        _create_npi_address_table,
+        _create_mrf_address_table,
+        _create_cms_address_table,
+        _create_geo_reference_tables,
+    ):
+        await create(database, schema)
+    bindings_by_name = {
+        f"{namespace or schema}.{name}": {"schema_name": schema, "table_name": name}
+        for namespace, name in native.geo_projection._PROJECTION_DEPENDENCIES
+    }
+    assert (
+        await database.scalar(
+            native._record_geo_assurance_candidate_sql(
+                schema, "entity_address_unified_stage", 1, dependency_bindings=bindings_by_name
+            )
+        )
+        is not None
+    )
+
+
 async def test_prepared_cutover_obeys_outer_rollback_and_native_authority(monkeypatch):
     async with _temporary_schema() as (database, schema):
         prepared = await _prepared_fixture(database, schema, monkeypatch)
         assert prepared.stage_oids[0][:2] == ("entity_address_unified", "entity_address_unified_stage")
+        assert receipts._VALIDATED.get() is None
+        phases = []
+        capture, acquire = receipts.relation, native._acquire_cutover_locks
+
+        async def capture_before_live_locks(*args, **kwargs):
+            if args[2] == "entity_address_unified_stage" and kwargs.get("content", True):
+                phases.append("digest")
+            return await capture(*args, **kwargs)
+
+        async def acquire_live_locks(*args, **kwargs):
+            phases.append("live-lock")
+            return await acquire(*args, **kwargs)
+
+        monkeypatch.setattr(receipts, "relation", capture_before_live_locks)
+        monkeypatch.setattr(native, "_acquire_cutover_locks", acquire_live_locks)
         with pytest.raises(RuntimeError, match="caller-owned"):
             await preparation.publish_prepared_entity_address_generation(prepared)
         with pytest.raises(RuntimeError, match="outer rollback"):
@@ -279,9 +338,12 @@ async def test_prepared_cutover_obeys_outer_rollback_and_native_authority(monkey
             receipt = await preparation.publish_prepared_entity_address_generation(prepared)
         await prepared.mark_committed()
         await preparation.cleanup_prepared_entity_address_generation(prepared)
-        assert receipt["relation_oids"][0] == prepared.stage_oids[0][2]
+        assert receipt["relation_oids"] is None
+        assert prepared.stage_oids[0][2] is None
         assert prepared.context["publication_state"] == "published"
         assert await database.scalar(f"SELECT marker FROM {schema}.entity_address_unified") == "new"
+        assert phases == ["digest", "live-lock", "digest", "live-lock"]
+        assert receipts._VALIDATED.get() is None
 
 
 async def test_missing_secondary_index_blocks_prepared_result(monkeypatch):
@@ -298,15 +360,36 @@ async def test_missing_secondary_index_blocks_prepared_result(monkeypatch):
         await preparation._require_stage_indexes(schema, stage)
 
 
-async def test_replaced_prepared_stage_blocks_cutover_and_cleanup(monkeypatch):
+async def test_changed_prepared_stage_blocks_cutover_and_cleanup_drains_name(monkeypatch):
     async with _temporary_schema() as (database, schema):
         prepared = await _prepared_fixture(database, schema, monkeypatch)
-        await database.status(f"ALTER TABLE {schema}.entity_address_unified_stage RENAME TO original_stage")
-        await database.status(f"CREATE TABLE {schema}.entity_address_unified_stage (marker text)")
-        with pytest.raises(RuntimeError, match="prepared stage changed"):
+        await database.status(f"UPDATE {schema}.entity_address_unified_stage SET marker='changed'")
+        with pytest.raises(ValueError, match="content_changed"):
             async with database.transaction():
                 await _install_overlay(database, schema)
                 await preparation.publish_prepared_entity_address_generation(prepared)
         await preparation.cleanup_prepared_entity_address_generation(prepared)
         assert await database.scalar(f"SELECT marker FROM {schema}.entity_address_unified") == "old"
-        assert await database.scalar(f"SELECT to_regclass('{schema}.entity_address_unified_stage') IS NOT NULL")
+        assert not await database.scalar(f"SELECT to_regclass('{schema}.entity_address_unified_stage') IS NOT NULL")
+
+
+@pytest.mark.parametrize("admission_present", [False, True])
+@pytest.mark.parametrize("overlay_present", [False, True])
+async def test_named_overlay_validation_is_independent_of_admission(monkeypatch, admission_present, overlay_present):
+    """A nullable legacy field selects names while missing selected overlays still refuse."""
+    inputs = _inputs(None)
+    monkeypatch.setattr(native, "_address_alias_generation", AsyncMock(return_value=0))
+    read = AsyncMock(return_value=overlay_present)
+    monkeypatch.setattr(preparation, "_preparation_scalar", read)
+    token = preparation.admitted._ADMISSION.set(object() if admission_present else None)
+    try:
+        if overlay_present:
+            await preparation._assert_staged_overlay("sample", inputs)
+        else:
+            with pytest.raises(RuntimeError, match="overlay changed"):
+                await preparation._assert_staged_overlay("sample", inputs)
+    finally:
+        preparation.admitted._ADMISSION.reset(token)
+    statement = read.await_args.args[0]
+    assert "IS NOT NULL" in statement and "::oid" not in statement
+    assert read.await_args.kwargs["relation"] == "sample.prepared_overlay"

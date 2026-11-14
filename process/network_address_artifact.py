@@ -234,8 +234,27 @@ def _authority_document(authority):
         "origin_lineage_id": serving.origin_lineage_id,
         "origin_generation": serving.origin_generation,
         "published_at": serving.published_at.isoformat(timespec="microseconds").replace("+00:00", "Z"),
-        "relation_oids": list(authority.relation_oids),
+        "relation_oids": None,
     }
+
+
+def _legacy_origin_document(origin, relation_oids):
+    # Historical wire values reproduce old pins; they never identify current tables.
+    _require(
+        type(relation_oids) is list
+        and len(relation_oids) == len(generation.RELATION_NAMES)
+        and all(type(value) is int and 0 < value < 2**32 for value in relation_oids)
+        and len(set(relation_oids)) == len(relation_oids),
+        "legacy_origin_invalid",
+    )
+    return {**origin, "relation_oids": relation_oids}
+
+
+async def _legacy_origin(connection, schema_name, origin):
+    wire_value = await connection.fetchval(
+        f'SELECT relation_oids FROM {_identifier(schema_name)}."{_AUTHORITY}" WHERE singleton IS TRUE'
+    )
+    return _legacy_origin_document(origin, wire_value)
 
 
 def _descriptor(binding):
@@ -324,10 +343,11 @@ def _descriptor_origin(binding):
         {"singleton": True, **binding["authority"]}
     )
     _require(
-        _authority_document(authority) == binding["authority"]
-        and authority.relation_oids[0] == binding["table"]["oid"],
+        _authority_document(authority) == {**binding["authority"], "relation_oids": None},
         "generation_invalid",
     )
+    if binding["authority"]["relation_oids"] is not None:
+        _legacy_origin_document(binding["authority"], binding["authority"]["relation_oids"])
     _require(type(binding["runtime_roles"]) is list, "roles_invalid")
     _roles(tuple(binding["runtime_roles"]))
 
@@ -340,13 +360,24 @@ async def _require_capture_snapshot(connection):
     )
 
 
-async def capture_network_address_artifact(connection, source, *, runtime_roles):
+async def capture_network_address_artifact(connection, address_source, *, runtime_roles, expected_artifact_sha256=None):
     """Capture actual current origin under native locks; this descriptor grants no authority."""
     from process import network_bootstrap_address_artifact as bootstrap
 
-    _require(type(source) is PinnedAddressSource and source.table_name == _TABLE, "source_invalid")
-    if bootstrap.is_bootstrap_source(source):
-        return await bootstrap.capture_bootstrap_address_artifact(connection, source, runtime_roles=runtime_roles)
+    _require(type(address_source) is PinnedAddressSource and address_source.table_name == _TABLE, "source_invalid")
+    _require(
+        expected_artifact_sha256 is None
+        or (
+            type(expected_artifact_sha256) is str
+            and len(expected_artifact_sha256) == 64
+            and all(character in "0123456789abcdef" for character in expected_artifact_sha256)
+        ),
+        "descriptor_digest_invalid",
+    )
+    if bootstrap.is_bootstrap_source(address_source):
+        return await bootstrap.capture_bootstrap_address_artifact(
+            connection, address_source, runtime_roles=runtime_roles
+        )
     await _require_capture_snapshot(connection)
     runtime_roles = _roles(runtime_roles)
     session = _CatalogSession(connection)
@@ -355,20 +386,34 @@ async def capture_network_address_artifact(connection, source, *, runtime_roles)
         "publication_busy",
     )
     oid = await connection.fetchval(
-        "SELECT to_regclass($1)::oid::bigint", f'{_identifier(source.schema_name)}."{_TABLE}"'
+        "SELECT to_regclass($1)::oid::bigint", f'{_identifier(address_source.schema_name)}."{_TABLE}"'
     )
     _require(type(oid) is int, "table_absent")
-    physical = await _locked_table(connection, source.schema_name, oid)
-    authority_name = f'{_identifier(source.schema_name)}."{_AUTHORITY}"'
+    physical = await _locked_table(connection, address_source.schema_name, oid)
+    authority_name = f'{_identifier(address_source.schema_name)}."{_AUTHORITY}"'
     await connection.execute(f"LOCK TABLE ONLY {authority_name} IN ACCESS SHARE MODE NOWAIT")
     authority_oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", authority_name)
     owner_oid = await _custody(connection, session, physical, authority_oid, runtime_roles)
     authority = await generation.read_entity_address_result_generation_authority(
-        session, schema_name=source.schema_name
+        session, schema_name=address_source.schema_name
     )
     origin = _authority_document(authority)
-    _require(origin["relation_oids"][0] == oid and _digest(origin) == source.generation_id, "source_generation_changed")
-    return await _captured_descriptor(connection, session, physical, authority_oid, origin, runtime_roles, owner_oid)
+    if _digest(origin) != address_source.generation_id:
+        origin = await _legacy_origin(connection, address_source.schema_name, origin)
+    _require(_digest(origin) == address_source.generation_id, "source_generation_changed")
+    descriptor = await _captured_descriptor(
+        connection, session, physical, authority_oid, origin, runtime_roles, owner_oid
+    )
+    if expected_artifact_sha256 is not None and descriptor["descriptor_sha256"] != expected_artifact_sha256:
+        origin = await _legacy_origin(connection, address_source.schema_name, _authority_document(authority))
+        legacy_descriptor_by_field = {**descriptor, "authority": origin, "generation_id": _digest(origin)}
+        legacy_descriptor_by_field["descriptor_sha256"] = _digest(
+            {key: field_value for key, field_value in legacy_descriptor_by_field.items() if key != "descriptor_sha256"}
+        )
+        legacy_descriptor_by_field = _descriptor(legacy_descriptor_by_field)
+        if legacy_descriptor_by_field["descriptor_sha256"] == expected_artifact_sha256:
+            descriptor = legacy_descriptor_by_field
+    return descriptor
 
 
 async def _captured_descriptor(connection, session, physical, authority_oid, origin, runtime_roles, owner_oid):

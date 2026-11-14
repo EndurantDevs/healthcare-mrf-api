@@ -48,7 +48,7 @@ def _logged(failure, caplog):
     return json.loads(record.getMessage().partition(" failed ")[2]), rendered
 
 
-async def test_signed_failure_keeps_only_scalar_identity_after_restoration(monkeypatch, caplog):
+async def test_signed_failure_keeps_request_diagnostics_after_restoration(monkeypatch, caplog):
     session = ReaderSession()
     database = reader_database(monkeypatch, [session])
     monkeypatch.setattr(boundary, "db", database)
@@ -71,18 +71,12 @@ async def test_signed_failure_keeps_only_scalar_identity_after_restoration(monke
         "request_id_source": "forwarded",
         "forwarded_request_id": REQUEST_ID,
         "core_request_id": CORE_ID,
-        "reader": {
-            "role_oid": 12345,
-            "database_oid": 23456,
-            "server_address": "192.0.2.1",
-            "server_port": 5432,
-            "backend_pid": 34567,
-        },
+        "reader": None,
     }
-    assert "role_oid" in rendered
+    assert "role_oid" not in rendered
 
 
-async def test_timeout_retains_identity_from_cancelled_reader_without_changing_cancellation(monkeypatch, caplog):
+async def test_timeout_keeps_request_diagnostics_and_cancellation(monkeypatch, caplog):
     session = ReaderSession()
     database = reader_database(monkeypatch, [session])
     monkeypatch.setattr(boundary, "db", database)
@@ -94,7 +88,7 @@ async def test_timeout_retains_identity_from_cancelled_reader_without_changing_c
     assert isinstance(caught.value.__cause__, asyncio.CancelledError)
     assert session.rolled_back and session.closed and not session.info and not database.has_reader_session()
     fields, _ = _logged(caught.value, caplog)
-    assert fields["reader"]["role_oid"] == 12345 and fields["request_id"] == REQUEST_ID
+    assert fields["reader"] is None and fields["request_id"] == REQUEST_ID
     assert fields["exception_class"] == "TimeoutError" and fields["sqlstate"] is None
 
 
@@ -141,7 +135,7 @@ async def test_reader_failure_metadata_does_not_cross_requests(monkeypatch):
                     raise failure
         assert not session.info
     assert [failure._api_reader_diagnostic["request_id"] for failure in failures] == ids
-    assert failures[0]._api_reader_diagnostic["reader"] is not failures[1]._api_reader_diagnostic["reader"]
+    assert all(failure._api_reader_diagnostic["reader"] is None for failure in failures)
 
 
 def test_log_fields_reject_opaque_attributes_and_unvalidated_identifiers(caplog):
@@ -227,7 +221,7 @@ async def test_signed_failure_uses_verified_context_id_and_retains_closed_respon
     if is_authorized:
         assert fields["request_id"] == verified_id and fields["request_id_source"] == "verified_transport"
         assert fields["forwarded_request_id"] == REQUEST_ID and fields["core_request_id"] == CORE_ID
-        assert fields["reader"]["role_oid"] == 12345 and fields["sqlstate"] == "42501"
+        assert fields["reader"] is None and fields["sqlstate"] == "42501"
     else:
         assert "request_id" not in fields and "reader" not in fields and not session.executed
     assert not session.info
@@ -257,5 +251,5 @@ async def test_claims_pin_logs_before_cleanup_and_preserves_closed_response(monk
     assert str(caught.value) == "Pricing snapshot is temporarily unavailable"
     assert session.closed and not session.info and not database.has_reader_session()
     fields = json.loads(caplog.records[-1].getMessage().partition(" failed ")[2])
-    assert fields["boundary"] == "claims_pin" and fields["reader"]["role_oid"] == 12345
+    assert fields["boundary"] == "claims_pin" and fields["reader"] is None
     assert fields["sqlstate"] == "42501" and fields["request_id"] == REQUEST_ID

@@ -77,12 +77,26 @@ async def _companion_relations(fixture):
             await fixture.database.status(
                 f'INSERT INTO "{fixture.schema}".{name}{suffix} VALUES (:marker)', marker=marker
             )
-    stage = await _prepared_bundle_stage(
-        fixture.schema,
-        "provider_directory_address_overlay_next",
-        "provider_directory_address_overlay",
-        _keep_stage_indexes,
+    publication_ref = importer._qt(fixture.schema, importer.address_alias_sql.ADDRESS_ALIAS_ARTIFACT_STATE_TABLE)
+    await fixture.database.status(
+        f"CREATE TABLE {publication_ref} (artifact_name varchar(128) PRIMARY KEY, "
+        "generation bigint NOT NULL DEFAULT 0 CHECK (generation >= 0), "
+        "updated_at timestamptz NOT NULL DEFAULT now())"
     )
+    await fixture.database.status(
+        f"INSERT INTO {publication_ref} (artifact_name) VALUES (:artifact_name)",
+        artifact_name=importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+    )
+    async with importer._provider_directory_artifact_build_guard(
+        fixture.schema, importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE
+    ) as fence:
+        stage = importer.ProviderDirectoryPreparedArtifactStage(
+            fixture.schema,
+            "provider_directory_address_overlay_next",
+            importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+            _keep_stage_indexes,
+            fence,
+        )
     address = SimpleNamespace(
         swaps=[SimpleNamespace(live_cls=SimpleNamespace(__main_table__="entity_address_unified"))]
     )

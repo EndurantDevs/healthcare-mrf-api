@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process import provider_directory_cms_native_inputs as inputs
+from tests.test_geo_assurance_dependency_bindings import _example_bindings
 
 _ADVANCE = """
 BEGIN
@@ -1081,7 +1082,7 @@ async def test_source_fence_versions_plain_and_protected_nucc_without_changing_p
         "_reference_authorities",
         AsyncMock(return_value={key: {} for key in ("cms-doctors", "geo", "tiger", "mrf")}),
     )
-    monkeypatch.setattr(inputs, "_geo_bindings", lambda *args: {"native": "geo"})
+    monkeypatch.setattr(inputs, "_geo_bindings", lambda *args: _example_bindings())
     revisions = AsyncMock(return_value=[{"plain_revision": 1}])
     monkeypatch.setattr(inputs, "_revision_guards", revisions)
     monkeypatch.setattr(
@@ -1102,7 +1103,7 @@ async def test_source_fence_versions_plain_and_protected_nucc_without_changing_p
             relations=physical_by_name,
             npi={"native": "npi"},
             reference_authorities={key: {} for key in ("cms-doctors", "geo", "tiger", "mrf")},
-            geo_bindings={"native": "geo"},
+            geo_bindings=_example_bindings(),
             revisions=[{"plain_revision": 1}],
             cms_office_read_relations={key: {} for key in CMS_OFFICE_READ_TABLES},
         )

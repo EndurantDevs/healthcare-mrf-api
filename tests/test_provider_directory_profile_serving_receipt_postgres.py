@@ -202,7 +202,7 @@ async def test_receipt_write_failure_rolls_back_profile_and_chain(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("shape", ["index", "trigger", "body", "default", "check", "replica"])
+@pytest.mark.parametrize("shape", ["index", "trigger", "settings", "default", "check", "replica"])
 async def test_unsupported_receipt_shape_fails_before_profile_mutation(monkeypatch, shape):
     async with _ordinary_profile(monkeypatch) as (database, engine, schema, initial, _execution, _admission, apply):
         async with engine.begin() as connection:
@@ -224,7 +224,7 @@ async def _tamper_receipt_shape(connection, schema, shape):
     statements_by_shape = {
         "index": f"CREATE INDEX synthetic_extra_index ON {schema}.provider_directory_cms_serving_receipt USING gin (payload)",
         "trigger": f"ALTER TABLE {schema}.provider_directory_cms_serving_receipt DISABLE TRIGGER cms_serving_receipt_insert",
-        "body": f"CREATE OR REPLACE FUNCTION {schema}.cms_serving_receipt_insert() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$ BEGIN RETURN NULL; END $$",
+        "settings": f"ALTER FUNCTION {schema}.cms_serving_receipt_insert() SET search_path=pg_temp,pg_catalog",
         "default": f"ALTER TABLE {schema}.provider_directory_cms_serving_receipt ALTER COLUMN created_at SET DEFAULT now()",
         "check": f"ALTER TABLE {schema}.provider_directory_cms_serving_receipt ADD CHECK (length(receipt_id)>0)",
     }

@@ -11,6 +11,7 @@ import pytest
 from process import provider_directory_cms_native_inputs as inputs
 from process import provider_directory_cms_tiger_inputs as tiger
 from process import provider_directory_generic_source_policy as policy
+from tests.test_geo_assurance_dependency_bindings import _example_bindings
 
 
 def _proof():
@@ -289,7 +290,7 @@ async def test_common_capture_preserves_geo_and_mutable_input_authorities(monkey
     )
     monkeypatch.setattr(inputs, "_physical_relations", AsyncMock(return_value=physical_by_name))
     monkeypatch.setattr(inputs, "_npi_revision", AsyncMock(return_value={"literal": "npi"}))
-    monkeypatch.setattr(inputs, "_geo_bindings", lambda *args: {"literal": "physical-parent-geo"})
+    monkeypatch.setattr(inputs, "_geo_bindings", lambda *args: _example_bindings())
     authorities = AsyncMock(return_value={family: {} for family in ("cms-doctors", "geo", "mrf")})
     monkeypatch.setattr(inputs, "_reference_authorities", authorities)
     revisions = AsyncMock(return_value=[{"literal_revision": 9}])
@@ -306,7 +307,7 @@ async def test_common_capture_preserves_geo_and_mutable_input_authorities(monkey
         relations=physical_by_name,
         npi={"literal": "npi"},
         reference_authorities={family: {} for family in ("cms-doctors", "geo", "mrf")},
-        geo_bindings={"literal": "physical-parent-geo"},
+        geo_bindings=_example_bindings(),
         revisions=[{"literal_revision": 9}],
         cms_office_read_relations=office_by_name,
         tiger_protected=_proof(),
@@ -429,7 +430,7 @@ async def test_tiger_version_three_preserves_optional_verified_nucc_wire():
         relations=physical_by_name,
         tiger_protected=_proof(),
         nucc_protected=nucc_proof,
-        geo_bindings={"literal": "geo"},
+        geo_bindings=_example_bindings(),
         reference_authorities={family: {} for family in ("cms-doctors", "geo", "mrf")},
         cms_office_read_relations={name: {} for name in CMS_OFFICE_READ_TABLES},
     )
@@ -585,9 +586,10 @@ async def test_captured_fence_maps_exact_heaps_before_queries_and_preserves_lega
     archive_owner.assert_awaited_once_with(session, "mrf")
     assert fence["version"] == 4 and fence["tiger_captured"] == _captured_proof()
     assert "tiger_protected" not in fence
-    assert {
-        name: fence["geo_bindings"][name] for name in ("tiger.zcta5", "tiger.zip_state")
-    } == tiger.captured_tiger_bindings(_captured_proof())
+    assert {name: fence["geo_bindings"][name] for name in ("tiger.zcta5", "tiger.zip_state")} == {
+        name: {field: binding[field] for field in ("schema_name", "table_name")}
+        for name, binding in tiger.captured_tiger_bindings(_captured_proof()).items()
+    }
     callback.assert_awaited_once_with(session)
     references.assert_awaited_once_with(session, "mrf", protected_tiger=_captured_proof())
     revisions.assert_awaited_once_with(session, "mrf", session.physical, captured_tiger=_captured_proof())
@@ -601,6 +603,19 @@ async def test_captured_fence_maps_exact_heaps_before_queries_and_preserves_lega
     for changed in [dict(fence, version=3), dict(fence, tiger_captured=None), dict(fence, geo_bindings={})]:
         with pytest.raises(RuntimeError):
             inputs.require_supported_native_address_inputs(changed)
+    for field in ("schema_name", "table_name"):
+        changed = deepcopy(fence)
+        changed["geo_bindings"]["tiger.zcta5"][field] = "other_input"
+        with pytest.raises(RuntimeError, match="tiger_proof_changed"):
+            inputs.require_supported_native_address_inputs(changed)
+    legacy = deepcopy(fence)
+    for binding in legacy["geo_bindings"].values():
+        binding.update(relation_oid=-1, relfilenode=True)
+    original = deepcopy(legacy)
+    inputs.require_supported_native_address_inputs(legacy)
+    monkeypatch.setattr(inputs, "capture_native_address_input_fence", AsyncMock(return_value=fence))
+    await inputs.assert_native_address_input_fence(session, "mrf", legacy)
+    assert legacy == original
 
 
 @pytest.mark.asyncio

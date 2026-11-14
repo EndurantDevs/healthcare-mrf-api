@@ -17,6 +17,12 @@ from process import provider_directory_serving_recovery_receipts as receipts
 from process.entity_address_cutover_contract import postgres_sqlstate
 from process.entity_address_unified import _sql_literal
 from tests.provider_directory_serving_recovery_postgres_support import ordinary_serving_case
+from tests.provider_directory_serving_recovery_receipts_postgres_support import (
+    test_native_named_lock_blocks_content_drift as test_native_named_lock_blocks_content_drift,
+)
+from tests.provider_directory_serving_recovery_receipts_postgres_support import (
+    test_native_snapshot_copy_preserves_receipt as test_native_snapshot_copy_preserves_receipt,
+)
 
 
 async def _state(case):
@@ -39,7 +45,7 @@ async def _publish_overlay(case, generation):
         run_id=None,
         stage=SimpleNamespace(schema=schema, stage_table="overlay_next", target_relation=receipts.ROOTS[0]),
     )
-    async with database.transaction():
+    async with receipts.validation_scope(database):
         await recovery.begin_overlay(case.directory, selected_by_field)
         await receipts.lock(database, schema, (*receipts.ROOTS, "overlay_next"))
         await read_access.recheck_ordinary_read_access(database, selected_by_field["read_access"])
@@ -157,6 +163,63 @@ async def test_native_ordinary_recovery_replays_and_preserves_failed_transaction
 
 
 @pytest.mark.asyncio
+async def test_native_legacy_profile_targets_replay_and_recover_without_rewriting(monkeypatch):
+    async with ordinary_serving_case(monkeypatch) as case:
+        database, schema = case.database, case.schema
+        await database.status(
+            f'CREATE TABLE "{schema}".provider_directory_profile_serving_generation '
+            "(singleton_key text PRIMARY KEY, generation_id text, source_set_hash text, profile_rows bigint, "
+            "profile_target_oid bigint, evidence_target_oid bigint)"
+        )
+        await database.status(
+            f'INSERT INTO "{schema}".provider_directory_profile_serving_generation '
+            "VALUES ('global','profile-generation','source-generation',2,101,102)"
+        )
+        baseline = await _state(case)
+        generation = recovery.publication_generation(case.pin)
+        await _forward(case, generation)
+        journal = receipts.qualified(schema, receipts.JOURNAL)
+        await database.status(f"""WITH historical AS (
+            SELECT generation,phase,jsonb_set(jsonb_set(document,'{{before,metadata,profile}}',
+                (document#>'{{before,metadata,profile}}') ||
+                jsonb_build_object('profile_target_oid',101,'evidence_target_oid',102)),
+                '{{after,metadata,profile}}',(document#>'{{after,metadata,profile}}') ||
+                jsonb_build_object('profile_target_oid',101,'evidence_target_oid',102)) AS value
+            FROM {journal})
+            UPDATE {journal} journal SET document=historical.value,
+                document_sha256=encode(sha256(convert_to(historical.value::text,'UTF8')),'hex')
+            FROM historical WHERE journal.generation=historical.generation AND journal.phase=historical.phase""")
+        await database.status(f"""WITH historical AS (
+            SELECT publication.generation,jsonb_set(publication.document,'{{predecessor}}',
+                to_jsonb(overlay.document_sha256)) AS value FROM {journal} publication
+            JOIN {journal} overlay USING (generation) WHERE publication.phase='published' AND overlay.phase='overlay')
+            UPDATE {journal} journal SET document=historical.value,
+                document_sha256=encode(sha256(convert_to(historical.value::text,'UTF8')),'hex')
+            FROM historical WHERE journal.generation=historical.generation AND journal.phase='published'""")
+        recorded = await database.all(f"SELECT phase,document,document_sha256 FROM {journal} ORDER BY phase")
+        await database.status(
+            f'UPDATE "{schema}".provider_directory_profile_serving_generation '
+            "SET profile_target_oid=201,evidence_target_oid=202"
+        )
+        assert (await recovery.resume_address(database, {}, _address_request(case, generation)))["serving_recovery"][
+            "phase"
+        ] == "published"
+        await recovery._recover(
+            case.directory,
+            {recovery.GENERATION_PARAM: generation, "source_ids": [case.pin["source_id"]]},
+        )
+        restored = await _state(case)
+        assert restored["roots"] == baseline["roots"]
+        assert restored["metadata"]["profile"] == baseline["metadata"]["profile"]
+        assert (
+            await database.all(
+                f"SELECT phase,document,document_sha256 FROM {journal} WHERE phase<>'recovered' ORDER BY phase"
+            )
+            == recorded
+        )
+
+
+@pytest.mark.asyncio
 async def test_native_ordinary_copy_catalog_and_cleanup_keep_exact_identity(monkeypatch):
     async with ordinary_serving_case(monkeypatch) as case:
         database, directory, schema = case.database, case.directory, case.schema
@@ -217,7 +280,7 @@ async def test_native_access_and_cleanup_refuse_substituted_relations(monkeypatc
         await database.status(f"INSERT INTO {table} VALUES ('replacement')")
         replacement = await artifacts._catalog(directory, name)
         assert tuple(replacement) != created_by_relation[name]
-        with pytest.raises(RuntimeError, match="rest_artifact_cleanup_custody_changed"):
+        with pytest.raises(RuntimeError, match="rest_artifact_cleanup_layout_changed"):
             await artifacts._cleanup(directory, created_by_relation)
         assert await artifacts._catalog(directory, name) == replacement
         assert await database.scalar(f"SELECT marker FROM {table}") == "replacement"
@@ -249,21 +312,25 @@ async def _refuse_late_source(case, task_by_field, restored):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["content", "acl", "occupied"])
+@pytest.mark.parametrize("damage", ["content", "layout", "occupied"])
 async def test_native_recovery_refuses_retained_drift(monkeypatch, damage):
     async with ordinary_serving_case(monkeypatch) as case:
         baseline = await _state(case)
         generation = recovery.publication_generation(case.pin)
         forward = await _forward(case, generation)
-        previous = receipts.retained_name(baseline["roots"][receipts.ROOTS[0]]["native"]["oid"])
+        async with case.database.transaction():
+            history = await recovery._load_history(case.database, case.schema, generation)
+        baseline = history["overlay"]["document"]["before"]
+        forward_plan = history["published"]["document"]["after"]
+        previous = receipts.retained_name(baseline["roots"][receipts.ROOTS[0]])
         if damage == "content":
             await case.database.status(f'UPDATE "{case.schema}"."{previous}" SET marker=\'changed\'')
             error = "content_changed"
-        elif damage == "acl":
-            await case.database.status(f'GRANT UPDATE(marker) ON "{case.schema}"."{previous}" TO PUBLIC')
-            error = "native_acl_changed"
+        elif damage == "layout":
+            await case.database.status(f'ALTER TABLE "{case.schema}"."{previous}" ADD COLUMN extra integer')
+            error = "relation_changed"
         else:
-            occupied = receipts.retained_name(forward["roots"][receipts.ROOTS[0]]["native"]["oid"])
+            occupied = receipts.retained_name(forward_plan["roots"][receipts.ROOTS[0]])
             await case.database.status(f'CREATE TABLE "{case.schema}"."{occupied}" (marker text)')
             error = "retained_name_occupied"
         task_by_field = {
@@ -347,7 +414,7 @@ async def test_native_metadata_refuses_ambiguous_receipt_tips(monkeypatch):
             await case.database.status(f"INSERT INTO {table} VALUES ('root',NULL,'{{}}')")
             assert (await receipts.metadata(case.database, case.schema))["common_receipt"] == {
                 "receipt_id": "root",
-                "payload": {},
+                "predecessor_receipt_id": None,
             }
         await case.database.status(f"INSERT INTO {table} VALUES ('branch_a','root','{{}}'),('branch_b','root','{{}}')")
         async with case.database.transaction():
@@ -355,13 +422,13 @@ async def test_native_metadata_refuses_ambiguous_receipt_tips(monkeypatch):
                 await receipts.metadata(case.database, case.schema)
 
 
-async def _wait_for_lock(database, relation_oid):
+async def _wait_for_lock(database, relation_name):
     async with asyncio.timeout(3):
         while not await database.scalar(
             "SELECT EXISTS(SELECT FROM pg_locks pending JOIN pg_stat_activity activity ON activity.pid=pending.pid "
             "WHERE activity.usename=current_user AND pending.pid<>pg_backend_pid() "
-            "AND pending.relation=CAST(:relation_oid AS oid) AND NOT pending.granted)",
-            relation_oid=relation_oid,
+            "AND pending.relation=to_regclass(:relation_name) AND NOT pending.granted)",
+            relation_name=relation_name,
         ):
             await asyncio.sleep(0.01)
 
@@ -401,7 +468,7 @@ async def test_native_cancellation_drains_owned_copy_and_cleanup(monkeypatch, op
                     else _copy_again(case, name, admission)
                 )
                 operation = asyncio.create_task(pending)
-                await _wait_for_lock(database, created_by_relation[name][0])
+                await _wait_for_lock(database, receipts.qualified(schema, name))
                 operation.cancel()
                 await asyncio.sleep(0)
                 if operation_kind == "cleanup":

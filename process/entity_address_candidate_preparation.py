@@ -8,7 +8,7 @@ import asyncio
 import importlib
 import os
 import re
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import date
@@ -37,7 +37,7 @@ class ProviderDirectoryAddressPreparationInput:
 
     dataset_pins: tuple[ProviderDirectoryAddressDatasetPin, ...]
     overlay_table: str
-    overlay_relation_oid: int
+    overlay_relation_oid: int | None
     address_alias_generation: int
     relation_overrides: tuple[tuple[str, str], ...] = ()
     semantic_as_of: str | None = None
@@ -53,14 +53,15 @@ class PreparedEntityAddressGeneration:
     patch_statements: list[tuple[str, str]]
     relation_names: list[str]
     required_names: list[str]
-    stage_oids: tuple[tuple[str, str, int], ...]
+    stage_oids: tuple[tuple[str, str, int | None], ...]
     context: dict
     publish_validation: dict
     preparation_input: ProviderDirectoryAddressPreparationInput
-    incumbent_overlay_fence: tuple[int, int] | None
+    incumbent_overlay_fence: tuple | None
     committed: bool = False
     native_dependencies: prepared_doctors.PreparedAddressDependencies | None = None
     source_preparation: object = field(default=None, repr=False, compare=False)
+    stage_proofs: tuple = ()
 
     @property
     def native_receipt(self) -> dict | None:
@@ -76,8 +77,8 @@ class PreparedEntityAddressGeneration:
             authority = await native.result_generation.read_entity_address_result_generation_authority(
                 session, schema_name=self.db_schema
             )
-            relation_oids = await native.result_generation._current_relation_oids(native.db, self.db_schema)
-            if authority.as_dict() != self.native_receipt or authority.relation_oids != relation_oids:
+            await native.result_generation._current_relation_names(native.db, self.db_schema)
+            if authority.as_dict() != self.native_receipt:
                 raise RuntimeError("entity-address prepared generation has not committed")
         self.committed = True
         self.context["publication_state"] = "published"
@@ -247,7 +248,9 @@ def validate_preparation_input(inputs: ProviderDirectoryAddressPreparationInput)
     _identifier(inputs.overlay_table)
     if inputs.overlay_table == "provider_directory_address_overlay":
         raise ValueError("entity-address preparation requires a staged overlay")
-    if type(inputs.overlay_relation_oid) is not int or inputs.overlay_relation_oid <= 0:
+    if inputs.overlay_relation_oid is not None and (
+        type(inputs.overlay_relation_oid) is not int or inputs.overlay_relation_oid <= 0
+    ):
         raise ValueError("entity-address preparation overlay OID is invalid")
     if type(inputs.address_alias_generation) is not int or inputs.address_alias_generation < 0:
         raise ValueError("entity-address preparation alias generation is invalid")
@@ -331,6 +334,8 @@ def _ordinary_serving_peers_sql(db_schema, pins):
 
 
 def _desired_datasets_sql(db_schema: str, ordinary_serving_peer_pins=()) -> str:
+    from process import provider_directory_published_replacement_inputs as serving_inputs
+
     # The bounded summary of a sealed dataset lists the same sources as its much larger raw document.
     membership = (
         "COALESCE(dataset.publication_metadata_summary_json -> 'source_ids', "
@@ -343,6 +348,18 @@ def _desired_datasets_sql(db_schema: str, ordinary_serving_peer_pins=()) -> str:
             f"CASE WHEN {_ordinary_serving_peers_sql(db_schema, ordinary_serving_peer_pins)} THEN true "
             f"ELSE {membership} END"
         )
+    if preflight_pin_by_field := serving_inputs.preflight_pin(db_schema):
+        columns = (
+            ("source_id", "source_id"),
+            ("endpoint_id", "endpoint_id"),
+            ("dataset_id", "dataset_id"),
+            ("dataset_hash", "dataset_hash"),
+            ("run_id", "parent_run_id"),
+        )
+        preflight_match_sql = " AND ".join(
+            f"pin.{column}={_native()._sql_literal(preflight_pin_by_field[field])}" for column, field in columns
+        )
+        membership = f"CASE WHEN ({preflight_match_sql}) THEN true ELSE ({membership}) END"
     return f"""SELECT pin.source_id, dataset.endpoint_id, dataset.dataset_id,
         dataset.acquisition_root_run_id AS run_id,
         COALESCE(dataset.published_at, dataset.validated_at) AS published_at
@@ -421,18 +438,36 @@ async def _assert_staged_overlay(db_schema: str, inputs: ProviderDirectoryAddres
     native = _native()
     if await native._address_alias_generation(db_schema) != inputs.address_alias_generation:
         raise RuntimeError("entity-address preparation address aliases changed")
-    desired_oid = await _preparation_scalar(
-        "SELECT to_regclass(:relation)::oid::bigint", relation=f"{db_schema}.{inputs.overlay_table}"
-    )
-    if desired_oid != inputs.overlay_relation_oid:
-        raise RuntimeError("entity-address preparation overlay changed")
+    if inputs.overlay_relation_oid is None or admitted._ADMISSION.get() is None:
+        exists = await _preparation_scalar(
+            "SELECT to_regclass(:relation) IS NOT NULL", relation=f"{db_schema}.{inputs.overlay_table}"
+        )
+        if not exists:
+            raise RuntimeError("entity-address preparation overlay changed")
+    else:
+        desired_oid = await _preparation_scalar(
+            "SELECT to_regclass(:relation)::oid::bigint", relation=f"{db_schema}.{inputs.overlay_table}"
+        )
+        if desired_oid != inputs.overlay_relation_oid:
+            raise RuntimeError("entity-address preparation overlay changed")
 
 
 async def capture_overlay_fence(db_schema: str, context: dict) -> None:
-    """Keep the incumbent fence separate from the desired overlay's future canonical OID."""
+    """Keep the incumbent publication separate from the desired named overlay."""
     native, inputs = _native(), current()
     await assert_dataset_pins(db_schema, inputs)
     await _assert_staged_overlay(db_schema, inputs)
+    if inputs.overlay_relation_oid is None or admitted._ADMISSION.get() is None:
+        exists = await _preparation_scalar(
+            "SELECT to_regclass(:relation) IS NOT NULL", relation=f"{db_schema}.provider_directory_address_overlay"
+        )
+        publication = await native._provider_directory_overlay_alias_fence(db_schema) if exists else None
+        context["incumbent_provider_directory_overlay_fence"] = publication
+        context["provider_directory_overlay_alias_generation"] = inputs.address_alias_generation
+        context["provider_directory_overlay_relation"] = f"{db_schema}.provider_directory_address_overlay"
+        context["provider_directory_overlay_publication"] = None if publication is None else publication[1]
+        context.pop("provider_directory_overlay_relation_oid", None)
+        return
     incumbent_oid = await _preparation_scalar(
         "SELECT to_regclass(:relation)::oid::bigint", relation=f"{db_schema}.provider_directory_address_overlay"
     )
@@ -488,16 +523,20 @@ def _cutover_plan(db_schema, stage_cls, support_stage_class_map, context):
 
 
 async def _capture_stage_oids(db_schema, swaps):
-    """Capture every target and physical stage before the first logging operation."""
+    """Capture named ordinary stages or the existing admitted-stage contract."""
     stage_oids = []
     for swap in swaps:
         stage = swap.stage_cls.__tablename__
-        relation_oid = await _preparation_scalar(
-            "SELECT oid::bigint FROM pg_class WHERE oid=to_regclass(:relation) AND relkind='r'",
-            relation=f"{db_schema}.{stage}",
-        )
-        if relation_oid is not None:
-            stage_oids.append((swap.live_cls.__main_table__, stage, int(relation_oid)))
+        if admitted._ADMISSION.get() is None:
+            if await _preparation_scalar("SELECT to_regclass(:relation) IS NOT NULL", relation=f"{db_schema}.{stage}"):
+                stage_oids.append((swap.live_cls.__main_table__, stage, None))
+        else:
+            relation_oid = await _preparation_scalar(
+                "SELECT oid::bigint FROM pg_class WHERE oid=to_regclass(:relation) AND relkind='r'",
+                relation=f"{db_schema}.{stage}",
+            )
+            if relation_oid is not None:
+                stage_oids.append((swap.live_cls.__main_table__, stage, int(relation_oid)))
     return tuple(stage_oids)
 
 
@@ -548,6 +587,17 @@ async def prepare_finalized_generation(db_schema, stage_cls, support_stage_class
             context=context,
             phase="entity-address-unified analyzing prepared table",
         )
+    stage_proofs = ()
+    if scope is None:
+        from process import provider_directory_serving_recovery_receipts as receipts
+
+        async with receipts.validation_scope(native.db):
+            stage_proofs = tuple(
+                [
+                    await receipts.prepare_relation(native.db, db_schema, swap.stage_cls.__tablename__)
+                    for swap in plan[0]
+                ]
+            )
     context.update(stage_persistence="p", result_generation_mode="ordinary", publication_state="prepared")
     prepared = PreparedEntityAddressGeneration(
         db_schema,
@@ -558,6 +608,7 @@ async def prepare_finalized_generation(db_schema, stage_cls, support_stage_class
         inputs,
         context.get("incumbent_provider_directory_overlay_fence"),
         native_dependencies=_NATIVE_DEPENDENCIES.get(),
+        stage_proofs=stage_proofs,
     )
     await source_preparation.freeze_source_generation(native.db, prepared, scope)
     return prepared
@@ -651,8 +702,21 @@ async def _finish_preparation(ctx, scope, dependencies):
     return prepared
 
 
-async def _assert_prepared_stages(prepared):
+async def _assert_prepared_stages(prepared, *, prepare_missing=False):
     native = _native()
+    if getattr(prepared, "stage_proofs", ()):
+        from process import provider_directory_serving_recovery_receipts as receipts
+
+        for swap, proof in zip(prepared.swaps, prepared.stage_proofs, strict=True):
+            if proof.schema != prepared.db_schema:
+                raise RuntimeError("entity-address prepared schema changed")
+            await receipts.recheck_prepared(
+                native.db, proof, swap.stage_cls.__tablename__, prepare_missing=prepare_missing
+            )
+            await _require_stage_indexes(prepared.db_schema, swap.stage_cls)
+        return
+    if any(oid is None for _target, _stage, oid in prepared.stage_oids):
+        raise RuntimeError("entity-address prepared stage validation is incomplete")
     for swap, (_target, stage, expected_oid) in zip(prepared.swaps, prepared.stage_oids, strict=True):
         actual_oid = await native.db.scalar(
             "SELECT oid::bigint FROM pg_class WHERE oid=to_regclass(:relation) AND relpersistence='p'",
@@ -669,9 +733,10 @@ async def publish_prepared_entity_address_generation(prepared, *, callbacks=None
     native.require_caller_owned_cutover_transaction(native.db)
     if prepared.committed:
         raise RuntimeError("entity-address prepared generation is already committed")
+    from process import provider_directory_serving_recovery_receipts as receipts
 
     async def verify_locked_stages():
-        """Check prepared identities after native locks and before the first swap."""
+        """Check prepared stage data and layout after locks and before the first swap."""
         await assert_dataset_pins(prepared.db_schema, prepared.preparation_input)
         await _assert_prepared_stages(prepared)
         await prepared_doctors.assert_applied_dependencies(native.db, prepared.native_dependencies)
@@ -683,16 +748,20 @@ async def publish_prepared_entity_address_generation(prepared, *, callbacks=None
         before_cutover=verify_locked_stages,
         after_publish=callbacks.after_publish if callbacks is not None else None,
     )
-    await native._run_entity_address_cutover(
-        prepared.db_schema,
-        prepared.swaps,
-        prepared.patch_statements,
-        prepared.relation_names,
-        prepared.required_names,
-        prepared.context,
-        callbacks=native_callbacks,
-        require_caller_owned_transaction=True,
-    )
+    has_stage_proofs = bool(getattr(prepared, "stage_proofs", ()))
+    async with receipts.validation_scope(native.db) if has_stage_proofs else nullcontext():
+        if has_stage_proofs:
+            await _assert_prepared_stages(prepared, prepare_missing=True)
+        await native._run_entity_address_cutover(
+            prepared.db_schema,
+            prepared.swaps,
+            prepared.patch_statements,
+            prepared.relation_names,
+            prepared.required_names,
+            prepared.context,
+            callbacks=native_callbacks,
+            require_caller_owned_transaction=True,
+        )
     if prepared.native_receipt is None:
         raise RuntimeError("entity-address prepared publication requires native result authority")
     return prepared.native_receipt
@@ -742,6 +811,15 @@ async def _drop_owned_stage(db_schema, stage, expected_oid, *, source_input=None
     """Recheck ownership after acquiring native locks; preserve a reused stage name."""
     native = _native()
     relation = f"{_identifier(db_schema)}.{_identifier(stage)}"
+    if expected_oid is None:
+        async with native.db.transaction():
+            await native.db.status("SET LOCAL lock_timeout='500ms'")
+            await native.db.status("SET LOCAL statement_timeout='5s'")
+            if not await native.db.scalar("SELECT to_regclass(:relation) IS NOT NULL", relation=relation):
+                return
+            await native._acquire_cutover_locks(db_schema, [stage], [stage])
+            await native.db.status(f"DROP TABLE {relation} RESTRICT")
+        return
     async with source_preparation.cleanup_transaction(
         native.db, source_input, relation=(db_schema, stage, expected_oid)
     ):
@@ -754,6 +832,63 @@ async def _drop_owned_stage(db_schema, stage, expected_oid, *, source_input=None
         actual_oid = await native.db.scalar("SELECT to_regclass(:relation)::oid::bigint", relation=relation)
         if actual_oid == expected_oid:
             await native.db.status(f"DROP TABLE {relation} RESTRICT")
+
+
+async def capture_provider_directory_overlay_alias_fence(
+    native, db_schema: str, source_selects: list[str], context: dict
+) -> None:
+    """Capture the selected named overlay before a long unified-address build."""
+    if current() is not None:
+        return await capture_overlay_fence(db_schema, context)
+    context.pop("provider_directory_overlay_relation_oid", None)
+    if not native._uses_provider_directory_overlay(db_schema, source_selects):
+        for name in (
+            "provider_directory_overlay_alias_generation",
+            "provider_directory_overlay_publication",
+            "provider_directory_overlay_relation",
+        ):
+            context.pop(name, None)
+        return
+    generation, published_at = await native._provider_directory_overlay_alias_fence(db_schema)
+    if generation != int(context.get("address_alias_generation") or 0):
+        raise RuntimeError(
+            "Provider Directory address overlay uses a stale address alias generation; "
+            "run a full address overlay rebuild before entity-address-unified"
+        )
+    context["provider_directory_overlay_alias_generation"] = generation
+    context["provider_directory_overlay_relation"] = f"{db_schema}.provider_directory_address_overlay"
+    context["provider_directory_overlay_publication"] = published_at
+
+
+async def assert_provider_directory_overlay_alias_fence(native, db_schema: str, context: dict) -> None:
+    """Recheck a logical publication or the validated controlled replacement."""
+    expected_name = context.get("provider_directory_overlay_relation")
+    expected_oid = context.get("provider_directory_overlay_relation_oid")
+    if expected_name is None and expected_oid is None:
+        return
+    expected_generation = int(context.get("provider_directory_overlay_alias_generation") or 0)
+    generation, published_at = await native._provider_directory_overlay_alias_fence(db_schema)
+    if generation != expected_generation:
+        raise RuntimeError("Provider Directory address overlay changed during entity-address-unified build")
+    if expected_name is not None:
+        if expected_name != f"{db_schema}.provider_directory_address_overlay":
+            raise RuntimeError("Provider Directory address overlay changed during entity-address-unified build")
+        if prepared := context.get("serving_recovery_prepared_address"):
+            proof = prepared["proofs"]["provider_directory_address_overlay"]
+            await native.serving_recovery.receipts.recheck_prepared(
+                native.db, proof, "provider_directory_address_overlay"
+            )
+        elif published_at != context.get("provider_directory_overlay_publication"):
+            raise RuntimeError("Provider Directory address overlay changed during entity-address-unified build")
+        return
+    # SOURCE-admitted legacy consumers retain their separate preparation contract.
+    actual_oid = await native.preparation_admission.read_scalar(
+        native.db,
+        "SELECT to_regclass(:relation)::oid::bigint",
+        relation=f"{db_schema}.provider_directory_address_overlay",
+    )
+    if actual_oid != int(expected_oid):
+        raise RuntimeError("Provider Directory address overlay changed during entity-address-unified build")
 
 
 _PROVIDER_DIRECTORY_CURRENT_OVERLAY_CTES_TEMPLATE = """

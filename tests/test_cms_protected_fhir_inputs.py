@@ -13,6 +13,7 @@ from process import provider_directory_cms_native_registration as registration
 from process import provider_directory_generic_source_policy as policy_module
 from process import provider_directory_generic_source_provision as provision
 from process.provider_directory_cms_typed_offices import CMS_OFFICE_READ_TABLES
+from tests.test_geo_assurance_dependency_bindings import _example_bindings
 
 
 def _policy():
@@ -382,7 +383,7 @@ async def test_native_fence_captures_fhir_and_recaptures_after_recursive_locks(c
     monkeypatch.setattr(
         inputs, "_reference_authorities", AsyncMock(return_value={"cms-doctors": {}, "geo": {}, "mrf": {}, "tiger": {}})
     )
-    monkeypatch.setattr(inputs, "_geo_bindings", lambda *args, **kwargs: {})
+    monkeypatch.setattr(inputs, "_geo_bindings", lambda *args, **kwargs: _example_bindings())
     monkeypatch.setattr(inputs, "_revision_guards", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         inputs, "_cms_office_read_relations", AsyncMock(return_value=dict.fromkeys(CMS_OFFICE_READ_TABLES, {}))
@@ -426,7 +427,7 @@ async def test_fhir_v5_preserves_every_existing_tiger_and_nucc_combination(catal
         database=dict(database_oid=81),
         relations=_physical(proof),
         fhir_protected=proof,
-        geo_bindings={},
+        geo_bindings=_example_bindings(),
         reference_authorities=dict.fromkeys(("cms-doctors", "geo", "mrf", "tiger"), {}),
         cms_office_read_relations=dict.fromkeys(CMS_OFFICE_READ_TABLES, {}),
     )
@@ -443,8 +444,9 @@ async def test_fhir_v5_preserves_every_existing_tiger_and_nucc_combination(catal
         prior_version = 3
     if tiger_kind == "captured":
         fence_by_field["tiger_captured"] = _captured_proof()
-        fence_by_field["geo_bindings"] = captured_tiger_bindings(fence_by_field["tiger_captured"])
-        for name, binding in fence_by_field["geo_bindings"].items():
+        captured_bindings = captured_tiger_bindings(fence_by_field["tiger_captured"])
+        fence_by_field["geo_bindings"].update(captured_bindings)
+        for name, binding in captured_bindings.items():
             fence_by_field["relations"]['"' + name.replace(".", '"."') + '"'] = dict(
                 relation_oid=binding["relation_oid"],
                 relfilenode=binding["relfilenode"],

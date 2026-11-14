@@ -773,7 +773,7 @@ def _geocode_reader_session(outcome):
             state.memberships += 1
             return membership_result
         sql = str(statement)
-        if sql.startswith("SET LOCAL"):
+        if sql.startswith(("SET LOCAL", "LOCK TABLE")):
             return None
         if "to_regclass" in sql:
             return SimpleNamespace(scalar=lambda: "mrf.openaddresses_geocode")
@@ -826,7 +826,7 @@ def _install_geocode_detail_loaders(monkeypatch):
         monkeypatch.setattr(provider, name, AsyncMock(return_value=value))
     monkeypatch.setattr(provider, "_NPI_DETAIL_RESPONSE_CACHE_TTL_SECONDS", 0)
     monkeypatch.setenv("HLTHPRT_ADDRESS_ARCHIVE_CUTOVER", "false")
-    monkeypatch.setattr(snapshot, "_inventory_serving_relations", AsyncMock(return_value={}))
+    monkeypatch.setattr(snapshot, "_inventory_relation_names", AsyncMock(return_value={}))
     monkeypatch.setattr(snapshot, "_requires_cms_receipt", AsyncMock(return_value=False))
     monkeypatch.setattr(snapshot, "_read_native_authorities", AsyncMock(return_value={}))
 
@@ -837,6 +837,7 @@ async def test_optional_geocodes_preserve_reader_membership(monkeypatch, outcome
     _install_geocode_detail_loaders(monkeypatch)
     database = db_connection.Database()
     session, state = _geocode_reader_session(outcome)
+    await snapshot._prepare_provider_reader(session, "mrf", fresh=True)
     monkeypatch.setattr(provider, "db", database)
     writer = AsyncMock(side_effect=AssertionError("geocode reads cannot open a Writer"))
     monkeypatch.setattr(provider, "run_as_writer", writer)

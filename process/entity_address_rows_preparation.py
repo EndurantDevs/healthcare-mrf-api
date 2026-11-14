@@ -52,23 +52,31 @@ async def _create_scratch(sql, schema, name, statement, oid_by_name, row_scratch
         """Capture successful creation before forwarding any pending cancellation."""
         await admission.create_stage_sql(schema, name, statement)
         scope = admission._ADMISSION.get()
-        oid = (
-            scope.owned_oids.get(name)
-            if scope is not None
-            else await admission.read_scalar(
-                sql.db, "SELECT to_regclass(:relation)::oid::bigint", relation=f"{schema}.{name}"
+        if ordinary_preparation.current() is not None:
+            oid_by_name[name] = None
+        else:
+            oid = (
+                scope.owned_oids.get(name)
+                if scope is not None
+                else await admission.read_scalar(
+                    sql.db, "SELECT to_regclass(:relation)::oid::bigint", relation=f"{schema}.{name}"
+                )
             )
-        )
-        if type(oid) is not int or oid <= 0:
-            raise RuntimeError("address row scratch identity is missing")
-        oid_by_name[name] = oid
+            if type(oid) is not int or oid <= 0:
+                raise RuntimeError("address row scratch identity is missing")
+            oid_by_name[name] = oid
 
     await admission._finish_owned_operation(create)
 
 
 async def _drop_scratch(sql, schema, names, oid_by_name):
-    scope = admission._ADMISSION.get() or ordinary_preparation.current()
+    scope = admission._ADMISSION.get()
+    ordinary = ordinary_preparation.current()
     for name in reversed(names):
+        if ordinary is not None:
+            if name in ordinary.created_names:
+                await admission.drop_stage(schema, name)
+            continue
         if scope is not None:
             if name in scope.owned_oids:
                 await admission.drop_stage(schema, name)

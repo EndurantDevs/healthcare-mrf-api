@@ -479,6 +479,9 @@ async def _activate(
 ) -> archive.NpiActivationReceipt:
     owner = await session.scalar(text("SELECT quote_ident(rolname) FROM pg_roles WHERE oid=:oid"), {"oid": owner_oid})
     await session.execute(text(f"SET LOCAL ROLE {owner}"))
+    from tests.npi_owned_publication_postgres_support import assert_geo_profile_read_only
+
+    await assert_geo_profile_read_only(session, incumbent.schema_name)
 
     async def record_activation(active_session, _receipt) -> None:
         """Persist a synthetic controller record in the caller transaction."""
@@ -613,13 +616,19 @@ async def _complete_activation_proof(
         validation=validation,
         previous_authority=destination_initial,
     )
-    async with sessions() as session, session.begin():
-        receipt = await _activate(
-            session,
-            prepared=prepared,
-            incumbent=incumbent,
-            owner_oid=owner_oid,
-            validation=validation,
+    async with sessions() as reader, reader.begin():
+        await reader.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+        assert (
+            await generation.read_npi_result_generation_authority(reader, schema_name=destination_schema)
+            == destination_initial
+        )
+        async with sessions() as session, session.begin():
+            receipt = await _activate(
+                session, prepared=prepared, incumbent=incumbent, owner_oid=owner_oid, validation=validation
+            )
+        assert (
+            await generation.read_npi_result_generation_authority(reader, schema_name=destination_schema)
+            == destination_initial
         )
     cleanup_schemas.discard(prepared.ownership.schema_name)
     cleanup_schemas.add(receipt.predecessor_schema_name)
@@ -699,10 +708,40 @@ async def test_ordinary_publication_generation_is_transactional() -> None:
             await engine.dispose()
 
 
+async def _assert_restored_npi_family_remains_uncached(connection, schema_name, published_generation):
+    """Keep a restored family uncached when its legacy trigger leaves the revision unchanged."""
+    from api.npi_native_cache_identity import npi_native_cache_identity
+
+    async def execute(statement, *, session=None, params=None):
+        """Read through the same actual native transaction used for publication."""
+        return await connection.execute(statement, params or {})
+
+    assert await npi_native_cache_identity(execute, schema_name) is None
+    async with connection.begin_nested() as savepoint:
+        await connection.execute(text(f'ALTER TABLE "{schema_name}".npi RENAME TO previous_npi'))
+        assert await npi_native_cache_identity(execute, schema_name) is None
+        await connection.execute(
+            text(f'CREATE TABLE "{schema_name}".npi (LIKE "{schema_name}".previous_npi INCLUDING ALL)')
+        )
+        await connection.execute(text(f'INSERT INTO "{schema_name}".npi SELECT * FROM "{schema_name}".previous_npi'))
+        await connection.execute(
+            text(
+                f'CREATE TRIGGER "{generation.REVISION_TRIGGER}" AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE '
+                f'ON "{schema_name}".npi FOR EACH STATEMENT '
+                f'EXECUTE FUNCTION "{schema_name}"."{generation.REVISION_FUNCTION}"()'
+            )
+        )
+        await connection.execute(text(f"UPDATE \"{schema_name}\".npi SET marker='after-restore'"))
+        assert await connection.scalar(text(f'SELECT marker FROM "{schema_name}".npi')) == "after-restore"
+        restored = await generation.read_npi_result_generation_authority(connection, schema_name=schema_name)
+        assert restored == published_generation
+        assert await npi_native_cache_identity(execute, schema_name) is None
+        await savepoint.rollback()
+
+
 @pytest.mark.asyncio
 async def test_owned_publication_binds_iso_import_date_and_rolls_back_generation() -> None:
     """Keep the owned publication's portable date compatible with native asyncpg."""
-    from api.npi_native_cache_identity import npi_native_cache_identity
     from process import npi_owned_publication as owned
 
     engine = create_async_engine(_database_url(), poolclass=NullPool)
@@ -724,17 +763,7 @@ async def test_owned_publication_binds_iso_import_date_and_rolls_back_generation
             assert advanced.relation_oids == receipt.relation_oids
             assert advanced.canonical_provenance.import_date.isoformat() == receipt.import_date
 
-            async def execute(statement, *, session=None, params=None):
-                """Read through the same actual native transaction used for publication."""
-                return await connection.execute(statement, params or {})
-
-            expected_key = f"native:{advanced.local_lineage_id}:{advanced.local_generation}:{receipt.publication_ref}"
-            assert await npi_native_cache_identity(execute, schema_name) == expected_key
-            async with connection.begin_nested() as savepoint:
-                await connection.execute(text(f'ALTER TABLE "{schema_name}".npi RENAME TO previous_npi'))
-                await connection.execute(text(f'CREATE TABLE "{schema_name}".npi (npi bigint)'))
-                assert await npi_native_cache_identity(execute, schema_name) is None
-                await savepoint.rollback()
+            await _assert_restored_npi_family_remains_uncached(connection, schema_name, advanced)
             await transaction.rollback()
         async with engine.connect() as connection:
             assert (
@@ -933,14 +962,17 @@ async def test_npi_snapshot_generation_activation_and_rollback(native_runtime) -
         async with sessions() as session, session.begin():
             await archive.cleanup_npi_stage(session, old_snapshot_owner)
         cleanup_schemas.discard(old_snapshot_owner.schema_name)
-        await _complete_activation_proof(
-            sessions,
-            source_schema=source_schema,
-            destination_schema=destination_schema,
-            source_initial=source_initial,
-            cleanup_schemas=cleanup_schemas,
-            custody=native_runtime.custody,
-        )
+        from tests.npi_owned_publication_postgres_support import independent_geo_profile
+
+        async with independent_geo_profile(native_runtime, destination_schema):
+            await _complete_activation_proof(
+                sessions,
+                source_schema=source_schema,
+                destination_schema=destination_schema,
+                source_initial=source_initial,
+                cleanup_schemas=cleanup_schemas,
+                custody=native_runtime.custody,
+            )
     finally:
         try:
             await _drop_schemas(engine, cleanup_schemas)
@@ -1888,3 +1920,61 @@ from tests.npi_owned_publication_postgres_support import (
 from tests.npi_owned_publication_postgres_support import (
     test_native_output_rejects_incomplete_canonical_closure as test_native_output_rejects_incomplete_canonical_closure,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rotation", ("ordinary", "archive"))
+@pytest.mark.parametrize("binding_mode", ("canonical_null", "canonical_named", "held"))
+async def test_native_npi_rotation_invalidates_only_its_geo_sources(monkeypatch, rotation, binding_mode):
+    from api import ptg2_geo_projection as projection
+    from process.entity_address_dependency_bindings import activate_geo_assurance_candidate_sql
+    from tests.npi_owned_publication_postgres_support import assert_geo_profile_read_only
+    from tests.test_entity_address_snapshot_destination import _owned_native_database
+    from tests.test_geo_assurance_dependency_bindings import (
+        _assert_busy_geo_state_independence,
+        _assert_pinned_geo_reader,
+        _npi_geo_actor,
+        _prepare_npi_geo_rotation,
+        _rotate_npi_with_timeout,
+    )
+
+    async_dsn = _database_url()
+    async with _owned_native_database(async_dsn, monkeypatch) as database:
+        stage_oid = await _prepare_npi_geo_rotation(database, binding_mode, monkeypatch)
+        async with _npi_geo_actor(database) as actor:
+            state_sql = "SELECT to_jsonb(state) FROM mrf.entity_address_geo_assurance_state state"
+            original_state = await database.scalar(state_sql)
+            readiness = text("SELECT " + projection.projection_state_available_sql("mrf"))
+            assert await database.scalar(str(readiness)) is True
+            await _assert_busy_geo_state_independence(database, rotation, actor)
+            with pytest.raises(ValueError, match="rollback publication"):
+                async with actor.sessions() as session, session.begin():
+                    await assert_geo_profile_read_only(session, "mrf")
+                    await _rotate_npi_with_timeout(session, rotation)
+                    assert await session.scalar(text(state_sql)) == original_state
+                    raise ValueError("rollback publication")
+            assert await database.scalar(str(readiness)) is True
+            assert (
+                await database.scalar(
+                    "SELECT candidate_geo_assurance_version FROM mrf.entity_address_geo_assurance_state"
+                )
+                == projection.GEO_ASSURANCE_VERSION
+            )
+            await _assert_pinned_geo_reader(database, actor, readiness, rotation)
+            assert await database.scalar(state_sql) == original_state
+            assert await database.scalar(str(readiness)) is (binding_mode == "held")
+            assert await database.scalar(activate_geo_assurance_candidate_sql("mrf")) == (
+                stage_oid if binding_mode == "held" else None
+            )
+
+
+@pytest.mark.asyncio
+async def test_native_npi_publication_refuses_missing_geo_write_rights(monkeypatch):
+    """Keep the enrolled case while proving metadata grants never authorize geo writes."""
+    from tests.npi_owned_publication_postgres_support import (
+        assert_held_geo_generation_independence,
+        assert_legacy_geo_fallback,
+    )
+
+    await assert_legacy_geo_fallback(_database_url(), monkeypatch)
+    await assert_held_geo_generation_independence(_database_url(), monkeypatch)

@@ -163,3 +163,73 @@ async def validate_profile_delta_total_wal(fhir, capacity_admission, capacity_fo
             f"commit_envelope={commit_envelope_bytes}:"
             f"maximum={maximum_wal_bytes}"
         )
+
+
+async def assert_artifact_build_fence(fhir: Any, stage: Any) -> None:
+    """Recheck the captured logical publication and existing artifact dependencies."""
+    if stage.build_fence is None:
+        return
+    if stage.target_relation == fhir.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE:
+        if (
+            not isinstance(stage.build_fence, fhir._ProviderDirectoryAliasBuildFence)
+            or stage.build_fence.target_name != fhir._qt(stage.schema, stage.target_relation)
+            or await fhir._address_overlay_publication(stage.schema, lock=True) != stage.build_fence.target_publication
+        ):
+            raise fhir.ProviderDirectoryArtifactBuildStale(stage.target_relation)
+    else:
+        current_target_oid = await fhir._provider_directory_relation_oid(stage.schema, stage.target_relation)
+        if current_target_oid != stage.build_fence.target_oid:
+            raise fhir.ProviderDirectoryArtifactBuildStale(stage.target_relation)
+    if stage.build_fence.alias_generation is not None:
+        current_alias_generation = await fhir._address_alias_generation(stage.schema)
+        if current_alias_generation != stage.build_fence.alias_generation:
+            raise fhir.ProviderDirectoryArtifactBuildStale(f"{stage.target_relation}:address_alias_generation")
+    if stage.build_fence.dependency_relation == fhir.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE:
+        publication = await fhir._address_overlay_publication(stage.schema, lock=True)
+        if publication is None or publication != getattr(stage.build_fence, "dependency_publication", None):
+            raise fhir.ProviderDirectoryArtifactBuildStale(f"{stage.target_relation}:dependency_relation")
+        if publication[0] != stage.build_fence.alias_generation:
+            raise fhir.ProviderDirectoryArtifactBuildStale(f"{stage.target_relation}:address_overlay_generation")
+    elif stage.build_fence.dependency_relation is not None:
+        current_dependency_oid = await fhir._provider_directory_relation_oid(
+            stage.schema, stage.build_fence.dependency_relation
+        )
+        if current_dependency_oid != stage.build_fence.dependency_relation_oid:
+            raise fhir.ProviderDirectoryArtifactBuildStale(f"{stage.target_relation}:dependency_relation")
+
+
+async def capture_address_corroboration_fence(
+    fhir: Any, schema: str, relation: str, source_ids: list[str], build_fence: Any
+) -> Any:
+    """Capture alias generation and overlay identity for corroboration build."""
+    alias_generation = await fhir._address_alias_generation(schema)
+    artifact_generation = await fhir._address_alias_artifact_generation(schema, relation)
+    if artifact_generation != alias_generation and source_ids:
+        raise RuntimeError(
+            "address alias generation changed; a full Provider Directory address corroboration rebuild is required"
+        )
+    dependency_relation = fhir._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(
+        fhir.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+        fhir.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
+    )
+    if dependency_relation == fhir.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE:
+        publication = await fhir._address_overlay_publication(schema)
+        if publication is None:
+            raise RuntimeError("Provider Directory address overlay dependency is missing")
+        if publication[0] != alias_generation:
+            raise RuntimeError("Provider Directory address overlay uses a stale address alias generation")
+        return fhir._ProviderDirectoryAliasBuildFence(
+            target_oid=build_fence.target_oid,
+            alias_generation=alias_generation,
+            dependency_relation=dependency_relation,
+            dependency_publication=publication,
+        )
+    dependency_relation_oid = await fhir._provider_directory_relation_oid(schema, dependency_relation)
+    if dependency_relation_oid is None:
+        raise RuntimeError("Provider Directory address overlay dependency is missing")
+    return replace(
+        build_fence,
+        alias_generation=alias_generation,
+        dependency_relation=dependency_relation,
+        dependency_relation_oid=dependency_relation_oid,
+    )

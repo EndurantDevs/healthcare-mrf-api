@@ -21,6 +21,12 @@ from tests.test_reader_failure_diagnostics import CORE_ID, REQUEST_ID, _database
 async def test_signed_provider_entry_uses_guarded_claims_reader(monkeypatch, resource):
     session = ReaderSession()
     install_reader_factory(monkeypatch, session)
+
+    async def pin_claims(reader):
+        assert reader.info["provider_profile_relations"]["mrf.npi"] == "mrf.npi"
+        assert any(str(statement).startswith("LOCK TABLE ") for statement, _ in reader.executed)
+
+    reference_family_reads.pin_claims_reader.side_effect = pin_claims
     request = SimpleNamespace(path="/api/v1/extensions/custom-import/" + resource, headers={})
     async with boundary.signed_request_reader(request, cold_caller()) as reader:
         assert reader is session
@@ -28,11 +34,12 @@ async def test_signed_provider_entry_uses_guarded_claims_reader(monkeypatch, res
             reference_family_reads.pin_claims_reader.assert_awaited_once_with(session)
         else:
             reference_family_reads.pin_claims_reader.assert_not_awaited()
+            assert "provider_profile_relations" not in session.info
     assert session.closed and session.committed
 
 
 @pytest.mark.parametrize("address,port", [(None, None), ("not-an-ip-address", 5432)])
-async def test_reader_failure_logs_only_valid_native_identity(monkeypatch, caplog, address, port):
+async def test_reader_failure_omits_physical_identity(monkeypatch, caplog, address, port):
     session = ReaderSession()
     database = install_reader_factory(monkeypatch, session)
     ordinary = cold_caller()
@@ -40,17 +47,13 @@ async def test_reader_failure_logs_only_valid_native_identity(monkeypatch, caplo
     failure = RuntimeError("credential-sentinel")
     with pytest.raises(RuntimeError) as caught:
         async with boundary.signed_request_reader(request, ordinary, verified_request_id=REQUEST_ID):
-            session.info["api_reader_identity"].update(server_address=address, server_port=port)
+            session.info["api_reader_identity"] = {"server_address": address, "server_port": port}
             raise failure
     assert caught.value is failure and not hasattr(request, "ctx")
     assert session.closed and session.rolled_back and not database.has_reader_session()
     fields, _ = _logged(failure, caplog)
     assert fields["request_id"] == REQUEST_ID and fields["request_id_source"] == "verified_transport"
-    assert fields["reader"] == (
-        {"role_oid": 12345, "database_oid": 23456, "backend_pid": 34567, "server_address": None, "server_port": None}
-        if address is None
-        else None
-    )
+    assert fields["reader"] is None
 
 
 @pytest.mark.parametrize("failure_type", [RuntimeError, asyncio.CancelledError])

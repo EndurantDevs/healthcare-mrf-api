@@ -8,6 +8,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
+import asyncpg
 import pytest
 from sqlalchemy import MetaData, text
 from sqlalchemy.schema import CreateTable
@@ -24,7 +25,9 @@ from process.entity_address_snapshot_source import (
     EntityAddressSourceCopy,
     entity_address_archive_relations,
     entity_address_unified,
-    native_entity_address_source_copy,
+)
+from process.entity_address_snapshot_source import (
+    native_entity_address_source_copy as native_entity_address_source_copy,
 )
 from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
@@ -416,7 +419,7 @@ async def _verify_current_pair(session, pair, monkeypatch, roles, physical, proo
     source_index = await _copy_source_index_shapes(session, proof.source_pin.schema_name)
     clone_index = await _copy_source_index_shapes(session, pair.address_ownership.schema_name)
     assert len(source_index) == 2 and source_index == clone_index
-    if physical:
+    if pair.witness_json is not None:
         await _reject_v2_tampering(session, pair)
     else:
         await _assert_v1_wire(session, pair)
@@ -458,7 +461,7 @@ async def test_native_pair_capture_replay_and_closed_custody(monkeypatch, tmp_pa
             await _cancel_capture(database, proof, roles, monkeypatch)
             await _reject_copy_budget(database, proof, roles)
             pair = await _capture_bounded_pair(database, proof, capture_id, roles)
-            assert (pair.witness_json is not None) is physical
+            assert pair.witness_json is None
             assert len(capture._json(pair.as_dict()).encode()) <= 65536
             assert pair.recipe.source_pin.schema_name == "mrf"
             assert len(pair.address_receipt.tables) == 7
@@ -493,10 +496,10 @@ async def _verify_physical_pair_replay(database, pair, proof, roles, monkeypatch
     async with database.session_factory() as session:
         assert (
             await session.scalar(
-                text("SELECT oid FROM pg_namespace WHERE nspname=:schema"),
+                text("SELECT nspname FROM pg_namespace WHERE nspname=:schema"),
                 {"schema": pair.address_ownership.schema_name},
             )
-            == pair.address_ownership.schema_oid
+            == pair.address_ownership.schema_name
         )
     await _prove_lost_acknowledgement(database, proof, roles, monkeypatch)
 
@@ -510,7 +513,7 @@ async def _verify_closed_pair(session, pair, monkeypatch):
 
         patch.setattr(capture, "capture_entity_address_archive_receipt", no_content_scan)
         patch.setattr(
-            "process.network_cms_registry_address_capture.capture_entity_address_archive_receipt",
+            "process.network_cms_registry_address_equivalence.receipt.capture_entity_address_archive_receipt",
             no_content_scan,
         )
         assert (
@@ -557,7 +560,8 @@ async def _verify_read_pair(database, pair, monkeypatch, *, published):
                 "process.network_cms_registry_address_equivalence.receipt._normalize_receipt_session", forbidden_scan
             )
             patch.setattr(
-                "process.network_cms_registry_address_capture.capture_entity_address_archive_receipt", forbidden_scan
+                "process.network_cms_registry_address_equivalence.receipt.capture_entity_address_archive_receipt",
+                forbidden_scan,
             )
             patch.setattr("process.network_fhir_source_epoch._content", forbidden_scan)
             resolved = await capture.resolve_committed_registry_cms_source_pair(session, pair.recipe)
@@ -609,33 +613,20 @@ async def _reject_read_pair_comments(database, pair):
 
 
 async def _reject_read_pair_write_grant(database, pair):
-    """Actual opened native custody is refused without changing reader settings."""
-    schema, role = pair.address_source.schema_name, pair.runtime_roles[0]
-    try:
-        async with database.session_factory() as session, session.begin():
-            await session.execute(text(f'GRANT UPDATE ON "{schema}".entity_address_unified TO "{role}"'))
-        async with database.session_factory() as session, session.begin():
-            await _read_transaction(session)
-            before = await _read_settings(session)
-            with pytest.raises(ValueError):
-                await capture.resolve_committed_registry_cms_source_pair(session, pair.recipe)
-            assert await _read_settings(session) == before
-    finally:
-        async with database.session_factory() as session, session.begin():
-            await session.execute(text(f'REVOKE UPDATE ON "{schema}".entity_address_unified FROM "{role}"'))
+    """Installed read-only permissions reject writes without a metadata attestation."""
+    async with database.session_factory() as session, session.begin():
+        await _reject_address_write_grant(session, pair, pair.runtime_roles[0])
 
 
 async def _reject_address_write_grant(session, pair, runtime_role):
-    """Both semantic and cheap final validators reject newly opened write custody."""
-    await session.execute(
-        text(f'GRANT UPDATE ON "{pair.address_source.schema_name}".entity_address_unified TO "{runtime_role}"')
-    )
-    with pytest.raises(ValueError):
-        await require_registry_cms_source_pair(session, pair)
-    with pytest.raises(ValueError):
-        await require_registry_cms_source_pair_connection(
-            await capture.native_driver(session), pair, verify_content=False
-        )
+    """The real application role cannot update the published snapshot."""
+    driver = await capture.native_driver(session)
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        async with driver.transaction():
+            await driver.execute(f'SET LOCAL ROLE "{runtime_role}"')
+            await driver.execute(
+                f'UPDATE "{pair.address_source.schema_name}".entity_address_unified SET entity_id=entity_id WHERE false'
+            )
 
 
 async def _assert_v1_wire(session, pair):
@@ -658,7 +649,8 @@ async def _assert_v1_wire(session, pair):
     assert pair.as_dict() == legacy_by_field
     assert pair.pair_sha256 == capture._digest(legacy_by_field)
     comment = await session.scalar(
-        text("SELECT obj_description(:oid,'pg_namespace')"), {"oid": pair.address_ownership.schema_oid}
+        text("SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=:schema"),
+        {"schema": pair.address_ownership.schema_name},
     )
     assert comment == capture._COMMENT + capture._json(legacy_by_field)
     assert decode_registry_cms_source_pair(json.loads(capture._json(legacy_by_field))) == pair
@@ -729,7 +721,7 @@ async def _prove_lost_acknowledgement(database, proof, roles, monkeypatch):
             runtime_roles=tuple(sorted(roles[1:])),
             source_copy=_bounded_source_copy(),
         )
-        assert retained.witness_json is not None
+        assert retained.witness_json is None
     finally:
         async with database.engine.begin() as connection:
             for schema in ("registry_cms_epoch_" + capture_id.hex, "entity_address_archive_" + capture_id.hex):

@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Generation-bound cache proof for canonical NPI publication receipts."""
+"""Current logical generations control canonical NPI cache freshness."""
 
 from __future__ import annotations
 
@@ -32,37 +32,14 @@ class _ScalarResult:
 
 
 @pytest.mark.asyncio
-async def test_publication_identity_requires_one_sealed_live_oid_match(monkeypatch):
+async def test_publication_identity_bypasses_native_cache_without_portable_invalidation(monkeypatch):
     monkeypatch.delenv("HLTHPRT_DB_SCHEMA", raising=False)
     monkeypatch.delenv("DB_SCHEMA", raising=False)
-    execute_stmt = AsyncMock(return_value=_RowsResult([(7, "nppub1_" + "c" * 43)]))
+    execute_stmt = AsyncMock(side_effect=AssertionError("native cache metadata must not be queried"))
     monkeypatch.setattr(npi_module, "_execute_stmt", execute_stmt)
-
     identity = await npi_module._npi_canonical_publication_identity()
-
-    assert identity == "7:nppub1_" + "c" * 43
-    statement = str(execute_stmt.await_args.args[0])
-    assert "npi_canonical_publication_receipt_seal" in statement
-    assert statement.count("to_regclass") == 6
-    assert set(execute_stmt.await_args.kwargs["params"]) == {
-        "npi_ref",
-        "npi_address_ref",
-        "npi_taxonomy_ref",
-        "npi_taxonomy_group_ref",
-        "npi_other_identifier_ref",
-        "npi_phone_staffing_ref",
-    }
-    assert set(execute_stmt.await_args.kwargs["params"].values()) == {
-        f"mrf.{table_name}"
-        for table_name in (
-            "npi",
-            "npi_address",
-            "npi_taxonomy",
-            "npi_taxonomy_group",
-            "npi_other_identifier",
-            "npi_phone_staffing",
-        )
-    }
+    assert identity is None
+    execute_stmt.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

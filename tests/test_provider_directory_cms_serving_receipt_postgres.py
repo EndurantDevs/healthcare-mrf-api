@@ -15,6 +15,7 @@ from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from process import entity_address_serving_receipt as address_continuity
 from process import provider_directory_cms_native_inputs as native_inputs
 from process import provider_directory_cms_serving_receipt as receipts
 from process import reference_family_result_generation as generation
@@ -98,7 +99,7 @@ def _create_profile_table(connection, schema):
 
 
 @asynccontextmanager
-async def _database(monkeypatch, *, install_receipt=True, install_source_guard=True):
+async def _database(monkeypatch, *, install_receipt=True, install_source_guard=True, portable_receipts=False):
     """Confine real guard SQL to a UUID schema in the existing UUID-owned database guard."""
     schema = "cms_receipt_" + uuid4().hex
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
@@ -117,6 +118,8 @@ async def _database(monkeypatch, *, install_receipt=True, install_source_guard=T
                 await connection.run_sync(
                     lambda sync: sync.exec_driver_sql(_migration("20261019130000")._repair_sql(schema))
                 )
+                if portable_receipts:
+                    await connection.run_sync(lambda sync: _apply(sync, "20261114120000"))
         yield engine, schema
     finally:
         async with engine.begin() as connection:
@@ -336,6 +339,194 @@ async def _publish_initial(engine, schema):
     return {"receipt_id": receipt_id, "payload": payload}
 
 
+async def _copy_cms_named_tables(connection, schema, copied_schema):
+    """Copy the existing table data without rewriting historical receipt metadata."""
+    names = (
+        *receipts._NATIVE_RELATIONS,
+        "provider_directory_source",
+        "provider_directory_endpoint_dataset",
+        "provider_directory_cms_candidate_coverage",
+        "provider_directory_cms_serving_coverage",
+        "provider_directory_cms_npd_relationship_receipt",
+        "address_alias_state_v1",
+        "address_alias_artifact_state_v1",
+        "entity_address_result_generation",
+        "reference_family_result_generation",
+        "provider_directory_profile_serving_generation",
+        receipts._TABLE,
+    )
+    await connection.execute(text(f'CREATE SCHEMA "{copied_schema}"'))
+    for name in names:
+        await connection.execute(
+            text(f'CREATE TABLE "{copied_schema}"."{name}" (LIKE "{schema}"."{name}" INCLUDING ALL)')
+        )
+        columns = "(receipt_id,payload,publication_xid,created_at)" if name == receipts._TABLE else ""
+        selection = "receipt_id,payload,publication_xid,created_at" if columns else "*"
+        await connection.execute(
+            text(f'INSERT INTO "{copied_schema}"."{name}" {columns} SELECT {selection} FROM "{schema}"."{name}"')
+        )
+
+
+def _install_existing_cms_hooks(sync, copied_schema):
+    """Install the existing business guards around the copied fixture."""
+    migration = _migration("20260930100000")
+    with Operations.context(MigrationContext.configure(sync)):
+        for function in (
+            migration._create_native_readers,
+            migration._create_archive_check,
+            migration._create_result_check,
+            migration._create_snapshot_check,
+            migration._create_current_check,
+            migration._create_insert_guard,
+            migration._create_fresh_guard,
+            migration._create_native_transition_guards,
+            migration._create_source_transition_guards,
+            migration._create_truncate_guards,
+        ):
+            function(f'"{copied_schema}"')
+
+
+async def _assert_copied_cms_authority_rollback(engine, copied_schema, current):
+    """Require rejected authority changes to leave the copied receipt current."""
+    for change in ("source", "vector"):
+        with pytest.raises(DBAPIError, match="cms_serving_fresh_receipt_required"):
+            async with engine.begin() as connection:
+                await _change_authority(connection, copied_schema, change)
+        async with engine.connect() as connection:
+            assert await receipts.read_named_serving_receipt(connection, copied_schema) == current
+
+
+@pytest.mark.asyncio
+async def test_named_receipt_reads_copied_metadata_and_keeps_data_checks(monkeypatch):
+    """Copy immutable metadata, publish a successor and retain rollback failures."""
+    async with _database(monkeypatch) as (engine, schema):
+        initial = await _publish_initial(engine, schema)
+        copied_schema = "cms_copy_" + uuid4().hex
+        try:
+            async with engine.begin() as connection:
+                await _copy_cms_named_tables(connection, schema, copied_schema)
+            async with engine.begin() as connection:
+                assert await receipts.read_named_current_receipt(connection, copied_schema) == initial
+                assert await receipts.read_named_serving_receipt(connection, copied_schema) == initial
+                captured = await receipts.capture_named_dependencies(connection, copied_schema, lock=True)
+                assert captured["address"]["relation_oids"] is captured["doctors"]["relation_oids"] is None
+                assert await receipts._ordinary_data_matches(connection, f'"{copied_schema}"', initial["payload"])
+                await connection.execute(
+                    text(
+                        f'UPDATE "{copied_schema}".provider_directory_cms_npd_relationship_receipt '
+                        "SET relationship_count=relationship_count+1"
+                    )
+                )
+                assert not await receipts._ordinary_data_matches(connection, f'"{copied_schema}"', initial["payload"])
+                await connection.execute(
+                    text(
+                        f'UPDATE "{copied_schema}".provider_directory_cms_npd_relationship_receipt '
+                        "SET relationship_count=relationship_count-1"
+                    )
+                )
+                # The committed historical document remains unchanged, including legacy fields.
+                assert (
+                    await connection.scalar(text(f'SELECT payload FROM "{copied_schema}".{receipts._TABLE}'))
+                    == initial["payload"]
+                )
+            async with engine.begin() as connection:
+                await connection.run_sync(lambda sync: _install_existing_cms_hooks(sync, copied_schema))
+                monkeypatch.setenv("HLTHPRT_DB_SCHEMA", copied_schema)
+                monkeypatch.setenv("DB_SCHEMA", copied_schema)
+                await connection.run_sync(lambda sync: _apply(sync, "20261114120000"))
+            async with engine.begin() as connection:
+                await _ordinary_callback_transition(connection, copied_schema)
+            async with engine.connect() as connection:
+                current = await receipts.read_named_serving_receipt(connection, copied_schema)
+                assert current["payload"]["predecessor_receipt_id"] == initial["receipt_id"]
+                assert current["payload"]["address"]["local_generation"] == 2
+                assert await receipts.verify_historical_receipt(
+                    connection, copied_schema, initial["receipt_id"], initial["payload"]
+                )
+            await _assert_copied_cms_authority_rollback(engine, copied_schema, current)
+        finally:
+            async with engine.begin() as connection:
+                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{copied_schema}" CASCADE'))
+
+
+@pytest.mark.asyncio
+async def test_forward_deferred_guard_commits_portable_ordinary_publication(monkeypatch):
+    """A populated historical chain advances after the forward routine correction."""
+    async with _database(monkeypatch) as (engine, schema):
+        initial = await _publish_initial(engine, schema)
+        async with engine.begin() as connection:
+            await connection.run_sync(lambda sync: _apply(sync, "20261114120000"))
+        appended_counts = []
+        async with engine.begin() as connection:
+            await _ordinary_callback_transition(connection, schema)
+            appended_counts.append(await connection.scalar(text(f'SELECT count(*) FROM "{schema}".{receipts._TABLE}')))
+        assert appended_counts == [2]
+        with pytest.raises(RuntimeError, match="cms_routines_prevent_downgrade"):
+            async with engine.begin() as connection:
+                await connection.run_sync(lambda sync: _apply(sync, "20261114120000", "downgrade"))
+        async with engine.connect() as connection:
+            assert await connection.scalar(text(f'SELECT count(*) FROM "{schema}".{receipts._TABLE}')) == 2
+            current = await receipts.read_named_current_receipt(connection, schema)
+            assert current["payload"]["predecessor_receipt_id"] == initial["receipt_id"]
+            assert current["payload"]["address"]["relation_oids"] is None
+
+
+async def _ordinary_callback_transition(connection, schema):
+    from types import SimpleNamespace
+
+    async def scalar(statement, **parameters):
+        return await connection.scalar(text(statement) if isinstance(statement, str) else statement, parameters)
+
+    async def status(statement):
+        return await connection.execute(text(statement))
+
+    @asynccontextmanager
+    async def transaction():
+        async with connection.begin_nested():
+            yield connection
+
+    database = SimpleNamespace(
+        scalar=scalar,
+        status=status,
+        transaction=transaction,
+        _transaction_binding=lambda: SimpleNamespace(session=connection),
+    )
+    callbacks = address_continuity.ordinary_address_receipt_callbacks(
+        database, schema, lambda value: "'" + value.replace("'", "''") + "'"
+    )
+    await callbacks.before_cutover()
+    await connection.execute(
+        text(
+            f'UPDATE "{schema}".entity_address_result_generation '
+            "SET local_generation=local_generation+1,origin_lineage_id=local_lineage_id,"
+            "origin_generation=local_generation+1,published_at=clock_timestamp(),relation_oids=NULL"
+        )
+    )
+    await callbacks.after_publish()
+
+
+@pytest.mark.asyncio
+async def test_forward_guard_ignores_legacy_metadata_only_changes(monkeypatch):
+    async with _database(monkeypatch, portable_receipts=True) as (engine, schema):
+        initial = await _publish_initial(engine, schema)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f'UPDATE "{schema}".entity_address_result_generation a '
+                    "SET relation_oids=ARRAY(SELECT value FROM unnest(a.relation_oids) WITH ORDINALITY r(value,position) ORDER BY position DESC)"
+                )
+            )
+            await connection.execute(
+                text(
+                    f'UPDATE "{schema}".provider_directory_profile_serving_generation '
+                    "SET evidence_target_oid=profile_target_oid,profile_target_oid=evidence_target_oid"
+                )
+            )
+        async with engine.connect() as connection:
+            assert await receipts.read_named_serving_receipt(connection, schema) == initial
+            assert await receipts.read_current_receipt(connection, schema) == initial
+
+
 async def _install_archive(engine, schema):
     """Use the real mutation ledger and ALWAYS triggers around a minimal canonical heap."""
     async with engine.begin() as connection:
@@ -469,9 +660,10 @@ async def test_archive_history_survives_later_native_input_changes(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_common_receipt_history_and_native_pair_refresh(monkeypatch):
+@pytest.mark.parametrize("portable_receipts", [False, True])
+async def test_common_receipt_history_and_native_pair_refresh(monkeypatch, portable_receipts):
     """Address-only and Profile-only publications each advance the chain; old acknowledgments remain provable."""
-    async with _database(monkeypatch) as (engine, schema):
+    async with _database(monkeypatch, portable_receipts=portable_receipts) as (engine, schema):
         first = await _publish_initial(engine, schema)
         async with engine.begin() as connection:
             assert await receipts.read_current_receipt(connection, schema) == first
@@ -494,10 +686,11 @@ async def test_common_receipt_history_and_native_pair_refresh(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("portable_receipts", [False, True])
 @pytest.mark.parametrize("change", ["address", "doctors", "profile", "source", "dataset", "vector", "root"])
-async def test_native_publication_without_common_receipt_rolls_back(monkeypatch, change):
+async def test_native_publication_without_common_receipt_rolls_back(monkeypatch, change, portable_receipts):
     """Generic publishers cannot commit any partial serving authority transition."""
-    async with _database(monkeypatch) as (engine, schema):
+    async with _database(monkeypatch, portable_receipts=portable_receipts) as (engine, schema):
         initial = await _publish_initial(engine, schema)
         with pytest.raises(DBAPIError, match="cms_serving_fresh_receipt_required"):
             async with engine.begin() as connection:
@@ -532,10 +725,11 @@ async def _change_authority(connection, schema, change):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("portable_receipts", [False, True])
 @pytest.mark.parametrize("operation", ["publish", "purge"])
-async def test_profile_selection_preserves_independent_cms_source_pin(monkeypatch, operation):
+async def test_profile_selection_preserves_independent_cms_source_pin(monkeypatch, operation, portable_receipts):
     """An ordinary published or purged Profile may omit CMS without withdrawing its native source."""
-    async with _database(monkeypatch) as (engine, schema):
+    async with _database(monkeypatch, portable_receipts=portable_receipts) as (engine, schema):
         initial = await _publish_initial(engine, schema)
         async with engine.begin() as connection:
             await connection.execute(
@@ -558,22 +752,29 @@ async def test_profile_selection_preserves_independent_cms_source_pin(monkeypatc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tamper", ["coverage", "vector", "doctors", "date", "overlay", "predecessor"])
-async def test_receipt_rejects_changed_authority_and_rolls_back(monkeypatch, tamper):
+@pytest.mark.parametrize("portable_receipts", [False, True])
+@pytest.mark.parametrize("tamper", ["coverage", "vector", "doctors", "date", "overlay", "predecessor", "counter"])
+async def test_receipt_rejects_changed_authority_and_rolls_back(monkeypatch, tamper, portable_receipts):
     """Neither a changed proof nor a forged native result can commit partial publication."""
-    async with _database(monkeypatch) as (engine, schema):
+    async with _database(monkeypatch, portable_receipts=portable_receipts) as (engine, schema):
         initial = await _publish_initial(engine, schema)
         with pytest.raises(DBAPIError):
             async with engine.begin() as connection:
                 await _advance_native(connection, schema)
                 payload = await _payload(connection, schema, initial)
-                _tamper(payload, tamper)
+                if portable_receipts and tamper == "overlay":
+                    payload["alias_generation"] += 1
+                else:
+                    _tamper(payload, tamper)
                 await receipts.append_serving_receipt(connection, schema, payload)
         async with engine.connect() as connection:
             assert await receipts.read_current_receipt(connection, schema) == initial
 
 
 def _tamper(payload, kind):
+    if kind == "counter":
+        payload["address"]["local_generation"] += 1
+        return
     if kind == "vector":
         payload["cms"]["dataset_hash"] = "d" * 64
         payload["desired_datasets"] = [{**_PIN, "dataset_hash": "d" * 64}]

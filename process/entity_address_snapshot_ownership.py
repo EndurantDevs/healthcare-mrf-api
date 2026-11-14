@@ -26,12 +26,18 @@ class EntityAddressArchiveStageOwnership:
 
     dataset_id: UUID
     schema_name: str
-    schema_oid: int
-    relation_oids: tuple[tuple[str, int], ...]
+    schema_oid: int | None
+    relation_oids: tuple[tuple[str, int | None], ...]
 
     def as_dict(self) -> dict[str, Any]:
         """Return the bounded persisted representation without database handles."""
 
+        if self.schema_oid is None:
+            return {
+                "dataset_id": str(self.dataset_id),
+                "schema_name": self.schema_name,
+                "table_names": [name for name, _ in self.relation_oids],
+            }
         relations = (
             [[table_name, oid] for table_name, oid in self.relation_oids]
             if tuple(name for name, _ in self.relation_oids) == _supported_names()[1]
@@ -172,11 +178,6 @@ async def capture_created_entity_address_archive_stage(
     schema_name = entity_address_archive_stage_schema(dataset_id)
     schema_oid = await _schema_oid(session, schema_name)
     relation_oids = await _table_oids(session, schema_oid)
-    await _assert_namespace_is_owned(
-        session,
-        schema_oid=schema_oid,
-        relation_oids=relation_oids,
-    )
     return EntityAddressArchiveStageOwnership(
         dataset_id=dataset_id,
         schema_name=schema_name,
@@ -216,6 +217,21 @@ def validate_entity_address_archive_stage_ownership(
 
     if isinstance(owner_value, EntityAddressArchiveStageOwnership):
         owner_value = owner_value.as_dict()
+    if isinstance(owner_value, Mapping) and set(owner_value) == {"dataset_id", "schema_name", "table_names"}:
+        try:
+            dataset_id = UUID(str(owner_value["dataset_id"]))
+        except (TypeError, ValueError, AttributeError) as error:
+            raise EntityAddressArchiveOwnershipError("entity-address archive ownership token is invalid") from error
+        names = owner_value["table_names"]
+        if (
+            owner_value["schema_name"] != entity_address_archive_stage_schema(dataset_id)
+            or not isinstance(names, list)
+            or tuple(names) not in _supported_names()
+        ):
+            raise EntityAddressArchiveOwnershipError("entity-address archive ownership token is invalid")
+        return EntityAddressArchiveStageOwnership(
+            dataset_id, owner_value["schema_name"], None, tuple((name, None) for name in names)
+        )
     if not isinstance(owner_value, Mapping) or set(owner_value) != {
         "dataset_id",
         "schema_name",
@@ -242,15 +258,9 @@ async def _assert_owner_current(
     owner: EntityAddressArchiveStageOwnership,
 ) -> None:
     schema_oid = await _schema_oid(session, owner.schema_name)
-    if schema_oid != owner.schema_oid:
-        raise EntityAddressArchiveOwnershipError("entity-address archive ownership schema OID differs")
-    if await _table_oids(session, schema_oid) != owner.relation_oids:
-        raise EntityAddressArchiveOwnershipError("entity-address archive ownership relation OID differs")
-    await _assert_namespace_is_owned(
-        session,
-        schema_oid=schema_oid,
-        relation_oids=owner.relation_oids,
-    )
+    current_relations = await _table_oids(session, schema_oid)
+    if tuple(name for name, _ in current_relations) != tuple(name for name, _ in owner.relation_oids):
+        raise EntityAddressArchiveOwnershipError("entity-address archive relation family differs")
 
 
 async def verify_entity_address_archive_stage_ownership(
@@ -281,8 +291,6 @@ async def cleanup_entity_address_archive_stage(
     )
     if current_schema_oid is None:
         return
-    if current_schema_oid != validated_owner.schema_oid:
-        raise EntityAddressArchiveOwnershipError("entity-address archive ownership schema OID differs")
     table_names = ", ".join(
         f"{_quoted(validated_owner.schema_name)}.{_quoted(table_name)}"
         for table_name, _ in validated_owner.relation_oids
@@ -292,7 +300,7 @@ async def cleanup_entity_address_archive_stage(
     await session.execute(text(f"DROP TABLE {table_names} RESTRICT"))
     remaining = await session.scalar(
         text("SELECT COUNT(*) FROM pg_catalog.pg_class WHERE relnamespace = :schema_oid"),
-        {"schema_oid": validated_owner.schema_oid},
+        {"schema_oid": current_schema_oid},
     )
     if int(remaining or 0) != 0:
         raise EntityAddressArchiveOwnershipError("entity-address archive ownership namespace is not empty")

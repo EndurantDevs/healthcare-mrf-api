@@ -17,6 +17,24 @@ native = importlib.import_module("process.entity_address_unified")
 generation = importlib.import_module("process.entity_address_result_generation")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ledger_exists", (False, True))
+async def test_retention_probe_distinguishes_absence_without_ignoring_denied_reads(monkeypatch, ledger_exists):
+    """An inaccessible namespace is not evidence that a present ledger is empty."""
+    denied = PermissionError("retention inventory is unavailable")
+    scalar = AsyncMock(side_effect=[True, True, denied] if ledger_exists else [False])
+    monkeypatch.setattr(native.db, "scalar", scalar)
+    swap = SimpleNamespace(live_cls=SimpleNamespace(__main_table__="entity_address_unified"))
+    if ledger_exists:
+        with pytest.raises(PermissionError, match="retention inventory"):
+            await adoption._require_protected_cutover("mrf", [swap], {})
+        assert scalar.await_args.kwargs["names"] == ["entity_address_unified", "entity_address_unified_old"]
+    else:
+        await adoption._require_protected_cutover("mrf", [swap], {})
+    probes = scalar.await_args_list[:2] if ledger_exists else scalar.await_args_list
+    assert all("pg_catalog.pg_namespace" in call.args[0] and "to_regclass" not in call.args[0] for call in probes)
+
+
 def _source_generation():
     return generation.EntityAddressServingGeneration(
         origin_lineage_id="c8f27af1-56ba-4cda-82d8-0fc67650918f",

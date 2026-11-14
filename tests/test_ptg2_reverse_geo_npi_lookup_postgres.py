@@ -50,10 +50,7 @@ def _location_query(schema: str) -> serving._MembershipLocationQuery:
     return serving._MembershipLocationQuery(
         address_table=f"{schema}.entity_address_unified",
         npi_scope_table=f"{schema}.ptg2_v3_npi_scope",
-        filter_sql=(
-            "npi_scope.snapshot_key = :shared_snapshot_key "
-            f"AND ({address_filter_sql})"
-        ),
+        filter_sql=(f"npi_scope.snapshot_key = :shared_snapshot_key AND ({address_filter_sql})"),
         parameter_map=query_parameter_map,
         distance_sql=distance_sql,
         knn_order_sql=None,
@@ -88,10 +85,7 @@ async def _insert_cms_spatial_candidate(database, schema: str) -> None:
 async def _insert_parity_edge_rows(database, schema: str) -> None:
     """Add one duplicate assured address and one incomplete issuer witness."""
 
-    await database.status(
-        f"INSERT INTO {schema}.ptg2_v3_npi_scope (snapshot_key, npi) "
-        "VALUES (41, 1990000304)"
-    )
+    await database.status(f"INSERT INTO {schema}.ptg2_v3_npi_scope (snapshot_key, npi) VALUES (41, 1990000304)")
     await database.status(
         f"""
         INSERT INTO {schema}.entity_address_unified (
@@ -161,7 +155,7 @@ def test_npi_only_sql_keeps_the_unique_scope_probe_correlated():
     assert "addr.location_key" in statement
     assert "ORDER BY distance_miles ASC NULLS LAST, npi" in statement
     assert statement.index("ORDER BY distance_miles") < statement.index("LIMIT :limit")
-    metadata_predicate = geo_projection.projection_state_available_sql("mrf")
+    metadata_predicate = geo_projection.projection_state_available_sql("mrf", has_canonical_generation=False)
     sql_without_metadata = statement
     for predicate in (metadata_predicate, _schema_sql(metadata_predicate, "mrf")):
         assert predicate in statement
@@ -264,22 +258,28 @@ async def test_npi_reader_short_circuits_empty_and_unavailable_queries(monkeypat
     query_builder = AsyncMock(return_value=None)
     monkeypatch.setattr(serving, "_membership_location_query", query_builder)
 
-    assert await serving._membership_npi_rows(
-        object(),
-        strict_v3_tables(),
-        {},
-        candidate_npis=(),
-        limit=10,
-    ) == []
+    assert (
+        await serving._membership_npi_rows(
+            object(),
+            strict_v3_tables(),
+            {},
+            candidate_npis=(),
+            limit=10,
+        )
+        == []
+    )
     query_builder.assert_not_awaited()
 
-    assert await serving._membership_npi_rows(
-        object(),
-        strict_v3_tables(),
-        {},
-        candidate_npis=None,
-        limit=10,
-    ) is None
+    assert (
+        await serving._membership_npi_rows(
+            object(),
+            strict_v3_tables(),
+            {},
+            candidate_npis=None,
+            limit=10,
+        )
+        is None
+    )
     query_builder.assert_awaited_once()
 
     query_builder.return_value = _location_query("mrf")
@@ -288,25 +288,31 @@ async def test_npi_reader_short_circuits_empty_and_unavailable_queries(monkeypat
     monkeypatch.setattr(serving, "_execute_membership_location_sql", query_executor)
     monkeypatch.setattr(serving, "_is_relation_available", evidence_probe)
 
-    assert await serving._membership_npi_rows(
-        object(),
-        strict_v3_tables(),
-        {"zip5": "00001"},
-        candidate_npis=None,
-        limit=10,
-    ) == []
+    assert (
+        await serving._membership_npi_rows(
+            object(),
+            strict_v3_tables(),
+            {"zip5": "00001"},
+            candidate_npis=None,
+            limit=10,
+        )
+        == []
+    )
     query_executor.assert_awaited_once()
     evidence_probe.assert_not_awaited()
 
     query_executor.return_value = [{"npi": 101}]
     evidence_probe.return_value = False
-    assert await serving._membership_npi_rows(
-        object(),
-        strict_v3_tables(),
-        {"zip5": "00001"},
-        candidate_npis=(101,),
-        limit=10,
-    ) == []
+    assert (
+        await serving._membership_npi_rows(
+            object(),
+            strict_v3_tables(),
+            {"zip5": "00001"},
+            candidate_npis=(101,),
+            limit=10,
+        )
+        == []
+    )
     evidence_probe.assert_awaited_once()
 
 
@@ -354,9 +360,7 @@ async def test_npi_only_reader_preserves_assurance_exhaustion_and_fail_closed(
             AsyncMock(side_effect=lambda *_args, **_kwargs: _location_query(schema)),
         )
         serving_tables = strict_v3_tables()
-        request_arg_map = {
-            "zip5": "00001", "lat": 42.0, "long": -83.0, "radius_miles": 30
-        }
+        request_arg_map = {"zip5": "00001", "lat": 42.0, "long": -83.0, "radius_miles": 30}
 
         async with database.transaction() as session:
             full_rows, npi_rows = await _read_full_and_compact_rows(
@@ -377,18 +381,14 @@ async def test_npi_only_reader_preserves_assurance_exhaustion_and_fail_closed(
             assert serving._is_graph_location_source_exhausted(full_rows, 10)
             assert serving._is_graph_location_source_exhausted(npi_rows, 10)
 
-            await session.execute(
-                serving.text(f"DROP TABLE {schema}.entity_address_evidence")
-            )
+            await session.execute(serving.text(f"DROP TABLE {schema}.entity_address_evidence"))
             missing_full_rows, missing_npi_rows = await _read_full_and_compact_rows(
                 session,
                 serving_tables,
                 request_arg_map,
                 limit=3,
             )
-            expected_missing_evidence_rows = [
-                {"_ptg_probe_empty": True, "_ptg_source_exhausted": False}
-            ]
+            expected_missing_evidence_rows = [{"_ptg_probe_empty": True, "_ptg_source_exhausted": False}]
             assert missing_full_rows == expected_missing_evidence_rows
             assert missing_npi_rows == expected_missing_evidence_rows
             assert not serving._is_graph_location_source_exhausted(

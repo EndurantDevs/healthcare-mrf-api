@@ -3,13 +3,13 @@
 
 import asyncio
 import json
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 
 from process import entity_address_candidate_preparation as address
@@ -236,6 +236,177 @@ async def test_native_target_membership_remains_required(monkeypatch, phase):
                     await operation
 
 
+async def test_native_preflight_refuses_membership_summary_drift_with_unchanged_digest(monkeypatch):
+    async with ordinary_serving_case(monkeypatch) as case:
+        await _seed(case)
+        async with replacement.preparation_scope(case.directory, _markers()) as fence:
+            snapshot = await inputs.capture(case.directory, fence)
+        digest = snapshot["publication"]["header"]["publication_metadata_sha256"]
+        await case.database.status(
+            f"UPDATE {case.schema}.provider_directory_endpoint_dataset SET publication_metadata_json="
+            "jsonb_set(publication_metadata_json::jsonb,'{source_ids}','[]')::json,"
+            "publication_metadata_summary_json=jsonb_set(publication_metadata_summary_json,'{source_ids}','[]') "
+            "WHERE dataset_id='dataset_shared'"
+        )
+        assert (
+            await case.database.scalar(
+                f"SELECT publication_metadata_sha256 FROM {case.schema}.provider_directory_endpoint_dataset "
+                "WHERE dataset_id='dataset_shared'"
+            )
+            == digest
+        )
+        with pytest.raises(ValueError, match="replacement_inputs_"):
+            async with inputs.preflight_publication(case.directory, snapshot):
+                pytest.fail("Summary source membership must be validated before entering the scope")
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+async def test_native_preflight_compact_recheck_and_reset_before_transaction_exit(monkeypatch, rollback):
+    async with ordinary_serving_case(monkeypatch) as case:
+        await _seed(case)
+        async with replacement.preparation_scope(case.directory, _markers()) as fence:
+            snapshot = await inputs.capture(case.directory, fence)
+        statements = []
+
+        def observe(_connection, _cursor, statement, _parameters, _context, _executemany):
+            statements.append(statement)
+
+        event.listen(case.database.engine.sync_engine, "before_cursor_execute", observe)
+        transaction = case.database.transaction
+
+        @asynccontextmanager
+        async def observe_exit():
+            async with transaction() as session:
+                try:
+                    yield session
+                finally:
+                    checkpoint = len(statements)
+                    await inputs.lock_and_check(case.directory, snapshot)
+                    assert any("publication_metadata_summary_json" in query for query in statements[checkpoint:])
+
+        async def scoped_recheck():
+            async with inputs.preflight_publication(case.directory, snapshot):
+                assert any("publication_metadata_summary_json" in query for query in statements)
+                checkpoint = len(statements)
+                await case.database.status("SET LOCAL statement_timeout='1s'")
+                await inputs.lock_and_check(case.directory, snapshot)
+                await inputs.lock_and_check(case.directory, snapshot)
+                assert not any("publication_metadata_summary_json" in query for query in statements[checkpoint:])
+                if rollback:
+                    raise RuntimeError("deliberate preflight rollback")
+
+        expectation = pytest.raises(RuntimeError, match="deliberate preflight rollback") if rollback else nullcontext()
+        try:
+            # The enclosing transaction makes preflight use its supported savepoint path.
+            async with transaction():
+                with monkeypatch.context() as temporary, expectation:
+                    temporary.setattr(case.database, "transaction", observe_exit)
+                    await scoped_recheck()
+            checkpoint = len(statements)
+            async with transaction():
+                await inputs.lock_and_check(case.directory, snapshot)
+            assert any("publication_metadata_summary_json" in query for query in statements[checkpoint:])
+        finally:
+            event.remove(case.database.engine.sync_engine, "before_cursor_execute", observe)
+
+
+async def test_native_preflight_does_not_borrow_validation_for_mutated_snapshot(monkeypatch):
+    async with ordinary_serving_case(monkeypatch) as case:
+        await _seed(case)
+        async with replacement.preparation_scope(case.directory, _markers()) as fence:
+            snapshot = await inputs.capture(case.directory, fence)
+        async with inputs.preflight_publication(case.directory, snapshot):
+            original = snapshot["publication"]["header"]["dataset_hash"]
+            snapshot["publication"]["header"]["dataset_hash"] = "d" * 64
+            try:
+                with pytest.raises(ValueError, match="replacement_inputs_publication_changed"):
+                    await inputs.lock_and_check(case.directory, snapshot)
+            finally:
+                snapshot["publication"]["header"]["dataset_hash"] = original
+            await inputs.lock_and_check(case.directory, snapshot)
+
+
+async def test_native_preflight_pin_checks_keep_target_and_peer_boundaries(monkeypatch):
+    async with ordinary_serving_case(monkeypatch) as case:
+        await _seed(case)
+        async with replacement.preparation_scope(case.directory, _markers()) as fence:
+            snapshot = await inputs.capture(case.directory, fence)
+        desired = await _desired_input(case, snapshot, monkeypatch)
+        assert inputs.preflight_pin(case.schema) is None
+        async with inputs.preflight_publication(case.directory, snapshot):
+            pin_by_field = inputs.preflight_pin(case.schema)
+            assert pin_by_field == inputs._pin(snapshot["publication"])
+            pin_by_field["source_id"] = "absent_source"
+            assert inputs.preflight_pin(case.schema) == inputs._pin(snapshot["publication"])
+            assert inputs.preflight_pin(case.schema + "_other") is None
+            await case.database.status("SET LOCAL statement_timeout='1s'")
+            await address.assert_dataset_pins(case.schema, desired)
+            for field, replacement_value in (("source_id", "absent_source"), ("dataset_hash", "d" * 64)):
+                changed = replace(
+                    desired,
+                    dataset_pins=tuple(
+                        replace(pin, **{field: replacement_value}) if pin.source_id == snapshot["source_id"] else pin
+                        for pin in desired.dataset_pins
+                    ),
+                )
+                with pytest.raises(RuntimeError, match="dataset pins changed"):
+                    await address.assert_dataset_pins(case.schema, changed)
+            with pytest.raises(RuntimeError, match="dataset pins changed"):
+                await address.assert_dataset_pins(case.schema, replace(desired, ordinary_serving_peer_pins=()))
+        assert inputs.preflight_pin(case.schema) is None
+        await case.database.status(
+            f"UPDATE {case.schema}.provider_directory_endpoint_dataset SET publication_metadata_json="
+            "jsonb_set(publication_metadata_json::jsonb,'{source_ids}','[]')::json,"
+            "publication_metadata_summary_json=jsonb_set(publication_metadata_summary_json,'{source_ids}','[]') "
+            "WHERE dataset_id='dataset_shared'"
+        )
+        async with case.database.transaction():
+            await case.database.status("SET LOCAL statement_timeout='1s'")
+            with pytest.raises(RuntimeError, match="dataset pins changed"):
+                await address.assert_dataset_pins(case.schema, desired)
+
+
+async def test_native_preflight_locks_writers_and_keeps_readers(monkeypatch):
+    async with ordinary_serving_case(monkeypatch) as case:
+        await _seed(case)
+        await _dormant(case)
+        async with replacement.preparation_scope(case.directory, _markers()) as fence:
+            snapshot = await inputs.capture(case.directory, fence)
+        async with inputs.preflight_publication(case.directory, snapshot):
+            await _assert_reader_continuity(case)
+            for statement in (
+                f"UPDATE {case.schema}.provider_directory_endpoint_dataset SET publication_metadata_json="
+                "jsonb_set(publication_metadata_json::jsonb,'{source_ids}','[]')::json,"
+                "publication_metadata_summary_json=jsonb_set(publication_metadata_summary_json,'{source_ids}','[]') "
+                "WHERE dataset_id='dataset_shared'",
+                f"UPDATE {case.schema}.provider_directory_source SET endpoint_id='endpoint_shared' "
+                "WHERE source_id='source_primary'",
+            ):
+                await _assert_phantom_blocked(case, statement)
+
+
+@pytest.mark.parametrize("damage", ["alias", "newly_serving"])
+async def test_native_preflight_final_vector_refuses_new_serving_phantoms(monkeypatch, damage):
+    async with ordinary_serving_case(monkeypatch) as case:
+        await _seed(case)
+        await _dormant(case)
+        async with replacement.preparation_scope(case.directory, _markers()) as fence:
+            snapshot = await inputs.capture(case.directory, fence)
+        statement_by_damage = {
+            "alias": f"INSERT INTO {case.schema}.provider_directory_source"
+            "(source_id,endpoint_id,org_name,requires_registration,requires_api_key) "
+            "VALUES ('new_alias','endpoint_shared','New alias',false,false)",
+            "newly_serving": f"UPDATE {case.schema}.provider_directory_endpoint_dataset "
+            "SET status='published',published_at=now() WHERE dataset_id='dataset_dormant'",
+        }
+        async with case.database.engine.begin() as writer:
+            await writer.execute(text("SET LOCAL statement_timeout='1s'"))
+            await writer.execute(text(statement_by_damage[damage]))
+        async with inputs.preflight_publication(case.directory, snapshot):
+            with pytest.raises(ValueError, match="replacement_inputs_serving_changed"):
+                await inputs.lock_and_check(case.directory, snapshot)
+
+
 async def test_native_peer_metadata_is_not_new_publication_authority(monkeypatch):
     async with ordinary_serving_case(monkeypatch) as case:
         await _seed(case)
@@ -298,13 +469,15 @@ async def test_native_final_cut_refuses_peer_and_complete_set_drift(monkeypatch,
                 await inputs.lock_and_check(case.directory, snapshot)
 
 
-async def test_native_final_freeze_blocks_phantoms_but_keeps_readers(monkeypatch):
+@pytest.mark.parametrize("preflight", [False, True])
+async def test_native_final_freeze_blocks_phantoms_but_keeps_readers(monkeypatch, preflight):
     async with ordinary_serving_case(monkeypatch) as case:
         await _seed(case)
         await _dormant(case)
         async with replacement.preparation_scope(case.directory, _markers()) as fence:
             snapshot = await inputs.capture(case.directory, fence)
-        async with case.database.transaction():
+        scope = inputs.preflight_publication(case.directory, snapshot) if preflight else case.database.transaction()
+        async with scope:
             await inputs.lock_and_check(case.directory, snapshot)
             await _assert_reader_continuity(case)
             for statement in (

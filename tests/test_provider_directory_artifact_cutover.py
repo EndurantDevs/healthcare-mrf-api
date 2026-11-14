@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 from collections.abc import Callable
 from contextlib import asynccontextmanager, nullcontext
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -32,9 +33,7 @@ async def _create_artifact_bundle_relations(database, schema: str) -> None:
         "artifact_stage_b": "new-b",
     }
     for relation_name, value in values_by_relation.items():
-        await database.status(
-            f"CREATE TABLE {schema}.{relation_name} (value text NOT NULL);"
-        )
+        await database.status(f"CREATE TABLE {schema}.{relation_name} (value text NOT NULL);")
         await database.status(
             f"INSERT INTO {schema}.{relation_name} VALUES (:value);",
             value=value,
@@ -63,9 +62,7 @@ async def _prepared_bundle_stage(
 
 async def _artifact_relation_value(database, schema: str, relation: str) -> str:
     """Read the marker value stored in a disposable artifact relation."""
-    return str(
-        await database.scalar(f"SELECT value FROM {schema}.{relation};")
-    )
+    return str(await database.scalar(f"SELECT value FROM {schema}.{relation};"))
 
 
 async def _assert_artifact_relation_values(
@@ -75,11 +72,14 @@ async def _assert_artifact_relation_values(
 ) -> None:
     """Assert marker values for a set of disposable artifact relations."""
     for relation, expected_value in expected_values_by_relation.items():
-        assert await _artifact_relation_value(
-            database,
-            schema,
-            relation,
-        ) == expected_value
+        assert (
+            await _artifact_relation_value(
+                database,
+                schema,
+                relation,
+            )
+            == expected_value
+        )
 
 
 class _FakeTransaction:
@@ -189,9 +189,7 @@ async def test_artifact_cutover_logs_stage_before_transaction_and_renames_indexe
     events = _install_cutover_db(monkeypatch)
 
     async def rename_indexes(schema, stage_table):
-        await importer.db.status(
-            f'ALTER INDEX "{schema}"."{stage_table}_lookup_idx" RENAME TO "artifact_lookup_idx";'
-        )
+        await importer.db.status(f'ALTER INDEX "{schema}"."{stage_table}_lookup_idx" RENAME TO "artifact_lookup_idx";')
 
     await importer._cutover_provider_directory_artifact_stage(
         schema="mrf",
@@ -359,20 +357,25 @@ async def test_artifact_build_guard_serializes_complete_build_cycle(monkeypatch)
     engine = _AdvisoryEngine()
     monkeypatch.setattr(importer.db, "engine", engine)
     monkeypatch.setattr(importer.asyncio, "sleep", AsyncMock())
-    monkeypatch.setattr(importer, "_provider_directory_relation_oid", AsyncMock(return_value=42))
+    publication_fields = (2, datetime(2026, 1, 1, tzinfo=UTC))
+    monkeypatch.setattr(importer, "_address_overlay_publication", AsyncMock(return_value=publication_fields))
     first_entered = importer.asyncio.Event()
     release_first = importer.asyncio.Event()
 
     async def hold_first_guard():
-        async with importer._provider_directory_artifact_build_guard("mrf", "address_overlay") as build_fence:
-            assert build_fence.target_oid == 42
+        async with importer._provider_directory_artifact_build_guard(
+            "mrf", importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE
+        ) as build_fence:
+            assert build_fence.target_oid is None and build_fence.target_publication == publication_fields
             first_entered.set()
             await release_first.wait()
 
     first_task = importer.asyncio.create_task(hold_first_guard())
     await first_entered.wait()
     with pytest.raises(importer.ProviderDirectoryArtifactCutoverConflict):
-        async with importer._provider_directory_artifact_build_guard("mrf", "address_overlay"):
+        async with importer._provider_directory_artifact_build_guard(
+            "mrf", importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE
+        ):
             raise AssertionError("the second publisher entered the guarded build")
     release_first.set()
     await first_task
@@ -399,15 +402,18 @@ async def test_artifact_build_guard_closes_lookup_transaction_before_build(monke
         finally:
             transaction_state.is_active = False
 
-    async def relation_oid(*args):
+    async def publication(*args):
         assert transaction_state.is_active and engine.locked
-        return 42
+        return (2, datetime(2026, 1, 1, tzinfo=UTC))
 
     monkeypatch.setattr(preparation, "active_nonprofile_sql_transaction", transaction)
-    monkeypatch.setattr(importer, "_provider_directory_relation_oid", relation_oid)
+    monkeypatch.setattr(importer, "_address_overlay_publication", publication)
     with pytest.raises(RuntimeError, match="synthetic build failure") if failure else nullcontext():
-        async with importer._provider_directory_artifact_build_guard("mrf", "address_overlay") as fence:
-            assert fence.target_oid == 42 and not transaction_state.is_active and engine.locked
+        async with importer._provider_directory_artifact_build_guard(
+            "mrf", importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE
+        ) as fence:
+            assert fence.target_oid is None and fence.target_publication[0] == 2
+            assert not transaction_state.is_active and engine.locked
             if failure:
                 raise RuntimeError("synthetic build failure")
     assert not transaction_state.is_active and not engine.locked
@@ -415,22 +421,35 @@ async def test_artifact_build_guard_closes_lookup_transaction_before_build(monke
 
 
 @pytest.mark.asyncio
-async def test_artifact_cutover_rejects_stage_built_from_superseded_target(monkeypatch):
+@pytest.mark.parametrize("changed", ["generation", "timestamp", "absent"])
+async def test_artifact_cutover_rejects_superseded_logical_publication(monkeypatch, changed):
     events = _install_cutover_db(monkeypatch)
-    monkeypatch.setattr(importer, "_provider_directory_relation_oid", AsyncMock(return_value=22))
-
+    publication_fields = (2, datetime(2026, 1, 1, tzinfo=UTC))
+    current_publication_by_change = {
+        "generation": (3, publication_fields[1]),
+        "timestamp": (2, publication_fields[1] + timedelta(seconds=1)),
+        "absent": None,
+    }
+    monkeypatch.setattr(
+        importer, "_address_overlay_publication", AsyncMock(return_value=current_publication_by_change[changed])
+    )
+    oid_lookup = AsyncMock(side_effect=AssertionError("Overlay fencing must use its logical publication"))
+    monkeypatch.setattr(importer, "_provider_directory_relation_oid", oid_lookup)
+    fence = importer._ProviderDirectoryAliasBuildFence(
+        target_oid=None,
+        target_name=importer._qt("mrf", importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE),
+        target_publication=publication_fields,
+    )
+    stage = importer.ProviderDirectoryPreparedArtifactStage(
+        "mrf", "overlay_stage", importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, AsyncMock(), fence
+    )
     with pytest.raises(importer.ProviderDirectoryArtifactBuildStale):
-        await importer._promote_provider_directory_artifact_stage(
-            "mrf",
-            "overlay_stage",
-            "address_overlay",
-            AsyncMock(),
-            importer.ProviderDirectoryArtifactBuildFence(target_oid=11),
+        await importer._promote_provider_directory_artifact_stage_transaction(
+            stage.schema, stage.stage_table, stage.target_relation, stage.rename_stage_indexes, fence
         )
-
-    assert events.count("transaction-rollback") == 1
-    assert events.count("transaction-commit") == 0
-    assert not any('RENAME TO "address_overlay_old"' in event for event in events)
+    oid_lookup.assert_not_called()
+    assert events.count("transaction-rollback") == 1 and events.count("transaction-commit") == 0
+    assert not any("RENAME TO" in event for event in events)
 
 
 @pytest.mark.asyncio
@@ -461,20 +480,103 @@ async def test_artifact_cutover_transaction_deadline_rolls_back(monkeypatch):
 
 def test_artifact_stage_names_are_unique_for_duplicate_runs():
     network_names = {importer._network_catalog_stage_table_name("run_1") for _index in range(10)}
-    overlay_names = {
-        importer._address_overlay_stage_table_name("run_1")
-        for _index in range(1_000)
-    }
+    overlay_names = {importer._address_overlay_stage_table_name("run_1") for _index in range(1_000)}
 
     assert len(network_names) == 10
     assert len(overlay_names) == 1_000
-    assert all(
-        importer._is_address_overlay_stage_table_name(name)
-        for name in overlay_names
-    )
+    assert all(importer._is_address_overlay_stage_table_name(name) for name in overlay_names)
     legacy_name = (
         f"{importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_PREFIX}_"
-        + "a"
-        * importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_LEGACY_IDENTIFIER_HEX_LENGTH
+        + "a" * importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_STAGE_LEGACY_IDENTIFIER_HEX_LENGTH
     )
     assert importer._is_address_overlay_stage_table_name(legacy_name)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_rename", [None, "address_overlay_old", "address_overlay"])
+async def test_artifact_rename_notifications_follow_successful_sql(monkeypatch, failed_rename):
+    events = []
+    stage = importer.ProviderDirectoryPreparedArtifactStage("mrf", "overlay_stage", "address_overlay", AsyncMock())
+
+    async def status(statement, **_params):
+        events.append(("sql", statement))
+        if failed_rename is not None and statement.endswith(f'RENAME TO "{failed_rename}";'):
+            raise RuntimeError("rename failed")
+
+    def renamed(schema, original, replacement, *, index=False):
+        assert events[-1] == ("sql", f'ALTER TABLE "mrf"."{original}" RENAME TO "{replacement}";')
+        events.append(("rename", schema, original, replacement, index))
+
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(importer, "_provider_directory_relation_attribute", AsyncMock(return_value="r"))
+    monkeypatch.setattr(importer.serving_recovery, "retain_overlay", AsyncMock())
+    monkeypatch.setattr(importer.serving_recovery.receipts, "record_rename", renamed)
+    if failed_rename is None:
+        await importer._install_provider_directory_prepared_stage(stage)
+    else:
+        with pytest.raises(RuntimeError, match="rename failed"):
+            await importer._install_provider_directory_prepared_stage(stage)
+    notifications = [event for event in events if event[0] == "rename"]
+    expected_count_by_failure = {None: 2, "address_overlay_old": 0, "address_overlay": 1}
+    assert len(notifications) == expected_count_by_failure[failed_rename]
+
+
+@pytest.mark.asyncio
+async def test_overlay_index_rename_notifications_follow_successful_sql(monkeypatch):
+    statements = []
+    notifications = []
+
+    async def status(statement, **_params):
+        statements.append(statement)
+
+    def renamed(schema, original, replacement, *, index=False):
+        assert statements[-1] == f'ALTER INDEX IF EXISTS "{schema}"."{original}" RENAME TO "{replacement}";'
+        assert index is True
+        notifications.append((original, replacement))
+
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(importer.serving_recovery.receipts, "record_rename", renamed)
+    await importer._rename_address_overlay_stage_indexes("mrf", "overlay_stage")
+    assert len(notifications) == len(importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_INDEX_SUFFIXES)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exists", [False, True])
+async def test_overlay_publication_requires_marker_for_existing_target(monkeypatch, exists):
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=exists))
+    marker = AsyncMock(return_value=None)
+    monkeypatch.setattr(importer.db, "first", marker)
+    if exists:
+        with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="publication_missing"):
+            await importer._address_overlay_publication("mrf")
+    else:
+        assert await importer._address_overlay_publication("mrf") is None
+        marker.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_overlay_bootstrap_and_copied_publication_use_logical_names(monkeypatch):
+    oid_lookup = AsyncMock(side_effect=AssertionError("Overlay fencing must not resolve physical identity"))
+    monkeypatch.setattr(importer, "_provider_directory_relation_oid", oid_lookup)
+    marker = AsyncMock(return_value=None)
+    monkeypatch.setattr(importer, "_address_overlay_publication", marker)
+    fence = importer._ProviderDirectoryAliasBuildFence(
+        target_oid=None, target_name=importer._qt("mrf", importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
+    )
+    stage = importer.ProviderDirectoryPreparedArtifactStage(
+        "mrf", "overlay_stage", importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, AsyncMock(), fence
+    )
+    await importer._assert_provider_directory_artifact_build_fence(stage)
+    marker.assert_awaited_once_with("mrf", lock=True)
+    oid_lookup.assert_not_called()
+
+
+def test_legacy_profile_fence_serialization_remains_unchanged():
+    from dataclasses import asdict
+
+    assert asdict(importer.ProviderDirectoryArtifactBuildFence(target_oid=7)) == {
+        "target_oid": 7,
+        "alias_generation": None,
+        "dependency_relation": None,
+        "dependency_relation_oid": None,
+    }

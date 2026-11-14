@@ -459,7 +459,7 @@ def test_source_query_requires_exact_overlay_and_date(changes):
 async def test_selected_address_inputs_are_rechecked_before_use(monkeypatch, failure):
     native = candidate._native()
     inputs = _address_inputs()
-    monkeypatch.setattr(native.db, "scalar", AsyncMock(return_value=0 if failure == "pin-count" else 42))
+    monkeypatch.setattr(native.db, "scalar", AsyncMock(return_value=0 if failure in {"pin-count", "overlay"} else 42))
     monkeypatch.setattr(native, "_address_alias_generation", AsyncMock(return_value=1 if failure == "aliases" else 0))
     token = candidate._PREPARATION.set(inputs)
     try:
@@ -1780,7 +1780,7 @@ async def test_failed_admitted_sibling_build_is_drained_before_failure_returns()
             admitted._ADMISSION.reset(token)
 
 
-async def test_stage_inventory_omits_missing_heaps_so_registration_cannot_invent_their_oid(monkeypatch):
+async def test_stage_inventory_omits_missing_named_heaps(monkeypatch):
     native = candidate._native()
     database = SimpleNamespace(scalar=AsyncMock(side_effect=[None, 42]))
     monkeypatch.setattr(native, "db", database)
@@ -1792,7 +1792,7 @@ async def test_stage_inventory_omits_missing_heaps_so_registration_cannot_invent
         )
     )
     assert await candidate._capture_stage_oids("test_schema", swaps) == (
-        ("entity_address_evidence", "evidence_stage", 42),
+        ("entity_address_evidence", "evidence_stage", None),
     )
     assert [call.kwargs["relation"] for call in database.scalar.await_args_list] == [
         "test_schema.missing_stage",

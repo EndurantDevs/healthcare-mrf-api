@@ -62,7 +62,7 @@ class _Measurements:
 
     def install(self, monkeypatch):
         read_snapshot = npi_api.provider_profile_read_snapshot
-        inventory_relations = snapshot._inventory_serving_relations
+        inventory_relations = snapshot._inventory_relation_names
         prelock = native._lock_cms_doctors_publication
         apply_stage = native._apply_cms_doctors_stage
 
@@ -112,7 +112,7 @@ class _Measurements:
             return result
 
         monkeypatch.setattr(npi_api, "provider_profile_read_snapshot", measured_snapshot)
-        monkeypatch.setattr(snapshot, "_inventory_serving_relations", measured_inventory)
+        monkeypatch.setattr(snapshot, "_inventory_relation_names", measured_inventory)
         monkeypatch.setattr(native, "_lock_cms_doctors_publication", measured_prelock)
         monkeypatch.setattr(native, "_apply_cms_doctors_stage", measured_apply)
 
@@ -258,7 +258,8 @@ async def test_full_detail_reads_during_native_doctors_publication(monkeypatch, 
 def _write_receipt(tmp_path, fixture, measurements, before, publication_by_field, cache_enabled):
     """Retain actual attempts and every request, including failing publication evidence."""
     receipt_by_field = {
-        "cache_enabled": cache_enabled,
+        "cache_requested": cache_enabled,
+        "cache_enabled": cache_enabled and fixture.npi_identity is not None,
         "reader_count": 3,
         "cadence": "continuous; no sleeps or quiet windows",
         "relation_count": 59,
@@ -284,15 +285,14 @@ def _write_receipt(tmp_path, fixture, measurements, before, publication_by_field
 
 
 def _assert_publication(measurements, publication_by_field, before, after, stages):
-    """Require a committed new native OID family and coherent successful reads on both sides."""
+    """Require a committed new logical generation and coherent successful reads on both sides."""
     assert all(
         not sample_by_field.get("error") and sample_by_field.get("relations") == 59
         for sample_by_field in measurements.requests
     )
     assert "error" not in publication_by_field, publication_by_field
     assert after.local_generation == before.local_generation + 1
-    oid_by_target = {target_name: oid for target_name, _stage, oid in stages}
-    assert after.relation_oids == tuple(oid_by_target[name] for name in snapshot._DOCTORS_TABLES)
+    assert {target_name for target_name, _stage, _unused in stages} == set(snapshot._DOCTORS_TABLES)
     assert {sample_by_field["generation"] for sample_by_field in measurements.requests} == {
         before.local_generation,
         after.local_generation,

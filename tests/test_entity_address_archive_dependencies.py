@@ -39,7 +39,13 @@ def _archive():
 
 
 def _captured(archive):
-    return dependencies.PreparedAddressDependencies("mrf", None, (), _example_bindings(), archive)
+    return dependencies.PreparedAddressDependencies(
+        "mrf",
+        None,
+        (),
+        dependencies.projection.validate_projection_dependency_bindings("mrf", _example_bindings()),
+        archive,
+    )
 
 
 def _database(monkeypatch):
@@ -126,7 +132,9 @@ async def test_capture_keeps_archive_separate_from_geo_heap_bindings(monkeypatch
     )
     assert captured.archive is archive
     assert captured.doctors is None and captured.stage_oids == ()
-    assert captured.dependency_bindings == _example_bindings()
+    assert captured.dependency_bindings == dependencies.projection.validate_projection_dependency_bindings(
+        "mrf", _example_bindings()
+    )
     assert "mrf.address_archive_v2" not in captured.dependency_bindings
     check.assert_awaited_once_with(backend, captured)
 
@@ -164,7 +172,9 @@ async def test_prepared_dependency_validation_locks_archive_on_its_actual_transa
     monkeypatch.setattr(dependencies, "_assert_bindings", check_bindings)
     await dependencies.assert_prepared_dependencies(database, _captured(archive))
     read_guard.assert_awaited_once_with(database)
-    check_bindings.assert_awaited_once_with(session, "mrf", _example_bindings())
+    check_bindings.assert_awaited_once_with(
+        session, "mrf", dependencies.projection.validate_projection_dependency_bindings("mrf", _example_bindings())
+    )
     full_scan.assert_not_awaited()
     assert database._transaction_binding() is None
 
@@ -180,7 +190,11 @@ async def test_applied_archive_guard_precedes_native_address_activation(monkeypa
     async with database.transaction():
         if applied:
             await dependencies.assert_applied_dependencies(database, _captured(archive))
-            check_bindings.assert_awaited_once_with(session, "mrf", _example_bindings())
+            check_bindings.assert_awaited_once_with(
+                session,
+                "mrf",
+                dependencies.projection.validate_projection_dependency_bindings("mrf", _example_bindings()),
+            )
         else:
             with pytest.raises(RuntimeError, match="archive merge missing"):
                 await dependencies.assert_applied_dependencies(database, _captured(archive))
@@ -273,9 +287,9 @@ async def test_captured_tiger_dependencies_require_fresh_factory_native_proof(mo
     bindings = _example_bindings()
     bindings.update(tiger.captured_tiger_bindings(_captured_proof()))
     if fault == "wrong_oid":
-        bindings["tiger.zcta5"]["relation_oid"] += 100
+        bindings["tiger.zcta5"]["table_name"] = "another_input"
     elif fault == "wrong_file":
-        bindings["tiger.zcta5"]["relfilenode"] += 1
+        bindings["tiger.zcta5"]["schema_name"] = "another_input"
     elif fault == "one_canonical":
         bindings["tiger.zip_state"]["schema_name"] = "tiger"
     elif fault == "other_source":
@@ -294,7 +308,12 @@ async def test_captured_tiger_dependencies_require_fresh_factory_native_proof(mo
     async with policy.bind_generic_source_transaction_factory(IssuedFactory(callback)):
         if fault is None:
             observed = await dependencies.capture_dependencies(database, "mrf", (), dependency_bindings=bindings)
-            assert observed.dependency_bindings == bindings and observed.doctors is None and observed.archive is None
+            assert (
+                observed.dependency_bindings
+                == dependencies.projection.validate_projection_dependency_bindings("mrf", bindings)
+                and observed.doctors is None
+                and observed.archive is None
+            )
             check.assert_awaited_once_with(database, observed)
         else:
             with pytest.raises(RuntimeError, match="not a proven input"):
@@ -312,4 +331,6 @@ def test_captured_tiger_linkage_does_not_allow_foreign_bindings_without_native_m
     bindings.update(tiger.captured_tiger_bindings(_captured_proof()))
     with pytest.raises(RuntimeError, match="not a proven input"):
         dependencies._validate_bindings("mrf", None, bindings)
-    assert dependencies._validate_bindings("mrf", None, bindings, tiger_captured=_captured_proof()) == bindings
+    assert dependencies._validate_bindings(
+        "mrf", None, bindings, tiger_captured=_captured_proof()
+    ) == dependencies.projection.validate_projection_dependency_bindings("mrf", bindings)

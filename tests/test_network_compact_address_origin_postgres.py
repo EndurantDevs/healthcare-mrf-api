@@ -860,9 +860,9 @@ async def indexed_api_db(indexed_db, monkeypatch):
 async def _api_rows(held, generation_id):
     async with held.database.reader_session() as session:
         assert session.info["api_reader_verified"] is True and current_session() is session
-        identity_by_field = dict(session.info["api_reader_identity"])
-        transaction = session.get_transaction()
+        assert "api_reader_identity" not in session.info
         await pin_claims_reader(session)
+        transaction = session.get_transaction()
         before = len(held.requests)
         async with api_catalog_read_snapshot(session, generation_id) as (manifest, approved_relation):
             assert len(held.requests) == before + 1
@@ -881,7 +881,6 @@ async def _api_rows(held, generation_id):
                 )
                 address_rows = [dict(address_entry) for address_entry in address_result.mappings()]
             assert session.get_transaction() is transaction and session.get_nested_transaction() is None
-            assert driver.get_server_pid() == identity_by_field["backend_pid"]
         return manifest, address_rows
 
 

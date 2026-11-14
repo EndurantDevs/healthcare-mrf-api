@@ -24,7 +24,7 @@ def ordinary_case(monkeypatch):
         scalar=AsyncMock(),
         status=AsyncMock(),
     )
-    actor_by_field = dict(session=11, current="writer", owner="owner", database_oid=42)
+    actor_by_field = {}
     session = object()
     monkeypatch.setattr(ordinary, "_native", lambda: SimpleNamespace(db=database))
     monkeypatch.setattr(ordinary.admitted, "_native", lambda: SimpleNamespace(db=database))
@@ -69,29 +69,27 @@ async def test_scope_cancels_and_settles_inherited_children_before_cleanup(ordin
 
 
 @pytest.mark.asyncio
-async def test_recreated_name_retains_the_original_oid_until_cleanup(ordinary_case):
+async def test_created_name_can_be_kept_after_successful_create(ordinary_case):
     async with ordinary.scope("sample", {"stage"}) as owned:
-        owned.owned_oids["stage"] = 101
-        ordinary_case.database.scalar.side_effect = [None, 202]
+        ordinary_case.database.scalar.side_effect = [False, True]
         create = AsyncMock()
         assert await ordinary.create("sample", "stage", create) is owned
         create.assert_awaited_once_with(ordinary_case.session)
-        assert owned.retired_oids == [("stage", "stage", 101)]
-        assert owned.owned_oids == {"stage": 202}
-        owned.keep((("stage", "stage", 202),))
-    ordinary_case.drain.assert_awaited_once_with("sample", (("stage", "stage", 101),))
+        assert owned.created_names == {"stage"}
+        owned.keep((("stage", "stage", None),))
+    ordinary_case.drain.assert_awaited_once_with("sample", ())
 
 
 @pytest.mark.asyncio
-async def test_missing_stage_is_not_locked_or_dropped_and_custody_is_retained(ordinary_case):
+async def test_missing_stage_is_not_locked_or_dropped_and_is_forgotten(ordinary_case):
     async with ordinary.scope("sample", {"stage"}) as owned:
-        owned.owned_oids["stage"] = 101
-        ordinary_case.database.scalar.return_value = None
+        owned.created_names.add("stage")
+        ordinary_case.database.scalar.return_value = False
         assert await ordinary.drop("sample", "stage") is owned
         statements = [call.args[0] for call in ordinary_case.database.status.await_args_list]
         assert not any("LOCK TABLE" in sql or "DROP TABLE" in sql for sql in statements)
-        assert owned.owned_oids == {"stage": 101} and not owned.pending_names
-    ordinary_case.drain.assert_awaited_once_with("sample", (("stage", "stage", 101),))
+        assert not owned.created_names and not owned.pending_names
+    ordinary_case.drain.assert_awaited_once_with("sample", ())
 
 
 @pytest.mark.asyncio
@@ -102,7 +100,7 @@ async def test_create_failure_clears_pending_names_and_preserves_the_error(ordin
             ordinary_case.database.scalar.return_value = None
             await ordinary.create("sample", "stage", AsyncMock(side_effect=failure))
     assert raised.value is failure and not owned.pending_names
-    assert not owned.owned_oids and not owned.active and ordinary.current() is None
+    assert not owned.created_names and not owned.active and ordinary.current() is None
     ordinary_case.drain.assert_awaited_once_with("sample", ())
 
 
@@ -132,15 +130,15 @@ async def test_conflicting_authority_is_refused_before_opening_a_transaction(ord
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "identity,owned_oid", [((), 101), ((("stage", "stage", 999),), 101), ((("stage", "stage", True),), 1)]
+    "stages", [(), (("stage", "foreign", None),), (("stage", "stage", None), ("stage", "stage", None))]
 )
-async def test_keep_cannot_transfer_missing_foreign_or_boolean_oids(ordinary_case, identity, owned_oid):
+async def test_keep_refuses_empty_missing_and_duplicate_names(ordinary_case, stages):
     async with ordinary.scope("sample", {"stage"}) as owned:
-        owned.owned_oids["stage"] = owned_oid
+        owned.created_names.add("stage")
         with pytest.raises(RuntimeError, match="finalized_"):
-            owned.keep(identity)
-        assert not owned.kept_oids and owned.owned_oids == {"stage": owned_oid}
-    ordinary_case.drain.assert_awaited_once_with("sample", (("stage", "stage", owned_oid),))
+            owned.keep(stages)
+        assert not owned.kept_names and owned.created_names == {"stage"}
+    ordinary_case.drain.assert_awaited_once_with("sample", (("stage", "stage", None),))
 
 
 @pytest.mark.asyncio

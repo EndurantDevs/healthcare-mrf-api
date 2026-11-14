@@ -349,7 +349,8 @@ async def _assert_guard_catalog(engine):
     async with engine.connect() as connection:
         oid = await connection.scalar(sa.text(f"SELECT '{_SCHEMA}.{migration._TABLE}'::regclass::oid"))
         await guards.assert_initial_receipt_guards(
-            _CatalogDatabase(connection), {"schema_name": _SCHEMA, "relation_oid": oid}
+            _CatalogDatabase(connection),
+            {"schema_name": _SCHEMA, "relation_name": migration._TABLE, "relation_oid": oid},
         )
         attributes, indexes, constraints = [
             [

@@ -35,7 +35,6 @@ ENTITY_ADDRESS_RESULT_MODELS = (
 RELATION_NAMES = tuple(model.__tablename__ for model in ENTITY_ADDRESS_RESULT_MODELS)
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _MAX_GENERATION = (1 << 63) - 1
-_MAX_OID = (1 << 32) - 1
 
 
 @dataclass(frozen=True)
@@ -58,12 +57,12 @@ class EntityAddressServingGeneration:
 
 @dataclass(frozen=True)
 class EntityAddressResultGenerationAuthority:
-    """Local counter plus the distinct origin currently served by local OIDs."""
+    """Local counter plus the portable origin of the named serving family."""
 
     local_lineage_id: str
     local_generation: int
     serving_generation: EntityAddressServingGeneration | None
-    relation_oids: tuple[int, ...] | None
+    relation_oids: None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return the durable authority without inventing a serving generation."""
@@ -72,7 +71,7 @@ class EntityAddressResultGenerationAuthority:
             "local_lineage_id": self.local_lineage_id,
             "local_generation": self.local_generation,
             "serving_generation": (None if self.serving_generation is None else self.serving_generation.as_dict()),
-            "relation_oids": None if self.relation_oids is None else list(self.relation_oids),
+            "relation_oids": None,
         }
 
 
@@ -133,17 +132,6 @@ def validate_entity_address_serving_generation(
     )
 
 
-def _relation_oids(relation_oid_values: object) -> tuple[int, ...]:
-    if not isinstance(relation_oid_values, (list, tuple)) or len(relation_oid_values) != len(RELATION_NAMES):
-        raise ValueError("entity-address result generation relation identity is invalid")
-    relation_oids = tuple(relation_oid_values)
-    if any(type(relation_oid) is not int or not 0 < relation_oid <= _MAX_OID for relation_oid in relation_oids) or len(
-        set(relation_oids)
-    ) != len(relation_oids):
-        raise ValueError("entity-address result generation relation identity is invalid")
-    return relation_oids
-
-
 def _row_mapping(row: object) -> Mapping[str, Any]:
     mapping = getattr(row, "_mapping", row)
     if not isinstance(mapping, Mapping):
@@ -167,7 +155,6 @@ def validate_entity_address_result_generation_authority(
         authority_by_field.get("origin_lineage_id"),
         authority_by_field.get("origin_generation"),
         authority_by_field.get("published_at"),
-        authority_by_field.get("relation_oids"),
     )
     if all(origin_value is None for origin_value in origin_values):
         return EntityAddressResultGenerationAuthority(
@@ -186,14 +173,13 @@ def validate_entity_address_result_generation_authority(
                 "published_at": authority_by_field["published_at"],
             }
         )
-        relation_oids = _relation_oids(authority_by_field["relation_oids"])
     except ValueError as error:
         raise RuntimeError("entity-address serving generation is invalid") from error
     return EntityAddressResultGenerationAuthority(
         local_lineage_id,
         local_generation,
         serving_generation,
-        relation_oids,
+        None,
     )
 
 
@@ -201,7 +187,7 @@ def _state_sql(schema_name: str, *, lock: bool) -> str:
     suffix = " FOR UPDATE" if lock else ""
     return (
         "SELECT singleton, local_lineage_id, local_generation, "
-        "origin_lineage_id, origin_generation, published_at, relation_oids "
+        "origin_lineage_id, origin_generation, published_at "
         f"FROM {_quoted(schema_name)}.{_quoted(TABLE_NAME)} "
         f"WHERE singleton IS TRUE{suffix}"
     )
@@ -231,26 +217,28 @@ async def read_entity_address_result_generation_authority(
     return validate_entity_address_result_generation_authority(row)
 
 
-async def _current_relation_oids(database: Any, schema_name: str) -> tuple[int, ...]:
+async def _current_relation_names(database: Any, schema_name: str) -> tuple[str, ...]:
+    """Require the fixed logical family without binding it to one database's IDs."""
+    schema = _schema_name(schema_name)
     rows = await database.all(
         text(
             "SELECT relation_name, "
-            "to_regclass(format('%I.%I', CAST(:schema_name AS text), relation_name))::oid::bigint "
-            "AS relation_oid "
+            "to_regclass(format('%I.%I', CAST(:schema_name AS text), relation_name)) IS NOT NULL "
+            "AS present "
             "FROM unnest(CAST(:relation_names AS text[])) WITH ORDINALITY "
             "AS relations(relation_name, ordinal) ORDER BY ordinal"
         ),
-        schema_name=schema_name,
+        schema_name=schema,
         relation_names=list(RELATION_NAMES),
     )
     try:
         names = tuple(str(row[0]) for row in rows)
-        relation_oids = _relation_oids(tuple(int(row[1]) for row in rows))
+        present = all(row[1] is True for row in rows)
     except IndexError, TypeError, ValueError:
         raise RuntimeError("entity-address serving relations are unavailable") from None
-    if names != RELATION_NAMES:
+    if names != RELATION_NAMES or not present:
         raise RuntimeError("entity-address serving relations are unavailable")
-    return relation_oids
+    return tuple(f"{schema}.{name}" for name in names)
 
 
 async def publish_local_entity_address_generation(
@@ -264,7 +252,7 @@ async def publish_local_entity_address_generation(
     current = await _locked_authority(database, schema)
     if current.local_generation >= _MAX_GENERATION:
         raise RuntimeError("entity-address local result generation is exhausted")
-    relation_oids = await _current_relation_oids(database, schema)
+    await _current_relation_names(database, schema)
     next_generation = current.local_generation + 1
     updated = await database.first(
         text(
@@ -273,17 +261,19 @@ async def publish_local_entity_address_generation(
             "origin_lineage_id=local_lineage_id, "
             "origin_generation=:next_generation, "
             "published_at=clock_timestamp(), "
-            "relation_oids=CAST(:relation_oids AS bigint[]) "
+            "relation_oids=NULL "
             "WHERE singleton IS TRUE "
             "RETURNING singleton, local_lineage_id, local_generation, "
-            "origin_lineage_id, origin_generation, published_at, relation_oids"
+            "origin_lineage_id, origin_generation, published_at"
         ),
         next_generation=next_generation,
-        relation_oids=list(relation_oids),
     )
     if updated is None:
         raise RuntimeError("entity-address result generation singleton is unavailable")
-    return validate_entity_address_result_generation_authority(updated)
+    authority = validate_entity_address_result_generation_authority(updated)
+    if authority.local_lineage_id != current.local_lineage_id or authority.local_generation != next_generation:
+        raise RuntimeError("entity-address local result generation changed during publication")
+    return authority
 
 
 async def publish_adopted_entity_address_generation(
@@ -292,7 +282,7 @@ async def publish_adopted_entity_address_generation(
     schema_name: str,
     source_generation: Mapping[str, Any] | EntityAddressServingGeneration | None,
 ) -> EntityAddressResultGenerationAuthority:
-    """Preserve a source origin while replacing only destination-local OIDs."""
+    """Preserve the source origin without rewriting database-local identities."""
 
     schema = _schema_name(schema_name)
     current_authority = await _locked_authority(database, schema)
@@ -301,15 +291,14 @@ async def publish_adopted_entity_address_generation(
             "origin_lineage_id": None,
             "origin_generation": None,
             "published_at": None,
-            "relation_oids": None,
         }
     else:
         source_identity = validate_entity_address_serving_generation(source_generation)
+        await _current_relation_names(database, schema)
         update_values_by_column = {
             "origin_lineage_id": UUID(source_identity.origin_lineage_id),
             "origin_generation": source_identity.origin_generation,
             "published_at": source_identity.published_at,
-            "relation_oids": list(await _current_relation_oids(database, schema)),
         }
     updated = await database.first(
         text(
@@ -317,10 +306,10 @@ async def publish_adopted_entity_address_generation(
             "origin_lineage_id=CAST(:origin_lineage_id AS uuid), "
             "origin_generation=:origin_generation, "
             "published_at=CAST(:published_at AS timestamptz), "
-            "relation_oids=CAST(:relation_oids AS bigint[]) "
+            "relation_oids=NULL "
             "WHERE singleton IS TRUE "
             "RETURNING singleton, local_lineage_id, local_generation, "
-            "origin_lineage_id, origin_generation, published_at, relation_oids"
+            "origin_lineage_id, origin_generation, published_at"
         ),
         **update_values_by_column,
     )

@@ -134,6 +134,9 @@ async def test_signed_reader_restores_context_and_keeps_active_writer_untouched(
 async def test_fixed_plan_workspace_keeps_complete_computation_on_same_read_only_connection(
     signed_reader_case, monkeypatch
 ):
+    from api.endpoint.npi import _runtime_db_schema
+    from api.provider_profile_snapshot import provider_profile_read_snapshot
+
     prepared = signed_reader_case
     case = prepared.case
     plan_fixture._native_fixture(monkeypatch)
@@ -145,7 +148,11 @@ async def test_fixed_plan_workspace_keeps_complete_computation_on_same_read_only
         request = SimpleNamespace(
             path=providers.CUSTOM_IMPORT_PROVIDERS_PATH, ctx=SimpleNamespace(sa_session=ordinary, session=ordinary)
         )
-        async with boundary.signed_request_reader(request, ordinary, plan_workspace=True) as reader:
+        async with (
+            boundary.signed_request_reader(request, ordinary, plan_workspace=True) as reader,
+            provider_profile_read_snapshot(prepared.database, _runtime_db_schema(), include_detail=True) as pinned,
+        ):
+            assert pinned is reader
             backend = await native_reader_witness(reader, case.reader)
             assert reader.info["native_plan_workspace"] is True
             temp_namespace_oid = await reader.scalar(text("SELECT pg_my_temp_schema()"))

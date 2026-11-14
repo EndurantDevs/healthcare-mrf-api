@@ -686,7 +686,9 @@ async def _retained_recipe_heap(session, database, schema, model, relation, orig
     await session.execute(text(address_writer._source_heap_sql(schema, model.__tablename__, columns)))
     for statement in address_writer._source_column_options(schema, model.__tablename__, columns):
         await session.execute(text(statement))
-    await address_writer._preserve_prepared_storage_options(session, schema, model.__tablename__, relation.oid)
+    await address_writer._preserve_prepared_storage_options(
+        session, schema, model.__tablename__, f'"{relation.schema}"."{relation.relation}"'
+    )
     return await _owned(database, schema, model.__tablename__)
 
 

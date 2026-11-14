@@ -169,7 +169,7 @@ async def test_original_admin_is_required_before_catalog_locks(frozen, damage):
     frozen.connection.execute.assert_not_awaited()
 
 
-@pytest.mark.parametrize("damage", ["locks", "dependencies", "roles", "namespace", "function", "transaction"])
+@pytest.mark.parametrize("damage", ["locks", "dependencies", "roles", "namespace", "function_arguments", "transaction"])
 async def test_exit_requires_original_physical_custody(frozen, damage):
     with pytest.raises(ValueError):
         async with _context(frozen):
@@ -179,8 +179,8 @@ async def test_exit_requires_original_physical_custody(frozen, damage):
                 frozen.roles["roles"].append({"oid": 999})
             if damage == "namespace":
                 frozen.namespaces[1]["nspowner"] = 999
-            if damage == "function":
-                frozen.rows[0]["definition"]["prosrc"] += " -- changed"
+            if damage == "function_arguments":
+                frozen.rows[0]["definition"]["proargnames"] = ["unsupported_argument"]
             if damage == "transaction":
                 frozen.actor["transaction"] = "1/2"
 

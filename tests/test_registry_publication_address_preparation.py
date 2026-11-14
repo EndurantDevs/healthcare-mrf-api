@@ -273,7 +273,9 @@ async def test_ptg_preparation_retains_same_fenced_session_driver_store_and_budg
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("drift", ["none", "generation", "schema_oid", "ordinary_archive", "missing", "refused"])
+@pytest.mark.parametrize(
+    "drift", ["none", "copied", "portable", "generation", "schema", "ordinary_archive", "missing", "refused"]
+)
 async def test_cms_dependency_uses_only_authenticated_existing_pair_readers(monkeypatch, drift):
     from process import network_cms_registry_source_pair as pairs
     from process import network_custom_address_source as addresses
@@ -281,23 +283,26 @@ async def test_cms_dependency_uses_only_authenticated_existing_pair_readers(monk
     pin = PinnedAddressSource("entity_address_archive_" + uuid4().hex, "entity_address_unified", "a" * 64)
     retained = SimpleNamespace(
         address_source=replace(pin, generation_id="b" * 64) if drift == "generation" else pin,
-        address_ownership=SimpleNamespace(schema_oid=42),
+        address_ownership=SimpleNamespace(
+            schema_name="another_archive" if drift == "schema" else pin.schema_name,
+            schema_oid=None if drift == "portable" else 42,
+        ),
         runtime_roles=("source_input_reader",),
     )
     comment = {"ordinary_archive": "ordinary-archive-v1:", "missing": None}.get(drift, pairs._COMMENT)
     connection = SimpleNamespace(fetchval=AsyncMock(return_value=comment))
-    read = AsyncMock(return_value=(retained, 43 if drift == "schema_oid" else 42))
+    read = AsyncMock(return_value=(retained, 43 if drift in {"copied", "portable"} else 42))
     verify = AsyncMock(side_effect=ValueError("pair_custody_changed") if drift == "refused" else None)
     monkeypatch.setattr(pairs, "_read_committed_pair", read)
     monkeypatch.setattr(pairs, "require_registry_cms_source_pair_connection", verify)
-    if drift in {"generation", "schema_oid", "refused"}:
+    if drift in {"generation", "schema", "refused"}:
         with pytest.raises(ValueError):
             await addresses._retained_dependency_readers(connection, pin)
     else:
         readers = await addresses._retained_dependency_readers(connection, pin)
-        assert readers == (retained.runtime_roles if drift == "none" else None)
+        assert readers == (retained.runtime_roles if drift in {"none", "copied", "portable"} else None)
     assert read.await_count == (0 if drift in {"ordinary_archive", "missing"} else 1)
-    assert verify.await_count == (1 if drift in {"none", "refused"} else 0)
+    assert verify.await_count == (1 if drift in {"none", "copied", "portable", "refused"} else 0)
     if verify.await_count:
         verify.assert_awaited_once_with(connection, retained, verify_content=False)
 

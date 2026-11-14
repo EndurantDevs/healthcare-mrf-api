@@ -161,6 +161,7 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20261115010000_ms_drg_companion_tables",
     "20261114010000_custom_import_snapshot_names",
     "20261114020000_custom_import_snapshot_metadata",
+    "20261114120000_portable_serving_metadata",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",

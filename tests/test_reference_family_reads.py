@@ -255,6 +255,29 @@ async def test_request_entrypoint_binds_pinning_only_to_real_pricing_consumers(m
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/v1/npi/near/", "/api/v1/extensions/custom-import/providers"])
+async def test_provider_request_pins_its_schema_before_claims_reader(monkeypatch, path):
+    from api import provider_profile_snapshot, reference_family_reads
+    from api.endpoint import npi
+
+    session = SimpleNamespace()
+    calls = []
+
+    async def prepare(actual_session, schema, *, fresh):
+        assert fresh is True
+        calls.append(("profile", actual_session, schema))
+
+    async def claims(actual_session):
+        calls.append(("claims", actual_session))
+
+    monkeypatch.setattr(npi, "_runtime_db_schema", lambda: "profile_copy")
+    monkeypatch.setattr(provider_profile_snapshot, "_prepare_provider_reader", prepare)
+    monkeypatch.setattr(reference_family_reads, "pin_claims_reader", claims)
+    await Database()._pin_request_reader(SimpleNamespace(path=path), session)
+    assert calls == [("profile", session, "profile_copy"), ("claims", session)]
+
+
+@pytest.mark.asyncio
 async def test_request_entrypoint_refuses_unavailable_reader_with_neutral_error(monkeypatch):
     from sanic.exceptions import ServiceUnavailable
 

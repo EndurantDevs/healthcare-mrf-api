@@ -13,7 +13,6 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from api.network_read_execution import (
-    _original_read_driver,
     _read_sql_failure_cause,
     _ReadSQLFailure,
     _recover_optional_read,
@@ -21,18 +20,16 @@ from api.network_read_execution import (
     _unavailable,
     execute_network_read,
     has_network_read_inventory,
-    network_read_name_inventory,
 )
 from process import entity_address_result_generation as address_generation
 from process import provider_directory_cms_serving_receipt as cms_serving_receipt
 from process import reference_family_result_generation as reference_generation
 from process.entity_address_cutover_contract import postgres_sqlstate
-from process.network_compact_layout import CompactAddressRelation
-from process.network_read_identity import NetworkReadIdentityError, verify_bound_network_names
 from process.npi_canonical_publication import NPI_CANONICAL_TABLES
 
 _SNAPSHOT = ContextVar("provider_profile_read_snapshot", default=None)
 _CMS_SERVING = ContextVar("provider_profile_cms_serving_generation", default=None)
+_GEO_BINDINGS = ContextVar("provider_profile_geo_dependencies", default=None)
 _CMS_RECEIPT_TABLE = "provider_directory_cms_serving_receipt"
 _PROFILE_GENERATION_TABLE = "provider_directory_profile_serving_generation"
 _DOCTORS_TABLES = reference_generation.RELATION_NAMES_BY_IMPORTER["cms-doctors"]
@@ -70,7 +67,7 @@ _DIRECTORY_PARTITION_ROOTS = frozenset(
         "provider_directory_dataset_affiliation_organization",
     )
 )
-_SNAPSHOT_RELATIONS_SQL = """SELECT name, c.oid::bigint, c.relkind::text AS relkind,
+_SNAPSHOT_RELATIONS_SQL = """SELECT name, c.relname IS NOT NULL AS present, c.relkind::text AS relkind,
     NOT c.relispartition AND NOT EXISTS(
       SELECT FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) AS direct_heap,
     c.relkind='p' AND c.relpersistence='p' AND NOT c.relispartition
@@ -115,6 +112,7 @@ _COMMON_TABLES = (
     address_generation.TABLE_NAME,
     _CMS_RECEIPT_TABLE,
     "address_alias_state_v1",
+    "entity_address_geo_assurance_state",
 )
 _GEO_TABLES = tuple(
     sorted(
@@ -138,6 +136,12 @@ def snapshot_relation_available(table_ref):
     if snapshot is None or table_ref not in snapshot:
         return None
     return snapshot[table_ref] is not None
+
+
+def snapshot_geo_dependency_bindings(schema):
+    """Reuse the active named input map read in this response's snapshot."""
+    selected = _GEO_BINDINGS.get()
+    return selected[1] if selected is not None and selected[0] == schema else None
 
 
 def snapshot_cms_serving_generation(schema):
@@ -241,61 +245,107 @@ async def provider_optional_read(session, logger):
         logger.debug("Optional provider read failed: %s", exc)
 
 
-async def _relation_oids(session, schema, table_names):
-    result = await execute_network_read(
-        session,
-        text(
-            "SELECT name, to_regclass(format('%I.%I', CAST(:schema AS text), name))::oid::bigint "
-            "FROM unnest(CAST(:names AS text[])) AS names(name)"
-        ),
-        {"schema": schema, "names": list(table_names)},
-    )
-    return {f"{schema}.{name}": oid for name, oid in result.all()}
-
-
 class _SnapshotSetupChanged(ServiceUnavailable):
-    """A catalog rename raced snapshot setup before any loader could run."""
+    """An optional name appeared while fixed serving names were being locked."""
 
 
-async def _snapshot_relation_oids(session, schema, table_names):
-    """Pin declared legacy partition roots while keeping direct heaps lock-free."""
-    result = await session.execute(
-        text(_SNAPSHOT_RELATIONS_SQL),
-        {"schema": schema, "names": list(table_names)},
-    )
-    rows = result.all()
-    partition_roots = []
-    for name, oid, kind, direct, partition_root in rows:
-        if oid is None or kind == "r" and direct is True:
-            continue
-        if name not in _DIRECTORY_PARTITION_ROOTS or kind != "p" or partition_root is not True:
-            raise ServiceUnavailable("Provider data is temporarily unavailable.")
-        partition_roots.append(name)
-    if partition_roots:
-        qualified_names = ", ".join(f'"{schema}"."{name}"' for name in sorted(partition_roots))
-        # Retain legacy recursive locks; immutable dataset publication still supplies custody.
-        await session.execute(text(f"LOCK TABLE {qualified_names} IN ACCESS SHARE MODE"))
-    return {f"{schema}.{name}": oid for name, oid, _kind, _direct, _partition_root in rows}
+def provider_snapshot_names(schema):
+    """Return the fixed ordinary provider family before its first data snapshot."""
+    return tuple((schema, name) for name in sorted(set((*_COMMON_TABLES, *_DETAIL_TABLES, *_GEO_TABLES))))
+
+
+async def lock_reader_relations(session, relation_names):
+    """Lock optional names before SELECT can freeze a repeatable-read snapshot."""
+    relations_by_name = {}
+    await session.execute(text("SET LOCAL lock_timeout = '250ms'"))
+    await session.execute(text("SET LOCAL statement_timeout = '5s'"))
+    relation_names = tuple(sorted(set(relation_names)))
+    for schema, name in relation_names:
+        if not all(
+            isinstance(identifier, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", identifier)
+            for identifier in (schema, name)
+        ):
+            raise ValueError("provider_profile_relation_invalid")
+    if relation_names:
+        qualified_names = ", ".join(f'"{schema}"."{name}"' for schema, name in relation_names)
+        try:
+            async with session.begin_nested():
+                await session.execute(text(f"LOCK TABLE {qualified_names} IN ACCESS SHARE MODE"))
+        except DBAPIError as error:
+            if postgres_sqlstate(error) not in {"42P01", "3F000"} and not (
+                postgres_sqlstate(error) == "42501"
+                and any(name == "npi_result_generation" for _, name in relation_names)
+            ):
+                raise
+        else:
+            return {f"{schema}.{name}": f"{schema}.{name}" for schema, name in relation_names}
+    for schema, name in relation_names:
+        qualified = f"{schema}.{name}"
+        try:
+            async with session.begin_nested():
+                await session.execute(text(f'LOCK TABLE "{schema}"."{name}" IN ACCESS SHARE MODE'))
+        except DBAPIError as error:
+            if postgres_sqlstate(error) == "42501" and name == "npi_result_generation":
+                relations_by_name[qualified] = False
+                continue
+            if postgres_sqlstate(error) not in {"42P01", "3F000"}:
+                raise
+            relations_by_name[qualified] = None
+        else:
+            relations_by_name[qualified] = qualified
+    return relations_by_name
+
+
+async def _inventory_relation_names(session, schema, table_names, *, locked_names=None):
+    """Inspect logical shape only after named locks protect all present tables."""
+    if locked_names is None:
+        locked_names = await lock_reader_relations(session, ((schema, name) for name in table_names))
+    result = await session.execute(text(_SNAPSHOT_RELATIONS_SQL), {"schema": schema, "names": list(table_names)})
+    relations_by_name = {}
+    for name, present, kind, direct, partition_root in result.all():
+        qualified = f"{schema}.{name}"
+        if bool(present) != (locked_names.get(qualified) is not None):
+            raise _SnapshotSetupChanged("Provider data changed during the read; retry the request.")
+        if present and not (kind == "r" and direct is True):
+            if name not in _DIRECTORY_PARTITION_ROOTS or kind != "p" or partition_root is not True:
+                raise ServiceUnavailable("Provider data is temporarily unavailable.")
+        relations_by_name[qualified] = qualified if present and locked_names.get(qualified) is not False else None
+    if set(relations_by_name) != {f"{schema}.{name}" for name in table_names}:
+        raise ServiceUnavailable("Provider data is temporarily unavailable.")
+    return relations_by_name
 
 
 async def _inventory_serving_relations(session, schema, *, include_detail):
-    """Inventory every optional name and reject a stale repeatable-read catalog."""
     table_names = tuple(sorted(set((*_COMMON_TABLES, *(_DETAIL_TABLES if include_detail else ())))))
     return await _inventory_relation_names(session, schema, table_names)
 
 
-async def _inventory_relation_names(session, schema, table_names):
-    """Reject unsupported topology and require an exact fresh name/OID recheck."""
-    relation_oids = await _snapshot_relation_oids(session, schema, table_names)
-    if await _relation_oids(session, schema, table_names) != relation_oids:
-        raise _SnapshotSetupChanged("Provider data changed during the read; retry the request.")
-    return relation_oids
+async def _read_doctors_generation(session, schema):
+    """Read the portable Doctors origin without validating legacy physical fields."""
+    result = await session.execute(
+        text(
+            "SELECT local_lineage_id,local_generation,origin_lineage_id,origin_generation,published_at "
+            f"FROM \"{schema}\".{reference_generation.TABLE_NAME} WHERE importer_id='cms-doctors'"
+        )
+    )
+    row = result.mappings().one_or_none()
+    if row is None:
+        raise ServiceUnavailable("Provider data is temporarily unavailable.")
+    logical = address_generation.validate_entity_address_result_generation_authority({"singleton": True, **row})
+    serving = logical.serving_generation
+    return reference_generation.ReferenceFamilyResultGenerationAuthority(
+        "cms-doctors",
+        logical.local_lineage_id,
+        logical.local_generation,
+        reference_generation.validate_reference_family_serving_generation(serving.as_dict()) if serving else None,
+        None,
+    )
 
 
-async def _read_native_authorities(session, schema, relation_oids, *, include_address, verify_names):
+async def _read_native_authorities(session, schema, relations_by_name, *, include_address):
     """Check installed native authorities before publishing their pinned metadata."""
     authorities_by_family = {}
-    if relation_oids[f"{schema}.{reference_generation.TABLE_NAME}"] is not None:
+    if relations_by_name[f"{schema}.{reference_generation.TABLE_NAME}"] is not None:
         has_doctors = (
             await execute_network_read(
                 session,
@@ -306,15 +356,11 @@ async def _read_native_authorities(session, schema, relation_oids, *, include_ad
             )
         ).scalar()
         if has_doctors:
-            authority = await reference_generation.read_reference_family_result_generation_authority(
-                session,
-                importer_id="cms-doctors",
-                schema_name=schema,
-            )
-            await verify_names()
+            authority = await _read_doctors_generation(session, schema)
             authorities_by_family["cms-doctors"] = authority
-            _require_matching_relations(authority, schema, _DOCTORS_TABLES, relation_oids)
-    if include_address and relation_oids[f"{schema}.{address_generation.TABLE_NAME}"] is not None:
+            if authority.serving_generation is not None:
+                _require_named_relations(schema, _DOCTORS_TABLES, relations_by_name)
+    if include_address and relations_by_name[f"{schema}.{address_generation.TABLE_NAME}"] is not None:
         has_address_authority = (
             await execute_network_read(
                 session, text(f'SELECT EXISTS (SELECT 1 FROM "{schema}".{address_generation.TABLE_NAME})')
@@ -325,21 +371,21 @@ async def _read_native_authorities(session, schema, relation_oids, *, include_ad
                 session,
                 schema_name=schema,
             )
-            await verify_names()
             authorities_by_family["entity-address"] = authority
-            _require_matching_relations(authority, schema, address_generation.RELATION_NAMES, relation_oids)
+            if authority.serving_generation is not None:
+                _require_named_address_relations(schema, relations_by_name)
     return authorities_by_family
 
 
-async def _requires_cms_receipt(session, schema, relation_oids):
+async def _requires_cms_receipt(session, schema, relations_by_name):
     """Keep withdrawals guarded by receipt history without treating legacy Doctors as CMS NPD."""
-    if relation_oids[f"{schema}.{_CMS_RECEIPT_TABLE}"] is not None:
+    if relations_by_name[f"{schema}.{_CMS_RECEIPT_TABLE}"] is not None:
         result = await execute_network_read(
             session, text(f'SELECT EXISTS (SELECT 1 FROM "{schema}".{_CMS_RECEIPT_TABLE})')
         )
         if result.scalar():
             return True
-    if relation_oids[f"{schema}.{_PROFILE_GENERATION_TABLE}"] is not None:
+    if relations_by_name[f"{schema}.{_PROFILE_GENERATION_TABLE}"] is not None:
         result = await execute_network_read(
             session,
             text(
@@ -351,23 +397,25 @@ async def _requires_cms_receipt(session, schema, relation_oids):
     return False
 
 
-async def _read_cms_receipt(session, schema, relation_oids, *, verify_names):
+async def _read_cms_receipt(session, schema, relations_by_name):
     """Accept only the immutable proof of the pinned native serving relations."""
     receipt = None
-    if relation_oids[f"{schema}.{_CMS_RECEIPT_TABLE}"] is not None:
-        receipt = await cms_serving_receipt.read_serving_receipt(session, schema)
-        await verify_names()
+    if relations_by_name[f"{schema}.{_CMS_RECEIPT_TABLE}"] is not None:
+        receipt = await cms_serving_receipt.read_named_serving_receipt(session, schema)
     if receipt is None:
         raise ServiceUnavailable("Provider data is temporarily unavailable.")
     return receipt
 
 
-def _require_matching_relations(authority, schema, table_names, relation_oids):
-    """Preserve generation-less legacy reads while rejecting a drifted native receipt."""
-    if authority.relation_oids is not None and authority.relation_oids != tuple(
-        relation_oids[f"{schema}.{name}"] for name in table_names
-    ):
+def _require_named_relations(schema, table_names, relations_by_name):
+    """Require a complete named family without inspecting legacy catalog IDs."""
+    if any(relations_by_name.get(f"{schema}.{name}") is None for name in table_names):
         raise ServiceUnavailable("Provider data is temporarily unavailable.")
+
+
+def _require_named_address_relations(schema, relations_by_name):
+    """Require the complete named address family without interpreting legacy IDs."""
+    _require_named_relations(schema, address_generation.RELATION_NAMES, relations_by_name)
 
 
 @asynccontextmanager
@@ -389,15 +437,16 @@ async def _provider_read_snapshot(database, schema, *, include_detail, table_nam
     """Share setup-only retry and exact Reader ownership across fixed projections."""
     if not isinstance(schema, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", schema):
         raise ValueError("provider_profile_schema_invalid")
-    max_attempts = 1 if database.has_reader_session() or database._transaction_binding() is not None else 3
-    scope_options_by_name = {"include_detail": include_detail}
-    if table_names is not None:
-        scope_options_by_name["table_names"] = table_names
+    is_new_reader = not database.has_reader_session()
+    max_attempts = 1 if not is_new_reader or database._transaction_binding() is not None else 3
+    selected_names = table_names or tuple(sorted(set((*_COMMON_TABLES, *(_DETAIL_TABLES if include_detail else ())))))
+    scope_options_by_name = {"include_detail": include_detail, "table_names": selected_names}
     for attempt in range(1, max_attempts + 1):
         has_yielded = False
         session = None
         try:
             async with database.reader_session() as session:
+                await _prepare_provider_reader(session, schema, fresh=is_new_reader, table_names=selected_names)
                 async with _read_snapshot_scope(session, schema, **scope_options_by_name):
                     has_yielded = True
                     yield session
@@ -419,61 +468,59 @@ async def _provider_read_snapshot(database, schema, *, include_detail, table_nam
             raise ServiceUnavailable("Provider data is temporarily unavailable.") from error
 
 
+async def _prepare_provider_reader(session, schema, *, fresh=False, table_names=None):
+    """Pin a fresh Reader or reuse names locked by request middleware."""
+    if "provider_profile_relations" in session.info:
+        return
+    if not fresh and session.in_transaction():
+        raise ServiceUnavailable("Provider reads require a fresh or already pinned snapshot.")
+    relation_names = (
+        provider_snapshot_names(schema) if table_names is None else ((schema, name) for name in table_names)
+    )
+    session.info["provider_profile_relations"] = await lock_reader_relations(session, relation_names)
+
+
 @asynccontextmanager
 async def _read_snapshot_scope(session, schema, *, include_detail, table_names=None):
-    """Finish setup before yielding; loader failures never replay a response."""
+    """Finish logical setup before yielding; loader failures never replay a response."""
     if not session.info.get("api_reader_verified"):
         await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-    await session.execute(text("SET LOCAL lock_timeout = '250ms'"))
-    await session.execute(text("SET LOCAL statement_timeout = '5s'"))
-    driver, backend_pid = await _original_read_driver(session)
-    relation_oids = (
-        await _inventory_serving_relations(session, schema, include_detail=include_detail)
-        if table_names is None
-        else await _inventory_relation_names(session, schema, table_names)
-    )
-    relations = tuple(
-        CompactAddressRelation(schema, name.split(".", 1)[1], oid)
-        for name, oid in relation_oids.items()
-        if oid is not None
-    )
-    absent_names = tuple((schema, name.split(".", 1)[1]) for name, oid in relation_oids.items() if oid is None)
-
-    async def verify_names():
-        """Check setup results on their original backend before publishing metadata."""
-        current_driver, current_pid = await _original_read_driver(session)
-        if current_driver is not driver or current_pid != backend_pid:
+    selected_names = table_names or tuple(sorted(set((*_COMMON_TABLES, *(_DETAIL_TABLES if include_detail else ())))))
+    pinned = session.info.get("provider_profile_relations")
+    if pinned is None:
+        relation_names = await _inventory_relation_names(session, schema, selected_names)
+    else:
+        if any(f"{schema}.{name}" not in pinned for name in selected_names):
             raise ServiceUnavailable("Provider data is temporarily unavailable.")
-        try:
-            await verify_bound_network_names(
-                driver, relations, expected_backend_pid=backend_pid, absent_names=absent_names
-            )
-        except NetworkReadIdentityError as error:
-            raise ServiceUnavailable("Provider data is temporarily unavailable.") from error
+        relation_names = await _inventory_relation_names(session, schema, selected_names, locked_names=pinned)
+    requires_cms_receipt = await _requires_cms_receipt(session, schema, relation_names)
+    authorities_by_family = await _read_native_authorities(
+        session, schema, relation_names, include_address=include_detail or requires_cms_receipt
+    )
+    receipt = await _read_cms_receipt(session, schema, relation_names) if requires_cms_receipt else None
+    geo_bindings = None
+    if relation_names.get(f"{schema}.entity_address_geo_assurance_state") is not None:
+        from process.entity_address_dependency_bindings import read_active_bindings
 
-    with network_read_name_inventory(driver, relations, absent_names=absent_names):
-        requires_cms_receipt = await _requires_cms_receipt(session, schema, relation_oids)
-        authorities_by_family = await _read_native_authorities(
-            session,
-            schema,
-            relation_oids,
-            include_address=include_detail or requires_cms_receipt,
-            verify_names=verify_names,
-        )
-        receipt = (
-            await _read_cms_receipt(session, schema, relation_oids, verify_names=verify_names)
-            if requires_cms_receipt
-            else None
-        )
-        await verify_names()
-        session.info["provider_profile_native_authorities"] = authorities_by_family
-        session.info["provider_profile_cms_serving_receipt"] = receipt
-        token = _SNAPSHOT.set(relation_oids)
-        cms_token = _CMS_SERVING.set((schema, authorities_by_family.get("cms-doctors")))
-        try:
-            yield session
-        finally:
-            _CMS_SERVING.reset(cms_token)
-            _SNAPSHOT.reset(token)
-            session.info.pop("provider_profile_native_authorities", None)
-            session.info.pop("provider_profile_cms_serving_receipt", None)
+        geo_bindings = await read_active_bindings(session, schema)
+    previous_authorities = session.info.get("provider_profile_native_authorities")
+    previous_receipt = session.info.get("provider_profile_cms_serving_receipt")
+    session.info["provider_profile_native_authorities"] = authorities_by_family
+    session.info["provider_profile_cms_serving_receipt"] = receipt
+    token = _SNAPSHOT.set(relation_names)
+    cms_token = _CMS_SERVING.set((schema, authorities_by_family.get("cms-doctors")))
+    geo_token = _GEO_BINDINGS.set((schema, geo_bindings))
+    try:
+        yield session
+    finally:
+        _GEO_BINDINGS.reset(geo_token)
+        _CMS_SERVING.reset(cms_token)
+        _SNAPSHOT.reset(token)
+        for key, previous in (
+            ("provider_profile_native_authorities", previous_authorities),
+            ("provider_profile_cms_serving_receipt", previous_receipt),
+        ):
+            if previous is None:
+                session.info.pop(key, None)
+            else:
+                session.info[key] = previous

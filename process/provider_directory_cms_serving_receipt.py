@@ -8,6 +8,7 @@ from uuid import UUID
 from sqlalchemy import text
 
 from db.cms_registry_source_pair_slot import COLUMN, MAX_BYTES
+from process import entity_address_result_generation as address_generation
 
 _TABLE = "provider_directory_cms_serving_receipt"
 _PIN_FIELDS = {"source_id", "endpoint_id", "dataset_id", "dataset_hash", "acquisition_root_run_id"}
@@ -190,6 +191,256 @@ async def assert_native_dependencies(session, schema, expected):
     """Keep the pre-build dependency snapshot pinned through caller-owned cutover."""
     if await capture_native_dependencies(session, schema, lock=True) != expected:
         raise RuntimeError("cms_serving_native_dependencies_changed")
+
+
+def portable_address_authority(authority):
+    """Normalize historical address metadata without interpreting database-local IDs."""
+    _fields(authority, _AUTHORITY_FIELDS)
+    validated = address_generation.validate_entity_address_result_generation_authority({"singleton": True, **authority})
+    origin = validated.serving_generation
+    return {
+        "local_lineage_id": validated.local_lineage_id,
+        "local_generation": validated.local_generation,
+        "origin_lineage_id": None if origin is None else origin.origin_lineage_id,
+        "origin_generation": None if origin is None else origin.origin_generation,
+        "published_at": None if origin is None else origin.as_dict()["published_at"],
+        "relation_oids": None,
+    }
+
+
+def _portable_snapshot(snapshot):
+    _fields(snapshot, {"profile", "address", "doctors", "alias_generation", "overlay_oid"})
+    _fields(snapshot["profile"], _PROFILE_FIELDS)
+    _fields(snapshot["doctors"], _AUTHORITY_FIELDS | {"importer_id"})
+    doctors_by_field = {
+        **portable_address_authority({key: snapshot["doctors"][key] for key in _AUTHORITY_FIELDS}),
+        "importer_id": snapshot["doctors"]["importer_id"],
+    }
+    if (
+        doctors_by_field["importer_id"] != "cms-doctors"
+        or doctors_by_field["local_generation"] <= 0
+        or doctors_by_field["origin_generation"] is None
+    ):
+        raise RuntimeError("cms_serving_doctors_authority_unavailable")
+    return {
+        "profile": {**snapshot["profile"], "profile_target_oid": None, "evidence_target_oid": None},
+        "address": portable_address_authority(snapshot["address"]),
+        "doctors": doctors_by_field,
+        "alias_generation": snapshot["alias_generation"],
+        "overlay_oid": None,
+    }
+
+
+def _native_document_sql(alias, fields):
+    legacy_fields = {"relation_oids", "profile_target_oid", "evidence_target_oid"}
+    return (
+        "jsonb_build_object("
+        + ",".join(
+            f"'{field}'," + ("NULL" if field in legacy_fields else f"{alias}.{field}") for field in sorted(fields)
+        )
+        + ")"
+    )
+
+
+async def capture_named_dependencies(session, schema, *, lock=False):
+    """Read portable origins and data metadata from the fixed logical serving family."""
+    namespace = _schema(schema)
+    if not session.in_transaction():
+        raise ValueError("cms_serving_receipt_requires_transaction")
+    if lock:
+        await _lock_native_dependencies(session, namespace)
+    if not await session.scalar(
+        text(
+            "SELECT bool_and(to_regclass(format('%I.%I',CAST(:schema AS text),name)) IS NOT NULL) "
+            "FROM unnest(CAST(:names AS text[])) relation(name)"
+        ),
+        {"schema": schema, "names": list(_NATIVE_RELATIONS)},
+    ):
+        raise RuntimeError("cms_serving_named_relations_unavailable")
+    snapshot = await session.scalar(
+        text(f"""SELECT jsonb_build_object(
+        'profile',(SELECT {_native_document_sql("p", _PROFILE_FIELDS)}
+          FROM {namespace}.provider_directory_profile_serving_generation p WHERE singleton_key='global'),
+        'address',(SELECT {_native_document_sql("a", _AUTHORITY_FIELDS)}
+          FROM {namespace}.entity_address_result_generation a WHERE singleton),
+        'doctors',(SELECT {_native_document_sql("d", _AUTHORITY_FIELDS | {"importer_id"})}
+          FROM {namespace}.reference_family_result_generation d WHERE importer_id='cms-doctors'),
+        'alias_generation',(SELECT generation FROM {namespace}.address_alias_state_v1 WHERE singleton),
+        'overlay_oid',NULL)""")
+    )
+    return _portable_snapshot(snapshot)
+
+
+async def _read_named_receipt(session, schema, *, current):
+    namespace = _schema(schema)
+    result = await session.execute(
+        text(f"""SELECT r.receipt_id,r.payload
+        FROM {namespace}.{_TABLE} r JOIN {namespace}.entity_address_result_generation a
+          ON r.address_lineage_id=a.local_lineage_id AND r.address_generation=a.local_generation
+        JOIN {namespace}.provider_directory_profile_serving_generation p
+          ON r.profile_generation_id=p.generation_id AND p.singleton_key='global'
+        WHERE a.singleton""")
+    )
+    row = result.mappings().one_or_none()
+    if row is None:
+        return None
+    receipt_by_field = dict(row)
+    payload = validate_receipt_payload(receipt_by_field["payload"])
+    expected = _portable_snapshot(
+        {key: payload[key] for key in ("profile", "address", "doctors", "alias_generation", "overlay_oid")}
+    )
+    actual = await capture_named_dependencies(session, schema)
+    if any(actual[key] != expected[key] for key in ("profile", "address", "doctors")):
+        return None
+    if current and not await _current_cms_pin_matches(session, namespace, payload):
+        return None
+    return receipt_by_field
+
+
+async def _current_cms_pin_matches(session, namespace, payload):
+    return bool(
+        await session.scalar(
+            text(f"""SELECT EXISTS (
+        SELECT 1 FROM {namespace}.provider_directory_endpoint_dataset d
+        JOIN {namespace}.provider_directory_source s ON s.source_id='cms-npd' AND s.endpoint_id=d.endpoint_id
+        JOIN {namespace}.provider_directory_cms_serving_coverage c ON c.dataset_id=d.dataset_id
+        WHERE d.dataset_id=:dataset_id AND d.endpoint_id=:endpoint_id AND d.dataset_hash=:dataset_hash
+          AND d.acquisition_root_run_id=:acquisition_root_run_id AND d.is_current AND d.status='published'
+          AND c.dataset_hash=d.dataset_hash AND c.proof_version=2 AND c.release_id=:release_id
+          AND c.published_at=d.published_at)"""),
+            {
+                key: payload["cms"][key]
+                for key in ("dataset_id", "endpoint_id", "dataset_hash", "acquisition_root_run_id", "release_id")
+            },
+        )
+    )
+
+
+async def read_named_current_receipt(session, schema):
+    """Read the existing current source pair without database-local identity predicates."""
+    return await _read_named_receipt(session, schema, current=True)
+
+
+async def read_named_serving_receipt(session, schema):
+    """Read copied accepted serving metadata by logical names and portable origins."""
+    return await _read_named_receipt(session, schema, current=False)
+
+
+async def append_ordinary_serving_receipt(session, schema, receipt_payload, predecessor):
+    """Continue the same source publication after application-owned data validation."""
+    if not session.in_transaction():
+        raise ValueError("cms_serving_receipt_requires_transaction")
+    receipt_payload = validate_receipt_payload(receipt_payload)
+    prior = validate_receipt_payload(predecessor["payload"])
+    immutable = ("cms", "desired_datasets", "selection")
+    if (
+        receipt_payload["predecessor_receipt_id"] != predecessor["receipt_id"]
+        or receipt_payload["expected_incumbent"] != {key: prior["cms"][key] for key in _PIN_FIELDS}
+        or any(receipt_payload[key] != prior[key] for key in immutable)
+        or receipt_payload.get("archive") != prior.get("archive")
+        or receipt_payload["cms"]["proof_version"] != 2
+        or (receipt_payload["profile"]["status"], receipt_payload["profile"]["operation"])
+        not in {("published", "publish"), ("purged", "purge")}
+        or receipt_payload["profile"]["selection_proof_id"] != receipt_payload["selection"]["proof_id"]
+    ):
+        raise RuntimeError("cms_serving_ordinary_predecessor_mismatch")
+    await _lock_ordinary_inputs(session, _schema(schema), receipt_payload)
+    native = _portable_snapshot(
+        {key: receipt_payload[key] for key in ("profile", "address", "doctors", "alias_generation", "overlay_oid")}
+    )
+    actual = await capture_named_dependencies(session, schema)
+    previous = _portable_snapshot({key: prior[key] for key in native})
+    address = native["address"]
+    if (
+        actual != native
+        or any(native[key] != previous[key] for key in ("profile", "doctors"))
+        or address["local_lineage_id"] != previous["address"]["local_lineage_id"]
+        or address["local_generation"] != previous["address"]["local_generation"] + 1
+        or address["origin_lineage_id"] != address["local_lineage_id"]
+        or address["origin_generation"] != address["local_generation"]
+    ):
+        raise RuntimeError("cms_serving_ordinary_native_mismatch")
+    namespace = _schema(schema)
+    if not await session.scalar(
+        text(f"""SELECT EXISTS (
+        SELECT 1 FROM {namespace}.{_TABLE} WHERE receipt_id=:receipt_id AND payload=CAST(:prior AS jsonb))
+        AND NOT EXISTS (SELECT 1 FROM {namespace}.{_TABLE} WHERE predecessor_receipt_id=:receipt_id)"""),
+        {"receipt_id": predecessor["receipt_id"], "prior": json.dumps(prior)},
+    ):
+        raise RuntimeError("cms_serving_ordinary_predecessor_mismatch")
+    if not await _ordinary_data_matches(session, namespace, receipt_payload):
+        raise RuntimeError("cms_serving_ordinary_data_mismatch")
+    return await append_serving_receipt(session, schema, receipt_payload)
+
+
+async def _lock_ordinary_inputs(session, namespace, payload):
+    """Keep the validated source scalars stable until the ordinary cutover commits."""
+    pins = [payload["cms"], *payload["desired_datasets"]]
+    await session.execute(
+        text(
+            f"SELECT 1 FROM {namespace}.provider_directory_source "
+            "WHERE source_id=ANY(CAST(:sources AS text[])) ORDER BY source_id FOR SHARE NOWAIT"
+        ),
+        {"sources": sorted({pin["source_id"] for pin in pins})},
+    )
+    await session.execute(
+        text(
+            f"SELECT 1 FROM {namespace}.provider_directory_endpoint_dataset "
+            "WHERE dataset_id=ANY(CAST(:datasets AS text[])) ORDER BY dataset_id FOR SHARE NOWAIT"
+        ),
+        {"datasets": sorted({pin["dataset_id"] for pin in pins})},
+    )
+    for table in (
+        "provider_directory_cms_candidate_coverage",
+        "provider_directory_cms_serving_coverage",
+        "provider_directory_cms_npd_relationship_receipt",
+    ):
+        await session.execute(
+            text(f"SELECT 1 FROM {namespace}.{table} WHERE dataset_id=:dataset FOR SHARE NOWAIT"),
+            {"dataset": payload["cms"]["dataset_id"]},
+        )
+
+
+async def _ordinary_data_matches(session, namespace, receipt_payload):
+    """Keep the existing dataset, coverage, relationship, vector and alias checks."""
+    return bool(
+        await session.scalar(
+            text(f"""WITH input AS (SELECT CAST(:payload AS jsonb) p)
+      SELECT EXISTS (
+        SELECT 1 FROM input,{namespace}.provider_directory_endpoint_dataset d
+        JOIN {namespace}.provider_directory_source s ON s.source_id='cms-npd' AND s.endpoint_id=d.endpoint_id
+        JOIN {namespace}.provider_directory_cms_candidate_coverage c ON c.dataset_id=d.dataset_id
+        JOIN {namespace}.provider_directory_cms_serving_coverage served ON served.dataset_id=d.dataset_id
+        JOIN {namespace}.provider_directory_cms_npd_relationship_receipt r ON r.dataset_id=d.dataset_id
+        WHERE d.dataset_id=p->'cms'->>'dataset_id' AND d.endpoint_id=p->'cms'->>'endpoint_id'
+          AND d.dataset_hash=p->'cms'->>'dataset_hash'
+          AND d.acquisition_root_run_id=p->'cms'->>'acquisition_root_run_id'
+          AND d.is_current AND d.status='published' AND c.proof_version=2 AND served.proof_version=2
+          AND c.release_id=p->'cms'->>'release_id' AND served.release_id=c.release_id
+          AND c.dataset_hash=d.dataset_hash AND served.dataset_hash=d.dataset_hash
+          AND served.published_at=d.published_at
+          AND c.admission_sha256=d.content_proof_admission_sha256 AND c.metadata_sha256=d.publication_metadata_sha256
+          AND r.release_id=c.release_id AND r.relationship_count=c.relationship_count
+          AND r.projection_contract='cms-npd-reference-ledger-v1')
+      AND EXISTS (
+        SELECT 1 FROM input,{namespace}.provider_directory_profile_serving_generation g
+        WHERE g.singleton_key='global' AND g.source_vector_json=(
+          SELECT COALESCE(jsonb_agg(jsonb_build_object('source_id',v->>'source_id','dataset_id',v->>'dataset_id')
+            ORDER BY v->>'source_id'),'[]'::jsonb) FROM jsonb_array_elements(p->'desired_datasets') v))
+      AND NOT EXISTS (
+        SELECT 1 FROM input,jsonb_array_elements(p->'desired_datasets') v
+        LEFT JOIN {namespace}.provider_directory_endpoint_dataset d ON d.dataset_id=v->>'dataset_id'
+        LEFT JOIN {namespace}.provider_directory_source s ON s.source_id=v->>'source_id'
+        WHERE d.dataset_id IS NULL OR d.endpoint_id IS DISTINCT FROM v->>'endpoint_id'
+          OR d.dataset_hash IS DISTINCT FROM v->>'dataset_hash'
+          OR d.acquisition_root_run_id IS DISTINCT FROM v->>'acquisition_root_run_id'
+          OR d.status<>'published' OR NOT d.is_current OR s.endpoint_id IS DISTINCT FROM d.endpoint_id)
+      AND EXISTS (SELECT 1 FROM input,{namespace}.address_alias_artifact_state_v1 a
+        WHERE a.artifact_name='provider_directory_address_overlay' AND a.generation=(p->>'alias_generation')::bigint)
+      """),
+            {"payload": json.dumps(receipt_payload)},
+        )
+    )
 
 
 def registry_source_pair_document(prepared_pair):

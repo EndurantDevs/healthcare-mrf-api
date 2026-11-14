@@ -203,12 +203,10 @@ def _desired_geo_bindings(schema, native_input_fence, doctors, dependency_bindin
         **({"tiger_captured": native_input_fence["tiger_captured"]} if "tiger_captured" in native_input_fence else {}),
     )
     if doctors is not None:
-        _target, stage, oid = doctors.stage_oids[0]
+        _target, stage, _unused = doctors.stage_oids[0]
         expected_by_name[f"{schema}.doctor_clinician_address"] = {
             "schema_name": schema,
             "table_name": stage,
-            "relation_oid": oid,
-            "relfilenode": dict(doctors.sealed_filenodes)[oid],
         }
         if dependency_bindings is None:
             raise RuntimeError("cms_address_desired_geo_bindings_required")

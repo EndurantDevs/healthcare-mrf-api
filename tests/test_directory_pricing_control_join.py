@@ -43,7 +43,11 @@ def _config(connection=None):
 
 def test_directory_pricing_join_preserves_exact_parents_without_database_work():
     scripts = ScriptDirectory.from_config(_config())
-    assert scripts.get_heads() == ["20261114020000_custom_import_snapshot_metadata"]
+    assert scripts.get_heads() == ["20261114120000_portable_serving_metadata"]
+    assert (
+        scripts.get_revision("20261114120000_portable_serving_metadata").down_revision
+        == "20261114020000_custom_import_snapshot_metadata"
+    )
     assert scripts.get_revision("20261114020000_custom_import_snapshot_metadata").down_revision == (
         "20261114010000_custom_import_snapshot_names"
     )

@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass
 from typing import Iterable, Mapping
@@ -64,12 +65,16 @@ from process.entity_address_cutover_contract import (
     run_publish_validation_operations,
 )
 from process.entity_address_dependency_bindings import (
-    activate_geo_assurance_candidate_sql as _activate_geo_assurance_candidate_sql,
-)
-from process.entity_address_dependency_bindings import (
+    activate_geo_assurance_candidate,
     lock_selected_publication_dependencies,
     preflight_publication_dependencies,
     selected_publication_dependencies,
+)
+from process.entity_address_dependency_bindings import (
+    activate_geo_assurance_candidate_sql as _activate_geo_assurance_candidate_sql,
+)
+from process.entity_address_dependency_bindings import (
+    geo_assurance_candidate_receipt_sql as _geo_assurance_candidate_receipt_sql,
 )
 from process.entity_address_dependency_bindings import (
     record_geo_assurance_candidate_sql as _record_geo_assurance_candidate_sql,
@@ -1921,13 +1926,19 @@ async def _swap_stage_table(db_schema: str, live_cls, stage_cls) -> None:
     table = live_cls.__main_table__
     await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
     await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
+    serving_recovery.receipts.record_rename(db_schema, table, table + "_old")
     await db.status(f"ALTER TABLE {db_schema}.{stage_cls.__tablename__} RENAME TO {table};")
+    serving_recovery.receipts.record_rename(db_schema, stage_cls.__tablename__, table)
 
     archived = _archived_identifier(f"{table}_idx_primary")
     await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived};")
     await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{table}_idx_primary RENAME TO {archived};")
+    serving_recovery.receipts.record_rename(db_schema, table + "_idx_primary", archived, index=True)
     await db.status(
         f"ALTER INDEX IF EXISTS {db_schema}.{stage_cls.__tablename__}_idx_primary RENAME TO {table}_idx_primary;"
+    )
+    serving_recovery.receipts.record_rename(
+        db_schema, stage_cls.__tablename__ + "_idx_primary", table + "_idx_primary", index=True
     )
 
     for index in getattr(stage_cls, "__my_additional_indexes__", []) or []:
@@ -1936,9 +1947,13 @@ async def _swap_stage_table(db_schema: str, live_cls, stage_cls) -> None:
         archived_live_name = _archived_identifier(old_live_name)
         await db.status(f"DROP INDEX IF EXISTS {db_schema}.{archived_live_name};")
         await db.status(f"ALTER INDEX IF EXISTS {db_schema}.{old_live_name} RENAME TO {archived_live_name};")
+        serving_recovery.receipts.record_rename(db_schema, old_live_name, archived_live_name, index=True)
         await db.status(
             f"ALTER INDEX IF EXISTS {db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
             f"RENAME TO {old_live_name};"
+        )
+        serving_recovery.receipts.record_rename(
+            db_schema, _stage_index_name(stage_cls.__tablename__, index_name), old_live_name, index=True
         )
 
 
@@ -2139,7 +2154,7 @@ async def _run_entity_address_cutover(
                 time.monotonic() - started,
                 _coerce_rowcount(rowcount),
             )
-        active_table_oid = await preparation_admission.read_scalar(db, _activate_geo_assurance_candidate_sql(db_schema))
+        active_table_oid = await activate_geo_assurance_candidate(db, db_schema)
         if active_table_oid is None:
             raise RuntimeError("geo assurance candidate does not match the published table and sources")
         context["geo_assurance_active_table_oid"] = int(active_table_oid)
@@ -4867,64 +4882,36 @@ def _uses_provider_directory_overlay(
     return any(overlay_from in source_select for source_select in source_selects)
 
 
-async def _provider_directory_overlay_alias_fence(
-    db_schema: str,
-) -> tuple[int, int]:
-    """Return the materialized alias generation and live overlay relation OID."""
+async def _provider_directory_overlay_alias_fence(db_schema: str) -> tuple[int, datetime.datetime]:
+    """Return the materialized alias generation and named publication timestamp."""
     row = await preparation_admission.read_first(
         db,
-        f"""
-        SELECT
-            receipt.generation,
-            to_regclass(:overlay_relation)::oid::bigint AS relation_oid
-        FROM {db_schema}.{address_alias_sql.ADDRESS_ALIAS_ARTIFACT_STATE_TABLE} AS receipt
-        WHERE receipt.artifact_name = :artifact_name;
-        """,
+        f"SELECT receipt.generation,receipt.updated_at,"
+        "to_regclass(:overlay_relation) IS NOT NULL AS relation_exists "
+        f"FROM {db_schema}.{address_alias_sql.ADDRESS_ALIAS_ARTIFACT_STATE_TABLE} AS receipt "
+        "WHERE receipt.artifact_name=:artifact_name",
         overlay_relation=f"{db_schema}.provider_directory_address_overlay",
         artifact_name="provider_directory_address_overlay",
     )
     if row is None:
         raise RuntimeError("Provider Directory address overlay alias-generation receipt is missing")
-    if row.relation_oid is None:
+    if not row.relation_exists:
         raise RuntimeError("Provider Directory address overlay relation is missing")
-    return int(row.generation), int(row.relation_oid)
+    return int(row.generation), row.updated_at
 
 
 async def _capture_provider_directory_overlay_alias_fence(
-    db_schema: str,
-    source_selects: list[str],
-    context: dict,
+    db_schema: str, source_selects: list[str], context: dict
 ) -> None:
-    """Fence a selected overlay before a long unified-address build."""
-    if candidate_preparation.current() is not None:
-        return await candidate_preparation.capture_overlay_fence(db_schema, context)
-    if not _uses_provider_directory_overlay(db_schema, source_selects):
-        context.pop("provider_directory_overlay_alias_generation", None)
-        context.pop("provider_directory_overlay_relation_oid", None)
-        return
-    generation, relation_oid = await _provider_directory_overlay_alias_fence(db_schema)
-    expected_generation = int(context.get("address_alias_generation") or 0)
-    if generation != expected_generation:
-        raise RuntimeError(
-            "Provider Directory address overlay uses a stale address alias generation; "
-            "run a full address overlay rebuild before entity-address-unified"
-        )
-    context["provider_directory_overlay_alias_generation"] = generation
-    context["provider_directory_overlay_relation_oid"] = relation_oid
+    """Capture the selected named overlay before a long unified-address build."""
+    return await candidate_preparation.capture_provider_directory_overlay_alias_fence(
+        sys.modules[__name__], db_schema, source_selects, context
+    )
 
 
-async def _assert_provider_directory_overlay_alias_fence(
-    db_schema: str,
-    context: dict,
-) -> None:
-    """Recheck the selected overlay under the alias cutover lock."""
-    expected_oid = context.get("provider_directory_overlay_relation_oid")
-    if expected_oid is None:
-        return
-    expected_generation = int(context.get("provider_directory_overlay_alias_generation") or 0)
-    generation, relation_oid = await _provider_directory_overlay_alias_fence(db_schema)
-    if generation != expected_generation or relation_oid != int(expected_oid):
-        raise RuntimeError("Provider Directory address overlay changed during entity-address-unified build")
+async def _assert_provider_directory_overlay_alias_fence(db_schema: str, context: dict) -> None:
+    """Recheck a logical publication or the validated controlled replacement."""
+    await candidate_preparation.assert_provider_directory_overlay_alias_fence(sys.modules[__name__], db_schema, context)
 
 
 _RAW_ALIAS_INTEGRITY_SQL = """
@@ -5859,20 +5846,6 @@ async def _project_geo_assurance_transaction(
         int(candidate_table_oid),
         effective_force,
     )
-
-
-def _geo_assurance_candidate_receipt_sql(db_schema, stage_table, projected_rows, binding_options, *, record_candidate):
-    """Leave authority recording to the Publisher when preparing a protected handoff."""
-    if record_candidate:
-        return _record_geo_assurance_candidate_sql(
-            db_schema,
-            stage_table,
-            projected_rows,
-            require_canonical_publication=candidate_preparation.has_prepared_doctors(),
-            **binding_options,
-        )
-    relation = f"{_validate_schema_name(db_schema)}.{_validate_schema_name(stage_table)}"
-    return "SELECT to_regclass(" + _sql_literal(relation) + ")::oid::bigint;"
 
 
 async def _apply_entity_address_transaction_settings() -> None:

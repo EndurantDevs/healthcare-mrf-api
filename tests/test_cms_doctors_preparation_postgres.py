@@ -3,6 +3,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -79,7 +80,17 @@ async def test_outer_rollback_keeps_all_three_stages_retryable(monkeypatch):
             await prepared.mark_committed(**receipt)
             assert prepared.committed and prepared.metrics["published"]
         assert await stage_oids(fixture, ctx) == ()
-        assert (await authority(fixture)).relation_oids == tuple(oid for _, _, oid in prepared.stage_oids)
+        published = await authority(fixture)
+        assert published.local_generation == incumbent.local_generation + 1
+        async with fixture.database.transaction() as session:
+            markers = await session.execute(
+                text(
+                    f'SELECT (SELECT city FROM "{fixture.schema}".doctor_clinician_address),'
+                    f'(SELECT medical_school FROM "{fixture.schema}".cms_doctor_education),'
+                    f'(SELECT org_pac_id FROM "{fixture.schema}".cms_doctor_group_site)'
+                )
+            )
+            assert tuple(markers.one()) == ("prepared",) * 3
 
 
 async def _apply_then_fail(fixture, prepared, failed_receipts):
@@ -277,14 +288,14 @@ async def test_ordinary_publisher_keeps_late_readers_on_incumbent(monkeypatch):
                 )
             )
             pending = await pending_publisher_locks(fixture, publisher)
-            assert await doctors_snapshot(fixture) == (("incumbent",) * 3, incumbent)
+            assert await doctors_snapshot(fixture) == (("incumbent",) * 3, replace(incumbent, relation_oids=None))
             assert pending
             with pytest.raises(_ServingRelationLockTimeout, match="serving_relation_lock_timeout"):
                 await publisher
             assert len(transaction_ids) > 1 and len(set(transaction_ids)) == len(transaction_ids)
             assert await authority(fixture) == incumbent and await stage_oids(fixture, ctx) == stages
             release.set()
-            assert await reader == (("incumbent",) * 3, incumbent)
+            assert await reader == (("incumbent",) * 3, replace(incumbent, relation_oids=None))
             published = await native._publish_cms_doctors_stage(
                 native.make_class(native.DoctorClinicianAddress, ctx["import_date"]),
                 fixture.schema,
@@ -292,8 +303,7 @@ async def test_ordinary_publisher_keeps_late_readers_on_incumbent(monkeypatch):
                 identity_ctx=ctx,
             )
             assert published.local_generation == incumbent.local_generation + 1
-            assert published.relation_oids == tuple(oid for _, _, oid in stages)
-            assert await doctors_snapshot(fixture) == (("prepared",) * 3, published)
+            assert await doctors_snapshot(fixture) == (("prepared",) * 3, replace(published, relation_oids=None))
             assert await stage_oids(fixture, ctx) == ()
         finally:
             release.set()

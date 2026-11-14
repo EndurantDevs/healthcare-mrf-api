@@ -41,10 +41,26 @@ def _control_grants(statements):
 
 @pytest.fixture
 async def grant_statements():
-    connection = SimpleNamespace(execute=AsyncMock())
+    connection = SimpleNamespace(execute=AsyncMock(), fetchval=AsyncMock(return_value=False))
     policy = SimpleNamespace(schema="control_schema", owner_role="control_owner")
     await privileges.grant_cms_control_privileges(connection, policy)
     return [call.args[0] for call in connection.execute.await_args_list]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("installed", (False, True))
+async def test_optional_npi_origin_read_grant_keeps_held_only_profiles_compatible(installed):
+    connection = SimpleNamespace(execute=AsyncMock(), fetchval=AsyncMock(return_value=installed))
+    policy = SimpleNamespace(schema="control_schema", owner_role="control_owner")
+    await privileges._grant_npi_generation_read(connection, policy)
+    assert connection.fetchval.await_args.args[1:] == (policy.schema,)
+    if installed:
+        connection.execute.assert_awaited_once_with(
+            'GRANT SELECT(origin_lineage_id,origin_generation) ON "control_schema"."npi_result_generation" '
+            'TO "control_owner"'
+        )
+    else:
+        connection.execute.assert_not_awaited()
 
 
 def test_fragment_only_grants_fixed_controls_to_configured_owner(grant_statements):
@@ -358,7 +374,9 @@ async def test_invalid_identifier_refuses_before_any_grant(field, value):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("interruption", [RuntimeError("rejected"), asyncio.CancelledError()])
 async def test_error_or_cancellation_propagates_without_retry_or_transaction_takeover(interruption):
-    connection = SimpleNamespace(execute=AsyncMock(side_effect=[None, None, interruption]))
+    connection = SimpleNamespace(
+        execute=AsyncMock(side_effect=[None, None, interruption]), fetchval=AsyncMock(return_value=False)
+    )
     policy = SimpleNamespace(schema="control_schema", owner_role="control_owner")
     with pytest.raises(type(interruption)) as caught:
         await privileges.grant_cms_control_privileges(connection, policy)

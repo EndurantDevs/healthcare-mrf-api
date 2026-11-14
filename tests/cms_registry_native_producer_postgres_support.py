@@ -1028,29 +1028,18 @@ async def _reject_nonoriginal_receipt_sessions(module, database, retained):
 
 
 async def _reject_prepared_custody(module, database, retained, state):
+    import asyncpg
     import pytest
 
-    from process.network_custom_address_source import NetworkCustomAddressSourceError
-
     schema = retained.address_ownership.schema_name
-    async with database.engine.begin() as connection:
-        await connection.execute(text(f'GRANT UPDATE ON {schema}.entity_address_unified TO "{state.roles[1]}"'))
-    try:
-        async with source.source_transaction(
-            database._source_component.database, isolation="repeatable read"
-        ) as session:
-            with pytest.raises(ValueError, match="privileges are not closed"):
-                await module.retention.bind_prepared_registry_cms_source_pair(
-                    session,
-                    retained,
-                    receipt_id=state.predecessor["receipt_id"],
-                    receipt_payload=state.predecessor["payload"],
-                )
-    finally:
-        async with database.engine.begin() as connection:
-            await connection.execute(text(f'REVOKE UPDATE ON {schema}.entity_address_unified FROM "{state.roles[1]}"'))
-    async with source.source_transaction(database._source_component.database, isolation="read committed") as session:
-        with pytest.raises(NetworkCustomAddressSourceError, match="repeatable-read transaction"):
+    async with database.session_factory() as session, session.begin():
+        driver = await module.address_capture.native_driver(session)
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with driver.transaction():
+                await driver.execute(f'SET LOCAL ROLE "{state.roles[1]}"')
+                await driver.execute(f'UPDATE "{schema}".entity_address_unified SET entity_id=entity_id WHERE false')
+    async with source.source_transaction(database._source_component.database, isolation="repeatable read") as session:
+        with pytest.raises(ValueError, match="prepared_receipt_invalid"):
             await module.retention.bind_prepared_registry_cms_source_pair(
                 session,
                 retained,
@@ -1085,7 +1074,10 @@ def _original_binder_observer(module, original, state, monkeypatch):
 
         with monkeypatch.context() as patch:
             patch.setattr(module.epoch_capture, "_content", forbidden_scan)
-            patch.setattr(module.address_capture, "capture_entity_address_archive_receipt", forbidden_scan)
+            patch.setattr(
+                "process.network_cms_registry_address_equivalence.receipt.capture_entity_address_archive_receipt",
+                forbidden_scan,
+            )
             return await original(session, prepared, receipt_id=receipt_id, receipt_payload=receipt_payload)
 
     return bind

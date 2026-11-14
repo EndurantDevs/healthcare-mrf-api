@@ -366,7 +366,7 @@ class _Resources:
     readers: object = field(repr=False)
 
     @asynccontextmanager
-    async def address(self):
+    async def address(self, *, expected_artifact_sha256=None):
         """Open a fresh independent RO snapshot only after the caller owns source fences."""
         async with self.address_sessions() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
@@ -379,8 +379,12 @@ class _Resources:
             generation = address._digest(address._authority_document(authority))
             pin = PinnedAddressSource(self.settings.address_profile.schema_name, "entity_address_unified", generation)
             descriptor = await address.capture_network_address_artifact(
-                driver, pin, runtime_roles=self.settings.address_profile.runtime_roles
+                driver,
+                pin,
+                runtime_roles=self.settings.address_profile.runtime_roles,
+                expected_artifact_sha256=expected_artifact_sha256,
             )
+            pin = PinnedAddressSource(pin.schema_name, pin.table_name, descriptor["generation_id"])
             yield driver, pin, descriptor
 
 
@@ -545,7 +549,11 @@ class _SourceResolver:
             ) as selected:
                 if _source_body(selected.accepted_sources) != command["accepted_sources"]:
                     raise _unavailable()
-                async with resources.address() as (_driver, pin, descriptor):
+                async with resources.address(expected_artifact_sha256=command["address_artifact_sha256"]) as (
+                    _driver,
+                    pin,
+                    descriptor,
+                ):
                     if descriptor["descriptor_sha256"] != command["address_artifact_sha256"]:
                         raise _unavailable()
                     yield self._composition(pin, selected.recipes, source_manifest)

@@ -130,29 +130,37 @@ async def test_epoch_requirement_preserves_comment_and_catalog_binding(monkeypat
     content.assert_not_awaited()
 
 
-async def test_clone_metadata_retains_ownership_role_trigger_index_checks(monkeypatch):
+@pytest.mark.parametrize("layout_changed", [False, True])
+async def test_clone_metadata_compares_named_layout_without_content_scan(monkeypatch, layout_changed):
+    from process import network_cms_registry_address_equivalence as equivalence
+
     pair, connection = _retained_pair(), Connection()
-    catalog_rows = _relations(pair.address_ownership, connection.owner_oid)
-    ownership, triggers, closed = AsyncMock(return_value=pair.address_ownership), AsyncMock(), AsyncMock()
-    content = AsyncMock(side_effect=AssertionError("metadata mode called content capturer"))
-    monkeypatch.setattr(clones, "verify_entity_address_archive_stage_ownership", ownership)
-    monkeypatch.setattr(clones, "_catalog_relations", AsyncMock(return_value=catalog_rows))
-    monkeypatch.setattr(clones, "_require_native_constraint_triggers", triggers)
-    monkeypatch.setattr(clones, "_closed", closed)
-    monkeypatch.setattr(clones, "capture_entity_address_archive_receipt", content)
-    actual = await clones.address_clone_identity(
-        clones.NativeReceiptSession(connection),
+    layout_by_table = {table.table_name: table.schema_sha256 for table in pair.address_receipt.tables}
+    if layout_changed:
+        layout_by_table[pair.address_receipt.tables[0].table_name] = "0" * 64
+    capture = AsyncMock(
+        return_value=(None, json.dumps({"schema_sha256_by_table": layout_by_table}), "e" * 64, (), None)
+    )
+    monkeypatch.setattr(equivalence, "_native_capture", capture)
+    session = clones.NativeReceiptSession(connection)
+    operation = clones.address_clone_identity(
+        session,
         pair.address_ownership,
         pair.owner_role,
         pair.runtime_roles,
         verify_content=False,
+        expected_receipt=pair.address_receipt,
     )
-    assert actual == (None, epoch._hash(catalog_rows))
-    ownership.assert_awaited_once()
-    triggers.assert_awaited_once_with(connection, pair.address_ownership.schema_oid)
-    closed.assert_awaited_once()
-    content.assert_not_awaited()
-    assert sum(query.startswith("LOCK TABLE") for query, _ in connection.calls) == 1
+    if layout_changed:
+        with pytest.raises(ValueError, match="^registry_cms_address_layout_changed$"):
+            await operation
+    else:
+        assert await operation == (None, "e" * 64)
+    capture.assert_awaited_once_with(session, pair.address_ownership.schema_name, None, verify_content=False)
+    named_family = ",".join(
+        f'"{pair.address_ownership.schema_name}"."{name}"' for name, _ in pair.address_ownership.relation_oids
+    )
+    assert connection.calls == [(f"LOCK TABLE {named_family} IN ACCESS SHARE MODE NOWAIT", ())]
 
 
 class GuardedRow(dict):
@@ -393,19 +401,25 @@ async def test_api_pair_resolver_reads_by_name_and_compares_no_physical_identity
 
 
 @pytest.mark.parametrize("copied", [False, True])
-async def test_pair_resolver_outside_api_reads_keeps_every_custody_check(monkeypatch, copied):
+async def test_pair_resolver_outside_api_preserves_source_and_data_checks(monkeypatch, copied):
     pair, connection = _witness_pair(), Connection()
     connection.payload = _publication_row(pair)
     doubles = _pair_resolver_doubles(
         monkeypatch, pair, connection, schema_oid=pair.address_ownership.schema_oid + int(copied)
     )
-    operation = pairs.resolve_committed_registry_cms_source_pair(clones.NativeReceiptSession(connection), pair.recipe)
-    if copied:
-        with pytest.raises(ValueError, match="^registry_cms_source_pair_invalid$"):
-            await operation
-        doubles.source.assert_not_awaited()
-        return
-    assert (await operation).pair == pair
-    assert doubles.source.await_args.kwargs == doubles.clone.await_args.kwargs == {"verify_content": False}
+    actual = await pairs.resolve_committed_registry_cms_source_pair(
+        clones.NativeReceiptSession(connection), pair.recipe
+    )
+    assert actual.pair == pair and actual.source_published_at is None
+    assert doubles.source.await_args.kwargs == {"verify_content": False}
+    assert doubles.clone.await_args.kwargs == {
+        "verify_content": False,
+        "expected_receipt": pair.address_receipt,
+        "expected_logical_sha256": json.loads(pair.witness_json)["logical_sha256"],
+    }
     doubles.witness.assert_awaited_once()
     doubles.checked.assert_not_awaited()
+    _assert_no_recorded_oid_sent(connection, pair)
+    doubles.publication.return_value = {"another": "receipt"}
+    with pytest.raises(ValueError, match="^registry_cms_source_pair_invalid$"):
+        await pairs.resolve_committed_registry_cms_source_pair(clones.NativeReceiptSession(connection), pair.recipe)

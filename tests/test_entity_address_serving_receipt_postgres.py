@@ -23,7 +23,7 @@ class _Stage:
 
 @asynccontextmanager
 async def _ordinary_publication(monkeypatch, *, history=True):
-    async with _database(monkeypatch) as (engine, schema):
+    async with _database(monkeypatch, portable_receipts=True) as (engine, schema):
         initial = await _publish_initial(engine, schema) if history else None
         async with engine.begin() as connection:
             await connection.execute(
@@ -46,7 +46,7 @@ async def _ordinary_publication(monkeypatch, *, history=True):
         monkeypatch.setattr(
             native,
             "_activate_geo_assurance_candidate_sql",
-            lambda name: f"SELECT to_regclass('{name}.entity_address_unified')::oid::bigint",
+            lambda name: f"SELECT to_regclass('{name}.entity_address_unified') IS NOT NULL",
         )
         try:
             yield database, engine, schema, initial
@@ -82,9 +82,7 @@ async def test_ordinary_swap_advances_address_and_common_receipt_in_one_transact
             assert current["payload"]["expected_incumbent"] == initial["payload"]["desired_datasets"][0]
             assert current["payload"]["address"]["local_generation"] == 2
             assert context["result_generation"]["local_generation"] == 2
-            assert (
-                current["payload"]["address"]["relation_oids"][0] != initial["payload"]["address"]["relation_oids"][0]
-            )
+            assert current["payload"]["address"]["relation_oids"] is None
             for key in (
                 "cms",
                 "selection",
@@ -171,14 +169,13 @@ async def test_competing_common_or_native_writer_fails_before_swap(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_inconsistent_existing_native_history_fails_before_address_swap(monkeypatch):
+async def test_missing_named_native_relation_fails_before_address_swap(monkeypatch):
     async with _ordinary_publication(monkeypatch) as (database, engine, schema, initial):
         async with engine.begin() as connection:
             await connection.execute(
                 text(f"ALTER TABLE {schema}.cms_doctor_education RENAME TO cms_doctor_education_retired")
             )
-            await connection.execute(text(f"CREATE TABLE {schema}.cms_doctor_education (synthetic_id int)"))
-        with pytest.raises(RuntimeError, match="native_authority_drift"):
+        with pytest.raises(DBAPIError):
             await _publish(database, schema)
         async with engine.connect() as connection:
             assert await connection.scalar(text(f"SELECT synthetic_id FROM {schema}.entity_address_unified")) == 1

@@ -82,7 +82,7 @@ async def test_stage_export_clones_pinned_family(monkeypatch):
         AsyncMock(return_value=[{"model": model, "source_ref": f'"mrf"."{model.__tablename__}"'} for model in models]),
     )
     monkeypatch.setattr(source, "_legacy_source_indexes", AsyncMock(return_value=[]))
-    monkeypatch.setattr(source, "_require_legacy_target_custody", AsyncMock())
+    monkeypatch.setattr(source, "_require_legacy_target_layout", AsyncMock())
     monkeypatch.setattr(source.family_archive, "_is_model_table_equal", AsyncMock(return_value=True))
 
     manifest = await source.export_entity_address_archive_stage(

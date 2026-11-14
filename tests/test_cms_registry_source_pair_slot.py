@@ -548,6 +548,8 @@ async def test_original_publication_revalidates_its_exact_own_prepared_pair(
             case.pair.owner_role,
             case.pair.runtime_roles,
             verify_content=verify_content,
+            expected_receipt=case.pair.address_receipt,
+            expected_logical_sha256=None,
         )
 
 

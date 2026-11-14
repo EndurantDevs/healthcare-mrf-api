@@ -423,7 +423,7 @@ def test_transport_json_is_decoded(callee_rows):
 
 
 @pytest.mark.parametrize("name", [key.split("(")[0] for key in _EXPECTED_FRONTIER])
-def test_every_callee_body_and_execute_acl_are_independently_bound(callee_rows, name):
+def test_source_callees_keep_their_contract_and_serving_implementations_are_portable(callee_rows, name):
     for field in ("body", "acl"):
         rows = deepcopy(callee_rows)
         entry = next(row for row in rows if row["definition"]["proname"] == name)
@@ -431,8 +431,12 @@ def test_every_callee_body_and_execute_acl_are_independently_bound(callee_rows, 
             entry["definition"]["prosrc"] += "\n-- changed"
         else:
             entry["acl"].append([999, int(entry["definition"]["proowner"]), "EXECUTE", False])
-        with pytest.raises(ValueError, match="definition_changed|acl_changed"):
-            _verify(rows)
+        if name in custody._SERVING_CALLEES:
+            captured = _verify(rows)
+            assert captured[name]["definition"]["proname"] == name
+        else:
+            with pytest.raises(ValueError, match="definition_changed|acl_changed"):
+                _verify(rows)
 
 
 @pytest.mark.parametrize(
@@ -522,13 +526,16 @@ def test_catalog_function_set_drift_is_refused(callee_rows, damage):
         ("entry", "language", "plpython3u"),
     ],
 )
-def test_catalog_identity_drift_is_refused(callee_rows, area, field, value):
+def test_serving_signatures_refuse_incompatibility_without_local_identity_pins(callee_rows, area, field, value):
     rows = deepcopy(callee_rows)
     owner_oid_by_name = {row["definition"]["proname"]: int(row["definition"]["proowner"]) for row in rows}
     entry = rows[0] if area == "entry" else rows[0]["definition"]
     entry[field] = value
-    with pytest.raises(ValueError):
+    if area == "definition" and field in {"oid", "proowner"}:
         _verify(rows, expected_owner_oids=owner_oid_by_name)
+    else:
+        with pytest.raises(ValueError):
+            _verify(rows, expected_owner_oids=owner_oid_by_name)
 
 
 @pytest.mark.parametrize("name", sorted(source_custody._SOURCE_EXEC_NAMES))
@@ -551,7 +558,8 @@ def test_independent_role_contract_is_required(callee_rows, damage):
     if damage == "owners":
         owner_oid_by_name.pop(next(iter(owner_oid_by_name)))
     elif damage == "owner type":
-        owner_oid_by_name[next(iter(owner_oid_by_name))] = True
+        source_name = next(name for name in owner_oid_by_name if name not in custody._SERVING_CALLEES)
+        owner_oid_by_name[source_name] = True
     elif damage == "roles":
         role_oid_by_kind.pop("builder")
     elif damage == "role type":

@@ -101,7 +101,7 @@ async def _read_catalog_body(pin_reader, outcome, failure):
         if outcome in {"body_error", "cancel"}:
             raise failure
         if outcome == "reader_drift":
-            session.info.update(api_reader_identity=dict(session.info["api_reader_identity"]))
+            session.info["api_reader_verified"] = False
 
 
 @pytest.mark.parametrize("outcome", ["success", "body_error", "cancel", "reader_drift"])

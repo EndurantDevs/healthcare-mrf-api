@@ -3,6 +3,7 @@
 
 import asyncio
 import importlib
+import json
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import replace
@@ -181,10 +182,19 @@ def _prepared(case):
     return candidate.PreparedEntityAddressGeneration("test_schema", [], [], [], [], stages, {}, {"rows": 1}, None, None)
 
 
+def _named_capture(schema, stages):
+    """Model the logical name fields returned by genuine native capture."""
+    return SimpleNamespace(
+        schema_name=schema,
+        relation_oids=tuple((logical, None) for logical, _, _ in stages),
+        catalog_json=json.dumps({"stage_table_names": {logical: stage for logical, stage, _ in stages}}),
+    )
+
+
 async def test_complete_handoff_is_issued_only_after_original_commit(source_case, monkeypatch):
     case, observed = source_case, []
     prepared = _prepared(case)
-    capture = SimpleNamespace(relation_oids=tuple((logical, oid) for logical, _, oid in prepared.stage_oids))
+    capture = _named_capture(prepared.db_schema, prepared.stage_oids)
 
     async def close(database, actual, scope, issued):
         assert database is case.database and actual is prepared and scope is case.scope
@@ -199,6 +209,31 @@ async def test_complete_handoff_is_issued_only_after_original_commit(source_case
     assert observed == ["closed"] and case.factory.events[-1][0] == "commit"
     assert preparation.require_source_generation(prepared, case.admission) is capture
     assert case.factory.binding.get() is None
+
+
+@pytest.mark.parametrize("change", ["local_ids", "schema", "stage", "family"])
+async def test_handoff_uses_selected_names_without_local_id_pins(source_case, monkeypatch, change):
+    case = source_case
+    prepared = _prepared(case)
+    captured = _named_capture(prepared.db_schema, prepared.stage_oids)
+    monkeypatch.setattr(preparation, "_freeze_native", AsyncMock(return_value=("test_reader", captured)))
+    await preparation.freeze_source_generation(case.database, prepared, case.scope)
+    if change == "local_ids":
+        prepared.stage_oids = tuple((logical, stage, oid + 100) for logical, stage, oid in prepared.stage_oids)
+        assert preparation.require_source_generation(prepared, case.admission) is captured
+        assert preparation.require_source_cleanup(prepared) is prepared.source_preparation
+        return
+    if change == "schema":
+        prepared.db_schema = "other_schema"
+    elif change == "stage":
+        logical, stage, oid = prepared.stage_oids[0]
+        prepared.stage_oids = ((logical, stage + "_other", oid), *prepared.stage_oids[1:])
+    else:
+        prepared.stage_oids = prepared.stage_oids[:-1]
+    with pytest.raises(RuntimeError, match="source_preparation_invalid"):
+        preparation.require_source_generation(prepared, case.admission)
+    with pytest.raises(RuntimeError, match="source_preparation_invalid"):
+        preparation.require_source_cleanup(prepared)
 
 
 @pytest.mark.parametrize("failure", ["native", "cancel", "commit"])
@@ -276,7 +311,7 @@ async def test_cleanup_of_original_candidates_does_not_request_a_new_spend_lease
 async def test_expired_lease_cleanup_entrypoint_drains_exact_issued_family(source_case, monkeypatch):
     case = source_case
     prepared = _prepared(case)
-    capture = SimpleNamespace(relation_oids=tuple((logical, oid) for logical, _, oid in prepared.stage_oids))
+    capture = _named_capture(prepared.db_schema, prepared.stage_oids)
     monkeypatch.setattr(preparation, "_freeze_native", AsyncMock(return_value=("test_reader", capture)))
     await preparation.freeze_source_generation(case.database, prepared, case.scope)
     owned_by_name = {f"test_schema.{name}": oid for _, name, oid in prepared.stage_oids}
@@ -584,7 +619,7 @@ async def _native_freeze_case(case, monkeypatch, failure):
     monkeypatch.setattr(modules.native_layout, "capture_retained_native_source", model_check)
     monkeypatch.setattr(modules.pins, "_custody", custody_check)
     monkeypatch.setattr(modules.read_catalog, "require_native_read_catalog", AsyncMock())
-    captured = SimpleNamespace(relation_oids=tuple((logical, oid) for logical, _, oid in stages))
+    captured = _named_capture(prepared.db_schema, stages)
     monkeypatch.setattr(
         modules.equivalence, "capture_registry_cms_address_copy_source", AsyncMock(return_value=captured)
     )

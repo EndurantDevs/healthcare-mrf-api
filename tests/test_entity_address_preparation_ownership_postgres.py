@@ -401,3 +401,22 @@ async def test_missing_backend_binding_rejects_build_and_cleans(monkeypatch):
         with pytest.raises(RuntimeError, match="executing-session binding unavailable"):
             await _prepare(ctx, inputs, admission)
         await _assert_stages_absent(database, schema)
+
+
+async def test_ordinary_creation_collision_preserves_uncreated_foreign_table(monkeypatch):
+    """An occupied declared name never becomes part of ordinary cleanup."""
+    from process import entity_address_ordinary_preparation as ordinary
+
+    async with _temporary_schema() as (database, schema):
+        monkeypatch.setattr(native, "db", database)
+        await database.status(f"CREATE TABLE {schema}.entity_address_unified_stage (marker text)")
+        await database.status(f"INSERT INTO {schema}.entity_address_unified_stage VALUES ('foreign')")
+
+        async def create(_session):
+            pytest.fail("occupied name reached CREATE")
+
+        with pytest.raises(RuntimeError, match="name_occupied"):
+            async with ordinary.scope(schema, {"entity_address_unified_stage"}) as owned:
+                await ordinary.create(schema, "entity_address_unified_stage", create)
+        assert not owned.created_names
+        assert await database.scalar(f"SELECT marker FROM {schema}.entity_address_unified_stage") == "foreign"

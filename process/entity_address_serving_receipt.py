@@ -34,8 +34,8 @@ def ordinary_address_receipt_callbacks(database, schema, quote_literal):
         if not await owner_session.scalar(text(f"SELECT EXISTS (SELECT 1 FROM {table})")):
             return
         async with preserve_transaction_sql_settings(database, ["lock_timeout"], quote_literal):
-            snapshot = await receipts.capture_native_dependencies(owner_session, schema, lock=True)
-        predecessor = await receipts.read_current_receipt(owner_session, schema)
+            snapshot = await receipts.capture_named_dependencies(owner_session, schema, lock=True)
+        predecessor = await receipts.read_named_current_receipt(owner_session, schema)
         if predecessor is None or await owner_session.scalar(
             text(f"SELECT EXISTS (SELECT 1 FROM {table} WHERE predecessor_receipt_id=:receipt_id)"),
             {"receipt_id": predecessor["receipt_id"]},
@@ -51,7 +51,7 @@ def ordinary_address_receipt_callbacks(database, schema, quote_literal):
         snapshot, owner_session = publication_by_field["snapshot"], publication_by_field["session"]
         if _publication_session(database) is not owner_session:
             raise RuntimeError("entity_address_common_receipt_transaction_changed")
-        result = await receipts.capture_native_dependencies(owner_session, schema)
+        result = await receipts.capture_named_dependencies(owner_session, schema)
         if any(result[key] != value for key, value in snapshot.items() if key != "address"):
             raise RuntimeError("entity_address_common_receipt_dependencies_changed")
         previous_address, address = snapshot["address"], result["address"]
@@ -68,6 +68,6 @@ def ordinary_address_receipt_callbacks(database, schema, quote_literal):
             "predecessor_receipt_id": predecessor["receipt_id"],
             "expected_incumbent": {key: predecessor["payload"]["cms"][key] for key in receipts._PIN_FIELDS},
         }
-        await receipts.append_serving_receipt(owner_session, schema, payload)
+        await receipts.append_ordinary_serving_receipt(owner_session, schema, payload, predecessor)
 
     return EntityAddressCutoverCallbacks(before_cutover=before_cutover, after_publish=after_publish)

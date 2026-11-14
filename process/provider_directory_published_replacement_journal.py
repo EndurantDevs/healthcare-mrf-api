@@ -31,9 +31,41 @@ def _header(values):
 
 def _outputs(before):
     return {
-        root: {"oid": item["native"]["oid"], "rows": item["rows"], "data_sha256": item["data_sha256"]}
+        root: {
+            "snapshot": item["native"]["schema"] + "." + item["native"]["relname"],
+            "retained_snapshot": item["native"]["schema"] + "." + receipts.retained_name(item["native"]),
+            "rows": item["rows"],
+            "data_sha256": item["data_sha256"],
+        }
         for root, item in before["roots"].items()
     }
+
+
+def normalize(binding, schema):
+    """Read old backup labels as names; never bind them to a current physical object."""
+    if binding is None:
+        return None
+    value = decoded(encoded(binding))
+    receipts.require(type(value) is dict and value.get("version") in (2, 3), "replacement_binding_invalid")
+    if value["version"] == 2:
+        entries = value.get("retained_outputs")
+        receipts.require(type(entries) is dict and set(entries) == set(receipts.ROOTS), "replacement_outputs_invalid")
+        for entry in entries.values():
+            receipts.require(
+                type(entry) is dict and set(entry) == {"oid", "rows", "data_sha256"},
+                "replacement_outputs_invalid",
+            )
+        value["retained_outputs"] = {
+            root: {
+                "snapshot": schema + "." + root,
+                "retained_snapshot": schema + "." + receipts.retained_name(entry),
+                "rows": entry["rows"],
+                "data_sha256": entry["data_sha256"],
+            }
+            for root, entry in entries.items()
+        }
+        value["version"] = 3
+    return value
 
 
 def capture(directory, fence, before):
@@ -49,7 +81,7 @@ def capture(directory, fence, before):
     serving_inputs.validate(snapshot)
     dataset = fence.datasets[0]
     return dict(
-        version=2,
+        version=3,
         source_id=dataset.source_id,
         incumbent=_header(scope.incumbent),
         publication=_header(scope.publication),
@@ -105,7 +137,7 @@ def _validate_contract(binding_by_field, pin):
             "serving_inputs",
         }
         and type(binding_by_field["version"]) is int
-        and binding_by_field["version"] == 2
+        and binding_by_field["version"] == 3
         and binding_by_field["source_id"] == pin["source_id"]
         and type(binding_by_field["source_contract"]) is list
         and bool(binding_by_field["source_contract"])
@@ -128,7 +160,7 @@ def _validate_contract(binding_by_field, pin):
 
 
 def validate(binding_by_field, pin, *, before=None):
-    """Keep the optional versioned preparation binding closed without changing journal v1."""
+    """Validate source coordinates, named retained outputs and the closed preparation binding."""
     if binding_by_field is None:
         return
     _validate_contract(binding_by_field, pin)
@@ -148,18 +180,26 @@ def validate(binding_by_field, pin, *, before=None):
     )
     outputs = binding_by_field["retained_outputs"]
     receipts.require(type(outputs) is dict and set(outputs) == set(receipts.ROOTS), "replacement_outputs_invalid")
-    for entry in outputs.values():
+    for root, entry in outputs.items():
         receipts.require(
             type(entry) is dict
-            and set(entry) == {"oid", "rows", "data_sha256"}
-            and type(entry["oid"]) is int
-            and 0 < entry["oid"] < 2**32
+            and set(entry) == {"snapshot", "retained_snapshot", "rows", "data_sha256"}
+            and type(entry["snapshot"]) is str
+            and type(entry["retained_snapshot"]) is str
             and type(entry["rows"]) is int
             and entry["rows"] >= 0
             and type(entry["data_sha256"]) is str
             and receipts._HASH.fullmatch(entry["data_sha256"]) is not None,
             "replacement_outputs_invalid",
         )
+        parts = entry["snapshot"].split(".")
+        backup = entry["retained_snapshot"].split(".")
+        receipts.require(
+            len(parts) == len(backup) == 2 and parts[0] == backup[0] and parts[1] == root, "replacement_outputs_invalid"
+        )
+        receipts.qualified(*parts)
+        receipts.qualified(*backup)
+        receipts.retained_name({"retained_name": backup[1]})
     if before is not None:
         receipts.require(outputs == _outputs(before), "replacement_output_binding_changed")
 

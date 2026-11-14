@@ -121,7 +121,7 @@ async def test_stage_cleanup_visits_only_explicit_nonempty_artifacts(monkeypatch
 async def test_row_scratch_cleanup_cannot_drop_an_unowned_name(monkeypatch):
     drop = AsyncMock()
     monkeypatch.setattr(rows.admission, "drop_stage", drop)
-    monkeypatch.setattr(rows.ordinary_preparation, "current", lambda: SimpleNamespace(owned_oids={"owned": 101}))
+    monkeypatch.setattr(rows.ordinary_preparation, "current", lambda: SimpleNamespace(created_names={"owned"}))
     token = rows.admission._ADMISSION.set(None)
     try:
         await rows._drop_scratch(SimpleNamespace(), "sample", ("owned", "foreign"), {"foreign": 202})

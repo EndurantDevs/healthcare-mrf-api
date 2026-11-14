@@ -129,9 +129,7 @@ async def signed_request_reader(request, ordinary_session, *, plan_workspace=Fal
                 raise CustomImportReadUnavailableError("signed read Reader ownership is unavailable")
             with _bind_request_reader(request, session, verified_request_id=verified_request_id):
                 if request.path.startswith("/api/v1/extensions/custom-import/providers"):
-                    from api.reference_family_reads import pin_claims_reader
-
-                    await pin_claims_reader(session)
+                    await db._pin_request_reader(request, session)
                 yield session
     except BaseException as failure:
         if type(_static_attribute(failure, "_api_reader_diagnostic")) is not dict:

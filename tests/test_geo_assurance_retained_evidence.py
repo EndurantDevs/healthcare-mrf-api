@@ -51,27 +51,35 @@ def test_retained_dependencies_do_not_require_moving_the_unified_anchor():
     assert 'JOIN "held_provider"."retained_npi_address" AS geo_nppes_anchor_source' in sql
 
 
-@pytest.mark.parametrize(
-    "defect", ["missing", "extra", "duplicate_oid", "duplicate_relation", "identifier", "bool_oid"]
-)
+@pytest.mark.parametrize("defect", ["missing", "extra", "duplicate_relation", "identifier"])
 def test_retained_evidence_refuses_incomplete_or_unsafe_dependencies(defect):
     bindings = _bindings()
     if defect == "missing":
         del bindings["tiger.zip_state"]
     if defect == "extra":
         bindings["mrf.unreviewed"] = bindings["mrf.npi_address"]
-    if defect == "duplicate_oid":
-        bindings["mrf.mrf_address"]["relation_oid"] = bindings["mrf.npi_address"]["relation_oid"]
     if defect == "duplicate_relation":
         bindings["mrf.mrf_address"]["table_name"] = bindings["mrf.npi_address"]["table_name"]
     if defect == "identifier":
         bindings["mrf.npi_address"]["schema_name"] = 'held"; SELECT 1; --'
-    if defect == "bool_oid":
-        bindings["mrf.npi_address"]["relation_oid"] = True
     with pytest.raises(ValueError):
         projection.legacy_evidence_source_id_sql(
             "office", schema_name="mrf", dependency_bindings=bindings, unified_schema_name="held_offices"
         )
+
+
+@pytest.mark.parametrize("legacy_id", [True, 0, "old metadata"])
+def test_retained_evidence_ignores_legacy_physical_fields(legacy_id):
+    bindings = _bindings()
+    expected_sql = projection.legacy_evidence_source_id_sql("office", schema_name="mrf", dependency_bindings=bindings)
+    for binding in bindings.values():
+        binding.update(relation_oid=legacy_id, relfilenode=legacy_id)
+    unchanged = copy.deepcopy(bindings)
+    assert (
+        projection.legacy_evidence_source_id_sql("office", schema_name="mrf", dependency_bindings=bindings)
+        == expected_sql
+    )
+    assert bindings == unchanged
 
 
 @pytest.mark.parametrize("field", ["unified_schema_name", "unified_table_name"])

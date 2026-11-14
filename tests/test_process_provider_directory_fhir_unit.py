@@ -10824,12 +10824,21 @@ def _artifact_publish_scalar(row_count: int, statements: list[str] | None = None
 
 
 def _stub_artifact_build_guard(monkeypatch):
+    publication_fields = (0, importer.datetime.datetime(2026, 1, 1))
+
     @contextlib.asynccontextmanager
     async def unlocked_guard(_schema, target_relation, **_kwargs):
-        target_oid = 101 if "address_overlay" in target_relation else None
-        yield importer.ProviderDirectoryArtifactBuildFence(target_oid=target_oid)
+        if target_relation == importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE:
+            yield importer._ProviderDirectoryAliasBuildFence(
+                target_oid=None,
+                target_name=importer._qt(_schema, target_relation),
+                target_publication=publication_fields,
+            )
+        else:
+            yield importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
 
     monkeypatch.setattr(importer, "_provider_directory_artifact_build_guard", unlocked_guard)
+    monkeypatch.setattr(importer, "_address_overlay_publication", AsyncMock(return_value=publication_fields))
     monkeypatch.setattr(importer, "_address_alias_generation", AsyncMock(return_value=0))
     monkeypatch.setattr(
         importer,
@@ -24450,7 +24459,7 @@ def test_pagination_guard_serializes_same_endpoint_across_roots():
 
 @pytest.mark.asyncio
 async def test_pagination_guard_uses_dedicated_connection(monkeypatch):
-    guard_connection = AsyncMock()
+    guard_connection = AsyncMock(info={})
     guard_connection.execute.return_value = SimpleNamespace(scalar=lambda: True)
     open_connection = AsyncMock(return_value=guard_connection)
     monkeypatch.setattr(
@@ -24474,7 +24483,7 @@ async def test_pagination_guard_uses_dedicated_connection(monkeypatch):
 async def test_pagination_guard_invalidates_connection_when_lock_wait_is_cancelled(
     monkeypatch,
 ):
-    guard_connection = AsyncMock()
+    guard_connection = AsyncMock(info={})
     guard_connection.execute.side_effect = asyncio.CancelledError
     monkeypatch.setattr(
         importer,

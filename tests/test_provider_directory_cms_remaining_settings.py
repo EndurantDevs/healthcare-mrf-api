@@ -86,14 +86,17 @@ def _receipt_case(monkeypatch, group, settings):
 
 @pytest.mark.parametrize("group", ["profile", "common"])
 @pytest.mark.parametrize("settings", [_OLD, _NEW])
-async def test_receipt_flows_keep_exact_source_bodies_and_settings(monkeypatch, group, settings):
+async def test_receipt_flows_use_named_contracts_and_settings(monkeypatch, group, settings):
     database, guards, check = _receipt_case(monkeypatch, group, settings)
     before = deepcopy(guards)
-    await check(database, dict(schema_name="example", relation_oid=41))
+    await check(database, dict(schema_name="example", relation_name="provider_directory_cms_serving_receipt"))
     assert guards == before
     guards[0]["function_body"] += " RETURN NULL;"
-    with pytest.raises(RuntimeError, match="receipt_guard_shape_changed"):
-        await check(database, dict(schema_name="example", relation_oid=41))
+    guards[0]["function_oid"] += 100
+    await check(database, dict(schema_name="example", relation_name="provider_directory_cms_serving_receipt"))
+    assert database.all.await_args.kwargs == dict(
+        schema="example", relation_name="provider_directory_cms_serving_receipt"
+    )
 
 
 @pytest.mark.parametrize("group", ["profile", "common"])
@@ -101,7 +104,7 @@ async def test_receipt_flows_keep_exact_source_bodies_and_settings(monkeypatch, 
 async def test_receipt_settings_near_misses_refuse(monkeypatch, group, settings):
     database, _guards, check = _receipt_case(monkeypatch, group, settings)
     with pytest.raises(RuntimeError, match="receipt_guard_shape_changed"):
-        await check(database, dict(schema_name="example", relation_oid=41))
+        await check(database, dict(schema_name="example", relation_name="provider_directory_cms_serving_receipt"))
 
 
 @pytest.mark.parametrize("field,value", [("function_schema", "other"), ("security_definer", True), ("language", "sql")])
@@ -109,7 +112,7 @@ async def test_receipt_attributes_remain_required_with_successor(monkeypatch, fi
     database, guards, check = _receipt_case(monkeypatch, "common", _NEW)
     guards[0][field] = value
     with pytest.raises(RuntimeError, match="receipt_guard_shape_changed"):
-        await check(database, dict(schema_name="example", relation_oid=41))
+        await check(database, dict(schema_name="example", relation_name="provider_directory_cms_serving_receipt"))
 
 
 async def test_initial_guards_outside_transition_keep_original_settings_only():
@@ -118,7 +121,7 @@ async def test_initial_guards_outside_transition_keep_original_settings_only():
     event, deferred, body = expected[name]
     guard = _guard_mapping(name, event, deferred, body, _OLD)
     database = SimpleNamespace(all=AsyncMock(return_value=[SimpleNamespace(_mapping=guard)]))
-    relation_by_field = dict(schema_name="example", relation_oid=41)
+    relation_by_field = dict(schema_name="example", relation_name="provider_directory_cms_serving_receipt")
     await receipt._assert_guards(database, relation_by_field, expected)
     guard["function_settings"] = _NEW
     with pytest.raises(RuntimeError, match="receipt_guard_shape_changed"):

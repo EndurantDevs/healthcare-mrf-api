@@ -29,9 +29,9 @@ def candidate_inputs():
         ),
     )
     geo = EntityAddressGeoAssurancePreparation(
-        next(entry[3] for entry in inputs.relations if entry[0] == "entity_address_unified"),
+        None,
         5,
-        tuple((name, entry["relation_oid"], entry["relfilenode"]) for name, entry in inputs.geo_bindings().items()),
+        tuple((name, entry["schema_name"], entry["table_name"]) for name, entry in inputs.geo_bindings().items()),
     )
     return replace(inputs, geo_preparation=geo)
 
@@ -69,9 +69,7 @@ class _Result:
 
 def provider_session(inputs, *, change=None):
     statements = []
-    signature_by_relation = {
-        name: [entry["relation_oid"], entry["relfilenode"]] for name, entry in inputs.geo_bindings().items()
-    }
+    signature_by_relation = inputs.geo_bindings()
     state_by_field = {
         "candidate_geo_assurance_version": 1,
         "candidate_table_oid": inputs.geo_preparation.stage_table_oid,
@@ -82,7 +80,7 @@ def provider_session(inputs, *, change=None):
         "bindings_match": True,
     }
     if change == "geo-state":
-        state_by_field["candidate_table_oid"] += 1
+        state_by_field["candidate_projected_rows"] += 1
 
     async def execute(statement, parameters=None):
         sql = str(statement)
@@ -134,7 +132,7 @@ def test_candidate_inputs_refuse_open_or_ambiguous_physical_scope(change):
 
 
 @pytest.mark.asyncio
-async def test_future_provider_signature_survives_physical_relation_rename():
+async def test_changed_selected_names_require_new_geo_preparation():
     inputs = candidate_inputs()
     original = provider_session(inputs)
     digest = await contract.provider_signature(original, candidate_inputs=inputs)
@@ -145,7 +143,9 @@ async def test_future_provider_signature_survives_physical_relation_rename():
             for index, (role, _schema, _relation, oid, filenode) in enumerate(inputs.relations)
         ),
     )
-    assert await contract.provider_signature(provider_session(renamed), candidate_inputs=renamed) == digest
+    assert len(digest) == 64
+    with pytest.raises(ValueError, match="geo authority changed"):
+        await contract.provider_signature(provider_session(renamed), candidate_inputs=renamed)
     sql, parameters = original.statements[-1]
     assert "active_geo_assurance_version" not in sql
     assert parameters["npi_relation"] == inputs.relation("npi")
@@ -174,17 +174,18 @@ async def test_candidate_signature_matches_published_oid_encoding():
         "zip": identities_by_role["geo_zip_lookup"],
         "geo_assurance": {
             "version": 1,
-            "table_oid": str(inputs.geo_preparation.stage_table_oid),
-            "signature": {
-                name: [entry["relation_oid"], entry["relfilenode"]] for name, entry in inputs.geo_bindings().items()
-            },
+            "table_oid": str(next(entry[3] for entry in inputs.relations if entry[0] == "entity_address_unified")),
+            "signature": inputs.geo_bindings(),
         },
         "geo_assurance_ready": True,
     }
-    published = SimpleNamespace(execute=AsyncMock(return_value=_Result(scalar=json.dumps(published_by_field))))
+    published = SimpleNamespace(
+        execute=AsyncMock(return_value=_Result(scalar=json.dumps(published_by_field))),
+        scalar=AsyncMock(return_value=inputs.geo_bindings()),
+    )
     assert candidate_digest == await contract.provider_signature(published)
     assert json.loads(candidate.statements[-1][1]["candidate_geo"]) == published_by_field["geo_assurance"]
-    assert type(inputs.geo_preparation.stage_table_oid) is int
+    assert inputs.geo_preparation.stage_table_oid is None
     published_sql = str(published.execute.await_args.args[0])
     assert "'table_oid', active_table_oid," in published_sql
     assert "active_table_oid::" not in published_sql

@@ -75,6 +75,7 @@ _ORIGIN_UPGRADE_REVISIONS = [
     "20261115010000_ms_drg_companion_tables",
     "20261114010000_custom_import_snapshot_names",
     CURRENT_HEAD,
+    "20261114120000_portable_serving_metadata",
 ]
 
 
@@ -197,7 +198,8 @@ def _assert_custom_import_manual_acceptance_lineage(script):
 
 def _assert_snapshot_migration_head(script):
     """Keep the current head and staged snapshot predecessors explicit."""
-    assert script.get_heads() == [CURRENT_HEAD]
+    assert script.get_heads() == ["20261114120000_portable_serving_metadata"]
+    assert script.get_revision("20261114120000_portable_serving_metadata").down_revision == CURRENT_HEAD
     assert script.get_revision(CURRENT_HEAD).down_revision == "20261114010000_custom_import_snapshot_names"
     assert script.get_revision("20261114010000_custom_import_snapshot_names").down_revision == (
         "20261115010000_ms_drg_companion_tables"

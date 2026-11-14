@@ -66,7 +66,7 @@ async def test_recovery_with_no_extra_dependencies_does_not_lock_unrelated_relat
 
 
 @pytest.mark.asyncio
-async def test_unchanged_root_oids_do_not_prepare_or_borrow_retained_heaps(monkeypatch):
+async def test_unchanged_snapshot_does_not_prepare_or_borrow_retained_heaps(monkeypatch):
     baseline, overlay, _ = serving_states()
     proofs_by_root = {
         root: SimpleNamespace(
@@ -134,12 +134,12 @@ async def test_inverse_preserves_unchanged_heaps_and_handles_absent_optional_cal
         {replaced: restored_proof},
         {"elapsed_seconds": 0},
     )
-    assert restored_state is after
+    recovery.receipts.require_state(after, restored_state)
     retain.assert_awaited_once_with(database, "sample", overlay["roots"][replaced])
     restore.assert_awaited_once_with(database, "sample", baseline["roots"][replaced], prepared=restored_proof)
     generations.publish_local_entity_address_generation.assert_awaited_once_with(database, schema_name="sample")
     assert append.await_args.args[3] == "recovered"
-    assert append.await_args.args[5:7] == (overlay, after)
+    assert append.await_args.args[5:7] == (overlay, restored_state)
 
 
 @pytest.mark.asyncio
@@ -189,7 +189,7 @@ async def test_prepared_address_is_rechecked_without_recapturing_or_rebuilding(m
         )
     ]
     if changed_after_lock:
-        with pytest.raises(ValueError, match="current_serving_changed"):
+        with pytest.raises(ValueError, match="state_changed"):
             await recovery.prepare_address(database, "sample", swaps, context_by_field)
     else:
         await recovery.prepare_address(database, "sample", swaps, context_by_field)

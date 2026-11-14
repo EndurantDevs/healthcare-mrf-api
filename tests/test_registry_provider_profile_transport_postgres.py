@@ -511,6 +511,7 @@ async def source_transport(source_preparation, profile_transport, published_prof
     await _source_reviewed_payer(held)
     held.writer_statements.clear()
     held.calls, held.requests, held.source_sql, held.driver_proofs = [], [], [], []
+    observed_statements = set()
     held.prior = object()
     original_pin = serving_read.read_published_api_pin
     original_reader = managed._request_reader
@@ -543,7 +544,8 @@ async def source_transport(source_preparation, profile_transport, published_prof
 
     @event.listens_for(held.database._reader_database.engine.sync_engine, "after_cursor_execute")
     def observe_sql(connection, cursor, statement, parameters, context, executemany):
-        if len(held.source_sql) < 5000:
+        if statement not in observed_statements and len(held.source_sql) < 5000:
+            observed_statements.add(statement)
             held.source_sql.append(statement)
 
     monkeypatch.setattr(serving_read, "read_published_api_pin", pin)
@@ -835,6 +837,7 @@ async def _native_prepared_plan_request(database, held, failure):
 
     async def setup(session):
         assert not session.info.get("api_reader_verified") and not database.has_reader_session()
+        assert session.info["provider_profile_relations"]["mrf.npi"] == "mrf.npi"
         await plan.prepare_plan_query_tables(session)
 
     async with database.reader_session(temporary_setup=setup) as session:

@@ -688,7 +688,7 @@ def test_complete_native_source_prefix_uses_unique_actual_ancestor_order():
 
     merged = complete.source_component_native_migrations()
     baseline = source_component_migrations()
-    assert len(merged) == len(set(merged)) == 135
+    assert len(merged) == len(set(merged)) == 136
     assert tuple(prefix for prefix in merged if prefix in set(baseline)) == baseline
     assert set(merged) - (set(baseline) | set(complete.NATIVE_INPUT_MIGRATIONS)) == {
         "20260830090000",
@@ -706,10 +706,11 @@ def test_complete_native_source_prefix_uses_unique_actual_ancestor_order():
     assert merged.index("20260629123000") < merged.index("20260629160000") < merged.index("20260630112000")
     assert merged.index("20260729110000") < merged.index("20260729120000") < merged.index("20260730110000")
     assert merged.index("20260628100000") < merged.index("20260628143000") < merged.index("20260628170000")
-    assert merged[-3:] == (
+    assert merged[-4:] == (
         "20261022120000",
         "20261023100000_provider_directory_retirement_parent_updates",
         "20261024050000",
+        "20261114120000",
     )
 
 
@@ -1148,3 +1149,19 @@ async def test_source_template_never_seals_a_busy_or_cancelled_baseline(monkeypa
     assert admin.fetchval.await_count == (1 if cancelled else 121)
     assert sleep.await_count == (1 if cancelled else 120)
     admin.execute.assert_not_awaited()
+
+
+def test_native_producer_fixture_exports_remain_available():
+    """The genuine native producer consumes these explicit fixture re-exports."""
+    from tests import test_network_cms_registry_source_pair_postgres as retained
+    from tests import test_network_registry_cms_prepared_pair_postgres as component
+
+    for name in (
+        "_retained_office_resources",
+        "_bounded_source_copy",
+        "_publish_pair",
+        "capture_registry_cms_source_pair",
+    ):
+        assert callable(getattr(component, name))
+    assert callable(retained.native_entity_address_source_copy)
+    assert component.cms is retained.cms

@@ -398,10 +398,8 @@ async def _move_to_destination(session, stored, owner):
         db_schema=stored["restored"]["db_schema"], import_date=stored["restored"]["import_date"]
     )
     moved = await destination.restore._move_owned_relations(session, owner=owner, db_schema=schema, stage_names=names)
-    expected_oids = tuple(
-        (catalog_row["table_name"], catalog_row["oid"]) for catalog_row in stored["restored"]["stage_relation_oids"]
-    )
-    _require(moved == expected_oids, "relocation differs")
+    expected_stages = destination.restore._stored_stage_oids(stored["restored"]["stage_relation_oids"], names)
+    _require(moved == expected_stages, "relocation differs")
     return schema, names
 
 
@@ -737,7 +735,9 @@ async def activate_validated_entity_address_archive_destination(
         schema, names = await _move_to_destination(session, stored, owner)
         prepared = _prepared_adoption(stored)
         dependency_bindings = await _resolve_dependency_bindings(session, schema, prepared)
-        expected_geo = destination._validated_geo_preparation(stored["geo_assurance"], db_schema=schema)
+        expected_geo = destination._validated_geo_preparation(
+            stored["geo_assurance"], db_schema=schema, dependency_bindings=dependency_bindings
+        )
         actual_geo = await destination._capture_geo_preparation(
             session,
             db_schema=schema,
@@ -1057,7 +1057,9 @@ async def _activate_set_validated_destination(
             entry["table_name"]: entry["oid"] for entry in prepared_stored["restored"]["stage_relation_oids"]
         }
         dependency_bindings = await _resolve_dependency_bindings(session, schema, prepared)
-        expected_geo = destination._validated_geo_preparation(prepared_stored["geo_assurance"], db_schema=schema)
+        expected_geo = destination._validated_geo_preparation(
+            prepared_stored["geo_assurance"], db_schema=schema, dependency_bindings=dependency_bindings
+        )
         actual_geo = await destination._capture_geo_preparation(
             session,
             db_schema=schema,

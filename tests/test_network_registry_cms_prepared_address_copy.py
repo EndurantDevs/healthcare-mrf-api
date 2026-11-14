@@ -23,10 +23,10 @@ def _prepared(rows=4):
 class BoundsConnection:
     """Return native aggregate metadata and retain the queries for range assertions."""
 
-    def __init__(self, keys, *, row_bytes=10, oid=42):
+    def __init__(self, keys, *, row_bytes=10, is_valid=True):
         self.keys = keys
         self.row_bytes = row_bytes
-        self.oid = oid
+        self.is_valid = is_valid
         self.bounds = []
 
     async def fetchrow(self, query, *arguments):
@@ -42,8 +42,81 @@ class BoundsConnection:
 
     async def fetchval(self, query, source):
         assert "relkind='r'" in query and "relpersistence='p'" in query
+        assert "NOT relrowsecurity" in query and "NOT relforcerowsecurity" in query
         assert source == '"sample"."stage"'
-        return self.oid
+        return self.is_valid
+
+
+def _address(legacy_oid=None):
+    stages = tuple((name, name + "_stage", legacy_oid) for name in clone._COPY_KEYS)
+    return clone.PreparedEntityAddressGeneration("sample", [], [], [], [], stages, {}, {}, None, None)
+
+
+@pytest.mark.parametrize("legacy_oid", [None, 42])
+def test_prepared_stage_names_accept_portable_and_legacy_metadata(legacy_oid):
+    address = _address(legacy_oid)
+    assert clone.prepared_address_stages(address) == tuple(sorted(address.stage_oids))
+
+
+@pytest.mark.parametrize("change", ["missing", "duplicate", "shape", "identifier", "committed"])
+def test_prepared_stage_family_and_shape_remain_required(change):
+    address = _address()
+    if change == "missing":
+        address.stage_oids = address.stage_oids[:-1]
+    elif change == "duplicate":
+        address.stage_oids = (address.stage_oids[-1], *address.stage_oids[1:])
+    elif change in {"shape", "identifier"}:
+        first = address.stage_oids[0]
+        replacement = first[:2] if change == "shape" else (first[0], "invalid.stage", None)
+        address.stage_oids = (replacement, *address.stage_oids[1:])
+    else:
+        address.committed = True
+    with pytest.raises(ValueError):
+        clone.prepared_address_stages(address)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_valid", [False, True])
+async def test_stage_locks_and_layout_use_qualified_names(is_valid):
+    address = _address()
+    session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(return_value=is_valid))
+    if is_valid:
+        assert await clone.lock_prepared_address(session, address) == tuple(sorted(address.stage_oids))
+    else:
+        with pytest.raises(ValueError, match="prepared_address_changed"):
+            await clone.lock_prepared_address(session, address)
+    assert str(session.execute.call_args.args[0]) == (
+        "LOCK TABLE "
+        + ",".join(f'"sample"."{stage}"' for _, stage, _ in sorted(address.stage_oids))
+        + " IN SHARE MODE NOWAIT"
+    )
+    for query, parameters in (call.args for call in session.scalar.call_args_list):
+        assert "relpersistence='p'" in str(query) and "NOT relrowsecurity" in str(query)
+        assert parameters["relation"] in {f'"sample"."{stage}"' for _, stage, _ in address.stage_oids}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schema", ["sample", "other"])
+async def test_native_layouts_match_the_full_source_name(monkeypatch, schema):
+    prepared = _prepared()
+    prepared.address = _address()
+    measured_relations = [
+        SimpleNamespace(schema=schema, relation=stage, oid=100 + index)
+        for index, (_, stage, _) in enumerate(prepared.address.stage_oids)
+    ]
+    admission = prepared.nonprofile_admission
+    admission.measure = AsyncMock(return_value=measured_relations)
+    admission.plan.native_address_targets, admission.lease = (), object()
+    capture = AsyncMock(side_effect=lambda _fhir, source, _targets: source)
+    monkeypatch.setattr(clone, "capture_retained_native_source", capture)
+    monkeypatch.setattr(clone, "retained_raw_policy", lambda _lease: {})
+    if schema == "other":
+        with pytest.raises(ValueError, match="prepared_address_changed"):
+            await clone._prepared_native_sources(prepared, prepared.address.stage_oids)
+        capture.assert_not_awaited()
+    else:
+        layouts, policy = await clone._prepared_native_sources(prepared, prepared.address.stage_oids)
+        assert layouts == dict(zip(clone._COPY_KEYS, measured_relations, strict=True)) and policy == "{}"
 
 
 def test_exact_native_model_keys_and_compound_range():
@@ -93,14 +166,15 @@ async def test_missing_or_changed_native_key_is_refused(indexed):
     connection = SimpleNamespace(fetchval=AsyncMock(return_value=indexed))
     with pytest.raises(ValueError, match="copy_key_invalid"):
         await clone._require_prepared_copy_key(connection, '"sample"."stage"', 42, ("location_key",))
-    query, oid, source, keys = connection.fetchval.call_args.args
-    assert (oid, source, keys) == (42, '"sample"."stage"', ["location_key"])
+    query, source, keys = connection.fetchval.call_args.args
+    assert (source, keys) == ('"sample"."stage"', ["location_key"])
     assert all(term in query for term in ("indimmediate", "indislive", "opcdefault", "indcollation", "attnotnull"))
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("overflow", [False, True])
-async def test_wide_or_actual_spool_overflow_halves_without_omitting_rows(monkeypatch, overflow):
+@pytest.mark.parametrize("legacy_oid", [None, 42])
+async def test_wide_or_actual_spool_overflow_halves_without_omitting_rows(monkeypatch, overflow, legacy_oid):
     keys = [("a", "npi", "1", "p" + str(index)) for index in range(5)]
     connection = BoundsConnection(keys, row_bytes=10 if overflow else 50)
     prepared, imports, attempted = _prepared(), [], []
@@ -119,7 +193,7 @@ async def test_wide_or_actual_spool_overflow_halves_without_omitting_rows(monkey
 
     monkeypatch.setattr(clone, "_copy_native_batch", copy)
     await clone._copy_prepared_rows(
-        connection, prepared, "retained", ("entity_address_plan_bridge", "stage", 42), 5, (4, 130)
+        connection, prepared, "retained", ("entity_address_plan_bridge", "stage", legacy_oid), 5, (4, 130)
     )
     assert imports == keys
     assert attempted == ([4, 2, 2, 1] if overflow else [2, 2, 1])
@@ -143,12 +217,12 @@ async def test_one_overwide_row_is_refused_before_admission(monkeypatch, overflo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["oid", "before", "after"])
-async def test_batch_oid_refusal_and_admission_cancellation_propagate(monkeypatch, failure):
+@pytest.mark.parametrize("failure", ["layout", "before", "after"])
+async def test_batch_layout_refusal_and_admission_cancellation_propagate(monkeypatch, failure):
     prepared = _prepared()
-    connection = BoundsConnection([("a",)], oid=43 if failure == "oid" else 42)
+    connection = BoundsConnection([("a",)], is_valid=failure != "layout")
     phases = []
-    if failure != "oid":
+    if failure != "layout":
         prepared.nonprofile_admission.assert_ready.side_effect = (
             asyncio.CancelledError if failure == "before" else [None, asyncio.CancelledError]
         )
@@ -159,11 +233,27 @@ async def test_batch_oid_refusal_and_admission_cancellation_propagate(monkeypatc
         await import_admission("after_import")
 
     monkeypatch.setattr(clone, "_copy_native_batch", copy)
-    with pytest.raises(ValueError if failure == "oid" else asyncio.CancelledError):
+    with pytest.raises(ValueError if failure == "layout" else asyncio.CancelledError):
         await clone._copy_prepared_rows(
             connection, prepared, "retained", ("entity_address_unified", "stage", 42), 1, (1, 130)
         )
     assert phases == (["copied"] if failure == "after" else [])
+
+
+@pytest.mark.asyncio
+async def test_copy_admission_keeps_the_original_source_transaction():
+    prepared = _prepared()
+    source = SimpleNamespace(verify_transaction=AsyncMock())
+    reader = SimpleNamespace(fetchval=AsyncMock(return_value=True))
+    admit = clone._prepared_import_admission(reader, prepared, "retained", '"sample"."stage"', None, source)
+    await admit("before_import")
+    source.verify_transaction.assert_awaited_once_with()
+    assert reader.fetchval.call_args.args[1] == '"sample"."stage"'
+    prepared.nonprofile_admission.assert_ready.assert_awaited_once_with(prepared.fhir, "retained")
+    source.verify_transaction.side_effect = asyncio.CancelledError
+    with pytest.raises(asyncio.CancelledError):
+        await admit("after_import")
+    assert reader.fetchval.await_count == prepared.nonprofile_admission.assert_ready.await_count == 1
 
 
 @pytest.mark.asyncio

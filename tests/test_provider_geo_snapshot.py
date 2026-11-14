@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Fixed geo inventories retain native guards; protocol doubles are not custody proof."""
+"""Fixed geo inputs use logical names and preserve portable publication checks."""
 
 import asyncio
 import json
@@ -31,6 +31,8 @@ _RAW_PARENTS = (
 def _database(session):
     @asynccontextmanager
     async def reader_session():
+        if "provider_profile_relations" not in session.info:
+            session.driver.active = False
         yield session
 
     return SimpleNamespace(
@@ -38,7 +40,7 @@ def _database(session):
     )
 
 
-async def test_geo_inventory_excludes_only_unconsumed_families_and_preserves_full_profile_guard():
+async def test_geo_inventory_excludes_unconsumed_families_and_preserves_profile_shape_checks():
     session = _Session(installed=(*snapshot._GEO_TABLES, *_RAW_PARENTS))
     session.kinds.update(dict.fromkeys(_RAW_PARENTS, "p"))
     session.indirect_names.update(_RAW_PARENTS)
@@ -49,15 +51,17 @@ async def test_geo_inventory_excludes_only_unconsumed_families_and_preserves_ful
         "npi_result_generation",
         "nucc_taxonomy",
     }
+    await snapshot._prepare_provider_reader(session, "mrf", fresh=True)
     async with snapshot.provider_geo_read_snapshot(_database(session), "mrf") as actual:
-        assert actual is session and execution.has_network_read_inventory()
+        assert actual is session and not execution.has_network_read_inventory()
         assert set(snapshot._SNAPSHOT.get()) == {"mrf." + name for name in snapshot._GEO_TABLES}
         assert snapshot.snapshot_relation_available("mrf.nucc_taxonomy") is True
         assert not any("mrf." + name in snapshot._SNAPSHOT.get() for name in _RAW_PARENTS)
-    assert not any(event.startswith("LOCK TABLE") for event in session.events)
+    locks = [event for event in session.events if event.startswith("LOCK TABLE")]
+    assert locks
     async with snapshot.provider_profile_read_snapshot(_database(session), "mrf", include_detail=True):
         assert all(snapshot.snapshot_relation_available("mrf." + name) for name in _RAW_PARENTS)
-    assert sum(event.startswith("LOCK TABLE") for event in session.events) == 1
+    assert [event for event in session.events if event.startswith("LOCK TABLE")] == locks
     assert snapshot._SNAPSHOT.get() is None and not execution.has_network_read_inventory()
 
 
@@ -75,13 +79,12 @@ async def test_geo_snapshot_keeps_consumed_relation_topology_guard(name, damage)
     assert snapshot._SNAPSHOT.get() is None and not execution.has_network_read_inventory()
 
 
-@pytest.mark.parametrize("change", (None, 999))
-async def test_geo_snapshot_keeps_fresh_name_and_oid_recheck(change):
+async def test_geo_snapshot_accepts_copied_names_without_native_id_comparison():
     session = _Session(installed=snapshot._GEO_TABLES)
-    session.catalog_change = {'"mrf"."npi"': change}
-    with pytest.raises(snapshot._SnapshotSetupChanged):
-        async with snapshot.provider_geo_read_snapshot(_database(session), "mrf"):
-            pytest.fail("stale geo name reached loader")
+    session.current = dict.fromkeys(session.current, 999)
+    async with snapshot.provider_geo_read_snapshot(_database(session), "mrf"):
+        assert snapshot.snapshot_relation_available("mrf.npi") is True
+        assert session.guard_count == 0
 
 
 async def test_geo_snapshot_preserves_cms_withdrawal_history_requirement(monkeypatch):
@@ -89,7 +92,7 @@ async def test_geo_snapshot_preserves_cms_withdrawal_history_requirement(monkeyp
     session.answers[snapshot._CMS_RECEIPT_TABLE] = True
     session.answers[snapshot._PROFILE_GENERATION_TABLE] = False
     missing_receipt = AsyncMock(return_value=None)
-    monkeypatch.setattr(snapshot.cms_serving_receipt, "read_serving_receipt", missing_receipt)
+    monkeypatch.setattr(snapshot.cms_serving_receipt, "read_named_serving_receipt", missing_receipt)
     with pytest.raises(ServiceUnavailable):
         async with snapshot.provider_geo_read_snapshot(_database(session), "mrf"):
             pytest.fail("withdrawn CMS profile bypassed receipt history")
@@ -97,27 +100,26 @@ async def test_geo_snapshot_preserves_cms_withdrawal_history_requirement(monkeyp
     assert snapshot._SNAPSHOT.get() is None and not execution.has_network_read_inventory()
 
 
-@pytest.mark.parametrize("drift", (False, True))
-async def test_geo_snapshot_checks_native_address_authority_and_original_names(monkeypatch, drift):
+async def test_geo_snapshot_uses_logical_address_generation(monkeypatch):
     session = _Session(installed=snapshot._GEO_TABLES)
     session.answers[snapshot.address_generation.TABLE_NAME] = True
-    pins = tuple(session.current[f'"mrf"."{name}"'] for name in snapshot.address_generation.RELATION_NAMES)
 
-    async def read_authority(actual, *, schema_name):
-        assert actual is session and schema_name == "mrf"
-        if drift:
-            session.current['"mrf"."npi"'] = 999
-        return SimpleNamespace(relation_oids=pins)
+    class Authority:
+        serving_generation = object()
 
-    monkeypatch.setattr(snapshot.address_generation, "read_entity_address_result_generation_authority", read_authority)
-    if drift:
-        with pytest.raises(ServiceUnavailable):
-            async with snapshot.provider_geo_read_snapshot(_database(session), "mrf"):
-                pytest.fail("drifted geo authority reached loader")
-    else:
-        async with snapshot.provider_geo_read_snapshot(_database(session), "mrf"):
-            assert session.info["provider_profile_native_authorities"]["entity-address"].relation_oids == pins
-            await execution.execute_network_read(session, text("SELECT geo_payload"))
+        @property
+        def relation_oids(self):
+            pytest.fail("physical metadata is not read")
+
+    authority = Authority()
+    monkeypatch.setattr(
+        snapshot.address_generation,
+        "read_entity_address_result_generation_authority",
+        AsyncMock(return_value=authority),
+    )
+    async with snapshot.provider_geo_read_snapshot(_database(session), "mrf"):
+        assert session.info["provider_profile_native_authorities"]["entity-address"] is authority
+        await execution.execute_network_read(session, text("SELECT geo_payload"))
     assert "provider_profile_native_authorities" not in session.info
 
 
@@ -137,7 +139,7 @@ async def test_geo_snapshot_reuses_setup_retry_without_replaying_loader(monkeypa
 
     @asynccontextmanager
     async def reader_session():
-        session = object()
+        session = SimpleNamespace(info={"provider_profile_relations": {}})
         opened.append(session)
         try:
             yield session

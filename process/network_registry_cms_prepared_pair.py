@@ -133,7 +133,9 @@ class PreparedRegistryCMSSourcePair:
             "address_ownership": self.address_ownership.as_dict(),
             "address_receipt": self.address_receipt.as_dict(),
             "address_catalog_sha256": self.address_catalog_sha256,
-            "address_stages": [list(stage) for stage in self.address_stages],
+            "address_stages": [list(stage[:2]) + [None] for stage in self.address_stages]
+            if self.address_ownership.schema_oid is None
+            else [list(stage) for stage in self.address_stages],
             "owner_role": self.owner_role,
             "runtime_roles": list(self.runtime_roles),
             "capacity_geometry_hash": self.capacity_geometry_hash,
@@ -399,7 +401,7 @@ def _prepared_from_copies(prepared, request, epoch, address_copy, roles, source_
         ownership,
         receipt,
         catalog,
-        stages,
+        tuple((logical, stage, None) for logical, stage, _ in stages) if ownership.schema_oid is None else stages,
         owner_role,
         runtime_roles,
         admission.plan.capacity_geometry_hash,
@@ -526,13 +528,18 @@ async def _require_prepared_pair(session, prepared_pair):
         prepared_pair.owner_role,
         prepared_pair.runtime_roles,
         verify_content=False,
+        expected_receipt=prepared_pair.address_receipt,
+        expected_logical_sha256=(
+            prepared_pair.address_catalog_sha256 if prepared_pair.address_ownership.schema_oid is None else None
+        ),
     )
     comment = await connection.fetchval(
-        "SELECT obj_description($1::oid,'pg_namespace')", prepared_pair.address_ownership.schema_oid
+        "SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=$1",
+        prepared_pair.address_ownership.schema_name,
     )
-    if catalog != prepared_pair.address_catalog_sha256 or comment != (
-        _prepared_comment_prefix(prepared_pair) + _json(prepared_pair.as_dict())
-    ):
+    if (
+        prepared_pair.address_ownership.schema_oid is None and catalog != prepared_pair.address_catalog_sha256
+    ) or comment != (_prepared_comment_prefix(prepared_pair) + _json(prepared_pair.as_dict())):
         raise ValueError("registry_cms_prepared_pair_invalid")
     return connection
 
@@ -585,12 +592,9 @@ async def bind_prepared_registry_cms_source_pair(session, prepared_pair, *, rece
     pair = _pair_from_prepared_receipt(prepared_pair, receipt_row)
     await _require_retained_authority(connection, prepared_pair, publication_document)
     current = await serving.capture_native_dependencies(session, request.source_pin.schema_name, lock=True)
-    expected_oid_by_logical = {logical: oid for logical, _stage, oid in prepared_pair.address_stages}
     if (
         publication_document["address"] != current["address"]
         or publication_document["profile"] != current["profile"]
-        or publication_document["address"]["relation_oids"]
-        != [expected_oid_by_logical[logical] for logical in RELATION_NAMES]
         or publication_document["selection"]["proof_id"] != request.selection_proof_id
     ):
         raise ValueError("registry_cms_prepared_receipt_invalid")

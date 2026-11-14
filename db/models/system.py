@@ -99,22 +99,10 @@ class EntityAddressResultGeneration(Base, JSONOutputMixin):
         CheckConstraint(
             "singleton IS TRUE AND local_generation >= 0 AND ("
             "(origin_lineage_id IS NULL AND origin_generation IS NULL "
-            "AND published_at IS NULL AND relation_oids IS NULL) OR ("
+            "AND published_at IS NULL) OR ("
             "origin_lineage_id IS NOT NULL AND origin_generation IS NOT NULL "
             "AND origin_generation > 0 "
-            "AND published_at IS NOT NULL AND relation_oids IS NOT NULL "
-            "AND array_ndims(relation_oids) = 1 "
-            "AND array_lower(relation_oids, 1) = 1 "
-            "AND cardinality(relation_oids) = 7 "
-            "AND array_position(relation_oids, NULL) IS NULL "
-            "AND 0 < ALL(relation_oids) "
-            "AND 4294967295 >= ALL(relation_oids) "
-            "AND relation_oids[1] <> ALL(relation_oids[2:7]) "
-            "AND relation_oids[2] <> ALL(relation_oids[3:7]) "
-            "AND relation_oids[3] <> ALL(relation_oids[4:7]) "
-            "AND relation_oids[4] <> ALL(relation_oids[5:7]) "
-            "AND relation_oids[5] <> ALL(relation_oids[6:7]) "
-            "AND relation_oids[6] <> relation_oids[7]))",
+            "AND published_at IS NOT NULL))",
             name="entity_address_result_generation_shape_check",
         ),
         {

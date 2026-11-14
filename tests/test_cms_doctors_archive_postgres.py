@@ -915,12 +915,11 @@ async def test_validated_archive_completes_with_continuous_snapshot_readers(monk
         await asyncio.wait_for(asyncio.gather(*tasks), 3)
         adopted = await doctors_snapshot(fixture)
         assert adopted[0] == incumbent[0]
-        assert adopted[1].relation_oids == tuple(oid for _, oid in receipt.relation_oids)
+        assert adopted[1].relation_oids is None
         assert adopted[1].serving_generation == incumbent[1].serving_generation
-        assert {observed[1].relation_oids for observed in observed_snapshots} == {
-            incumbent[1].relation_oids,
-            adopted[1].relation_oids,
-        }
+        assert all(observed[0] == incumbent[0] for observed in observed_snapshots)
+        assert {observed[1].serving_generation for observed in observed_snapshots} == {incumbent[1].serving_generation}
+        assert {name for name, _ in receipt.relation_oids} == set(generation.RELATION_NAMES_BY_IMPORTER["cms-doctors"])
     finally:
         for task in tasks:
             task.cancel()
@@ -967,8 +966,10 @@ async def test_archive_activation_preserves_late_readers(monkeypatch, is_validat
         markers, adopted = await doctors_snapshot(fixture)
         assert markers == incumbent[0] and adopted.local_generation == incumbent[1].local_generation
         assert adopted.serving_generation == (incumbent[1].serving_generation if is_validated else None)
-        assert adopted.relation_oids == (tuple(oid for _, oid in receipt.relation_oids) if is_validated else None)
-        assert tuple(sorted(receipt.relation_oids)) == activation_by_field["ownership"].relation_oids
+        assert adopted.relation_oids is None
+        assert {name for name, _ in receipt.relation_oids} == {
+            name for name, _ in activation_by_field["ownership"].relation_oids
+        }
     finally:
         release.set()
         tasks = [task for task in (reader, publisher) if task is not None]

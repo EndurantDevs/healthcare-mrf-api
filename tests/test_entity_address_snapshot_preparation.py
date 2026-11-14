@@ -48,11 +48,16 @@ def _proof():
 
 
 def _selected():
-    return {"contract": dependencies.PUBLISHER_SELECTED_INPUTS_CONTRACT, "dependency_bindings": _example_bindings()}
+    return {
+        "contract": dependencies.PUBLISHER_SELECTED_INPUTS_CONTRACT,
+        "dependency_bindings": dependencies.projection.validate_projection_dependency_bindings(
+            "mrf", _example_bindings()
+        ),
+    }
 
 
 @pytest.mark.parametrize(
-    "change", ["map_oid", "map_filenode", "map_missing", "context_map", "digest", "geo_digest", "missing"]
+    "change", ["map_schema", "map_table", "map_missing", "context_map", "digest", "geo_digest", "missing"]
 )
 def test_selected_input_seal_rejects_changed_map_or_missing_independent_evidence(change):
     selected = _selected()
@@ -69,14 +74,16 @@ def test_selected_input_seal_rejects_changed_map_or_missing_independent_evidence
     seal_by_field = {"publisher_selected_inputs_sha256": preparation._digest(selected)}
     preparation._require_selected_inputs_seal(prepared_by_field, seal_by_field)
     match change:
-        case "map_oid":
-            selected["dependency_bindings"]["mrf.npi_address"]["relation_oid"] += 100
-        case "map_filenode":
-            selected["dependency_bindings"]["mrf.npi_address"]["relfilenode"] += 100
+        case "map_schema":
+            selected["dependency_bindings"]["mrf.npi_address"]["schema_name"] = "another_input"
+        case "map_table":
+            selected["dependency_bindings"]["mrf.npi_address"]["table_name"] = "another_input"
         case "map_missing":
             selected["dependency_bindings"].pop("tiger.zcta5")
         case "context_map":
-            prepared_by_field["restored"]["context"]["dependency_bindings"]["tiger.zcta5"]["relation_oid"] += 100
+            prepared_by_field["restored"]["context"]["dependency_bindings"]["tiger.zcta5"]["schema_name"] = (
+                "another_input"
+            )
         case "digest":
             seal_by_field["publisher_selected_inputs_sha256"] = "f" * 64
         case "geo_digest":
@@ -99,8 +106,8 @@ async def test_selected_heap_lock_checks_native_identities_before_projection(mat
             await dependencies.lock_publisher_selected_inputs(session, "mrf", _selected())
     sql = str(session.execute.await_args.args[0])
     assert sql.endswith(" NOWAIT") and sql.count("ONLY") == 6
-    for entry in _example_bindings().values():
-        assert str(entry["relation_oid"]) in str(session.scalar.await_args.args[0])
+    assert "pg_relation_filenode" not in str(session.scalar.await_args.args[0])
+    assert "relpersistence" in str(session.scalar.await_args.args[0])
 
 
 @pytest.mark.parametrize("changed", [False, True])
@@ -109,17 +116,17 @@ def test_selected_context_rehydration_is_closed_and_keeps_the_original_map(chang
         "address_alias_generation": 1,
         "stage_persistence": "p",
         "snapshot_contract": preparation.destination.restore.CONTRACT,
-        "dependency_bindings": _example_bindings(),
+        "dependency_bindings": _selected()["dependency_bindings"],
         "publisher_selected_inputs": _selected(),
     }
     if changed:
-        context_by_field["dependency_bindings"]["mrf.npi_address"]["relation_oid"] += 100
+        context_by_field["dependency_bindings"]["mrf.npi_address"]["schema_name"] = "another_input"
         with pytest.raises(preparation.destination.restore.EntityAddressSnapshotRestoreError):
             preparation.destination.restore._rehydrated_context(context_by_field, db_schema="mrf")
     else:
         actual = preparation.destination.restore._rehydrated_context(context_by_field, db_schema="mrf")
         assert actual["publisher_selected_inputs"] == _selected()
-        actual["publisher_selected_inputs"]["dependency_bindings"]["mrf.npi_address"]["relation_oid"] += 100
+        actual["publisher_selected_inputs"]["dependency_bindings"]["mrf.npi_address"]["schema_name"] = "another_input"
         assert context_by_field["publisher_selected_inputs"] == _selected()
 
 
@@ -127,9 +134,10 @@ def test_selected_context_rehydration_is_closed_and_keeps_the_original_map(chang
 def test_geo_receipt_preserves_ordinary_shape_and_selected_digest(digest):
     native = preparation.destination
     signature_entries = tuple(
-        (name, value["relation_oid"], value["relfilenode"]) for name, value in sorted(_example_bindings().items())
+        (name, value["schema_name"], value["table_name"])
+        for name, value in sorted(_selected()["dependency_bindings"].items())
     )
-    receipt = native.EntityAddressGeoAssurancePreparation(7, 10, signature_entries, digest)
+    receipt = native.EntityAddressGeoAssurancePreparation(None, 10, signature_entries, digest)
     stored = receipt.as_dict()
     assert ("publisher_selected_inputs_sha256" in stored) is (digest is not None)
     assert native._validated_geo_preparation(stored, db_schema="mrf") == receipt
@@ -408,7 +416,7 @@ async def test_late_native_failure_propagates_to_the_callers_transaction(monkeyp
     handback.assert_awaited_once()
 
 
-async def test_private_return_preserves_seven_oids_and_the_evidence_sequence(monkeypatch):
+async def test_private_return_preserves_seven_names_and_the_evidence_sequence(monkeypatch):
     restore = preparation.destination.restore
     names = sorted(model.__tablename__ for model in restore._models())
     owner = SimpleNamespace(
@@ -418,10 +426,13 @@ async def test_private_return_preserves_seven_oids_and_the_evidence_sequence(mon
     monkeypatch.setattr(restore, "_require_empty_owned_schema", AsyncMock())
     monkeypatch.setattr(restore, "_verify_moved_stage_oids", AsyncMock())
     monkeypatch.setattr(restore, "verify_entity_address_archive_stage_ownership", AsyncMock())
-    evidence_oid = dict(owner.relation_oids)["entity_address_evidence"]
 
-    async def sequences(_session, oid):
-        return ("entity_address_evidence_candidate_evidence_id_seq",) if oid == evidence_oid else ()
+    async def sequences(_session, relation):
+        return (
+            ("entity_address_evidence_candidate_evidence_id_seq",)
+            if relation == '"example"."entity_address_evidence_candidate"'
+            else ()
+        )
 
     monkeypatch.setattr(restore, "_owned_sequence_names", sequences)
     session = _session()

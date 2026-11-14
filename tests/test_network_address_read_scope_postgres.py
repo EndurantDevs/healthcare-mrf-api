@@ -453,9 +453,14 @@ async def test_http_network_snapshot_uses_real_request_lifecycle(
     event.listen(Engine, "before_cursor_execute", record)
     try:
         for query, authorization, status in ((path, {}, 403), (path + "&network_generation=01", headers_by_name, 400)):
+            statements.clear()
             request, reply = await app.asgi_client.get(query, headers=authorization)
             assert reply.status == status and observations == []
-            assert not any(sql.startswith("SET TRANSACTION") for sql in statements)
+            # Middleware starts its Reader before the route validates authorization and selectors.
+            assert [sql for sql in statements if sql.startswith("SET TRANSACTION")] == (
+                ["SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"] if middleware_enabled else []
+            )
+            assert not any("network_serving_control" in sql or context.current_schema in sql for sql in statements)
             await _assert_request_snapshot_closed(context, request)
         for ending, status in (("success", 200), ("error", 404)):
             resolved_before = len(observations)

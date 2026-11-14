@@ -13119,7 +13119,7 @@ PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE = "provider_directory_address_overlay"
 
 
 async def _npi_canonical_publication_identity(*, session: Any = None) -> str | None:
-    """Return the uncached receipt identity for the six current NPI tables."""
+    """Return the current logical generation key for the six named NPI tables."""
     return await npi_canonical_publication_identity(
         _execute_stmt,
         _runtime_db_schema(),
@@ -13461,7 +13461,7 @@ async def _fetch_location_status_by_record_id(
         async with (
             provider_directory_read_snapshot(db, session, reuse=use_passed_session) as status_session,
             provider_read_savepoint(status_session)
-            if use_passed_session or has_network_read_inventory(status_session)
+            if use_passed_session or db.has_reader_session() or has_network_read_inventory(status_session)
             else contextlib.nullcontext(),
         ):
             editions = await _named_directory_editions(status_session, _runtime_db_schema())

@@ -1,24 +1,26 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Ordinary replacements retain exact reader access inside their original cut."""
+"""Ordinary replacements replay current explicit SELECT on named tables."""
 
 import asyncio
-from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from process import code_catalog_snapshot as catalog
 from process import provider_directory_artifact_read_access as access
 from process import provider_directory_serving_recovery as recovery
 
 
-def _grant(principal, *, column=None, privilege="SELECT", grantable=False):
-    return catalog._AccessGrant(column, principal, privilege, grantable, "ordinary_owner")
+def _grant(principal, *, column=None, grantable=False):
+    return dict(column_sql=column, principal_sql=principal, is_grantable=grantable)
 
 
-def _capture(*, incumbent=None, successor=None):
-    return (object(), SimpleNamespace(execute=AsyncMock()), "actor", "relations", incumbent, successor)
+def _driver(grants=(), stage_grants=()):
+    return SimpleNamespace(
+        fetch=AsyncMock(side_effect=lambda _sql, _schema, _table, reads: grants if reads else stage_grants),
+        fetchval=AsyncMock(return_value=True),
+        execute=AsyncMock(),
+    )
 
 
 def _swap():
@@ -28,177 +30,97 @@ def _swap():
 
 
 @pytest.mark.asyncio
-async def test_ordinary_replay_keeps_exact_select_scope_and_rechecks_exclusive(monkeypatch):
-    grants = (
-        _grant("reader"),
-        _grant("column_reader", column="value", grantable=True),
-        _grant(None),
-        _grant("writer", privilege="UPDATE"),
+async def test_ordinary_final_replay_preserves_explicit_select(monkeypatch):
+    driver = _driver(
+        (_grant('"reader"'), _grant('"column_reader"', column='"value"', grantable=True), _grant("PUBLIC"))
     )
-    incumbent = catalog._RelationAccess("ordinary_owner", grants)
-    private = catalog._RelationAccess("ordinary_owner", ())
-    successor = catalog._RelationAccess("ordinary_owner", grants[:-1])
-    before = _capture(incumbent=incumbent, successor=private)
-    after = (*before[:5], successor)
-    capture = AsyncMock(side_effect=[before, after, after])
+    capture = AsyncMock(return_value=driver)
     monkeypatch.setattr(access, "_ordinary_access", capture)
     proofs = await access.prepare_ordinary_read_access(object(), "sample", (_swap(),))
+    driver.fetch.assert_not_called()
+    driver.execute.assert_not_called()
     await access.recheck_ordinary_read_access(object(), proofs)
-    assert [call.args[0] for call in before[1].execute.await_args_list] == [
+    assert [call.args[0] for call in driver.execute.await_args_list] == [
         'GRANT SELECT ON TABLE "sample"."stage" TO "reader"',
         'GRANT SELECT ("value") ON TABLE "sample"."stage" TO "column_reader" WITH GRANT OPTION',
         'GRANT SELECT ON TABLE "sample"."stage" TO PUBLIC',
     ]
     assert capture.await_args.kwargs == {"exclusive": True}
+    assert driver.fetch.await_args.args[1:] == ("sample", "live", True)
 
 
 @pytest.mark.asyncio
-async def test_first_publication_does_not_invent_reader_grants(monkeypatch):
-    private = catalog._RelationAccess("ordinary_owner", ())
-    captured = _capture(successor=private)
-    monkeypatch.setattr(access, "_ordinary_access", AsyncMock(return_value=captured))
-    proofs = await access.prepare_ordinary_read_access(object(), "sample", (_swap(), _swap()))
-    assert len(proofs) == 2
-    captured[1].execute.assert_not_called()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["stage_visible", "incumbent_grant", "stage_grant", "oid", "actor"])
-async def test_ordinary_replay_refuses_privacy_or_drift(monkeypatch, damage):
-    incumbent = catalog._RelationAccess("ordinary_owner", (_grant("reader"),))
-    private = catalog._RelationAccess("ordinary_owner", ())
-    before = _capture(incumbent=incumbent, successor=private)
-    after = (*before[:5], incumbent)
-    match damage:
-        case "stage_visible":
-            before = (*before[:5], incumbent)
-        case "incumbent_grant":
-            after = (*after[:4], private, after[5])
-        case "stage_grant":
-            after = (*after[:5], catalog._RelationAccess("ordinary_owner", (_grant("other"),)))
-        case "oid":
-            after = (*after[:3], "other-relations", *after[4:])
-        case "actor":
-            after = (*after[:2], "other-transaction", *after[3:])
-    monkeypatch.setattr(access, "_ordinary_access", AsyncMock(side_effect=[before, after]))
-    with pytest.raises(RuntimeError, match="ordinary_address_read_access_"):
-        await access.prepare_ordinary_read_access(object(), "sample", (_swap(),))
-
-
-@pytest.mark.asyncio
-async def test_prepared_read_access_cannot_cross_task_or_transaction(monkeypatch):
-    captured = _capture(successor=catalog._RelationAccess("ordinary_owner", ()))
-    monkeypatch.setattr(access, "_ordinary_access", AsyncMock(return_value=captured))
-    proof = (await access.prepare_ordinary_read_access(object(), "sample", (_swap(),)))[0]
-    with pytest.raises(RuntimeError, match="writer_changed"):
-        await asyncio.create_task(access.recheck_ordinary_read_access(object(), (proof,)))
-    monkeypatch.setattr(access, "_ordinary_access", AsyncMock(return_value=(*captured[:2], "new-xid", *captured[3:])))
-    with pytest.raises(RuntimeError, match="grants_changed"):
-        await access.recheck_ordinary_read_access(object(), (proof,))
-
-
-def _relations():
-    return [
-        dict(
-            name=name,
-            oid=oid,
-            relowner=1,
-            owned=True,
-            relkind="r",
-            relpersistence="p",
-            relrowsecurity=False,
-            relforcerowsecurity=False,
-        )
-        for name, oid in (("live", 11), ("stage", 12))
+async def test_final_replay_refreshes_grants_in_later_transactions(monkeypatch):
+    driver = _driver()
+    driver.fetch.side_effect = [(), (_grant('"first_reader"'),), (), (_grant('"latest_reader"'),)]
+    monkeypatch.setattr(access, "_ordinary_access", AsyncMock(return_value=driver))
+    proofs = await access.prepare_ordinary_read_access(object(), "sample", (_swap(),))
+    await access.recheck_ordinary_read_access(object(), proofs)
+    await asyncio.create_task(access.recheck_ordinary_read_access(object(), proofs))
+    assert [call.args[0] for call in driver.execute.await_args_list] == [
+        'GRANT SELECT ON TABLE "sample"."stage" TO "first_reader"',
+        'GRANT SELECT ON TABLE "sample"."stage" TO "latest_reader"',
     ]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", [None, "owner", "rls", "kind", "stage_missing", "missing_lock"])
-async def test_ordinary_capture_requires_owner_plain_heaps_and_native_locks(monkeypatch, damage):
-    from process import provider_directory_serving_recovery_receipts as receipts
+async def test_first_publication_does_not_invent_reader_grants(monkeypatch):
+    driver = _driver()
+    monkeypatch.setattr(access, "_ordinary_access", AsyncMock(return_value=driver))
+    proofs = await access.prepare_ordinary_read_access(object(), "sample", (_swap(), _swap()))
+    await access.recheck_ordinary_read_access(object(), proofs)
+    assert len(proofs) == 2
+    driver.execute.assert_not_called()
 
-    rows = deepcopy(_relations())
-    if damage == "owner":
-        rows[0]["owned"] = False
-    elif damage == "rls":
-        rows[1]["relrowsecurity"] = True
-    elif damage == "kind":
-        rows[1]["relkind"] = "v"
-    elif damage == "stage_missing":
-        rows[1]["oid"] = None
-    driver = SimpleNamespace(
-        fetch=AsyncMock(return_value=rows), fetchval=AsyncMock(return_value=1 if damage == "missing_lock" else 2)
+
+async def test_replay_clears_candidate_only_grants_before_copying_live_read_access():
+    driver = _driver(
+        (_grant('"reader"'),),
+        (_grant('"extra"'), _grant('"extra"'), _grant('"extra"', column='"value"')),
     )
-    monkeypatch.setattr(receipts, "ordinary", AsyncMock(return_value=(object(), driver, {})))
-    monkeypatch.setattr(
-        access, "_relation_access", AsyncMock(return_value=catalog._RelationAccess("ordinary_owner", ()))
-    )
-    if damage is not None:
-        with pytest.raises(RuntimeError, match="ordinary_address_read_access_"):
-            await access._ordinary_access(object(), "sample", "live", "stage")
-    else:
-        await access._ordinary_access(object(), "sample", "live", "stage", exclusive=True)
-        assert driver.fetchval.await_args.args[1:] == (["AccessExclusiveLock"], [11, 12])
+    await access._replay_select(driver, "sample", "live", "stage")
+    assert [call.args[0] for call in driver.execute.await_args_list] == [
+        'REVOKE ALL PRIVILEGES ON TABLE "sample"."stage" FROM "extra" CASCADE',
+        'REVOKE ALL PRIVILEGES ("value") ON TABLE "sample"."stage" FROM "extra" CASCADE',
+        'GRANT SELECT ON TABLE "sample"."stage" TO "reader"',
+    ]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", [None, "no_owner_usage", "different_owners", "unsupported_isolation"])
-async def test_ordinary_capture_requires_effective_native_rights_to_one_shared_owner(monkeypatch, damage):
-    """Inherited ownership is native authority; table grants and mixed owners cannot replace it."""
+@pytest.mark.parametrize("exclusive", [False, True])
+@pytest.mark.parametrize("live_exists", [False, True])
+async def test_ordinary_access_acquires_named_locks(monkeypatch, exclusive, live_exists):
     from process import provider_directory_serving_recovery_receipts as receipts
 
-    relations = _relations()
-    for relation in relations:
-        relation["owned"] = False
-    if damage == "different_owners":
-        relations[0]["relowner"] = 2
-    driver = SimpleNamespace(
-        fetch=AsyncMock(return_value=relations),
-        fetchval=AsyncMock(side_effect=[damage not in {"no_owner_usage", "unsupported_isolation"}, 2]),
-    )
-    monkeypatch.setattr(receipts, "ordinary", AsyncMock(return_value=(object(), driver, {"owner": 3})))
-    monkeypatch.setattr(
-        access, "_relation_access", AsyncMock(return_value=catalog._RelationAccess("ordinary_owner", ()))
-    )
-    if damage:
-        with pytest.raises(RuntimeError, match="ordinary_address_read_access_owner_changed"):
-            await access._ordinary_access(object(), "sample", "live", "stage")
-    else:
-        await access._ordinary_access(object(), "sample", "live", "stage", exclusive=True)
-    calls = driver.fetchval.await_args_list
-    if damage == "different_owners":
-        assert calls == []
-    else:
-        assert calls[0].args == (access._INHERITED_OWNER_USAGE_SQL, 1)
-        assert "current_setting('transaction_isolation')='read committed'" in calls[0].args[0]
-        assert "UNION" in calls[0].args[0] and "WHERE membership.inherit_option" in calls[0].args[0]
-        assert len(calls) == (1 if damage else 2)
+    driver = _driver()
+    driver.fetchval.return_value = live_exists
+    monkeypatch.setattr(receipts, "ordinary", AsyncMock(return_value=(object(), driver, None)))
+    assert await access._ordinary_access(object(), "sample", "live", "stage", exclusive=exclusive) is driver
+    tables = '"sample"."live","sample"."stage"' if live_exists else '"sample"."stage"'
+    mode = "ACCESS EXCLUSIVE" if exclusive else "SHARE"
+    driver.execute.assert_awaited_once_with(f"LOCK TABLE {tables} IN {mode} MODE NOWAIT")
+    driver.fetch.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_ordinary_read_recheck_refuses_revoked_native_owner_rights(monkeypatch):
-    """The final native permission check cannot reuse authority captured before revocation."""
+@pytest.mark.parametrize("live,stage,error", [("same", "same", RuntimeError), ("invalid.name", "stage", ValueError)])
+async def test_ordinary_access_validates_names_before_database_calls(monkeypatch, live, stage, error):
     from process import provider_directory_serving_recovery_receipts as receipts
 
-    rows = _relations()
-    for row in rows:
-        row["owned"] = False
-    session, database = object(), object()
-    driver = SimpleNamespace(
-        fetch=AsyncMock(return_value=rows),
-        fetchval=AsyncMock(side_effect=[True, 2, True, 2, False]),
-        execute=AsyncMock(),
-    )
-    monkeypatch.setattr(receipts, "ordinary", AsyncMock(return_value=(session, driver, {"owner": 3})))
-    monkeypatch.setattr(
-        access, "_relation_access", AsyncMock(return_value=catalog._RelationAccess("ordinary_owner", ()))
-    )
-    proofs = await access.prepare_ordinary_read_access(database, "sample", (_swap(),))
-    with pytest.raises(RuntimeError, match="ordinary_address_read_access_owner_changed"):
-        await access.recheck_ordinary_read_access(database, proofs)
-    assert driver.execute.await_count == 0
-    assert driver.fetchval.await_count == 5
+    ordinary = AsyncMock()
+    monkeypatch.setattr(receipts, "ordinary", ordinary)
+    with pytest.raises(error):
+        await access._ordinary_access(object(), "sample", live, stage)
+    ordinary.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_recheck_rejects_malformed_names(monkeypatch):
+    capture = AsyncMock()
+    monkeypatch.setattr(access, "_ordinary_access", capture)
+    with pytest.raises(ValueError, match="read_access_invalid"):
+        await access.recheck_ordinary_read_access(object(), (object(),))
+    capture.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -319,9 +241,10 @@ async def test_marked_overlay_copies_reads_before_hashing_successor(monkeypatch)
         return (object(),)
 
     monkeypatch.setattr(recovery, "_load_history", AsyncMock(return_value={}))
+    monkeypatch.setattr(recovery, "_journal", AsyncMock(return_value={}))
     monkeypatch.setattr(recovery.receipts, "lock", AsyncMock())
     monkeypatch.setattr(recovery.receipts, "prepare_relation", prepare)
-    monkeypatch.setattr(recovery.receipts, "prepared_state", AsyncMock(return_value={}))
+    monkeypatch.setattr(recovery.receipts, "prepared_state", AsyncMock(return_value={"metadata": {}, "roots": {}}))
     monkeypatch.setattr(recovery.receipts, "ordinary", AsyncMock(return_value=(None, None, "writer")))
     monkeypatch.setattr(access, "prepare_ordinary_artifact_reads", copy)
     await recovery.begin_overlay(directory, selection_by_field)

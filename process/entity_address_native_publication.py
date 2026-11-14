@@ -224,11 +224,9 @@ def _validate_authority(value):
         and 0 <= value["local_generation"] < 2**63,
         "native lineage differs",
     )
-    if value["serving_generation"] is None:
-        _require(value["relation_oids"] is None, "native authority is partial")
-    else:
+    if value["serving_generation"] is not None:
         generation.validate_entity_address_serving_generation(value["serving_generation"])
-        generation._relation_oids(value["relation_oids"])
+    return {**value, "relation_oids": None}
 
 
 def validate_entity_address_native_publication(receipt):
@@ -259,8 +257,7 @@ def validate_entity_address_native_publication(receipt):
         and authority["local_lineage_id"] == handoff["incumbent"]["local_lineage_id"]
         and authority["local_generation"] == handoff["incumbent"]["local_generation"] + 1
         and origin["origin_lineage_id"] == authority["local_lineage_id"]
-        and origin["origin_generation"] == authority["local_generation"]
-        and authority["relation_oids"] == [entry["relation_oid"] for entry in handoff["stage_relations"]],
+        and origin["origin_generation"] == authority["local_generation"],
         "published authority differs",
     )
     _require(
@@ -1018,7 +1015,7 @@ async def _publish_prepared(session, handoff, prepared, receipt, continuation):
         current = await generation.read_entity_address_result_generation_authority(
             session, schema_name=handoff["schema_name"]
         )
-        _require(current.as_dict() == handoff["incumbent"], "incumbent changed")
+        _require(current.as_dict() == _validate_authority(handoff["incumbent"]), "incumbent changed")
         await _require_native_attempt(session, handoff)
         callbacks = native.ordinary_address_receipt_callbacks(native.db, handoff["schema_name"], native._sql_literal)
         await native._run_entity_address_cutover(
@@ -1265,8 +1262,7 @@ async def _require_cleanup_nonserving(session, handoff):
     )
     safe = await session.scalar(
         text(
-            f'SELECT NOT EXISTS(SELECT 1 FROM "{schema}"."{generation.TABLE_NAME}" WHERE relation_oids OPERATOR(pg_catalog.&&) CAST(:oids AS bigint[])) '
-            "AND NOT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "SELECT NOT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
             "WHERE n.nspname=:schema AND c.relname=ANY(:names) AND c.oid=ANY(:oids))"
         ),
         {

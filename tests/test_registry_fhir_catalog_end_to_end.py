@@ -550,7 +550,7 @@ async def _first_pair_origin_metadata(case, pair, cuts):
     assert cuts[0]["after"]["metadata_readers"]["roles"] == [
         [role, expected_oid_by_role[role]] for role in metadata_read_roles
     ]
-    assert pair.witness_json is not None and pair.address_receipt.tables[0].row_count > 0
+    assert pair.witness_json is None and pair.address_receipt.tables[0].row_count > 0
     before = await _origin_source_authority(case.administrator)
     for role, connection in zip(
         roles[:2], (case.address_custody.execution, case.address_custody.custodian), strict=True

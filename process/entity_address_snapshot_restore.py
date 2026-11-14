@@ -52,7 +52,7 @@ class PreparedEntityAddressSnapshotRestore:
     ownership: EntityAddressArchiveStageOwnership
     db_schema: str
     import_date: str
-    stage_relation_oids: tuple[tuple[str, int], ...]
+    stage_relation_oids: tuple[tuple[str, int | None], ...]
     semantic_receipt: EntityAddressArchiveReceipt
     stage_integrity: EntityAddressStageIntegrityReceipt
     prepared: adoption.PreparedEntityAddressSnapshotAdoption
@@ -291,21 +291,21 @@ async def _actual_receipt(
         raise EntityAddressSnapshotRestoreError("entity-address restore semantic receipt differs")
 
 
-async def _primary_index_name(session: Any, relation_oid: int) -> str:
+async def _primary_index_name(session: Any, relation: str) -> str:
     value = await session.scalar(
         text(
             "SELECT index_relation.relname FROM pg_catalog.pg_index AS index_meta "
             "JOIN pg_catalog.pg_class AS index_relation ON index_relation.oid = index_meta.indexrelid "
-            "WHERE index_meta.indrelid = :relation_oid AND index_meta.indisprimary IS TRUE"
+            "WHERE index_meta.indrelid = pg_catalog.to_regclass(:relation) AND index_meta.indisprimary IS TRUE"
         ),
-        {"relation_oid": relation_oid},
+        {"relation": relation},
     )
     if not isinstance(value, str) or not value:
         raise EntityAddressSnapshotRestoreError("entity-address restore primary index is unavailable")
     return value
 
 
-async def _owned_sequence_names(session: Any, relation_oid: int) -> tuple[str, ...]:
+async def _owned_sequence_names(session: Any, relation: str) -> tuple[str, ...]:
     """Return only serial or identity sequences owned by one captured stage relation."""
 
     rows = (
@@ -315,10 +315,10 @@ async def _owned_sequence_names(session: Any, relation_oid: int) -> tuple[str, .
                 "JOIN pg_catalog.pg_depend AS dependency ON dependency.classid = 'pg_class'::regclass "
                 "AND dependency.objid = sequence_relation.oid "
                 "WHERE sequence_relation.relkind = 'S' AND dependency.refclassid = 'pg_class'::regclass "
-                "AND dependency.refobjid = :relation_oid AND dependency.deptype IN ('a', 'i') "
+                "AND dependency.refobjid = pg_catalog.to_regclass(:relation) AND dependency.deptype IN ('a', 'i') "
                 "ORDER BY sequence_relation.relname"
             ),
-            {"relation_oid": relation_oid},
+            {"relation": relation},
         )
     ).mappings()
     sequence_names = tuple(str(row["relname"]) for row in rows)
@@ -355,11 +355,9 @@ async def _reset_restored_evidence_sequence(session: Any, owner: EntityAddressAr
     """Advance the verified local evidence sequence past data-only restored identifiers."""
 
     evidence_table_name = entity_address_unified.EntityAddressEvidence.__tablename__
-    evidence_relation_oid = dict(owner.relation_oids).get(evidence_table_name)
+    evidence_relation = f"{_quoted(owner.schema_name)}.{_quoted(evidence_table_name)}"
     expected_sequence_name = f"{evidence_table_name}_evidence_id_seq"
-    if not isinstance(evidence_relation_oid, int) or await _owned_sequence_names(session, evidence_relation_oid) != (
-        expected_sequence_name,
-    ):
+    if await _owned_sequence_names(session, evidence_relation) != (expected_sequence_name,):
         raise EntityAddressSnapshotRestoreError("entity-address restore evidence sequence is invalid")
     sequence_reference = f"{owner.schema_name}.{expected_sequence_name}"
     table_reference = f"{_quoted(owner.schema_name)}.{_quoted(evidence_table_name)}"
@@ -382,16 +380,17 @@ async def _move_owned_relations(
     db_schema: str,
     stage_names: Mapping[str, str],
     heaps=False,
-) -> tuple[tuple[str, int], ...]:
-    """Move only catalog-verified owned relations and retain their stable OIDs."""
+) -> tuple[tuple[str, int | None], ...]:
+    """Move the named candidate tables and their model-defined indexes and sequences."""
 
     stage_oids = []
     for table_name, relation_oid in owner.relation_oids:
         if table_name == alias_authority.AUTHORITY_TABLE:
             continue
         stage_table_name = stage_names[table_name]
-        primary_index = None if heaps else await _primary_index_name(session, relation_oid)
-        sequence_names = await _owned_sequence_names(session, relation_oid)
+        relation = f"{_quoted(owner.schema_name)}.{_quoted(table_name)}"
+        primary_index = None if heaps else await _primary_index_name(session, relation)
+        sequence_names = await _owned_sequence_names(session, relation)
         await session.execute(
             text(
                 f"ALTER TABLE {_quoted(owner.schema_name)}.{_quoted(table_name)} RENAME TO {_quoted(stage_table_name)}"
@@ -416,7 +415,7 @@ async def _move_owned_relations(
                 f"ALTER TABLE {_quoted(owner.schema_name)}.{_quoted(stage_table_name)} SET SCHEMA {_quoted(db_schema)}"
             )
         )
-        stage_oids.append((stage_table_name, relation_oid))
+        stage_oids.append((stage_table_name, None))
     return tuple(sorted(stage_oids))
 
 
@@ -424,42 +423,35 @@ async def _verify_moved_stage_oids(
     session: Any,
     *,
     db_schema: str,
-    stage_oids: tuple[tuple[str, int], ...],
+    stage_oids: tuple[tuple[str, int | None], ...],
 ) -> None:
-    """Require each moved owner relation to retain its captured OID and new name."""
+    """Require the complete named stage layout after moving the candidate."""
 
     await _verify_stored_stage_oids(session, db_schema=db_schema, stage_oids=stage_oids)
 
 
 async def _require_empty_owned_schema(session: Any, owner: EntityAddressArchiveStageOwnership) -> None:
-    """Require the original source namespace to be unchanged and empty."""
-
-    current_oid = await session.scalar(
-        text("SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = :schema_name"),
-        {"schema_name": owner.schema_name},
+    """Require only the permitted alias table and indexes in the named namespace."""
+    exists = await session.scalar(
+        text("SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname=:schema)"),
+        {"schema": owner.schema_name},
     )
-    if current_oid != owner.schema_oid:
-        raise EntityAddressSnapshotRestoreError("entity-address restore ownership schema OID differs")
+    if exists is not True:
+        raise EntityAddressSnapshotRestoreError("entity-address restore namespace is unavailable")
+    alias_name = (
+        alias_authority.AUTHORITY_TABLE if alias_authority.AUTHORITY_TABLE in dict(owner.relation_oids) else None
+    )
     remaining = await session.scalar(
-        text("SELECT COUNT(*) FROM pg_catalog.pg_class WHERE relnamespace = :schema_oid"),
-        {"schema_oid": owner.schema_oid},
+        text(
+            "SELECT count(*) FROM pg_catalog.pg_class relation JOIN pg_catalog.pg_namespace namespace "
+            "ON namespace.oid=relation.relnamespace WHERE namespace.nspname=:schema "
+            "AND (CAST(:alias AS text) IS NULL OR (relation.relname<>:alias AND NOT EXISTS("
+            "SELECT 1 FROM pg_catalog.pg_index idx JOIN pg_catalog.pg_class target ON target.oid=idx.indrelid "
+            "WHERE idx.indexrelid=relation.oid AND target.relnamespace=namespace.oid AND target.relname=:alias)))"
+        ),
+        {"schema": owner.schema_name, "alias": alias_name},
     )
-    if alias_authority.AUTHORITY_TABLE in dict(owner.relation_oids):
-        expected_oid = dict(owner.relation_oids)[alias_authority.AUTHORITY_TABLE]
-        actual_oid = await session.scalar(
-            text("SELECT to_regclass(:relation)::oid"),
-            {"relation": f'"{owner.schema_name}"."{alias_authority.AUTHORITY_TABLE}"'},
-        )
-        if actual_oid != expected_oid:
-            raise EntityAddressSnapshotRestoreError("entity-address alias authority OID differs")
-        remaining = await session.scalar(
-            text(
-                "SELECT count(*) FROM pg_catalog.pg_class WHERE relnamespace=:schema_oid AND oid<>:oid "
-                "AND oid NOT IN(SELECT indexrelid FROM pg_catalog.pg_index WHERE indrelid=:oid)"
-            ),
-            {"schema_oid": owner.schema_oid, "oid": expected_oid},
-        )
-    if int(remaining or 0) != 0:
+    if remaining != 0:
         raise EntityAddressSnapshotRestoreError("entity-address restore ownership namespace is not empty")
 
 
@@ -469,16 +461,16 @@ async def _drop_empty_owned_schema(session: Any, owner: EntityAddressArchiveStag
 
 
 async def _return_owned_relations(session, *, owner, db_schema, stage_names) -> None:
-    """Return prepared heaps to the same private namespace without replacing OIDs."""
+    """Return prepared heaps to their exact original candidate names."""
     await _require_empty_owned_schema(session, owner)
-    stage_oids = tuple(sorted((stage_names[name], oid) for name, oid in owner.relation_oids if name in stage_names))
+    stage_oids = tuple(sorted((stage_names[name], None) for name, _oid in owner.relation_oids if name in stage_names))
     await _verify_moved_stage_oids(session, db_schema=db_schema, stage_oids=stage_oids)
     evidence_name = entity_address_unified.EntityAddressEvidence.__tablename__
     for table_name, relation_oid in owner.relation_oids:
         if table_name == alias_authority.AUTHORITY_TABLE:
             continue
         stage_name = stage_names[table_name]
-        sequences = await _owned_sequence_names(session, relation_oid)
+        sequences = await _owned_sequence_names(session, f"{_quoted(db_schema)}.{_quoted(stage_name)}")
         expected = (stage_name + "_evidence_id_seq",) if table_name == evidence_name else ()
         if sequences != expected:
             raise EntityAddressSnapshotRestoreError("entity-address restore sequence ownership changed")
@@ -557,7 +549,7 @@ async def finalize_entity_address_archive_restore(
     )
 
 
-def _stored_stage_oids(value: Any, stage_names: Mapping[str, str]) -> tuple[tuple[str, int], ...]:
+def _stored_stage_oids(value: Any, stage_names: Mapping[str, str]) -> tuple[tuple[str, int | None], ...]:
     if not isinstance(value, list):
         raise EntityAddressSnapshotRestoreError("entity-address restore stage ownership is invalid")
     stage_oid_pairs = []
@@ -566,16 +558,11 @@ def _stored_stage_oids(value: Any, stage_names: Mapping[str, str]) -> tuple[tupl
             not isinstance(entry, Mapping)
             or set(entry) != {"table_name", "oid"}
             or not isinstance(entry["table_name"], str)
-            or type(entry["oid"]) is not int
-            or entry["oid"] <= 0
         ):
             raise EntityAddressSnapshotRestoreError("entity-address restore stage ownership is invalid")
-        stage_oid_pairs.append((entry["table_name"], entry["oid"]))
+        stage_oid_pairs.append((entry["table_name"], None))
     expected_names = tuple(sorted(stage_names.values()))
-    if (
-        tuple(name for name, _ in sorted(stage_oid_pairs)) != expected_names
-        or len({oid for _, oid in stage_oid_pairs}) != 7
-    ):
+    if tuple(name for name, _ in sorted(stage_oid_pairs)) != expected_names:
         raise EntityAddressSnapshotRestoreError("entity-address restore stage ownership is invalid")
     return tuple(sorted(stage_oid_pairs))
 
@@ -584,29 +571,29 @@ async def _verify_stored_stage_oids(
     session: Any,
     *,
     db_schema: str,
-    stage_oids: tuple[tuple[str, int], ...],
+    stage_oids: tuple[tuple[str, int | None], ...],
 ) -> None:
-    """Check only local OID fences; do not rescan or rebuild a prepared stage."""
+    """Check the named persistent layout without rescanning prepared contents."""
 
-    for table_name, expected_oid in stage_oids:
-        observed_oid = await session.scalar(
+    for table_name, _legacy_oid in stage_oids:
+        available = await session.scalar(
             text(
-                "SELECT relation.oid FROM pg_catalog.pg_class AS relation "
+                "SELECT NOT relation.relrowsecurity AND NOT relation.relforcerowsecurity FROM pg_catalog.pg_class AS relation "
                 "JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace "
                 "WHERE namespace.nspname = :schema_name AND relation.relname = :table_name "
                 "AND relation.relkind IN ('r', 'p') AND relation.relpersistence = 'p'"
             ),
             {"schema_name": db_schema, "table_name": table_name},
         )
-        if observed_oid != expected_oid:
-            raise EntityAddressSnapshotRestoreError("entity-address restore stage OID differs")
+        if available is not True:
+            raise EntityAddressSnapshotRestoreError("entity-address restore stage layout differs")
 
 
 async def _lock_stored_stage_relations(
     session: Any,
     *,
     db_schema: str,
-    stage_oids: tuple[tuple[str, int], ...],
+    stage_oids: tuple[tuple[str, int | None], ...],
 ) -> None:
     """Keep the exact restored stage stable through the caller-owned activation transaction."""
 
@@ -710,7 +697,7 @@ def _validated_rehydration_state(
     str,
     str,
     dict[str, str],
-    tuple[tuple[str, int], ...],
+    tuple[tuple[str, int | None], ...],
     EntityAddressStageIntegrityReceipt,
     dict[str, Any],
     dict[str, Any],
@@ -737,8 +724,8 @@ def _validated_rehydration_state(
     stage_oids = _stored_stage_oids(stored["stage_relation_oids"], stage_names)
     expected_stage_oids = tuple(
         sorted(
-            (stage_names[table_name], relation_oid)
-            for table_name, relation_oid in owner.relation_oids
+            (stage_names[table_name], None)
+            for table_name, _relation_oid in owner.relation_oids
             if table_name in stage_names
         )
     )

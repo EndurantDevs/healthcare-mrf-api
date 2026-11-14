@@ -433,24 +433,54 @@ async def _prepare_protected_ordinary_rotation(db_schema, stage_cls, partial_sup
 
 
 async def _require_protected_cutover(db_schema, swaps, context):
-    """Bind frozen stage OIDs and reject a legacy destructive rotation of protected history."""
+    """Validate named stages and preserve the current locations of retained snapshots."""
     db = entity_address_unified.db
     if context.get("snapshot_contract") == "entity_address_unified.postgres.v2":
         expected = context.get("protected_stage_oids")
         if not isinstance(expected, Mapping) or set(expected) != {swap.stage_cls.__tablename__ for swap in swaps}:
             raise RuntimeError("protected address stage inventory differs")
-        for stage_name, oid in expected.items():
-            actual = await db.scalar("SELECT to_regclass(:relation)::oid", relation=f'"{db_schema}"."{stage_name}"')
-            if actual != oid:
-                raise RuntimeError("protected address stage OID differs")
+        stage_count = await db.scalar(
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "WHERE n.nspname=:schema AND c.relname=ANY(CAST(:names AS text[])) "
+            "AND c.relkind='r' AND c.relpersistence='p' AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity",
+            schema=db_schema,
+            names=list(expected),
+        )
+        if stage_count != len(expected):
+            raise RuntimeError("protected address stage layout differs")
         context["retained_relations"] = []
         return
+    if not await db.scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE n.nspname='hp_snapshot_retention' AND c.relname='generation')"
+    ):
+        return
+    if not await db.scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE n.nspname='hp_snapshot_retention' AND c.relname='generation_relocation')"
+    ):
+        raise RuntimeError("retained snapshot location catalog is missing")
     protected = await db.scalar(
-        "SELECT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-        "JOIN pg_namespace authority ON authority.nspname='hp_snapshot_retention' AND authority.nspowner=c.relowner "
-        "WHERE n.nspname=:schema AND c.relname=ANY(:names))",
+        "WITH current_locations AS ("
+        "SELECT generation.current_location_fence IS NOT NULL AND location.fence_token IS NULL AS missing_location, "
+        "CASE WHEN generation.current_location_fence IS NULL THEN generation.inventory "
+        "ELSE location.after_inventory END AS inventory "
+        "FROM hp_snapshot_retention.generation AS generation "
+        "LEFT JOIN hp_snapshot_retention.generation_relocation AS location "
+        "ON location.generation_id=generation.generation_id AND location.fence_token=generation.current_location_fence "
+        "WHERE generation.state IN ('retained', 'retiring')) "
+        "SELECT EXISTS(SELECT 1 FROM current_locations WHERE missing_location OR CASE "
+        "WHEN jsonb_typeof(inventory->'relations') IS DISTINCT FROM 'array' THEN true "
+        "ELSE jsonb_array_length(inventory->'relations')=0 OR EXISTS("
+        "SELECT 1 FROM jsonb_array_elements(inventory->'relations') AS relation "
+        "WHERE jsonb_typeof(relation->'schema_name') IS DISTINCT FROM 'string' "
+        "OR jsonb_typeof(relation->'relation_name') IS DISTINCT FROM 'string' "
+        "OR relation->>'schema_name'='' OR relation->>'relation_name'='' "
+        "OR (relation->>'schema_name'=:schema AND relation->>'relation_name'=ANY(CAST(:names AS text[])))) END)",
         schema=db_schema,
-        names=[swap.live_cls.__main_table__ for swap in swaps],
+        names=[
+            name for swap in swaps for name in (swap.live_cls.__main_table__, swap.live_cls.__main_table__ + "_old")
+        ],
     )
     if protected is True:
         raise RuntimeError("legacy address rotation cannot replace a protected snapshot")

@@ -32,7 +32,9 @@ from process.entity_address_candidate_preparation import PreparedEntityAddressGe
 from process.entity_address_result_generation import ENTITY_ADDRESS_RESULT_MODELS, RELATION_NAMES
 from process.entity_address_snapshot_source import entity_address_unified
 from process.network_cms_registry_source_pair import (
-    capture_registry_cms_source_pair,
+    capture_registry_cms_source_pair as capture_registry_cms_source_pair,
+)
+from process.network_cms_registry_source_pair import (
     require_registry_cms_source_pair,
     resolve_committed_registry_cms_source_pair,
 )
@@ -48,13 +50,15 @@ from tests import cms_npd_admission_postgres_support as support
 from tests import test_provider_directory_cms_serving_receipt_postgres as native
 from tests.provider_directory_cms_capacity_test_support import cms_execution, paired_profile_envelope, signed_cms_plan
 from tests.retained_wal_diagnostics import RetainedWalDiagnostic, retained_bound_operands, retained_wal_attribution
+from tests.test_network_cms_registry_source_pair_postgres import _bounded_source_copy as _bounded_source_copy
+from tests.test_network_cms_registry_source_pair_postgres import _publish_pair as _publish_pair
 from tests.test_network_cms_registry_source_pair_postgres import (
-    _bounded_source_copy,
-    _publish_pair,
     _read_transaction,
-    _retained_office_resources,
     _verify_read_pair,
     _verify_retained_entity_read,
+)
+from tests.test_network_cms_registry_source_pair_postgres import (
+    _retained_office_resources as _retained_office_resources,
 )
 from tests.test_network_custom_address_source_postgres import BootstrapCopyConnection
 from tests.test_provider_directory_cms_preparation import VALIDATION_TIME
@@ -606,7 +610,7 @@ async def _origin_pair_read(connection, pair, *, granted):
                 await pair_reader._publication(session, pair.proof, current=False)
             return
         resolved, oid = await pair_reader._read_committed_pair(connection, pair.address_source.schema_name)
-        assert resolved == pair and oid == pair.address_ownership.schema_oid
+        assert resolved == pair
         assert (
             await pair_reader.require_registry_cms_source_pair_connection(connection, pair, verify_content=False)
             == pair
@@ -1427,9 +1431,12 @@ async def _assert_retained_address_parity(database, retained, prepared):
         )
         assert witness.source == source_capture
         assert witness.clone_receipt == retained.address_receipt
-        assert set(dict(source_capture.relation_oids).values()).isdisjoint(
-            dict(retained.address_ownership.relation_oids).values()
-        )
+        assert {name for name, _ in source_capture.relation_oids} == {
+            name for name, _ in retained.address_ownership.relation_oids
+        }
+        assert all(oid is None for _, oid in source_capture.relation_oids)
+        assert all(oid is None for _, oid in retained.address_ownership.relation_oids)
+        assert set(retained.address_ownership.as_dict()) == {"dataset_id", "schema_name", "table_names"}
         assert source_capture.schema_name != retained.address_ownership.schema_name
         assert source_capture.semantic_receipt.main_input_sha256 == retained.address_receipt.main_input_sha256
         driver = await address_capture.native_driver(session)

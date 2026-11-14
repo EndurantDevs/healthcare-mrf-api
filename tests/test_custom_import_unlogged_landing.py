@@ -24,7 +24,11 @@ def test_landing_migration_extends_the_unique_current_head():
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["20261114020000_custom_import_snapshot_metadata"]
+    assert script.get_heads() == ["20261114120000_portable_serving_metadata"]
+    assert (
+        script.get_revision("20261114120000_portable_serving_metadata").down_revision
+        == "20261114020000_custom_import_snapshot_metadata"
+    )
     assert script.get_revision("20261114020000_custom_import_snapshot_metadata").down_revision == (
         "20261114010000_custom_import_snapshot_names"
     )

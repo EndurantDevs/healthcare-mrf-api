@@ -59,15 +59,37 @@ class PreparedCMSDoctorsGeneration:
         native = _native()
         if native.db._transaction_binding() is not None or self.native_receipt is None:
             raise RuntimeError("cms_doctors_preparation_commit_pending")
-        authority = generation.validate_reference_family_result_generation_authority(payload.get("doctors"))
-        if authority != self.native_receipt or authority.relation_oids != tuple(oid for _, _, oid in self.stage_oids):
-            raise RuntimeError("cms_doctors_preparation_receipt_changed")
+        _require_committed_doctors_generation(self, payload.get("doctors"))
         async with native.db.session() as session:
             if not await common_receipts.verify_historical_receipt(session, self.schema, receipt_id, payload):
                 raise RuntimeError("cms_doctors_preparation_commit_unproved")
         self.committed = True
         self.context["publication_state"] = "published"
         self.metrics.update(published=True, publication_state="published")
+
+
+def _require_committed_doctors_generation(prepared, doctors_by_field):
+    """Match the complete logical family and origin without database-local identities."""
+    expected = prepared.native_receipt
+    if (
+        not isinstance(doctors_by_field, dict)
+        or doctors_by_field.get("importer_id") != _IMPORTER
+        or expected.importer_id != _IMPORTER
+        or expected.serving_generation is None
+        or tuple(relation_name for relation_name, _, _ in prepared.stage_oids)
+        != generation.RELATION_NAMES_BY_IMPORTER[_IMPORTER]
+    ):
+        raise RuntimeError("cms_doctors_preparation_receipt_changed")
+    logical = common_receipts.portable_address_authority(
+        {field_name: field_value for field_name, field_value in doctors_by_field.items() if field_name != "importer_id"}
+    )
+    if logical != {
+        "local_lineage_id": expected.local_lineage_id,
+        "local_generation": expected.local_generation,
+        **expected.serving_generation.as_dict(),
+        "relation_oids": None,
+    }:
+        raise RuntimeError("cms_doctors_preparation_receipt_changed")
 
 
 async def _stage_inventory(session, schema, import_date):

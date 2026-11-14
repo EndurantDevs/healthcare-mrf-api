@@ -79,16 +79,13 @@ def _validate_bindings(schema, doctors, dependency_bindings, *, tiger_captured=N
     tiger_by_name = {} if tiger_captured is None else captured_tiger_bindings(tiger_captured)
     for canonical, binding in bindings.items():
         if canonical in tiger_by_name:
-            if binding != tiger_by_name[canonical]:
+            if binding != {field: tiger_by_name[canonical][field] for field in ("schema_name", "table_name")}:
                 raise RuntimeError("entity-address geo dependency is not a proven input")
             continue
         namespace, table = canonical.split(".")
-        expected_oid = None
         if doctors is not None and table == _ADDRESS:
-            _target, table, expected_oid = doctors.stage_oids[0]
-        if (binding["schema_name"], binding["table_name"]) != (namespace, table) or (
-            expected_oid is not None and binding["relation_oid"] != expected_oid
-        ):
+            _target, table, _unused = doctors.stage_oids[0]
+        if (binding["schema_name"], binding["table_name"]) != (namespace, table):
             raise RuntimeError("entity-address geo dependency is not a proven input")
     return bindings
 
@@ -142,7 +139,7 @@ async def capture_dependencies(
 
 
 async def _assert_bindings(session, schema, bindings):
-    """Recheck exact heap OIDs and filenodes while holding every dependency name."""
+    """Recheck named input layout while holding every dependency relation."""
     await session.execute(text(projection.projection_dependency_lock_sql(schema, dependency_bindings=bindings)))
     if not await session.scalar(
         text("SELECT " + projection.projection_dependency_bindings_match_sql(schema, bindings))
@@ -159,21 +156,17 @@ async def lock_prepared_relations(database, dependencies):
     schema = dependencies.schema
     relations = ", ".join(f'ONLY "{schema}"."{stage}"' for _target, stage, _oid in dependencies.stage_oids)
     await database.status(f"LOCK TABLE {relations} IN ACCESS SHARE MODE NOWAIT")
-    binding = dependencies.dependency_bindings[f"{schema}.{_ADDRESS}"]
-    expected_identities = [(f'"{schema}"."{stage}"', oid) for _target, stage, oid in dependencies.stage_oids]
+    expected_names = [f'"{schema}"."{stage}"' for _target, stage, _unused in dependencies.stage_oids]
     observed_rows = await database.all(
-        "SELECT requested.relation,c.oid::bigint AS oid,"
-        "(SELECT pg_relation_filenode(oid)::bigint FROM pg_class WHERE oid=:binding_oid) AS address_filenode "
+        "SELECT requested.relation,(c.relkind='r' AND c.relpersistence='p' "
+        "AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity) AS accepted "
         "FROM unnest(CAST(:relations AS text[])) WITH ORDINALITY AS requested(relation,ordinal) "
         "LEFT JOIN pg_class c ON c.oid=to_regclass(requested.relation) AND c.relkind='r' AND c.relpersistence='p' "
         "ORDER BY requested.ordinal",
-        relations=[relation for relation, _oid in expected_identities],
-        binding_oid=binding["relation_oid"],
+        relations=expected_names,
     )
-    if [(row[0], row[1]) for row in observed_rows] != expected_identities:
-        raise RuntimeError("entity-address prepared Doctors identity changed")
-    if any(row[2] != binding["relfilenode"] for row in observed_rows):
-        raise RuntimeError("entity-address geo dependency binding changed")
+    if [row[0] for row in observed_rows] != expected_names or any(row[1] is not True for row in observed_rows):
+        raise RuntimeError("entity-address prepared Doctors layout changed")
 
 
 async def assert_prepared_dependencies(database, dependencies):

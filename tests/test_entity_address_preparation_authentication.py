@@ -128,7 +128,8 @@ async def test_private_prepare_rejects_unbounded_destination(destination):
 
 
 @pytest.mark.parametrize("changed", [False, True])
-async def test_relocation_requires_exact_persisted_stage_oids(monkeypatch, changed):
+@pytest.mark.parametrize("legacy_ids", [False, True])
+async def test_relocation_requires_exact_persisted_stage_names(monkeypatch, changed, legacy_ids):
     owner, _proof = _inventory()
     schema, _date, names = preparation.destination.restore._stage_plan(db_schema="example", import_date="20260913")
     pairs = tuple(sorted((names[name], oid) for name, oid in owner.relation_oids))
@@ -136,10 +137,11 @@ async def test_relocation_requires_exact_persisted_stage_oids(monkeypatch, chang
         "restored": {
             "db_schema": schema,
             "import_date": "20260913",
-            "stage_relation_oids": [{"table_name": name, "oid": oid} for name, oid in pairs],
+            "stage_relation_oids": [{"table_name": name, "oid": oid if legacy_ids else None} for name, oid in pairs],
         }
     }
-    move = AsyncMock(return_value=pairs[:-1] if changed else pairs)
+    moved_stages = tuple((name, None) for name, _oid in pairs)
+    move = AsyncMock(return_value=moved_stages[:-1] if changed else moved_stages)
     monkeypatch.setattr(preparation.destination.restore, "_move_owned_relations", move)
     if changed:
         with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="relocation differs"):

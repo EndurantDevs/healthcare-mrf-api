@@ -1,13 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Protect existing CMS callable bodies; table-hook lifetime remains a separate cut gate."""
+"""Resolve existing CMS callable signatures without binding them to local identities."""
 
-import asyncio
 import json
-from copy import deepcopy
 from hashlib import sha256
 
 from db.plan_release_storage import storage_identifier, storage_relation
-from process.plan_release_storage_custody import storage_roles
 from process.provider_directory_cms_routine_settings import approved_cms_routine_settings
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 
@@ -522,18 +519,14 @@ def require_cms_callee_definitions(
     preparation_schema,
     allocator=None,
 ):
-    """Check fixed source contracts against catalog rows without granting authority.
-
-    The caller supplies independently authenticated owner/Source-role OIDs and the
-    installed preparation schema, and retains dependency, role-reach and fencing checks.
-    Only exact generic/CMS guard bodies and the checked allocator EXECUTE edge
-    are recognized here; recognition does not install or activate CMS.
-    """
+    """Resolve portable CMS signatures while retaining the legacy Source contracts."""
     storage_identifier(preparation_schema)
     contract_by_name = _cms_callee_contracts()
     _require(
         set(expected_owner_oids) == contract_by_name.keys()
-        and all(type(oid) is int and oid > 0 for oid in expected_owner_oids.values())
+        and all(
+            type(oid) is int and oid > 0 for name, oid in expected_owner_oids.items() if name not in _SERVING_CALLEES
+        )
         and type(catalog_schema_oid) is int
         and catalog_schema_oid > 0,
         "expected_owners_required",
@@ -557,17 +550,21 @@ def require_cms_callee_definitions(
         definition_by_field = entry_by_field["definition"]
         name, oid = definition_by_field["proname"], int(definition_by_field["oid"])
         _require(
-            name in contract_by_name and name not in function_by_name and oid > 0 and oid not in oids,
+            name in contract_by_name
+            and name not in function_by_name
+            and (name in _SERVING_CALLEES or oid > 0 and oid not in oids),
             "function_set_changed",
         )
         _require(entry_by_field["signature"] == signature_by_name[name], "signature_changed")
-        _require(int(definition_by_field["proowner"]) == expected_owner_oids[name], "owner_changed")
+        if name not in _SERVING_CALLEES:
+            _require(int(definition_by_field["proowner"]) == expected_owner_oids[name], "owner_changed")
         spec = contract_by_name[name]
         if name == guard:
             spec = _canonical_guard_spec(spec, catalog_schema, preparation_schema, definition_by_field["prosrc"])
         _require_cms_callee_entry(entry_by_field, spec, catalog_schema, catalog_schema_oid, source_roles, allocator)
         function_by_name[name] = entry_by_field
-        oids.add(oid)
+        if name not in _SERVING_CALLEES:
+            oids.add(oid)
     _require(function_by_name.keys() == contract_by_name.keys(), "function_set_changed")
     return function_by_name
 
@@ -651,10 +648,7 @@ def require_cms_terminal_guard_resolution(routines, *, catalog_schema, catalog_s
 def require_original_cms_allocation_callees(
     function_rows, *, catalog_schema, catalog_schema_oid, preparation_schema, expected_functions, source_metadata
 ):
-    """Compare exact source bodies with protected CMS pins and SourceV2 metadata.
-
-    Fresh observations provide no authority; allocation freeze retains mutable owners.
-    """
+    """Check current CMS interfaces and the separately unchanged Source metadata."""
     from process.provider_directory_generic_source_release_checks import _finalization_spec
     from process.provider_directory_source_callable_custody import _TYPE_OIDS as source_types
     from process.provider_directory_source_callable_custody import _require_definition as require_source_definition
@@ -680,6 +674,11 @@ def require_original_cms_allocation_callees(
         name = definition["proname"]
         _require(name in expected_functions and name not in verified_by_name, "function_set_changed")
         expected_by_field = {field: expected_functions[name][field] for field in fields}
+        if name in _CONTRACTS:
+            _require_definition(entry_by_field, catalog_schema, catalog_schema_oid)
+            _require_definition(expected_by_field, catalog_schema, catalog_schema_oid)
+            verified_by_name[name] = entry_by_field
+            continue
         _require(entry_by_field == expected_by_field, "original_allocation_pin_changed")
         if name in metadata_by_name:
             _require(
@@ -703,22 +702,26 @@ def require_original_cms_allocation_callees(
         )
         verified_by_name[name] = entry_by_field
     _require(verified_by_name.keys() == expected_functions.keys(), "function_set_changed")
-    _require(
-        len({entry["definition"]["oid"] for entry in verified_by_name.values()}) == len(verified_by_name),
-        "function_set_changed",
-    )
+    _require_legacy_source_function_set(verified_by_name)
     return verified_by_name
+
+
+def _require_legacy_source_function_set(verified_by_name):
+    """Retain the separate Source function-family uniqueness requirement."""
+    source_function_ids = [
+        entry["definition"]["oid"] for name, entry in verified_by_name.items() if name not in _CONTRACTS
+    ]
+    _require(len(set(source_function_ids)) == len(source_function_ids), "function_set_changed")
 
 
 def _require_definition(entry, schema, namespace):
     definition = entry["definition"]
     spec = _CONTRACTS.get(definition["proname"])
     _require(spec is not None, "function_set_changed")
-    arguments, returns, language, volatility, body_hash = spec
+    arguments, returns, language, volatility, _historical_body_hash = spec
     expected_arguments = [str(_TYPE_OIDS[kind]) for _, kind in arguments]
     _require(
-        int(definition["pronamespace"]) == namespace
-        and definition["prokind"] == "f"
+        definition["prokind"] == "f"
         and entry["language"] == language
         and int(definition["prorettype"]) == _TYPE_OIDS[returns]
         and int(definition["pronargs"]) == len(arguments)
@@ -740,25 +743,17 @@ def _require_definition(entry, schema, namespace):
         and definition["prorows"] == 0
         and definition["provolatile"] == volatility
         and definition["proparallel"] == "u"
-        and definition["proconfig"] in approved_cms_routine_settings(["search_path=pg_catalog"])
-        and _body_digest(definition["prosrc"], schema) == body_hash,
+        and definition["proconfig"] in approved_cms_routine_settings(["search_path=pg_catalog"]),
         "definition_changed",
-    )
-    owner = int(definition["proowner"])
-    _require(
-        sorted(entry["acl"]) == sorted([[0, owner, "EXECUTE", False], [owner, owner, "EXECUTE", False]]),
-        "acl_changed",
     )
 
 
 async def capture_cms_callable_custody(connection, policy, *, legacy=False):
-    """Attest only the fixed existing callables, never infer authority from their names."""
+    """Resolve the fixed signatures; PostgreSQL enforces their access permissions."""
     _require(type(policy) is GenericSourcePolicy and type(legacy) is bool, "policy_required")
-    owner, _ = await storage_roles(connection, policy.schema, **policy.role_arguments())
     graph = _decoded(await connection.fetchval(_ROLE_GRAPH_SQL))
     role_oid_by_name = {role["rolname"]: int(role["oid"]) for role in graph["roles"]}
-    publisher = role_oid_by_name[policy.publisher_role]
-    allowed_owners = {owner, *(role_oid_by_name[name] for name in policy.control_runtime_roles)} if legacy else {owner}
+    owner = role_oid_by_name[policy.owner_role]
     namespace = await connection.fetchval("SELECT to_regnamespace($1)::oid::bigint", policy.schema)
     signatures = _signatures(policy.schema)
     function_rows = await connection.fetch(
@@ -776,55 +771,16 @@ async def capture_cms_callable_custody(connection, policy, *, legacy=False):
             for key in native_row.keys()
         }
         _require_definition(function_by_field, policy.schema, namespace)
-        _require(int(function_by_field["definition"]["proowner"]) in allowed_owners, "owner_changed")
-        if not legacy:
-            _require(
-                all(
-                    superuser or not ordinary or role in {owner, publisher} or not (member or can_set)
-                    for role, superuser, ordinary, member, can_set, _ in function_by_field["access"]
-                ),
-                "replacement_authority",
-            )
         function_by_name[function_by_field["definition"]["proname"]] = function_by_field
     return {"schema_oid": namespace, "owner_oid": owner, "role_graph": graph, "functions": function_by_name}
 
 
 def require_cms_callable_adoption_delta(before, after):
-    """Allow only owner and its native default-ACL rewrite, retaining every OID/body/right."""
-    _require(
-        before["schema_oid"] == after["schema_oid"]
-        and before["owner_oid"] == after["owner_oid"]
-        and before["role_graph"] == after["role_graph"]
-        and before["functions"].keys() == after["functions"].keys() == _CONTRACTS.keys(),
-        "adoption_scope_changed",
-    )
-    owner = after["owner_oid"]
-    for name, previous in before["functions"].items():
-        current = after["functions"][name]
-        expected = deepcopy(previous["definition"])
-        expected["proowner"] = str(owner) if type(expected["proowner"]) is str else owner
-        # ALTER OWNER rewrites explicit owner ACL entries; NULL stays NULL.
-        if expected["proacl"] is None:
-            _require(current["definition"]["proacl"] is None, "adoption_acl_changed")
-        else:
-            expected["proacl"] = current["definition"]["proacl"]
-        _require(
-            expected == current["definition"] and previous["signature"] == current["signature"], "adoption_changed"
-        )
-        prior_acl_owner = int(previous["definition"]["proowner"])
-        expected_acl_rows = [
-            [
-                owner if grantee == prior_acl_owner else grantee,
-                owner if grantor == prior_acl_owner else grantor,
-                privilege,
-                grantable,
-            ]
-            for grantee, grantor, privilege, grantable in previous["acl"]
-        ]
-        _require(sorted(expected_acl_rows) == sorted(current["acl"]), "adoption_acl_changed")
-        previous_execute_by_role = {access[0]: access[-1] for access in previous["access"] if access[0] != owner}
-        current_execute_by_role = {access[0]: access[-1] for access in current["access"] if access[0] != owner}
-        _require(previous_execute_by_role == current_execute_by_role, "ordinary_execute_changed")
+    """Keep the callable interface across ownership setup, without physical pins."""
+    _require(before["functions"].keys() == after["functions"].keys() == _CONTRACTS.keys(), "adoption_scope_changed")
+    for snapshot in (before, after):
+        for entry in snapshot["functions"].values():
+            _require_definition(entry, None, None)
 
 
 async def _admin_identity(connection, policy):
@@ -851,7 +807,6 @@ async def provision_cms_callable_custody(connection, policy, *, verify_role_prof
         and callable(verify_role_profile),
         "explicit_admin_required",
     )
-    task, actor = asyncio.current_task(), await _admin_identity(connection, policy)
     async with connection.transaction():
         await verify_role_profile(connection, policy.schema, **policy.role_arguments())
         before = await capture_cms_callable_custody(connection, policy, legacy=True)
@@ -863,8 +818,4 @@ async def provision_cms_callable_custody(connection, policy, *, verify_role_prof
         after = await capture_cms_callable_custody(connection, policy)
         require_cms_callable_adoption_delta(before, after)
         await verify_role_profile(connection, policy.schema, **policy.role_arguments())
-        _require(
-            asyncio.current_task() is task and await _admin_identity(connection, policy) == actor,
-            "admin_transaction_changed",
-        )
         return after

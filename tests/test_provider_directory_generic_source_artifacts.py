@@ -176,14 +176,12 @@ async def test_terminal_capability_cannot_replace_another_fence(case):
     active = artifacts._ACTIVE.set(case.admission)
     session = SimpleNamespace(in_transaction=lambda: True)
     case.directory.db = SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=session))
-    held = artifacts._TERMINAL.set((case.admission, session))
+    held = artifacts._TERMINAL.set(case.admission)
     try:
         with pytest.raises(RuntimeError, match="rest_artifact_terminal_changed"):
             artifacts.is_fence_held(case.directory, SimpleNamespace(datasets=()), None)
-        case.directory.db._transaction_binding = lambda: SimpleNamespace(
-            session=SimpleNamespace(in_transaction=lambda: True)
-        )
-        with pytest.raises(RuntimeError, match="rest_artifact_terminal_changed"):
+        case.directory.db._transaction_binding = lambda: None
+        with pytest.raises(RuntimeError, match="rest_artifact_transaction_required"):
             artifacts.is_fence_held(case.directory, case.fence, None)
     finally:
         artifacts._TERMINAL.reset(held)
@@ -191,15 +189,15 @@ async def test_terminal_capability_cannot_replace_another_fence(case):
 
 
 @pytest.mark.asyncio
-async def test_cleanup_refuses_a_replaced_native_relation(case, monkeypatch):
+async def test_cleanup_refuses_an_incompatible_named_relation(case, monkeypatch):
     @asynccontextmanager
     async def transaction():
         yield
 
     case.directory.db = SimpleNamespace(transaction=transaction, status=AsyncMock())
-    monkeypatch.setattr(artifacts, "_catalog", AsyncMock(return_value=(101, 202, "r", "u")))
-    with pytest.raises(RuntimeError, match="rest_artifact_cleanup_custody_changed"):
-        await artifacts._cleanup(case.directory, {"pdra_owned": (100, 202, "r", "u")})
+    monkeypatch.setattr(artifacts, "_catalog", AsyncMock(return_value=("v", "p")))
+    with pytest.raises(RuntimeError, match="rest_artifact_cleanup_layout_changed"):
+        await artifacts._cleanup(case.directory, {"pdra_owned": ("r", "u")})
     case.directory.db.status.assert_not_awaited()
 
 
@@ -249,7 +247,7 @@ async def test_prepared_npi_metrics_require_original_native_stages_and_selector(
         producer=None if ordinary else case.admission.producer,
         task=asyncio.current_task(),
         prepared=dict(
-            relations={"typed": ("private_stage", 1, 2, "r", "u")},
+            relations={"typed": ("private_stage", "r", "u")},
             metrics=dict(resource_id_npis_backfilled=counts_by_resource),
         ),
     )
@@ -258,7 +256,7 @@ async def test_prepared_npi_metrics_require_original_native_stages_and_selector(
     case.directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES = SimpleNamespace(
         get=lambda: {"typed": "private_stage"}
     )
-    catalog = AsyncMock(return_value=(1, 2, "r", "u"))
+    catalog = AsyncMock(return_value=("r", "u"))
     monkeypatch.setattr(artifacts, "_catalog", catalog)
     factory_token = artifacts.source._FACTORY.set(None if ordinary else case.factory)
     token = artifacts._ACTIVE.set(case.admission)
@@ -271,7 +269,7 @@ async def test_prepared_npi_metrics_require_original_native_stages_and_selector(
             await artifacts.prepared_npi_backfill(
                 case.directory, None, run_id="other", source_ids=["source_a"], seen_table=None
             )
-        catalog.return_value = (9, 2, "r", "u")
+        catalog.return_value = ("v", "p")
         with pytest.raises(RuntimeError, match="stage_changed"):
             await artifacts.prepared_npi_backfill(
                 case.directory, None, run_id=None, source_ids=["source_a"], seen_table=None
@@ -313,7 +311,7 @@ async def test_ordinary_preparation_inserts_the_repaired_projection_in_the_datab
     monkeypatch.setattr(directory.db, "scalar", AsyncMock(return_value=3))
     monkeypatch.setattr(directory, "_create_provider_directory_artifact_scope_layout", AsyncMock())
     monkeypatch.setattr(directory, "_build_artifact_scope_pk", AsyncMock())
-    monkeypatch.setattr(artifacts, "_catalog", AsyncMock(side_effect=[None, (1, 2, "r", "u")]))
+    monkeypatch.setattr(artifacts, "_catalog", AsyncMock(side_effect=[None, ("r", "u")]))
     copy = AsyncMock()
     parity = AsyncMock()
     monkeypatch.setattr(artifacts, "_copy", copy)
@@ -322,7 +320,7 @@ async def test_ordinary_preparation_inserts_the_repaired_projection_in_the_datab
     await artifacts._prepare_model(
         directory, admission, directory.ProviderDirectoryPractitioner, "private_stage", created_by_relation
     )
-    assert created_by_relation == {"private_stage": (1, 2, "r", "u")}
+    assert created_by_relation == {"private_stage": ("r", "u")}
     insert_sql, params = status.await_args_list[0].args[0], status.await_args_list[0].kwargs
     assert insert_sql.startswith('INSERT INTO "mrf"."private_stage" (')
     assert "provider_directory_dataset_resource" in insert_sql and "i.resource_id::bigint" in insert_sql

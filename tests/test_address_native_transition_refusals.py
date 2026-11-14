@@ -176,7 +176,6 @@ def test_handoff_decoder_requires_exact_attempt_and_complete_seven_table_identit
         "counter",
         "lineage",
         "origin",
-        "oid_order",
         "row_count",
         "source",
         "inventory_file",
@@ -193,7 +192,6 @@ def test_publication_decoder_keeps_generation_accounting_and_physical_catalog_bo
         "counter": lambda: receipt["result_generation"].update(local_generation=2),
         "lineage": lambda: receipt["result_generation"].update(local_lineage_id="550e8400-e29b-41d4-a716-446655440001"),
         "origin": lambda: receipt["result_generation"]["serving_generation"].update(origin_generation=2),
-        "oid_order": lambda: receipt["result_generation"]["relation_oids"].reverse(),
         "row_count": lambda: receipt["validation"].update(rows=2),
         "source": lambda: receipt.update(source_contract_sha256="c" * 64),
         "inventory_file": lambda: receipt["inventory"]["relations"][0].update(relfilenode=999),
@@ -210,6 +208,14 @@ def test_publication_decoder_keeps_generation_accounting_and_physical_catalog_bo
             publication.validate_entity_address_native_publication(receipt)
     else:
         assert publication.validate_entity_address_native_publication(receipt) == receipt
+
+
+@pytest.mark.parametrize("legacy_ids", [None, [7, 6, 5, 4, 3, 2, 1], "legacy metadata"])
+def test_publication_decoder_ignores_legacy_generation_ids(legacy_ids):
+    receipt = _publication_receipt(_handoff())
+    receipt["result_generation"]["relation_oids"] = legacy_ids
+    assert publication.validate_entity_address_native_publication(receipt) == receipt
+    assert publication._validate_authority(receipt["result_generation"])["relation_oids"] is None
 
 
 def _clone_session(events, equality_probes, failure):
@@ -413,7 +419,7 @@ def _cleanup_scalar(query, handoff_by_field, transactions, failure):
         return "synthetic"
     if "pg_current_xact_id" in query:
         return next(transactions)
-    if "relation_oids OPERATOR" in query:
+    if "SELECT NOT EXISTS(SELECT 1 FROM pg_class" in query:
         return failure != "serving"
     if "SELECT count(DISTINCT relation.relowner)" in query:
         return failure != "owner"
@@ -779,7 +785,7 @@ def test_controlled_attempt_uses_uuid_stages_and_preserves_only_same_attempt_rep
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("supplied,changed", [(False, False), (True, False), (True, True)])
-async def test_dependency_binding_locks_then_rechecks_exact_physical_inputs(supplied, changed):
+async def test_dependency_binding_locks_then_rechecks_named_input_layout(supplied, changed):
     bindings_by_name = _example_bindings() if supplied else None
     queries = []
 
@@ -800,18 +806,20 @@ async def test_dependency_binding_locks_then_rechecks_exact_physical_inputs(supp
         observed_by_name = await publication._dependency_bindings(session, "mrf", bindings_by_name)
         assert set(observed_by_name) == set(_example_bindings())
         if supplied:
-            assert observed_by_name == bindings_by_name
+            assert observed_by_name == publication.projection.validate_projection_dependency_bindings(
+                "mrf", bindings_by_name
+            )
         else:
-            for index, (namespace, table) in enumerate(publication.projection._PROJECTION_DEPENDENCIES, 1):
+            for namespace, table in publication.projection._PROJECTION_DEPENDENCIES:
                 namespace = namespace or "mrf"
                 assert observed_by_name[f"{namespace}.{table}"] == {
                     "schema_name": namespace,
                     "table_name": table,
-                    "relation_oid": index,
-                    "relfilenode": 100 + index,
                 }
     assert queries[-1].startswith("LOCK TABLE ONLY") and queries[-1].endswith(" IN ACCESS SHARE MODE;")
-    assert "pg_relation_filenode" in str(session.scalar.await_args.args[0])
+    layout_query = str(session.scalar.await_args.args[0])
+    assert "relpersistence='p'" in layout_query and "NOT held.relrowsecurity" in layout_query
+    assert "pg_relation_filenode" not in layout_query
 
 
 @pytest.mark.asyncio
@@ -1109,8 +1117,8 @@ async def test_retirement_requires_a_reference_probe():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ["inventory", "oid", "legacy"])
-async def test_protected_cutover_refuses_inventory_and_oid_drift(monkeypatch, fault):
+@pytest.mark.parametrize("fault", ["inventory", "layout", "legacy"])
+async def test_protected_cutover_refuses_inventory_layout_and_references(monkeypatch, fault):
     stage = SimpleNamespace(__tablename__="entity_address_unified_synthetic")
     swap = SimpleNamespace(stage_cls=stage, live_cls=SimpleNamespace(__main_table__="entity_address_unified"))
     context_by_field = {
@@ -1121,13 +1129,29 @@ async def test_protected_cutover_refuses_inventory_and_oid_drift(monkeypatch, fa
         context_by_field["protected_stage_oids"] = {}
     if fault == "legacy":
         context_by_field.clear()
-    scalar = AsyncMock(return_value=True if fault == "legacy" else 99)
+    scalar = AsyncMock(return_value=True if fault == "legacy" else 0)
     monkeypatch.setattr(adoption.entity_address_unified.db, "scalar", scalar)
     before = deepcopy(context_by_field)
-    with pytest.raises(RuntimeError, match="inventory differs|OID differs|legacy address rotation"):
+    with pytest.raises(RuntimeError, match="inventory differs|layout differs|legacy address rotation"):
         await adoption._require_protected_cutover("mrf", [swap], context_by_field)
     assert context_by_field == before
-    assert scalar.await_count == int(fault != "inventory")
+    assert scalar.await_count == {"inventory": 0, "layout": 1, "legacy": 3}[fault]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("saved_id", [None, -1, {"legacy": "ignored"}])
+async def test_protected_cutover_uses_stage_names_and_layout(monkeypatch, saved_id):
+    stage = SimpleNamespace(__tablename__="entity_address_unified_synthetic")
+    swap = SimpleNamespace(stage_cls=stage)
+    context_by_field = {
+        "snapshot_contract": source.CONTRACT,
+        "protected_stage_oids": {stage.__tablename__: saved_id},
+    }
+    scalar = AsyncMock(return_value=1)
+    monkeypatch.setattr(adoption.entity_address_unified.db, "scalar", scalar)
+    await adoption._require_protected_cutover("mrf", [swap], context_by_field)
+    assert context_by_field["retained_relations"] == []
+    assert scalar.call_args.kwargs == {"schema": "mrf", "names": [stage.__tablename__]}
 
 
 @asynccontextmanager
@@ -1268,19 +1292,30 @@ async def test_restore_completion_requires_the_v2_inventory():
         await restore.complete_entity_address_archive_restore(
             session, owner=owner, db_schema="mrf", import_date="synthetic"
         )
-    assert len(queries) == 2 and all(query.startswith("SELECT") for query in queries)
+    assert len(queries) == 1 and all(query.startswith("SELECT") for query in queries)
 
 
 @pytest.mark.asyncio
-async def test_restore_namespace_rejects_alias_oid_substitution():
+@pytest.mark.parametrize(
+    "has_namespace,remaining_count,error",
+    [(False, None, "namespace is unavailable"), (True, 1, "namespace is not empty"), (True, 0, None)],
+)
+async def test_restore_namespace_requires_named_empty_inventory(has_namespace, remaining_count, error):
     owner = _set_owner()
-    session = SimpleNamespace(scalar=AsyncMock(side_effect=[owner.schema_oid, 1, 999]), execute=AsyncMock())
-    with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="alias authority OID differs"):
+    session = SimpleNamespace(scalar=AsyncMock(side_effect=[has_namespace, remaining_count]), execute=AsyncMock())
+    if error:
+        with pytest.raises(restore.EntityAddressSnapshotRestoreError, match=error):
+            await restore._drop_empty_owned_schema(session, owner)
+        session.execute.assert_not_awaited()
+    else:
         await restore._drop_empty_owned_schema(session, owner)
-    session.execute.assert_not_awaited()
-    assert session.scalar.await_args.args[1] == {
-        "relation": f'"{owner.schema_name}"."{preparation.alias.AUTHORITY_TABLE}"'
-    }
+        assert str(session.execute.await_args.args[0]) == f'DROP SCHEMA "{owner.schema_name}"'
+    assert session.scalar.await_args_list[0].args[1] == {"schema": owner.schema_name}
+    if has_namespace:
+        assert session.scalar.await_args.args[1] == {
+            "schema": owner.schema_name,
+            "alias": preparation.alias.AUTHORITY_TABLE,
+        }
 
 
 def test_restore_input_cannot_mix_seven_and_eight_tables():

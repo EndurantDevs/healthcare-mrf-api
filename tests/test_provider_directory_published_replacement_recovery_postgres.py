@@ -16,6 +16,7 @@ from process import provider_directory_published_source_replacement as replaceme
 from process import provider_directory_serving_recovery as recovery
 from process import provider_directory_serving_recovery_receipts as receipts
 from tests.provider_directory_serving_recovery_postgres_support import ordinary_serving_case
+from tests.test_entity_address_candidate_preparation_postgres import _prepare_named_geo_inputs
 from tests.test_provider_directory_published_replacement_postgres import _alias, _apply_drift, _markers, _prepare
 from tests.test_provider_directory_serving_recovery_postgres import _publish_address, _state
 
@@ -36,7 +37,7 @@ async def _prepared_address(case, fence, stage):
     await database.status(f"INSERT INTO \"{schema}\".entity_address_unified_stage VALUES ('new')")
     index_name = native._stage_index_name(_PreparedAddressStage.__tablename__, "marker")
     await database.status(f'CREATE INDEX "{index_name}" ON "{schema}".entity_address_unified_stage(marker)')
-    assert await database.scalar(native._record_geo_assurance_candidate_sql(schema, "entity_address_unified_stage", 1))
+    await _prepare_named_geo_inputs(database, schema)
     dataset = fence.datasets[0]
     snapshot = await serving_inputs.capture(case.directory, fence)
     inputs = preparation.ProviderDirectoryAddressPreparationInput(
@@ -85,7 +86,7 @@ async def _forward(case, fence, generation):
     admission = artifacts._publication_admission(directory, fence, request, {"Location"})
     token = artifacts._ACTIVE.set(replace(admission, recovery=recovery_by_field))
     try:
-        async with database.transaction():
+        async with receipts.validation_scope(database):
             await serving_inputs.lock_and_check(directory, recovery_by_field["serving_inputs"])
             await directory._lock_and_verify_artifact_dataset_fence(fence, database)
             await recovery.begin_overlay(directory, recovery_by_field)
@@ -126,7 +127,7 @@ async def test_native_replacement_journal_replays_restores_old_alias_and_exact_h
         assert binding["incumbent"]["dataset_hash"] is None
         assert binding["publication"]["dataset_id"] == "dataset_shared"
         assert history["published"]["document"]["preparation"][journal.FIELD] == binding
-        journal.validate(binding, case.pin, before=baseline)
+        journal.validate(binding, case.pin, before=history["overlay"]["document"]["before"])
         replay = await artifacts.replay_published_replacement(case.directory, _markers())
         assert replay["serving_recovery"] == {"generation": generation, "phase": "published"}
         assert await _state(case) == forward
@@ -258,6 +259,7 @@ async def _coupled_preparation(case, fence):
         await database.status(
             f'ALTER INDEX "{_schema}"."{_stage}_pkey" RENAME TO provider_directory_address_overlay_pkey'
         )
+        receipts.record_rename(_schema, _stage + "_pkey", "provider_directory_address_overlay_pkey", index=True)
 
     stage = directory.ProviderDirectoryPreparedArtifactStage(schema, "overlay_next", receipts.ROOTS[0], rename_indexes)
     bundle = directory.ProviderDirectoryArtifactBundle(stages=[stage])
@@ -384,7 +386,9 @@ async def test_native_prepared_owner_commits_overlay_address_alias_and_journal_t
             async with database.transaction():
                 history = await recovery._load_history(database, schema, generation)
             assert set(history) == {"overlay", "published"}
-            assert history["overlay"]["document"]["writer"] == history["published"]["document"]["writer"]
+            assert all(
+                event["document"]["version"] == 2 and "writer" not in event["document"] for event in history.values()
+            )
             recovery_request_by_field = {
                 recovery.OPERATION_PARAM: "recover",
                 recovery.GENERATION_PARAM: generation,
@@ -395,53 +399,28 @@ async def test_native_prepared_owner_commits_overlay_address_alias_and_journal_t
             assert await _alias(database, schema) == "endpoint_repoint"
 
 
-async def _reject_coupled_session(case, address):
-    """Use a genuine second ordinary transaction while retaining the original publication task."""
-    from db.connection import _SESSION, _TRANSACTION
-
-    token = _TRANSACTION.set(())
-    session_token = _SESSION.set(None)
-    try:
-        async with case.database.session_factory() as session, session.begin():
-            async with case.database.bind_existing_session(session):
-                await recovery.prepare_address(case.database, case.schema, address.swaps, address.context)
-    finally:
-        _SESSION.reset(session_token)
-        _TRANSACTION.reset(token)
-
-
 async def _reject_coupled_context(case, address, stale):
-    """Exercise the real scope guard without substituting its actor or native proofs."""
-    context = address.context
-    if stale == "session":
-        await _reject_coupled_session(case, address)
-        return
-    if stale == "task":
-        await asyncio.create_task(recovery.prepare_address(case.database, case.schema, address.swaps, context))
-        return
-    if stale == "admission":
-        admission = artifacts.current(case.directory)
-        token = artifacts._ACTIVE.set(replace(admission, recovery=dict(admission.recovery)))
-        try:
-            await recovery.prepare_address(case.database, case.schema, address.swaps, context)
-        finally:
-            artifacts._ACTIVE.reset(token)
-        return
-    if stale == "context":
-        await recovery.prepare_address(case.database, case.schema, address.swaps, dict(context))
-        return
-    key = recovery.GENERATION_PARAM if stale == "generation" else "serving_recovery_prepared_address"
-    original = context[key]
-    context[key] = recovery.publication_generation(case.pin) if stale == "generation" else dict(original)
-    try:
-        await recovery.prepare_address(case.database, case.schema, address.swaps, context)
-    finally:
-        context[key] = original
+    """Refuse changed publication coordinates and unprepared named stages."""
+    context_by_field = dict(address.context)
+    schema, swaps = case.schema, address.swaps
+    if stale == "schema":
+        schema += "_other"
+    elif stale == "stage":
+        swaps = [SimpleNamespace(live_cls=swaps[0].live_cls, stage_cls=SimpleNamespace(__tablename__="missing_stage"))]
+    else:
+        key = {
+            "generation": recovery.GENERATION_PARAM,
+            "source": "partial_provider_directory_source_ids",
+            "dataset": "partial_provider_directory_dataset_id",
+            "root": "partial_provider_directory_run_id",
+        }[stale]
+        context_by_field[key] = ["another_source"] if stale == "source" else "different_value"
+    await recovery.prepare_address(case.database, schema, swaps, context_by_field)
 
 
-@pytest.mark.parametrize("stale", ["admission", "session", "task", "generation", "context", "prepared"])
-async def test_native_coupled_preparation_refuses_transplanted_writer_or_context(monkeypatch, stale):
-    """A real inserted overlay cannot authorize another session, task, admission or prepared context."""
+@pytest.mark.parametrize("stale", ["schema", "stage", "generation", "source", "dataset", "root"])
+async def test_native_coupled_preparation_refuses_changed_named_data_or_publication(monkeypatch, stale):
+    """A coupled cut must retain its validated stage names and exact source coordinates."""
     from process import entity_address_candidate_preparation as preparation
 
     native = importlib.import_module("process.entity_address_unified")
@@ -456,9 +435,9 @@ async def test_native_coupled_preparation_refuses_transplanted_writer_or_context
             async def refuse_prepared_publish(actual_address, *, callbacks):
                 assert actual_address is address and callbacks is not None
                 state = recovery._COUPLED_ADDRESS.get()
-                assert state is not None and type(state["document"]) is str
+                assert state is not None and type(state["entry"]) is dict
                 original_deadline = address.context["serving_recovery_wall"].when()
-                with pytest.raises(ValueError, match="coupled_preparation_changed"):
+                with pytest.raises(ValueError, match="coupled_preparation_changed|prepared_name_changed"):
                     await _reject_coupled_context(case, address, stale)
                 assert recovery._COUPLED_ADDRESS.get() is state
                 assert address.context["serving_recovery_wall"].when() == original_deadline
@@ -563,7 +542,12 @@ async def test_native_coupled_owner_refuses_unprepared_bundle_or_lost_index(monk
             token = artifacts._ACTIVE.set(replace(admission, recovery=recovery_by_field))
             fence_token = case.directory._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(fence)
             try:
-                with pytest.raises(RuntimeError, match="replacement_bundle_changed|all serving indexes"):
+                refusal = (
+                    pytest.raises(ValueError, match="relation_changed")
+                    if damage == "missing_index"
+                    else pytest.raises(RuntimeError, match="replacement_bundle_changed")
+                )
+                with refusal:
                     await artifacts.publish_prepared_replacement(case.directory, fence, bundle, address)
             finally:
                 case.directory._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.reset(fence_token)

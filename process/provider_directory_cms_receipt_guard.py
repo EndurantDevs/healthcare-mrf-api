@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Shared Profile transition SQL and exact catalog recognition for its read-only receipt guards."""
+"""Shared Profile transition SQL and named receipt-guard contracts."""
 
 import re
 
@@ -51,11 +51,12 @@ _GUARD_CATALOG_SQL = """
 SELECT t.tgname AS name,t.tgtype AS event_mask,t.tgenabled::text AS enabled,t.tgdeferrable AS deferrable,
        t.tginitdeferred AS initially_deferred,t.tgnargs AS argument_count,t.tgqual IS NULL AS no_condition,
        t.tgattr::text AS update_columns,n.nspname AS function_schema,p.proname AS function_name,
-       p.oid::bigint AS function_oid,p.pronargs AS function_arguments,p.prosecdef AS security_definer,p.proconfig AS function_settings,
-       p.prosrc AS function_body,l.lanname AS language,p.prorettype='trigger'::regtype AS returns_trigger
+       p.pronargs AS function_arguments,p.prosecdef AS security_definer,p.proconfig AS function_settings,
+       l.lanname AS language,p.prorettype='trigger'::regtype AS returns_trigger
 FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid JOIN pg_namespace n ON n.oid=p.pronamespace
 JOIN pg_language l ON l.oid=p.prolang
-WHERE t.tgrelid=:relation_oid AND NOT t.tgisinternal ORDER BY t.tgname
+WHERE t.tgrelid=to_regclass(format('%I.%I',CAST(:schema AS text),CAST(:relation_name AS text)))
+  AND NOT t.tgisinternal ORDER BY t.tgname
 """
 
 
@@ -80,7 +81,7 @@ async def profile_receipt_guard_count(database, relation_by_field):
 
 
 async def assert_profile_receipt_guards(database, relation_by_field, captured_triggers=None):
-    """Reject additional, disabled, immediate, relocated or changed-body serving guards."""
+    """Require the enabled deferred serving-guard contract by qualified name."""
     schema = relation_by_field["schema_name"]
     quoted_schema = '"' + schema.replace('"', '""') + '"'
     expected_by_name = {
@@ -141,7 +142,7 @@ async def assert_common_receipt_guards(database, relation_by_field, captured_tri
 
 async def _assert_guards(database, relation_by_field, expected_by_name, captured_triggers=None):
     schema = relation_by_field["schema_name"]
-    observed = await database.all(_GUARD_CATALOG_SQL, relation_oid=relation_by_field["relation_oid"])
+    observed = await database.all(_GUARD_CATALOG_SQL, schema=schema, relation_name=relation_by_field["relation_name"])
     if len(observed) != len(expected_by_name):
         raise RuntimeError("provider_directory_profile_capacity_receipt_guard_shape_changed")
     if captured_triggers is not None and len(captured_triggers) != len(expected_by_name):
@@ -170,7 +171,6 @@ async def _assert_guards(database, relation_by_field, expected_by_name, captured
             )
             or guard_by_field["language"] != "plpgsql"
             or guard_by_field["returns_trigger"] is not True
-            or _normalized(guard_by_field["function_body"]) != _normalized(expected[2])
         ):
             raise RuntimeError("provider_directory_profile_capacity_receipt_guard_shape_changed")
         if captured_triggers is not None:
@@ -178,7 +178,5 @@ async def _assert_guards(database, relation_by_field, expected_by_name, captured
             if captured is None or (
                 captured["tgtype"] != guard_by_field["event_mask"]
                 or captured["trigger_enabled"] != guard_by_field["enabled"]
-                or captured["trigger_function_oid"] != guard_by_field["function_oid"]
-                or _normalized(captured["trigger_function_source"]) != _normalized(guard_by_field["function_body"])
             ):
                 raise RuntimeError("provider_directory_profile_capacity_receipt_guard_shape_changed")

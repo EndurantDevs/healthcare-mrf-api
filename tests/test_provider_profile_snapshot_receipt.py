@@ -53,10 +53,10 @@ async def test_required_proof_survives_profile_withdrawal(has_history_table, has
 @pytest.mark.parametrize("has_receipt_table", [False, True])
 async def test_missing_common_proof_is_unavailable(monkeypatch, has_receipt_table):
     read_receipt = AsyncMock(return_value=None)
-    monkeypatch.setattr(snapshot.cms_serving_receipt, "read_serving_receipt", read_receipt)
+    monkeypatch.setattr(snapshot.cms_serving_receipt, "read_named_serving_receipt", read_receipt)
     oid_by_relation = {"mrf.provider_directory_cms_serving_receipt": 1 if has_receipt_table else None}
     with pytest.raises(ServiceUnavailable, match="temporarily unavailable"):
-        await snapshot._read_cms_receipt(SimpleNamespace(), "mrf", oid_by_relation, verify_names=AsyncMock())
+        await snapshot._read_cms_receipt(SimpleNamespace(), "mrf", oid_by_relation)
     assert read_receipt.await_count == int(has_receipt_table)
 
 
@@ -81,6 +81,7 @@ async def test_snapshot_lock_retry_owns_only_unyielded_sessions(
     @asynccontextmanager
     async def reader_session():
         session = _Session()
+        session.info["provider_profile_relations"] = {}
         sessions.append(session)
         try:
             yield session
@@ -120,6 +121,7 @@ async def test_snapshot_does_not_retry_unissued_sqlstate(monkeypatch, damage):
     @asynccontextmanager
     async def reader_session():
         session = _Session()
+        session.info["provider_profile_relations"] = {}
         sessions.append(session)
         try:
             yield session

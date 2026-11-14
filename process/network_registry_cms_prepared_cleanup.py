@@ -1,10 +1,10 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Native custody checks for explicitly authorized terminal-owner cleanup.
+"""Named data checks for explicitly authorized terminal-attempt cleanup.
 
 Callers must authenticate the terminal run/attempt and stopped worker, and hold
 the shared capture lock before opening this transaction. Neither an expired
-lease nor a capture UUID authorizes deletion. This module establishes physical
-custody only; it does not infer execution ownership from an untagged v1 stamp.
+lease nor a capture UUID authorizes deletion. Snapshot names and logical data
+identify the prepared family; PostgreSQL enforces the caller's access.
 """
 
 import json
@@ -101,7 +101,11 @@ def _stages(entries):
     if type(entries) is not list or len(entries) != len(RELATION_NAMES):
         _invalid()
     for entry in entries:
-        if type(entry) is not list or len(entry) != 3 or type(entry[2]) is not int or not 0 < entry[2] < 2**32:
+        if (
+            type(entry) is not list
+            or len(entry) != 3
+            or (entry[2] is not None and (type(entry[2]) is not int or not 0 < entry[2] < 2**32))
+        ):
             _invalid()
         _identifier(entry[0])
         _identifier(entry[1])
@@ -110,7 +114,7 @@ def _stages(entries):
         stages != tuple(sorted(stages))
         or {entry[0] for entry in stages} != set(RELATION_NAMES)
         or len({entry[1] for entry in stages}) != len(stages)
-        or len({entry[2] for entry in stages}) != len(stages)
+        or (any(entry[2] is not None for entry in stages) and len({entry[2] for entry in stages}) != len(stages))
     ):
         _invalid()
     return stages
@@ -126,7 +130,6 @@ def _require_pair_scope(pair):
         or replace(pair.recipe.source_pin, retained_epoch=None) != pair.request.source_pin
         or pair.recipe.binding_coordinates != pair.request.binding_coordinates
         or pair.address_ownership.dataset_id != epoch.epoch_id
-        or not 0 < pair.address_ownership.schema_oid < 2**32
         or (pair.owner_role, pair.runtime_roles) != (epoch.owner_role, epoch.runtime_roles)
         or pair.request.expected_admission_sha256 != epoch.admission_sha256
         or pair.request.expected_metadata_sha256 != epoch.metadata_sha256
@@ -140,8 +143,7 @@ def _require_pair_scope(pair):
     ):
         if type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
             _invalid()
-    oids = [oid for _name, oid in epoch.relation_oids + pair.address_ownership.relation_oids]
-    oids += [entry[2] for entry in pair.address_stages]
+    oids = [oid for _name, oid in epoch.relation_oids]
     if any(type(oid) is not int or not 0 < oid < 2**32 for oid in oids) or len(oids) != len(set(oids)):
         _invalid()
 
@@ -198,7 +200,7 @@ async def _caller_connection(session):
     return connection
 
 
-async def _require_native_custody(session, pair):
+async def _require_snapshot_data(session, pair):
     try:
         if type(pair) is PreparedRegistryCMSSourcePair:
             await _require_prepared_pair(session, pair)
@@ -209,7 +211,7 @@ async def _require_native_custody(session, pair):
 
 
 async def probe_registry_cms_source_capture(session, *, capture_id, owner_role, runtime_roles):
-    """Return absent, prepared or finalized custody on the caller's fresh snapshot."""
+    """Return absent, prepared or finalized data on the caller's fresh snapshot."""
     if type(capture_id) is not UUID or not capture_id.int:
         _invalid()
     if (
@@ -224,20 +226,17 @@ async def probe_registry_cms_source_capture(session, *, capture_id, owner_role, 
     connection = await _caller_connection(session)
     schemas = ("entity_address_archive_" + capture_id.hex, "registry_cms_epoch_" + capture_id.hex)
     schema_records = await connection.fetch(
-        """SELECT n.nspname, n.oid::bigint, r.rolname,
+        """SELECT n.nspname,
           CASE WHEN octet_length(obj_description(n.oid,'pg_namespace')) <= $2
           THEN obj_description(n.oid,'pg_namespace') END AS comment
-          FROM pg_namespace n JOIN pg_roles r ON r.oid=n.nspowner
+          FROM pg_namespace n
           WHERE n.nspname=ANY($1::text[]) ORDER BY n.nspname""",
         list(schemas),
         MAX_DOCUMENT_BYTES + len(_PREPARED_COMMENT),
     )
     if not schema_records:
         return None
-    if len(schema_records) != 2 or any(
-        schema_record["rolname"] != owner_role or type(schema_record["comment"]) is not str
-        for schema_record in schema_records
-    ):
+    if len(schema_records) != 2 or any(type(schema_record["comment"]) is not str for schema_record in schema_records):
         _invalid()
     comment = next(
         schema_record["comment"] for schema_record in schema_records if schema_record["nspname"] == schemas[0]
@@ -258,7 +257,7 @@ async def probe_registry_cms_source_capture(session, *, capture_id, owner_role, 
         if prefix is None:
             _invalid()
         pair = decode_registry_cms_source_pair(_document(comment, prefix))
-    await _require_native_custody(session, pair)
+    await _require_snapshot_data(session, pair)
     if pair.recipe.source_pin.retained_epoch.epoch_id != capture_id or (pair.owner_role, pair.runtime_roles) != (
         owner_role,
         runtime_roles,
@@ -271,9 +270,9 @@ async def cleanup_prepared_registry_cms_source_pair(session, prepared_pair):
     """Remove exact prepared copies only after private terminal-owner authorization.
 
     The caller must prove the authenticated owner/attempt terminal and its worker
-    stopped, then hold the shared capture lock through this transaction. Native
-    custody is necessary but does not replace those checks. Finalized pairs are
-    preserved. Return the closed status: removed, absent or finalized.
+    stopped, then hold the shared capture lock through this transaction. Named
+    data validation does not replace those checks. Finalized pairs are preserved.
+    Return the closed status: removed, absent or finalized.
     """
     if type(prepared_pair) is not PreparedRegistryCMSSourcePair:
         _invalid()

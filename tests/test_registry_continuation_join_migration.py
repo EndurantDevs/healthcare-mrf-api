@@ -50,7 +50,8 @@ def test_join_preserves_both_completed_parent_histories():
     assert all(script.get_revision(parent).down_revision == FIRST_RETIREMENT for parent in parents)
     assert script.get_revision(FIRST_RETIREMENT).down_revision == CHECKER_EXECUTION
     assert script.get_revision(SERVING_RECOVERY).down_revision == CURRENT_HEAD
-    assert script.get_heads() == [LIFECYCLE_HEAD]
+    assert script.get_heads() == ["20261114120000_portable_serving_metadata"]
+    assert script.get_revision("20261114120000_portable_serving_metadata").down_revision == LIFECYCLE_HEAD
     assert script.get_revision(LIFECYCLE_HEAD).down_revision == "20261114010000_custom_import_snapshot_names"
     assert script.get_revision("20261114010000_custom_import_snapshot_names").down_revision == (
         "20261115010000_ms_drg_companion_tables"
@@ -99,7 +100,8 @@ def test_join_upgrade_and_downgrade_require_no_database_operations():
 def test_staged_join_preserves_parent_histories():
     script = _script()
     assert script.get_revision(SERVING_RECOVERY).down_revision == CURRENT_HEAD
-    assert script.get_heads() == [LIFECYCLE_HEAD]
+    assert script.get_heads() == ["20261114120000_portable_serving_metadata"]
+    assert script.get_revision("20261114120000_portable_serving_metadata").down_revision == LIFECYCLE_HEAD
     assert script.get_revision(STAGED_JOIN).down_revision == (SOURCE_CHECK, STAGED_VERIFICATION)
     assert script.get_revision(STAGED_VERIFICATION).down_revision == CONTINUATION
     assert script.get_revision(SOURCE_CHECK).down_revision == "20261019140000_plan_pricing_attribution_idempotency"
@@ -157,7 +159,8 @@ def test_staged_join_uses_no_database():
 def test_manual_join_preserves_parent_histories_without_database_operations():
     script = _script()
     assert script.get_revision(SERVING_RECOVERY).down_revision == CURRENT_HEAD
-    assert script.get_heads() == [LIFECYCLE_HEAD]
+    assert script.get_heads() == ["20261114120000_portable_serving_metadata"]
+    assert script.get_revision("20261114120000_portable_serving_metadata").down_revision == LIFECYCLE_HEAD
     revision = script.get_revision(MANUAL_JOIN)
     assert revision.down_revision == (STAGED_JOIN, PTG_MEMBERSHIP)
     assert script.get_revision(PTG_MEMBERSHIP).down_revision == MANUAL_ACCEPTANCE

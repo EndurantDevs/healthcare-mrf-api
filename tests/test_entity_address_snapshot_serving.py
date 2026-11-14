@@ -14,11 +14,15 @@ generation = importlib.import_module("process.entity_address_result_generation")
 
 
 def _session(*, active: bool = True):
-    return SimpleNamespace(
+    session = SimpleNamespace(
         execute=AsyncMock(),
         scalar=AsyncMock(return_value="read committed"),
         in_transaction=lambda: active,
     )
+    session.scalar.side_effect = lambda sql: (
+        None if "active_dependency_bindings" in str(sql) else session.scalar.return_value
+    )
+    return session
 
 
 def _geo_signature(schema_name: str) -> tuple[tuple[str, int, int], ...]:
@@ -34,24 +38,17 @@ def _geo_signature(schema_name: str) -> tuple[tuple[str, int, int], ...]:
 
 
 def _install_observation_results(monkeypatch: pytest.MonkeyPatch, schema_name: str) -> None:
-    relation_oids = iter(range(10, 17))
+    async def relation_name(_session, schema, table):
+        return f"{schema}.{table}"
 
-    async def relation_oid(_session, _schema_name, _table_name):
-        return next(relation_oids)
-
-    monkeypatch.setattr(serving, "_relation_oid", relation_oid)
+    monkeypatch.setattr(serving, "_relation_name", relation_name)
     monkeypatch.setattr(serving, "_alias_state", AsyncMock(return_value=(2, 1, 4)))
     monkeypatch.setattr(
         serving,
         "_geo_assurance_state",
-        AsyncMock(return_value=(1, 10, _geo_signature(schema_name))),
+        AsyncMock(return_value=1),
     )
     monkeypatch.setattr(serving, "_result_generation_state", AsyncMock(return_value=None))
-
-    async def lock_dependencies(session, schema, **_options):
-        await session.execute(serving.text(serving.geo_projection.projection_dependency_lock_sql(schema)))
-
-    monkeypatch.setattr(serving, "lock_active_dependencies", lock_dependencies)
 
 
 @pytest.mark.asyncio
@@ -69,8 +66,9 @@ async def test_queue_capture_uses_fixed_bounds_and_writer_lock_order(monkeypatch
         serving.address_alias_sql.alias_advisory_xact_lock_sql(),
     ]
     assert len([statement for statement in statements[4:11] if " IN SHARE MODE" in statement]) == 7
-    assert statements[11] == serving.geo_projection.projection_dependency_lock_sql("mrf")
-    assert captured.relation_oids == tuple(range(10, 17))
+    assert statements[11].startswith('LOCK TABLE "mrf"."doctor_clinician_address"')
+    assert statements[11].endswith(" IN ACCESS SHARE MODE")
+    assert captured.relation_oids == (None,) * 7
     assert captured.result_generation is None
     assert serving.validate_entity_address_observed_serving_capture(captured.as_dict()) == captured
 
@@ -111,6 +109,10 @@ def test_legacy_capture_without_generation_is_explicitly_generationless():
         geo_active_table_oid=10,
         geo_active_relation_signature=_geo_signature("mrf"),
     ).as_dict()
+    capture["contract"] = serving.LEGACY_CONTRACT
+    for relation in capture["relations"]:
+        relation["relation_oid"] = 17
+    capture["geo_assurance"] = {"version": 1, "active_table_oid": 17, "active_relation_signature": None}
     capture.pop("result_generation")
 
     validated = serving.validate_entity_address_observed_serving_capture(capture)
@@ -118,7 +120,7 @@ def test_legacy_capture_without_generation_is_explicitly_generationless():
     assert validated.result_generation is None
 
 
-def test_capture_rejects_duplicate_relation_oids():
+def test_capture_ignores_legacy_relation_oids():
     capture = serving.EntityAddressObservedServingCapture(
         contract=serving.CONTRACT,
         source_schema="mrf",
@@ -131,12 +133,15 @@ def test_capture_rejects_duplicate_relation_oids():
         geo_active_relation_signature=_geo_signature("mrf"),
     ).as_dict()
 
-    with pytest.raises(ValueError, match="relation identity"):
-        serving.validate_entity_address_observed_serving_capture(capture)
+    capture["contract"] = serving.LEGACY_CONTRACT
+    capture["geo_assurance"] = {"version": 1, "active_table_oid": 10, "active_relation_signature": None}
+    for relation in capture["relations"]:
+        relation["relation_oid"] = 10
+    assert serving.validate_entity_address_observed_serving_capture(capture).relation_oids == (None,) * 7
 
 
 @pytest.mark.asyncio
-async def test_generation_state_rejects_stale_relation_identity(monkeypatch):
+async def test_generation_state_uses_portable_origin_for_named_relations(monkeypatch):
     authority = generation.EntityAddressResultGenerationAuthority(
         local_lineage_id="c8f27af1-56ba-4cda-82d8-0fc67650918f",
         local_generation=12,
@@ -153,11 +158,16 @@ async def test_generation_state_rejects_stale_relation_identity(monkeypatch):
         AsyncMock(return_value=authority),
     )
 
-    with pytest.raises(RuntimeError, match="does not identify the serving relations"):
+    names = tuple(f"mrf.{name}" for name in generation.RELATION_NAMES)
+    assert (
+        await serving._result_generation_state(object(), schema_name="mrf", relation_names=names)
+        == authority.serving_generation
+    )
+    with pytest.raises(RuntimeError, match="serving relations are incomplete"):
         await serving._result_generation_state(
             object(),
             schema_name="mrf",
-            relation_oids=tuple(range(10, 17)),
+            relation_names=names[:-1],
         )
 
 
@@ -206,8 +216,8 @@ async def test_receive_admission_uses_read_locks_but_source_observer_stays_stric
     statements = [str(call.args[0]) for call in session.execute.await_args_list]
     assert len([statement for statement in statements[3:10] if " IN ACCESS SHARE MODE" in statement]) == 7
     assert not any("ISOLATION LEVEL" in statement for statement in statements)
-    assert str(session.scalar.await_args.args[0]) == "SHOW transaction_isolation"
-    assert serving._geo_assurance_state.await_args.kwargs["require_current_dependencies"] is False
+    assert str(session.scalar.await_args_list[0].args[0]) == "SHOW transaction_isolation"
+    assert serving._geo_assurance_state.await_args.kwargs["allow_unpublished_geo"] is True
     assert serving.validate_entity_address_observed_serving_capture(captured.as_dict()) == captured
 
 
@@ -234,7 +244,7 @@ async def test_receive_final_comparison_uses_writer_order_and_rejects_changed_to
 
 def _install_empty_receive_results(monkeypatch):
     _install_observation_results(monkeypatch, "mrf")
-    monkeypatch.setattr(serving, "_geo_assurance_state", AsyncMock(return_value=(None, None, None)))
+    monkeypatch.setattr(serving, "_geo_assurance_state", AsyncMock(return_value=None))
     authority = SimpleNamespace(local_generation=0, serving_generation=None, relation_oids=None)
     monkeypatch.setattr(
         generation, "read_entity_address_result_generation_authority", AsyncMock(return_value=authority)
@@ -245,12 +255,17 @@ def _install_empty_receive_results(monkeypatch):
 @pytest.mark.asyncio
 async def test_empty_receive_roundtrips_null_geo_and_rechecks_before_publication(monkeypatch):
     session = _session()
-    session.scalar.side_effect = lambda sql: "read committed" if str(sql) == "SHOW transaction_isolation" else False
+    session.scalar.side_effect = lambda sql: (
+        None
+        if "active_dependency_bindings" in str(sql)
+        else "read committed"
+        if str(sql) == "SHOW transaction_isolation"
+        else False
+    )
     _install_empty_receive_results(monkeypatch)
     captured = await serving.capture_entity_address_receive_admission(session, schema_name="mrf")
-    assert captured.as_dict()["geo_assurance"] == dict.fromkeys(
-        ("version", "active_table_oid", "active_relation_signature")
-    )
+    assert captured.as_dict()["geo_assurance"]["version"] is None
+    assert set(captured.as_dict()["geo_assurance"]) == {"version", "dependencies"}
     assert serving.validate_entity_address_observed_serving_capture(captured, allow_unpublished_geo=True) == captured
     with pytest.raises(ValueError):
         serving.validate_entity_address_observed_serving_capture(captured)
@@ -266,18 +281,30 @@ async def test_empty_receive_roundtrips_null_geo_and_rechecks_before_publication
 @pytest.mark.parametrize("invalid", ("generation", "populated", "alias", "relation"))
 async def test_empty_receive_final_recheck_rejects_changed_state(monkeypatch, invalid):
     session = _session()
-    session.scalar.side_effect = lambda sql: "read committed" if str(sql) == "SHOW transaction_isolation" else False
+    session.scalar.side_effect = lambda sql: (
+        None
+        if "active_dependency_bindings" in str(sql)
+        else "read committed"
+        if str(sql) == "SHOW transaction_isolation"
+        else False
+    )
     _install_empty_receive_results(monkeypatch)
     expected = (await serving.capture_entity_address_receive_admission(session, schema_name="mrf")).as_dict()
     authority = _install_empty_receive_results(monkeypatch)
     if invalid == "generation":
         authority.local_generation = 1
     elif invalid == "populated":
-        session.scalar.side_effect = lambda sql: "read committed" if str(sql) == "SHOW transaction_isolation" else True
+        session.scalar.side_effect = lambda sql: (
+            None
+            if "active_dependency_bindings" in str(sql)
+            else "read committed"
+            if str(sql) == "SHOW transaction_isolation"
+            else True
+        )
     elif invalid == "alias":
         monkeypatch.setattr(serving, "_alias_state", AsyncMock(return_value=(2, 1, 5)))
     else:
-        monkeypatch.setattr(serving, "_relation_oid", AsyncMock(side_effect=range(20, 27)))
+        monkeypatch.setattr(serving, "_relation_name", AsyncMock(side_effect=RuntimeError("relation is unavailable")))
     with pytest.raises(RuntimeError):
         await serving.require_entity_address_receive_incumbent(session, schema_name="mrf", expected=expected)
 
@@ -298,3 +325,41 @@ async def test_receive_admission_rejects_unsupported_isolation_without_changing_
     with pytest.raises(RuntimeError, match="requires READ COMMITTED isolation"):
         await serving.capture_entity_address_receive_admission(session, schema_name="mrf")
     session.execute.assert_not_awaited()
+
+
+async def test_named_dependency_capture_discards_old_catalog_metadata(monkeypatch):
+    session = _session()
+    _install_observation_results(monkeypatch, "mrf")
+    bindings_by_role = {
+        name: {"schema_name": "published_inputs", "table_name": table, "relation_oid": None, "relfilenode": None}
+        for name, _schema, table in serving._dependency_relations("mrf")
+    }
+    session.scalar.side_effect = lambda _sql: bindings_by_role
+    captured = await serving.capture_entity_address_observed_serving(session, schema_name="mrf")
+    document = captured.as_dict()
+    assert document["contract"] == serving.CONTRACT
+    assert all(set(relation) == {"model_name", "table_name"} for relation in document["relations"])
+    assert all(
+        set(binding) == {"schema_name", "table_name"} for binding in document["geo_assurance"]["dependencies"].values()
+    )
+    assert serving.validate_entity_address_observed_serving_capture(document) == captured
+    assert all(
+        'ONLY "published_inputs".' + '"' + table + '"' in str(session.execute.await_args_list[11].args[0])
+        for _, _, table in serving._dependency_relations("mrf")
+    )
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_canonical_dependency_capture_locks_inheritance(monkeypatch, explicit):
+    session = _session()
+    _install_observation_results(monkeypatch, "mrf")
+    bindings_by_role = {
+        name: {"schema_name": schema, "table_name": table}
+        for name, schema, table in serving._dependency_relations("mrf")
+    }
+    session.scalar.side_effect = lambda _sql: bindings_by_role if explicit else None
+    await serving.capture_entity_address_observed_serving(session, schema_name="mrf")
+    lock_sql = str(session.execute.await_args_list[11].args[0])
+    assert "ONLY" not in lock_sql
+    assert '"tiger"."zcta5"' in lock_sql and '"tiger"."zip_state"' in lock_sql
+    assert lock_sql.endswith(" IN ACCESS SHARE MODE")

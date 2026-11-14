@@ -9,7 +9,7 @@ import pytest
 
 from process import network_cms_registry_source_pair as retained
 from process import network_registry_cms_prepared_pair as prepared
-from process.entity_address_snapshot_receipt import validate_entity_address_archive_receipt
+from process.entity_address_snapshot_receipt import _models, validate_entity_address_archive_receipt
 from process.registry_source_recipe_store import canonical_registry_source_recipes
 from tests.test_cms_registry_source_pair_slot import _prepared, _row
 from tests.test_network_cms_registry_address_witness_decode import _witness
@@ -39,7 +39,7 @@ def _witness_pair():
     )
     payload = json.loads(pair.cms_receipt_payload)
     source_oid_by_table = dict(document["source"]["relation_oids"])
-    payload["address"]["relation_oids"] = [source_oid_by_table[model.__tablename__] for model in retained._models()]
+    payload["address"]["relation_oids"] = [source_oid_by_table[model.__tablename__] for model in _models()]
     return replace(
         pair,
         address_source=replace(pair.address_source, generation_id=retained._digest(payload["address"])),
@@ -61,6 +61,24 @@ def test_retained_wire_roundtrip_preserves_original_capture(make_pair):
     assert replay.proof.source_pin.retained_epoch is None
     assert replay.recipe.source_pin.retained_epoch.epoch_id == replay.address_ownership.dataset_id
     assert replay.recipe.source_pin.read_schema_name != replay.proof.source_pin.schema_name
+
+
+def test_retained_logical_layout_uses_named_or_validated_witness_evidence():
+    legacy = _retained_pair()
+    assert legacy.address_ownership.schema_oid is not None
+    assert retained._address_logical_sha256(legacy) is None
+    named = replace(
+        legacy,
+        address_ownership=replace(
+            legacy.address_ownership,
+            schema_oid=None,
+            relation_oids=tuple((name, None) for name, _ in legacy.address_ownership.relation_oids),
+        ),
+    )
+    assert retained._address_logical_sha256(named) == named.address_catalog_sha256
+    witnessed = _witness_pair()
+    assert retained._address_logical_sha256(witnessed) == json.loads(witnessed.witness_json)["logical_sha256"]
+    assert retained._address_logical_sha256(witnessed) != witnessed.address_catalog_sha256
 
 
 @pytest.mark.parametrize("pin_kind", ["foreign-source", "retained", "custody", "untyped"])
@@ -197,7 +215,7 @@ def test_decoder_refuses_unclosed_pair_metadata(container):
         ("clone", "relation_oids"),
     ],
 )
-def test_pair_refuses_valid_witness_for_another_address_family(side, coordinate):
+def test_legacy_witness_binds_names_without_local_identity_pins(side, coordinate):
     pair = _witness_pair()
     document = json.loads(pair.witness_json)
     if coordinate == "schema_name":
@@ -208,6 +226,11 @@ def test_pair_refuses_valid_witness_for_another_address_family(side, coordinate)
     else:
         next(entry for entry in document[side][coordinate] if entry[0] == "entity_address_unified")[1] += 1000
     foreign_wire = retained.decode_registry_cms_address_copy_witness(document)
-    with pytest.raises(ValueError, match="^registry_cms_source_pair_invalid$"):
-        replace(pair, witness_json=foreign_wire)
+    if coordinate == "schema_name":
+        with pytest.raises(ValueError, match="^registry_cms_source_pair_invalid$"):
+            replace(pair, witness_json=foreign_wire)
+    else:
+        copied = replace(pair, witness_json=foreign_wire)
+        assert copied.address_receipt == pair.address_receipt
+        assert copied.proof == pair.proof
     assert retained.decode_registry_cms_source_pair(pair.as_dict()) == pair

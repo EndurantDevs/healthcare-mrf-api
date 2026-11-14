@@ -39,6 +39,7 @@ async def _reader_scope(session, state_by_field):
         yield session
     finally:
         session.info.pop("api_reader_verified", None)
+        session.info.pop("provider_profile_relations", None)
         state_by_field.pop("reader", None)
 
 
@@ -60,6 +61,11 @@ def _reader_and_writer_session(state_by_field):
     with_read_identity_receipts(session)
 
     async def execute(statement, _parameters=None):
+        if str(statement).startswith("SELECT local_lineage_id,local_generation,"):
+            authority = state_by_field["authority"]
+            fields = ("local_lineage_id", "local_generation", "origin_lineage_id", "origin_generation", "published_at")
+            row = {name: authority[name] for name in fields} if authority is not None else None
+            return SimpleNamespace(mappings=lambda: SimpleNamespace(one_or_none=lambda: row))
         if "SELECT EXISTS" in str(statement) and generation.TABLE_NAME in str(statement):
             assert state_by_field.get("reader") is True
             return SimpleNamespace(scalar=lambda: session.scalar.return_value)
@@ -67,6 +73,14 @@ def _reader_and_writer_session(state_by_field):
 
     session.execute.side_effect = execute
     return session
+
+
+def _named_doctors_relations():
+    installed_names = {*RELATIONS, generation.TABLE_NAME}
+    return {
+        f"{schema}.{name}": f"{schema}.{name}" if name in installed_names else None
+        for schema, name in snapshot.provider_snapshot_names("mrf")
+    }
 
 
 @pytest.fixture
@@ -120,16 +134,16 @@ def runtime(monkeypatch):
     monkeypatch.setattr(profile, "fetch_state_profile_projection", AsyncMock(return_value=None))
     monkeypatch.setattr(profile, "fetch_additional_state_profile_projections", AsyncMock(return_value=[]))
     monkeypatch.setattr(npi, "_fetch_provider_directory_profile_map", AsyncMock(return_value={}))
-    oid_by_relation = {f"mrf.{name}": oid for name, oid in zip(RELATIONS, OIDS, strict=True)}
-    oid_by_relation.update(
-        {f"mrf.{generation.TABLE_NAME}": 22000, f"mrf.{snapshot.address_generation.TABLE_NAME}": None}
-    )
-    monkeypatch.setattr(snapshot, "_inventory_serving_relations", AsyncMock(return_value=oid_by_relation))
+    relations_by_name = _named_doctors_relations()
+    monkeypatch.setattr(snapshot, "lock_reader_relations", AsyncMock(return_value=relations_by_name))
+    monkeypatch.setattr(snapshot, "_inventory_relation_names", AsyncMock(return_value=relations_by_name))
     monkeypatch.setattr(snapshot, "_requires_cms_receipt", AsyncMock(return_value=False))
     monkeypatch.setattr(generation, "_first", first)
     monkeypatch.setattr(generation, "current_reference_family_relation_oids", AsyncMock(return_value=OIDS))
     monkeypatch.setattr(revisions, "install_reference_revision_guards", AsyncMock())
-    return SimpleNamespace(state_by_field=state_by_field, database=database, session=session)
+    return SimpleNamespace(
+        state_by_field=state_by_field, database=database, session=session, relations_by_name=relations_by_name
+    )
 
 
 async def republish(runtime, monkeypatch, mode):
@@ -214,25 +228,34 @@ async def test_republication_refuses_old_credential_page(runtime, monkeypatch, m
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ["missing", "oids", "source", "schema"])
+@pytest.mark.parametrize("fault", ["missing", "names", "source", "schema"])
 async def test_snapshot_and_source_drift_still_refuse(runtime, monkeypatch, fault):
     if fault == "missing":
         runtime.state_by_field["authority"] = None
-    elif fault == "oids":
-        runtime.state_by_field["authority"]["relation_oids"][2] += 1
+    elif fault == "names":
+        runtime.relations_by_name[f"mrf.{RELATIONS[0]}"] = None
     elif fault == "source":
         runtime.state_by_field["credentials"] = [_credential_row(1, "MD", generation="d" * 64)]
     else:
         monkeypatch.setattr(cms.CMSDoctorEducation.__table__, "schema", "synthetic")
     error, reason = {
-        "missing": (RuntimeError, "^reference family generation authority is unavailable$"),
+        "missing": (ServiceUnavailable, r"^Provider data is temporarily unavailable\.$"),
         "source": (RuntimeError, "^cms_education_profile_generation_mixed$"),
-        "oids": (ServiceUnavailable, r"^Provider data is temporarily unavailable\.$"),
+        "names": (ServiceUnavailable, r"^Provider data is temporarily unavailable\.$"),
         "schema": (ServiceUnavailable, r"^Provider data is temporarily unavailable\.$"),
     }[fault]
     with pytest.raises(error, match=reason):
         await npi.get_provider_profile(SimpleNamespace(args={}), str(NPI))
     assert snapshot.snapshot_cms_serving_generation("mrf") is None
+    assert not runtime.session.info and runtime.database._transaction_binding() is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_relation_ids_do_not_change_profile_result(runtime):
+    before = await npi.get_provider_profile(SimpleNamespace(args={}), str(NPI))
+    runtime.state_by_field["authority"]["relation_oids"] = [31001, 31002, 31003]
+    after = await npi.get_provider_profile(SimpleNamespace(args={}), str(NPI))
+    assert before.status == after.status == 200 and before.body == after.body
     assert not runtime.session.info and runtime.database._transaction_binding() is None
 
 

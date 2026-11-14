@@ -211,8 +211,8 @@ async def _retained_dependency_readers(connection, pinned_source):
     )
     if comment is None or not comment.startswith(prefixes):
         return None
-    pair, schema_oid = await _read_committed_pair(connection, pinned_source.schema_name)
-    if pair.address_source != pinned_source or pair.address_ownership.schema_oid != schema_oid:
+    pair, _ = await _read_committed_pair(connection, pinned_source.schema_name)
+    if pair.address_source != pinned_source or pair.address_ownership.schema_name != pinned_source.schema_name:
         raise NetworkCustomAddressSourceError("Retained CMS address dependency differs")
     await require_registry_cms_source_pair_connection(connection, pair, verify_content=False)
     return pair.runtime_roles

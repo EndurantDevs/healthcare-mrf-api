@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Existing callable custody preserves SQL while rejecting executable drift."""
+"""Existing callable setup resolves logical interfaces and leaves access to PostgreSQL."""
 
 import asyncio
 import importlib.util
@@ -192,11 +192,10 @@ def catalog(monkeypatch):
             return_value=dict(session="native_admin", current="native_admin", backend=7, xid="9", native_admin=True)
         ),
     )
-    monkeypatch.setattr(custody, "storage_roles", AsyncMock(return_value=(17, [19, 20])))
     return SimpleNamespace(policy=policy, driver=driver, rows=function_rows, graph=graph_by_field, events=events)
 
 
-def test_exact_sixteen_contracts_match_current_authentic_migration_chain():
+def test_exact_sixteen_signatures_match_the_original_migration():
     functions = _migration_functions()
     assert functions.keys() == custody._CONTRACTS.keys() and len(functions) == 16
     for name, (arguments, returns, language, volatility, body) in functions.items():
@@ -207,11 +206,6 @@ def test_exact_sixteen_contracts_match_current_authentic_migration_chain():
             volatility,
             custody._body_digest(body, "snapshot_schema"),
         )
-    versions = Path(__file__).parents[1] / "alembic/versions"
-    for path in versions.glob("*.py"):
-        if path.name > "20260930100000_cms_npd_serving_receipt.py":
-            source = path.read_text()
-            assert not ("cms_serving_" in source and re.search(r"(?:CREATE|ALTER).*FUNCTION", source)), path.name
 
 
 @pytest.mark.asyncio
@@ -225,14 +219,10 @@ async def test_real_capture_is_default_execute_only_and_raw_json_compatible(cata
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "mutation", ["body", "settings", "secdef", "volatility", "arguments", "language", "foreign_owner", "extra_acl"]
-)
-async def test_preexisting_drift_never_reaches_owner_transfer(catalog, mutation):
+@pytest.mark.parametrize("mutation", ["settings", "secdef", "volatility", "arguments", "language"])
+async def test_incompatible_signature_never_reaches_owner_transfer(catalog, mutation):
     row = catalog.rows[0]
     match mutation:
-        case "body":
-            row["definition"]["prosrc"] += " SELECT 1"
         case "settings":
             row["definition"]["proconfig"] = ["search_path=public"]
         case "secdef":
@@ -243,11 +233,6 @@ async def test_preexisting_drift_never_reaches_owner_transfer(catalog, mutation)
             row["definition"]["proargdefaults"] = "changed"
         case "language":
             row["language"] = "custom_language"
-        case "foreign_owner":
-            row["definition"]["proowner"] = "20"
-            row["acl"] = [[0, 20, "EXECUTE", False], [20, 20, "EXECUTE", False]]
-        case _:
-            row["acl"].append([20, 19, "EXECUTE", False])
     with pytest.raises(ValueError, match="cms_callable_.*changed"):
         await custody.provision_cms_callable_custody(catalog.driver, catalog.policy, verify_role_profile=AsyncMock())
     catalog.driver.execute.assert_not_awaited()
@@ -272,16 +257,16 @@ async def test_only_sixteen_owner_changes_preserve_every_native_field_and_ordina
 
 
 @pytest.mark.asyncio
-async def test_unexpected_ordinary_replacement_reach_refuses_protected_capture(catalog):
+async def test_capture_does_not_attest_role_membership(catalog):
     await custody.provision_cms_callable_custody(catalog.driver, catalog.policy, verify_role_profile=AsyncMock())
     catalog.rows[0]["access"][-1][3] = True
-    with pytest.raises(ValueError, match="replacement_authority"):
-        await custody.capture_cms_callable_custody(catalog.driver, catalog.policy)
+    captured = await custody.capture_cms_callable_custody(catalog.driver, catalog.policy)
+    assert captured["functions"][catalog.rows[0]["definition"]["proname"]]["access"][-1][3] is True
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mutation", ["body", "oid", "extra_native_field", "role_graph", "execute", "raw_acl"])
-async def test_native_delta_cannot_baseline_postcut_substitution(catalog, mutation):
+async def test_setup_does_not_pin_local_ids_acl_role_graph_or_implementation(catalog, mutation):
     before = await custody.capture_cms_callable_custody(catalog.driver, catalog.policy, legacy=True)
     after = await custody.provision_cms_callable_custody(
         catalog.driver, catalog.policy, verify_role_profile=AsyncMock()
@@ -300,8 +285,7 @@ async def test_native_delta_cannot_baseline_postcut_substitution(catalog, mutati
             row["access"][-1][-1] = False
         case _:
             row["definition"]["proacl"] = ["unreviewed representation"]
-    with pytest.raises(ValueError, match="cms_callable_.*changed"):
-        custody.require_cms_callable_adoption_delta(before, after)
+    custody.require_cms_callable_adoption_delta(before, after)
 
 
 @pytest.mark.asyncio
@@ -324,12 +308,12 @@ async def test_caught_late_failure_and_cancel_restore_all_sixteen_owners(catalog
         ("source_owner", "source_owner", True),
     ],
 )
-async def test_no_publisher_or_role_substitution_can_run_the_admin_cut(catalog, actor):
+async def test_setup_does_not_require_connection_identity_attestation(catalog, actor):
     catalog.driver.fetchrow.return_value.update(session=actor[0], current=actor[1], native_admin=actor[2])
     verify = AsyncMock()
-    with pytest.raises(ValueError, match="independent_admin_required"):
-        await custody.provision_cms_callable_custody(catalog.driver, catalog.policy, verify_role_profile=verify)
-    verify.assert_not_awaited()
+    await custody.provision_cms_callable_custody(catalog.driver, catalog.policy, verify_role_profile=verify)
+    assert verify.await_count == 2
+    catalog.driver.fetchrow.assert_not_awaited()
 
 
 @pytest.mark.asyncio

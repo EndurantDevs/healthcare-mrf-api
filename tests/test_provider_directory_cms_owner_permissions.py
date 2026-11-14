@@ -686,15 +686,18 @@ def test_revoked_original_owner_execute_refuses_without_repair(owner_case, name)
 
 
 @pytest.mark.parametrize("name", ["cms_serving_native_snapshot", "provider_directory_subset_payload_sha256"])
-def test_unbound_extra_routine_caller_is_not_authenticated_by_observation(owner_case, name):
+def test_source_routine_caller_contract_and_serving_execute_permissions_remain_distinct(owner_case, name):
     case = owner_case
     routine = next(
         row["native"] for row in case.inventory["routines"] if row["native"]["definition"]["proname"] == name
     )
     routine["acl"].append([_READER, _WRITER, "EXECUTE", False])
     _authenticate(case)
-    with pytest.raises(ValueError, match="acl_changed|source_routine_caller_unbound"):
+    if name in planner.callables._SERVING_CALLEES:
         _plan(case)
+    else:
+        with pytest.raises(ValueError, match="acl_changed|source_routine_caller_unbound"):
+            _plan(case)
 
 
 def test_raw_role_oid_strings_normalize_only_after_authentication(owner_case):

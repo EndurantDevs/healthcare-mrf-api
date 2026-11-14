@@ -3,6 +3,7 @@
 
 import asyncio
 import importlib
+import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -259,13 +260,22 @@ async def freeze_source_generation(database, prepared, scope):
     prepared.source_preparation = issued
 
 
+def _require_prepared_names(capture, prepared):
+    """Keep the selected source schema and complete logical stage family."""
+    _require(capture.schema_name == prepared.db_schema)
+    stage_names_by_logical = {logical: stage for logical, stage, _ in prepared.stage_oids}
+    _require(len(stage_names_by_logical) == len(prepared.stage_oids) == len(capture.relation_oids))
+    _require(set(stage_names_by_logical) == {logical for logical, _ in capture.relation_oids})
+    _require(json.loads(capture.catalog_json).get("stage_table_names") == stage_names_by_logical)
+
+
 def require_source_generation(prepared, admission, *, policy=None):
     """A forged PreparedGeneration cannot substitute for the committed issued handoff."""
     issued = _issued(prepared.source_preparation, phases={"prepared"})
     _require(issued.task is asyncio.current_task() and issued.prepared() is prepared and issued.admission is admission)
     _require(policy is None or policy is issued.factory.policy)
     _require(prepared.publish_validation == issued.validation and prepared.preparation_input == issued.inputs)
-    _require(issued.capture.relation_oids == tuple((logical, oid) for logical, _, oid in sorted(prepared.stage_oids)))
+    _require_prepared_names(issued.capture, prepared)
     return issued.capture
 
 
@@ -274,7 +284,7 @@ def require_source_cleanup(prepared):
     issued = _original(prepared.source_preparation, phases={"prepared"})
     _require(issued.task is asyncio.current_task() and issued.prepared() is prepared)
     _require(prepared.db_schema == issued.factory.policy.schema)
-    _require(issued.capture.relation_oids == tuple((logical, oid) for logical, _, oid in sorted(prepared.stage_oids)))
+    _require_prepared_names(issued.capture, prepared)
     return issued
 
 

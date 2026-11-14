@@ -182,7 +182,7 @@ class PinnedRegistryCMSAddressInput:
             session, source_capture=self.source_capture, clone_ownership=ownership
         )
         _require(witness.clone_receipt == receipt)
-        _require(dict(ownership.relation_oids) == {entry.relation: entry.oid for entry in annotations})
+        _require({name for name, _ in ownership.relation_oids} == {entry.relation for entry in annotations})
         original["complete"] = True
 
     def require_complete(self):

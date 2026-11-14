@@ -43,9 +43,9 @@ def current_pair(monkeypatch):
     capture = AsyncMock(side_effect=[snapshot_by_field, result])
     read = AsyncMock(return_value=predecessor_by_field)
     append = AsyncMock(return_value="b" * 64)
-    monkeypatch.setattr(continuity.receipts, "capture_native_dependencies", capture)
-    monkeypatch.setattr(continuity.receipts, "read_current_receipt", read)
-    monkeypatch.setattr(continuity.receipts, "append_serving_receipt", append)
+    monkeypatch.setattr(continuity.receipts, "capture_named_dependencies", capture)
+    monkeypatch.setattr(continuity.receipts, "read_named_current_receipt", read)
+    monkeypatch.setattr(continuity.receipts, "append_ordinary_serving_receipt", append)
     return predecessor_by_field, snapshot_by_field, result, capture, read, append
 
 
@@ -80,6 +80,7 @@ async def test_successor_uses_exact_predecessor_and_native_result(current_pair):
     assert payload["selection"] == predecessor["payload"]["selection"]
     assert payload["cms"] == predecessor["payload"]["cms"]
     assert predecessor["payload"]["address"] == snapshot["address"]
+    assert append.await_args.args[3] == predecessor
 
 
 @pytest.mark.asyncio
@@ -94,7 +95,7 @@ async def test_inconsistent_existing_history_fails_before_swap(current_pair, mis
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field", ["profile", "doctors", "alias_generation", "overlay_oid", "address"])
+@pytest.mark.parametrize("field", ["profile", "doctors", "alias_generation", "address"])
 async def test_after_publish_rejects_unrelated_drift_or_missing_address_advance(current_pair, field):
     if field == "address":
         current_pair[2][field] = current_pair[1][field]

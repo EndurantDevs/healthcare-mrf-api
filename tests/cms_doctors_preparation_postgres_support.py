@@ -342,6 +342,8 @@ async def authority(fixture):
 async def doctors_snapshot(fixture, *, entered=None, release=None):
     """Read all three markers under the actual response lock and authority checks."""
     async with snapshot.provider_profile_read_snapshot(fixture.database, fixture.schema) as session:
+        names = tuple(f"{fixture.schema}.{name}" for name in generation.RELATION_NAMES_BY_IMPORTER["cms-doctors"])
+        assert tuple(snapshot._SNAPSHOT.get()[name] for name in names) == names
         markers = tuple(
             [
                 await session.scalar(text(f'SELECT {column} FROM "{fixture.schema}".{table}'))
@@ -353,6 +355,7 @@ async def doctors_snapshot(fixture, *, entered=None, release=None):
             ]
         )
         incumbent = session.info["provider_profile_native_authorities"]["cms-doctors"]
+        assert incumbent.relation_oids is None
         if entered is not None:
             entered.set()
             await release.wait()

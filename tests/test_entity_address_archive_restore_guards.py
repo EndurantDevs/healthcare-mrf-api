@@ -54,11 +54,11 @@ def _stored_restore():
     }
 
 
-def test_valid_restore_record_round_trips_exact_owner_and_alias_generation():
+def test_valid_restore_record_normalizes_legacy_ids_and_keeps_alias_generation():
     stored = _stored_restore()
     schema, date, names, stage_oids, integrity, context, validation = restore._validated_rehydration_state(stored)
     assert (schema, date) == ("mrf", "20260914")
-    assert dict(stage_oids) == {names[name]: oid for name, oid in _owner().relation_oids}
+    assert dict(stage_oids) == {names[name]: None for name, _oid in _owner().relation_oids}
     assert integrity.as_dict() == stored["stage_integrity"]
     assert context == {
         **stored["context"],
@@ -70,8 +70,11 @@ def test_valid_restore_record_round_trips_exact_owner_and_alias_generation():
     assert stored["context"]["address_alias_generation"] == 7
     stored["context"]["dependency_bindings"] = _example_bindings()
     *_, context, _validation = restore._validated_rehydration_state(stored)
-    assert context["dependency_bindings"] == stored["context"]["dependency_bindings"]
-    context["dependency_bindings"]["mrf.npi_address"]["relation_oid"] += 1
+    assert context["dependency_bindings"]["mrf.npi_address"] == {
+        "schema_name": "held_input",
+        "table_name": "npi_address",
+    }
+    context["dependency_bindings"]["mrf.npi_address"]["table_name"] = "other"
     assert context["dependency_bindings"] != stored["context"]["dependency_bindings"]
 
 
@@ -106,13 +109,13 @@ async def test_invalid_persisted_restore_fails_before_locks_or_ddl(field, value)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mutation", ["duplicate_oid", "foreign_oid", "missing", "semantic_object"])
+@pytest.mark.parametrize("mutation", ["duplicate_name", "foreign_name", "missing", "semantic_object"])
 async def test_restore_metadata_cannot_substitute_owned_stage_relations(mutation):
     stored = _stored_restore()
-    if mutation == "duplicate_oid":
-        stored["stage_relation_oids"][0]["oid"] = stored["stage_relation_oids"][1]["oid"]
-    elif mutation == "foreign_oid":
-        stored["stage_relation_oids"][0]["oid"] = 999
+    if mutation == "duplicate_name":
+        stored["stage_relation_oids"][0]["table_name"] = stored["stage_relation_oids"][1]["table_name"]
+    elif mutation == "foreign_name":
+        stored["stage_relation_oids"][0]["table_name"] = "unrelated_stage"
     elif mutation == "missing":
         stored["stage_relation_oids"].pop()
     else:
@@ -185,7 +188,7 @@ def test_restore_sequence_names_cannot_target_unrelated_or_truncated_identifiers
 async def test_restore_rejects_missing_primary_index(primary_name):
     session = SimpleNamespace(scalar=AsyncMock(return_value=primary_name))
     with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="primary index is unavailable"):
-        await restore._primary_index_name(session, 17)
+        await restore._primary_index_name(session, '"stage"."address"')
 
 
 @pytest.mark.asyncio
@@ -193,7 +196,7 @@ async def test_restore_rejects_duplicate_sequence_ownership_records():
     rows = [{"relname": "address_id_seq"}, {"relname": "address_id_seq"}]
     session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(mappings=lambda: rows)))
     with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="sequence ownership is invalid"):
-        await restore._owned_sequence_names(session, 17)
+        await restore._owned_sequence_names(session, '"stage"."address"')
 
 
 @pytest.mark.asyncio
@@ -210,18 +213,18 @@ async def test_restore_requires_its_owned_evidence_sequence(monkeypatch, sequenc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("catalog_results", [[100], [99, 1]])
-async def test_restore_never_drops_substituted_or_nonempty_namespace(catalog_results):
+@pytest.mark.parametrize("catalog_results", [[False], [True, 1]])
+async def test_restore_never_drops_missing_or_nonempty_namespace(catalog_results):
     session = SimpleNamespace(scalar=AsyncMock(side_effect=catalog_results), execute=AsyncMock())
-    with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="ownership"):
+    with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="namespace"):
         await restore._drop_empty_owned_schema(session, _owner())
     session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_restore_rejects_substituted_stage_oid_before_activation():
-    session = SimpleNamespace(scalar=AsyncMock(return_value=999), execute=AsyncMock())
-    with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="stage OID differs"):
+async def test_restore_rejects_missing_or_unsupported_stage_before_activation():
+    session = SimpleNamespace(scalar=AsyncMock(return_value=False), execute=AsyncMock())
+    with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="stage layout differs"):
         await restore._verify_stored_stage_oids(session, db_schema="mrf", stage_oids=(("address_20260914", 17),))
     session.execute.assert_not_awaited()
 
@@ -236,3 +239,15 @@ async def test_restore_rejects_semantic_receipt_drift(monkeypatch):
     )
     with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="semantic receipt differs"):
         await restore._actual_receipt(SimpleNamespace(), schema_name="stage", expected=expected)
+
+
+@pytest.mark.asyncio
+async def test_restore_accepts_named_layout_without_legacy_physical_identity():
+    stored = _stored_restore()
+    for entry in stored["stage_relation_oids"]:
+        entry["oid"] = None
+    _schema, _date, _names, stages, *_ = restore._validated_rehydration_state(stored)
+    session = SimpleNamespace(scalar=AsyncMock(return_value=True))
+    await restore._verify_stored_stage_oids(session, db_schema="mrf", stage_oids=stages)
+    assert session.scalar.await_count == 7
+    assert all("expected_oid" not in call.kwargs for call in session.scalar.await_args_list)

@@ -258,7 +258,7 @@ def normalized_bindings(bindings: Any) -> list[dict[str, Any]]:
     return normalized_bindings_list
 
 
-def _provider_signature_sql(*, candidate_inputs=None) -> str:
+def _provider_signature_sql(*, candidate_inputs=None, dependency_bindings=None) -> str:
     state_relation = table("entity_address_geo_assurance_state")
     geo_identity = f"""COALESCE((
         SELECT jsonb_build_object(
@@ -267,7 +267,7 @@ def _provider_signature_sql(*, candidate_inputs=None) -> str:
             'signature', active_relation_signature
         ) FROM {state_relation} WHERE singleton
     ), '{{}}'::jsonb)"""
-    geo_ready = geo_projection.projection_state_available_sql(SCHEMA)
+    geo_ready = geo_projection.projection_state_available_sql(SCHEMA, dependency_bindings=dependency_bindings)
     if candidate_inputs is not None:
         geo_identity, geo_ready = "CAST(:candidate_geo AS jsonb)", "TRUE"
     return f"""
@@ -344,14 +344,19 @@ async def provider_signature(session: Any, *, candidate_inputs=None) -> str:
         "evidence_relation": f"{SCHEMA}.entity_address_evidence",
         "zip_relation": f"{SCHEMA}.geo_zip_lookup",
     }
+    dependency_bindings = None
     if candidate_inputs is not None:
         geo_identity = await _lock_candidate_provider_inputs(session, candidate_inputs)
         parameters_by_name = {
             key: candidate_inputs.relation(value.split(".", 1)[1]) for key, value in parameters_by_name.items()
         }
         parameters_by_name["candidate_geo"] = canonical_json(geo_identity)
+    else:
+        from process.entity_address_dependency_bindings import read_active_bindings
+
+        dependency_bindings = await read_active_bindings(session, SCHEMA)
     signature_result = await session.execute(
-        text(_provider_signature_sql(candidate_inputs=candidate_inputs)),
+        text(_provider_signature_sql(candidate_inputs=candidate_inputs, dependency_bindings=dependency_bindings)),
         parameters_by_name,
     )
     return _validated_provider_signature(signature_result.scalar_one())
@@ -410,15 +415,15 @@ async def _candidate_geo_identity(session, inputs, state):
 
     bindings = inputs.geo_bindings()
     address_oid = next(entry[3] for entry in inputs.relations if entry[0] == "entity_address_unified")
-    signature_by_relation = {name: [entry["relation_oid"], entry["relfilenode"]] for name, entry in bindings.items()}
+    signature_by_relation = bindings
     expected = inputs.geo_preparation
     if expected is not None:
-        if type(expected) is not EntityAddressGeoAssurancePreparation or expected.stage_table_oid != address_oid:
+        if type(expected) is not EntityAddressGeoAssurancePreparation:
             raise ValueError("pricing projection candidate geo authority differs")
         captured = await _capture_geo_preparation(
             session,
             db_schema=SCHEMA,
-            stage_table_oid=address_oid,
+            stage_table_oid=None,
             projected_rows=expected.projected_rows,
             dependency_bindings=bindings,
             **(
@@ -431,14 +436,14 @@ async def _candidate_geo_identity(session, inputs, state):
             raise ValueError("pricing projection candidate geo authority changed")
     else:
         ready = (
-            await session.execute(text(f"SELECT {geo_projection.projection_state_available_sql(SCHEMA)}"))
+            await session.execute(
+                text(f"SELECT {geo_projection.projection_state_available_sql(SCHEMA, dependency_bindings=bindings)}")
+            )
         ).scalar_one()
         if (
             not state
             or ready is not True
             or state["active_geo_assurance_version"] != geo_projection.GEO_ASSURANCE_VERSION
-            or state["active_table_oid"] != address_oid
-            or state["active_relation_signature"] != signature_by_relation
         ):
             raise ValueError("pricing projection retained geo authority changed")
     return {

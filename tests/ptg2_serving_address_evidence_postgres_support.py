@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 import os
 import re
 import uuid
+from contextlib import asynccontextmanager
 
 import pytest
 
 from api import ptg2_serving as serving
 from db.connection import Database
-
 
 ZCTA5_ZIP_INDEX_NAME = "zcta5_zcta5ce_idx"
 
@@ -83,6 +82,13 @@ async def _create_unified_address_table(database: Database, schema: str) -> None
 
 
 async def _create_geo_assurance_state_table(database: Database, schema: str) -> None:
+    if not await database.scalar(f"SELECT to_regclass('{schema}.npi_result_generation') IS NOT NULL"):
+        await database.status(
+            f"CREATE TABLE {schema}.npi_result_generation (origin_lineage_id uuid, origin_generation bigint)"
+        )
+        await database.status(
+            f"INSERT INTO {schema}.npi_result_generation VALUES ('12345678-1234-5678-1234-567812345678',1)"
+        )
     await database.status(
         f"""
         CREATE TABLE {schema}.entity_address_geo_assurance_state (
@@ -101,10 +107,7 @@ async def _create_geo_assurance_state_table(database: Database, schema: str) -> 
         )
         """
     )
-    await database.status(
-        f"INSERT INTO {schema}.entity_address_geo_assurance_state (singleton) "
-        "VALUES (true)"
-    )
+    await database.status(f"INSERT INTO {schema}.entity_address_geo_assurance_state (singleton) VALUES (true)")
 
 
 async def _create_unified_address_geo_index(database: Database, schema: str) -> None:
@@ -223,13 +226,8 @@ async def _create_geo_reference_tables(database: Database, schema: str) -> None:
         """,
     }
     for table_name, column_sql in table_sql_by_name.items():
-        await database.status(
-            f"CREATE TABLE {schema}.{table_name} ({column_sql})"
-        )
-    await database.status(
-        f"CREATE INDEX {ZCTA5_ZIP_INDEX_NAME} "
-        f"ON {schema}.zcta5 (zcta5ce)"
-    )
+        await database.status(f"CREATE TABLE {schema}.{table_name} ({column_sql})")
+    await database.status(f"CREATE INDEX {ZCTA5_ZIP_INDEX_NAME} ON {schema}.zcta5 (zcta5ce)")
 
 
 async def _create_tables(database: Database, schema: str) -> None:
@@ -264,10 +262,9 @@ def _schema_sql(sql: str, schema: str) -> str:
         "ptg2_snapshot",
         "ptg2_v3_npi_scope",
         "geo_zip_lookup",
+        "npi_result_generation",
     ):
-        source_relation = re.escape(
-            f"{serving.PTG2_SCHEMA}.{table_name}"
-        )
+        source_relation = re.escape(f"{serving.PTG2_SCHEMA}.{table_name}")
         sql = re.sub(
             rf"(?P<prefix>\b(?:FROM|JOIN|UPDATE|INTO)\s+)"
             rf"{source_relation}(?![A-Za-z0-9_])",

@@ -63,7 +63,7 @@ async def _install_detail_tables(component, monkeypatch):
     schema = component.policy.schema
     async with component.admin_engine.begin() as connection:
         assert await connection.scalar(text("SELECT session_user=current_user")) is True
-        before_by_name = await snapshot._relation_oids(connection, schema, RELATIONS)
+        before_by_name = await snapshot._inventory_relation_names(connection, schema, RELATIONS)
         later_names = {
             "npi_result_generation",
             "npi_canonical_publication_receipt",
@@ -88,14 +88,16 @@ async def _install_detail_tables(component, monkeypatch):
         )
         await _align_npi_receipt_validator_owner(connection, component.policy)
         await _grant_nppes_fixture_inputs(connection, component.policy)
-        after_by_name = await snapshot._relation_oids(connection, schema, RELATIONS)
+        after_by_name = await snapshot._inventory_relation_names(connection, schema, RELATIONS)
         assert len(after_by_name) == 59
         assert all(
-            oid is not None
-            for name, oid in after_by_name.items()
+            qualified is not None
+            for name, qualified in after_by_name.items()
             if not name.endswith((".npi_canonical_publication_receipt", ".npi_canonical_publication_receipt_seal"))
         )
-        assert all(after_by_name[name] == oid for name, oid in before_by_name.items() if oid is not None)
+        assert all(
+            after_by_name[name] == qualified for name, qualified in before_by_name.items() if qualified is not None
+        )
         await _grant_detail_reads(connection, component, before_by_name, after_by_name)
 
 
@@ -158,8 +160,8 @@ async def _grant_detail_reads(connection, component, before_by_name, after_by_na
     policy = component.policy
     model_names = {table.name for table in models.db.metadata.tables.values()}
     model_names.update((profile.PROFILE_TABLE, profile.PROFILE_EVIDENCE_TABLE))
-    for qualified, oid in after_by_name.items():
-        if oid is None:
+    for qualified, present_name in after_by_name.items():
+        if present_name is None:
             continue
         namespace, name = qualified.split(".")
         relation = f"{storage_identifier(namespace)}.{storage_identifier(name)}"
@@ -466,7 +468,7 @@ async def _detail_source_fixture(monkeypatch):
             _bind_doctors_database(monkeypatch, component.database)
             monkeypatch.setattr(fhir, "db", component.database)
             async with component.admin_engine.begin() as connection:
-                after_by_name = await snapshot._relation_oids(connection, component.policy.schema, RELATIONS)
+                after_by_name = await snapshot._inventory_relation_names(connection, component.policy.schema, RELATIONS)
                 assert len(after_by_name) == 59 and all(after_by_name.values())
                 await _grant_detail_reads(connection, component, after_by_name, after_by_name)
             yield SimpleNamespace(
@@ -508,13 +510,16 @@ async def detail_database(monkeypatch, tmp_path):
                 fixture.npi_receipt = await _finalize_publication(
                     raw, fixture.schema, chain.chain_ref, (1, 4, 1, 1, 1, 1)
                 )
+                await npi_generation.publish_local_npi_result_generation(
+                    raw, schema_name=fixture.schema, receipt=fixture.npi_receipt
+                )
         finally:
             await raw.close()
         async with fixture.database.transaction() as session:
-            oids = await snapshot._relation_oids(session, fixture.schema, RELATIONS)
-            assert len(oids) == 59 and all(oids.values())
+            names = await snapshot._inventory_relation_names(session, fixture.schema, RELATIONS)
+            assert len(names) == 59 and all(names.values())
             fixture.npi_identity = await npi_api._npi_canonical_publication_identity(session=session)
-            assert fixture.npi_identity is not None
+            assert fixture.npi_identity is None  # Portable snapshots bypass the native response cache.
             assert (await npi_api._fetch_provider_enrichment_detail(NPI, session=session))["summary"] is not None
         async with _prepared_detail_stage(fixture):
             yield fixture

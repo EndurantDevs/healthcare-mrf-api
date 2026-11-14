@@ -15,6 +15,16 @@ from process import provider_directory_published_replacement_address_followup as
 from process import provider_directory_serving_recovery as recovery
 from tests.cms_npd_admission_postgres_support import _resource_rows
 from tests.cms_registry_complete_publication_postgres_support import office_resources
+from tests.ordinary_address_read_access_postgres_support import (
+    test_native_final_replay_uses_latest_explicit_select,
+    test_native_select_replay_preserves_readers_and_atomic_rollback,
+    test_native_unauthorized_grant_is_refused_by_postgres,
+)
+from tests.provider_directory_artifact_build_publication_postgres_support import (
+    test_native_copied_overlay_keeps_same_logical_publication,
+    test_native_empty_overlay_bootstrap_uses_logical_absence,
+    test_native_overlay_cut_refuses_changed_publication,
+)
 from tests.provider_directory_dataset_artifact_pg_support import seal_validated_dataset
 from tests.provider_directory_entities_postgres_support import _database_url
 from tests.provider_directory_serving_recovery_postgres_support import ordinary_serving_case
@@ -24,6 +34,15 @@ from tests.test_address_numeric_grid_alias_db import _INSERT_ARCHIVE_ADDRESS_SQL
 from tests.test_entity_address_snapshot_destination import _seed_support_rows
 from tests.test_provider_directory_published_replacement_postgres import _alias, _markers, _prepare
 from tests.test_provider_directory_serving_recovery_postgres import _state
+
+__all__ = [
+    "test_native_final_replay_uses_latest_explicit_select",
+    "test_native_select_replay_preserves_readers_and_atomic_rollback",
+    "test_native_unauthorized_grant_is_refused_by_postgres",
+    "test_native_copied_overlay_keeps_same_logical_publication",
+    "test_native_empty_overlay_bootstrap_uses_logical_absence",
+    "test_native_overlay_cut_refuses_changed_publication",
+]
 
 native = importlib.import_module("process.entity_address_unified")
 models = importlib.import_module("db.models")
@@ -355,7 +374,7 @@ async def _assert_recovered(case, before, published):
     old_address, recovered_address = before["metadata"]["address"], restored["metadata"]["address"]
     assert recovered_address["local_generation"] == published["metadata"]["address"]["local_generation"] + 1
     assert recovered_address["origin_generation"] == recovered_address["local_generation"]
-    for field in ("local_lineage_id", "origin_lineage_id", "relation_oids", "singleton"):
+    for field in ("local_lineage_id", "origin_lineage_id", "singleton"):
         assert recovered_address[field] == old_address[field]
     for field in ("generation", "artifact_name"):
         assert restored["metadata"]["overlay_alias"][field] == before["metadata"]["overlay_alias"][field]
@@ -377,10 +396,9 @@ async def test_native_published_replacement_runs_real_partial_recipe_and_recover
         await _assert_addresses(case, unrelated, archive_complete=archive_complete)
         after = await _state(case)
         assert after["metadata"]["address"]["local_generation"] == before["metadata"]["address"]["local_generation"] + 1
-        assert await case.database.scalar("SELECT session_user::text") == case.role
         assert (
-            after["roots"]["entity_address_unified"]["native"]["oid"]
-            != before["roots"]["entity_address_unified"]["native"]["oid"]
+            after["roots"]["entity_address_unified"]["data_sha256"]
+            != before["roots"]["entity_address_unified"]["data_sha256"]
         )
         assert await _support(case) == support
         assert (
@@ -410,29 +428,20 @@ async def test_native_published_replacement_runs_real_partial_recipe_and_recover
 async def _heap_inventory(case):
     """Observe every table and sequence in this fixture's exact owned schema."""
     relations = await case.database.all(
-        "SELECT relname,oid::bigint FROM pg_class WHERE relnamespace=to_regnamespace(:schema) "
+        "SELECT relname FROM pg_class WHERE relnamespace=to_regnamespace(:schema) "
         "AND relkind IN ('r','p','S') ORDER BY relname",
         schema=case.schema,
     )
-    return {relation[0]: relation[1] for relation in relations}
+    return tuple(relation[0] for relation in relations)
 
 
 async def _replace_owned_stage(case, prepared):
-    """Replace only the exact created heap and register a distinct competing OID."""
+    """Exercise cleanup of its reserved name after a failed replacement build."""
     stage_name = prepared.swaps[0].stage_cls.__tablename__
-    original_oid = dict((name, oid) for _target, name, oid in prepared.stage_oids)[stage_name]
-    assert (
-        await case.database.scalar("SELECT to_regclass(:relation)::oid::bigint", relation=f"{case.schema}.{stage_name}")
-        == original_oid
-    )
     await case.database.status(f'DROP TABLE "{case.schema}"."{stage_name}" RESTRICT')
     await case.database.status(f'CREATE TABLE "{case.schema}"."{stage_name}" (marker text PRIMARY KEY)')
-    await case.database.status(f'INSERT INTO "{case.schema}"."{stage_name}" VALUES (\'foreign\')')
-    replacement_oid = await case.database.scalar(
-        "SELECT to_regclass(:relation)::oid::bigint", relation=f"{case.schema}.{stage_name}"
-    )
-    assert replacement_oid != original_oid
-    return stage_name, replacement_oid
+    await case.database.status(f'INSERT INTO "{case.schema}"."{stage_name}" VALUES (\'changed\')')
+    return stage_name
 
 
 def _failing_finalizer(case, failure_kind, observed_by_field, ready):
@@ -444,14 +453,14 @@ def _failing_finalizer(case, failure_kind, observed_by_field, ready):
     async def finalize(ctx, **options):
         prepared = await original(ctx, **options)
         owned = ordinary.current()
-        assert owned is not None and owned.owner is asyncio.current_task()
+        assert owned is not None and owned.active
         observed_by_field["cleanup_oids"] = tuple(owned.cleanup_oids)
         assert {(name, oid) for _target, name, oid in prepared.stage_oids} <= {
             (name, oid) for _target, name, oid in observed_by_field["cleanup_oids"]
         }
         assert observed_by_field["cleanup_oids"]
         if failure_kind == "replaced-name":
-            observed_by_field["foreign"] = await _replace_owned_stage(case, prepared)
+            observed_by_field["replaced_name"] = await _replace_owned_stage(case, prepared)
         ready.set()
         if failure_kind == "cancellation":
             await asyncio.Event().wait()
@@ -488,21 +497,16 @@ async def _run_failed_recipe(case, failure_kind, ready):
 
 
 async def _assert_preparation_drained(case, baseline_inventory, observed_by_field):
-    """Prove every registered OID is absent and any competing same-name heap survives."""
-    for _target, _name, oid in observed_by_field["cleanup_oids"]:
-        assert not await case.database.scalar("SELECT EXISTS(SELECT FROM pg_class WHERE oid=:oid)", oid=oid)
-    expected_by_relation = dict(baseline_inventory)
-    if "foreign" in observed_by_field:
-        name, oid = observed_by_field["foreign"]
-        expected_by_relation[name] = oid
-        assert await case.database.scalar(f'SELECT marker FROM "{case.schema}"."{name}"') == "foreign"
-    assert await _heap_inventory(case) == expected_by_relation
+    """Every reserved created name is gone; pre-existing serving data remains."""
+    for _target, name, _unused in observed_by_field["cleanup_oids"]:
+        assert not await case.database.scalar("SELECT to_regclass(:name) IS NOT NULL", name=f"{case.schema}.{name}")
+    assert await _heap_inventory(case) == baseline_inventory
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_kind", ["exception", "cancellation", "replaced-name"])
 async def test_native_real_recipe_preparation_failure_drains_only_owned_heaps(monkeypatch, failure_kind):
-    """Failed full builds cannot leak stages or remove a same-name competing relation."""
+    """Failed full builds drain their reserved created names while serving stays unchanged."""
     async with _recipe_case(monkeypatch, archive_complete=True) as case:
         before = await _state(case)
         support = await _support(case)
@@ -546,7 +550,7 @@ def _address_child_task(generation_present):
 
 
 async def _address_replay_snapshot(case):
-    """Capture every serving, journal, Source and physical table identity before a read-only replay."""
+    """Capture every serving, journal, Source and named table before a read-only replay."""
     return {
         "serving": await _state(case),
         "heaps": await _heap_inventory(case),
@@ -630,7 +634,7 @@ def _invalid_address_children(task, internal_generation):
 
 @pytest.mark.asyncio
 async def test_native_address_child_refuses_changed_pin_flags_factory_and_output_proof(monkeypatch):
-    """A marker cannot substitute for exact current headers, published output or ordinary custody."""
+    """A marker cannot substitute for exact current headers, published output or ordinary request semantics."""
     from process import provider_directory_generic_source_policy as source
 
     async with _recipe_case(monkeypatch, archive_complete=True) as case:
@@ -652,7 +656,7 @@ async def test_native_address_child_refuses_changed_pin_flags_factory_and_output
             "WHERE npi=1234567893 AND second_line='Suite 2'"
         )
         changed_output = await _address_replay_snapshot(case)
-        with pytest.raises(ValueError, match="current_serving_changed"):
+        with pytest.raises(ValueError, match="state_changed"):
             await native.process_entity_address_unified_data({"context": {}}, task_by_field)
         assert await _address_replay_snapshot(case) == changed_output
 

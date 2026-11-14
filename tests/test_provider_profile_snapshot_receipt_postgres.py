@@ -8,6 +8,7 @@ import json
 import pytest
 from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from api import provider_profile_snapshot as snapshot
 from process import provider_directory_cms_serving_receipt as receipts
@@ -88,16 +89,16 @@ async def test_cms_profile_requires_a_committed_common_proof(monkeypatch, instal
 
 @pytest.mark.parametrize("table", ["provider_directory_profile", "provider_directory_address_overlay"])
 @pytest.mark.parametrize("include_detail", [False, True])
-async def test_replaced_projection_cannot_reuse_common_proof(monkeypatch, table, include_detail):
+async def test_copied_named_projection_preserves_common_proof(monkeypatch, table, include_detail):
     async with snapshot_database(monkeypatch, populated=False) as (database, schema):
         await create_composite_families(database, schema)
-        await receipt_fixture._publish_initial(database.engine, schema)
+        accepted = await receipt_fixture._publish_initial(database.engine, schema)
         await database.status(f"ALTER TABLE {schema}.{table} RENAME TO abandoned_projection")
         await database.status(f"CREATE TABLE {schema}.{table} (synthetic_id int)")
         await grant_profile_reader(database, schema, (table,))
-        with pytest.raises(ServiceUnavailable):
-            async with snapshot.provider_profile_read_snapshot(database, schema, include_detail=include_detail):
-                pytest.fail("A different physical projection cannot inherit the accepted proof")
+        async with snapshot.provider_profile_read_snapshot(database, schema, include_detail=include_detail) as session:
+            assert session.info["provider_profile_cms_serving_receipt"] == accepted
+            assert (await session.execute(text(f"SELECT synthetic_id FROM {schema}.{table}"))).all() == []
 
 
 async def test_withdrawal_still_requires_its_common_proof(monkeypatch):
@@ -109,17 +110,41 @@ async def test_withdrawal_still_requires_its_common_proof(monkeypatch):
                 text(f"""UPDATE {schema}.provider_directory_profile_serving_generation
                 SET generation_id='pdprofile_{"3" * 32}',status='purged',operation='purge',source_vector_json='[]'""")
             )
-            payload = await receipt_fixture._payload(connection, schema, initial)
-            payload["desired_datasets"] = []
-            receipt_id = await receipts.append_serving_receipt(connection, schema, payload)
+            withdrawal_payload = await receipt_fixture._payload(connection, schema, initial)
+            withdrawal_payload["desired_datasets"] = []
+            receipt_id = await receipts.append_serving_receipt(connection, schema, withdrawal_payload)
         async with snapshot.provider_profile_read_snapshot(database, schema) as session:
-            assert session.info["provider_profile_cms_serving_receipt"]["receipt_id"] == receipt_id
-        await database.status(f"ALTER TABLE {schema}.provider_directory_address_overlay RENAME TO abandoned_overlay")
-        await database.status(f"CREATE TABLE {schema}.provider_directory_address_overlay (synthetic_id int)")
-        await grant_profile_reader(database, schema, ("provider_directory_address_overlay",))
-        with pytest.raises(ServiceUnavailable):
-            async with snapshot.provider_profile_read_snapshot(database, schema):
-                pytest.fail("Removing CMS from Profile does not remove the accepted address proof")
+            accepted = session.info["provider_profile_cms_serving_receipt"]
+            assert accepted == {"receipt_id": receipt_id, "payload": withdrawal_payload}
+            assert accepted["payload"]["predecessor_receipt_id"] == initial["receipt_id"]
+            assert accepted["payload"]["cms"] == initial["payload"]["cms"]
+            assert accepted["payload"]["expected_incumbent"] == receipt_fixture._PIN
+            assert accepted["payload"]["desired_datasets"] == []
+            assert (accepted["payload"]["profile"]["status"], accepted["payload"]["profile"]["operation"]) == (
+                "purged",
+                "purge",
+            )
+            assert await receipts.read_named_current_receipt(session, schema) == accepted
+        coverage_sql = f"SELECT dataset_id,release_id,proof_version,dataset_hash,published_at FROM {schema}.provider_directory_cms_serving_coverage"
+        before_coverage = await database.all(coverage_sql)
+        with pytest.raises(DBAPIError, match="cms_serving_fresh_receipt_required"):
+            async with database.engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        f"UPDATE {schema}.provider_directory_profile_serving_generation "
+                        "SET control_generation=control_generation+1,generation_id=:generation"
+                    ),
+                    {"generation": "pdprofile_" + "4" * 32},
+                )
+        async with snapshot.provider_profile_read_snapshot(database, schema) as session:
+            assert session.info["provider_profile_cms_serving_receipt"] == accepted
+            assert await receipts.read_named_current_receipt(session, schema) == accepted
+        assert await database.all(coverage_sql) == before_coverage
+        assert tuple(
+            await database.first(
+                f"SELECT status,is_current FROM {schema}.provider_directory_endpoint_dataset WHERE dataset_id='dataset'"
+            )
+        ) == ("published", True)
 
 
 async def _replace_overlay(database, schema, prior, started):
@@ -156,4 +181,9 @@ async def test_common_proof_and_projection_cross_cutover_together(monkeypatch):
                 await asyncio.gather(publication, return_exceptions=True)
         async with snapshot.provider_profile_read_snapshot(database, schema) as session:
             assert session.info["provider_profile_cms_serving_receipt"] == accepted
-            assert accepted["payload"]["overlay_oid"] != initial["payload"]["overlay_oid"]
+            assert accepted["payload"]["predecessor_receipt_id"] == initial["receipt_id"]
+            assert (
+                accepted["payload"]["address"]["local_generation"]
+                == initial["payload"]["address"]["local_generation"] + 1
+            )
+            assert accepted["payload"]["desired_datasets"] == initial["payload"]["desired_datasets"]

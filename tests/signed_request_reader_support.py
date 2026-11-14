@@ -22,15 +22,31 @@ def _transport_session(session):
     session.info = {}
 
     async def execute(statement, params=None):
-        if str(statement).startswith("SELECT session_user, current_user"):
+        if str(statement) == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY":
             scope = session.begin()
             await scope.__aenter__()
             state_by_field.update(scope=scope, active=True)
             await original_execute(
                 getattr(session, "snapshot_sql", "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             )
-            return _FakeResult(("reader_test", "reader_test", 12345, 23456, "192.0.2.1", 5432, 34567))
+            return _FakeResult(None)
+        if (
+            str(statement)
+            == "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')"
+        ):
+            assert state_by_field["active"]
+            return _FakeResult(("repeatable read", "on"))
+        if str(statement) in ("SET LOCAL lock_timeout = '250ms'", "SET LOCAL statement_timeout = '5s'") or (
+            str(statement).startswith("LOCK TABLE ") and str(statement).endswith(" IN ACCESS SHARE MODE")
+        ):
+            assert state_by_field["active"]
+            return _FakeResult(None)
         return await original_execute(statement) if params is None else await original_execute(statement, params)
+
+    @asynccontextmanager
+    async def begin_nested():
+        assert state_by_field["active"]
+        yield session
 
     async def finish(failure=None):
         if state_by_field["active"]:
@@ -47,6 +63,7 @@ def _transport_session(session):
         await finish()
 
     session.execute = execute
+    session.begin_nested = begin_nested
     session.in_transaction = lambda: state_by_field["active"] or original_in_transaction()
     session.commit, session.rollback, session.close = commit, rollback, close
     return session
@@ -70,6 +87,7 @@ def install_reader_factory(monkeypatch, session=None):
 
     @asynccontextmanager
     async def empty_workspace(_reader):
+        await session.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         yield None
 
     monkeypatch.setattr(database, "_connect_reader", connect_reader)

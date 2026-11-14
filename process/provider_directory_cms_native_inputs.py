@@ -685,6 +685,33 @@ def _require_fhir_fence(fence, schema):
         raise RuntimeError("cms_address_native_fhir_proof_changed")
 
 
+def _normalized_geo_bindings(fence):
+    """Normalize compatible stored bindings without rewriting their descriptor."""
+    try:
+        return validate_projection_dependency_bindings(fence["schema"], fence["geo_bindings"])
+    except ValueError as error:
+        raise RuntimeError("cms_address_native_geo_inputs_unavailable") from error
+
+
+def _require_captured_tiger_fence(fence, geo_bindings):
+    """Check captured TIGER names against normalized current or historical bindings."""
+    captured_tiger = fence.get("tiger_captured")
+    if fence["version"] == 4 or (fence["version"] == 5 and captured_tiger is not None):
+        if captured_tiger is None:
+            raise RuntimeError("cms_address_native_tiger_proof_changed")
+        captured_tiger_relations(captured_tiger, fence["relations"])
+        if captured_tiger["database_oid"] != fence["database"]["database_oid"]:
+            raise RuntimeError("cms_address_native_tiger_proof_changed")
+        expected_tiger = captured_tiger_bindings(captured_tiger)
+        if any(
+            geo_bindings.get(name) != {field: binding[field] for field in ("schema_name", "table_name")}
+            for name, binding in expected_tiger.items()
+        ):
+            raise RuntimeError("cms_address_native_tiger_proof_changed")
+    elif captured_tiger is not None:
+        raise RuntimeError("cms_address_native_tiger_proof_changed")
+
+
 def require_supported_native_address_inputs(fence: dict) -> None:
     """Require complete physical pins plus accepted native publication families."""
     from process.provider_directory_cms_typed_offices import CMS_OFFICE_READ_TABLES
@@ -721,18 +748,9 @@ def require_supported_native_address_inputs(fence: dict) -> None:
         raise RuntimeError("cms_address_native_tiger_proof_changed")
     if fence.get("geo_bindings") is None:
         raise RuntimeError("cms_address_native_geo_inputs_unavailable")
+    geo_bindings = _normalized_geo_bindings(fence)
     captured_tiger = fence.get("tiger_captured")
-    if fence["version"] == 4 or (fence["version"] == 5 and captured_tiger is not None):
-        if captured_tiger is None:
-            raise RuntimeError("cms_address_native_tiger_proof_changed")
-        captured_tiger_relations(captured_tiger, fence["relations"])
-        if captured_tiger["database_oid"] != fence["database"]["database_oid"]:
-            raise RuntimeError("cms_address_native_tiger_proof_changed")
-        expected_tiger = captured_tiger_bindings(captured_tiger)
-        if any(fence["geo_bindings"].get(name) != binding for name, binding in expected_tiger.items()):
-            raise RuntimeError("cms_address_native_tiger_proof_changed")
-    elif captured_tiger is not None:
-        raise RuntimeError("cms_address_native_tiger_proof_changed")
+    _require_captured_tiger_fence(fence, geo_bindings)
     _require_fhir_fence(fence, schema)
     authorities = fence["reference_authorities"]
     required_families = {"cms-doctors", "geo"} | (
@@ -747,7 +765,8 @@ def require_supported_native_address_inputs(fence: dict) -> None:
 async def assert_native_address_input_fence(session, schema: str, expected: dict) -> None:
     """Hold source locks through caller cutover; changed rows, swaps or acceptance reject."""
     require_supported_native_address_inputs(expected)
-    if await capture_native_address_input_fence(session, schema, cutover=True) != expected:
+    expected_by_field = dict(expected, geo_bindings=_normalized_geo_bindings(expected))
+    if await capture_native_address_input_fence(session, schema, cutover=True) != expected_by_field:
         raise RuntimeError("cms_address_native_inputs_changed")
 
 

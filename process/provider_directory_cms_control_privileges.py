@@ -341,6 +341,7 @@ async def grant_cms_control_privileges(connection, policy):
     maintain_statements = tuple(
         f"GRANT MAINTAIN ON {storage_relation(policy.schema, root)} TO {owner}" for root in MAINTAIN_TABLES
     )
+    await _grant_npi_generation_read(connection, policy)
     for statement in (
         *table_statements,
         *column_statements,
@@ -348,6 +349,21 @@ async def grant_cms_control_privileges(connection, policy):
         f"GRANT SET ON PARAMETER temp_file_limit TO {owner}",
     ):
         await connection.execute(statement)
+
+
+async def _grant_npi_generation_read(connection, policy):
+    """Let an existing address publisher compare canonical NPI origin metadata when installed."""
+    installed = await connection.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class relation "
+        "JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace "
+        "WHERE namespace.nspname=$1 AND relation.relname='npi_result_generation')",
+        policy.schema,
+    )
+    if installed:
+        await connection.execute(
+            "GRANT SELECT(origin_lineage_id,origin_generation) ON "
+            f"{storage_relation(policy.schema, 'npi_result_generation')} TO {storage_identifier(policy.owner_role)}"
+        )
 
 
 READ_COLUMN_GRANTS = {

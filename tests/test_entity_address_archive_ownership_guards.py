@@ -182,23 +182,35 @@ async def test_namespace_cleanup_admits_only_owned_relations(monkeypatch, kind, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("substitution", ["schema", "table"])
-async def test_revalidation_rejects_same_name_replacement(monkeypatch, substitution):
+async def test_named_stage_revalidation_accepts_copied_local_identities(monkeypatch, substitution):
     owner = _owner()
     monkeypatch.setattr(ownership, "_schema_oid", AsyncMock(return_value=100 if substitution == "schema" else 99))
     changed = replace(owner, relation_oids=((owner.relation_oids[0][0], 100), *owner.relation_oids[1:]))
     monkeypatch.setattr(ownership, "_table_oids", AsyncMock(return_value=changed.relation_oids))
+    checked = AsyncMock()
+    monkeypatch.setattr(ownership, "_assert_namespace_is_owned", checked)
     session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
-    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="OID differs"):
-        await ownership.verify_entity_address_archive_stage_ownership(session, owner=owner)
+    assert await ownership.verify_entity_address_archive_stage_ownership(session, owner=owner) == owner
+    checked.assert_not_awaited()
     session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_cleanup_does_not_lock_or_delete_a_replacement_namespace():
+async def test_cleanup_never_deletes_a_different_named_family(monkeypatch):
+    owner = _owner()
+    monkeypatch.setattr(ownership, "_schema_oid", AsyncMock(return_value=100))
+    monkeypatch.setattr(ownership, "_table_oids", AsyncMock(return_value=owner.relation_oids[:-1]))
     session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(return_value=100), execute=AsyncMock())
-    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="schema OID differs"):
-        await ownership.cleanup_entity_address_archive_stage(session, owner=_owner())
-    session.execute.assert_not_awaited()
+    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="relation family differs"):
+        await ownership.cleanup_entity_address_archive_stage(session, owner=owner)
+    assert all("DROP" not in str(call.args[0]) for call in session.execute.await_args_list)
+
+
+def test_named_stage_checkpoint_round_trips_without_local_ids():
+    named = replace(_owner(), schema_oid=None, relation_oids=tuple((name, None) for name, _ in _owner().relation_oids))
+    document = named.as_dict()
+    assert set(document) == {"dataset_id", "schema_name", "table_names"}
+    assert ownership.validate_entity_address_archive_stage_ownership(document) == named
 
 
 @pytest.mark.asyncio

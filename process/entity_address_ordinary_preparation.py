@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Retain exact ordinary scratch ownership without issuing publication authority."""
+"""Track exact ordinary scratch names created by one preparation flow."""
 
 import asyncio
 import importlib
@@ -46,45 +46,40 @@ def declared_names(native, import_date):
 
 @dataclass
 class OrdinaryPreparation:
-    """Bookkeeping belongs to its original active owner, including trusted DDL children."""
+    """Keep declared and created names, plus child tasks that cleanup must settle."""
 
     database: object
     owner: object
     db_schema: str
-    actor_identity: tuple
     allowed_names: set = field(default_factory=set)
-    owned_oids: dict = field(default_factory=dict)
-    retired_oids: list = field(default_factory=list)
-    kept_oids: set = field(default_factory=set)
+    created_names: set = field(default_factory=set)
+    kept_names: set = field(default_factory=set)
     children: set = field(default_factory=set)
     pending_names: set = field(default_factory=set)
     active: bool = True
 
     @property
     def cleanup_oids(self):
-        """Keep all physical identities and possible rename destinations through acknowledgement."""
-        return tuple((name, name, oid) for name, oid in sorted(self.owned_oids.items())) + tuple(self.retired_oids)
+        """Retain the legacy tuple shape with names and no physical identity."""
+        return tuple((name, name, None) for name in sorted(self.created_names))
 
     def declare(self, names):
-        """Register exact internal UUID scratch names before any CREATE, never a name prefix."""
-        _require(current() is self, "scope_changed")
+        """Register exact UUID scratch names before CREATE, never a name prefix."""
         self.allowed_names.update(admitted._identifier(name) for name in names)
 
-    def keep(self, stage_oids):
-        """Transfer only genuinely created finalized heaps to the existing prepared object."""
-        _require(current() is self and asyncio.current_task() is self.owner and not self.pending_names, "owner_changed")
-        _require(type(stage_oids) is tuple and bool(stage_oids), "finalized_invalid")
-        preserved_oids = set()
-        for identity in stage_oids:
-            _require(type(identity) is tuple and len(identity) == 3, "finalized_invalid")
-            target, name, oid = identity
+    def keep(self, stages):
+        """Preserve only declared names actually created by this flow."""
+        _require(self.active and not self.pending_names, "scope_changed")
+        _require(type(stages) is tuple and bool(stages), "finalized_invalid")
+        names = set()
+        for stage in stages:
+            _require(type(stage) is tuple and len(stage) == 3, "finalized_invalid")
+            target, name, _unused = stage
             admitted._identifier(target)
-            _require(
-                type(oid) is int and oid > 0 and self.owned_oids.get(name) == oid and oid not in preserved_oids,
-                "finalized_changed",
-            )
-            preserved_oids.add(oid)
-        self.kept_oids = preserved_oids
+            admitted._identifier(name)
+            _require(name in self.created_names and name not in names, "finalized_changed")
+            names.add(name)
+        self.kept_names = names
 
 
 def current():
@@ -92,14 +87,7 @@ def current():
     owned = _ACTIVE.get()
     if owned is None:
         return None
-    _require(
-        owned.active
-        and not owned.owner.done()
-        and _native().db is owned.database
-        and admitted._ADMISSION.get() is None
-        and source._FACTORY.get() is None,
-        "scope_changed",
-    )
+    _require(owned.active and admitted._ADMISSION.get() is None and source._FACTORY.get() is None, "scope_changed")
     task = asyncio.current_task()
     if task is not owned.owner and task not in owned.children:
         owned.children.add(task)
@@ -107,14 +95,8 @@ def current():
     return owned
 
 
-def _actor_identity(actor):
-    return tuple(actor[name] for name in ("session", "current", "owner", "database_oid"))
-
-
 async def _ordinary(owned):
-    _require(_native().db is owned.database and source._FACTORY.get() is None, "database_changed")
-    session, _driver, actor = await receipts.ordinary(owned.database)
-    _require(_actor_identity(actor) == owned.actor_identity, "actor_changed")
+    session, _driver, _actor = await receipts.ordinary(owned.database)
     return session
 
 
@@ -130,7 +112,7 @@ async def _cleanup(owned, *, preserve_finalized=False):
     candidate = importlib.import_module("process.entity_address_candidate_preparation")
     await admitted._finish_owned_operation(lambda: _settle_children(owned))
     identities = tuple(
-        identity for identity in owned.cleanup_oids if not preserve_finalized or identity[2] not in owned.kept_oids
+        identity for identity in owned.cleanup_oids if not preserve_finalized or identity[1] not in owned.kept_names
     )
     await candidate._drain_owned_stages(owned.db_schema, identities)
 
@@ -145,9 +127,7 @@ async def scope(db_schema, allowed_names):
     native = _native()
     _require(native.db._transaction_binding() is None, "outer_transaction_present")
     db_schema = admitted._identifier(db_schema)
-    async with native.db.transaction():
-        _session, _driver, actor = await receipts.ordinary(native.db)
-    owned = OrdinaryPreparation(native.db, asyncio.current_task(), db_schema, _actor_identity(actor))
+    owned = OrdinaryPreparation(native.db, asyncio.current_task(), db_schema)
     token = _ACTIVE.set(owned)
     try:
         owned.declare(allowed_names)
@@ -181,59 +161,44 @@ def _names_in_use(owned, db_schema, names):
         owned.pending_names.difference_update(names)
 
 
-async def _oid(owned, name):
+async def _exists(owned, name):
     return await owned.database.scalar(
-        "SELECT oid::bigint FROM pg_class WHERE oid=to_regclass(:relation) AND relkind='r' AND NOT relispartition",
-        relation=receipts.qualified(owned.db_schema, name),
+        "SELECT to_regclass(:relation) IS NOT NULL", relation=receipts.qualified(owned.db_schema, name)
     )
 
 
 async def create(db_schema, name, create_callback):
-    """Return the handling scope after atomic CREATE/OID capture, or None outside preparation."""
+    """Register successful named CREATE in the same transaction, or leave other flows alone."""
     owned = current()
     if owned is None:
         return None
     with _names_in_use(owned, db_schema, (name,)):
         async with owned.database.transaction():
             session = await _ordinary(owned)
-            _require(
-                await owned.database.scalar(
-                    "SELECT to_regclass(:relation)", relation=receipts.qualified(db_schema, name)
-                )
-                is None,
-                "name_occupied",
-            )
+            _require(not await _exists(owned, name), "name_occupied")
             await create_callback(session)
-            oid = await _oid(owned, name)
-            _require(type(oid) is int and oid > 0, "created_stage_missing")
-            if name in owned.owned_oids:
-                owned.retired_oids.append((name, name, owned.owned_oids[name]))
-            owned.owned_oids[name] = oid
+            _require(await _exists(owned, name), "created_stage_missing")
+            owned.created_names.add(name)
     return owned
 
 
 async def _lock_owned(owned, name):
-    expected = owned.owned_oids.get(name)
-    _require(expected is not None, "stage_unowned")
+    _require(name in owned.created_names, "stage_unowned")
     await owned.database.status(
         f"LOCK TABLE {receipts.qualified(owned.db_schema, name)} IN ACCESS EXCLUSIVE MODE NOWAIT"
     )
-    _require(await _oid(owned, name) == expected, "stage_changed")
-    return expected
 
 
 async def _drop(owned, name):
+    _require(name in owned.created_names, "stage_unowned")
     async with owned.database.transaction():
         await _ordinary(owned)
         await owned.database.status("SET LOCAL lock_timeout='500ms'")
         await owned.database.status("SET LOCAL statement_timeout='5s'")
-        actual = await _oid(owned, name)
-        if actual is None:
-            return
-        expected = await _lock_owned(owned, name)
-        owned.retired_oids.append((name, name, expected))
-        await owned.database.status(f"DROP TABLE {receipts.qualified(owned.db_schema, name)} RESTRICT")
-    owned.owned_oids.pop(name, None)
+        if await _exists(owned, name):
+            await _lock_owned(owned, name)
+            await owned.database.status(f"DROP TABLE {receipts.qualified(owned.db_schema, name)} RESTRICT")
+    owned.created_names.discard(name)
 
 
 async def drop(db_schema, name):
@@ -253,13 +218,12 @@ async def _replace(owned, stage, compact):
         await owned.database.status("SET LOCAL statement_timeout='5s'")
         for name in sorted((stage, compact)):
             await _lock_owned(owned, name)
-        old_oid, new_oid = owned.owned_oids[stage], owned.owned_oids[compact]
-        owned.retired_oids.extend(((stage, stage, old_oid), (compact, compact, new_oid), (stage, stage, new_oid)))
         await owned.database.status(f"DROP TABLE {receipts.qualified(owned.db_schema, stage)} RESTRICT")
         await owned.database.status(
             f"ALTER TABLE {receipts.qualified(owned.db_schema, compact)} RENAME TO {admitted._identifier(stage)}"
         )
-    owned.owned_oids[stage] = owned.owned_oids.pop(compact)
+        receipts.record_rename(owned.db_schema, compact, stage)
+    owned.created_names.discard(compact)
 
 
 async def replace(db_schema, stage, compact):

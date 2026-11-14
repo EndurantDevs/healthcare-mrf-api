@@ -163,7 +163,7 @@ def native_receipt():
     """Use native-shaped metadata without asserting database custody."""
     return {
         "native": {
-            "oid": 101,
+            "schema": "serving",
             "relname": receipts.ROOTS[0],
             "relowner": 201,
             "columns": [{"name": "value"}],
@@ -176,7 +176,7 @@ def native_receipt():
     }
 
 
-@pytest.mark.parametrize("damage", ["rows", "data", "owner", "index", "constraint", "column"])
+@pytest.mark.parametrize("damage", ["rows", "data", "index", "constraint", "column"])
 def test_retained_receipt_refuses_data_or_native_catalog_tamper(damage):
     expected, actual = native_receipt(), native_receipt()
     match damage:
@@ -184,8 +184,6 @@ def test_retained_receipt_refuses_data_or_native_catalog_tamper(damage):
             actual["rows"] = 3
         case "data":
             actual["data_sha256"] = "d" * 64
-        case "owner":
-            actual["native"]["relowner"] += 1
         case "index":
             actual["native"]["indexes"][0]["valid"] = False
         case "constraint":
@@ -196,7 +194,7 @@ def test_retained_receipt_refuses_data_or_native_catalog_tamper(damage):
         receipts.require_relation(expected, actual, renamed=True)
 
 
-def test_only_authenticated_oid_preserving_names_are_normalized():
+def test_retained_names_are_normalized_without_physical_identity():
     expected, actual = native_receipt(), copy.deepcopy(native_receipt())
     actual["native"]["relname"] = receipts.retained_name(101)
     actual["native"]["indexes"][0]["name"] = receipts.retained_name(102, index=True)
@@ -211,18 +209,17 @@ def serving_states():
     root_by_name = {name: native_receipt() for name in receipts.ROOTS}
     for number, (name, receipt) in enumerate(root_by_name.items(), 1):
         receipt["native"].update(relname=name, oid=100 + number)
-    relation_oids = [102, 301, 302, 303, 304, 305, 306]
+    relations = ["serving." + name for name in receipts.generations.RELATION_NAMES]
     address_by_field = dict(
         singleton=True,
         local_lineage_id="bb7b24a0-2195-4fc7-8401-b5321ad42767",
         local_generation=3,
-        relation_oids=relation_oids,
     )
     baseline_by_field = {
         "roots": root_by_name,
         "metadata": {
             "address": address_by_field,
-            "relations": relation_oids,
+            "relations": relations,
             "alias": {"generation": 0},
             "overlay_alias": {"generation": 0},
             "profile": None,
@@ -233,9 +230,10 @@ def serving_states():
     }
     overlay_by_field = copy.deepcopy(baseline_by_field)
     overlay_by_field["roots"][receipts.ROOTS[0]]["native"]["oid"] = 401
+    overlay_by_field["roots"][receipts.ROOTS[0]]["data_sha256"] = "d" * 64
     published_by_field = copy.deepcopy(overlay_by_field)
     published_by_field["roots"][receipts.ROOTS[1]]["native"]["oid"] = 402
-    published_by_field["metadata"]["relations"][0] = 402
+    published_by_field["roots"][receipts.ROOTS[1]]["data_sha256"] = "e" * 64
     published_by_field["metadata"]["address"]["local_generation"] = 4
     return baseline_by_field, overlay_by_field, published_by_field
 
@@ -263,7 +261,7 @@ def test_event_refuses_counter_reset_unrelated_changes_or_forged_receipt(damage)
             published["roots"][receipts.ROOTS[1]]["native"]["relname"] = "caller_table"
         case "common_chain":
             overlay["metadata"]["common_receipt"] = {"receipt_id": "c" * 64}
-            published["metadata"]["common_receipt"] = {"payload": {"predecessor_receipt_id": "d" * 64}}
+            published["metadata"]["common_receipt"] = {"receipt_id": "new", "predecessor_receipt_id": "d" * 64}
     with pytest.raises(ValueError, match="serving_recovery_"):
         recovery._require_transition("published", overlay, published)
 
@@ -433,48 +431,34 @@ async def test_metadata_drift_after_preparation_refuses_overlay_cutover(monkeypa
     monkeypatch.setattr(artifacts, "current", lambda actual: selected if actual is directory else None)
     monkeypatch.setattr(receipts, "lock_metadata", lock_metadata)
     monkeypatch.setattr(receipts, "prepared_state", prepared_state)
-    with pytest.raises(ValueError, match="current_serving_changed"):
+    with pytest.raises(ValueError, match="state_changed"):
         await recovery.before_overlay(directory)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", [None, "session", "task", "transaction", "lock", "catalog"])
-async def test_prepared_digest_requires_original_frozen_transaction(monkeypatch, damage):
-    """A content receipt cannot survive changed native identity or be reused by another task."""
+@pytest.mark.parametrize("damage", [None, "scope", "name", "catalog"])
+async def test_prepared_digest_requires_frozen_named_scope(monkeypatch, damage):
+    """Cached data survives only within validation of its still-locked logical name."""
     original = native_receipt()
-    session = object()
-    actor_by_field = {"backend": 401, "xid": "901"}
-    driver = SimpleNamespace(fetchval=AsyncMock(return_value=damage != "lock"))
-    proof = receipts.PreparedRelation(
-        session,
-        asyncio.current_task(),
-        recovery.encoded(actor_by_field),
-        "serving",
-        recovery.encoded(original),
-        0.1,
-        1024,
-        2048,
-    )
+    proof = receipts.PreparedRelation("serving", recovery.encoded(original), 0.1, 1024, 2048)
     actual = copy.deepcopy(original)
-    if damage == "session":
-        session = object()
-    elif damage == "task":
-        proof = replace(proof, task=object())
-    elif damage == "transaction":
-        actor_by_field = {**actor_by_field, "xid": "902"}
-    elif damage == "catalog":
+    if damage == "catalog":
         actual["native"]["columns"][0]["name"] = "changed"
-    ordinary = AsyncMock(return_value=(session, driver, actor_by_field))
+    monkeypatch.setattr(receipts, "lock", AsyncMock())
     relation = AsyncMock(return_value={"native": actual["native"]})
-    monkeypatch.setattr(receipts, "ordinary", ordinary)
     monkeypatch.setattr(receipts, "relation", relation)
-    if damage is not None:
-        with pytest.raises(ValueError, match="serving_recovery_"):
-            await receipts.recheck_prepared(object(), proof, receipts.ROOTS[0])
-    else:
-        assert await receipts.recheck_prepared(object(), proof, receipts.ROOTS[0]) == original
-        relation.assert_awaited_once()
-        assert relation.await_args.kwargs == {"content": False}
+    cached = {} if damage == "name" else {("serving", receipts.ROOTS[0]): recovery.encoded(original)}
+    token = receipts._VALIDATED.set(None if damage == "scope" else cached)
+    try:
+        if damage is not None:
+            with pytest.raises(ValueError, match="serving_recovery_"):
+                await receipts.recheck_prepared(object(), proof, receipts.ROOTS[0])
+        else:
+            assert await receipts.recheck_prepared(object(), proof, receipts.ROOTS[0]) == original
+            relation.assert_awaited_once()
+            assert relation.await_args.kwargs == {"content": False}
+    finally:
+        receipts._VALIDATED.reset(token)
 
 
 @pytest.mark.asyncio
@@ -519,6 +503,7 @@ async def test_address_short_cutover_wall_includes_commit(monkeypatch):
         await asyncio.sleep(0.05)
 
     monkeypatch.setattr(contract, "entity_address_cutover_transaction", transaction)
+    monkeypatch.setattr(receipts, "validation_scope", transaction)
     context_by_field = {recovery.GENERATION_PARAM: GENERATION}
     with pytest.raises(TimeoutError):
         async with recovery.address_transaction(object(), "500ms", str, context_by_field):
@@ -561,6 +546,12 @@ def _address_retry_case(monkeypatch, phase, error, marked):
     monkeypatch.setattr(receipts, "lock", AsyncMock())
     monkeypatch.setattr(receipts, "lock_metadata", AsyncMock())
     monkeypatch.setattr(receipts, "ordinary", AsyncMock(return_value=(object(), object(), {})))
+
+    @asynccontextmanager
+    async def validation_scope(_database):
+        yield
+
+    monkeypatch.setattr(receipts, "validation_scope", validation_scope)
     monkeypatch.setattr(receipts, "prepared_state", AsyncMock(return_value=current))
     monkeypatch.setattr(receipts, "retain", AsyncMock())
     monkeypatch.setattr(access, "prepare_ordinary_read_access", AsyncMock(return_value=(object(),)))
@@ -668,6 +659,7 @@ async def test_cancelled_marked_address_clears_preparation_marker(monkeypatch):
         yield
 
     monkeypatch.setattr(contract, "entity_address_cutover_transaction", transaction)
+    monkeypatch.setattr(receipts, "validation_scope", transaction)
     context_by_field = {recovery.GENERATION_PARAM: GENERATION}
     with pytest.raises(asyncio.CancelledError):
         async with recovery.address_transaction(object(), "500ms", str, context_by_field):

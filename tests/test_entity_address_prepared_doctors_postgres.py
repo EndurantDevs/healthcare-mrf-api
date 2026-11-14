@@ -116,20 +116,14 @@ async def _prepared_family(fixture):
 
 
 async def _bindings(fixture, doctors):
-    """Observe all six actual heaps, substituting only the prepared Doctors address."""
+    """Name all six inputs, substituting only the prepared Doctors address."""
     bindings_by_name = {}
     for namespace, name in dependencies.projection._PROJECTION_DEPENDENCIES:
         namespace = namespace or fixture.schema
         actual_name = doctors.relation_overrides.get(name, name)
-        row = await fixture.database.first(
-            "SELECT oid::bigint,pg_relation_filenode(oid)::bigint FROM pg_class WHERE oid=to_regclass(:name)",
-            name=f'"{namespace}"."{actual_name}"',
-        )
         bindings_by_name[f"{namespace}.{name}"] = {
             "schema_name": namespace,
             "table_name": actual_name,
-            "relation_oid": row[0],
-            "relfilenode": row[1],
         }
     return bindings_by_name
 
@@ -260,12 +254,13 @@ def _assert_apply_and_rollback(original, doctors, monkeypatch):
             )
             assert await publication.receipts.read_current_receipt(session, fhir._schema()) == kwargs["predecessor"]
             await dependencies.assert_prepared_dependencies(fhir.db, address.native_dependencies)
-            for _target, stage, oid in address.stage_oids:
-                assert (
-                    await session.scalar(
-                        text("SELECT to_regclass(:name)::oid::bigint"), {"name": f"{address.db_schema}.{stage}"}
-                    )
-                    == oid
+            for _target, stage, _unused in address.stage_oids:
+                assert await session.scalar(
+                    text(
+                        "SELECT EXISTS(SELECT 1 FROM pg_class WHERE oid=to_regclass(:name) "
+                        "AND relkind='r' AND relpersistence='p' AND NOT relrowsecurity AND NOT relforcerowsecurity)"
+                    ),
+                    {"name": f"{address.db_schema}.{stage}"},
                 )
         assert not doctors.committed and not address.committed
         _assert_rollback_metadata_charge(fhir, admission, metadata_before)
@@ -294,8 +289,8 @@ def _assert_rollback_metadata_charge(fhir, admission, metadata_before):
         "bare_override",
         "missing_bundle",
         "missing_geo",
-        "wrong_oid",
-        "wrong_filenode",
+        "wrong_name",
+        "unsafe_layout",
         "unproven_other",
         "held_tiger",
         "family",
@@ -317,27 +312,20 @@ async def test_unproven_or_changed_doctors_inputs_fail_before_native_work(monkey
                     supplied = object()
                 case "missing_geo":
                     bindings = None
-                case "wrong_oid":
-                    address["relation_oid"] += 100000
-                case "wrong_filenode":
-                    owner = fixture.component.owner
-                    await fixture.database.status(f'GRANT USAGE ON SCHEMA tiger TO "{owner}"')
-                    await fixture.database.status(f'GRANT SELECT ON tiger.zip_state,tiger.zcta5 TO "{owner}"')
-                    address["relfilenode"] += 100000
+                case "wrong_name":
+                    address["table_name"] = "unproven_doctors"
+                case "unsafe_layout":
+                    async with fixture.engine.begin() as connection:
+                        await connection.execute(
+                            text(f'ALTER TABLE "{fixture.schema}".geo_zip_lookup ENABLE ROW LEVEL SECURITY')
+                        )
                 case "unproven_other":
                     bindings[f"{fixture.schema}.npi_address"]["table_name"] = "address_stage"
                 case "held_tiger":
                     await fixture.database.status(f'CREATE TABLE "{fixture.schema}".held_zcta AS TABLE tiger.zcta5')
-                    identity = await fixture.database.first(
-                        "SELECT oid::bigint,pg_relation_filenode(oid)::bigint FROM pg_class "
-                        "WHERE oid=to_regclass(:name)",
-                        name=f"{fixture.schema}.held_zcta",
-                    )
                     bindings["tiger.zcta5"] = {
                         "schema_name": fixture.schema,
                         "table_name": "held_zcta",
-                        "relation_oid": identity[0],
-                        "relfilenode": identity[1],
                     }
                 case "family":
                     supplied = replace(doctors, stage_oids=doctors.stage_oids[:1])
@@ -346,7 +334,7 @@ async def test_unproven_or_changed_doctors_inputs_fail_before_native_work(monkey
             process = AsyncMock()
             monkeypatch.setattr(native, "process_entity_address_unified_data", process)
             refusal = {
-                "wrong_filenode": "entity-address geo dependency binding changed",
+                "unsafe_layout": "entity-address geo dependency binding changed",
                 "disabled_seal": "ordinary mutation",
             }.get(change)
             async with custody:
@@ -364,21 +352,19 @@ def _example_bindings():
         f"{schema or 'mrf'}.{name}": {
             "schema_name": schema or "mrf",
             "table_name": name,
-            "relation_oid": index,
-            "relfilenode": index + 10,
         }
-        for index, (schema, name) in enumerate(dependencies.projection._PROJECTION_DEPENDENCIES, 1)
+        for schema, name in dependencies.projection._PROJECTION_DEPENDENCIES
     }
 
 
 def test_dependency_options_copy_input_maps_and_keep_standalone_default():
-    """Runtime callers cannot mutate captured input identity through emitted geo options."""
+    """Runtime callers cannot mutate captured input names through emitted geo options."""
     assert preparation.geo_dependency_options() == {}
     bindings = _example_bindings()
     captured = dependencies.PreparedAddressDependencies("mrf", None, (), deepcopy(bindings))
     token = preparation._NATIVE_DEPENDENCIES.set(captured)
     try:
-        preparation.geo_dependency_options()["dependency_bindings"]["mrf.npi_address"]["relation_oid"] = 99
+        preparation.geo_dependency_options()["dependency_bindings"]["mrf.npi_address"]["table_name"] = "other"
         assert captured.dependency_bindings == bindings
     finally:
         preparation._NATIVE_DEPENDENCIES.reset(token)
@@ -413,14 +399,14 @@ async def test_real_finalizer_forwards_desired_geo_bindings(monkeypatch):
 async def test_source_backend_rejects_replacement_and_releases_locks_after_cancellation(
     monkeypatch, tmp_path, geo_source_inputs, native_source_commit
 ):
-    """Actual admitted source queries release cancellation locks and refuse a replaced heap."""
+    """Source reads release cancelled locks, accept equal named copies and reject unsafe layout."""
 
     async def observe(*, scope, schema, stage, projected_rows):
         component = native.db._doctors_source_component
         fixture = SimpleNamespace(database=native.db, schema=schema, engine=component.admin_engine, component=component)
         doctors = preparation._NATIVE_DEPENDENCIES.get().doctors
         await _assert_backend_lock_cleanup(fixture, doctors)
-        await _assert_replacement_rejected(fixture, doctors)
+        await _assert_named_replacement_layout(fixture, doctors)
         async with native.preparation_admission.native_transaction():
             await native._apply_entity_address_transaction_settings()
             await _assert_geo_targets(native.db, schema, stage, projected_rows)
@@ -454,24 +440,30 @@ async def _assert_backend_lock_cleanup(fixture, doctors):
         await connection.execute(text(f"LOCK TABLE {relation} IN ACCESS EXCLUSIVE MODE NOWAIT"))
 
 
-async def _assert_replacement_rejected(fixture, doctors):
-    """A readable same-name foreign heap cannot stand in for the producer's sealed original."""
-    database, schema = fixture.database, fixture.schema
+async def _assert_named_replacement_layout(fixture, doctors):
+    """An equal named copy remains readable, while an unsafe input layout refuses."""
+    schema = fixture.schema
     stage = doctors.stage_oids[0][1]
+    expected_ranges = await native._npi_table_ranges(schema, "doctor_clinician_address", 2)
     async with fixture.engine.begin() as connection:
         await connection.execute(text(f'ALTER TABLE "{schema}"."{stage}" RENAME TO held_doctors'))
         await connection.execute(
             text(f'CREATE TABLE "{schema}"."{stage}" (LIKE "{schema}".held_doctors INCLUDING ALL)')
         )
+        await connection.execute(text(f'INSERT INTO "{schema}"."{stage}" SELECT * FROM "{schema}".held_doctors'))
         owner = fixture.component.policy.owner_role.replace('"', '""')
         await connection.execute(text(f'GRANT SELECT ON "{schema}"."{stage}" TO "{owner}"'))
     try:
-        with pytest.raises(RuntimeError, match="Doctors identity changed"):
+        assert await native._npi_table_ranges(schema, "doctor_clinician_address", 2) == expected_ranges
+        async with fixture.engine.begin() as connection:
+            await connection.execute(text(f'ALTER TABLE "{schema}"."{stage}" ENABLE ROW LEVEL SECURITY'))
+        with pytest.raises(RuntimeError, match="Doctors layout changed"):
             await native._npi_table_ranges(schema, "doctor_clinician_address", 2)
     finally:
         async with fixture.engine.begin() as connection:
             await connection.execute(text(f'DROP TABLE "{schema}"."{stage}" RESTRICT'))
             await connection.execute(text(f'ALTER TABLE "{schema}".held_doctors RENAME TO "{stage}"'))
+    assert await native._npi_table_ranges(schema, "doctor_clinician_address", 2) == expected_ranges
 
 
 async def _run_admitted_source_address(monkeypatch, tmp_path, source_commit, callback, source_row, *, rollback=False):

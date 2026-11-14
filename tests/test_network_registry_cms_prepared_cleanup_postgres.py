@@ -3,6 +3,7 @@
 
 import json
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -13,8 +14,6 @@ from sqlalchemy import text
 
 from process import network_registry_cms_prepared_cleanup as cleanup
 from process import network_registry_cms_prepared_pair as retention
-from process import provider_directory_cms_npd as cms
-from process import provider_directory_cms_serving_receipt as serving
 from process.network_cms_registry_source_pair import (
     _json,
     capture_registry_cms_source_pair,
@@ -24,7 +23,7 @@ from process.network_registry_cms_source_attempt import RegistryCMSSourceAttempt
 from tests import cms_npd_admission_postgres_support as support
 from tests.provider_directory_cms_capacity_test_support import cms_execution
 from tests.test_network_cms_registry_source_pair_postgres import _bounded_source_copy, _publish_pair
-from tests.test_network_registry_cms_prepared_pair_postgres import _prepared_input, _publish_stages
+from tests.test_network_registry_cms_prepared_pair_postgres import _prepared_input
 from tests.test_provider_directory_cms_resource_batch_postgres import cms_resource_template as cms_resource_template
 
 
@@ -159,9 +158,8 @@ def _reject_documents(original):
         (("lease_digest",), "invalid"),
         (("runtime_roles",), [original.owner_role]),
         (("address_stages", 0, 2), True),
-        (("address_ownership", "schema_oid"), 0),
-        (("address_ownership", "schema_oid"), 2**32),
-        (("address_ownership", "relation_oids", 0, "oid"), 2**32),
+        (("address_ownership", "dataset_id"), str(uuid4())),
+        (("address_ownership", "table_names", 0), "unrelated_table"),
         (("recipe", "source_pin", "retained_epoch", "epoch_id"), str(uuid4())),
         (("request", "source_pin", "resource_table_oid"), True),
         (("request", "extra_data_upper_bound_bytes"), False),
@@ -191,7 +189,7 @@ async def test_native_catalog_identity_preserves_search_path_and_rejects_index_l
             await session.execute(text("SELECT set_config('search_path',:path,true)"), {"path": search_path})
             assert await _probe(session, capture) == capture.retained
             assert await session.scalar(text("SELECT current_setting('search_path')")) == search_path
-        with pytest.raises(ValueError, match="registry_cms_prepared_pair_invalid"):
+        with pytest.raises(ValueError, match="registry_cms_address_layout_changed"):
             async with session.begin_nested():
                 await session.execute(
                     text(f'DROP INDEX "{address_schema}".entity_address_unified_canonical_network_ids_idx')
@@ -221,38 +219,96 @@ async def test_native_finalized_pair_is_preserved(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("prepared_capture", ["finalized_v2"], indirect=True)
 async def test_native_finalized_v2_probe_preserves_witness(prepared_capture):
-    """Validate a genuine existing v2 capture without interpreting it as prepared."""
+    """Validate a current capture without interpreting it as prepared."""
     capture = prepared_capture
     pair = capture.pair
-    assert pair.witness_json is not None
+    assert pair.witness_json is None
     async with capture.database.session_factory() as session, session.begin():
         await _repeatable_read(session)
         assert await _probe(session, capture) == pair
         assert await require_registry_cms_source_pair(session, pair) == pair
 
 
+async def _historical_pair_with_native_data(session, pair):
+    """Bind a historical wire fixture to actual copied rows and logical layouts."""
+    from process import network_cms_registry_address_equivalence as equivalence
+    from tests.test_network_cms_registry_address_witness_decode import _witness
+
+    document = _witness()
+    for key, schema in (("source", pair.proof.source_pin.schema_name), ("clone", pair.address_ownership.schema_name)):
+        semantic, catalog, logical_hash, ordinals, sequence = await equivalence._native_capture(session, schema, None)
+        side = document[key]
+        side.update(
+            schema_name=schema,
+            receipt=semantic.as_dict(),
+            catalog_sha256=equivalence.receipt._canonical_digest(json.loads(catalog)),
+            ordinals=ordinals,
+        )
+        side["sequence"].update(json.loads(sequence))
+        side["sequence"].update(schema_name=schema, table_oid=dict(side["relation_oids"])["entity_address_evidence"])
+        document["logical_sha256"] = logical_hash
+    historical = json.loads(_json(document))
+    clone = historical["clone"]
+    owner = replace(
+        pair.address_ownership,
+        schema_oid=clone["schema_oid"],
+        relation_oids=tuple(tuple(entry) for entry in clone["relation_oids"]),
+    )
+    return replace(
+        pair, address_ownership=owner, witness_json=equivalence.decode_registry_cms_address_copy_witness(historical)
+    )
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tamper", ["oid", "comment", "address_acl", "raw_acl"])
+@pytest.mark.parametrize("prepared_capture", ["finalized_v2"], indirect=True)
+async def test_historical_v2_replay_preserves_data_and_refuses_layout_drift(prepared_capture):
+    """Old wire IDs stay opaque while native data and layout remain verified."""
+    from process import network_cms_registry_source_pair as source_pair
+
+    capture = prepared_capture
+    async with capture.database.session_factory() as session, session.begin():
+        await _repeatable_read(session)
+        legacy = await _historical_pair_with_native_data(session, capture.pair)
+        comment = (source_pair._COMMENT_V2 + _json(legacy.as_dict())).replace("'", "''")
+        await (await cleanup.native_driver(session)).execute(
+            f"COMMENT ON SCHEMA \"{legacy.address_ownership.schema_name}\" IS '{comment}'"
+        )
+        assert await _probe(session, capture) == legacy
+        assert await require_registry_cms_source_pair(session, legacy) == legacy
+        with pytest.raises(ValueError):
+            async with session.begin_nested():
+                await session.execute(
+                    text(
+                        f'ALTER TABLE "{legacy.address_ownership.schema_name}".entity_address_unified ADD COLUMN unexpected integer'
+                    )
+                )
+                await _probe(session, capture)
+        assert await _probe(session, capture) == legacy
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tamper", ["dataset", "comment", "address_shape", "raw_acl"])
 async def test_native_tampering_refuses_removal(prepared_capture, tamper):
     capture = prepared_capture
     address = capture.retained.address_ownership.schema_name
     raw = capture.retained.recipe.source_pin.retained_epoch.schema_name
     async with capture.database.session_factory() as session, session.begin():
-        if tamper in {"oid", "comment"}:
+        if tamper in {"dataset", "comment"}:
             document = json.loads(_json(capture.retained.as_dict()))
-            if tamper == "oid":
-                document["address_ownership"]["schema_oid"] += 1
+            if tamper == "dataset":
+                document["address_ownership"]["dataset_id"] = str(uuid4())
             else:
                 document["lease_digest"] = "0" * 64
             comment = (retention._PREPARED_COMMENT + _json(document)).replace("'", "''")
             await (await cleanup.native_driver(session)).execute(f"COMMENT ON SCHEMA \"{address}\" IS '{comment}'")
-        else:
-            schema, table = (
-                (address, "entity_address_unified")
-                if tamper == "address_acl"
-                else (raw, "provider_directory_dataset_resource")
+        elif tamper == "address_shape":
+            await session.execute(
+                text(f'ALTER TABLE "{address}".entity_address_unified ADD COLUMN unrelated_column integer')
             )
-            await session.execute(text(f'GRANT UPDATE ON "{schema}"."{table}" TO "{capture.roles[1]}"'))
+        else:
+            await session.execute(
+                text(f'GRANT UPDATE ON "{raw}".provider_directory_dataset_resource TO "{capture.roles[1]}"')
+            )
     async with capture.database.session_factory() as session, session.begin():
         await _repeatable_read(session)
         with pytest.raises(ValueError):

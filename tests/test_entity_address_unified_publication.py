@@ -368,3 +368,39 @@ async def test_entity_address_cutover_does_not_retry_non_lock_failure(monkeypatc
         )
 
     assert recording_db.transaction_events == ["BEGIN", "ROLLBACK"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_stage_rename", [False, True])
+async def test_address_swap_notifies_successful_table_and_index_renames(monkeypatch, failed_stage_rename):
+    statements = []
+    notifications = []
+    stage = SimpleNamespace(
+        __tablename__="address_stage", __my_additional_indexes__=[{"name": "lookup", "index_elements": ["npi"]}]
+    )
+
+    async def status(statement, **_params):
+        statements.append(statement)
+        if failed_stage_rename and statement == "ALTER TABLE mrf.address_stage RENAME TO entity_address_unified;":
+            raise RuntimeError("stage rename failed")
+
+    def renamed(schema, original, replacement, *, index=False):
+        kind = "INDEX IF EXISTS" if index else "TABLE"
+        if original == "entity_address_unified" and not index:
+            kind += " IF EXISTS"
+        assert statements[-1] == f"ALTER {kind} {schema}.{original} RENAME TO {replacement};"
+        notifications.append((original, replacement, index))
+
+    monkeypatch.setattr(entity_address_unified.db, "status", status)
+    monkeypatch.setattr(entity_address_unified.serving_recovery.receipts, "record_rename", renamed)
+    if failed_stage_rename:
+        with pytest.raises(RuntimeError, match="stage rename failed"):
+            await entity_address_unified._swap_stage_table("mrf", _LiveTable, stage)
+        assert notifications == [("entity_address_unified", "entity_address_unified_old", False)]
+    else:
+        await entity_address_unified._swap_stage_table("mrf", _LiveTable, stage)
+        assert notifications[:2] == [
+            ("entity_address_unified", "entity_address_unified_old", False),
+            ("address_stage", "entity_address_unified", False),
+        ]
+        assert len(notifications) == 6 and all(entry[2] for entry in notifications[2:])

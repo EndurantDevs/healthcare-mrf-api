@@ -243,7 +243,7 @@ async def test_replacement_after_logging_check_is_never_logged_or_deleted(monkey
         assert await database.scalar(f"SELECT marker FROM {schema}.entity_address_unified") == "old"
 
 
-async def test_cleanup_rechecks_oid_after_concurrent_name_replacement(monkeypatch):
+async def test_cleanup_drains_reserved_name_after_concurrent_replacement(monkeypatch):
     async with _temporary_schema() as (database, schema):
         prepared = await _prepared_fixture(database, schema, monkeypatch)
         acquire_locks = native._acquire_cutover_locks
@@ -261,7 +261,7 @@ async def test_cleanup_rechecks_oid_after_concurrent_name_replacement(monkeypatc
 
         monkeypatch.setattr(native, "_acquire_cutover_locks", replace_then_lock)
         await preparation.cleanup_prepared_entity_address_generation(prepared)
-        assert await database.scalar(f"SELECT marker FROM {schema}.entity_address_unified_stage") == "replacement"
+        assert await database.scalar(f"SELECT to_regclass('{schema}.entity_address_unified_stage')") is None
         assert await database.scalar(f"SELECT marker FROM {schema}.original_stage") == "new"
         assert await database.scalar(f"SELECT marker FROM {schema}.entity_address_unified") == "old"
 
