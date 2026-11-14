@@ -38,7 +38,8 @@
     "uhc-flex-practitioner-enrichment",
     "uhc-flex-rooted-graph-enrichment",
     "uhc-provider-files",
-    "wyoming"
+    "wyoming",
+    "independence-provider-directory"
   ],
   "retained_entry_ids": [
     "uhc-provider-files"
@@ -92,7 +93,8 @@
     "pdfhir_1ceb7c0986c320b7eb924881",
     "pdfhir_2b088f28554b9e51505b455e",
     "pdfhir_2754e999dd691175821ec26e",
-    "pdfhir_72257bf04f7fb816c0ad6fb9"
+    "pdfhir_72257bf04f7fb816c0ad6fb9",
+    "pdfhir_dd4d8d4cf1e5dd3e609ae0b3"
   ],
   "authority_ids_by_source_id": {
     "pdfhir_1ceb7c0986c320b7eb924881": "unitedhealthcare",
@@ -158,7 +160,8 @@
       {"entry_id": "uhc-flex-practitioner-enrichment", "source_id": "pdfhir_1ceb7c0986c320b7eb924881", "resource_profile": "P1_DATASET"},
       {"entry_id": "uhc-flex-rooted-graph-enrichment", "source_id": "pdfhir_2b088f28554b9e51505b455e", "resource_profile": "R8_DATASET"},
       {"entry_id": "uhc-provider-files", "source_id": "pdfhir_2754e999dd691175821ec26e", "resource_profile": "A6"},
-      {"entry_id": "wyoming", "source_id": "pdfhir_72257bf04f7fb816c0ad6fb9", "resource_profile": "R8"}
+      {"entry_id": "wyoming", "source_id": "pdfhir_72257bf04f7fb816c0ad6fb9", "resource_profile": "R8"},
+      {"entry_id": "independence-provider-directory", "source_id": "pdfhir_dd4d8d4cf1e5dd3e609ae0b3", "resource_profile": "R8"}
     ]
   },
   "excluded_public_fields": [

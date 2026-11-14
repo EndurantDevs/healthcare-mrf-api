@@ -15682,8 +15682,8 @@ def _write_supplemental_catalog_fixtures(tmp_path):
 
 
 def _assert_supplemental_catalog_metrics(metrics) -> None:
-    assert metrics["sources_seeded"] == 24
-    assert metrics["supplemental_catalog_sources_considered"] == 24
+    assert metrics["sources_seeded"] == 25
+    assert metrics["supplemental_catalog_sources_considered"] == 25
     catalog_metrics = metrics["supplemental_catalogs"]["catalogs"]
     assert catalog_metrics["reviewed_provider_directory_candidates"]["rows"] == 8
     assert catalog_metrics["amerihealth_caritas"]["rows"] == 1
@@ -15694,7 +15694,7 @@ def _assert_supplemental_catalog_metrics(metrics) -> None:
     assert catalog_metrics["anthem"]["rows"] == 1
     assert catalog_metrics["aetna_provider_directorydata"]["rows"] == 1
     assert catalog_metrics["mvp_health_care"]["rows"] == 1
-    assert catalog_metrics["configured_sources"]["rows"] == 3
+    assert catalog_metrics["configured_sources"]["rows"] == 4
     assert catalog_metrics["provider_directory_blockers"]["rows"] == 3
 
 
@@ -15719,16 +15719,21 @@ def _assert_supplemental_source_rows(upserted_source_rows) -> None:
     aetna = _source_seeded_from(upserted_source_rows, "aetna-developer-portal")
     assert aetna["org_name"] == "Aetna"
     assert aetna["api_base"] == importer.AETNA_PROVIDER_DIRECTORY_DATA_BASE
+    independence = _source_seeded_from(upserted_source_rows, "independence-provider-directory")
+    assert independence["source_id"] == "pdfhir_dd4d8d4cf1e5dd3e609ae0b3"
+    assert independence["canonical_api_base"] == importer.INDEPENDENCE_PROVIDER_DIRECTORY_BASE
     blockers = [
-        row for row in upserted_source_rows if row["seed_source"] == importer.PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE
+        source_row
+        for source_row in upserted_source_rows
+        if source_row["seed_source"] == importer.PROVIDER_DIRECTORY_BLOCKER_REGISTRY_SOURCE
     ]
-    assert {row["org_name"] for row in blockers} == {
+    assert {source_row["org_name"] for source_row in blockers} == {
         "Chorus Community Health Plans (fka Children's Community Health Plan)",
         "First Medical Health Plan, Inc.",
         "Territory of Puerto Rico",
     }
-    assert all(row["api_base"] is None for row in blockers)
-    assert all(row["metadata_json"]["provider_directory_blocked"] is True for row in blockers)
+    assert all(source_row["api_base"] is None for source_row in blockers)
+    assert all(source_row["metadata_json"]["provider_directory_blocked"] is True for source_row in blockers)
 
 
 @pytest.mark.asyncio
