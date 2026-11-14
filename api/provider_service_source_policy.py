@@ -18,7 +18,7 @@ from process.ptg_parts.result_archive_source_authority import (
     result_archive_manifest_sha256,
 )
 from process.registry_catalog_policy import RegistryOrganizationVisibility
-from process.registry_network_catalog_read import RegistryNetworkCatalogError, _catalog_manifest
+from process.registry_network_catalog_read import RegistryNetworkCatalogError
 from process.registry_ptg_published_plan_contract import _digest, _uuid
 from process.registry_published_plan_binding_refs import _require_reference, _review_commands
 
@@ -239,7 +239,6 @@ async def admitted_plan_release_bindings(session, selection) -> tuple[PlanReleas
         bindings = _original_role_bindings(selection, "in_network", scope)
         connection = await session.connection()
         driver = (await connection.get_raw_connection()).driver_connection
-        await _catalog_manifest(driver, scope.manifest.generation_id, registry_schema(), scope.manifest)
         snapshots = await _snapshot_manifests(driver, bindings)
         reviews, mappings = await _source_evidence(
             driver, bindings, scope.manifest.approved_custom_revision, _identifier(registry_schema())

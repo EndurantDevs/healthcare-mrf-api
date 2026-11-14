@@ -53,12 +53,12 @@ async def test_distance_card_resolves_release_metadata_once(monkeypatch, project
     response = await pricing_module.list_providers_by_procedure(request)
 
     assert response.status == 200
-    assert len(session.calls) == 4  # Access, storage mode, optional projection and one frozen release read.
+    assert len(session.reads) == 3  # Storage mode, optional projection and one frozen release read.
     assert "AS readable" in session.calls[0][0]
-    assert "AS storage_present" in session.calls[1][0]
-    assert "to_regclass" in session.calls[2][0]
-    assert "plan_release_serving_revision" in session.calls[3][0]
-    assert ("plan_pricing_projection_candidate" in session.calls[3][0]) is projection_relation
+    assert "AS storage_present" in session.reads[0]
+    assert "to_regclass" in session.reads[1]
+    assert "plan_release_serving_revision" in session.reads[2]
+    assert ("plan_pricing_projection_candidate" in session.reads[2]) is projection_relation
     selection = search.await_args.kwargs["release_selection"]
     if binding_state == "ready":
         assert selection.plan_release_id == PLAN_RELEASE_ID
@@ -99,13 +99,13 @@ async def test_ineligible_distance_card_keeps_guard_but_bounded_full_skips_it(mo
     if updates.get("view") == "full":
         assert session.calls == []
     else:
-        assert len(session.calls) == 3
+        assert len(session.reads) == 2
         assert "AS readable" in session.calls[0][0]
-        assert "AS storage_present" in session.calls[1][0]
-        assert "plan_pricing_projection_candidate" not in session.calls[1][0]
-        assert "to_regclass" not in session.calls[1][0]
-        assert "plan_pricing_projection_candidate" not in session.calls[2][0]
-        assert "to_regclass" not in session.calls[2][0]
+        assert "AS storage_present" in session.reads[0]
+        assert "plan_pricing_projection_candidate" not in session.reads[0]
+        assert "to_regclass" not in session.reads[0]
+        assert "plan_pricing_projection_candidate" not in session.reads[1]
+        assert "to_regclass" not in session.reads[1]
     resolver.assert_awaited_once()
 
 
@@ -124,11 +124,11 @@ async def test_cost_ordered_office_visit_refuses_before_projection_resolution(mo
 
     assert response.status == 422
     assert json.loads(response.body)["code"] == "ptg2_provider_scope_refused"
-    assert len(session.calls) == 3
+    assert len(session.reads) == 2
     assert "AS readable" in session.calls[0][0]
-    assert "AS storage_present" in session.calls[1][0]
-    assert "plan_pricing_projection_candidate" not in session.calls[1][0]
-    assert "plan_pricing_projection_candidate" not in session.calls[2][0]
+    assert "AS storage_present" in session.reads[0]
+    assert "plan_pricing_projection_candidate" not in session.reads[0]
+    assert "plan_pricing_projection_candidate" not in session.reads[1]
     resolver.assert_not_awaited()
     search.assert_not_awaited()
 

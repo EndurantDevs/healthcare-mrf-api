@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 from api import plan_release_serving, ptg2_serving
+from tests.test_plan_release_serving_resolution import storage_reply
 
 PLAN_RELEASE_ID = "hprelease_" + "0" * 26
 PLAN_ID = "hpplan_" + "1" * 26
@@ -137,13 +138,18 @@ class _Session:
         self.pricing_projection_relation = pricing_projection_relation
         self.calls = []
 
-    async def execute(self, statement, params):
+    @property
+    def reads(self):
+        """Statements other than the storage probe, share locks and table checks."""
+        return [sql for sql, _ in self.calls if storage_reply(sql) is None]
+
+    async def execute(self, statement, params=None):
         sql = str(statement)
         self.calls.append((sql, params))
         if "AS storage_present" in sql:
             return []
-        if "AS readable" in sql:
-            return [SimpleNamespace(_mapping={"readable": True}) for _ in range(2)]
+        if storage_reply(sql) is not None:
+            return storage_reply(sql)
         if "to_regclass" in sql:
             return SimpleNamespace(scalar_one=lambda: self.pricing_projection_relation)
         return list(self.rows)

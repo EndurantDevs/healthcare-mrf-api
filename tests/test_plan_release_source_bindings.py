@@ -2,6 +2,7 @@
 """Closed storage routing and request-pinned canonical binding regressions."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -11,7 +12,7 @@ from api import plan_release_serving_resolution as resolution
 from api import plan_release_source_binding_custody as custody
 from api import plan_release_source_bindings as source
 from api.plan_release_pricing_projection import plan_release_binding_set_sql, source_plan_release_serving_sql
-from tests.test_plan_release_serving_resolution import PLAN_RELEASE_ID, SERVING_REVISION_ID, _binding_row
+from tests.test_plan_release_serving_resolution import PLAN_RELEASE_ID, SERVING_REVISION_ID, _binding_row, storage_reply
 from tests.test_plan_release_supporting_metadata import commitment_page
 
 
@@ -127,9 +128,10 @@ async def test_custody_requires_one_native_true_result(phase, invalid_rows):
 
 
 class ReaderSession:
-    def __init__(self, rows, *, headers=None):
+    def __init__(self, rows, *, headers=None, is_admitted=True):
         self.rows = rows
         self.headers = [header()] if headers is None else headers
+        self.is_admitted = is_admitted
         self.calls = []
         self.info = {}
 
@@ -138,6 +140,10 @@ class ReaderSession:
         self.calls.append((sql, parameters))
         if "supporting_commitments AS MATERIALIZED" in sql:
             return commitment_page(self.rows)
+        if "AS admitted" in sql:
+            return SimpleNamespace(scalar_one=lambda: self.is_admitted)
+        if storage_reply(sql) is not None:
+            return storage_reply(sql)
         return self.headers if "AS storage_present" in sql else self.rows
 
 
@@ -145,7 +151,6 @@ class ReaderSession:
 @pytest.mark.parametrize("storage", [source.SOURCE_BINDING_STORAGE, source.CUSTOM_SOURCE_BINDING_STORAGE])
 async def test_guard_and_pricing_load_recheck_the_current_tuple_in_one_snapshot(monkeypatch, storage):
     session = ReaderSession([_binding_row()], headers=[header(binding_storage=storage)])
-    monkeypatch.setattr(custody, "require_source_binding_custody", AsyncMock())
     monkeypatch.setattr(serving, "has_pricing_projection_relation", AsyncMock(return_value=False))
     guard = await resolution.resolve_plan_release_guard_selection(session, PLAN_RELEASE_ID)
     assert guard is not None
@@ -163,8 +168,7 @@ async def test_guard_and_pricing_load_recheck_the_current_tuple_in_one_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_incomplete_physical_tuple_is_refused_before_any_selection(monkeypatch):
-    monkeypatch.setattr(custody, "require_source_binding_custody", AsyncMock())
+async def test_incomplete_physical_tuple_is_refused_before_any_selection():
     session = ReaderSession([_binding_row(expected_binding_count=2)])
     with pytest.raises(ValueError, match="incomplete"):
         await source.load_source_binding_rows(
@@ -191,12 +195,16 @@ async def test_oversized_source_admission_refuses_before_loading_binding_rows(mo
 
 
 @pytest.mark.asyncio
-async def test_actual_custody_refusal_does_not_attempt_binding_sql(monkeypatch):
-    session = ReaderSession([_binding_row()])
-    monkeypatch.setattr(custody, "require_source_binding_custody", AsyncMock(side_effect=ValueError("custody")))
-    with pytest.raises(ValueError, match="custody"):
+async def test_refused_registry_table_does_not_attempt_binding_sql():
+    session = ReaderSession([_binding_row()], is_admitted=False)
+    with pytest.raises(ValueError, match="^plan_release_storage_read_table_refused$"):
         await source.load_source_binding_rows(session, "sample", admission(), include_pricing_projection=False)
-    assert session.calls == []
+    (lock_sql, _), (check_sql, _) = session.calls
+    assert lock_sql == (
+        'LOCK TABLE ONLY "sample_registry".hp_plan_release_binding, ONLY "sample_registry".hp_plan_serving_revision, '
+        'ONLY "sample_registry".hp_plan_release, ONLY "sample_registry".hp_plan_current_release IN ACCESS SHARE MODE'
+    )
+    assert "row_security_active" in check_sql
 
 
 @pytest.mark.parametrize(
@@ -215,13 +223,13 @@ def test_discovery_rejects_malformed_or_ambiguous_coordinates(change):
 
 
 @pytest.mark.asyncio
-async def test_lost_initial_current_admission_never_uses_legacy_storage(monkeypatch):
+async def test_lost_initial_current_admission_never_uses_legacy_storage():
     session = ReaderSession([])
-    monkeypatch.setattr(custody, "require_source_binding_custody", AsyncMock())
     with pytest.raises(ValueError, match="incomplete"):
         await resolution.resolve_plan_release_guard_selection(session, PLAN_RELEASE_ID)
-    assert len(session.calls) == 2
-    assert all("plan_release_snapshot_binding" not in sql for sql, _ in session.calls)
+    reads = [sql for sql, _ in session.calls if storage_reply(sql) is None]
+    assert len(reads) == 2 and len(session.calls) == 4
+    assert all("plan_release_snapshot_binding" not in sql for sql in reads)
 
 
 @pytest.mark.asyncio
@@ -230,7 +238,6 @@ async def test_internal_admission_is_preserved_for_later_full_read(monkeypatch):
 
     session = ReaderSession([_binding_row()])
     session.info["api_reader_verified"] = True
-    monkeypatch.setattr(custody, "require_source_binding_custody", AsyncMock())
     monkeypatch.setattr(serving, "has_pricing_projection_relation", AsyncMock(return_value=False))
     monkeypatch.setattr(boundary, "has_reader_session", lambda database: True)
     monkeypatch.setattr(boundary, "current_session", lambda: session)

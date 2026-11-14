@@ -10,7 +10,7 @@ from sqlalchemy import text
 
 from api import plan_release_serving
 from api.plan_release_pricing_projection import plan_release_serving_sql
-from api.plan_release_read_storage import is_retained_session_read
+from api.plan_release_read_storage import is_retained_session_read, lock_binding_storage
 from api.plan_release_serving import (
     PLAN_RELEASE_PIN_OWNER_TYPE,
     PTG2_SCHEMA,
@@ -145,6 +145,7 @@ async def _load_release_rows(
             admission,
             include_pricing_projection=False,
         )
+    await lock_binding_storage(session, PTG2_SCHEMA, retained=retained)
     sql = (
         plan_release_serving_sql(PTG2_SCHEMA, include_pricing_projection=False, retained=True)
         + f"\n LIMIT {MAX_BILLING_SEARCH_RELEASE_BINDINGS + 1}"
@@ -197,6 +198,7 @@ async def resolve_plan_release_guard_selection(
             include_pricing_projection=False,
         )
         return _selection_from_rows(normalized, canonical_rows)
+    await lock_binding_storage(session, PTG2_SCHEMA, retained=retained)
     sql = (
         plan_release_serving_sql(PTG2_SCHEMA, include_pricing_projection=False, retained=True)
         if retained

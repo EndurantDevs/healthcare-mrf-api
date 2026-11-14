@@ -10,11 +10,10 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy.dialects.postgresql import asyncpg as postgresql_asyncpg
 
-from api import plan_release_source_binding_custody as custody
 from api import plan_release_source_bindings as source
 from api import plan_release_supporting_metadata as supporting
 from process import registry_pricing_release_binding_lookup as lookup
-from tests.test_plan_release_serving_resolution import PLAN_RELEASE_ID, SERVING_REVISION_ID, _binding_row
+from tests.test_plan_release_serving_resolution import PLAN_RELEASE_ID, SERVING_REVISION_ID, _binding_row, storage_reply
 
 
 def commitment_page(binding_rows):
@@ -263,14 +262,14 @@ class CommitmentReader:
         self.calls = []
         self.statements = []
 
-    async def execute(self, statement, parameters):
+    async def execute(self, statement, parameters=None):
         sql = str(statement)
         self.calls.append((sql, parameters))
         self.statements.append((statement, parameters))
         if "supporting_commitments AS MATERIALIZED" in sql:
             assert set(parameters) == {"p1", "p2"}
             return [{"bounded": True, "rows_json": json.dumps(self.commitments)}]
-        return self.physical_rows
+        return self.physical_rows if storage_reply(sql) is None else storage_reply(sql)
 
 
 @pytest.mark.asyncio
@@ -297,14 +296,14 @@ async def test_scalar_statement_binds_both_parameters():
 @pytest.mark.asyncio
 async def test_scalar_budget_refusal_never_returns_bindings(monkeypatch):
     monkeypatch.setenv("HLTHPRT_PLAN_REGISTRY_SCHEMA", "sample_registry")
-    monkeypatch.setattr(custody, "require_source_binding_custody", AsyncMock())
     physical_rows = [_binding_row(expected_binding_count=2, binding_ordinal=ordinal) for ordinal in range(2)]
     reader = CommitmentReader([], physical_rows)
-    reader.execute = AsyncMock(side_effect=[physical_rows, [{"bounded": False, "rows_json": None}]])
+    admitted = storage_reply("AS admitted")
+    reader.execute = AsyncMock(side_effect=[[], admitted, physical_rows, [{"bounded": False, "rows_json": None}]])
     with pytest.raises(supporting.SupportingMetadataResourceLimit, match="metadata_unavailable") as caught:
         await source.load_source_binding_rows(reader, "mrf", _admission(), include_pricing_projection=False)
     assert isinstance(caught.value, ValueError)
-    assert reader.execute.await_count == 2
+    assert reader.execute.await_count == 4
     assert "supporting_commitments AS MATERIALIZED" in str(reader.execute.await_args.args[0])
 
 
@@ -312,7 +311,6 @@ async def test_scalar_budget_refusal_never_returns_bindings(monkeypatch):
 @pytest.mark.parametrize("include_projection", [False, True])
 async def test_scalar_loader_checks_same_session_and_returns_only_physical_rows(monkeypatch, include_projection):
     monkeypatch.setenv("HLTHPRT_PLAN_REGISTRY_SCHEMA", "sample_registry")
-    monkeypatch.setattr(custody, "require_source_binding_custody", AsyncMock())
     physical_rows = [_binding_row(expected_binding_count=2, binding_ordinal=ordinal) for ordinal in range(2)]
     reader = CommitmentReader(_committed_rows(), physical_rows)
     before = deepcopy(physical_rows)
@@ -322,7 +320,7 @@ async def test_scalar_loader_checks_same_session_and_returns_only_physical_rows(
         )
         == before
     )
-    assert len(reader.calls) == 2
+    assert len(reader.calls) == 4
     assert all("supporting_rate_file_receipts" not in binding for binding in physical_rows)
     reader.commitments[1]["supporting_metadata"] = {}
     with pytest.raises(ValueError, match="commitment_invalid"):

@@ -55,8 +55,6 @@ def _fixture(monkeypatch, *, excluded=(), org=None):
     scope = NetworkAddressReadScope(pin, None, None, "a" * 64, excluded, None, org or RegistryOrganizationVisibility())
     monkeypatch.setattr(policy, "current_network_address_scope", lambda: scope)
     monkeypatch.setattr(policy, "PTG2_SCHEMA", "synthetic_ptg")
-    proven = AsyncMock(side_effect=lambda driver, generation, schema, actual: actual)
-    monkeypatch.setattr(policy, "_catalog_manifest", proven)
     approved_by_field = {
         "record_key": mapping["binding_id"],
         "record_revision": 1,
@@ -97,7 +95,6 @@ def _fixture(monkeypatch, *, excluded=(), org=None):
         batches=batches,
         driver=driver,
         session=session,
-        proven=proven,
         scope=scope,
     )
 
@@ -120,7 +117,6 @@ async def test_reviewed_denial_never_regains_public_branch(monkeypatch, denial):
     assert await policy.admitted_plan_release_bindings(held.session, held.selection) == ()
     assert held.selection.bindings == (held.binding,)
     assert held.driver.fetchrow.await_count == 3
-    held.proven.assert_awaited_once_with(held.driver, 17, policy.registry_schema(), held.scope.manifest)
 
 
 @pytest.mark.asyncio
@@ -197,15 +193,6 @@ async def test_actual_snapshot_manifest_ignores_activation_only(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_invalid_active_pin_stops_before_any_metadata_read(monkeypatch):
-    held = _fixture(monkeypatch)
-    held.proven.side_effect = policy.RegistryNetworkCatalogError("registry_network_catalog_source_changed")
-    with pytest.raises(PlanPricingProjectionUnavailable):
-        await policy.admitted_plan_release_bindings(held.session, held.selection)
-    held.driver.fetchrow.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_selected_ptg_lane_requires_exact_reviewed_source_authority(monkeypatch):
     held = _fixture(monkeypatch)
     monkeypatch.setattr(
@@ -229,24 +216,6 @@ async def test_batches_bind_retained_revision_and_never_query_current_or_locks(m
         assert "registry_revision_control" not in sql and "FOR UPDATE" not in sql and "FOR SHARE" not in sql
     assert "binding.approved_revision=$2" in calls[2].args[0]
     assert "links.record_json->'archived'='false'" in calls[2].args[0]
-
-
-@pytest.mark.asyncio
-async def test_catalog_proof_uses_actual_active_driver_identity(monkeypatch):
-    from process import registry_network_catalog_read as catalog
-
-    held = _fixture(monkeypatch)
-    monkeypatch.setattr(policy, "_catalog_manifest", catalog._catalog_manifest)
-    held.driver.is_in_transaction = lambda: True
-    token = catalog._PINNED_READ.set((held.driver, held.scope.manifest, policy.registry_schema()))
-    try:
-        assert await policy.admitted_plan_release_bindings(held.session, held.selection) == (held.binding,)
-        other = SimpleNamespace(is_in_transaction=lambda: True)
-        held.session.connection.return_value.get_raw_connection.return_value.driver_connection = other
-        with pytest.raises(PlanPricingProjectionUnavailable):
-            await policy.admitted_plan_release_bindings(held.session, held.selection)
-    finally:
-        catalog._PINNED_READ.reset(token)
 
 
 @pytest.mark.asyncio
