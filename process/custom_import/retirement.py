@@ -3,8 +3,10 @@
 """Protected, transactional retirement of unreferenced physical snapshot families.
 
 The caller owns the transaction and must provide its external control-plane
-reference check on this same session. Ordinary readers and workers cannot own
-this operation. No authority, external-reference proof, or commit is inferred.
+reference check on this same session. Only a login that owns the snapshot
+storage can complete it; PostgreSQL privileges enforce that, so readers and
+workers without ownership are refused by the database. No external-reference
+proof or commit is inferred.
 
 The complete reference census pins every retained family's relations and holds
 SHARE locks on frozen reference heaps until caller commit. Its cost grows with
@@ -140,17 +142,13 @@ async def _owner_schema(session):
           AND current_setting('transaction_read_only') = 'off'
           AND current_setting('statement_timeout')::interval > interval '0'
           AND current_setting('lock_timeout')::interval > interval '0'
-          AND EXISTS (
-              SELECT 1 FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_class c
-                ON c.oid=pg_catalog.to_regclass(:registry)
-              WHERE r.rolname=current_user AND r.rolsuper
-          )
+          AND pg_catalog.to_regclass(:registry) IS NOT NULL
     """),
         {"registry": f"{quoted}.custom_import_snapshot_family"},
     )
     if allowed is not True:
         raise SnapshotRetirementRefused(
-            "snapshot retirement requires protected native owner authority and finite bounds"
+            "snapshot retirement requires a direct writable login transaction and finite bounds"
         )
     return schema, quoted
 

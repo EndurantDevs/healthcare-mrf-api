@@ -529,3 +529,11 @@ async def test_retirement_preserves_closed_continuation_history_but_refuses_acti
     )
 
     await verify(monkeypatch)
+
+
+async def test_retention_sweep_dry_run_keeps_storage_and_execute_retires_it():
+    from tests.custom_import_retirement_postgres import (
+        test_retention_sweep_dry_run_keeps_storage_and_execute_retires_it as verify,
+    )
+
+    await verify()
