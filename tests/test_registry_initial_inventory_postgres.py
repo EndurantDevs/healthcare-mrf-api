@@ -103,7 +103,7 @@ async def _access_snapshot(worker, *, candidate_schema=None):
     return json.loads(
         await worker.fixture.connection.fetchval(
             "SELECT jsonb_build_object('schemas',(SELECT jsonb_agg(to_jsonb(n) ORDER BY n.oid) FROM pg_namespace n "
-            "WHERE n.nspname=ANY($1::text[])),'relations',(SELECT jsonb_agg(jsonb_build_array(c.oid,c.relname,c.relowner,c.relacl) "
+            "WHERE n.nspname=ANY($1::text[])),'relations',(SELECT jsonb_agg(jsonb_build_array(c.oid,c.relname,c.relowner,c.relacl,n.nspname) "
             "ORDER BY c.oid) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=ANY($1::text[])),"
             "'memberships',(SELECT jsonb_agg(to_jsonb(m) ORDER BY m.oid) FROM pg_auth_members m))::text",
             [worker.fixture.control_schema, worker.fixture.source_schema, worker.bootstrap.address_source.schema_name]
@@ -112,12 +112,14 @@ async def _access_snapshot(worker, *, candidate_schema=None):
     )
 
 
-def _assert_existing_access(before_by_name, after_by_name):
-    assert before_by_name["schemas"] == after_by_name["schemas"]
+def _assert_existing_access(before_by_name, after_by_name, retired_schemas=()):
+    """Refusal may only remove the refused request's own retired candidate schema."""
+    kept_schemas = [schema for schema in before_by_name["schemas"] if schema["nspname"] not in retired_schemas]
+    assert kept_schemas == after_by_name["schemas"]
     assert before_by_name["memberships"] == after_by_name["memberships"]
     after_by_oid = {relation[0]: relation for relation in after_by_name["relations"]}
     for relation in before_by_name["relations"]:
-        assert after_by_oid.get(relation[0]) == relation
+        assert relation[4] in retired_schemas or after_by_oid.get(relation[0]) == relation
 
 
 @asynccontextmanager
@@ -645,9 +647,11 @@ async def test_initial_inventory_requires_direct_custody_enrollment(initial_work
         )
         assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".network_candidate_custody') == 0
         assert len(access_snapshots) == 1
+        # The after snapshot still selects the candidate schema, so equality also proves it was dropped.
         _assert_existing_access(
             access_snapshots[0],
             await _access_snapshot(worker, candidate_schema=candidate_schemas[0] if candidate_schemas else None),
+            tuple(candidate_schemas),
         )
 
 

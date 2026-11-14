@@ -8,7 +8,7 @@ from contextlib import AsyncExitStack, aclosing, asynccontextmanager
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 import asyncpg
 import httpx
@@ -797,12 +797,85 @@ async def test_final_authority_revocation_refuses_prepared_candidate(worker_perm
             await consume_registry_publication_once(**arguments)
         assert len(calls) == 5 and await _head(fixture) is None
         assert (await _status(fixture, queued))["state"] == "rejected"
-        assert (
-            await fixture.fixture.connection.fetchval(
-                f"SELECT count(*) FROM \"{fixture.fixture.control_schema}\".network_membership_candidate WHERE state='ready'"
-            )
-            == 1
+        candidates = await fixture.fixture.connection.fetch(
+            "SELECT state,to_regnamespace(schema_name) IS NULL AS dropped "
+            f'FROM "{fixture.fixture.control_schema}".network_membership_candidate'
         )
+        assert [dict(candidate) for candidate in candidates] == [{"state": "rejected", "dropped": True}]
+
+
+async def _synthetic_candidate(fixture, request_id, owner, state="open", validation=None):
+    connection, control = fixture.fixture.connection, fixture.fixture.control_schema
+    candidate_id = uuid4()
+    schema = "network_candidate_" + candidate_id.hex
+    await connection.execute(f'CREATE SCHEMA "{schema}" AUTHORIZATION "{owner}"')
+    await connection.execute(f'CREATE TABLE "{schema}".network_membership (npi bigint)')
+    await connection.execute(f'ALTER TABLE "{schema}".network_membership OWNER TO "{owner}"')
+    await connection.execute(
+        f'INSERT INTO "{control}".network_membership_candidate (candidate_id,dataset_id,schema_id,producer_id,'
+        "schema_name,state,source_generations,approved_custom_revision,expected_head,expected_rows,"
+        "validation_json,index_ready) VALUES ($1,$2,$3,$4,$5,$6::text,'{}',0,0,0,$7::jsonb,$6::text='published')",
+        candidate_id,
+        uuid5(request_id, "dataset"),
+        uuid4(),
+        uuid4(),
+        schema,
+        state,
+        None if validation is None and state != "published" else json.dumps(validation or {}),
+    )
+    return candidate_id, schema
+
+
+async def _candidate_outcome(fixture, candidate_id):
+    row = await fixture.fixture.connection.fetchrow(
+        "SELECT state,to_regnamespace(schema_name) IS NULL AS dropped "
+        f'FROM "{fixture.fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
+        candidate_id,
+    )
+    return dict(row)
+
+
+async def test_rejected_request_retirement_keeps_served_sealed_referenced_and_foreign_candidates(worker_permissions):
+    """Only the rejected request's own unsealed, unreferenced candidate is dropped; others keep state and schema."""
+    fixture = worker_permissions
+    connection, control = fixture.fixture.connection, fixture.fixture.control_schema
+    execution, lifecycle = fixture.roles_by_kind["execution"], fixture.roles_by_kind["lifecycle"]
+    requests_by_name = {name: uuid4() for name in ("own", "referenced", "foreign", "manifest", "sealed", "published")}
+    candidates_by_name = {
+        name: (await _synthetic_candidate(fixture, request_id, lifecycle if name == "foreign" else execution))[0]
+        for name, request_id in requests_by_name.items()
+        if name != "published"
+    }
+    candidates_by_name["published"], _ = await _synthetic_candidate(
+        fixture, requests_by_name["published"], execution, "published"
+    )
+    referenced_schema = "network_candidate_" + candidates_by_name["referenced"].hex
+    candidates_by_name["other"], _ = await _synthetic_candidate(
+        fixture, uuid4(), execution, validation={"address_source": {"schema_name": referenced_schema}}
+    )
+    await connection.execute(
+        f'INSERT INTO "{control}".network_serving_manifest (candidate_id,schema_revision,source_generations,'
+        "approved_custom_revision,manifest_sha256) VALUES ($1,1,'{}',0,$2)",
+        candidates_by_name["manifest"],
+        "0" * 64,
+    )
+    await connection.execute(
+        f'INSERT INTO "{control}".network_candidate_custody (candidate_id,seal_sha256,receipt_json) '
+        "VALUES ($1,$2,'{}')",
+        candidates_by_name["sealed"],
+        "0" * 64,
+    )
+    async with _consumer(fixture) as (arguments, _):
+        for request_id in requests_by_name.values():
+            await consumer._retire_rejected_candidates(arguments["execution_pool"], arguments["config"], request_id)
+    expected_by_name = {
+        "own": {"state": "rejected", "dropped": True},
+        "foreign": {"state": "rejected", "dropped": False},
+        "published": {"state": "published", "dropped": False},
+        **{name: {"state": "open", "dropped": False} for name in ("referenced", "manifest", "sealed", "other")},
+    }
+    for name, expected in expected_by_name.items():
+        assert await _candidate_outcome(fixture, candidates_by_name[name]) == expected, name
 
 
 @pytest.mark.parametrize("fault", ["lease", "expiry", "cancel", "renew"])
