@@ -1,14 +1,13 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Native trusted capture, legacy writer and metadata-only privilege proofs."""
+"""Native PostgreSQL capture permissions and shared retention quotas."""
 
 from __future__ import annotations
 
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -16,12 +15,10 @@ from sqlalchemy import insert, text
 from sqlalchemy.exc import DBAPIError
 
 from db.models.custom_import import CustomImportCaptureParquetPart, CustomImportCaptureUsage
-from process.custom_import import capture_retention, https_candidate
-from process.custom_import.capture_authority import require_raw_capture_authority
+from process.custom_import import capture_retention, raw_capture_store
 from process.custom_import.capture_pending import append_pending_parquet_part
 from process.custom_import.capture_store import CaptureBundleConflict, CaptureStoreError
 from process.custom_import.definition import canonical_json
-from process.custom_import.definition_store import register_definition
 from process.custom_import.segmented_capture_policy import SegmentedCapturePolicy
 from tests.custom_import_postgres_support import isolated_publication_case
 from tests.test_custom_import_capture_pending_postgres import _parts, _start_attempt
@@ -31,8 +28,13 @@ from tests.test_custom_import_capture_store_postgres import (
     _register_replayable_bundle,
     _seed_parquet_case,
 )
-from tests.test_custom_import_https_originals import _original_request
-from tests.test_custom_import_raw_capture_postgres import _mixed_policy, _register_raw, _sealed_originals
+from tests.test_custom_import_raw_capture_postgres import (
+    _identity_kwargs,
+    _mixed_policy,
+    _register_raw,
+    _sealed_originals,
+    _seed_raw_case,
+)
 from tests.test_custom_import_segmented_capture_postgres import _POLICY, _part, _pending
 
 pytestmark = pytest.mark.asyncio(loop_scope="module")
@@ -45,111 +47,105 @@ async def capture_case():
 
 
 @asynccontextmanager
-async def _roles(case):
-    created_roles = []
+async def _role(case):
+    role = "capture_reader_" + uuid.uuid4().hex[:16]
+    async with case.engine.begin() as connection:
+        await connection.execute(text(f'CREATE ROLE "{role}" NOLOGIN NOSUPERUSER INHERIT'))
     try:
-        for _ in range(2):
-            role = "capture_reader_" + uuid.uuid4().hex[:16]
-            async with case.engine.begin() as connection:
-                await connection.execute(text(f'CREATE ROLE "{role}" NOLOGIN NOSUPERUSER INHERIT'))
-            created_roles.append(role)
-        yield SimpleNamespace(writer=created_roles[0], member=created_roles[1])
+        yield role
     finally:
-        for role in reversed(created_roles):
-            async with case.engine.begin() as connection:
-                await connection.execute(text(f'DROP OWNED BY "{role}"'))
-                await connection.execute(text(f'DROP ROLE "{role}"'))
+        async with case.engine.begin() as connection:
+            await connection.execute(text(f'DROP OWNED BY "{role}"'))
+            await connection.execute(text(f'DROP ROLE "{role}"'))
+
+
+async def test_readonly_capture_permissions_are_enforced_by_postgres(capture_case):
+    async with _role(capture_case) as role:
+        relation = f'"{capture_case.schema_name}".custom_import_capture_raw_object'
+        async with capture_case.sessions() as session, session.begin():
+            await session.execute(text(f'GRANT USAGE ON SCHEMA "{capture_case.schema_name}" TO "{role}"'))
+            await session.execute(text(f'GRANT SELECT (dataset_id, byte_count) ON {relation} TO "{role}"'))
+            await session.execute(text(f'SET LOCAL ROLE "{role}"'))
+            await session.execute(text(f"SELECT dataset_id, byte_count FROM {relation} LIMIT 0"))
+        for statement in (
+            f"INSERT INTO {relation} DEFAULT VALUES",
+            f"UPDATE {relation} SET byte_count=0",
+            f"DELETE FROM {relation}",
+            f"TRUNCATE {relation}",
+        ):
+            await _denied_statement(capture_case, role, text(statement))
 
 
 @pytest.mark.parametrize(
-    ("relation", "privilege"),
+    "denied",
     (
-        ("custom_import_capture_bundle", "INSERT"),
-        ("custom_import_capture", "UPDATE"),
-        ("custom_import_capture_parquet_part", "INSERT"),
-        ("custom_import_capture_usage", "UPDATE"),
-        ("custom_import_capture_raw_object", "DELETE"),
-        ("custom_import_capture_raw_object", "TRUNCATE"),
-        ("custom_import_capture_parquet_part", "INSERT (payload)"),
-        ("custom_import_capture_parquet_part", "UPDATE (byte_count)"),
+        "bundle_insert",
+        "header_insert",
+        "raw_insert",
+        "raw_select",
+        "header_lock",
+        "quota",
+        "sequence",
     ),
 )
-async def test_nonowner_table_and_column_writes_block_originals(capture_case, relation, privilege):
-    async with _roles(capture_case) as roles:
+async def test_raw_preflight_checks_effective_access_without_changing_storage(capture_case, denied):
+    schema = f'"{capture_case.schema_name}"'
+    bundle = f"{schema}.custom_import_capture_bundle"
+    async with _role(capture_case) as role:
+        await _legacy_grants(capture_case, role)
         async with capture_case.sessions() as session, session.begin():
-            await require_raw_capture_authority(session)
-            await session.execute(
-                text(f'GRANT {privilege} ON "{capture_case.schema_name}".{relation} TO "{roles.writer}"')
+            sequence = await session.scalar(
+                text("SELECT pg_get_serial_sequence(:relation,'capture_bundle_id')"), {"relation": bundle}
             )
-            with pytest.raises(CaptureStoreError, match="closed capture write grants"):
-                await require_raw_capture_authority(session)
-
-
-async def test_inherited_column_grant_is_checked_at_its_root(capture_case):
-    async with _roles(capture_case) as roles:
-        relation = f'"{capture_case.schema_name}".custom_import_capture_parquet_part'
+            await session.execute(text(f'GRANT USAGE ON SEQUENCE {sequence} TO "{role}"'))
+            await session.execute(text(f'GRANT SELECT ON {schema}.custom_import_capture_usage TO "{role}"'))
+            await session.execute(text(f'GRANT SELECT,INSERT ON {schema}.custom_import_capture_raw_object TO "{role}"'))
+        async with capture_case.sessions() as session:
+            before = (await session.execute(text(f"SELECT last_value,is_called FROM {sequence}"))).one()
+            counts = await _preflight_capture_counts(session, schema)
         async with capture_case.sessions() as session, session.begin():
-            await session.execute(text(f'GRANT INSERT (payload) ON {relation} TO "{roles.writer}"'))
-            await session.execute(text(f'GRANT "{roles.writer}" TO "{roles.member}"'))
-            assert await session.scalar(
-                text("SELECT has_column_privilege(:role, :relation, 'payload', 'INSERT')"),
-                {"role": roles.member, "relation": relation},
-            )
-            with pytest.raises(CaptureStoreError, match="closed capture write grants"):
-                await require_raw_capture_authority(session)
-
-
-@pytest.mark.parametrize("grant_root", ("owner_assumable", "superuser"))
-async def test_privileged_grant_root_cannot_leak_writes_to_restricted_member(capture_case, grant_root):
-    async with _roles(capture_case) as roles:
-        relation = f'"{capture_case.schema_name}".custom_import_capture_raw_object'
+            await session.execute(text(f'SET LOCAL ROLE "{role}"'))
+            await raw_capture_store.require_raw_capture_write_access(session)
+        privilege, relation = {
+            "bundle_insert": ("INSERT", bundle),
+            "header_insert": ("INSERT", f"{schema}.custom_import_capture"),
+            "raw_insert": ("INSERT", f"{schema}.custom_import_capture_raw_object"),
+            "raw_select": ("SELECT", f"{schema}.custom_import_capture_raw_object"),
+            "header_lock": ("UPDATE", f"{schema}.custom_import_capture"),
+            "quota": ("SELECT", f"{schema}.custom_import_capture_usage"),
+            "sequence": ("USAGE", f"SEQUENCE {sequence}"),
+        }[denied]
         async with capture_case.sessions() as session, session.begin():
-            owner = await session.scalar(
-                text("SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = to_regclass(:relation)"),
-                {"relation": relation},
-            )
-            if grant_root == "owner_assumable":
-                await session.execute(text(f'GRANT "{owner}" TO "{roles.writer}" WITH INHERIT FALSE, SET TRUE'))
-            else:
-                await session.execute(text(f'ALTER ROLE "{roles.writer}" SUPERUSER'))
-            await session.execute(text(f'GRANT "{roles.writer}" TO "{roles.member}" WITH INHERIT TRUE, SET FALSE'))
-            await session.execute(text(f'GRANT DELETE ON {relation} TO "{roles.writer}"'))
-            parameters_by_name = {"role": roles.member, "owner": owner, "relation": relation}
-            assert await session.scalar(
-                text("SELECT has_table_privilege(:role, :relation, 'DELETE')"), parameters_by_name
-            )
-            assert not await session.scalar(text("SELECT pg_has_role(:role, :owner, 'USAGE')"), parameters_by_name)
-            assert not await session.scalar(text("SELECT pg_has_role(:role, :owner, 'SET')"), parameters_by_name)
-            with pytest.raises(CaptureStoreError, match="closed capture write grants"):
-                await require_raw_capture_authority(session)
+            await session.execute(text(f'REVOKE {privilege} ON {relation} FROM "{role}"'))
+        with pytest.raises((DBAPIError, CaptureStoreError)) as rejected:
+            async with capture_case.sessions() as session, session.begin():
+                await session.execute(text(f'SET LOCAL ROLE "{role}"'))
+                await raw_capture_store.require_raw_capture_write_access(session)
+        if denied != "sequence":
+            assert rejected.value.orig.sqlstate == "42501"
+        async with capture_case.sessions() as session, session.begin():
+            restored = "UPDATE" if denied == "sequence" else privilege
+            await session.execute(text(f'GRANT {restored} ON {relation} TO "{role}"'))
+            await session.execute(text(f'SET LOCAL ROLE "{role}"'))
+            await raw_capture_store.require_raw_capture_write_access(session)
+        async with capture_case.sessions() as session:
+            assert (await session.execute(text(f"SELECT last_value,is_called FROM {sequence}"))).one() == before
+            assert await _preflight_capture_counts(session, schema) == counts
 
 
-async def test_public_grant_refuses_and_rollback_restores_authority(capture_case):
-    async with capture_case.sessions() as session:
-        try:
-            await session.begin()
-            await session.execute(
-                text(f'GRANT INSERT ON "{capture_case.schema_name}".custom_import_capture_parquet_part TO PUBLIC')
+async def _preflight_capture_counts(session, schema):
+    return tuple(
+        [
+            await session.scalar(text(f"SELECT count(*) FROM {schema}.{relation}"))
+            for relation in (
+                "custom_import_capture_bundle",
+                "custom_import_capture",
+                "custom_import_capture_raw_object",
+                "custom_import_capture_usage",
+                "custom_import_capture_parquet_part",
             )
-            with pytest.raises(CaptureStoreError, match="closed capture write grants"):
-                await require_raw_capture_authority(session)
-        finally:
-            await session.rollback()
-        async with session.begin():
-            await require_raw_capture_authority(session)
-
-
-async def test_nonowner_cannot_enable_raw_with_read_permissions(capture_case):
-    async with _roles(capture_case) as roles, capture_case.sessions() as session, session.begin():
-        await session.execute(text(f'GRANT USAGE ON SCHEMA "{capture_case.schema_name}" TO "{roles.writer}"'))
-        await session.execute(
-            text(
-                f'GRANT SELECT (dataset_id, byte_count) ON "{capture_case.schema_name}".custom_import_capture_raw_object TO "{roles.writer}"'
-            )
-        )
-        await session.execute(text(f'SET LOCAL ROLE "{roles.writer}"'))
-        with pytest.raises(CaptureStoreError, match="trusted registrar"):
-            await require_raw_capture_authority(session)
+        ]
+    )
 
 
 async def _legacy_grants(case, role):
@@ -201,11 +197,11 @@ async def _denied_statement(case, role, statement):
 
 
 async def test_metadata_provisioning_preserves_restricted_segmented_writes(capture_case):
-    async with _roles(capture_case) as roles:
-        await _legacy_grants(capture_case, roles.writer)
+    async with _role(capture_case) as role:
+        await _legacy_grants(capture_case, role)
         direct_attempt = await _pending(capture_case)
         async with capture_case.sessions() as session, session.begin():
-            await session.execute(text(f'SET LOCAL ROLE "{roles.writer}"'))
+            await session.execute(text(f'SET LOCAL ROLE "{role}"'))
             await session.execute(insert(CustomImportCaptureParquetPart).values(**_part(direct_attempt)))
         request, registered = await _start_attempt(capture_case)
         part = next(iter(_parts(request).values()))[0]
@@ -214,12 +210,12 @@ async def test_metadata_provisioning_preserves_restricted_segmented_writes(captu
             ("custom_import_capture_raw_object", "dataset_id, byte_count"),
         ):
             with pytest.raises(DBAPIError) as rejected:
-                await _append_as(capture_case, roles.writer, request, registered, part)
+                await _append_as(capture_case, role, request, registered, part)
             assert rejected.value.orig.sqlstate == "42501"
-            await _metadata_grant(capture_case, roles.writer, relation, columns)
-        assert await _append_as(capture_case, roles.writer, request, registered, part) == 1
-        assert await _append_as(capture_case, roles.writer, request, registered, part) == 0
-        await _metadata_remains_read_only(capture_case, roles.writer)
+            await _metadata_grant(capture_case, role, relation, columns)
+        assert await _append_as(capture_case, role, request, registered, part) == 1
+        assert await _append_as(capture_case, role, request, registered, part) == 0
+        await _metadata_remains_read_only(capture_case, role)
 
 
 @pytest.mark.parametrize("missing_relation", ("custom_import_capture_usage", "custom_import_capture_raw_object"))
@@ -228,21 +224,21 @@ async def test_retention_preflight_requires_both_metadata_grants(capture_case, m
         "custom_import_capture_usage": "dataset_id, retained_bytes",
         "custom_import_capture_raw_object": "dataset_id, byte_count",
     }
-    async with _roles(capture_case) as roles:
-        await _legacy_grants(capture_case, roles.writer)
+    async with _role(capture_case) as role:
+        await _legacy_grants(capture_case, role)
         for relation, columns in columns_by_relation.items():
             if relation != missing_relation:
-                await _metadata_grant(capture_case, roles.writer, relation, columns)
+                await _metadata_grant(capture_case, role, relation, columns)
         with pytest.raises(DBAPIError) as rejected:
             async with capture_case.sessions() as session, session.begin():
-                await session.execute(text(f'SET LOCAL ROLE "{roles.writer}"'))
+                await session.execute(text(f'SET LOCAL ROLE "{role}"'))
                 await capture_retention.require_capture_retention_read_access(session)
         assert rejected.value.orig.sqlstate == "42501"
-        await _metadata_grant(capture_case, roles.writer, missing_relation, columns_by_relation[missing_relation])
+        await _metadata_grant(capture_case, role, missing_relation, columns_by_relation[missing_relation])
         async with capture_case.sessions() as session, session.begin():
-            await session.execute(text(f'SET LOCAL ROLE "{roles.writer}"'))
+            await session.execute(text(f'SET LOCAL ROLE "{role}"'))
             await capture_retention.require_capture_retention_read_access(session)
-        await _metadata_remains_read_only(capture_case, roles.writer)
+        await _metadata_remains_read_only(capture_case, role)
 
 
 async def _metadata_remains_read_only(case, role):
@@ -251,32 +247,24 @@ async def _metadata_remains_read_only(case, role):
     await _denied_statement(case, role, text(f"UPDATE {schema}.custom_import_capture_usage SET retained_bytes=0"))
     await _denied_statement(case, role, text(f"DELETE FROM {schema}.custom_import_capture_raw_object"))
     async with case.sessions() as session, session.begin():
-        with pytest.raises(CaptureStoreError, match="closed capture write grants"):
-            await require_raw_capture_authority(session)
-    async with case.sessions() as session, session.begin():
         await session.execute(text(f'REVOKE INSERT ON {schema}.custom_import_capture_parquet_part FROM "{role}"'))
     await _denied_statement(
         case, role, insert(CustomImportCaptureParquetPart).values(capture_bundle_id=1, stream_slot=1, part_ordinal=1)
     )
 
 
-async def test_open_canonical_grant_stops_raw_before_source_io(capture_case, monkeypatch):
-    request, _payloads = _original_request("ndjson", "none")
-    async with capture_case.sessions() as session, session.begin():
-        seed = await register_definition(session, "synthetic_authority_" + uuid.uuid4().hex[:16], request.definition)
-    request = replace(
-        request,
-        dataset_id=seed.dataset_id,
-        definition_revision_id=seed.definition_revision_id,
-        schema_revision_id=seed.schema_revision_id,
-    )
-    acquire = AsyncMock(side_effect=AssertionError("untrusted schema must not access the source"))
-    monkeypatch.setattr(https_candidate.https, "acquire_https", acquire)
-    async with _roles(capture_case) as roles:
-        await _legacy_grants(capture_case, roles.writer)
-        with pytest.raises(https_candidate.HttpsCandidateError):
-            await https_candidate.run_https_candidate(capture_case.sessions, request)
-    acquire.assert_not_awaited()
+async def test_existing_segmented_writer_does_not_block_permitted_raw_capture(capture_case):
+    async with _role(capture_case) as role:
+        await _legacy_grants(capture_case, role)
+        seed, captures = await _seed_raw_case(capture_case)
+        async with capture_case.sessions() as session, session.begin():
+            registered = await _register_raw(session, seed, captures)
+        assert registered.created
+        async with capture_case.sessions() as session:
+            replayed = await raw_capture_store.load_replayable_raw_bundle(
+                session, capture_bundle_id=registered.capture_bundle_id, **_identity_kwargs(seed)
+            )
+            assert replayed == captures
 
 
 def _originals(captures, snapshot):

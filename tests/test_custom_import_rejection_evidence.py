@@ -25,7 +25,6 @@ from process.custom_import.runner_codec import definition_digest, digest_text, r
 _NOW = dt.datetime(2026, 1, 2, tzinfo=dt.UTC)
 _DIGEST = b"p" * 32
 _PINS = {"dataset_id": 3, "execution_id": 17, "build_id": 23}
-_REJECTION_OID = 1001 + reader.SNAPSHOT_MODELS.index(reader.Rejection)
 
 
 class _Result:
@@ -46,11 +45,6 @@ class _Session:
         self.scope_reads = 0
         self.after_lock_rows = None
         self.failure = None
-        self.header_source_oid = _REJECTION_OID
-        self.locked_relations = [
-            SimpleNamespace(relation_slot=slot, table_oid=slot + 1000, current_oid=slot + 1000, is_locked=True)
-            for slot in range(1, len(reader.SNAPSHOT_MODELS) + 1)
-        ]
 
     def in_transaction(self):
         return self.active
@@ -80,7 +74,7 @@ class _Session:
         if self.failure is not None:
             raise self.failure
         if isinstance(statement, TextClause):
-            return _Result(self.locked_relations if "custom_import_snapshot_relation" in statement.text else [])
+            return _Result([])
         first = statement.column_descriptions[0]["name"]
         if first == "CustomImportExecution":
             self.scope_reads += 1
@@ -101,13 +95,10 @@ class _Session:
             SimpleNamespace(
                 rejection_ordinal=row.rejection_ordinal,
                 key_bytes=0 if row.canonical_root_key is None else len(row.canonical_root_key.encode()),
-                source_oid=self.header_source_oid,
             )
             for row in events
         ]
-        return _Result(
-            rows or [SimpleNamespace(rejection_ordinal=None, key_bytes=None, source_oid=self.header_source_oid)]
-        )
+        return _Result(rows)
 
 
 def _definition_rows(definition):
@@ -211,7 +202,6 @@ def _event(definition, ordinal=0, *, value="0000000001", key_values=None, **chan
         source_ordinal=ordinal,
         producing_token_sha256=_DIGEST,
         canonical_evidence="must not be selected or exposed",
-        source_oid=_REJECTION_OID,
     )
     event_dict.update(changes)
     return SimpleNamespace(**event_dict)
@@ -249,8 +239,8 @@ async def test_failed_unsealed_build_returns_typed_key_without_activation_or_aut
     assert "ci_snapshot_31.custom_import_rejection" in payload_sql
     assert "producing_token_sha256" in payload_sql and "producing_fence" in payload_sql
     assert "canonical_evidence" not in payload_sql and "OFFSET" not in payload_sql
-    assert "pg_catalog.pg_typeof(retained_rejection)" in payload_sql
-    assert "LEFT OUTER JOIN LATERAL" in statements[-2] and "LIMIT" in statements[-2]
+    assert "LIMIT" in statements[-2] and "octet_length" in statements[-2]
+    assert all(term not in sql for sql in statements for term in ("pg_typeof", "pg_locks", "table_oid"))
     assert "canonical_binding" not in statements[2] and "snapshot_token" not in statements[2]
 
 
@@ -324,7 +314,7 @@ async def test_binding_is_rechecked_after_read_lock(retained):
     retained.session.after_lock_rows = [changed]
     with pytest.raises(reader.RejectionEvidenceUnavailable):
         await reader.read_rejection_page(retained.session, **_PINS)
-    assert retained.session.scope_reads == 2 and len(retained.session.statements) == 6
+    assert retained.session.scope_reads == 2 and len(retained.session.statements) == 5
 
 
 async def test_exact_original_producer_and_keyset_survive_multiple_pages(retained):
@@ -350,7 +340,7 @@ async def test_empty_retained_scope_is_complete_not_unavailable(retained):
 async def test_scope_digest_change_blocks_continuation_before_payload_read(retained):
     with pytest.raises(reader.RejectionEvidenceUnavailable):
         await reader.read_rejection_page(retained.session, **_PINS, after_ordinal=0, scope_sha256="a" * 64)
-    assert len(retained.session.statements) == 6
+    assert len(retained.session.statements) == 5
 
 
 @pytest.mark.parametrize(
@@ -563,7 +553,7 @@ async def test_nullable_request_identity_change_invalidates_continuation(retaine
     statement_count = len(retained.session.statements)
     with pytest.raises(reader.RejectionEvidenceUnavailable):
         await reader.read_rejection_page(retained.session, **_PINS, after_ordinal=0, scope_sha256=first["scope_sha256"])
-    assert len(retained.session.statements) == statement_count + 6
+    assert len(retained.session.statements) == statement_count + 5
     assert not retained.session.active
 
 
@@ -675,9 +665,7 @@ async def test_inconsistent_header_or_hydration_fails_closed(retained, monkeypat
         response = await execute(statement, parameters)
         if not isinstance(statement, TextClause) and statement.column_descriptions[0]["name"] == projection:
             return _Result(
-                [SimpleNamespace(rejection_ordinal=0, key_bytes=-1, source_oid=_REJECTION_OID)]
-                if projection == "rejection_ordinal"
-                else []
+                [SimpleNamespace(rejection_ordinal=0, key_bytes=-1)] if projection == "rejection_ordinal" else []
             )
         return response
 
@@ -703,46 +691,3 @@ async def test_caller_cancellation_propagates_and_closes_page_transaction(retain
     with pytest.raises(asyncio.CancelledError):
         await reader.read_rejection_page(retained.session, **_PINS)
     assert not retained.session.active
-
-
-@pytest.mark.parametrize("change", ["missing", "duplicate", "wrong_oid", "unlocked", "invalid_oid"])
-async def test_registry_and_actual_locks_must_match(retained, change):
-    relations = retained.session.locked_relations
-    if change == "missing":
-        relations.pop()
-    elif change == "duplicate":
-        relations.append(relations[-1])
-    elif change == "wrong_oid":
-        relations[-1].current_oid += 1
-    elif change == "unlocked":
-        relations[-1].is_locked = False
-    else:
-        relations[-1].table_oid = 0
-    with pytest.raises(reader.RejectionEvidenceUnavailable):
-        await reader.read_rejection_page(retained.session, **_PINS)
-    assert retained.session.scope_reads == 1 and not retained.session.active
-
-
-@pytest.mark.parametrize("empty", [False, True])
-@pytest.mark.parametrize("source_oid", [None, _REJECTION_OID + 1])
-async def test_header_relation_witness_rejects_replacement_even_when_empty(retained, empty, source_oid):
-    retained.session.header_source_oid = source_oid
-    if empty:
-        retained.session.events = []
-    with pytest.raises(reader.RejectionEvidenceUnavailable):
-        await reader.read_rejection_page(retained.session, **_PINS)
-    assert retained.session.statements[-1].column_descriptions[0]["name"] == "rejection_ordinal"
-
-
-@pytest.mark.parametrize("source_oid", [None, _REJECTION_OID + 1])
-async def test_hydrated_relation_must_match_the_registered_header_source(retained, source_oid):
-    retained.session.events[0].source_oid = source_oid
-    with pytest.raises(reader.RejectionEvidenceUnavailable):
-        await reader.read_rejection_page(retained.session, **_PINS)
-    assert retained.session.statements[-1].column_descriptions[0]["name"] == "rejection_id"
-
-
-async def test_missing_header_witness_is_not_an_empty_page(retained, monkeypatch):
-    monkeypatch.setattr(retained.session, "_headers", lambda events: _Result([]))
-    with pytest.raises(reader.RejectionEvidenceUnavailable):
-        await reader.read_rejection_page(retained.session, **_PINS)

@@ -51,7 +51,7 @@ def _admission_records(scenario):
 
 
 async def _freeze_admission(case, request, monkeypatch):
-    async def stop_before_admission(_sessions, _request, build_id, _direct):
+    async def stop_before_admission(_sessions, _request, build_id):
         return build_id
 
     with monkeypatch.context() as patch:
@@ -162,7 +162,7 @@ async def test_action_only_decisions_match_unchanged_native_admission(monkeypatc
                 action["record_kind"] == "root" and action["occurrence_id"] == actions[0]["parent_id"]
                 for action in actions
             )
-        await staging._admit_local_pages(case.sessions, request, build_id, True)
+        await staging._admit_local_pages(case.sessions, request, build_id)
         assert len(payloads) == 1
 
 

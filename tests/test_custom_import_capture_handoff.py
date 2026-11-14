@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process.custom_import import capture_handoff as service
+from process.custom_import.capture_store import CaptureStoreError
 from process.custom_import.runner_types import LeaseAuthorityLost
 from tests.capture_handoff_test_support import NOW, fixture
 from tests.test_custom_import_admission_service import Session
@@ -18,6 +19,7 @@ from tests.test_custom_import_admission_service import Session
 def _store(monkeypatch):
     state = fixture()
     state.session = Session()
+    state.session.in_transaction = lambda: state.session.active
     state.now = NOW
     state.retained = SimpleNamespace(
         idempotency_key=state.request.idempotency_key,
@@ -41,7 +43,7 @@ def _store(monkeypatch):
     monkeypatch.setattr(service.execution, "_lock_current_capture_binding", AsyncMock(side_effect=locked))
     monkeypatch.setattr(service.execution, "_database_now", AsyncMock(side_effect=lambda *_: state.now))
     monkeypatch.setattr(service.runner_registry, "validate_revision_identity", AsyncMock())
-    monkeypatch.setattr(service, "require_raw_capture_authority", AsyncMock())
+    monkeypatch.setattr(service, "require_raw_capture_write_access", AsyncMock())
     monkeypatch.setattr(service, "register_raw_capture_bundle", AsyncMock(side_effect=register))
     monkeypatch.setattr(
         service.execution,
@@ -56,11 +58,10 @@ def _store(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_preflight_anchors_to_first_start_and_requires_registrar(monkeypatch):
+async def test_preflight_anchors_to_first_start(monkeypatch):
     state = _store(monkeypatch)
     deadline = await service.preflight_capture(state.factory, state.verified)
     assert deadline == NOW + timedelta(seconds=4)
-    service.require_raw_capture_authority.assert_awaited_once_with(state.session)
     state.now = NOW + timedelta(seconds=5)
     with pytest.raises(LeaseAuthorityLost):
         await service.preflight_capture(state.factory, state.verified)
@@ -68,8 +69,33 @@ async def test_preflight_anchors_to_first_start_and_requires_registrar(monkeypat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("state_name", ("inactive", "new", "dirty", "deleted"))
+async def test_preflight_requires_a_clean_active_transaction(monkeypatch, state_name):
+    state = _store(monkeypatch)
+    if state_name == "inactive":
+        state.session.in_transaction = lambda: False
+    else:
+        setattr(state.session, state_name, (object(),))
+    with pytest.raises(CaptureStoreError):
+        await service.preflight_capture(state.factory, state.verified)
+    service.register_raw_capture_bundle.assert_not_called()
+    assert state.session.events == ["open", "begin", "rollback", "close"]
+
+
+@pytest.mark.asyncio
+async def test_registrar_denial_fails_preflight_without_registration(monkeypatch):
+    state = _store(monkeypatch)
+    service.require_raw_capture_write_access.side_effect = CaptureStoreError("synthetic registrar denial")
+    with pytest.raises(CaptureStoreError, match="registrar denial"):
+        await service.preflight_capture(state.factory, state.verified)
+    service.require_raw_capture_write_access.assert_awaited_once_with(state.session)
+    service.register_raw_capture_bundle.assert_not_awaited()
+    assert state.session.events == ["open", "begin", "rollback", "close"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["missing", "digest"])
-async def test_unavailable_definition_prevents_registrar_access(monkeypatch, failure):
+async def test_unavailable_definition_prevents_registration(monkeypatch, failure):
     state = _store(monkeypatch)
     if failure == "missing":
         state.session.get.return_value = None
@@ -78,7 +104,6 @@ async def test_unavailable_definition_prevents_registrar_access(monkeypatch, fai
     with pytest.raises(service.CaptureHandoffError, match="^custom_import_capture_unavailable$"):
         await service.preflight_capture(state.factory, state.verified)
     service.runner_registry.validate_revision_identity.assert_not_called()
-    service.require_raw_capture_authority.assert_not_called()
     service.register_raw_capture_bundle.assert_not_called()
     service.execution.bind_execution_capture_bundle.assert_not_called()
     assert state.session.durable == state.session.pending == []
@@ -156,7 +181,6 @@ async def test_retained_read_without_committed_binding_never_loads_or_registers(
         await service.retained_capture(state.factory, state.verified)
     service.load_replayable_raw_bundle.assert_not_called()
     service.register_raw_capture_bundle.assert_not_called()
-    service.require_raw_capture_authority.assert_not_called()
     service.execution.bind_execution_capture_bundle.assert_not_called()
     assert state.session.durable == state.session.pending == []
     assert state.session.events == ["open", "begin", "rollback", "close"]
@@ -170,7 +194,6 @@ async def test_lost_ack_observation_after_acquisition_expiry_never_reopens_sourc
     state.verified = replace(state.verified, fence=2)
     assert await service.retained_capture(state.factory, state.verified) == (71, state.captures)
     service.register_raw_capture_bundle.assert_not_called()
-    service.require_raw_capture_authority.assert_not_called()
     with pytest.raises(LeaseAuthorityLost):
         await service.preflight_capture(state.factory, state.verified)
 

@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Protected, transactional retirement of unreferenced physical snapshot families.
+"""Transactional retirement of unreferenced snapshot families.
 
 The caller owns the transaction and must provide its external control-plane
 reference check on this same session. Only a login that owns the snapshot
@@ -58,7 +58,6 @@ from process.custom_import.storage_layout import (
     snapshot_tables,
 )
 
-REFERENCE_PAGE_ROWS = 50_000
 MAX_RETIREMENT_SECONDS = 120
 MAX_REFERENCE_CLOSURE_SECONDS = 1
 _IDENTITY_NAMES = (
@@ -137,19 +136,14 @@ async def _owner_schema(session):
     quoted = connection.dialect.identifier_preparer.quote_schema(schema)
     allowed = await session.scalar(
         text("""
-        SELECT current_user = session_user
-          AND current_setting('transaction_isolation') = 'read committed'
+        SELECT current_setting('transaction_isolation') = 'read committed'
           AND current_setting('transaction_read_only') = 'off'
           AND current_setting('statement_timeout')::interval > interval '0'
           AND current_setting('lock_timeout')::interval > interval '0'
-          AND pg_catalog.to_regclass(:registry) IS NOT NULL
-    """),
-        {"registry": f"{quoted}.custom_import_snapshot_family"},
+    """)
     )
     if allowed is not True:
-        raise SnapshotRetirementRefused(
-            "snapshot retirement requires a direct writable login transaction and finite bounds"
-        )
+        raise SnapshotRetirementRefused("snapshot retirement requires a writable bounded read-committed transaction")
     return schema, quoted
 
 
@@ -338,6 +332,20 @@ async def _reference_pages(session, table, family_id):
             raise SnapshotRetirementRefused("snapshot retirement retains a revision reference")
 
 
+async def _optional_relation_names(session, family_id):
+    return tuple(
+        await session.scalars(
+            text("""
+        SELECT c.relname FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+        WHERE n.nspname=:namespace AND c.relname IN ('source_bulk_landing','legacy_copy_origin')
+        ORDER BY c.relname
+    """),
+            {"namespace": snapshot_schema(family_id)},
+        )
+    )
+
+
 async def _revision_references(session, family, retained, *, include_canonical=True):
     if not await session.scalar(select(exists().where(CustomImportRevisionHome.family_id == family.family_id))):
         return
@@ -349,7 +357,9 @@ async def _revision_references(session, family, retained, *, include_canonical=T
         for name in set(_REFERENCES) & store.keys():
             await _reference_pages(session, store[name], family.family_id)
     for retained_family in retained:
-        if retained_family.family_id != family.family_id and retained_family.origin_table_oid is not None:
+        if retained_family.family_id != family.family_id and "legacy_copy_origin" in await _optional_relation_names(
+            session, retained_family.family_id
+        ):
             origin = Table(
                 "legacy_copy_origin",
                 MetaData(),
@@ -363,18 +373,13 @@ async def _revision_references(session, family, retained, *, include_canonical=T
             await _reference_pages(session, origin, family.family_id)
 
 
-async def _locked_relations(session, quoted, family, retained):
+async def _locked_relations(session, family, retained):
     projection_names = await lock_historical_projection(session, family)
+    optional_names_by_family = {}
     for row in retained:
-        await session.execute(
-            text(f"SELECT * FROM {quoted}.resolve_custom_import_snapshot_relations(:family)"), {"family": row.family_id}
-        )
         namespace = snapshot_schema(row.family_id)
-        names = list(snapshot_tables(row.family_id))
-        if row.landing_table_oid is not None:
-            names.append("source_bulk_landing")
-        if row.origin_table_oid is not None:
-            names.append("legacy_copy_origin")
+        optional_names_by_family[row.family_id] = await _optional_relation_names(session, row.family_id)
+        names = [*snapshot_tables(row.family_id), *optional_names_by_family[row.family_id]]
         if row.family_id == family.family_id:
             names.extend(projection_names)
         targets = ",".join(f'"{namespace}"."{name}"' for name in names)
@@ -382,15 +387,15 @@ async def _locked_relations(session, quoted, family, retained):
         await session.execute(text(f"LOCK TABLE {targets} IN {mode} MODE NOWAIT"))
         if row.family_id != family.family_id and row.frozen_at is not None:
             await _close_frozen_reference_heaps(session, row)
-        await session.execute(
-            text(f"SELECT * FROM {quoted}.resolve_custom_import_snapshot_relations(:family)"), {"family": row.family_id}
-        )
+        if await _optional_relation_names(session, row.family_id) != optional_names_by_family[row.family_id]:
+            raise SnapshotRetirementRefused("snapshot retirement reference census changed")
+    return optional_names_by_family
 
 
 async def _close_frozen_reference_heaps(session, family):
     """Keep frozen reference scans stable against owner DML while allowing reads."""
     names = sorted(set(_REFERENCES) & snapshot_tables(family.family_id).keys())
-    if family.origin_table_oid is not None:
+    if "legacy_copy_origin" in await _optional_relation_names(session, family.family_id):
         names.append("legacy_copy_origin")
     namespace = snapshot_schema(family.family_id)
     targets = ",".join(f'"{namespace}"."{name}"' for name in names)
@@ -406,12 +411,12 @@ async def _close_mutable_references(session, quoted, retained):
         namespace = snapshot_schema(row.family_id)
         names = set(_REFERENCES) & snapshot_tables(row.family_id).keys()
         tables.extend(f'"{namespace}"."{name}"' for name in sorted(names))
-        if row.origin_table_oid is not None:
+        if "legacy_copy_origin" in await _optional_relation_names(session, row.family_id):
             tables.append(f'"{namespace}".legacy_copy_origin')
     await session.execute(text("LOCK TABLE " + ",".join(tables) + " IN SHARE MODE NOWAIT"))
 
 
-async def _commit_reference_closure(session, quoted, family, retained, engine_id, reason):
+async def _commit_reference_closure(session, quoted, family, retained, optional_names_by_family, engine_id, reason):
     """Recheck mutable data under bounded write exclusion immediately before DDL."""
     async with asyncio.timeout(MAX_REFERENCE_CLOSURE_SECONDS):
         await session.execute(
@@ -422,7 +427,9 @@ async def _commit_reference_closure(session, quoted, family, retained, engine_id
     """),
             {"budget_ms": int(MAX_REFERENCE_CLOSURE_SECONDS * 1000)},
         )
-        family_columns = tuple(CustomImportSnapshotFamily.__table__.columns)
+        family_columns = tuple(
+            getattr(CustomImportSnapshotFamily, name) for name in (*_IDENTITY_NAMES, "created_at", "frozen_at")
+        )
         census = [tuple(getattr(entry, column.name) for column in family_columns) for entry in retained]
         await session.execute(
             text(
@@ -444,10 +451,8 @@ async def _commit_reference_closure(session, quoted, family, retained, engine_id
         if [tuple(entry) for entry in fresh_census] != census:
             raise SnapshotRetirementRefused("snapshot retirement reference census changed")
         for entry in retained:
-            await session.execute(
-                text(f"SELECT * FROM {quoted}.resolve_custom_import_snapshot_relations(:family)"),
-                {"family": entry.family_id},
-            )
+            if await _optional_relation_names(session, entry.family_id) != optional_names_by_family[entry.family_id]:
+                raise SnapshotRetirementRefused("snapshot retirement reference census changed")
         await assert_closed_continuations(session, family)
         mutable_families = [
             entry for entry in retained if entry.family_id != family.family_id and entry.frozen_at is None
@@ -462,16 +467,15 @@ async def _physical_drop(session, quoted, family):
     routines = (
         await session.execute(
             text("""
-        SELECT p.oid, p.oid::regprocedure::text signature, p.prokind::text prokind,
-               p.proowner = n.nspowner AS owned
+        SELECT p.oid, p.oid::regprocedure::text signature, p.prokind::text prokind
         FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
         WHERE n.nspname=:namespace ORDER BY p.oid
     """),
             {"namespace": namespace},
         )
     ).all()
-    if any(not routine.owned or routine.prokind != "f" for routine in routines):
-        raise SnapshotRetirementRefused("snapshot retirement routine ownership is incompatible")
+    if any(routine.prokind != "f" for routine in routines):
+        raise SnapshotRetirementRefused("snapshot retirement routine kind is incompatible")
     dependencies = (
         await session.execute(
             text("""
@@ -493,11 +497,7 @@ async def _physical_drop(session, quoted, family):
             raise SnapshotRetirementRefused("snapshot retirement routine dependencies are cyclic")
         for oid in ready_oids:
             await session.execute(text(f"DROP FUNCTION {signatures_by_oid.pop(oid)} RESTRICT"))
-    names = list(snapshot_tables(family.family_id))
-    if family.landing_table_oid is not None:
-        names.append("source_bulk_landing")
-    if family.origin_table_oid is not None:
-        names.append("legacy_copy_origin")
+    names = [*snapshot_tables(family.family_id), *await _optional_relation_names(session, family.family_id)]
     if await session.scalar(select(exists().where(CustomImportQueryProjection.family_id == family.family_id))):
         names.extend(("custom_import_derived_root", "custom_import_derived_child"))
     qualified_tables_sql = ",".join(f'"{namespace}"."{name}"' for name in names)
@@ -505,9 +505,7 @@ async def _physical_drop(session, quoted, family):
     await session.execute(text(f"DROP TABLE {qualified_tables_sql} RESTRICT"))
     await session.execute(text(f'DROP SCHEMA "{namespace}" RESTRICT'))
     for model in (CustomImportRevisionHome, CustomImportSnapshotRelation):
-        delete_result = await session.execute(delete(model).where(model.family_id == family.family_id))
-        if model is CustomImportSnapshotRelation and delete_result.rowcount != 15:
-            raise SnapshotRetirementRefused("snapshot retirement relation census changed")
+        await session.execute(delete(model).where(model.family_id == family.family_id))
 
 
 async def _locked_family(session, family_id, engine_id):
@@ -593,10 +591,6 @@ async def _retire_snapshot(session, family_id, engine_id, assert_external_unrefe
     exact session. It must compare the supplied current/rollback pointers with
     its own attachment history and refuse every retained external reference.
     """
-    from process.custom_import.retirement_inventory import (
-        can_prove_frozen_reference_inventory,
-    )
-
     snapshot_schema(family_id)
     lifecycle_lock_key(engine_id, 1)
     if not callable(assert_external_unreferenced):
@@ -627,13 +621,14 @@ async def _retire_snapshot(session, family_id, engine_id, assert_external_unrefe
             )
         )
     ).all()
-    await _locked_relations(session, quoted, family, retained)
+    optional_names_by_family = await _locked_relations(session, family, retained)
     frozen_families = [
         entry for entry in retained if entry.family_id != family.family_id and entry.frozen_at is not None
     ]
-    if not await can_prove_frozen_reference_inventory(session, family, retained):
-        await _revision_references(session, family, frozen_families, include_canonical=False)
-    return await _commit_reference_closure(session, quoted, family, retained, engine_id, reason)
+    await _revision_references(session, family, frozen_families, include_canonical=False)
+    return await _commit_reference_closure(
+        session, quoted, family, retained, optional_names_by_family, engine_id, reason
+    )
 
 
 async def retire_snapshot_family(session, family_id, *, engine_id, assert_external_unreferenced):

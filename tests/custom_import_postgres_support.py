@@ -181,6 +181,17 @@ def _install_custom_import_migrations(
     )
     if is_segmented_capture_enabled and is_snapshot_storage_enabled and migration_through is None:
         install_snapshot_retirement_migration(sync_connection, schema_name)
+        install_source_completion_contract(sync_connection, schema_name)
+
+
+def install_source_completion_contract(connection, schema_name):
+    """Keep current application batch closure available in the legacy-shaped fixture."""
+    migration = _migration(
+        _ROOT / "alembic/versions/20261114010000_custom_import_snapshot_names.py", "source_completion_test_migration"
+    )
+    migration.op = Operations(MigrationContext.configure(connection))
+    identity = f'"{schema_name}".source_set_finalize(uuid,integer[])'
+    migration._refresh(identity, lambda source: migration._source_finalizer_body(source, schema_name))
 
 
 def install_snapshot_storage_migrations(sync_connection, schema_name, migration_names=_SNAPSHOT_MIGRATION_NAMES):

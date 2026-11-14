@@ -265,7 +265,6 @@ async def test_reference_proof_checks_wrong_parent_membership_and_every_bounded_
                     ),
                     {"dataset": other_graph.dataset_id, "schema": other_graph.schema_revision_id, "child": identity},
                 )
-        monkeypatch.setattr(retirement, "REFERENCE_PAGE_ROWS", 2)
         with pytest.raises(retirement.SnapshotRetirementRefused, match="revision reference"):
             async with case.sessions() as session, session.begin():
                 await _bounded(session)
@@ -276,6 +275,98 @@ async def test_reference_proof_checks_wrong_parent_membership_and_every_bounded_
                     assert_external_unreferenced=_external_fixture_check,
                 )
         await _verify_sparse_remaining_reference_pages(case, family_id, monkeypatch)
+
+
+@pytest.mark.parametrize("operation", ["insert", "update"])
+async def test_retirement_excludes_frozen_writes_and_rescans_after_commit(operation):
+    async with isolated_publication_case() as case:
+        _, family_id = await _replaced_fence(case)
+        _, _, kept_family_id = await _sealed_current_snapshot(case)
+        relation = f'"{retirement.snapshot_schema(kept_family_id)}".custom_import_build_family'
+        insert = (
+            f"INSERT INTO {relation} "
+            "(build_id,root_record_id,root_key_sha256,selection_kind,source_root_occurrence_id,"
+            "last_child_collection_slot,last_child_key_sha256,last_input_child_revision_id,attached_child_count) "
+        )
+        async with case.sessions() as session, session.begin():
+            await session.execute(
+                text(
+                    f'INSERT INTO "{case.schema_name}".custom_import_revision_home '
+                    "(family_id,revision_kind,revision_ids) VALUES (:family,2,'{[9000000,9000001)}')"
+                ),
+                {"family": family_id},
+            )
+            await session.execute(
+                text(insert + "VALUES (1,1,decode(repeat('11',32),'hex'),'source',1,NULL,NULL,NULL,0)")
+            )
+        statement = text(
+            insert + "VALUES (1,2,decode(repeat('11',32),'hex'),'source',2,1,decode(repeat('22',32),'hex'),9000000,0)"
+            if operation == "insert"
+            else f"UPDATE {relation} SET last_child_collection_slot=1,"
+            "last_child_key_sha256=decode(repeat('22',32),'hex'),last_input_child_revision_id=9000000 "
+            "WHERE build_id=1 AND root_record_id=1"
+        )
+        async with case.sessions() as session, session.begin():
+            await _bounded(session)
+            family = await session.get(CustomImportSnapshotFamily, family_id)
+            kept = await session.get(CustomImportSnapshotFamily, kept_family_id)
+            assert kept.frozen_at is not None
+            await retirement._close_frozen_reference_heaps(session, kept)
+            await retirement._revision_references(session, family, [family, kept])
+            with pytest.raises(DBAPIError) as refused:
+                async with case.sessions() as writer, writer.begin():
+                    await writer.execute(text("SET LOCAL lock_timeout='100ms'"))
+                    await writer.execute(statement)
+            assert getattr(refused.value.orig, "sqlstate", None) == "55P03"
+            async with case.sessions() as reader:
+                assert await reader.scalar(text(f"SELECT count(*) FROM {relation}")) == 1
+                assert await reader.scalar(text(f"SELECT last_input_child_revision_id FROM {relation}")) is None
+        async with case.sessions() as writer, writer.begin():
+            await writer.execute(statement)
+        with pytest.raises(retirement.SnapshotRetirementRefused, match="revision reference"):
+            async with case.sessions() as session, session.begin():
+                await _bounded(session)
+                await retirement.retire_snapshot_family(
+                    session, family_id, engine_id="synthetic", assert_external_unreferenced=_external_fixture_check
+                )
+        async with case.sessions() as session:
+            assert await session.get(CustomImportSnapshotFamily, family_id) is not None
+            assert await session.get(CustomImportSnapshotRetirement, family_id) is None
+
+
+async def test_retirement_excludes_only_its_target_and_completed_retired_sources():
+    async with isolated_publication_case() as case:
+        _, family_id = await _replaced_fence(case)
+        graph, _, kept_family_id = await _sealed_current_snapshot(case)
+        async with case.sessions() as session, session.begin():
+            await _bounded(session)
+            await session.execute(
+                text(
+                    f'INSERT INTO "{case.schema_name}".custom_import_revision_home '
+                    "(family_id,revision_kind,revision_ids) VALUES "
+                    "(:target,2,'{[8000000,8000001)}'),(:kept,2,'{[9000000,9000001)}')"
+                ),
+                {"target": family_id, "kept": kept_family_id},
+            )
+            await session.execute(
+                text(
+                    f'INSERT INTO "{retirement.snapshot_schema(kept_family_id)}".custom_import_family_child '
+                    "(family_revision_id,dataset_id,schema_revision_id,root_record_id,collection_slot,child_revision_id) "
+                    "VALUES (777,:dataset,:schema,999,1,9000000)"
+                ),
+                {"dataset": graph.dataset_id, "schema": graph.schema_revision_id},
+            )
+            family = await session.get(CustomImportSnapshotFamily, family_id)
+            kept = await session.get(CustomImportSnapshotFamily, kept_family_id)
+            await retirement._revision_references(session, kept, [family, kept])
+            await _remember_retirement(session, kept_family_id)
+            await retirement._physical_drop(session, '"' + case.schema_name + '"', kept)
+        async with case.sessions() as session, session.begin():
+            await _bounded(session)
+            receipt = await retirement.retire_snapshot_family(
+                session, family_id, engine_id="synthetic", assert_external_unreferenced=_external_fixture_check
+            )
+            assert receipt.reason == "replaced_fence" and not receipt.replayed
 
 
 async def _prepare_sparse_reference_table(session, publication_case, family_id):
@@ -490,7 +581,7 @@ async def test_indexed_reference_proof_preserves_multirange_holes_and_unbounded_
                     text("CREATE INDEX exact_child_reference ON pg_temp.custom_import_child_scalar (child_revision_id)")
                 )
             await retirement._reference_pages(session, table, family_id)
-            for revision_id in (904, 2000):
+            for revision_id in (904, 2000, 2**63 - 1):
                 await session.execute(
                     text("UPDATE pg_temp.custom_import_child_scalar SET child_revision_id=:revision"),
                     {"revision": revision_id},
@@ -745,7 +836,10 @@ async def test_retirement_refuses_origin_registered_during_the_frozen_proof(monk
         async with case.sessions() as session, session.begin():
             assert await session.get(CustomImportSnapshotFamily, family_id) is not None
             assert await session.get(CustomImportSnapshotRetirement, family_id) is None
-            assert (await session.get(CustomImportSnapshotFamily, other_family)).origin_table_oid is not None
+            assert await session.scalar(
+                text("SELECT to_regclass(:relation) IS NOT NULL"),
+                {"relation": f'"{retirement.snapshot_schema(other_family)}".legacy_copy_origin'},
+            )
 
 
 async def _published_fixture_check(session, family, current, rollback):

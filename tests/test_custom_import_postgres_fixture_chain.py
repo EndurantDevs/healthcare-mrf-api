@@ -146,8 +146,14 @@ def test_fixture_installs_snapshot_prerequisites_exactly_once(
     monkeypatch.setattr(support, "_migration", load)
     monkeypatch.setattr(support, "MigrationContext", SimpleNamespace(configure=lambda value: value))
     monkeypatch.setattr(support, "Operations", lambda value: value)
+    completion_contract = Mock()
+    monkeypatch.setattr(support, "install_source_completion_contract", completion_contract)
     support._install_custom_import_migrations(connection, schema, segmented, snapshots, migration_through)
     installs_continuation_authority = segmented and snapshots and migration_through is None
+    if installs_continuation_authority:
+        completion_contract.assert_called_once_with(connection, schema)
+    else:
+        completion_contract.assert_not_called()
     expected_migrations = _expected_fixture_migrations(segmented, expected_tail, installs_continuation_authority)
     assert installed_migrations == expected_migrations
     assert len(installed_migrations) == len(set(installed_migrations))

@@ -142,7 +142,7 @@ def test_indexes_cover_enabled_fields_and_include_nulls():
     assert "field_3" in storage.query_projection_tables(17, _definition())["custom_import_derived_child"].c
 
 
-def test_manifest_has_native_owner_binding_and_explicit_completion_shape():
+def test_manifest_has_logical_producer_binding_and_explicit_completion_shape():
     table = CustomImportQueryProjection.__table__
     ddl = str(CreateTable(table).compile(dialect=postgresql.dialect()))
     assert not CustomImportQueryProjection.__runtime_schema_sync__
@@ -169,5 +169,5 @@ def test_manifest_has_native_owner_binding_and_explicit_completion_shape():
     )
     for scope in ("root", "child"):
         for suffix in ("table_oid", "table_owner", "columns_sha256"):
-            assert not table.c[f"{scope}_{suffix}"].nullable
+            assert f"{scope}_{suffix}" not in table.c
     assert str(table.c.after_entity_binding_id.server_default.arg) == "0"

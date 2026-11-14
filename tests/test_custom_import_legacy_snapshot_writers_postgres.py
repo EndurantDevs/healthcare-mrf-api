@@ -335,18 +335,22 @@ async def test_native_legacy_registration_is_exact_idempotent_and_default_denied
             assert await _register(session, legacy) == family_id
             family = await session.get(CustomImportSnapshotFamily, family_id)
             assert family.generation_id == legacy.attempt.generation_id and family.frozen_at is None
-            assert family.origin_table_oid and family.origin_table_owner and len(family.origin_columns_sha256) == 32
+            origin_oid = await session.scalar(
+                text("SELECT to_regclass(:table_name)::oid"),
+                {"table_name": f"ci_snapshot_{family_id}.legacy_copy_origin"},
+            )
+            assert origin_oid is not None
             assert (
                 await session.scalar(
                     text("SELECT count(*) FROM pg_constraint WHERE conrelid=CAST(:oid AS oid) AND contype='f'"),
-                    {"oid": family.origin_table_oid},
+                    {"oid": origin_oid},
                 )
                 == 0
             )
             assert (
                 await session.scalar(
                     text("SELECT count(*) FROM pg_trigger WHERE tgrelid=CAST(:oid AS oid) AND NOT tgisinternal"),
-                    {"oid": family.origin_table_oid},
+                    {"oid": origin_oid},
                 )
                 == 0
             )

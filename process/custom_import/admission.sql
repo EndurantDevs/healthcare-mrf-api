@@ -5,9 +5,9 @@ SELECT CASE
     WHEN NOT EXISTS (
         SELECT 1 FROM __CONTROL__.custom_import_snapshot_family f
         JOIN __CONTROL__.custom_import_snapshot_relation r ON r.family_id=f.family_id
-        WHERE r.relation_slot=1 AND r.table_oid=CAST(:root_relation AS regclass)::oid
-          AND f.landing_table_oid=CAST(:landing_relation AS regclass)::oid
-          AND f.landing_table_owner IS NOT NULL AND f.landing_columns_sha256 IS NOT NULL
+        WHERE r.relation_slot=1
+          AND pg_catalog.parse_ident(:root_relation,true)=ARRAY['ci_snapshot_'||f.family_id::text,'custom_import_root_record']
+          AND pg_catalog.parse_ident(:landing_relation,true)=ARRAY['ci_snapshot_'||f.family_id::text,'source_bulk_landing']
           AND f.frozen_at IS NULL
           AND ROW(f.dataset_id,f.definition_revision_id,f.schema_revision_id,f.execution_id,
               f.capture_bundle_id,f.producing_fence,f.producing_token_sha256)

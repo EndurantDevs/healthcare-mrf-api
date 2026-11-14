@@ -23,6 +23,7 @@ from db.models.custom_import_storage import CustomImportSnapshotFamily
 from process.custom_import import build_output as output
 from process.custom_import import execution as lifecycle
 from process.custom_import import query_projection_build as projection
+from process.custom_import import query_projection_initialize as initialize
 from process.custom_import.build_source import SourceBuildRequest, _page_session
 from process.custom_import.capture_pending import (
     PendingCaptureRequest,
@@ -255,7 +256,7 @@ async def _native_state(state):
         relations = (
             await session.execute(
                 text(
-                    "SELECT c.oid,c.relname,c.relowner FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                    "SELECT n.nspname,c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
                     "WHERE n.nspname=:schema AND c.relname=ANY(CAST(:names AS text[])) ORDER BY c.relname"
                 ),
                 {"schema": snapshot_schema(state.family_id), "names": list(QUERY_PROJECTION_TABLE_NAMES)},
@@ -331,6 +332,41 @@ async def _role_session(case, role):
             await connection.commit()
 
 
+async def test_projection_initialization_preserves_select_for_the_inherited_root_owner():
+    async with isolated_publication_case() as case, _reader_roles(case) as (root_owner, initializer):
+        family_id = uuid.uuid4().int % (2**63 - 1) + 1
+        namespace = snapshot_schema(family_id)
+        has_created_schema = False
+
+        async def prepare(session):
+            await session.execute(text("SET LOCAL statement_timeout='5s'"))
+
+        try:
+            async with case.engine.begin() as connection:
+                await connection.execute(text(f'GRANT "{root_owner}" TO "{initializer}"'))
+                await connection.execute(text(f'CREATE SCHEMA "{namespace}" AUTHORIZATION "{root_owner}"'))
+                has_created_schema = True
+                await connection.execute(text(f'CREATE TABLE "{namespace}".custom_import_root_record (value bigint)'))
+                await connection.execute(
+                    text(f'ALTER TABLE "{namespace}".custom_import_root_record OWNER TO "{root_owner}"')
+                )
+            async with _role_session(case, initializer) as session, session.begin():
+                assert await session.scalar(text(f'SELECT count(*) FROM "{namespace}".custom_import_root_record')) == 0
+                await initialize._create_cells(
+                    session, SimpleNamespace(family_id=family_id), None, _definition(), prepare=prepare
+                )
+            async with _role_session(case, root_owner) as session, session.begin():
+                for name in QUERY_PROJECTION_TABLE_NAMES:
+                    table = f'"{namespace}"."{name}"'
+                    assert await session.scalar(text(f"SELECT count(*) FROM {table}")) == 0
+                    await _assert_denied(session, f"UPDATE {table} SET selected_value=selected_value")
+                    await _assert_denied(session, f"TRUNCATE {table}")
+        finally:
+            if has_created_schema:
+                async with case.engine.begin() as connection:
+                    await connection.execute(text(f'DROP SCHEMA IF EXISTS "{namespace}" CASCADE'))
+
+
 async def _worker_cannot_mutate(state, worker):
     namespace = snapshot_schema(state.family_id)
     root = f'"{namespace}".custom_import_derived_root'
@@ -346,10 +382,10 @@ async def _worker_cannot_mutate(state, worker):
             f"TRUNCATE {root}",
             f"ALTER TABLE {root} ADD COLUMN unexpected bigint",
             f'CREATE TABLE "{namespace}".unregistered_projection (entity_binding_id bigint)',
-            f"UPDATE {manifest} SET root_table_oid=child_table_oid",
+            f"UPDATE {manifest} SET root_count=root_count",
             f"INSERT INTO {manifest} SELECT * FROM {manifest}",
             f"DELETE FROM {manifest}",
-            f"UPDATE {registry} SET table_oid=1",
+            f"UPDATE {registry} SET relation_slot=relation_slot",
         ):
             await _assert_denied(session, statement)
 

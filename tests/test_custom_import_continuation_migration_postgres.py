@@ -9,7 +9,7 @@ from db.models.custom_import import CustomImportBuildAttempt
 from db.models.custom_import_storage import CustomImportSnapshotFamily
 from process.custom_import import build_graph, build_output
 from process.custom_import.build_source import stage_segmented_source
-from tests.custom_import_postgres_support import isolated_publication_case
+from tests.custom_import_postgres_support import install_source_completion_contract, isolated_publication_case
 from tests.test_custom_import_build_output_postgres import _activate, _complete, _records, _request_for
 from tests.test_custom_import_continuation_migration import _migration
 
@@ -23,7 +23,6 @@ async def _retained_metadata(session, schema):
                 CustomImportSnapshotFamily.producing_token_sha256,
                 CustomImportSnapshotFamily.generation_id,
                 CustomImportSnapshotFamily.frozen_at,
-                CustomImportSnapshotFamily.landing_table_oid,
             ).order_by(CustomImportSnapshotFamily.family_id)
         )
     ).all()
@@ -52,6 +51,8 @@ async def _retained_metadata(session, schema):
 
 async def test_existing_base_and_candidate_writers_refresh_without_rebinding_retained_rows():
     async with isolated_publication_case(migration_through="20261010000000") as case:
+        async with case.engine.begin() as connection:
+            await connection.run_sync(install_source_completion_contract, case.schema_name)
         original = await _request_for(case, _records(2, 3))
         _, reference = await _complete(case, original)
         await _activate(case, original, reference.generation_id)

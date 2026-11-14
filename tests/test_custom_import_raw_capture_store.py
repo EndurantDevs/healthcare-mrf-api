@@ -32,7 +32,7 @@ _QUOTA = 1024 * 1024
 
 
 @pytest.mark.parametrize("damage", ["limits_type", "captures_type", "empty", "unsealed", "payload_type", "size"])
-async def test_raw_input_shapes_fail_before_authority_quota_or_writes(monkeypatch, damage):
+async def test_raw_input_shapes_fail_before_quota_or_writes(monkeypatch, damage):
     session, captures, quota = _case(monkeypatch)
     options_by_name = {"limits": object()} if damage == "limits_type" else {}
     captures_by_damage = {
@@ -60,7 +60,7 @@ async def test_raw_registration_slot_drift_stops_before_copy(monkeypatch):
     assert not session.copy_calls
 
 
-async def test_raw_invalid_persisted_definition_stops_before_authority(monkeypatch):
+async def test_raw_invalid_persisted_definition_stops_before_writes(monkeypatch):
     session, captures, quota = _case(monkeypatch)
     session.definition.canonical_definition = "not-json"
     with pytest.raises(CaptureBundleConflict, match="definition is invalid"):
@@ -205,11 +205,6 @@ def _case(monkeypatch, *, format_name="csv", compression="none", original_payloa
         session.events.append("quota")
 
     monkeypatch.setattr(capture_store, "load_registry", registry)
-    monkeypatch.setattr(
-        raw_capture_store,
-        "require_raw_capture_authority",
-        AsyncMock(side_effect=lambda _session: session.events.append("authority")),
-    )
     quota_check = AsyncMock(side_effect=quota)
     monkeypatch.setattr(raw_capture_store.capture_retention, "validate_dataset_retained_bytes", quota_check)
     return session, captures, quota_check
@@ -254,7 +249,7 @@ async def test_original_formats_round_trip_without_parquet_relabeling(monkeypatc
     assert options["columns"] == raw_capture_store._COPY_COLUMNS
     assert [copied_record[1] for copied_record in options["records"]] == [2, 7]
     assert [copied_record[8] for copied_record in options["records"]] == [capture.payload for capture in retained]
-    assert session.events.index("lock") < session.events.index("authority") < session.events.index("quota")
+    assert session.events.index("lock") < session.events.index("quota")
     assert session.events.index("quota") < session.events.index("copy")
     assert session.events.index("copy") < session.events.index("metadata") < session.events.index("payload")
     assert all(header.payload_contract is None for header in session.headers)
@@ -270,17 +265,6 @@ async def test_empty_originals_are_retained_and_zero_quota_is_valid(monkeypatch)
     await _register(session, captures, quota=0)
     assert all(capture.payload == b"" for capture in await _load(session))
     assert quota.await_args.kwargs["new_byte_count"] == 0
-
-
-async def test_new_originals_recheck_authority_before_quota_or_copy(monkeypatch):
-    session, captures, quota = _case(monkeypatch)
-    check = AsyncMock(side_effect=CaptureStoreError("raw capture authority denied"))
-    monkeypatch.setattr(raw_capture_store, "require_raw_capture_authority", check)
-    with pytest.raises(CaptureStoreError, match="authority denied"):
-        await _register(session, captures)
-    check.assert_awaited_once_with(session)
-    quota.assert_not_awaited()
-    assert not session.copy_calls
 
 
 @pytest.mark.parametrize(
@@ -354,14 +338,14 @@ async def test_wrong_definition_owner_is_rejected_before_writes(monkeypatch):
     assert not session.events
 
 
-@pytest.mark.parametrize("damage", ("transaction", "dirty", "limits", "quota"))
+@pytest.mark.parametrize("damage", ("transaction", "new", "dirty", "deleted", "limits", "quota"))
 async def test_registration_boundaries_fail_before_database_work(monkeypatch, damage):
     session, captures, _ = _case(monkeypatch)
     options_by_name = {}
     if damage == "transaction":
         session.in_transaction = lambda: False
-    elif damage == "dirty":
-        session.dirty = (object(),)
+    elif damage in {"new", "dirty", "deleted"}:
+        setattr(session, damage, (object(),))
     elif damage == "limits":
         options_by_name["limits"] = replace(CaptureLimits(), maximum_compressed_bytes=65 * 1024 * 1024)
     else:

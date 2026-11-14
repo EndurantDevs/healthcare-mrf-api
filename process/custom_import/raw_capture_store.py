@@ -7,10 +7,15 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, false, func, insert, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models.custom_import import CustomImportCaptureParquetPart, CustomImportDefinitionRevision
+from db.models.custom_import import (
+    CustomImportCapture,
+    CustomImportCaptureBundle,
+    CustomImportCaptureParquetPart,
+    CustomImportDefinitionRevision,
+)
 from db.models.custom_import_raw_capture import (
     MAX_RAW_OBJECT_BYTES,
     RAW_OBJECT_CONTRACT,
@@ -18,7 +23,6 @@ from db.models.custom_import_raw_capture import (
 )
 from process.custom_import import capture_retention, capture_store
 from process.custom_import.capture import CaptureError, CaptureManifest, SealedCapture, verify_capture
-from process.custom_import.capture_authority import require_raw_capture_authority
 from process.custom_import.capture_limits import CaptureLimits
 from process.custom_import.capture_store import (
     CaptureBundleConflict,
@@ -46,6 +50,49 @@ _COPY_COLUMNS = (
     "payload",
 )
 _METADATA_COLUMNS = tuple(getattr(_RAW, name) for name in _COPY_COLUMNS[:-1])
+
+
+async def require_raw_capture_write_access(session: AsyncSession) -> None:
+    """Check native registrar operations without reading or creating capture rows."""
+
+    capture_store._require_transaction(session)
+    capture_store._require_clean_session(session)
+    for model in (CustomImportCaptureBundle, CustomImportCapture, _RAW):
+        table = model.__table__
+        readable = select(table).limit(0)
+        if model is not _RAW:
+            readable = readable.with_for_update()
+        await session.execute(readable)
+        columns = [
+            column
+            for column in table.columns
+            if column is not table.autoincrement_column and column.server_default is None
+        ]
+        await session.execute(
+            insert(table).from_select(
+                [column.name for column in columns],
+                select(*columns).where(false()),
+                include_defaults=False,
+            )
+        )
+    await session.execute(capture_retention._retained_bytes_statement(1, 0).limit(0))
+    await session.execute(select(CustomImportCaptureParquetPart.stream_slot).limit(0))
+    connection = await session.connection()
+    options = connection.sync_connection.get_execution_options()
+    table = CustomImportCaptureBundle.__table__
+    dialect = connection.sync_connection.dialect
+    schema = (options.get("schema_translate_map") or {}).get(table.schema, table.schema) or dialect.default_schema_name
+    quote = dialect.identifier_preparer.quote
+    relation = f"{quote(schema)}.{quote(table.name)}"
+    allowed = await session.scalar(
+        text(
+            "SELECT pg_catalog.has_sequence_privilege("
+            "pg_catalog.pg_get_serial_sequence(:relation,'capture_bundle_id'),'USAGE,UPDATE')"
+        ),
+        {"relation": relation},
+    )
+    if allowed is not True:
+        raise CaptureStoreError("raw capture sequence access is unavailable")
 
 
 def _checked_limits(limits):
@@ -157,7 +204,6 @@ async def register_raw_capture_bundle(
     captures_by_stream = _verify_captures(captures, definition, limits)
     registration = await capture_store.register_capture_bundle(session, **asdict(identity), receipts=receipts)
     if registration.created:
-        await require_raw_capture_authority(session)
         await capture_retention.validate_dataset_retained_bytes(
             session,
             dataset_id=dataset_id,

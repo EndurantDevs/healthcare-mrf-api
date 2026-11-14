@@ -198,8 +198,8 @@ async def test_completed_trim_commits_only_when_executing(monkeypatch, execute, 
     ("error", "reason"),
     (
         (
-            BuildScratchCleanupRefused("build scratch cleanup requires full automated post-seal verification"),
-            "build scratch cleanup requires full automated post-seal verification",
+            BuildScratchCleanupRefused("build scratch cleanup requires completed automated post-seal verification"),
+            "build scratch cleanup requires completed automated post-seal verification",
         ),
         (PublicationConflict("target generation is not sealed"), "target generation is not sealed"),
         (_db_error("55P03"), "trim bound elapsed"),
@@ -293,7 +293,7 @@ async def test_control_binding_passes_live_identity_and_both_refusal_types(monke
 
     class Session:
         async def execute(self, statement):
-            return SimpleNamespace(one=lambda: ("synthetic_db", "synthetic_owner", "42"))
+            pytest.fail("retirement routing must not inspect database or connection identity")
 
     retire, refusals = retention_sweep.control_plane_retire("synthetic_engine", module.__name__)
     session = Session()
@@ -306,7 +306,4 @@ async def test_control_binding_passes_live_identity_and_both_refusal_types(monke
     assert context == {
         "engine_id": "synthetic_engine",
         "engine_namespace": str(retention_sweep.CustomImportSnapshotFamily.__table__.schema),
-        "expected_database": "synthetic_db",
-        "expected_system_identifier": "42",
-        "expected_owner": "synthetic_owner",
     }

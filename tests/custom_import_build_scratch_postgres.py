@@ -6,6 +6,8 @@ import datetime as dt
 import uuid
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from alembic.migration import MigrationContext
@@ -110,7 +112,7 @@ async def _physical(case, family_id):
         rows = (
             await session.execute(
                 text("""
-            SELECT c.relname,c.oid,c.relfilenode,pg_total_relation_size(c.oid) bytes,
+            SELECT c.relname,
                    array_agg(a.attname::text ORDER BY a.attnum) columns
             FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
             JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
@@ -123,7 +125,7 @@ async def _physical(case, family_id):
             name: await session.scalar(text(f'SELECT count(*) FROM "{namespace}"."{name}"'))
             for name in cleanup.SCRATCH_RELATIONS
         }
-        return {row.relname: (row.oid, tuple(row.columns)) for row in rows}, count_by_name
+        return {row.relname: tuple(row.columns) for row in rows}, count_by_name
 
 
 async def _indexes(case, family_id):
@@ -131,7 +133,7 @@ async def _indexes(case, family_id):
         rows = (
             await session.execute(
                 text("""
-            SELECT c.relname,c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+            SELECT c.relname,pg_get_indexdef(c.oid) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
             WHERE n.nspname=:namespace AND c.relkind='i'
         """),
                 {"namespace": f"ci_snapshot_{family_id}"},
@@ -235,7 +237,9 @@ async def test_cleanup_is_atomic_pin_safe_and_preserves_retained_base_continuati
         from process.custom_import.storage_layout import _PHASE_INDEX_NAMES
 
         phase_names = frozenset().union(*_PHASE_INDEX_NAMES.values())
-        assert indexes_after == {name: oid for name, oid in indexes_before.items() if name not in phase_names}
+        assert indexes_after == {
+            name: definition for name, definition in indexes_before.items() if name not in phase_names
+        }
         assert await _read(case, request, sealed.generation_id) == before_read
         assert await fixture._assert_sealed_materialization(case, request, sealed) == before_material
         assert (await build_output.build_output(case.sessions, request, build_id)).seal.replayed
@@ -247,7 +251,12 @@ async def test_cleanup_is_atomic_pin_safe_and_preserves_retained_base_continuati
             marker = await session.get(CustomImportBuildScratchCleanup, family_id)
             assert marker.aggregate_evidence["build_counters"]["source_occurrence_count"] > 0
             assert marker.aggregate_evidence["structural_counts"]["family_count"] == 3
-            assert len(marker.aggregate_evidence["relations"]) == 17
+            assert marker.aggregate_evidence["relations"] == [
+                f'"ci_snapshot_{family_id}"."custom_import_build_occurrence"',
+                f'"ci_snapshot_{family_id}"."custom_import_build_family"',
+                f'"ci_snapshot_{family_id}"."custom_import_build_candidate_context"',
+                f'"ci_snapshot_{family_id}"."source_bulk_landing"',
+            ]
 
         await _continue_trimmed_base(case, request, sealed, before_read, monkeypatch)
 
@@ -317,7 +326,7 @@ async def test_cleanup_refuses_phase_index_rebound_to_a_serving_table():
         indexes_before = await _indexes(case, family_id)
         async with case.sessions() as session, session.begin():
             await _bounds(session)
-            with pytest.raises(cleanup.BuildScratchCleanupRefused, match="phase index custody"):
+            with pytest.raises(cleanup.BuildScratchCleanupRefused, match="phase index shape"):
                 async with session.begin_nested():
                     await session.execute(
                         text(f'DROP INDEX "ci_snapshot_{family_id}".custom_import_build_raw_parent_idx')
@@ -349,14 +358,14 @@ async def test_cleanup_refuses_unverified_and_manual_accepted_scratch(monkeypatc
         sealed = await build_output.build_output(case.sessions, request, build_id)
         assert sealed.generation_id == generation_id
         before = await _physical(case, family_id)
-        with pytest.raises(cleanup.BuildScratchCleanupRefused, match="full automated"):
+        with pytest.raises(cleanup.BuildScratchCleanupRefused, match="completed automated"):
             await _trim(case, family_id)
         assert await _physical(case, family_id) == before
         async with case.sessions() as session:
             assert await session.get(CustomImportBuildScratchCleanup, family_id) is None
 
 
-async def test_cleanup_owner_custody_and_changed_registry_refusal():
+async def test_cleanup_obeys_native_permissions_and_preserves_metadata():
     async with _source_case() as case:
         async with case.engine.begin() as connection:
             await connection.run_sync(install_cleanup_migration, case.schema_name)
@@ -366,28 +375,34 @@ async def test_cleanup_owner_custody_and_changed_registry_refusal():
         family_id = await _family(case, request)
         before = await _physical(case, family_id)
         role = "scratch_fixture_" + uuid.uuid4().hex[:12]
+        namespace = f"ci_snapshot_{family_id}"
         async with case.engine.begin() as connection:
             await connection.execute(text(f'CREATE ROLE "{role}" NOLOGIN'))
         try:
-            async with case.sessions() as session, session.begin():
-                await _bounds(session)
-                await session.execute(text(f'SET LOCAL ROLE "{role}"'))
-                with pytest.raises((cleanup.BuildScratchCleanupRefused, DBAPIError)):
+            async with case.engine.begin() as connection:
+                await connection.execute(text(f'GRANT USAGE ON SCHEMA "{case.schema_name}","{namespace}" TO "{role}"'))
+                await connection.execute(
+                    text(f'GRANT SELECT,UPDATE ON ALL TABLES IN SCHEMA "{case.schema_name}" TO "{role}"')
+                )
+                await connection.execute(text(f'GRANT SELECT ON ALL TABLES IN SCHEMA "{namespace}" TO "{role}"'))
+                await connection.execute(
+                    text(
+                        f'GRANT EXECUTE ON FUNCTION "{case.schema_name}".resolve_custom_import_generation_snapshot'
+                        f'(bigint,bigint,bigint,bigint) TO "{role}"'
+                    )
+                )
+            with pytest.raises(DBAPIError) as denied:
+                async with case.sessions() as session, session.begin():
+                    await _bounds(session)
+                    await session.execute(text(f'SET LOCAL ROLE "{role}"'))
                     await cleanup.trim_build_scratch(session, family_id, engine_id="synthetic_engine")
+            assert getattr(denied.value.orig, "sqlstate", None) == "42501"
+            tables = tuple(f'"{namespace}"."{name}"' for name in cleanup.SCRATCH_RELATIONS)
+            assert denied.value.statement == "LOCK TABLE " + ",".join(tables) + " IN ACCESS EXCLUSIVE MODE NOWAIT"
         finally:
             async with case.engine.begin() as connection:
+                await connection.execute(text(f'DROP OWNED BY "{role}"'))
                 await connection.execute(text(f'DROP ROLE "{role}"'))
-        assert await _physical(case, family_id) == before
-        async with case.sessions() as session, session.begin():
-            await _bounds(session)
-            with pytest.raises(DBAPIError):
-                async with session.begin_nested():
-                    await session.execute(
-                        text(
-                            f'ALTER TABLE "ci_snapshot_{family_id}".custom_import_build_family ADD COLUMN synthetic_extra integer'
-                        )
-                    )
-                    await cleanup.trim_build_scratch(session, family_id, engine_id="synthetic_engine")
         assert await _physical(case, family_id) == before
         async with case.sessions() as session:
             relation = f'"{case.schema_name}".custom_import_build_scratch_cleanup'
@@ -401,9 +416,31 @@ async def test_cleanup_owner_custody_and_changed_registry_refusal():
                 text("SELECT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass(:relation))"),
                 {"relation": relation},
             )
-            assert not await session.scalar(
-                text("""SELECT EXISTS(SELECT 1 FROM pg_class c,
-                LATERAL aclexplode(coalesce(c.relacl,acldefault('r',c.relowner))) acl
-                WHERE c.oid=to_regclass(:relation) AND acl.grantee<>c.relowner)"""),
-                {"relation": relation},
-            )
+
+
+@pytest.mark.parametrize("empty", (True, False))
+async def test_cleanup_replay_preserves_history_and_requires_empty_named_scratch(monkeypatch, empty):
+    family = SimpleNamespace(family_id=17)
+    evidence_by_kind = {"relations": {"historical": [1, 2, "unchanged"]}, "post_seal_audit": {"audit_id": "recorded"}}
+    marker = SimpleNamespace(
+        family_id=17, engine_id="synthetic", retained_bytes=100, remaining_bytes=0, aggregate_evidence=evidence_by_kind
+    )
+    session = SimpleNamespace(get=AsyncMock(return_value=marker))
+    monkeypatch.setattr(cleanup.retirement, "_owner_schema", AsyncMock())
+    monkeypatch.setattr(cleanup.retirement, "_locked_family", AsyncMock(return_value=(family, None)))
+    monkeypatch.setattr(cleanup, "_eligible", AsyncMock(return_value=(None, None, None, None)))
+    monkeypatch.setattr(cleanup, "_affinity", Mock(return_value={"family_id": 17}))
+    monkeypatch.setattr(cleanup, "_empty", AsyncMock(return_value=empty))
+    audit = AsyncMock()
+    monkeypatch.setattr(cleanup, "_post_audit", audit)
+    truncate = AsyncMock()
+    monkeypatch.setattr(cleanup, "_truncate", truncate)
+    if empty:
+        assert (await cleanup.trim_build_scratch(session, 17, engine_id="synthetic")).replayed
+        audit.assert_awaited_once_with(session, family, None, {"family_id": 17}, "synthetic", marker)
+    else:
+        with pytest.raises(cleanup.BuildScratchCleanupRefused, match="replay storage differs"):
+            await cleanup.trim_build_scratch(session, 17, engine_id="synthetic")
+        audit.assert_not_awaited()
+    truncate.assert_not_awaited()
+    assert marker.aggregate_evidence is evidence_by_kind

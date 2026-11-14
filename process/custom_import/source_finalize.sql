@@ -16,7 +16,6 @@ SELECT a.accepting AS a_accepting,
     a.first_part AS a_first_part,
     a.first_row AS a_first_row,
     a.first_source AS a_first_source,
-    a.opened_by AS a_opened_by,
     a.schema_revision_id AS a_schema_revision_id,
     a.source_byte_limit AS a_source_byte_limit,
     a.stream_slot AS a_stream_slot,
@@ -71,15 +70,15 @@ SELECT CASE WHEN EXISTS(SELECT 1 FROM pg_constraint c WHERE c.contype='f' AND c.
         CAST(:custom_import_build_occurrence_relation AS regclass)])) THEN 'source_set_hot_relationship_guards_present' END problem;
 
 -- query: authority
-SELECT CASE WHEN :a_batch_id IS NULL OR NOT :a_accepting OR :a_opened_by<>session_user
+SELECT CASE WHEN :a_batch_id IS NULL OR NOT :a_accepting
         OR CAST(:a_transaction_id AS xid8)<>pg_current_xact_id() THEN 'source_bulk_authority_mismatch' END problem;
 
 -- query: binding
 SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM __CONTROL__.custom_import_snapshot_family f
         JOIN __CONTROL__.custom_import_snapshot_relation r ON r.family_id=f.family_id
-        WHERE r.relation_slot=1 AND r.table_oid=CAST(:custom_import_root_record_relation AS regclass)::oid
-            AND f.landing_table_oid=CAST(:source_bulk_landing_relation AS regclass)::oid
-            AND f.landing_table_owner IS NOT NULL AND f.landing_columns_sha256 IS NOT NULL
+        WHERE r.relation_slot=1
+            AND pg_catalog.parse_ident(:custom_import_root_record_relation,true)=ARRAY['ci_snapshot_'||f.family_id::text,'custom_import_root_record']
+            AND pg_catalog.parse_ident(:source_bulk_landing_relation,true)=ARRAY['ci_snapshot_'||f.family_id::text,'source_bulk_landing']
             AND f.frozen_at IS NULL
             AND ROW(f.dataset_id,f.definition_revision_id,f.schema_revision_id,f.execution_id,
                 f.capture_bundle_id,f.producing_fence,f.producing_token_sha256)
@@ -87,7 +86,7 @@ SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM __CONTROL__.custom_import_snapshot_fam
                     :b_capture_bundle_id,:b_producing_fence,:b_producing_token_sha256)) THEN 'custom_import_source_snapshot_binding_mismatch' END problem;
 
 -- query: locked_authority
-SELECT CASE WHEN :a_batch_id IS NULL OR NOT :a_accepting OR :a_opened_by<>session_user
+SELECT CASE WHEN :a_batch_id IS NULL OR NOT :a_accepting
         OR CAST(:a_transaction_id AS xid8)<>pg_current_xact_id() OR :a_build_id<>:b_build_id THEN 'source_bulk_authority_mismatch' END problem;
 
 -- query: phase
@@ -109,7 +108,7 @@ SELECT CASE WHEN EXISTS(SELECT 1 FROM __CANDIDATE__.source_bulk_landing l
         LEFT JOIN __CONTROL__.source_bulk_authorization authorized
             ON authorized.batch_id=l.batch_id AND authorized.transaction_id=l.transaction_id
             AND authorized.accepting=l.accepting AND authorized.accepting
-            AND authorized.opened_by=session_user AND authorized.transaction_id=pg_current_xact_id()
+            AND authorized.transaction_id=pg_current_xact_id()
             AND ROW(authorized.build_id,authorized.dataset_id,authorized.definition_revision_id,
                 authorized.schema_revision_id,authorized.execution_id,authorized.capture_bundle_id,
                 authorized.fence,authorized.token_hash)
@@ -508,10 +507,3 @@ SELECT CASE WHEN e.state IS DISTINCT FROM 'running' OR l.fence IS DISTINCT FROM 
     OR least(l.expires_at,:b_build_deadline_at)<=clock_timestamp() THEN 'source_set_lease_lost' END problem
 FROM __CONTROL__.custom_import_execution e LEFT JOIN __CONTROL__.custom_import_lease l ON l.execution_id=e.execution_id
 WHERE e.execution_id=:b_execution_id;
-
--- query: copy_closure
-SELECT session_user::text AS role_name,NOT EXISTS(
-    SELECT 1 FROM __CONTROL__.source_bulk_authorization a
-    WHERE a.build_id=:b_build_id AND a.opened_by=session_user
-        AND a.transaction_id=pg_current_xact_id() AND a.accepting
-) AS close_copy;

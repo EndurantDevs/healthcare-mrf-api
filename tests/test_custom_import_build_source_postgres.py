@@ -423,6 +423,23 @@ async def test_reference_proof_checks_wrong_parent_membership_and_every_bounded_
     await verify(monkeypatch)
 
 
+@pytest.mark.parametrize("operation", ["insert", "update"])
+async def test_retirement_excludes_frozen_writes_and_rescans_after_commit(operation):
+    from tests.custom_import_retirement_postgres import (
+        test_retirement_excludes_frozen_writes_and_rescans_after_commit as verify,
+    )
+
+    await verify(operation)
+
+
+async def test_retirement_excludes_only_its_target_and_completed_retired_sources():
+    from tests.custom_import_retirement_postgres import (
+        test_retirement_excludes_only_its_target_and_completed_retired_sources as verify,
+    )
+
+    await verify()
+
+
 async def test_partial_reference_indexes_preserve_nulls_matches_and_fallback(monkeypatch):
     from tests.custom_import_retirement_postgres import (
         test_partial_reference_indexes_preserve_nulls_matches_and_fallback as verify,

@@ -22,13 +22,16 @@ def _rows(values):
     return SimpleNamespace(all=lambda: values)
 
 
-async def _ledger(*, counts_by_name=None, final_counts_by_name=None):
+async def _ledger(*, counts_by_name=None, final_counts_by_name=None, sampled=False, candidate_generation=9):
     counts_by_name = dict.fromkeys(scratch._COUNT_NAMES, 0) if counts_by_name is None else counts_by_name
     binding_by_name = {
         "contract": audit.CONTRACT,
         "root_page_rows": 2,
-        "identity": {"counts": counts_by_name, "candidate": {"generation_id": 9}},
+        "identity": {"counts": counts_by_name, "candidate": {"generation_id": candidate_generation}},
     }
+    if sampled:
+        binding_by_name["sampling"] = audit._sampling_plan(binding_by_name["identity"])
+    selected = audit._selected_ordinals(binding_by_name)
     header = audit.Audit(
         audit_id=uuid.UUID(int=1),
         family_id=7,
@@ -46,6 +49,9 @@ async def _ledger(*, counts_by_name=None, final_counts_by_name=None):
         outcome = {0: "started", 41: "range_eof", 42: "range_eof", 61: "not_applicable", 62: "counts"}.get(
             ordinal, "passed"
         )
+        is_omitted = selected is not None and ordinal > 0 and ordinal not in selected
+        if is_omitted:
+            outcome = "not_applicable"
         previous = await audit._append(
             session,
             header,
@@ -57,10 +63,10 @@ async def _ledger(*, counts_by_name=None, final_counts_by_name=None):
             root_eof=True,
             outcome=outcome,
             page_root_count=0,
-            range_sha256=audit._digest([]) if ordinal in (41, 42) else None,
+            range_sha256=audit._digest([]) if ordinal in (41, 42) and not is_omitted else None,
             state="complete" if ordinal == 62 else "scanning",
             failure_code=None,
-            counts=(counts_by_name if final_counts_by_name is None else final_counts_by_name)
+            counts=({} if is_omitted else counts_by_name if final_counts_by_name is None else final_counts_by_name)
             if ordinal == 62
             else None,
         )
@@ -111,6 +117,80 @@ async def test_appended_ledger_yields_historical_receipt():
         "checkpoint_sha256": checkpoints[-1].checkpoint_sha256.hex(),
     }
     assert "custom_import_post_seal_audit_checkpoint.checkpoint >" in str(session.scalars.await_args_list[1].args[0])
+
+
+def test_sample_is_fixed_by_logical_snapshot_and_excludes_inapplicable_checks():
+    identity_by_name = {"candidate": {"generation_id": 9}, "counts": {"root_count": 3}}
+    plan = audit._sampling_plan(identity_by_name)
+    assert plan == audit._sampling_plan(deepcopy(identity_by_name))
+    assert len(plan["selected_ordinals"]) == len(set(plan["selected_ordinals"])) == 13
+    assert plan["population_count"] == 61 and plan["percent"] == 20
+    assert 61 not in plan["selected_ordinals"]
+    assert all(ordinal in (*range(1, 61), 62) for ordinal in plan["selected_ordinals"])
+    assert audit._sampling_plan({**identity_by_name, "candidate": {"generation_id": 10}}) != plan
+
+
+@pytest.mark.parametrize(
+    "field,value", [("percent", 20.0), ("seed", "0" * 64), ("selected_ordinals", []), ("population_count", 62)]
+)
+def test_sample_plan_cannot_be_changed_or_rerolled(field, value):
+    binding_by_name = {"identity": {"candidate": {"generation_id": 9}}}
+    binding_by_name["sampling"] = audit._sampling_plan(binding_by_name["identity"])
+    binding_by_name["sampling"][field] = value
+    with pytest.raises(audit.PostSealAuditRefused, match="sample plan differs"):
+        audit._selected_ordinals(binding_by_name)
+
+
+@pytest.mark.parametrize("candidate_generation", range(1, 8))
+async def test_sampled_ledger_reports_only_its_actual_scope(candidate_generation):
+    header, checkpoints = await _ledger(sampled=True, candidate_generation=candidate_generation)
+    selected_ordinals = set(header.binding["sampling"]["selected_ordinals"])
+    receipt = await audit.completed_audit_receipt(
+        _ledger_session(header, checkpoints), header.audit_id, engine_id="engine_a", family_id=7
+    )
+    assert receipt["contract"] == audit.SAMPLED_CONTRACT
+    assert receipt["sampling"] == header.binding["sampling"]
+    assert {
+        row.arm_ordinal for row in checkpoints if row.outcome in {"passed", "range_eof", "counts"}
+    } == selected_ordinals
+    assert checkpoints[-1].counts == (header.binding["identity"]["counts"] if 62 in selected_ordinals else {})
+
+
+async def test_sampled_transition_cannot_skip_selected_checks_or_claim_unmeasured_counts():
+    header, checkpoints = await _ledger(sampled=True)
+    selected = audit._selected_ordinals(header.binding)
+    ordinal = next(ordinal for ordinal in selected if ordinal not in (41, 42, 62))
+    checkpoints[ordinal].outcome = "not_applicable"
+    with pytest.raises(audit.PostSealAuditRefused, match="outcome differs"):
+        audit._validate_transition(checkpoints[ordinal - 1], checkpoints[ordinal], 2, selected)
+    # A sampled final checkpoint must not invent the result of an omitted count query.
+    final = SimpleNamespace(
+        **(
+            audit._next_checkpoint(SimpleNamespace(checkpoint=61, next_ordinal=62))
+            | {"state": "complete", "outcome": "not_applicable", "counts": {"root_count": 3}}
+        )
+    )
+    with pytest.raises(audit.PostSealAuditRefused, match="sampled omission differs"):
+        audit._validate_transition(SimpleNamespace(next_ordinal=62), final, 2, selected - {62})
+
+
+@pytest.mark.parametrize("sample_percent", [True, 0, 19, 20.0, "20", 101])
+async def test_invalid_sample_is_refused_before_database_access(sample_percent):
+    with pytest.raises(audit.PostSealAuditRefused, match="sample percent"):
+        await audit.begin_post_seal_audit(object(), 7, engine_id="engine_a", sample_percent=sample_percent)
+
+
+async def test_sampling_does_not_hide_recorded_failures():
+    header, _ = await _ledger(sampled=True)
+    omitted = min(set(range(1, 61)) - audit._selected_ordinals(header.binding))
+    session = SimpleNamespace(scalar=AsyncMock(return_value=omitted))
+    with pytest.raises(audit.PostSealAuditRefused, match="known failed check"):
+        await audit._check_known_failures(session, 7, header.binding)
+    query = session.scalar.await_args.args[0]
+    parameters = query.compile().params
+    assert parameters["family_id_1"] == 7
+    assert header.binding["identity"]["candidate"] in parameters.values()
+    assert set(parameters["arm_ordinal_1"]) == audit._selected_ordinals(header.binding)
 
 
 @pytest.mark.parametrize("damage", ["page_bound", "gap", "counts", "count_type"])
@@ -355,38 +435,26 @@ async def test_scratch_evidence_stays_bounded():
     session.flush.assert_not_awaited()
 
 
-@pytest.mark.parametrize("catalog", ["control", "functions", "projection", "heap", "writer", "column_writer"])
-async def test_audit_rejects_incomplete_catalog_custody(catalog):
+@pytest.mark.parametrize("catalog", ["control", "projection"])
+async def test_audit_rejects_incomplete_logical_records(catalog):
     generation, _materialization, _seal, _token = _generation_seal_fixtures()
     session = SimpleNamespace(scalar=AsyncMock(return_value=None), execute=AsyncMock(return_value=_rows([])))
     with pytest.raises(audit.PostSealAuditRefused):
         if catalog == "control":
             await audit._row_digests(session, '"synthetic"', generation)
-        elif catalog == "functions":
-            await audit._function_fingerprints(session, '"synthetic"')
-        elif catalog == "projection":
+        else:
             session.scalar.return_value = SimpleNamespace(family_id=8)
             await audit._projection_tables(session, SimpleNamespace(family_id=7, generation_id=9))
-        else:
-            heaps = (
-                []
-                if catalog == "heap"
-                else [{"writable": catalog == "writer", "column_writable": catalog == "column_writer"}]
-            )
-            session.execute.return_value = SimpleNamespace(mappings=lambda: _rows(heaps))
-            await audit._heap_fingerprints(session, ('"synthetic"."records"',))
 
 
-@pytest.mark.parametrize("damage", ["foreign_owner", "procedure"])
-async def test_retirement_requires_owned_plain_functions(damage):
+async def test_retirement_refuses_unsupported_routine_kind():
     routine = SimpleNamespace(
         oid=1,
         signature='"ci_snapshot_7"."guard"()',
-        owned=damage != "foreign_owner",
-        prokind="p" if damage == "procedure" else "f",
+        prokind="p",
     )
     session = SimpleNamespace(execute=AsyncMock(return_value=_rows([routine])))
-    with pytest.raises(retirement.SnapshotRetirementRefused, match="routine ownership"):
+    with pytest.raises(retirement.SnapshotRetirementRefused, match="routine kind"):
         await retirement._physical_drop(session, '"synthetic"', _retirement_family())
     session.execute.assert_awaited_once()
     assert str(session.execute.await_args.args[0]).lstrip().startswith("SELECT")
@@ -394,7 +462,7 @@ async def test_retirement_requires_owned_plain_functions(damage):
 
 async def test_retirement_refuses_cyclic_routine_dependencies():
     routines = [
-        SimpleNamespace(oid=identifier, signature=f'"ci_snapshot_7"."guard_{identifier}"()', owned=True, prokind="f")
+        SimpleNamespace(oid=identifier, signature=f'"ci_snapshot_7"."guard_{identifier}"()', prokind="f")
         for identifier in (1, 2)
     ]
     session = SimpleNamespace(execute=AsyncMock(side_effect=[_rows(routines), _rows([(1, 2), (2, 1)])]))
@@ -419,13 +487,6 @@ async def test_lifecycle_lock_requires_valid_engine_identity(engine):
     with pytest.raises(retirement.SnapshotRetirementRefused, match="engine identity"):
         await retirement.lock_snapshot_lifecycle(session, engine_id=engine, dataset_id=7)
     session.execute.assert_not_awaited()
-
-
-async def test_scratch_requires_complete_relation_census():
-    session = SimpleNamespace(execute=AsyncMock(), scalars=AsyncMock(return_value=_rows([])))
-    with pytest.raises(scratch.BuildScratchCleanupRefused, match="relation census"):
-        await scratch._manifest(session, '"synthetic"', SimpleNamespace(family_id=7, landing_table_oid=1))
-    session.execute.assert_awaited_once()
 
 
 async def test_retirement_requires_consistent_publication_history():

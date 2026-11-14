@@ -515,21 +515,19 @@ readable without rewriting their bytes or hashes.
 
 ### Capture database authority
 
-Original-byte acquisition is a trusted standalone registrar operation, not a
-direct-SQL worker capability. It requires effective ownership of the five
-capture relations: bundle, stream header, Parquet part, canonical usage and raw
-object. The pre-acquisition check refuses source access when any of those
-relations retains a non-owner table or column write grant, including grants to
-`PUBLIC` or an inherited group role. Explicit write grants to any non-owner are
-refused, even for superusers or owner-assumable roles: their grants can be
-inherited by less-privileged members. Registration checks again before inserting
-originals. The application never grants privileges or changes its role.
+Original-byte acquisition checks the registrar's effective PostgreSQL access
+before opening the source. Zero-row statements check bundle, header and raw-object
+inserts and reads, header locks and retained-byte accounting reads. The bundle
+sequence must permit allocation; preflight never advances it. These checks run
+on the registrar connection, including when a worker uses the capture handoff.
+They do not inspect owners or other roles' grants. Actual registration and
+readback remain subject to native permissions if access changes after preflight.
+The application never grants privileges or changes its role.
 Exact bound replay still reads the retained bytes without reacquiring a source.
 
 The raw-object migration is additive. It does not revoke existing canonical
-writer grants or enable hosted raw acquisition. A schema with restricted legacy
-canonical writers can keep those writers and all old guards; raw acquisition
-remains unavailable there until the write-authority cutover is complete.
+writer grants or enable hosted raw acquisition. Restricted canonical writers
+can coexist with a separately permitted raw registrar.
 
 Before upgrading a restricted segmented writer to the mixed-retention check,
 the database administrator must explicitly provision its existing quota-reader
@@ -550,14 +548,11 @@ They are explicit deployment provisioning, not automatic migration grants.
 Fresh segmented acquisition checks these metadata privileges without reading rows
 before opening the source; bound replay does not require this acquisition preflight.
 
-To enable originals, first upgrade every trusted capture writer, stop old writers
-and drain their open transactions. Then close non-owner write grants at every
-table and column grant root, preserving metadata-only reads. Inherited privileges
-must not recover a removed write grant. Preserve existing canonical counter,
-immutability and lease guards; do not disable them or rewrite their counters.
-Existing ordinary-SQL entry points or owner-role escalation must not bypass this
-boundary. Only then start trusted registrar acquisition. The check does not
-revoke a statement that was already authorized before the cutover.
+Before enabling originals, upgrade capture writers to the shared retained-byte
+accounting and drain their older transactions. Provision only the registrar's
+required native access; quota readers retain metadata-only access. Preserve
+existing canonical counter, immutability and lease guards. Preflight does not
+revoke a statement that was already authorized before a permission change.
 
 This is an authority boundary, not a format, revision or dataset restriction:
 trusted writers retain and replay mixed historical v1, v2 and raw captures in the

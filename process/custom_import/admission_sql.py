@@ -27,6 +27,7 @@ from process.custom_import.build_source import (
     _page_session,
     _prepare_statement,
     _resolve_build_snapshot,
+    _try_ordinary_write,
 )
 from process.custom_import.runner_types import CandidateRunnerError, SessionFactory
 from process.custom_import.storage_layout import snapshot_schema
@@ -77,36 +78,6 @@ class AdmissionError(RuntimeError):
     def __init__(self, code: str):
         super().__init__(code)
         self.sqlstate = "40001" if code == "custom_import_build_progress_conflict" else "P0001"
-
-
-async def _has_admission_owner(session) -> bool:
-    """Select direct SQL only for the existing cursor and dispatcher owner."""
-
-    await _prepare_statement(session)
-    connection = await session.connection()
-    model_schema = CustomImportBuildAttempt.__table__.schema
-    schema_map = connection.sync_connection.get_execution_options().get("schema_translate_map") or {}
-    control_schema = schema_map.get(model_schema, model_schema)
-    if not control_schema:
-        raise CandidateRunnerError("admission requires an explicit model schema")
-    control = connection.dialect.identifier_preparer.quote_schema(control_schema)
-    statement = text("""
-        SELECT pg_catalog.count(*)=2 AND coalesce(pg_catalog.bool_and(
-            pg_catalog.pg_get_userbyid(p.proowner)=CURRENT_USER),false)
-        FROM pg_catalog.pg_proc p WHERE p.oid IN (
-            pg_catalog.to_regprocedure(:begin),pg_catalog.to_regprocedure(:admit))
-    """).bindparams(bindparam("begin", type_=String()), bindparam("admit", type_=String()))
-    return (
-        await session.execute(
-            statement,
-            {
-                "begin": f"{control}.begin_custom_import_build("
-                "pg_catalog.int8,pg_catalog.int8,pg_catalog.bytea,pg_catalog.int8,pg_catalog.int8,pg_catalog.bool,"
-                "pg_catalog.int4,pg_catalog.int8,pg_catalog.int4,pg_catalog.timestamptz)",
-                "admit": f"{control}.admit_custom_import_build_page(pg_catalog.int8,pg_catalog.int8)",
-            },
-        )
-    ).scalar_one() is True
 
 
 @lru_cache(maxsize=1)
@@ -248,11 +219,11 @@ async def _verify_writer_permit(session, request, permit, purpose):
     ).scalar_one_or_none()
     if matched != request.execution_id:
         raise AdmissionError("custom_import_admission_authority_mismatch")
-    if not await _has_admission_owner(session):
-        raise AdmissionError("custom_import_admission_owner_required")
 
 
-async def _retry_admission_timeout(session_factory, request, build_id, error, *, admission_permit=None):
+async def _retry_admission_timeout(
+    session_factory, request, build_id, error, *, admission_permit=None, allow_dispatcher=False
+):
     """Retry one logical group only after the failed decision page fully closed."""
 
     cursor = getattr(error, "_custom_import_admission_cursor", None)
@@ -261,6 +232,13 @@ async def _retry_admission_timeout(session_factory, request, build_id, error, *,
     async with _page_session(session_factory, request, build_id) as (session, build):
         if admission_permit is not None:
             await _verify_admission_permit(session, request, admission_permit)
+        if allow_dispatcher:
+            direct, result = await _try_ordinary_write(
+                session, _admit_locked, build, cursor, physical_row_cap=build.page_row_limit
+            )
+            if not direct:
+                await _call(session, "admit_custom_import_build_page", (("bigint", build_id), ("bigint", cursor)))
+            return result
         return await _admit_locked(session, build, cursor, physical_row_cap=build.page_row_limit)
 
 

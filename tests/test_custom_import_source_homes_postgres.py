@@ -23,6 +23,7 @@ from process.custom_import.storage_layout import snapshot_schema
 from tests.custom_import_postgres_support import (
     _migration,
     _seed_publication_identity,
+    install_source_completion_contract,
     isolated_publication_case,
     lease_digest,
 )
@@ -214,6 +215,8 @@ async def _case():
 
 async def test_native_source_fresh_home_replay_and_missing_home_rejection():
     async with _case() as case:
+        async with case.engine.begin() as connection:
+            await connection.run_sync(install_source_completion_contract, case.schema_name)
         context, page, family_id = await _bootstrap(case)
         assert await source._store_single_page(case.sessions, context, page) == 1
         await source._compare_committed_page(case.sessions, context, page)

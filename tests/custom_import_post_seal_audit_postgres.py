@@ -394,10 +394,8 @@ async def test_child_reference_changed_sql_refuses_eighteen_checkpoint_prefix(mo
         # Exercise the real04 ->05 transition before the new verifier refresh.
         async with case.engine.begin() as connection:
             await _assert_logged_forward_migration(connection, case.schema_name, family_id)
-        with monkeypatch.context() as patch:
-            patch.setattr(audit, "_sql_resource", lambda: (old_document, old_hash))
-            with pytest.raises(audit.PostSealAuditRefused, match="binding changed; start a new attempt"):
-                await _step(case, progress)
+        with pytest.raises(audit.PostSealAuditRefused, match="SQL changed; start a new attempt"):
+            await _step(case, progress)
         with pytest.raises(audit.PostSealAuditRefused, match="SQL changed; start a new attempt"):
             await _begin(case, family_id)
         restarted = await _begin(case, family_id, restart=True)
@@ -618,7 +616,7 @@ async def test_manual_audit_resumes_and_authorizes_only_complete_cleanup(monkeyp
         before_read = await scratch._read(case, request, sealed.generation_id)
         progress = await _begin(case, family_id)
         assert (await _begin(case, family_id)).replayed
-        with pytest.raises(cleanup.BuildScratchCleanupRefused, match="full automated"):
+        with pytest.raises(cleanup.BuildScratchCleanupRefused, match="completed automated"):
             await scratch._trim(case, family_id)
         original = audit._run_arm
 
@@ -644,30 +642,71 @@ async def test_manual_audit_resumes_and_authorizes_only_complete_cleanup(monkeyp
         assert await scratch._read(case, request, sealed.generation_id) == before_read
 
 
-async def test_audit_stales_on_same_oid_heap_and_authority_changes(monkeypatch):
+async def test_sampled_audit_preserves_history_and_authorizes_only_its_completed_scope(monkeypatch):
+    monkeypatch.setattr(audit, "ROOT_PAGE_ROWS", 2)
+    async with _source_case() as case:
+        request, _, sealed, family_id = await _ready(case, monkeypatch)
+        await scratch.fixture._activate(case, request, sealed.generation_id)
+        before_read = await scratch._read(case, request, sealed.generation_id)
+        partial = await _step(case, await _begin(case, family_id))
+        async with case.sessions() as session:
+            previous = await session.get(Checkpoint, (partial.audit_id, partial.checkpoint))
+            previous_digest = bytes(previous.checkpoint_sha256)
+        with pytest.raises(audit.PostSealAuditRefused, match="sample changed"):
+            await _begin(case, family_id, sample_percent=20)
+        progress = await _begin(case, family_id, restart=True, sample_percent=20)
+        assert progress.audit_id != partial.audit_id
+        assert (await _begin(case, family_id)).audit_id == progress.audit_id
+        async with case.sessions() as session:
+            header = await session.get(Audit, progress.audit_id)
+            plan = deepcopy(header.binding["sampling"])
+        with pytest.raises(cleanup.BuildScratchCleanupRefused, match="completed automated"):
+            await scratch._trim(case, family_id)
+        executed_ordinals = set()
+        original = audit._run_arm
+
+        async def observe(session, context, previous):
+            executed_ordinals.add(previous.next_ordinal)
+            return await original(session, context, previous)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(audit, "_run_arm", observe)
+            progress = await _finish(case, progress)
+        assert progress.state == "complete"
+        assert executed_ordinals == set(plan["selected_ordinals"])
+        async with case.sessions() as session, session.begin():
+            await scratch._bounds(session)
+            receipt = await audit.completed_audit_receipt(
+                session, progress.audit_id, engine_id="synthetic_engine", family_id=family_id
+            )
+            assert receipt["contract"] == audit.SAMPLED_CONTRACT
+            assert receipt["sampling"] == plan
+            previous = await session.get(Checkpoint, (partial.audit_id, partial.checkpoint))
+            assert bytes(previous.checkpoint_sha256) == previous_digest
+            assert previous.state == "scanning"
+            assert (
+                await session.scalar(
+                    select(func.count()).select_from(Checkpoint).where(Checkpoint.audit_id == partial.audit_id)
+                )
+                == partial.checkpoint + 1
+            )
+            final = await session.get(Checkpoint, (progress.audit_id, progress.checkpoint))
+            if 62 not in executed_ordinals:
+                assert final.counts == {} and final.outcome == "not_applicable"
+        assert not (await scratch._trim(case, family_id)).replayed
+        assert (await scratch._trim(case, family_id)).replayed
+        assert await scratch._read(case, request, sealed.generation_id) == before_read
+
+
+async def test_audit_accepts_storage_maintenance_but_rejects_sql_changes(monkeypatch):
     async with _source_case() as case:
         _request, _build_id, _sealed, family_id = await _ready(case, monkeypatch)
         progress = await _begin(case, family_id)
-        async with case.sessions() as session, session.begin():
-            await scratch._bounds(session)
-            with pytest.raises(audit.PostSealAuditRefused, match="binding changed"):
-                async with session.begin_nested():
-                    await session.execute(text(f'TRUNCATE "ci_snapshot_{family_id}".source_bulk_landing'))
-                    await audit.advance_post_seal_audit(
-                        session, progress.audit_id, engine_id="synthetic_engine", expected_checkpoint=0
-                    )
-        async with case.sessions() as session, session.begin():
-            await scratch._bounds(session)
-            with pytest.raises(audit.PostSealAuditRefused, match="binding changed"):
-                async with session.begin_nested():
-                    await session.execute(
-                        text(
-                            f'ALTER FUNCTION "{case.schema_name}".verify_custom_import_build_structure(bigint) COST 101'
-                        )
-                    )
-                    await audit.advance_post_seal_audit(
-                        session, progress.audit_id, engine_id="synthetic_engine", expected_checkpoint=0
-                    )
+        async with case.engine.begin() as connection:
+            await connection.execute(text(f'TRUNCATE "ci_snapshot_{family_id}".source_bulk_landing'))
+            await connection.execute(
+                text(f'ALTER FUNCTION "{case.schema_name}".verify_custom_import_build_structure(bigint) COST 101')
+            )
         document, _old_hash = audit._sql_resource()
         with monkeypatch.context() as patch:
             patch.setattr(audit, "_sql_resource", lambda: (document, b"s" * 32))
@@ -696,7 +735,7 @@ async def test_audit_records_real_invariant_failure_without_waiving_it(monkeypat
         with pytest.raises(audit.PostSealAuditRefused, match="failed"):
             await _begin(case, family_id)
         assert (await _begin(case, family_id, restart=True)).audit_id != progress.audit_id
-        with pytest.raises(cleanup.BuildScratchCleanupRefused, match="full automated"):
+        with pytest.raises(cleanup.BuildScratchCleanupRefused, match="completed automated"):
             await scratch._trim(case, family_id)
         assert await manual._proof(case, build_id) == original
 
@@ -792,7 +831,7 @@ async def test_audit_metadata_is_owner_only_and_append_chain_is_checked(monkeypa
         await _assert_audit_storage_custody(case)
 
 
-async def test_audit_reads_trimmed_retained_base_and_rejects_base_rewrite(monkeypatch):
+async def test_audit_reads_trimmed_retained_base_and_preserves_immutable_manifest(monkeypatch):
     monkeypatch.setattr(audit, "ROOT_PAGE_ROWS", 2)
     async with _source_case() as case:
         async with case.engine.begin() as connection:
@@ -814,14 +853,42 @@ async def test_audit_reads_trimmed_retained_base_and_rejects_base_rewrite(monkey
         await _assert_complete(case, progress)
         async with case.sessions() as session, session.begin():
             await scratch._bounds(session)
-            with pytest.raises(audit.PostSealAuditRefused, match="binding changed"):
+            with pytest.raises(DBAPIError, match="custom_import_build_immutable"):
                 async with session.begin_nested():
-                    await session.execute(text(f'TRUNCATE "ci_snapshot_{base_family}".source_bulk_landing'))
-                    context = await audit.audit_context_for_trim(session, family_id, engine_id="synthetic_engine")
-                    await audit.verified_audit_for_trim(session, context, engine_id="synthetic_engine")
+                    await session.execute(
+                        text(
+                            f"UPDATE \"{case.schema_name}\".custom_import_generation SET created_at=created_at+INTERVAL '1 second' WHERE generation_id=:generation"
+                        ),
+                        {"generation": first.generation_id},
+                    )
+            context = await audit.audit_context_for_trim(session, family_id, engine_id="synthetic_engine")
+            await audit.verified_audit_for_trim(session, context, engine_id="synthetic_engine")
 
 
-async def test_audit_binds_completed_projection_heaps_and_manifest():
+async def _assert_portable_audit_identity(session, context):
+    relations = await audit._leaf_tables(session, context.family)
+    assert relations == context.identity["candidate_relations"]
+    assert all(
+        isinstance(name, str) and name.startswith(f'"ci_snapshot_{context.family.family_id}".') for name in relations
+    )
+    copied = '"audit_copy_' + uuid.uuid4().hex[:12] + '"'
+    await session.execute(text(f"CREATE SCHEMA {copied}"))
+    try:
+        for table in audit._CONTROL_FIELDS:
+            await session.execute(text(f"CREATE TABLE {copied}.{table} AS TABLE {context.quoted}.{table}"))
+        assert await session.scalar(
+            text("SELECT to_regclass(:original)::oid <> to_regclass(:copied)::oid"),
+            {"original": f"{context.quoted}.custom_import_generation", "copied": f"{copied}.custom_import_generation"},
+        )
+        assert (
+            await audit._row_digests(session, copied, context.generation, context.build.build_id)
+            == context.identity["candidate_rows"]
+        )
+    finally:
+        await session.execute(text(f"DROP SCHEMA {copied} CASCADE"))
+
+
+async def test_audit_binds_completed_projection_manifest():
     async with _source_case() as case:
         async with case.engine.begin() as connection:
             await connection.run_sync(install_audit_migration, case.schema_name)
@@ -837,20 +904,18 @@ async def test_audit_binds_completed_projection_heaps_and_manifest():
         async with case.sessions() as session, session.begin():
             await scratch._bounds(session)
             header = await session.get(Audit, progress.audit_id)
-            derived_oids = (
-                await session.scalars(
-                    text(
-                        "SELECT c.oid::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-                        "WHERE n.nspname=:namespace AND c.relname IN ('custom_import_derived_root','custom_import_derived_child')"
-                    ),
-                    {"namespace": f"ci_snapshot_{family_id}"},
-                )
-            ).all()
-            assert len(derived_oids) == 2 and all(str(oid) in header.binding["heaps"] for oid in derived_oids)
+            assert set(header.binding) == {"contract", "identity", "root_page_rows"}
             assert "custom_import_query_projection" in header.binding["identity"]["candidate_rows"]
+            context = await audit.audit_context_for_trim(session, family_id, engine_id="synthetic_engine")
+            await _assert_portable_audit_identity(session, context)
             with pytest.raises(audit.PostSealAuditRefused, match="binding changed"):
                 async with session.begin_nested():
-                    await session.execute(text(f'TRUNCATE "ci_snapshot_{family_id}".custom_import_derived_root'))
+                    await session.execute(
+                        text(
+                            f"UPDATE \"{case.schema_name}\".custom_import_query_projection SET created_at=created_at+INTERVAL '1 second' WHERE family_id=:family"
+                        ),
+                        {"family": family_id},
+                    )
                     await audit.advance_post_seal_audit(
                         session, progress.audit_id, engine_id="synthetic_engine", expected_checkpoint=0
                     )
@@ -1060,10 +1125,8 @@ async def test_family_reference_changed_sql_requires_fresh_twenty_checkpoint_aud
             await _begin(case, family_id)
         async with case.engine.begin() as connection:
             await connection.run_sync(_refresh_family_reference, case.schema_name)
-        with monkeypatch.context() as patch:
-            patch.setattr(audit, "_sql_resource", lambda: (old_document, old_hash))
-            with pytest.raises(audit.PostSealAuditRefused, match="binding changed; start a new attempt"):
-                await _step(case, previous)
+        with pytest.raises(audit.PostSealAuditRefused, match="SQL changed; start a new attempt"):
+            await _step(case, previous)
         restarted = await _begin(case, family_id, restart=True)
         assert restarted.audit_id != previous.audit_id and (restarted.checkpoint, restarted.next_ordinal) == (0, 1)
         for _ in range(20):

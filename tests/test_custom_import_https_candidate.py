@@ -154,7 +154,7 @@ def coordinator(monkeypatch):
         return replace(grant, fence=kwargs["fence"])
 
     mocks_by_name = {
-        "require_raw_capture_authority": AsyncMock(),
+        "require_raw_capture_write_access": AsyncMock(),
         "load_registry": AsyncMock(),
         "reserve_execution": AsyncMock(return_value=ExecutionSubmission(17, "queued", True)),
         "lookup_execution_request": AsyncMock(return_value=ExecutionSubmission(17, "running", False, 23)),

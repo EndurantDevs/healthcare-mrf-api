@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Native batch homes exercise stored producers, OIDs, replay and real commits."""
+"""Native batch homes exercise stored producers, replay and real commits."""
 
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -21,13 +21,16 @@ from tests.custom_import_build_scratch_postgres import (
     test_cleanup_is_atomic_pin_safe_and_preserves_retained_base_continuation as test_cleanup_is_atomic_pin_safe_and_preserves_retained_base_continuation,
 )
 from tests.custom_import_build_scratch_postgres import (
-    test_cleanup_owner_custody_and_changed_registry_refusal as test_cleanup_owner_custody_and_changed_registry_refusal,
+    test_cleanup_obeys_native_permissions_and_preserves_metadata as test_cleanup_obeys_native_permissions_and_preserves_metadata,
 )
 from tests.custom_import_build_scratch_postgres import (
     test_cleanup_refuses_phase_index_rebound_to_a_serving_table as test_cleanup_refuses_phase_index_rebound_to_a_serving_table,
 )
 from tests.custom_import_build_scratch_postgres import (
     test_cleanup_refuses_unverified_and_manual_accepted_scratch as test_cleanup_refuses_unverified_and_manual_accepted_scratch,
+)
+from tests.custom_import_build_scratch_postgres import (
+    test_cleanup_replay_preserves_history_and_requires_empty_named_scratch as test_cleanup_replay_preserves_history_and_requires_empty_named_scratch,
 )
 from tests.custom_import_build_scratch_postgres import (
     test_retention_sweep_trims_kept_sealed_scratch_and_replays as test_retention_sweep_trims_kept_sealed_scratch_and_replays,
@@ -223,8 +226,8 @@ async def test_native_materialization_functions_have_no_nonowner_execute_acl():
             )
 
 
-async def test_inventory_supports_two_atomic_retirements_on_one_backend(monkeypatch):
-    from process.custom_import import retirement, retirement_inventory
+async def test_retirement_supports_two_atomic_retirements_with_fresh_reference_scans(monkeypatch):
+    from process.custom_import import retirement
     from tests import custom_import_retirement_postgres as retirement_fixture
     from tests.test_custom_import_snapshot_storage_postgres import (
         _bounded,
@@ -235,38 +238,26 @@ async def test_inventory_supports_two_atomic_retirements_on_one_backend(monkeypa
         _, _, first = await retirement_fixture._superseded_snapshot(case)
         _, _, second = await retirement_fixture._superseded_snapshot(case)
         _, _, kept = await _sealed_current_snapshot(case)
-        try:
+        original = retirement._revision_references
+        scans = []
+
+        async def record_reference_scan(session, family, *args, **kwargs):
+            scans.append((family.family_id, kwargs.get("include_canonical", True)))
+            await original(session, family, *args, **kwargs)
+
+        monkeypatch.setattr(retirement, "_revision_references", record_reference_scan)
+        for family_id in (first, second):
             async with AsyncSession(bind=connection) as session, session.begin():
                 await _bounded(session)
-                backend = await session.scalar(text("SELECT pg_backend_pid()"))
-                await retirement_inventory.prepare_frozen_reference_inventory(session)
-            original = retirement._revision_references
-            scans = []
-
-            async def record_reference_scan(session, family, *args, **kwargs):
-                scans.append((family.family_id, kwargs.get("include_canonical", True)))
-                await original(session, family, *args, **kwargs)
-
-            monkeypatch.setattr(retirement, "_revision_references", record_reference_scan)
-            for family_id in (first, second):
-                async with AsyncSession(bind=connection) as session, session.begin():
-                    await _bounded(session)
-                    receipt = await retirement.retire_snapshot_family(
-                        session,
-                        family_id,
-                        engine_id="synthetic",
-                        assert_external_unreferenced=retirement_fixture._published_fixture_check,
-                    )
-                    assert receipt.reason == "superseded" and not receipt.replayed
-                    assert await session.scalar(text("SELECT pg_backend_pid()")) == backend
-            assert scans == [(first, False), (first, True), (second, False), (second, True)]
-            async with AsyncSession(bind=connection) as session, session.begin():
-                assert (
-                    await session.scalar(text("SELECT to_regnamespace(:name)"), {"name": snapshot_schema(kept)})
-                    is not None
+                receipt = await retirement.retire_snapshot_family(
+                    session,
+                    family_id,
+                    engine_id="synthetic",
+                    assert_external_unreferenced=retirement_fixture._published_fixture_check,
                 )
-        finally:
-            if connection.in_transaction():
-                await connection.rollback()
-            async with AsyncSession(bind=connection) as session, session.begin():
-                await retirement_inventory.cleanup_frozen_reference_inventory(session)
+                assert receipt.reason == "superseded" and not receipt.replayed
+        assert scans == [(first, False), (first, True), (second, False), (second, True)]
+        async with AsyncSession(bind=connection) as session, session.begin():
+            assert (
+                await session.scalar(text("SELECT to_regnamespace(:name)"), {"name": snapshot_schema(kept)}) is not None
+            )

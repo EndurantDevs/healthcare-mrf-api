@@ -106,7 +106,16 @@ def test_factorized_downgrade_refuses_immutable_v3_candidates(monkeypatch) -> No
 
 def _assert_current_registry_head(script):
     """Keep the complete catalog refresh and inventory revision chain explicit."""
-    assert script.get_heads() == ["20261115010000_ms_drg_companion_tables"]
+    assert script.get_heads() == ["20261114020000_custom_import_snapshot_metadata"]
+    assert script.get_revision("20261114020000_custom_import_snapshot_metadata").down_revision == (
+        "20261114010000_custom_import_snapshot_names"
+    )
+    assert script.get_revision("20261114010000_custom_import_snapshot_names").down_revision == (
+        "20261115010000_ms_drg_companion_tables"
+    )
+    assert script.get_revision("20261115010000_ms_drg_companion_tables").down_revision == (
+        "20261113010000_address_canonical_space_normalization"
+    )
     assert script.get_revision("20261113010000_address_canonical_space_normalization").down_revision == (
         "20261111010000_code_sets_publication_idempotency"
     )

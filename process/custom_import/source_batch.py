@@ -167,13 +167,6 @@ async def _load_request(session, execution_id, build_id, fence, lease_token, sou
     return request, policy.capture, build.capture_bundle_id
 
 
-async def _require_owner(session):
-    """Check both exact mapped entry-point owners; never grant or SET ROLE."""
-
-    if not await staging._is_source_writer_owner(session):
-        raise RuntimeError("trusted SOURCE requires the existing entry-point owners")
-
-
 async def _verify_source_permit(session, request, source_permit):
     """Recheck exact signed scope under the existing execution/build locks."""
     if not isinstance(source_permit, SourcePermit) or (
@@ -215,7 +208,6 @@ async def _verify_source_permit(session, request, source_permit):
     ).scalar_one_or_none()
     if matched != request.execution_id:
         raise RuntimeError("custom_import_source_authority_mismatch")
-    await _require_owner(session)
 
 
 @asynccontextmanager
