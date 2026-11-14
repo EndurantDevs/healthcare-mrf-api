@@ -53,6 +53,12 @@ def _entry_sha256(name: str, entry: Any) -> str:
     return hashlib.sha256(_stable_json([name, entry]).encode()).hexdigest()
 
 
+class _HashedRole(dict):
+    """A finished merged role that keeps its commitments, so the repeat check and the proof shard reuse them."""
+
+    __slots__ = ("components",)
+
+
 def _role_network_fields(payload_by_field: Mapping[str, Any]) -> list[str]:
     """Name the list fields that vary per network within one merged role."""
 
@@ -121,6 +127,8 @@ def _is_merged_role(payload_by_field: Mapping[str, Any]) -> bool:
 def merged_role_hash_components(payload_by_field: Mapping[str, Any]) -> tuple[str, list[str], str] | None:
     """Return the base, per-network entry and payload commitments of a merged role, or None for any other payload."""
 
+    if type(payload_by_field) is _HashedRole:
+        return payload_by_field.components
     if not _is_merged_role(payload_by_field):
         return None
     if payload_by_field.get(_REPEAT) is True:
@@ -169,17 +177,21 @@ def merged_role_rows(
         payload_by_role_id[payload_by_field["resource_id"]] = (
             payload_by_field if previous is None else merge_semantic_resource_payloads(previous, payload_by_field)
         )
-    return [
-        {
-            **retained_rows[0],
-            "resource_id": role_id,
-            "payload_hash": resource_payload_sha256_for_contract(
-                payload_by_field, resource_hash_contract, resource_type="PractitionerRole"
-            ),
-            "payload_json": payload_by_field,
-        }
-        for role_id, payload_by_field in sorted(payload_by_role_id.items())
-    ]
+    merged_rows = []
+    for role_id, payload_by_field in sorted(payload_by_role_id.items()):
+        hashed_role = _HashedRole(payload_by_field)
+        hashed_role.components = merged_role_hash_components(payload_by_field)
+        merged_rows.append(
+            {
+                **retained_rows[0],
+                "resource_id": role_id,
+                "payload_hash": resource_payload_sha256_for_contract(
+                    hashed_role, resource_hash_contract, resource_type="PractitionerRole"
+                ),
+                "payload_json": hashed_role,
+            }
+        )
+    return merged_rows
 
 
 def _merge_role_payloads(first: Mapping[str, Any], second: Mapping[str, Any]) -> dict[str, Any] | None:

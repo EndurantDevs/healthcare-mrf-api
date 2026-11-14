@@ -26,7 +26,7 @@ def identifier_descriptor(identifier: dict[str, Any]) -> str:
     for coding in identifier_type.get("coding") or []:
         if isinstance(coding, dict):
             descriptor_parts.extend((coding.get("system"), coding.get("code"), coding.get("display")))
-    return " ".join(str(part).lower() for part in descriptor_parts if part)
+    return " ".join([str(part).lower() for part in descriptor_parts if part])
 
 
 def identifier_value(resource: dict[str, Any], *tokens: str, allow_systemless: bool = False) -> str | None:
@@ -55,9 +55,10 @@ def explicit_npi(resource: dict[str, Any], *, valid_only: bool = False) -> int |
         if not isinstance(identifier, dict):
             continue
         value = _clean_text(identifier.get("value"))
-        if not value or not any(
-            token in identifier_descriptor(identifier) for token in ("us-npi", "npi", "national provider")
-        ):
+        if not value:
+            continue
+        descriptor = identifier_descriptor(identifier)
+        if not any(token in descriptor for token in ("us-npi", "npi", "national provider")):
             continue
         if valid_only and any(ch.isnumeric() and not ch.isascii() for ch in value):
             continue
