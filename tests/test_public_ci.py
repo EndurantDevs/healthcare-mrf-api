@@ -1,6 +1,8 @@
 """Public validation remains runnable without organization infrastructure."""
 
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -197,7 +199,11 @@ def _assert_source_validation_job(workflow) -> None:
 def test_public_ci_is_hosted_read_only_and_runs_import_checks():
     """Pin hosted stages, trusted artifacts and read-only source validation."""
     workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
-    assert sorted(path.name for path in workflows.iterdir()) == ["artifact-cleanup.yml", "ci.yml"]
+    assert sorted(path.name for path in workflows.iterdir()) == [
+        "artifact-cleanup.yml",
+        "ci.yml",
+        "postgres-client-cache.yml",
+    ]
     text = (workflows / "ci.yml").read_text(encoding="utf-8")
     workflow = yaml.safe_load(text)
     assert set(workflow.get("on", workflow.get(True))) == {"pull_request", "push", "merge_group"}
@@ -527,6 +533,39 @@ def test_catalog_integration_requires_capability_and_complete_eligible_execution
     )
     assert steps_by_name["Upload exact-source catalog integration evidence"]["with"]["if-no-files-found"] == "error"
     assert "fhir-catalog-integration" in jobs["measurement"]["needs"]
+
+
+def test_weekly_cache_warmup_reuses_database_lane_client_steps(tmp_path):
+    workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
+    warmup = yaml.safe_load((workflows / "postgres-client-cache.yml").read_text())
+    assert warmup.get("on", warmup.get(True)) == {"schedule": [{"cron": "17 0 * * 1"}], "workflow_dispatch": None}
+    assert warmup["permissions"] == {"contents": "read"}
+    job = warmup["jobs"]["warm"]
+    assert job["if"] == "github.repository == 'EndurantDevs/healthcare-mrf-api' && github.ref == 'refs/heads/dev'"
+    assert job["runs-on"] == "ubuntu-latest"
+    for step in job["steps"]:
+        if "uses" in step:
+            assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", step["uses"])
+        if step.get("uses", "").startswith("actions/checkout@"):
+            assert step["with"]["persist-credentials"] is False
+    workflow = yaml.safe_load((workflows / "ci.yml").read_text())
+    lane_steps = workflow["jobs"]["address-canonical-db-tests"]["steps"]
+    start = [step.get("name") for step in lane_steps].index("Resolve PostgreSQL client cache key")
+    # Identical steps compute the same cache key as the database lanes.
+    assert job["steps"][-4:] == lane_steps[start : start + 4]
+    steps_by_name = {step["name"]: step for step in job["steps"]}
+    assert steps_by_name["Check out pinned public CI"]["with"]["ref"] == "${{ steps.pin.outputs.revision }}"
+    workflow_directory = tmp_path / "source/.github/workflows"
+    workflow_directory.mkdir(parents=True)
+    (workflow_directory / "ci.yml").write_text((workflows / "ci.yml").read_text())
+    output = tmp_path / "github-output"
+    subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", steps_by_name["Read the pinned CI revision"]["run"]],
+        cwd=tmp_path,
+        env={**os.environ, "GITHUB_OUTPUT": str(output)},
+        check=True,
+    )
+    assert output.read_text() == f"revision={workflow['env']['CI_REVISION']}\n"
 
 
 def test_completed_cleanup_is_independent_and_executes_only_a_pinned_helper():

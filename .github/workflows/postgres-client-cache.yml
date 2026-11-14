@@ -1,0 +1,67 @@
+name: PostgreSQL client cache
+'on':
+  schedule:
+    # The cache key rotates with the ISO week, which starts Monday 00:00 UTC.
+    - cron: '17 0 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: postgres-client-cache
+  cancel-in-progress: false
+env:
+  CI_ROOT: ${{ github.workspace }}/ci
+jobs:
+  warm:
+    name: Warm PostgreSQL client cache
+    # Caches saved on the default branch are readable by every pull request and merge queue run.
+    if: github.repository == 'EndurantDevs/healthcare-mrf-api' && github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the CI workflow
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: source
+          sparse-checkout: .github/workflows/ci.yml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Read the pinned CI revision
+        id: pin
+        run: |
+          revision=$(sed -n 's/^  CI_REVISION: \([0-9a-f]\{40\}\)$/\1/p' source/.github/workflows/ci.yml)
+          test "${#revision}" -eq 40
+          printf 'revision=%s\n' "$revision" >> "$GITHUB_OUTPUT"
+      - name: Check out pinned public CI
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: EndurantDevs/endurant-ci
+          ref: ${{ steps.pin.outputs.revision }}
+          path: ci
+          persist-credentials: false
+      # The steps below must match the database lanes in ci.yml so both compute the same cache key.
+      - name: Resolve PostgreSQL client cache key
+        id: postgres-client-key
+        env:
+          INSTALLER_HASH: ${{ hashFiles('ci/scripts/install_postgres_client') }}
+        run: |
+          . /etc/os-release
+          printf 'key=postgres-client-18-%s-%s-%s-%s\n' "$VERSION_CODENAME" "$(dpkg --print-architecture)" \
+            "$(date -u +%G-W%V)" "$INSTALLER_HASH" >> "$GITHUB_OUTPUT"
+      - name: Restore PostgreSQL client packages
+        id: postgres-client-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/postgres-client-cache
+          key: ${{ steps.postgres-client-key.outputs.key }}
+      - name: Install PostgreSQL client
+        id: postgres-client
+        env:
+          POSTGRES_CLIENT_CACHE: ${{ runner.temp }}/postgres-client-cache
+        run: bash "$CI_ROOT/scripts/install_postgres_client"
+      - name: Save PostgreSQL client packages
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/postgres-client-cache
+          key: ${{ steps.postgres-client-key.outputs.key }}
+        if: steps.postgres-client-cache.outputs.cache-hit != 'true' && steps.postgres-client.outputs.cache-ready == 'true'
