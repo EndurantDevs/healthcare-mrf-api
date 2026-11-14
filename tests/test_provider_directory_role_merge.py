@@ -178,3 +178,14 @@ def test_proofs_of_two_merged_roles_never_reduce_to_one() -> None:
 
     with pytest.raises(proof_store.ProviderDirectoryProofStoreError, match="identity changed"):
         proof_store.reduce_dataset_proof_records(records)
+
+
+def test_merged_rows_carry_the_commitments_a_fresh_hash_gives(staged_row) -> None:
+    merged_row = staged_row(role("r1", "n1"))
+    plain_payload_by_field = dict(merged_row["payload_json"])
+
+    assert role_merge.merged_role_hash_components(merged_row["payload_json"]) == (
+        role_merge.merged_role_hash_components(plain_payload_by_field)
+    )
+    assert merged_row["payload_hash"] == role_merge.merged_role_hash_components(plain_payload_by_field)[2]
+    assert json.dumps(merged_row["payload_json"], sort_keys=True) == json.dumps(plain_payload_by_field, sort_keys=True)

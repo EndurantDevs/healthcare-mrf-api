@@ -2,10 +2,12 @@
 """Bound independent bulk transfers without sharing physical Source sessions."""
 
 import asyncio
-from contextlib import asynccontextmanager, nullcontext
-from dataclasses import replace
+from contextlib import asynccontextmanager, nullcontext, suppress
+from dataclasses import dataclass, replace
 from functools import partial
+from typing import Any
 
+from process import provider_directory_bulk_spool as spool
 from process.provider_directory_fhir_response import AdaptiveRequestSlots
 from process.provider_directory_generic_source_policy import source_copy_executor
 
@@ -63,11 +65,19 @@ def preferred_output_error(directory, current_error, candidate_error):
 async def stream_output(directory, session, source_record, identity, manifest, output_pair, options, stream_state):
     """Retry a broken stream from its committed boundary under the original guard."""
     output, checkpoint = output_pair
+    is_spooled = options.range_resume_enabled and spool.is_enabled(source_record)
+    if is_spooled and (
+        spool_error := await _spooled_export(directory, session, source_record, identity, manifest, options)
+    ):
+        return spool_error
     attempts = directory._source_fetch_retry_attempts()
     for attempt in range(attempts):
         error = await directory._stream_one_checkpointed_bulk_output(
             session, source_record, identity, manifest, output, checkpoint, options, stream_state
         )
+        if is_spooled and error is None:
+            validator = directory._stored_bulk_output_validator(checkpoint)
+            spool.spooled_output(identity.checkpoint_id, output.output_index, validator).path.unlink(missing_ok=True)
         if not options.range_resume_enabled or error not in _TRANSIENT_STREAM_ERRORS or attempt + 1 >= attempts:
             return error
         validator = directory._stored_bulk_output_validator(checkpoint)
@@ -95,6 +105,202 @@ async def stream_output(directory, session, source_record, identity, manifest, o
             committed_bytes=checkpoint["committed_bytes"],
             error=error,
         )
+
+
+def holds_copy(source_record, checkpoint_id, output_checkpoint, validator):
+    """Whether this validated output is already saved, so its link is no longer needed."""
+    return (
+        validator is not None
+        and spool.is_enabled(source_record)
+        and spool.spooled_output(checkpoint_id, output_checkpoint["output_index"], validator).path.exists()
+    )
+
+
+# A slow transfer still observes cancellation and the deadline while it stays below one frame.
+_COPY_PROBE_SECONDS = 1.0
+
+
+@dataclass(frozen=True)
+class _CopyContext:
+    directory: Any
+    session: Any
+    source_record: dict
+    identity: Any
+    manifest: Any
+    options: Any
+
+
+async def _spooled_export(directory, session, source_record, identity, manifest, options):
+    """Save every incomplete output of one export once, before any of them is parsed."""
+    tasks_by_checkpoint = state(directory, source_record).setdefault("spool_exports", {})
+    task = tasks_by_checkpoint.get(identity.checkpoint_id)
+    if task is None:
+        context = _CopyContext(directory, session, source_record, identity, manifest, options)
+        task = asyncio.create_task(_spool_export(context))
+        tasks_by_checkpoint[identity.checkpoint_id] = task
+    try:
+        # Every stream of the export waits on one shared task; a cancelled stream stops it only through the drain.
+        error = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await _cancel_and_drain([task])
+        raise
+    if error and tasks_by_checkpoint.get(identity.checkpoint_id) is task:
+        del tasks_by_checkpoint[identity.checkpoint_id]  # a later attempt downloads what is still missing
+    return error
+
+
+async def _spool_export(context):
+    directory, checkpoint_id = context.directory, context.identity.checkpoint_id
+    checkpoints = await directory._load_bulk_output_checkpoints(checkpoint_id)
+    spooled_outputs = []
+    for output in context.manifest.outputs:
+        checkpoint = directory._bulk_output_checkpoint_for_manifest_output(checkpoint_id, output, checkpoints)
+        # Completion clears the ETag capability and keeps only its proof, so a completed output has no validator.
+        if directory._is_complete_bulk_output_proof(checkpoint):
+            continue
+        validator = directory._stored_bulk_output_validator(checkpoint)
+        if validator is None:
+            return "bulk_export_spool_validator_missing"
+        spooled_outputs.append((output, spool.spooled_output(checkpoint_id, output.output_index, validator)))
+    # The shared transfer budget bounds how many downloads run at once.
+    tasks = [asyncio.create_task(_spool_output(context, pair)) for pair in spooled_outputs]
+    if not tasks:
+        return None
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    except asyncio.CancelledError:
+        await _cancel_and_drain(tasks)
+        raise
+    if pending:  # a download raised: stop the others before the failure propagates
+        await _cancel_and_drain(pending)
+    for task in done:
+        if not task.cancelled() and task.exception() is not None:
+            raise task.exception()
+    output_error = None
+    for task in tasks:
+        output_error = preferred_output_error(directory, output_error, task.result())
+    return output_error
+
+
+async def _cancel_and_drain(tasks):
+    """Cancel each download once and wait until every one has closed its copy, even if the waiter is cancelled again.
+
+    Checkpoint ownership is released only after this returns, so no copy is still being written when a retry starts.
+    """
+    for task in tasks:
+        task.cancel()
+    while not all(task.done() for task in tasks):
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait(tasks)
+
+
+async def _spool_output(context, spooled_pair):
+    directory, spooled = context.directory, spooled_pair[1]
+    attempts = directory._source_fetch_retry_attempts()
+    for attempt in range(attempts):
+        error = None if spooled.path.exists() else await _timed_download(context, spooled_pair)
+        if error is None:
+            fetch_url = _output_request(context, spooled_pair, 0)[1].fetch_url
+            state(directory, context.source_record).setdefault("spool", {})[fetch_url] = spooled
+            return None
+        if not is_transient_output_error(directory, error) or attempt + 1 >= attempts:
+            return error
+        await asyncio.sleep(directory._source_fetch_retry_delay_seconds(attempt))
+    return "bulk_export_spool_incomplete"
+
+
+async def _timed_download(context, spooled_pair):
+    """Download one copy and log its size and duration, the download rate the link window depends on."""
+    directory, (output, spooled) = context.directory, spooled_pair
+    started = directory.time.monotonic()
+    error = await _download_copy(context, spooled_pair)
+    if error is None:
+        directory._bulk_export_log(
+            "spool_output",
+            source_id=context.source_record.get("source_id"),
+            output_index=output.output_index,
+            raw_bytes=spooled.content_length,
+            stored_bytes=spooled.path.stat().st_size,
+            seconds=round(directory.time.monotonic() - started, 1),
+        )
+    return error
+
+
+def _output_request(context, spooled_pair, offset):
+    output, spooled = spooled_pair
+    resume = context.directory.BulkOutputResumeOptions(None, offset, spooled.etag, spooled.content_length)
+    output_request = context.directory._bulk_output_stream_request(
+        context.source_record,
+        output.url,
+        requires_access_token=context.manifest.requires_access_token,
+        resume_options=resume,
+    )
+    return resume, output_request
+
+
+async def _download_copy(context, spooled_pair):
+    """Download one output into its copy through the same request budget and response checks as a stream."""
+    directory = context.directory
+    writer = await asyncio.to_thread(spool.SpoolWriter, spooled_pair[1])
+    try:
+        error = await _receive_copy(context, spooled_pair, writer)
+        if error is None:
+            await asyncio.to_thread(writer.finish)
+        return error
+    except asyncio.CancelledError, directory.ImportCancelledError, directory.ResourceImportControlPlaneFailure:
+        raise
+    except spool.SpoolLengthError as exc:
+        await asyncio.to_thread(writer.discard)
+        return str(exc)
+    except Exception as exc:
+        if (error := directory._bulk_stream_error(exc)) is None:
+            raise
+        return error
+    finally:
+        await asyncio.to_thread(writer.close)
+
+
+async def _receive_copy(context, spooled_pair, writer):
+    """Append the bytes past the copy's last durable frame, probing on a time cadence and renewing per frame."""
+    if writer.durable_bytes >= spooled_pair[1].content_length:
+        return None
+    directory, options = context.directory, context.options
+    resume, output_request = _output_request(context, spooled_pair, writer.durable_bytes)
+    timeout = directory.aiohttp.ClientTimeout(total=None, sock_connect=options.timeout, sock_read=options.timeout)
+    async with request(
+        directory,
+        context.source_record,
+        context.session,
+        output_request.fetch_url,
+        headers=output_request.headers_by_name,
+        timeout=timeout,
+        allow_redirects=False,
+        ssl=directory._ssl_context(),
+    ) as response:
+        if error := directory._bulk_response_error_for_request(response, resume):
+            return error
+        probed_at, renewed_bytes = directory.time.monotonic(), writer.durable_bytes
+        async for chunk in response.content.iter_chunked(spool.READ_BYTES):
+            await asyncio.to_thread(writer.write, chunk)
+            if directory.time.monotonic() - probed_at >= _COPY_PROBE_SECONDS:
+                await _stream_probe(context)
+                probed_at = directory.time.monotonic()
+            if writer.durable_bytes > renewed_bytes:
+                renewed_bytes = writer.durable_bytes
+                await _renew_lease(context)
+    return None
+
+
+async def _stream_probe(context):
+    """Check cancellation, the deadline and the held lock as the stream path does while consuming bytes."""
+    probe = context.options.ownership_probe
+    await (probe.stream_probe if isinstance(probe, context.directory._BulkCheckpointProbes) else probe)()
+
+
+async def _renew_lease(context):
+    """No rows are written while copies download, so each durable frame renews the checkpoint lease."""
+    async with write_slot(context.directory, context.source_record):
+        await context.directory._refresh_bulk_export_rows_written(context.identity)
 
 
 async def run_outputs(directory, identity, options, stream_state, pending_outputs, stream_output):
@@ -209,6 +415,11 @@ async def _paced_response(directory, source_record, session, url, shared, option
 async def request(directory, source_record, session, url, *, export_start=False, **options):
     """Share one adaptive transfer budget; retry only rejected, unread responses."""
     shared = state(directory, source_record)
+    spooled = shared.get("spool", {}).get(url)
+    offset = spool.served_offset(spooled, options.get("headers") or {}) if spooled is not None else None
+    if offset is not None:
+        yield spool.SpooledResponse(spooled, offset)
+        return
     attempts = 0
     while True:
         async with _paced_response(directory, source_record, session, url, shared, options) as response:

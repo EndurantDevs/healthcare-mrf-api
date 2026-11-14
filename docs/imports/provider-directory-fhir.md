@@ -975,6 +975,20 @@ chunk. Full ownership and custody checks remain at bounded writes, including a
 recheck after COPY before payload and byte-offset progress commit atomically.
 Cancellation, deadline expiry or loss of ownership or the lock rolls back that batch.
 
+Signed output links can expire before a large export is parsed. For the source ids
+listed in `HLTHPRT_PROVIDER_DIRECTORY_BULK_SPOOL_SOURCES`, with byte-range resume
+enabled and `HLTHPRT_PROVIDER_DIRECTORY_BULK_SPOOL_ROOT` set to a persistent
+directory, the worker first saves every incomplete output of an export as zstd
+under `<root>/<checkpoint_id>/`. Downloads use the shared transfer budget and the
+stored length and strong-ETag validators. Each copy is written in fsynced frames,
+so a broken download resumes from its last whole frame. Parsing starts once every
+output is saved, reads the copies through the same response checks and byte
+offsets, and deletes each copy when its output completes. While copies download,
+each saved frame renews the checkpoint lease and rechecks ownership. An output
+that already has a copy skips the link probe, so once every incomplete output is
+saved, parsing and a retry after the links expire read only the copies. Without
+both settings, outputs stream directly as before.
+
 The candidate is published only when every selected resource reports a
 complete, unbounded, error-free scan with no next page remaining. Publication
 locks the endpoint identity and atomically marks the prior current dataset
