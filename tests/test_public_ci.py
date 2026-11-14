@@ -203,6 +203,7 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
         "artifact-cleanup.yml",
         "ci.yml",
         "postgres-client-cache.yml",
+        "publish-retained-image.yml",
     ]
     text = (workflows / "ci.yml").read_text(encoding="utf-8")
     workflow = yaml.safe_load(text)
@@ -379,6 +380,41 @@ def test_stale_artifact_cleanup_is_main_only_and_pinned():
             "run": "python3 ci/scripts/artifact_cleanup.py --stale",
         },
     ]
+
+
+def test_retained_image_publication_is_manual_and_pinned():
+    """Keep retained publication explicit and limited to its trusted publisher."""
+    path = Path(__file__).resolve().parents[1] / ".github/workflows/publish-retained-image.yml"
+    workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert workflow.get("on", workflow.get(True)) == {
+        "workflow_dispatch": {
+            "inputs": {
+                name: {"required": True, "type": "string"}
+                for name in ("source_run_id", "source_run_attempt", "image_artifact_id", "measurement_artifact_id")
+            }
+        }
+    }
+    assert workflow["permissions"] == {"contents": "read", "actions": "read"}
+    assert set(workflow["jobs"]) == {"dev-image-publication"}
+    job = workflow["jobs"]["dev-image-publication"]
+    assert job["if"] == "github.repository == 'EndurantDevs/healthcare-mrf-api' && github.ref == 'refs/heads/dev'"
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["permissions"] == {
+        "contents": "read",
+        "pull-requests": "read",
+        "actions": "read",
+        "packages": "write",
+    }
+    revision = job["env"]["CI_REVISION"]
+    assert re.fullmatch(r"[0-9a-f]{40}", revision) and revision != "0" * 40
+    checkout = job["steps"][0]
+    assert checkout["uses"] == "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+    assert checkout["with"] == {
+        "repository": "EndurantDevs/endurant-ci",
+        "ref": revision,
+        "path": "ci",
+        "persist-credentials": False,
+    }
 
 
 def test_dependency_updates_target_the_development_branch():
