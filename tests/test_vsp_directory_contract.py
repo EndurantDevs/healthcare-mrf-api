@@ -23,6 +23,9 @@ def test_source_error_inside_success_response_is_never_empty_completion():
         search_result({"totalCounts": 4, "locations": []})
     with pytest.raises(VSPDirectoryError, match="vsp_search_response_incomplete"):
         search_result({"totalCounts": 50, "locations": []})
+    for payload in ({"totalCounts": 1}, {"totalCounts": 0, "locations": None}, {"totalCounts": False}):
+        with pytest.raises(VSPDirectoryError, match="vsp_search_response_invalid"):
+            search_result(payload)
 
 
 @pytest.mark.parametrize(

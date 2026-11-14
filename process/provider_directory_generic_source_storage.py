@@ -35,7 +35,7 @@ from process.provider_directory_source_storage_binding import (
     require_storage_schema,
     storage_document,
 )
-from process.vsp_directory_contract import OFFICE_DOCTORS_INVALID
+from process.vsp_directory_contract import OFFICE_DOCTORS_INVALID, SEARCH_RESPONSE_INVALID
 from process.vsp_directory_contract import RESOURCE_TYPES as VSP_RESOURCE_TYPES
 from process.vsp_directory_contract import SOURCE_ID as VSP_SOURCE_ID
 from process.vsp_directory_store import is_artifact_root_failure
@@ -907,7 +907,11 @@ def _is_empty_vsp_checkpoint_failure(header, candidate_by_field, identity_by_fie
                     header["import_run_id"] == root_run_id or candidate_by_field["contract"] == NAMED_ISOLATED_CONTRACT
                 )
                 and header["status"] == "failed"
-                and failure_metadata.get("error") == OFFICE_DOCTORS_INVALID
+                and (
+                    failure_metadata.get("error") == OFFICE_DOCTORS_INVALID
+                    or candidate_by_field["contract"] == NAMED_ISOLATED_CONTRACT
+                    and failure_metadata.get("error") == SEARCH_RESPONSE_INVALID
+                )
                 and candidate_by_field["relationship_sha256"] is None
             )
         )
@@ -957,6 +961,15 @@ async def _locked_transition_header(connection, policy, identity_by_field):
     return header
 
 
+def _transition_metadata_matches(metadata, expected, status):
+    """A failed candidate can add an error without changing its identity."""
+    return metadata == expected or (
+        status == "failed"
+        and type(metadata) is dict
+        and all(field in metadata and metadata[field] == value for field, value in expected.items())
+    )
+
+
 async def _locked_transition_candidate(
     connection, policy, identity_by_field, old_storage, new_storage, expected_counts, *, by_name=False
 ):
@@ -971,14 +984,7 @@ async def _locked_transition_candidate(
         header, candidate_by_field, identity_by_field, expected_counts, new_storage
     )
     metadata = _json(header["publication_metadata_json"])
-    has_identity_metadata = metadata == stored_identity["metadata"] or (
-        header["status"] == "failed"
-        and type(metadata) is dict
-        and all(
-            field_name in metadata and metadata[field_name] == expected_value
-            for field_name, expected_value in stored_identity["metadata"].items()
-        )
-    )
+    has_identity_metadata = _transition_metadata_matches(metadata, stored_identity["metadata"], header["status"])
     has_changed_header_owner = header["import_run_id"] != identity_by_field["failed_run_id"]
     candidate_storage_by_field = candidate_by_field.get("storage")
     source_ids = stored_identity["metadata"].get("source_ids")
@@ -1004,7 +1010,12 @@ async def _locked_transition_candidate(
         == {name for name in expected_counts if not name.startswith("LU:")}
         == {_resource_family(name) for name in expected_counts}
         and candidate_storage_by_field in (old_storage, new_storage)
-        and (not by_name or is_named_fhir or is_empty_vsp_failure and metadata.get("error") == OFFICE_DOCTORS_INVALID),
+        and (
+            not by_name
+            or is_named_fhir
+            or is_empty_vsp_failure
+            and metadata.get("error") in (OFFICE_DOCTORS_INVALID, SEARCH_RESPONSE_INVALID)
+        ),
         "transition_candidate_changed",
     )
     if by_name and candidate_by_field["contract"] == ISOLATED_CONTRACT:
@@ -1031,7 +1042,10 @@ async def _verify_transition_run(
     root_run_id = identity_by_field["acquisition_root_run_id"]
     failed_run_id = identity_by_field["failed_run_id"]
     is_vsp_artifact_failure = is_empty_vsp_failure and not has_changed_header_owner and failed_run_id != root_run_id
-    is_retained_vsp_failure = is_empty_vsp_failure and expected_failure_error == OFFICE_DOCTORS_INVALID
+    is_retained_vsp_failure = is_empty_vsp_failure and expected_failure_error in (
+        OFFICE_DOCTORS_INVALID,
+        SEARCH_RESPONSE_INVALID,
+    )
     failure_field = (
         ",error::jsonb->>'message' AS error_message"
         if has_changed_header_owner or is_vsp_artifact_failure or is_retained_vsp_failure
@@ -1638,7 +1652,7 @@ async def transition_isolated_loading_candidate_storage(
         successor_by_field,
         candidate_by_field,
         previous_status,
-        is_empty_vsp_failure and failure_error != OFFICE_DOCTORS_INVALID,
+        is_empty_vsp_failure and failure_error not in (OFFICE_DOCTORS_INVALID, SEARCH_RESPONSE_INVALID),
     )
     return {**receipt_by_field, "already_applied": False}
 
