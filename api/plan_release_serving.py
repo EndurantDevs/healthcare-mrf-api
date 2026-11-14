@@ -14,8 +14,9 @@ from api.plan_release_pricing_projection import (
     has_pricing_projection_relation,
     plan_release_serving_queries,
     plan_release_serving_sql,
+    pricing_projection_relation,
 )
-from api.plan_release_read_storage import is_retained_session_read
+from api.plan_release_read_storage import is_retained_session_read, lock_binding_storage, lock_read_tables
 from api.plan_release_readiness import is_release_binding_serving_ready
 from api.plan_release_serving_metadata import (
     plan_release_header_from_rows as _release_header_from_rows,
@@ -342,6 +343,7 @@ async def _is_release_binding_set_serving_ready(
 
 async def _legacy_plan_release_rows(session, plan_release_id, include_projection, *, retained):
     """Keep the original retained/native storage decision and predicates intact."""
+    await lock_binding_storage(session, PTG2_SCHEMA, retained=retained)
     release_sql = (
         plan_release_serving_sql(PTG2_SCHEMA, include_pricing_projection=include_projection, retained=True)
         if retained
@@ -377,6 +379,8 @@ async def resolve_plan_release_serving(
     if admission == NOT_CURRENT_SOURCE_RELEASE:
         return None
     include_projection = await has_pricing_projection_relation(session, PTG2_SCHEMA)
+    if include_projection:
+        await lock_read_tables(session, [{"name": pricing_projection_relation(PTG2_SCHEMA)}])
     if admission is not None:
         release_query_result = await load_source_binding_rows(
             session,

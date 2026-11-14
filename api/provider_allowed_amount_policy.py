@@ -103,9 +103,6 @@ async def admitted_allowed_amount_bindings(session, selection):
     try:
         bindings = source_policy._original_role_bindings(selection, "allowed_amounts", scope)
         driver = (await (await session.connection()).get_raw_connection()).driver_connection
-        await source_policy._catalog_manifest(
-            driver, scope.manifest.generation_id, source_policy.registry_schema(), scope.manifest
-        )
         snapshots = await _allowed_snapshots(driver, bindings)
         reviews, mappings = await source_policy._source_evidence(
             driver,

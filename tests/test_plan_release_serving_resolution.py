@@ -13,18 +13,26 @@ SERVING_REVISION_ID = "hpserve_" + "3" * 26
 SERVING_REVISION_PUBLISHED_AT = "2026-08-25T12:34:56.123456Z"
 
 
+def storage_reply(sql):
+    """Answer the by-name storage probe, share lock and table check of an admitted native read."""
+    if "AS readable" in sql:
+        return [SimpleNamespace(_mapping={"readable": True}) for _ in range(2)]
+    if "AS admitted" in sql:
+        return SimpleNamespace(scalar_one=lambda: True)
+    return [] if sql.startswith("LOCK TABLE") else None
+
+
 class _Session:
     def __init__(self, rows):
         self.rows = rows
         self.calls = []
 
-    async def execute(self, statement, params):
+    async def execute(self, statement, params=None):
         self.calls.append((str(statement), params))
         if "AS storage_present" in str(statement):
             return []
-        if "AS readable" in str(statement):
-            return [SimpleNamespace(_mapping={"readable": True}) for _ in range(2)]
-        return list(self.rows)
+        reply = storage_reply(str(statement))
+        return list(self.rows) if reply is None else reply
 
 
 class _SequenceSession:
@@ -32,13 +40,12 @@ class _SequenceSession:
         self.results = list(results)
         self.calls = []
 
-    async def execute(self, statement, params):
+    async def execute(self, statement, params=None):
         self.calls.append((str(statement), params))
         if "AS storage_present" in str(statement):
             return []
-        if "AS readable" in str(statement):
-            return [SimpleNamespace(_mapping={"readable": True}) for _ in range(2)]
-        return list(self.results.pop(0))
+        reply = storage_reply(str(statement))
+        return list(self.results.pop(0)) if reply is None else reply
 
 
 def _binding_row(**updates):
@@ -118,7 +125,7 @@ def test_typed_resolution_marks_existing_unpublished_release_unavailable():
 
     assert serving_resolution.state == "unavailable"
     assert serving_resolution.selection is None
-    assert len(session.calls) == 4
+    assert len(session.calls) == 8
 
 
 def test_existence_probe_detects_release_without_snapshot_bindings():
@@ -136,8 +143,8 @@ def test_existence_probe_detects_release_without_snapshot_bindings():
         )
     )
 
-    ready_sql = session.calls[2][0]
-    existence_sql = session.calls[3][0]
+    ready_sql = session.calls[-2][0]
+    existence_sql = session.calls[-1][0]
     assert "plan_release_snapshot_binding" in ready_sql
     assert "plan_release_snapshot_binding" not in existence_sql
     assert serving_resolution.state == "unavailable"
@@ -193,8 +200,8 @@ def test_typed_resolution_rejects_release_binding_fanout_before_readiness(
 
     assert serving_resolution.state == "unavailable"
     assert serving_resolution.selection is None
-    assert len(session.calls) == 3
-    assert f"LIMIT {row_limit}" in session.calls[2][0]
+    assert len(session.calls) == 7
+    assert f"LIMIT {row_limit}" in session.calls[-1][0]
     readiness.assert_not_awaited()
 
 

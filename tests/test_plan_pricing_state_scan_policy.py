@@ -25,6 +25,7 @@ from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 from tests.test_plan_pricing_state_scan import _args, _keyring, _occurrence, _selection, _Session
 from tests.test_plan_release_serving import _release_selection
+from tests.test_plan_release_serving_resolution import storage_reply
 from tests.test_pricing_api import make_request
 from tests.test_provider_service_source_policy import _fixture
 
@@ -414,8 +415,8 @@ def _scan_reader(held, bindings, rows):
 
     async def execute(statement, parameters=None):
         sql = str(statement)
-        if "AS readable" in sql:
-            return [SimpleNamespace(_mapping={"readable": True}) for _ in range(2)]
+        if storage_reply(sql) is not None:
+            return storage_reply(sql)
         if "AS storage_present" in sql:
             return []
         if "to_regclass" in sql:

@@ -2,9 +2,6 @@
 """Read-only native custody checks for one closed, attached Source cohort."""
 
 import hashlib
-import re
-
-from sqlalchemy import text
 
 from api.plan_release_source_bindings import required_registry_schema
 from db.plan_release_storage import storage_identifier
@@ -136,15 +133,3 @@ async def require_source_binding_custody_fetch(fetch, schema, admission):
     custody = await fetch(sql, child, admission.serving_revision_id, schema + ".plan_release_serving_revision")
     if len(custody) != 1 or custody[0]["valid"] is not True:
         raise ValueError("plan_release_source_binding_custody")
-
-
-async def require_source_binding_custody(session, schema, admission):
-    """Use the same bounded custody decision through this exact ORM Reader."""
-
-    async def fetch(sql, *parameters):
-        """Translate only the fixed native positional parameters for SQLAlchemy."""
-        sql = re.sub(r"\$(\d+)", lambda match: ":p" + match[1], sql)
-        rows = await session.execute(text(sql), {"p" + str(index): value for index, value in enumerate(parameters, 1)})
-        return [dict(getattr(row, "_mapping", row)) for row in rows]
-
-    await require_source_binding_custody_fetch(fetch, schema, admission)

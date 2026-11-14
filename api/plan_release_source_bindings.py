@@ -94,6 +94,25 @@ _CANONICAL_BINDINGS_SQL = r"""(
         WHERE complete_binding.serving_revision_id=revision.serving_revision_id)=header.expected_binding_count
 )"""
 
+# Registry binding root columns read by the canonical binding query and the supporting metadata.
+_REGISTRY_BINDING_COLUMNS = {
+    "plan_release_id": "character varying(64)",
+    "serving_revision_id": "character varying(64)",
+    "role": "character varying(64)",
+    "ordinal": "integer",
+    "required": "boolean",
+    "node_id": "character varying(64)",
+    "source_key": "character varying(128)",
+    "snapshot_id": "character varying(96)",
+    "source_file_import_id": "character varying(64)",
+    "received_installation_id": "uuid",
+    "custom_plan_component_id": "character varying(64)",
+    "plan_id": "text",
+    "market_type": "character varying(64)",
+    "logical_content_id": "character varying(128)",
+    "metadata_json": "jsonb",
+}
+
 _HEADER_SQL = """WITH ranked_headers AS (
  SELECT serving_revision_id,plan_release_id,binding_set_digest,expected_binding_count,
  jsonb_typeof(CAST(source_manifest AS jsonb)) AS manifest_type,
@@ -234,10 +253,14 @@ def source_query_parameters(admission: SourceBindingAdmission, pin_owner_type: s
 async def load_source_binding_rows(session, schema, admission, *, include_pricing_projection):
     """Return a complete independently committed cohort, or refuse it as a whole."""
     from api.plan_release_pricing_projection import source_plan_release_serving_sql
-    from api.plan_release_source_binding_custody import require_source_binding_custody
+    from api.plan_release_read_storage import lock_read_tables
     from api.plan_release_supporting_metadata import require_session_supporting_metadata
 
-    await require_source_binding_custody(session, schema, admission)
+    registry = storage_identifier(required_registry_schema())
+    tables = [{"name": f"{registry}.hp_plan_release_binding", "columns": _REGISTRY_BINDING_COLUMNS}]
+    for name in ("hp_plan_serving_revision", "hp_plan_release", "hp_plan_current_release"):
+        tables.append({"name": f"{registry}.{name}"})
+    await lock_read_tables(session, tables)
     result = await session.execute(
         text(
             source_plan_release_serving_sql(

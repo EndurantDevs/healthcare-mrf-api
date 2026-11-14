@@ -497,9 +497,8 @@ async def test_retired_canonical_release_is_unavailable_only_to_fresh_readers(mo
     [
         ("partial_tuple", "plan_release_source_binding_incomplete"),
         ("logical_type", "plan_release_source_binding_incomplete"),
-        ("child_write", "plan_release_source_binding_custody"),
         ("marker", "plan_release_binding_storage_invalid"),
-        ("header_owner", "plan_release_storage_retained_reader_cohort_changed"),
+        ("row_security", "plan_release_storage_read_table_refused"),
     ],
 )
 async def test_canonical_reader_rejects_incomplete_or_unprotected_cohort_without_legacy_fallback(
@@ -514,6 +513,19 @@ async def test_canonical_reader_rejects_incomplete_or_unprotected_cohort_without
         assert not await reader.fetchval(
             "SELECT has_table_privilege(current_user,$1,'SELECT')", case.relation("plan_release_snapshot_binding")
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["child_write", "header_owner", "runtime_manifest"])
+async def test_canonical_reader_serves_after_owner_grant_or_role_policy_drift(monkeypatch, drift):
+    async with canonical_case(monkeypatch) as (case, admin, _reader, registry, before, payloads):
+        if drift == "runtime_manifest":
+            await admin.execute(f"DROP TABLE {registry}.catalog_runtime_manifest")
+        else:
+            await _damage_source_cohort(case, admin, registry, drift, payloads)
+        async with reader_session(case) as session:
+            selected = await resolution.resolve_plan_release_guard_selection(session, RELEASE)
+            assert selected == serving._selection_from_rows(RELEASE, before)
 
 
 @pytest.mark.asyncio
@@ -546,6 +558,9 @@ async def test_bulk_claimed_source_missing_relation_refuses_and_recovers_savepoi
 async def _damage_source_cohort(case, admin, registry, damage, payloads):
     if damage == "header_owner":
         await admin.execute(f'ALTER TABLE {case.relation("plan_release_serving_revision")} OWNER TO "{case.owner}"')
+        return
+    if damage == "row_security":
+        await admin.execute(f"ALTER TABLE {registry}.hp_plan_release_binding ENABLE ROW LEVEL SECURITY")
         return
     if damage == "partial_tuple":
         await admin.execute(
