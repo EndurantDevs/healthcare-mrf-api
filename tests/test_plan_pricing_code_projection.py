@@ -55,7 +55,7 @@ def _identity():
 
 
 def _capability(schema="reference_family_archive_00000000000000000000000000000001"):
-    return CodePricingCapability(_identity(), (SimpleNamespace(schema_name=schema), {}, 1, 2))
+    return CodePricingCapability(_identity(), schema)
 
 
 def test_complete_identity_is_separate_from_full_projection_and_binds_all_inputs():
@@ -151,7 +151,7 @@ async def test_physical_capability_scope_is_local_and_restored_on_failure():
     async def read(capability):
         with code_projection_scope(capability):
             await asyncio.sleep(0)
-            assert capability.found[0].schema_name in table("plan_pricing_provider_membership")
+            assert capability.schema_name in table("plan_pricing_provider_membership")
             assert table("npi") == '"mrf"."npi"'
             assert current_code_projection() is capability
         return current_code_projection()
@@ -383,7 +383,7 @@ def test_policy_alias_remapping_and_inferred_taxonomy_stay_inside_native_read_sc
         ),
     )
     identity = capability_identity(selected, ("CPT", "27447"), "b" * 64, [first, alias])
-    scope = CodePricingCapability(identity, _capability().found).contributors((selected.bindings[1],))
+    scope = CodePricingCapability(identity, _capability().schema_name).contributors((selected.bindings[1],))
     sql = scope.relation("plan_pricing_provider_membership")
     assert "WHEN 0 THEN 1" in sql
     cells = scope.relation("plan_pricing_provider_cell")

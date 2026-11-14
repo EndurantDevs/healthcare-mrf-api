@@ -15,7 +15,6 @@ from process.ptg_parts.ptg2_shared_blocks import (
 from process.ptg_parts.ptg2_v4_finalizer_map_sql import (
     _MAP_PACK_SQL,
     _ROOT_SELECTION_SQL,
-    _ROOT_SELECTION_SQL_TEMPLATE,
     _TARGET_ANCHOR_SQL,
 )
 from process.ptg_parts.ptg2_v4_snapshot_maps import (
@@ -211,24 +210,6 @@ async def read_v4_finalizer_map_set(
         root_table=_quote_ident(PTG2_V4_FINALIZER_MAP_ROOT_TABLE),
         manifest_key=PTG2_V4_FINALIZER_MAP_MANIFEST_KEY,
     )
-    from api.ptg2_code_scope import is_source_api_reader, source_read_relation
-
-    if is_source_api_reader(session):
-        statement = _ROOT_SELECTION_SQL_TEMPLATE.format(
-            root_relation=source_read_relation(
-                session,
-                schema_name,
-                PTG2_V4_FINALIZER_MAP_ROOT_TABLE,
-                default=f"{schema}.{_quote_ident(PTG2_V4_FINALIZER_MAP_ROOT_TABLE)}",
-            ),
-            layout_relation=source_read_relation(
-                session, schema_name, "ptg2_v3_snapshot_layout", default=f"{schema}.ptg2_v3_snapshot_layout"
-            ),
-            snapshot_block_relation=source_read_relation(
-                session, schema_name, "ptg2_v3_snapshot_block", default=f"{schema}.ptg2_v3_snapshot_block"
-            ),
-            manifest_key=PTG2_V4_FINALIZER_MAP_MANIFEST_KEY,
-        )
     root_query = await session.execute(
         text(statement),
         {

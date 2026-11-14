@@ -2204,7 +2204,6 @@ def _shared_v3_code_scope_sql(
     plan_market_type: str = "",
     code_alias: str = "code_metadata",
     scope_alias: str = "logical_scope",
-    api_source_session=None,
 ) -> tuple[str, list[str], dict[str, Any], str]:
     """Join physical code metadata to this snapshot's logical plan mappings."""
 
@@ -2215,15 +2214,6 @@ def _shared_v3_code_scope_sql(
     normalized_plan = str(requested_plan or "").strip()
     normalized_market_type = _normalized_plan_market_type(plan_market_type)
     scope_relation, plan_relation = _shared_v3_snapshot_scope_table(), _shared_plan_scope_table()
-    if api_source_session is not None:
-        from api.ptg2_code_scope import source_read_relation
-
-        scope_relation = source_read_relation(
-            api_source_session, PTG2_SCHEMA, "ptg2_v3_snapshot_scope", default=scope_relation
-        )
-        plan_relation = source_read_relation(
-            api_source_session, PTG2_SCHEMA, "ptg2_v3_snapshot_plan_scope", default=plan_relation
-        )
     if normalized_plan:
         plan_filters.append("plan_scope.plan_id = :plan_id")
         query_params_by_name["plan_id"] = normalized_plan

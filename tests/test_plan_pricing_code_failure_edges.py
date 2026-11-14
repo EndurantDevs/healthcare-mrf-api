@@ -18,7 +18,6 @@ from api.plan_pricing_code_contract import (
     sealed_read_digest,
     validate_params,
 )
-from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from tests.test_plan_pricing_code_projection import (
     _capability,
@@ -189,17 +188,15 @@ async def test_retirement_refuses_forged_identity_before_any_mutation(monkeypatc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("found", [None, _capability().found])
-async def test_attached_but_missing_capability_fails_closed(monkeypatch, found):
-    session = SimpleNamespace(scalar=AsyncMock(return_value=True), execute=AsyncMock(), commit=AsyncMock())
-    monkeypatch.setattr(build, "resolve_inputs", AsyncMock(return_value=(_identity(), [])))
+@pytest.mark.parametrize("found", [None, ("synthetic", {"identity": _identity()})])
+async def test_absent_capability_keeps_ordinary_routing_and_stored_identity_serves(monkeypatch, found):
+    session = SimpleNamespace(scalar=AsyncMock(), execute=AsyncMock(), commit=AsyncMock())
     monkeypatch.setattr(read, "locate", AsyncMock(return_value=found))
+    capability = await read.resolve_code_pricing(session, _selection(), {"code_system": "CPT", "code": "27447"})
     if found is None:
-        with pytest.raises(PlanPricingProjectionUnavailable, match="capability is unavailable"):
-            await read.resolve_code_pricing(session, _selection(), {"code_system": "CPT", "code": "27447"})
+        assert capability is None
     else:
-        capability = await read.resolve_code_pricing(session, _selection(), {"code_system": "CPT", "code": "27447"})
-        assert capability.identity == _identity() and capability.found is found
+        assert capability.identity == _identity() and capability.schema_name == "synthetic"
     session.execute.assert_not_awaited()
     session.commit.assert_not_awaited()
 
