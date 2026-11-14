@@ -84,9 +84,9 @@ def _write_observations(tmp_path, observation_payload_by_kind):
 def test_all_maintained_sources_can_produce_ready_rows_and_table():
     report = _report(_observation_payload_by_kind())
 
-    assert report["maintained_source_count"] == 37
+    assert report["maintained_source_count"] == 38
     assert report["ready"] is True
-    assert len(report["sources"]) == 37
+    assert len(report["sources"]) == 38
     assert next(row for row in report["sources"] if row["entry_id"] == "cms-npd")["source_id"] == "cms-npd"
     assert next(row for row in report["sources"] if row["entry_id"] == "pacificsource")["source_id"] == (
         "pdfhir_19526dc970938f7a212516fa"
@@ -95,9 +95,12 @@ def test_all_maintained_sources_can_produce_ready_rows_and_table():
         next(row for row in report["sources"] if row["entry_id"] == "bcbs-alabama")["source_id"]
         == "pdfhir_e0153166e75593bd07cb0525"
     )
+    assert next(row for row in report["sources"] if row["entry_id"] == "bcbs-minnesota")["source_id"] == (
+        "pdfhir_69fc4cc6c4ce23447dc03058"
+    )
     assert {row["status"] for row in report["sources"]} == {"ready"}
     table = gates.format_table(report)
-    assert table.count("\n") == 38
+    assert table.count("\n") == 39
     assert "bcbs-alabama" in table
     assert "aetna-commercial-medicare" in table
     assert "florida-blue" in table

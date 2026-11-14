@@ -259,8 +259,8 @@ def test_profile_source_matrix_selects_all_reviewed_sources_and_special_contract
     profile_spec = matrix.load_matrix_source_spec()
     selections = matrix.resolve_matrix_source_selection(manifest, profile_spec)
 
-    assert len(profile_spec["source_ids"]) == 37
-    assert len(selections) == 35
+    assert len(profile_spec["source_ids"]) == 38
+    assert len(selections) == 36
     source_id_by_entry = {
         selection.entry_id: selection.source_id
         for selection in selections
@@ -271,6 +271,10 @@ def test_profile_source_matrix_selects_all_reviewed_sources_and_special_contract
         "capital-blue-cross-chip": "pdfhir_5c4da9c19d969edfdebc9ce1",
     }
     assert selections[0].source_id == "cms-npd"
+    minnesota = next(selection for selection in selections if selection.entry_id == "bcbs-minnesota")
+    assert minnesota.source_id == "pdfhir_69fc4cc6c4ce23447dc03058"
+    assert minnesota.resource_profile == "A7"
+    assert minnesota.resources == tuple(profile_spec["verification_matrix"]["resource_profiles"]["A7"]["resources"])
     molina = next(selection for selection in selections if selection.entry_id == "molina")
     assert molina.resource_profile == "R8"
     assert molina.resources == tuple(profile_spec["verification_matrix"]["resource_profiles"]["R8"]["resources"])

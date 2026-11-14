@@ -95,9 +95,9 @@ def test_rendered_inventory_summary_and_access_requirements():
     rendered_document = generator.render_markdown(manifest)
 
     assert "## Inventory Summary" in rendered_document
-    assert "| Acquisition-configured | 37 |" in rendered_document
+    assert "| Acquisition-configured | 38 |" in rendered_document
     assert "| Externally supported | 0 |" in rendered_document
-    assert "| Probe-only | 14 |" in rendered_document
+    assert "| Probe-only | 13 |" in rendered_document
     assert "| Known not importable | 3 |" in rendered_document
     assert "| Total tracked | 54 |" in rendered_document
     assert "### Credentialed Or Registered Access" in rendered_document

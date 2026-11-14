@@ -335,7 +335,7 @@ async def test_actual_fetch_applies_source_deadline_to_http_and_whole_operation(
 @pytest.mark.asyncio
 async def test_plan_finder_has_independent_bounded_deadline_and_preserves_old_artifact(tmp_path, monkeypatch):
     monkeypatch.setattr(source_fetch, "FETCH_DEADLINE_SECONDS", 0.01)
-    monkeypatch.setattr(source_fetch, "PLAN_FINDER_FETCH_DEADLINE_SECONDS", 0.3)
+    # The successful transfer uses the real deadline, including HTTP and worker startup.
     spec = _spec(source_id="plan-finder")
     async with _source_http() as (state, transport):
         state.delay = 0.04

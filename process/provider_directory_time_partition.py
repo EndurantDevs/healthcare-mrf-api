@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
+import urllib.parse
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -744,3 +745,88 @@ async def mark_partition_page_fetched(state: PartitionFetchState) -> None:
     """Account for a fetched page under the existing partition state lock."""
     async with state.state_lock:
         state.page_count += 1
+
+
+def last_updated_partition_url(
+    directory,
+    start_url: str,
+    window: TimeWindow,
+    *,
+    page_count: int,
+    count_only: bool,
+) -> str:
+    """Build a deterministic count or data URL before checkpointing it."""
+    parsed = urllib.parse.urlsplit(start_url)
+    replaced_names = {
+        "_count",
+        "_lastUpdated",
+        "_sort",
+        "_summary",
+        "_total",
+    }
+    query_items = [
+        (key, query_value)
+        for key, query_value in urllib.parse.parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+        )
+        if key not in replaced_names
+    ]
+    query_items.extend(
+        (
+            (
+                "_lastUpdated",
+                f"ge{directory._format_last_updated_partition_instant(window.start)}",
+            ),
+            (
+                "_lastUpdated",
+                f"lt{directory._format_last_updated_partition_instant(window.end)}",
+            ),
+        )
+    )
+    if count_only:
+        query_items.extend(
+            (
+                ("_summary", "count"),
+                ("_total", "accurate"),
+            )
+        )
+        if directory._resource_or_metadata_parent_base(start_url) == directory.bcbs_minnesota.API_BASE:
+            query_items.append(("_count", "0"))
+    else:
+        query_items.extend(
+            (
+                ("_sort", "_lastUpdated,_id"),
+                ("_count", str(page_count)),
+            )
+        )
+    return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query_items, doseq=True)))
+
+
+def last_updated_partition_unfiltered_count_url(directory, start_url: str) -> str:
+    """Build a deterministic count or data URL before checkpointing it."""
+    parsed = urllib.parse.urlsplit(start_url)
+    replaced_names = {
+        "_count",
+        "_lastUpdated",
+        "_sort",
+        "_summary",
+        "_total",
+    }
+    query_items = [
+        (key, query_value)
+        for key, query_value in urllib.parse.parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+        )
+        if key not in replaced_names
+    ]
+    query_items.extend(
+        (
+            ("_summary", "count"),
+            ("_total", "accurate"),
+        )
+    )
+    if directory._resource_or_metadata_parent_base(start_url) == directory.bcbs_minnesota.API_BASE:
+        query_items.append(("_count", "0"))
+    return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query_items, doseq=True)))

@@ -1,0 +1,190 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+"""Traverse issued search caches without trusting the gateway's page totals."""
+
+from types import SimpleNamespace
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit
+
+API_BASE = "https://api.bluecrossmn.com/fhir/provider"
+CACHED_RESOURCES = frozenset({"InsurancePlan", "Location", "HealthcareService"})
+STRATEGY_VERSION = "provider-directory-fhir-minnesota-time-cache-v4"
+CACHE_TOTAL_KEY = "minnesota_cache_expected_total"
+INITIAL_PAGE_COUNT = 50
+PAGE_COUNT_CAP = 500
+_QUERY_NAMES = frozenset(
+    {"_count", "_getpages", "_getpagesoffset", "_pretty", "_bundletype", "_summary", "_total", "_format"}
+)
+
+
+def _query(url, resource):
+    parsed = urlsplit(url)
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    query_by_name = dict(pairs)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != urlsplit(API_BASE).netloc
+        or parsed.path not in {urlsplit(API_BASE).path, urlsplit(API_BASE).path + "/" + resource}
+        or parsed.fragment
+        or len(pairs) != len(query_by_name)
+        or set(query_by_name) - _QUERY_NAMES
+    ):
+        raise ValueError("minnesota_cache_url_invalid")
+    return query_by_name
+
+
+def start_url(directory, url):
+    """Zero requests the native first page, including its search-cache handle."""
+    if urlsplit(url).path.rsplit("/", 1)[-1] in CACHED_RESOURCES:
+        return directory._url_with_replaced_query_item(url, "_count", "0")
+    return url
+
+
+def page_error(bundle_payload, resource, current_url, expected_total=None):
+    """Refuse malformed pages and evidence contradicting cached completion."""
+    if expected_total is not None and (type(expected_total) is not int or expected_total < 0):
+        return "minnesota_cache_expected_total_invalid"
+    total = bundle_payload.get("total")
+    if total is not None and expected_total is not None and total != expected_total:
+        return "minnesota_cache_total_changed"
+    total = expected_total if total is None else total
+    links = bundle_payload.get("link", [])
+    if not isinstance(links, list) or any(not isinstance(link, dict) for link in links):
+        return "minnesota_cache_links_invalid"
+    next_links = [link.get("url") for link in links if link.get("relation") == "next"]
+    if len(next_links) > 1 or any(not isinstance(url, str) or not url.strip() for url in next_links):
+        return "minnesota_cache_links_invalid"
+    entries = bundle_payload.get("entry", [])
+    if not isinstance(entries, list) or any(
+        not isinstance(entry, dict)
+        or not isinstance(entry.get("resource"), dict)
+        or entry["resource"].get("resourceType") != resource
+        or not isinstance(entry["resource"].get("id"), str)
+        or not entry["resource"]["id"]
+        for entry in entries
+    ):
+        return "minnesota_cache_resource_invalid"
+    try:
+        query = _query(current_url, resource)
+        is_initial = query.get("_count") == "0" and "_getpages" not in query
+        if "_getpages" in query or is_initial:
+            offset, count = (
+                (0, INITIAL_PAGE_COUNT) if is_initial else (int(query["_getpagesoffset"]), int(query["_count"]))
+            )
+            if total is not None:
+                if type(total) is not int or total < 0:
+                    return "minnesota_cache_total_invalid"
+                processed = offset + len(entries)
+                if total < processed:
+                    return "minnesota_cache_total_below_processed"
+                if len(entries) < count and not next_links and total > processed:
+                    return "minnesota_cache_short_page_before_total"
+    except (KeyError, ValueError) as exc:
+        return "minnesota_cache_page_invalid:" + str(exc)
+    bundle_type = bundle_payload.get("type")
+    if bundle_type != "searchset" and (is_initial or bundle_type is not None):
+        return "minnesota_cache_non_searchset_bundle"
+    # The gateway omits cached page types; empty pages still need terminal accounting.
+    if not entries and bundle_type is None and total is None:
+        return "minnesota_cache_ambiguous_empty_page"
+    if is_initial and not entries and bundle_payload.get("total") != 0:
+        return "minnesota_cache_initial_page_missing"
+    return None
+
+
+async def completion_error(
+    directory, context, resource, expected_total, rows_processed, retained_rows=None, *, source_record=None, run_id=None
+):
+    """Reconcile fetched rows and any advertised total with distinct stored IDs."""
+    if expected_total is not None and rows_processed != expected_total:
+        return "minnesota_cache_unique_candidate_total_mismatch"
+    if (
+        context is None
+        and retained_rows is None
+        and source_record
+        and source_record.get("_endpoint_dataset_id")
+        and source_record.get("_endpoint_id")
+    ):
+        # Candidates without pagination use the current run, including retries.
+        context = SimpleNamespace(
+            dataset_id=source_record["_endpoint_dataset_id"],
+            endpoint_id=source_record["_endpoint_id"],
+            acquisition_root_run_id=run_id,
+            source_ids=tuple(source_record.get("_partition_checkpoint_source_ids") or (source_record["source_id"],)),
+        )
+    if context is not None:
+        unique_count = await directory._caresource_unique_candidate_count(context, resource)
+    elif retained_rows is not None:
+        unique_count = len({resource_row["resource_id"] for resource_row in retained_rows})
+    else:
+        return "minnesota_cache_candidate_context_missing"
+    if unique_count != rows_processed:
+        return "minnesota_cache_unique_candidate_total_mismatch"
+    return None
+
+
+def resume_error(resume_state):
+    """Retain known population bounds through interruptions and completion reuse."""
+    if resume_state is None:
+        return None
+    total = resume_state.completeness.get(CACHE_TOTAL_KEY)
+    if total is None:
+        return None
+    if type(total) is not int or total < 0:
+        return "minnesota_cache_expected_total_invalid"
+    if resume_state.rows_processed > total or (resume_state.complete and resume_state.rows_processed != total):
+        return "minnesota_cache_checkpoint_total_mismatch"
+    return None
+
+
+def next_url(current_url, next_link, resource, page_count, entry_count):
+    """Advance only a server-issued cache, using the verified 500-row cap."""
+    if (
+        resource not in CACHED_RESOURCES
+        or type(entry_count) is not int
+        or type(page_count) is not int
+        or not 0 < page_count <= PAGE_COUNT_CAP
+    ):
+        raise ValueError("minnesota_cache_page_invalid")
+    current = _query(current_url, resource)
+    if "_getpages" not in current:
+        if current.get("_count") != "0" or "_getpagesoffset" in current or not 0 <= entry_count <= INITIAL_PAGE_COUNT:
+            raise ValueError("minnesota_cache_initial_page_invalid")
+        if not next_link:
+            if entry_count == INITIAL_PAGE_COUNT:
+                raise ValueError("minnesota_cache_handle_missing")
+            return None
+        issued = _query(urljoin(current_url, next_link), resource)
+        cache = issued.get("_getpages")
+        if issued.get("_getpagesoffset") != str(entry_count) or issued.get("_count") != str(INITIAL_PAGE_COUNT):
+            raise ValueError("minnesota_cache_initial_cursor_invalid")
+        offset = entry_count
+    else:
+        cache = current["_getpages"]
+        count = current.get("_count", "")
+        offset = current.get("_getpagesoffset", "")
+        if not count.isascii() or not count.isdigit() or not 0 < int(count) <= PAGE_COUNT_CAP:
+            raise ValueError("minnesota_cache_count_invalid")
+        if not offset.isascii() or not offset.isdigit() or not 0 <= entry_count <= int(count):
+            raise ValueError("minnesota_cache_offset_invalid")
+        offset = int(offset) + entry_count
+        if next_link:
+            issued = _query(urljoin(current_url, next_link), resource)
+            # The gateway can append an extra -H to each continuation value.
+            if issued.get("_getpages") not in {cache, cache + "-H"} or issued.get("_getpagesoffset", "").removesuffix(
+                "-H"
+            ) != str(offset):
+                raise ValueError("minnesota_cache_cursor_changed")
+        elif entry_count < int(count):
+            return None
+    if (
+        not cache
+        or len(cache) > 1024
+        or not all(character.isascii() and (character.isalnum() or character == "-") for character in cache)
+    ):
+        raise ValueError("minnesota_cache_handle_invalid")
+    if not entry_count:
+        raise ValueError("minnesota_cache_empty_continuation")
+    return (
+        API_BASE
+        + "?"
+        + urlencode({"_getpages": cache, "_getpagesoffset": offset, "_count": page_count, "_bundletype": "searchset"})
+    )
