@@ -64,11 +64,6 @@ async def test_consumer_drains_before_both_owned_pools_close(monkeypatch, outcom
     monkeypatch.setattr(worker.source_policy, "source_transaction_available", lambda: None)
     monkeypatch.setattr(worker.asyncpg, "create_pool", _pool_factory(config, events, outcome))
     monkeypatch.setattr(worker, "_source_config", AsyncMock(return_value=config))
-    monkeypatch.setattr(
-        worker,
-        "_worker_backend_qualification",
-        AsyncMock(return_value=SimpleNamespace(verifier=lambda role: AsyncMock())),
-    )
     monkeypatch.setattr(worker, "_qualified_worker_runtime", AsyncMock(return_value=consumer))
     qualify = AsyncMock(return_value="qualified-inbox")
     monkeypatch.setattr(worker.RegistryACASourceNotificationStore, "qualify", qualify)

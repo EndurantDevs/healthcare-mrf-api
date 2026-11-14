@@ -696,10 +696,9 @@ async def test_split_ptg_metadata_owner_publishes_and_retains_sealed_generations
     assert await custody_split._protected(fixture) == fixture.protected
 
 
-@pytest.mark.parametrize("kind", ["queue", "custody", "custodian"])
+@pytest.mark.parametrize("kind", ["custody", "custodian"])
 async def test_split_ptg_actual_owner_or_custodian_actor_is_refused(split_db, kind):
     from process.network_candidate_custody import NetworkCandidateCustodyError
-    from process.registry_publication_worker import _custody_runtime
 
     fixture = split_db
     await custody_split._assert_handoff(fixture)
@@ -721,14 +720,8 @@ async def test_split_ptg_actual_owner_or_custodian_actor_is_refused(split_db, ki
         )
         assert await custody_split._protected(fixture) == fixture.protected
         return
-    if kind == "custodian":
-        with pytest.raises(ValueError, match="config_invalid"):
-            _split_ptg_worker_config(fixture, fixture.roles_by_kind[kind])
-    else:
-        config = _split_ptg_worker_config(fixture, fixture.roles_by_kind[kind])
-        async with AsyncExitStack() as stack, custody_split._login(fixture, "execution") as execution:
-            with pytest.raises(NetworkCandidateCustodyError):
-                await _custody_runtime(config, stack, config.consumer, execution)
+    with pytest.raises(ValueError, match="config_invalid"):
+        _split_ptg_worker_config(fixture, fixture.roles_by_kind[kind])
     assert await custody_split._protected(fixture) == fixture.protected
 
 
@@ -780,16 +773,6 @@ async def test_split_ordinary_login_and_set_role_admin_are_refused(split_db):
     assert await custody_split._protected(fixture) == fixture.protected
 
 
-async def _fresh_split_qualification(fixture):
-    async with custody_split._login(fixture, "lifecycle") as lifecycle:
-        return await publication_worker._qualify_fresh_backends(
-            lifecycle,
-            schema=fixture.fixture.control_schema,
-            observer_role=fixture.roles_by_kind["lifecycle"],
-            execution_roles=tuple(fixture.roles_by_kind[kind] for kind in ("execution", "custodian")),
-        )
-
-
 async def _reconnect_native_pool(pool):
     async with pool.acquire() as connection:
         before = connection.get_server_pid()
@@ -816,80 +799,41 @@ async def _reconnect_native_sessions(sessions):
     return before, after
 
 
-def _observe_native_backends(monkeypatch, observer_roles):
+def _observe_native_backends(monkeypatch):
     original_pool = publication_worker.asyncpg.create_pool
     original_sessions = publication_worker._worker_sessions
-    original_qualify = publication_worker._qualify_fresh_backends
-    pools_by_role, sessions_by_role, verified_by_role = {}, {}, {}
+    pools_by_role, sessions_by_role = {}, {}
 
     async def create_pool(**options):
         pool = await original_pool(**options)
         pools_by_role[options["user"]] = pool
         return pool
 
-    def worker_sessions(config, stack, url, *, backend_verifier=None):
-        sessions = original_sessions(config, stack, url, backend_verifier=backend_verifier)
+    def worker_sessions(config, stack, url):
+        sessions = original_sessions(config, stack, url)
         assert url.username not in sessions_by_role
         sessions_by_role[url.username] = sessions
         return sessions
 
-    async def qualify(connection, **options):
-        assert set(pools_by_role) == set(observer_roles)
-        qualification = await original_qualify(connection, **options)
-
-        def verifier(role):
-            async def verify(backend):
-                await qualification.verifier(role)(backend)
-                verified_by_role.setdefault(role, set()).add(backend.get_server_pid())
-
-            return verify
-
-        return SimpleNamespace(verifier=verifier)
-
     monkeypatch.setattr(publication_worker.asyncpg, "create_pool", create_pool)
     monkeypatch.setattr(publication_worker, "_worker_sessions", worker_sessions)
-    monkeypatch.setattr(publication_worker, "_qualify_fresh_backends", qualify)
-    return SimpleNamespace(
-        pools_by_role=pools_by_role, sessions_by_role=sessions_by_role, verified_by_role=verified_by_role
-    )
+    return SimpleNamespace(pools_by_role=pools_by_role, sessions_by_role=sessions_by_role)
 
 
 async def _check_native_reconnections(observed, config, consumer, execution_connection=None):
     execution_role, custody_role = config.consumer.execution_role, config.custody_url.username
-    if execution_connection is not None:
-        assert execution_connection.get_server_pid() in observed.verified_by_role[execution_role]
-    else:
-        pids = await _reconnect_native_pool(observed.pools_by_role[execution_role])
-        assert set(pids) <= observed.verified_by_role[execution_role]
+    if execution_connection is None:
+        await _reconnect_native_pool(observed.pools_by_role[execution_role])
     assert set(observed.sessions_by_role) == {execution_role, custody_role}
     assert consumer.composition_runtime.sessions is observed.sessions_by_role[execution_role]
-    for role, sessions in observed.sessions_by_role.items():
-        pids = await _reconnect_native_sessions(sessions)
-        assert set(pids) <= observed.verified_by_role[role]
-
-
-async def test_backend_observer_preserves_session_factory_and_verifier(monkeypatch):
-    """The passive observer forwards the real factory's inputs and result unchanged."""
-    config, stack, factory, backend_verifier = object(), object(), object(), object()
-    url = SimpleNamespace(username="fixture_custodian")
-    recorded_calls = []
-
-    def sessions(actual_config, actual_stack, actual_url, *, backend_verifier):
-        recorded_calls.append((actual_config, actual_stack, actual_url, backend_verifier))
-        return factory
-
-    monkeypatch.setattr(publication_worker, "_worker_sessions", sessions)
-    observed = _observe_native_backends(monkeypatch, ())
-    assert publication_worker._worker_sessions(config, stack, url, backend_verifier=backend_verifier) is factory
-    assert recorded_calls == [(config, stack, url, backend_verifier)]
-    assert observed.sessions_by_role == {url.username: factory}
-    assert observed.pools_by_role == observed.verified_by_role == {}
+    for sessions in observed.sessions_by_role.values():
+        await _reconnect_native_sessions(sessions)
 
 
 async def test_fresh_worker_connections_and_reconnects(split_db, monkeypatch):
     """Exercise the actual worker, both driver pools and SQLAlchemy checkout."""
     config = _split_ptg_worker_config(split_db)
-    observed = _observe_native_backends(monkeypatch, (config.consumer.lifecycle_role,))
+    observed = _observe_native_backends(monkeypatch)
 
     async def consume(**arguments):
         await _check_native_reconnections(observed, config, arguments["config"])
@@ -937,8 +881,7 @@ def _native_source_config(fixture, family):
 async def test_source_worker_native_backend_qualification(split_db, monkeypatch, family):
     """Only notification/business operations are doubled; native connection qualification is real."""
     module, config = _native_source_config(split_db, family)
-    observers = () if family == "cms" else (config.reader_role,)
-    observed = _observe_native_backends(monkeypatch, observers)
+    observed = _observe_native_backends(monkeypatch)
     if family == "aca":
         monkeypatch.setattr(module.source_policy, "source_transaction_available", lambda: None)
         monkeypatch.setattr(module, "_source_config", AsyncMock(return_value=config))
@@ -975,32 +918,3 @@ async def test_native_source_worker_refuses_unlimited_temp_default(split_db, mon
         await module.run_registry_cms_source_worker(config)
     consume.assert_not_awaited()
     assert await custody_split._protected(split_db) == split_db.protected
-
-
-async def test_backend_predating_floor_is_refused(split_db):
-    async with AsyncExitStack() as stack:
-        existing_connections = [
-            (kind, await stack.enter_async_context(custody_split._login(split_db, kind)))
-            for kind in ("execution", "custodian")
-        ]
-        qualification = await _fresh_split_qualification(split_db)
-        for kind, connection in existing_connections:
-            started = await connection.fetchval("SELECT backend_start FROM pg_stat_activity WHERE pid=pg_backend_pid()")
-            assert started < qualification.not_before
-            with pytest.raises(ValueError, match="registry_publication_worker_backend_invalid"):
-                await qualification.verifier(split_db.roles_by_kind[kind])(connection)
-
-
-async def test_same_login_set_role_is_refused(split_db):
-    qualification = await _fresh_split_qualification(split_db)
-    for kind in ("execution", "custodian"):
-        async with custody_split._login(split_db, kind) as connection:
-            role = split_db.roles_by_kind[kind]
-            verify = qualification.verifier(role)
-            await verify(connection)
-            await connection.execute('SET ROLE "' + role + '"')
-            assert await connection.fetchval("SELECT session_user=current_user") is True
-            with pytest.raises(ValueError, match="registry_publication_worker_backend_invalid"):
-                await verify(connection)
-            await connection.execute("RESET ROLE")
-            await verify(connection)

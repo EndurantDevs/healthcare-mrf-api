@@ -365,57 +365,11 @@ class _CustodyConnection:
     def __init__(self, role, config, outcome, events, identity_by_name):
         self.config, self.outcome, self.events, self.identity_by_name = config, outcome, events, identity_by_name
         self.role, self.active, self.identity_reads = role, False, 0
-        self.catalog_roles = set(publication._custody_roles(config)) | {
-            identity_by_name["schema_owner_role"],
-            identity_by_name["custody_owner_role"],
-            role,
-        }
-        self.q_reaching_roles = set()
-
-    async def fetchval(self, sql, *args):
-        assert sql == foundation._Q_REACH_SQL
-        names, owner_oid = args
-        assert type(names) is list and owner_oid == self.identity_by_name["schema_owner_oid"]
-        self.events.append("q reach")
-        return all(
-            name in self.catalog_roles
-            and name != self.identity_by_name["schema_owner_role"]
-            and name not in self.q_reaching_roles
-            for name in names
-        )
 
     async def fetchrow(self, sql, *args):
-        assert "safe_login" in sql and args == (self.config.consumer.control_schema,) * 2
+        assert "custody_owner_role" in sql and args == (self.config.consumer.control_schema,)
         self.identity_reads += 1
-        identity_record_by_name = dict(
-            self.identity_by_name,
-            safe_login=True,
-            current_role=self.role,
-            session_role=self.role,
-            can_assume_schema_owner=self.identity_by_name["schema_owner_oid"]
-            == self.identity_by_name["custody_owner_oid"],
-        )
-        if self.role == self.config.custody_url.username and self.outcome == "identity":
-            identity_record_by_name["database_oid"] += 1
-        if self.role == self.config.custody_url.username and self.outcome in {
-            "assume_schema_owner",
-            "inherit_schema_owner",
-            "member_schema_owner",
-        }:
-            identity_record_by_name["can_assume_schema_owner"] = True
-        return identity_record_by_name
-
-    @asynccontextmanager
-    async def transaction(self, **options):
-        assert not self.active
-        assert options == dict(isolation="repeatable_read", readonly=True)
-        self.active = True
-        self.events.append("verify begin")
-        try:
-            yield self
-        finally:
-            self.active = False
-            self.events.append("verify end")
+        return dict(self.identity_by_name)
 
 
 class _CustodyPool:
@@ -479,11 +433,7 @@ def _custody_finalizer(config, case):
             assert config.notification_store.approval_role in runtime_roles
         assert await authorize(case.execution, case.copy_target) is False
         assert await authorize(case.custodian, object()) is False
-        authorized = await authorize(case.custodian, case.copy_target)
-        if case.outcome == "identity":
-            assert authorized is False
-            raise ValueError("custody_identity_changed")
-        assert authorized is True
+        assert await authorize(case.custodian, case.copy_target) is True
         case.events.append("finalize")
         if case.outcome == "seal failure":
             raise RuntimeError("custody_seal_failed")
@@ -494,41 +444,12 @@ def _custody_finalizer(config, case):
     return finalize
 
 
-def _custody_verifier(config, case):
-    async def verify(connection, actual, *, control_schema, required):
-        assert connection is case.custodian and actual is case.copy_target and case.custodian.active
-        assert control_schema == config.consumer.control_schema and required is True
-        assert case.events[-2:] == ["custody release" if config.ptg is not None else "finalize", "verify begin"]
-        case.events.append("verify")
-        if case.outcome == "verify failure":
-            raise RuntimeError("custody_verify_failed")
-        if case.outcome == "verify cancel":
-            raise asyncio.CancelledError
-        if case.outcome == "mismatch":
-            return {**case.sealed_by_name, "receipt": {**case.sealed_by_name["receipt"], "candidate_sha256": "c" * 64}}
-        return dict(case.sealed_by_name)
-
-    return verify
-
-
 def _runtime_custody_case(monkeypatch, config, outcome, protected_store_owner):
     """Build real runtime callbacks around isolated native custody and preserve exact cleanup."""
     events = []
     identity_by_name = dict(
-        database_name="example",
-        database_oid=100,
-        server_address="127.0.0.1",
-        server_port=5432,
-        server_started="2026-01-01",
-        control_oid=200,
-        inbox_oid=200,
-        custody_owner_oid=300,
         custody_owner_role=config.ptg.store.owner_role if protected_store_owner else "protected_control_owner",
-        schema_owner_oid=300,
         schema_owner_role=config.ptg.store.owner_role if protected_store_owner else "protected_control_owner",
-        candidate_table_oid=301,
-        candidate_owner_oid=300,
-        seal_table_oid=302,
     )
     copy_target = MembershipCopyTarget(
         *(str(UUID(int=i)) for i in (1, 2, 3, 4)), "network_candidate_" + UUID(int=4).hex
@@ -561,10 +482,8 @@ def _runtime_custody_case(monkeypatch, config, outcome, protected_store_owner):
     }
 
     case.sealed_by_name = sealed_by_name
-    finalizer, verifier = (
-        AsyncMock(side_effect=_custody_finalizer(config, case)),
-        AsyncMock(side_effect=_custody_verifier(config, case)),
-    )
+    finalizer = AsyncMock(side_effect=_custody_finalizer(config, case))
+    verifier = AsyncMock(side_effect=AssertionError("unexpected seal re-read"))
     monkeypatch.setattr(foundation, "seal_network_candidate_custody", finalizer)
     _install_custody_company_fence(monkeypatch, config, case, finalizer)
     monkeypatch.setattr(foundation, "verify_network_candidate_custody", verifier)
@@ -586,13 +505,9 @@ async def _exercise_runtime_custody_callback(
     )
     if split_owner:
         schema_owner = config.ptg.store.owner_role if protected_store_owner else "schema_owner"
-        case.identity_by_name.update(schema_owner_oid=400, schema_owner_role=schema_owner, candidate_owner_oid=400)
-        case.execution.catalog_roles.add(schema_owner)
-        case.custodian.catalog_roles.add(schema_owner)
+        case.identity_by_name["schema_owner_role"] = schema_owner
         if protected_store_owner:
             case.identity_by_name["custody_owner_role"] = "ledger_owner"
-            case.execution.catalog_roles.add("ledger_owner")
-            case.custodian.catalog_roles.add("ledger_owner")
     case.pre_enrolled_only = pre_enrolled_only
     execution_pool, custody_pool = case.execution_pool, case.custody_pool
     execution, copy_target, events = case.execution, case.copy_target, case.events
@@ -608,34 +523,24 @@ async def _exercise_runtime_custody_callback(
 
     if outcome == "complete":
         await operation()
-        assert completions == [True] and finalizer.await_count == verifier.await_count == 1
+        assert completions == [True] and finalizer.await_count == 1
     else:
-        error = (
-            asyncio.CancelledError
-            if outcome.endswith("cancel")
-            else ValueError
-            if outcome in {"mismatch", "identity", "assume_schema_owner", "inherit_schema_owner", "member_schema_owner"}
-            else RuntimeError
-        )
-        with pytest.raises(error):
+        with pytest.raises(asyncio.CancelledError if outcome.endswith("cancel") else RuntimeError):
             await operation()
         assert not completions
-        assert verifier.await_count == int(outcome in {"verify failure", "verify cancel", "mismatch"})
         assert finalizer.await_count == int(outcome != "entry")
+    verifier.assert_not_awaited()
     assert create_pool.await_count == int(config.ptg is None)
     assert execution_pool.checkouts == custody_pool.checkouts == 1
     assert execution.identity_reads == 1 and custody_pool.closes == 1
     assert events.index("custody created") < events.index("custody acquire") < events.index("custody close")
-    assert events.index("q reach") < events.index("custody created")
     assert events[-1] == "custody close" and not execution_pool.active and not custody_pool.active
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("parser,factory", WORKERS)
 @pytest.mark.parametrize("pre_enrolled_only", [False, True])
-async def test_runtime_callback_uses_one_distinct_connection_and_checks_exact_final_receipt(
-    monkeypatch, parser, factory, pre_enrolled_only
-):
+async def test_runtime_callback_seals_once_on_one_distinct_connection(monkeypatch, parser, factory, pre_enrolled_only):
     await _exercise_runtime_custody_callback(
         monkeypatch, parser, factory, "complete", pre_enrolled_only=pre_enrolled_only
     )
@@ -643,9 +548,7 @@ async def test_runtime_callback_uses_one_distinct_connection_and_checks_exact_fi
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("parser,factory", (WORKERS[0], WORKERS[2]))
-@pytest.mark.parametrize(
-    "outcome", ("entry", "seal failure", "seal cancel", "verify failure", "verify cancel", "mismatch", "identity")
-)
+@pytest.mark.parametrize("outcome", ("entry", "seal failure", "seal cancel"))
 async def test_runtime_callback_failures_cancel_completion_and_close_registered_pool(
     monkeypatch, parser, factory, outcome
 ):
@@ -666,72 +569,11 @@ async def test_split_runtime_binds_both_owners_without_assuming_schema_owner(mon
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["assume_schema_owner", "inherit_schema_owner", "member_schema_owner"])
-async def test_split_runtime_refuses_custodian_that_can_assume_schema_owner(monkeypatch, outcome):
-    await _exercise_runtime_custody_callback(monkeypatch, WORKERS[0][0], WORKERS[0][1], outcome, split_owner=True)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("reach", ("self", "member", "missing", "original_actor"))
-async def test_complete_actor_q_refusal_precedes_custodian_pool_creation(monkeypatch, reach):
-    from contextlib import AsyncExitStack
-
-    parsed = publication.parse_registry_publication_worker_config(json.dumps(_configured(publication_configuration)[0]))
-    actor = parsed.consumer.queue_owner_role if reach in {"self", "original_actor"} else parsed.consumer.api_role
-    consumer = replace(parsed.consumer, api_role=actor)
-    config = SimpleNamespace(**{**vars(parsed), "consumer": consumer})
-    case, create, finalizer, verifier, completions = _runtime_custody_case(monkeypatch, config, "complete", False)
-    case.identity_by_name.update(
-        schema_owner_oid=400, schema_owner_role=parsed.consumer.queue_owner_role, candidate_owner_oid=400
-    )
-    case.execution.catalog_roles.add(parsed.consumer.queue_owner_role)
-    if reach == "original_actor":
-        consumer = replace(consumer, api_role="safe_api")
-        case.execution.catalog_roles.add("safe_api")
-    if reach == "member":
-        case.execution.q_reaching_roles.add(actor)
-    elif reach == "missing":
-        case.execution.catalog_roles.remove(actor)
-    async with AsyncExitStack() as stack:
-        async with case.execution_pool.acquire(timeout=config.sql_limits.connect_timeout_seconds) as original:
-            with pytest.raises(foundation.NetworkCandidateCustodyError):
-                await publication._custody_runtime(config, stack, consumer, original)
-        assert not stack._exit_callbacks
-    create.assert_not_awaited()
-    finalizer.assert_not_awaited()
-    verifier.assert_not_awaited()
-    assert not completions and case.custody_pool.closes == case.custody_pool.checkouts == 0
-    assert case.execution.identity_reads == 1
-    assert case.events == ["execution acquire", "q reach", "execution release"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("drift", ["candidate_owner_oid", "safe_login", "session_role", "current_role"])
-async def test_runtime_identity_refuses_changed_native_owner_or_original_login(drift):
-    identity_by_name = dict(
-        safe_login=True,
-        current_role="custodian",
-        session_role="custodian",
-        control_oid=10,
-        schema_owner_oid=11,
-        schema_owner_role="schema_owner",
-        custody_owner_oid=12,
-        custody_owner_role="custody_owner",
-        candidate_owner_oid=11,
-        candidate_table_oid=13,
-        seal_table_oid=14,
-        can_assume_schema_owner=False,
-    )
-    identity_by_name[drift] = (
-        99 if drift == "candidate_owner_oid" else False if drift == "safe_login" else "another_role"
-    )
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=identity_by_name))
+async def test_runtime_owner_lookup_refuses_a_missing_custody_ledger():
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=None))
     with pytest.raises(ValueError, match="connection_invalid"):
-        await publication._custody_identity(connection, "control", "custodian")
-    sql = connection.fetchrow.await_args.args[0]
-    assert "owner.oid=ledger.relowner" in sql
-    for privilege in ("MEMBER", "USAGE", "SET"):
-        assert f"pg_has_role(current_user,n.nspowner,'{privilege}')" in sql
+        await publication._custody_identity(connection, "control")
+    assert connection.fetchrow.await_args.args[1:] == ("control",)
 
 
 def _install_custody_company_fence(monkeypatch, config, case, finalizer):
@@ -743,28 +585,15 @@ def _install_custody_company_fence(monkeypatch, config, case, finalizer):
         class Session:
             driver = custodian
 
-            async def __aenter__(self):
+            async def connection(self):
                 return self
-
-            async def __aexit__(self, *args):
-                return None
-
-            def begin(self):
-                return custodian.transaction(isolation="repeatable_read", readonly=True)
-
-            async def connection(self, **options):
-                return self
-
-            async def execute(self, statement):
-                assert str(statement) == "SET TRANSACTION READ ONLY"
 
             async def get_raw_connection(self):
                 return SimpleNamespace(driver_connection=custodian)
 
         sessions = Session
 
-        def owned_sessions(actual, stack, url, *, backend_verifier=None):
-            assert backend_verifier is None
+        def owned_sessions(actual, stack, url):
             assert actual is config and url == config.custody_url and url != config.execution_url
             events.append("custody created")
             stack.push_async_callback(custody_pool.close)

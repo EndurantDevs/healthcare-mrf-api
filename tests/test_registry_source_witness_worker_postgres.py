@@ -10,7 +10,6 @@ import pytest
 
 from process import network_fhir_source_witness_capture as capture_module
 from process import registry_publication_worker as worker_module
-from process.network_candidate_custody import NetworkCandidateCustodyError
 from process.registry_candidate_composition import RegistryCompositionAddressSources
 from process.registry_source_witness_runtime import RegistrySourceWitnessConfig
 from tests import registry_candidate_custody_split_postgres_support as custody_fixture
@@ -73,13 +72,13 @@ def _observe_worker(monkeypatch, *, export_case=None):
         observed.installed.append(installed)
         return installed
 
-    async def identity(connection, schema, role):
-        actual = await original_identity(connection, schema, role)
+    async def identity(connection, schema):
+        actual = await original_identity(connection, schema)
         observed.identities.append(actual)
         return actual
 
-    async def qualified(config, resources, qualification, connection):
-        consumer = await original_qualified(config, resources, qualification, connection)
+    async def qualified(config, resources, connection):
+        consumer = await original_qualified(config, resources, connection)
         observed.qualified.append(consumer)
         if export_case is not None:
             runtime = config.initial_address_sources.source_witness_runtime
@@ -122,7 +121,7 @@ async def _record_native_actors(case, record_property):
 
 
 async def test_actual_worker_refuses_incomplete_actors_before_custodian_pool(monkeypatch, record_property):
-    """Bind refusals to authenticated Q/R/K identities, including a metadata-owner reader alias."""
+    """Bind refusals to authenticated Q/R/K identities."""
     async with _worker_case(monkeypatch) as case:
         await _record_native_actors(case, record_property)
         fixture, config = case.fixture, case.config
@@ -140,23 +139,6 @@ async def test_actual_worker_refuses_incomplete_actors_before_custodian_pool(mon
             assert observed.identities[0]["schema_owner_role"] == fixture.roles_by_kind["queue"]
             assert observed.identities[0]["custody_owner_role"] == fixture.roles_by_kind["custody"]
             _assert_drained(observed, [config.consumer.lifecycle_role, config.consumer.execution_role])
-        await _refuse_metadata_owner_reader(case, monkeypatch)
-
-
-async def _refuse_metadata_owner_reader(case, monkeypatch):
-    """A genuine metadata owner named as Reader must still fail the native Q-reach check."""
-    config, fixture = case.config, case.fixture
-    owner = fixture.roles_by_kind["queue"]
-    consumer = replace(config.consumer, reader_roles=tuple(sorted({*config.consumer.reader_roles, owner})))
-    aliased = replace(config, consumer=consumer)
-    assert owner in config.source_witness.runtime_roles
-    with monkeypatch.context() as patch:
-        observed = _observe_worker(patch)
-        with pytest.raises(NetworkCandidateCustodyError):
-            await worker_module.run_registry_publication_worker(aliased)
-    assert observed.qualified == [] and len(observed.identities) == 1
-    assert observed.identities[0]["schema_owner_role"] == owner
-    _assert_drained(observed, [consumer.lifecycle_role, consumer.execution_role])
 
 
 async def test_actual_worker_owns_original_export_and_drains_native_pools(monkeypatch, record_property):
