@@ -149,7 +149,7 @@ async def test_metadata_owner_that_is_a_reader_cannot_escape_source_census(monke
     runtime = _runtime(set(_ACTORS) - {"registry_reader"})
     config = _config(runtime)
     case, create, finalizer, verifier, _ = _runtime_custody_case(monkeypatch, config, "complete", False)
-    case.identity_by_name.update(schema_owner_role="registry_reader", schema_owner_oid=400, candidate_owner_oid=400)
+    case.identity_by_name["schema_owner_role"] = "registry_reader"
     async with AsyncExitStack() as stack:
         with pytest.raises(ValueError, match="registry_source_witness_runtime_census_differs"):
             await worker._custody_runtime(config, stack, config.consumer, case.execution)
@@ -195,14 +195,10 @@ async def test_preparation_forwards_only_the_configured_source_runtime_before_in
 
     verify_inputs = AsyncMock(side_effect=ValueError("unit_native_input_refused"))
     materialize = AsyncMock(side_effect=AssertionError("refused inputs must not materialize"))
-    monkeypatch.setattr(worker, "_custody_identity", AsyncMock(return_value=identity_by_name))
-    monkeypatch.setattr(custody, "_q_reach_closed", AsyncMock())
     monkeypatch.setattr(worker, "_registered_address_sources", AsyncMock(return_value=registered))
     monkeypatch.setattr(worker, "_require_execution_address_reads", verify_inputs)
     monkeypatch.setattr(preparation, "prepare_registry_composition_address_artifact", materialize)
-    callback = worker._address_preparer(
-        config, config.consumer, SimpleNamespace(acquire=acquire), identity_by_name, config.custody_url.username
-    )
+    callback = worker._address_preparer(config, config.consumer, SimpleNamespace(acquire=acquire), identity_by_name)
     with pytest.raises(ValueError, match="unit_native_input_refused"):
         await callback(
             request_id="00000000-0000-0000-0000-000000000001",
@@ -260,9 +256,8 @@ async def test_worker_forwards_source_capability_to_both_independent_sealers(mon
             consumer = await worker._custody_runtime(config, stack, config.consumer, connection)
             await consumer.seal_candidate(case.copy_target, pre_enrolled_only=True)
     assert create.await_count == int(not session)
-    assert finalizer.await_count == verifier.await_count == 1
+    assert finalizer.await_count == 1 and verifier.await_count == 0
     assert case.custody_pool.closes == 1 and not case.custody_pool.active
-    assert case.events.index("q reach") < case.events.index("custody created")
     runtime.source_export.assert_not_called()
 
 

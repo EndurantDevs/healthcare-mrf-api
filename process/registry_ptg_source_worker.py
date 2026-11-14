@@ -34,7 +34,6 @@ from process.registry_publication_worker import (
     _qualified_worker_runtime,
     _sql_limits,
     _verify_custody_config,
-    _worker_backend_qualification,
 )
 
 CONFIG_ENV = "HLTHPRT_REGISTRY_PTG_SOURCE_WORKER"
@@ -161,12 +160,7 @@ async def run_registry_ptg_source_worker(config, *, event=None):
         reader = await asyncpg.create_pool(**_pool_options(config.notification_url, 1, config.sql_limits))
         stack.push_async_callback(_close_pool, reader)
         reader = _BoundedPool(reader, config.sql_limits.connect_timeout_seconds)
-        async with reader.acquire() as notification:
-            qualification = await _worker_backend_qualification(config, notification, config.reader_role)
-        execution_verifier = qualification.verifier(config.consumer.execution_role)
-        execution = await asyncpg.create_pool(
-            **_pool_options(config.execution_url, 1, config.sql_limits, backend_verifier=execution_verifier)
-        )
+        execution = await asyncpg.create_pool(**_pool_options(config.execution_url, 1, config.sql_limits))
         stack.push_async_callback(_close_pool, execution)
         execution = _BoundedPool(execution, config.sql_limits.connect_timeout_seconds)
         async with execution.acquire() as connection:
@@ -178,7 +172,7 @@ async def run_registry_ptg_source_worker(config, *, event=None):
                     identity = await qualify_registry_ptg_source_notifications(
                         notification_connection, config.notification_store, reader_role=config.reader_role
                     )
-            consumer = await _qualified_worker_runtime(config, stack, qualification, connection)
+            consumer = await _qualified_worker_runtime(config, stack, connection)
             await consumer.composition_runtime.qualify()
             notification_result = await consume_registry_ptg_source_notification_once(
                 connection=connection,

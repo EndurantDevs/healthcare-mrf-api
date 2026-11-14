@@ -370,7 +370,7 @@ async def test_actual_worker_keeps_membership_factory_until_owned_pools_close(mo
     )
     installed_runtimes = []
 
-    async def qualified(config, stack, qualification, connection):
+    async def qualified(config, stack, connection):
         runtime = config.initial_address_sources.source_witness_runtime
         assert runtime.source_export is exported and config.source_witness is None
         installed_runtimes.append(runtime)
@@ -432,17 +432,13 @@ async def test_factory_startup_failure_prevents_worker_startup(monkeypatch, fail
 @pytest.mark.asyncio
 @pytest.mark.parametrize("omitted", ("registry_queue_owner", "registry_reader", "sealed_operator"))
 async def test_actual_worker_refuses_incomplete_census_before_custody_creation(monkeypatch, omitted):
-    from process import network_candidate_custody
-
     events, pool_options = resources(monkeypatch)
     exported, factory = _factory(monkeypatch, events)
     document = _document()
     document["source_witness"]["runtime_roles"].remove(omitted)
     identity = AsyncMock(return_value={"custody_owner_role": "protected_control_owner"})
-    reach = AsyncMock(side_effect=AssertionError("census must refuse before custody reach verification"))
     consume = AsyncMock(side_effect=AssertionError("incomplete census must not claim work"))
     monkeypatch.setattr(worker, "_custody_identity", identity)
-    monkeypatch.setattr(network_candidate_custody, "_q_reach_closed", reach)
     monkeypatch.setattr(worker, "consume_registry_publication_once", consume)
     with pytest.raises(ValueError, match="registry_source_witness_runtime_census_differs"):
         await worker.run_registry_publication_worker(
@@ -451,7 +447,6 @@ async def test_actual_worker_refuses_incomplete_census_before_custody_creation(m
     assert [options["user"] for options in pool_options] == ["worker_lifecycle", "worker_execution"]
     assert events[-4:] == ["execution close", "lifecycle close", "authority close", "source close"]
     identity.assert_awaited_once()
-    reach.assert_not_awaited()
     consume.assert_not_awaited()
     factory.assert_called_once_with()
     exported.assert_not_called()

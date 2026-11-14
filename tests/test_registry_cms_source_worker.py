@@ -253,11 +253,6 @@ def resources(monkeypatch, *, wrong_database=False, fail_connect=False, fail_clo
     )
     verify = AsyncMock()
     monkeypatch.setattr(worker.RegistryPublicationSQLLimits, "verify", verify)
-    monkeypatch.setattr(
-        worker,
-        "_worker_backend_qualification",
-        AsyncMock(return_value=SimpleNamespace(verifier=lambda role: AsyncMock())),
-    )
 
     async def create_pool(**kwargs):
         harness.options["pool"] = kwargs

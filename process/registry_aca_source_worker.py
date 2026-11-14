@@ -45,7 +45,6 @@ from process.registry_publication_worker import (
     _qualified_worker_runtime,
     _sql_limits,
     _verify_custody_config,
-    _worker_backend_qualification,
 )
 
 CONFIG_ENV = "HLTHPRT_REGISTRY_ACA_SOURCE_WORKER"
@@ -215,12 +214,7 @@ async def run_registry_aca_source_worker(config, *, event=None):
         reader = await asyncpg.create_pool(**_pool_options(config.notification_url, 1, config.sql_limits))
         stack.push_async_callback(_close_pool, reader)
         reader = _BoundedPool(reader, config.sql_limits.connect_timeout_seconds)
-        async with reader.acquire() as notification:
-            qualification = await _worker_backend_qualification(config, notification, config.reader_role)
-        execution_verifier = qualification.verifier(config.consumer.execution_role)
-        execution = await asyncpg.create_pool(
-            **_pool_options(config.execution_url, 1, config.sql_limits, backend_verifier=execution_verifier)
-        )
+        execution = await asyncpg.create_pool(**_pool_options(config.execution_url, 1, config.sql_limits))
         stack.push_async_callback(_close_pool, execution)
         execution = _BoundedPool(execution, config.sql_limits.connect_timeout_seconds)
         async with execution.acquire() as connection:
@@ -231,7 +225,7 @@ async def run_registry_aca_source_worker(config, *, event=None):
                     _invalid()
                 async with notification.transaction(isolation="repeatable_read", readonly=True):
                     identity = await config.notification_store.qualify(notification, writing=False)
-            consumer = await _qualified_worker_runtime(config, stack, qualification, connection)
+            consumer = await _qualified_worker_runtime(config, stack, connection)
             if consumer.seal_candidate is None:
                 _invalid()
             await consumer.composition_runtime.qualify()

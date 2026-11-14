@@ -9,7 +9,6 @@ from uuid import UUID
 
 import pytest
 
-from process import network_candidate_custody as custody
 from process import registry_candidate_composition as composition
 from process import registry_composition_resume as resume
 from process import registry_publication_worker as worker
@@ -87,8 +86,6 @@ async def test_qualified_preparer_freezes_format_before_preparing_addresses(
     source_descriptors = replace(_sources(), compact=requested)
     format_pin = AsyncMock(return_value=registered)
     monkeypatch.setattr(resume, "resolve_registered_compact_format", format_pin)
-    monkeypatch.setattr(worker, "_custody_identity", AsyncMock(return_value=identity_by_field))
-    monkeypatch.setattr(custody, "_q_reach_closed", AsyncMock())
     prepared_sources = []
 
     async def prepare(actual, **options):
@@ -104,7 +101,7 @@ async def test_qualified_preparer_freezes_format_before_preparing_addresses(
         yield connection
 
     callback = worker._address_preparer(
-        settings, settings.consumer, SimpleNamespace(acquire=acquire), identity_by_field, "custodian_login"
+        settings, settings.consumer, SimpleNamespace(acquire=acquire), identity_by_field
     )
     request = UUID(int=9)
     operation = callback(

@@ -180,11 +180,6 @@ async def test_second_pool_failure_closes_first_without_consumer(monkeypatch):
         yield object()
 
     pool = SimpleNamespace(close=AsyncMock(), terminate=lambda: None, acquire=acquire)
-    monkeypatch.setattr(
-        worker,
-        "_worker_backend_qualification",
-        AsyncMock(return_value=SimpleNamespace(verifier=lambda role: AsyncMock())),
-    )
     monkeypatch.setattr(worker.asyncpg, "create_pool", AsyncMock(side_effect=[pool, RuntimeError("synthetic")]))
     consume = AsyncMock()
     monkeypatch.setattr(worker, "consume_registry_ptg_source_notification_once", consume)
@@ -262,11 +257,6 @@ def resources(monkeypatch, failure=None):
     harness.execution = Connection("executor", harness.events)
     harness.reader = Connection("office_reader", harness.events)
     monkeypatch.setattr(worker.RegistryPublicationSQLLimits, "verify", AsyncMock())
-    monkeypatch.setattr(
-        worker,
-        "_worker_backend_qualification",
-        AsyncMock(return_value=SimpleNamespace(verifier=lambda role: AsyncMock())),
-    )
 
     async def create_pool(**options):
         if failure == "startup":
@@ -326,8 +316,6 @@ async def test_typed_event_consumption_qualifies_before_work_and_closes_owned_re
     options = {"event": selected} if override else {}
     assert await worker.run_registry_ptg_source_worker(configured, **options) == {"state": state}
     assert harness.events == [
-        "office_reader checkout",
-        "office_reader released",
         "executor checkout",
         "office_reader checkout",
         "reader transaction",
@@ -387,8 +375,6 @@ async def test_runner_failures_drain_and_release_owned_pools_and_runtime(monkeyp
         )
     if failure == "startup":
         assert not harness.events and not harness.options
-    elif failure == "office_reader checkout":
-        assert harness.events == ["office_reader checkout", "office_reader closed"]
     else:
         assert harness.events[-2:] == ["executor closed", "office_reader closed"]
     if failure in {"runtime qualification", "consume", "cancel", "result"}:
@@ -423,8 +409,6 @@ async def test_runner_rejects_unqualified_execution_before_notification_or_runti
             worker.parse_registry_ptg_source_worker_config(json.dumps(configuration()))
         )
     assert harness.events == [
-        "office_reader checkout",
-        "office_reader released",
         "executor checkout",
         "executor released",
         "executor closed",

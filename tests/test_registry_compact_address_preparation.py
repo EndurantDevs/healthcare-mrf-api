@@ -101,11 +101,10 @@ async def test_aca_ptg_custody_keeps_qualified_factory_without_unsupported_prepa
     configured = aca.parse_registry_aca_source_worker_config(json.dumps(configuration()))
     configured = replace(configured, custody_url=configured.execution_url.set(username="custodian"))
     sessions = Mock(return_value=object())
-    verifier = AsyncMock()
     monkeypatch.setattr(worker, "_worker_sessions", sessions)
     async with AsyncExitStack() as stack:
-        consumer = worker._ptg_custody_runtime(configured, stack, configured.consumer, {}, backend_verifier=verifier)
-        sessions.assert_called_once_with(configured, stack, configured.custody_url, backend_verifier=verifier)
+        consumer = worker._ptg_custody_runtime(configured, stack, configured.consumer, {})
+        sessions.assert_called_once_with(configured, stack, configured.custody_url)
     assert callable(consumer.seal_candidate)
     assert "prepare_address_sources" not in {field.name for field in fields(consumer)}
 

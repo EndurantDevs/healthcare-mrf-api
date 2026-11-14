@@ -37,7 +37,6 @@ from process.registry_publication_worker import (
     _qualified_worker_runtime,
     _sql_limits,
     _verify_custody_config,
-    _worker_backend_qualification,
 )
 
 CONFIG_ENV = "HLTHPRT_REGISTRY_CMS_SOURCE_WORKER"
@@ -287,9 +286,6 @@ async def _notification_sessions(config, stack):
     async with engine.connect() as reader:
         raw = await reader.get_raw_connection()
         expected_identity = await _notification_reader_identity(config, raw.driver_connection)
-        qualification = await _worker_backend_qualification(
-            config, raw.driver_connection, config.notification_url.username
-        )
 
     async def verify(connection):
         """Verify actual reader limits, direct role and trusted database on each checkout."""
@@ -301,7 +297,7 @@ async def _notification_sessions(config, stack):
         connection.run_async(verify)
 
     event.listen(engine.sync_engine, "checkout", checkout)
-    return async_sessionmaker(engine), expected_identity, qualification
+    return async_sessionmaker(engine), expected_identity
 
 
 async def run_registry_cms_source_worker(config, *, event=None):
@@ -316,16 +312,13 @@ async def run_registry_cms_source_worker(config, *, event=None):
         {name: getattr(config, name) for name in REGISTRY_CMS_EVENT_FIELDS} if event is None else dict(event)
     )
     async with AsyncExitStack() as stack:
-        sessions, identity, qualification = await _notification_sessions(config, stack)
-        execution_verifier = qualification.verifier(config.consumer.execution_role)
-        pool = await asyncpg.create_pool(
-            **_pool_options(config.execution_url, 1, config.sql_limits, backend_verifier=execution_verifier)
-        )
+        sessions, identity = await _notification_sessions(config, stack)
+        pool = await asyncpg.create_pool(**_pool_options(config.execution_url, 1, config.sql_limits))
         stack.push_async_callback(_close_pool, pool)
         async with _BoundedPool(pool, config.sql_limits.connect_timeout_seconds).acquire() as connection:
             if await _identity(connection, config, config.consumer.execution_role) != identity:
                 raise ValueError("registry_cms_source_worker_connection_invalid")
-            consumer = await _qualified_worker_runtime(config, stack, qualification, connection)
+            consumer = await _qualified_worker_runtime(config, stack, connection)
             if consumer.composition_runtime is not None:
                 await consumer.composition_runtime.qualify()
             result_by_name = await consume_registry_cms_source_notification_once(

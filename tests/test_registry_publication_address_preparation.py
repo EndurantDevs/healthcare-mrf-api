@@ -163,9 +163,7 @@ def _receipt(address_sources, roles):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reader_count", [1, 29])
-@pytest.mark.parametrize(
-    "outcome", ["materialize", "retained", "helper_failure", "identity", "roles", "input_reader", "cancel"]
-)
+@pytest.mark.parametrize("outcome", ["materialize", "retained", "helper_failure", "input_reader", "cancel"])
 async def test_custodian_callback_preserves_complete_census(monkeypatch, outcome, reader_count):
     """Keep every accepted actor through commit, failure, cancellation and retained-only preparation."""
     settings = _settings(reader_count)
@@ -197,17 +195,11 @@ async def test_custodian_callback_preserves_complete_census(monkeypatch, outcome
             raise asyncio.CancelledError
         return None if outcome == "retained" else artifact
 
-    identity = AsyncMock(side_effect=[identity_by_name, {} if outcome == "identity" else identity_by_name])
-    reach = AsyncMock(side_effect=[None, ValueError("role_reach_changed") if outcome == "roles" else None])
     from process import registry_composition_resume as resume
 
     monkeypatch.setattr(resume, "resolve_registered_compact_format", AsyncMock(return_value=None))
-    monkeypatch.setattr(worker, "_custody_identity", identity)
-    monkeypatch.setattr(custody, "_q_reach_closed", reach)
     monkeypatch.setattr(composition, "prepare_registry_composition_address_artifact", prepare)
-    callback = worker._address_preparer(
-        settings, settings.consumer, SimpleNamespace(acquire=acquire), identity_by_name, "custodian_login"
-    )
+    callback = worker._address_preparer(settings, settings.consumer, SimpleNamespace(acquire=acquire), identity_by_name)
     operation = callback(
         request_id=_DriverUUID(str(uuid4())),
         approved_revision=4,
@@ -215,7 +207,7 @@ async def test_custodian_callback_preserves_complete_census(monkeypatch, outcome
         expected_head=0,
         address_sources=address_sources,
     )
-    await _assert_preparation_outcome(operation, connection, address_sources, artifact, identity, reach, outcome)
+    await _assert_preparation_outcome(operation, connection, address_sources, artifact, outcome)
 
 
 @pytest.mark.parametrize("role_count", [0, 33, 128, 129])
@@ -383,7 +375,7 @@ async def test_rollback_preparation_rejects_unknown_or_noncallable_callbacks(cal
         )
 
 
-async def _assert_preparation_outcome(operation, connection, address_sources, artifact, identity, reach, outcome):
+async def _assert_preparation_outcome(operation, connection, address_sources, artifact, outcome):
     """Check every success, retained-only, failure and cancellation outcome after the callback."""
     if outcome in {"materialize", "retained"}:
         prepared_sources = await operation
@@ -393,7 +385,6 @@ async def _assert_preparation_outcome(operation, connection, address_sources, ar
             if outcome == "retained"
             else prepared_sources.prepared_address_artifact is artifact
         )
-        assert identity.await_count == reach.await_count == 2
     else:
         with pytest.raises(asyncio.CancelledError if outcome == "cancel" else ValueError):
             await operation

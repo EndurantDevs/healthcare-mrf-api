@@ -479,9 +479,7 @@ async def _mixed_custody_options(case):
     from process.registry_publication_worker import _custody_identity, _custody_runtime_roles
 
     async with fixture.execution_connection.transaction():
-        identity = await _custody_identity(
-            fixture.execution_connection, fixture.control_schema, fixture.custody_roles["execution"]
-        )
+        identity = await _custody_identity(fixture.execution_connection, fixture.control_schema)
 
     async def authorize(driver, supplied):
         return supplied == copy_target and await driver.fetchval(
