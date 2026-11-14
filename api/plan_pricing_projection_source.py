@@ -20,7 +20,6 @@ from api.plan_pricing_projection_contract import (
     table,
 )
 from api.ptg2_candidate_audit import PTG2CandidateAuditAccess
-from api.ptg2_code_scope import source_read_relation
 from api.ptg2_tables import read_serving_tables, snapshot_serving_tables
 
 PROVIDER_BATCH_SIZE = 5_000
@@ -53,7 +52,6 @@ async def binding_source(
     binding: Mapping[str, Any],
     *,
     candidate_audit_access: PTG2CandidateAuditAccess | None = None,
-    api_read: bool = False,
 ) -> tuple[Any, tuple[Any, ...]]:
     """Validate logical authority and identify its sealed physical read."""
 
@@ -61,10 +59,6 @@ async def binding_source(
 
     snapshot_id = str(binding["snapshot_id"])
     options_by_name = {}
-    if type(api_read) is not bool:
-        raise ValueError("pricing projection Source API mode is invalid")
-    if api_read:
-        options_by_name["api_read"] = True
     if candidate_audit_access is not None:
         if type(candidate_audit_access) is not PTG2CandidateAuditAccess or not candidate_audit_access.is_match(
             snapshot_id=snapshot_id,
@@ -100,9 +94,7 @@ async def binding_source(
 
 async def _binding_market_type(session, serving, snapshot_id, plan_id, market_type):
     """Keep the original plan predicate and guard its effective market before use."""
-    plan_scope = source_read_relation(
-        session, serving.PTG2_SCHEMA, "ptg2_v3_snapshot_plan_scope", default=serving._shared_plan_scope_table()
-    )
+    plan_scope = serving._shared_plan_scope_table()
     scope_result = await session.execute(
         text(f"""
             SELECT plan_market_type

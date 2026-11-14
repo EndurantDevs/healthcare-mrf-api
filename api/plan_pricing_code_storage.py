@@ -3,14 +3,12 @@
 
 import base64
 import re
-from contextlib import nullcontext
 from uuid import UUID
 
 from sqlalchemy import text
 
-from api.network_read_execution import execute_network_read
 from api.plan_pricing_code_contract import CONTRACT, SPEC, ZIP_CONTRACT, identity_digest
-from api.ptg_membership_storage import _api_read_snapshot, _api_storage_read, _read_metadata, protected_owner
+from api.ptg_membership_storage import protected_owner
 from process import reference_family_archive as native
 from process.entity_address_snapshot_preparation import _require_no_untrusted_mutation, _seal_published_relation
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
@@ -75,25 +73,6 @@ async def source_pins(session, identity, *, create=False):
     return _pins(identity)
 
 
-async def _api_source_pins(session, identity):
-    """Keep every source retention predicate inside the authenticated API scope."""
-    from api.ptg2_serving import PTG2_SCHEMA
-
-    for pin in _pins(identity):
-        present = (
-            await execute_network_read(
-                session,
-                text(
-                    f"SELECT EXISTS(SELECT 1 FROM ONLY {native._quoted(PTG2_SCHEMA)}.ptg2_snapshot_pin WHERE owner_type=:owner_type AND owner_id=:owner_id AND snapshot_id=:snapshot_id)"
-                ),
-                pin,
-            )
-        ).scalar_one()
-        if present is not True:
-            raise PTG2ManifestArtifactError("code pricing source retention pin is missing")
-    return _pins(identity)
-
-
 def _membership_views(identity):
     view_oid_by_name = {}
     for source in identity["sources"]:
@@ -107,7 +86,7 @@ def _membership_views(identity):
     return view_oid_by_name
 
 
-async def _storage(session, view_oid, owner, identity, *, api_read=False):
+async def _storage(session, view_oid, owner, identity):
     dependencies = (
         await session.execute(
             text(
@@ -139,10 +118,7 @@ async def _storage(session, view_oid, owner, identity, *, api_read=False):
         dataset = UUID(schema[len(prefix) :])
     except ValueError as error:
         raise PTG2ManifestArtifactError("code pricing namespace differs") from error
-    if api_read is True:
-        await _api_read_snapshot(session)
-    else:
-        await native._lock_family(session, schema, SPEC.table_names, "ACCESS SHARE", nowait=True)
+    await native._lock_family(session, schema, SPEC.table_names, "ACCESS SHARE", nowait=True)
     ownership = await native.capture_model_family_stage_ownership(session, SPEC, dataset)
     if ownership.schema_oid != schema_oid or set(ownership.relation_oids) != {
         (dependency_row[3], int(dependency_row[0])) for dependency_row in storage_relations
@@ -152,11 +128,64 @@ async def _storage(session, view_oid, owner, identity, *, api_read=False):
     return ownership
 
 
+_FAMILY_SQL = """SELECT DISTINCT n.nspname,c.relname FROM pg_rewrite r
+ JOIN pg_depend d ON d.classid='pg_rewrite'::regclass AND d.objid=r.oid AND d.refclassid='pg_class'::regclass
+ JOIN pg_class c ON c.oid=d.refobjid JOIN pg_namespace n ON n.oid=c.relnamespace
+ WHERE r.ev_class=to_regclass(:view) AND c.oid<>r.ev_class AND n.nspname<>'hp_snapshot_retention'"""
+_PLAIN_HEAPS_SQL = """SELECT count(*) FROM pg_catalog.pg_class c
+ WHERE c.oid=ANY(CAST(:relations AS pg_catalog.regclass[])::pg_catalog.oid[])
+ AND c.relkind='r' AND c.relpersistence='p'
+ AND c.relam=(SELECT oid FROM pg_catalog.pg_am WHERE amname='heap')
+ AND NOT (c.relrowsecurity OR c.relforcerowsecurity OR c.relispartition)
+ AND NOT pg_catalog.row_security_active(c.oid)
+ AND NOT EXISTS(SELECT FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)
+ AND NOT EXISTS(SELECT FROM pg_catalog.pg_rewrite WHERE ev_class=c.oid)"""
+
+
+async def has_locked_plain_heaps(session, relations):
+    """Share locks last until the read ends, so row security or rules cannot be added meanwhile.
+
+    pg_class is read through the transaction snapshot, which can predate the lock under repeatable read;
+    row_security_active reads the current catalog, so a row filter committed before the lock is refused too.
+    """
+    await session.execute(text(f"LOCK TABLE {','.join(relations)} IN ACCESS SHARE MODE"))
+    return await session.scalar(text(_PLAIN_HEAPS_SQL), {"relations": list(relations)}) == len(relations)
+
+
+async def _locate_by_name(session, identity):
+    """Serve the stored capability the request anchor names; nothing is recomputed."""
+    from api.ptg2_serving import PTG2_SCHEMA
+
+    view = "hp_snapshot_retention." + attachment_name(identity)
+    if await session.scalar(text("SELECT to_regclass(:view) IS NOT NULL"), {"view": view}) is not True:
+        return None
+    dependencies = (await session.execute(text(_FAMILY_SQL), {"view": view})).all()
+    schema = dependencies[0][0] if dependencies else ""
+    if re.fullmatch("reference_family_archive_[0-9a-f]{32}", schema) is None or set(map(tuple, dependencies)) != {
+        (schema, name) for name in SPEC.table_names
+    }:
+        raise PTG2ManifestArtifactError("code pricing attachment dependencies differ")
+    relations = [native._quoted(schema) + "." + native._quoted(name) for name in SPEC.table_names]
+    if not await has_locked_plain_heaps(session, (*relations, native._quoted(PTG2_SCHEMA) + ".ptg2_snapshot_pin")):
+        raise PTG2ManifestArtifactError("code pricing storage is not a plain heap")
+    manifest = f"SELECT identity,content_digest,counts FROM ONLY {native._quoted(schema)}.plan_pricing_code_manifest WHERE singleton=1"
+    header_by_field = dict((await session.execute(text(manifest))).mappings().one())
+    try:
+        is_same_anchor = attachment_name(header_by_field["identity"]) == attachment_name(identity)
+    except (KeyError, TypeError) as error:
+        raise PTG2ManifestArtifactError("code pricing sealed identity differs") from error
+    if not is_same_anchor or re.fullmatch("[0-9a-f]{64}", header_by_field["content_digest"] or "") is None:
+        raise PTG2ManifestArtifactError("code pricing sealed identity differs")
+    await source_pins(session, header_by_field["identity"])
+    return schema, header_by_field
+
+
 async def locate(session, identity, *, allow_stale_provider=False, api_read=False):
-    """An exact closed native view, never a comment or caller receipt, authorizes reads."""
+    """Importers prove the closed native view; API reads serve the stored capability by name."""
     if type(api_read) is not bool:
         raise PTG2ManifestArtifactError("capability API read mode is invalid")
-    driver, transaction, backend_pid = await _api_read_snapshot(session) if api_read else (None, None, None)
+    if api_read:
+        return await _locate_by_name(session, identity)
     owner = await protected_owner(session)
     if owner is None:
         return None
@@ -174,38 +203,33 @@ async def locate(session, identity, *, allow_stale_provider=False, api_read=Fals
         raise PTG2ManifestArtifactError("code pricing attachment custody differs")
     view_oid = int(attachment_record[0])
     await _require_no_untrusted_mutation(session, [view_oid], owner)
-    ownership = await _storage(session, view_oid, owner, identity, **({"api_read": True} if api_read else {}))
-    async with _api_storage_read(session, ownership, driver, transaction, backend_pid) if api_read else nullcontext():
-        header = (
-            (
-                await _read_metadata(
-                    session,
-                    text(
-                        f"SELECT identity,content_digest,counts FROM {('ONLY ' if api_read else '') + native._quoted(ownership.schema_name)}.plan_pricing_code_manifest WHERE singleton=1"
-                    ),
-                    api_read=api_read,
+    ownership = await _storage(session, view_oid, owner, identity)
+    header = (
+        (
+            await session.execute(
+                text(
+                    f"SELECT identity,content_digest,counts FROM {native._quoted(ownership.schema_name)}.plan_pricing_code_manifest WHERE singleton=1"
                 )
             )
-            .mappings()
-            .one()
         )
-        if re.fullmatch("[0-9a-f]{64}", header["content_digest"] or "") is None:
-            raise PTG2ManifestArtifactError("code pricing sealed identity differs")
-        if header["identity"] != identity:
-            old, new = dict(header["identity"]), dict(identity)
-            if identity["contract"] == ZIP_CONTRACT and old.get("provider_signature") != new.get("provider_signature"):
-                old["scope"] = {
-                    key: scope_value for key, scope_value in old.get("scope", {}).items() if key != "geo_cells"
-                }
-                new["scope"] = {key: scope_value for key, scope_value in new["scope"].items() if key != "geo_cells"}
-            old.pop("provider_signature", None)
-            new.pop("provider_signature", None)
-            if allow_stale_provider and old == new:
-                await (_api_source_pins if api_read else source_pins)(session, header["identity"])
-                return None
-            raise PTG2ManifestArtifactError("code pricing sealed identity differs")
-        await (_api_source_pins if api_read else source_pins)(session, identity)
-        return ownership, dict(header), owner, view_oid
+        .mappings()
+        .one()
+    )
+    if re.fullmatch("[0-9a-f]{64}", header["content_digest"] or "") is None:
+        raise PTG2ManifestArtifactError("code pricing sealed identity differs")
+    if header["identity"] != identity:
+        old, new = dict(header["identity"]), dict(identity)
+        if identity["contract"] == ZIP_CONTRACT and old.get("provider_signature") != new.get("provider_signature"):
+            old["scope"] = {key: scope_value for key, scope_value in old.get("scope", {}).items() if key != "geo_cells"}
+            new["scope"] = {key: scope_value for key, scope_value in new["scope"].items() if key != "geo_cells"}
+        old.pop("provider_signature", None)
+        new.pop("provider_signature", None)
+        if allow_stale_provider and old == new:
+            await source_pins(session, header["identity"])
+            return None
+        raise PTG2ManifestArtifactError("code pricing sealed identity differs")
+    await source_pins(session, identity)
+    return ownership, dict(header), owner, view_oid
 
 
 async def seal(session, ownership, identity, *, reader_principals):

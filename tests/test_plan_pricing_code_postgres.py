@@ -364,9 +364,10 @@ async def test_code_native_publisher_reader_parity_dependency_retention_and_adop
         try:
             async with async_sessionmaker(reader)() as session, session.begin():
                 await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
-                found = await locate(session, identity)
-                assert receipt(found) == ready
-                scope = CodePricingCapability(identity, found)
+                assert receipt(await locate(session, identity)) == ready
+                schema_name, header = await locate(session, identity, api_read=True)
+                scope = CodePricingCapability(header["identity"], schema_name)
+                assert scope.projection_id == ready["projection_id"]
                 await _assert_reader_scope_parity(session, scope)
         finally:
             await reader.dispose()
@@ -474,8 +475,8 @@ async def test_concurrent_code_preparation_and_provider_refresh_preserve_exact_o
         first, duplicate = await asyncio.gather(prepare(), prepare())
         assert first == duplicate and len(db.stages) == 1
         async with db.sessions() as old_reader, old_reader.begin():
-            old_found = await locate(old_reader, identity)
-            old_scope = CodePricingCapability(copy.deepcopy(identity), old_found)
+            old_schema, old_header = await locate(old_reader, identity, api_read=True)
+            old_scope = CodePricingCapability(old_header["identity"], old_schema)
             identity["provider_signature"] = "c" * 64
             refreshed = await prepare()
             assert first["projection_id"] != refreshed["projection_id"]
@@ -487,3 +488,84 @@ async def test_concurrent_code_preparation_and_provider_refresh_preserve_exact_o
             assert receipt(await locate(session, identity)) == refreshed
             assert await retire_unreferenced(session, first)
             assert receipt(await locate(session, identity)) == refreshed
+
+
+async def _copied_family(db, identity):
+    """Publish a code family, its pc_ view and pin as a copied database would hold them."""
+    from uuid import uuid4
+
+    async with db.sessions() as session, session.begin():
+        stage = await native.precreate_model_family_stage(session, SPEC, uuid4())
+        schema = native._quoted(stage.schema_name)
+        await session.execute(
+            text(
+                f"INSERT INTO {schema}.plan_pricing_code_manifest (singleton,identity,content_digest,counts) "
+                "VALUES (1,CAST(:identity AS jsonb),:digest,CAST('{}' AS jsonb))"
+            ),
+            {"identity": orjson.dumps(identity).decode(), "digest": "d" * 64},
+        )
+        dependencies = ",".join(
+            f"(SELECT count(*) FROM {schema}.{native._quoted(name)} WHERE false) AS own_{index}"
+            for index, name in enumerate(SPEC.table_names)
+            if name != "plan_pricing_code_manifest"
+        )
+        await session.execute(
+            text(
+                f'CREATE VIEW hp_snapshot_retention."{attachment_name(identity)}" AS SELECT identity,content_digest,'
+                f"{dependencies} FROM {schema}.plan_pricing_code_manifest WHERE singleton=1"
+            )
+        )
+        await session.execute(
+            text("INSERT INTO mrf.ptg2_snapshot_pin VALUES (:owner_type,:owner_id,'synthetic-snapshot','test')"),
+            {"owner_type": identity["contract"], "owner_id": identity_digest(identity)},
+        )
+    return stage, schema
+
+
+async def _assert_stale_snapshot_refuses_row_filter(db, schema, request_by_field):
+    """A repeatable read snapshot taken before a committed row filter still refuses the family after the lock."""
+    from api.plan_pricing_code_read import resolve_code_pricing
+    from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+
+    forced = text(
+        f"ALTER TABLE {schema}.plan_pricing_code_membership ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY"
+    )
+    async with db.sessions() as reader:
+        with pytest.raises(PTG2ManifestArtifactError, match="plain heap"):
+            async with reader.begin():
+                await reader.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+                await reader.execute(text("SELECT 1"))  # this snapshot predates the row filter committed below
+                async with db.admin.begin() as admin:
+                    await admin.execute(forced)
+                await resolve_code_pricing(reader, _selection(), request_by_field)
+
+
+@pytest.mark.asyncio
+async def test_copied_family_serves_by_name_and_lock_holds_off_row_security(monkeypatch):
+    """Serve a copied family by name; its share lock holds off row security, and a row filter is refused."""
+    from sqlalchemy.exc import DBAPIError
+
+    from api.plan_pricing_code_read import resolve_code_pricing
+    from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
+
+    async with _database(monkeypatch) as db:
+        identity = capability_identity(_selection(), ("CPT", "27447"), "b" * 64, [_source()])
+        # Identifiers recorded on another database match nothing in this catalog.
+        identity["sources"][0]["membership"]["active_attachment"]["relation_oid"] = 4_000_000_000
+        stage, schema = await _copied_family(db, identity)
+        request_by_field = {"code_system": "CPT", "code": "27447"}
+        rls = text(f"ALTER TABLE {schema}.plan_pricing_code_membership ENABLE ROW LEVEL SECURITY")
+        async with db.sessions() as reader, reader.begin():
+            capability = await resolve_code_pricing(reader, _selection(), request_by_field)
+            assert capability.schema_name == stage.schema_name and capability.identity == identity
+            async with db.admin.connect() as admin:
+                await admin.execute(text("SET lock_timeout='100ms'"))
+                with pytest.raises(DBAPIError, match="lock timeout"):
+                    await admin.execute(rls)
+        await _assert_stale_snapshot_refuses_row_filter(db, schema, request_by_field)
+        async with db.admin.begin() as admin:
+            await admin.execute(rls)
+        async with db.sessions() as reader:
+            with pytest.raises(PTG2ManifestArtifactError, match="plain heap"):
+                async with reader.begin():
+                    await resolve_code_pricing(reader, _selection(), request_by_field)

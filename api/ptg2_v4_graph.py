@@ -830,11 +830,7 @@ async def load_v4_graph_root(
         _ROOT_CACHE.move_to_end(cache_key)
         return cached
     schema = _quote_ident(schema_name)
-    from api.ptg2_code_scope import source_read_relation
-
-    root_relation = source_read_relation(
-        session, schema_name, "ptg2_v4_snapshot_map_root", default=f"{schema}.ptg2_v4_snapshot_map_root"
-    )
+    root_relation = f"{schema}.ptg2_v4_snapshot_map_root"
     query_result = await session.execute(
         text(
             f"""

@@ -9,6 +9,7 @@ import orjson
 import pytest
 
 from api import plan_pricing_code_read as code_read
+from api import plan_pricing_code_storage as storage
 from api import plan_pricing_projection_read as projection
 from api import plan_pricing_state_scan as scan
 from api import ptg_provider_membership_build as membership
@@ -47,7 +48,7 @@ async def test_state_scan_resolves_complete_code_and_restores_outer_capability(m
     assert len(session.calls) == 1
     sql, parameters_by_name = session.calls[0]
     assert "plan_pricing_code_provider_state" in sql
-    assert capability.found[0].schema_name in sql and outer.found[0].schema_name not in sql
+    assert capability.schema_name in sql and outer.schema_name not in sql
     assert parameters_by_name["projection_id"] == capability.projection_id
     assert selection.pricing_projection_id is None and current_code_projection() is None
 
@@ -61,6 +62,7 @@ async def test_aggregate_fallback_reaches_packed_reader_with_exact_code_context(
     monkeypatch.setattr(code_read, "resolve_code_pricing", resolve)
     monkeypatch.setattr(projection, "current_network_address_scope", lambda: None)
     monkeypatch.setattr(projection, "geo_cells", AsyncMock(return_value=["60601"]))
+    monkeypatch.setattr(storage, "has_locked_plain_heaps", AsyncMock(return_value=True))
     session = object()
     arguments_by_name = {"code_system": "CPT", "code": "27447", "zip5": "60601", "include_providers": "false"}
     pagination = SimpleNamespace(limit=2, offset=0, page=1)
@@ -70,7 +72,7 @@ async def test_aggregate_fallback_reaches_packed_reader_with_exact_code_context(
         assert cells == ["60601"] and (request.code_system, request.code) == ("CPT", "27447")
         assert request.contract == CONTRACT and request.projection_id == capability.projection_id
         assert current_code_projection() is capability
-        assert capability.found[0].schema_name in table("plan_pricing_aggregate_pack")
+        assert capability.schema_name in table("plan_pricing_aggregate_pack")
         return [orjson.Fragment(b'{"geo_cell":"60601","rate_count":2}')], 1
 
     read = AsyncMock(side_effect=read_aggregate_page)
@@ -106,6 +108,7 @@ async def test_unavailable_capability_never_escapes_into_ordinary_reader(monkeyp
     monkeypatch.setattr(projection, "read_aggregate_pack_page", read)
     geo = AsyncMock(return_value=["60601"])
     monkeypatch.setattr(projection, "geo_cells", geo)
+    monkeypatch.setattr(storage, "has_locked_plain_heaps", AsyncMock(return_value=True))
     with code_projection_scope(outer):
         with pytest.raises(PlanPricingProjectionUnavailable) as caught:
             if kind == "state":

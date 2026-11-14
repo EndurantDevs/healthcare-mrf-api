@@ -134,7 +134,7 @@ def test_zip_capability_cannot_be_used_for_state_or_provider_witnesses():
     from api.plan_pricing_state_scan import _validate_search_request
     from tests.test_plan_pricing_state_scan import _args
 
-    capability = CodePricingCapability(_zip_identity(), (SimpleNamespace(schema_name="synthetic"),))
+    capability = CodePricingCapability(_zip_identity(), "synthetic")
     with code_projection_scope(capability), pytest.raises(PlanPricingProjectionUnavailable, match="state-scan"):
         _validate_search_request(
             capability.selection(_selection()), _args(), PaginationParams(limit=1, page=1, offset=0, source="test")
@@ -230,9 +230,23 @@ async def test_membership_probe_cannot_report_success_after_exhausting_bound(mon
 
 
 @pytest.mark.asyncio
+async def test_stored_zip_scope_without_geo_cells_is_unavailable(monkeypatch):
+    from api import plan_pricing_code_read as read
+
+    stored = _zip_identity()
+    stored["scope"] = {key: scope_value for key, scope_value in stored["scope"].items() if key != "geo_cells"}
+    monkeypatch.setattr(read, "locate", AsyncMock(return_value=("reference_family_archive_x", {"identity": stored})))
+    selectors_by_field = {key: scope_value for key, scope_value in _scope().items() if key != "geo_cells"}
+    with pytest.raises(PlanPricingProjectionUnavailable, match="stored ZIP capability scope is invalid"):
+        await read._resolve_capability(object(), _selection(), ("CPT", "27447"), scope=selectors_by_field)
+
+
+@pytest.mark.asyncio
 async def test_changed_complete_zip_scope_cannot_read_an_attached_pack(monkeypatch):
+    from api import plan_pricing_code_storage as storage
     from api import plan_pricing_projection_read as reader
 
+    monkeypatch.setattr(storage, "has_locked_plain_heaps", AsyncMock(return_value=True))
     monkeypatch.setattr(reader, "geo_cells", AsyncMock(return_value=["48104"]))
     monkeypatch.setattr(reader, "current_code_projection", lambda: SimpleNamespace(identity=_zip_identity()))
     session = SimpleNamespace(execute=AsyncMock())
@@ -278,18 +292,18 @@ async def test_exact_zip_attachment_is_preferred_and_invalid_storage_never_falls
     from api import plan_pricing_code_read as reader
 
     identity = _zip_identity()
-    session = SimpleNamespace(scalar=AsyncMock(return_value=True))
-    monkeypatch.setattr(reader, "_lock_provider_relations", AsyncMock())
-    monkeypatch.setattr(build, "resolve_inputs", AsyncMock(return_value=(identity, [])))
-    locate = AsyncMock(return_value=(SimpleNamespace(schema_name="synthetic"),))
+    session = SimpleNamespace()
+    locate = AsyncMock(return_value=("synthetic", {"identity": identity}))
     monkeypatch.setattr(reader, "locate", locate)
     request_by_field = {**_params(expected=False), "view": "card", "include_providers": "false"}
     capability = await reader.resolve_code_pricing(session, _selection(), request_by_field)
-    assert capability.identity == identity and session.scalar.await_count == 1
+    assert capability.identity == identity and capability.schema_name == "synthetic"
+    assert locate.await_args.args[1]["scope"] == {key: value for key, value in _scope().items() if key != "geo_cells"}
+    assert locate.await_args.kwargs == {"api_read": True}
     locate.side_effect = PlanPricingProjectionUnavailable("invalid attached storage")
     with pytest.raises(PlanPricingProjectionUnavailable, match="invalid attached"):
         await reader.resolve_code_pricing(session, _selection(), request_by_field)
-    assert session.scalar.await_count == 2
+    assert locate.await_count == 2
 
 
 @pytest.mark.asyncio
