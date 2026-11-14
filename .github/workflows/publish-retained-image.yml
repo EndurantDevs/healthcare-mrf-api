@@ -33,7 +33,7 @@ jobs:
       actions: read
       packages: write
     env:
-      CI_REVISION: 7169e11b3e16943a3e3e72999125f086982f4dce
+      CI_REVISION: cd8e00cc0134afc2413227c95676deea89428cf3
       PYTHONDONTWRITEBYTECODE: '1'
       IMAGE_ARTIFACT_ID: ${{ inputs.image_artifact_id }}
       MEASUREMENT_ARTIFACT_ID: ${{ inputs.measurement_artifact_id }}
@@ -44,7 +44,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 7169e11b3e16943a3e3e72999125f086982f4dce
+        ref: cd8e00cc0134afc2413227c95676deea89428cf3
         path: ci
         persist-credentials: false
     - name: Install pinned uv

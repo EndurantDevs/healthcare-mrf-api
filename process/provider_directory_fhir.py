@@ -301,6 +301,7 @@ from process.provider_directory_fhir_subset_identity import (
 from process.provider_directory_generic_source_adapters import resource_scan_types
 from process.provider_directory_generic_source_policy import (
     is_source_storage_required,
+    require_source_selection,
     source_copy_executor,
 )
 from process.provider_directory_generic_source_policy import (
@@ -58091,23 +58092,7 @@ def _validate_provider_directory_endpoint_scope(
     source_records: list[dict[str, Any]],
     requested_scope: str | None,
 ) -> str | None:
-    if not requested_scope:
-        return None
-    canonical_scope = _canonical_base(requested_scope)
-    if not canonical_scope:
-        raise RuntimeError("provider_directory_endpoint_scope_invalid")
-    resolved_base_values = [
-        _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
-        for source_record in source_records
-    ]
-    if not resolved_base_values or any(not value for value in resolved_base_values):
-        raise RuntimeError("provider_directory_endpoint_scope_unresolved_base")
-    resolved_bases = set(resolved_base_values)
-    if len(resolved_bases) != 1:
-        raise RuntimeError("provider_directory_endpoint_scope_multiple_bases")
-    if canonical_scope not in resolved_bases:
-        raise RuntimeError("provider_directory_endpoint_scope_mismatch")
-    return canonical_scope
+    return source_selection.validate_endpoint_scope(sys.modules[__name__], source_records, requested_scope)
 
 
 def _compatibility_storage_source(
@@ -69810,6 +69795,7 @@ async def process_provider_directory_fhir_data(
         source_rows = _scope_source_rows(source_rows, requested_source_ids)
         if limit and (task.get("retest_results_path") or task.get("retest_results_url")):
             source_rows = source_rows[:limit]
+        require_source_selection(source_rows)
         census_contract = (
             bind_current_version_census_contract(census_request, source_rows) if census_request is not None else None
         )
@@ -69822,6 +69808,7 @@ async def process_provider_directory_fhir_data(
             source_rows = await source_selection.qualify_stale_isolated_source(
                 sys.modules[__name__], source_rows, task, timeout=timeout, run_id=run_id
             )
+        require_source_selection(source_rows)
         endpoint_rows_seeded = await _upsert_provider_directory_source_rows(
             source_rows,
             require_reviewed_subset_generation=bool(

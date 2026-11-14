@@ -190,6 +190,14 @@ def source_transaction_available():
     return None
 
 
+def require_source_selection(source_rows):
+    """Apply optional orchestration admission before using resolved source metadata."""
+    validator = getattr(_FACTORY.get(), "require_source_selection", None)
+    if validator is not None:
+        _require(callable(validator), "source_selection_validator_required")
+        _require(validator(source_rows) is None, "source_selection_validator_changed")
+
+
 def source_producer_identity() -> tuple[str, str]:
     """Return baked (source commit, image digest) without authorizing a SQL session."""
     factory = _FACTORY.get()
