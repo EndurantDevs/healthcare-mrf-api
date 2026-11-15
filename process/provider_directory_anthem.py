@@ -153,7 +153,7 @@ def _validate_count_transition(proof: dict, saved: dict, rows: int, boundary: st
 
 
 def prepare_resume(start: str, saved_url: str, resource_type: str, cap: int, rows_processed: int, completeness: dict):
-    """Resize only a retained role cursor; persist its proof with the accepted page."""
+    """Keep issued role page sizes and validate previously committed count transitions."""
     proof_by_field = dict(completeness)
     transition = proof_by_field.get(PAGE_COUNT_TRANSITION_KEY)
     if resource_type != "PractitionerRole" or start != start_url(resource_type, 1000):
@@ -168,21 +168,9 @@ def prepare_resume(start: str, saved_url: str, resource_type: str, cap: int, row
     if saved["_count"] != "500":
         return resume_url(start, saved_url, resource_type, cap), proof_by_field
     resume_url(start_url(resource_type, 500), saved_url, resource_type, cap)
-    if cap < 1000 or rows_processed <= 0 or int(saved["_offset"]) != rows_processed or boundary is None:
+    if rows_processed <= 0 or int(saved["_offset"]) != rows_processed or boundary is None:
         raise ValueError("anthem_page_count_transition_invalid")
-    proof_by_field[PAGE_COUNT_TRANSITION_KEY] = {
-        "from": 500,
-        "to": 1000,
-        "issued_offset": rows_processed,
-        "issued_cursor_sha256": hashlib.sha256(saved_url.encode()).hexdigest(),
-        "sorted_last_id": boundary,
-    }
-    prefix, query = saved_url.split("?", 1)
-    parts = query.split("&")
-    for index, part in enumerate(parts):
-        if parse_qsl(part, strict_parsing=True) == [("_count", "500")]:
-            parts[index] = part.split("=", 1)[0] + "=1000"
-    return prefix + "?" + "&".join(parts), proof_by_field
+    return saved_url, proof_by_field
 
 
 def prepare_acquisition(start: str, resource_type: str, cap: int, resume):

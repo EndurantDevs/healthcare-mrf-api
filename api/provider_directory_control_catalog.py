@@ -22,8 +22,12 @@ _SELECTION_PROJECTION_TIMEOUT_SECONDS = 5.0
 _CMS_CANDIDATE_TIMEOUT_SECONDS = 5.0
 
 
-async def provider_directory_control_catalog(editions=()) -> dict[str, Any]:
-    """Return optional outcomes and the exact current Profile request."""
+class _OptionalCatalogProjectionError(RuntimeError):
+    """An owning transaction must roll back before static catalog fallback."""
+
+
+async def provider_directory_control_catalog(editions=(), *, allow_optional_fallback: bool = True) -> dict[str, Any]:
+    """Project optional fields; transaction owners defer fallback until rollback."""
 
     static_map = provider_directory_source_catalog()
     selection_payload = None
@@ -35,14 +39,18 @@ async def provider_directory_control_catalog(editions=()) -> dict[str, Any]:
             "Provider Directory selection projection failed",
             exc_info=True,
         )
+        if not allow_optional_fallback:
+            raise _OptionalCatalogProjectionError("selection projection failed") from None
     try:
         async with asyncio.timeout(_OUTCOME_ENRICHMENT_TIMEOUT_SECONDS):
             catalog_map = await enrich_provider_directory_source_catalog(static_map, editions=editions)
     except Exception:
         logging.getLogger(__name__).warning(
-            "Provider Directory outcome enrichment failed; returning static catalog",
+            "Provider Directory outcome enrichment failed",
             exc_info=True,
         )
+        if not allow_optional_fallback:
+            raise _OptionalCatalogProjectionError("outcome enrichment failed") from None
         catalog_map = static_map
     if selection_payload is not None:
         catalog_map = {
@@ -56,4 +64,6 @@ async def provider_directory_control_catalog(editions=()) -> dict[str, Any]:
             catalog_map = {**catalog_map, "cms_serving_candidate": candidate}
     except Exception:
         logging.getLogger(__name__).warning("CMS candidate projection failed", exc_info=True)
+        if not allow_optional_fallback:
+            raise _OptionalCatalogProjectionError("CMS candidate projection failed") from None
     return catalog_map
