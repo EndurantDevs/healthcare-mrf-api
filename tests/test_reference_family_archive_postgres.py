@@ -1405,4 +1405,4 @@ async def test_code_pricing_family_serves_by_name_in_this_lane(monkeypatch):
     from tests import test_plan_pricing_code_postgres as code_pricing
 
     monkeypatch.setattr(code_pricing, "_url", lambda: make_url(_database_url()))
-    await code_pricing.test_copied_family_serves_by_name_and_lock_holds_off_row_security(monkeypatch)
+    await code_pricing.serve_copied_family_by_name(monkeypatch)
