@@ -1,13 +1,16 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Address artifact and compact dependency verification on a synthetic connection."""
 
+from copy import deepcopy
 from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
 
+import asyncpg
 import pytest
 
+from process import entity_address_snapshot_receipt as receipt
 from process import network_address_artifact as artifact
 from process import network_candidate_custody as custody
 from process import network_compact_custom_preparation as custom
@@ -42,7 +45,10 @@ def _descriptor():
         "generation_id": artifact._digest(origin_by_field),
         "alias_generation": 0,
         "alias_catalog_sha256": "a" * 64,
-        "catalog": {"address": {}, "authority": {}},
+        "catalog": {
+            "address": {"shapes": [["entity_address_unified", 41, "a" * 64]]},
+            "authority": {"shapes": [[artifact._AUTHORITY, 80, "b" * 64]]},
+        },
         "runtime_roles": list(ROLES),
     }
     document_by_field["descriptor_sha256"] = artifact._digest(document_by_field)
@@ -72,155 +78,260 @@ class Connection:
     def __init__(self):
         self.calls = []
         self.physical = {41: _physical(41, "entity_address_unified"), 80: _physical(80, artifact._AUTHORITY)}
-        self.owner = {
-            "oid": 100,
-            **dict.fromkeys(
-                ("rolcanlogin", "rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls"), False
-            ),
-        }
-        self.database, self.runtime_safe, self.namespace_unsafe = {"oid": 11, "name": "synthetic"}, True, False
+        self.schema_hashes = {"entity_address_unified": "a" * 64, artifact._AUTHORITY: "b" * 64}
+        self.active, self.denied_name = True, None
         self.candidate_by_name = None
+        self.origin_by_field = {
+            field: _descriptor()["authority"][field]
+            for field in ("origin_lineage_id", "origin_generation", "published_at")
+        }
 
     def is_in_transaction(self):
-        return True
+        return self.active
 
     async def fetchrow(self, statement, *arguments):
         self.calls.append((statement, arguments))
-        if statement.startswith("SELECT oid::bigint AS oid,datname"):
-            return self.database
+        if statement.startswith("SELECT origin_lineage_id,origin_generation,published_at"):
+            if self.denied_name == artifact._AUTHORITY:
+                raise asyncpg.InsufficientPrivilegeError("native SELECT denied")
+            if not any(row["relname"] == artifact._AUTHORITY for row in self.physical.values()):
+                raise asyncpg.UndefinedTableError("named authority absent")
+            return self.origin_by_field
         if statement.startswith("SELECT c.oid::bigint,c.relname"):
             return self.physical.get(arguments[0])
-        if statement.startswith("SELECT r.oid::bigint"):
-            return self.owner
         assert statement.startswith('SELECT * FROM "synthetic_control".network_membership_candidate')
         assert arguments == (UUID(RETAINED),)
         return self.candidate_by_name
 
     async def fetchval(self, statement, *arguments):
         self.calls.append((statement, arguments))
-        if statement.startswith("SELECT to_regclass"):
-            return 41
-        if statement.startswith("SELECT count(*)=cardinality"):
-            return self.runtime_safe
-        if statement.startswith("SELECT EXISTS(SELECT FROM pg_roles principal"):
-            return self.namespace_unsafe
-        assert statement == "SELECT current_user"
-        return "api_user"
+        assert statement.startswith("SELECT to_regclass")
+        selected = next(
+            (oid for oid, row in self.physical.items() if arguments == (f'"{row["schema_name"]}"."{row["relname"]}"',)),
+            None,
+        )
+        return selected is not None if statement.endswith("IS NOT NULL") else selected
 
     async def execute(self, statement, *arguments):
         self.calls.append((statement, arguments))
         assert statement.startswith("LOCK TABLE ONLY ")
+        relation = statement.removeprefix("LOCK TABLE ONLY ").removesuffix(" IN ACCESS SHARE MODE NOWAIT")
+        if relation == f'"{SCHEMA}"."{self.denied_name}"':
+            raise asyncpg.InsufficientPrivilegeError("native SELECT denied")
+        if relation not in {f'"{row["schema_name"]}"."{row["relname"]}"' for row in self.physical.values()}:
+            raise asyncpg.UndefinedTableError("named relation absent")
         return "LOCK TABLE"
 
+    async def prepare(self, statement):
+        self.calls.append((statement, ()))
+        assert statement in (
+            "SHOW search_path",
+            "SET LOCAL search_path=pg_catalog,pg_temp",
+            "SELECT set_config('search_path',$1::VARCHAR,true)",
+        )
+        rows = [{"search_path": "public"}] if statement == "SHOW search_path" else []
+        return SimpleNamespace(get_attributes=lambda: (), fetch=AsyncMock(return_value=rows))
 
-def _catalog_spies(monkeypatch, descriptor):
-    mutation, subjects = AsyncMock(), AsyncMock()
-    catalog = AsyncMock(return_value=descriptor["catalog"])
-    alias = AsyncMock(return_value=descriptor["alias_catalog_sha256"])
-    monkeypatch.setattr(artifact.protected, "_require_no_untrusted_mutation", mutation)
-    monkeypatch.setattr(artifact, "require_native_read_catalog_subjects", subjects)
-    monkeypatch.setattr(artifact, "_catalog", catalog)
-    monkeypatch.setattr(artifact.protected, "_require_alias_authority", alias)
-    return mutation, subjects, catalog, alias
+
+def _schema_spy(monkeypatch, connection):
+    async def schema_identity(session, oid, schema, logical, *, names_by_stage):
+        assert session.native_connection is connection and schema == SCHEMA
+        assert names_by_stage == {connection.physical[oid]["relname"]: logical}
+        return connection.schema_hashes[logical]
+
+    schema = AsyncMock(side_effect=schema_identity)
+    monkeypatch.setattr(receipt, "_schema_identity", schema)
+    return schema
 
 
-async def test_address_verification_keeps_both_explicit_locks(monkeypatch):
+@pytest.mark.parametrize("name", ["live", "portable", "legacy"])
+async def test_address_verification_keeps_both_explicit_locks(monkeypatch, name):
     descriptor = _descriptor()
     connection = Connection()
-    _catalog_spies(monkeypatch, descriptor)
+    if name == "portable":
+        origin_by_field = {
+            field: descriptor["authority"][field]
+            for field in ("origin_lineage_id", "origin_generation", "published_at")
+        }
+        connection.physical[41]["relname"] = artifact.retained_address_name("entity_address_unified", origin_by_field)
+    elif name == "legacy":
+        connection.physical[41]["relname"] = "entity_address_unified_retained_29"
+    schema = _schema_spy(monkeypatch, connection)
     assert (await artifact.verify_network_address_artifact(connection, descriptor, runtime_roles=ROLES)).table_oid == 41
     statements = [sql for sql, arguments in connection.calls]
     assert [sql for sql in statements if sql.startswith("LOCK TABLE")] == [
-        f'LOCK TABLE ONLY "{SCHEMA}"."entity_address_unified" IN ACCESS SHARE MODE NOWAIT',
+        f'LOCK TABLE ONLY "{SCHEMA}"."{connection.physical[41]["relname"]}" IN ACCESS SHARE MODE NOWAIT',
         f'LOCK TABLE ONLY "{SCHEMA}"."entity_address_result_generation" IN ACCESS SHARE MODE NOWAIT',
+    ]
+    assert [call.args[1:4] for call in schema.await_args_list] == [
+        (41, SCHEMA, "entity_address_unified"),
+        (80, SCHEMA, artifact._AUTHORITY),
     ]
     assert not any("transaction_read_only" in sql for sql in statements)
     assert any("to_regclass" in sql for sql in statements)
+    assert statements[-1] == "SELECT set_config('search_path',$1::VARCHAR,true)"
 
 
+@pytest.mark.parametrize("oid", [41, 80], ids=["address", "authority"])
 @pytest.mark.parametrize(
     "damage",
     [
         "absent",
         "schema",
         "name",
-        "filenode",
-        "namespace_oid",
-        "schema_owner",
-        "owner_role",
-        "owner",
-        "authority_missing",
-        "authority_schema",
-        "authority_name",
         "heap_kind",
         "temporary",
         "rls",
+        "force_rls",
+        "partition",
         "rules",
         "inherited",
-        "runtime",
-        "namespace_privileges",
-        "mutation",
-        "subjects",
-        "catalog",
-        "alias",
-        "database",
-        "roles",
-        "digest",
+        "shape",
     ],
 )
-async def test_address_verification_keeps_every_refusal(monkeypatch, damage):
+async def test_address_verification_keeps_named_schema_refusals(monkeypatch, oid, damage):
     descriptor, connection = _descriptor(), Connection()
-    mutation, subjects, catalog, alias = _catalog_spies(monkeypatch, descriptor)
+    _schema_spy(monkeypatch, connection)
     changes_by_fault = {
         "schema": ("schema_name", "other_schema"),
         "name": ("relname", "other_table"),
-        "filenode": ("relfilenode", 999),
-        "namespace_oid": ("schema_oid", 999),
-        "schema_owner": ("schema_owner_oid", 999),
-        "owner": ("owner_oid", 999),
         "heap_kind": ("relkind", "v"),
         "temporary": ("relpersistence", "t"),
         "rls": ("relrowsecurity", True),
+        "force_rls": ("relforcerowsecurity", True),
+        "partition": ("relispartition", True),
         "rules": ("rules", True),
         "inherited": ("inherited", True),
     }
     if damage in changes_by_fault:
         field, changed = changes_by_fault[damage]
-        connection.physical[41][field] = changed
+        connection.physical[oid][field] = changed
     if damage == "absent":
-        connection.physical.pop(41)
-    if damage == "authority_missing":
-        connection.physical.pop(80)
-    if damage == "authority_schema":
-        connection.physical[80]["schema_oid"] = 999
-    if damage == "authority_name":
-        connection.physical[80]["relname"] = "other_authority"
-    if damage == "owner_role":
-        connection.owner["rolsuper"] = True
-    if damage == "runtime":
-        connection.runtime_safe = False
-    if damage == "namespace_privileges":
-        connection.namespace_unsafe = True
-    if damage == "mutation":
-        mutation.side_effect = RuntimeError("ordinary mutation available")
-    if damage == "subjects":
-        subjects.side_effect = RuntimeError("unsafe executable catalog")
-    if damage == "catalog":
-        catalog.return_value = {}
-    if damage == "alias":
-        alias.return_value = "b" * 64
-    if damage == "database":
-        connection.database = {"oid": 99, "name": "other"}
+        connection.physical.pop(oid)
+    if damage == "shape":
+        connection.schema_hashes[connection.physical[oid]["relname"]] = "c" * 64
+    with pytest.raises((artifact.NetworkAddressArtifactError, asyncpg.UndefinedTableError)):
+        await artifact.verify_network_address_artifact(connection, descriptor, runtime_roles=ROLES)
+
+
+@pytest.mark.parametrize("name", ["entity_address_unified", artifact._AUTHORITY])
+async def test_address_verification_preserves_native_permission_failure(monkeypatch, name):
+    connection = Connection()
+    connection.denied_name = name
+    schema = _schema_spy(monkeypatch, connection)
+    with pytest.raises(asyncpg.InsufficientPrivilegeError, match="native SELECT denied"):
+        await artifact.verify_network_address_artifact(connection, _descriptor(), runtime_roles=ROLES)
+    schema.assert_not_awaited()
+
+
+@pytest.mark.parametrize("damage", ["transaction", "roles", "digest", "generation", "shape_count", "shape_name"])
+async def test_address_verification_keeps_descriptor_and_transaction_refusals(monkeypatch, damage):
+    descriptor, connection = _descriptor(), Connection()
+    _schema_spy(monkeypatch, connection)
+    if damage == "transaction":
+        connection.active = False
     if damage == "roles":
-        descriptor["runtime_roles"] = ["other_reader"]
+        descriptor["runtime_roles"] = ["reader", "reader"]
     if damage == "digest":
         descriptor["descriptor_sha256"] = "0" * 64
-    if damage == "roles":
+    if damage == "generation":
+        descriptor["generation_id"] = "c" * 64
+    if damage == "shape_count":
+        descriptor["catalog"]["address"]["shapes"] *= 2
+    if damage == "shape_name":
+        descriptor["catalog"]["address"]["shapes"][0][0] = "other_table"
+    if damage != "digest":
         descriptor["descriptor_sha256"] = artifact._digest(
             {key: field for key, field in descriptor.items() if key != "descriptor_sha256"}
         )
-    with pytest.raises((ValueError, RuntimeError)):
+    with pytest.raises(artifact.NetworkAddressArtifactError):
         await artifact.verify_network_address_artifact(connection, descriptor, runtime_roles=ROLES)
+
+
+async def test_address_verification_preserves_historical_metadata_after_copy(monkeypatch):
+    descriptor, connection = _descriptor(), Connection()
+    before = deepcopy(descriptor)
+    connection.physical = {
+        oid + 100: {
+            **row,
+            "oid": oid + 100,
+            "relfilenode": 900,
+            "owner_oid": 901,
+            "schema_oid": 902,
+            "schema_owner_oid": 903,
+        }
+        for oid, row in connection.physical.items()
+    }
+    schema = _schema_spy(monkeypatch, connection)
+    relation = await artifact.verify_network_address_artifact(connection, descriptor, runtime_roles=("target_reader",))
+    assert relation == CompactAddressRelation(SCHEMA, "entity_address_unified", 141)
+    assert [call.args[1] for call in schema.await_args_list] == [141, 180]
+    assert descriptor == before
+
+
+@pytest.mark.parametrize("field", ["origin_lineage_id", "origin_generation", "published_at", "absent"])
+async def test_live_fallback_requires_saved_logical_generation(monkeypatch, field):
+    connection = Connection()
+    schema = _schema_spy(monkeypatch, connection)
+    if field == "absent":
+        connection.origin_by_field = None
+    else:
+        connection.origin_by_field[field] = {
+            "origin_lineage_id": str(UUID(int=99)),
+            "origin_generation": 99,
+            "published_at": "2026-02-01T00:00:00Z",
+        }[field]
+    with pytest.raises(artifact.NetworkAddressArtifactError, match="source_generation_changed"):
+        await artifact.verify_network_address_artifact(connection, _descriptor(), runtime_roles=ROLES)
+    schema.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [None, "missing", "extra", "duplicate_name", "duplicate_position", "zero", "boolean", "incomplete", "reordered"],
+)
+def test_legacy_shape_positions_require_exact_named_bijection(damage):
+    columns = [{"attname": "first", "attnum": 1}, {"attname": "second", "attnum": 2}]
+    recorded_columns = [{"attname": "first", "attnum": 1}, {"attname": "second", "attnum": 3}]
+    if damage == "missing":
+        columns.pop()
+    if damage == "extra":
+        columns.append({"attname": "third", "attnum": 3})
+    if damage == "duplicate_name":
+        recorded_columns[1]["attname"] = "first"
+    if damage in {"duplicate_position", "zero", "boolean"}:
+        recorded_columns[1]["attnum"] = {"duplicate_position": 1, "zero": 0, "boolean": True}[damage]
+    if damage == "incomplete":
+        recorded_columns[1].pop("attnum")
+    if damage == "reordered":
+        columns[0]["attnum"], columns[1]["attnum"] = 2, 1
+    if damage is None:
+        assert artifact._legacy_address_positions(columns, recorded_columns) == {0: 0, 1: 1, 2: 3}
+    else:
+        with pytest.raises(artifact.NetworkAddressArtifactError, match="structural_catalog_changed"):
+            artifact._legacy_address_positions(columns, recorded_columns)
+
+
+@pytest.mark.parametrize("damage", ["constraint", "index", "attribute", "reference"])
+async def test_copied_shape_refuses_unknown_or_foreign_positions(monkeypatch, damage):
+    columns = [{"attnum": 1, "attname": "first"}]
+    constraint_by_field = {"contype": "p", "key_columns": "{1}", "referenced_table": None, "referenced_columns": None}
+    index_by_field = {"keys": "1", "key_attributes": [{"attribute_number": 1}]}
+    if damage == "constraint":
+        constraint_by_field["key_columns"] = "{9}"
+    elif damage == "index":
+        index_by_field["keys"] = "9"
+    elif damage == "attribute":
+        index_by_field["key_attributes"][0]["attribute_number"] = 9
+    else:
+        constraint_by_field["referenced_table"], constraint_by_field["referenced_columns"] = "other_table", "{1}"
+    monkeypatch.setattr(receipt, "_catalog_columns", AsyncMock(return_value=columns))
+    monkeypatch.setattr(receipt, "_catalog_constraints", AsyncMock(return_value=[constraint_by_field]))
+    monkeypatch.setattr(receipt, "_catalog_indexes", AsyncMock(return_value=[index_by_field]))
+    with pytest.raises(artifact.NetworkAddressArtifactError, match="structural_catalog_changed"):
+        await artifact._copied_address_shape(
+            object(), {"columns": deepcopy(columns)}, {"oid": 41, "schema_name": SCHEMA}, "entity_address_unified"
+        )
 
 
 def _candidate():
@@ -320,7 +431,7 @@ async def test_retained_edge_cannot_bypass_exact_independent_seal(monkeypatch, d
         )
 
 
-@pytest.mark.parametrize("damage", [None, "binding", "carrier", "heap", "base_oid", "own_edge"])
+@pytest.mark.parametrize("damage", [None, "copied_base", "binding", "carrier", "heap", "base_schema", "own_edge"])
 async def test_layout_preserves_custom_carrier_and_owned_edge_checks(monkeypatch, damage):
     candidate_by_name, retained, expected_by_field = _candidate()
     connection = Connection()
@@ -342,15 +453,18 @@ async def test_layout_preserves_custom_carrier_and_owned_edge_checks(monkeypatch
         carriers.base_artifact_sha256 = "d" * 64
     if damage == "heap":
         report["writer_closure"]["relation_oids"]["entity_address_unified"] = 99
-    if damage == "base_oid":
-        report["serving_readiness"]["address_artifact"]["table"]["oid"] = 99
     if damage == "own_edge":
         report["serving_readiness"]["edge_artifacts"][0]["seal_sha256"] = "d" * 64
     monkeypatch.setattr(custom, "compact_custom_receipt", lambda candidate_by_name: custom_receipt)
     monkeypatch.setattr(custom, "compact_carrier_receipt", lambda candidate_by_name: carriers)
-    base = CompactAddressRelation(SCHEMA, "entity_address_unified", 41)
-    if damage is None:
+    base = CompactAddressRelation(
+        "other_schema" if damage == "base_schema" else SCHEMA,
+        "entity_address_unified",
+        141 if damage == "copied_base" else 41,
+    )
+    if damage in (None, "copied_base"):
         layout = await dependencies._verified_layout(connection, candidate_by_name, base, CONTROL)
+        assert layout.base == base
         assert layout.custom == CompactAddressRelation(candidate_by_name["schema_name"], "entity_address_unified", 54)
     else:
         with pytest.raises(ValueError):

@@ -10,6 +10,12 @@ import pytest
 from process import network_published_api_pin as published
 from process.registry_network_catalog_read import _PINNED_READ
 
+_SERVING_GENERATION = {
+    "origin_lineage_id": "11111111-1111-4111-8111-111111111111",
+    "origin_generation": 7,
+    "published_at": "2026-01-01T00:00:00Z",
+}
+
 
 def test_supplied_manifest_flag_cannot_skip_request_audits():
     connection = SimpleNamespace(is_in_transaction=lambda: True)
@@ -52,13 +58,116 @@ async def test_invalid_generation_never_runs_metadata_sql(generation):
 
 
 def _published_entry(serving_readiness, *, base_rls=False, own_rls=False):
-    candidate_json = json.dumps({"validation_json": {"serving_readiness": serving_readiness, "writer_closure": {}}})
-    return {"candidate_json": candidate_json, "base_rls": base_rls, "own_rls": own_rls}
+    candidate_json = json.dumps(
+        {
+            "validation_json": {
+                "serving_readiness": serving_readiness,
+                "writer_closure": {},
+                "address_source": {"schema_name": "example_addresses", "table_name": "entity_address_unified"},
+            }
+        }
+    )
+    return {
+        "candidate_json": candidate_json,
+        "base_rls": base_rls,
+        "own_rls": own_rls,
+        "base_schema": "example_addresses",
+        "base_name": "entity_address_unified",
+    }
+
+
+def _published_connection(entry):
+    report = json.loads(entry["candidate_json"])["validation_json"] if entry is not None else None
+
+    async def fetchrow(statement, *_parameters):
+        if statement.startswith("SELECT origin_lineage_id,origin_generation,published_at"):
+            return _SERVING_GENERATION
+        if statement.startswith("SELECT\n candidate.validation_json") and report is not None:
+            source = report["address_source"]
+            serving = report["serving_readiness"]
+            artifact = serving.get("address_artifact", {})
+            ordinal = artifact.get("table", {}).get("oid")
+            return {
+                "is_compact": serving.get("component") == "compact_network_serving",
+                "schema_name": source["schema_name"],
+                "table_name": source["table_name"],
+                "retained_name": f"{source['table_name']}_retained_{ordinal:x}" if ordinal is not None else None,
+                "serving_generation_json": (
+                    json.dumps({field: artifact.get("authority", {}).get(field) for field in _SERVING_GENERATION})
+                    if artifact.get("contract") == "network_address_artifact.postgres.v1"
+                    else None
+                ),
+            }
+        return entry
+
+    return SimpleNamespace(
+        fetchrow=AsyncMock(side_effect=fetchrow),
+        fetchval=AsyncMock(side_effect=lambda _statement, _portable, _retained, live: live),
+        execute=AsyncMock(),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_retained", [False, True])
+async def test_logical_address_locks_existing_named_table(has_retained):
+    coordinates_by_field = {
+        "is_compact": True,
+        "schema_name": "example_addresses",
+        "table_name": "entity_address_unified",
+        "retained_name": "entity_address_unified_retained_b",
+        "serving_generation_json": None,
+    }
+    name = "entity_address_unified_retained_b" if has_retained else "entity_address_unified"
+    qualified = f'"example_addresses"."{name}"'
+    connection = SimpleNamespace(
+        fetchrow=AsyncMock(return_value=coordinates_by_field),
+        fetchval=AsyncMock(return_value=qualified),
+        execute=AsyncMock(),
+    )
+    locked, portable = await published._lock_logical_address(connection, 3, "example_control")
+    assert locked == qualified and portable is None
+    connection.execute.assert_awaited_once_with(f"LOCK TABLE {locked} IN ACCESS SHARE MODE")
+    assert connection.fetchval.await_args.args[1:] == (
+        None,
+        '"example_addresses"."entity_address_unified_retained_b"',
+        '"example_addresses"."entity_address_unified"',
+    )
+
+
+@pytest.mark.asyncio
+async def test_portable_origin_names_precede_legacy_names():
+    coordinates_by_field = {
+        "is_compact": True,
+        "schema_name": "example_addresses",
+        "table_name": "entity_address_unified",
+        "retained_name": "entity_address_unified_retained_b",
+        "serving_generation_json": json.dumps(_SERVING_GENERATION),
+    }
+    expected = published.retained_address_name("entity_address_unified", _SERVING_GENERATION)
+    qualified = f'"example_addresses"."{expected}"'
+    connection = SimpleNamespace(
+        fetchrow=AsyncMock(return_value=coordinates_by_field),
+        fetchval=AsyncMock(return_value=qualified),
+        execute=AsyncMock(),
+    )
+    assert await published._lock_logical_address(connection, 3, "example_control") == (qualified, expected)
+    assert connection.fetchval.await_args.args[1:] == (
+        qualified,
+        '"example_addresses"."entity_address_unified_retained_b"',
+        '"example_addresses"."entity_address_unified"',
+    )
+    connection.execute.assert_awaited_once_with(f"LOCK TABLE {qualified} IN ACCESS SHARE MODE")
+    for damaged in ({}, {**_SERVING_GENERATION, "origin_generation": True}):
+        coordinates_by_field["serving_generation_json"] = json.dumps(damaged)
+        connection.execute.reset_mock()
+        with pytest.raises(ValueError):
+            await published._lock_logical_address(connection, 3, "example_control")
+        connection.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_missing_published_generation_is_unavailable():
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=None))
+    connection = _published_connection(None)
     with pytest.raises(published.NetworkServingReadUnavailable, match="generation is unavailable"):
         await published.read_published_api_pin(connection, 3, "example_control")
     statement, generation = connection.fetchrow.await_args.args
@@ -71,17 +180,18 @@ async def test_generation_without_a_compact_layout_resolves_from_its_validation_
     entry = _published_entry({"index_definition_sha256": "d" * 64}, base_rls=None)
     manifest, proofs = SimpleNamespace(), []
     monkeypatch.setattr(published, "_pinned_manifest", lambda _entry, custody: proofs.append(custody) or manifest)
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=entry))
+    connection = _published_connection(entry)
     resolved = await published.read_published_api_pin(connection, None, "example_control", approved=False)
     assert resolved == (manifest, None, None)
     assert proofs[0]["compact_layout"] is None and proofs[0]["seal_sha256"] is None
+    connection.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("own_rls", [True, None], ids=["row security", "no address table"])
 async def test_generation_without_a_compact_layout_refuses_a_row_filtered_address_table(own_rls):
     entry = _published_entry({"index_definition_sha256": "d" * 64}, base_rls=None, own_rls=own_rls)
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=entry))
+    connection = _published_connection(entry)
     with pytest.raises(published.NetworkServingReadUnavailable, match="address rows are unavailable"):
         await published.read_published_api_pin(connection, None, "example_control", approved=False)
     assert "AS own_rls" in connection.fetchrow.await_args.args[0]
@@ -90,8 +200,10 @@ async def test_generation_without_a_compact_layout_refuses_a_row_filtered_addres
 @pytest.mark.asyncio
 @pytest.mark.parametrize("base_rls", [True, None], ids=["row security", "no heap under either name"])
 async def test_unreadable_published_address_heap_is_unavailable(base_rls):
-    entry = _published_entry({"component": "compact_network_serving", "address_artifact": {}}, base_rls=base_rls)
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=entry))
+    entry = _published_entry(
+        {"component": "compact_network_serving", "address_artifact": {"table": {"oid": 11}}}, base_rls=base_rls
+    )
+    connection = _published_connection(entry)
     with pytest.raises(published.NetworkServingReadUnavailable, match="address rows are unavailable"):
         await published.read_published_api_pin(connection, None, "example_control")
 
@@ -102,6 +214,7 @@ async def test_compact_custom_addresses_require_an_unfiltered_own_table(monkeypa
     from process import network_compact_layout as layouts
 
     report_by_field = {
+        "address_source": {"schema_name": "example_addresses", "table_name": "entity_address_unified"},
         "serving_readiness": {
             "component": "compact_network_serving",
             "address_artifact": {"table": {"oid": 11}},
@@ -124,7 +237,7 @@ async def test_compact_custom_addresses_require_an_unfiltered_own_table(monkeypa
     monkeypatch.setattr(layouts, "bind_compact_geo_search_candidate", lambda layout, _candidate: layout)
     proofs = []
     monkeypatch.setattr(published, "_pinned_manifest", lambda _entry, custody: proofs.append(custody) or object())
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=entry_by_field))
+    connection = _published_connection(entry_by_field)
     if own_rls is not False:
         with pytest.raises(published.NetworkServingReadUnavailable, match="address rows are unavailable"):
             await published.read_published_api_pin(connection, 3, "example_control", approved=False)
@@ -140,10 +253,14 @@ async def test_manifest_only_read_touches_no_approved_records(monkeypatch):
     from process import network_compact_layout as layouts
 
     report_by_field = {
+        "address_source": {"schema_name": "example_addresses", "table_name": "entity_address_unified"},
         "serving_readiness": {
             "component": "compact_network_serving",
-            # The address contract does not matter: every compact generation is named by its report.
-            "address_artifact": {"contract": "network_address_artifact.postgres.v1", "table": {"oid": 11}},
+            "address_artifact": {
+                "contract": "network_address_artifact.postgres.v1",
+                "table": {"oid": 11},
+                "authority": _SERVING_GENERATION,
+            },
             "edge_artifacts": [],
             "index_definition_sha256": "d" * 64,
         },
@@ -164,26 +281,22 @@ async def test_manifest_only_read_touches_no_approved_records(monkeypatch):
     proofs = []
     monkeypatch.setattr(published, "_pinned_manifest", lambda _entry, custody: proofs.append(custody) or manifest)
     monkeypatch.setattr(layouts, "bind_compact_geo_search_candidate", lambda layout, _candidate: layout)
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=entry_by_field))
+    connection = _published_connection(entry_by_field)
     resolved = await published.read_published_api_pin(connection, 3, "example_control", approved=False)
     assert resolved == (manifest, None, None) and not hasattr(manifest, "_published_api_request")
     approved_records = 'FROM "example_control".registry_approved_record'
-    statement = connection.fetchrow.await_args.args[0]
+    statement = next(call.args[0] for call in connection.fetchrow.await_args_list if "AS approved_rows" in call.args[0])
     assert "NULL::bigint AS approved_rows" in statement and approved_records not in statement
     # The candidate's own validation report supplies the relation names; the ledger is never read.
     assert "network_candidate_custody" not in statement and proofs[0]["seal_sha256"] is None
     assert proofs[0]["compact_layout"].base == layouts.CompactAddressRelation(
         "example_addresses", "entity_address_unified", 11
     )
-    assert proofs[0]["receipt"] == {
-        "closure": {},
-        "control": {},
-        "index_definition_sha256": "d" * 64,
-    }
+    assert proofs[0]["receipt"] == {"closure": {}, "control": {}, "index_definition_sha256": "d" * 64}
 
     entry_by_field.update(approved_oid=31, approved_rows=5)
     pinned, approved, relation = await published.read_published_api_pin(connection, 3, "example_control")
-    assert approved_records in connection.fetchrow.await_args.args[0]
+    assert any(approved_records in call.args[0] for call in connection.fetchrow.await_args_list)
     assert pinned is manifest and manifest._published_api_request is True
     assert (approved.approved_revision, approved.generation_id, approved.total_rows) == (4, "c" * 64, 5)
     assert (relation.schema_name, relation.table_name, relation.table_oid) == (

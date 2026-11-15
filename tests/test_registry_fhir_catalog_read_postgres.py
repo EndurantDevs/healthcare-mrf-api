@@ -15,7 +15,7 @@ from db.registry_fhir_catalog import MAX_CORE_BYTES, table_sql
 from process import registry_fhir_catalog_read as catalog
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.registry_catalog_policy import RegistryOrganizationVisibility
-from tests.fhir_catalog_named_copy_support import assert_copied_fhir_view
+from tests.fhir_catalog_named_copy_support import assert_copied_fhir_view, assert_fhir_address_rotation
 from tests.test_network_compact_address_origin_postgres import indexed_api_db as indexed_api_db
 from tests.test_network_compact_address_origin_postgres import indexed_db as indexed_db
 from tests.test_network_custom_address_source_postgres import bootstrap_db as bootstrap_db
@@ -916,3 +916,9 @@ async def test_unpublished_and_changed_pin_refuse(catalog_database, monkeypatch)
 @pytest.mark.asyncio
 async def test_copied_catalog_preserves_named_api_reader(indexed_api_db, monkeypatch):
     await assert_copied_fhir_view(indexed_api_db, monkeypatch)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timing", ["before_lock", "after_selection"])
+async def test_catalog_address_rotation_preserves_page(indexed_api_db, monkeypatch, timing):
+    await assert_fhir_address_rotation(indexed_api_db, monkeypatch, timing)

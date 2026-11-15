@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Batched native metadata keeps exact artifact custody and catalog bytes."""
+"""Named artifact reads retain schema validation and native permission boundaries."""
 
 import json
 from contextlib import AsyncExitStack
@@ -7,6 +7,7 @@ from time import perf_counter
 from types import SimpleNamespace
 from uuid import uuid4
 
+import asyncpg
 import pytest
 
 from process import mrf_address_publication as native
@@ -37,12 +38,6 @@ async def catalog_db(address_db):
         yield SimpleNamespace(
             resources=address_db, subjects=tuple(sorted((address_db.roles["reader"], *created_roles)))
         )
-
-
-async def _legacy_subjects(session, oids, subjects):
-    pairs = (None,) if len(subjects) == 1 else tuple((subjects[0], role) for role in subjects[1:])
-    for pair in pairs:
-        await native.require_native_read_catalog(session, oids, executable_roles=pair)
 
 
 async def _legacy_catalog(session, physical, authority):
@@ -94,7 +89,7 @@ async def _verification(resources, descriptor, roles):
     return result, {"statements": len(counted.statements), "wall_seconds": elapsed}
 
 
-async def test_full_verification_metadata_cost_and_parity(catalog_db, monkeypatch):
+async def test_named_verification_cost_is_independent_of_subject_count(catalog_db):
     resources = catalog_db.resources
     measurements = []
     for count in (1, 2, 4, 8):
@@ -107,18 +102,14 @@ async def test_full_verification_metadata_cost_and_parity(catalog_db, monkeypatc
             assert artifact._json(await _legacy_catalog(session, physical, authority)) == artifact._json(
                 descriptor["catalog"]
             )
-        with monkeypatch.context() as legacy:
-            legacy.setattr(artifact, "require_native_read_catalog_subjects", _legacy_subjects)
-            legacy.setattr(artifact, "_catalog", _legacy_catalog)
-            before, old_cost = await _verification(resources, descriptor, roles)
-        after, new_cost = await _verification(resources, descriptor, roles)
-        assert before == after
-        assert new_cost["statements"] < old_cost["statements"]
-        measurements.append({"subjects": count, "legacy": old_cost, "batched": new_cost})
-    assert len({entry["batched"]["statements"] for entry in measurements}) == 1
-    assert [entry["legacy"]["statements"] for entry in measurements] == sorted(
-        entry["legacy"]["statements"] for entry in measurements
-    )
+        actual, cost = await _verification(resources, descriptor, roles)
+        assert actual.schema_name == resources.schema and actual.table_name == "entity_address_unified"
+        assert (
+            await resources.reader.fetchval(f'SELECT location_key FROM "{actual.schema_name}"."{actual.table_name}"')
+            == "old-office"
+        )
+        measurements.append({"subjects": count, **cost})
+    assert len({entry["statements"] for entry in measurements}) == 1
     print("NETWORK_ADDRESS_CATALOG_COST=" + json.dumps(measurements, sort_keys=True))
 
 
@@ -152,7 +143,7 @@ async def _native_index_function(resources):
 
 
 @pytest.mark.parametrize("unsafe", ("final_subject", "executable_owner", "current_user"))
-async def test_every_subject_keeps_inherited_native_executable_refusal(catalog_db, monkeypatch, unsafe):
+async def test_named_reads_do_not_reauthenticate_executable_owners(catalog_db, unsafe):
     resources = catalog_db.resources
     roles = catalog_db.subjects if unsafe != "current_user" else catalog_db.subjects[1:]
     descriptor = await _descriptor(resources, roles)
@@ -166,14 +157,14 @@ async def test_every_subject_keeps_inherited_native_executable_refusal(catalog_d
             selected,
             owner,
         )
+    before, _ = await _verification(resources, descriptor, roles)
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        async with resources.admin.transaction():
+            await resources.admin.execute(f'SET LOCAL ROLE "{selected}"')
+            await resources.admin.execute(f'ALTER FUNCTION {function["identity"]} OWNER TO "{owner}"')
     await resources.admin.execute(f'ALTER FUNCTION {function["identity"]} OWNER TO "{owner}"')
     try:
-        for is_legacy in (True, False):
-            with monkeypatch.context() as verifier:
-                if is_legacy:
-                    verifier.setattr(artifact, "require_native_read_catalog_subjects", _legacy_subjects)
-                with pytest.raises(RuntimeError, match="executable ownership is unsupported"):
-                    await _verification(resources, descriptor, roles)
+        assert (await _verification(resources, descriptor, roles))[0] == before
     finally:
         await resources.admin.execute(f"ALTER FUNCTION {function['identity']} OWNER TO {function['owner']}")
 
@@ -215,7 +206,7 @@ async def test_batched_verifier_keeps_missing_and_changed_native_catalog_refusal
 
 
 @pytest.mark.parametrize("kind", ("OPERATOR", "OPERATOR CLASS", "OPERATOR FAMILY"))
-async def test_final_subject_cannot_replace_native_operator_catalog_objects(catalog_db, monkeypatch, kind):
+async def test_operator_changes_use_native_permissions_not_reader_attestation(catalog_db, kind):
     resources = catalog_db.resources
     roles = catalog_db.subjects
     descriptor = await _descriptor(resources, roles)
@@ -229,13 +220,13 @@ async def test_final_subject_cannot_replace_native_operator_catalog_objects(cata
         identity = "pg_catalog.integer_ops USING btree"
         owner_query = "SELECT quote_ident(r.rolname) FROM pg_opfamily o JOIN pg_roles r ON r.oid=o.opfowner WHERE o.opfnamespace='pg_catalog'::regnamespace AND o.opfname='integer_ops' AND o.opfmethod=(SELECT oid FROM pg_am WHERE amname='btree')"
     owner = await resources.admin.fetchval(owner_query)
+    before, _ = await _verification(resources, descriptor, roles)
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        async with resources.admin.transaction():
+            await resources.admin.execute(f'SET LOCAL ROLE "{roles[-1]}"')
+            await resources.admin.execute(f'ALTER {kind} {identity} OWNER TO "{roles[-1]}"')
     await resources.admin.execute(f'ALTER {kind} {identity} OWNER TO "{roles[-1]}"')
     try:
-        for is_legacy in (True, False):
-            with monkeypatch.context() as verifier:
-                if is_legacy:
-                    verifier.setattr(artifact, "require_native_read_catalog_subjects", _legacy_subjects)
-                with pytest.raises(RuntimeError, match="executable ownership is unsupported"):
-                    await _verification(resources, descriptor, roles)
+        assert (await _verification(resources, descriptor, roles))[0] == before
     finally:
         await resources.admin.execute(f"ALTER {kind} {identity} OWNER TO {owner}")

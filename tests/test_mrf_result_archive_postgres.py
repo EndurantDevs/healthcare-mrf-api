@@ -1072,17 +1072,40 @@ async def _activate_manual_archive(sessions, destination_schema, manifest, owner
         )
 
 
-async def _assert_retained_mrf_publication_rejected(session, destination_schema):
-    """Inherited owner membership cannot bypass the ordinary writer's exact-owner boundary."""
+async def _assert_retained_mrf_publication_rollback(session, destination_schema, monkeypatch):
+    """Native rights allow the real swap; a later failure still rolls back its complete generation."""
     before = await generation.read_reference_family_result_generation_authority(
         session, importer_id="mrf", schema_name=destination_schema
     )
     before_oids = await generation.current_reference_family_relation_oids(
         session, importer_id="mrf", schema_name=destination_schema
     )
+    prior_owner = await session.scalar(
+        text("SELECT relowner::regrole::text FROM pg_class WHERE oid=to_regclass(:relation)"),
+        {"relation": f'"{destination_schema}".issuer'},
+    )
     await session.commit()
-    with pytest.raises(RuntimeError, match="publication_read_access_custody_changed"):
-        await initial._publish_mrf_table_generation("20260921", destination_schema)
+    original_transaction = initial.db.transaction
+
+    @asynccontextmanager
+    async def rollback_after_publication():
+        async with original_transaction() as writer:
+            yield writer
+            current = await generation.read_reference_family_result_generation_authority(
+                session, importer_id="mrf", schema_name=destination_schema
+            )
+            assert current.local_generation == before.local_generation + 1
+            assert current.relation_oids != before_oids
+            assert await session.scalar(
+                text("SELECT has_table_privilege(CAST(:role AS name),:relation,'SELECT')"),
+                {"role": prior_owner, "relation": f'"{destination_schema}".issuer'},
+            )
+            raise RuntimeError("synthetic rollback after ordinary publication")
+
+    with monkeypatch.context() as rollback:
+        rollback.setattr(initial.db, "transaction", rollback_after_publication)
+        with pytest.raises(RuntimeError, match="synthetic rollback after ordinary publication"):
+            await initial._publish_mrf_table_generation("20260921", destination_schema)
     assert (
         await generation.read_reference_family_result_generation_authority(
             session, importer_id="mrf", schema_name=destination_schema
@@ -1167,7 +1190,7 @@ async def _run_interleaved_archive_cycle(
         monkeypatch.setattr(initial, "db", _PublisherDatabase(session, destination_schema))
         monkeypatch.setattr(initial, "get_import_schema", lambda *_args: destination_schema)
         await _stage_normal_mrf_family(session, destination_schema, "20260921", uuid4())
-        await _assert_retained_mrf_publication_rejected(session, destination_schema)
+        await _assert_retained_mrf_publication_rollback(session, destination_schema, monkeypatch)
     await _assert_manual_mrf_activation_rollback(native.publisher, destination_schema, manifest, ownership)
     await _activate_manual_archive(native.publisher, destination_schema, manifest, ownership)
     await _assert_manual_mrf_publication_owner(native.publisher, ownership)

@@ -579,8 +579,6 @@ SELECT t.oid AS trigger_oid,t.tgconstraint AS constraint_oid,t.tgname,p.prosrc,
  AND (p.proconfig=ARRAY['search_path=pg_catalog']::text[]
       OR p.proconfig=ARRAY['search_path=pg_catalog, pg_temp']::text[])
  AND language.lanname='plpgsql'
- AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_roles principal WHERE {ordinary}
-     AND pg_catalog.pg_has_role(principal.oid,p.proowner,'MEMBER'))
  AND ((t.tgname='cms_serving_no_truncate' AND t.tgtype=34 AND t.tgconstraint=0
        AND NOT t.tgdeferrable AND NOT t.tginitdeferred)
   OR (t.tgname='cms_serving_address_transition' AND t.tgtype=29 AND t.tgdeferrable AND t.tginitdeferred
@@ -594,7 +592,7 @@ JOIN pg_catalog.pg_proc p ON p.oid=t.tgfoid JOIN pg_catalog.pg_language language
 LEFT JOIN pg_catalog.pg_constraint k ON k.oid=t.tgconstraint
 WHERE n.nspname=:schema AND c.relname='entity_address_result_generation' AND NOT t.tgisinternal
 ORDER BY t.tgname
-""".format(ordinary=_ORDINARY_PRINCIPAL_SQL)
+"""
 
 
 async def _cms_receipt_guard_oids(session, schema, owner_oid):
@@ -1172,6 +1170,7 @@ async def _publication_receipt(session, schema, owner, prepared, result):
         )
         _require(oid == dict(owner.relation_oids)[model.__tablename__], "published OID differs")
         relations.append({"table_name": model.__tablename__, "relation_oid": oid})
+    generation = prepared.context.get("result_generation", {}).get("serving_generation")
     return {
         **result,
         "publication": {
@@ -1179,6 +1178,7 @@ async def _publication_receipt(session, schema, owner, prepared, result):
             "schema_name": schema,
             "relations": relations,
             "retained_relations": prepared.context.get("retained_relations", []),
+            **({"serving_generation": generation} if generation is not None else {}),
             "alias_authority": {
                 "schema_name": owner.schema_name,
                 "schema_oid": owner.schema_oid,

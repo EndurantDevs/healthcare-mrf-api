@@ -11,6 +11,21 @@ import pytest
 from process import entity_address_snapshot_ownership as ownership
 
 
+@pytest.mark.parametrize("result", [None, False, 1, True])
+async def test_legacy_rotation_requires_explicit_matching_publication_authentication(result):
+    session, owner = object(), object()
+    publication, rotation = {}, {"retained_relations": []}
+    authenticate = AsyncMock(return_value=result)
+    if result is True:
+        await ownership._require_rotation_binding(session, owner, publication, rotation, authenticate)
+    else:
+        with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="unauthenticated"):
+            await ownership._require_rotation_binding(session, owner, publication, rotation, authenticate)
+    authenticate.assert_awaited_once_with(session, owner, publication, rotation)
+    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="unauthenticated"):
+        await ownership._require_rotation_binding(session, owner, publication, rotation, None)
+
+
 def _owner():
     dataset_id = UUID("550e8400-e29b-41d4-a716-446655440000")
     return ownership.EntityAddressArchiveStageOwnership(
@@ -41,21 +56,26 @@ def test_v2_owner_closed_inventory():
 
 
 async def test_v2_retirement_rechecks_catalog_under_locks_before_any_drop(monkeypatch):
-    from process import entity_address_snapshot_preparation as protected
     from process import network_cms_registry_address_capture as capture
     from process import network_compact_retention as retention
 
     monkeypatch.setattr(capture, "native_driver", AsyncMock(return_value=object()))
-    monkeypatch.setattr(retention, "require_network_compact_artifacts_unreferenced", AsyncMock(return_value=True))
+    monkeypatch.setattr(retention, "require_named_address_artifacts_unreferenced", AsyncMock(return_value=True))
 
     owner = _set_owner()
-    monkeypatch.setattr(protected, "_publisher_authority", AsyncMock(return_value=31))
-    monkeypatch.setattr(ownership, "_validated_publication_owner", lambda *_: ("example", [], {"relation_oid": 8}))
-    monkeypatch.setattr(ownership, "_require_retained_catalog", lambda *_: None)
+    monkeypatch.setattr(
+        ownership, "_validated_publication_owner", lambda *_: ("example", [], {"schema_name": owner.schema_name})
+    )
+
+    def require_catalog(rows, _names):
+        if not rows:
+            raise ownership.EntityAddressArchiveOwnershipError("catalog differs")
+
+    monkeypatch.setattr(ownership, "_require_retained_catalog", require_catalog)
     catalog = AsyncMock(side_effect=[[{"nspname": "example", "relname": "retained"}], []])
     monkeypatch.setattr(ownership, "_retained_relation_catalog", catalog)
     session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
-    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="catalog changed"):
+    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="catalog differs"):
         await ownership.cleanup_entity_address_archive_publication(
             session, owner=owner, publication={}, assert_unreferenced=AsyncMock(return_value=True)
         )

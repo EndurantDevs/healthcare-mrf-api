@@ -16,6 +16,7 @@ from sqlalchemy.engine import make_url
 from process import entity_address_alias_guard as alias_guard
 from process import entity_address_snapshot_adoption as adoption
 from process import network_address_artifact as artifact
+from process.entity_address_retained_names import retained_address_name
 from process.network_address_projection import PinnedAddressSource
 from tests.test_address_numeric_grid_alias_runtime_db import _create_alias_probe_schema
 from tests.test_network_membership_serving_indexes_postgres import _full_source
@@ -223,7 +224,7 @@ async def test_rotation_between_catalog_read_and_lock_rejects_replacement_name(a
             await artifact._locked_table(RotatingConnection(), address_db.schema, address_db.descriptor["table"]["oid"])
     retained = await _verify(address_db)
     assert retained.table_oid == address_db.descriptor["table"]["oid"]
-    assert retained.table_name.endswith("_retained_" + format(retained.table_oid, "x"))
+    assert retained.table_name == _retained_name(address_db)
 
 
 async def test_native_rotation_keeps_pin_for_reader(address_db, monkeypatch):
@@ -238,7 +239,7 @@ async def test_native_rotation_keeps_pin_for_reader(address_db, monkeypatch):
     retained = await _rotate(address_db, monkeypatch)
     after = await _verify(address_db)
     assert before.table_oid == after.table_oid == retained["relation_oid"]
-    assert after.table_name == retained["retained_name"] == f"entity_address_unified_retained_{before.table_oid:x}"
+    assert after.table_name == retained["retained_name"] == _retained_name(address_db)
     assert (
         await address_db.reader.fetchval(f'SELECT location_key FROM "{after.schema_name}"."{after.table_name}"')
         == "old-office"
@@ -279,7 +280,7 @@ async def test_native_rotation_keeps_pin_for_reader(address_db, monkeypatch):
         "wrong_name",
     ],
 )
-async def test_changed_custody_or_structure_rejects(address_db, damage):
+async def test_named_reader_checks_schema_and_native_access(address_db, damage):
     resources = address_db
     admin, schema, roles = resources.admin, resources.schema, resources.roles
     match damage:
@@ -329,8 +330,11 @@ async def test_changed_custody_or_structure_rejects(address_db, damage):
             await admin.execute(
                 f'ALTER TABLE "{schema}".entity_address_unified RENAME TO entity_address_unified_retained_1'
             )
-    with pytest.raises((artifact.NetworkAddressArtifactError, RuntimeError)):
-        await _verify(resources)
+    if damage in {"new_oid", "new_index", "column_added", "authority_index", "wrong_name"}:
+        with pytest.raises((artifact.NetworkAddressArtifactError, RuntimeError)):
+            await _verify(resources)
+    else:
+        assert (await _verify(resources)).table_name == "entity_address_unified"
 
 
 async def test_pure_descriptor_digest_grants_no_generation_or_custody_authority(address_db):
@@ -355,3 +359,42 @@ async def test_capture_requires_a_repeatable_snapshot(address_db):
             await artifact.capture_network_address_artifact(
                 address_db.reader, address_db.source, runtime_roles=(address_db.roles["reader"],)
             )
+
+
+def _retained_name(resources):
+    origin_by_field = {
+        field: resources.descriptor["authority"][field]
+        for field in ("origin_lineage_id", "origin_generation", "published_at")
+    }
+    return retained_address_name("entity_address_unified", origin_by_field)
+
+
+async def test_named_artifact_verifier_accepts_copy_and_real_rotation(address_db, monkeypatch):
+    resources = address_db
+    schema, role = resources.schema, resources.roles["reader"]
+    metadata = deepcopy(resources.descriptor)
+    original = await _verify(resources)
+    await resources.admin.execute(
+        f'ALTER TABLE "{schema}".entity_address_unified RENAME TO before_copy; '
+        f'CREATE TABLE "{schema}".entity_address_unified (LIKE "{schema}".before_copy INCLUDING ALL); '
+        f'INSERT INTO "{schema}".entity_address_unified SELECT * FROM "{schema}".before_copy; '
+        f'ALTER TABLE "{schema}".entity_address_unified OWNER TO "{resources.roles["owner"]}"; '
+        f'GRANT SELECT ON "{schema}".entity_address_unified TO "{role}"'
+    )
+    copied = await _verify(resources)
+    assert copied.table_name == original.table_name and copied.table_oid != original.table_oid
+    await _rotate(resources, monkeypatch)
+    retained = await _verify(resources)
+    assert retained.table_name == _retained_name(resources) and retained.table_oid == copied.table_oid
+    assert resources.descriptor == metadata
+    assert (
+        await resources.reader.fetchval(f'SELECT location_key FROM "{schema}"."{retained.table_name}"') == "old-office"
+    )
+    await resources.admin.execute(f'REVOKE SELECT ON "{schema}"."{retained.table_name}" FROM "{role}"')
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        await _verify(resources)
+    await resources.admin.execute(f'GRANT SELECT ON "{schema}"."{retained.table_name}" TO "{role}"')
+    async with resources.reader.transaction():
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await resources.reader.execute(f'UPDATE "{schema}"."{retained.table_name}" SET location_key=location_key')
+    assert (await _verify(resources)).table_name == retained.table_name

@@ -39,7 +39,7 @@ _ARCHIVED = 9003
 
 
 def _candidate_lookup_queries(queries, control_schema):
-    # The request snapshot reads the published routing metadata once; no other statement looks up the candidate.
+    # The request reads the complete routing metadata once, after its small address-coordinate lookup.
     lookups = [query for query in queries if "to_jsonb(candidate)::text AS candidate_json" in query.query]
     assert [query.query for query in lookups] == [published_api_pin_statement(control_schema)]
     return lookups
@@ -300,7 +300,7 @@ async def _admit(admission, selection, *, excluded=(_EXCLUDED,)):
     assert not any("binding_matches AS MATERIALIZED" in query.query for query in queries)
     candidate_queries = _candidate_lookup_queries(queries, held.fixture.control_schema)
     assert len(candidate_queries) == 1
-    assert candidate_queries[0].args == (admission.manifest.generation_id,)
+    assert candidate_queries[0].args == (admission.manifest.generation_id, None)
     assert candidate_queries[0].exception is None
     assert not any("validation_json::text AS validation_json" in query.query for query in queries)
     assert not any("network_candidate_custody" in query.query for query in queries)

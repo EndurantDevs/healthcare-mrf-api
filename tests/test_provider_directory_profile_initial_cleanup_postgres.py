@@ -16,6 +16,7 @@ from tests import test_provider_directory_profile_failed_cleanup_postgres as com
 from tests.cms_npd_admission_postgres_support import admission_database, fhir
 from tests.cms_npd_admission_postgres_support import cms_admission_template as cms_admission_template
 from tests.test_provider_directory_profile_failed_cleanup import sign
+from tests.test_provider_directory_profile_failed_cleanup_postgres import cleanup_fixture_clock as cleanup_fixture_clock
 from tests.test_provider_directory_profile_initial_cleanup import BUILD, OWNER, _original_authority
 
 

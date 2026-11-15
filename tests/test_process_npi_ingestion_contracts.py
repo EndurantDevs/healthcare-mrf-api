@@ -738,7 +738,7 @@ def _assert_npi_generation_published(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("corruption", ("transaction", "owner", "rls", "grantor", "stage_missing"))
-async def test_npi_rotation_refuses_unproven_reader_preservation(npi_module, corruption):
+async def test_npi_rotation_preserves_native_reads_without_owner_admission(npi_module, corruption):
     connection = _ShutdownRawConnection({"npi_20251108": 1})
     if corruption == "owner":
         connection.read_relation_overrides["npi"] = {"owned": False}
@@ -754,14 +754,22 @@ async def test_npi_rotation_refuses_unproven_reader_preservation(npi_module, cor
             connection, schema="testschema", live_table="npi", stage_table="npi_20251108", index_suffixes=()
         )
 
-    with pytest.raises(RuntimeError, match="publication_read_access"):
-        if corruption == "transaction":
+    if corruption in {"owner", "grantor"}:
+        async with connection.transaction():
             await rotate()
-        else:
-            async with connection.transaction():
+        grant = 'GRANT SELECT ON TABLE "testschema"."npi_20251108" TO "reader"'
+        assert connection.events.index(grant) < next(
+            index for index, event in enumerate(connection.events) if event.startswith("DROP")
+        )
+    else:
+        with pytest.raises(RuntimeError, match="publication_read_access"):
+            if corruption == "transaction":
                 await rotate()
+            else:
+                async with connection.transaction():
+                    await rotate()
+        assert not any(event.startswith(("GRANT", "DROP", "ALTER")) for event in connection.events)
     assert not connection.is_in_transaction()
-    assert not any(event.startswith(("GRANT", "DROP", "ALTER")) for event in connection.events)
 
 
 @pytest.mark.asyncio

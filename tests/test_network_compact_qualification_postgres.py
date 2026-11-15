@@ -16,7 +16,9 @@ from api.network_provider_read import NetworkProviderNotFound, read_network_prov
 from process import entity_address_snapshot_adoption as adoption
 from process import network_address_artifact as artifact
 from process import network_compact_preparation as compact_preparation
+from process.entity_address_retained_names import retained_address_name
 from process.network_address_projection import PinnedAddressSource
+from process.network_compact_retention import NetworkCompactRetentionError, require_named_address_artifacts_unreferenced
 from process.network_membership_candidate_lifecycle import (
     admit_network_membership_batch,
     create_network_candidate,
@@ -24,11 +26,14 @@ from process.network_membership_candidate_lifecycle import (
 )
 from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_publication import NetworkPublicationError
-from process.network_serving_read import resolve_network_serving_manifest
+from process.network_published_api_pin import read_published_api_pin
+from process.network_serving_read import NetworkServingReadUnavailable, resolve_network_serving_manifest
 from tests import test_network_compact_publication_postgres as publication
 from tests.test_api_database_jit import (
     test_native_api_jit_covers_pool_growth_transaction_end_and_reconnect as test_native_api_jit_covers_pool_growth_transaction_end_and_reconnect,
 )
+from tests.test_network_address_artifact_postgres import address_db as address_db
+from tests.test_network_address_read_race_postgres import _prepare_replacement, _swap_replacement
 from tests.test_network_compact_address_postgres import compact_db as compact_db
 from tests.test_network_compact_publication_postgres import compact_publication_db as compact_publication_db
 from tests.test_network_geo_search_api_sql import projection_api_case as projection_api_case
@@ -64,6 +69,181 @@ from tests.test_network_index_catalog_postgres import (
     test_legacy_catalog_keeps_its_original_deparse_context as test_legacy_catalog_keeps_its_original_deparse_context,
 )
 from tests.test_network_membership_slices_postgres import slice_db as slice_db
+
+
+async def _named_base_rows(fixture):
+    async with publication._reader(fixture) as (_session, connection):
+        manifest, _, _ = await read_published_api_pin(connection, None, fixture.control_schema, approved=False)
+        base = manifest.compact_layout.base
+        rows = await connection.fetch(
+            f'SELECT location_key FROM "{base.schema_name}"."{base.table_name}" ORDER BY location_key'
+        )
+        return base.table_name, [row["location_key"] for row in rows]
+
+
+@pytest.mark.asyncio
+async def test_copied_address_generation_survives_real_rotation(compact_publication_db, monkeypatch):
+    """Copy immutable metadata, rotate with the real publisher, and preserve named reads."""
+    fixture = compact_publication_db
+    candidate_target = await publication._candidate(fixture, (42, 88), 0)
+    await _publish_ready(fixture, candidate_target)
+    address = fixture.address
+    assert address.descriptor["contract"] == "network_address_artifact.postgres.v1"
+    schema, table = address.schema, "entity_address_unified"
+    metadata_sql = (
+        f'SELECT validation_json::text FROM "{fixture.control_schema}".network_membership_candidate '
+        "ORDER BY candidate_id"
+    )
+    metadata = await fixture.connection.fetch(metadata_sql)
+    before = await _named_base_rows(fixture)
+    assert before == (table, ["old-office", "other-office"])
+    old_oid = await _copy_address_base(address)
+    assert await _named_base_rows(fixture) == before
+    await _prepare_replacement(address, populated=False)
+    retained = await _swap_replacement(address, monkeypatch)
+    generation_by_field = {
+        field: address.descriptor["authority"][field]
+        for field in ("origin_lineage_id", "origin_generation", "published_at")
+    }
+    name = retained_address_name(table, generation_by_field)
+    assert retained["retained_name"] == name
+    assert await _named_base_rows(fixture) == (name, before[1])
+    # A second ordinary rotation retains a different logical generation without replacing the first.
+    await _prepare_replacement(address, populated=False)
+    successor = await _swap_replacement(address, monkeypatch)
+    assert successor["retained_name"] != name
+    assert await _named_base_rows(fixture) == (name, before[1])
+    assert await fixture.connection.fetch(metadata_sql) == metadata
+    async with fixture.connection.transaction():
+        with pytest.raises(NetworkCompactRetentionError, match="artifact_referenced"):
+            await require_named_address_artifacts_unreferenced(
+                fixture.connection, [(schema, name)], control_schema=fixture.control_schema
+            )
+    # Existing receipts whose heap was already retained under its old spelling remain readable.
+    legacy = f"{table}_retained_{old_oid:x}"
+    await address.admin.execute(f'ALTER TABLE "{schema}"."{name}" RENAME TO "{legacy}"')
+    assert await _named_base_rows(fixture) == (legacy, before[1])
+    async with fixture.connection.transaction():
+        with pytest.raises(NetworkCompactRetentionError, match="artifact_referenced"):
+            await require_named_address_artifacts_unreferenced(
+                fixture.connection, [(schema, legacy)], control_schema=fixture.control_schema
+            )
+
+
+async def _copy_address_base(address):
+    schema, table = address.schema, "entity_address_unified"
+    old_oid = await address.admin.fetchval("SELECT to_regclass($1)::oid", f"{schema}.{table}")
+    async with address.admin.transaction():
+        await address.admin.execute(
+            f'ALTER TABLE "{schema}"."{table}" RENAME TO original_before_copy; '
+            f'CREATE TABLE "{schema}"."{table}" (LIKE "{schema}".original_before_copy INCLUDING ALL); '
+            f'INSERT INTO "{schema}"."{table}" OVERRIDING SYSTEM VALUE SELECT * FROM "{schema}".original_before_copy; '
+            f'ALTER TABLE "{schema}"."{table}" OWNER TO "{address.roles["owner"]}"; '
+            f'GRANT SELECT ON "{schema}"."{table}" TO "{address.roles["reader"]}"'
+        )
+    assert await address.admin.fetchval("SELECT to_regclass($1)::oid", f"{schema}.{table}") != old_oid
+    return old_oid
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("during_read", [False, True], ids=["before-snapshot", "after-snapshot"])
+async def test_copied_legacy_rotation_refuses_api_replacement(compact_publication_db, monkeypatch, during_read):
+    fixture = compact_publication_db
+    target = await publication._candidate(fixture, (42, 88), 0)
+    await _publish_ready(fixture, target)
+    address = fixture.address
+    await _copy_address_base(address)
+    assert await _named_base_rows(fixture) == ("entity_address_unified", ["old-office", "other-office"])
+
+    async def read(connection):
+        return await read_published_api_pin(connection, None, fixture.control_schema, approved=False)
+
+    await _assert_legacy_rotation_refused(address, monkeypatch, during_read, read, NetworkServingReadUnavailable)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("during_read", [False, True], ids=["before-snapshot", "after-snapshot"])
+async def test_copied_legacy_rotation_refuses_artifact_replacement(address_db, monkeypatch, during_read):
+    address = address_db
+    await _copy_address_base(address)
+
+    async def read(connection):
+        return await artifact.verify_network_address_artifact(
+            connection, address.descriptor, runtime_roles=(address.roles["reader"],)
+        )
+
+    async with address.reader.transaction(isolation="repeatable_read", readonly=True):
+        assert (await read(address.reader)).table_name == "entity_address_unified"
+    await _assert_legacy_rotation_refused(address, monkeypatch, during_read, read, artifact.NetworkAddressArtifactError)
+
+
+async def _assert_legacy_rotation_refused(address, monkeypatch, during_read, read, error):
+    await _prepare_replacement(address, populated=True)
+    if not during_read:
+        await _swap_replacement(address, monkeypatch, legacy_names=True)
+    async with address.reader.transaction(isolation="repeatable_read", readonly=True):
+        connection = address.reader
+        origin_sql = (
+            f'SELECT origin_generation FROM "{address.schema}".entity_address_result_generation WHERE singleton'
+        )
+        origin = await connection.fetchval(origin_sql)
+        assert origin == (1 if during_read else 2)
+        if during_read:
+            await _swap_replacement(address, monkeypatch, legacy_names=True)
+            assert await connection.fetchval(origin_sql) == origin
+        # The replacement is visible by its live name, but cannot serve as the saved generation.
+        assert (
+            await connection.fetchval(f'SELECT location_key FROM "{address.schema}".entity_address_unified')
+            == "new-office"
+        )
+        reason = (
+            "source_generation_changed" if error is artifact.NetworkAddressArtifactError else "metadata is unavailable"
+        )
+        with pytest.raises(error, match=reason):
+            await read(connection)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["default", "extra_column", "index"])
+@pytest.mark.parametrize("retained", [False, True], ids=["copied-live", "copied-retained"])
+async def test_copied_address_shape_keeps_semantic_checks(compact_publication_db, monkeypatch, damage, retained):
+    fixture = compact_publication_db
+    candidate_target = await publication._candidate(fixture, (42, 88), 0)
+    await _publish_ready(fixture, candidate_target)
+    address = fixture.address
+    metadata_sql = f'SELECT validation_json::text FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1'
+    metadata = await fixture.connection.fetchval(metadata_sql, UUID(candidate_target.candidate_id))
+    descriptor = json.loads(metadata)["serving_readiness"]["address_artifact"]
+    await _copy_address_base(address)
+    async with address.reader.transaction(isolation="repeatable_read", readonly=True):
+        assert (
+            await artifact.verify_network_address_artifact(
+                address.reader, descriptor, runtime_roles=(address.roles["reader"],)
+            )
+        ).table_name == "entity_address_unified"
+    table_name = "entity_address_unified"
+    if retained:
+        await _prepare_replacement(address, populated=True)
+        table_name = (await _swap_replacement(address, monkeypatch))["retained_name"]
+        async with address.reader.transaction(isolation="repeatable_read", readonly=True):
+            assert (
+                await artifact.verify_network_address_artifact(
+                    address.reader, descriptor, runtime_roles=(address.roles["reader"],)
+                )
+            ).table_name == table_name
+    table = f'"{address.schema}"."{table_name}"'
+    changes_by_fault = {
+        "default": f"ALTER TABLE {table} ALTER COLUMN checksum SET DEFAULT 999",
+        "extra_column": f"ALTER TABLE {table} ADD COLUMN unexpected_copy_column integer",
+        "index": f"CREATE INDEX unexpected_copy_index ON {table}(location_key)",
+    }
+    await address.admin.execute(changes_by_fault[damage])
+    async with address.reader.transaction(isolation="repeatable_read", readonly=True):
+        with pytest.raises(artifact.NetworkAddressArtifactError, match="structural_catalog_changed"):
+            await artifact.verify_network_address_artifact(
+                address.reader, descriptor, runtime_roles=(address.roles["reader"],)
+            )
+    assert await fixture.connection.fetchval(metadata_sql, UUID(candidate_target.candidate_id)) == metadata
 
 
 async def _publish_ready(fixture, target):
@@ -355,3 +535,54 @@ async def test_dense_membership_deduplicates_exact_offices_and_isolates_provider
                 "1000000004": 2,
                 "1234567893": 1,
             }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("can_read_registry", [False, True])
+async def test_absent_origin_cannot_rotate_referenced_copy(compact_publication_db, monkeypatch, can_read_registry):
+    fixture = compact_publication_db
+    await _publish_ready(fixture, await publication._candidate(fixture, (42, 88), 0))
+    address = fixture.address
+    await _copy_address_base(address)
+    expected_rows = (await _named_base_rows(fixture))[1]
+    origin = await address.admin.fetchrow(
+        f'SELECT origin_lineage_id,origin_generation,published_at FROM "{address.schema}".entity_address_result_generation '
+        "WHERE singleton"
+    )
+    await _prepare_replacement(address, populated=False)
+    monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", fixture.control_schema)
+    if can_read_registry:
+        await fixture.connection.execute(
+            f'GRANT USAGE ON SCHEMA "{fixture.control_schema}" TO "{address.roles["publisher"]}"; '
+            f'GRANT SELECT ON ALL TABLES IN SCHEMA "{fixture.control_schema}" TO "{address.roles["publisher"]}"'
+        )
+    await address.admin.execute(
+        f'ALTER TABLE "{address.schema}".entity_address_result_generation '
+        "ALTER COLUMN origin_lineage_id DROP NOT NULL,ALTER COLUMN origin_generation DROP NOT NULL,"
+        "ALTER COLUMN published_at DROP NOT NULL; "
+        f'UPDATE "{address.schema}".entity_address_result_generation '
+        "SET origin_lineage_id=NULL,origin_generation=NULL,published_at=NULL"
+    )
+    failure = NetworkCompactRetentionError if can_read_registry else asyncpg.InsufficientPrivilegeError
+    with pytest.raises(failure):
+        await _swap_replacement(address, monkeypatch)
+    unchanged_rows = await address.reader.fetch(
+        f'SELECT location_key FROM "{address.schema}".entity_address_unified ORDER BY location_key'
+    )
+    assert [address_row["location_key"] for address_row in unchanged_rows] == expected_rows
+    with pytest.raises(NetworkServingReadUnavailable, match="metadata is unavailable"):
+        await _named_base_rows(fixture)
+    assert await address.admin.fetchval(
+        "SELECT to_regclass($1) IS NOT NULL", address.schema + ".entity_address_unified_next"
+    )
+    await address.admin.execute(
+        f'UPDATE "{address.schema}".entity_address_result_generation '
+        "SET origin_lineage_id=$1,origin_generation=$2,published_at=$3 WHERE singleton",
+        *origin.values(),
+    )
+    await address.admin.execute(
+        f'ALTER TABLE "{address.schema}".entity_address_result_generation '
+        "ALTER COLUMN origin_lineage_id SET NOT NULL,ALTER COLUMN origin_generation SET NOT NULL,"
+        "ALTER COLUMN published_at SET NOT NULL"
+    )
+    assert (await _named_base_rows(fixture))[1] == expected_rows

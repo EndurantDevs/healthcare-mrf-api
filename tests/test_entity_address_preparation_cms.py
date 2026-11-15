@@ -106,21 +106,31 @@ async def test_unsupported_or_populated_receipts_refuse_before_guard_admission(s
     assert session.scalar.await_count == (3 if safe is True else 2)
 
 
-def test_cms_catalog_attestation_keeps_owner_function_and_constraint_envelopes():
+def test_cms_catalog_guard_keeps_function_trigger_and_constraint_envelopes():
     statement = preparation._CMS_GUARDS_SQL
+    for custody_predicate in ("pg_catalog.pg_roles", "pg_catalog.pg_has_role", "p.proowner", ":owner_oid"):
+        assert custody_predicate not in statement
     for predicate in (
-        preparation._ORDINARY_PRINCIPAL_SQL,
-        "pg_catalog.pg_has_role(principal.oid,p.proowner,'MEMBER')",
+        "p.pronamespace=c.relnamespace AND p.proname=t.tgname AND p.pronargs=0 AND p.pronargdefaults=0",
+        "p.provariadic=0 AND p.proargtypes=''::oidvector AND p.proallargtypes IS NULL",
+        "p.proargmodes IS NULL AND p.proargnames IS NULL AND NOT p.proretset",
+        "p.prokind='f' AND p.prorettype='pg_catalog.trigger'::regtype",
         "p.proconfig=ARRAY['search_path=pg_catalog']::text[]",
+        "p.proconfig=ARRAY['search_path=pg_catalog, pg_temp']::text[]",
         "AND NOT p.prosecdef",
         "p.prosupport=0",
         "language.lanname='plpgsql'",
+        "t.tgenabled IN ('O','A')",
+        "t.tgnargs=0 AND t.tgargs=''::bytea AND t.tgqual IS NULL AND t.tgattr=''::int2vector",
         "t.tgtype=34 AND t.tgconstraint=0",
         "t.tgtype=29 AND t.tgdeferrable AND t.tginitdeferred",
         "k.contype='t'",
+        "k.conname=t.tgname",
         "k.conrelid=c.oid",
+        "k.convalidated AND k.conislocal AND k.coninhcount=0",
         "k.conkey IS NULL",
         "k.confkey IS NULL",
         "k.conbin IS NULL",
+        "c.relname='entity_address_result_generation' AND NOT t.tgisinternal",
     ):
         assert predicate in statement

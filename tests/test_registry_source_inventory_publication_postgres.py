@@ -343,6 +343,8 @@ async def _canonical_request(context, manifest, copy_target, monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-network-read-token")
     monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", context.fixture.control_schema)
     network_id = context.reviewed[2][0]["record_id"]
+    base = manifest.compact_layout.base
+    address_lock = f"LOCK TABLE {_identifier(base.schema_name)}.{_identifier(base.table_name)} IN ACCESS SHARE MODE"
     async with db.reader_session() as session:
         driver = (await (await session.connection()).get_raw_connection()).driver_connection
         statements = []
@@ -361,7 +363,7 @@ async def _canonical_request(context, manifest, copy_target, monkeypatch):
             assert inventory.root == source_inventory_root(entries) and len(entries) == 1
             await _assert_canonical_locations(session, manifest, network_id)
             await asyncio.sleep(0)
-        assert not any(_requests_lock(query_event.query) for query_event in statements)
+        assert {query_event.query for query_event in statements if _requests_lock(query_event.query)} == {address_lock}
         request = SimpleNamespace(
             query_string=f"network_ids={network_id}",
             headers={"Authorization": "Bearer synthetic-network-read-token"},
@@ -373,7 +375,7 @@ async def _canonical_request(context, manifest, copy_target, monkeypatch):
         with driver.query_logger(statements.append):
             http_response = await read_addresses(request)
             await asyncio.sleep(0)
-        assert not any(_requests_lock(query_event.query) for query_event in statements)
+        assert {query_event.query for query_event in statements if _requests_lock(query_event.query)} == {address_lock}
         assert http_response.status == 200 and json.loads(http_response.body) == {"locations": ["a" * 64]}
         assert http_response.headers["X-Network-Generation"] == str(manifest.generation_id)
         assert http_response.headers["Cache-Control"] == "private, no-store"

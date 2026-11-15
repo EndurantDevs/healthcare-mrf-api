@@ -1353,8 +1353,8 @@ async def test_native_autocomplete_authorizes_before_raw_limit_and_globally_reje
     ]
     first, small = await _autocomplete(fixture, limit=1, counted=True)
     larger, large = await _autocomplete(fixture, limit=50, counted=True)
-    # Read-mode check, published routing metadata, approved source pin and the plan page.
-    assert len(first["plans"]) == 1 and len(larger["plans"]) == 50 and small == large == 4
+    # Read-mode check, address coordinates, published routing metadata, approved source pin and the plan page.
+    assert len(first["plans"]) == 1 and len(larger["plans"]) == 50 and small == large == 5
     assert "42" in (await _autocomplete(fixture, query="Sample", exclusions=(42,)))["plans"][0]["network_checksum"]
     retained = fixture.manifest
     fixture.manifest = await _publish_legacy_batch_bindings(

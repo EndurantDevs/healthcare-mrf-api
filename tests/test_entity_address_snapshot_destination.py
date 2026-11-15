@@ -446,12 +446,21 @@ async def _assert_family_identity_and_rows(
     schema: str,
     expected_oid_by_table: Mapping[str, int],
     *,
-    suffix: str,
+    retained: bool,
 ) -> None:
-    """Require every populated family member to retain its expected OID."""
+    """Require every prior family member to remain readable at its actual retained name."""
 
     for table_name, expected_oid in expected_oid_by_table.items():
-        actual_table_name = table_name + suffix
+        actual_table_name = table_name
+        if retained:
+            actual_table_name = await database.scalar(
+                "SELECT c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
+                "WHERE n.nspname=:schema AND c.oid=:oid",
+                schema=schema,
+                oid=expected_oid,
+            )
+            assert isinstance(actual_table_name, str)
+            assert actual_table_name != table_name and "_retained_" in actual_table_name
         assert (
             await database.scalar(
                 "SELECT to_regclass(:relation_name)::oid::bigint",
@@ -595,7 +604,7 @@ async def test_native_destination_adoption_is_query_ready_and_failure_preserves_
             database,
             successful_schema,
             successful_incumbent_oid_by_table,
-            suffix="_old",
+            retained=True,
         )
         assert await database.scalar(f"SELECT count(*) FROM {successful_schema}.adoption_receipt") == 1
         await _assert_adopted_generation(database, successful_schema)
@@ -616,7 +625,7 @@ async def test_native_destination_adoption_is_query_ready_and_failure_preserves_
             database,
             rollback_schema,
             rollback_incumbent_oid_by_table,
-            suffix="",
+            retained=False,
         )
         assert await database.scalar(f"SELECT count(*) FROM {rollback_schema}.adoption_receipt") == 0
         rolled_back_generation = await _generation_authority(database, rollback_schema)
@@ -663,7 +672,7 @@ async def test_native_destination_preserves_six_held_bindings_through_activation
             await database.status(f"ALTER TABLE {relation} DISABLE ROW LEVEL SECURITY")
         with pytest.raises(RuntimeError, match="synthetic receipt failure"):
             await _activate(database, stored, fail_after_publish=True)
-        await _assert_family_identity_and_rows(database, schema, incumbent, suffix="")
+        await _assert_family_identity_and_rows(database, schema, incumbent, retained=False)
         assert await database.scalar(f'SELECT count(*) FROM "{schema}".adoption_receipt') == 0
         await _activate(database, stored, fail_after_publish=False)
         assert (

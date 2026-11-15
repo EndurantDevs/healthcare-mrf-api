@@ -3,6 +3,7 @@
 
 import json
 
+from process.entity_address_retained_names import has_matching_live_address_generation, retained_address_name
 from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_compact_custom_preparation import compact_carrier_receipt, compact_custom_receipt
@@ -12,7 +13,7 @@ from process.network_serving_read import NetworkServingReadUnavailable, _pinned_
 
 _PUBLISHED_SQL = """SELECT to_jsonb(candidate)::text AS candidate_json,
  to_jsonb(manifest)::text AS manifest_json,
- physical.relname AS base_name,space.nspname AS base_schema,
+ selected.table_name AS base_name,names.schema_name AS base_schema,
  (physical.relrowsecurity OR physical.relforcerowsecurity OR pg_catalog.row_security_active(physical.oid)) AS base_rls,
  (SELECT own.relrowsecurity OR own.relforcerowsecurity OR pg_catalog.row_security_active(own.oid)
    FROM pg_catalog.pg_class own WHERE own.oid=
@@ -21,16 +22,23 @@ _PUBLISHED_SQL = """SELECT to_jsonb(candidate)::text AS candidate_json,
  {approved_rows} AS approved_rows
  FROM {control}.network_serving_manifest manifest
  JOIN {control}.network_membership_candidate candidate USING(candidate_id)
- LEFT JOIN pg_catalog.pg_class physical ON physical.oid=(
-  -- Rotation keeps a published heap under its retained name and gives the recorded name to the replacement.
-  SELECT named.oid FROM pg_catalog.pg_class named
-   JOIN pg_catalog.pg_namespace home ON home.oid=named.relnamespace
-  WHERE home.nspname=candidate.validation_json->'address_source'->>'schema_name' AND named.relkind='r'
-   AND named.relname IN (candidate.validation_json->'address_source'->>'table_name',
-    (candidate.validation_json->'address_source'->>'table_name')||'_retained_'||pg_catalog.to_hex(
-     (candidate.validation_json->'serving_readiness'->'address_artifact'->'table'->>'oid')::bigint))
-  ORDER BY named.relname=candidate.validation_json->'address_source'->>'table_name' LIMIT 1)
- LEFT JOIN pg_catalog.pg_namespace space ON space.oid=physical.relnamespace
+ LEFT JOIN LATERAL (SELECT
+  candidate.validation_json->'address_source'->>'schema_name' AS schema_name,
+  candidate.validation_json->'address_source'->>'table_name' AS live_name,
+  (candidate.validation_json->'address_source'->>'table_name')||'_retained_'||pg_catalog.to_hex(
+   (candidate.validation_json->'serving_readiness'->'address_artifact'->'table'->>'oid')::bigint) AS retained_name
+ ) names ON true
+ LEFT JOIN LATERAL (SELECT CASE
+  WHEN names.schema_name IS NULL OR names.live_name IS NULL THEN NULL
+  WHEN pg_catalog.to_regclass(CASE WHEN $2::text IS NOT NULL THEN
+   pg_catalog.format('%I.%I',names.schema_name,$2::text) END) IS NOT NULL THEN $2::text
+  WHEN names.retained_name IS NULL THEN names.live_name
+  WHEN pg_catalog.to_regclass(pg_catalog.format('%I.%I',names.schema_name,names.retained_name)) IS NOT NULL
+   THEN names.retained_name ELSE names.live_name END AS table_name
+ ) selected ON true
+ LEFT JOIN pg_catalog.pg_class physical ON physical.oid=CASE WHEN selected.table_name IS NOT NULL THEN
+  pg_catalog.to_regclass(pg_catalog.format('%I.%I',names.schema_name,selected.table_name)) END
+  AND physical.relkind='r'
  WHERE manifest.generation_id=coalesce($1::bigint,
   (SELECT generation_id FROM {control}.network_serving_control WHERE id=1))
  AND manifest.eligible AND candidate.state='published'"""
@@ -39,6 +47,24 @@ _PUBLISHED_SQL = """SELECT to_jsonb(candidate)::text AS candidate_json,
 _APPROVED_ROWS_SQL = """(SELECT coalesce(sum(jsonb_array_length(record_json->'memberships_json')),0)::bigint
   FROM {control}.registry_approved_record WHERE approved_revision=candidate.approved_custom_revision
    AND record_kind='membership' AND record_json->'archived'='false'::jsonb)"""
+
+_ADDRESS_SOURCE_SQL = """SELECT
+ candidate.validation_json->'serving_readiness'->>'component'='compact_network_serving' AS is_compact,
+ candidate.validation_json->'address_source'->>'schema_name' AS schema_name,
+ candidate.validation_json->'address_source'->>'table_name' AS table_name,
+ (candidate.validation_json->'address_source'->>'table_name')||'_retained_'||pg_catalog.to_hex(
+  (candidate.validation_json->'serving_readiness'->'address_artifact'->'table'->>'oid')::bigint) AS retained_name,
+ CASE WHEN candidate.validation_json->'serving_readiness'->'address_artifact'->>'contract'
+  ='network_address_artifact.postgres.v1' THEN jsonb_build_object(
+   'origin_lineage_id',candidate.validation_json->'serving_readiness'->'address_artifact'->'authority'->'origin_lineage_id',
+   'origin_generation',candidate.validation_json->'serving_readiness'->'address_artifact'->'authority'->'origin_generation',
+   'published_at',candidate.validation_json->'serving_readiness'->'address_artifact'->'authority'->'published_at'
+  )::text END AS serving_generation_json
+ FROM {control}.network_serving_manifest manifest
+ JOIN {control}.network_membership_candidate candidate USING(candidate_id)
+ WHERE manifest.generation_id=coalesce($1::bigint,
+  (SELECT generation_id FROM {control}.network_serving_control WHERE id=1))
+ AND manifest.eligible AND candidate.state='published'"""
 
 
 def published_api_pin_statement(control_schema, *, approved=True):
@@ -104,10 +130,7 @@ def _published_layout(entry, candidate):
     return bind_compact_geo_search_candidate(layout, candidate)
 
 
-def _decode_published_pin(entry, schema, *, approved=True):
-    if entry is None:
-        raise NetworkServingReadUnavailable("Published network generation is unavailable")
-    candidate = json.loads(entry["candidate_json"])
+def _decode_published_pin(entry, candidate, schema, *, approved=True):
     report = candidate["validation_json"]
     layout = None
     if is_compact_candidate(candidate):
@@ -141,12 +164,60 @@ def _decode_published_pin(entry, schema, *, approved=True):
     return manifest, approved, relation
 
 
+async def _lock_logical_address(connection, generation_id, schema):
+    coordinates = await connection.fetchrow(_ADDRESS_SOURCE_SQL.format(control=_identifier(schema)), generation_id)
+    if coordinates is None:
+        raise NetworkServingReadUnavailable("Published network generation is unavailable")
+    if coordinates["is_compact"] is not True:
+        return None, None
+    namespace = _identifier(coordinates["schema_name"])
+    live = namespace + "." + _identifier(coordinates["table_name"])
+    retained = namespace + "." + _identifier(coordinates["retained_name"])
+    origin_json = coordinates["serving_generation_json"]
+    portable = (
+        retained_address_name(coordinates["table_name"], json.loads(origin_json)) if origin_json is not None else None
+    )
+    # A retained read needs no access to the replacement; native locks prevent another rename.
+    relation = await connection.fetchval(
+        "SELECT CASE WHEN to_regclass($1::text) IS NOT NULL THEN $1::text "
+        "WHEN to_regclass($2::text) IS NOT NULL THEN $2::text ELSE $3::text END",
+        namespace + "." + _identifier(portable) if portable is not None else None,
+        retained,
+        live,
+    )
+    await connection.execute(f"LOCK TABLE {relation} IN ACCESS SHARE MODE")
+    return relation, portable
+
+
 async def read_published_api_pin(connection, generation_id, schema, *, approved=True):
-    """Use stored publication evidence; actual data queries report missing objects or access."""
+    """Resolve published names under native locks retained by the caller's read transaction."""
     if generation_id is not None and (type(generation_id) is not int or not 0 < generation_id < 2**63):
         raise NetworkServingReadUnavailable("Published network generation selector is invalid")
-    entry = await connection.fetchrow(published_api_pin_statement(schema, approved=approved), generation_id)
-    return _decode_published_pin(entry, schema, approved=approved)
+    locked, portable = await _lock_logical_address(connection, generation_id, schema)
+    entry = await connection.fetchrow(published_api_pin_statement(schema, approved=approved), generation_id, portable)
+    if entry is None:
+        raise NetworkServingReadUnavailable("Published network generation is unavailable")
+    candidate = json.loads(entry["candidate_json"])
+    if locked is not None:
+        selected = _identifier(entry["base_schema"]) + "." + _identifier(entry["base_name"])
+        if selected != locked:
+            await connection.execute(f"LOCK TABLE {selected} IN ACCESS SHARE MODE")
+        report_by_field = candidate["validation_json"]
+        artifact_by_field = report_by_field["serving_readiness"]["address_artifact"]
+        if (
+            entry["base_name"] == report_by_field["address_source"]["table_name"]
+            and artifact_by_field.get("contract") == "network_address_artifact.postgres.v1"
+        ):
+            origin_by_field = {
+                field: artifact_by_field["authority"][field]
+                for field in ("origin_lineage_id", "origin_generation", "published_at")
+            }
+            _require(
+                await has_matching_live_address_generation(
+                    connection, entry["base_schema"], entry["base_name"], origin_by_field
+                )
+            )
+    return _decode_published_pin(entry, candidate, schema, approved=approved)
 
 
 def active_published_api_pin(connection, manifest=None, *, control_schema=None):
