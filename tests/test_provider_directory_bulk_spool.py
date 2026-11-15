@@ -195,6 +195,29 @@ async def test_export_saves_only_incomplete_outputs_and_reports_a_missing_valida
 
 
 @pytest.mark.asyncio
+async def test_all_outputs_download_at_once_beyond_the_output_concurrency(spooled_source, monkeypatch):
+    count_by_kind = {"active": 0, "peak": 0}
+
+    async def output(request):
+        count_by_kind["active"] += 1
+        count_by_kind["peak"] = max(count_by_kind["peak"], count_by_kind["active"])
+        await asyncio.sleep(0.3)  # hold the response so concurrent downloads overlap
+        count_by_kind["active"] -= 1
+        return web.Response(body=BODY, headers={"ETag": ETAG, "Accept-Ranges": "bytes"})
+
+    application = web.Application()
+    application.router.add_get("/output", output)
+    async with TestServer(application) as server, aiohttp.ClientSession() as session:
+        manifest, _ = _two_output_export(monkeypatch, str(server.make_url("/output")), ("streaming",) * 12)
+        assert parallel.output_concurrency(directory, spooled_source) == 8
+
+        assert await parallel._spool_export(_context(session, spooled_source, manifest)) is None
+
+        assert count_by_kind["peak"] == 12
+        assert all(spool.spooled_output(CHECKPOINT_ID, index, _validator()).path.exists() for index in range(12))
+
+
+@pytest.mark.asyncio
 async def test_completed_outputs_keep_only_their_proof_and_are_skipped(spooled_source, monkeypatch):
     requests = []
     async with _output_server(requests) as server, aiohttp.ClientSession() as session:

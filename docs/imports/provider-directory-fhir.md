@@ -979,8 +979,10 @@ Signed output links can expire before a large export is parsed. For the source i
 listed in `HLTHPRT_PROVIDER_DIRECTORY_BULK_SPOOL_SOURCES`, with byte-range resume
 enabled and `HLTHPRT_PROVIDER_DIRECTORY_BULK_SPOOL_ROOT` set to a persistent
 directory, the worker first saves every incomplete output of an export as zstd
-under `<root>/<checkpoint_id>/`. Downloads use the shared transfer budget and the
-stored length and strong-ETag validators. Each copy is written in fsynced frames,
+under `<root>/<checkpoint_id>/`. All incomplete outputs download at once, up to 32,
+whatever the source's output concurrency; throttling still halves that budget, and
+parsing keeps the output concurrency. Downloads check the stored length and
+strong-ETag validators. Each copy is written in fsynced frames,
 so a broken download resumes from its last whole frame. Parsing starts once every
 output is saved, reads the copies through the same response checks and byte
 offsets, and deletes each copy when its output completes. While copies download,
